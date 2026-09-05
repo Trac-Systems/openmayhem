@@ -59,6 +59,13 @@ pub(crate) struct GatewayJobArtifactSummary {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub(crate) struct GatewayJobErrorInfo {
+    pub(crate) code: String,
+    pub(crate) category: String,
+    pub(crate) retryable: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct StoredGatewayJob {
     pub(crate) schema_version: u32,
     pub(crate) id: String,
@@ -74,6 +81,8 @@ pub(crate) struct StoredGatewayJob {
     pub(crate) artifacts: Vec<GatewayJobArtifact>,
     pub(crate) receipt: Option<Value>,
     pub(crate) error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) error_info: Option<GatewayJobErrorInfo>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +98,7 @@ pub(crate) struct StoredGatewayJobSummary {
     pub(crate) artifacts: Vec<GatewayJobArtifactSummary>,
     pub(crate) receipt: Option<Value>,
     pub(crate) error: Option<String>,
+    pub(crate) error_info: Option<GatewayJobErrorInfo>,
 }
 
 impl From<&StoredGatewayJob> for StoredGatewayJobSummary {
@@ -114,6 +124,7 @@ impl From<&StoredGatewayJob> for StoredGatewayJobSummary {
                 .collect(),
             receipt: job.receipt.clone(),
             error: job.error.clone(),
+            error_info: job.error_info.clone(),
         }
     }
 }
@@ -291,12 +302,27 @@ impl GatewayJobStore {
         error: Option<String>,
         now: u64,
     ) -> Result<StoredGatewayJob, String> {
+        self.complete_with_error_info(id, status, result, artifacts, receipt, error, None, now)
+    }
+
+    pub(crate) fn complete_with_error_info(
+        &mut self,
+        id: &str,
+        status: GatewayJobStatus,
+        result: Option<Value>,
+        artifacts: Vec<GatewayJobArtifact>,
+        receipt: Option<Value>,
+        error: Option<String>,
+        error_info: Option<GatewayJobErrorInfo>,
+        now: u64,
+    ) -> Result<StoredGatewayJob, String> {
         if let Some(existing) = self.records.get(id) {
             if existing.status == status
                 && existing.result == result
                 && existing.artifacts == artifacts
                 && existing.receipt == receipt
                 && existing.error == error
+                && existing.error_info == error_info
             {
                 let existing = existing.clone();
                 if status == GatewayJobStatus::ReconciliationPending {
@@ -326,6 +352,7 @@ impl GatewayJobStore {
             artifacts,
             receipt,
             error,
+            error_info,
         };
         let sealed = seal_job(&self.key, &job)?;
         if sealed.len() > self.max_bytes {
@@ -1031,6 +1058,120 @@ mod tests {
     }
 
     #[test]
+    fn failed_job_error_info_is_optional_durable_and_part_of_terminal_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let seed = [19_u8; 32];
+        let mut store =
+            GatewayJobStore::durable(seed, root.path().to_owned(), 8, 1024 * 1024, 60, 10).unwrap();
+        let info = GatewayJobErrorInfo {
+            code: "provider_model_output_invalid".to_owned(),
+            category: "provider_response".to_owned(),
+            retryable: false,
+        };
+        for id in ["legacy", "typed"] {
+            store
+                .begin(
+                    id.to_owned(),
+                    "chat".to_owned(),
+                    "model".to_owned(),
+                    None,
+                    id.to_owned(),
+                    10,
+                )
+                .unwrap();
+        }
+        let message = Some("The provider returned invalid output.".to_owned());
+        let legacy = store
+            .complete(
+                "legacy",
+                GatewayJobStatus::Failed,
+                None,
+                Vec::new(),
+                None,
+                message.clone(),
+                11,
+            )
+            .unwrap();
+        // With None omitted, this is the unchanged version-1 record shape.
+        assert!(serde_json::to_value(&legacy)
+            .unwrap()
+            .get("error_info")
+            .is_none());
+        let typed = store
+            .complete_with_error_info(
+                "typed",
+                GatewayJobStatus::Failed,
+                None,
+                Vec::new(),
+                None,
+                message.clone(),
+                Some(info.clone()),
+                11,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .complete_with_error_info(
+                    "typed",
+                    GatewayJobStatus::Failed,
+                    None,
+                    Vec::new(),
+                    None,
+                    message.clone(),
+                    Some(info.clone()),
+                    12
+                )
+                .unwrap(),
+            typed
+        );
+        assert!(store
+            .complete(
+                "typed",
+                GatewayJobStatus::Failed,
+                None,
+                Vec::new(),
+                None,
+                message.clone(),
+                12
+            )
+            .is_err());
+        let mut changed_info = info.clone();
+        changed_info.retryable = true;
+        assert!(store
+            .complete_with_error_info(
+                "typed",
+                GatewayJobStatus::Failed,
+                None,
+                Vec::new(),
+                None,
+                message,
+                Some(changed_info),
+                12
+            )
+            .is_err());
+        drop(store);
+        let mut reopened =
+            GatewayJobStore::durable(seed, root.path().to_owned(), 8, 1024 * 1024, 60, 12).unwrap();
+        assert_eq!(reopened.get("legacy", 12).unwrap().unwrap(), legacy);
+        assert_eq!(reopened.get("typed", 12).unwrap().unwrap(), typed);
+        let summaries = reopened.list_summaries_for_owner(None, 12).unwrap();
+        assert_eq!(
+            summaries
+                .iter()
+                .find(|job| job.id == "typed")
+                .unwrap()
+                .error_info,
+            Some(info)
+        );
+        assert!(summaries
+            .iter()
+            .find(|job| job.id == "legacy")
+            .unwrap()
+            .error_info
+            .is_none());
+    }
+
+    #[test]
     fn durable_jobs_are_encrypted_restart_safe_owned_and_ttl_purged() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("jobs");
@@ -1486,6 +1627,7 @@ mod tests {
             artifacts: Vec::new(),
             receipt: None,
             error: None,
+            error_info: None,
         };
         let key = derive_job_store_key([1_u8; 32]);
         let sealed = seal_job(&key, &job).unwrap();

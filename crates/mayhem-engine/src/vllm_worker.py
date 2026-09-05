@@ -24,6 +24,7 @@ processor = None
 ctx_size = 2048
 batch_invariant = False
 kernel_policy = "auto"
+execution_properties = None
 event_loop = asyncio.new_event_loop()
 asyncio.set_event_loop(event_loop)
 request_queue = queue.Queue()
@@ -32,6 +33,11 @@ active_request_ids = set()
 cancelled_requests_lock = threading.Lock()
 completed_request_id = 0
 generation_multiplexer = None
+
+
+MAX_KERNEL_BACKEND_LENGTH = 64
+MAX_MTP_SPECULATIVE_TOKENS = 32
+MAX_EXECUTION_PROBE_SECONDS = 10.0
 
 
 class RequestCancelled(Exception):
@@ -427,6 +433,245 @@ def positive_int(value, default):
         return int(default)
 
 
+def optional_bool(payload, name):
+    if name not in payload or payload[name] is None:
+        return None
+    value = payload[name]
+    if type(value) is not bool:
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
+def kernel_backend(value, name):
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    if (
+        not value
+        or len(value.encode("ascii", errors="ignore")) != len(value)
+        or len(value) > MAX_KERNEL_BACKEND_LENGTH
+        or not ("a" <= value[0] <= "z")
+        or any(not (character.islower() or character.isdigit() or character == "_") for character in value)
+    ):
+        raise ValueError(
+            f"{name} must be a lowercase vLLM backend identifier of at most "
+            f"{MAX_KERNEL_BACKEND_LENGTH} bytes"
+        )
+    return value
+
+
+def optional_kernel_backend(payload, name):
+    if name not in payload or payload[name] is None:
+        return None
+    return kernel_backend(payload[name], name)
+
+
+def optional_mtp_num_speculative_tokens(payload):
+    name = "vllm_mtp_num_speculative_tokens"
+    if name not in payload or payload[name] is None:
+        return None
+    value = payload[name]
+    if type(value) is not int or not (1 <= value <= MAX_MTP_SPECULATIVE_TOKENS):
+        raise ValueError(
+            f"{name} must be between 1 and {MAX_MTP_SPECULATIVE_TOKENS}"
+        )
+    return value
+
+
+def optional_compilation_config(payload):
+    config = {}
+    mode = payload.get("vllm_compilation_mode")
+    if mode is not None:
+        if type(mode) is not int or not 0 <= mode <= 3:
+            raise ValueError("vllm_compilation_mode must be an integer between 0 and 3")
+        config["mode"] = mode
+    cudagraph_mode = payload.get("vllm_cudagraph_mode")
+    if cudagraph_mode is not None:
+        supported = ("NONE", "FULL_DECODE_ONLY", "FULL", "PIECEWISE", "FULL_AND_PIECEWISE")
+        if type(cudagraph_mode) is not str or cudagraph_mode.upper() not in supported:
+            raise ValueError("vllm_cudagraph_mode must be one of " + ", ".join(supported))
+        config["cudagraph_mode"] = cudagraph_mode.upper()
+    return config
+
+
+def enum_value(value):
+    return getattr(value, "value", value)
+
+
+def config_value(config, name):
+    if isinstance(config, dict):
+        return config.get(name)
+    return getattr(config, name, None)
+
+
+def effective_kernel_backend(config, name):
+    value = config_value(config, name)
+    if value is None:
+        return None
+    return kernel_backend(enum_value(value), name)
+
+
+def effective_mtp_num_speculative_tokens(config):
+    speculative = config_value(config, "speculative_config")
+    if speculative is None:
+        return None
+    method = enum_value(config_value(speculative, "method"))
+    tokens = config_value(speculative, "num_speculative_tokens")
+    if method != "mtp":
+        raise ValueError("vLLM speculative execution method must be 'mtp'")
+    if tokens is None:
+        raise ValueError("vLLM did not expose effective MTP num_speculative_tokens")
+    return optional_mtp_num_speculative_tokens(
+        {"vllm_mtp_num_speculative_tokens": tokens}
+    )
+
+
+def effective_execution_properties(initialized_engine, required_kwargs):
+    config = getattr(initialized_engine, "vllm_config", None)
+    if config is None:
+        raise ValueError("vLLM did not expose initialized vllm_config")
+    model_config = config_value(config, "model_config")
+    kernel_config = config_value(config, "kernel_config")
+    effective = {
+        "enforce_eager": config_value(model_config, "enforce_eager"),
+        "linear_backend": effective_kernel_backend(kernel_config, "linear_backend"),
+        "moe_backend": effective_kernel_backend(kernel_config, "moe_backend"),
+        "seed": config_value(model_config, "seed"),
+        "use_fp64_gumbel": config_value(model_config, "use_fp64_gumbel"),
+        "async_scheduling": config_value(
+            config_value(config, "scheduler_config"), "async_scheduling"
+        ),
+        "kv_cache_dtype": enum_value(
+            config_value(config_value(config, "cache_config"), "cache_dtype")
+        ),
+    }
+    if "compilation_config" in required_kwargs:
+        compilation = config_value(config, "compilation_config")
+        cudagraph_mode = config_value(compilation, "cudagraph_mode")
+        effective["compilation_config"] = optional_compilation_config({
+            "vllm_compilation_mode": enum_value(config_value(compilation, "mode")),
+            # Composite CUDA graph enums have tuple values; their names are canonical.
+            "vllm_cudagraph_mode": getattr(cudagraph_mode, "name", cudagraph_mode),
+        })
+    for name, expected in required_kwargs.items():
+        if name == "speculative_config":
+            continue
+        if name == "compilation_config":
+            fields = [
+                (f"{name}.{field}", config_value(effective[name], field), value)
+                for field, value in expected.items()
+            ]
+        else:
+            fields = [(name, effective[name], expected)]
+        for field, actual, requested in fields:
+            if type(actual) is not type(requested) or actual != requested:
+                raise ValueError(
+                    f"vLLM initialized execution mismatch for {field}: "
+                    f"expected {requested!r}, got {actual!r}"
+                )
+    mtp_tokens = effective_mtp_num_speculative_tokens(config)
+    expected_mtp_tokens = config_value(
+        required_kwargs.get("speculative_config"), "num_speculative_tokens"
+    )
+    if mtp_tokens != expected_mtp_tokens:
+        raise ValueError(
+            "vLLM initialized execution mismatch for num_speculative_tokens: "
+            f"expected {expected_mtp_tokens!r}, got {mtp_tokens!r}"
+        )
+    properties = {
+        "vllm_enforce_eager": effective["enforce_eager"],
+        "vllm_linear_backend": effective["linear_backend"],
+        "vllm_moe_backend": effective["moe_backend"],
+        "vllm_mtp_num_speculative_tokens": mtp_tokens,
+    }
+    if "compilation_config" in required_kwargs:
+        properties.update({
+            "vllm_compilation_mode": effective["compilation_config"].get("mode"),
+            "vllm_cudagraph_mode": effective["compilation_config"].get("cudagraph_mode"),
+        })
+    return properties
+
+
+async def observe_worker_execution(initialized_engine, payload):
+    requested = optional_compilation_config(payload)
+    if not requested:
+        return {}
+    rpc = getattr(initialized_engine, "collective_rpc", None)
+    if not callable(rpc):
+        raise ValueError("vLLM does not support the named execution observation RPC")
+    ranks = await asyncio.wait_for(
+        rpc("mayhem_execution_snapshot", timeout=MAX_EXECUTION_PROBE_SECONDS),
+        timeout=MAX_EXECUTION_PROBE_SECONDS,
+    )
+    parallel = config_value(getattr(initialized_engine, "vllm_config", None), "parallel_config")
+    count = config_value(parallel, "world_size")
+    tp_size = config_value(parallel, "tensor_parallel_size")
+    if (type(count) is not int or count < 1 or type(tp_size) is not int
+            or tp_size != positive_int(payload.get("tensor_parallel"), 1)
+            or count != tp_size):
+        raise ValueError("vLLM execution observation lacks initialized rank geometry")
+    for name in ("pipeline_parallel_size", "data_parallel_size", "prefill_context_parallel_size"):
+        value = config_value(parallel, name)
+        if type(value) is not int or value != 1:
+            raise ValueError(f"vLLM explicit execution observation requires {name}=1")
+    if type(ranks) is not list or len(ranks) != count:
+        raise ValueError(f"vLLM execution observation requires exactly {count} worker ranks")
+    seen_ranks = set()
+    resolved = None
+    for rank in ranks:
+        if type(rank) is not dict or set(rank) != {
+            "rank", "local_rank", "world_size", "pid", "compilation_mode", "cudagraph_mode"
+        }:
+            raise ValueError("vLLM execution observation has missing/unknown rank fields")
+        for field in ("rank", "local_rank", "pid", "world_size"):
+            if type(rank[field]) is not int or rank[field] < (1 if field == "pid" else 0):
+                raise ValueError(f"vLLM execution observation has invalid {field}")
+        if rank["world_size"] != count:
+            raise ValueError("vLLM execution observation has inconsistent world_size")
+        if rank["rank"] in seen_ranks:
+            raise ValueError("vLLM execution observation has duplicate ranks")
+        seen_ranks.add(rank["rank"])
+        actual = optional_compilation_config({
+            "vllm_compilation_mode": rank["compilation_mode"],
+            "vllm_cudagraph_mode": rank["cudagraph_mode"],
+        })
+        if (set(actual) != {"mode", "cudagraph_mode"}
+                or actual["cudagraph_mode"] != rank["cudagraph_mode"]):
+            raise ValueError("vLLM execution observation lacks resolved compilation fields")
+        if resolved is not None and actual != resolved:
+            raise ValueError("vLLM execution observation is inconsistent across TP ranks")
+        resolved = actual
+        for field, expected in requested.items():
+            if type(actual[field]) is not type(expected) or actual[field] != expected:
+                raise ValueError(
+                    f"vLLM worker execution mismatch at rank {rank['rank']} for {field}: "
+                    f"expected {expected!r}, got {actual[field]!r}"
+                )
+    if seen_ranks != set(range(count)):
+        raise ValueError("vLLM execution observation has missing/out-of-range worker ranks")
+    return {
+        "vllm_compilation_mode": resolved["mode"],
+        "vllm_cudagraph_mode": resolved["cudagraph_mode"],
+        "worker_execution_observation": {
+            "source": "worker_extension_cls.collective_rpc",
+            "rank_count": len(ranks),
+            "world_size": count,
+            "ranks": sorted(ranks, key=lambda rank: rank["rank"]),
+        },
+    }
+
+
+async def shutdown_rejected_engine(initialized_engine):
+    shutdown = getattr(initialized_engine, "shutdown", None)
+    if not callable(shutdown):
+        raise ValueError("vLLM rejected engine has no shutdown method")
+    kwargs = accepted_kwargs(shutdown, {"timeout": MAX_EXECUTION_PROBE_SECONDS})
+    result = await asyncio.wait_for(
+        asyncio.to_thread(shutdown, **kwargs), timeout=MAX_EXECUTION_PROBE_SECONDS
+    )
+    if inspect.isawaitable(result):
+        await asyncio.wait_for(result, timeout=MAX_EXECUTION_PROBE_SECONDS)
+
+
 def utilization_float(value):
     if value is None:
         return None
@@ -602,8 +847,9 @@ def make_sampling_params(payload, speciality_sampling_kwargs=None):
 
 
 def create_engine(payload):
-    global kernel_policy
+    global execution_properties, kernel_policy
 
+    execution_properties = None
     path = str(payload["path"])
     configure_deterministic_runtime(path)
     AsyncEngineArgs = import_attr(
@@ -619,6 +865,11 @@ def create_engine(payload):
         )
     )
     tensor_parallel = positive_int(payload.get("tensor_parallel"), 1)
+    requested_enforce_eager = optional_bool(payload, "vllm_enforce_eager")
+    requested_linear_backend = optional_kernel_backend(payload, "vllm_linear_backend")
+    requested_moe_backend = optional_kernel_backend(payload, "vllm_moe_backend")
+    requested_mtp_tokens = optional_mtp_num_speculative_tokens(payload)
+    requested_compilation_config = optional_compilation_config(payload)
     kwargs = {
         "model": path,
         "tokenizer": path,
@@ -629,25 +880,57 @@ def create_engine(payload):
             payload.get("max_num_tokens"), max(256, positive_int(payload.get("ctx_size"), 2048))
         ),
         "tensor_parallel_size": tensor_parallel,
-        "enforce_eager": bool(payload.get("enforce_eager", True)),
+        "enforce_eager": (
+            True if requested_enforce_eager is None else requested_enforce_eager
+        ),
         "seed": 0,
         "use_fp64_gumbel": True,
         "async_scheduling": False,
         "limit_mm_per_prompt": {"image": 1, "audio": 1, "video": 1},
         "mm_processor_cache_gb": 0,
     }
-    required_options = {"seed", "use_fp64_gumbel", "async_scheduling"}
-    if model_uses_nvfp4(path):
+    required_options = {
+        "enforce_eager",
+        "seed",
+        "use_fp64_gumbel",
+        "async_scheduling",
+    }
+    if requested_compilation_config:
+        kwargs["compilation_config"] = requested_compilation_config
+        required_options.add("compilation_config")
+        kwargs["worker_extension_cls"] = (
+            "mayhem_vllm_execution_probe.MayhemExecutionProbe"
+        )
+        required_options.add("worker_extension_cls")
+    uses_nvfp4 = model_uses_nvfp4(path)
+    if requested_linear_backend is not None:
+        kwargs["linear_backend"] = requested_linear_backend
+        required_options.add("linear_backend")
+    elif uses_nvfp4:
         # vLLM's batch-invariant path selects CUTLASS for deterministic NVFP4
         # execution. Hybrid GDN models cannot enable that global mode, so pin
         # the same kernel family explicitly instead of using auto-selected
         # FlashInfer linear/MoE kernels.
         kwargs["linear_backend"] = "cutlass"
+        required_options.add("linear_backend")
+    if requested_moe_backend is not None:
+        kwargs["moe_backend"] = requested_moe_backend
+        required_options.add("moe_backend")
+    elif uses_nvfp4:
         kwargs["moe_backend"] = "cutlass"
-        required_options.update(("linear_backend", "moe_backend"))
+        required_options.add("moe_backend")
+    if uses_nvfp4 and requested_linear_backend is None and requested_moe_backend is None:
         kernel_policy = "nvfp4-cutlass"
+    elif requested_linear_backend is not None or requested_moe_backend is not None:
+        kernel_policy = "explicit"
     else:
         kernel_policy = "auto"
+    if requested_mtp_tokens is not None:
+        kwargs["speculative_config"] = {
+            "method": "mtp",
+            "num_speculative_tokens": requested_mtp_tokens,
+        }
+        required_options.add("speculative_config")
     dtype = payload.get("dtype")
     if dtype:
         kwargs["dtype"] = str(dtype)
@@ -658,16 +941,31 @@ def create_engine(payload):
     gpu_memory_utilization = utilization_float(payload.get("gpu_memory_utilization"))
     if gpu_memory_utilization is not None:
         kwargs["gpu_memory_utilization"] = gpu_memory_utilization
-    args = AsyncEngineArgs(
-        **required_engine_kwargs(
-            AsyncEngineArgs,
-            kwargs,
-            required_options,
-        )
+    accepted_engine_kwargs = required_engine_kwargs(
+        AsyncEngineArgs,
+        kwargs,
+        required_options,
     )
+    # vLLM can mutate nested arguments while building its initialized config.
+    required_kwargs = copy.deepcopy({
+        name: kwargs[name] for name in sorted(required_options)
+        if name != "worker_extension_cls"
+    })
+    args = AsyncEngineArgs(**accepted_engine_kwargs)
     if hasattr(AsyncLLM, "from_engine_args"):
-        return AsyncLLM.from_engine_args(args)
-    return AsyncLLM(args)
+        initialized_engine = AsyncLLM.from_engine_args(args)
+    else:
+        initialized_engine = AsyncLLM(args)
+    try:
+        execution_properties = effective_execution_properties(
+            initialized_engine, required_kwargs
+        )
+    except Exception:
+        shutdown = getattr(initialized_engine, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+        raise
+    return initialized_engine
 
 
 def load_generation_capacity(payload):
@@ -1025,7 +1323,7 @@ async def async_handle_generate(request_id, payload):
                 if chunk_text or ids:
                     if not ids:
                         ids = [-1]
-                    for token in ids:
+                    for position, token in enumerate(ids):
                         send(
                             {
                                 "id": request_id,
@@ -1033,7 +1331,7 @@ async def async_handle_generate(request_id, payload):
                                 "chunk": {
                                     "index": completion_tokens,
                                     "token_id": int(token),
-                                    "text": chunk_text if token == ids[0] else "",
+                                    "text": chunk_text if position == 0 else "",
                                 },
                             }
                         )
@@ -1076,11 +1374,29 @@ async def async_handle_generate(request_id, payload):
     }
 
 
-def handle_load(payload):
+async def handle_load(payload):
     global engine, tokenizer, processor, ctx_size, model_path, generation_multiplexer
+    global execution_properties
     model_path = str(payload["path"])
     ctx_size = positive_int(payload.get("ctx_size"), 2048)
     engine = create_engine(payload)
+    if optional_compilation_config(payload):
+        initialized_engine = engine
+        frontend_properties = execution_properties
+        execution_properties = None
+        try:
+            observed = await observe_worker_execution(initialized_engine, payload)
+            execution_properties = {**frontend_properties, **observed}
+        except BaseException as error:
+            engine = tokenizer = processor = generation_multiplexer = None
+            try:
+                await shutdown_rejected_engine(initialized_engine)
+            except Exception as shutdown_error:
+                raise RuntimeError(
+                    f"vLLM execution observation failed: {error!r}; "
+                    f"shutdown failed: {shutdown_error!r}"
+                ) from error
+            raise
     try:
         from transformers import AutoProcessor, AutoTokenizer
 
@@ -1106,6 +1422,7 @@ def handle_load(payload):
         "n_vocab": int(vocab_size()),
         "kv_cache_size_tokens": kv_cache["size_tokens"],
         "kv_cache_max_concurrency": kv_cache["max_concurrency"],
+        "execution": execution_properties,
         "determinism": {
             "async_scheduling": False,
             "batch_invariant": batch_invariant,
@@ -1134,12 +1451,14 @@ def handle(request_id, op, payload):
     raise ValueError(f"unknown vLLM worker op {op!r}")
 
 
-def emit_control_response(request):
+async def emit_control_response(request):
     request_id = int(request.get("id", 0))
     try:
         if "parse_error" in request:
             raise ValueError(request["parse_error"])
         result = handle(request_id, str(request.get("op", "")), request.get("payload"))
+        if inspect.isawaitable(result):
+            result = await result
         check_cancelled(request_id)
         send({"id": request_id, "type": "response", "ok": True, "result": result})
     except SystemExit:
@@ -1191,7 +1510,7 @@ async def run_worker():
         op = str(request.get("op", ""))
         if op == "generate":
             if generation_multiplexer is None:
-                emit_control_response(request)
+                await emit_control_response(request)
                 continue
             try:
                 generation_multiplexer.submit(request_id, request.get("payload") or {})
@@ -1203,7 +1522,7 @@ async def run_worker():
 
         if generation_multiplexer is not None:
             await generation_multiplexer.drain()
-        emit_control_response(request)
+        await emit_control_response(request)
 
     if generation_multiplexer is not None:
         await generation_multiplexer.drain()

@@ -37,8 +37,9 @@ use crate::{
         DEFAULT_OPEN_TIMEOUT_MILLIS, DEFAULT_PROVIDER_COOLOFF_MILLIS,
     },
     job_store::{
-        gateway_job_id, BeginGatewayJob, GatewayJobArtifact, GatewayJobListEntry, GatewayJobLookup,
-        GatewayJobStatus, GatewayJobStore, StoredGatewayJob, StoredGatewayJobSummary,
+        gateway_job_id, BeginGatewayJob, GatewayJobArtifact, GatewayJobErrorInfo,
+        GatewayJobListEntry, GatewayJobLookup, GatewayJobStatus, GatewayJobStore, StoredGatewayJob,
+        StoredGatewayJobSummary,
     },
     pricing::{
         cancellation_settlement_usage, logical_cumulative_priced_usage_au, normalize_rate_map,
@@ -55,10 +56,10 @@ use crate::{
         DEFAULT_IMAGE_FLOOR_IMAGES_PER_S, DEFAULT_LLM_GENERATION_FLOOR_TOK_S,
         DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
     },
-    verify_tier1_attestation, AttestationPolicyVerificationContext, AttestationVerificationRequest,
-    EnclaveContractRecord, HardwareQuoteVerifierCommand, HeartbeatAttestation, HeartbeatCaps,
-    HeartbeatPerf, HeartbeatQueue, HeartbeatSlots, ProviderHeartbeat, ProviderKey,
-    ProviderProbation, ReputationEventKind, VerifiedAttestation,
+    verify_execution_mode_binding, verify_tier1_attestation, AttestationPolicyVerificationContext,
+    AttestationVerificationRequest, EnclaveContractRecord, HardwareQuoteVerifierCommand,
+    HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
+    ProviderHeartbeat, ProviderKey, ProviderProbation, ReputationEventKind, VerifiedAttestation,
     GATEWAY_ATTESTATION_VERIFIER_VERSION,
 };
 use axum::{
@@ -99,17 +100,18 @@ use mayhem_proto::{
     receipt_signing_bytes, record_usage_receipt_feature_key, record_usage_receipt_signing_bytes,
     session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
     stable_json_bytes, tools_only_model_input_prompt_units, validate_transcription_result,
-    validated_audio_metadata, validated_wav_audio_metadata, AdminAttestationPolicy,
-    AdminEnclaveAttestationBinding, AttestationReport, AttestationTrustDataRef,
-    AttestationVerifierProfile, CheckpointPolicy, CtxBracketSchedule, EndpointFamilyContract,
-    EndpointValueType, HardwareQuoteKind, HardwareQuoteRouteAdvertisement,
-    HardwareQuoteRoutePolicyBinding, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
-    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
-    SessionReceipt, SpendVoucher, SpendVoucherBody, TpmActivateCredentialChallengeFrame,
-    TpmActivateCredentialHello, TpmActivateCredentialResponseFrame, TranscriptionResult,
-    TranscriptionResultLimits, ValidatedAudioFormat, VisibleToolCall, WorkflowBinding,
-    WorkflowOutputBinding, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    validated_audio_metadata, validated_wav_audio_metadata, vllm_execution_mode_binding,
+    AdminAttestationPolicy, AdminEnclaveAttestationBinding, AttestationReport,
+    AttestationTrustDataRef, AttestationVerifierProfile, CheckpointPolicy, CtxBracketSchedule,
+    EndpointFamilyContract, EndpointValueType, ExecutionModeBinding, ExecutionModeRequestPolicy,
+    HardwareQuoteKind, HardwareQuoteRouteAdvertisement, HardwareQuoteRoutePolicyBinding,
+    ModelSpecialityDescriptor, MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest,
+    ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody,
+    TpmActivateCredentialChallengeFrame, TpmActivateCredentialHello,
+    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
+    ValidatedAudioFormat, VisibleToolCall, WorkflowBinding, WorkflowOutputBinding, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
     SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
@@ -122,6 +124,7 @@ use mayhem_proto::{
 use mayhem_proto::{chunk_json_payload, visible_output_units};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use sha2::{Digest as _, Sha256};
 use tokio::{net::TcpListener, sync::Notify};
 use tower::limit::ConcurrencyLimitLayer;
 
@@ -316,6 +319,7 @@ pub struct GatewayState {
 struct GatewayCatalogRuntime {
     models: Arc<Vec<GatewayModel>>,
     canaries: Arc<GatewayCanaryRegistry>,
+    execution_modes: Arc<GatewayExecutionModeRegistry>,
     attestation_authority: Option<Arc<GatewayAttestationAuthority>>,
 }
 
@@ -1849,6 +1853,31 @@ pub struct GatewayCanaryRegistry {
     pub prompt_ids_by_set: BTreeMap<String, Vec<String>>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct GatewayExecutionModeRegistry {
+    pub modes_by_artifact_root: BTreeMap<String, BTreeMap<String, GatewayExecutionModeConfig>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayExecutionModeConfig {
+    pub binding: ExecutionModeBinding,
+    pub requests: ExecutionModeRequestPolicy,
+    pub canary: GatewayCanaryModelConfig,
+}
+
+impl GatewayExecutionModeRegistry {
+    fn get(
+        &self,
+        artifact_root: &str,
+        binding: &ExecutionModeBinding,
+    ) -> Option<&GatewayExecutionModeConfig> {
+        self.modes_by_artifact_root
+            .get(artifact_root)?
+            .get(&binding.mode_id)
+            .filter(|config| config.binding == *binding)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GatewayCanaryModelConfig {
     pub canary_set: String,
@@ -3122,21 +3151,28 @@ impl GatewayJobHandle {
         })
     }
 
-    async fn persist_failure_if_active(&self, error: String) {
+    async fn persist_failure_if_active(&self, error: &ApiError) {
         let id = self.id.clone();
         let store = self.store.clone();
+        let error_info = GatewayJobErrorInfo {
+            code: error.public_code.to_owned(),
+            category: error.category.to_owned(),
+            retryable: error.retryable,
+        };
+        let message = error.message.clone();
         let persisted = tokio::task::spawn_blocking(move || {
             let mut store = store.lock_recover("gateway job vault");
             if !store.is_active(&id) {
                 return Ok(());
             }
-            store.complete(
+            store.complete_with_error_info(
                 &id,
                 GatewayJobStatus::Failed,
                 None,
                 Vec::new(),
                 None,
-                Some(error),
+                Some(message),
+                Some(error_info),
                 now_secs(),
             )?;
             Ok::<_, String>(())
@@ -3939,6 +3975,9 @@ pub struct GatewaySessionInvocation {
     pub hedge: GatewayHedgeInvocation,
     pub failover: GatewayFailoverInvocation,
     pub access_token: Option<GatewayTokenAttribution>,
+    pub expected_execution_mode: Option<ExecutionModeBinding>,
+    selected_route_key: Option<ProviderKey>,
+    execution_mode_canary: Option<GatewayCanaryModelConfig>,
     verified_attestation_evidence: Arc<Mutex<Option<VerifiedAttestation>>>,
     client_cancellation: Option<GatewayRequestCancellation>,
     job: Option<GatewayJobHandle>,
@@ -4183,6 +4222,29 @@ pub struct Usage {
 }
 
 impl GatewayState {
+    fn compatible_execution_modes(
+        &self,
+        endpoint_family: &str,
+        effective_body: Option<&Value>,
+    ) -> Vec<ExecutionModeBinding> {
+        let Some(effective_body) = effective_body else {
+            return Vec::new();
+        };
+        self.catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .execution_modes
+            .modes_by_artifact_root
+            .values()
+            .flat_map(BTreeMap::values)
+            .filter(|mode| {
+                mode.requests
+                    .validate_request(endpoint_family, effective_body)
+                    .is_ok()
+            })
+            .map(|mode| mode.binding.clone())
+            .collect()
+    }
+
     fn voucher_settlement_binding(
         &self,
         _model: &GatewayModel,
@@ -4296,6 +4358,26 @@ impl GatewayState {
         Ok(canary_registry_from_catalog_root(&root, &canary_sets))
     }
 
+    pub fn execution_mode_registry_from_catalog_and_canary_json(
+        catalog: &str,
+        canary_json_by_set: &BTreeMap<String, String>,
+    ) -> Result<GatewayExecutionModeRegistry, String> {
+        let root: Value = serde_json::from_str(catalog).map_err(|err| err.to_string())?;
+        let mut canary_sets = BTreeMap::new();
+        for (set_id, raw) in canary_json_by_set {
+            let doc: CanarySetDocument =
+                serde_json::from_str(raw).map_err(|err| format!("parsing {set_id}: {err}"))?;
+            if doc.set_id != *set_id {
+                return Err(format!(
+                    "canary set map key {set_id} does not match document {}",
+                    doc.set_id
+                ));
+            }
+            canary_sets.insert(set_id.clone(), gateway_canary_prompts(doc));
+        }
+        execution_mode_registry_from_catalog_root(&root, canary_json_by_set, &canary_sets)
+    }
+
     pub fn fixture() -> Self {
         let mut tiers = BTreeMap::new();
         tiers.insert("T1".to_owned(), 1);
@@ -4383,6 +4465,7 @@ impl GatewayState {
             catalog_runtime: Arc::new(Mutex::new(GatewayCatalogRuntime {
                 models: Arc::new(models),
                 canaries: Arc::new(canaries),
+                execution_modes: Arc::new(GatewayExecutionModeRegistry::default()),
                 attestation_authority: None,
             })),
             receipts: Arc::new(Mutex::new(Vec::new())),
@@ -4658,20 +4741,47 @@ impl GatewayState {
     /// of the provider table are rebuilt, so enclave/binary approvals and
     /// price changes take effect without a gateway restart.
     pub fn replace_model_catalog(&self, models: Vec<GatewayModel>) {
-        let (canaries, authority) = {
+        let (canaries, execution_modes, authority) = {
             let runtime = self.catalog_runtime.lock_recover("gateway catalog runtime");
             (
                 (*runtime.canaries).clone(),
+                (*runtime.execution_modes).clone(),
                 runtime.attestation_authority.as_deref().cloned(),
             )
         };
-        self.replace_authenticated_catalog(models, canaries, authority);
+        self.replace_authenticated_catalog_with_execution_modes(
+            models,
+            canaries,
+            execution_modes,
+            authority,
+        );
     }
 
     pub fn replace_authenticated_catalog(
         &self,
         models: Vec<GatewayModel>,
         canaries: GatewayCanaryRegistry,
+        authority: Option<GatewayAttestationAuthority>,
+    ) {
+        let execution_modes = self
+            .catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .execution_modes
+            .as_ref()
+            .clone();
+        self.replace_authenticated_catalog_with_execution_modes(
+            models,
+            canaries,
+            execution_modes,
+            authority,
+        );
+    }
+
+    pub fn replace_authenticated_catalog_with_execution_modes(
+        &self,
+        models: Vec<GatewayModel>,
+        canaries: GatewayCanaryRegistry,
+        execution_modes: GatewayExecutionModeRegistry,
         authority: Option<GatewayAttestationAuthority>,
     ) {
         let models = sanitize_gateway_models(models);
@@ -4724,6 +4834,7 @@ impl GatewayState {
         *runtime = GatewayCatalogRuntime {
             models: Arc::new(models),
             canaries: Arc::new(canaries),
+            execution_modes: Arc::new(execution_modes),
             attestation_authority: authority,
         };
         drop(provider_table);
@@ -4738,6 +4849,14 @@ impl GatewayState {
         self.catalog_runtime
             .lock_recover("gateway catalog runtime")
             .canaries = Arc::new(registry);
+        self.canary_scheduler = Arc::new(Mutex::new(GatewayCanaryScheduler::default()));
+        self
+    }
+
+    pub fn with_execution_mode_registry(mut self, registry: GatewayExecutionModeRegistry) -> Self {
+        self.catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .execution_modes = Arc::new(registry);
         self.canary_scheduler = Arc::new(Mutex::new(GatewayCanaryScheduler::default()));
         self
     }
@@ -4834,6 +4953,9 @@ impl GatewayState {
     }
 
     pub fn ingest_provider_heartbeat(&self, heartbeat: ProviderHeartbeat, received_at_millis: u64) {
+        if !self.heartbeat_execution_mode_is_catalog_bound(&heartbeat) {
+            return;
+        }
         let key = ProviderKey::from_heartbeat(&heartbeat);
         let heartbeat_ts = heartbeat.ts;
         let heartbeat_nonce = heartbeat.nonce.clone();
@@ -4858,6 +4980,9 @@ impl GatewayState {
         heartbeat: ProviderHeartbeat,
         received_at_millis: u64,
     ) -> Result<(), String> {
+        if !self.heartbeat_execution_mode_is_catalog_bound(&heartbeat) {
+            return Err("signed provider heartbeat execution mode is not catalog-bound".to_owned());
+        }
         let advertisement = signed_heartbeat_attestation_advertisement(signed_raw, &heartbeat)?;
         let advertises_tpm = advertisement
             .as_ref()
@@ -4879,6 +5004,29 @@ impl GatewayState {
             }
         }
         Ok(())
+    }
+
+    fn heartbeat_execution_mode_is_catalog_bound(&self, heartbeat: &ProviderHeartbeat) -> bool {
+        let Some(binding) = heartbeat.execution_mode.as_ref() else {
+            return true;
+        };
+        let key = ProviderKey::from_heartbeat(heartbeat);
+        let runtime = self.catalog_runtime.lock_recover("gateway catalog runtime");
+        let mut artifact_roots = runtime
+            .models
+            .iter()
+            .filter(|model| model.id == heartbeat.model_id)
+            .flat_map(|model| model.mayhem.route_candidates.iter())
+            .filter(|candidate| route_key(candidate) == key)
+            .map(|candidate| candidate.artifact_root.as_str());
+        let Some(artifact_root) = artifact_roots.next() else {
+            return false;
+        };
+        artifact_roots.next().is_none()
+            && runtime
+                .execution_modes
+                .get(artifact_root, binding)
+                .is_some()
     }
 
     fn update_heartbeat_attestation_advertisement(
@@ -8476,7 +8624,11 @@ fn gateway_job_metadata(job: &StoredGatewayJob) -> Value {
     gateway_job_summary_metadata(&StoredGatewayJobSummary::from(job))
 }
 
-fn persisted_job_error_info(message: &str) -> Value {
+fn persisted_job_error_info(message: &str, error_info: Option<&GatewayJobErrorInfo>) -> Value {
+    if let Some(error_info) = error_info {
+        return json!(error_info);
+    }
+    // Jobs written before typed error persistence retain their legacy classification.
     let lower = message.to_ascii_lowercase();
     let (code, category, retryable) = if lower.contains("insufficient local balance") {
         ("insufficient_balance", "payment", false)
@@ -8534,7 +8686,7 @@ fn gateway_job_summary_metadata(job: &StoredGatewayJobSummary) -> Value {
         })).collect::<Vec<_>>(),
         "receipt": job.receipt,
         "error": job.error,
-        "error_info": job.error.as_deref().map(persisted_job_error_info),
+        "error_info": job.error.as_deref().map(|message| persisted_job_error_info(message, job.error_info.as_ref())),
     })
 }
 
@@ -9846,7 +9998,7 @@ fn video_generation_metadata_from_summary(
         "completed_at": job.finished_at,
         "expires_at": job.expires_at,
         "error": job.error,
-        "error_info": job.error.as_deref().map(persisted_job_error_info),
+        "error_info": job.error.as_deref().map(|message| persisted_job_error_info(message, job.error_info.as_ref())),
         "prompt": prompt,
         "size": size,
         "seconds": seconds,
@@ -12760,13 +12912,13 @@ where
                 job.persist_cancelled_if_active("cancellation_requested")
                     .await;
             } else {
-                job.persist_failure_if_active(error.message.clone()).await;
+                job.persist_failure_if_active(error).await;
             }
         } else if job.is_active() {
             let error = ApiError::internal_message(
                 "gateway job execution returned without publishing a terminal result",
             );
-            job.persist_failure_if_active(error.message.clone()).await;
+            job.persist_failure_if_active(&error).await;
             return Err(error);
         }
         result
@@ -12835,6 +12987,13 @@ struct GatewayRequestOptions {
     client_cancellation: Option<GatewayRequestCancellation>,
     job: Option<GatewayJobHandle>,
     billing: Option<GatewayBillingContext>,
+    execution_mode_expectation: Option<GatewayExecutionModeExpectation>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum GatewayExecutionModeExpectation {
+    Baseline,
+    Mode(ExecutionModeBinding),
 }
 
 impl Default for GatewayRequestOptions {
@@ -12852,6 +13011,7 @@ impl Default for GatewayRequestOptions {
             client_cancellation: None,
             job: None,
             billing: None,
+            execution_mode_expectation: None,
         }
     }
 }
@@ -13026,6 +13186,21 @@ struct CanaryPromptDocument {
     seed: Option<i64>,
     #[serde(flatten)]
     endpoint_attributes: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewaySerializedExecutionMode {
+    schema_version: u32,
+    profile: Value,
+    #[serde(default)]
+    generation_execution_profile: Option<Value>,
+    requests: ExecutionModeRequestPolicy,
+    canary: Value,
+    canary_set_sha256: String,
+    modality_fingerprints: BTreeMap<String, String>,
+    resource_profiles: BTreeMap<String, Value>,
+    speciality_calibrations: BTreeMap<String, BTreeMap<String, Value>>,
 }
 
 struct ExpectedProviderReceipt<'a> {
@@ -13223,6 +13398,160 @@ fn canary_registry_from_catalog_root(
     GatewayCanaryRegistry {
         models,
         prompt_ids_by_set,
+    }
+}
+
+fn execution_mode_registry_from_catalog_root(
+    root: &Value,
+    canary_json_by_set: &BTreeMap<String, String>,
+    canary_sets: &BTreeMap<String, Vec<GatewayCanaryPrompt>>,
+) -> Result<GatewayExecutionModeRegistry, String> {
+    let Some(raw_registry) = root.get("vllm_execution_modes") else {
+        return Ok(GatewayExecutionModeRegistry::default());
+    };
+    let raw_registry = raw_registry
+        .as_object()
+        .ok_or_else(|| "vllm_execution_modes must be an object".to_owned())?;
+    let models = root
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "catalog models must be an array".to_owned())?;
+    let mut registry = GatewayExecutionModeRegistry::default();
+    for (artifact_root, raw_modes) in raw_registry {
+        let raw_modes = raw_modes.as_object().ok_or_else(|| {
+            format!("vllm execution modes for artifact {artifact_root} must be an object")
+        })?;
+        let owners = models
+            .iter()
+            .flat_map(|model| {
+                model
+                    .get("artifacts")
+                    .and_then(Value::as_object)
+                    .into_iter()
+                    .flat_map(move |artifacts| {
+                        artifacts.iter().filter_map(move |(name, artifact)| {
+                            (artifact.get("artifact_root").and_then(Value::as_str)
+                                == Some(artifact_root.as_str()))
+                            .then(|| (model, name.clone()))
+                        })
+                    })
+            })
+            .collect::<Vec<_>>();
+        if owners.len() != 1 {
+            return Err(format!(
+                "execution-mode artifact root {artifact_root} must have exactly one catalog owner"
+            ));
+        }
+        let (owner, artifact_name) = owners[0].clone();
+        let model_id = owner
+            .get("model_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "execution-mode owner is missing model_id".to_owned())?;
+        let mut modes = BTreeMap::new();
+        for (mode_id, raw_mode) in raw_modes {
+            let binding = vllm_execution_mode_binding(artifact_root, mode_id, raw_mode)
+                .map_err(|_| format!("execution mode {mode_id} for {artifact_root} is invalid"))?;
+            let mode: GatewaySerializedExecutionMode = serde_json::from_value(raw_mode.clone())
+                .map_err(|_| format!("execution mode {mode_id} for {artifact_root} is invalid"))?;
+            if mode.schema_version != 1 {
+                return Err(format!(
+                    "execution mode {mode_id} for {artifact_root} has unsupported schema version"
+                ));
+            }
+            // The proto helper validates the full serialized profile. Reading these
+            // fields here ensures this loader cannot silently accept a partial mode.
+            let _ = (
+                &mode.profile,
+                &mode.generation_execution_profile,
+                &mode.modality_fingerprints,
+                &mode.resource_profiles,
+            );
+            let canary_set = mode
+                .canary
+                .get("set_id")
+                .and_then(Value::as_str)
+                .ok_or_else(|| format!("execution mode {mode_id} has no canary set"))?;
+            let canary_raw = canary_json_by_set.get(canary_set).ok_or_else(|| {
+                format!("execution mode {mode_id} references an unavailable canary set")
+            })?;
+            let actual_canary_sha256 = format!("{:x}", Sha256::digest(canary_raw.as_bytes()));
+            if actual_canary_sha256 != mode.canary_set_sha256 {
+                return Err(format!(
+                    "execution mode {mode_id} canary bytes do not match the signed digest"
+                ));
+            }
+
+            let mut projected = owner.clone();
+            let projected_object = projected
+                .as_object_mut()
+                .ok_or_else(|| "catalog model must be an object".to_owned())?;
+            projected_object.insert("canary".to_owned(), mode.canary.clone());
+            let artifact = owner
+                .get("artifacts")
+                .and_then(|artifacts| artifacts.get(&artifact_name))
+                .cloned()
+                .ok_or_else(|| "execution-mode artifact disappeared".to_owned())?;
+            projected_object.insert(
+                "artifacts".to_owned(),
+                Value::Object(Map::from_iter([(artifact_name.clone(), artifact)])),
+            );
+            projected_object.insert(
+                "speciality_assessment".to_owned(),
+                json!({"calibrated": {artifact_name.clone(): mode.speciality_calibrations}}),
+            );
+            let projected_root = json!({"models": [projected]});
+            let mut projected_registry =
+                canary_registry_from_catalog_root(&projected_root, canary_sets);
+            let canary = projected_registry.models.remove(model_id).ok_or_else(|| {
+                format!("execution mode {mode_id} has no usable mode-specific canary evidence")
+            })?;
+            if !mode_canary_has_exact_evidence(&canary, artifact_root) {
+                return Err(format!(
+                    "execution mode {mode_id} has no exact canary evidence for its artifact"
+                ));
+            }
+            modes.insert(
+                mode_id.clone(),
+                GatewayExecutionModeConfig {
+                    binding,
+                    requests: mode.requests,
+                    canary,
+                },
+            );
+        }
+        registry
+            .modes_by_artifact_root
+            .insert(artifact_root.clone(), modes);
+    }
+    Ok(registry)
+}
+
+fn mode_canary_has_exact_evidence(canary: &GatewayCanaryModelConfig, artifact_root: &str) -> bool {
+    match canary.verification_method.as_str() {
+        CANARY_VERIFICATION_TOKEN_FINGERPRINT => {
+            canary
+                .fingerprints_by_artifact_root
+                .contains_key(artifact_root)
+                && canary
+                    .token_prefixes_by_artifact_root
+                    .contains_key(artifact_root)
+        }
+        CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH => canary
+            .perceptual_hashes_by_artifact_root
+            .contains_key(artifact_root),
+        CANARY_VERIFICATION_EMBEDDING_COSINE => canary
+            .embedding_vectors_by_artifact_root
+            .contains_key(artifact_root),
+        CANARY_VERIFICATION_TRANSCRIPT_MATCH => canary
+            .transcripts_by_artifact_root
+            .contains_key(artifact_root),
+        CANARY_VERIFICATION_AUDIO_FINGERPRINT => canary
+            .audio_fingerprints_by_artifact_root
+            .contains_key(artifact_root),
+        CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT => canary
+            .video_fingerprints_by_artifact_root
+            .contains_key(artifact_root),
+        _ => false,
     }
 }
 
@@ -13953,6 +14282,7 @@ fn heartbeat_for_route(
         identity_anchor: route_identity_anchor(candidate),
         inventory_root: None,
         runtime_id: None,
+        execution_mode: None,
         workflow_classes: BTreeMap::new(),
         accepting_new: true,
         caps: heartbeat_caps_for_route(model, candidate),
@@ -14397,6 +14727,7 @@ impl GatewayRequestOptions {
             client_cancellation: None,
             job: None,
             billing: None,
+            execution_mode_expectation: None,
         })
     }
 }
@@ -15142,6 +15473,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "expected_execution_mode": invocation.expected_execution_mode.clone(),
             "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
@@ -15353,6 +15685,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "expected_execution_mode": invocation.expected_execution_mode.clone(),
             "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
@@ -15520,6 +15853,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "expected_execution_mode": invocation.expected_execution_mode.clone(),
             "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
@@ -15687,6 +16021,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "expected_execution_mode": invocation.expected_execution_mode.clone(),
             "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
@@ -15844,6 +16179,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "expected_execution_mode": invocation.expected_execution_mode.clone(),
             "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
@@ -16001,6 +16337,7 @@ impl ScBridgeGatewaySessionBackend {
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "expected_execution_mode": invocation.expected_execution_mode.clone(),
             "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
@@ -16199,6 +16536,8 @@ fn validate_direct_session_accept(
                 "provider accept attestation verification failed: {err}"
             ))
         })?;
+        verify_execution_mode_binding(&verified, invocation.expected_execution_mode.as_ref())
+            .map_err(|_| fail("provider accept execution mode binding mismatch".to_owned()))?;
         verify_direct_session_accept_signature(frame, provider, top_sig)?;
         invocation.retain_verified_attestation(verified.clone());
         Some(verified)
@@ -16251,7 +16590,14 @@ fn provider_reject_session_error(frame: &Value, session_id: &str) -> GatewaySess
 fn clean_provider_reject_code(code: &str) -> bool {
     matches!(
         code,
-        "CAPACITY" | "BUSY" | "RATE" | "QUOTA" | "PRICE_FLOOR" | "DRAINING" | "BALANCE"
+        "CAPACITY"
+            | "BUSY"
+            | "RATE"
+            | "QUOTA"
+            | "PRICE_FLOOR"
+            | "DRAINING"
+            | "BALANCE"
+            | "EXECUTION_MODE"
     )
 }
 
@@ -16325,6 +16671,9 @@ fn provider_session_api_error(err: &GatewaySessionError) -> ApiError {
 
 fn route_attempt_error_code(last_error: Option<&str>) -> (&'static str, &'static str, bool) {
     let lower = last_error.unwrap_or("").to_ascii_lowercase();
+    if lower.contains("execution_mode") || lower.contains("execution mode") {
+        return ("execution_mode_unavailable", "route_selection", true);
+    }
     if lower.contains("request exceeds provider")
         || lower.contains("per-request capacity")
         || lower.contains("output exceeds caps")
@@ -16390,6 +16739,9 @@ fn route_attempts_failed_error(
         "provider_price_floor" => {
             "Every otherwise eligible provider refused the request at the offered price."
         }
+        "execution_mode_unavailable" => {
+            "No currently available execution mode supports this request."
+        }
         "provider_transport_closed" => {
             "Every attempted provider transport closed before returning a billable result."
         }
@@ -16406,6 +16758,7 @@ fn route_attempts_failed_error(
         "provider_admission_no_capacity" | "provider_response_timeout" => {
             StatusCode::SERVICE_UNAVAILABLE
         }
+        "execution_mode_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
         "payment_reservation_failed" => StatusCode::PAYMENT_REQUIRED,
         "provider_price_floor" => StatusCode::BAD_REQUEST,
         "provider_verification_failed" => StatusCode::BAD_GATEWAY,
@@ -20986,6 +21339,7 @@ async fn run_embedding_with_route_retry(
     let requirements = request_requirements_for_embedding(
         state,
         model,
+        Some(request),
         inputs,
         now_millis_u64(),
         options.max_price_au,
@@ -20995,8 +21349,13 @@ async fn run_embedding_with_route_retry(
             DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
         ),
     );
-    let eligible_routes =
-        ordered_route_candidates_for_embedding_with_options(state, model, inputs, &options);
+    let eligible_routes = ordered_route_candidates_for_embedding_with_options(
+        state,
+        model,
+        Some(request),
+        inputs,
+        &options,
+    );
     let RouteWaitOutcome {
         routes: eligible_routes,
         waited,
@@ -21007,7 +21366,15 @@ async fn run_embedding_with_route_retry(
         &requirements,
         deadline,
         eligible_routes,
-        || ordered_route_candidates_for_embedding_with_options(state, model, inputs, &options),
+        || {
+            ordered_route_candidates_for_embedding_with_options(
+                state,
+                model,
+                Some(request),
+                inputs,
+                &options,
+            )
+        },
     )
     .await;
     if eligible_routes.is_empty() {
@@ -21024,6 +21391,7 @@ async fn run_embedding_with_route_retry(
             model,
             &options,
             &requirements.required_modalities,
+            requirements.compatible_execution_modes.as_deref(),
         ));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
@@ -21062,6 +21430,7 @@ async fn run_embedding_with_route_retry(
                     ordered_route_candidates_for_embedding_with_options(
                         state,
                         model,
+                        Some(request),
                         inputs,
                         &attempt_options,
                     )
@@ -21085,6 +21454,7 @@ async fn run_embedding_with_route_retry(
                 pending_routes = ordered_route_candidates_for_embedding_with_options(
                     state,
                     model,
+                    Some(request),
                     inputs,
                     &attempt_options,
                 );
@@ -21092,8 +21462,13 @@ async fn run_embedding_with_route_retry(
             }
         };
         recovery.begin_attempt(route);
-        let invocation =
-            state.prepare_embedding_invocation_for_route(model, inputs, route, &attempt_options)?;
+        let invocation = state.prepare_embedding_invocation_for_route(
+            model,
+            Some(request),
+            inputs,
+            route,
+            &attempt_options,
+        )?;
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -21137,6 +21512,7 @@ async fn run_embedding_with_route_retry(
                 pending_routes = ordered_route_candidates_for_embedding_with_options(
                     state,
                     model,
+                    Some(request),
                     inputs,
                     &attempt_options,
                 );
@@ -21206,6 +21582,7 @@ async fn run_image_generation_with_route_retry(
             model,
             &options,
             &requirements.required_modalities,
+            requirements.compatible_execution_modes.as_deref(),
         ));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
@@ -21392,6 +21769,7 @@ async fn run_audio_speech_with_route_retry(
             model,
             &options,
             &requirements.required_modalities,
+            requirements.compatible_execution_modes.as_deref(),
         ));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
@@ -21582,6 +21960,7 @@ async fn run_audio_transcription_with_route_retry(
             model,
             &options,
             &requirements.required_modalities,
+            requirements.compatible_execution_modes.as_deref(),
         ));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
@@ -21781,6 +22160,7 @@ async fn run_artifact_generation_with_route_retry(
             model,
             &options,
             &requirements.required_modalities,
+            requirements.compatible_execution_modes.as_deref(),
         ));
     }
     if eligible_routes.is_empty() && !state.dev_session_shim {
@@ -22037,6 +22417,7 @@ fn no_eligible_route_error(
     model: &GatewayModel,
     options: &GatewayRequestOptions,
     required_modalities: &[String],
+    compatible_execution_modes: Option<&[ExecutionModeBinding]>,
 ) -> ApiError {
     if let Some(error) = preferred_provider_refusal_error(state, model, options) {
         return error;
@@ -22140,6 +22521,11 @@ fn no_eligible_route_error(
     {
         return no_price_band_route_error();
     }
+    if let Some(error) =
+        execution_mode_exclusion_error(state, &price_candidates, compatible_execution_modes)
+    {
+        return error;
+    }
     let now_millis = now_millis_u64();
     if !price_candidates.is_empty()
         && price_candidates
@@ -22165,6 +22551,48 @@ fn no_eligible_route_error(
     }
     ApiError::bad_request("no provider route is currently eligible", Some("model"))
         .with_public_error("no_provider_route_eligible", "route_selection", false)
+}
+
+fn execution_mode_exclusion_error(
+    state: &GatewayState,
+    candidates: &[&GatewayRouteCandidate],
+    compatible: Option<&[ExecutionModeBinding]>,
+) -> Option<ApiError> {
+    let compatible = compatible?;
+    let now_millis = now_millis_u64();
+    let entries = state
+        .provider_table
+        .lock_recover("provider table")
+        .entries(now_millis)
+        .into_iter()
+        .map(|entry| (entry.key.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let live = candidates
+        .iter()
+        .filter_map(|candidate| entries.get(&route_key(candidate)))
+        .filter(|entry| {
+            baseline_route_state(entry, &state.baseline_route_requirements(now_millis))
+                == BaselineRouteState::Live
+        })
+        .collect::<Vec<_>>();
+    if live.is_empty()
+        || live.iter().any(|entry| {
+            entry
+                .heartbeat
+                .as_ref()
+                .and_then(|heartbeat| heartbeat.execution_mode.as_ref())
+                .is_none_or(|binding| compatible.contains(binding))
+        })
+    {
+        return None;
+    }
+    Some(
+        ApiError::service_unavailable(
+            "No currently available execution mode supports this request.",
+            Some("model"),
+        )
+        .with_public_error("execution_mode_unavailable", "route_selection", true),
+    )
 }
 
 fn chat_context_capacity_error(
@@ -22215,12 +22643,17 @@ fn no_eligible_chat_route_error(
     request: &ChatCompletionRequest,
     options: &GatewayRequestOptions,
 ) -> ApiError {
+    let compatible = state.compatible_execution_modes(
+        direct_chat_endpoint_family(request),
+        request.endpoint_request.as_ref(),
+    );
     chat_context_capacity_error(state, model, request, options).unwrap_or_else(|| {
         no_eligible_route_error(
             state,
             model,
             options,
             &chat_required_modalities(&request.messages),
+            Some(&compatible),
         )
     })
 }
@@ -22922,6 +23355,77 @@ fn apply_model_sampling_defaults(
     Ok(())
 }
 
+fn synchronize_effective_chat_contract_request(
+    model: &GatewayModel,
+    request: &mut ChatCompletionRequest,
+) -> Result<(), ApiError> {
+    let endpoint_family = direct_chat_endpoint_family(request).to_owned();
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == endpoint_family)
+        .ok_or_else(|| {
+            ApiError::bad_gateway(
+                "The signed endpoint contract is unavailable.",
+                Some("model"),
+            )
+        })?;
+    let Some(body) = request.endpoint_request.as_mut() else {
+        return Ok(());
+    };
+    let object = body.as_object_mut().ok_or_else(|| {
+        ApiError::bad_gateway("The normalized endpoint request is invalid.", Some("model"))
+    })?;
+    let values = [
+        ("temperature", request.temperature.map(|value| json!(value))),
+        ("top_p", request.top_p.map(|value| json!(value))),
+        ("top_k", request.top_k.map(|value| json!(value))),
+        ("min_p", request.min_p.map(|value| json!(value))),
+        (
+            "repeat_penalty",
+            request.repeat_penalty.map(|value| json!(value)),
+        ),
+        (
+            "frequency_penalty",
+            request.frequency_penalty.map(|value| json!(value)),
+        ),
+        (
+            "presence_penalty",
+            request.presence_penalty.map(|value| json!(value)),
+        ),
+        ("max_tokens", request.max_tokens.map(|value| json!(value))),
+        (
+            "max_completion_tokens",
+            request.max_completion_tokens.map(|value| json!(value)),
+        ),
+    ];
+    for (name, value) in values {
+        if contract.request_attribute_specs.contains_key(name)
+            || contract
+                .request_attributes
+                .iter()
+                .any(|attribute| attribute == name)
+        {
+            match value {
+                Some(value) => {
+                    object.insert(name.to_owned(), value);
+                }
+                None => {
+                    object.remove(name);
+                }
+            }
+        }
+    }
+    mayhem_proto::validate_endpoint_request(contract, body).map_err(|_| {
+        ApiError::bad_gateway(
+            "The effective request does not satisfy its signed endpoint contract.",
+            Some("model"),
+        )
+    })
+}
+
 fn apply_model_speciality_defaults(
     model: &GatewayModel,
     request: &mut ChatCompletionRequest,
@@ -23097,6 +23601,7 @@ async fn build_chat_completion(
     let mut request = request;
     apply_model_sampling_defaults(&model, &mut request)?;
     apply_model_speciality_defaults(&model, &mut request)?;
+    synchronize_effective_chat_contract_request(&model, &mut request)?;
     if request.messages.is_empty() {
         return Err(ApiError::bad_request(
             "messages must contain at least one item",
@@ -23524,6 +24029,7 @@ async fn open_live_direct_chat_session(
             "rules_ver": invocation.rules_ver,
             "voucher": invocation.spend_voucher.clone(),
             "att_nonce": att_nonce,
+            "expected_execution_mode": invocation.expected_execution_mode.clone(),
             "attestation_policy_binding": invocation.attestation_policy_binding(),
             "ts": now,
             "nonce": blake3_hex(format!("open:{}:{now}", invocation.session_id).as_bytes()),
@@ -24089,11 +24595,14 @@ async fn recover_live_direct_chat_after_retryable(
             .map(|partial| &partial.provider_receipt.body),
     );
     let partials = partial.into_iter().collect::<Vec<_>>();
-    let retry_request = if partials.is_empty() {
+    let mut retry_request = if partials.is_empty() {
         session.request.clone()
     } else {
         redispatch_request_with_partials(&session.request, &partials)
     };
+    synchronize_effective_chat_contract_request(&session.model, &mut retry_request).map_err(
+        |_| GatewaySessionError::new("effective redispatch request failed contract validation"),
+    )?;
     let mut retry_options = session.options.clone();
     retry_options.billing = Some(next_billing);
     if !partials.is_empty() {
@@ -25229,6 +25738,7 @@ async fn run_chat_with_route_retry(
                 if let Some(partial) = err.partial {
                     partials.push(*partial);
                     attempt_request = redispatch_request_with_partials(request, &partials);
+                    synchronize_effective_chat_contract_request(model, &mut attempt_request)?;
                     attempt_options.min_ctx = Some(exact_conversation_floor_after_partials(
                         &attempt_request,
                         &partials,
@@ -25291,6 +25801,7 @@ fn ordered_route_candidates_for_request_with_options<'a>(
 fn ordered_route_candidates_for_embedding_with_options<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
+    request: Option<&EmbeddingRequest>,
     inputs: &[String],
     options: &GatewayRequestOptions,
 ) -> Vec<&'a GatewayRouteCandidate> {
@@ -25298,6 +25809,7 @@ fn ordered_route_candidates_for_embedding_with_options<'a>(
     let routes = ordered_route_candidates_for_embedding_with_max_price_seed(
         state,
         model,
+        request,
         inputs,
         options.min_att_tier,
         options.max_price_au,
@@ -25586,6 +26098,7 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
 fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
     state: &GatewayState,
     model: &'a GatewayModel,
+    request: Option<&EmbeddingRequest>,
     inputs: &[String],
     min_att_tier: Option<u8>,
     max_price_au: Option<MoneyAu>,
@@ -25598,6 +26111,7 @@ fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
     let requirements = request_requirements_for_embedding(
         state,
         model,
+        request,
         inputs,
         now_millis,
         max_price_au,
@@ -26620,6 +27134,10 @@ fn request_requirements_for_chat(
         requires_vision: chat_modalities.image || chat_modalities.video,
         required_modalities: chat_required_modalities(&request.messages),
         required_specialities: request.effective_specialities.clone(),
+        compatible_execution_modes: Some(state.compatible_execution_modes(
+            direct_chat_endpoint_family(request),
+            request.endpoint_request.as_ref(),
+        )),
         modality_load,
         min_ctx: effective_context_floor(explicit_min_ctx, input_tokens, output_tokens),
         input_tokens,
@@ -26758,6 +27276,7 @@ fn exact_conversation_floor_after_partials(
 fn request_requirements_for_embedding(
     state: &GatewayState,
     _model: &GatewayModel,
+    request: Option<&EmbeddingRequest>,
     inputs: &[String],
     now_millis: u64,
     max_price_au: Option<MoneyAu>,
@@ -26783,6 +27302,13 @@ fn request_requirements_for_embedding(
         requires_json: false,
         requires_vision: false,
         required_modalities: vec!["embedding".to_owned()],
+        compatible_execution_modes: Some(match request {
+            Some(request) => state.compatible_execution_modes(
+                embedding_endpoint_family(request),
+                request.endpoint_request.as_ref(),
+            ),
+            None => Vec::new(),
+        }),
         modality_load: BTreeMap::from([(
             "embedding".to_owned(),
             ModalityRequestLoad {
@@ -26822,6 +27348,10 @@ fn request_requirements_for_image_generation(
         requires_json: false,
         requires_vision: false,
         required_modalities: vec!["image".to_owned()],
+        compatible_execution_modes: Some(state.compatible_execution_modes(
+            image_generation_endpoint_family(request),
+            request.endpoint_request.as_ref(),
+        )),
         modality_load: BTreeMap::from([(
             "image".to_owned(),
             ModalityRequestLoad {
@@ -26862,6 +27392,10 @@ fn request_requirements_for_audio_speech(
         requires_json: false,
         requires_vision: false,
         required_modalities: vec!["audio".to_owned()],
+        compatible_execution_modes: Some(state.compatible_execution_modes(
+            audio_speech_endpoint_family(request),
+            request.endpoint_request.as_ref(),
+        )),
         modality_load: BTreeMap::from([(
             "audio".to_owned(),
             ModalityRequestLoad {
@@ -26901,6 +27435,12 @@ fn request_requirements_for_audio_transcription(
         requires_json: false,
         requires_vision: false,
         required_modalities: vec!["audio".to_owned(), "text".to_owned()],
+        compatible_execution_modes: Some(
+            state.compatible_execution_modes(
+                &request.endpoint_family,
+                Some(&request.contract_request),
+            ),
+        ),
         modality_load: BTreeMap::from([(
             "audio".to_owned(),
             ModalityRequestLoad {
@@ -27090,6 +27630,12 @@ fn request_requirements_for_artifact_generation(
         requires_json: false,
         requires_vision: false,
         required_modalities,
+        compatible_execution_modes: Some(
+            state.compatible_execution_modes(
+                &request.endpoint_family,
+                Some(&request.contract_request),
+            ),
+        ),
         required_specialities: request.effective_specialities.clone(),
         workflow: request
             .workflow
@@ -27679,7 +28225,28 @@ fn selector_route_is_eligible(
 ) -> bool {
     route_matches_selector_filters(candidate, min_att_tier, quant, &state.receipt_config.rail)
         && !state.route_provider_in_cooloff(candidate, now_millis)
+        && route_execution_mode_is_eligible(state, candidate, entry)
         && crate::provider_table::evaluate_eligibility(entry, requirements).is_ok()
+}
+
+fn route_execution_mode_is_eligible(
+    state: &GatewayState,
+    candidate: &GatewayRouteCandidate,
+    entry: &ProviderTableEntry,
+) -> bool {
+    let Some(binding) = entry
+        .heartbeat
+        .as_ref()
+        .and_then(|heartbeat| heartbeat.execution_mode.as_ref())
+    else {
+        return true;
+    };
+    state
+        .catalog_runtime
+        .lock_recover("gateway catalog runtime")
+        .execution_modes
+        .get(&candidate.artifact_root, binding)
+        .is_some()
 }
 
 fn selector_eligible_route_keys(
@@ -29939,13 +30506,26 @@ impl GatewayState {
         model: &GatewayModel,
         invocation: &GatewaySessionInvocation,
     ) {
-        let canaries = self
-            .catalog_runtime
-            .lock_recover("gateway catalog runtime")
-            .canaries
-            .clone();
-        let Some(config) = canaries.models.get(&model.id).cloned() else {
-            return;
+        let canaries = {
+            let runtime = self.catalog_runtime.lock_recover("gateway catalog runtime");
+            runtime.canaries.clone()
+        };
+        let config = match invocation.expected_execution_mode.as_ref() {
+            Some(_) => {
+                let Some(canary) = invocation.execution_mode_canary.clone() else {
+                    eprintln!(
+                        "gateway execution-mode canary snapshot unavailable; audit probe remains unverified"
+                    );
+                    return;
+                };
+                canary
+            }
+            None => {
+                let Some(config) = canaries.models.get(&model.id).cloned() else {
+                    return;
+                };
+                config
+            }
         };
         if config.prompts.is_empty() {
             return;
@@ -30071,12 +30651,15 @@ impl GatewayState {
             return Ok(None);
         };
         let spec = context_needle_spec(model, served_invocation, config, self.canary_policy.seed);
-        let request = context_needle_chat_request(&model.id, &spec);
+        let mut request = context_needle_chat_request(&model.id, &spec);
+        if normalize_canary_chat_request(model, &mut request).is_err() {
+            return Ok(None);
+        }
         let invocation = match self.prepare_chat_invocation_for_route(
             model,
             &request,
             Some(&route),
-            &GatewayRequestOptions::default(),
+            &canary_request_options(served_invocation),
         ) {
             Ok(invocation) => invocation,
             Err(_) => return Ok(None),
@@ -30352,7 +30935,7 @@ impl GatewayState {
                 model,
                 &request,
                 route.as_ref(),
-                &GatewayRequestOptions::default(),
+                &canary_request_options(served_invocation),
             )?;
             let result = self
                 .session_backend
@@ -30637,7 +31220,7 @@ impl GatewayState {
                         model,
                         &request,
                         Some(route),
-                        &GatewayRequestOptions::default(),
+                        &canary_request_options(served_invocation),
                     )?;
                     let result = self
                         .session_backend
@@ -30884,7 +31467,7 @@ impl GatewayState {
                         model,
                         &request,
                         route.as_ref(),
-                        &GatewayRequestOptions::default(),
+                        &canary_request_options(served_invocation),
                     )?;
                     let result = self
                         .session_backend
@@ -30912,7 +31495,7 @@ impl GatewayState {
                         model,
                         &request,
                         route.as_ref(),
-                        &GatewayRequestOptions::default(),
+                        &canary_request_options(served_invocation),
                     )?;
                     let result = self
                         .session_backend
@@ -31096,13 +31679,14 @@ impl GatewayState {
             if !expected_vectors.contains_key(&prompt.id) {
                 continue;
             }
-            let request = canary_embedding_request(&model.id, prompt);
+            let request = canary_embedding_request(model, prompt)?;
             let inputs = embedding_input_texts(&request)?;
             let invocation = self.prepare_embedding_invocation_for_route(
                 model,
+                Some(&request),
                 &inputs,
                 route.as_ref(),
-                &GatewayRequestOptions::default(),
+                &canary_request_options(served_invocation),
             )?;
             let result = self
                 .session_backend
@@ -31214,7 +31798,7 @@ impl GatewayState {
                 model,
                 &request,
                 route.as_ref(),
-                &GatewayRequestOptions::default(),
+                &canary_request_options(served_invocation),
             )?;
             let result = self
                 .session_backend
@@ -31333,13 +31917,13 @@ impl GatewayState {
             let (artifacts, receipt, request_body, session_id) = if model.mayhem.model_class
                 == "tts"
             {
-                let request = canary_audio_speech_request(&model.id, prompt);
+                let request = canary_audio_speech_request(model, prompt)?;
                 validate_audio_speech_request(&request)?;
                 let invocation = self.prepare_audio_speech_invocation_for_route(
                     model,
                     &request,
                     route.as_ref(),
-                    &GatewayRequestOptions::default(),
+                    &canary_request_options(served_invocation),
                 )?;
                 let result = self
                     .session_backend
@@ -31365,7 +31949,7 @@ impl GatewayState {
                     model,
                     &request,
                     route.as_ref(),
-                    &GatewayRequestOptions::default(),
+                    &canary_request_options(served_invocation),
                 )?;
                 let result = self
                     .session_backend
@@ -31524,7 +32108,7 @@ impl GatewayState {
                 model,
                 &request,
                 route.as_ref(),
-                &GatewayRequestOptions::default(),
+                &canary_request_options(served_invocation),
             )?;
             let result = self
                 .session_backend
@@ -31779,6 +32363,78 @@ impl GatewayState {
         })
     }
 
+    fn execution_mode_for_route_before_spend(
+        &self,
+        model: &GatewayModel,
+        route: Option<&GatewayRouteCandidate>,
+        endpoint_family: &str,
+        effective_body: Option<&Value>,
+        expectation: Option<&GatewayExecutionModeExpectation>,
+    ) -> Result<
+        (
+            Option<ExecutionModeBinding>,
+            Option<GatewayCanaryModelConfig>,
+        ),
+        ApiError,
+    > {
+        let mode_error = || {
+            ApiError::service_unavailable(
+                "The selected provider route changed execution mode before admission.",
+                Some("model"),
+            )
+            .with_public_error("execution_mode_unavailable", "route_selection", true)
+        };
+        let Some(route) = route else {
+            return match expectation {
+                None | Some(GatewayExecutionModeExpectation::Baseline) => Ok((None, None)),
+                Some(GatewayExecutionModeExpectation::Mode(_)) => Err(mode_error()),
+            };
+        };
+        let key = route_key(route);
+        let heartbeat = self
+            .provider_table
+            .lock_recover("provider table")
+            .entries(now_millis_u64())
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .and_then(|entry| entry.heartbeat)
+            .ok_or_else(mode_error)?;
+        if heartbeat.model_id != model.id {
+            return Err(mode_error());
+        }
+        let actual = heartbeat.execution_mode;
+        match expectation {
+            Some(GatewayExecutionModeExpectation::Baseline) if actual.is_some() => {
+                return Err(mode_error())
+            }
+            Some(GatewayExecutionModeExpectation::Mode(expected))
+                if actual.as_ref() != Some(expected) =>
+            {
+                return Err(mode_error())
+            }
+            _ => {}
+        }
+        let Some(binding) = actual else {
+            return Ok((None, None));
+        };
+        let Some(effective_body) = effective_body else {
+            return Err(mode_error());
+        };
+        let runtime = self.catalog_runtime.lock_recover("gateway catalog runtime");
+        let mode = runtime
+            .execution_modes
+            .get(&route.artifact_root, &binding)
+            .ok_or_else(mode_error)?;
+        if mode
+            .requests
+            .validate_request(endpoint_family, effective_body)
+            .is_err()
+        {
+            return Err(mode_error());
+        }
+        Ok((Some(binding), Some(mode.canary.clone())))
+    }
+
     fn prepare_chat_invocation_for_route(
         &self,
         model: &GatewayModel,
@@ -31809,6 +32465,14 @@ impl GatewayState {
         let max_spend_au =
             estimate_max_spend_au(price, request, served_ctx, &billing, protocol_prompt_tokens);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
+        let (expected_execution_mode, execution_mode_canary) = self
+            .execution_mode_for_route_before_spend(
+                model,
+                route,
+                direct_chat_endpoint_family(request),
+                request.endpoint_request.as_ref(),
+                options.execution_mode_expectation.as_ref(),
+            )?;
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
@@ -31871,6 +32535,9 @@ impl GatewayState {
             hedge: hedge_invocation_for_model(model, options, failover),
             failover,
             access_token: options.access_token.clone(),
+            expected_execution_mode,
+            selected_route_key: route.map(route_key),
+            execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
@@ -31908,6 +32575,7 @@ impl GatewayState {
     fn prepare_embedding_invocation_for_route(
         &self,
         model: &GatewayModel,
+        request: Option<&EmbeddingRequest>,
         inputs: &[String],
         route: Option<&GatewayRouteCandidate>,
         options: &GatewayRequestOptions,
@@ -31934,6 +32602,16 @@ impl GatewayState {
             .transpose()?;
         let max_spend_au = estimate_embedding_max_spend_au(price, inputs);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
+        let (expected_execution_mode, execution_mode_canary) = self
+            .execution_mode_for_route_before_spend(
+                model,
+                route,
+                request
+                    .map(embedding_endpoint_family)
+                    .unwrap_or(mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS),
+                request.and_then(|request| request.endpoint_request.as_ref()),
+                options.execution_mode_expectation.as_ref(),
+            )?;
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
@@ -31996,6 +32674,9 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            expected_execution_mode,
+            selected_route_key: route.map(route_key),
+            execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
@@ -32034,6 +32715,14 @@ impl GatewayState {
             .transpose()?;
         let max_spend_au = estimate_image_generation_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
+        let (expected_execution_mode, execution_mode_canary) = self
+            .execution_mode_for_route_before_spend(
+                model,
+                route,
+                image_generation_endpoint_family(request),
+                request.endpoint_request.as_ref(),
+                options.execution_mode_expectation.as_ref(),
+            )?;
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
@@ -32096,6 +32785,9 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            expected_execution_mode,
+            selected_route_key: route.map(route_key),
+            execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
@@ -32134,6 +32826,14 @@ impl GatewayState {
             .transpose()?;
         let max_spend_au = estimate_audio_speech_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
+        let (expected_execution_mode, execution_mode_canary) = self
+            .execution_mode_for_route_before_spend(
+                model,
+                route,
+                audio_speech_endpoint_family(request),
+                request.endpoint_request.as_ref(),
+                options.execution_mode_expectation.as_ref(),
+            )?;
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
@@ -32196,6 +32896,9 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            expected_execution_mode,
+            selected_route_key: route.map(route_key),
+            execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
@@ -32234,6 +32937,14 @@ impl GatewayState {
             .transpose()?;
         let max_spend_au = estimate_audio_transcription_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
+        let (expected_execution_mode, execution_mode_canary) = self
+            .execution_mode_for_route_before_spend(
+                model,
+                route,
+                &request.endpoint_family,
+                Some(&request.contract_request),
+                options.execution_mode_expectation.as_ref(),
+            )?;
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
@@ -32296,6 +33007,9 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            expected_execution_mode,
+            selected_route_key: route.map(route_key),
+            execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
@@ -32338,6 +33052,14 @@ impl GatewayState {
             .transpose()?;
         let max_spend_au = estimate_artifact_generation_max_spend_au(price, request);
         ensure_max_price_allows(price_rate_gate_basis_au(price), options.max_price_au)?;
+        let (expected_execution_mode, execution_mode_canary) = self
+            .execution_mode_for_route_before_spend(
+                model,
+                route,
+                &request.endpoint_family,
+                Some(&request.contract_request),
+                options.execution_mode_expectation.as_ref(),
+            )?;
         let spend_reservation =
             self.reserve_session_spend(&session_id, max_spend_au, &options.access_token)?;
         let opened_at = now_secs();
@@ -32400,6 +33122,9 @@ impl GatewayState {
             hedge: GatewayHedgeInvocation::default(),
             failover,
             access_token: options.access_token.clone(),
+            expected_execution_mode,
+            selected_route_key: route.map(route_key),
+            execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
             job: options.job.clone(),
@@ -33279,14 +34004,20 @@ fn contract_upgrade_required_reason(expected: u32, actual: Option<u32>) -> Strin
 }
 
 fn canary_route_key(model: &GatewayModel, invocation: &GatewaySessionInvocation) -> String {
+    let mode_identity = invocation
+        .expected_execution_mode
+        .as_ref()
+        .map(|binding| format!("{}:{}", binding.mode_id, binding.policy_hash))
+        .unwrap_or_else(|| "baseline".to_owned());
     format!(
-        "{}:{}:{}",
+        "{}:{}:{}:{}",
         model.id,
         invocation
             .provider_pubkey
             .as_deref()
             .unwrap_or("local-provider"),
-        invocation.enclave_id
+        invocation.enclave_id,
+        mode_identity,
     )
 }
 
@@ -33294,6 +34025,14 @@ fn canary_served_route(
     model: &GatewayModel,
     invocation: &GatewaySessionInvocation,
 ) -> Option<GatewayRouteCandidate> {
+    if let Some(selected) = invocation.selected_route_key.as_ref() {
+        return model
+            .mayhem
+            .route_candidates
+            .iter()
+            .find(|candidate| route_key(candidate) == *selected)
+            .cloned();
+    }
     let provider = invocation.provider_pubkey.as_deref()?;
     model
         .mayhem
@@ -33303,6 +34042,16 @@ fn canary_served_route(
             candidate.provider == provider && candidate.enclave_id == invocation.enclave_id
         })
         .cloned()
+}
+
+fn canary_request_options(invocation: &GatewaySessionInvocation) -> GatewayRequestOptions {
+    GatewayRequestOptions {
+        execution_mode_expectation: Some(match invocation.expected_execution_mode.as_ref() {
+            Some(binding) => GatewayExecutionModeExpectation::Mode(binding.clone()),
+            None => GatewayExecutionModeExpectation::Baseline,
+        }),
+        ..GatewayRequestOptions::default()
+    }
 }
 
 fn canary_expected_fingerprint(
@@ -33318,7 +34067,13 @@ fn canary_expected_fingerprint(
                 .get(&attestation.contract.artifact_root)
                 .cloned()
         })
-        .or_else(|| config.default_fingerprint.clone())
+        .or_else(|| {
+            invocation
+                .expected_execution_mode
+                .is_none()
+                .then(|| config.default_fingerprint.clone())
+                .flatten()
+        })
 }
 
 fn canary_expected_token_prefixes(
@@ -33334,7 +34089,13 @@ fn canary_expected_token_prefixes(
                 .get(&attestation.contract.artifact_root)
                 .cloned()
         })
-        .or_else(|| config.default_token_prefixes.clone())
+        .or_else(|| {
+            invocation
+                .expected_execution_mode
+                .is_none()
+                .then(|| config.default_token_prefixes.clone())
+                .flatten()
+        })
 }
 
 fn canary_expected_perceptual_hashes(
@@ -33350,7 +34111,13 @@ fn canary_expected_perceptual_hashes(
                 .get(&attestation.contract.artifact_root)
                 .cloned()
         })
-        .or_else(|| config.default_perceptual_hashes.clone())
+        .or_else(|| {
+            invocation
+                .expected_execution_mode
+                .is_none()
+                .then(|| config.default_perceptual_hashes.clone())
+                .flatten()
+        })
 }
 
 fn canary_expected_embedding_vectors(
@@ -33366,7 +34133,13 @@ fn canary_expected_embedding_vectors(
                 .get(&attestation.contract.artifact_root)
                 .cloned()
         })
-        .or_else(|| config.default_embedding_vectors.clone())
+        .or_else(|| {
+            invocation
+                .expected_execution_mode
+                .is_none()
+                .then(|| config.default_embedding_vectors.clone())
+                .flatten()
+        })
 }
 
 fn canary_expected_transcripts(
@@ -33382,7 +34155,13 @@ fn canary_expected_transcripts(
                 .get(&attestation.contract.artifact_root)
                 .cloned()
         })
-        .or_else(|| config.default_transcripts.clone())?;
+        .or_else(|| {
+            invocation
+                .expected_execution_mode
+                .is_none()
+                .then(|| config.default_transcripts.clone())
+                .flatten()
+        })?;
     let runtime_prompts = config
         .prompts
         .iter()
@@ -33406,7 +34185,13 @@ fn canary_expected_audio_fingerprints(
                 .get(&attestation.contract.artifact_root)
                 .cloned()
         })
-        .or_else(|| config.default_audio_fingerprints.clone())
+        .or_else(|| {
+            invocation
+                .expected_execution_mode
+                .is_none()
+                .then(|| config.default_audio_fingerprints.clone())
+                .flatten()
+        })
 }
 
 fn canary_expected_video_fingerprints(
@@ -33422,7 +34207,13 @@ fn canary_expected_video_fingerprints(
                 .get(&attestation.contract.artifact_root)
                 .cloned()
         })
-        .or_else(|| config.default_video_fingerprints.clone())
+        .or_else(|| {
+            invocation
+                .expected_execution_mode
+                .is_none()
+                .then(|| config.default_video_fingerprints.clone())
+                .flatten()
+        })
 }
 
 #[derive(Clone, Debug)]
@@ -33582,7 +34373,34 @@ fn canary_chat_request(
     };
     apply_model_sampling_defaults(model, &mut request)?;
     apply_model_speciality_defaults(model, &mut request)?;
+    normalize_canary_chat_request(model, &mut request)?;
     Ok(request)
+}
+
+fn normalize_canary_chat_request(
+    model: &GatewayModel,
+    request: &mut ChatCompletionRequest,
+) -> Result<(), ApiError> {
+    let family = mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS;
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == family)
+        .ok_or_else(|| {
+            ApiError::bad_gateway("Canary endpoint contract is unavailable.", Some("model"))
+        })?;
+    let raw = direct_session_contract_request(&direct_session_request_body(request));
+    let normalized = normalize_endpoint_request_for_provider(contract, &raw).map_err(|_| {
+        ApiError::bad_gateway(
+            "Canary request does not satisfy its signed endpoint contract.",
+            Some("model"),
+        )
+    })?;
+    request.endpoint_family = Some(family.to_owned());
+    request.endpoint_request = Some(normalized.normalized_request);
+    Ok(())
 }
 
 fn canary_image_prompt_text(prompt: &GatewayCanaryPrompt) -> String {
@@ -33681,21 +34499,47 @@ fn canary_text_input(prompt: &GatewayCanaryPrompt) -> String {
         })
 }
 
-fn canary_embedding_request(model_id: &str, prompt: &GatewayCanaryPrompt) -> EmbeddingRequest {
-    EmbeddingRequest {
-        model: model_id.to_owned(),
+fn canary_embedding_request(
+    model: &GatewayModel,
+    prompt: &GatewayCanaryPrompt,
+) -> Result<EmbeddingRequest, ApiError> {
+    let mut request = EmbeddingRequest {
+        model: model.id.clone(),
         input: json!(canary_text_input(prompt)),
         encoding_format: Some("float".to_owned()),
         dimensions: None,
         user: None,
         endpoint_family: None,
         endpoint_request: None,
-    }
+    };
+    let family = mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS;
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == family)
+        .ok_or_else(|| {
+            ApiError::bad_gateway("Canary endpoint contract is unavailable.", Some("model"))
+        })?;
+    let raw = direct_session_contract_request(&direct_session_embedding_request_body(&request));
+    let normalized = normalize_endpoint_request_for_provider(contract, &raw).map_err(|_| {
+        ApiError::bad_gateway(
+            "Canary request does not satisfy its signed endpoint contract.",
+            Some("model"),
+        )
+    })?;
+    request.endpoint_family = Some(family.to_owned());
+    request.endpoint_request = Some(normalized.normalized_request);
+    Ok(request)
 }
 
-fn canary_audio_speech_request(model_id: &str, prompt: &GatewayCanaryPrompt) -> AudioSpeechRequest {
-    AudioSpeechRequest {
-        model: model_id.to_owned(),
+fn canary_audio_speech_request(
+    model: &GatewayModel,
+    prompt: &GatewayCanaryPrompt,
+) -> Result<AudioSpeechRequest, ApiError> {
+    let mut request = AudioSpeechRequest {
+        model: model.id.clone(),
         input: canary_text_input(prompt),
         voice: prompt.voice.clone(),
         response_format: Some(
@@ -33717,7 +34561,27 @@ fn canary_audio_speech_request(model_id: &str, prompt: &GatewayCanaryPrompt) -> 
         seed: None,
         endpoint_family: None,
         endpoint_request: None,
-    }
+    };
+    let family = mayhem_proto::ENDPOINT_OPENAI_AUDIO_SPEECH;
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == family)
+        .ok_or_else(|| {
+            ApiError::bad_gateway("Canary endpoint contract is unavailable.", Some("model"))
+        })?;
+    let raw = direct_session_contract_request(&direct_session_audio_speech_request_body(&request));
+    let normalized = normalize_endpoint_request_for_provider(contract, &raw).map_err(|_| {
+        ApiError::bad_gateway(
+            "Canary request does not satisfy its signed endpoint contract.",
+            Some("model"),
+        )
+    })?;
+    request.endpoint_family = Some(family.to_owned());
+    request.endpoint_request = Some(normalized.normalized_request);
+    Ok(request)
 }
 
 fn canary_artifact_generation_request(
@@ -36665,10 +37529,193 @@ mod tests {
     fn persisted_job_errors_expose_public_info() {
         let info = persisted_job_error_info(
             "The request exceeds the signed capacity envelope of every otherwise eligible provider.",
+            None,
         );
         assert_eq!(info["code"], "request_exceeds_provider_capacity");
         assert_eq!(info["category"], "request_validation");
         assert_eq!(info["retryable"], false);
+    }
+
+    #[tokio::test]
+    async fn owned_job_failures_preserve_typed_public_errors_after_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("jobs");
+        let seed = [17_u8; 32];
+        let store = Arc::new(Mutex::new(
+            GatewayJobStore::durable(seed, directory.clone(), 8, 1024 * 1024, 60, now_secs())
+                .unwrap(),
+        ));
+        let active_cancellations = Arc::new(Mutex::new(BTreeMap::new()));
+        let contract_error = request_scoped_api_error(&GatewaySessionError::request_scoped(
+            "model_output_invalid: PRIVATE_PROVIDER_DIAGNOSTIC",
+        ))
+        .unwrap();
+        assert_eq!(contract_error.public_code, "provider_model_output_invalid");
+        assert!(!contract_error.retryable);
+        let errors =
+            [
+                contract_error,
+                ApiError::bad_gateway("The reservation could not complete.", None)
+                    .with_public_error("payment_reservation_failed", "payment", true),
+                ApiError::request_capacity("The requested dimensions are too large.", Some("size")),
+                ApiError::internal_message("The request could not finish."),
+            ];
+        let mut expected = Vec::new();
+        for (index, error) in errors.into_iter().enumerate() {
+            let id = format!("job_typed_error_{index}");
+            let info = json!({
+                "code": error.public_code,
+                "category": error.category,
+                "retryable": error.retryable,
+            });
+            let message = error.message.clone();
+            store
+                .lock_recover("test job store")
+                .begin(
+                    id.clone(),
+                    mayhem_proto::ENDPOINT_OPENAI_VIDEOS.to_owned(),
+                    "model".to_owned(),
+                    None,
+                    id.clone(),
+                    now_secs(),
+                )
+                .unwrap();
+            let cancellation = GatewayRequestCancellation::new();
+            active_cancellations
+                .lock_recover("test job cancellations")
+                .insert(id.clone(), cancellation.clone());
+            let job = GatewayJobHandle {
+                id: id.clone(),
+                store: store.clone(),
+                cancellation,
+                active_cancellations: active_cancellations.clone(),
+                settlement_reconciliation_started: Arc::new(AtomicBool::new(false)),
+            };
+            let returned = spawn_owned_gateway_job_request::<(), _>(job, async move { Err(error) })
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert_eq!(returned.public_code, info["code"]);
+            assert!(!active_cancellations
+                .lock_recover("test job cancellations")
+                .contains_key(&id));
+            expected.push((id, info, message));
+        }
+        let legacy_id = "job_legacy_error";
+        let legacy_message = "No eligible provider became available before the admission deadline.";
+        {
+            let mut store = store.lock_recover("test job store");
+            store
+                .begin(
+                    legacy_id.to_owned(),
+                    mayhem_proto::ENDPOINT_OPENAI_VIDEOS.to_owned(),
+                    "model".to_owned(),
+                    None,
+                    legacy_id.to_owned(),
+                    now_secs(),
+                )
+                .unwrap();
+            store
+                .complete(
+                    legacy_id,
+                    GatewayJobStatus::Failed,
+                    None,
+                    Vec::new(),
+                    None,
+                    Some(legacy_message.to_owned()),
+                    now_secs(),
+                )
+                .unwrap();
+        }
+        expected.push((legacy_id.to_owned(), json!({
+            "code": "provider_admission_no_capacity", "category": "provider_admission", "retryable": true,
+        }), legacy_message.to_owned()));
+        drop(store);
+        let mut reopened =
+            GatewayJobStore::durable(seed, directory, 8, 1024 * 1024, 60, now_secs()).unwrap();
+        for (id, info, message) in expected {
+            let job = reopened.get(&id, now_secs()).unwrap().unwrap();
+            assert_eq!(job.status, GatewayJobStatus::Failed);
+            assert_eq!(job.error.as_deref(), Some(message.as_str()));
+            assert!(job.receipt.is_none());
+            assert!(job.result.is_none());
+            assert!(job.artifacts.is_empty());
+            let metadata = gateway_job_metadata(&job);
+            assert_eq!(metadata["error_info"], info);
+            assert_eq!(
+                video_generation_metadata_from_job(&job).unwrap()["error_info"],
+                info
+            );
+            assert!(!serde_json::to_string(&job)
+                .unwrap()
+                .contains("PRIVATE_PROVIDER_DIAGNOSTIC"));
+            assert!(!metadata.to_string().contains("safe_detail"));
+        }
+    }
+
+    #[tokio::test]
+    async fn owned_job_failure_preserves_receipted_terminal_and_reconciling_jobs() {
+        for status in [
+            GatewayJobStatus::Completed,
+            GatewayJobStatus::Cancelled,
+            GatewayJobStatus::ReconciliationPending,
+        ] {
+            let store = Arc::new(Mutex::new(GatewayJobStore::in_memory(
+                [18_u8; 32],
+                4,
+                1024 * 1024,
+                60,
+            )));
+            let id = "job_receipted_error";
+            let before = {
+                let mut store = store.lock_recover("test job store");
+                store
+                    .begin(
+                        id.to_owned(),
+                        "chat".to_owned(),
+                        "model".to_owned(),
+                        None,
+                        id.to_owned(),
+                        now_secs(),
+                    )
+                    .unwrap();
+                store
+                    .complete(
+                        id,
+                        status,
+                        Some(json!({"output": "completed work"})),
+                        vec![GatewayJobArtifact {
+                            id: "output".to_owned(),
+                            content_type: "text/plain".to_owned(),
+                            bytes: b"completed work".to_vec(),
+                            blake3: blake3::hash(b"completed work").to_hex().to_string(),
+                        }],
+                        Some(json!({"body": {"session_id": "settled-session"}})),
+                        Some("existing terminal reason".to_owned()),
+                        now_secs(),
+                    )
+                    .unwrap()
+            };
+            let job = GatewayJobHandle {
+                id: id.to_owned(),
+                store: store.clone(),
+                cancellation: GatewayRequestCancellation::new(),
+                active_cancellations: Arc::new(Mutex::new(BTreeMap::new())),
+                settlement_reconciliation_started: Arc::new(AtomicBool::new(true)),
+            };
+            assert!(spawn_owned_gateway_job_request::<(), _>(job, async {
+                Err(ApiError::internal_message("A later operation failed."))
+            })
+            .await
+            .unwrap()
+            .is_err());
+            let mut store = store.lock_recover("test job store");
+            assert_eq!(store.get(id, now_secs()).unwrap().unwrap(), before);
+            assert_eq!(
+                store.pending_reconciliations(now_secs()).unwrap().len(),
+                usize::from(status == GatewayJobStatus::ReconciliationPending)
+            );
+        }
     }
 
     #[derive(Debug)]
@@ -38010,6 +39057,7 @@ mod tests {
         let small_embedding_invocation = state
             .prepare_embedding_invocation_for_route(
                 &model,
+                None,
                 &small_embedding,
                 None,
                 &GatewayRequestOptions::default(),
@@ -38018,6 +39066,7 @@ mod tests {
         let large_embedding_invocation = state
             .prepare_embedding_invocation_for_route(
                 &model,
+                None,
                 &large_embedding,
                 None,
                 &GatewayRequestOptions::default(),
@@ -38250,7 +39299,7 @@ mod tests {
             "json": true,
         });
         let request = test_chat_request(&model.id);
-        let invocation = GatewayState::from_models(vec![model.clone()])
+        let invocation = test_gateway_state_from_models(vec![model.clone()])
             .prepare_chat_invocation_for_route(
                 &model,
                 &request,
@@ -38276,6 +39325,7 @@ mod tests {
         let invocation = GatewayState::from_models(vec![model.clone()])
             .prepare_embedding_invocation_for_route(
                 &model,
+                None,
                 &inputs,
                 None,
                 &GatewayRequestOptions::default(),
@@ -39245,6 +40295,7 @@ mod tests {
             &model,
             &options,
             &media_requirements.required_modalities,
+            None,
         );
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(error.message.contains("image"));
@@ -39286,6 +40337,7 @@ mod tests {
             &model,
             &price_limited,
             &price_requirements.required_modalities,
+            None,
         );
         assert_eq!(error.status, StatusCode::BAD_REQUEST);
         assert_eq!(error.public_code, "no_provider_within_price_band");
@@ -40553,6 +41605,9 @@ mod tests {
             hedge: GatewayHedgeInvocation::default(),
             failover: GatewayFailoverInvocation::default(),
             access_token: None,
+            expected_execution_mode: None,
+            selected_route_key: None,
+            execution_mode_canary: None,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: None,
             job: None,
@@ -41262,6 +42317,332 @@ mod tests {
             endpoint_family: None,
             endpoint_request: None,
         }
+    }
+
+    fn test_mode_canary_config() -> GatewayCanaryModelConfig {
+        GatewayCanaryModelConfig {
+            canary_set: "mode-canary".to_owned(),
+            requires_launch_evidence: false,
+            match_min_bps: 9_000,
+            verification_method: CANARY_VERIFICATION_TOKEN_FINGERPRINT.to_owned(),
+            verification_tolerance_bps: None,
+            prompts: Vec::new(),
+            fingerprints_by_artifact_root: BTreeMap::new(),
+            token_prefixes_by_artifact_root: BTreeMap::new(),
+            perceptual_hashes_by_artifact_root: BTreeMap::new(),
+            embedding_vectors_by_artifact_root: BTreeMap::new(),
+            transcripts_by_artifact_root: BTreeMap::new(),
+            audio_fingerprints_by_artifact_root: BTreeMap::new(),
+            video_fingerprints_by_artifact_root: BTreeMap::new(),
+            speciality_calibrations_by_artifact_root: BTreeMap::new(),
+            default_fingerprint: Some("baseline-only".to_owned()),
+            default_token_prefixes: None,
+            default_perceptual_hashes: None,
+            default_embedding_vectors: None,
+            default_transcripts: None,
+            default_audio_fingerprints: None,
+            default_video_fingerprints: None,
+        }
+    }
+
+    fn mode_test_state_and_request() -> (
+        GatewayState,
+        GatewayModel,
+        ChatCompletionRequest,
+        ExecutionModeBinding,
+    ) {
+        let mut model = test_routed_model(1);
+        model.mayhem.sampling.temperature = Some(0.25);
+        let baseline = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        )
+        .unwrap();
+        model.mayhem.adapter.endpoint_families = vec![baseline.clone()];
+        let mut mode_contract = baseline.clone();
+        mode_contract
+            .request_attribute_specs
+            .get_mut("temperature")
+            .unwrap()
+            .enum_values = vec![json!(0.25)];
+        let binding = ExecutionModeBinding {
+            mode_id: "fast".to_owned(),
+            policy_hash: "ab".repeat(32),
+        };
+        let artifact_root = model.mayhem.route_candidates[0].artifact_root.clone();
+        let registry = GatewayExecutionModeRegistry {
+            modes_by_artifact_root: BTreeMap::from([(
+                artifact_root,
+                BTreeMap::from([(
+                    binding.mode_id.clone(),
+                    GatewayExecutionModeConfig {
+                        binding: binding.clone(),
+                        requests: ExecutionModeRequestPolicy {
+                            endpoint_families: vec![mode_contract],
+                        },
+                        canary: test_mode_canary_config(),
+                    },
+                )]),
+            )]),
+        };
+        let state = test_gateway_state_from_models(vec![model.clone()])
+            .with_execution_mode_registry(registry);
+        let raw = json!({
+            "model": model.id,
+            "messages": [{"role": "user", "content": "hello"}]
+        });
+        let normalized = normalize_endpoint_request_for_provider(&baseline, &raw).unwrap();
+        let mut request: ChatCompletionRequest =
+            serde_json::from_value(normalized.normalized_request.clone()).unwrap();
+        request.endpoint_family = Some(mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS.to_owned());
+        request.endpoint_request = Some(normalized.normalized_request);
+        (state, model, request, binding)
+    }
+
+    #[test]
+    fn mode_policy_filters_defaulted_effective_request_without_changing_baseline() {
+        let (state, model, mut request, binding) = mode_test_state_and_request();
+        apply_model_sampling_defaults(&model, &mut request).unwrap();
+        synchronize_effective_chat_contract_request(&model, &mut request).unwrap();
+        let requirements = request_requirements_for_chat(
+            &state,
+            &model,
+            &request,
+            now_millis_u64(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(requirements.compatible_execution_modes, Some(vec![binding]));
+
+        request.endpoint_request.as_mut().unwrap()["temperature"] = json!(0.75);
+        let restricted = request_requirements_for_chat(
+            &state,
+            &model,
+            &request,
+            now_millis_u64(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(restricted.compatible_execution_modes, Some(Vec::new()));
+
+        let route = &model.mayhem.route_candidates[0];
+        let now = now_millis_u64();
+        let mut heartbeat = heartbeat_for_route(&model, route, now.saturating_add(1));
+        heartbeat.execution_mode = requirements.compatible_execution_modes.unwrap().pop();
+        state.ingest_provider_heartbeat(heartbeat, now.saturating_add(1));
+        let error = execution_mode_exclusion_error(&state, &[route], Some(&[]))
+            .expect("mode-only exclusion should have a dedicated terminal classification");
+        assert_eq!(error.public_code, "execution_mode_unavailable");
+        assert!(!error.message.contains("fast"));
+        assert!(!error.message.contains("0.75"));
+    }
+
+    #[test]
+    fn execution_mode_registry_rejects_missing_or_corrupt_canary_bytes() {
+        let artifact_root = "de".repeat(32);
+        let canary_document = json!({
+            "set_id": "mode-canary-v1",
+            "prompts": [{
+                "id": "fixed",
+                "messages": [{"role": "user", "content": "fixed"}],
+                "max_tokens": 1
+            }]
+        });
+        let canary_raw = serde_json::to_string(&canary_document).unwrap();
+        let document: CanarySetDocument = serde_json::from_str(&canary_raw).unwrap();
+        let prompts = gateway_canary_prompts(document);
+        let prefixes = BTreeMap::from([("fixed".to_owned(), vec![1])]);
+        let fingerprint = aggregate_token_prefixes_for_prompts(&prompts, &prefixes).unwrap();
+        let mode = json!({
+            "schema_version": 1,
+            "profile": {
+                "schema_version": 1,
+                "engine": "vllm",
+                "enforce_eager": true,
+                "linear_backend": "default",
+                "moe_backend": "default",
+                "proof_sha256": "11".repeat(32)
+            },
+            "generation_execution_profile": null,
+            "requests": {
+                "endpoint_families": [mayhem_proto::endpoint_family_contract_template(
+                    mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                ).unwrap()]
+            },
+            "canary": {
+                "set_id": "mode-canary-v1",
+                "match_min": 0.9,
+                "verification_method": "token_fingerprint",
+                "fingerprints": {"weights": fingerprint},
+                "token_prefixes": {"weights": {"fixed": [1]}}
+            },
+            "canary_set_sha256": format!("{:x}", Sha256::digest(canary_raw.as_bytes())),
+            "modality_fingerprints": {},
+            "resource_profiles": {},
+            "speciality_calibrations": {}
+        });
+        let catalog = serde_json::to_string(&json!({
+            "models": [{
+                "model_id": "mayhem/mode-test",
+                "tier": "stable",
+                "artifacts": {"weights": {"artifact_root": artifact_root}}
+            }],
+            "vllm_execution_modes": {
+                (artifact_root.clone()): {"fast": mode}
+            }
+        }))
+        .unwrap();
+        let canaries = BTreeMap::from([("mode-canary-v1".to_owned(), canary_raw.clone())]);
+        let registry =
+            GatewayState::execution_mode_registry_from_catalog_and_canary_json(&catalog, &canaries)
+                .unwrap();
+        assert!(registry.modes_by_artifact_root[&artifact_root].contains_key("fast"));
+
+        let mut ambiguous: Value = serde_json::from_str(&catalog).unwrap();
+        ambiguous["models"][0]["artifacts"]["weights-copy"] =
+            json!({"artifact_root": artifact_root});
+        assert!(
+            GatewayState::execution_mode_registry_from_catalog_and_canary_json(
+                &ambiguous.to_string(),
+                &canaries,
+            )
+            .is_err()
+        );
+
+        assert!(
+            GatewayState::execution_mode_registry_from_catalog_and_canary_json(
+                &catalog,
+                &BTreeMap::new(),
+            )
+            .is_err()
+        );
+        let corrupt = BTreeMap::from([("mode-canary-v1".to_owned(), format!("{canary_raw}\n"))]);
+        assert!(
+            GatewayState::execution_mode_registry_from_catalog_and_canary_json(&catalog, &corrupt,)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn heartbeat_mode_is_catalog_bound_and_downgrade_race_fails_before_reservation() {
+        let (state, model, request, binding) = mode_test_state_and_request();
+        let route = &model.mayhem.route_candidates[0];
+        let key = route_key(route);
+        let now = now_millis_u64();
+        let registry = state
+            .catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .execution_modes
+            .as_ref()
+            .clone();
+        let mut wrong_root_model = model.clone();
+        wrong_root_model.mayhem.route_candidates[0].artifact_root = "ef".repeat(32);
+        let wrong_root_state = test_gateway_state_from_models(vec![wrong_root_model.clone()])
+            .with_execution_mode_registry(registry);
+        let mut wrong_root = heartbeat_for_route(
+            &wrong_root_model,
+            &wrong_root_model.mayhem.route_candidates[0],
+            now.saturating_add(1),
+        );
+        wrong_root.execution_mode = Some(binding.clone());
+        wrong_root_state.ingest_provider_heartbeat(wrong_root, now.saturating_add(1));
+        assert_eq!(
+            wrong_root_state
+                .provider_table
+                .lock_recover("provider table")
+                .entries(now.saturating_add(1))[0]
+                .heartbeat
+                .as_ref()
+                .unwrap()
+                .execution_mode,
+            None
+        );
+
+        let mut unknown = heartbeat_for_route(&model, route, now.saturating_add(1));
+        unknown.execution_mode = Some(ExecutionModeBinding {
+            mode_id: binding.mode_id.clone(),
+            policy_hash: "cd".repeat(32),
+        });
+        state.ingest_provider_heartbeat(unknown, now.saturating_add(1));
+        let current = state
+            .provider_table
+            .lock_recover("provider table")
+            .entries(now.saturating_add(1))
+            .into_iter()
+            .find(|entry| entry.key == key)
+            .unwrap();
+        assert_eq!(current.heartbeat.unwrap().execution_mode, None);
+
+        let mut exact = heartbeat_for_route(&model, route, now.saturating_add(2));
+        exact.execution_mode = Some(binding.clone());
+        state.ingest_provider_heartbeat(exact, now.saturating_add(2));
+        let admitted = state
+            .prepare_chat_invocation_for_route(
+                &model,
+                &request,
+                Some(route),
+                &GatewayRequestOptions::default(),
+            )
+            .unwrap();
+        assert_eq!(admitted.expected_execution_mode, Some(binding.clone()));
+        assert!(admitted.execution_mode_canary.is_some());
+        state
+            .catalog_runtime
+            .lock_recover("gateway catalog runtime")
+            .execution_modes = Arc::new(GatewayExecutionModeRegistry::default());
+        assert!(admitted.execution_mode_canary.is_some());
+        drop(admitted);
+        let mut downgraded = heartbeat_for_route(&model, route, now.saturating_add(3));
+        downgraded.execution_mode = None;
+        state.ingest_provider_heartbeat(downgraded, now.saturating_add(3));
+
+        let before = state
+            .wallet_spend
+            .lock_recover("gateway wallet spend state")
+            .reservations
+            .len();
+        let error = state
+            .prepare_chat_invocation_for_route(
+                &model,
+                &request,
+                Some(route),
+                &GatewayRequestOptions {
+                    execution_mode_expectation: Some(GatewayExecutionModeExpectation::Mode(
+                        binding,
+                    )),
+                    ..GatewayRequestOptions::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(error.public_code, "execution_mode_unavailable");
+        assert_eq!(
+            state
+                .wallet_spend
+                .lock_recover("gateway wallet spend state")
+                .reservations
+                .len(),
+            before
+        );
+    }
+
+    #[test]
+    fn mode_canary_has_distinct_cadence_and_never_uses_default_evidence() {
+        let mut invocation = test_invocation();
+        let baseline_key = canary_route_key(&test_model(), &invocation);
+        assert_eq!(
+            canary_expected_fingerprint(&test_mode_canary_config(), &invocation),
+            Some("baseline-only".to_owned())
+        );
+        invocation.expected_execution_mode = Some(ExecutionModeBinding {
+            mode_id: "fast".to_owned(),
+            policy_hash: "ab".repeat(32),
+        });
+        assert_ne!(baseline_key, canary_route_key(&test_model(), &invocation));
+        assert_eq!(
+            canary_expected_fingerprint(&test_mode_canary_config(), &invocation),
+            None
+        );
     }
 
     #[test]
@@ -42914,6 +44295,7 @@ mod tests {
             ordered_route_candidates_for_embedding_with_options(
                 &state,
                 &model,
+                None,
                 &inputs,
                 &GatewayRequestOptions::default(),
             )
@@ -42929,7 +44311,7 @@ mod tests {
             ..GatewayRequestOptions::default()
         };
         assert!(ordered_route_candidates_for_embedding_with_options(
-            &state, &model, &inputs, &strict,
+            &state, &model, None, &inputs, &strict,
         )
         .is_empty());
 
@@ -45677,7 +47059,7 @@ mod tests {
             PreparedGatewayJob::Started(job) => job,
             _ => panic!("fresh request must start a job"),
         };
-        job.persist_failure_if_active("first request failed".to_owned())
+        job.persist_failure_if_active(&ApiError::bad_gateway("first request failed", None))
             .await;
         assert!(!state
             .active_job_cancellations
@@ -48314,6 +49696,7 @@ mod tests {
             "PRICE_FLOOR",
             "DRAINING",
             "BALANCE",
+            "EXECUTION_MODE",
         ] {
             let err = provider_reject_session_error(
                 &json!({
@@ -48354,7 +49737,7 @@ mod tests {
         let refusal = terminal_balance_refusal(&err).expect("BALANCE reject is terminal");
         assert_eq!(refusal.status, StatusCode::PAYMENT_REQUIRED);
 
-        for code in ["CAPACITY", "BUSY", "DRAINING"] {
+        for code in ["CAPACITY", "BUSY", "DRAINING", "EXECUTION_MODE"] {
             let err = provider_reject_session_error(
                 &json!({
                     "t": "s.reject",

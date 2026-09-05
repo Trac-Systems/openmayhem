@@ -1,0 +1,149 @@
+diff --git a/tests/v1/attention/test_flashinfer_metadata_builder.py b/tests/v1/attention/test_flashinfer_metadata_builder.py
+new file mode 100644
+index 0000000..5e85c81
+--- /dev/null
++++ b/tests/v1/attention/test_flashinfer_metadata_builder.py
+@@ -0,0 +1,120 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Regression tests for FlashInfer's persistent host metadata buffers."""
++
++import unittest
++from itertools import product
++from unittest.mock import MagicMock, patch
++
++import torch
++
++from vllm.config import (
++    AttentionConfig,
++    CUDAGraphMode,
++    ModelConfig,
++    SpeculativeConfig,
++    VllmConfig,
++    set_current_vllm_config,
++)
++from vllm.platforms import current_platform
++from vllm.v1.attention.backends.utils import PerLayerParameters
++from vllm.v1.kv_cache_interface import FullAttentionSpec
++
++
++def check_persistent_host_buffer_pinning(
++    cuda_device: torch.device,
++    use_v2_model_runner: bool,
++    has_speculation: bool,
++    pin_memory: bool,
++):
++    from vllm.v1.attention.backends import flashinfer
++
++    # Mock configuration only: no model config resolution or weight downloads.
++    config = MagicMock(spec=VllmConfig)
++    config.model_config = MagicMock(spec=ModelConfig)
++    config.model_config.dtype = torch.float16
++    config.model_config.max_model_len = 32
++    config.model_config.get_num_attention_heads.return_value = 4
++    config.cache_config = MagicMock()
++    config.scheduler_config = MagicMock(max_num_seqs=2)
++    config.compilation_config = MagicMock(cudagraph_mode=CUDAGraphMode.NONE)
++    config.parallel_config = MagicMock(
++        decode_context_parallel_size=1,
++        dcp_kv_cache_interleave_size=1,
++    )
++    config.attention_config = AttentionConfig(use_trtllm_attention=False)
++    config.use_v2_model_runner = use_v2_model_runner
++    config.speculative_config = (
++        MagicMock(
++            spec=SpeculativeConfig,
++            num_speculative_tokens=1,
++            parallel_drafting=False,
++        )
++        if has_speculation
++        else None
++    )
++    kv_cache_spec = FullAttentionSpec(
++        block_size=16,
++        num_kv_heads=2,
++        head_size=64,
++        dtype=torch.float16,
++    )
++    per_layer_parameters = {
++        "layer.0": PerLayerParameters(
++            window_left=-1, logits_soft_cap=0.0, sm_scale=64**-0.5
++        )
++    }
++
++    # Exercise the real constructor and allocators; only layer registration
++    # and the platform pinning flag are patched. GPU buffers total 36 bytes.
++    with (
++        set_current_vllm_config(config),
++        patch.object(flashinfer, "PIN_MEMORY", pin_memory),
++        patch.object(
++            flashinfer, "get_per_layer_parameters", return_value=per_layer_parameters
++        ),
++    ):
++        builder = flashinfer.FlashInferMetadataBuilder(
++            kv_cache_spec, ["layer.0"], config, cuda_device
++        )
++
++    # V2 and speculative proposals can reuse host metadata while an earlier
++    # asynchronous H2D copy is in flight. Legacy non-spec decoding stays pinned.
++    expected_pinned = pin_memory and not use_v2_model_runner and not has_speculation
++    assert builder.pin_memory is expected_pinned
++    for name in ("paged_kv_indptr", "paged_kv_indices", "paged_kv_last_page_len"):
++        buffer = getattr(builder, name)
++        assert buffer.gpu.device == cuda_device, name
++        assert buffer.cpu.device.type == "cpu", name
++        assert buffer.cpu.is_pinned() is expected_pinned, name
++    assert builder.paged_kv_indptr_cpu_buffer.device.type == "cpu"
++    assert builder.paged_kv_indptr_cpu_buffer.is_pinned() is expected_pinned
++
++
++class TestFlashInferMetadataBuilder(unittest.TestCase):
++    @classmethod
++    def setUpClass(cls):
++        if not current_platform.is_cuda() or not torch.cuda.is_available():
++            raise unittest.SkipTest("Requires CUDA for real pinned host allocations")
++        try:
++            import flashinfer  # noqa: F401
++        except ImportError as exc:
++            raise unittest.SkipTest("Requires FlashInfer") from exc
++
++    def test_persistent_host_buffer_pinning(self):
++        device = torch.device("cuda:0")
++        for use_v2_model_runner, has_speculation, pin_memory in product(
++            (False, True), repeat=3
++        ):
++            with self.subTest(
++                use_v2_model_runner=use_v2_model_runner,
++                has_speculation=has_speculation,
++                pin_memory=pin_memory,
++            ):
++                check_persistent_host_buffer_pinning(
++                    device, use_v2_model_runner, has_speculation, pin_memory
++                )
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/vllm/v1/attention/backends/flashinfer.py b/vllm/v1/attention/backends/flashinfer.py
+index 8031900..f11a1bd 100755
+--- a/vllm/v1/attention/backends/flashinfer.py
++++ b/vllm/v1/attention/backends/flashinfer.py
+@@ -718,10 +718,14 @@ class FlashInferMetadataBuilder(AttentionMetadataBuilder[FlashInferMetadata]):
+                 "earlier GPUs."
+             )
+         # Preparing persistent buffers
+-        # Since we do not have explicit synchronization in ModelRunnerV2, we do not pin
+-        # reused CPU buffers to avoid a race condition between step N async copies to
+-        # GPU and step N+1 buffer updates.
+-        self.pin_memory = not vllm_config.use_v2_model_runner and PIN_MEMORY
++        # ModelRunnerV2 and speculative proposals can reuse host metadata before
++        # an earlier asynchronous H2D copy completes. Pageable staging prevents
++        # the next proposal's metadata from overwriting that copy's source.
++        self.pin_memory = (
++            PIN_MEMORY
++            and not vllm_config.use_v2_model_runner
++            and speculative_config is None
++        )
+         self.paged_kv_indptr = self._make_buffer(max_num_reqs + 1)
+         self.paged_kv_indptr_cpu_buffer = torch.zeros_like(
+             self.paged_kv_indptr.cpu, pin_memory=self.pin_memory

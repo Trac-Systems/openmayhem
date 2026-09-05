@@ -83,7 +83,8 @@ use mayhem_gateway::{
         gateway_bind_is_loopback, gateway_token_hash, serve as serve_gateway,
         validate_gateway_bind_access, GatewayAccessControl, GatewayAttestationAuthority,
         GatewayAttestationCollateral, GatewayCanaryChallengeContext, GatewayCanaryProbePolicy,
-        GatewayCanaryRegistry, GatewayLocalRunBadge, GatewayMarketInfo, GatewayModel,
+        GatewayCanaryRegistry, GatewayExecutionModeRegistry, GatewayLocalRunBadge,
+        GatewayMarketInfo, GatewayModel,
         GatewayReceiptSettlementPublisher, GatewayRouteCandidate, GatewayState,
         GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore, GatewayUpdateModelNotice,
         MayhemModelInfo, ModelCaps, PriceRefAu, ProviderKybInfo, SamplingProfile,
@@ -3292,6 +3293,10 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long)]
     artifact: String,
 
+    /// Named vLLM execution mode to calibrate. Omit for the baseline model.
+    #[arg(long)]
+    execution_mode: Option<String>,
+
     /// Local artifact file or snapshot path. It must match the admin catalog artifact.
     #[arg(long, value_name = "PATH")]
     artifact_path: PathBuf,
@@ -3392,9 +3397,43 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long)]
     vllm_max_num_seqs: Option<u32>,
 
+    /// Local worker count for an isolated-worker execution mode; each worker serves one sequence.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(1..))]
+    vllm_worker_count: Option<u32>,
+
+    #[arg(skip)]
+    vllm_generation_topology: Option<mayhem_proto::GenerationExecutionTopology>,
+
+    #[arg(skip)]
+    vllm_runtime: Option<python_runtime::VllmRuntime>,
+
     /// vLLM prefill-token batch ceiling used by calibration.
     #[arg(long)]
     vllm_max_num_batched_tokens: Option<u32>,
+
+    /// Whether vLLM calibration disables compilation and CUDA graphs.
+    #[arg(long, value_name = "BOOL")]
+    vllm_enforce_eager: Option<bool>,
+
+    /// vLLM compilation mode used by calibration (0..3).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=3))]
+    vllm_compilation_mode: Option<u32>,
+
+    /// vLLM CUDA graph mode used by calibration.
+    #[arg(long, value_parser = ["NONE", "FULL_DECODE_ONLY", "FULL", "PIECEWISE", "FULL_AND_PIECEWISE"])]
+    vllm_cudagraph_mode: Option<String>,
+
+    /// vLLM linear kernel backend used by calibration.
+    #[arg(long)]
+    vllm_linear_backend: Option<String>,
+
+    /// vLLM MoE kernel backend used by calibration.
+    #[arg(long)]
+    vllm_moe_backend: Option<String>,
+
+    /// vLLM MTP speculative-token count used by calibration.
+    #[arg(long)]
+    vllm_mtp_num_speculative_tokens: Option<u32>,
 
     /// Print a machine-readable calibration report.
     #[arg(long)]
@@ -3537,6 +3576,30 @@ struct CatalogCanaryPlanArgs {
     /// vLLM prefill-token batch ceiling for printed calibration commands.
     #[arg(long)]
     vllm_max_num_batched_tokens: Option<u32>,
+
+    /// Whether printed vLLM calibration commands disable compilation and CUDA graphs.
+    #[arg(long, value_name = "BOOL")]
+    vllm_enforce_eager: Option<bool>,
+
+    /// vLLM compilation mode for printed calibration commands (0..3).
+    #[arg(long, value_parser = clap::value_parser!(u32).range(0..=3))]
+    vllm_compilation_mode: Option<u32>,
+
+    /// vLLM CUDA graph mode for printed calibration commands.
+    #[arg(long, value_parser = ["NONE", "FULL_DECODE_ONLY", "FULL", "PIECEWISE", "FULL_AND_PIECEWISE"])]
+    vllm_cudagraph_mode: Option<String>,
+
+    /// vLLM linear kernel backend for printed calibration commands.
+    #[arg(long)]
+    vllm_linear_backend: Option<String>,
+
+    /// vLLM MoE kernel backend for printed calibration commands.
+    #[arg(long)]
+    vllm_moe_backend: Option<String>,
+
+    /// vLLM MTP speculative-token count for printed calibration commands.
+    #[arg(long)]
+    vllm_mtp_num_speculative_tokens: Option<u32>,
 
     /// Include dev-tier models in addition to launch-tier models.
     #[arg(long)]
@@ -6265,6 +6328,10 @@ struct ProviderRoomLeaveArgs {
 
 #[derive(Clone, Debug, Parser)]
 struct ProviderServePlanArgs {
+    /// Optional signed execution mode for the selected artifact; omitted uses the baseline.
+    #[arg(long)]
+    execution_mode: Option<String>,
+
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
@@ -6348,6 +6415,10 @@ struct ProviderServePlanArgs {
 
 #[derive(Clone, Debug, Parser)]
 struct ProviderServeAddArgs {
+    /// Optional signed execution mode for the selected artifact; omitted uses the baseline.
+    #[arg(long)]
+    execution_mode: Option<String>,
+
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
@@ -6411,6 +6482,10 @@ struct ProviderServeRemoveArgs {
 
 #[derive(Debug, Parser)]
 struct ProviderServeSwitchArgs {
+    /// Optional signed execution mode for the replacement artifact; omitted uses the baseline.
+    #[arg(long)]
+    execution_mode: Option<String>,
+
     #[command(flatten)]
     tx: ProviderTxArgs,
 
@@ -6463,6 +6538,10 @@ struct ProviderServeSwitchArgs {
 
 #[derive(Clone, Debug, Parser)]
 struct ProviderStartArgs {
+    /// Optional signed execution mode for the selected artifact; omitted uses the baseline.
+    #[arg(long)]
+    execution_mode: Option<String>,
+
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
@@ -7754,6 +7833,7 @@ fn doctor(args: DoctorArgs) -> Result<()> {
             &home,
             &backend,
             None,
+            None,
             Some(verdict),
             &report,
             args.gpu_layers,
@@ -8503,6 +8583,7 @@ fn catalog_artifact_resident_bytes(artifact: &catalog::CatalogArtifact) -> u64 {
 
 fn provider_start_args_for_local_run_display(home: &Path) -> ProviderStartArgs {
     ProviderStartArgs {
+        execution_mode: None,
         home: Some(home.to_path_buf()),
         enclave: None,
         rooms: "auto".to_owned(),
@@ -10844,14 +10925,14 @@ fn catalog_artifact_root_owners(document: &Value) -> BTreeMap<String, BTreeSet<S
     owners
 }
 
-fn catalog_generation_execution_profiles(document: &Value) -> BTreeMap<String, Value> {
+fn catalog_root_keyed_entries(document: &Value, field: &str) -> BTreeMap<String, Value> {
     document
-        .get("generation_execution_profiles")
+        .get(field)
         .and_then(Value::as_object)
-        .map(|profiles| {
-            profiles
+        .map(|entries| {
+            entries
                 .iter()
-                .map(|(root, profile)| (root.clone(), profile.clone()))
+                .map(|(root, value)| (root.clone(), value.clone()))
                 .collect()
         })
         .unwrap_or_default()
@@ -10902,33 +10983,50 @@ fn validate_additive_catalog_update(
         changed.join(", ")
     );
 
-    let base_profiles = catalog_generation_execution_profiles(&base_document);
-    let candidate_profiles = catalog_generation_execution_profiles(&candidate_document);
     let base_root_owners = catalog_artifact_root_owners(&base_document);
     let candidate_root_owners = catalog_artifact_root_owners(&candidate_document);
-    let mut unapproved_execution_profile_changes = BTreeSet::new();
-    for root in base_profiles.keys().chain(candidate_profiles.keys()) {
-        if base_profiles.get(root) == candidate_profiles.get(root) {
-            continue;
+    let validate_root_owned_map = |field: &str,
+                                   change_kind: &str,
+                                   entry_kind: &str|
+     -> Result<()> {
+        let base_entries = catalog_root_keyed_entries(&base_document, field);
+        let candidate_entries = catalog_root_keyed_entries(&candidate_document, field);
+        let mut unapproved_changes = BTreeSet::new();
+        for root in base_entries.keys().chain(candidate_entries.keys()) {
+            if base_entries.get(root) == candidate_entries.get(root) {
+                continue;
+            }
+            let owners = base_root_owners
+                .get(root)
+                .or_else(|| candidate_root_owners.get(root));
+            let authorized = owners.is_some_and(|owners| {
+                owners.len() == 1
+                    && owners.iter().all(|model_id| {
+                        !base.contains_key(model_id) || allowed_model_changes.contains(model_id)
+                    })
+            });
+            if !authorized {
+                unapproved_changes.insert(root.clone());
+            }
         }
-        let owners = base_root_owners
-            .get(root)
-            .or_else(|| candidate_root_owners.get(root));
-        let authorized = owners.is_some_and(|owners| {
-            owners.len() == 1
-                && owners.iter().all(|model_id| {
-                    !base.contains_key(model_id) || allowed_model_changes.contains(model_id)
-                })
-        });
-        if !authorized {
-            unapproved_execution_profile_changes.insert(root.clone());
-        }
-    }
-    ensure!(
-        unapproved_execution_profile_changes.is_empty(),
-        "catalog signing refuses unapproved generation execution profile changes for artifact root(s): {}; add profiles only with new models or explicitly review the owning existing model with --allow-model-change",
-        unapproved_execution_profile_changes.into_iter().collect::<Vec<_>>().join(", ")
-    );
+        ensure!(
+            unapproved_changes.is_empty(),
+            "catalog signing refuses unapproved {change_kind} changes for artifact root(s): {}; add {entry_kind} only with new models or explicitly review the owning existing model with --allow-model-change",
+            unapproved_changes.into_iter().collect::<Vec<_>>().join(", ")
+        );
+        Ok(())
+    };
+    validate_root_owned_map(
+        "generation_execution_profiles",
+        "generation execution profile",
+        "profiles",
+    )?;
+    validate_root_owned_map(
+        "vllm_execution_profiles",
+        "vLLM execution profile",
+        "profiles",
+    )?;
+    validate_root_owned_map("vllm_execution_modes", "vLLM execution mode", "modes")?;
 
     let changed_authority_fields = ["attestation_policy_chain", "enclave_attestation_bindings"]
         .into_iter()
@@ -15812,7 +15910,7 @@ fn catalog_artifact_plan_verify_command(
     catalog_canary_plan_command(argv)
 }
 
-fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
+fn catalog_calibrate_canary(mut args: CatalogCalibrateCanaryArgs) -> Result<()> {
     let catalog_path = args
         .catalog_path
         .clone()
@@ -15855,7 +15953,7 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
         .map(|path| absolutize(path.clone()))
         .transpose()?;
     let catalog_doc = catalog::load_document(&catalog_path)?;
-    let model = catalog_doc
+    let base_model = catalog_doc
         .models
         .iter()
         .find(|model| model.model_id == args.model)
@@ -15866,12 +15964,12 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
                 catalog_path.display()
             )
         })?;
-    let artifact = model.artifacts.get(&args.artifact).with_context(|| {
+    let base_artifact = base_model.artifacts.get(&args.artifact).with_context(|| {
         format!(
             "artifact {} not found for model {}; available: {}",
             args.artifact,
-            model.model_id,
-            model
+            base_model.model_id,
+            base_model
                 .artifacts
                 .keys()
                 .map(String::as_str)
@@ -15879,6 +15977,49 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
                 .join(", ")
         )
     })?;
+    let execution_mode = args
+        .execution_mode
+        .as_deref()
+        .map(|mode_id| {
+            catalog_doc
+                .vllm_execution_mode(&base_artifact.artifact_root, mode_id)
+                .with_context(|| {
+                    format!(
+                        "execution mode {mode_id} not found for model {} artifact {}",
+                        base_model.model_id, args.artifact
+                    )
+                })
+        })
+        .transpose()?;
+    let execution_mode_binding = execution_mode
+        .map(|mode| {
+            mode.binding(
+                &base_artifact.artifact_root,
+                args.execution_mode
+                    .as_deref()
+                    .expect("execution mode id accompanies selected mode"),
+            )
+        })
+        .transpose()?;
+    let execution_mode_model = execution_mode
+        .map(|mode| catalog::execution_mode_model(base_model, &args.artifact, mode))
+        .transpose()?;
+    let model = execution_mode_model.as_ref().unwrap_or(base_model);
+    let artifact = model
+        .artifacts
+        .get(&args.artifact)
+        .expect("effective execution mode retains its selected artifact");
+    bind_calibration_vllm_execution_profile(
+        &mut args,
+        execution_mode
+            .map(|mode| &mode.profile)
+            .or_else(|| catalog_doc.vllm_execution_profile(&artifact.artifact_root)),
+    )?;
+    let generation_profile = match execution_mode {
+        Some(mode) => mode.generation_execution_profile.as_ref(),
+        None => catalog_doc.generation_execution_profile(&artifact.artifact_root),
+    };
+    bind_calibration_generation_topology(&mut args, generation_profile)?;
     validate_calibration_args_for_artifact(artifact, &args)?;
     let calibration_memory = calibration_memory_context(artifact, &artifact_path, &args)?;
     preflight_catalog_calibration_managed_runtime(artifact, &args)?;
@@ -15892,9 +16033,19 @@ fn catalog_calibrate_canary(args: CatalogCalibrateCanaryArgs) -> Result<()> {
     )?;
     let canary_set_sha256 =
         canary_set_file_sha256(&canaries_dir, &model.canary.set_id).map_err(anyhow::Error::msg)?;
+    if let Some(mode) = execution_mode {
+        ensure!(
+            canary_set_sha256 == mode.canary_set_sha256,
+            "execution mode {} canary input bytes hash to {}, expected {}",
+            args.execution_mode.as_deref().unwrap_or("<missing>"),
+            canary_set_sha256,
+            mode.canary_set_sha256
+        );
+    }
     catalog_endpoint_calibration_preflight(model, &prompts)?;
     preflight_calibration_prompt_resources(model, &prompts)?;
-    let runtime_config = catalog_canary_runtime_config(artifact, &artifact_path, &args)?;
+    let mut runtime_config = catalog_canary_runtime_config(artifact, &artifact_path, &args)?;
+    runtime_config.execution_mode = execution_mode_binding;
     let existing = existing_catalog_canary_fingerprint(model, &args.artifact);
     let resume_core_report = resume_core_report_path
         .as_ref()
@@ -16644,6 +16795,7 @@ fn validate_resumed_canary_core(
             source: recorded.measurement_source.clone(),
             probe: calibration_memory.probe.clone(),
             chatterbox_device: calibration_memory.chatterbox_device,
+            vllm_replica_limit_bytes: calibration_memory.vllm_replica_limit_bytes,
         };
         aggregate_calibrated_modality_resource_profiles(model, &report.prompts, &recorded_memory)?
     } else {
@@ -17748,6 +17900,14 @@ fn catalog_endpoint_calibration_materialize_request(
     mut request: Value,
     fixtures: &CatalogEndpointCalibrationFixtures,
 ) -> Result<Value> {
+    if matches!(
+        contract.family.as_str(),
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+            | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+            | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+    ) {
+        return catalog_endpoint_calibration_materialize_tool_request(contract, case, request);
+    }
     if contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
         return catalog_endpoint_calibration_materialize_workflow_request(case, request, fixtures);
     }
@@ -17852,6 +18012,63 @@ fn catalog_endpoint_calibration_materialize_request(
             json!(base64::engine::general_purpose::STANDARD.encode(bytes)),
         );
     }
+    Ok(request)
+}
+
+fn catalog_endpoint_calibration_materialize_tool_request(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    case: &mayhem_proto::EndpointCalibrationCase,
+    mut request: Value,
+) -> Result<Value> {
+    // Supply a companion fixture, never repair an explicit tools value or omission test.
+    if !case.expect_accept
+        || request.get("tools").is_some()
+        || case
+            .mutations
+            .iter()
+            .any(|mutation| mutation.path == "tools" || mutation.path.starts_with("tools."))
+    {
+        return Ok(request);
+    }
+    let choice = request.get("tool_choice");
+    let named = choice
+        .and_then(Value::as_object)
+        .and_then(provider_engine_named_tool_choice);
+    if named.is_none() && !matches!(choice.and_then(Value::as_str), Some("required" | "any")) {
+        return Ok(request);
+    }
+    let spec = contract
+        .request_attribute_specs
+        .get("tools")
+        .context("forced-tool calibration has no signed tools spec")?;
+    let tools = spec
+        .calibration_values
+        .iter()
+        .chain(spec.default.iter())
+        .chain(spec.enum_values.iter())
+        .find(|value| {
+            let matches_choice = value.as_array().is_some_and(|tools| {
+                tools.iter().any(|tool| {
+                    provider_engine_tool_definition(tool)
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|name| named.is_none_or(|chosen| chosen == name))
+                })
+            });
+            if !matches_choice {
+                return false;
+            }
+            let mut candidate = request.clone();
+            candidate["tools"] = (*value).clone();
+            mayhem_proto::validate_endpoint_request(contract, &candidate).is_ok()
+        })
+        .with_context(|| {
+            format!(
+                "calibration case {} has no signed tools fixture matching tool_choice",
+                case.case_id
+            )
+        })?;
+    request["tools"] = tools.clone();
     Ok(request)
 }
 
@@ -18409,6 +18626,8 @@ fn calibration_endpoint_attribute_is_handled(
             | "messages"
             | "messages.role"
             | "messages.name"
+            | "messages.reasoning"
+            | "messages.reasoning_content"
             | "messages.tool_calls"
             | "messages.tool_call_id"
             | "messages.content.type"
@@ -18477,6 +18696,8 @@ fn calibration_endpoint_attribute_is_handled(
                 | "messages"
                 | "messages.role"
                 | "messages.name"
+                | "messages.reasoning"
+                | "messages.reasoning_content"
                 | "messages.tool_calls"
                 | "messages.tool_call_id"
                 | "messages.content.type"
@@ -19302,7 +19523,16 @@ fn validate_calibration_args_for_artifact(
     let has_vllm_runtime_options = args.vllm_dtype.is_some()
         || args.vllm_kv_cache_dtype.is_some()
         || args.vllm_max_num_seqs.is_some()
-        || args.vllm_max_num_batched_tokens.is_some();
+        || args.vllm_worker_count.is_some()
+        || args.vllm_generation_topology.is_some()
+        || args.vllm_runtime.is_some()
+        || args.vllm_max_num_batched_tokens.is_some()
+        || args.vllm_enforce_eager.is_some()
+        || args.vllm_compilation_mode.is_some()
+        || args.vllm_cudagraph_mode.is_some()
+        || args.vllm_linear_backend.is_some()
+        || args.vllm_moe_backend.is_some()
+        || args.vllm_mtp_num_speculative_tokens.is_some();
     for (name, value) in [
         ("--vllm-dtype", args.vllm_dtype.as_deref()),
         ("--vllm-kv-cache-dtype", args.vllm_kv_cache_dtype.as_deref()),
@@ -19318,6 +19548,28 @@ fn validate_calibration_args_for_artifact(
         ensure!(
             value > 0,
             "--vllm-max-num-batched-tokens must be greater than zero"
+        );
+    }
+    mayhem_engine::validate_vllm_compilation_config(
+        args.vllm_enforce_eager,
+        args.vllm_compilation_mode,
+        args.vllm_cudagraph_mode.as_deref(),
+    )?;
+    for (name, value) in [
+        ("--vllm-linear-backend", args.vllm_linear_backend.as_deref()),
+        ("--vllm-moe-backend", args.vllm_moe_backend.as_deref()),
+    ] {
+        if let Some(value) = value {
+            ensure!(
+                matches!(value, "auto" | "cutlass"),
+                "{name} must be one of auto, cutlass"
+            );
+        }
+    }
+    if let Some(value) = args.vllm_mtp_num_speculative_tokens {
+        ensure!(
+            (1..=32).contains(&value),
+            "--vllm-mtp-num-speculative-tokens must be between 1 and 32"
         );
     }
     let has_trt_options = args.trt_engine_dir.is_some()
@@ -19401,7 +19653,12 @@ fn calibration_memory_context(
                 artifact.engine
             )
         })?;
-    let pool = provider_memory_pool(&hardware, verdict, &artifact.engine, args.gpu_layers);
+    let mut pool = provider_memory_pool(&hardware, verdict, &artifact.engine, args.gpu_layers);
+    if args.vllm_generation_topology
+        == Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
+    {
+        scope_vllm_execution_mode_memory_pool(&mut pool, &hardware, args.trt_tensor_parallel.unwrap_or(1))?;
+    }
     let reserve_basis = pool.total_bytes.max(pool.available_bytes);
     let (reserve_bytes, reserve_source) =
         provider_memory_reserve_bytes(args.memory_reserve.as_deref(), reserve_basis, pool.unified)?;
@@ -19412,6 +19669,11 @@ fn calibration_memory_context(
         human_bytes(pool.available_bytes),
         human_bytes(reserve_bytes)
     );
+    let vllm_replica_limit_bytes = calibration_vllm_replica_allocation(
+        args,
+        pool.total_bytes,
+        f13_budget_bytes,
+    )?;
 
     let chatterbox_device = (artifact.engine == "chatterbox")
         .then(|| {
@@ -19453,7 +19715,37 @@ fn calibration_memory_context(
         ),
         probe,
         chatterbox_device,
+        vllm_replica_limit_bytes,
     })
+}
+
+fn calibration_vllm_replica_allocation(
+    args: &CatalogCalibrateCanaryArgs,
+    total_bytes: u64,
+    f13_budget_bytes: u64,
+) -> Result<Option<u64>> {
+    if args.vllm_generation_topology
+        != Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
+    {
+        ensure!(args.vllm_worker_count.is_none(),
+            "--vllm-worker-count requires a signed isolated-worker execution mode");
+        return Ok(None);
+    }
+    let count = args.vllm_worker_count.context("isolated calibration worker count is missing")?;
+    ensure!(count > 0, "isolated calibration worker count must be positive");
+    let target = args.vllm_memory_utilization
+        .context("isolated calibration requires --vllm-memory-utilization per worker")?;
+    validate_provider_vllm_memory_utilization_pct(target)?;
+    let per_worker = u64::try_from(u128::from(total_bytes) * u128::from(target) / 100)
+        .context("isolated calibration worker allocation exceeds u64")?;
+    ensure!(per_worker > 0, "isolated calibration worker allocation is empty");
+    let aggregate = per_worker.checked_mul(u64::from(count))
+        .context("isolated calibration allocation overflow")?;
+    ensure!(aggregate <= f13_budget_bytes,
+        "isolated calibration workers require {}, exceeding the F13 budget {}",
+        human_bytes(aggregate), human_bytes(f13_budget_bytes));
+    // This is an aggregate process containment limit, not a claim of measured usage.
+    Ok(Some(aggregate))
 }
 
 fn calibration_accelerator_preflight(
@@ -19878,6 +20170,99 @@ fn catalog_canary_artifact_binding(
     }
 }
 
+fn bind_calibration_vllm_execution_profile(
+    args: &mut CatalogCalibrateCanaryArgs,
+    profile: Option<&catalog::CatalogVllmExecutionProfile>,
+) -> Result<()> {
+    args.vllm_runtime = profile.and_then(|profile| profile.runtime.clone());
+    let Some(profile) = profile else {
+        return Ok(());
+    };
+    let mtp_tokens = profile
+        .speculative_decoding
+        .as_ref()
+        .map(|speculative| speculative.num_speculative_tokens);
+    ensure!(
+        args.vllm_enforce_eager.is_none_or(|value| value == profile.enforce_eager)
+            && args.vllm_compilation_mode.is_none_or(|value| Some(value) == profile.compilation_mode)
+            && args.vllm_cudagraph_mode.as_ref().is_none_or(|value| Some(value) == profile.cudagraph_mode.as_ref())
+            && args.vllm_linear_backend.as_ref().is_none_or(|value| value == &profile.linear_backend)
+            && args.vllm_moe_backend.as_ref().is_none_or(|value| value == &profile.moe_backend)
+            && args.vllm_mtp_num_speculative_tokens.is_none_or(|value| Some(value) == mtp_tokens),
+        "vLLM calibration options must match the artifact's catalog execution profile; use a separate catalog draft to calibrate a changed profile"
+    );
+    args.vllm_enforce_eager = Some(profile.enforce_eager);
+    args.vllm_compilation_mode = profile.compilation_mode;
+    args.vllm_cudagraph_mode = profile.cudagraph_mode.clone();
+    args.vllm_linear_backend = Some(profile.linear_backend.clone());
+    args.vllm_moe_backend = Some(profile.moe_backend.clone());
+    args.vllm_mtp_num_speculative_tokens = mtp_tokens;
+    Ok(())
+}
+
+fn validate_calibration_vllm_execution_profile(
+    runtime: &CatalogCanaryRuntimeConfig,
+    profile: Option<&catalog::CatalogVllmExecutionProfile>,
+) -> Result<()> {
+    ensure!(
+        runtime.vllm_runtime.as_ref() == profile.and_then(|value| value.runtime.as_ref())
+            && runtime.vllm_enforce_eager == profile.map(|value| value.enforce_eager)
+            && runtime.vllm_compilation_mode == profile.and_then(|value| value.compilation_mode)
+            && runtime.vllm_cudagraph_mode.as_deref()
+                == profile.and_then(|value| value.cudagraph_mode.as_deref())
+            && runtime.vllm_linear_backend.as_deref()
+                == profile.map(|value| value.linear_backend.as_str())
+            && runtime.vllm_moe_backend.as_deref()
+                == profile.map(|value| value.moe_backend.as_str())
+            && runtime.vllm_mtp_num_speculative_tokens
+                == profile
+                    .and_then(|value| value.speculative_decoding.as_ref())
+                    .map(|value| value.num_speculative_tokens),
+        "report vLLM execution settings do not match the artifact's catalog execution profile"
+    );
+    Ok(())
+}
+
+fn bind_calibration_generation_topology(
+    args: &mut CatalogCalibrateCanaryArgs,
+    profile: Option<&catalog::CatalogGenerationExecutionProfile>,
+) -> Result<()> {
+    args.vllm_generation_topology = profile.and_then(|profile| profile.topology);
+    if generation_execution_uses_isolated_workers(profile) {
+        ensure!(args.execution_mode.is_some(),
+            "isolated calibration requires --execution-mode");
+        ensure!(args.vllm_max_num_seqs.is_none_or(|count| count == 1)
+            && args.trt_max_batch_size.is_none(),
+            "isolated calibration requires one sequence per worker; use --vllm-worker-count for concurrency");
+        let count = args.vllm_worker_count.unwrap_or(1);
+        ensure!(count > 0, "isolated calibration worker count must be positive");
+        args.vllm_worker_count = Some(count);
+        args.vllm_max_num_seqs = Some(1);
+    } else {
+        ensure!(args.vllm_worker_count.is_none(),
+            "--vllm-worker-count requires a signed isolated-worker execution mode");
+    }
+    Ok(())
+}
+
+fn validate_calibration_generation_topology(
+    runtime: &CatalogCanaryRuntimeConfig,
+    profile: Option<&catalog::CatalogGenerationExecutionProfile>,
+) -> Result<()> {
+    ensure!(runtime.vllm_generation_topology == profile.and_then(|profile| profile.topology),
+        "report generation topology does not match the catalog execution mode");
+    if generation_execution_uses_isolated_workers(profile) {
+        ensure!(runtime.execution_mode.is_some()
+            && runtime.vllm_worker_count.is_some_and(|count| count > 0)
+            && runtime.vllm_max_num_seqs == Some(1),
+            "isolated calibration report requires a mode binding, positive worker count and one sequence per worker");
+    } else {
+        ensure!(runtime.vllm_worker_count.is_none(),
+            "report worker count requires a signed isolated-worker execution mode");
+    }
+    Ok(())
+}
+
 fn catalog_canary_runtime_config(
     artifact: &catalog::CatalogArtifact,
     artifact_path: &Path,
@@ -19898,6 +20283,7 @@ fn catalog_canary_runtime_config(
         .trt_max_num_tokens
         .map(|tokens| tokens.max(args.ctx_size.max(1)).max(1));
     Ok(CatalogCanaryRuntimeConfig {
+        execution_mode: None,
         ctx_size: args.ctx_size.max(1),
         seed: args.seed,
         threads: args.threads,
@@ -19935,8 +20321,31 @@ fn catalog_canary_runtime_config(
         vllm_max_num_seqs: (artifact.engine == "vllm")
             .then(|| args.vllm_max_num_seqs.or(args.trt_max_batch_size))
             .flatten(),
+        vllm_worker_count: args.vllm_worker_count,
+        vllm_generation_topology: args.vllm_generation_topology,
+        vllm_runtime: (artifact.engine == "vllm")
+            .then(|| args.vllm_runtime.clone())
+            .flatten(),
         vllm_max_num_batched_tokens: (artifact.engine == "vllm")
             .then_some(args.vllm_max_num_batched_tokens)
+            .flatten(),
+        vllm_enforce_eager: (artifact.engine == "vllm")
+            .then_some(args.vllm_enforce_eager)
+            .flatten(),
+        vllm_compilation_mode: (artifact.engine == "vllm")
+            .then_some(args.vllm_compilation_mode)
+            .flatten(),
+        vllm_cudagraph_mode: (artifact.engine == "vllm")
+            .then_some(args.vllm_cudagraph_mode.clone())
+            .flatten(),
+        vllm_linear_backend: (artifact.engine == "vllm")
+            .then_some(args.vllm_linear_backend.clone())
+            .flatten(),
+        vllm_moe_backend: (artifact.engine == "vllm")
+            .then_some(args.vllm_moe_backend.clone())
+            .flatten(),
+        vllm_mtp_num_speculative_tokens: (artifact.engine == "vllm")
+            .then_some(args.vllm_mtp_num_speculative_tokens)
             .flatten(),
     })
 }
@@ -20341,11 +20750,34 @@ fn catalog_merge_canary_reports(args: CatalogMergeCanaryReportsArgs) -> Result<(
     let first = source_reports
         .first()
         .context("cross-platform canary reports disappeared during merge")?;
-    let model = catalog_doc
+    let base_model = catalog_doc
         .models
         .iter()
         .find(|model| model.model_id == first.model_id)
         .with_context(|| format!("model {} is absent from the catalog", first.model_id))?;
+    let execution_mode_model = first
+        .runtime_config
+        .execution_mode
+        .as_ref()
+        .map(|binding| {
+            let artifact = base_model.artifacts.get(&first.artifact).with_context(|| {
+                format!(
+                    "artifact {} is absent from model {}",
+                    first.artifact, first.model_id
+                )
+            })?;
+            let mode = catalog_doc
+                .vllm_execution_mode(&artifact.artifact_root, &binding.mode_id)
+                .with_context(|| format!("execution mode {} is absent", binding.mode_id))?;
+            let expected_binding = mode.binding(&artifact.artifact_root, &binding.mode_id)?;
+            ensure!(
+                &expected_binding == binding,
+                "report execution mode binding does not match the current catalog"
+            );
+            catalog::execution_mode_model(base_model, &first.artifact, mode)
+        })
+        .transpose()?;
+    let model = execution_mode_model.as_ref().unwrap_or(base_model);
     let canary_prompts =
         load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, true)?;
     let mut merged =
@@ -20441,6 +20873,10 @@ fn merge_token_canary_calibration_reports(
             "cross-platform reports must identify the same model, artifact, and engine"
         );
         ensure!(
+            report.runtime_config.execution_mode == merged.runtime_config.execution_mode,
+            "cross-platform reports must bind the same execution mode"
+        );
+        ensure!(
             report.verification_method == merged.verification_method,
             "cross-platform reports use different verification methods"
         );
@@ -20457,6 +20893,20 @@ fn merge_token_canary_calibration_reports(
             report.runtime_config.ctx_size == merged.runtime_config.ctx_size
                 && report.runtime_config.seed == merged.runtime_config.seed,
             "cross-platform reports must use the same context size and seed"
+        );
+        ensure!(
+            report.runtime_config.vllm_runtime == merged.runtime_config.vllm_runtime
+                && report.runtime_config.vllm_enforce_eager == merged.runtime_config.vllm_enforce_eager
+                && report.runtime_config.vllm_compilation_mode
+                    == merged.runtime_config.vllm_compilation_mode
+                && report.runtime_config.vllm_cudagraph_mode
+                    == merged.runtime_config.vllm_cudagraph_mode
+                && report.runtime_config.vllm_linear_backend
+                    == merged.runtime_config.vllm_linear_backend
+                && report.runtime_config.vllm_moe_backend == merged.runtime_config.vllm_moe_backend
+                && report.runtime_config.vllm_mtp_num_speculative_tokens
+                    == merged.runtime_config.vllm_mtp_num_speculative_tokens,
+            "cross-platform reports must use the same vLLM execution profile"
         );
         ensure!(
             report.prompt_count == merged.prompt_count
@@ -21076,12 +21526,17 @@ fn catalog_canary_evidence_report(
                 );
             }
             let prompt_count = canary_check.as_ref().ok().map(|info| info.prompt_count);
-            let key = (model.model_id.clone(), artifact_name.clone());
+            let key = (
+                model.model_id.clone(),
+                artifact_name.clone(),
+                None::<String>,
+            );
             entry_index.insert(key, entries.len());
             entries.push(CatalogCanaryEvidenceEntry {
                 model_id: model.model_id.clone(),
                 tier: model.tier.clone(),
                 artifact: artifact_name.clone(),
+                execution_mode: None,
                 engine: artifact.engine.clone(),
                 canary_set: model.canary.set_id.clone(),
                 verification_method: model.canary.verification_method.clone(),
@@ -21132,7 +21587,17 @@ fn catalog_canary_evidence_report(
     }
 
     for path in report_paths {
-        let report_value = match read_json_file(path) {
+        let report_bytes =
+            match fs::read(path).with_context(|| format!("reading {}", path.display())) {
+                Ok(bytes) => bytes,
+                Err(err) => {
+                    errors.push(format!("{}: {err}", path.display()));
+                    continue;
+                }
+            };
+        let report_value = match serde_json::from_slice::<Value>(&report_bytes)
+            .with_context(|| format!("parsing {}", path.display()))
+        {
             Ok(value) => value,
             Err(err) => {
                 errors.push(format!("{}: {err}", path.display()));
@@ -21150,7 +21615,103 @@ fn catalog_canary_evidence_report(
                     continue;
                 }
             };
-        let key = (calibration.model_id.clone(), calibration.artifact.clone());
+        let base_calibration_model = catalog_doc
+            .models
+            .iter()
+            .find(|model| model.model_id == calibration.model_id)
+            .filter(|model| !launch_only || model.tier == "launch");
+        let Some(base_calibration_model) = base_calibration_model else {
+            errors.push(format!(
+                "{} references {} / {}, which is outside the requested catalog scope",
+                path.display(),
+                calibration.model_id,
+                calibration.artifact
+            ));
+            continue;
+        };
+        let report_mode_id = calibration
+            .runtime_config
+            .execution_mode
+            .as_ref()
+            .map(|binding| binding.mode_id.clone());
+        let execution_mode_model = if let Some(binding) =
+            calibration.runtime_config.execution_mode.as_ref()
+        {
+            let Some(artifact) = base_calibration_model.artifacts.get(&calibration.artifact) else {
+                errors.push(format!(
+                    "{} references unknown artifact {} for model {}",
+                    path.display(),
+                    calibration.artifact,
+                    calibration.model_id
+                ));
+                continue;
+            };
+            let Some(execution_mode) =
+                catalog_doc.vllm_execution_mode(&artifact.artifact_root, &binding.mode_id)
+            else {
+                errors.push(format!(
+                    "{} references unknown execution mode {} for {} / {}",
+                    path.display(),
+                    binding.mode_id,
+                    calibration.model_id,
+                    calibration.artifact
+                ));
+                continue;
+            };
+            match catalog::execution_mode_model(
+                base_calibration_model,
+                &calibration.artifact,
+                execution_mode,
+            ) {
+                Ok(model) => Some(model),
+                Err(error) => {
+                    errors.push(format!(
+                        "{} execution mode {} is invalid: {error:#}",
+                        path.display(),
+                        binding.mode_id
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+        let calibration_model = execution_mode_model
+            .as_ref()
+            .unwrap_or(base_calibration_model);
+        let key = (
+            calibration.model_id.clone(),
+            calibration.artifact.clone(),
+            report_mode_id.clone(),
+        );
+        if !entry_index.contains_key(&key) {
+            let Some(mode_id) = report_mode_id.as_deref() else {
+                errors.push(format!(
+                    "{} references {} / {}, which is outside the requested catalog scope",
+                    path.display(),
+                    calibration.model_id,
+                    calibration.artifact
+                ));
+                continue;
+            };
+            let artifact = calibration_model
+                .artifacts
+                .get(&calibration.artifact)
+                .expect("effective execution mode retains its selected artifact");
+            let entry = catalog_execution_mode_evidence_entry(
+                calibration_model,
+                &calibration.artifact,
+                artifact,
+                &canaries_dir,
+                catalog_doc
+                    .vllm_execution_mode(&artifact.artifact_root, mode_id)
+                    .expect("effective execution mode came from catalog"),
+                mode_id,
+                mode,
+            );
+            entry_index.insert(key.clone(), entries.len());
+            entries.push(entry);
+        }
         let Some(entry_idx) = entry_index.get(&key).copied() else {
             errors.push(format!(
                 "{} references {} / {}, which is outside the requested catalog scope",
@@ -21160,11 +21721,6 @@ fn catalog_canary_evidence_report(
             ));
             continue;
         };
-        let calibration_model = catalog_doc
-            .models
-            .iter()
-            .find(|model| model.model_id == calibration.model_id)
-            .expect("evidence entry model comes from catalog");
         let canary_min_match_bps = catalog_canary_min_match_bps(calibration_model);
         let entry = &mut entries[entry_idx];
         if entry.report_path.is_some() {
@@ -21356,6 +21912,50 @@ fn catalog_canary_evidence_report(
                     .to_owned(),
             );
         }
+        if calibration.runtime_config.execution_mode != entry.execution_mode {
+            entry.errors.push(
+                "report execution mode binding does not match the current catalog mode policy"
+                    .to_owned(),
+            );
+        }
+        let vllm_profile = if let Some(binding) = &entry.execution_mode {
+            catalog_doc
+                .vllm_execution_mode(
+                    &entry.expected_artifact_binding.artifact_root,
+                    &binding.mode_id,
+                )
+                .map(|mode| &mode.profile)
+        } else {
+            catalog_doc.vllm_execution_profile(&entry.expected_artifact_binding.artifact_root)
+        };
+        if let Some(profile) = vllm_profile {
+            // Bind the retained calibration bytes, not reserialized JSON. Generation
+            // dispatch profiles, including mode-local profiles, reference separate
+            // concurrent evidence and are never claimed or updated by this report.
+            let report_sha256 = sha256_bytes_hex(&report_bytes);
+            if profile.proof_sha256 != report_sha256 {
+                entry.errors.push(format!(
+                    "vLLM execution profile proof_sha256 does not match calibration report bytes; expected {report_sha256} for artifact root {}",
+                    entry.expected_artifact_binding.artifact_root
+                ));
+            }
+        }
+        if let Err(error) =
+            validate_calibration_vllm_execution_profile(&calibration.runtime_config, vllm_profile)
+        {
+            entry.errors.push(error.to_string());
+        }
+        let generation_profile = match &entry.execution_mode {
+            Some(binding) => catalog_doc
+                .vllm_execution_mode(&entry.expected_artifact_binding.artifact_root, &binding.mode_id)
+                .and_then(|mode| mode.generation_execution_profile.as_ref()),
+            None => catalog_doc.generation_execution_profile(&entry.expected_artifact_binding.artifact_root),
+        };
+        if let Err(error) = validate_calibration_generation_topology(
+            &calibration.runtime_config, generation_profile,
+        ) {
+            entry.errors.push(error.to_string());
+        }
         entry.errors.extend(
             validate_endpoint_calibration_report(
                 &calibration_model.adapter.endpoint_families,
@@ -21399,21 +21999,13 @@ fn catalog_canary_evidence_report(
                 .push("report catalog_fingerprint must be 32-byte hex".to_owned());
         }
         validate_modality_fingerprint_evidence(
-            catalog_doc
-                .models
-                .iter()
-                .find(|model| model.model_id == entry.model_id)
-                .expect("evidence entry model comes from catalog"),
+            calibration_model,
             &entry.artifact,
             Some(&calibration.modality_fingerprints),
             &mut entry.errors,
         );
         validate_modality_resource_profile_evidence(
-            catalog_doc
-                .models
-                .iter()
-                .find(|model| model.model_id == entry.model_id)
-                .expect("evidence entry model comes from catalog"),
+            calibration_model,
             &entry.artifact,
             Some(&calibration.modality_resource_profiles),
             &mut entry.errors,
@@ -21599,6 +22191,169 @@ fn catalog_canary_evidence_report(
         applied_count: None,
         ok: errors.is_empty(),
         entries,
+        errors,
+    }
+}
+
+fn catalog_execution_mode_evidence_entry(
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    canaries_dir: &Path,
+    execution_mode: &catalog::CatalogVllmExecutionMode,
+    mode_id: &str,
+    report_mode: CatalogCanaryReportMode,
+) -> CatalogCanaryEvidenceEntry {
+    let mut errors = Vec::new();
+    let required_output_method = required_launch_output_canary_method(model);
+    if let Some(required_method) = required_output_method {
+        if model.canary.verification_method != required_method {
+            errors.push(format!(
+                "launch model_class {} requires output canary method {}, not {}",
+                model.model_class, required_method, model.canary.verification_method
+            ));
+        }
+    }
+    let canary_check = canary_set_matrix_check(canaries_dir, model);
+    if let Err(error) = &canary_check {
+        errors.push(error.clone());
+    }
+    let canary_set_sha256 = match canary_set_file_sha256(canaries_dir, &model.canary.set_id) {
+        Ok(hash) => {
+            if hash != execution_mode.canary_set_sha256 {
+                errors.push(format!(
+                    "execution mode {mode_id} current canary input hash {hash} does not match signed hash {}",
+                    execution_mode.canary_set_sha256
+                ));
+            }
+            Some(hash)
+        }
+        Err(error) => {
+            errors.push(format!(
+                "canary set hash error for {}: {error}",
+                model.canary.set_id
+            ));
+            None
+        }
+    };
+    let expected_fingerprint = existing_catalog_canary_fingerprint(model, artifact_name);
+    let expected_modality_fingerprints = model
+        .modality_assessment
+        .calibrated_fingerprints
+        .get(artifact_name)
+        .cloned();
+    let expected_modality_resource_profiles = Some(
+        model
+            .modality_assessment
+            .resource_profiles
+            .get(artifact_name)
+            .cloned()
+            .unwrap_or_default(),
+    );
+    let expected_speciality_calibrations = model
+        .speciality_assessment
+        .calibrated
+        .get(artifact_name)
+        .cloned();
+    let expected_token_prefixes = model.canary.token_prefixes.get(artifact_name).cloned();
+    let expected_perceptual_hashes = model.canary.perceptual_hashes.get(artifact_name).cloned();
+    let expected_embedding_vectors = model.canary.embedding_vectors.get(artifact_name).cloned();
+    let expected_transcripts = model.canary.transcripts.get(artifact_name).cloned();
+    let expected_audio_fingerprints = model.canary.audio_fingerprints.get(artifact_name).cloned();
+    let expected_video_fingerprints = model.canary.video_fingerprints.get(artifact_name).cloned();
+    if report_mode == CatalogCanaryReportMode::VerifyMatchesCatalog {
+        match expected_fingerprint.as_deref() {
+            Some(value) if is_hex_len(value, 64) => {}
+            Some(_) => errors.push(format!(
+                "execution mode canary fingerprint for {artifact_name} must be 32-byte hex"
+            )),
+            None => errors.push(format!(
+                "execution mode canary fingerprint missing artifact {artifact_name}"
+            )),
+        }
+        validate_modality_fingerprint_evidence(
+            model,
+            artifact_name,
+            expected_modality_fingerprints.as_ref(),
+            &mut errors,
+        );
+        validate_modality_resource_profile_evidence(
+            model,
+            artifact_name,
+            expected_modality_resource_profiles.as_ref(),
+            &mut errors,
+        );
+        validate_speciality_calibration_evidence(
+            model,
+            artifact_name,
+            artifact,
+            expected_speciality_calibrations.as_ref(),
+            &mut errors,
+        );
+        if model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT
+            && expected_token_prefixes
+                .as_ref()
+                .is_none_or(BTreeMap::is_empty)
+        {
+            errors.push(format!(
+                "execution mode canary token_prefixes missing artifact {artifact_name}"
+            ));
+        }
+        validate_expected_canary_method_values(
+            &model.canary.verification_method,
+            artifact_name,
+            expected_perceptual_hashes.as_ref(),
+            expected_embedding_vectors.as_ref(),
+            expected_transcripts.as_ref(),
+            expected_audio_fingerprints.as_ref(),
+            expected_video_fingerprints.as_ref(),
+            &mut errors,
+        );
+    }
+    let binding = execution_mode
+        .binding(&artifact.artifact_root, mode_id)
+        .expect("validated catalog execution mode has a binding");
+    CatalogCanaryEvidenceEntry {
+        model_id: model.model_id.clone(),
+        tier: model.tier.clone(),
+        artifact: artifact_name.to_owned(),
+        execution_mode: Some(binding),
+        engine: artifact.engine.clone(),
+        canary_set: model.canary.set_id.clone(),
+        verification_method: model.canary.verification_method.clone(),
+        canary_set_sha256,
+        prompt_count: canary_check.ok().map(|info| info.prompt_count),
+        expected_fingerprint,
+        expected_modality_fingerprints,
+        expected_modality_resource_profiles,
+        expected_speciality_calibrations,
+        expected_token_prefixes,
+        expected_perceptual_hashes,
+        expected_embedding_vectors,
+        expected_transcripts,
+        expected_audio_fingerprints,
+        expected_video_fingerprints,
+        expected_artifact_binding: catalog_canary_artifact_binding(artifact),
+        report_path: None,
+        report_fingerprint: None,
+        report_modality_fingerprints: None,
+        report_modality_resource_profiles: None,
+        report_speciality_calibrations: None,
+        report_token_prefixes: None,
+        report_perceptual_hashes: None,
+        report_embedding_vectors: None,
+        report_transcripts: None,
+        report_audio_fingerprints: None,
+        report_video_fingerprints: None,
+        report_canary_set_sha256: None,
+        report_artifact_binding: None,
+        matches_catalog: None,
+        modality_fingerprints_match_catalog: None,
+        modality_resource_profiles_match_catalog: None,
+        speciality_calibrations_match_catalog: None,
+        token_prefixes_match_catalog: None,
+        method_values_match_catalog: None,
+        ok: errors.is_empty(),
         errors,
     }
 }
@@ -22364,16 +23119,20 @@ fn apply_canary_report_fingerprints(
     catalog_value: &mut Value,
     report: &CatalogCanaryEvidenceReport,
 ) -> Result<usize> {
-    let models = catalog_value
-        .get_mut("models")
-        .and_then(Value::as_array_mut)
-        .context("catalog JSON must contain models array")?;
     let mut applied = 0usize;
     for entry in &report.entries {
         let Some(fingerprint) = &entry.report_fingerprint else {
             continue;
         };
-        let model = models
+        if entry.execution_mode.is_some() {
+            apply_execution_mode_canary_report(catalog_value, entry, fingerprint)?;
+            applied += 1;
+            continue;
+        }
+        let model = catalog_value
+            .get_mut("models")
+            .and_then(Value::as_array_mut)
+            .context("catalog JSON must contain models array")?
             .iter_mut()
             .find(|model| model.get("model_id").and_then(Value::as_str) == Some(&entry.model_id))
             .with_context(|| format!("model {} disappeared from catalog JSON", entry.model_id))?;
@@ -22547,6 +23306,111 @@ fn apply_canary_report_fingerprints(
         applied += 1;
     }
     Ok(applied)
+}
+
+fn apply_execution_mode_canary_report(
+    catalog_value: &mut Value,
+    entry: &CatalogCanaryEvidenceEntry,
+    fingerprint: &str,
+) -> Result<()> {
+    let binding = entry
+        .execution_mode
+        .as_ref()
+        .context("execution mode report has no mode binding")?;
+    let root = &entry.expected_artifact_binding.artifact_root;
+    let mode = catalog_value
+        .get_mut("vllm_execution_modes")
+        .and_then(Value::as_object_mut)
+        .and_then(|modes| modes.get_mut(root))
+        .and_then(Value::as_object_mut)
+        .and_then(|modes| modes.get_mut(&binding.mode_id))
+        .and_then(Value::as_object_mut)
+        .with_context(|| {
+            format!(
+                "execution mode {} disappeared for artifact root {root}",
+                binding.mode_id
+            )
+        })?;
+    let canary = mode
+        .get_mut("canary")
+        .and_then(Value::as_object_mut)
+        .with_context(|| format!("execution mode {} has no canary object", binding.mode_id))?;
+    match entry.verification_method.as_str() {
+        CANARY_VERIFICATION_TOKEN_FINGERPRINT => {
+            canary
+                .entry("fingerprints")
+                .or_insert_with(|| json!({}))
+                .as_object_mut()
+                .context("execution mode canary.fingerprints is not an object")?
+                .insert(entry.artifact.clone(), json!(fingerprint));
+            if let Some(prefixes) = &entry.report_token_prefixes {
+                canary
+                    .entry("token_prefixes")
+                    .or_insert_with(|| json!({}))
+                    .as_object_mut()
+                    .context("execution mode canary.token_prefixes is not an object")?
+                    .insert(entry.artifact.clone(), json!(prefixes));
+            }
+        }
+        CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH => insert_canary_method_map(
+            canary,
+            &entry.model_id,
+            "perceptual_hashes",
+            &entry.artifact,
+            entry.report_perceptual_hashes.as_ref(),
+        )?,
+        CANARY_VERIFICATION_EMBEDDING_COSINE => insert_canary_method_map(
+            canary,
+            &entry.model_id,
+            "embedding_vectors",
+            &entry.artifact,
+            entry.report_embedding_vectors.as_ref(),
+        )?,
+        CANARY_VERIFICATION_TRANSCRIPT_MATCH => insert_canary_method_map(
+            canary,
+            &entry.model_id,
+            "transcripts",
+            &entry.artifact,
+            entry.report_transcripts.as_ref(),
+        )?,
+        CANARY_VERIFICATION_AUDIO_FINGERPRINT => insert_canary_method_map(
+            canary,
+            &entry.model_id,
+            "audio_fingerprints",
+            &entry.artifact,
+            entry.report_audio_fingerprints.as_ref(),
+        )?,
+        CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT => insert_canary_method_map(
+            canary,
+            &entry.model_id,
+            "video_fingerprints",
+            &entry.artifact,
+            entry.report_video_fingerprints.as_ref(),
+        )?,
+        other => bail!("cannot apply unsupported canary verification_method {other}"),
+    }
+    mode.insert(
+        "modality_fingerprints".to_owned(),
+        json!(entry
+            .report_modality_fingerprints
+            .as_ref()
+            .context("execution mode report has no modality fingerprints")?),
+    );
+    mode.insert(
+        "resource_profiles".to_owned(),
+        json!(entry
+            .report_modality_resource_profiles
+            .as_ref()
+            .context("execution mode report has no modality resource profiles")?),
+    );
+    mode.insert(
+        "speciality_calibrations".to_owned(),
+        json!(entry
+            .report_speciality_calibrations
+            .as_ref()
+            .context("execution mode report has no speciality calibrations")?),
+    );
+    Ok(())
 }
 
 fn insert_canary_method_map<T: Serialize>(
@@ -22876,6 +23740,28 @@ fn catalog_canary_calibration_plan_command(
                 &mut argv,
                 "--vllm-max-num-batched-tokens",
                 max_num_batched_tokens.to_string(),
+            );
+        }
+        if let Some(enforce_eager) = args.vllm_enforce_eager {
+            push_plan_value_arg(&mut argv, "--vllm-enforce-eager", enforce_eager.to_string());
+        }
+        if let Some(mode) = args.vllm_compilation_mode {
+            push_plan_value_arg(&mut argv, "--vllm-compilation-mode", mode.to_string());
+        }
+        if let Some(mode) = &args.vllm_cudagraph_mode {
+            push_plan_value_arg(&mut argv, "--vllm-cudagraph-mode", mode);
+        }
+        if let Some(linear_backend) = &args.vllm_linear_backend {
+            push_plan_value_arg(&mut argv, "--vllm-linear-backend", linear_backend);
+        }
+        if let Some(moe_backend) = &args.vllm_moe_backend {
+            push_plan_value_arg(&mut argv, "--vllm-moe-backend", moe_backend);
+        }
+        if let Some(tokens) = args.vllm_mtp_num_speculative_tokens {
+            push_plan_value_arg(
+                &mut argv,
+                "--vllm-mtp-num-speculative-tokens",
+                tokens.to_string(),
             );
         }
         if let Some(target) = args.vllm_memory_utilization {
@@ -23699,7 +24585,11 @@ fn needle_device_for_engine(engine: &str) -> Option<&'static str> {
 fn ensure_catalog_artifact_python(
     home: &Path,
     artifact: &catalog::CatalogArtifact,
+    vllm_runtime: Option<python_runtime::VllmRuntime>,
 ) -> Result<python_runtime::PythonRuntime> {
+    if artifact.engine == "vllm" {
+        return python_runtime::ensure_vllm_python(home, vllm_runtime);
+    }
     match needle_device_for_engine(&artifact.engine) {
         Some(device) => python_runtime::ensure_needle_python_for_device(home, device),
         None => python_runtime::ensure_backend_python(
@@ -23730,7 +24620,7 @@ fn preflight_catalog_calibration_managed_runtime(
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
-    ensure_catalog_artifact_python(&home, artifact).with_context(|| {
+    ensure_catalog_artifact_python(&home, artifact, args.vllm_runtime.clone()).with_context(|| {
         format!(
             "preparing the managed {} calibration runtime under {}",
             artifact.engine,
@@ -23763,7 +24653,7 @@ fn catalog_calibration_backend(
         let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
         let home = absolutize(home)?;
         fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
-        let runtime = ensure_catalog_artifact_python(&home, artifact).with_context(|| {
+        let runtime = ensure_catalog_artifact_python(&home, artifact, args.vllm_runtime.clone()).with_context(|| {
             format!(
                 "preparing the managed {} calibration runtime under {}",
                 artifact.engine,
@@ -23947,6 +24837,21 @@ fn catalog_calibration_backend(
         }
         if let Some(max_num_batched_tokens) = args.vllm_max_num_batched_tokens {
             config.ubatch_size = max_num_batched_tokens;
+        }
+        config.vllm_enforce_eager = args.vllm_enforce_eager;
+        config.vllm_compilation_mode = args.vllm_compilation_mode;
+        config.vllm_cudagraph_mode = args.vllm_cudagraph_mode.clone();
+        config.vllm_linear_backend = args.vllm_linear_backend.clone();
+        config.vllm_moe_backend = args.vllm_moe_backend.clone();
+        config.vllm_mtp_num_speculative_tokens = args.vllm_mtp_num_speculative_tokens;
+        if args.vllm_generation_topology
+            == Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
+        {
+            config.vllm_generation_topology = Some(mayhem_engine::VllmGenerationTopology::IsolatedWorkers);
+            config.vllm_concurrent_generation_capacity = args.vllm_worker_count;
+            config.vllm_worker_address_space_limit_bytes = Some(calibration_memory.f13_budget_bytes);
+            config.memory_limit_bytes = Some(calibration_memory.vllm_replica_limit_bytes
+                .context("isolated calibration is missing aggregate F13 admission")?);
         }
     }
     if artifact.engine == "sulphur" {
@@ -40609,6 +41514,7 @@ fn up_provider_workers_deferred(plan: &UpPlan) -> bool {
 
 fn up_provider_serve_plan_args(plan: &UpPlan) -> ProviderServePlanArgs {
     ProviderServePlanArgs {
+        execution_mode: None,
         home: Some(plan.home.clone()),
         rpc_url: Some(plan.rpc_url.clone()),
         catalog_path: None,
@@ -43041,6 +43947,7 @@ struct GatewayDevCatalogSnapshot {
     catalog_hash: String,
     catalog_doc: catalog::CatalogDocument,
     canary_registry: GatewayCanaryRegistry,
+    execution_mode_registry: GatewayExecutionModeRegistry,
     attestation_authority: catalog::CatalogAttestationAuthority,
 }
 
@@ -43087,12 +43994,19 @@ async fn run_gateway_catalog_watcher(
             let contract = read_contract_catalog(&rpc).await?;
             let contract_models = gateway_models_from_contract(&contract)?;
             let policy_epoch = contract.active_billing_epoch;
-            let (catalog_hash, catalog_doc, canary_registry, attestation_authority) =
+            let (
+                catalog_hash,
+                catalog_doc,
+                canary_registry,
+                execution_mode_registry,
+                attestation_authority,
+            ) =
                 match config.dev_catalog.as_ref() {
                     Some(dev) => (
                         dev.catalog_hash.clone(),
                         Some(dev.catalog_doc.clone()),
                         dev.canary_registry.clone(),
+                        dev.execution_mode_registry.clone(),
                         dev.attestation_authority.clone(),
                     ),
                     None => match read_optional_catalog_release_anchor(&rpc).await? {
@@ -43123,10 +44037,18 @@ async fn run_gateway_catalog_watcher(
                                 )
                                 .map_err(anyhow::Error::msg)
                                 .context("loading refreshed gateway canary registry")?;
+                            let execution_mode_registry =
+                                GatewayState::execution_mode_registry_from_catalog_and_canary_json(
+                                    &catalog_json,
+                                    &canary_json_by_set,
+                                )
+                                .map_err(anyhow::Error::msg)
+                                .context("loading refreshed gateway execution mode registry")?;
                             (
                                 release.catalog_hash,
                                 Some(catalog_doc),
                                 canary_registry,
+                                execution_mode_registry,
                                 files.attestation_authority,
                             )
                         }
@@ -43134,6 +44056,7 @@ async fn run_gateway_catalog_watcher(
                             "unpublished-empty".to_owned(),
                             None,
                             GatewayCanaryRegistry::default(),
+                            GatewayExecutionModeRegistry::default(),
                             catalog::CatalogAttestationAuthority::default(),
                         ),
                         None => bail!(
@@ -43173,6 +44096,7 @@ async fn run_gateway_catalog_watcher(
             Result::<_, anyhow::Error>::Ok((
                 models,
                 canary_registry,
+                execution_mode_registry,
                 authority,
                 policy_epoch,
                 snapshot,
@@ -43180,12 +44104,24 @@ async fn run_gateway_catalog_watcher(
         }
         .await;
         match refresh {
-            Ok((models, canary_registry, authority, policy_epoch, snapshot)) => {
+            Ok((
+                models,
+                canary_registry,
+                execution_mode_registry,
+                authority,
+                policy_epoch,
+                snapshot,
+            )) => {
                 last_error = None;
                 state.update_billing_epoch(policy_epoch);
                 if snapshot != applied_snapshot {
                     let model_count = models.len();
-                    state.replace_authenticated_catalog(models, canary_registry, authority);
+                    state.replace_authenticated_catalog_with_execution_modes(
+                        models,
+                        canary_registry,
+                        execution_mode_registry,
+                        authority,
+                    );
                     applied_snapshot = snapshot;
                     eprintln!(
                         "Gateway authenticated catalog refreshed from contract: {model_count} model(s)"
@@ -43520,7 +44456,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         payment_directory,
         ledger_watcher,
     ) = if args.dev_embedded_catalog {
-        let state = GatewayState::from_embedded_catalog().with_dev_session_shim();
+        let state = GatewayState::from_embedded_catalog()
+            .with_execution_mode_registry(GatewayExecutionModeRegistry::default())
+            .with_dev_session_shim();
         (
             state,
             "dev-embedded-catalog".to_owned(),
@@ -43563,6 +44501,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         let (
             catalog_doc,
             canary_registry,
+            execution_mode_registry,
             catalog_source,
             catalog_attestation_authority,
             catalog_hash,
@@ -43627,6 +44566,13 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             )
             .map_err(anyhow::Error::msg)
             .context("loading verified canary registry from local gateway catalog")?;
+            let execution_mode_registry =
+                GatewayState::execution_mode_registry_from_catalog_and_canary_json(
+                    &catalog_json,
+                    &canary_json_by_set,
+                )
+                .map_err(anyhow::Error::msg)
+                .context("loading verified execution mode registry from local gateway catalog")?;
             let trust = if args.dev_skip_catalog_verify {
                 "dev-local-unverified"
             } else {
@@ -43635,6 +44581,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             (
                 Some(catalog_doc),
                 canary_registry,
+                execution_mode_registry,
                 format!("contract:{rpc_url}; catalog:{trust}:{catalog_hash}"),
                 attestation_authority,
                 catalog_hash,
@@ -43671,9 +44618,17 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                         )
                         .map_err(anyhow::Error::msg)
                         .context("loading verified canary registry from gateway catalog")?;
+                    let execution_mode_registry =
+                        GatewayState::execution_mode_registry_from_catalog_and_canary_json(
+                            &catalog_json,
+                            &canary_json_by_set,
+                        )
+                        .map_err(anyhow::Error::msg)
+                        .context("loading verified execution mode registry from gateway catalog")?;
                     (
                         Some(catalog_doc),
                         canary_registry,
+                        execution_mode_registry,
                         format!("contract:{rpc_url}; catalog:{}", release.catalog_hash),
                         catalog_files.attestation_authority,
                         release.catalog_hash,
@@ -43682,6 +44637,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 None if models.is_empty() => (
                     None,
                     GatewayCanaryRegistry::default(),
+                    GatewayExecutionModeRegistry::default(),
                     format!("contract:{rpc_url}; catalog:unpublished-empty"),
                     catalog::CatalogAttestationAuthority::default(),
                     "unpublished-empty".to_owned(),
@@ -43769,6 +44725,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                             .clone()
                             .expect("development catalog path produced a catalog document"),
                         canary_registry: canary_registry.clone(),
+                        execution_mode_registry: execution_mode_registry.clone(),
                         attestation_authority: catalog_attestation_authority.clone(),
                     }),
                 hardware: hardware.clone(),
@@ -43839,6 +44796,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         receipt_outbox.clone().spawn_retry(rpc.clone());
         let mut state = GatewayState::from_models(models)
             .with_canary_registry(canary_registry)
+            .with_execution_mode_registry(execution_mode_registry)
             .with_provider_earnings(provider_earnings)
             .with_local_provider_id(wallet.public_key.clone())
             .with_hidden_update_models(hidden_update_models)
@@ -46037,6 +46995,10 @@ struct CatalogCanarySidecarBinding {
 
 #[derive(Debug, Clone, Deserialize, Eq, PartialEq, Serialize)]
 struct CatalogCanaryRuntimeConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    execution_mode: Option<mayhem_proto::ExecutionModeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vllm_runtime: Option<python_runtime::VllmRuntime>,
     ctx_size: u32,
     seed: u32,
     threads: Option<i32>,
@@ -46055,8 +47017,24 @@ struct CatalogCanaryRuntimeConfig {
     vllm_kv_cache_dtype: Option<String>,
     #[serde(default)]
     vllm_max_num_seqs: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vllm_worker_count: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vllm_generation_topology: Option<mayhem_proto::GenerationExecutionTopology>,
     #[serde(default)]
     vllm_max_num_batched_tokens: Option<u32>,
+    #[serde(default)]
+    vllm_enforce_eager: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vllm_compilation_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    vllm_cudagraph_mode: Option<String>,
+    #[serde(default)]
+    vllm_linear_backend: Option<String>,
+    #[serde(default)]
+    vllm_moe_backend: Option<String>,
+    #[serde(default)]
+    vllm_mtp_num_speculative_tokens: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -46139,6 +47117,7 @@ struct CalibrationMemoryContext {
     source: String,
     probe: CalibrationMemoryProbe,
     chatterbox_device: Option<ChatterboxManagedDevice>,
+    vllm_replica_limit_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -46270,6 +47249,8 @@ struct CatalogCanaryEvidenceEntry {
     model_id: String,
     tier: String,
     artifact: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_mode: Option<mayhem_proto::ExecutionModeBinding>,
     engine: String,
     canary_set: String,
     verification_method: String,
@@ -47137,6 +48118,9 @@ fn load_catalog_canary_json_by_set(
         .models
         .iter()
         .map(|model| model.canary.set_id.as_str())
+        .chain(catalog.vllm_execution_modes.values().flat_map(|modes| {
+            modes.values().map(|mode| mode.canary.set_id.as_str())
+        }))
         .collect::<BTreeSet<_>>()
     {
         let mut components = Path::new(set_id).components();
@@ -57987,12 +58971,21 @@ struct ReceiptsExportReport {
 }
 
 #[derive(Debug, Clone)]
+struct ProviderExecutionMode {
+    binding: mayhem_proto::ExecutionModeBinding,
+    requests: mayhem_proto::ExecutionModeRequestPolicy,
+    baseline_adapter: catalog::CatalogAdapter,
+}
+
+#[derive(Debug, Clone)]
 struct ProviderCandidate {
+    execution_mode: Option<ProviderExecutionMode>,
     enclave: LedgerEnclave,
     model: catalog::CatalogModel,
     artifact_name: String,
     artifact: catalog::CatalogArtifact,
     generation_execution_profile: Option<catalog::CatalogGenerationExecutionProfile>,
+    vllm_execution_profile: Option<catalog::CatalogVllmExecutionProfile>,
     generation_execution_capacity: u32,
     verdict: BackendVerdict,
     price: Option<LedgerPriceSchedule>,
@@ -58042,7 +59035,17 @@ struct ProviderCtxFeasibility {
     estimated_kv_bytes: u64,
     estimated_overhead_bytes: u64,
     estimated_media_bytes: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replica_allocation: Option<ProviderVllmReplicaAllocation>,
     memory_budget: ProviderMemoryBudget,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct ProviderVllmReplicaAllocation {
+    worker_count: u32,
+    per_worker_required_bytes: u64,
+    per_worker_allocation_bytes: u64,
+    utilization: VllmMemoryUtilizationPlan,
 }
 
 impl ProviderCtxFeasibility {
@@ -58060,6 +59063,7 @@ impl ProviderCtxFeasibility {
             estimated_kv_bytes: 0,
             estimated_overhead_bytes: 0,
             estimated_media_bytes: 0,
+            replica_allocation: None,
             memory_budget: ProviderMemoryBudget::not_applicable(),
         }
     }
@@ -60262,6 +61266,8 @@ impl Default for PendingProviderPayload {
 
 #[derive(Clone, Debug)]
 struct ProviderSessionTerms {
+    execution_mode: Option<mayhem_proto::ExecutionModeBinding>,
+    execution_mode_requests: Option<mayhem_proto::ExecutionModeRequestPolicy>,
     contract_version: u32,
     provider: String,
     enclave_id: String,
@@ -60828,11 +61834,11 @@ async fn provider_serve_plan(args: ProviderServePlanArgs) -> Result<()> {
     let home = absolutize(home)?;
     let computed = compute_provider_serve_plan(&home, &args).await?;
     let selection = &computed.selection;
-    let up_command = provider_auto_fit_up_command(
+    let copy_paste = provider_serve_plan_commands(
         &home,
         selection,
+        &args,
         computed.gpu_layers,
-        &args.disable_modalities,
         computed.hardware_quote_config.as_ref(),
     );
     let selected = selection
@@ -60848,6 +61854,7 @@ async fn provider_serve_plan(args: ProviderServePlanArgs) -> Result<()> {
                 "model_id": &candidate.enclave.model_id,
                 "backend": &candidate.enclave.backend,
                 "artifact": &candidate.artifact_name,
+                "execution_mode": candidate.execution_mode.as_ref().map(|mode| &mode.binding),
                 "model_class": &candidate.enclave.model_class,
                 "served_ctx": candidate.served_ctx,
                 "required_bytes": candidate.feasibility.estimated_required_bytes,
@@ -60882,9 +61889,7 @@ async fn provider_serve_plan(args: ProviderServePlanArgs) -> Result<()> {
         "modalities": selection.modalities,
         "score": selection.score,
         "rationale": selection.rationale,
-        "copy_paste": {
-            "up": up_command,
-        },
+        "copy_paste": copy_paste,
     });
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
@@ -60908,6 +61913,9 @@ async fn provider_serve_plan(args: ProviderServePlanArgs) -> Result<()> {
             "Copy/paste start command: {}",
             report["copy_paste"]["up"].as_str().unwrap_or("")
         );
+        for command in report["copy_paste"]["serve"].as_array().into_iter().flatten() {
+            println!("Then: {}", command.as_str().unwrap_or(""));
+        }
     }
     Ok(())
 }
@@ -60956,6 +61964,7 @@ async fn prepare_provider_serve_worker(
     let home = absolutize(home)?;
     let supervisor_url = mayhemd_control_url(&home)?;
     let serve_plan_args = ProviderServePlanArgs {
+        execution_mode: args.execution_mode.clone(),
         home: Some(home.clone()),
         rpc_url: None,
         catalog_path: None,
@@ -61023,7 +62032,7 @@ async fn prepare_provider_serve_worker(
         .clone()
         .map(absolutize)
         .transpose()?;
-    let child = provider_serve_child_config(
+    let mut child = provider_serve_child_config(
         &home,
         &selected.enclave.enclave_id,
         &selected.artifact.engine,
@@ -61038,6 +62047,9 @@ async fn prepare_provider_serve_worker(
         computed.hardware_quote_config.as_ref(),
         name,
     )?;
+    if let Some(mode) = &selected.execution_mode {
+        append_provider_serve_execution_mode(&mut child, &mode.binding.mode_id)?;
+    }
     let serve_terms = provider_join_context_terms_for_candidate(selected)?;
     Ok(PreparedProviderServeWorker {
         home,
@@ -61226,6 +62238,7 @@ async fn provider_serve_switch(args: ProviderServeSwitchArgs) -> Result<()> {
         .flatten()
         .unwrap_or_default();
     let add_args = ProviderServeAddArgs {
+        execution_mode: args.execution_mode.clone(),
         home: Some(home.clone()),
         enclave: args.enclave.clone(),
         gpu_layers: args.gpu_layers,
@@ -61569,6 +62582,18 @@ fn append_provider_hardware_quote_args(
     ]);
 }
 
+fn append_provider_serve_execution_mode(child: &mut Value, mode_id: &str) -> Result<()> {
+    mayhem_proto::validate_execution_mode_id(mode_id).map_err(anyhow::Error::msg)?;
+    let args = child.get_mut("args").and_then(Value::as_array_mut)
+        .context("supervised provider command is missing its argument list")?;
+    ensure!(
+        !args.iter().any(|arg| arg.as_str() == Some("--execution-mode")),
+        "supervised provider command already selects an execution mode"
+    );
+    args.extend([json!("--execution-mode"), json!(mode_id)]);
+    Ok(())
+}
+
 fn provider_backend_runtime_child_env(
     backend: &str,
     runtime: &ProviderBackendRuntime,
@@ -61783,6 +62808,7 @@ fn provider_start_args_for_serve_plan(
     home: &Path,
 ) -> ProviderStartArgs {
     ProviderStartArgs {
+        execution_mode: args.execution_mode.clone(),
         home: Some(home.to_path_buf()),
         enclave: None,
         rooms: "auto".to_owned(),
@@ -61834,6 +62860,63 @@ fn provider_start_args_for_serve_plan(
     }
 }
 
+fn provider_serve_plan_commands(
+    home: &Path,
+    selection: &ProviderAutoFitSelection,
+    args: &ProviderServePlanArgs,
+    gpu_layers: Option<u32>,
+    hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
+) -> Value {
+    if selection.candidates.iter().all(|candidate| candidate.execution_mode.is_none()) {
+        return json!({"up": provider_auto_fit_up_command(
+            home, selection, gpu_layers, &args.disable_modalities, hardware_quote_config,
+        )});
+    }
+    // `up` has no per-worker mode selector. Replay via the supervised serve command.
+    let serve = selection.candidates.iter().map(|candidate| {
+        provider_serve_mode_add_argv(home, candidate, args, gpu_layers, hardware_quote_config)
+            .iter().map(|value| shell_single_quote(value)).collect::<Vec<_>>().join(" ")
+    }).collect::<Vec<_>>();
+    json!({
+        "up": format!("mayhem up --yes --home {}", shell_single_quote(&home.display().to_string())),
+        "serve": serve,
+    })
+}
+
+fn provider_serve_mode_add_argv(
+    home: &Path,
+    candidate: &ProviderCandidate,
+    args: &ProviderServePlanArgs,
+    gpu_layers: Option<u32>,
+    hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
+) -> Vec<String> {
+    let mut argv = vec![
+        "mayhem".to_owned(), "provider".to_owned(), "serve".to_owned(), "add".to_owned(),
+        candidate.enclave.enclave_id.clone(), "--home".to_owned(), home.display().to_string(),
+        "--ctx".to_owned(), candidate.served_ctx.to_string(),
+    ];
+    if let Some(mode) = &candidate.execution_mode {
+        argv.extend(["--execution-mode".to_owned(), mode.binding.mode_id.clone()]);
+    }
+    if let Some(layers) = gpu_layers {
+        argv.extend(["--gpu-layers".to_owned(), layers.to_string()]);
+    }
+    for modality in &args.disable_modalities {
+        argv.extend(["--disable-modality".to_owned(), modality.clone()]);
+    }
+    for speciality in &args.speciality_levels {
+        argv.extend(["--speciality-levels".to_owned(), speciality.clone()]);
+    }
+    if let Some(config) = hardware_quote_config {
+        argv.extend([
+            "--hardware-quote-kind".to_owned(), hardware_quote_kind_name(&config.kind),
+            "--hardware-quote-command".to_owned(), config.command.display().to_string(),
+            "--hardware-quote-timeout-seconds".to_owned(), config.timeout.as_secs().to_string(),
+        ]);
+    }
+    argv
+}
+
 fn provider_auto_fit_up_command(
     home: &Path,
     selection: &ProviderAutoFitSelection,
@@ -61882,11 +62965,11 @@ fn provider_backend_runtime_preflight(
     gpu_layers: Option<u32>,
 ) -> Result<ProviderBackendRuntime> {
     let backend = selected.artifact.engine.as_str();
-    let managed_backend = managed_python_backend_for_artifact(&selected.artifact);
     let mut runtime = provider_backend_runtime_preflight_for_backend(
         home,
         backend,
-        Some(managed_backend),
+        Some(&selected.artifact),
+        selected.vllm_execution_profile.as_ref().and_then(|profile| profile.runtime.clone()),
         Some(&selected.verdict),
         hardware,
         gpu_layers,
@@ -61916,7 +62999,8 @@ fn provider_backend_runtime_preflight(
 fn provider_backend_runtime_preflight_for_backend(
     home: &Path,
     backend: &str,
-    managed_backend: Option<&str>,
+    artifact: Option<&catalog::CatalogArtifact>,
+    vllm_runtime: Option<python_runtime::VllmRuntime>,
     verdict: Option<&BackendVerdict>,
     hardware: &HardwareReport,
     gpu_layers: Option<u32>,
@@ -61925,7 +63009,6 @@ fn provider_backend_runtime_preflight_for_backend(
     match backend {
         "vllm" | "trt-llm" | "mlx" | "ace-step" | "chatterbox" | "needle-cpu" | "needle-gpu"
         | "sulphur" | "transformers-asr" => {
-            let python_backend = managed_backend.unwrap_or(backend);
             let chatterbox_device = if backend == "chatterbox" {
                 let device = chatterbox_managed_device(hardware).context(
                     "hardware probe did not select a supported Chatterbox managed device",
@@ -61938,9 +63021,15 @@ fn provider_backend_runtime_preflight_for_backend(
             } else {
                 None
             };
-            let python = match needle_device_for_engine(backend) {
-                Some(device) => python_runtime::ensure_needle_python_for_device(home, device),
-                None => python_runtime::ensure_backend_python(home, python_backend),
+            let python = if let Some(artifact) = artifact {
+                ensure_catalog_artifact_python(home, artifact, vllm_runtime)
+            } else if backend == "vllm" {
+                python_runtime::ensure_vllm_python(home, None)
+            } else {
+                match needle_device_for_engine(backend) {
+                    Some(device) => python_runtime::ensure_needle_python_for_device(home, device),
+                    None => python_runtime::ensure_backend_python(home, backend),
+                }
             }
             .with_context(|| format!("preparing the managed {backend} runtime"))?;
             let cache_dir = home.join("cache").join(backend);
@@ -66187,6 +67276,7 @@ fn provider_join_serve_plan_args(
     rpc_url: &str,
 ) -> ProviderServePlanArgs {
     ProviderServePlanArgs {
+        execution_mode: None,
         home: Some(home.to_path_buf()),
         rpc_url: Some(rpc_url.to_owned()),
         catalog_path: None,
@@ -71415,7 +72505,10 @@ fn provider_memory_budget(
     enclave: &LedgerEnclave,
     args: &ProviderStartArgs,
 ) -> Result<ProviderMemoryBudget> {
-    let pool = provider_memory_pool(hardware, verdict, &enclave.backend, args.gpu_layers);
+    let mut pool = provider_memory_pool(hardware, verdict, &enclave.backend, args.gpu_layers);
+    if enclave.backend == "vllm" && args.execution_mode.is_some() {
+        scope_vllm_execution_mode_memory_pool(&mut pool, hardware, enclave_tp_degree(&enclave.caps)?)?;
+    }
     let claimed_bytes = read_provider_memory_claimed_bytes(
         args.home.as_deref(),
         provider_memory_pool_available_reflects_resident_memory(&pool.pool, pool.unified),
@@ -71446,6 +72539,39 @@ fn provider_memory_budget(
         worker_limit_bytes,
         budget_bytes,
     })
+}
+
+fn scope_vllm_execution_mode_memory_pool(
+    pool: &mut ProviderMemoryPool,
+    hardware: &HardwareReport,
+    tp_degree: u32,
+) -> Result<()> {
+    let device_memories = hardware.gpus.iter()
+        .filter(|gpu| gpu.vendor == GpuVendor::Nvidia)
+        .map(|gpu| {
+            gpu.memory_bytes.or_else(|| {
+                nvidia_gpu_uses_host_unified_memory(hardware, gpu)
+                    .then_some(hardware.memory.available_bytes.unwrap_or(hardware.memory.total_bytes))
+            }).filter(|bytes| *bytes > 0)
+                .context("vLLM execution mode requires known memory for every selectable NVIDIA device")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(tp_degree > 0 && u64::from(tp_degree) <= device_memories.len() as u64,
+        "vLLM execution mode TP degree exceeds the probed NVIDIA device count");
+    // Without a pinned device set, budget against the smallest selectable device,
+    // never memory on unrelated GPUs. This remains safe under device reordering.
+    let per_device = device_memories.iter().copied().min()
+        .context("vLLM execution mode requires a probed NVIDIA device")?;
+    let total = if pool.unified {
+        per_device
+    } else {
+        per_device.checked_mul(u64::from(tp_degree))
+            .context("vLLM TP memory budget overflow")?
+    };
+    pool.total_bytes = pool.total_bytes.min(total);
+    pool.available_bytes = pool.available_bytes.min(pool.total_bytes);
+    pool.source.push_str(&format!("; execution-mode TP{tp_degree} minimum-device budget"));
+    Ok(())
 }
 
 fn provider_kv_bytes_per_token(
@@ -71761,7 +72887,6 @@ fn read_provider_memory_claimed_bytes(
     if !dir.exists() {
         return Ok(0);
     }
-    let now = unix_epoch_seconds().unwrap_or(0);
     let mut unique =
         BTreeMap::<(u32, String, String), (u64, PathBuf, ProviderMemoryClaimRecord)>::new();
     for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
@@ -71778,10 +72903,7 @@ fn read_provider_memory_claimed_bytes(
             let _ = fs::remove_file(&path);
             continue;
         };
-        if now.saturating_sub(record.created_at) > F13_MEMORY_CLAIM_TTL_SECONDS {
-            let _ = fs::remove_file(&path);
-            continue;
-        }
+        // A live owner's allocation remains reserved regardless of the claim's age.
         if !process_is_running(record.pid) {
             let _ = fs::remove_file(&path);
             continue;
@@ -71920,6 +73042,7 @@ fn provider_context_feasibility(
             estimated_kv_bytes: estimate.kv_bytes,
             estimated_overhead_bytes: estimate.overhead_bytes,
             estimated_media_bytes: estimate.media_bytes,
+            replica_allocation: None,
             memory_budget,
         });
     }
@@ -71992,6 +73115,7 @@ fn provider_context_feasibility(
                 estimated_kv_bytes: estimate.kv_bytes,
                 estimated_overhead_bytes: estimate.overhead_bytes,
                 estimated_media_bytes: estimate.media_bytes,
+                replica_allocation: None,
                 memory_budget,
             });
         }
@@ -72089,6 +73213,15 @@ fn provider_vllm_generation_execution_capacity(
     )
     .unwrap_or(u64::MAX)
     .min(feasibility.memory_budget.budget_bytes);
+    if generation_execution_uses_isolated_workers(Some(profile)) {
+        ensure!(allocation_bytes > 0, "isolated vLLM worker allocation is empty");
+        let memory_capacity = u32::try_from(
+            feasibility.memory_budget.budget_bytes / allocation_bytes,
+        )
+        .unwrap_or(u32::MAX);
+        ensure!(memory_capacity > 0, "no isolated vLLM worker fits the admitted memory budget");
+        return Ok(provider_capacity.min(scheduler_capacity).min(memory_capacity));
+    }
     let static_bytes = feasibility
         .estimated_required_bytes
         .saturating_sub(feasibility.estimated_kv_bytes);
@@ -72105,6 +73238,55 @@ fn provider_vllm_generation_execution_capacity(
         .min(provider_capacity)
         .min(memory_capacity)
         .max(1))
+}
+
+fn generation_execution_uses_isolated_workers(
+    profile: Option<&catalog::CatalogGenerationExecutionProfile>,
+) -> bool {
+    profile.is_some_and(|profile| {
+        profile.topology == Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
+    })
+}
+
+fn reserve_provider_vllm_replica_memory(
+    feasibility: &mut ProviderCtxFeasibility,
+    capacity: u32,
+    utilization: VllmMemoryUtilizationPlan,
+) -> Result<()> {
+    ensure!(capacity > 0, "isolated worker count must be positive");
+    ensure!(feasibility.replica_allocation.is_none(), "replica memory was already reserved");
+    let count = u64::from(capacity);
+    let per_worker_allocation_bytes = u64::try_from(
+        u128::from(feasibility.memory_budget.total_bytes) * u128::from(utilization.target_pct) / 100,
+    )
+    .context("isolated worker allocation exceeds u64")?;
+    let required = feasibility.estimated_required_bytes;
+    ensure!(per_worker_allocation_bytes >= required,
+        "isolated worker allocation is below its full model/context requirement");
+    let aggregate = per_worker_allocation_bytes.checked_mul(count)
+        .context("aggregate isolated worker allocation overflow")?;
+    ensure!(aggregate <= feasibility.memory_budget.budget_bytes,
+        "isolated workers require {}, exceeding the admitted budget {}",
+        human_bytes(aggregate), human_bytes(feasibility.memory_budget.budget_bytes));
+    let scale = |bytes: u64| bytes.checked_mul(count)
+        .context("aggregate isolated worker estimate overflow");
+    let weights = scale(feasibility.estimated_weights_bytes)?;
+    let kv = scale(feasibility.estimated_kv_bytes)?;
+    let overhead = scale(feasibility.estimated_overhead_bytes)?;
+    let media = scale(feasibility.estimated_media_bytes)?;
+    // Claim the full planned allocation, not only currently populated weights/KV.
+    feasibility.estimated_required_bytes = aggregate;
+    feasibility.estimated_weights_bytes = weights;
+    feasibility.estimated_kv_bytes = kv;
+    feasibility.estimated_overhead_bytes = overhead;
+    feasibility.estimated_media_bytes = media;
+    feasibility.replica_allocation = Some(ProviderVllmReplicaAllocation {
+        worker_count: capacity,
+        per_worker_required_bytes: required,
+        per_worker_allocation_bytes,
+        utilization,
+    });
+    Ok(())
 }
 
 fn reserve_provider_generation_execution_memory(
@@ -72188,6 +73370,23 @@ fn provider_vllm_memory_utilization(
     selected: &ProviderCandidate,
     local_target_pct: Option<u32>,
 ) -> Result<VllmMemoryUtilizationPlan> {
+    if let Some(allocation) = selected.feasibility.replica_allocation {
+        ensure!(generation_execution_uses_isolated_workers(selected.generation_execution_profile.as_ref()),
+            "replica allocation requires an isolated execution profile");
+        ensure!(allocation.worker_count == selected.generation_execution_capacity,
+            "replica allocation count does not match admitted execution capacity");
+        let target_pct = local_target_pct.unwrap_or(allocation.utilization.target_pct);
+        validate_provider_vllm_memory_utilization_pct(target_pct)?;
+        ensure!(target_pct >= allocation.utilization.floor_pct
+            && target_pct <= allocation.utilization.target_pct,
+            "isolated worker utilization {target_pct}% is outside its admitted {}%-{}% allocation; re-run admission before increasing it",
+            allocation.utilization.floor_pct, allocation.utilization.target_pct);
+        return Ok(VllmMemoryUtilizationPlan {
+            target_pct,
+            floor_pct: allocation.utilization.floor_pct,
+            max_pct: allocation.utilization.target_pct,
+        });
+    }
     provider_vllm_memory_utilization_for_feasibility(
         &selected.enclave.caps,
         &selected.feasibility,
@@ -72306,6 +73505,10 @@ fn provider_vllm_memory_utilization_for_candidates(
         let reserved_bytes =
             u64::try_from((u128::from(budget.total_bytes) * u128::from(target_pct)) / 100)
                 .unwrap_or(u64::MAX);
+        let worker_count = candidate.feasibility.replica_allocation
+            .map_or(1, |allocation| u64::from(allocation.worker_count));
+        let reserved_bytes = reserved_bytes.checked_mul(worker_count)
+            .context("aggregate vLLM allocation overflow")?;
         let allocation = pool_allocations
             .entry(budget.pool.clone())
             .or_insert((0, budget.budget_bytes));
@@ -73481,8 +74684,33 @@ fn build_provider_candidates(
             ));
             continue;
         }
-        let generation_execution_profile = catalog_doc
-            .generation_execution_profile(&artifact.artifact_root)
+        let execution_policy = if let Some(mode_id) = &args.execution_mode {
+            mayhem_proto::validate_execution_mode_id(mode_id).map_err(anyhow::Error::msg)?;
+            let Some(policy) = catalog_doc.vllm_execution_mode(&artifact.artifact_root, mode_id) else {
+                rejections.push(provider_rejection(
+                    enclave,
+                    format!("signed catalog has no execution mode {mode_id} for artifact {artifact_name}"),
+                    None,
+                ));
+                continue;
+            };
+            Some(policy)
+        } else {
+            None
+        };
+        let generation_execution_profile = match execution_policy {
+            Some(policy) => policy.generation_execution_profile.as_ref(),
+            None => catalog_doc.generation_execution_profile(&artifact.artifact_root),
+        }.cloned();
+        let execution_mode = execution_policy
+            .map(|policy| -> Result<_> { Ok(ProviderExecutionMode {
+                binding: policy.binding(&artifact.artifact_root, args.execution_mode.as_deref().unwrap())?,
+                requests: policy.requests.clone(),
+                baseline_adapter: model.adapter.clone(),
+            }) })
+            .transpose()?;
+        let vllm_execution_profile = execution_policy.map(|policy| &policy.profile)
+            .or_else(|| catalog_doc.vllm_execution_profile(&artifact.artifact_root))
             .cloned();
         let served_modalities = match provider_served_modalities(model, &args.disable_modalities) {
             Ok(modalities) => modalities,
@@ -73515,6 +74743,11 @@ fn build_provider_candidates(
             ));
             continue;
         }
+        // Ledger identity remains the baseline model; only this worker's signed mode is narrowed.
+        let mode_model = execution_policy
+            .map(|policy| catalog::execution_mode_model(model, &artifact_name, policy))
+            .transpose()?;
+        let model = mode_model.as_ref().unwrap_or(model);
         let served_specialities =
             match ledger_enclave_served_specialities(enclave, &args.speciality_levels) {
                 Ok(specialities) => specialities,
@@ -73567,10 +74800,16 @@ fn build_provider_candidates(
                 continue;
             }
         };
-        if let Err(err) = reserve_provider_generation_execution_memory(
-            &mut feasibility,
-            generation_execution_capacity,
-        ) {
+        let reserve_result = if generation_execution_uses_isolated_workers(generation_execution_profile.as_ref()) {
+            provider_vllm_memory_utilization_for_feasibility(
+                &enclave.caps, &feasibility, args.vllm_memory_utilization,
+            ).and_then(|utilization| reserve_provider_vllm_replica_memory(
+                &mut feasibility, generation_execution_capacity, utilization,
+            ))
+        } else {
+            reserve_provider_generation_execution_memory(&mut feasibility, generation_execution_capacity)
+        };
+        if let Err(err) = reserve_result {
             rejections.push(provider_rejection(
                 enclave,
                 format!("reserving independent generation memory: {err:#}"),
@@ -73630,11 +74869,13 @@ fn build_provider_candidates(
             continue;
         };
         candidates.push(ProviderCandidate {
+            execution_mode,
             enclave: enclave.clone(),
             model: model.clone(),
             artifact_name,
             artifact,
             generation_execution_profile,
+            vllm_execution_profile,
             generation_execution_capacity,
             verdict: verdict.clone(),
             price: Some(price),
@@ -76711,7 +77952,11 @@ async fn send_provider_heartbeat_round(
         let ts = unix_epoch_millis()?;
         let mut heartbeat = json!({
             "t": "hb",
-            "v": HEARTBEAT_SCHEMA_VERSION,
+            "v": if selected.execution_mode.is_some() {
+                mayhem_gateway::EXECUTION_MODE_HEARTBEAT_SCHEMA_VERSION
+            } else {
+                HEARTBEAT_SCHEMA_VERSION
+            },
             "contract_version": CONTRACT_VERSION,
             "provider": provider_pubkey,
             "enclave_id": selected.enclave.enclave_id,
@@ -76762,6 +78007,9 @@ async fn send_provider_heartbeat_round(
             "ts": ts,
             "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, provider_pubkey, ts, seq).as_bytes()).to_hex().to_string(),
         });
+        if let Some(mode) = &selected.execution_mode {
+            heartbeat["execution_mode"] = serde_json::to_value(&mode.binding)?;
+        }
         if let Some(workflow_classes) = provider_heartbeat_workflow_classes(
             selected,
             heartbeat_min_ask_au,
@@ -79326,6 +80574,11 @@ fn validate_provider_session_request_modalities(
     body: &Value,
 ) -> Result<BTreeMap<String, u32>> {
     let verified = provider_verify_endpoint_request(body, Some(&terms.model_id), &terms.adapter)?;
+    if let Some(policy) = &terms.execution_mode_requests {
+        policy.validate_request(verified.family, verified.request).map_err(|_| {
+            provider_session_request_error("request is not supported by the negotiated execution mode")
+        })?;
+    }
     provider_session_request_result(validate_provider_session_modalities(
         &active.required_modalities,
         &terms.served_modalities,
@@ -83581,6 +84834,7 @@ struct ProviderModalitySelfTestCase {
 
 fn provider_modality_self_test_plan(
     ctx: &ProviderSessionContext<'_>,
+    adapter: &catalog::CatalogAdapter,
     canaries_dir: &Path,
 ) -> Result<Vec<ProviderModalitySelfTestCase>> {
     let prompts = load_canary_prompts_checked(
@@ -83638,7 +84892,7 @@ fn provider_modality_self_test_plan(
             let body = provider_canary_self_test_body(&ctx.selected.model, prompt)?;
             let body = provider_seal_local_contract_request(
                 &body,
-                &ctx.selected.model.adapter,
+                adapter,
                 &ctx.selected.model.model_id,
             )
             .with_context(|| {
@@ -83664,6 +84918,13 @@ fn provider_modality_self_test(
 ) -> Result<Vec<ProviderModalityHealthReport>> {
     let mut reports = Vec::new();
     for case in cases {
+        if let Some(policy) = &terms.execution_mode_requests {
+            let verified =
+                provider_verify_endpoint_request(&case.body, Some(&terms.model_id), &terms.adapter)?;
+            policy.validate_request(verified.family, verified.request).map_err(|_| {
+                provider_session_request_error("request is not supported by the negotiated execution mode")
+            })?;
+        }
         let output = responder
             .respond(terms, &case.body, &CancellationToken::new())
             .with_context(|| format!("functional modality canary {} failed", case.prompt_id))?;
@@ -83706,7 +84967,7 @@ fn provider_session_responder_with_modality_health(
         );
         return Ok((responder, health));
     }
-    let cases = provider_modality_self_test_plan(ctx, ctx.canaries_dir)?;
+    let cases = provider_modality_self_test_plan(ctx, &terms.adapter, ctx.canaries_dir)?;
     let health = provider_modality_self_test(ctx, &terms, responder.as_mut(), cases)?;
     Ok((responder, health))
 }
@@ -84904,12 +86165,26 @@ fn provider_engine_load_config(
     }
     if selected.artifact.engine == "vllm" {
         config.vllm_tensor_parallel = Some(enclave_tp_degree(&selected.enclave.caps)?);
-        if selected.generation_execution_profile.is_some() {
+        let isolated = generation_execution_uses_isolated_workers(selected.generation_execution_profile.as_ref());
+        if isolated {
+            ensure!(selected.execution_mode.is_some(),
+                "isolated dispatch requires authenticated execution-mode negotiation");
+            let allocation = selected.feasibility.replica_allocation
+                .context("isolated dispatch has no aggregate memory admission")?;
+            ensure!(allocation.worker_count == selected.generation_execution_capacity,
+                "isolated worker count differs from its admitted allocation");
+            config.vllm_generation_topology = Some(mayhem_engine::VllmGenerationTopology::IsolatedWorkers);
+            config.vllm_max_num_seqs = Some(1);
+            config.vllm_worker_address_space_limit_bytes = config.memory_limit_bytes;
+            config.memory_limit_bytes = Some(config.memory_limit_bytes
+                .unwrap_or(selected.feasibility.estimated_required_bytes)
+                .min(selected.feasibility.estimated_required_bytes));
+        } else if selected.generation_execution_profile.is_some() {
             config.vllm_max_num_seqs = Some(selected.generation_execution_capacity.max(1));
         } else if let Some(scheduler_capacity) = enclave_max_batch_size(&selected.enclave.caps)? {
             config.vllm_max_num_seqs = Some(scheduler_capacity);
         }
-        config.vllm_concurrent_generation_capacity = (selected.generation_execution_capacity > 1)
+        config.vllm_concurrent_generation_capacity = (isolated || selected.generation_execution_capacity > 1)
             .then_some(selected.generation_execution_capacity);
         if let Some(max_num_tokens) = enclave_max_num_tokens(&selected.enclave.caps)? {
             config.ubatch_size = max_num_tokens.max(1);
@@ -84928,6 +86203,17 @@ fn provider_engine_load_config(
         let utilization = provider_vllm_memory_utilization(selected, args.vllm_memory_utilization)?;
         config.vllm_gpu_memory_utilization_pct = Some(utilization.target_pct);
         config.vllm_gpu_memory_utilization_floor_pct = Some(utilization.floor_pct);
+        if let Some(profile) = &selected.vllm_execution_profile {
+            config.vllm_enforce_eager = Some(profile.enforce_eager);
+            config.vllm_compilation_mode = profile.compilation_mode;
+            config.vllm_cudagraph_mode = profile.cudagraph_mode.clone();
+            config.vllm_linear_backend = Some(profile.linear_backend.clone());
+            config.vllm_moe_backend = Some(profile.moe_backend.clone());
+            config.vllm_mtp_num_speculative_tokens = profile
+                .speculative_decoding
+                .as_ref()
+                .map(|speculative| speculative.num_speculative_tokens);
+        }
     }
     Ok(config)
 }
@@ -86037,6 +87323,7 @@ fn provider_attestation_runtime_config(
         }
     });
     Ok(AttestationRuntimeConfig {
+        execution_mode: selected.execution_mode.as_ref().map(|mode| mode.binding.clone()),
         model_class: selected.enclave.model_class.clone(),
         backend: selected.artifact.engine.clone(),
         ctx,
@@ -86273,11 +87560,15 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         (None, None)
     };
     Ok(ProviderSessionTerms {
+        execution_mode: ctx.selected.execution_mode.as_ref().map(|mode| mode.binding.clone()),
+        execution_mode_requests: ctx.selected.execution_mode.as_ref().map(|mode| mode.requests.clone()),
         contract_version: CONTRACT_VERSION,
         provider: ctx.wallet.public_key.clone(),
         enclave_id: ctx.selected.enclave.enclave_id.clone(),
         model_id: ctx.selected.enclave.model_id.clone(),
-        adapter: ctx.selected.model.adapter.clone(),
+        adapter: ctx.selected.execution_mode.as_ref()
+            .map(|mode| &mode.baseline_adapter)
+            .unwrap_or(&ctx.selected.model.adapter).clone(),
         generation_execution_profile: ctx.selected.generation_execution_profile.clone(),
         sampling: ctx.selected.model.sampling.clone(),
         workflow_policy: ctx.selected.model.workflow.clone(),
@@ -86922,6 +88213,19 @@ fn provider_session_open_decision(
         return reject(
             "UPGRADE_REQUIRED",
             contract_upgrade_required_reason(terms.contract_version, actual_contract_version),
+        );
+    }
+    let expected_mode = match frame.get("expected_execution_mode") {
+        None | Some(Value::Null) => None,
+        Some(value) => match serde_json::from_value::<mayhem_proto::ExecutionModeBinding>(value.clone()) {
+            Ok(binding) => Some(binding),
+            Err(_) => return reject("SCHEMA", "invalid execution mode binding".to_owned()),
+        },
+    };
+    if expected_mode != terms.execution_mode {
+        return reject(
+            "EXECUTION_MODE",
+            "provider execution mode changed or was not negotiated; select a compatible route".to_owned(),
         );
     }
     let session_id = frame
@@ -88065,17 +89369,19 @@ fn provider_engine_tool_call_outputs_after_reasoning(
     delimiters: ProviderReasoningDelimiters,
     strategy: ProviderEngineToolStrategy,
     tools: &[ToolSpec],
+    json_grammar_enforced: bool,
 ) -> Option<Vec<Value>> {
     let visible = provider_engine_tool_parse_text(text, output_mode, reasoning_enabled, delimiters);
     if let Some(calls) = provider_engine_tool_call_outputs(&visible, strategy, tools) {
         return Some(calls);
     }
-    if visible == text {
+    if visible == text || !json_grammar_enforced {
         return None;
     }
     // A tool grammar may return only the canonical call without the reasoning
-    // close marker prefilled by the chat template. Keep the raw fallback
-    // fail-closed through the same advertised-tool parser and validator.
+    // close marker. Only an entirely JSON-constrained response can take this
+    // path; unfinished free-form reasoning must never become an executable call.
+    serde_json::from_str::<Value>(text).ok()?;
     provider_engine_tool_call_outputs(text, strategy, tools)
 }
 
@@ -88648,6 +89954,10 @@ fn provider_engine_session_response_with_sampling_bounded(
     let reasoning_speciality_enabled = provider_reasoning_speciality_enabled(&request);
     let reasoning_output_mode = provider_reasoning_output_mode(adapter, &request);
     let reasoning_delimiters = provider_reasoning_delimiters(adapter);
+    let json_grammar_enforced = matches!(
+        request.grammar.as_ref(),
+        Some(GrammarSpec::ToolCall { .. } | GrammarSpec::JsonSchema { .. })
+    );
     let mut reasoning_stream_filter =
         ProviderReasoningOutputFilter::with_delimiters(reasoning_output_mode, reasoning_delimiters);
     let mut token_ids = Vec::new();
@@ -88700,6 +90010,7 @@ fn provider_engine_session_response_with_sampling_bounded(
                 reasoning_delimiters,
                 mode.strategy,
                 &mode.tools,
+                json_grammar_enforced,
             )
         })
         .unwrap_or_default();
@@ -90648,13 +91959,13 @@ fn provider_response_json_schema(body: &Value) -> Value {
 fn provider_engine_tool_call_outputs(
     text: &str,
     strategy: ProviderEngineToolStrategy,
-    _tools: &[ToolSpec],
+    tools: &[ToolSpec],
 ) -> Option<Vec<Value>> {
     let mut calls = match strategy {
         ProviderEngineToolStrategy::MayhemJson => provider_mayhem_json_tool_call_outputs(text),
         ProviderEngineToolStrategy::OpenAiToolCalls => provider_openai_tool_call_outputs(text),
         ProviderEngineToolStrategy::QwenFunctionXml => {
-            provider_qwen_function_xml_tool_call_outputs(text)
+            provider_qwen_function_xml_tool_call_outputs(text, tools)
                 .or_else(|| provider_mayhem_json_tool_call_outputs(text))
         }
         ProviderEngineToolStrategy::GemmaFunctionCall => gemma4::parse_tool_calls(text)
@@ -90763,7 +92074,10 @@ fn provider_openai_tool_call_value(call: &Value) -> Option<Value> {
     Some(provider_normalized_tool_call(id, name, arguments))
 }
 
-fn provider_qwen_function_xml_tool_call_outputs(text: &str) -> Option<Vec<Value>> {
+fn provider_qwen_function_xml_tool_call_outputs(
+    text: &str,
+    tools: &[ToolSpec],
+) -> Option<Vec<Value>> {
     const TOOL_OPEN: &str = "<tool_call>";
     const TOOL_CLOSE: &str = "</tool_call>";
 
@@ -90776,13 +92090,14 @@ fn provider_qwen_function_xml_tool_call_outputs(text: &str) -> Option<Vec<Value>
         let tool_end = tool_body.find(TOOL_CLOSE)?;
         calls.push(provider_qwen_function_xml_tool_call_body(
             tool_body[..tool_end].trim(),
+            tools,
         )?);
         remaining = &tool_body[tool_end + TOOL_CLOSE.len()..];
     }
     (!calls.is_empty()).then_some(calls)
 }
 
-fn provider_qwen_function_xml_tool_call_body(tool_body: &str) -> Option<Value> {
+fn provider_qwen_function_xml_tool_call_body(tool_body: &str, tools: &[ToolSpec]) -> Option<Value> {
     const FUNCTION_OPEN: &str = "<function=";
     const FUNCTION_CLOSE: &str = "</function>";
     const PARAMETER_OPEN: &str = "<parameter=";
@@ -90800,6 +92115,7 @@ fn provider_qwen_function_xml_tool_call_body(tool_body: &str) -> Option<Value> {
     if function_name.is_empty() {
         return None;
     }
+    let tool = tools.iter().find(|tool| tool.name == function_name);
     let function_body_start = function_name_end + 1;
     let function_body_end_relative = tool_body[function_body_start..].rfind(FUNCTION_CLOSE)?;
     let function_body_end = function_body_start + function_body_end_relative;
@@ -90824,9 +92140,8 @@ fn provider_qwen_function_xml_tool_call_body(tool_body: &str) -> Option<Value> {
         }
         let value_start = name_end + 1;
         let value_end = remaining[value_start..].find(PARAMETER_CLOSE)? + value_start;
-        let raw_value = remaining[value_start..value_end].trim();
         let value =
-            serde_json::from_str(raw_value).unwrap_or_else(|_| Value::String(raw_value.to_owned()));
+            provider_qwen_xml_parameter_value(tool, name, &remaining[value_start..value_end]);
         arguments.insert(name.to_owned(), value);
         remaining = remaining[value_end + PARAMETER_CLOSE.len()..].trim();
     }
@@ -90836,6 +92151,65 @@ fn provider_qwen_function_xml_tool_call_body(tool_body: &str) -> Option<Value> {
         function_name.to_owned(),
         Value::Object(arguments).to_string(),
     ))
+}
+
+fn provider_qwen_xml_parameter_value(tool: Option<&ToolSpec>, name: &str, raw: &str) -> Value {
+    let parsed =
+        serde_json::from_str(raw.trim()).unwrap_or_else(|_| Value::String(raw.trim().to_owned()));
+    let Some(tool) = tool.filter(|tool| {
+        tool.parameters
+            .get("properties")
+            .and_then(|properties| properties.get(name))
+            .is_some_and(|schema| schema.as_object().is_some_and(|schema| !schema.is_empty()))
+    }) else {
+        return parsed;
+    };
+
+    // The native template frames unquoted parameter values with one newline on each side.
+    let text = raw
+        .strip_prefix("\r\n")
+        .or_else(|| raw.strip_prefix('\n'))
+        .unwrap_or(raw);
+    let text = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'))
+        .unwrap_or(text);
+    let string = Value::String(text.to_owned());
+    if parsed.is_string() {
+        // Native XML string payloads are literal, not JSON-escaped strings.
+        return string;
+    }
+
+    // Keep the original schema root available so its validator resolves property unions/refs.
+    let mut parameters = tool.parameters.clone();
+    provider_rebase_local_json_schema_refs(&mut parameters, "#/$defs/tool_parameters");
+    let escaped_name = name.replace('~', "~0").replace('/', "~1");
+    let property_check = ToolSpec::new(
+        &tool.name,
+        json!({
+            "$defs": { "tool_parameters": parameters },
+            "type": "object",
+            "properties": {
+                "value": { "$ref": format!("#/$defs/tool_parameters/properties/{escaped_name}") }
+            }
+        }),
+    );
+    // Ambiguous non-string values keep legacy JSON decoding (including permissive schemas
+    // and string|number unions). Use literal text only when the decoded value is invalid.
+    if mayhem_engine::validate_tool_call_arguments(&property_check, &json!({ "value": &parsed }))
+        .is_ok()
+    {
+        parsed
+    } else if mayhem_engine::validate_tool_call_arguments(
+        &property_check,
+        &json!({ "value": &string }),
+    )
+    .is_ok()
+    {
+        string
+    } else {
+        parsed
+    }
 }
 
 fn make_provider_tool_call_ids_unique(calls: &mut [Value]) -> Option<()> {
@@ -94522,6 +95896,8 @@ mod tests {
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact: catalog.models[0].artifacts["gguf-q4_k_m"].clone(),
             generation_execution_profile: None,
+            vllm_execution_profile: None,
+            execution_mode: None,
             generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "llama.cpp".to_owned(),
@@ -98950,6 +100326,8 @@ status: linked
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
             generation_execution_profile: None,
+            vllm_execution_profile: None,
+            execution_mode: None,
             generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
@@ -99188,6 +100566,8 @@ status: linked
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
             generation_execution_profile: None,
+            vllm_execution_profile: None,
+            execution_mode: None,
             generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
@@ -104154,6 +105534,8 @@ status: linked
             artifact_name,
             artifact,
             generation_execution_profile: None,
+            vllm_execution_profile: None,
+            execution_mode: None,
             generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "llama.cpp".to_owned(),
@@ -104204,6 +105586,7 @@ status: linked
                 estimated_kv_bytes: 0,
                 estimated_overhead_bytes: 0,
                 estimated_media_bytes: 0,
+                replica_allocation: None,
                 memory_budget: ProviderMemoryBudget {
                     pool: "dedicated_vram".to_owned(),
                     source: "test".to_owned(),
@@ -104751,6 +106134,7 @@ status: linked
             source: "test-device-memory".to_owned(),
             probe: CalibrationMemoryProbe::ProcessRss,
             chatterbox_device: None,
+            vllm_replica_limit_bytes: None,
         };
 
         let profiles = aggregate_calibrated_modality_resource_profiles(
@@ -104895,6 +106279,7 @@ status: linked
         let profile = catalog::CatalogGenerationExecutionProfile {
             schema_version: 1,
             engine: "vllm".to_owned(),
+            topology: None,
             independent_dispatch: true,
             request_modalities: vec![vec!["text".to_owned()]],
             proof_sha256: "ab".repeat(32),
@@ -104927,6 +106312,154 @@ status: linked
                 max_pct: 85,
             }
         );
+    }
+
+    #[test]
+    fn vllm_execution_mode_budget_uses_only_a_safe_tp_device_capacity() {
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        let device = hardware.gpus.iter().find(|gpu| gpu.vendor == GpuVendor::Nvidia).unwrap().clone();
+        hardware.gpus = vec![device.clone(), device];
+        hardware.gpus[0].memory_bytes = Some(24 * GIB_BYTES);
+        hardware.gpus[1].memory_bytes = Some(80 * GIB_BYTES);
+        let original = ProviderMemoryPool {
+            pool: "nvidia_dedicated_memory".to_owned(), source: "test".to_owned(),
+            unified: false, total_bytes: 104 * GIB_BYTES, available_bytes: 104 * GIB_BYTES,
+        };
+        for (tp, expected) in [(1, 24), (2, 48)] {
+            let mut pool = original.clone();
+            scope_vllm_execution_mode_memory_pool(&mut pool, &hardware, tp).unwrap();
+            assert_eq!(pool.total_bytes, expected * GIB_BYTES);
+            assert_eq!(pool.available_bytes, expected * GIB_BYTES);
+            hardware.gpus.reverse();
+            let mut reordered = original.clone();
+            scope_vllm_execution_mode_memory_pool(&mut reordered, &hardware, tp).unwrap();
+            assert_eq!(reordered.total_bytes, pool.total_bytes);
+        }
+        for tp in [0, 3] {
+            assert!(scope_vllm_execution_mode_memory_pool(&mut original.clone(), &hardware, tp).is_err());
+        }
+        hardware.gpus[0].memory_bytes = None;
+        hardware.gpus[0].unified_memory = false;
+        hardware.host.arch = "x86_64".to_owned();
+        assert!(scope_vllm_execution_mode_memory_pool(&mut original.clone(), &hardware, 1).is_err());
+        hardware.gpus[0].memory_bytes = Some(24 * GIB_BYTES);
+        let mut unified = original;
+        unified.unified = true;
+        scope_vllm_execution_mode_memory_pool(&mut unified, &hardware, 2).unwrap();
+        assert_eq!(unified.total_bytes, 24 * GIB_BYTES);
+    }
+
+    #[test]
+    fn vllm_isolated_generation_capacity_scales_with_full_worker_memory() {
+        let profile = test_isolated_generation_profile();
+        let mut selected = test_isolated_vllm_candidate();
+        let mut args = test_provider_start_args();
+        for (required_gib, target, expected) in [(30, 35, 2), (10, 15, 5), (60, 65, 1)] {
+            selected.feasibility.estimated_required_bytes = required_gib * GIB_BYTES;
+            args.vllm_memory_utilization = Some(target);
+            assert_eq!(provider_vllm_generation_execution_capacity(
+                &selected.artifact, Some(&profile), &selected.enclave.caps,
+                &selected.verdict, &args, &selected.feasibility,
+            ).unwrap(), expected);
+        }
+        selected.feasibility.estimated_required_bytes = 30 * GIB_BYTES;
+        args.vllm_memory_utilization = Some(35);
+        args.max_sessions = Some(1);
+        assert_eq!(provider_vllm_generation_execution_capacity(
+            &selected.artifact, Some(&profile), &selected.enclave.caps,
+            &selected.verdict, &args, &selected.feasibility,
+        ).unwrap(), 1);
+        args.max_sessions = None;
+        selected.enclave.caps = json!({"max_batch_size": 1});
+        assert_eq!(provider_vllm_generation_execution_capacity(
+            &selected.artifact, Some(&profile), &selected.enclave.caps,
+            &selected.verdict, &args, &selected.feasibility,
+        ).unwrap(), 1);
+    }
+
+    fn test_isolated_generation_profile() -> catalog::CatalogGenerationExecutionProfile {
+        catalog::CatalogGenerationExecutionProfile {
+            schema_version: 1,
+            engine: "vllm".to_owned(),
+            topology: Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers),
+            independent_dispatch: true,
+            request_modalities: vec![vec!["text".to_owned()]],
+            proof_sha256: "ab".repeat(32),
+        }
+    }
+
+    fn test_isolated_vllm_candidate() -> ProviderCandidate {
+        let mut selected = test_auto_fit_candidate('c', "test/vllm-isolated", "text", 30, 80, 1, 30.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.artifact.engine = "vllm".to_owned();
+        selected.enclave.caps = json!({});
+        selected.verdict.backend = "vllm".to_owned();
+        selected.verdict.max_sessions = 9;
+        selected.generation_execution_profile = Some(test_isolated_generation_profile());
+        selected.feasibility.memory_budget.total_bytes = 100 * GIB_BYTES;
+        selected.feasibility.estimated_weights_bytes = 20 * GIB_BYTES;
+        selected.feasibility.estimated_kv_bytes = 6 * GIB_BYTES;
+        selected.feasibility.estimated_overhead_bytes = 3 * GIB_BYTES;
+        selected.feasibility.estimated_media_bytes = GIB_BYTES;
+        selected
+    }
+
+    #[test]
+    fn vllm_isolated_reservation_claims_full_allocations_and_cannot_grow_after_admission() {
+        let mut selected = test_isolated_vllm_candidate();
+        let plan = provider_vllm_memory_utilization(&selected, None).unwrap();
+        assert_eq!(plan.target_pct, 35);
+        reserve_provider_vllm_replica_memory(&mut selected.feasibility, 2, plan).unwrap();
+        selected.generation_execution_capacity = 2;
+        assert_eq!(selected.feasibility.estimated_required_bytes, 70 * GIB_BYTES);
+        assert_eq!(selected.feasibility.estimated_weights_bytes, 40 * GIB_BYTES);
+        assert_eq!(selected.feasibility.estimated_kv_bytes, 12 * GIB_BYTES);
+        assert_eq!(selected.feasibility.estimated_overhead_bytes, 6 * GIB_BYTES);
+        assert_eq!(selected.feasibility.estimated_media_bytes, 2 * GIB_BYTES);
+        assert_eq!(selected.feasibility.replica_allocation.unwrap().per_worker_required_bytes, 30 * GIB_BYTES);
+        assert_eq!(provider_vllm_memory_utilization(&selected, None).unwrap().target_pct, 35);
+        assert!(provider_vllm_memory_utilization(&selected, Some(36)).is_err());
+        assert!(provider_vllm_memory_utilization(&selected, Some(29)).is_err());
+        assert_eq!(provider_vllm_memory_utilization(&selected, Some(30)).unwrap().target_pct, 30);
+        let home = test_temp_dir("isolated-vllm-claim");
+        let claim = write_provider_memory_claim(&home, &"ab".repeat(32), &selected).unwrap().unwrap();
+        assert_eq!(read_provider_memory_claimed_bytes(Some(&home), false).unwrap(), 70 * GIB_BYTES);
+        drop(claim);
+        assert_eq!(read_provider_memory_claimed_bytes(Some(&home), false).unwrap(), 0);
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn vllm_isolated_reservation_rejects_invalid_allocations_without_partial_mutation() {
+        for (count, target) in [(0, 35), (2, 20), (3, 35), (u32::MAX, 35)] {
+            let mut selected = test_isolated_vllm_candidate();
+            let before = serde_json::to_value(&selected.feasibility).unwrap();
+            let plan = VllmMemoryUtilizationPlan { target_pct: target, floor_pct: 30, max_pct: 80 };
+            assert!(reserve_provider_vllm_replica_memory(&mut selected.feasibility, count, plan).is_err());
+            assert_eq!(serde_json::to_value(&selected.feasibility).unwrap(), before);
+        }
+        let mut selected = test_isolated_vllm_candidate();
+        selected.feasibility.memory_budget.total_bytes = u64::MAX;
+        selected.feasibility.memory_budget.budget_bytes = u64::MAX;
+        let before = serde_json::to_value(&selected.feasibility).unwrap();
+        assert!(reserve_provider_vllm_replica_memory(&mut selected.feasibility, 2,
+            VllmMemoryUtilizationPlan { target_pct: 85, floor_pct: 1, max_pct: 85 }).is_err());
+        assert_eq!(serde_json::to_value(&selected.feasibility).unwrap(), before);
+    }
+
+    #[test]
+    fn vllm_isolated_workers_remain_counted_in_a_shared_memory_pool() {
+        let mut isolated = test_isolated_vllm_candidate();
+        let plan = provider_vllm_memory_utilization(&isolated, None).unwrap();
+        reserve_provider_vllm_replica_memory(&mut isolated.feasibility, 2, plan).unwrap();
+        isolated.generation_execution_capacity = 2;
+        assert_eq!(provider_vllm_memory_utilization_for_candidates(std::slice::from_ref(&isolated), None)
+            .unwrap().unwrap().target_pct, 35);
+        assert!(provider_vllm_memory_utilization_for_candidates(std::slice::from_ref(&isolated), Some(36)).is_err());
+        let mut shared = test_isolated_vllm_candidate();
+        shared.generation_execution_profile = None;
+        let error = provider_vllm_memory_utilization_for_candidates(&[isolated, shared], None).unwrap_err();
+        assert!(error.to_string().contains("exceeding the admitted shared budget"), "{error:#}");
     }
 
     #[test]
@@ -105472,6 +107005,40 @@ status: linked
 
         assert_eq!(claimed, 12 * GIB_BYTES);
         assert!(claim_path.exists());
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn provider_memory_claim_reader_retains_live_owners_past_ttl() {
+        let home = test_temp_dir("mayhem-provider-live-claim-past-ttl");
+        let dir = provider_memory_claims_dir(&home);
+        fs::create_dir_all(&dir).unwrap();
+        let created_at = unix_epoch_seconds()
+            .unwrap()
+            .checked_sub(F13_MEMORY_CLAIM_TTL_SECONDS + 1)
+            .unwrap();
+        let live = test_provider_memory_claim(1, 70 * GIB_BYTES, created_at);
+        let dead = ProviderMemoryClaimRecord {
+            pid: u32::MAX,
+            ..live.clone()
+        };
+        let live_path = dir.join("live-past-ttl.json");
+        let dead_path = dir.join("dead-past-ttl.json");
+        write_test_provider_memory_claim(&live_path, &live);
+        write_test_provider_memory_claim(&dead_path, &dead);
+
+        for available_reflects_resident_memory in [false, true] {
+            assert_eq!(
+                read_provider_memory_claimed_bytes(
+                    Some(&home),
+                    available_reflects_resident_memory,
+                )
+                .unwrap(),
+                live.claimed_bytes
+            );
+            assert!(live_path.exists());
+            assert!(!dead_path.exists());
+        }
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -106477,6 +108044,7 @@ esac
         };
         let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
         let runtime_config = AttestationRuntimeConfig {
+            execution_mode: None,
             model_class: DEFAULT_MODEL_CLASS.to_owned(),
             backend: "llama.cpp".to_owned(),
             ctx: 8192,
@@ -107552,6 +109120,94 @@ esac
         assert_eq!(route.reputation_bps, 3_100);
         assert_eq!(route.probation.as_ref().unwrap().successful_sessions, 0);
         assert!(route.probation.as_ref().unwrap().active);
+    }
+
+    #[test]
+    fn provider_execution_mode_open_negotiation_preserves_baseline_and_rejects_downgrade() {
+        let mut terms = test_provider_session_terms();
+        let mut frame = test_session_open_frame(&terms);
+        assert_eq!(provider_session_open_decision(&frame, &terms), ProviderSessionDecision::Accept);
+        frame["expected_execution_mode"] = Value::Null;
+        assert_eq!(provider_session_open_decision(&frame, &terms), ProviderSessionDecision::Accept);
+        let mode = mayhem_proto::ExecutionModeBinding {
+            mode_id: "throughput".to_owned(),
+            policy_hash: "ab".repeat(32),
+        };
+        frame["expected_execution_mode"] = serde_json::to_value(&mode).unwrap();
+        assert!(matches!(provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Reject { code: "EXECUTION_MODE", .. }));
+        terms.execution_mode = Some(mode);
+        assert_eq!(provider_session_open_decision(&frame, &terms), ProviderSessionDecision::Accept);
+        for value in [Value::Null, json!({"mode_id":"throughput", "policy_hash":"cd".repeat(32)})] {
+            frame["expected_execution_mode"] = value;
+            assert!(matches!(provider_session_open_decision(&frame, &terms),
+                ProviderSessionDecision::Reject { code: "EXECUTION_MODE", .. }));
+        }
+        frame.as_object_mut().unwrap().remove("expected_execution_mode");
+        assert!(matches!(provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Reject { code: "EXECUTION_MODE", .. }));
+        frame["expected_execution_mode"] = json!({"mode_id":"../invalid", "policy_hash":"ab".repeat(32)});
+        assert!(matches!(provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Reject { code: "SCHEMA", .. }));
+    }
+
+    #[test]
+    fn provider_execution_mode_cli_and_supervisor_selection_is_explicit() {
+        let baseline = ProviderStartArgs::try_parse_from(["start"]).unwrap();
+        assert!(baseline.execution_mode.is_none());
+        let args = ProviderStartArgs::try_parse_from(["start", "--execution-mode", "throughput"]).unwrap();
+        assert_eq!(args.execution_mode.as_deref(), Some("throughput"));
+        let add = ProviderServeAddArgs::try_parse_from(["add", "test/model", "--execution-mode", "throughput"]).unwrap();
+        assert_eq!(add.execution_mode.as_deref(), Some("throughput"));
+        let switch = ProviderServeSwitchArgs::try_parse_from(["switch", "old", "new", "--execution-mode", "throughput"]).unwrap();
+        assert_eq!(switch.execution_mode.as_deref(), Some("throughput"));
+        let plan = ProviderServePlanArgs::try_parse_from(["plan", "--execution-mode", "throughput"]).unwrap();
+        assert_eq!(provider_start_args_for_serve_plan(&plan, Path::new(".")).execution_mode, plan.execution_mode);
+        let mut child = json!({"args": ["provider", "start", "--enclave", "test"]});
+        append_provider_serve_execution_mode(&mut child, "throughput").unwrap();
+        assert_eq!(child["args"], json!(["provider", "start", "--enclave", "test", "--execution-mode", "throughput"]));
+        assert!(append_provider_serve_execution_mode(&mut child, "throughput").is_err());
+        assert!(append_provider_serve_execution_mode(&mut json!({"args": []}), "../bad").is_err());
+        assert!(append_provider_serve_execution_mode(&mut json!({}), "throughput").is_err());
+    }
+
+    #[test]
+    fn provider_execution_mode_plan_replays_supervised_mode_without_changing_baseline() {
+        let home = Path::new("/tmp/provider home");
+        let args = ProviderServePlanArgs::try_parse_from([
+            "plan", "--execution-mode", "throughput", "--ctx", "8192",
+            "--disable-modality", "image", "--speciality-levels", "reasoning_effort=medium",
+        ]).unwrap();
+        let candidate = test_auto_fit_candidate('a', "test/model", "text", 4, 16, 1, 10.0);
+        let mut selection = ProviderAutoFitSelection {
+            candidates: vec![candidate], total_required_bytes: 0, total_budget_bytes: 0,
+            modalities: vec!["text".to_owned()], score: 0.0, rationale: String::new(),
+        };
+        let baseline = provider_serve_plan_commands(home, &selection, &args, Some(12), None);
+        assert_eq!(baseline, json!({"up": provider_auto_fit_up_command(
+            home, &selection, Some(12), &args.disable_modalities, None,
+        )}));
+        let candidate = &mut selection.candidates[0];
+        candidate.execution_mode = Some(ProviderExecutionMode {
+            binding: mayhem_proto::ExecutionModeBinding {
+                mode_id: "throughput".to_owned(), policy_hash: "ab".repeat(32),
+            },
+            requests: mayhem_proto::ExecutionModeRequestPolicy { endpoint_families: Vec::new() },
+            baseline_adapter: candidate.model.adapter.clone(),
+        });
+        let argv = provider_serve_mode_add_argv(home, candidate, &args, Some(12), None);
+        let parsed = ProviderServeAddArgs::try_parse_from(&argv[3..]).unwrap();
+        assert_eq!(parsed.execution_mode.as_deref(), Some("throughput"));
+        assert_eq!(parsed.enclave, candidate.enclave.enclave_id);
+        assert_eq!(parsed.home.as_deref(), Some(home));
+        assert_eq!(parsed.ctx, Some(candidate.served_ctx));
+        assert_eq!(parsed.gpu_layers, Some(12));
+        assert_eq!(parsed.disable_modalities, args.disable_modalities);
+        assert_eq!(parsed.speciality_levels, args.speciality_levels);
+        let report = provider_serve_plan_commands(home, &selection, &args, Some(12), None);
+        assert!(!report["up"].as_str().unwrap().contains("--provider"));
+        assert_eq!(report["serve"].as_array().unwrap().len(), 1);
+        assert!(report["serve"][0].as_str().unwrap().contains("'--execution-mode' 'throughput'"));
     }
 
     #[test]
@@ -108684,6 +110340,7 @@ esac
         };
         let runtime_keypair = RuntimeKeypair::from_seed([9; 32]);
         let runtime_config = AttestationRuntimeConfig {
+            execution_mode: None,
             model_class: DEFAULT_MODEL_CLASS.to_owned(),
             backend: "trt-llm".to_owned(),
             ctx: 8192,
@@ -108813,6 +110470,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         };
         let provider_pubkey = "55".repeat(32);
         let runtime_config = AttestationRuntimeConfig {
+            execution_mode: None,
             model_class: DEFAULT_MODEL_CLASS.to_owned(),
             backend: "vllm".to_owned(),
             ctx: 8192,
@@ -110843,6 +112501,474 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    #[ignore = "diagnostic export; requires MAYHEM_CANARY_REQUESTS_OUTPUT"]
+    fn export_canonical_canary_generate_requests() -> Result<()> {
+        struct RecordingBackend(FakeEngineBackend);
+
+        impl EngineBackend for RecordingBackend {
+            fn backend_id(&self) -> &'static str {
+                "canonical-canary-request-recorder"
+            }
+
+            fn load(
+                &mut self,
+                config: LoadConfig,
+            ) -> mayhem_engine::Result<mayhem_engine::LoadedModelInfo> {
+                self.0.load(config)
+            }
+
+            fn tokenize(&self, text: &str) -> mayhem_engine::Result<mayhem_engine::Tokenization> {
+                self.0.tokenize(text)
+            }
+
+            fn generate(
+                &mut self,
+                request: GenerateRequest,
+                sink: &mut dyn mayhem_engine::TokenSink,
+                cancellation: &CancellationToken,
+            ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
+                assert!(self.0.last_request.is_none(), "expected one native request");
+                // Let the real helper finish; this synthetic output is never exported as evidence.
+                sink.on_token(mayhem_engine::TokenChunk {
+                    index: 0,
+                    token_id: 0,
+                    text: String::new(),
+                })?;
+                self.0.generate(request, sink, cancellation)
+            }
+        }
+
+        let root = mayhem_asset_root()?;
+        let output = PathBuf::from(
+            std::env::var_os("MAYHEM_CANARY_REQUESTS_OUTPUT")
+                .filter(|path| !path.is_empty())
+                .context("set MAYHEM_CANARY_REQUESTS_OUTPUT to an explicit JSON output path")?,
+        );
+        let output = root.join(output);
+        let catalog_path = std::env::var_os("MAYHEM_CANARY_REQUESTS_CATALOG")
+            .map(PathBuf::from)
+            .map(|path| root.join(path))
+            .unwrap_or_else(|| root.join("catalog/models.json"));
+        let catalog = catalog::load_document(&catalog_path)?;
+        let model_id = std::env::var("MAYHEM_CANARY_REQUESTS_MODEL")
+            .unwrap_or_else(|_| "Qwen/Qwen3.8-27B".to_owned());
+        let artifact_name = std::env::var("MAYHEM_CANARY_REQUESTS_ARTIFACT")
+            .unwrap_or_else(|_| "nvfp4".to_owned());
+        let baseline_model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == model_id)
+            .with_context(|| format!("catalog model {model_id}"))?;
+        let baseline_artifact = baseline_model.artifacts.get(&artifact_name)
+            .with_context(|| format!("catalog artifact {artifact_name}"))?;
+        let mode_id = std::env::var("MAYHEM_CANARY_REQUESTS_EXECUTION_MODE").ok();
+        let mode = mode_id.as_deref().map(|id| {
+            catalog.vllm_execution_mode(&baseline_artifact.artifact_root, id)
+                .with_context(|| format!("catalog execution mode {id}"))
+        }).transpose()?;
+        let projected = mode.map(|mode| {
+            catalog::execution_mode_model(baseline_model, &artifact_name, mode)
+        }).transpose()?;
+        let model = projected.as_ref().unwrap_or(baseline_model);
+        let binding = mode.map(|mode| {
+            mode.binding(&baseline_artifact.artifact_root, mode_id.as_deref().unwrap())
+        }).transpose()?;
+        let seed: u32 = std::env::var("MAYHEM_CANARY_REQUESTS_SEED")
+            .ok().map(|value| value.parse()).transpose()?.unwrap_or(0);
+        ensure!(
+            model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT,
+            "{model_id} is not a token-fingerprint canary model"
+        );
+        let artifact = model
+            .artifacts
+            .get(&artifact_name)
+            .with_context(|| format!("catalog artifact {artifact_name}"))?;
+        let canaries_dir = std::env::var_os("MAYHEM_CANARY_REQUESTS_CANARIES")
+            .map(PathBuf::from)
+            .map(|path| root.join(path))
+            .unwrap_or_else(|| root.join("catalog/canaries"));
+        let canary_sha256 = canary_set_file_sha256(&canaries_dir, &model.canary.set_id)
+            .map_err(anyhow::Error::msg)?;
+        if let Some(mode) = mode {
+            ensure!(mode.canary_set_sha256 == canary_sha256, "mode canary input bytes changed");
+        }
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, true)?;
+        let prompts_by_id = prompts
+            .iter()
+            .map(|prompt| (prompt.id.as_str(), prompt))
+            .collect::<BTreeMap<_, _>>();
+        ensure!(
+            prompts_by_id.len() == prompts.len(),
+            "duplicate canary prompt IDs"
+        );
+        let mut rows = Vec::new();
+        let mut ids = BTreeSet::new();
+        let mut capture = |prompt: &CanaryPrompt,
+                           speciality: Option<(&str, &str)>,
+                           expected_prefix: &[i32]|
+         -> Result<()> {
+            let id = match speciality {
+                Some((name, level)) => format!("speciality:{name}:{level}:{}", prompt.id),
+                None => format!("base:{}", prompt.id),
+            };
+            ensure!(ids.insert(id.clone()), "duplicate vector ID {id}");
+            ensure!(!expected_prefix.is_empty(), "empty catalog prefix for {id}");
+            let mut backend = RecordingBackend(FakeEngineBackend::new(""));
+            calibrate_token_canary_prompt_with_speciality(
+                &mut backend,
+                model,
+                prompt,
+                seed,
+                false,
+                speciality,
+            )
+            .with_context(|| format!("capturing {id}"))?;
+            let request = backend
+                .0
+                .last_request
+                .take()
+                .context("missing native request")?;
+            // Keep the complete native request, including its original generation budget.
+            rows.push(json!({
+                "id": id,
+                "prompt_id": prompt.id,
+                "speciality": speciality.map(|(name, level)| json!({"name": name, "level": level})),
+                "request": serde_json::to_value(request)?,
+                "expected_prefix": expected_prefix,
+            }));
+            Ok(())
+        };
+        let base_prefixes = model
+            .canary
+            .token_prefixes
+            .get(&artifact_name)
+            .context("missing catalog base token prefixes")?;
+        for (prompt_id, prefix) in base_prefixes {
+            let prompt = prompts_by_id
+                .get(prompt_id.as_str())
+                .with_context(|| format!("unknown base canary prompt {prompt_id}"))?;
+            capture(prompt, None, prefix)?;
+        }
+        let effective_levels = catalog::artifact_effective_speciality_levels(model, artifact);
+        if let Some(specialities) = model.speciality_assessment.calibrated.get(&artifact_name) {
+            for (name, levels) in specialities {
+                let descriptor = model
+                    .adapter
+                    .specialities
+                    .iter()
+                    .find(|descriptor| descriptor.name == *name)
+                    .with_context(|| format!("unknown catalog speciality {name}"))?;
+                let canonical_prompts = speciality_canary_prompts(model, &prompts, descriptor)?;
+                for (level, calibration) in levels {
+                    ensure!(
+                        effective_levels
+                            .get(name)
+                            .is_some_and(|levels| levels.contains(level)),
+                        "unsupported catalog speciality {name}={level}"
+                    );
+                    for (prompt_id, prefix) in &calibration.token_prefixes {
+                        let prompt = canonical_prompts
+                            .iter()
+                            .find(|prompt| prompt.id == *prompt_id)
+                            .with_context(|| {
+                                format!("{name}={level} prefix {prompt_id} is not a canonical speciality prompt")
+                            })?;
+                        capture(prompt, Some((name, level)), prefix)?;
+                    }
+                }
+            }
+        }
+        ensure!(!rows.is_empty(), "no catalog token prefixes to export");
+        let document = json!({
+            "model_id": model.model_id,
+            "artifact_name": artifact_name,
+            "artifact_root": artifact.artifact_root,
+            "canary_set": model.canary.set_id,
+            "catalog_sha256": file_sha256_hex(&catalog_path)?,
+            "canary_set_sha256": canary_sha256,
+            "seed": seed,
+            "execution_mode": binding,
+            "generation_execution_profile": match mode {
+                Some(mode) => mode.generation_execution_profile.as_ref(),
+                None => catalog.generation_execution_profile(&artifact.artifact_root),
+            },
+            "vllm_execution_profile": match mode {
+                Some(mode) => Some(&mode.profile),
+                None => catalog.vllm_execution_profile(&artifact.artifact_root),
+            },
+            "rows": rows,
+        });
+        fs::write(&output, serde_json::to_vec_pretty(&document)?)
+            .with_context(|| format!("writing canonical requests to {}", output.display()))?;
+        eprintln!(
+            "exported {} canonical requests to {}",
+            rows.len(),
+            output.display()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn qwen_endpoint_calibration_preflight_is_complete() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "Qwen/Qwen3.8-27B")
+            .expect("Qwen 3.8 catalog model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+
+        catalog_endpoint_calibration_preflight(model, &prompts).unwrap();
+    }
+
+    #[test]
+    fn qwen_endpoint_calibration_preserves_reasoning_history() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "Qwen/Qwen3.8-27B")
+            .expect("Qwen 3.8 catalog model");
+        let (_, fixtures) = catalog_endpoint_calibration_fixtures(model, &[]);
+        for family in [
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT,
+        ] {
+            let contract = model
+                .adapter
+                .endpoint_families
+                .iter()
+                .find(|contract| contract.family == family)
+                .unwrap();
+            let mut request = json!({
+                "model": model.model_id,
+                "messages": [
+                    {"role": "user", "content": "Choose two markers."},
+                    {"role": "assistant", "content": "First chosen.",
+                     "reasoning": "calibration-history-first-731"},
+                    {"role": "assistant", "content": "Second chosen.",
+                     "reasoning_content": "calibration-history-second-827"},
+                    {"role": "user", "content": "Continue."}
+                ],
+                "max_tokens": 8
+            });
+            for mode in [None, Some("preserve"), Some("latest_only")] {
+                if let Some(mode) = mode {
+                    request["thinking_history"] = json!(mode);
+                }
+                let normalized = normalize_endpoint_calibration_request(contract, &request)
+                    .unwrap()
+                    .normalized_request;
+                assert_eq!(normalized["messages"], request["messages"]);
+                let transport =
+                    catalog_endpoint_calibration_transport(contract, &normalized, &fixtures)
+                        .unwrap();
+                let (translation, handled) = catalog_endpoint_calibration_translation(
+                    model,
+                    contract,
+                    &normalized,
+                    &transport,
+                )
+                .unwrap();
+                assert_eq!(translation["messages"], request["messages"]);
+                for (path, marker) in [
+                    ("messages.reasoning", "calibration-history-first-731"),
+                    (
+                        "messages.reasoning_content",
+                        "calibration-history-second-827",
+                    ),
+                ] {
+                    assert!(handled.contains(path), "{family}: {path}");
+                    assert_eq!(
+                        translation["prompt"].as_str().unwrap().contains(marker),
+                        mode != Some("latest_only"),
+                        "{family}: {path}, mode={mode:?}"
+                    );
+                }
+                let sealed =
+                    catalog_endpoint_calibration_seal(contract, &normalized, transport).unwrap();
+                provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)
+                    .unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn qwen_endpoint_calibration_materializes_forced_tools() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "Qwen/Qwen3.8-27B")
+            .expect("Qwen 3.8 catalog model");
+        let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, &[]);
+        for family in [
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+            mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT,
+        ] {
+            let contract = model
+                .adapter
+                .endpoint_families
+                .iter()
+                .find(|contract| contract.family == family)
+                .unwrap();
+            let cases = mayhem_proto::generate_endpoint_calibration_cases(contract).unwrap();
+            let case = cases
+                .iter()
+                .find(|case| {
+                    case.case_kind == "accepted_value_2" && case.attributes == ["tool_choice"]
+                })
+                .expect("signed named tool_choice calibration row");
+            let raw = mayhem_proto::materialize_endpoint_calibration_request(case, &substitutions)
+                .unwrap();
+            assert!(raw.get("tools").is_none());
+            assert_eq!(raw["tool_choice"]["type"], "function");
+            let name = raw["tool_choice"]["function"]["name"].as_str().unwrap();
+            let request = catalog_endpoint_calibration_materialize_request(
+                contract,
+                case,
+                raw.clone(),
+                &fixtures,
+            )
+            .unwrap();
+            let mut expected = raw.clone();
+            expected["tools"] =
+                contract.request_attribute_specs["tools"].calibration_values[0].clone();
+            assert_eq!(
+                request, expected,
+                "{family}: only add the signed tools companion"
+            );
+            let normalized = normalize_endpoint_calibration_request(contract, &request)
+                .unwrap()
+                .normalized_request;
+            assert_eq!(normalized["tool_choice"], raw["tool_choice"]);
+            assert_eq!(normalized["tools"], request["tools"]);
+            let transport =
+                catalog_endpoint_calibration_transport(contract, &normalized, &fixtures).unwrap();
+            let (translation, handled) =
+                catalog_endpoint_calibration_translation(model, contract, &normalized, &transport)
+                    .unwrap();
+            assert!(handled.contains("tools"));
+            assert!(handled.contains("tool_choice"));
+            assert_eq!(translation["tools"], request["tools"]);
+            assert_eq!(translation["grammar"]["kind"], "tool_call");
+            assert_eq!(translation["grammar"]["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(translation["grammar"]["tools"][0]["name"], name);
+            assert_eq!(
+                translation["grammar"]["tools"][0]["parameters"],
+                request["tools"][0]["function"]["parameters"]
+            );
+
+            for choice in [
+                json!({"type": "function", "name": name}),
+                json!("required"),
+                json!("any"),
+                json!("auto"),
+                json!("none"),
+            ] {
+                let mut variant = raw.clone();
+                variant["tool_choice"] = choice.clone();
+                let materialized = catalog_endpoint_calibration_materialize_request(
+                    contract,
+                    case,
+                    variant.clone(),
+                    &fixtures,
+                )
+                .unwrap();
+                let forced = !matches!(choice.as_str(), Some("auto" | "none"));
+                if forced {
+                    variant["tools"] = request["tools"].clone();
+                }
+                assert_eq!(materialized, variant);
+                let (translation, _) = catalog_endpoint_calibration_translation(
+                    model,
+                    contract,
+                    &materialized,
+                    &transport,
+                )
+                .unwrap();
+                assert_eq!(translation["grammar"]["kind"] == "tool_call", forced);
+            }
+
+            for tools in [
+                json!(null),
+                json!([]),
+                json!([{
+                    "type": "function", "function": {
+                        "name": "unrelated_tool", "parameters": {"type": "object"}
+                    }
+                }]),
+            ] {
+                let mut explicit = raw.clone();
+                explicit["tools"] = tools;
+                let materialized = catalog_endpoint_calibration_materialize_request(
+                    contract,
+                    case,
+                    explicit.clone(),
+                    &fixtures,
+                )
+                .unwrap();
+                assert_eq!(materialized, explicit);
+                assert!(
+                    catalog_endpoint_calibration_translation(
+                        model,
+                        contract,
+                        &materialized,
+                        &transport,
+                    )
+                    .is_err(),
+                    "{family}: invalid explicit tools must still fail"
+                );
+            }
+            let mut rejected = case.clone();
+            rejected.expect_accept = false;
+            assert_eq!(
+                catalog_endpoint_calibration_materialize_request(
+                    contract,
+                    &rejected,
+                    raw.clone(),
+                    &fixtures,
+                )
+                .unwrap(),
+                raw
+            );
+            let mut omission = case.clone();
+            omission
+                .mutations
+                .push(mayhem_proto::EndpointCalibrationMutation {
+                    path: "tools".to_owned(),
+                    value: mayhem_proto::EndpointCalibrationValue::Omitted,
+                });
+            assert_eq!(
+                catalog_endpoint_calibration_materialize_request(
+                    contract,
+                    &omission,
+                    raw.clone(),
+                    &fixtures,
+                )
+                .unwrap(),
+                raw
+            );
+            let mut missing = raw;
+            missing["tool_choice"] = json!({"type": "function", "name": "unsigned_tool"});
+            assert!(catalog_endpoint_calibration_materialize_request(
+                contract, case, missing, &fixtures,
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("no signed tools fixture matching tool_choice"));
+        }
+    }
+
+    #[test]
     fn ace_music_endpoint_preflight_uses_real_codec_and_repaint_fixtures() {
         let catalog_path = repo_path("catalog/models.json").unwrap();
         let catalog = catalog::load_document(&catalog_path).unwrap();
@@ -111430,6 +113556,166 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             resolve_provider_served_modalities(DEFAULT_MODEL_CLASS, &enabled, &["text".to_owned()])
                 .unwrap_err();
         assert!(error.to_string().contains("cannot disable core text"));
+    }
+
+    #[test]
+    fn provider_modality_self_test_preserves_baseline_fingerprint_and_mode_policy() {
+        let family = mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS;
+        let mut baseline = test_isolated_vllm_candidate();
+        baseline.model.canary.set_id = "test-mode-modality-health".to_owned();
+        baseline.model.caps.vision = true;
+        baseline.served_modalities = vec!["text".to_owned(), "image".to_owned()];
+        baseline.model.adapter.modality_set = baseline.served_modalities.clone();
+        baseline.model.adapter.endpoint_families =
+            vec![mayhem_proto::endpoint_family_contract_template(family).unwrap()];
+        let baseline_adapter = baseline.model.adapter.clone();
+        let adapter_before = serde_json::to_value(&baseline_adapter).unwrap();
+        let requests: mayhem_proto::ExecutionModeRequestPolicy = serde_json::from_value(json!({
+            "endpoint_families": [{
+                "family": family,
+                "request_attributes": ["min_p"],
+                "required_request_attributes": [],
+                "response_attributes": [],
+                "required_response_attributes": [],
+                "request_attribute_specs": {
+                    "min_p": {"value_types": ["number"], "minimum": 0, "maximum": 0}
+                },
+                "response_attribute_specs": {},
+                "interaction_groups": []
+            }]
+        })).unwrap();
+        let mut selected = baseline.clone();
+        selected.model.adapter.endpoint_families[0].request_attribute_specs.insert(
+            "min_p".to_owned(), requests.endpoint_families[0].request_attribute_specs["min_p"].clone(),
+        );
+        selected.execution_mode = Some(ProviderExecutionMode {
+            binding: mayhem_proto::ExecutionModeBinding {
+                mode_id: "test-mode".to_owned(), policy_hash: "ab".repeat(32),
+            },
+            requests,
+            baseline_adapter: baseline_adapter.clone(),
+        });
+        let canaries = test_canary_dir_with_prompts(&selected.model.canary.set_id, json!([{
+            "id": "image-health",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "Describe this image."},
+                {"type": "image_url", "image_url": {"url": tiny_png_data_url()}}
+            ]}],
+            "temperature": 0, "min_p": 0, "seed": 7, "max_tokens": 64
+        }]));
+        let args = test_provider_start_args();
+        let wallet: WalletInfo = serde_json::from_value(json!({
+            "created": false, "keypair_path": "unused", "public_key": "55".repeat(32)
+        })).unwrap();
+        let runtime = ProviderBackendRuntime::default();
+        let artifacts = ProviderArtifactPaths { primary: PathBuf::from("unused"), sidecars: BTreeMap::new() };
+        let attestation: Tier1AttestationReport = serde_json::from_value(json!({
+            "report_head": "aa".repeat(32),
+            "report": {
+                "schema_version": mayhem_proto::ATTESTATION_SCHEMA_VERSION,
+                "alg": mayhem_proto::ATTESTATION_ALG,
+                "enclave_id": selected.enclave.enclave_id,
+                "enclave_pubkey": "22".repeat(32), "provider_pubkey": wallet.public_key,
+                "manifest_hash": "33".repeat(32), "binary_hash": "44".repeat(32),
+                "att_tier": 1, "boot_epoch": 1, "report_ts": 1, "nonce_u": "66".repeat(32),
+                "runtime_config": AttestationRuntimeConfig::default(),
+                "sig_enclave": "77".repeat(64), "sig_provider": "88".repeat(64)
+            }
+        })).unwrap();
+        let rules = RulesRef { ver: 1, hash: "99".repeat(32) };
+        let ctx = ProviderSessionContext {
+            args: &args, home: &canaries, keypair_path: Path::new("unused"), password: "",
+            wallet: &wallet, selected: &selected, backend_runtime: &runtime, artifact_paths: &artifacts,
+            canaries_dir: &canaries, rooms: &[], attestation: &attestation,
+            attestation_head: &attestation.report_head, identity_anchor: "test",
+            tpm_activation_hello: None, workflow_inventory_root: None, workflow_admission: None,
+            rules: &rules,
+        };
+        let terms = provider_session_terms(&ctx).unwrap();
+        assert_eq!(serde_json::to_value(&terms.adapter).unwrap(), adapter_before);
+        let mut responder = EngineProviderSessionResponder {
+            backend: Box::new(FakeEngineBackend::new("image described").with_backend_id("vllm")),
+        };
+
+        // Reproduce the old production failure: mode sealing, baseline verification.
+        let wrong_cases = provider_modality_self_test_plan(
+            &ctx, &selected.model.adapter, &canaries,
+        ).unwrap();
+        let error = provider_modality_self_test(&ctx, &terms, &mut responder, wrong_cases).unwrap_err();
+        assert!(format!("{error:#}").contains("endpoint contract fingerprint does not match"));
+
+        let cases = provider_modality_self_test_plan(&ctx, &terms.adapter, &canaries).unwrap();
+        assert_eq!(cases.len(), 1);
+        assert_eq!(cases[0].prompt_id, "image-health");
+        assert_eq!(cases[0].modalities, vec!["image", "text"]);
+        assert_eq!(cases[0].body["contract_request"]["max_tokens"], 4);
+        assert_eq!(cases[0].body["mayhem_contract"]["endpoint_contract_fingerprint"],
+            mayhem_proto::endpoint_contract_fingerprint(&baseline_adapter.endpoint_families[0]));
+        let health = provider_modality_self_test(&ctx, &terms, &mut responder, cases.clone()).unwrap();
+        assert_eq!(health.len(), 1);
+        assert!(health[0].ok);
+
+        // A valid baseline envelope must not bypass the supplemental mode policy.
+        let mut forbidden = cases;
+        let mut body = forbidden[0].body["contract_request"].clone();
+        body["min_p"] = json!(0.05);
+        body["endpoint_family"] = json!(family);
+        forbidden[0].body = provider_seal_local_contract_request(
+            &body, &terms.adapter, &terms.model_id,
+        ).unwrap();
+        let error = provider_modality_self_test(&ctx, &terms, &mut responder, forbidden.clone()).unwrap_err();
+        assert!(error.to_string().contains("negotiated execution mode"));
+        assert_eq!(provider_response_error_code(&error), "request_invalid");
+
+        let baseline_ctx = ProviderSessionContext { selected: &baseline, ..ctx };
+        let baseline_terms = provider_session_terms(&baseline_ctx).unwrap();
+        let baseline_cases = provider_modality_self_test_plan(
+            &baseline_ctx, &baseline_terms.adapter, &canaries,
+        ).unwrap();
+        assert!(provider_modality_self_test(
+            &baseline_ctx, &baseline_terms, &mut responder, baseline_cases,
+        ).unwrap()[0].ok);
+        assert!(provider_modality_self_test(
+            &baseline_ctx, &baseline_terms, &mut responder, forbidden,
+        ).unwrap()[0].ok);
+        assert_eq!(serde_json::to_value(&baseline.model.adapter).unwrap(), adapter_before);
+        assert_eq!(serde_json::to_value(&terms.adapter).unwrap(), adapter_before);
+        fs::remove_dir_all(canaries).unwrap();
+    }
+
+    #[test]
+    fn provider_execution_mode_request_policy_preserves_baseline_contract_fingerprint() {
+        let mut terms = test_provider_session_terms();
+        let family = mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS;
+        let adapter_before = serde_json::to_value(&terms.adapter).unwrap();
+        let requests: mayhem_proto::ExecutionModeRequestPolicy = serde_json::from_value(json!({
+            "endpoint_families": [{
+                "family": family,
+                "request_attributes": ["min_p"],
+                "required_request_attributes": [],
+                "response_attributes": [],
+                "required_response_attributes": [],
+                "request_attribute_specs": {
+                    "min_p": {"value_types": ["number"], "minimum": 0, "maximum": 0}
+                },
+                "response_attribute_specs": {},
+                "interaction_groups": []
+            }]
+        })).unwrap();
+        let body = json!({"messages": [{"role":"user", "content":"arbitrary request"}], "min_p": 0.05});
+        let sealed = provider_test_seal_contract_request(&body, &terms.adapter).unwrap();
+        let active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap();
+        terms.execution_mode_requests = Some(requests);
+        let error = validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap_err();
+        assert!(error.to_string().contains("negotiated execution mode"));
+        assert!(!error.to_string().contains("0.05"));
+        assert_eq!(provider_response_error_code(&error), "request_invalid");
+        let mut compatible = body;
+        compatible["min_p"] = json!(0.0);
+        let sealed = provider_test_seal_contract_request(&compatible, &terms.adapter).unwrap();
+        validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap();
+        assert_eq!(serde_json::to_value(&terms.adapter).unwrap(), adapter_before);
     }
 
     #[test]
@@ -112329,6 +114615,50 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ),
             ProviderReasoningOutputMode::StripPrefilled
         );
+    }
+
+    #[test]
+    fn provider_engine_session_response_raw_tool_fallback_requires_request_grammar() {
+        let document = catalog::load_document(&repo_path("catalog/models.json").unwrap()).unwrap();
+        let model = document
+            .models
+            .iter()
+            .find(|model| model.model_id == "hauhaucs/qwen3.6-35b-a3b-uncensored")
+            .expect("reasoning-enabled tool model");
+        for (choice, expected_tools) in [("auto", 0), ("required", 1)] {
+            let mut backend =
+                FakeEngineBackend::new(r#"{"tool":"write","arguments":{"path":"README.md"}}"#);
+            let body = json!({
+                "model": model.model_id,
+                "messages": [{"role": "user", "content": "write a file"}],
+                "tools": [{"type": "function", "function": {
+                    "name": "write",
+                    "parameters": {
+                        "type": "object", "required": ["path"],
+                        "properties": {"path": {"type": "string"}},
+                    },
+                }}],
+                "tool_choice": choice,
+            });
+            let sealed =
+                provider_seal_local_contract_request(&body, &model.adapter, &model.model_id)
+                    .unwrap();
+            let output = provider_engine_session_response_with_sampling(
+                &mut backend,
+                Some(&model.model_id),
+                &model.adapter,
+                &model.sampling,
+                model.workflow.as_ref(),
+                &sealed,
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(output.tools.len(), expected_tools, "tool_choice={choice}");
+            let request = backend.last_request.as_ref().unwrap();
+            assert_eq!(provider_reasoning_speciality_enabled(request), Some(true));
+            assert_eq!(request.grammar.is_some(), choice == "required");
+        }
     }
 
     #[test]
@@ -113970,6 +116300,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(
             provider_attestation_runtime_config(&selected).unwrap(),
             AttestationRuntimeConfig {
+                execution_mode: None,
                 model_class: DEFAULT_MODEL_CLASS.to_owned(),
                 backend: "trt-llm".to_owned(),
                 ctx: 8192,
@@ -114078,9 +116409,25 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             catalog::CatalogGenerationExecutionProfile {
                 schema_version: 1,
                 engine: "vllm".to_owned(),
+                topology: None,
                 independent_dispatch: true,
                 request_modalities: vec![vec!["text".to_owned()]],
                 proof_sha256: "ab".repeat(32),
+            },
+        );
+        catalog.vllm_execution_profiles.insert(
+            vllm_artifact.artifact_root.clone(),
+            catalog::CatalogVllmExecutionProfile {
+                schema_version: 1,
+                engine: "vllm".to_owned(),
+                runtime: None,
+                enforce_eager: false,
+                compilation_mode: None,
+                cudagraph_mode: None,
+                linear_backend: "cutlass".to_owned(),
+                moe_backend: "cutlass".to_owned(),
+                speculative_decoding: None,
+                proof_sha256: "ac".repeat(32),
             },
         );
         catalog.models[0]
@@ -114095,6 +116442,83 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .remove(0);
         assert_eq!(selected.generation_execution_capacity, 2);
         assert!(selected.generation_execution_profile.is_some());
+        assert!(selected.vllm_execution_profile.is_some());
+
+        let mut mode_catalog = catalog.clone();
+        let mut mode_profile = selected.vllm_execution_profile.clone().unwrap();
+        mode_profile.enforce_eager = true;
+        mode_profile.runtime = Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1);
+        let mut mode_canary = selected.model.canary.clone();
+        mode_canary.set_id = "test-mode-canary".to_owned();
+        let request_policies = selected.model.adapter.endpoint_families.iter().map(|family| {
+            mayhem_proto::EndpointFamilyContract {
+                family: family.family.clone(),
+                request_attributes: vec![],
+                required_request_attributes: vec![],
+                response_attributes: vec![],
+                required_response_attributes: vec![],
+                request_attribute_specs: BTreeMap::new(),
+                response_attribute_specs: BTreeMap::new(),
+                interaction_groups: vec![],
+                speciality_mappings: BTreeMap::new(),
+            }
+        }).collect();
+        let mode_policy = catalog::CatalogVllmExecutionMode {
+            schema_version: 1,
+            profile: mode_profile,
+            generation_execution_profile: None,
+            requests: mayhem_proto::ExecutionModeRequestPolicy { endpoint_families: request_policies },
+            canary: mode_canary,
+            canary_set_sha256: "ad".repeat(32),
+            modality_fingerprints: BTreeMap::new(),
+            resource_profiles: BTreeMap::new(),
+            speciality_calibrations: BTreeMap::new(),
+        };
+        mode_catalog.vllm_execution_modes.insert(selected.artifact.artifact_root.clone(),
+            BTreeMap::from([("throughput".to_owned(), mode_policy)]));
+        let mut mode_args = args.clone();
+        mode_args.execution_mode = Some("throughput".to_owned());
+        let mode_selected = build_provider_candidates(&contract, &mode_catalog, &hardware, &mode_args)
+            .unwrap().remove(0);
+        assert_eq!(mode_selected.enclave.enclave_id, selected.enclave.enclave_id);
+        assert_eq!(mode_selected.artifact.artifact_root, selected.artifact.artifact_root);
+        assert_eq!(mode_selected.model.canary.set_id, "test-mode-canary");
+        assert_eq!(mode_selected.generation_execution_capacity, 1);
+        assert!(mode_selected.generation_execution_profile.is_none());
+        assert!(mode_selected.vllm_execution_profile.as_ref().unwrap().enforce_eager);
+        assert_eq!(mode_selected.vllm_execution_profile.as_ref().unwrap().runtime,
+            Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1));
+        let mut calibration_args = test_calibrate_canary_args();
+        bind_calibration_vllm_execution_profile(
+            &mut calibration_args, mode_selected.vllm_execution_profile.as_ref(),
+        ).unwrap();
+        assert_eq!(calibration_args.vllm_runtime,
+            Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1));
+        let binding = &mode_selected.execution_mode.as_ref().unwrap().binding;
+        assert_eq!(provider_attestation_runtime_config(&mode_selected).unwrap().execution_mode.as_ref(), Some(binding));
+        assert_eq!(serde_json::to_value(&mode_selected.execution_mode.as_ref().unwrap().baseline_adapter).unwrap(),
+            serde_json::to_value(&selected.model.adapter).unwrap());
+        let baseline_again = build_provider_candidates(&contract, &mode_catalog, &hardware, &args)
+            .unwrap().remove(0);
+        assert!(baseline_again.execution_mode.is_none());
+        assert_eq!(baseline_again.generation_execution_capacity, 2);
+        assert_eq!(baseline_again.model.canary.set_id, selected.model.canary.set_id);
+        assert_eq!(baseline_again.vllm_execution_profile.as_ref().unwrap().runtime, None);
+        let mut default_mode_catalog = mode_catalog.clone();
+        let root = &selected.artifact.artifact_root;
+        default_mode_catalog.vllm_execution_profiles.get_mut(root).unwrap().runtime =
+            Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1);
+        default_mode_catalog.vllm_execution_modes.get_mut(root).unwrap()
+            .get_mut("throughput").unwrap().profile.runtime = None;
+        let default_mode = build_provider_candidates(&contract, &default_mode_catalog, &hardware, &mode_args)
+            .unwrap().remove(0);
+        assert_eq!(default_mode.vllm_execution_profile.as_ref().unwrap().runtime, None);
+        bind_calibration_vllm_execution_profile(
+            &mut calibration_args, default_mode.vllm_execution_profile.as_ref(),
+        ).unwrap();
+        assert_eq!(calibration_args.vllm_runtime, None);
+        mode_args.execution_mode = Some("missing".to_owned());
+        assert!(build_provider_candidates(&contract, &mode_catalog, &hardware, &mode_args).is_err());
 
         let mut uncapped_contract = contract.clone();
         uncapped_contract.enclaves[0]
@@ -114195,6 +116619,41 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(config.vllm_kv_cache_dtype.as_deref(), Some("fp8"));
         assert_eq!(config.vllm_gpu_memory_utilization_pct, Some(6));
         assert_eq!(config.vllm_gpu_memory_utilization_floor_pct, Some(1));
+        assert_eq!(config.vllm_enforce_eager, Some(false));
+        assert_eq!(config.vllm_compilation_mode, None);
+        assert_eq!(config.vllm_cudagraph_mode, None);
+        assert_eq!(config.vllm_linear_backend.as_deref(), Some("cutlass"));
+        assert_eq!(config.vllm_moe_backend.as_deref(), Some("cutlass"));
+        assert_eq!(config.vllm_mtp_num_speculative_tokens, None);
+        let mut legacy_selected = selected.clone();
+        legacy_selected.vllm_execution_profile = None;
+        let legacy_config = provider_engine_load_config(
+            &args,
+            &legacy_selected,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(legacy_config.vllm_enforce_eager, None);
+        assert_eq!(legacy_config.vllm_compilation_mode, None);
+        assert_eq!(legacy_config.vllm_cudagraph_mode, None);
+        assert_eq!(legacy_config.vllm_linear_backend, None);
+        assert_eq!(legacy_config.vllm_moe_backend, None);
+        assert_eq!(legacy_config.vllm_mtp_num_speculative_tokens, None);
+        let mut graph_selected = selected.clone();
+        let profile = graph_selected.vllm_execution_profile.as_mut().unwrap();
+        profile.compilation_mode = Some(0);
+        profile.cudagraph_mode = Some("FULL_DECODE_ONLY".to_owned());
+        let graph_config = provider_engine_load_config(
+            &args,
+            &graph_selected,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(graph_config.vllm_enforce_eager, Some(false));
+        assert_eq!(graph_config.vllm_compilation_mode, Some(0));
+        assert_eq!(graph_config.vllm_cudagraph_mode.as_deref(), Some("FULL_DECODE_ONLY"));
         assert_eq!(
             config.memory_limit_bytes,
             Some(selected.feasibility.memory_budget.worker_limit_bytes)
@@ -114206,6 +116665,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(
             provider_attestation_runtime_config(&selected).unwrap(),
             AttestationRuntimeConfig {
+                execution_mode: None,
                 model_class: DEFAULT_MODEL_CLASS.to_owned(),
                 backend: "vllm".to_owned(),
                 ctx: 131_072,
@@ -114214,6 +116674,31 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 max_num_tokens: Some(4096),
             }
         );
+        mode_catalog.vllm_execution_modes.get_mut(&selected.artifact.artifact_root)
+            .unwrap().get_mut("throughput").unwrap().generation_execution_profile =
+            Some(test_isolated_generation_profile());
+        mode_args.execution_mode = Some("throughput".to_owned());
+        let mut isolated = build_provider_candidates(&contract, &mode_catalog, &hardware, &mode_args)
+            .unwrap().remove(0);
+        let isolated_config = provider_engine_load_config(
+            &mode_args, &isolated, &artifact_paths, &ProviderBackendRuntime::default(),
+        ).unwrap();
+        assert_eq!(isolated_config.vllm_generation_topology,
+            Some(mayhem_engine::VllmGenerationTopology::IsolatedWorkers));
+        assert_eq!(isolated_config.vllm_max_num_seqs, Some(1));
+        assert_eq!(isolated_config.vllm_concurrent_generation_capacity,
+            Some(isolated.generation_execution_capacity));
+        assert_eq!(isolated_config.ctx_size, 131_072);
+        assert_eq!(isolated_config.memory_limit_bytes,
+            Some(isolated.feasibility.estimated_required_bytes));
+        assert_eq!(isolated_config.vllm_worker_address_space_limit_bytes,
+            Some(isolated.feasibility.memory_budget.worker_limit_bytes));
+        isolated.execution_mode = None;
+        assert!(provider_engine_load_config(
+            &mode_args, &isolated, &artifact_paths, &ProviderBackendRuntime::default(),
+        ).is_err());
+        assert_eq!(config.vllm_generation_topology, None);
+        assert_eq!(config.vllm_worker_address_space_limit_bytes, None);
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -114834,6 +117319,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             artifact_name: "onnx-lessac-low".to_owned(),
             artifact,
             generation_execution_profile: None,
+            vllm_execution_profile: None,
+            execution_mode: None,
             generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "piper".to_owned(),
@@ -114910,6 +117397,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             artifact_name: "comfy-runtime".to_owned(),
             artifact,
             generation_execution_profile: None,
+            vllm_execution_profile: None,
+            execution_mode: None,
             generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
@@ -115007,6 +117496,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
             generation_execution_profile: None,
+            vllm_execution_profile: None,
+            execution_mode: None,
             generation_execution_capacity: 1,
             verdict,
             price: None,
@@ -115183,6 +117674,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
             generation_execution_profile: None,
+            vllm_execution_profile: None,
+            execution_mode: None,
             generation_execution_capacity: 1,
             verdict,
             price: contract.prices.first().cloned(),
@@ -115277,6 +117770,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
             generation_execution_profile: None,
+            vllm_execution_profile: None,
+            execution_mode: None,
             generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
@@ -115364,6 +117859,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             artifact_name: "workflow-class".to_owned(),
             artifact,
             generation_execution_profile: None,
+            vllm_execution_profile: None,
+            execution_mode: None,
             generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
@@ -115422,6 +117919,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             artifact_name: "gguf-q4_k_m".to_owned(),
             artifact,
             generation_execution_profile: None,
+            vllm_execution_profile: None,
+            execution_mode: None,
             generation_execution_capacity: 1,
             verdict: BackendVerdict {
                 backend: "comfyui".to_owned(),
@@ -116687,6 +119186,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         terms.generation_execution_profile = Some(catalog::CatalogGenerationExecutionProfile {
             schema_version: 1,
             engine: "vllm".to_owned(),
+            topology: None,
             independent_dispatch: true,
             request_modalities: vec![vec!["text".to_owned()]],
             proof_sha256: "aa".repeat(32),
@@ -117148,12 +119648,109 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             PROVIDER_QWEN_REASONING_DELIMITERS,
             ProviderEngineToolStrategy::QwenFunctionXml,
             &tools,
+            true,
         )
         .expect("grammar-constrained tool call");
 
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0]["name"], "write");
         assert_eq!(calls[0]["arguments"], r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
+    fn provider_tool_parser_never_executes_a_call_inside_unfinished_reasoning() {
+        let tools = vec![ToolSpec::new(
+            "write",
+            json!({"type":"object","properties":{"path":{"type":"string"}}}),
+        )];
+        for text in [
+            r#"{"tool":"write","arguments":{"path":"README.md"}}"#,
+            "Consider this example:\n<tool_call>\n<function=write>\n<parameter=path>README.md</parameter>\n</function>\n</tool_call>",
+        ] {
+            assert!(provider_engine_tool_call_outputs_after_reasoning(
+                text,
+                ProviderReasoningOutputMode::StripPrefilled,
+                Some(true),
+                PROVIDER_QWEN_REASONING_DELIMITERS,
+                ProviderEngineToolStrategy::QwenFunctionXml,
+                &tools,
+                false,
+            ).is_none(), "unconstrained reasoning must not become an executable call");
+        }
+    }
+
+    #[test]
+    fn provider_tool_parser_rejects_reasoning_text_even_with_json_grammar() {
+        let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
+        for text in [
+            "Consider this example:\n<tool_call>\n<function=write>\n<parameter=path>README.md</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=write>\n<parameter=path>README.md</parameter>\n</function>\n</tool_call>",
+            "```json\n{\"tool\":\"write\",\"arguments\":{}}\n```",
+            "{\"tool\":\"write\",\"arguments\":{}",
+        ] {
+            assert!(provider_engine_tool_call_outputs_after_reasoning(
+                text,
+                ProviderReasoningOutputMode::StripPrefilled,
+                Some(true),
+                PROVIDER_QWEN_REASONING_DELIMITERS,
+                ProviderEngineToolStrategy::QwenFunctionXml,
+                &tools,
+                true,
+            ).is_none());
+        }
+    }
+
+    #[test]
+    fn provider_tool_parser_preserves_visible_native_call_without_grammar() {
+        let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
+        let text = "private reasoning</think>\n<tool_call>\n<function=write>\n<parameter=path>README.md</parameter>\n</function>\n</tool_call>";
+        for output_mode in [
+            ProviderReasoningOutputMode::StripPrefilled,
+            ProviderReasoningOutputMode::Preserve,
+        ] {
+            let calls = provider_engine_tool_call_outputs_after_reasoning(
+                text,
+                output_mode,
+                Some(true),
+                PROVIDER_QWEN_REASONING_DELIMITERS,
+                ProviderEngineToolStrategy::QwenFunctionXml,
+                &tools,
+                false,
+            )
+            .expect("visible native tool call");
+            assert_eq!(calls[0]["arguments"], r#"{"path":"README.md"}"#);
+        }
+    }
+
+    #[test]
+    fn provider_tool_parser_preserves_openai_grammar_call_and_schema_validation() {
+        let tools = vec![ToolSpec::new(
+            "write",
+            json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"],
+            }),
+        )];
+        for (arguments, valid) in [(json!({"path": "README.md"}), true), (json!({}), false)] {
+            let text =
+                json!({"tool_calls": [{"function": {"name": "write", "arguments": arguments}}]})
+                    .to_string();
+            let calls = provider_engine_tool_call_outputs_after_reasoning(
+                &text,
+                ProviderReasoningOutputMode::Preserve,
+                Some(true),
+                PROVIDER_QWEN_REASONING_DELIMITERS,
+                ProviderEngineToolStrategy::OpenAiToolCalls,
+                &tools,
+                true,
+            )
+            .expect("structured tool attempt");
+            assert_eq!(
+                validate_provider_engine_tool_call_outputs(&calls, &tools).is_ok(),
+                valid
+            );
+        }
     }
 
     #[test]
@@ -117167,6 +119764,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             PROVIDER_QWEN_REASONING_DELIMITERS,
             ProviderEngineToolStrategy::QwenFunctionXml,
             &tools,
+            false,
         )
         .is_none());
         let calls = provider_engine_tool_call_outputs_after_reasoning(
@@ -117176,6 +119774,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             PROVIDER_QWEN_REASONING_DELIMITERS,
             ProviderEngineToolStrategy::QwenFunctionXml,
             &tools,
+            true,
         )
         .expect("structured tool attempt");
         let error = validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap_err();
@@ -117229,6 +119828,255 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             json!({ "pattern": "**/*.md" })
         );
         assert_ne!(calls[1]["id"], calls[2]["id"]);
+    }
+
+    #[test]
+    fn qwen_xml_parameters_preserve_declared_strings() {
+        let tools = vec![ToolSpec::new(
+            "write_file",
+            json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                "required": ["path", "content"],
+                "additionalProperties": false
+            }),
+        )];
+        for content in [
+            "123",
+            "1.5",
+            "true",
+            "false",
+            "null",
+            "[1,2]",
+            "{\"a\":1}",
+            "\"quoted\"",
+            "",
+            "  123  ",
+            "\n  line one\nline two\n",
+        ] {
+            let xml = format!("<tool_call><function=write_file><parameter=path>\nindex.html\n</parameter><parameter=content>\n{content}\n</parameter></function></tool_call>");
+            let calls = provider_engine_tool_call_outputs(
+                &xml,
+                ProviderEngineToolStrategy::QwenFunctionXml,
+                &tools,
+            )
+            .unwrap();
+            validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap();
+            let arguments: Value =
+                serde_json::from_str(calls[0]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(
+                arguments,
+                json!({ "path": "index.html", "content": content })
+            );
+        }
+    }
+
+    #[test]
+    fn qwen_xml_parameters_preserve_json_typed_values() {
+        let tools = vec![ToolSpec::new(
+            "typed",
+            json!({
+                "type": "object",
+                "properties": {
+                    "integer": { "type": "integer" }, "number": { "type": "number" },
+                    "boolean": { "type": "boolean" }, "null": { "type": "null" },
+                    "array": { "type": "array", "items": { "type": "integer" } },
+                    "object": { "type": "object", "properties": { "x": { "type": "string" } } }
+                },
+                "required": ["integer", "number", "boolean", "null", "array", "object"]
+            }),
+        )];
+        let xml = "<tool_call><function=typed><parameter=integer>\n12\n</parameter><parameter=number>1.5</parameter><parameter=boolean>true</parameter><parameter=null>null</parameter><parameter=array>[1,2]</parameter><parameter=object>{\"x\":\"value\"}</parameter></function></tool_call>";
+        let calls = provider_engine_tool_call_outputs(
+            xml,
+            ProviderEngineToolStrategy::QwenFunctionXml,
+            &tools,
+        )
+        .unwrap();
+        validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap();
+        let arguments: Value =
+            serde_json::from_str(calls[0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            arguments,
+            json!({ "integer": 12, "number": 1.5, "boolean": true, "null": null, "array": [1,2], "object": { "x": "value" } })
+        );
+    }
+
+    #[test]
+    fn qwen_xml_parameters_use_schema_unions_and_local_refs() {
+        let tools = vec![ToolSpec::new(
+            "typed",
+            json!({
+                "type": "object",
+                "$defs": {
+                    "text": { "type": "string" },
+                    "count": { "type": "integer", "minimum": 1 },
+                    "text_alias": { "$ref": "#/$defs/text" }
+                },
+                "properties": {
+                    "nullable": { "type": ["string", "null"] },
+                    "union": { "oneOf": [{ "$ref": "#/$defs/text" }, { "type": "boolean" }] },
+                    "any": { "anyOf": [{ "type": "string" }, { "type": "integer" }] },
+                    "ref/~": { "$ref": "#/$defs/text_alias" },
+                    "count": { "$ref": "#/$defs/count" }
+                },
+                "required": ["nullable", "union", "any", "ref/~", "count"]
+            }),
+        )];
+        let xml = "<tool_call><function=typed><parameter=nullable>null</parameter><parameter=union>false</parameter><parameter=any>123</parameter><parameter=ref/~>\n{\"x\":1}\n</parameter><parameter=count>2</parameter></function></tool_call>";
+        let calls = provider_engine_tool_call_outputs(
+            xml,
+            ProviderEngineToolStrategy::QwenFunctionXml,
+            &tools,
+        )
+        .unwrap();
+        validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap();
+        let arguments: Value =
+            serde_json::from_str(calls[0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            arguments,
+            json!({ "nullable": null, "union": false, "any": 123, "ref/~": "{\"x\":1}", "count": 2 })
+        );
+    }
+
+    #[test]
+    fn qwen_xml_parameters_keep_legacy_values_for_permissive_property_schemas() {
+        for schema in [
+            json!({ "description": "Any value" }),
+            json!({ "$ref": "#/$defs/permissive" }),
+        ] {
+            let tools = vec![ToolSpec::new(
+                "typed",
+                json!({
+                    "type": "object",
+                    "$defs": { "permissive": {} },
+                    "properties": { "value": schema },
+                    "required": ["value"]
+                }),
+            )];
+            for (raw, expected) in [
+                ("123", json!(123)),
+                ("true", json!(true)),
+                ("null", Value::Null),
+                ("[1]", json!([1])),
+            ] {
+                let xml = format!("<tool_call><function=typed><parameter=value>\n{raw}\n</parameter></function></tool_call>");
+                let calls = provider_engine_tool_call_outputs(
+                    &xml,
+                    ProviderEngineToolStrategy::QwenFunctionXml,
+                    &tools,
+                )
+                .unwrap();
+                validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap();
+                let arguments: Value =
+                    serde_json::from_str(calls[0]["arguments"].as_str().unwrap()).unwrap();
+                assert_eq!(arguments["value"], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn qwen_xml_parameters_prefer_decoded_union_candidate_unless_invalid() {
+        for (schema, expected) in [
+            (json!({ "type": ["string", "integer"] }), json!(123)),
+            (
+                json!({ "oneOf": [{ "type": "string" }, { "type": "integer", "minimum": 200 }] }),
+                json!("123"),
+            ),
+        ] {
+            let tools = vec![ToolSpec::new(
+                "typed",
+                json!({
+                    "type": "object", "properties": { "value": schema }, "required": ["value"]
+                }),
+            )];
+            let calls = provider_engine_tool_call_outputs(
+                "<tool_call><function=typed><parameter=value>123</parameter></function></tool_call>",
+                ProviderEngineToolStrategy::QwenFunctionXml, &tools
+            ).unwrap();
+            validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap();
+            let arguments: Value =
+                serde_json::from_str(calls[0]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(arguments["value"], expected);
+        }
+    }
+
+    #[test]
+    fn qwen_xml_parameters_leave_invalid_values_for_existing_guard() {
+        for (schema, raw) in [
+            (json!({ "type": "integer" }), "1.5"),
+            (json!({ "type": "boolean" }), "TRUE"),
+            (json!({ "type": "object" }), "[]"),
+            (
+                json!({ "type": "array", "items": { "type": "integer" } }),
+                "[\"bad\"]",
+            ),
+            (
+                json!({ "type": "string", "enum": ["allowed"] }),
+                "\"allowed\"",
+            ),
+            (json!({ "type": "integer", "minimum": 1 }), "0"),
+        ] {
+            let tools = vec![ToolSpec::new(
+                "typed",
+                json!({
+                    "type": "object", "properties": { "value": schema }, "required": ["value"]
+                }),
+            )];
+            let xml = format!("<tool_call><function=typed><parameter=value>\n{raw}\n</parameter></function></tool_call>");
+            let calls = provider_engine_tool_call_outputs(
+                &xml,
+                ProviderEngineToolStrategy::QwenFunctionXml,
+                &tools,
+            )
+            .unwrap();
+            let error = validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap_err();
+            assert!(
+                error.to_string().contains("do not satisfy the schema"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn qwen_xml_parameters_do_not_invent_missing_required_arguments() {
+        let tools = vec![ToolSpec::new(
+            "write_file",
+            json!({
+                "type": "object",
+                "properties": { "path": { "type": "string" }, "content": { "type": "string" } },
+                "required": ["path", "content"]
+            }),
+        )];
+        let calls = provider_engine_tool_call_outputs(
+            "<tool_call><function=write_file><parameter=content>123</parameter></function></tool_call>",
+            ProviderEngineToolStrategy::QwenFunctionXml, &tools
+        ).unwrap();
+        let arguments: Value =
+            serde_json::from_str(calls[0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments, json!({ "content": "123" }));
+        assert!(validate_provider_engine_tool_call_outputs(&calls, &tools).is_err());
+    }
+
+    #[test]
+    fn qwen_xml_parameters_keep_untyped_decoding_and_reject_duplicate_parameters() {
+        let tools = vec![ToolSpec::new(
+            "typed",
+            json!({
+                "type": "object", "properties": { "value": {} }
+            }),
+        )];
+        let calls = provider_engine_tool_call_outputs(
+            "<tool_call><function=typed><parameter=value>123</parameter></function></tool_call>",
+            ProviderEngineToolStrategy::QwenFunctionXml,
+            &tools,
+        )
+        .unwrap();
+        assert_eq!(calls[0]["arguments"], "{\"value\":123}");
+        assert!(provider_engine_tool_call_outputs(
+            "<tool_call><function=typed><parameter=value>123</parameter><parameter=value>456</parameter></function></tool_call>",
+            ProviderEngineToolStrategy::QwenFunctionXml, &tools
+        ).is_none());
     }
 
     #[test]
@@ -119831,6 +122679,7 @@ State initialization...
             source: "test resume memory".to_owned(),
             probe: CalibrationMemoryProbe::ProcessRss,
             chatterbox_device: None,
+            vllm_replica_limit_bytes: None,
         };
 
         validate_resumed_canary_core(
@@ -119847,10 +122696,31 @@ State initialization...
         )
         .unwrap();
 
-        let mut mismatched = report;
+        let mut mismatched = report.clone();
         mismatched.runtime_config.ctx_size += 1;
         let error = validate_resumed_canary_core(
             &mismatched,
+            model,
+            "gguf-q4_k_m",
+            artifact,
+            &artifact_path,
+            &prompts,
+            &canary_sha,
+            &runtime_config,
+            &calibration_memory,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("runtime configuration"));
+
+        let mut mismatched_mode = report;
+        mismatched_mode.runtime_config.execution_mode =
+            Some(mayhem_proto::ExecutionModeBinding {
+                mode_id: "throughput".to_owned(),
+                policy_hash: "ab".repeat(32),
+            });
+        let error = validate_resumed_canary_core(
+            &mismatched_mode,
             model,
             "gguf-q4_k_m",
             artifact,
@@ -119955,6 +122825,250 @@ State initialization...
     }
 
     #[test]
+    fn calibration_vllm_execution_profile_binds_defaults_and_rejects_drift() {
+        let profile = catalog::CatalogVllmExecutionProfile {
+            schema_version: 1,
+            engine: "vllm".to_owned(),
+            runtime: None,
+            enforce_eager: false,
+            compilation_mode: None,
+            cudagraph_mode: None,
+            linear_backend: "cutlass".to_owned(),
+            moe_backend: "cutlass".to_owned(),
+            speculative_decoding: None,
+            proof_sha256: "ab".repeat(32),
+        };
+        let mut artifact =
+            test_catalog(&"aa".repeat(32)).models[0].artifacts["gguf-q4_k_m"].clone();
+        artifact.engine = "vllm".to_owned();
+        let mut args = test_calibrate_canary_args();
+        bind_calibration_vllm_execution_profile(&mut args, None).unwrap();
+        let legacy = catalog_canary_runtime_config(&artifact, Path::new("model"), &args).unwrap();
+        validate_calibration_vllm_execution_profile(&legacy, None).unwrap();
+        assert!(validate_calibration_vllm_execution_profile(&legacy, Some(&profile)).is_err());
+
+        bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).unwrap();
+        let runtime = catalog_canary_runtime_config(&artifact, Path::new("model"), &args).unwrap();
+        assert_eq!(runtime.vllm_enforce_eager, Some(false));
+        assert_eq!(runtime.vllm_linear_backend.as_deref(), Some("cutlass"));
+        validate_calibration_vllm_execution_profile(&runtime, Some(&profile)).unwrap();
+        assert!(validate_calibration_vllm_execution_profile(&runtime, None).is_err());
+
+        args.vllm_enforce_eager = Some(true);
+        assert!(bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).is_err());
+        args.vllm_enforce_eager = Some(false);
+        args.vllm_mtp_num_speculative_tokens = Some(3);
+        assert!(bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).is_err());
+
+        let mut mtp_profile = profile.clone();
+        mtp_profile.speculative_decoding = Some(catalog::CatalogVllmSpeculativeDecodingProfile {
+            method: "mtp".to_owned(),
+            num_speculative_tokens: 3,
+        });
+        bind_calibration_vllm_execution_profile(&mut args, Some(&mtp_profile)).unwrap();
+        let runtime = catalog_canary_runtime_config(&artifact, Path::new("model"), &args).unwrap();
+        validate_calibration_vllm_execution_profile(&runtime, Some(&mtp_profile)).unwrap();
+        assert!(validate_calibration_vllm_execution_profile(&runtime, Some(&profile)).is_err());
+    }
+
+    #[test]
+    fn calibration_vllm_execution_profile_runtime_rejects_mismatch() {
+        let mut profile: catalog::CatalogVllmExecutionProfile = serde_json::from_value(json!({
+            "schema_version": 1,
+            "engine": "vllm",
+            "enforce_eager": false,
+            "linear_backend": "auto",
+            "moe_backend": "cutlass",
+            "proof_sha256": "ab".repeat(32),
+        })).unwrap();
+        let artifact = test_vllm_artifact();
+        let mut args = test_calibrate_canary_args();
+        bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).unwrap();
+        let legacy = catalog_canary_runtime_config(&artifact, Path::new("model"), &args).unwrap();
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(encoded.get("vllm_runtime").is_none());
+        let restored: CatalogCanaryRuntimeConfig = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(restored.vllm_runtime, None);
+        assert_eq!(serde_json::to_value(restored).unwrap(), encoded);
+        validate_calibration_vllm_execution_profile(&legacy, Some(&profile)).unwrap();
+
+        profile.runtime = Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1);
+        bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).unwrap();
+        let runtime = catalog_canary_runtime_config(&artifact, Path::new("model"), &args).unwrap();
+        validate_calibration_vllm_execution_profile(&runtime, Some(&profile)).unwrap();
+        assert!(validate_calibration_vllm_execution_profile(&legacy, Some(&profile)).is_err());
+        let encoded = serde_json::to_value(&runtime).unwrap();
+        assert_eq!(encoded["vllm_runtime"], "flashinfer_speculative_metadata_v1");
+        assert_eq!(serde_json::from_value::<CatalogCanaryRuntimeConfig>(encoded.clone()).unwrap(), runtime);
+        let mut unknown = encoded;
+        unknown["vllm_runtime"] = json!("unknown_runtime");
+        assert!(serde_json::from_value::<CatalogCanaryRuntimeConfig>(unknown).is_err());
+
+        profile.runtime = None;
+        assert!(validate_calibration_vllm_execution_profile(&runtime, Some(&profile)).is_err());
+        assert!(validate_calibration_vllm_execution_profile(&runtime, None).is_err());
+        let mut unprofiled = legacy.clone();
+        unprofiled.vllm_runtime = runtime.vllm_runtime;
+        unprofiled.vllm_enforce_eager = None;
+        unprofiled.vllm_linear_backend = None;
+        unprofiled.vllm_moe_backend = None;
+        assert!(validate_calibration_vllm_execution_profile(&unprofiled, None).is_err());
+        bind_calibration_vllm_execution_profile(&mut args, None).unwrap();
+        assert_eq!(args.vllm_runtime, None);
+    }
+
+    #[test]
+    fn calibration_vllm_execution_profile_compilation_binding_and_report_drift() {
+        let mut profile = catalog::CatalogVllmExecutionProfile {
+            schema_version: 1,
+            engine: "vllm".to_owned(),
+            runtime: None,
+            enforce_eager: false,
+            compilation_mode: None,
+            cudagraph_mode: None,
+            linear_backend: "auto".to_owned(),
+            moe_backend: "cutlass".to_owned(),
+            speculative_decoding: None,
+            proof_sha256: "ab".repeat(32),
+        };
+        let artifact = test_vllm_artifact();
+        let mut args = test_calibrate_canary_args();
+        bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).unwrap();
+        let legacy = catalog_canary_runtime_config(&artifact, Path::new("model"), &args).unwrap();
+        let encoded = serde_json::to_value(&legacy).unwrap();
+        assert!(encoded.get("execution_mode").is_none());
+        assert!(encoded.get("vllm_compilation_mode").is_none());
+        assert!(encoded.get("vllm_cudagraph_mode").is_none());
+        let restored: CatalogCanaryRuntimeConfig = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(legacy, restored);
+        assert_eq!(serde_json::to_value(restored).unwrap(), encoded);
+
+        let mut mode_runtime = legacy.clone();
+        mode_runtime.execution_mode = Some(mayhem_proto::ExecutionModeBinding {
+            mode_id: "throughput".to_owned(),
+            policy_hash: "ab".repeat(32),
+        });
+        let encoded_mode = serde_json::to_value(&mode_runtime).unwrap();
+        assert_eq!(encoded_mode["execution_mode"]["mode_id"], "throughput");
+        assert_eq!(
+            serde_json::from_value::<CatalogCanaryRuntimeConfig>(encoded_mode).unwrap(),
+            mode_runtime
+        );
+
+        args.vllm_compilation_mode = Some(0);
+        assert!(bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).is_err());
+        args.vllm_compilation_mode = None;
+        args.vllm_cudagraph_mode = Some("NONE".to_owned());
+        assert!(bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).is_err());
+
+        for (mode, graph) in [
+            (Some(0), None),
+            (None, Some("FULL_DECODE_ONLY")),
+            (Some(0), Some("FULL_DECODE_ONLY")),
+        ] {
+            profile.compilation_mode = mode;
+            profile.cudagraph_mode = graph.map(str::to_owned);
+            let mut args = test_calibrate_canary_args();
+            bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).unwrap();
+            validate_calibration_args_for_artifact(&artifact, &args).unwrap();
+            let runtime = catalog_canary_runtime_config(&artifact, Path::new("model"), &args).unwrap();
+            assert_eq!(runtime.vllm_compilation_mode, mode);
+            assert_eq!(runtime.vllm_cudagraph_mode.as_deref(), graph);
+            validate_calibration_vllm_execution_profile(&runtime, Some(&profile)).unwrap();
+            assert!(validate_calibration_vllm_execution_profile(&runtime, None).is_err());
+            assert!(validate_calibration_vllm_execution_profile(&legacy, Some(&profile)).is_err());
+            bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).unwrap();
+            for (field, value) in [
+                ("vllm_compilation_mode", json!(3)),
+                ("vllm_cudagraph_mode", json!("NONE")),
+            ] {
+                let mut changed = serde_json::to_value(&runtime).unwrap();
+                changed[field] = value;
+                let changed = serde_json::from_value(changed).unwrap();
+                assert!(validate_calibration_vllm_execution_profile(&changed, Some(&profile)).is_err());
+            }
+            args.vllm_compilation_mode = Some(3);
+            assert!(bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).is_err());
+            args.vllm_compilation_mode = mode;
+            args.vllm_cudagraph_mode = Some("NONE".to_owned());
+            assert!(bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).is_err());
+        }
+    }
+
+    #[test]
+    fn calibration_vllm_execution_profile_compilation_cli_validation() {
+        let calibration = ["mayhem", "--model", "test/model", "--artifact", "vllm",
+            "--artifact-path", "/tmp/checkpoint"];
+        let plan = ["mayhem", "--artifact-base", "/tmp/artifacts", "--report-dir", "/tmp/reports"];
+        for (flag, value) in [
+            ("--vllm-compilation-mode", "-1"),
+            ("--vllm-compilation-mode", "4"),
+            ("--vllm-compilation-mode", "0.0"),
+            ("--vllm-compilation-mode", "true"),
+            ("--vllm-cudagraph-mode", "full"),
+            ("--vllm-cudagraph-mode", "UNKNOWN"),
+        ] {
+            assert!(CatalogCalibrateCanaryArgs::try_parse_from(
+                calibration.into_iter().chain([flag, value])).is_err());
+            assert!(CatalogCanaryPlanArgs::try_parse_from(
+                plan.into_iter().chain([flag, value])).is_err());
+        }
+        let controls = ["--vllm-enforce-eager", "false", "--vllm-compilation-mode", "0",
+            "--vllm-cudagraph-mode", "FULL_DECODE_ONLY"];
+        let mut args = CatalogCalibrateCanaryArgs::try_parse_from(
+            calibration.into_iter().chain(controls)).unwrap();
+        let plan_args = CatalogCanaryPlanArgs::try_parse_from(plan.into_iter().chain(controls)).unwrap();
+        assert_eq!(plan_args.vllm_compilation_mode, args.vllm_compilation_mode);
+        assert_eq!(plan_args.vllm_cudagraph_mode, args.vllm_cudagraph_mode);
+        let artifact = test_vllm_artifact();
+        validate_calibration_args_for_artifact(&artifact, &args).unwrap();
+        for eager in [None, Some(true)] {
+            args.vllm_enforce_eager = eager;
+            assert!(validate_calibration_args_for_artifact(&artifact, &args).is_err());
+        }
+        args.vllm_cudagraph_mode = Some("NONE".to_owned());
+        validate_calibration_args_for_artifact(&artifact, &args).unwrap();
+        args.vllm_compilation_mode = Some(1);
+        assert!(validate_calibration_args_for_artifact(&artifact, &args).is_err());
+        let non_vllm = &test_catalog(&"aa".repeat(32)).models[0].artifacts["gguf-q4_k_m"];
+        for (mode, graph) in [(Some(0), None), (None, Some("NONE"))] {
+            args.vllm_enforce_eager = None;
+            args.vllm_compilation_mode = mode;
+            args.vllm_cudagraph_mode = graph.map(str::to_owned);
+            assert!(validate_calibration_args_for_artifact(non_vllm, &args).is_err());
+        }
+    }
+
+    #[test]
+    fn calibrate_canary_execution_mode_is_optional_and_exact() {
+        let baseline = CatalogCalibrateCanaryArgs::try_parse_from([
+            "mayhem",
+            "--model",
+            "test/model",
+            "--artifact",
+            "vllm",
+            "--artifact-path",
+            "/tmp/checkpoint",
+        ])
+        .unwrap();
+        assert!(baseline.execution_mode.is_none());
+
+        let mode = CatalogCalibrateCanaryArgs::try_parse_from([
+            "mayhem",
+            "--model",
+            "test/model",
+            "--artifact",
+            "vllm",
+            "--execution-mode",
+            "throughput",
+            "--artifact-path",
+            "/tmp/checkpoint",
+        ])
+        .unwrap();
+        assert_eq!(mode.execution_mode.as_deref(), Some("throughput"));
+    }
+
+    #[test]
     fn calibration_vllm_memory_controls_validate_and_propagate() {
         let catalog = test_catalog(&"aa".repeat(32));
         let model = &catalog.models[0];
@@ -119967,6 +123081,12 @@ State initialization...
         args.vllm_kv_cache_dtype = Some("fp8".to_owned());
         args.vllm_max_num_seqs = Some(2);
         args.vllm_max_num_batched_tokens = Some(2048);
+        args.vllm_enforce_eager = Some(false);
+        args.vllm_compilation_mode = Some(0);
+        args.vllm_cudagraph_mode = Some("FULL_DECODE_ONLY".to_owned());
+        args.vllm_linear_backend = Some("auto".to_owned());
+        args.vllm_moe_backend = Some("cutlass".to_owned());
+        args.vllm_mtp_num_speculative_tokens = Some(3);
 
         validate_calibration_args_for_artifact(&artifact, &args).unwrap();
         let runtime =
@@ -119978,6 +123098,12 @@ State initialization...
         assert_eq!(runtime.vllm_kv_cache_dtype.as_deref(), Some("fp8"));
         assert_eq!(runtime.vllm_max_num_seqs, Some(2));
         assert_eq!(runtime.vllm_max_num_batched_tokens, Some(2048));
+        assert_eq!(runtime.vllm_enforce_eager, Some(false));
+        assert_eq!(runtime.vllm_compilation_mode, Some(0));
+        assert_eq!(runtime.vllm_cudagraph_mode.as_deref(), Some("FULL_DECODE_ONLY"));
+        assert_eq!(runtime.vllm_linear_backend.as_deref(), Some("auto"));
+        assert_eq!(runtime.vllm_moe_backend.as_deref(), Some("cutlass"));
+        assert_eq!(runtime.vllm_mtp_num_speculative_tokens, Some(3));
 
         let mut legacy_args = test_calibrate_canary_args();
         legacy_args.trt_max_batch_size = Some(3);
@@ -120007,6 +123133,12 @@ State initialization...
         plan_args.vllm_kv_cache_dtype = Some("fp8".to_owned());
         plan_args.vllm_max_num_seqs = Some(2);
         plan_args.vllm_max_num_batched_tokens = Some(2048);
+        plan_args.vllm_enforce_eager = Some(false);
+        plan_args.vllm_compilation_mode = Some(0);
+        plan_args.vllm_cudagraph_mode = Some("FULL_DECODE_ONLY".to_owned());
+        plan_args.vllm_linear_backend = Some("auto".to_owned());
+        plan_args.vllm_moe_backend = Some("cutlass".to_owned());
+        plan_args.vllm_mtp_num_speculative_tokens = Some(3);
         let command = catalog_canary_calibration_plan_command(CatalogCanaryCalibrationPlanInput {
             catalog_path: Path::new("/tmp/catalog.json"),
             canaries_dir: Path::new("/tmp/canaries"),
@@ -120036,6 +123168,12 @@ State initialization...
             ("--vllm-kv-cache-dtype", "fp8"),
             ("--vllm-max-num-seqs", "2"),
             ("--vllm-max-num-batched-tokens", "2048"),
+            ("--vllm-enforce-eager", "false"),
+            ("--vllm-compilation-mode", "0"),
+            ("--vllm-cudagraph-mode", "FULL_DECODE_ONLY"),
+            ("--vllm-linear-backend", "auto"),
+            ("--vllm-moe-backend", "cutlass"),
+            ("--vllm-mtp-num-speculative-tokens", "3"),
         ] {
             assert!(command
                 .argv
@@ -120732,6 +123870,7 @@ State initialization...
             source: "test-process-rss".to_owned(),
             probe: CalibrationMemoryProbe::ProcessRss,
             chatterbox_device: None,
+            vllm_replica_limit_bytes: None,
         };
 
         let (value, baseline, peak) =
@@ -120834,6 +123973,7 @@ State initialization...
             source: "test-process-rss".to_owned(),
             probe: CalibrationMemoryProbe::ProcessRss,
             chatterbox_device: None,
+            vllm_replica_limit_bytes: None,
         };
         let mut backend = SpecialityCalibrationBackend::default();
 
@@ -120906,6 +124046,7 @@ State initialization...
             source: "test-process-rss".to_owned(),
             probe: CalibrationMemoryProbe::ProcessRss,
             chatterbox_device: None,
+            vllm_replica_limit_bytes: None,
         };
         let mut off_backend = SpecialityCalibrationBackend::default();
         let off = calibrate_model_specialities(
@@ -121916,6 +125057,404 @@ State initialization...
     }
 
     #[test]
+    fn canary_evidence_vllm_execution_profile_proof_binds_exact_report_bytes() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
+        let artifact = catalog.models[0].artifacts.get_mut("gguf-q4_k_m").unwrap();
+        artifact.engine = "vllm".to_owned();
+        let root = artifact.artifact_root.clone();
+        let mut profile = catalog::CatalogVllmExecutionProfile {
+            schema_version: 1,
+            engine: "vllm".to_owned(),
+            runtime: None,
+            enforce_eager: false,
+            compilation_mode: Some(0),
+            cudagraph_mode: Some("FULL_DECODE_ONLY".to_owned()),
+            linear_backend: "auto".to_owned(),
+            moe_backend: "cutlass".to_owned(),
+            speculative_decoding: None,
+            proof_sha256: String::new(),
+        };
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = catalog.models[0].model_id.clone();
+        calibration.engine = "vllm".to_owned();
+        let mut args = test_calibrate_canary_args();
+        bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).unwrap();
+        calibration.runtime_config = catalog_canary_runtime_config(
+            &catalog.models[0].artifacts["gguf-q4_k_m"],
+            &calibration.artifact_path,
+            &args,
+        )
+        .unwrap();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        let report_path = write_temp_calibration_report(&calibration);
+        let pretty_bytes = fs::read(&report_path).unwrap();
+        let compact_bytes = serde_json::to_vec(&calibration).unwrap();
+        let mut retained_bytes = b" \n".to_vec();
+        retained_bytes.extend_from_slice(&pretty_bytes);
+        retained_bytes.extend_from_slice(b"\r\n");
+        fs::write(&report_path, &retained_bytes).unwrap();
+        let retained_sha256 = file_sha256_hex(&report_path).unwrap();
+        assert_eq!(
+            read_json_file(&report_path).unwrap(),
+            serde_json::to_value(&calibration).unwrap()
+        );
+        catalog.generation_execution_profiles.insert(
+            root.clone(),
+            catalog::CatalogGenerationExecutionProfile {
+                schema_version: 1,
+                engine: "vllm".to_owned(),
+                topology: None,
+                independent_dispatch: true,
+                request_modalities: vec![vec!["text".to_owned()]],
+                proof_sha256: "ab".repeat(32),
+            },
+        );
+
+        for mode in [
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
+            CatalogCanaryReportMode::ApplyToCatalog,
+        ] {
+            profile.proof_sha256 = retained_sha256.clone();
+            catalog
+                .vllm_execution_profiles
+                .insert(root.clone(), profile.clone());
+            let valid = catalog_canary_evidence_report(
+                &catalog,
+                PathBuf::from("catalog.json"),
+                canaries_dir.clone(),
+                true,
+                std::slice::from_ref(&report_path),
+                mode,
+            );
+            assert!(valid.ok, "{mode:?}: {:?}", valid.errors);
+
+            for proof in [
+                "00".repeat(32),
+                String::new(),
+                retained_sha256.to_ascii_uppercase(),
+                sha256_bytes_hex(&pretty_bytes),
+                sha256_bytes_hex(&compact_bytes),
+            ] {
+                assert_ne!(proof, retained_sha256);
+                catalog
+                    .vllm_execution_profiles
+                    .get_mut(&root)
+                    .unwrap()
+                    .proof_sha256 = proof;
+                let invalid = catalog_canary_evidence_report(
+                    &catalog,
+                    PathBuf::from("catalog.json"),
+                    canaries_dir.clone(),
+                    true,
+                    std::slice::from_ref(&report_path),
+                    mode,
+                );
+                assert!(!invalid.ok, "{mode:?} accepted an unbound proof");
+                assert!(
+                    invalid.errors.iter().any(|error| {
+                        error.contains("vLLM execution profile proof_sha256")
+                            && error.contains(&retained_sha256)
+                    }),
+                    "{:?}",
+                    invalid.errors
+                );
+            }
+        }
+
+        calibration.runtime_config.vllm_enforce_eager = Some(true);
+        write_json_file(&report_path, &calibration).unwrap();
+        profile.proof_sha256 = file_sha256_hex(&report_path).unwrap();
+        catalog.vllm_execution_profiles.insert(root, profile);
+        for mode in [
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
+            CatalogCanaryReportMode::ApplyToCatalog,
+        ] {
+            let invalid = catalog_canary_evidence_report(
+                &catalog,
+                PathBuf::from("catalog.json"),
+                canaries_dir.clone(),
+                true,
+                std::slice::from_ref(&report_path),
+                mode,
+            );
+            assert!(!invalid.ok);
+            assert!(invalid
+                .errors
+                .iter()
+                .any(|error| error.contains("vLLM execution settings")));
+            assert!(!invalid
+                .errors
+                .iter()
+                .any(|error| error.contains("proof_sha256")));
+        }
+        let _ = fs::remove_file(report_path);
+        let _ = fs::remove_dir_all(canaries_dir);
+    }
+
+    #[test]
+    fn canary_evidence_vllm_execution_profile_proof_preserves_unprofiled_evidence() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
+        let root = catalog.models[0].artifacts["gguf-q4_k_m"]
+            .artifact_root
+            .clone();
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = catalog.models[0].model_id.clone();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+
+        for (engine, independent_dispatch) in [("llama.cpp", false), ("vllm", false), ("vllm", true)] {
+            catalog.models[0]
+                .artifacts
+                .get_mut("gguf-q4_k_m")
+                .unwrap()
+                .engine = engine.to_owned();
+            calibration.engine = engine.to_owned();
+            let report_path = write_temp_calibration_report(&calibration);
+            if independent_dispatch {
+                let independent_proof = "ab".repeat(32);
+                assert_ne!(independent_proof, file_sha256_hex(&report_path).unwrap());
+                catalog.generation_execution_profiles.insert(
+                    root.clone(),
+                    catalog::CatalogGenerationExecutionProfile {
+                        schema_version: 1,
+                        engine: "vllm".to_owned(),
+                        topology: None,
+                        independent_dispatch: true,
+                        request_modalities: vec![vec!["text".to_owned()]],
+                        proof_sha256: independent_proof,
+                    },
+                );
+            }
+            for mode in [
+                CatalogCanaryReportMode::VerifyMatchesCatalog,
+                CatalogCanaryReportMode::ApplyToCatalog,
+            ] {
+                let report = catalog_canary_evidence_report(
+                    &catalog,
+                    PathBuf::from("catalog.json"),
+                    canaries_dir.clone(),
+                    true,
+                    std::slice::from_ref(&report_path),
+                    mode,
+                );
+                assert!(
+                    report.ok,
+                    "{engine}, {independent_dispatch}, {mode:?}: {:?}",
+                    report.errors
+                );
+            }
+            let _ = fs::remove_file(report_path);
+        }
+        let _ = fs::remove_dir_all(canaries_dir);
+    }
+
+    #[test]
+    fn canary_evidence_binds_execution_mode_policy_report_and_input_bytes() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        catalog.models[0].artifacts.get_mut("gguf-q4_k_m").unwrap().engine =
+            "vllm".to_owned();
+        insert_test_canary_expectation(
+            &mut catalog.models[0],
+            "gguf-q4_k_m",
+            "aa".repeat(32),
+        );
+        let root = catalog.models[0].artifacts["gguf-q4_k_m"]
+            .artifact_root
+            .clone();
+        let mut restricted = catalog.models[0].adapter.endpoint_families[0].clone();
+        restricted.request_attribute_specs.retain(|path, _| path == "min_p");
+        let min_p = restricted.request_attribute_specs.get_mut("min_p").unwrap();
+        min_p.default = None;
+        min_p.minimum = Some(0.0);
+        min_p.maximum = Some(0.0);
+        min_p.enum_values = vec![json!(0.0)];
+        min_p.calibration_values = vec![json!(0.0)];
+        restricted.request_attributes = vec!["min_p".to_owned()];
+        restricted.required_request_attributes.clear();
+        restricted.response_attributes.clear();
+        restricted.required_response_attributes.clear();
+        restricted.response_attribute_specs.clear();
+        restricted.interaction_groups.clear();
+        restricted.speciality_mappings.clear();
+
+        let mut mode_canary = catalog.models[0].canary.clone();
+        mode_canary.set_id = "test-mode-canary".to_owned();
+        let mode_dir = test_canary_dir(&mode_canary.set_id, 0.0);
+        let baseline_dir = test_canary_dir("test-canary", 0.0);
+        fs::copy(
+            baseline_dir.join("test-canary.json"),
+            mode_dir.join("test-canary.json"),
+        )
+        .unwrap();
+        let _ = fs::remove_dir_all(baseline_dir);
+        let mode_input_sha256 = canary_set_file_sha256(&mode_dir, &mode_canary.set_id).unwrap();
+        let profile = catalog::CatalogVllmExecutionProfile {
+            schema_version: 1,
+            engine: "vllm".to_owned(),
+            runtime: None,
+            enforce_eager: false,
+            compilation_mode: None,
+            cudagraph_mode: None,
+            linear_backend: "auto".to_owned(),
+            moe_backend: "cutlass".to_owned(),
+            speculative_decoding: None,
+            proof_sha256: "00".repeat(32),
+        };
+        let mut execution_mode = catalog::CatalogVllmExecutionMode {
+            schema_version: 1,
+            profile: profile.clone(),
+            generation_execution_profile: None,
+            requests: mayhem_proto::ExecutionModeRequestPolicy {
+                endpoint_families: vec![restricted],
+            },
+            canary: mode_canary,
+            canary_set_sha256: mode_input_sha256.clone(),
+            modality_fingerprints: BTreeMap::from([("text".to_owned(), "cc".repeat(32))]),
+            resource_profiles: BTreeMap::new(),
+            speciality_calibrations: BTreeMap::new(),
+        };
+        let binding = execution_mode.binding(&root, "throughput").unwrap();
+        let effective = catalog::execution_mode_model(
+            &catalog.models[0],
+            "gguf-q4_k_m",
+            &execution_mode,
+        )
+        .unwrap();
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = catalog.models[0].model_id.clone();
+        calibration.engine = "vllm".to_owned();
+        calibration.canary_set = effective.canary.set_id.clone();
+        calibration.canary_set_sha256 = mode_input_sha256;
+        calibration.endpoint_calibration =
+            test_endpoint_calibration_report_for_adapter(&effective.adapter);
+        let mut args = test_calibrate_canary_args();
+        bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).unwrap();
+        calibration.runtime_config = catalog_canary_runtime_config(
+            &effective.artifacts["gguf-q4_k_m"],
+            Path::new("model"),
+            &args,
+        )
+        .unwrap();
+        calibration.runtime_config.execution_mode = Some(binding.clone());
+        let report_path = write_temp_calibration_report(&calibration);
+        execution_mode.profile.proof_sha256 = file_sha256_hex(&report_path).unwrap();
+        catalog.vllm_execution_modes.insert(
+            root.clone(),
+            BTreeMap::from([("throughput".to_owned(), execution_mode)]),
+        );
+
+        let evidence = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            mode_dir.clone(),
+            true,
+            std::slice::from_ref(&report_path),
+            CatalogCanaryReportMode::ApplyToCatalog,
+        );
+        assert!(evidence.ok, "{:?}", evidence.errors);
+        assert_eq!(evidence.report_count, 1);
+        assert_eq!(evidence.entries.len(), 2);
+        assert!(evidence
+            .entries
+            .iter()
+            .find(|entry| entry.execution_mode.is_none())
+            .unwrap()
+            .report_path
+            .is_none());
+        assert_eq!(
+            evidence.entries.iter().find_map(|entry| entry
+                .execution_mode
+                .as_ref()
+                .map(|binding| binding.mode_id.as_str())),
+            Some("throughput")
+        );
+
+        calibration.runtime_config.execution_mode.as_mut().unwrap().policy_hash = "ff".repeat(32);
+        write_json_file(&report_path, &calibration).unwrap();
+        catalog
+            .vllm_execution_modes
+            .get_mut(&root)
+            .unwrap()
+            .get_mut("throughput")
+            .unwrap()
+            .profile
+            .proof_sha256 = file_sha256_hex(&report_path).unwrap();
+        let forged = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            mode_dir.clone(),
+            true,
+            std::slice::from_ref(&report_path),
+            CatalogCanaryReportMode::ApplyToCatalog,
+        );
+        assert!(!forged.ok);
+        assert!(forged.errors.iter().any(|error| error.contains("mode binding")));
+
+        fs::write(
+            mode_dir.join("test-mode-canary.json"),
+            b"{\"changed\":true}",
+        )
+        .unwrap();
+        let stale_input = catalog_canary_evidence_report(
+            &catalog,
+            PathBuf::from("catalog.json"),
+            mode_dir.clone(),
+            true,
+            std::slice::from_ref(&report_path),
+            CatalogCanaryReportMode::ApplyToCatalog,
+        );
+        assert!(!stale_input.ok);
+        assert!(stale_input
+            .errors
+            .iter()
+            .any(|error| error.contains("current canary input hash")));
+        let _ = fs::remove_file(report_path);
+        let _ = fs::remove_dir_all(mode_dir);
+    }
+
+    #[test]
+    fn canary_evidence_rejects_unbound_vllm_execution_settings() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        catalog.models[0].tier = "launch".to_owned();
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
+        let canaries_dir = test_canary_dir("test-canary", 0.0);
+        let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
+        calibration.model_id = "test/model@4bit".to_owned();
+        stamp_test_calibration_report(&mut calibration, &canaries_dir);
+        calibration.runtime_config.vllm_enforce_eager = Some(false);
+        let report_path = write_temp_calibration_report(&calibration);
+
+        for mode in [
+            CatalogCanaryReportMode::VerifyMatchesCatalog,
+            CatalogCanaryReportMode::ApplyToCatalog,
+        ] {
+            let report = catalog_canary_evidence_report(
+                &catalog,
+                PathBuf::from("catalog.json"),
+                canaries_dir.clone(),
+                true,
+                std::slice::from_ref(&report_path),
+                mode,
+            );
+            assert!(!report.ok);
+            assert!(
+                report
+                    .errors
+                    .iter()
+                    .any(|error| error.contains("vLLM execution settings")),
+                "{:?}",
+                report.errors
+            );
+        }
+    }
+
+    #[test]
     fn canary_evidence_rejects_missing_endpoint_calibration_row() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
@@ -122277,6 +125816,29 @@ State initialization...
         );
         assert_eq!(merged.runtime_config.threads, Some(12));
 
+        let mut changed_execution = cuda.clone();
+        changed_execution.runtime_config.vllm_enforce_eager = Some(false);
+        let error = merge_token_canary_calibration_reports(
+            &catalog.models[0],
+            &prompts,
+            vec![metal.clone(), changed_execution],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("same vLLM execution profile"));
+
+        let mut changed_mode = cuda.clone();
+        changed_mode.runtime_config.execution_mode = Some(mayhem_proto::ExecutionModeBinding {
+            mode_id: "throughput".to_owned(),
+            policy_hash: "ab".repeat(32),
+        });
+        let error = merge_token_canary_calibration_reports(
+            &catalog.models[0],
+            &prompts,
+            vec![metal.clone(), changed_mode],
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("same execution mode"));
+
         cuda.artifact_binding.artifact_root = "bb".repeat(32);
         let error =
             merge_token_canary_calibration_reports(&catalog.models[0], &prompts, vec![metal, cuda])
@@ -122479,6 +126041,61 @@ State initialization...
         assert_eq!(
             catalog_value["models"][0]["canary"]["token_prefixes"]["gguf-q4_k_m"]["p1"],
             json!(test_canary_tokens_for_label(&"aa".repeat(32)))
+        );
+
+        let mut mode_report = report.clone();
+        mode_report.entries[0].execution_mode = Some(mayhem_proto::ExecutionModeBinding {
+            mode_id: "throughput".to_owned(),
+            policy_hash: "ab".repeat(32),
+        });
+        let root = mode_report.entries[0]
+            .expected_artifact_binding
+            .artifact_root
+            .clone();
+        let mut mode_catalog = json!({
+            "models": [{
+                "model_id": "test/model@4bit",
+                "canary": {"fingerprints": {"gguf-q4_k_m": "baseline"}}
+            }],
+            "vllm_execution_modes": {}
+        });
+        mode_catalog["vllm_execution_modes"][&root] = json!({
+            "throughput": {
+                "generation_execution_profile": {"proof_sha256": "parallel-proof"},
+                "canary": {"fingerprints": {"gguf-q4_k_m": "mode-old"}},
+                "modality_fingerprints": {},
+                "resource_profiles": {},
+                "speciality_calibrations": {}
+            },
+            "latency": {
+                "canary": {"fingerprints": {"gguf-q4_k_m": "other-mode"}},
+                "modality_fingerprints": {},
+                "resource_profiles": {},
+                "speciality_calibrations": {}
+            }
+        });
+        assert_eq!(
+            apply_canary_report_fingerprints(&mut mode_catalog, &mode_report).unwrap(),
+            1
+        );
+        assert_eq!(
+            mode_catalog["models"][0]["canary"]["fingerprints"]["gguf-q4_k_m"],
+            "baseline"
+        );
+        assert_eq!(
+            mode_catalog["vllm_execution_modes"][&root]["throughput"]["canary"]
+                ["fingerprints"]["gguf-q4_k_m"],
+            json!(test_canary_aggregate_for_label(&"aa".repeat(32)))
+        );
+        assert_eq!(
+            mode_catalog["vllm_execution_modes"][&root]["latency"]["canary"]["fingerprints"]
+                ["gguf-q4_k_m"],
+            "other-mode"
+        );
+        assert_eq!(
+            mode_catalog["vllm_execution_modes"][&root]["throughput"]
+                ["generation_execution_profile"]["proof_sha256"],
+            "parallel-proof"
         );
     }
 
@@ -124998,6 +128615,179 @@ State initialization...
     }
 
     #[test]
+    fn catalog_signing_guard_binds_vllm_profiles_to_model_review() {
+        let temp = test_temp_dir("mayhem-catalog-vllm-profile-signing");
+        let base_path = temp.join("base.json");
+        let candidate_path = temp.join("candidate.json");
+        let existing_root = "11".repeat(32);
+        let new_root = "22".repeat(32);
+        let profile = |proof: &str| {
+            json!({
+                "schema_version": 1,
+                "engine": "vllm",
+                "enforce_eager": false,
+                "linear_backend": "cutlass",
+                "moe_backend": "cutlass",
+                "proof_sha256": proof
+            })
+        };
+        let base = json!({
+            "models": [{
+                "model_id": "test/keep",
+                "artifacts": {"nvfp4": {"artifact_root": existing_root}}
+            }],
+            "vllm_execution_profiles": {
+                existing_root.clone(): profile(&"33".repeat(32))
+            }
+        });
+        write_json_file(&base_path, &base).unwrap();
+
+        let mut additive = base.clone();
+        additive["models"].as_array_mut().unwrap().push(json!({
+            "model_id": "test/new",
+            "artifacts": {"nvfp4": {"artifact_root": new_root}}
+        }));
+        additive["vllm_execution_profiles"][&new_root] = profile(&"44".repeat(32));
+        write_json_file(&candidate_path, &additive).unwrap();
+        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+            .unwrap();
+
+        additive["vllm_execution_profiles"][&existing_root] = profile(&"55".repeat(32));
+        write_json_file(&candidate_path, &additive).unwrap();
+        let error =
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+                .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unapproved vLLM execution profile changes"));
+        validate_additive_catalog_update(
+            &base_path,
+            &candidate_path,
+            &BTreeSet::from(["test/keep".to_owned()]),
+            false,
+        )
+        .unwrap();
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn catalog_signing_guard_binds_vllm_modes_to_model_review() {
+        let temp = test_temp_dir("mayhem-catalog-vllm-mode-signing");
+        let base_path = temp.join("base.json");
+        let candidate_path = temp.join("candidate.json");
+        let existing_root = "11".repeat(32);
+        let new_root = "22".repeat(32);
+        let unknown_root = "33".repeat(32);
+        let ambiguous_root = "44".repeat(32);
+        let mode = |max_num_seqs: u32| {
+            json!({
+                "schema_version": 1,
+                "max_num_seqs": max_num_seqs,
+                "max_num_batched_tokens": 2048
+            })
+        };
+        let base = json!({
+            "models": [
+                {
+                    "model_id": "test/keep",
+                    "artifacts": {"nvfp4": {"artifact_root": existing_root}}
+                },
+                {
+                    "model_id": "test/shared-a",
+                    "artifacts": {"nvfp4": {"artifact_root": ambiguous_root}}
+                },
+                {
+                    "model_id": "test/shared-b",
+                    "artifacts": {"nvfp4": {"artifact_root": ambiguous_root}}
+                }
+            ],
+            "vllm_execution_modes": {
+                existing_root.clone(): {"latency": mode(1)}
+            }
+        });
+
+        let mut no_modes = base.clone();
+        no_modes
+            .as_object_mut()
+            .unwrap()
+            .remove("vllm_execution_modes");
+        write_json_file(&base_path, &no_modes).unwrap();
+        write_json_file(&candidate_path, &no_modes).unwrap();
+        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+            .unwrap();
+
+        write_json_file(&base_path, &base).unwrap();
+        let mut additive = base.clone();
+        additive["models"].as_array_mut().unwrap().push(json!({
+            "model_id": "test/new",
+            "artifacts": {"nvfp4": {"artifact_root": new_root}}
+        }));
+        additive["vllm_execution_modes"][&new_root] = json!({"throughput": mode(8)});
+        write_json_file(&candidate_path, &additive).unwrap();
+        validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+            .unwrap();
+
+        let assert_existing_change_requires_allow = |candidate: &Value| {
+            write_json_file(&candidate_path, candidate).unwrap();
+            let error = validate_additive_catalog_update(
+                &base_path,
+                &candidate_path,
+                &BTreeSet::new(),
+                false,
+            )
+            .unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("unapproved vLLM execution mode changes"));
+            validate_additive_catalog_update(
+                &base_path,
+                &candidate_path,
+                &BTreeSet::from(["test/keep".to_owned()]),
+                false,
+            )
+            .unwrap();
+        };
+
+        let mut added = base.clone();
+        added["vllm_execution_modes"][&existing_root]["throughput"] = mode(8);
+        assert_existing_change_requires_allow(&added);
+
+        let mut removed = base.clone();
+        removed["vllm_execution_modes"][&existing_root]
+            .as_object_mut()
+            .unwrap()
+            .remove("latency");
+        assert_existing_change_requires_allow(&removed);
+
+        let mut mutated = base.clone();
+        mutated["vllm_execution_modes"][&existing_root]["latency"] = mode(2);
+        assert_existing_change_requires_allow(&mutated);
+
+        let mut unknown = base.clone();
+        unknown["vllm_execution_modes"][&unknown_root] = json!({"latency": mode(1)});
+        write_json_file(&candidate_path, &unknown).unwrap();
+        let error =
+            validate_additive_catalog_update(&base_path, &candidate_path, &BTreeSet::new(), false)
+                .unwrap_err();
+        assert!(error.to_string().contains(&unknown_root));
+
+        let mut ambiguous = base.clone();
+        ambiguous["vllm_execution_modes"][&ambiguous_root] = json!({"latency": mode(1)});
+        write_json_file(&candidate_path, &ambiguous).unwrap();
+        let error = validate_additive_catalog_update(
+            &base_path,
+            &candidate_path,
+            &BTreeSet::from(["test/shared-a".to_owned(), "test/shared-b".to_owned()]),
+            false,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains(&ambiguous_root));
+
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn catalog_signing_guard_ignores_lossless_json_number_reserialization() {
         let temp = test_temp_dir("mayhem-catalog-number-reserialization");
         let base_path = temp.join("base.json");
@@ -125853,6 +129643,7 @@ State initialization...
 
     fn test_provider_start_args() -> ProviderStartArgs {
         ProviderStartArgs {
+            execution_mode: None,
             home: None,
             enclave: None,
             rooms: "auto".to_owned(),
@@ -126025,6 +129816,8 @@ State initialization...
 
     fn test_provider_session_terms() -> ProviderSessionTerms {
         ProviderSessionTerms {
+            execution_mode: None,
+            execution_mode_requests: None,
             contract_version: CONTRACT_VERSION,
             provider: "55".repeat(32),
             enclave_id: test_contract(&"aa".repeat(32)).enclaves[0]
@@ -126474,6 +130267,8 @@ State initialization...
                 artifact_sidecars: BTreeMap::new(),
             },
             runtime_config: CatalogCanaryRuntimeConfig {
+                execution_mode: None,
+                vllm_runtime: None,
                 ctx_size: 1024,
                 seed: 0,
                 threads: None,
@@ -126489,7 +130284,15 @@ State initialization...
                 vllm_dtype: None,
                 vllm_kv_cache_dtype: None,
                 vllm_max_num_seqs: None,
+                vllm_worker_count: None,
+                vllm_generation_topology: None,
                 vllm_max_num_batched_tokens: None,
+                vllm_enforce_eager: None,
+                vllm_compilation_mode: None,
+                vllm_cudagraph_mode: None,
+                vllm_linear_backend: None,
+                vllm_moe_backend: None,
+                vllm_mtp_num_speculative_tokens: None,
             },
             canary_set: "test-canary".to_owned(),
             canary_set_sha256: String::new(),
@@ -126641,6 +130444,71 @@ State initialization...
             file_sha256_hex(&dir.join(format!("{}.json", report.canary_set))).unwrap();
     }
 
+    #[test]
+    fn calibration_isolated_topology_is_mode_bound_and_serial_per_worker() {
+        let profile = test_isolated_generation_profile();
+        let mut args = test_calibrate_canary_args();
+        assert!(bind_calibration_generation_topology(&mut args, Some(&profile)).is_err());
+        args.execution_mode = Some("isolated".to_owned());
+        args.vllm_worker_count = Some(3);
+        bind_calibration_generation_topology(&mut args, Some(&profile)).unwrap();
+        assert_eq!(args.vllm_worker_count, Some(3));
+        assert_eq!(args.vllm_max_num_seqs, Some(1));
+        let mut artifact = test_catalog(&"aa".repeat(32)).models[0].artifacts["gguf-q4_k_m"].clone();
+        artifact.engine = "vllm".to_owned();
+        let mut runtime = catalog_canary_runtime_config(&artifact, Path::new("model.safetensors"), &args).unwrap();
+        runtime.execution_mode = Some(mayhem_proto::ExecutionModeBinding {
+            mode_id: "isolated".to_owned(), policy_hash: "ab".repeat(32),
+        });
+        validate_calibration_generation_topology(&runtime, Some(&profile)).unwrap();
+        assert!(validate_calibration_generation_topology(&runtime, None).is_err());
+        runtime.vllm_max_num_seqs = Some(2);
+        assert!(validate_calibration_generation_topology(&runtime, Some(&profile)).is_err());
+        runtime.vllm_max_num_seqs = Some(1);
+        runtime.vllm_worker_count = Some(0);
+        assert!(validate_calibration_generation_topology(&runtime, Some(&profile)).is_err());
+        args.vllm_max_num_seqs = Some(2);
+        assert!(bind_calibration_generation_topology(&mut args, Some(&profile)).is_err());
+        args.vllm_max_num_seqs = None;
+        args.vllm_worker_count = None;
+        bind_calibration_generation_topology(&mut args, Some(&profile)).unwrap();
+        assert_eq!(args.vllm_worker_count, Some(1));
+        assert!(bind_calibration_generation_topology(&mut args, None).is_err());
+    }
+
+    #[test]
+    fn calibration_isolated_memory_is_checked_before_loading_any_worker() {
+        let mut args = test_calibrate_canary_args();
+        assert_eq!(calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).unwrap(), None);
+        args.execution_mode = Some("isolated".to_owned());
+        args.vllm_worker_count = Some(2);
+        bind_calibration_generation_topology(&mut args, Some(&test_isolated_generation_profile())).unwrap();
+        assert!(calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).is_err());
+        args.vllm_memory_utilization = Some(35);
+        assert_eq!(calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).unwrap(), Some(70 * GIB_BYTES));
+        assert!(calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 69 * GIB_BYTES).is_err());
+        args.vllm_worker_count = Some(3);
+        assert!(calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).is_err());
+        args.vllm_memory_utilization = Some(85);
+        assert!(calibration_vllm_replica_allocation(&args, u64::MAX, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn calibration_legacy_runtime_omits_optional_topology_and_count() {
+        let args = test_calibrate_canary_args();
+        let artifact = &test_catalog(&"aa".repeat(32)).models[0].artifacts["gguf-q4_k_m"];
+        let runtime = catalog_canary_runtime_config(artifact, Path::new("model.gguf"), &args).unwrap();
+        validate_calibration_generation_topology(&runtime, None).unwrap();
+        let json = serde_json::to_value(&runtime).unwrap();
+        assert!(json.get("vllm_generation_topology").is_none());
+        assert!(json.get("vllm_worker_count").is_none());
+        let decoded: CatalogCanaryRuntimeConfig = serde_json::from_value(json).unwrap();
+        assert_eq!(decoded, runtime);
+        let mut drift = runtime;
+        drift.vllm_worker_count = Some(1);
+        assert!(validate_calibration_generation_topology(&drift, None).is_err());
+    }
+
     fn test_calibrate_canary_args() -> CatalogCalibrateCanaryArgs {
         CatalogCalibrateCanaryArgs {
             home: None,
@@ -126648,6 +130516,7 @@ State initialization...
             canaries_dir: None,
             model: "test/model".to_owned(),
             artifact: "gguf-q4_k_m".to_owned(),
+            execution_mode: None,
             artifact_path: PathBuf::from("/tmp/model.gguf"),
             vision_projector_path: None,
             artifact_sidecars: Vec::new(),
@@ -126673,7 +130542,16 @@ State initialization...
             vllm_dtype: None,
             vllm_kv_cache_dtype: None,
             vllm_max_num_seqs: None,
+            vllm_worker_count: None,
+            vllm_generation_topology: None,
+            vllm_runtime: None,
             vllm_max_num_batched_tokens: None,
+            vllm_enforce_eager: None,
+            vllm_compilation_mode: None,
+            vllm_cudagraph_mode: None,
+            vllm_linear_backend: None,
+            vllm_moe_backend: None,
+            vllm_mtp_num_speculative_tokens: None,
             json: false,
         }
     }
@@ -126709,6 +130587,12 @@ State initialization...
             vllm_kv_cache_dtype: None,
             vllm_max_num_seqs: None,
             vllm_max_num_batched_tokens: None,
+            vllm_enforce_eager: None,
+            vllm_compilation_mode: None,
+            vllm_cudagraph_mode: None,
+            vllm_linear_backend: None,
+            vllm_moe_backend: None,
+            vllm_mtp_num_speculative_tokens: None,
             include_dev: false,
             json: false,
         }
@@ -128456,6 +132340,8 @@ State initialization...
             catalog_id: "test".to_owned(),
             generated_at: "2026-07-02T00:00:00Z".to_owned(),
             generation_execution_profiles: BTreeMap::new(),
+            vllm_execution_profiles: BTreeMap::new(),
+            vllm_execution_modes: BTreeMap::new(),
             models: vec![catalog::CatalogModel {
                 model_id: "test/model@4bit".to_owned(),
                 model_class: DEFAULT_MODEL_CLASS.to_owned(),

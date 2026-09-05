@@ -1536,6 +1536,10 @@ fn fixture_heartbeat(
         min_ask_au: candidate.min_ask_au,
         transport_peer: Some(candidate.provider.clone()),
         identity_anchor: Some(format!("provider:{}", candidate.provider)),
+        inventory_root: None,
+        runtime_id: None,
+        execution_mode: None,
+        workflow_classes: BTreeMap::new(),
         accepting_new: route_index % 5 != 4,
         caps: HeartbeatCaps {
             tools: model.mayhem.caps.tools,

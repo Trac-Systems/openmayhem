@@ -1,0 +1,14 @@
+{
+  "aarch64": {
+    "filename": "vllm-0.24.0+mayhem.specmeta1-cp38-abi3-manylinux_2_28_aarch64.whl",
+    "sha256": "edd083a50cc8469ec5ebf347dbe73236d8cd988b63ed63ca49f4e7a7b7480e39",
+    "size": 614981674,
+    "url": "https://huggingface.co/datasets/TracNetwork/openmayhem-runtime-wheels/resolve/71df65564accb60fd9f492f1d731ddcee2dee9cc/vllm-0.24.0+mayhem.specmeta1-cp38-abi3-manylinux_2_28_aarch64.whl"
+  },
+  "x86_64": {
+    "filename": "vllm-0.24.0+mayhem.specmeta1-cp38-abi3-manylinux_2_28_x86_64.whl",
+    "sha256": "15b03d4d57e971627349dfc72275f2806457334d934cc1e29dfbd4d616d5a058",
+    "size": 638028744,
+    "url": "https://huggingface.co/datasets/TracNetwork/openmayhem-runtime-wheels/resolve/71df65564accb60fd9f492f1d731ddcee2dee9cc/vllm-0.24.0+mayhem.specmeta1-cp38-abi3-manylinux_2_28_x86_64.whl"
+  }
+}

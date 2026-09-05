@@ -845,6 +845,12 @@ headers) and 2.18 generation tok/s for a 12,017-input/32-output-token request.
 Those figures are host-specific request-path evidence, not canonical provider
 limits or pure kernel benchmarks.
 
+Separately calibrated vLLM execution modes can be selected with
+`--execution-mode <mode-id>` on `provider serve plan`, `add`, or `switch` when
+the signed catalog lists the mode for that artifact. Omitting the flag keeps baseline
+behavior; parallel dispatch needs the selected mode's own approval. See
+[the provider instructions](MODEL-CHEATSHEET.md#optional-vllm-execution-modes).
+
 **Routes:**
 
 | Class | Routes |

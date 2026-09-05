@@ -330,6 +330,220 @@ pub const TIER1_SOFTWARE_ATTESTATION_TIER: u8 = 1;
 pub const TIER2_DEVICE_IDENTITY_TIER: u8 = 2;
 pub const TIER3_CONFIDENTIAL_COMPUTE_TIER: u8 = 3;
 pub const TIER4_PROVIDER_KYB_TIER: u8 = 4;
+pub const MAX_EXECUTION_MODE_ID_BYTES: usize = 64;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionModeBinding {
+    #[serde(deserialize_with = "deserialize_execution_mode_id")]
+    pub mode_id: String,
+    #[serde(deserialize_with = "deserialize_execution_mode_policy_hash")]
+    pub policy_hash: String,
+}
+
+impl ExecutionModeBinding {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_execution_mode_id(&self.mode_id)?;
+        validate_execution_mode_policy_hash(&self.policy_hash)
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedVllmExecutionMode {
+    schema_version: u32,
+    profile: SerializedVllmExecutionProfile,
+    #[serde(default)]
+    generation_execution_profile: Option<SerializedGenerationExecutionProfile>,
+    requests: ExecutionModeRequestPolicy,
+    canary: SerializedVllmExecutionModeCanary,
+    canary_set_sha256: String,
+    #[serde(rename = "modality_fingerprints")]
+    _modality_fingerprints: BTreeMap<String, String>,
+    #[serde(rename = "resource_profiles")]
+    _resource_profiles: BTreeMap<String, Value>,
+    #[serde(rename = "speciality_calibrations")]
+    _speciality_calibrations: BTreeMap<String, BTreeMap<String, Value>>,
+}
+
+/// Explicit generation worker topology; omission preserves legacy dispatch policy.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GenerationExecutionTopology {
+    SharedWorker,
+    /// Only valid in an authenticated execution mode's own generation profile.
+    IsolatedWorkers,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedGenerationExecutionProfile {
+    schema_version: u32,
+    engine: String,
+    independent_dispatch: bool,
+    request_modalities: Vec<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    topology: Option<GenerationExecutionTopology>,
+    #[serde(rename = "proof_sha256", skip_serializing)]
+    _proof_sha256: String,
+}
+
+/// Explicit managed vLLM runtime; omission preserves the baseline runtime.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VllmRuntime {
+    FlashinferSpeculativeMetadataV1,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedVllmExecutionProfile {
+    schema_version: u32,
+    engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime: Option<VllmRuntime>,
+    enforce_eager: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compilation_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cudagraph_mode: Option<String>,
+    linear_backend: String,
+    moe_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    speculative_decoding: Option<SerializedVllmSpeculativeDecodingProfile>,
+    #[serde(rename = "proof_sha256", skip_serializing)]
+    _proof_sha256: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedVllmSpeculativeDecodingProfile {
+    method: String,
+    num_speculative_tokens: u32,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SerializedVllmExecutionModeCanary {
+    set_id: String,
+    match_min: f64,
+    #[serde(default = "default_execution_mode_verification_method")]
+    verification_method: String,
+    #[serde(default)]
+    verification_tolerance_bps: Option<u32>,
+    #[serde(default, rename = "fingerprints")]
+    _fingerprints: BTreeMap<String, String>,
+    #[serde(default, rename = "token_prefixes")]
+    _token_prefixes: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
+    #[serde(default, rename = "perceptual_hashes")]
+    _perceptual_hashes: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, rename = "embedding_vectors")]
+    _embedding_vectors: BTreeMap<String, BTreeMap<String, Vec<f32>>>,
+    #[serde(default, rename = "transcripts")]
+    _transcripts: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, rename = "audio_fingerprints")]
+    _audio_fingerprints: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, rename = "video_fingerprints")]
+    _video_fingerprints: BTreeMap<String, BTreeMap<String, String>>,
+}
+
+fn default_execution_mode_verification_method() -> String {
+    "token_fingerprint".to_owned()
+}
+
+/// Derives the authenticated binding for a serialized catalog vLLM execution mode.
+///
+/// The full mode shape is validated, while measured evidence and `proof_sha256`
+/// remain outside the policy hash because they are authenticated by the catalog.
+pub fn vllm_execution_mode_binding(
+    artifact_root: &str,
+    mode_id: &str,
+    serialized_mode: &Value,
+) -> Result<ExecutionModeBinding, String> {
+    validate_execution_mode_id(mode_id)?;
+    if artifact_root.len() != 64
+        || !artifact_root
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err("execution mode requires an exact lowercase artifact root".to_owned());
+    }
+    let mode: SerializedVllmExecutionMode = serde_json::from_value(serialized_mode.clone())
+        .map_err(|error| format!("invalid serialized vllm execution mode: {error}"))?;
+    let runtime = serde_json::to_value(mode.profile).map_err(|error| error.to_string())?;
+    let generation_execution_profile = mode
+        .generation_execution_profile
+        .map(serde_json::to_value)
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let mut policy = serde_json::json!({
+        "domain": "mayhem-vllm-execution-mode-v1",
+        "artifact_root": artifact_root,
+        "mode_id": mode_id,
+        "schema_version": mode.schema_version,
+        "runtime": runtime,
+        "requests": mode.requests,
+        "canary_set": mode.canary.set_id,
+        "canary_set_sha256": mode.canary_set_sha256,
+        "verification_method": mode.canary.verification_method,
+        "match_min": mode.canary.match_min,
+        "verification_tolerance_bps": mode.canary.verification_tolerance_bps,
+    });
+    if let Some(profile) = generation_execution_profile {
+        policy["generation_execution_profile"] = profile;
+    }
+    let bytes = stable_json_bytes(&policy).map_err(|error| error.to_string())?;
+    Ok(ExecutionModeBinding {
+        mode_id: mode_id.to_owned(),
+        policy_hash: blake3::hash(&bytes).to_hex().to_string(),
+    })
+}
+
+pub fn validate_execution_mode_id(value: &str) -> Result<(), String> {
+    let valid = !value.is_empty()
+        && value.len() <= MAX_EXECUTION_MODE_ID_BYTES
+        && value != "baseline"
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'_' | b'-')
+        });
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "execution mode id must be a 1..={MAX_EXECUTION_MODE_ID_BYTES} byte portable identifier"
+        ))
+    }
+}
+
+pub fn validate_execution_mode_policy_hash(value: &str) -> Result<(), String> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        Ok(())
+    } else {
+        Err("execution mode policy hash must be canonical lowercase 64-hex".to_owned())
+    }
+}
+
+fn deserialize_execution_mode_id<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    validate_execution_mode_id(&value).map_err(serde::de::Error::custom)?;
+    Ok(value)
+}
+
+fn deserialize_execution_mode_policy_hash<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = String::deserialize(deserializer)?;
+    validate_execution_mode_policy_hash(&value).map_err(serde::de::Error::custom)?;
+    Ok(value)
+}
 
 pub fn video_generation_required_modalities(
     output_modalities: &[String],
@@ -525,6 +739,171 @@ pub struct EndpointFamilyContract {
     pub speciality_mappings: BTreeMap<String, EndpointSpecialityMapping>,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionModeRequestPolicy {
+    #[serde(deserialize_with = "deserialize_execution_mode_endpoint_families")]
+    pub endpoint_families: Vec<EndpointFamilyContract>,
+}
+
+fn deserialize_execution_mode_endpoint_families<'de, D>(
+    deserializer: D,
+) -> Result<Vec<EndpointFamilyContract>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    const FAMILY_FIELDS: &[&str] = &[
+        "family",
+        "request_attributes",
+        "required_request_attributes",
+        "response_attributes",
+        "required_response_attributes",
+        "request_attribute_specs",
+        "response_attribute_specs",
+        "interaction_groups",
+        "speciality_mappings",
+    ];
+    const SPEC_FIELDS: &[&str] = &[
+        "value_types",
+        "default",
+        "enum_values",
+        "minimum",
+        "maximum",
+        "multiple_of",
+        "min_length",
+        "max_length",
+        "min_items",
+        "max_items",
+        "calibration_values",
+    ];
+    const SPECIALITY_FIELDS: &[&str] = &["request_path", "target", "native_path", "selector"];
+
+    let families = Vec::<Value>::deserialize(deserializer)?;
+    families
+        .into_iter()
+        .enumerate()
+        .map(|(index, family)| {
+            let path = format!("endpoint_families[{index}]");
+            reject_unknown_execution_mode_fields(&family, FAMILY_FIELDS, &path)
+                .map_err(serde::de::Error::custom)?;
+            for (field, allowed) in [
+                ("request_attribute_specs", SPEC_FIELDS),
+                ("response_attribute_specs", SPEC_FIELDS),
+                ("speciality_mappings", SPECIALITY_FIELDS),
+            ] {
+                if let Some(entries) = family.get(field).and_then(Value::as_object) {
+                    for (name, entry) in entries {
+                        reject_unknown_execution_mode_fields(
+                            entry,
+                            allowed,
+                            &format!("{path}.{field}.{name}"),
+                        )
+                        .map_err(serde::de::Error::custom)?;
+                    }
+                }
+            }
+            serde_json::from_value(family).map_err(serde::de::Error::custom)
+        })
+        .collect()
+}
+
+fn reject_unknown_execution_mode_fields(
+    value: &Value,
+    allowed: &[&str],
+    path: &str,
+) -> Result<(), String> {
+    // Check schema objects only, leaving arbitrary JSON in defaults, enums and
+    // calibration values intact. Reject sequences that could bypass key checks.
+    let object = value
+        .as_object()
+        .ok_or_else(|| format!("execution mode policy {path} must be a JSON object"))?;
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(format!("unknown execution mode policy field {path}.{key}"));
+        }
+    }
+    Ok(())
+}
+
+impl ExecutionModeRequestPolicy {
+    /// Validates supplemental mode restrictions without applying defaults or
+    /// replacing validation against the baseline endpoint contract.
+    pub fn validate_request(
+        &self,
+        family: &str,
+        effective_body: &Value,
+    ) -> Result<(), Vec<EndpointContractViolation>> {
+        let Some(contract) = self
+            .endpoint_families
+            .iter()
+            .find(|contract| contract.family == family)
+        else {
+            return Err(vec![EndpointContractViolation {
+                path: "endpoint_family".to_owned(),
+                reason: format!("execution mode does not support endpoint family {family}"),
+            }]);
+        };
+
+        let Some(_) = effective_body.as_object() else {
+            return Err(vec![EndpointContractViolation {
+                path: "request".to_owned(),
+                reason: "effective execution mode request must be a JSON object".to_owned(),
+            }]);
+        };
+        let mut violations = Vec::new();
+        for path in &contract.required_request_attributes {
+            if execution_mode_values_at_path(effective_body, path).is_empty() {
+                violations.push(EndpointContractViolation {
+                    path: path.clone(),
+                    reason: "required execution mode request attribute is missing".to_owned(),
+                });
+            }
+        }
+        for (path, spec) in &contract.request_attribute_specs {
+            for value in execution_mode_values_at_path(effective_body, path) {
+                if let Err(reason) = validate_endpoint_attribute_value(spec, value) {
+                    violations.push(EndpointContractViolation {
+                        path: path.clone(),
+                        reason,
+                    });
+                }
+            }
+        }
+        if violations.is_empty() {
+            Ok(())
+        } else {
+            Err(violations)
+        }
+    }
+}
+
+fn execution_mode_values_at_path<'a>(value: &'a Value, path: &str) -> Vec<&'a Value> {
+    fn collect<'a>(value: &'a Value, segments: &[&str], values: &mut Vec<&'a Value>) {
+        if segments.is_empty() {
+            values.push(value);
+            return;
+        }
+        match value {
+            Value::Array(items) => {
+                for item in items {
+                    collect(item, segments, values);
+                }
+            }
+            Value::Object(object) => {
+                if let Some(value) = object.get(segments[0]) {
+                    collect(value, &segments[1..], values);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let segments = path.split('.').collect::<Vec<_>>();
+    let mut values = Vec::new();
+    collect(value, &segments, &mut values);
+    values
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointSpecialityTarget {
@@ -655,6 +1034,8 @@ pub struct AttestationRuntimeConfig {
     pub ctx: u32,
     pub tp_degree: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<ExecutionModeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_batch_size: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_num_tokens: Option<u32>,
@@ -667,6 +1048,7 @@ impl Default for AttestationRuntimeConfig {
             backend: "unknown".to_owned(),
             ctx: 0,
             tp_degree: 1,
+            execution_mode: None,
             max_batch_size: None,
             max_num_tokens: None,
         }
@@ -2737,6 +3119,557 @@ mod tests {
     }
 
     #[test]
+    fn execution_mode_binding_serde_requires_portable_id_and_canonical_hash() {
+        let encoded = format!(
+            r#"{{"mode_id":"vllm-throughput_2","policy_hash":"{}"}}"#,
+            "ab".repeat(32)
+        );
+        let binding: ExecutionModeBinding = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(serde_json::to_string(&binding).unwrap(), encoded);
+
+        for mode_id in ["", "baseline", "has.dot", "UPPERCASE", "has/slash"] {
+            let invalid = format!(
+                r#"{{"mode_id":"{mode_id}","policy_hash":"{}"}}"#,
+                "ab".repeat(32)
+            );
+            assert!(serde_json::from_str::<ExecutionModeBinding>(&invalid).is_err());
+        }
+        assert!(validate_execution_mode_id(&"a".repeat(MAX_EXECUTION_MODE_ID_BYTES + 1)).is_err());
+        let uppercase_hash = format!(
+            r#"{{"mode_id":"valid","policy_hash":"{}"}}"#,
+            "AB".repeat(32)
+        );
+        assert!(serde_json::from_str::<ExecutionModeBinding>(&uppercase_hash).is_err());
+        assert!(serde_json::from_value::<ExecutionModeBinding>(json!({
+            "mode_id": "valid",
+            "policy_hash": "ab".repeat(31),
+        }))
+        .is_err());
+    }
+
+    fn execution_mode_request_policy() -> ExecutionModeRequestPolicy {
+        let mut min_p = EndpointAttributeSpec::new(EndpointValueType::Number);
+        min_p.enum_values = vec![json!(0)];
+        let mut logit_bias = EndpointAttributeSpec::new(EndpointValueType::Object);
+        logit_bias.value_types.push(EndpointValueType::Null);
+        logit_bias.enum_values = vec![json!({}), Value::Null];
+
+        ExecutionModeRequestPolicy {
+            endpoint_families: vec![EndpointFamilyContract {
+                family: ENDPOINT_OPENAI_CHAT_COMPLETIONS.to_owned(),
+                request_attributes: vec!["min_p".to_owned(), "logit_bias".to_owned()],
+                required_request_attributes: Vec::new(),
+                response_attributes: Vec::new(),
+                required_response_attributes: Vec::new(),
+                request_attribute_specs: BTreeMap::from([
+                    ("logit_bias".to_owned(), logit_bias),
+                    ("min_p".to_owned(), min_p),
+                ]),
+                response_attribute_specs: BTreeMap::new(),
+                interaction_groups: Vec::new(),
+                speciality_mappings: BTreeMap::new(),
+            }],
+        }
+    }
+
+    fn serialized_vllm_execution_mode() -> Value {
+        json!({
+            "schema_version": 1,
+            "profile": {
+                "schema_version": 1,
+                "engine": "vllm",
+                "enforce_eager": false,
+                "compilation_mode": 0,
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "linear_backend": "cutlass",
+                "moe_backend": "cutlass",
+                "speculative_decoding": {
+                    "method": "mtp",
+                    "num_speculative_tokens": 3,
+                },
+                "proof_sha256": "11".repeat(32),
+            },
+            "requests": execution_mode_request_policy(),
+            "canary": {
+                "set_id": "mode-canary",
+                "match_min": 0.95,
+                "verification_method": "token_fingerprint",
+                "verification_tolerance_bps": null,
+                "fingerprints": {"artifact": "measured"},
+                "token_prefixes": {"artifact": {"prompt": [1, 2]}},
+                "perceptual_hashes": {},
+                "embedding_vectors": {},
+                "transcripts": {},
+                "audio_fingerprints": {},
+                "video_fingerprints": {},
+            },
+            "canary_set_sha256": "22".repeat(32),
+            "modality_fingerprints": {"text": "measured"},
+            "resource_profiles": {"text": {"measured_working_set_bytes": 1}},
+            "speciality_calibrations": {"reasoning": {"high": {"fingerprint": "measured"}}},
+        })
+    }
+
+    #[test]
+    fn vllm_execution_mode_binding_matches_legacy_policy_projection() {
+        let artifact_root = "ab".repeat(32);
+        let mut serialized_mode = serialized_vllm_execution_mode();
+        let binding =
+            vllm_execution_mode_binding(&artifact_root, "throughput", &serialized_mode).unwrap();
+        let mut expected_policy = json!({
+            "domain": "mayhem-vllm-execution-mode-v1",
+            "artifact_root": artifact_root,
+            "mode_id": "throughput",
+            "schema_version": 1,
+            "runtime": {
+                "schema_version": 1,
+                "engine": "vllm",
+                "enforce_eager": false,
+                "compilation_mode": 0,
+                "cudagraph_mode": "FULL_DECODE_ONLY",
+                "linear_backend": "cutlass",
+                "moe_backend": "cutlass",
+                "speculative_decoding": {
+                    "method": "mtp",
+                    "num_speculative_tokens": 3,
+                },
+            },
+            "requests": execution_mode_request_policy(),
+            "canary_set": "mode-canary",
+            "canary_set_sha256": "22".repeat(32),
+            "verification_method": "token_fingerprint",
+            "match_min": 0.95,
+            "verification_tolerance_bps": null,
+        });
+        assert_eq!(
+            binding.policy_hash,
+            blake3::hash(&stable_json_bytes(&expected_policy).unwrap())
+                .to_hex()
+                .to_string()
+        );
+
+        serialized_mode["generation_execution_profile"] = json!({
+            "schema_version": 1,
+            "engine": "vllm",
+            "independent_dispatch": true,
+            "request_modalities": [["text"]],
+            "proof_sha256": "33".repeat(32),
+        });
+        let profile: SerializedGenerationExecutionProfile = serde_json::from_value(
+            serialized_mode["generation_execution_profile"].clone(),
+        )
+        .unwrap();
+        let legacy_profile_bytes = br#"{"schema_version":1,"engine":"vllm","independent_dispatch":true,"request_modalities":[["text"]]}"#;
+        assert_eq!(profile.topology, None);
+        assert_eq!(serde_json::to_vec(&profile).unwrap(), legacy_profile_bytes);
+        expected_policy["generation_execution_profile"] =
+            serde_json::from_slice(legacy_profile_bytes).unwrap();
+        assert_eq!(
+            vllm_execution_mode_binding(&artifact_root, "throughput", &serialized_mode)
+                .unwrap()
+                .policy_hash,
+            blake3::hash(&stable_json_bytes(&expected_policy).unwrap())
+                .to_hex()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn generation_execution_topology_serde_uses_exact_snake_case() {
+        for (topology, wire) in [
+            (GenerationExecutionTopology::SharedWorker, "shared_worker"),
+            (
+                GenerationExecutionTopology::IsolatedWorkers,
+                "isolated_workers",
+            ),
+        ] {
+            assert_eq!(serde_json::to_value(topology).unwrap(), json!(wire));
+            assert_eq!(
+                serde_json::from_value::<GenerationExecutionTopology>(json!(wire)).unwrap(),
+                topology
+            );
+        }
+        for value in [
+            json!("unknown"),
+            json!("SharedWorker"),
+            json!("isolated"),
+            json!(1),
+        ] {
+            assert!(serde_json::from_value::<GenerationExecutionTopology>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn vllm_execution_mode_binding_authenticates_topology_but_not_its_proof() {
+        let artifact_root = "ab".repeat(32);
+        let mut mode = serialized_vllm_execution_mode();
+        mode["generation_execution_profile"] = json!({
+            "schema_version": 1,
+            "engine": "vllm",
+            "independent_dispatch": true,
+            "request_modalities": [["text"]],
+            "proof_sha256": "33".repeat(32),
+        });
+        let legacy = vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
+        let mut hashes = BTreeSet::from([legacy.policy_hash]);
+        for topology in ["shared_worker", "isolated_workers"] {
+            mode["generation_execution_profile"]["topology"] = json!(topology);
+            let binding =
+                vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
+            assert!(hashes.insert(binding.policy_hash.clone()));
+            let mut changed_proof = mode.clone();
+            changed_proof["generation_execution_profile"]["proof_sha256"] =
+                json!("44".repeat(32));
+            assert_eq!(
+                vllm_execution_mode_binding(&artifact_root, "throughput", &changed_proof).unwrap(),
+                binding
+            );
+        }
+        let mut missing_proof = mode.clone();
+        missing_proof["generation_execution_profile"]
+            .as_object_mut()
+            .unwrap()
+            .remove("proof_sha256");
+        assert!(vllm_execution_mode_binding(&artifact_root, "throughput", &missing_proof).is_err());
+        for value in [
+            json!("unknown"),
+            json!("IsolatedWorkers"),
+            json!(true),
+            json!(2),
+        ] {
+            mode["generation_execution_profile"]["topology"] = value;
+            assert!(vllm_execution_mode_binding(&artifact_root, "throughput", &mode).is_err());
+        }
+    }
+
+    #[test]
+    fn vllm_execution_mode_binding_excludes_proofs_and_measured_evidence() {
+        let artifact_root = "ab".repeat(32);
+        let mode = serialized_vllm_execution_mode();
+        let expected = vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
+
+        for (pointer, value) in [
+            ("/profile/proof_sha256", json!("different")),
+            ("/canary/fingerprints/artifact", json!("different")),
+            ("/canary/token_prefixes/artifact/prompt/0", json!(99)),
+            ("/modality_fingerprints/text", json!("different")),
+            (
+                "/resource_profiles/text/measured_working_set_bytes",
+                json!(99),
+            ),
+            (
+                "/speciality_calibrations/reasoning/high/fingerprint",
+                json!("different"),
+            ),
+        ] {
+            let mut changed = mode.clone();
+            *changed.pointer_mut(pointer).unwrap() = value;
+            assert_eq!(
+                vllm_execution_mode_binding(&artifact_root, "throughput", &changed).unwrap(),
+                expected,
+                "excluded field {pointer} changed the binding"
+            );
+        }
+    }
+
+    #[test]
+    fn vllm_execution_mode_binding_authenticates_mode_concurrency_policy_not_proof() {
+        let artifact_root = "ab".repeat(32);
+        let mut mode = serialized_vllm_execution_mode();
+        let without_profile =
+            vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
+        mode["generation_execution_profile"] = json!({
+            "schema_version": 1,
+            "engine": "vllm",
+            "independent_dispatch": true,
+            "request_modalities": [["text"]],
+            "proof_sha256": "33".repeat(32),
+        });
+        let with_profile =
+            vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
+        assert_ne!(with_profile, without_profile);
+
+        let mut changed_proof = mode.clone();
+        changed_proof["generation_execution_profile"]["proof_sha256"] = json!("44".repeat(32));
+        assert_eq!(
+            vllm_execution_mode_binding(&artifact_root, "throughput", &changed_proof).unwrap(),
+            with_profile
+        );
+
+        for (field, value) in [
+            ("independent_dispatch", json!(false)),
+            ("request_modalities", json!([["audio", "text"]])),
+        ] {
+            let mut changed_policy = mode.clone();
+            changed_policy["generation_execution_profile"][field] = value;
+            assert_ne!(
+                vllm_execution_mode_binding(&artifact_root, "throughput", &changed_policy).unwrap(),
+                with_profile
+            );
+        }
+    }
+
+    #[test]
+    fn vllm_execution_mode_binding_authenticates_runtime_and_preserves_baseline() {
+        let artifact_root = "ab".repeat(32);
+        let mut mode = serialized_vllm_execution_mode();
+        let baseline = vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
+        let profile: SerializedVllmExecutionProfile =
+            serde_json::from_value(mode["profile"].clone()).unwrap();
+        assert_eq!(profile.runtime, None);
+        assert!(serde_json::to_value(profile).unwrap().get("runtime").is_none());
+
+        mode["profile"]["runtime"] = Value::Null;
+        assert_eq!(
+            vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap(),
+            baseline
+        );
+        let profile: SerializedVllmExecutionProfile =
+            serde_json::from_value(mode["profile"].clone()).unwrap();
+        assert_eq!(profile.runtime, None);
+        assert!(serde_json::to_value(profile).unwrap().get("runtime").is_none());
+
+        let runtime = VllmRuntime::FlashinferSpeculativeMetadataV1;
+        assert_eq!(serde_json::to_value(runtime).unwrap(), json!("flashinfer_speculative_metadata_v1"));
+        mode["profile"]["runtime"] = serde_json::to_value(runtime).unwrap();
+        let profile: SerializedVllmExecutionProfile =
+            serde_json::from_value(mode["profile"].clone()).unwrap();
+        assert_eq!(profile.runtime, Some(runtime));
+        assert_eq!(serde_json::to_value(profile).unwrap()["runtime"], mode["profile"]["runtime"]);
+        let selected = vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
+        assert_ne!(selected, baseline);
+        mode["profile"]["proof_sha256"] = json!("ff".repeat(32));
+        assert_eq!(
+            vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap(),
+            selected
+        );
+
+        for invalid in [json!("unknown_runtime"), json!(1), json!({"runtime": "flashinfer_speculative_metadata_v1"})] {
+            mode["profile"]["runtime"] = invalid;
+            assert!(vllm_execution_mode_binding(&artifact_root, "throughput", &mode).is_err());
+        }
+    }
+
+    #[test]
+    fn vllm_execution_mode_binding_rejects_noncanonical_shape() {
+        let artifact_root = "ab".repeat(32);
+        let mode = serialized_vllm_execution_mode();
+        for pointer in ["", "/profile", "/canary"] {
+            let mut invalid = mode.clone();
+            invalid
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_owned(), json!(true));
+            assert!(vllm_execution_mode_binding(&artifact_root, "throughput", &invalid).is_err());
+        }
+        let mut missing_evidence = mode.clone();
+        missing_evidence
+            .as_object_mut()
+            .unwrap()
+            .remove("resource_profiles");
+        assert!(
+            vllm_execution_mode_binding(&artifact_root, "throughput", &missing_evidence).is_err()
+        );
+        let mut invalid_profile = mode.clone();
+        invalid_profile["generation_execution_profile"] = json!({
+            "schema_version": 1,
+            "engine": "vllm",
+            "independent_dispatch": true,
+            "request_modalities": [["text"]],
+            "proof_sha256": "33".repeat(32),
+            "unexpected": true,
+        });
+        assert!(
+            vllm_execution_mode_binding(&artifact_root, "throughput", &invalid_profile).is_err()
+        );
+        assert!(
+            vllm_execution_mode_binding(&artifact_root.to_uppercase(), "throughput", &mode)
+                .is_err()
+        );
+        assert!(vllm_execution_mode_binding(&artifact_root, "baseline", &mode).is_err());
+    }
+
+    #[test]
+    fn execution_mode_policy_serde_rejects_unknown_nested_schema_fields() {
+        let mut valid = serde_json::to_value(execution_mode_request_policy()).unwrap();
+        valid["endpoint_families"][0]["response_attribute_specs"]["score"] =
+            json!({"value_types": ["number"]});
+        valid["endpoint_families"][0]["speciality_mappings"] = json!({
+            "reasoning": {
+                "request_path": "reasoning",
+                "target": "backend_parameter",
+                "native_path": "reasoning",
+            },
+        });
+        serde_json::from_value::<ExecutionModeRequestPolicy>(valid.clone()).unwrap();
+
+        for (pointer, field, expected_path) in [
+            ("", "unknown", "unknown"),
+            (
+                "/endpoint_families/0",
+                "response_attribute",
+                "endpoint_families[0].response_attribute",
+            ),
+            (
+                "/endpoint_families/0/request_attribute_specs/min_p",
+                "enum_value",
+                "endpoint_families[0].request_attribute_specs.min_p.enum_value",
+            ),
+            (
+                "/endpoint_families/0/request_attribute_specs/min_p",
+                "maximun",
+                "endpoint_families[0].request_attribute_specs.min_p.maximun",
+            ),
+            (
+                "/endpoint_families/0/response_attribute_specs/score",
+                "maximun",
+                "endpoint_families[0].response_attribute_specs.score.maximun",
+            ),
+            (
+                "/endpoint_families/0/speciality_mappings/reasoning",
+                "native_paths",
+                "endpoint_families[0].speciality_mappings.reasoning.native_paths",
+            ),
+        ] {
+            let mut invalid = valid.clone();
+            invalid
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert(field.to_owned(), json!(0));
+            let error = serde_json::from_str::<ExecutionModeRequestPolicy>(
+                &serde_json::to_string(&invalid).unwrap(),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(expected_path), "{error}");
+        }
+    }
+
+    #[test]
+    fn execution_mode_policy_serde_preserves_arbitrary_spec_values_and_wire_shape() {
+        let mut policy = execution_mode_request_policy();
+        let spec = policy.endpoint_families[0]
+            .request_attribute_specs
+            .get_mut("logit_bias")
+            .unwrap();
+        let payload = json!({"enum_value": {"maximun": 0}, "unknown": [1, 2]});
+        spec.default = Some(payload.clone());
+        spec.enum_values = vec![payload.clone()];
+        spec.calibration_values = vec![payload];
+        spec.minimum = Some(0.0);
+        spec.maximum = Some(1.0);
+        spec.multiple_of = Some(1.0);
+        spec.min_length = Some(0);
+        spec.max_length = Some(1);
+        spec.min_items = Some(0);
+        spec.max_items = Some(1);
+
+        let encoded = serde_json::to_string(&policy).unwrap();
+        let decoded: ExecutionModeRequestPolicy = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(decoded, policy);
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), encoded);
+    }
+
+    #[test]
+    fn execution_mode_policy_serde_rejects_sequence_encoded_schema_objects() {
+        let family = json!([
+            ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            ["min_p"],
+            [],
+            [],
+            [],
+            {"min_p": {"value_types": ["number"], "maximun": 0}},
+            {},
+            [],
+            {},
+        ]);
+        let error = serde_json::from_value::<ExecutionModeRequestPolicy>(json!({
+            "endpoint_families": [family],
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("endpoint_families[0] must be a JSON object"));
+    }
+
+    #[test]
+    fn execution_mode_policy_serde_leaves_baseline_types_permissive() {
+        let policy = execution_mode_request_policy();
+        let expected = &policy.endpoint_families[0];
+        let mut family = serde_json::to_value(expected).unwrap();
+        family["unknown"] = json!(true);
+        family["request_attribute_specs"]["min_p"]["enum_value"] = json!([0]);
+        family["request_attribute_specs"]["min_p"]["maximun"] = json!(0);
+
+        let decoded_spec: EndpointAttributeSpec =
+            serde_json::from_value(family["request_attribute_specs"]["min_p"].clone()).unwrap();
+        assert_eq!(decoded_spec, expected.request_attribute_specs["min_p"]);
+        let decoded_family: EndpointFamilyContract = serde_json::from_value(family).unwrap();
+        assert_eq!(&decoded_family, expected);
+    }
+
+    #[test]
+    fn execution_mode_request_policy_restricts_effective_values_only() {
+        let policy = execution_mode_request_policy();
+        assert!(policy
+            .validate_request(ENDPOINT_OPENAI_CHAT_COMPLETIONS, &json!({"min_p": 0}))
+            .is_ok());
+        assert!(policy
+            .validate_request(ENDPOINT_OPENAI_CHAT_COMPLETIONS, &json!({"min_p": 0.05}))
+            .is_err());
+
+        assert!(policy
+            .validate_request(ENDPOINT_OPENAI_CHAT_COMPLETIONS, &json!({}))
+            .is_ok());
+        let effective_default = json!({"min_p": 0.05});
+        assert!(policy
+            .validate_request(ENDPOINT_OPENAI_CHAT_COMPLETIONS, &effective_default)
+            .is_err());
+    }
+
+    #[test]
+    fn execution_mode_request_policy_uses_declared_logit_bias_types_and_values() {
+        let policy = execution_mode_request_policy();
+        for logit_bias in [json!({}), Value::Null] {
+            assert!(policy
+                .validate_request(
+                    ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                    &json!({"logit_bias": logit_bias}),
+                )
+                .is_ok());
+        }
+        for logit_bias in [json!({"42": 1}), json!([])] {
+            assert!(policy
+                .validate_request(
+                    ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                    &json!({"logit_bias": logit_bias}),
+                )
+                .is_err());
+        }
+    }
+
+    #[test]
+    fn execution_mode_request_policy_refuses_unknown_families_and_ignores_other_fields() {
+        let policy = execution_mode_request_policy();
+        assert!(policy
+            .validate_request("unsupported", &json!({"min_p": 0}))
+            .is_err());
+        assert!(policy
+            .validate_request(
+                ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                &json!({
+                    "model": "another-model",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "provider_extension": {"unchanged": true},
+                }),
+            )
+            .is_ok());
+    }
+
+    #[test]
     fn at_most_integer_canonicalization_never_exceeds_the_request() {
         let mut enumerated = EndpointAttributeSpec::new(EndpointValueType::Integer);
         enumerated.enum_values = (9_u64..=121).step_by(8).map(Value::from).collect();
@@ -2894,6 +3827,18 @@ mod tests {
         }));
 
         assert!(missing.is_err());
+    }
+
+    #[test]
+    fn runtime_config_legacy_wire_bytes_are_unchanged_without_execution_mode() {
+        let encoded = serde_json::to_vec(&AttestationRuntimeConfig::default()).unwrap();
+
+        assert_eq!(
+            encoded,
+            br#"{"model_class":"text-generation","backend":"unknown","ctx":0,"tp_degree":1}"#
+        );
+        let decoded: AttestationRuntimeConfig = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.execution_mode, None);
     }
 
     #[test]

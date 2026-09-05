@@ -84,7 +84,7 @@ KV capacity. Heartbeats advertise that provider-derived capacity and current
 load. The `.29` result proves that machine sustained two sessions; `2` is not
 a canonical limit, default, promise, or value to copy to another provider.
 
-The paid/live launch gate is complete. Two overlapping full-context FIAT
+The paid/live launch gate for the baseline is complete. Two overlapping full-context FIAT
 requests returned independent final signed receipts, cancellation of one
 shorter overlap did not disrupt its paid peer, the `.29` route remained live,
 and a metered `openmayhem.ai` request completed. The provider accepts FIAT,
@@ -110,6 +110,44 @@ the vLLM EngineCore held 46,303 MiB of accelerator memory and the host retained
 about 64.67 GiB of available system memory; the provider stayed active with
 zero restarts. These are `.29` request-path measurements, not universal
 performance requirements or pure kernel benchmarks.
+
+## Optional Execution Modes
+
+A faster runtime configuration is not automatically equivalent to the baseline
+calibration. Optional `vllm_execution_modes` are keyed by exact artifact root
+and mode ID. Each mode must have its own runtime profile, canary input hash,
+recorded output evidence, modality resources, and speciality calibrations.
+Do not copy baseline fingerprints or weaken its request contract to admit a mode.
+
+For explicit vLLM compilation settings, verify the resolved configuration on
+every initialized worker before accepting the load. Frontend configuration and
+startup arguments are insufficient: a backend can downgrade CUDA-graph mode
+inside its worker. Retain the named worker-observation result, require complete
+rank coverage and agreement, and reject missing, timed-out or mismatched
+observations. Do not relabel a report after a downgrade. A different effective
+configuration requires its own mode-policy binding and fresh evidence. Legacy
+loads without explicit compilation settings keep their existing behavior.
+
+Use `catalog calibrate-canary --execution-mode <id>` for mode-specific evidence.
+Resume, report merge, evidence verification, and catalog apply must agree on the
+same artifact and mode-policy hash. Mode evidence updates only that mode, not
+the baseline artifact or another mode. Sampling defaults remain unchanged;
+supplemental request restrictions must describe actual runtime limitations.
+For example, an MTP runtime that cannot serve nonzero `min_p` must advertise
+that restriction rather than silently ignoring the user's value.
+
+Independent dispatch also requires the mode's own signed
+`generation_execution_profile` and overlapping-request proof. A baseline
+parallelism proof does not authorize a different execution mode. Without that
+mode-specific opt-in, requests remain exclusive; with it, capacity is still
+derived from the provider's measured memory, context, and scheduler capacity,
+not a fixed session count in calibration.
+
+Before publication, test baseline and mode request selection, stale-advertisement
+rejection, runtime attestation binding, mode-specific canary probes, and paid
+requests. A compatible mode must use the unchanged baseline endpoint contract
+fingerprint plus its supplemental restrictions. Existing baseline providers and
+clients must keep working without selecting a mode.
 
 ## Comfy Workflow Calibration
 

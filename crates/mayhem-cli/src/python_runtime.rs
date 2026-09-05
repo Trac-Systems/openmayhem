@@ -15,6 +15,12 @@ use sha2::{Digest, Sha256};
 const GIB: u64 = 1024 * 1024 * 1024;
 
 const VLLM_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/vllm.txt");
+const VLLM_SPECMETA_REQUIREMENTS: &[u8] =
+    include_bytes!("../resources/python/vllm-specmeta-v1.txt");
+const VLLM_SPECMETA_BACKEND: &str = "vllm-flashinfer-specmeta-v1";
+const VLLM_SPECMETA_VERSION: &str = "0.24.0+mayhem.specmeta1";
+const VLLM_SPECMETA_MODULE_SHA256: &str =
+    "01678024fc88e5f031b866fd6affbb0d82917c271938d8c5878fa0e68c023ab5";
 const TRT_LLM_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/trt-llm.txt");
 const MLX_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/mlx.txt");
 const LLAMA_MEDIA_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/llama-media.txt");
@@ -145,6 +151,20 @@ pub(crate) struct PythonRuntime {
     pub(crate) requirements_sha256: String,
 }
 
+pub(crate) use mayhem_proto::VllmRuntime;
+
+pub(crate) fn ensure_vllm_python(
+    home: &Path,
+    runtime: Option<VllmRuntime>,
+) -> Result<PythonRuntime> {
+    match runtime {
+        None => ensure_backend_python(home, "vllm"),
+        Some(VllmRuntime::FlashinferSpeculativeMetadataV1) => {
+            ensure_backend_python(home, VLLM_SPECMETA_BACKEND)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 struct PythonRuntimeSpec {
     backend: &'static str,
@@ -173,6 +193,15 @@ struct EmbeddedPythonWheel {
     version: &'static str,
     source: &'static [u8],
     source_sha256: &'static str,
+}
+
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ManagedVllmWheel {
+    filename: String,
+    url: String,
+    sha256: String,
+    size: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -241,6 +270,7 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
     let spec = python_runtime_spec(backend)
         .with_context(|| format!("backend {backend} does not use a managed Python runtime"))?;
     verify_requirements(&spec)?;
+    let runtime_wheel = managed_vllm_wheel(&spec, env::consts::OS, env::consts::ARCH)?;
     let cache_root = home.join("cache").join(spec.backend);
 
     if let Some(explicit) = env::var_os(spec.override_env) {
@@ -334,12 +364,9 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
         })?;
         fs::create_dir_all(&uv_cache)
             .with_context(|| format!("creating uv cache directory {}", uv_cache.display()))?;
-        let create = Command::new(&uv)
-            .arg("venv")
-            .arg("--python")
-            .arg(MANAGED_PYTHON_VERSION)
-            .arg("--seed")
-            .arg(&venv)
+        let mut create_command = Command::new(&uv);
+        create_command.args(managed_venv_args(runtime_wheel.is_some())).arg(&venv);
+        let create = create_command
             .env("UV_PYTHON_INSTALL_DIR", &python_install_dir)
             .env("UV_CACHE_DIR", &uv_cache)
             .env("UV_NO_PROGRESS", "1")
@@ -378,6 +405,10 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
             )
         })?;
         let managed_python = venv_python(&venv);
+        let runtime_wheel_path = runtime_wheel
+            .as_ref()
+            .map(|wheel| materialize_managed_vllm_wheel(&cache_root.join("wheels"), wheel))
+            .transpose()?;
         let mut install_command = Command::new(&managed_python);
         install_command
             .arg("-m")
@@ -389,6 +420,9 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
             install_command
                 .arg("--extra-index-url")
                 .arg(extra_index_url);
+        }
+        if let Some(wheel) = runtime_wheel_path {
+            install_command.arg(wheel);
         }
         let install = install_command
             .arg("--requirement")
@@ -3155,6 +3189,13 @@ fn file_sha256(path: &Path) -> Result<String> {
 
 fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
     match backend {
+        VLLM_SPECMETA_BACKEND => Some(PythonRuntimeSpec {
+            backend: VLLM_SPECMETA_BACKEND,
+            version: VLLM_SPECMETA_VERSION,
+            requirements: VLLM_SPECMETA_REQUIREMENTS,
+            requirements_sha256: "5d1ab55151bdb49a2b902e0799827b48c87f3f0068c1196a3716405036edc1d2",
+            ..python_runtime_spec("vllm")?
+        }),
         "vllm" => Some(PythonRuntimeSpec {
             backend: "vllm",
             override_env: "MAYHEM_VLLM_PYTHON",
@@ -3519,6 +3560,164 @@ fn install_embedded_python_wheels(
     Ok(())
 }
 
+fn managed_vllm_wheel(
+    spec: &PythonRuntimeSpec,
+    os: &str,
+    arch: &str,
+) -> Result<Option<ManagedVllmWheel>> {
+    if spec.backend != VLLM_SPECMETA_BACKEND {
+        return Ok(None);
+    }
+    ensure!(
+        os == "linux" && matches!(arch, "aarch64" | "x86_64"),
+        "the selected vLLM runtime supports Linux aarch64/x86_64, not {os}/{arch}"
+    );
+    let wheels: std::collections::BTreeMap<String, ManagedVllmWheel> = serde_json::from_slice(
+        include_bytes!("../resources/python/vllm-specmeta-v1-wheels.json"),
+    )
+    .context("reading the pinned vLLM runtime wheel manifest")?;
+    let wheel = wheels
+        .get(arch)
+        .context("missing pinned vLLM runtime architecture")?;
+    ensure!(
+        wheel.filename
+            == format!("vllm-{VLLM_SPECMETA_VERSION}-cp38-abi3-manylinux_2_28_{arch}.whl")
+            && wheel.sha256.len() == 64
+            && wheel.sha256.bytes().all(|byte| byte.is_ascii_hexdigit())
+            && wheel.size > 0
+            && wheel.size <= GIB,
+        "invalid pinned vLLM runtime wheel metadata"
+    );
+    let url = reqwest::Url::parse(&wheel.url).context("invalid vLLM runtime wheel URL")?;
+    let segments: Vec<_> = url
+        .path_segments()
+        .context("invalid runtime wheel URL path")?
+        .collect();
+    ensure!(
+        url.scheme() == "https"
+            && url.host_str() == Some("huggingface.co")
+            && url.username().is_empty()
+            && url.password().is_none()
+            && url.query().is_none()
+            && url.fragment().is_none()
+            && segments.len() == 6
+            && segments[..4]
+                == [
+                    "datasets",
+                    "TracNetwork",
+                    "openmayhem-runtime-wheels",
+                    "resolve"
+                ]
+            && segments[4].len() == 40
+            && segments[4].bytes().all(|byte| byte.is_ascii_hexdigit())
+            && segments[5] == wheel.filename,
+        "vLLM runtime wheel URL must use the immutable release repository revision"
+    );
+    Ok(Some(wheel.clone()))
+}
+
+fn verify_managed_vllm_wheel(path: &Path, wheel: &ManagedVllmWheel) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "runtime wheel is not a regular file"
+    );
+    ensure!(metadata.len() == wheel.size, "runtime wheel size mismatch");
+    let mut input = File::open(path)?;
+    let mut digest = Sha256::new();
+    std::io::copy(&mut input, &mut digest)?;
+    ensure!(
+        format!("{:x}", digest.finalize()) == wheel.sha256,
+        "runtime wheel checksum mismatch"
+    );
+    Ok(())
+}
+
+fn copy_managed_vllm_wheel(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    wheel: &ManagedVllmWheel,
+) -> Result<()> {
+    let mut digest = Sha256::new();
+    let mut remaining = wheel.size;
+    let mut buffer = [0_u8; 64 * 1024];
+    while remaining > 0 {
+        let limit = remaining.min(buffer.len() as u64) as usize;
+        let count = input.read(&mut buffer[..limit])?;
+        ensure!(count != 0, "runtime wheel download was truncated");
+        digest.update(&buffer[..count]);
+        output.write_all(&buffer[..count])?;
+        remaining -= count as u64;
+    }
+    ensure!(
+        input.read(&mut buffer[..1])? == 0,
+        "runtime wheel download exceeds its pinned size"
+    );
+    ensure!(
+        format!("{:x}", digest.finalize()) == wheel.sha256,
+        "runtime wheel download checksum mismatch"
+    );
+    Ok(())
+}
+
+fn managed_venv_args(require_managed: bool) -> Vec<&'static str> {
+    let mut args = vec!["venv", "--python", MANAGED_PYTHON_VERSION, "--seed"];
+    // The version-bound JIT runtime needs CPython headers, absent from many system installs.
+    if require_managed {
+        args.push("--managed-python");
+    }
+    args
+}
+
+fn materialize_managed_vllm_wheel(cache: &Path, wheel: &ManagedVllmWheel) -> Result<PathBuf> {
+    fs::create_dir_all(cache)?;
+    let path = cache.join(&wheel.filename);
+    if path.try_exists()? {
+        verify_managed_vllm_wheel(&path, wheel)?;
+        return Ok(path);
+    }
+    let client = reqwest::blocking::Client::builder()
+        .https_only(true)
+        .redirect(reqwest::redirect::Policy::limited(5))
+        .connect_timeout(Duration::from_secs(30))
+        .timeout(Duration::from_secs(1800))
+        .user_agent(format!("openmayhem/managed-vllm-{VLLM_SPECMETA_VERSION}"))
+        .build()?;
+    let mut response = client.get(&wheel.url).send()?.error_for_status()?;
+    if let Some(length) = response.content_length() {
+        ensure!(
+            length == wheel.size,
+            "runtime wheel response length differs from its pinned size"
+        );
+    }
+    let partial = path.with_extension("whl.partial");
+    // The backend bootstrap lock owns this single bounded partial download.
+    match fs::symlink_metadata(&partial) {
+        Ok(metadata) => {
+            ensure!(
+                metadata.is_file() && !metadata.file_type().is_symlink(),
+                "runtime wheel partial is not a regular file"
+            );
+            fs::remove_file(&partial)?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let mut output = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&partial)?;
+    let result = copy_managed_vllm_wheel(&mut response, &mut output, wheel)
+        .and_then(|()| output.sync_all().map_err(Into::into));
+    drop(output);
+    if let Err(error) = result {
+        let _ = fs::remove_file(&partial);
+        return Err(error).context("downloading the pinned vLLM runtime wheel");
+    }
+    fs::rename(&partial, &path)?;
+    Ok(path)
+}
+
 fn install_embedded_python_module(
     python: &Path,
     venv: &Path,
@@ -3671,7 +3870,9 @@ fn exact_requirement_pairs(text: &str) -> Result<Vec<(String, String)>> {
     Ok(pairs)
 }
 
-fn validate_python(python: &Path, spec: &PythonRuntimeSpec, cache_root: &Path) -> Result<()> {
+const PYTHON_RUNTIME_VERSION_MARKER: &str = "__MAYHEM_RUNTIME_VERSION__=";
+
+fn python_validation_script(spec: &PythonRuntimeSpec) -> Result<String> {
     let text = std::str::from_utf8(spec.requirements)
         .with_context(|| format!("{} requirements are not UTF-8", spec.backend))?;
     let mut expected_pairs = exact_requirement_pairs(text)?;
@@ -3690,11 +3891,21 @@ fn validate_python(python: &Path, spec: &PythonRuntimeSpec, cache_root: &Path) -
     let expected_versions = serde_json::to_string(&expected_pairs)?;
     let required_imports = serde_json::to_string(spec.required_imports)?;
     let embedded_module = python_embedded_module_literal(spec)?;
-    const VERSION_MARKER: &str = "__MAYHEM_RUNTIME_VERSION__=";
-    let script = format!(
-        "import hashlib,importlib,importlib.metadata as m,pathlib; expected=dict({expected_versions}); mismatched=[f'{{name}}={{m.version(name)}} (expected {{version}})' for name,version in expected.items() if not (m.version(name) == version or ('+' not in version and m.version(name).partition('+')[0] == version))]; assert not mismatched, '; '.join(mismatched); modules={{name:importlib.import_module(name) for name in {required_imports}}}; embedded={embedded_module}; embedded_ok=embedded is None or (pathlib.Path(modules[embedded[0]].__file__).is_file() and hashlib.sha256(pathlib.Path(modules[embedded[0]].__file__).read_bytes()).hexdigest()==embedded[1]); assert embedded_ok, 'embedded runtime module checksum mismatch'; print({:?} + m.version({:?}))",
-        VERSION_MARKER, spec.distribution
-    );
+    let runtime_integrity = if spec.backend == VLLM_SPECMETA_BACKEND {
+        format!(
+            "runtime_file=pathlib.Path(modules['vllm'].__file__).parent / 'v1/attention/backends/flashinfer.py'\nif not runtime_file.is_file() or hashlib.sha256(runtime_file.read_bytes()).hexdigest()!={VLLM_SPECMETA_MODULE_SHA256:?}:\n    raise RuntimeError('vLLM speculative metadata runtime checksum mismatch')\nimport sysconfig\ninclude_paths=[pathlib.Path(value) for key,value in sysconfig.get_paths().items() if key in ('include','platinclude') and value]\nif not all(any((directory/header).is_file() for directory in include_paths) for header in ('Python.h','pyconfig.h')):\n    raise RuntimeError('vLLM JIT runtime requires CPython development headers; use a complete managed Python installation')\n"
+        )
+    } else {
+        String::new()
+    };
+    Ok(format!(
+        "import hashlib,importlib,importlib.metadata as m,pathlib\nexpected=dict({expected_versions})\nmismatched=[f'{{name}}={{m.version(name)}} (expected {{version}})' for name,version in expected.items() if not (m.version(name) == version or ('+' not in version and m.version(name).partition('+')[0] == version))]\nif mismatched:\n    raise RuntimeError('; '.join(mismatched))\nmodules={{name:importlib.import_module(name) for name in {required_imports}}}\nembedded={embedded_module}\nembedded_ok=embedded is None or (pathlib.Path(modules[embedded[0]].__file__).is_file() and hashlib.sha256(pathlib.Path(modules[embedded[0]].__file__).read_bytes()).hexdigest()==embedded[1])\nif not embedded_ok:\n    raise RuntimeError('embedded runtime module checksum mismatch')\n{runtime_integrity}print({PYTHON_RUNTIME_VERSION_MARKER:?} + m.version({:?}))\n",
+        spec.distribution
+    ))
+}
+
+fn validate_python(python: &Path, spec: &PythonRuntimeSpec, cache_root: &Path) -> Result<()> {
+    let script = python_validation_script(spec)?;
     let mut command = Command::new(python);
     configure_validation_cache(&mut command, cache_root)?;
     let output = command
@@ -3720,7 +3931,7 @@ fn validate_python(python: &Path, spec: &PythonRuntimeSpec, cache_root: &Path) -
     let actual = stdout
         .lines()
         .rev()
-        .find_map(|line| line.trim().strip_prefix(VERSION_MARKER))
+        .find_map(|line| line.trim().strip_prefix(PYTHON_RUNTIME_VERSION_MARKER))
         .with_context(|| {
             format!(
                 "{} validated {} but did not emit its version marker",
@@ -3728,7 +3939,7 @@ fn validate_python(python: &Path, spec: &PythonRuntimeSpec, cache_root: &Path) -
                 spec.distribution
             )
         })?;
-    if !python_distribution_version_matches(actual, spec.version) {
+    if !python_runtime_version_matches(actual, spec) {
         bail!(
             "{} has {} {}, expected {}",
             python.display(),
@@ -3738,6 +3949,12 @@ fn validate_python(python: &Path, spec: &PythonRuntimeSpec, cache_root: &Path) -
         );
     }
     Ok(())
+}
+
+fn python_runtime_version_matches(actual: &str, spec: &PythonRuntimeSpec) -> bool {
+    // A managed variant belongs only to the profile that explicitly selects it.
+    !(spec.backend == "vllm" && actual == VLLM_SPECMETA_VERSION)
+        && python_distribution_version_matches(actual, spec.version)
 }
 
 fn python_embedded_module_literal(spec: &PythonRuntimeSpec) -> Result<String> {
@@ -4476,6 +4693,194 @@ mod tests {
             Some("MAYHEM_SULPHUR_PYTHON")
         );
         assert!(python_runtime_spec("llama.cpp").is_none());
+    }
+
+    #[test]
+    fn vllm_specmeta_runtime_is_explicit_and_keeps_existing_dependency_pins() {
+        let base = python_runtime_spec("vllm").unwrap();
+        let fixed = python_runtime_spec(VLLM_SPECMETA_BACKEND).unwrap();
+        verify_requirements(&base).unwrap();
+        verify_requirements(&fixed).unwrap();
+        assert_ne!(base.backend, fixed.backend);
+        assert_eq!(base.version, "0.24.0");
+        assert_eq!(fixed.version, VLLM_SPECMETA_VERSION);
+        assert_eq!(base.override_env, fixed.override_env);
+        assert_eq!(base.required_imports, fixed.required_imports);
+        let pins = |spec: PythonRuntimeSpec| {
+            exact_requirement_pairs(std::str::from_utf8(spec.requirements).unwrap())
+                .unwrap()
+                .into_iter()
+                .filter(|(name, _)| name != "vllm")
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(pins(base), pins(fixed));
+        assert!(managed_vllm_wheel(&base, "macos", "aarch64")
+            .unwrap()
+            .is_none());
+        for arch in ["aarch64", "x86_64"] {
+            assert!(managed_vllm_wheel(&fixed, "linux", arch).unwrap().is_some());
+        }
+        for (os, arch) in [
+            ("macos", "aarch64"),
+            ("windows", "x86_64"),
+            ("linux", "riscv64"),
+        ] {
+            assert!(managed_vllm_wheel(&fixed, os, arch).is_err());
+        }
+        assert_eq!(
+            serde_json::to_value(VllmRuntime::FlashinferSpeculativeMetadataV1).unwrap(),
+            serde_json::json!("flashinfer_speculative_metadata_v1")
+        );
+        assert!(
+            serde_json::from_value::<VllmRuntime>(serde_json::json!("arbitrary_runtime")).is_err()
+        );
+        assert!(!python_distribution_version_matches(
+            "0.24.0",
+            VLLM_SPECMETA_VERSION
+        ));
+        assert!(!python_distribution_version_matches(
+            "0.24.0+other",
+            VLLM_SPECMETA_VERSION
+        ));
+        assert!(python_runtime_version_matches("0.24.0", &base));
+        assert!(python_runtime_version_matches("0.24.0+cu130", &base));
+        assert!(!python_runtime_version_matches(
+            VLLM_SPECMETA_VERSION,
+            &base
+        ));
+        assert!(python_runtime_version_matches(
+            VLLM_SPECMETA_VERSION,
+            &fixed
+        ));
+        assert!(!python_runtime_version_matches("0.24.0", &fixed));
+    }
+
+    #[test]
+    fn runtime_validation_uses_explicit_errors_not_optimizable_assertions() {
+        for backend in ["vllm", VLLM_SPECMETA_BACKEND, "sulphur", "sulphur-mlx"] {
+            let script = python_validation_script(&python_runtime_spec(backend).unwrap()).unwrap();
+            assert!(!script.contains("assert "), "{backend}");
+            assert!(script.contains("if mismatched:\n    raise RuntimeError"));
+            assert!(script.contains("if not embedded_ok:\n    raise RuntimeError"));
+            if backend == VLLM_SPECMETA_BACKEND {
+                assert!(script.contains(
+                    "raise RuntimeError('vLLM speculative metadata runtime checksum mismatch')"
+                ));
+                assert!(script.contains("requires CPython development headers"));
+                assert!(script.contains("('Python.h','pyconfig.h')"));
+            } else {
+                assert!(!script.contains("requires CPython development headers"));
+            }
+        }
+    }
+
+    #[test]
+    fn version_bound_runtime_requires_managed_python_without_changing_baseline() {
+        assert_eq!(managed_venv_args(false), vec!["venv", "--python", MANAGED_PYTHON_VERSION, "--seed"]);
+        assert_eq!(managed_venv_args(true), vec!["venv", "--python", MANAGED_PYTHON_VERSION, "--seed", "--managed-python"]);
+    }
+
+    #[test]
+    #[ignore = "requires Python; exercises the actual validator under -O without model imports"]
+    fn runtime_validation_rejects_corrupt_modules_with_python_optimization() {
+        let python = env::var_os("MAYHEM_TEST_PYTHON").unwrap_or_else(|| "python3".into());
+        let spec = python_runtime_spec(VLLM_SPECMETA_BACKEND).unwrap();
+        let pairs =
+            exact_requirement_pairs(std::str::from_utf8(spec.requirements).unwrap()).unwrap();
+        let prefix = format!(
+            "import importlib,importlib.metadata,types\nversions=dict({})\nimportlib.metadata.version=lambda name: versions[name]\nimportlib.import_module=lambda name: types.SimpleNamespace(__file__='/missing-validation-fixture/vllm/__init__.py')\n",
+            serde_json::to_string(&pairs).unwrap()
+        );
+        let script = python_validation_script(&spec).unwrap();
+        let result = Command::new(&python)
+            .args(["-O", "-c", &format!("{prefix}{script}")])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("runtime checksum mismatch"));
+
+        let missing_headers = format!(
+            "{prefix}import hashlib,pathlib\nhashlib.sha256=lambda data: types.SimpleNamespace(hexdigest=lambda: {VLLM_SPECMETA_MODULE_SHA256:?})\npathlib.Path.read_bytes=lambda self: b'fixture'\npathlib.Path.is_file=lambda self: self.name == 'flashinfer.py'\n{script}"
+        );
+        let result = Command::new(&python)
+            .args(["-O", "-c", &missing_headers])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("requires CPython development headers"));
+
+        let base = python_runtime_spec("vllm").unwrap();
+        let script = python_validation_script(&base).unwrap();
+        let wrong = format!("{prefix}versions['torch']='0.0.0'\n{script}");
+        let result = Command::new(&python)
+            .args(["-O", "-c", &wrong])
+            .output()
+            .unwrap();
+        assert!(!result.status.success());
+        assert!(String::from_utf8_lossy(&result.stderr).contains("torch=0.0.0"));
+        let valid = format!("{prefix}versions['vllm']='0.24.0'\n{script}");
+        let result = Command::new(&python)
+            .args(["-O", "-c", &valid])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+    }
+
+    #[test]
+    #[ignore = "downloads and installs the pinned runtime into an explicitly supplied home"]
+    fn managed_vllm_specmeta_installation() {
+        let home = PathBuf::from(
+            env::var_os("MAYHEM_TEST_MANAGED_VLLM_HOME")
+                .expect("set MAYHEM_TEST_MANAGED_VLLM_HOME to the intended installation home"),
+        );
+        assert!(home.is_absolute());
+        assert!(
+            env::var_os("MAYHEM_VLLM_PYTHON").is_none(),
+            "unset the override to test managed installation"
+        );
+        let runtime =
+            ensure_vllm_python(&home, Some(VllmRuntime::FlashinferSpeculativeMetadataV1)).unwrap();
+        assert_eq!(
+            runtime.python,
+            venv_python(&home.join("venvs").join(VLLM_SPECMETA_BACKEND))
+        );
+        assert_eq!(
+            runtime.requirements_sha256,
+            python_runtime_spec(VLLM_SPECMETA_BACKEND)
+                .unwrap()
+                .requirements_sha256
+        );
+        println!(
+            "{}",
+            serde_json::json!({"python": runtime.python, "source": runtime.source,
+            "requirements_sha256": runtime.requirements_sha256, "runtime": VllmRuntime::FlashinferSpeculativeMetadataV1})
+        );
+    }
+
+    #[test]
+    fn vllm_runtime_wheel_copy_is_bounded_and_rejects_corruption() {
+        let payload = b"checked wheel bytes";
+        let wheel = ManagedVllmWheel {
+            filename: "test.whl".to_owned(),
+            url: "https://example.invalid/test.whl".to_owned(),
+            sha256: format!("{:x}", Sha256::digest(payload)),
+            size: payload.len() as u64,
+        };
+        let mut output = Vec::new();
+        copy_managed_vllm_wheel(&mut payload.as_slice(), &mut output, &wheel).unwrap();
+        assert_eq!(output, payload);
+        assert!(copy_managed_vllm_wheel(&mut &payload[..3], &mut Vec::new(), &wheel).is_err());
+        let longer = [payload.as_slice(), b"excess"].concat();
+        let mut output = Vec::new();
+        assert!(copy_managed_vllm_wheel(&mut longer.as_slice(), &mut output, &wheel).is_err());
+        assert_eq!(output.len(), payload.len());
+        let mut damaged = payload.to_vec();
+        damaged[0] ^= 1;
+        assert!(copy_managed_vllm_wheel(&mut damaged.as_slice(), &mut Vec::new(), &wheel).is_err());
     }
 
     #[test]

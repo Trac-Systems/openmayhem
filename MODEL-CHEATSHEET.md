@@ -97,6 +97,32 @@ routing, vouchers, receipts, and reporting. Current price brackets are:
 A lower context does not create a new enclave and does not need admin approval.
 If a provider changes its committed context, it signs its own leave/rejoin.
 
+### Optional vLLM execution modes
+
+Some artifacts can publish additional, separately calibrated execution modes in
+the signed catalog's `vllm_execution_modes` map. Select only a mode listed for
+the exact artifact root; omitting the flag keeps the baseline runtime.
+
+```bash
+mayhem provider serve plan <model-or-enclave> --execution-mode <mode-id> --json
+mayhem up --yes
+mayhem provider serve add <model-or-enclave> --execution-mode <mode-id>
+```
+
+Use `provider serve switch <current-target> <model-or-enclave>
+--execution-mode <mode-id>` to change an existing supervised provider. The
+selected mode supplies its own
+runtime settings, request restrictions and canary evidence. This is not a
+user sampling override: gateways route only compatible requests to the mode,
+and unsupported values are never silently discarded.
+
+A mode does not inherit baseline independent dispatch. It needs its own signed
+generation execution profile and overlap proof; without that opt-in it remains
+exclusive. Capacity is still derived from the provider's actual resources.
+Mode-aware providers and gateways are required to serve these routes; older
+gateways ignore their advertisements. Baseline routes remain unchanged. See
+[CALIBRATION.md](CALIBRATION.md#optional-execution-modes) for evidence rules.
+
 ## Public API error codes
 
 Every model class uses the same public gateway error taxonomy. Direct failures
@@ -111,6 +137,7 @@ Use the code, not prose guessing, when triaging:
 | `request_exceeds_provider_capacity` | Request exceeds the signed envelope for the chosen model or workflow: context, media size, duration, frames, steps, output count, or input bytes. |
 | `required_modality_unavailable` | The catalog entry exists but no live route serves the requested modality set. |
 | `provider_admission_no_capacity` | A route exists but no provider accepted before the wait deadline; the lane may be full, busy, or draining. |
+| `execution_mode_unavailable` | No currently available execution mode supports the request. Retry later or select a compatible route; this is a routing failure, not insufficient funds. |
 | `payment_rail_not_supported_by_provider` | Buyer selected a rail no live provider for that model accepts. |
 | `insufficient_balance` | Buyer has too little unreserved credit on the selected rail. |
 | `payment_reservation_failed` | Spend reservation failed before work began; retry after route/accounting health recovers. |
@@ -330,6 +357,7 @@ atomic activation before using it to materialize a frozen runtime.
 | Backend | Exact managed runtime |
 |---|---|
 | vLLM | `uv 0.11.29`, Python 3.12, `vllm 0.24.0`, `torch 2.11.0`, `transformers 5.12.1`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `compressed-tensors 0.17.0`, `triton 3.6.0`, `av 18` |
+| vLLM optional `flashinfer_speculative_metadata_v1` | Only when selected by the signed execution-mode profile: `vllm 0.24.0+mayhem.specmeta1`, with the same remaining direct dependency pins as baseline. Linux x86_64/aarch64 wheels are size/SHA-256 pinned in [`vllm-specmeta-v1-wheels.json`](crates/mayhem-cli/resources/python/vllm-specmeta-v1-wheels.json). Uses a separate managed Python 3.12 environment with `Python.h` and `pyconfig.h` required for CUDA JIT compilation; explicit interpreter overrides must pass the same header, version and module-integrity checks. Verified wheels are cached separately from the venv for repair/reuse. |
 | MLX language/vision | `uv 0.11.29`, Python 3.12, `mlx-lm 0.31.3`, `mlx-vlm 0.6.3`, `mlx 0.32.0`, `llguidance 1.7.6`, `transformers 5.12.1`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `av 18` |
 | llama.cpp media | `llama-cpp-2`/`llama-cpp-sys-2 0.1.150` from llama.cpp revision `7f15e87e3cb0f636e236243e6ee4fc2a4c357277`, with `llguidance` and `mtmd`; acceleration is compile-time CUDA, Metal, or Vulkan. macOS source builds use Metal with runtime CPU fallback; Linux x86_64/aarch64 and Windows x86_64 select working CUDA, then Vulkan, then CPU; Windows ARM64 uses CPU. `MAYHEM_LLAMA_CPP_FEATURES` preserves an explicit, validated operator override. |
 | Transformers ASR | `uv 0.11.29`, Python 3.12, `transformers 5.14.1`, `torch 2.13.0`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `numpy 2.4.6`, `soundfile 0.14.0`, `soxr 1.1.0`, `librosa 0.11.0` |

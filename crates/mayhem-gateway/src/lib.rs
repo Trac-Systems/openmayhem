@@ -35,8 +35,8 @@ use mayhem_attestation::{verify_tpm_hardware_quote, TpmVerificationMaterials};
 use mayhem_proto::{
     attestation_report_head, attestation_signing_bytes, catalog_enclave_id, hardware_quote_binding,
     AttestationMeasurementLayer, AttestationReport, AttestationSigner, CatalogEnclaveIdentity,
-    HardwareQuote, HardwareQuoteKind, MoneyAu, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION,
-    CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    ExecutionModeBinding, HardwareQuote, HardwareQuoteKind, MoneyAu, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -48,6 +48,7 @@ pub const DEFAULT_MAX_REPORT_AGE_SECS: u64 = 24 * 60 * 60;
 pub const DEFAULT_MAX_REPORT_CLOCK_SKEW_SECS: u64 = 5 * 60;
 pub const DEFAULT_HARDWARE_QUOTE_VERIFIER_TIMEOUT_SECS: u64 = 120;
 pub const HEARTBEAT_SCHEMA_VERSION: u32 = 4;
+pub const EXECUTION_MODE_HEARTBEAT_SCHEMA_VERSION: u32 = 5;
 pub const DEFAULT_HEARTBEAT_MAX_AGE_MILLIS: u64 = DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS;
 pub const DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS: u64 = 5_000;
 pub const DEFAULT_HEARTBEAT_REPLAY_CACHE_CAPACITY: usize = 5_000;
@@ -113,6 +114,13 @@ pub enum GatewayError {
     ReportHash(String),
     #[error("attestation signing payload failed: {0}")]
     SigningPayload(String),
+    #[error("attestation execution mode binding is invalid: {reason}")]
+    InvalidExecutionModeBinding { reason: String },
+    #[error("verified execution mode mismatch: expected {expected:?}, got {actual:?}")]
+    ExecutionModeMismatch {
+        expected: Option<ExecutionModeBinding>,
+        actual: Option<ExecutionModeBinding>,
+    },
     #[error("hardware attestation requires a hardware quote")]
     HardwareQuoteRequired,
     #[error("hardware quote evidence is empty")]
@@ -131,7 +139,9 @@ pub enum GatewayError {
     ProviderTrustMaterialRejected { kind: String },
     #[error("heartbeat JSON error: {0}")]
     HeartbeatJson(String),
-    #[error("heartbeat must have t=\"hb\" and v={expected_version}")]
+    #[error(
+        "heartbeat must have t=\"hb\" and a supported schema/execution_mode combination (baseline v={expected_version})"
+    )]
     BadHeartbeatSchema { expected_version: u32 },
     #[error("contract upgrade required: expected CONTRACT_VERSION {expected}, got {actual}")]
     ContractUpgradeRequired { expected: u32, actual: u32 },
@@ -191,7 +201,7 @@ pub struct AttestationVerificationRequest<'a> {
     pub attestation_policy: Option<&'a AttestationPolicyVerificationContext<'a>>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct VerifiedAttestation {
     pub enclave_id: String,
     pub provider_pubkey: String,
@@ -201,6 +211,8 @@ pub struct VerifiedAttestation {
     pub report_ts: u64,
     pub att_tier: u8,
     pub runtime_binary_hash: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<ExecutionModeBinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -227,6 +239,8 @@ pub struct ProviderHeartbeat {
     pub inventory_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_mode: Option<ExecutionModeBinding>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub workflow_classes: BTreeMap<String, HeartbeatWorkflowClass>,
     pub accepting_new: bool,
@@ -456,10 +470,26 @@ pub fn validate_provider_heartbeat(
 ) -> Result<ProviderHeartbeat> {
     let heartbeat: ProviderHeartbeat = serde_json::from_value(request.raw.clone())
         .map_err(|err| GatewayError::HeartbeatJson(err.to_string()))?;
-    if heartbeat.t != "hb" || heartbeat.v != HEARTBEAT_SCHEMA_VERSION {
+    if heartbeat.t != "hb" {
         return Err(GatewayError::BadHeartbeatSchema {
             expected_version: HEARTBEAT_SCHEMA_VERSION,
         });
+    }
+    match (heartbeat.v, heartbeat.execution_mode.as_ref()) {
+        (HEARTBEAT_SCHEMA_VERSION, None) => {}
+        (EXECUTION_MODE_HEARTBEAT_SCHEMA_VERSION, Some(binding)) => {
+            binding
+                .validate()
+                .map_err(|reason| GatewayError::BadHeartbeatField {
+                    field: "execution_mode",
+                    reason,
+                })?
+        }
+        _ => {
+            return Err(GatewayError::BadHeartbeatSchema {
+                expected_version: HEARTBEAT_SCHEMA_VERSION,
+            });
+        }
     }
     if heartbeat.contract_version != CONTRACT_VERSION {
         return Err(GatewayError::ContractUpgradeRequired {
@@ -542,6 +572,11 @@ pub fn verify_tier1_attestation(
         &expected_tp_degree(&request.contract.caps).to_string(),
         &report.runtime_config.tp_degree.to_string(),
     )?;
+    if let Some(binding) = report.runtime_config.execution_mode.as_ref() {
+        binding
+            .validate()
+            .map_err(|reason| GatewayError::InvalidExecutionModeBinding { reason })?;
+    }
 
     let expected_enclave_id = catalog_enclave_id(&request.contract.identity());
     if request.contract.enclave_id != expected_enclave_id {
@@ -578,7 +613,22 @@ pub fn verify_tier1_attestation(
         report_ts: report.report_ts,
         att_tier: report.att_tier,
         runtime_binary_hash: report.binary_hash.clone(),
+        execution_mode: report.runtime_config.execution_mode.clone(),
     })
+}
+
+pub fn verify_execution_mode_binding(
+    verified: &VerifiedAttestation,
+    expected: Option<&ExecutionModeBinding>,
+) -> Result<()> {
+    if verified.execution_mode.as_ref() == expected {
+        Ok(())
+    } else {
+        Err(GatewayError::ExecutionModeMismatch {
+            expected: expected.cloned(),
+            actual: verified.execution_mode.clone(),
+        })
+    }
 }
 
 pub fn verify_attestation(
@@ -3233,6 +3283,59 @@ mod tests {
         (hex::encode(public_key), hex::encode(signature))
     }
 
+    fn execution_mode_binding() -> ExecutionModeBinding {
+        ExecutionModeBinding {
+            mode_id: "vllm-throughput".to_owned(),
+            policy_hash: "ab".repeat(32),
+        }
+    }
+
+    fn tier1_contract() -> EnclaveContractRecord {
+        let mut contract = EnclaveContractRecord {
+            enclave_id: String::new(),
+            admin_pubkey: "admin".to_owned(),
+            model_id: "model/test@4bit".to_owned(),
+            model_class: DEFAULT_MODEL_CLASS.to_owned(),
+            artifact_root: "artifact".to_owned(),
+            artifact_sidecar_roots: BTreeMap::new(),
+            manifest_hash: "manifest".to_owned(),
+            binary_hash: "binary".to_owned(),
+            launch_measurements: json!({}),
+            att_tier: 1,
+            caps: json!({"tp_degree": 1}),
+        };
+        contract.enclave_id = catalog_enclave_id(&contract.identity());
+        contract
+    }
+
+    fn signed_tier1_report(
+        contract: &EnclaveContractRecord,
+        execution_mode: Option<ExecutionModeBinding>,
+    ) -> AttestationReport {
+        let enclave_key = SigningKey::from_bytes(&[21_u8; 32]);
+        let provider_key = SigningKey::from_bytes(&[22_u8; 32]);
+        let mut report = sample_report();
+        report.enclave_id = contract.enclave_id.clone();
+        report.enclave_pubkey = hex::encode(enclave_key.verifying_key().to_bytes());
+        report.provider_pubkey = hex::encode(provider_key.verifying_key().to_bytes());
+        report.manifest_hash = contract.manifest_hash.clone();
+        report.binary_hash = contract.binary_hash.clone();
+        report.runtime_config.execution_mode = execution_mode;
+
+        let body = report.body();
+        report.sig_enclave = hex::encode(
+            enclave_key
+                .sign(&attestation_signing_bytes(&body, AttestationSigner::Enclave).unwrap())
+                .to_bytes(),
+        );
+        report.sig_provider = hex::encode(
+            provider_key
+                .sign(&attestation_signing_bytes(&body, AttestationSigner::Provider).unwrap())
+                .to_bytes(),
+        );
+        report
+    }
+
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-gateway");
@@ -3264,6 +3367,85 @@ mod tests {
     }
 
     #[test]
+    fn tier1_attestation_authenticates_and_returns_execution_mode() {
+        let contract = tier1_contract();
+        let binding = execution_mode_binding();
+        let report = signed_tier1_report(&contract, Some(binding.clone()));
+        let request = AttestationVerificationRequest::new(
+            &report,
+            &contract,
+            &report.nonce_u,
+            &report.provider_pubkey,
+            report.report_ts,
+        );
+
+        let verified = verify_tier1_attestation(&request).expect("valid mode attestation");
+        assert_eq!(verified.execution_mode, Some(binding.clone()));
+        verify_execution_mode_binding(&verified, Some(&binding)).unwrap();
+        assert!(matches!(
+            verify_execution_mode_binding(&verified, None),
+            Err(GatewayError::ExecutionModeMismatch { .. })
+        ));
+
+        let baseline_report = signed_tier1_report(&contract, None);
+        let baseline_request = AttestationVerificationRequest::new(
+            &baseline_report,
+            &contract,
+            &baseline_report.nonce_u,
+            &baseline_report.provider_pubkey,
+            baseline_report.report_ts,
+        );
+        let baseline = verify_tier1_attestation(&baseline_request).unwrap();
+        verify_execution_mode_binding(&baseline, None).unwrap();
+        assert!(matches!(
+            verify_execution_mode_binding(&baseline, Some(&binding)),
+            Err(GatewayError::ExecutionModeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn tier1_attestation_rejects_invalid_or_tampered_execution_mode() {
+        let contract = tier1_contract();
+        let mut invalid = signed_tier1_report(&contract, Some(execution_mode_binding()));
+        invalid
+            .runtime_config
+            .execution_mode
+            .as_mut()
+            .unwrap()
+            .mode_id = "INVALID".to_owned();
+        let invalid_request = AttestationVerificationRequest::new(
+            &invalid,
+            &contract,
+            &invalid.nonce_u,
+            &invalid.provider_pubkey,
+            invalid.report_ts,
+        );
+        assert!(matches!(
+            verify_tier1_attestation(&invalid_request),
+            Err(GatewayError::InvalidExecutionModeBinding { .. })
+        ));
+
+        let mut tampered = signed_tier1_report(&contract, Some(execution_mode_binding()));
+        tampered
+            .runtime_config
+            .execution_mode
+            .as_mut()
+            .unwrap()
+            .policy_hash = "cd".repeat(32);
+        let tampered_request = AttestationVerificationRequest::new(
+            &tampered,
+            &contract,
+            &tampered.nonce_u,
+            &tampered.provider_pubkey,
+            tampered.report_ts,
+        );
+        assert!(matches!(
+            verify_tier1_attestation(&tampered_request),
+            Err(GatewayError::BadSignature { .. })
+        ));
+    }
+
+    #[test]
     fn validates_signed_heartbeat_and_rejects_bad_signature() {
         let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
         let provider = hex::encode(signing_key.verifying_key().to_bytes());
@@ -3292,6 +3474,125 @@ mod tests {
             max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
         })
         .expect_err("tampered heartbeat must fail");
+        assert!(matches!(err, GatewayError::BadHeartbeatSignature { .. }));
+    }
+
+    #[test]
+    fn heartbeat_execution_mode_version_matrix_is_strict() {
+        let signing_key = SigningKey::from_bytes(&[23_u8; 32]);
+        let provider = hex::encode(signing_key.verifying_key().to_bytes());
+        let now = 1_800_000_000_000;
+
+        let baseline = signed_heartbeat(&signing_key, &provider, now, "d0");
+        let decoded: ProviderHeartbeat = serde_json::from_value(baseline.clone()).unwrap();
+        assert_eq!(decoded.execution_mode, None);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), baseline);
+        assert!(
+            validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+                raw: &baseline,
+                now_millis: now,
+                replay_cache: &mut HeartbeatReplayCache::default(),
+                max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+                max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+            })
+            .is_ok()
+        );
+
+        let mut v4_mode = baseline.clone();
+        v4_mode["execution_mode"] = serde_json::to_value(execution_mode_binding()).unwrap();
+        resign_heartbeat(&signing_key, &mut v4_mode);
+        assert!(
+            validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+                raw: &v4_mode,
+                now_millis: now,
+                replay_cache: &mut HeartbeatReplayCache::default(),
+                max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+                max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+            })
+            .is_err()
+        );
+
+        let mut v5_mode = v4_mode;
+        v5_mode["v"] = json!(EXECUTION_MODE_HEARTBEAT_SCHEMA_VERSION);
+        resign_heartbeat(&signing_key, &mut v5_mode);
+        let accepted = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &v5_mode,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect("signed v5 mode heartbeat");
+        assert_eq!(accepted.execution_mode, Some(execution_mode_binding()));
+
+        for version in [EXECUTION_MODE_HEARTBEAT_SCHEMA_VERSION, 3, 6] {
+            let mut invalid = baseline.clone();
+            invalid["v"] = json!(version);
+            resign_heartbeat(&signing_key, &mut invalid);
+            assert!(
+                validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+                    raw: &invalid,
+                    now_millis: now,
+                    replay_cache: &mut HeartbeatReplayCache::default(),
+                    max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+                    max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+                })
+                .is_err()
+            );
+        }
+
+        let mut malformed_mode = baseline;
+        malformed_mode["v"] = json!(EXECUTION_MODE_HEARTBEAT_SCHEMA_VERSION);
+        malformed_mode["execution_mode"] = json!({
+            "mode_id": "INVALID",
+            "policy_hash": "ab".repeat(32),
+        });
+        resign_heartbeat(&signing_key, &mut malformed_mode);
+        assert!(matches!(
+            validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+                raw: &malformed_mode,
+                now_millis: now,
+                replay_cache: &mut HeartbeatReplayCache::default(),
+                max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+                max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+            }),
+            Err(GatewayError::HeartbeatJson(_))
+        ));
+    }
+
+    #[test]
+    fn heartbeat_execution_mode_tampering_and_downgrade_break_signature() {
+        let signing_key = SigningKey::from_bytes(&[24_u8; 32]);
+        let provider = hex::encode(signing_key.verifying_key().to_bytes());
+        let now = 1_800_000_000_000;
+        let mut heartbeat = signed_heartbeat(&signing_key, &provider, now, "d1");
+        heartbeat["v"] = json!(EXECUTION_MODE_HEARTBEAT_SCHEMA_VERSION);
+        heartbeat["execution_mode"] = serde_json::to_value(execution_mode_binding()).unwrap();
+        resign_heartbeat(&signing_key, &mut heartbeat);
+
+        let mut tampered = heartbeat.clone();
+        tampered["execution_mode"]["policy_hash"] = json!("cd".repeat(32));
+        let err = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &tampered,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect_err("tampered mode binding must fail");
+        assert!(matches!(err, GatewayError::BadHeartbeatSignature { .. }));
+
+        let mut downgraded = heartbeat;
+        downgraded["v"] = json!(HEARTBEAT_SCHEMA_VERSION);
+        downgraded.as_object_mut().unwrap().remove("execution_mode");
+        let err = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &downgraded,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect_err("unsigned mode downgrade must fail");
         assert!(matches!(err, GatewayError::BadHeartbeatSignature { .. }));
     }
 

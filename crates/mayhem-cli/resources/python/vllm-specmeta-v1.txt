@@ -1,0 +1,8 @@
+vllm==0.24.0+mayhem.specmeta1
+torch==2.11.0
+transformers==5.12.1
+tokenizers==0.22.2
+safetensors==0.8.0
+compressed-tensors==0.17.0
+triton==3.6.0
+av==18.0.0

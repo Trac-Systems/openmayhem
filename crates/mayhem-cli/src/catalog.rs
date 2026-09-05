@@ -37,6 +37,7 @@ const MODEL_CLASS_MUSIC_GENERATION: &str = "music-generation";
 const MODEL_CLASS_WORKFLOW: &str = "workflow";
 const MAX_CATALOG_MODALITY_INFLIGHT_ITEMS: u32 = 1_024;
 const MAX_CATALOG_MODALITY_ITEMS_PER_REQUEST: u32 = 1_024;
+const MAX_VLLM_SPECULATIVE_TOKENS: u32 = 32;
 
 #[derive(Debug, Clone)]
 pub struct VerifyOptions {
@@ -109,6 +110,11 @@ pub(crate) struct CatalogDocument {
     pub(crate) generated_at: String,
     #[serde(default)]
     pub(crate) generation_execution_profiles: BTreeMap<String, CatalogGenerationExecutionProfile>,
+    #[serde(default)]
+    pub(crate) vllm_execution_profiles: BTreeMap<String, CatalogVllmExecutionProfile>,
+    #[serde(default)]
+    pub(crate) vllm_execution_modes:
+        BTreeMap<String, BTreeMap<String, CatalogVllmExecutionMode>>,
     pub(crate) models: Vec<CatalogModel>,
 }
 
@@ -119,6 +125,21 @@ impl CatalogDocument {
     ) -> Option<&CatalogGenerationExecutionProfile> {
         self.generation_execution_profiles.get(artifact_root)
     }
+
+    pub(crate) fn vllm_execution_profile(
+        &self,
+        artifact_root: &str,
+    ) -> Option<&CatalogVllmExecutionProfile> {
+        self.vllm_execution_profiles.get(artifact_root)
+    }
+
+    pub(crate) fn vllm_execution_mode(
+        &self,
+        artifact_root: &str,
+        mode_id: &str,
+    ) -> Option<&CatalogVllmExecutionMode> {
+        self.vllm_execution_modes.get(artifact_root)?.get(mode_id)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -128,7 +149,136 @@ pub(crate) struct CatalogGenerationExecutionProfile {
     pub(crate) engine: String,
     pub(crate) independent_dispatch: bool,
     pub(crate) request_modalities: Vec<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) topology: Option<mayhem_proto::GenerationExecutionTopology>,
     pub(crate) proof_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CatalogVllmExecutionProfile {
+    pub(crate) schema_version: u32,
+    pub(crate) engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) runtime: Option<crate::python_runtime::VllmRuntime>,
+    pub(crate) enforce_eager: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) compilation_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) cudagraph_mode: Option<String>,
+    pub(crate) linear_backend: String,
+    pub(crate) moe_backend: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) speculative_decoding: Option<CatalogVllmSpeculativeDecodingProfile>,
+    pub(crate) proof_sha256: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CatalogVllmSpeculativeDecodingProfile {
+    pub(crate) method: String,
+    pub(crate) num_speculative_tokens: u32,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CatalogVllmExecutionMode {
+    pub(crate) schema_version: u32,
+    pub(crate) profile: CatalogVllmExecutionProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) generation_execution_profile: Option<CatalogGenerationExecutionProfile>,
+    pub(crate) requests: mayhem_proto::ExecutionModeRequestPolicy,
+    pub(crate) canary: CanaryRef,
+    pub(crate) canary_set_sha256: String,
+    pub(crate) modality_fingerprints: BTreeMap<String, String>,
+    pub(crate) resource_profiles: BTreeMap<String, CatalogModalityResourceProfile>,
+    pub(crate) speciality_calibrations:
+        BTreeMap<String, BTreeMap<String, CatalogSpecialityCalibration>>,
+}
+
+impl CatalogVllmExecutionMode {
+    pub(crate) fn binding(
+        &self,
+        artifact_root: &str,
+        mode_id: &str,
+    ) -> Result<mayhem_proto::ExecutionModeBinding> {
+        let serialized_mode = serde_json::to_value(self)?;
+        mayhem_proto::vllm_execution_mode_binding(artifact_root, mode_id, &serialized_mode)
+            .map_err(anyhow::Error::msg)
+    }
+}
+
+pub(crate) fn execution_mode_model(
+    model: &CatalogModel,
+    artifact_name: &str,
+    mode: &CatalogVllmExecutionMode,
+) -> Result<CatalogModel> {
+    let artifact = model.artifacts.get(artifact_name)
+        .with_context(|| format!("unknown execution mode artifact {artifact_name}"))?;
+    if artifact.engine != "vllm" || mode.schema_version != 1 {
+        bail!("execution mode requires a vllm artifact and schema version 1");
+    }
+    let mut errors = Vec::new();
+    validate_vllm_execution_profile_values("execution mode", &mode.profile, &mut errors);
+    validate_mode_generation_execution_profile(
+        "execution mode",
+        model,
+        artifact,
+        mode,
+        &mut errors,
+    );
+    validate_execution_mode_request_policy("execution mode", model, mode, &mut errors);
+    if mode.profile.speculative_decoding.is_some()
+        && model.sampling.min_p.is_some_and(|value| value != 0.0)
+    {
+        errors.push("execution mode cannot inherit a nonzero min_p sampling default".to_owned());
+    }
+    if !safe_execution_mode_canary_id(&mode.canary.set_id)
+        || mode.canary.set_id == model.canary.set_id
+        || !is_lower_hex_len(&mode.canary_set_sha256, 64)
+    {
+        errors.push("execution mode requires its own canary set and exact input hash".to_owned());
+    }
+    if mode.canary.verification_method != model.canary.verification_method
+        || mode.canary.match_min != model.canary.match_min
+        || mode.canary.verification_tolerance_bps != model.canary.verification_tolerance_bps
+    {
+        errors.push("execution mode must preserve baseline verification rules".to_owned());
+    }
+    if !errors.is_empty() {
+        bail!("{}", errors.join("; "));
+    }
+
+    let mut effective = model.clone();
+    effective.artifacts.retain(|name, _| name == artifact_name);
+    effective.adapter.endpoint_families.retain(|contract| mode.requests.endpoint_families
+        .iter().any(|policy| policy.family == contract.family));
+    for contract in &mut effective.adapter.endpoint_families {
+        let restrictions = mode.requests.endpoint_families.iter()
+            .find(|policy| policy.family == contract.family).expect("retained mode family");
+        for (path, restriction) in &restrictions.request_attribute_specs {
+            let mut spec = restriction.clone();
+            let original = &contract.request_attribute_specs[path];
+            if let Some(default) = &original.default {
+                mayhem_proto::validate_endpoint_attribute_value(&spec, default)
+                    .map_err(anyhow::Error::msg)
+                    .with_context(|| format!("execution mode cannot serve inherited default for {path}"))?;
+                spec.default = Some(default.clone());
+            }
+            contract.request_attribute_specs.insert(path.clone(), spec);
+        }
+    }
+    effective.canary = mode.canary.clone();
+    effective.modality_assessment.calibrated_fingerprints = BTreeMap::from([
+        (artifact_name.to_owned(), mode.modality_fingerprints.clone()),
+    ]);
+    effective.modality_assessment.resource_profiles = BTreeMap::from([
+        (artifact_name.to_owned(), mode.resource_profiles.clone()),
+    ]);
+    effective.speciality_assessment.calibrated = BTreeMap::from([
+        (artifact_name.to_owned(), mode.speciality_calibrations.clone()),
+    ]);
+    Ok(effective)
 }
 
 /// The optional attestation authority carried inside the signed catalog bytes.
@@ -459,7 +609,7 @@ fn default_modality_set() -> Vec<String> {
     vec!["text".to_owned()]
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub(crate) struct CanaryRef {
     pub(crate) set_id: String,
     pub(crate) match_min: f64,
@@ -596,7 +746,7 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
         validated_catalog_attestation_authority(&catalog_bytes);
 
     let mut model_ids = BTreeSet::new();
-    let mut canary_sets = BTreeSet::new();
+    let canary_sets = catalog_canary_sets(&catalog);
     let mut artifact_count = 0usize;
     let mut dev_model_count = 0usize;
     let mut launch_model_count = 0usize;
@@ -612,7 +762,6 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
             other => errors.push(format!("{} has invalid tier {}", model.model_id, other)),
         }
         artifact_count += model.artifacts.len();
-        canary_sets.insert(model.canary.set_id.clone());
         validate_model(model, &mut errors);
     }
     if launch_model_count < 1 {
@@ -625,6 +774,7 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
     for model in &catalog.models {
         validate_model_canary_modality_coverage(&options.canaries_dir, model, &mut errors);
     }
+    validate_execution_mode_canary_files(&catalog, &options.canaries_dir, &mut errors);
 
     let download_checks = if options.check_dev_downloads && errors.is_empty() {
         run_download_checks(&catalog, options.hf_token_file.as_deref())?
@@ -657,6 +807,21 @@ pub fn verify(options: VerifyOptions) -> Result<CatalogVerifyReport> {
         attestation_policy_errors,
         attestation_authority,
     })
+}
+
+fn catalog_canary_sets(catalog: &CatalogDocument) -> BTreeSet<String> {
+    catalog
+        .models
+        .iter()
+        .map(|model| model.canary.set_id.clone())
+        .chain(
+            catalog
+                .vllm_execution_modes
+                .values()
+                .flat_map(|modes| modes.values())
+                .map(|mode| mode.canary.set_id.clone()),
+        )
+        .collect()
 }
 
 pub(crate) fn verify_signed_catalog_base(
@@ -828,6 +993,8 @@ fn validate_catalog(catalog: &CatalogDocument, errors: &mut Vec<String>) {
         errors.push("generated_at is required".to_owned());
     }
     validate_generation_execution_profiles(catalog, errors);
+    validate_vllm_execution_profiles(catalog, errors);
+    validate_vllm_execution_modes(catalog, errors);
 }
 
 fn validate_generation_execution_profiles(catalog: &CatalogDocument, errors: &mut Vec<String>) {
@@ -876,68 +1043,544 @@ fn validate_generation_execution_profiles(catalog: &CatalogDocument, errors: &mu
                 None
             }
         };
-        if profile.schema_version != 1 {
-            errors.push(format!("{label}.schema_version must be 1"));
-        }
-        if profile.engine != "vllm" {
-            errors.push(format!("{label}.engine must be vllm"));
-        }
-        if !profile.independent_dispatch {
-            errors.push(format!("{label}.independent_dispatch must be true"));
-        }
-        if !is_lower_hex_len(&profile.proof_sha256, 64) {
+        // Legacy readers must never interpret isolated workers as shared-worker dispatch.
+        if profile.topology == Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers) {
             errors.push(format!(
-                "{label}.proof_sha256 must be exact lowercase 32-byte hex"
+                "{label}.topology isolated_workers requires an authenticated execution mode's own generation_execution_profile"
             ));
         }
-        if profile.request_modalities.is_empty() {
-            errors.push(format!(
-                "{label}.request_modalities must contain at least one modality set"
-            ));
+        validate_generation_execution_profile_values(&label, profile, bound_model, errors);
+    }
+}
+
+fn validate_generation_execution_profile_values(
+    label: &str,
+    profile: &CatalogGenerationExecutionProfile,
+    bound_model: Option<&CatalogModel>,
+    errors: &mut Vec<String>,
+) {
+    if profile.schema_version != 1 {
+        errors.push(format!("{label}.schema_version must be 1"));
+    }
+    if profile.engine != "vllm" {
+        errors.push(format!("{label}.engine must be vllm"));
+    }
+    if !profile.independent_dispatch {
+        errors.push(format!("{label}.independent_dispatch must be true"));
+    }
+    if !is_lower_hex_len(&profile.proof_sha256, 64) {
+        errors.push(format!(
+            "{label}.proof_sha256 must be exact lowercase 32-byte hex"
+        ));
+    }
+    if profile.request_modalities.is_empty() {
+        errors.push(format!(
+            "{label}.request_modalities must contain at least one modality set"
+        ));
+        return;
+    }
+
+    let mut seen_sets = BTreeSet::new();
+    for (set_index, modality_set) in profile.request_modalities.iter().enumerate() {
+        let set_label = format!("{label}.request_modalities[{set_index}]");
+        if modality_set.is_empty() {
+            errors.push(format!("{set_label} must not be empty"));
             continue;
         }
 
-        let mut seen_sets = BTreeSet::new();
-        for (set_index, modality_set) in profile.request_modalities.iter().enumerate() {
-            let set_label = format!("{label}.request_modalities[{set_index}]");
-            if modality_set.is_empty() {
-                errors.push(format!("{set_label} must not be empty"));
-                continue;
-            }
-
-            let mut normalized = BTreeSet::new();
-            for modality in modality_set {
-                if !valid_adapter_modality(modality) || modality == "embedding" {
-                    errors.push(format!(
-                        "{set_label} contains unsupported generation modality {modality:?}"
-                    ));
-                }
-                if bound_model.is_some_and(|model| !model.adapter.modality_set.contains(modality)) {
-                    errors.push(format!(
-                        "{set_label} contains modality {modality} not served by the bound artifact's model"
-                    ));
-                }
-                if !normalized.insert(modality.clone()) {
-                    errors.push(format!("{set_label} duplicates modality {modality}"));
-                }
-            }
-            let normalized = normalized.into_iter().collect::<Vec<_>>();
-            if !normalized.iter().any(|modality| modality == "text") {
+        let mut normalized = BTreeSet::new();
+        for modality in modality_set {
+            if !valid_adapter_modality(modality) || modality == "embedding" {
                 errors.push(format!(
-                    "{set_label} must include text for vLLM generation dispatch"
+                    "{set_label} contains unsupported generation modality {modality:?}"
                 ));
             }
-            if &normalized != modality_set {
+            if bound_model.is_some_and(|model| !model.adapter.modality_set.contains(modality)) {
                 errors.push(format!(
-                    "{set_label} must be a sorted, unique normalized modality set"
+                    "{set_label} contains modality {modality} not served by the bound artifact's model"
                 ));
             }
-            if !seen_sets.insert(normalized) {
-                errors.push(format!(
-                    "{label}.request_modalities contains a duplicate modality set"
-                ));
+            if !normalized.insert(modality.clone()) {
+                errors.push(format!("{set_label} duplicates modality {modality}"));
             }
         }
+        let normalized = normalized.into_iter().collect::<Vec<_>>();
+        if !normalized.iter().any(|modality| modality == "text") {
+            errors.push(format!(
+                "{set_label} must include text for vLLM generation dispatch"
+            ));
+        }
+        if &normalized != modality_set {
+            errors.push(format!(
+                "{set_label} must be a sorted, unique normalized modality set"
+            ));
+        }
+        if !seen_sets.insert(normalized) {
+            errors.push(format!(
+                "{label}.request_modalities contains a duplicate modality set"
+            ));
+        }
+    }
+}
+
+fn validate_vllm_execution_profiles(catalog: &CatalogDocument, errors: &mut Vec<String>) {
+    let mut primary_artifacts = BTreeMap::<&str, Vec<(&CatalogModel, &CatalogArtifact)>>::new();
+    for model in &catalog.models {
+        for artifact in model.artifacts.values() {
+            primary_artifacts
+                .entry(artifact.artifact_root.as_str())
+                .or_default()
+                .push((model, artifact));
+        }
+    }
+
+    for (artifact_root, profile) in &catalog.vllm_execution_profiles {
+        let label = format!("vllm_execution_profiles[{artifact_root}]");
+        if !is_lower_hex_len(artifact_root, 64) {
+            errors.push(format!("{label} key must be exact lowercase 32-byte hex"));
+        }
+
+        let bound_model = match primary_artifacts.get(artifact_root.as_str()) {
+            Some(bindings) if bindings.len() == 1 => {
+                let (model, artifact) = bindings[0];
+                if artifact.engine != "vllm" {
+                    errors.push(format!(
+                        "{label} must bind a vllm artifact, found engine {}",
+                        artifact.engine
+                    ));
+                }
+                if artifact.engine != profile.engine {
+                    errors.push(format!(
+                        "{label}.engine {} does not match bound artifact engine {}",
+                        profile.engine, artifact.engine
+                    ));
+                }
+                Some(model)
+            }
+            Some(bindings) => {
+                errors.push(format!(
+                    "{label} must resolve to exactly one primary catalog artifact root, found {}",
+                    bindings.len()
+                ));
+                None
+            }
+            None => {
+                errors.push(format!(
+                    "{label} references an unknown primary catalog artifact root"
+                ));
+                None
+            }
+        };
+
+        validate_vllm_execution_profile_values(&label, profile, errors);
+        if profile.speculative_decoding.is_some() {
+            let speculative_label = format!("{label}.speculative_decoding");
+            if let Some(model) = bound_model {
+                if model.sampling.min_p.is_some_and(|value| value != 0.0) {
+                    errors.push(format!(
+                        "{speculative_label} cannot be enabled because owning model {} has an incompatible nonzero min_p sampling default",
+                        model.model_id
+                    ));
+                }
+                let incompatible_attributes = model
+                    .adapter
+                    .endpoint_families
+                    .iter()
+                    .flat_map(|contract| contract.request_attributes.iter())
+                    .filter_map(|attribute| {
+                        let leaf = attribute.rsplit('.').next().unwrap_or(attribute);
+                        matches!(leaf, "min_p" | "logit_bias").then_some(leaf)
+                    })
+                    .collect::<BTreeSet<_>>();
+                if !incompatible_attributes.is_empty() {
+                    errors.push(format!(
+                        "{speculative_label} cannot be enabled because owning model {} exposes incompatible request attribute(s): {}",
+                        model.model_id,
+                        incompatible_attributes.into_iter().collect::<Vec<_>>().join(", ")
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn validate_vllm_execution_profile_values(
+    label: &str,
+    profile: &CatalogVllmExecutionProfile,
+    errors: &mut Vec<String>,
+) {
+    if profile.schema_version != 1 {
+        errors.push(format!("{label}.schema_version must be 1"));
+    }
+    if profile.engine != "vllm" {
+        errors.push(format!("{label}.engine must be vllm"));
+    }
+    if let Err(error) = mayhem_engine::validate_vllm_compilation_config(
+        Some(profile.enforce_eager),
+        profile.compilation_mode,
+        profile.cudagraph_mode.as_deref(),
+    ) {
+        errors.push(format!("{label}: {error}"));
+    }
+    validate_vllm_backend_policy(label, "linear_backend", &profile.linear_backend, errors);
+    validate_vllm_backend_policy(label, "moe_backend", &profile.moe_backend, errors);
+    if !is_lower_hex_len(&profile.proof_sha256, 64) {
+        errors.push(format!(
+            "{label}.proof_sha256 must be exact lowercase 32-byte hex"
+        ));
+    }
+    if let Some(speculative) = &profile.speculative_decoding {
+        if speculative.method != "mtp" {
+            errors.push(format!("{label}.speculative_decoding.method must be mtp"));
+        }
+        if !(1..=MAX_VLLM_SPECULATIVE_TOKENS).contains(&speculative.num_speculative_tokens) {
+            errors.push(format!(
+                "{label}.speculative_decoding.num_speculative_tokens must be between 1 and {MAX_VLLM_SPECULATIVE_TOKENS}"
+            ));
+        }
+    }
+}
+
+fn validate_vllm_execution_modes(catalog: &CatalogDocument, errors: &mut Vec<String>) {
+    for (root, modes) in &catalog.vllm_execution_modes {
+        let label = format!("vllm_execution_modes[{root}]");
+        if !is_lower_hex_len(root, 64) {
+            errors.push(format!("{label} key must be exact lowercase 32-byte hex"));
+        }
+        let owners = catalog
+            .models
+            .iter()
+            .flat_map(|model| {
+                model.artifacts.iter().filter_map(move |(name, artifact)| {
+                    (artifact.artifact_root == *root).then_some((model, name, artifact))
+                })
+            })
+            .collect::<Vec<_>>();
+        let [(model, artifact_name, artifact)] = owners.as_slice() else {
+            errors.push(format!(
+                "{label} must resolve to exactly one primary catalog artifact root, found {}",
+                owners.len()
+            ));
+            continue;
+        };
+        if artifact.engine != "vllm" {
+            errors.push(format!("{label} must bind a vllm artifact"));
+        }
+        if modes.is_empty() || modes.len() > 16 {
+            errors.push(format!(
+                "{label} must contain between 1 and 16 execution modes"
+            ));
+        }
+        for (mode_id, mode) in modes {
+            let label = format!("{label}[{mode_id}]");
+            if let Err(error) = mayhem_proto::validate_execution_mode_id(mode_id) {
+                errors.push(format!("{label}: {error}"));
+            }
+            if mode.schema_version != 1 {
+                errors.push(format!("{label}.schema_version must be 1"));
+            }
+            validate_vllm_execution_profile_values(&label, &mode.profile, errors);
+            validate_mode_generation_execution_profile(&label, model, artifact, mode, errors);
+            validate_execution_mode_request_policy(&label, model, mode, errors);
+            if mode.profile.speculative_decoding.is_some()
+                && model.sampling.min_p.is_some_and(|value| value != 0.0)
+            {
+                errors.push(format!("{label} cannot inherit a nonzero min_p sampling default with speculative decoding"));
+            }
+            if mode.canary.set_id == model.canary.set_id
+                || !safe_execution_mode_canary_id(&mode.canary.set_id)
+            {
+                errors.push(format!(
+                    "{label} requires its own nonempty canary set; baseline fallback is forbidden"
+                ));
+            }
+            if !is_lower_hex_len(&mode.canary_set_sha256, 64) {
+                errors.push(format!(
+                    "{label}.canary_set_sha256 must be exact lowercase 32-byte hex"
+                ));
+            }
+            if mode.canary.verification_method != model.canary.verification_method
+                || mode.canary.match_min != model.canary.match_min
+                || mode.canary.verification_tolerance_bps != model.canary.verification_tolerance_bps
+            {
+                errors.push(format!(
+                    "{label} must preserve the baseline verification method and tolerance"
+                ));
+            }
+            if mode.canary.verification_method == VERIFICATION_TOKEN_FINGERPRINT
+                && !mode.canary.token_prefixes.contains_key(*artifact_name)
+            {
+                errors.push(format!(
+                    "{label} requires its own token prefixes for {artifact_name}"
+                ));
+            }
+            // Validate the mode's evidence in isolation. Never fill missing results from baseline.
+            let mut calibrated = (*model).clone();
+            calibrated
+                .artifacts
+                .retain(|name, _| name == *artifact_name);
+            calibrated.canary = mode.canary.clone();
+            calibrated.modality_assessment.calibrated_fingerprints =
+                BTreeMap::from([((*artifact_name).clone(), mode.modality_fingerprints.clone())]);
+            calibrated.modality_assessment.resource_profiles =
+                BTreeMap::from([((*artifact_name).clone(), mode.resource_profiles.clone())]);
+            calibrated.speciality_assessment.calibrated = BTreeMap::from([(
+                (*artifact_name).clone(),
+                mode.speciality_calibrations.clone(),
+            )]);
+            let before = errors.len();
+            validate_canary_verification(&calibrated, errors);
+            let descriptors = calibrated
+                .adapter
+                .specialities
+                .iter()
+                .map(|descriptor| (descriptor.name.as_str(), descriptor))
+                .collect();
+            validate_speciality_calibrations(&calibrated, &descriptors, errors);
+            for error in &mut errors[before..] {
+                *error = format!("{label}: {error}");
+            }
+        }
+    }
+}
+
+fn validate_mode_generation_execution_profile(
+    label: &str,
+    model: &CatalogModel,
+    artifact: &CatalogArtifact,
+    mode: &CatalogVllmExecutionMode,
+    errors: &mut Vec<String>,
+) {
+    let Some(profile) = mode.generation_execution_profile.as_ref() else {
+        // Execution mode and independent dispatch are separate opt-ins.
+        return;
+    };
+    let profile_label = format!("{label}.generation_execution_profile");
+    if model.model_class != DEFAULT_MODEL_CLASS {
+        errors.push(format!(
+            "{profile_label} is only valid for generation-capable text models"
+        ));
+    }
+    if artifact.engine != profile.engine {
+        errors.push(format!(
+            "{profile_label}.engine {} does not match bound artifact engine {}",
+            profile.engine, artifact.engine
+        ));
+    }
+    validate_generation_execution_profile_values(&profile_label, profile, Some(model), errors);
+}
+
+fn safe_execution_mode_canary_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+}
+
+fn validate_execution_mode_canary_files(
+    catalog: &CatalogDocument,
+    canaries_dir: &Path,
+    errors: &mut Vec<String>,
+) {
+    for (root, modes) in &catalog.vllm_execution_modes {
+        for (mode_id, mode) in modes {
+            if !safe_execution_mode_canary_id(&mode.canary.set_id) {
+                continue; // Structural validation reports the unsafe identifier.
+            }
+            let path = canaries_dir.join(format!("{}.json", mode.canary.set_id));
+            let label = format!("vllm_execution_modes[{root}][{mode_id}]");
+            let canary = match fs::read(&path) {
+                Ok(bytes) => {
+                    let digest = format!("{:x}", Sha256::digest(&bytes));
+                    if digest != mode.canary_set_sha256 {
+                        errors.push(format!(
+                            "{label} canary input bytes do not match canary_set_sha256"
+                        ));
+                    }
+                    match serde_json::from_slice::<CanarySet>(&bytes) {
+                        Ok(canary) => canary,
+                        Err(error) => {
+                            errors.push(format!("{label} cannot parse mode canary: {error}"));
+                            continue;
+                        }
+                    }
+                }
+                Err(error) => {
+                    errors.push(format!("{label} cannot read mode canary: {error}"));
+                    continue;
+                }
+            };
+            validate_canary_set_contents(&canary, &mode.canary.set_id, errors);
+            if mode.canary.verification_method == VERIFICATION_TOKEN_FINGERPRINT {
+                let prompt_ids = canary
+                    .prompts
+                    .iter()
+                    .map(|prompt| &prompt.id)
+                    .collect::<BTreeSet<_>>();
+                for prefixes in mode.canary.token_prefixes.values() {
+                    if prefixes.keys().collect::<BTreeSet<_>>() != prompt_ids {
+                        errors.push(format!(
+                            "{label} token prefixes must cover exactly its own canary prompt IDs"
+                        ));
+                    }
+                }
+                for calibration in mode
+                    .speciality_calibrations
+                    .values()
+                    .flat_map(|levels| levels.values())
+                {
+                    if calibration
+                        .token_prefixes
+                        .keys()
+                        .any(|id| !prompt_ids.contains(id))
+                    {
+                        errors.push(format!("{label} speciality evidence references a prompt outside its canary set"));
+                    }
+                }
+            }
+            if let Some(model) = catalog.models.iter().find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == *root)
+            }) {
+                let mut effective = model.clone();
+                effective.canary = mode.canary.clone();
+                validate_canary_modality_coverage(&canary, &effective, errors);
+            }
+        }
+    }
+}
+
+fn validate_execution_mode_request_policy(
+    label: &str,
+    model: &CatalogModel,
+    mode: &CatalogVllmExecutionMode,
+    errors: &mut Vec<String>,
+) {
+    let mut families = BTreeSet::new();
+    if mode.requests.endpoint_families.is_empty() {
+        errors.push(format!("{label}.requests must declare an endpoint family"));
+    }
+    for restricted in &mode.requests.endpoint_families {
+        if !families.insert(&restricted.family) {
+            errors.push(format!(
+                "{label}.requests duplicates family {}",
+                restricted.family
+            ));
+        }
+        let Some(baseline) = model
+            .adapter
+            .endpoint_families
+            .iter()
+            .find(|contract| contract.family == restricted.family)
+        else {
+            errors.push(format!(
+                "{label}.requests references unsupported family {}",
+                restricted.family
+            ));
+            continue;
+        };
+        if !restricted.response_attributes.is_empty()
+            || !restricted.required_response_attributes.is_empty()
+            || !restricted.response_attribute_specs.is_empty()
+            || !restricted.interaction_groups.is_empty()
+            || !restricted.speciality_mappings.is_empty()
+            || !restricted.required_request_attributes.is_empty()
+        {
+            errors.push(format!(
+                "{label}.requests may only restrict existing request attribute values"
+            ));
+        }
+        let attributes = restricted
+            .request_attributes
+            .iter()
+            .collect::<BTreeSet<_>>();
+        if attributes.len() != restricted.request_attributes.len()
+            || attributes != restricted.request_attribute_specs.keys().collect()
+        {
+            errors.push(format!(
+                "{label}.requests must declare each restricted attribute exactly once"
+            ));
+        }
+        for (path, spec) in &restricted.request_attribute_specs {
+            let Some(standard) = baseline
+                .request_attribute_specs
+                .get(path)
+                .filter(|_| baseline.request_attributes.contains(path))
+            else {
+                errors.push(format!(
+                    "{label}.requests references unsupported attribute {path}"
+                ));
+                continue;
+            };
+            if spec.default.is_some() {
+                errors.push(format!(
+                    "{label}.requests cannot replace the default for {path}"
+                ));
+            }
+            validate_endpoint_attribute_spec(
+                label,
+                &restricted.family,
+                "mode",
+                path,
+                spec,
+                standard,
+                errors,
+            );
+        }
+        if mode.profile.speculative_decoding.is_some() {
+            for path in &baseline.request_attributes {
+                let leaf = path.rsplit('.').next().unwrap_or(path);
+                let safe = match leaf {
+                    "min_p" => restricted
+                        .request_attribute_specs
+                        .get(path)
+                        .is_some_and(|spec| {
+                            spec.minimum == Some(0.0)
+                                && spec.maximum == Some(0.0)
+                                && spec.value_types.iter().all(|kind| {
+                                    matches!(
+                                        kind,
+                                        EndpointValueType::Number | EndpointValueType::Integer
+                                    )
+                                })
+                        }),
+                    "logit_bias" => {
+                        restricted
+                            .request_attribute_specs
+                            .get(path)
+                            .is_some_and(|spec| {
+                                !spec.enum_values.is_empty()
+                                    && spec.enum_values.iter().all(|value| {
+                                        value.is_null()
+                                            || value.as_object().is_some_and(|map| map.is_empty())
+                                    })
+                            })
+                    }
+                    _ => continue,
+                };
+                if !safe {
+                    errors.push(format!(
+                        "{label}.requests must exclude speculative-incompatible values of {path}"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+fn validate_vllm_backend_policy(
+    profile_label: &str,
+    field: &str,
+    value: &str,
+    errors: &mut Vec<String>,
+) {
+    if !matches!(value, "auto" | "cutlass") {
+        errors.push(format!(
+            "{profile_label}.{field} must be one of auto, cutlass"
+        ));
     }
 }
 
@@ -4873,110 +5516,112 @@ fn validate_canary_set(canaries_dir: &Path, set_id: &str, errors: &mut Vec<Strin
             serde_json::from_str::<CanarySet>(&text)
                 .with_context(|| format!("parsing canary set {}", path.display()))
         }) {
-        Ok(canary) => {
-            if canary.set_id != set_id {
-                errors.push(format!(
-                    "canary set file {} declares {}",
-                    set_id, canary.set_id
-                ));
-            }
-            if canary.prompts.is_empty() {
-                errors.push(format!("canary set {set_id} has no prompts"));
-            }
-            let mut prompt_ids = BTreeSet::new();
-            for prompt in &canary.prompts {
-                if prompt.id.trim().is_empty() {
-                    errors.push(format!("canary set {set_id} has an empty prompt id"));
-                } else if !prompt_ids.insert(prompt.id.as_str()) {
-                    errors.push(format!(
-                        "canary set {set_id} duplicates prompt id {}",
-                        prompt.id
-                    ));
-                }
-                if prompt.max_tokens == Some(0) {
-                    errors.push(format!(
-                        "canary prompt {} in {set_id} must use positive max_tokens",
-                        prompt.id
-                    ));
-                }
-                if prompt
-                    .temperature
-                    .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
-                {
-                    errors.push(format!(
-                        "canary prompt {} in {set_id} has invalid temperature",
-                        prompt.id
-                    ));
-                }
-                if prompt
-                    .top_p
-                    .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1.0)
-                {
-                    errors.push(format!(
-                        "canary prompt {} in {set_id} has invalid top_p",
-                        prompt.id
-                    ));
-                }
-                if prompt
-                    .top_k
-                    .is_some_and(|value| !(0..=1_000_000).contains(&value))
-                {
-                    errors.push(format!(
-                        "canary prompt {} in {set_id} has invalid top_k",
-                        prompt.id
-                    ));
-                }
-                if prompt
-                    .min_p
-                    .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
-                {
-                    errors.push(format!(
-                        "canary prompt {} in {set_id} has invalid min_p",
-                        prompt.id
-                    ));
-                }
-                if prompt
-                    .repeat_penalty
-                    .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 10.0)
-                {
-                    errors.push(format!(
-                        "canary prompt {} in {set_id} has invalid repeat_penalty",
-                        prompt.id
-                    ));
-                }
-                if prompt
-                    .frequency_penalty
-                    .is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value))
-                {
-                    errors.push(format!(
-                        "canary prompt {} in {set_id} has invalid frequency_penalty",
-                        prompt.id
-                    ));
-                }
-                if prompt
-                    .presence_penalty
-                    .is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value))
-                {
-                    errors.push(format!(
-                        "canary prompt {} in {set_id} has invalid presence_penalty",
-                        prompt.id
-                    ));
-                }
-                if prompt.temperature.is_some_and(|value| value > 0.0) && prompt.seed.is_none() {
-                    errors.push(format!(
-                        "canary prompt {} in {set_id} must pin seed when temperature is non-zero",
-                        prompt.id
-                    ));
-                }
-                if prompt.seed.is_some_and(|seed| seed > u64::from(u32::MAX)) {
-                    errors.push(format!(
-                        "canary prompt {} in {set_id} seed exceeds u32",
-                        prompt.id
-                    ));
-                }
-            }
-        }
+        Ok(canary) => validate_canary_set_contents(&canary, set_id, errors),
         Err(err) => errors.push(err.to_string()),
+    }
+}
+
+fn validate_canary_set_contents(canary: &CanarySet, set_id: &str, errors: &mut Vec<String>) {
+    if canary.set_id != set_id {
+        errors.push(format!(
+            "canary set file {} declares {}",
+            set_id, canary.set_id
+        ));
+    }
+    if canary.prompts.is_empty() {
+        errors.push(format!("canary set {set_id} has no prompts"));
+    }
+    let mut prompt_ids = BTreeSet::new();
+    for prompt in &canary.prompts {
+        if prompt.id.trim().is_empty() {
+            errors.push(format!("canary set {set_id} has an empty prompt id"));
+        } else if !prompt_ids.insert(prompt.id.as_str()) {
+            errors.push(format!(
+                "canary set {set_id} duplicates prompt id {}",
+                prompt.id
+            ));
+        }
+        if prompt.max_tokens == Some(0) {
+            errors.push(format!(
+                "canary prompt {} in {set_id} must use positive max_tokens",
+                prompt.id
+            ));
+        }
+        if prompt
+            .temperature
+            .is_some_and(|value| !value.is_finite() || !(0.0..=2.0).contains(&value))
+        {
+            errors.push(format!(
+                "canary prompt {} in {set_id} has invalid temperature",
+                prompt.id
+            ));
+        }
+        if prompt
+            .top_p
+            .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 1.0)
+        {
+            errors.push(format!(
+                "canary prompt {} in {set_id} has invalid top_p",
+                prompt.id
+            ));
+        }
+        if prompt
+            .top_k
+            .is_some_and(|value| !(0..=1_000_000).contains(&value))
+        {
+            errors.push(format!(
+                "canary prompt {} in {set_id} has invalid top_k",
+                prompt.id
+            ));
+        }
+        if prompt
+            .min_p
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            errors.push(format!(
+                "canary prompt {} in {set_id} has invalid min_p",
+                prompt.id
+            ));
+        }
+        if prompt
+            .repeat_penalty
+            .is_some_and(|value| !value.is_finite() || value <= 0.0 || value > 10.0)
+        {
+            errors.push(format!(
+                "canary prompt {} in {set_id} has invalid repeat_penalty",
+                prompt.id
+            ));
+        }
+        if prompt
+            .frequency_penalty
+            .is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value))
+        {
+            errors.push(format!(
+                "canary prompt {} in {set_id} has invalid frequency_penalty",
+                prompt.id
+            ));
+        }
+        if prompt
+            .presence_penalty
+            .is_some_and(|value| !value.is_finite() || !(-2.0..=2.0).contains(&value))
+        {
+            errors.push(format!(
+                "canary prompt {} in {set_id} has invalid presence_penalty",
+                prompt.id
+            ));
+        }
+        if prompt.temperature.is_some_and(|value| value > 0.0) && prompt.seed.is_none() {
+            errors.push(format!(
+                "canary prompt {} in {set_id} must pin seed when temperature is non-zero",
+                prompt.id
+            ));
+        }
+        if prompt.seed.is_some_and(|seed| seed > u64::from(u32::MAX)) {
+            errors.push(format!(
+                "canary prompt {} in {set_id} seed exceeds u32",
+                prompt.id
+            ));
+        }
     }
 }
 
@@ -4995,6 +5640,14 @@ fn validate_model_canary_modality_coverage(
         Ok(canary) => canary,
         Err(_) => return,
     };
+    validate_canary_modality_coverage(&canary, model, errors);
+}
+
+fn validate_canary_modality_coverage(
+    canary: &CanarySet,
+    model: &CatalogModel,
+    errors: &mut Vec<String>,
+) {
     let mut covered = BTreeSet::new();
     for prompt in &canary.prompts {
         covered.extend(canary_prompt_modalities(model, prompt));
@@ -5491,7 +6144,51 @@ mod tests {
                 engine: "vllm".to_owned(),
                 independent_dispatch: true,
                 request_modalities: vec![vec!["text".to_owned()]],
+                topology: None,
                 proof_sha256: "a".repeat(64),
+            },
+        );
+        (catalog, artifact_root)
+    }
+
+    fn catalog_with_valid_vllm_execution_profile() -> (CatalogDocument, String) {
+        let mut catalog = repository_catalog();
+        catalog.vllm_execution_profiles.clear();
+
+        let mut root_counts = BTreeMap::<String, usize>::new();
+        for artifact in catalog
+            .models
+            .iter()
+            .flat_map(|model| model.artifacts.values())
+        {
+            *root_counts
+                .entry(artifact.artifact_root.clone())
+                .or_default() += 1;
+        }
+        let artifact_root = catalog
+            .models
+            .iter()
+            .flat_map(|model| model.artifacts.values())
+            .find(|artifact| {
+                artifact.engine == "vllm"
+                    && root_counts.get(&artifact.artifact_root).copied() == Some(1)
+            })
+            .expect("repository catalog must contain a uniquely rooted vLLM artifact")
+            .artifact_root
+            .clone();
+        catalog.vllm_execution_profiles.insert(
+            artifact_root.clone(),
+            CatalogVllmExecutionProfile {
+                schema_version: 1,
+                engine: "vllm".to_owned(),
+                runtime: None,
+                enforce_eager: false,
+                compilation_mode: None,
+                cudagraph_mode: None,
+                linear_backend: "auto".to_owned(),
+                moe_backend: "cutlass".to_owned(),
+                speculative_decoding: None,
+                proof_sha256: "b".repeat(64),
             },
         );
         (catalog, artifact_root)
@@ -5561,7 +6258,7 @@ mod tests {
     }
 
     #[test]
-    fn catalog_without_generation_execution_profiles_remains_compatible() {
+    fn catalog_without_generation_or_vllm_execution_profiles_remains_compatible() {
         let catalog: CatalogDocument = serde_json::from_value(serde_json::json!({
             "schema_version": 1,
             "catalog_id": "legacy",
@@ -5572,6 +6269,7 @@ mod tests {
         .expect("legacy catalog must parse while retaining top-level extensibility");
 
         assert!(catalog.generation_execution_profiles.is_empty());
+        assert!(catalog.vllm_execution_profiles.is_empty());
         let mut errors = Vec::new();
         validate_catalog(&catalog, &mut errors);
         assert!(errors.is_empty(), "{errors:#?}");
@@ -5591,6 +6289,71 @@ mod tests {
                 .request_modalities,
             vec![vec!["text".to_owned()]]
         );
+    }
+
+    #[test]
+    fn generation_execution_profile_absent_topology_preserves_serialized_bytes() {
+        let legacy = format!(
+            r#"{{"schema_version":1,"engine":"vllm","independent_dispatch":true,"request_modalities":[["text"]],"proof_sha256":"{}"}}"#,
+            "a".repeat(64)
+        );
+        let profile: CatalogGenerationExecutionProfile = serde_json::from_str(&legacy).unwrap();
+        assert_eq!(profile.topology, None);
+        assert_eq!(serde_json::to_string(&profile).unwrap(), legacy);
+    }
+
+    #[test]
+    fn generation_execution_profile_root_topology_rejects_only_isolated_workers() {
+        let (mut catalog, root) = catalog_with_valid_generation_execution_profile();
+        for topology in [
+            None,
+            Some(mayhem_proto::GenerationExecutionTopology::SharedWorker),
+        ] {
+            catalog
+                .generation_execution_profiles
+                .get_mut(&root)
+                .unwrap()
+                .topology = topology;
+            let mut errors = Vec::new();
+            validate_catalog(&catalog, &mut errors);
+            assert!(errors.is_empty(), "{topology:?}: {errors:#?}");
+        }
+        catalog
+            .generation_execution_profiles
+            .get_mut(&root)
+            .unwrap()
+            .topology = Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers);
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].contains("isolated_workers requires an authenticated execution mode"));
+    }
+
+    #[test]
+    fn generation_execution_profile_topology_rejects_unknown_values_in_root_and_mode() {
+        let (catalog, root, _) = catalog_with_optional_vllm_mode();
+        let mode =
+            serde_json::to_value(catalog.vllm_execution_mode(&root, "throughput").unwrap()).unwrap();
+        for value in [
+            serde_json::json!("unknown"),
+            serde_json::json!("IsolatedWorkers"),
+            serde_json::json!(false),
+            serde_json::json!(2),
+        ] {
+            let mut invalid_mode = mode.clone();
+            invalid_mode["generation_execution_profile"]["topology"] = value;
+            let invalid_root = serde_json::json!({
+                "schema_version": 1,
+                "catalog_id": "strict-topology",
+                "generated_at": "now",
+                "generation_execution_profiles": {
+                    (root.clone()): invalid_mode["generation_execution_profile"].clone(),
+                },
+                "models": [],
+            });
+            assert!(serde_json::from_value::<CatalogDocument>(invalid_root).is_err());
+            assert!(serde_json::from_value::<CatalogVllmExecutionMode>(invalid_mode).is_err());
+        }
     }
 
     #[test]
@@ -5745,6 +6508,1350 @@ mod tests {
         .expect_err("profile value must deny unknown fields");
 
         assert!(error.to_string().contains("unknown field `unexpected`"));
+    }
+
+    #[test]
+    fn vllm_execution_profile_accepts_strict_bound_policy() {
+        let (catalog, artifact_root) = catalog_with_valid_vllm_execution_profile();
+
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let profile = catalog
+            .vllm_execution_profile(&artifact_root)
+            .expect("profile must resolve");
+        assert!(!profile.enforce_eager);
+        assert_eq!(profile.linear_backend, "auto");
+        assert_eq!(profile.moe_backend, "cutlass");
+        assert!(profile.speculative_decoding.is_none());
+    }
+
+    fn catalog_with_optional_vllm_mode() -> (CatalogDocument, String, String) {
+        let mut catalog = repository_catalog();
+        let (model, artifact_name, artifact) = catalog
+            .models
+            .iter()
+            .find_map(|model| {
+                model
+                    .adapter
+                    .endpoint_families
+                    .iter()
+                    .any(|contract| contract.request_attribute_specs.contains_key("min_p"))
+                    .then(|| {
+                        model
+                            .artifacts
+                            .iter()
+                            .find(|(_, artifact)| artifact.engine == "vllm")
+                            .map(|(name, artifact)| (model, name, artifact))
+                    })
+                    .flatten()
+            })
+            .expect("catalog includes a vllm artifact with sampling controls");
+        let root = artifact.artifact_root.clone();
+        let artifact_name = artifact_name.clone();
+        let mut canary = model.canary.clone();
+        canary.set_id = format!("{}-test-mode", canary.set_id);
+        canary.fingerprints.retain(|name, _| name == &artifact_name);
+        canary
+            .token_prefixes
+            .retain(|name, _| name == &artifact_name);
+        let endpoint_families = model
+            .adapter
+            .endpoint_families
+            .iter()
+            .map(|baseline| {
+                let request_attribute_specs = baseline
+                    .request_attribute_specs
+                    .iter()
+                    .filter(|(path, _)| {
+                        matches!(path.rsplit('.').next(), Some("min_p" | "logit_bias"))
+                    })
+                    .map(|(path, spec)| {
+                        let mut spec = spec.clone();
+                        spec.default = None;
+                        if path.ends_with("min_p") {
+                            spec.minimum = Some(0.0);
+                            spec.maximum = Some(0.0);
+                            spec.calibration_values = vec![serde_json::json!(0.0)];
+                        } else {
+                            spec.enum_values = vec![serde_json::json!({})];
+                            spec.calibration_values = spec.enum_values.clone();
+                        }
+                        (path.clone(), spec)
+                    })
+                    .collect::<BTreeMap<_, _>>();
+                EndpointFamilyContract {
+                    family: baseline.family.clone(),
+                    request_attributes: request_attribute_specs.keys().cloned().collect(),
+                    required_request_attributes: Vec::new(),
+                    response_attributes: Vec::new(),
+                    required_response_attributes: Vec::new(),
+                    request_attribute_specs,
+                    response_attribute_specs: BTreeMap::new(),
+                    interaction_groups: Vec::new(),
+                    speciality_mappings: BTreeMap::new(),
+                }
+            })
+            .collect();
+        let mode = CatalogVllmExecutionMode {
+            schema_version: 1,
+            profile: CatalogVllmExecutionProfile {
+                schema_version: 1,
+                engine: "vllm".to_owned(),
+                runtime: None,
+                enforce_eager: false,
+                compilation_mode: Some(0),
+                cudagraph_mode: Some("FULL_DECODE_ONLY".to_owned()),
+                linear_backend: "cutlass".to_owned(),
+                moe_backend: "cutlass".to_owned(),
+                speculative_decoding: Some(CatalogVllmSpeculativeDecodingProfile {
+                    method: "mtp".to_owned(),
+                    num_speculative_tokens: 3,
+                }),
+                proof_sha256: "b".repeat(64),
+            },
+            generation_execution_profile: Some(CatalogGenerationExecutionProfile {
+                schema_version: 1,
+                engine: "vllm".to_owned(),
+                independent_dispatch: true,
+                request_modalities: vec![vec!["text".to_owned()]],
+                topology: None,
+                proof_sha256: "e".repeat(64),
+            }),
+            requests: mayhem_proto::ExecutionModeRequestPolicy { endpoint_families },
+            canary,
+            canary_set_sha256: "d".repeat(64),
+            modality_fingerprints: model.modality_assessment.calibrated_fingerprints
+                [&artifact_name]
+                .clone(),
+            resource_profiles: model
+                .modality_assessment
+                .resource_profiles
+                .get(&artifact_name)
+                .cloned()
+                .unwrap_or_default(),
+            speciality_calibrations: model
+                .speciality_assessment
+                .calibrated
+                .get(&artifact_name)
+                .cloned()
+                .unwrap_or_default(),
+        };
+        catalog.vllm_execution_modes = BTreeMap::from([(
+            root.clone(),
+            BTreeMap::from([("throughput".to_owned(), mode)]),
+        )]);
+        (catalog, root, artifact_name)
+    }
+
+    #[test]
+    fn vllm_execution_mode_is_optional_and_does_not_narrow_baseline() {
+        let (catalog, root, _) = catalog_with_optional_vllm_mode();
+        let mut errors = Vec::new();
+        validate_vllm_execution_modes(&catalog, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert!(catalog.vllm_execution_mode(&root, "unknown").is_none());
+        let mode = catalog.vllm_execution_mode(&root, "throughput").unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == root)
+            })
+            .unwrap();
+        for baseline in &model.adapter.endpoint_families {
+            let Some(spec) = baseline.request_attribute_specs.get("min_p") else {
+                continue;
+            };
+            assert!(mayhem_proto::validate_endpoint_attribute_value(
+                spec,
+                &serde_json::json!(0.05)
+            )
+            .is_ok());
+            assert!(mode
+                .requests
+                .validate_request(&baseline.family, &serde_json::json!({"min_p": 0.05}))
+                .is_err());
+            for value in [serde_json::json!(0), serde_json::json!(0.0)] {
+                assert!(mode
+                    .requests
+                    .validate_request(&baseline.family, &serde_json::json!({"min_p": value}))
+                    .is_ok());
+            }
+        }
+        let legacy: CatalogDocument = serde_json::from_value(serde_json::json!({
+            "schema_version": 1, "catalog_id": "legacy", "generated_at": "now", "models": [],
+        }))
+        .unwrap();
+        assert!(legacy.vllm_execution_modes.is_empty());
+    }
+
+    #[test]
+    fn catalog_report_canary_sets_include_execution_modes() {
+        let (catalog, root, _) = catalog_with_optional_vllm_mode();
+        let mode_canary = catalog
+            .vllm_execution_mode(&root, "throughput")
+            .unwrap()
+            .canary
+            .set_id
+            .clone();
+
+        let canary_sets = catalog_canary_sets(&catalog);
+
+        assert!(canary_sets.contains(&mode_canary));
+        for model in &catalog.models {
+            assert!(canary_sets.contains(&model.canary.set_id));
+        }
+    }
+
+    #[test]
+    fn execution_mode_model_preserves_identity_defaults_and_baseline() {
+        let (catalog, root, artifact_name) = catalog_with_optional_vllm_mode();
+        let mode = catalog.vllm_execution_mode(&root, "throughput").unwrap();
+        let mut model = catalog
+            .models
+            .iter()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == root)
+            })
+            .unwrap()
+            .clone();
+        let restricted_family = mode
+            .requests
+            .endpoint_families
+            .iter()
+            .find(|family| family.request_attribute_specs.contains_key("min_p"))
+            .unwrap();
+        model
+            .adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|family| family.family == restricted_family.family)
+            .unwrap()
+            .request_attribute_specs
+            .get_mut("min_p")
+            .unwrap()
+            .default = Some(serde_json::json!(0));
+        let baseline = format!("{model:#?}");
+
+        let effective = execution_mode_model(&model, &artifact_name, mode).unwrap();
+
+        assert_eq!(format!("{model:#?}"), baseline);
+        assert_eq!(effective.model_id, model.model_id);
+        assert_eq!(effective.model_class, model.model_class);
+        assert_eq!(effective.family, model.family);
+        assert_eq!(effective.params_b, model.params_b);
+        assert_eq!(effective.tier, model.tier);
+        assert_eq!(effective.sampling, model.sampling);
+        assert_eq!(effective.artifacts.len(), 1);
+        assert!(effective.artifacts.contains_key(&artifact_name));
+        let default = effective
+            .adapter
+            .endpoint_families
+            .iter()
+            .find(|family| family.family == restricted_family.family)
+            .unwrap()
+            .request_attribute_specs["min_p"]
+            .default
+            .as_ref();
+        assert_eq!(default, Some(&serde_json::json!(0)));
+    }
+
+    #[test]
+    fn execution_mode_model_uses_only_mode_evidence() {
+        let (catalog, root, artifact_name) = catalog_with_optional_vllm_mode();
+        let mode = catalog.vllm_execution_mode(&root, "throughput").unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == root)
+            })
+            .unwrap();
+
+        let effective = execution_mode_model(model, &artifact_name, mode).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&effective.canary).unwrap(),
+            serde_json::to_value(&mode.canary).unwrap()
+        );
+        assert_eq!(
+            effective.modality_assessment.calibrated_fingerprints,
+            BTreeMap::from([(artifact_name.clone(), mode.modality_fingerprints.clone())])
+        );
+        assert_eq!(
+            effective.modality_assessment.resource_profiles,
+            BTreeMap::from([(artifact_name.clone(), mode.resource_profiles.clone())])
+        );
+        assert_eq!(
+            effective.speciality_assessment.calibrated,
+            BTreeMap::from([(artifact_name, mode.speciality_calibrations.clone())])
+        );
+    }
+
+    #[test]
+    fn execution_mode_model_rejects_invalid_inherited_default() {
+        let (catalog, root, artifact_name) = catalog_with_optional_vllm_mode();
+        let mode = catalog.vllm_execution_mode(&root, "throughput").unwrap();
+        let mut model = catalog
+            .models
+            .iter()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == root)
+            })
+            .unwrap()
+            .clone();
+        let restricted_family = mode
+            .requests
+            .endpoint_families
+            .iter()
+            .find(|family| family.request_attribute_specs.contains_key("min_p"))
+            .unwrap();
+        model
+            .adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|family| family.family == restricted_family.family)
+            .unwrap()
+            .request_attribute_specs
+            .get_mut("min_p")
+            .unwrap()
+            .default = Some(serde_json::json!(0.5));
+
+        let error = execution_mode_model(&model, &artifact_name, mode).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("cannot serve inherited default for min_p"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn execution_mode_model_narrows_endpoint_families() {
+        let (catalog, root, artifact_name) = catalog_with_optional_vllm_mode();
+        let mut mode = catalog
+            .vllm_execution_mode(&root, "throughput")
+            .unwrap()
+            .clone();
+        mode.profile.speculative_decoding = None;
+        let selected_family = mode
+            .requests
+            .endpoint_families
+            .iter()
+            .find(|family| !family.request_attribute_specs.is_empty())
+            .unwrap()
+            .clone();
+        let expected_family = selected_family.family.clone();
+        mode.requests.endpoint_families = vec![selected_family];
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == root)
+            })
+            .unwrap();
+
+        let effective = execution_mode_model(model, &artifact_name, &mode).unwrap();
+
+        assert_eq!(effective.adapter.endpoint_families.len(), 1);
+        assert_eq!(effective.adapter.endpoint_families[0].family, expected_family);
+    }
+
+    #[test]
+    fn vllm_execution_mode_rejects_widening_defaults_and_incompatible_sampling() {
+        let (catalog, root, _) = catalog_with_optional_vllm_mode();
+        for mutation in [
+            "sampling",
+            "default",
+            "unknown",
+            "family",
+            "response",
+            "required",
+            "inherited",
+        ] {
+            let mut altered = catalog.clone();
+            if mutation == "inherited" {
+                let model = altered
+                    .models
+                    .iter_mut()
+                    .find(|model| {
+                        model
+                            .artifacts
+                            .values()
+                            .any(|artifact| artifact.artifact_root == root)
+                    })
+                    .unwrap();
+                model.sampling.min_p = Some(0.05);
+                for contract in &mut model.adapter.endpoint_families {
+                    contract.request_attributes.retain(|path| path != "min_p");
+                    contract.request_attribute_specs.remove("min_p");
+                }
+                let mode = altered
+                    .vllm_execution_modes
+                    .get_mut(&root)
+                    .unwrap()
+                    .get_mut("throughput")
+                    .unwrap();
+                for contract in &mut mode.requests.endpoint_families {
+                    contract.request_attributes.retain(|path| path != "min_p");
+                    contract.request_attribute_specs.remove("min_p");
+                }
+                let mut errors = Vec::new();
+                validate_vllm_execution_modes(&altered, &mut errors);
+                assert!(
+                    errors
+                        .iter()
+                        .any(|error| error.contains("inherit a nonzero min_p")),
+                    "{errors:#?}"
+                );
+                continue;
+            }
+            let mode = altered
+                .vllm_execution_modes
+                .get_mut(&root)
+                .unwrap()
+                .get_mut("throughput")
+                .unwrap();
+            let contract = mode
+                .requests
+                .endpoint_families
+                .iter_mut()
+                .find(|contract| contract.request_attribute_specs.contains_key("min_p"))
+                .unwrap();
+            match mutation {
+                "sampling" => {
+                    contract
+                        .request_attribute_specs
+                        .get_mut("min_p")
+                        .unwrap()
+                        .maximum = Some(1.0)
+                }
+                "default" => {
+                    contract
+                        .request_attribute_specs
+                        .get_mut("min_p")
+                        .unwrap()
+                        .default = Some(serde_json::json!(0.0))
+                }
+                "unknown" => {
+                    contract.request_attribute_specs.insert(
+                        "unknown".to_owned(),
+                        mayhem_proto::EndpointAttributeSpec::new(EndpointValueType::Number),
+                    );
+                }
+                "family" => contract.family = "unknown".to_owned(),
+                "response" => contract.response_attributes.push("choices".to_owned()),
+                "required" => contract
+                    .required_request_attributes
+                    .push("min_p".to_owned()),
+                _ => unreachable!(),
+            }
+            let mut errors = Vec::new();
+            validate_vllm_execution_modes(&altered, &mut errors);
+            assert!(!errors.is_empty(), "accepted {mutation}");
+        }
+    }
+
+    #[test]
+    fn vllm_execution_mode_never_falls_back_to_baseline_canary_evidence() {
+        let (catalog, root, artifact) = catalog_with_optional_vllm_mode();
+        for mutation in [
+            "canary",
+            "prefixes",
+            "modality",
+            "speciality",
+            "tolerance",
+            "resources",
+        ] {
+            let mut altered = catalog.clone();
+            let baseline = altered
+                .models
+                .iter()
+                .find(|model| {
+                    model
+                        .artifacts
+                        .values()
+                        .any(|artifact| artifact.artifact_root == root)
+                })
+                .unwrap()
+                .canary
+                .clone();
+            let mode = altered
+                .vllm_execution_modes
+                .get_mut(&root)
+                .unwrap()
+                .get_mut("throughput")
+                .unwrap();
+            match mutation {
+                "canary" => mode.canary.set_id = baseline.set_id,
+                "prefixes" => {
+                    mode.canary.token_prefixes.remove(&artifact);
+                }
+                "modality" => mode.modality_fingerprints.clear(),
+                "resources" => {
+                    if mode.resource_profiles.is_empty() {
+                        continue;
+                    }
+                    mode.resource_profiles.clear();
+                }
+                "speciality" => {
+                    if mode.speciality_calibrations.is_empty() {
+                        continue;
+                    }
+                    mode.speciality_calibrations.clear();
+                }
+                "tolerance" => mode.canary.match_min = 0.5,
+                _ => unreachable!(),
+            }
+            let mut errors = Vec::new();
+            validate_vllm_execution_modes(&altered, &mut errors);
+            assert!(
+                !errors.is_empty(),
+                "accepted missing/changed {mutation} evidence"
+            );
+        }
+    }
+
+    #[test]
+    fn vllm_execution_mode_parallelism_is_optional_and_requires_own_valid_profile() {
+        let (catalog, root, artifact_name) = catalog_with_optional_vllm_mode();
+        let baseline_profiles = catalog.generation_execution_profiles.clone();
+
+        let mut missing = catalog.clone();
+        missing
+            .vllm_execution_modes
+            .get_mut(&root)
+            .unwrap()
+            .get_mut("throughput")
+            .unwrap()
+            .generation_execution_profile = None;
+        let mut errors = Vec::new();
+        validate_vllm_execution_modes(&missing, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let mode = missing.vllm_execution_mode(&root, "throughput").unwrap();
+        assert!(mode.profile.speculative_decoding.is_some());
+        assert!(mode.generation_execution_profile.is_none());
+        let model = missing.models.iter().find(|model| {
+            model.artifacts.values().any(|artifact| artifact.artifact_root == root)
+        }).unwrap();
+        execution_mode_model(model, &artifact_name, mode).unwrap();
+
+        let mut invalid = catalog.clone();
+        let invalid_profile = invalid
+            .vllm_execution_modes
+            .get_mut(&root)
+            .unwrap()
+            .get_mut("throughput")
+            .unwrap()
+            .generation_execution_profile
+            .as_mut()
+            .unwrap();
+        invalid_profile.independent_dispatch = false;
+        invalid_profile.proof_sha256 = "F".repeat(64);
+        invalid_profile.request_modalities = vec![vec!["embedding".to_owned()]];
+        errors.clear();
+        validate_vllm_execution_modes(&invalid, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("independent_dispatch must be true")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("proof_sha256 must be exact lowercase")));
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unsupported generation modality")));
+
+        let mut non_mtp = missing;
+        non_mtp
+            .vllm_execution_modes
+            .get_mut(&root)
+            .unwrap()
+            .get_mut("throughput")
+            .unwrap()
+            .profile
+            .speculative_decoding = None;
+        errors.clear();
+        validate_vllm_execution_modes(&non_mtp, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+        assert_eq!(catalog.generation_execution_profiles, baseline_profiles);
+    }
+
+    #[test]
+    fn vllm_execution_mode_isolated_topology_preserves_baseline_and_other_models() {
+        let (mut catalog, root, artifact_name) = catalog_with_optional_vllm_mode();
+        let baseline = catalog.clone();
+        catalog
+            .vllm_execution_modes
+            .get_mut(&root)
+            .unwrap()
+            .get_mut("throughput")
+            .unwrap()
+            .generation_execution_profile
+            .as_mut()
+            .unwrap()
+            .topology = Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers);
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+        let mode = catalog.vllm_execution_mode(&root, "throughput").unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| {
+                model.artifacts.values().any(|artifact| artifact.artifact_root == root)
+            })
+            .unwrap();
+        let effective = execution_mode_model(model, &artifact_name, mode).unwrap();
+        assert_eq!(effective.sampling, model.sampling);
+        assert_eq!(
+            serde_json::to_value(&effective.artifacts).unwrap(),
+            serde_json::json!({(artifact_name.clone()): model.artifacts[&artifact_name]})
+        );
+        assert_ne!(
+            mode.binding(&root, "throughput").unwrap(),
+            baseline
+                .vllm_execution_mode(&root, "throughput")
+                .unwrap()
+                .binding(&root, "throughput")
+                .unwrap()
+        );
+        assert_eq!(
+            format!("{:?}", catalog.models),
+            format!("{:?}", baseline.models)
+        );
+        assert_eq!(
+            catalog.generation_execution_profiles,
+            baseline.generation_execution_profiles
+        );
+        assert_eq!(
+            catalog.vllm_execution_profiles,
+            baseline.vllm_execution_profiles
+        );
+        for artifact in catalog
+            .models
+            .iter()
+            .flat_map(|model| model.artifacts.values())
+        {
+            assert_eq!(
+                catalog.generation_execution_profile(&artifact.artifact_root),
+                baseline.generation_execution_profile(&artifact.artifact_root)
+            );
+            if artifact.artifact_root != root {
+                assert!(catalog
+                    .vllm_execution_mode(&artifact.artifact_root, "throughput")
+                    .is_none());
+            }
+        }
+
+        let mut invalid_root = catalog.clone();
+        invalid_root.generation_execution_profiles.insert(
+            root,
+            mode.generation_execution_profile.clone().unwrap(),
+        );
+        validate_catalog(&invalid_root, &mut errors);
+        assert_eq!(errors.len(), 1, "{errors:#?}");
+        assert!(errors[0].contains("isolated_workers requires an authenticated execution mode"));
+    }
+
+    #[test]
+    fn vllm_execution_mode_isolated_topology_requires_existing_policy_and_own_proof() {
+        let (mut catalog, root, artifact_name) = catalog_with_optional_vllm_mode();
+        let root_profile = catalog
+            .vllm_execution_mode(&root, "throughput")
+            .unwrap()
+            .generation_execution_profile
+            .clone()
+            .unwrap();
+        // A valid root proof cannot supply a missing or invalid mode-owned proof.
+        catalog
+            .generation_execution_profiles
+            .insert(root.clone(), root_profile);
+        catalog
+            .vllm_execution_modes
+            .get_mut(&root)
+            .unwrap()
+            .get_mut("throughput")
+            .unwrap()
+            .generation_execution_profile
+            .as_mut()
+            .unwrap()
+            .topology = Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers);
+        let mode = catalog.vllm_execution_mode(&root, "throughput").unwrap();
+        let serialized = serde_json::to_value(mode).unwrap();
+        let mut missing_proof = serialized.clone();
+        missing_proof["generation_execution_profile"]
+            .as_object_mut()
+            .unwrap()
+            .remove("proof_sha256");
+        assert!(serde_json::from_value::<CatalogVllmExecutionMode>(missing_proof).is_err());
+        for (pointer, value, expected_error) in [
+            (
+                "/schema_version",
+                serde_json::json!(2),
+                "schema_version must be 1",
+            ),
+            (
+                "/profile/engine",
+                serde_json::json!("llama.cpp"),
+                "engine must be vllm",
+            ),
+            (
+                "/generation_execution_profile/schema_version",
+                serde_json::json!(2),
+                "schema_version must be 1",
+            ),
+            (
+                "/generation_execution_profile/engine",
+                serde_json::json!("llama.cpp"),
+                "engine must be vllm",
+            ),
+            (
+                "/generation_execution_profile/independent_dispatch",
+                serde_json::json!(false),
+                "independent_dispatch must be true",
+            ),
+            (
+                "/generation_execution_profile/proof_sha256",
+                serde_json::json!(""),
+                "proof_sha256 must be exact lowercase",
+            ),
+            (
+                "/generation_execution_profile/request_modalities",
+                serde_json::json!([["embedding"]]),
+                "unsupported generation modality",
+            ),
+            (
+                "/requests/endpoint_families",
+                serde_json::json!([]),
+                "requests must declare an endpoint family",
+            ),
+            (
+                "/canary/set_id",
+                serde_json::json!(""),
+                "requires its own nonempty canary set",
+            ),
+            (
+                "/canary/token_prefixes",
+                serde_json::json!({}),
+                "requires its own token prefixes",
+            ),
+            (
+                "/canary_set_sha256",
+                serde_json::json!(""),
+                "canary_set_sha256 must be exact lowercase",
+            ),
+        ] {
+            let mut invalid = serialized.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            let mut altered = catalog.clone();
+            altered.vllm_execution_modes.get_mut(&root).unwrap().insert(
+                "throughput".to_owned(),
+                serde_json::from_value(invalid).unwrap(),
+            );
+            let mut errors = Vec::new();
+            validate_catalog(&altered, &mut errors);
+            assert!(
+                errors.iter().any(|error| error.contains(expected_error)),
+                "{pointer}: {errors:#?}"
+            );
+            if pointer.starts_with("/generation_execution_profile/") {
+                let model = altered
+                    .models
+                    .iter()
+                    .find(|model| {
+                        model.artifacts.values().any(|artifact| artifact.artifact_root == root)
+                    })
+                    .unwrap();
+                assert!(execution_mode_model(
+                    model,
+                    &artifact_name,
+                    altered.vllm_execution_mode(&root, "throughput").unwrap(),
+                )
+                .is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn vllm_execution_mode_binding_covers_policy_without_circular_evidence_hash() {
+        let (catalog, root, _) = catalog_with_optional_vllm_mode();
+        let mode = catalog.vllm_execution_mode(&root, "throughput").unwrap();
+        let binding = mode.binding(&root, "throughput").unwrap();
+        binding.validate().unwrap();
+        let mut filled_proof = mode.clone();
+        filled_proof.profile.proof_sha256 = "c".repeat(64);
+        assert_eq!(filled_proof.binding(&root, "throughput").unwrap(), binding);
+        let mut filled_generation_proof = mode.clone();
+        filled_generation_proof
+            .generation_execution_profile
+            .as_mut()
+            .unwrap()
+            .proof_sha256 = "f".repeat(64);
+        assert_eq!(
+            filled_generation_proof
+                .binding(&root, "throughput")
+                .unwrap(),
+            binding
+        );
+        let mut changed_generation_policy = mode.clone();
+        changed_generation_policy
+            .generation_execution_profile
+            .as_mut()
+            .unwrap()
+            .request_modalities
+            .push(vec!["audio".to_owned(), "text".to_owned()]);
+        assert_ne!(
+            changed_generation_policy
+                .binding(&root, "throughput")
+                .unwrap(),
+            binding
+        );
+        assert_ne!(
+            mode.binding(&"a".repeat(64), "throughput").unwrap(),
+            binding
+        );
+        assert_ne!(mode.binding(&root, "different").unwrap(), binding);
+        let mut changed_runtime = mode.clone();
+        changed_runtime.profile.runtime = Some(
+            crate::python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1,
+        );
+        assert_ne!(changed_runtime.binding(&root, "throughput").unwrap(), binding);
+        let mut changed = mode.clone();
+        changed
+            .profile
+            .speculative_decoding
+            .as_mut()
+            .unwrap()
+            .num_speculative_tokens = 2;
+        assert_ne!(changed.binding(&root, "throughput").unwrap(), binding);
+        let mut changed = mode.clone();
+        changed.canary.set_id.push_str("-different");
+        assert_ne!(changed.binding(&root, "throughput").unwrap(), binding);
+        let mut changed = mode.clone();
+        changed.canary_set_sha256 = "e".repeat(64);
+        assert_ne!(changed.binding(&root, "throughput").unwrap(), binding);
+        let mut changed = mode.clone();
+        changed.requests.endpoint_families.clear();
+        assert_ne!(changed.binding(&root, "throughput").unwrap(), binding);
+        assert!(mode.binding(&root.to_uppercase(), "throughput").is_err());
+        assert!(mode.binding(&root, "baseline").is_err());
+        let mut invalid = serde_json::to_value(mode).unwrap();
+        invalid["unexpected"] = serde_json::json!(true);
+        assert!(serde_json::from_value::<CatalogVllmExecutionMode>(invalid).is_err());
+    }
+
+    #[test]
+    fn vllm_execution_mode_rejects_unowned_ambiguous_and_non_vllm_artifacts() {
+        let (catalog, root, _) = catalog_with_optional_vllm_mode();
+        for mutation in ["unknown", "ambiguous", "engine"] {
+            let mut altered = catalog.clone();
+            match mutation {
+                "unknown" => {
+                    let modes = altered.vllm_execution_modes.remove(&root).unwrap();
+                    altered.vllm_execution_modes.insert("a".repeat(64), modes);
+                }
+                "ambiguous" => {
+                    let owner = altered
+                        .models
+                        .iter()
+                        .find(|model| {
+                            model
+                                .artifacts
+                                .values()
+                                .any(|artifact| artifact.artifact_root == root)
+                        })
+                        .unwrap()
+                        .clone();
+                    altered.models.push(owner);
+                }
+                "engine" => {
+                    for artifact in altered
+                        .models
+                        .iter_mut()
+                        .flat_map(|model| model.artifacts.values_mut())
+                    {
+                        if artifact.artifact_root == root {
+                            artifact.engine = "llama.cpp".to_owned();
+                        }
+                    }
+                }
+                _ => unreachable!(),
+            }
+            let mut errors = Vec::new();
+            validate_vllm_execution_modes(&altered, &mut errors);
+            assert!(!errors.is_empty(), "accepted {mutation}");
+        }
+    }
+
+    #[test]
+    fn vllm_execution_mode_canary_file_verification_binds_exact_input_bytes() {
+        let (mut catalog, root, _) = catalog_with_optional_vllm_mode();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == root)
+            })
+            .unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../catalog/canaries")
+            .join(format!("{}.json", model.canary.set_id));
+        let mut canary: Value = serde_json::from_slice(&fs::read(source).unwrap()).unwrap();
+        let mode = catalog
+            .vllm_execution_modes
+            .get_mut(&root)
+            .unwrap()
+            .get_mut("throughput")
+            .unwrap();
+        canary["set_id"] = Value::String(mode.canary.set_id.clone());
+        let bytes = serde_json::to_vec(&canary).unwrap();
+        mode.canary_set_sha256 = format!("{:x}", Sha256::digest(&bytes));
+        let suffix = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "mayhem-mode-canary-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir(&dir).unwrap();
+        let path = dir.join(format!("{}.json", mode.canary.set_id));
+        fs::write(&path, &bytes).unwrap();
+        let mut errors = Vec::new();
+        validate_execution_mode_canary_files(&catalog, &dir, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        fs::write(&path, serde_json::to_vec_pretty(&canary).unwrap()).unwrap();
+        validate_execution_mode_canary_files(&catalog, &dir, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("input bytes do not match")),
+            "{errors:#?}"
+        );
+        fs::remove_file(&path).unwrap();
+        errors.clear();
+        validate_execution_mode_canary_files(&catalog, &dir, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("cannot read mode canary")),
+            "{errors:#?}"
+        );
+        fs::remove_dir(&dir).unwrap();
+    }
+
+    #[test]
+    fn vllm_execution_profile_compilation_controls_are_optional_and_roundtrip() {
+        let (mut catalog, root) = catalog_with_valid_vllm_execution_profile();
+        let profile = catalog.vllm_execution_profiles.get_mut(&root).unwrap();
+        let legacy = serde_json::to_value(&*profile).unwrap();
+        assert!(legacy.get("compilation_mode").is_none());
+        assert!(legacy.get("cudagraph_mode").is_none());
+        let restored: CatalogVllmExecutionProfile = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(restored).unwrap(), legacy);
+
+        for mode in 0..=3 {
+            for graph in ["NONE", "FULL_DECODE_ONLY", "FULL", "PIECEWISE", "FULL_AND_PIECEWISE"] {
+                let profile = catalog.vllm_execution_profiles.get_mut(&root).unwrap();
+                profile.compilation_mode = Some(mode);
+                profile.cudagraph_mode = Some(graph.to_owned());
+                let encoded = serde_json::to_value(&*profile).unwrap();
+                assert_eq!(encoded["compilation_mode"], serde_json::json!(mode));
+                assert_eq!(encoded["cudagraph_mode"], serde_json::json!(graph));
+                let restored: CatalogVllmExecutionProfile = serde_json::from_value(encoded).unwrap();
+                assert_eq!(*profile, restored);
+                let mut errors = Vec::new();
+                validate_vllm_execution_profiles(&catalog, &mut errors);
+                assert!(errors.is_empty(), "{errors:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn vllm_execution_profile_rejects_invalid_or_eager_compilation_controls() {
+        let (mut catalog, root) = catalog_with_valid_vllm_execution_profile();
+        for (eager, mode, graph) in [
+            (false, Some(4), None),
+            (false, None, Some("full")),
+            (false, None, Some("UNKNOWN")),
+            (true, Some(1), None),
+            (true, None, Some("FULL_DECODE_ONLY")),
+        ] {
+            let profile = catalog.vllm_execution_profiles.get_mut(&root).unwrap();
+            profile.enforce_eager = eager;
+            profile.compilation_mode = mode;
+            profile.cudagraph_mode = graph.map(str::to_owned);
+            let mut errors = Vec::new();
+            validate_vllm_execution_profiles(&catalog, &mut errors);
+            assert!(!errors.is_empty(), "{eager:?} {mode:?} {graph:?}");
+        }
+        let profile = catalog.vllm_execution_profiles.get_mut(&root).unwrap();
+        profile.compilation_mode = Some(0);
+        profile.cudagraph_mode = Some("NONE".to_owned());
+        let encoded = serde_json::to_value(&*profile).unwrap();
+        let mut errors = Vec::new();
+        validate_vllm_execution_profiles(&catalog, &mut errors);
+        assert!(errors.is_empty(), "{errors:?}");
+        for (field, value) in [
+            ("compilation_mode", serde_json::json!(-1)),
+            ("compilation_mode", serde_json::json!(true)),
+            ("compilation_mode", serde_json::json!(0.0)),
+            ("compilation_mode", serde_json::json!("0")),
+            ("cudagraph_mode", serde_json::json!(0)),
+        ] {
+            let mut invalid = encoded.clone();
+            invalid[field] = value;
+            assert!(serde_json::from_value::<CatalogVllmExecutionProfile>(invalid).is_err());
+        }
+    }
+
+    #[test]
+    fn vllm_mtp_profile_rejects_models_exposing_incompatible_sampling_attributes() {
+        let (mut catalog, artifact_root) = catalog_with_valid_vllm_execution_profile();
+        let owning_model = catalog
+            .models
+            .iter_mut()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == artifact_root)
+            })
+            .expect("owning model");
+        for contract in &mut owning_model.adapter.endpoint_families {
+            contract.request_attributes.retain(|attribute| {
+                !matches!(attribute.rsplit('.').next(), Some("min_p" | "logit_bias"))
+            });
+        }
+        catalog
+            .vllm_execution_profiles
+            .get_mut(&artifact_root)
+            .expect("profile")
+            .speculative_decoding = Some(CatalogVllmSpeculativeDecodingProfile {
+            method: "mtp".to_owned(),
+            num_speculative_tokens: 2,
+        });
+
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+
+        let owning_model = catalog
+            .models
+            .iter_mut()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == artifact_root)
+            })
+            .expect("owning model");
+        owning_model.adapter.endpoint_families[0]
+            .request_attributes
+            .push("min_p".to_owned());
+        errors.clear();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains("cannot be enabled")
+                && error.contains("incompatible request attribute(s): min_p")
+        }));
+
+        let attributes = &mut catalog
+            .models
+            .iter_mut()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == artifact_root)
+            })
+            .expect("owning model")
+            .adapter
+            .endpoint_families[0]
+            .request_attributes;
+        attributes.retain(|attribute| attribute != "min_p");
+        attributes.push("parameters.logit_bias".to_owned());
+        errors.clear();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors.iter().any(|error| {
+            error.contains("cannot be enabled")
+                && error.contains("incompatible request attribute(s): logit_bias")
+        }));
+    }
+
+    #[test]
+    fn vllm_mtp_profile_rejects_incompatible_sampling_defaults() {
+        let (mut catalog, root) = catalog_with_valid_vllm_execution_profile();
+        let model = catalog
+            .models
+            .iter_mut()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == root)
+            })
+            .unwrap();
+        for contract in &mut model.adapter.endpoint_families {
+            contract.request_attributes.retain(|attribute| {
+                !matches!(attribute.rsplit('.').next(), Some("min_p" | "logit_bias"))
+            });
+        }
+        model.sampling.min_p = Some(0.1);
+        catalog
+            .vllm_execution_profiles
+            .get_mut(&root)
+            .unwrap()
+            .speculative_decoding = Some(CatalogVllmSpeculativeDecodingProfile {
+            method: "mtp".to_owned(),
+            num_speculative_tokens: 2,
+        });
+        let mut errors = Vec::new();
+        validate_vllm_execution_profiles(&catalog, &mut errors);
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("nonzero min_p sampling default")),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn vllm_execution_profile_rejects_invalid_policy_values() {
+        let (mut catalog, artifact_root) = catalog_with_valid_vllm_execution_profile();
+        let profile = catalog
+            .vllm_execution_profiles
+            .get_mut(&artifact_root)
+            .expect("profile");
+        profile.schema_version = 2;
+        profile.engine = "llama.cpp".to_owned();
+        profile.linear_backend = "unsafe-linear".to_owned();
+        profile.moe_backend = "unsafe-moe".to_owned();
+        profile.proof_sha256 = "B".repeat(64);
+        profile.speculative_decoding = Some(CatalogVllmSpeculativeDecodingProfile {
+            method: "draft_model".to_owned(),
+            num_speculative_tokens: 0,
+        });
+
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        for expected in [
+            "schema_version must be 1",
+            "engine must be vllm",
+            "does not match bound artifact engine",
+            "linear_backend must be one of auto, cutlass",
+            "moe_backend must be one of auto, cutlass",
+            "proof_sha256 must be exact lowercase",
+            "speculative_decoding.method must be mtp",
+            "num_speculative_tokens must be between 1 and 32",
+        ] {
+            assert!(
+                errors.iter().any(|error| error.contains(expected)),
+                "missing {expected:?} in {errors:#?}"
+            );
+        }
+
+        let profile = catalog
+            .vllm_execution_profiles
+            .get_mut(&artifact_root)
+            .expect("profile");
+        profile.schema_version = 1;
+        profile.engine = "vllm".to_owned();
+        profile.linear_backend = "auto".to_owned();
+        profile.moe_backend = "auto".to_owned();
+        profile.proof_sha256 = "b".repeat(64);
+        profile.speculative_decoding = Some(CatalogVllmSpeculativeDecodingProfile {
+            method: "mtp".to_owned(),
+            num_speculative_tokens: MAX_VLLM_SPECULATIVE_TOKENS + 1,
+        });
+        errors.clear();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("num_speculative_tokens must be between 1 and 32")));
+    }
+
+    #[test]
+    fn vllm_execution_profile_rejects_unknown_ambiguous_and_non_vllm_roots() {
+        let (mut catalog, artifact_root) = catalog_with_valid_vllm_execution_profile();
+        let profile = catalog
+            .vllm_execution_profiles
+            .remove(&artifact_root)
+            .expect("profile");
+
+        catalog
+            .vllm_execution_profiles
+            .insert("0".repeat(64), profile.clone());
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("unknown primary catalog artifact root")));
+
+        catalog.vllm_execution_profiles.clear();
+        catalog
+            .vllm_execution_profiles
+            .insert("A".repeat(64), profile.clone());
+        errors.clear();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("key must be exact lowercase")));
+
+        catalog.vllm_execution_profiles.clear();
+        catalog
+            .vllm_execution_profiles
+            .insert(artifact_root.clone(), profile.clone());
+        let duplicate_model = catalog
+            .models
+            .iter()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == artifact_root)
+            })
+            .expect("bound model")
+            .clone();
+        catalog.models.push(duplicate_model);
+        errors.clear();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors.iter().any(|error| error
+            .contains("must resolve to exactly one primary catalog artifact root, found 2")));
+
+        catalog.models.pop();
+        let mut root_counts = BTreeMap::<String, usize>::new();
+        for artifact in catalog
+            .models
+            .iter()
+            .flat_map(|model| model.artifacts.values())
+        {
+            *root_counts
+                .entry(artifact.artifact_root.clone())
+                .or_default() += 1;
+        }
+        let non_vllm_root = catalog
+            .models
+            .iter()
+            .flat_map(|model| model.artifacts.values())
+            .find(|artifact| {
+                artifact.engine != "vllm"
+                    && root_counts.get(&artifact.artifact_root).copied() == Some(1)
+            })
+            .expect("repository catalog must contain a uniquely rooted non-vLLM artifact")
+            .artifact_root
+            .clone();
+        catalog.vllm_execution_profiles.clear();
+        catalog
+            .vllm_execution_profiles
+            .insert(non_vllm_root, profile);
+        errors.clear();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors
+            .iter()
+            .any(|error| error.contains("must bind a vllm artifact")));
+    }
+
+    #[test]
+    fn vllm_execution_profile_runtime_source_roundtrip_and_legacy_default() {
+        let source = serde_json::json!({
+            "schema_version": 1,
+            "engine": "vllm",
+            "enforce_eager": false,
+            "linear_backend": "auto",
+            "moe_backend": "cutlass",
+            "proof_sha256": "b".repeat(64),
+        });
+        let legacy: CatalogVllmExecutionProfile = serde_json::from_value(source.clone()).unwrap();
+        assert_eq!(legacy.runtime, None);
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), source);
+
+        let mut explicit_default = source.clone();
+        explicit_default["runtime"] = serde_json::Value::Null;
+        let default: CatalogVllmExecutionProfile = serde_json::from_value(explicit_default).unwrap();
+        assert_eq!(default, legacy);
+        assert_eq!(serde_json::to_value(default).unwrap(), source);
+
+        let mut selected_source = source;
+        selected_source["runtime"] = serde_json::json!("flashinfer_speculative_metadata_v1");
+        let selected: CatalogVllmExecutionProfile = serde_json::from_value(selected_source.clone()).unwrap();
+        assert_eq!(selected.runtime, Some(crate::python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1));
+        assert_eq!(serde_json::to_value(selected).unwrap(), selected_source);
+
+        selected_source["runtime"] = serde_json::json!("unknown_runtime");
+        let error = serde_json::from_value::<CatalogVllmExecutionProfile>(selected_source).unwrap_err();
+        assert!(error.to_string().contains("unknown variant"), "{error}");
+    }
+
+    #[test]
+    fn vllm_execution_profile_denies_unknown_fields() {
+        let profile_error = serde_json::from_value::<CatalogDocument>(serde_json::json!({
+            "schema_version": 1,
+            "catalog_id": "strict-vllm-profile",
+            "generated_at": "2026-09-04T00:00:00Z",
+            "vllm_execution_profiles": {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+                    "schema_version": 1,
+                    "engine": "vllm",
+                    "enforce_eager": false,
+                    "linear_backend": "auto",
+                    "moe_backend": "cutlass",
+                    "proof_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "unexpected": true
+                }
+            },
+            "models": []
+        }))
+        .expect_err("vLLM profile value must deny unknown fields");
+        assert!(profile_error
+            .to_string()
+            .contains("unknown field `unexpected`"));
+
+        let speculative_error = serde_json::from_value::<CatalogDocument>(serde_json::json!({
+            "schema_version": 1,
+            "catalog_id": "strict-vllm-speculative-profile",
+            "generated_at": "2026-09-04T00:00:00Z",
+            "vllm_execution_profiles": {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa": {
+                    "schema_version": 1,
+                    "engine": "vllm",
+                    "enforce_eager": false,
+                    "linear_backend": "auto",
+                    "moe_backend": "cutlass",
+                    "speculative_decoding": {
+                        "method": "mtp",
+                        "num_speculative_tokens": 2,
+                        "unexpected": true
+                    },
+                    "proof_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                }
+            },
+            "models": []
+        }))
+        .expect_err("speculative profile value must deny unknown fields");
+        assert!(speculative_error
+            .to_string()
+            .contains("unknown field `unexpected`"));
     }
 
     #[test]

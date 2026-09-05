@@ -1,8 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use mayhem_proto::{
-    AttestationMeasurementLayer, AttestationVerifierProfile, HardwareQuoteKind, MoneyAu,
-    ReceiptUsage,
+    AttestationMeasurementLayer, AttestationVerifierProfile, ExecutionModeBinding,
+    HardwareQuoteKind, MoneyAu, ReceiptUsage,
 };
 use serde::{Deserialize, Serialize};
 
@@ -211,6 +211,11 @@ pub struct RequestRequirements {
     pub required_specialities: BTreeMap<String, String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<WorkflowRouteRequirements>,
+    /// Exact signed execution-mode bindings compatible with the request's
+    /// already-normalized effective body. `None` is reserved for control-plane
+    /// admissions that do not execute a model request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compatible_execution_modes: Option<Vec<ExecutionModeBinding>>,
     pub modality_load: BTreeMap<String, ModalityRequestLoad>,
     pub min_ctx: u32,
     pub input_tokens: u64,
@@ -269,6 +274,7 @@ pub enum IneligibilityReason {
     CircuitOpen,
     ThroughputFloor,
     Workflow,
+    ExecutionMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -471,6 +477,7 @@ impl Default for RequestRequirements {
             required_modalities: Vec::new(),
             required_specialities: BTreeMap::new(),
             workflow: None,
+            compatible_execution_modes: None,
             modality_load: BTreeMap::new(),
             min_ctx: 0,
             input_tokens: 0,
@@ -900,6 +907,14 @@ pub fn evaluate_eligibility(
         .heartbeat
         .as_ref()
         .ok_or(IneligibilityReason::HeartbeatMissing)?;
+    if let (Some(compatible), Some(actual)) = (
+        request.compatible_execution_modes.as_ref(),
+        heartbeat.execution_mode.as_ref(),
+    ) {
+        if !compatible.contains(actual) {
+            return Err(IneligibilityReason::ExecutionMode);
+        }
+    }
     if request.requires_tools && !heartbeat.caps.tools
         || request.requires_json && !heartbeat.caps.json
         || request.requires_vision && !heartbeat.caps.vision
@@ -1563,6 +1578,7 @@ mod tests {
             identity_anchor: None,
             inventory_root: None,
             runtime_id: None,
+            execution_mode: None,
             workflow_classes: BTreeMap::new(),
             accepting_new: true,
             caps: caps(),
@@ -1607,6 +1623,7 @@ mod tests {
             identity_anchor: None,
             inventory_root: None,
             runtime_id: None,
+            execution_mode: None,
             workflow_classes: BTreeMap::new(),
             accepting_new: true,
             caps: caps(),
@@ -2360,6 +2377,37 @@ mod tests {
                 "{gate} must agree with selector truth"
             );
         }
+    }
+
+    #[test]
+    fn execution_mode_eligibility_preserves_baseline_and_requires_exact_binding() {
+        let now = 1_000_000;
+        let binding = ExecutionModeBinding {
+            mode_id: "fast".to_owned(),
+            policy_hash: "ab".repeat(32),
+        };
+        let mut request = eligible_request(now + 1);
+        request.compatible_execution_modes = Some(vec![binding.clone()]);
+
+        let baseline = entry_for(1, now, 0.2, 100);
+        assert!(evaluate_eligibility(&baseline, &request).is_ok());
+
+        let mut exact = baseline.clone();
+        exact.heartbeat.as_mut().unwrap().execution_mode = Some(binding);
+        assert!(evaluate_eligibility(&exact, &request).is_ok());
+
+        exact
+            .heartbeat
+            .as_mut()
+            .unwrap()
+            .execution_mode
+            .as_mut()
+            .unwrap()
+            .policy_hash = "cd".repeat(32);
+        assert_eq!(
+            evaluate_eligibility(&exact, &request),
+            Err(IneligibilityReason::ExecutionMode)
+        );
     }
 
     #[test]

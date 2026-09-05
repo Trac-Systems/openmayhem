@@ -21,6 +21,8 @@ pub const DEFAULT_BATCH_SIZE: u32 = 512;
 pub const DEFAULT_UBATCH_SIZE: u32 = 512;
 pub const DEFAULT_SEED: u32 = 0x4d415948;
 pub const MTMD_MEDIA_MARKER: &str = "<__media__>";
+const VLLM_MAX_KERNEL_BACKEND_LEN: usize = 64;
+const VLLM_MAX_MTP_SPECULATIVE_TOKENS: u32 = 32;
 #[cfg(any(
     feature = "ace-step",
     feature = "chatterbox",
@@ -442,6 +444,14 @@ impl ModelArtifact {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VllmGenerationTopology {
+    #[default]
+    SharedWorker,
+    IsolatedWorkers,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LoadConfig {
     pub artifact: ModelArtifact,
@@ -476,6 +486,10 @@ pub struct LoadConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_concurrent_generation_capacity: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_generation_topology: Option<VllmGenerationTopology>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_worker_address_space_limit_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threads: Option<i32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu_layers: Option<u32>,
@@ -501,6 +515,18 @@ pub struct LoadConfig {
     pub vllm_dtype: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_kv_cache_dtype: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_enforce_eager: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_compilation_mode: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_cudagraph_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_linear_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_moe_backend: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vllm_mtp_num_speculative_tokens: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_gpu_memory_utilization_pct: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -630,6 +656,8 @@ impl Default for LoadConfig {
             ubatch_size: DEFAULT_UBATCH_SIZE,
             vllm_max_num_seqs: None,
             vllm_concurrent_generation_capacity: None,
+            vllm_generation_topology: None,
+            vllm_worker_address_space_limit_bytes: None,
             threads: None,
             gpu_layers: None,
             trt_engine_dir: None,
@@ -643,6 +671,12 @@ impl Default for LoadConfig {
             vllm_tensor_parallel: None,
             vllm_dtype: None,
             vllm_kv_cache_dtype: None,
+            vllm_enforce_eager: None,
+            vllm_compilation_mode: None,
+            vllm_cudagraph_mode: None,
+            vllm_linear_backend: None,
+            vllm_moe_backend: None,
+            vllm_mtp_num_speculative_tokens: None,
             vllm_gpu_memory_utilization_pct: None,
             vllm_gpu_memory_utilization_floor_pct: None,
             backend_cache_dir: None,
@@ -2042,6 +2076,54 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
     Ok(())
 }
 
+fn validate_vllm_kernel_backend(field: &str, backend: Option<&str>) -> Result<()> {
+    let Some(backend) = backend else {
+        return Ok(());
+    };
+    let mut chars = backend.chars();
+    let first = chars.next();
+    if backend.len() > VLLM_MAX_KERNEL_BACKEND_LEN
+        || !first.is_some_and(|value| value.is_ascii_lowercase())
+        || !chars.all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || value == '_')
+    {
+        return Err(EngineError::InvalidConfig(format!(
+            "{field} must be a lowercase vLLM backend identifier of at most {VLLM_MAX_KERNEL_BACKEND_LEN} bytes"
+        )));
+    }
+    Ok(())
+}
+
+pub fn validate_vllm_compilation_config(
+    enforce_eager: Option<bool>,
+    compilation_mode: Option<u32>,
+    cudagraph_mode: Option<&str>,
+) -> Result<()> {
+    if compilation_mode.is_some_and(|mode| mode > 3) {
+        return Err(EngineError::InvalidConfig(
+            "vllm_compilation_mode must be an integer between 0 and 3".to_owned(),
+        ));
+    }
+    if cudagraph_mode.is_some_and(|mode| {
+        !matches!(
+            mode,
+            "NONE" | "FULL_DECODE_ONLY" | "FULL" | "PIECEWISE" | "FULL_AND_PIECEWISE"
+        )
+    }) {
+        return Err(EngineError::InvalidConfig(
+            "vllm_cudagraph_mode must be one of NONE, FULL_DECODE_ONLY, FULL, PIECEWISE, FULL_AND_PIECEWISE".to_owned(),
+        ));
+    }
+    if enforce_eager.unwrap_or(true)
+        && (compilation_mode.is_some_and(|mode| mode != 0)
+            || cudagraph_mode.is_some_and(|mode| mode != "NONE"))
+    {
+        return Err(EngineError::InvalidConfig(
+            "enabled vLLM compilation or CUDA graphs require vllm_enforce_eager=false (default is true)".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_load_config(config: &LoadConfig) -> Result<()> {
     if config.artifact.path.as_os_str().is_empty() {
         return Err(EngineError::InvalidConfig(
@@ -2073,13 +2155,77 @@ fn validate_load_config(config: &LoadConfig) -> Result<()> {
             "vllm_concurrent_generation_capacity must be greater than zero".to_owned(),
         ));
     }
-    if config
+    if config.vllm_generation_topology == Some(VllmGenerationTopology::IsolatedWorkers) {
+        if !config
+            .vllm_worker_address_space_limit_bytes
+            .is_some_and(|bytes| bytes >= 1024 && bytes <= i64::MAX as u64)
+        {
+            return Err(EngineError::InvalidConfig(
+                "isolated vLLM workers require a finite vllm_worker_address_space_limit_bytes of at least 1024 bytes per process".to_owned(),
+            ));
+        }
+        let count = config.vllm_concurrent_generation_capacity.ok_or_else(|| {
+            EngineError::InvalidConfig(
+                "isolated vLLM workers require an admitted vllm_concurrent_generation_capacity"
+                    .to_owned(),
+            )
+        })?;
+        if effective_vllm_max_num_seqs(config) != 1 {
+            return Err(EngineError::InvalidConfig(
+                "isolated vLLM workers require vllm_max_num_seqs=1 per worker".to_owned(),
+            ));
+        }
+        // The Linux containment helper has a minimum granularity of one KiB.
+        if config
+            .memory_limit_bytes
+            .is_some_and(|total| total / u64::from(count) < 1024)
+        {
+            return Err(EngineError::InvalidConfig(
+                "isolated vLLM memory_limit_bytes must allow at least 1024 bytes per worker"
+                    .to_owned(),
+            ));
+        }
+    } else if config
         .vllm_concurrent_generation_capacity
         .is_some_and(|capacity| capacity > effective_vllm_max_num_seqs(config))
     {
         return Err(EngineError::InvalidConfig(
             "vllm_concurrent_generation_capacity cannot exceed vllm_max_num_seqs".to_owned(),
         ));
+    }
+    if config.vllm_worker_address_space_limit_bytes.is_some()
+        && config.vllm_generation_topology != Some(VllmGenerationTopology::IsolatedWorkers)
+    {
+        return Err(EngineError::InvalidConfig(
+            "vllm_worker_address_space_limit_bytes requires isolated vLLM workers".to_owned(),
+        ));
+    }
+    let has_vllm_execution_properties = config.vllm_generation_topology.is_some()
+        || config.vllm_enforce_eager.is_some()
+        || config.vllm_compilation_mode.is_some()
+        || config.vllm_cudagraph_mode.is_some()
+        || config.vllm_linear_backend.is_some()
+        || config.vllm_moe_backend.is_some()
+        || config.vllm_mtp_num_speculative_tokens.is_some();
+    if has_vllm_execution_properties && config.artifact.format != ArtifactFormat::VllmSafetensors {
+        return Err(EngineError::InvalidConfig(
+            "vLLM execution properties require a vLLM safetensors artifact".to_owned(),
+        ));
+    }
+    validate_vllm_compilation_config(
+        config.vllm_enforce_eager,
+        config.vllm_compilation_mode,
+        config.vllm_cudagraph_mode.as_deref(),
+    )?;
+    validate_vllm_kernel_backend("vllm_linear_backend", config.vllm_linear_backend.as_deref())?;
+    validate_vllm_kernel_backend("vllm_moe_backend", config.vllm_moe_backend.as_deref())?;
+    if config
+        .vllm_mtp_num_speculative_tokens
+        .is_some_and(|tokens| tokens == 0 || tokens > VLLM_MAX_MTP_SPECULATIVE_TOKENS)
+    {
+        return Err(EngineError::InvalidConfig(format!(
+            "vllm_mtp_num_speculative_tokens must be between 1 and {VLLM_MAX_MTP_SPECULATIVE_TOKENS}"
+        )));
     }
 
     let kv_fields = [
@@ -2574,7 +2720,13 @@ fn default_ubatch_size() -> u32 {
 }
 
 fn effective_vllm_max_num_seqs(config: &LoadConfig) -> u32 {
-    config.vllm_max_num_seqs.unwrap_or(config.batch_size).max(1)
+    let default =
+        if config.vllm_generation_topology == Some(VllmGenerationTopology::IsolatedWorkers) {
+            1
+        } else {
+            config.batch_size
+        };
+    config.vllm_max_num_seqs.unwrap_or(default).max(1)
 }
 
 fn default_max_new_tokens() -> u32 {
@@ -7855,16 +8007,20 @@ print("ok")
 
 #[cfg(feature = "vllm")]
 mod vllm_backend {
+    mod probe_module;
+    use probe_module::{OwnedProbeModule, IMPORT_PRELUDE};
+
     use super::{
         attach_worker_containment, effective_vllm_max_num_seqs, engine_worker_command,
-        select_runtime_compatible_cuda_home, validate_load_config, verify_artifact,
+        select_runtime_compatible_cuda_home, validate_load_config,
+        validate_vllm_compilation_config, validate_vllm_kernel_backend, verify_artifact,
         vllm_safetensors_payload_path, ArtifactFormat, CancellationToken,
         ConcurrentGenerationBackend, EngineBackend, EngineError, FinishReason, GenerateOutput,
         GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization,
-        UsageCounters, WorkerContainment,
+        UsageCounters, VllmGenerationTopology, WorkerContainment,
     };
     use serde::de::DeserializeOwned;
-    use serde::Deserialize;
+    use serde::{Deserialize, Serialize};
     use serde_json::{json, Value};
     use std::collections::{HashMap, HashSet};
     use std::env;
@@ -7893,6 +8049,7 @@ mod vllm_backend {
     pub struct VllmBackend {
         python: PathBuf,
         worker: Option<Arc<VllmWorker>>,
+        isolated_workers: Vec<Arc<VllmWorker>>,
         loaded: Option<LoadedModelInfo>,
         next_id: Arc<AtomicU64>,
         memory_limit_bytes: Option<u64>,
@@ -7905,6 +8062,9 @@ mod vllm_backend {
         loaded_generation_capacity: Option<usize>,
         loaded_kv_cache_size_tokens: Option<u64>,
         loaded_kv_full_context_capacity: Option<usize>,
+        loaded_execution: Option<WorkerExecutionInfo>,
+        loaded_topology: Option<VllmGenerationTopology>,
+        loaded_per_worker: Vec<Value>,
     }
 
     impl VllmBackend {
@@ -7919,6 +8079,7 @@ mod vllm_backend {
             Ok(Self {
                 python: python.into(),
                 worker: None,
+                isolated_workers: Vec::new(),
                 loaded: None,
                 next_id: Arc::new(AtomicU64::new(1)),
                 memory_limit_bytes: None,
@@ -7931,6 +8092,9 @@ mod vllm_backend {
                 loaded_generation_capacity: None,
                 loaded_kv_cache_size_tokens: None,
                 loaded_kv_full_context_capacity: None,
+                loaded_execution: None,
+                loaded_topology: None,
+                loaded_per_worker: Vec::new(),
             })
         }
 
@@ -7943,14 +8107,24 @@ mod vllm_backend {
             }
         }
 
-        fn spawn_worker(&mut self) -> Result<Arc<VllmWorker>> {
+        fn spawn_worker(&mut self, execution_probe: bool) -> Result<Arc<VllmWorker>> {
             if let Some(worker) = &self.worker {
-                return Ok(Arc::clone(worker));
+                let has_probe = worker
+                    .process
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .probe_module
+                    .is_some();
+                if has_probe == execution_probe {
+                    return Ok(Arc::clone(worker));
+                }
             }
+            self.reset_worker();
             let worker = Arc::new(VllmWorker::spawn(
                 &self.python,
                 self.memory_limit_bytes,
                 self.cache_root.as_deref(),
+                execution_probe,
             )?);
             self.worker = Some(Arc::clone(&worker));
             Ok(worker)
@@ -7960,7 +8134,11 @@ mod vllm_backend {
         where
             T: DeserializeOwned,
         {
-            let worker = self.worker.as_ref().ok_or(EngineError::NotLoaded)?;
+            let worker = self
+                .worker
+                .as_ref()
+                .or_else(|| self.isolated_workers.first())
+                .ok_or(EngineError::NotLoaded)?;
             worker.call_streaming(
                 self.next_request_id(),
                 op,
@@ -7977,10 +8155,182 @@ mod vllm_backend {
                 worker.terminate();
             }
         }
+
+        fn reset_isolated_workers(&mut self) {
+            for worker in self.isolated_workers.drain(..) {
+                worker.terminate();
+            }
+        }
+
+        fn load_isolated_workers(
+            &mut self,
+            config: &LoadConfig,
+            model_path: &Path,
+            attempts: &[Option<u32>],
+            generation_epoch: u64,
+        ) -> Result<LoadedModelInfo> {
+            let count = config.vllm_concurrent_generation_capacity.ok_or_else(|| {
+                EngineError::InvalidConfig("isolated vLLM worker count is missing".to_owned())
+            })?;
+            let capacity = usize::try_from(count).map_err(|_| {
+                EngineError::InvalidConfig("isolated vLLM worker count exceeds usize".to_owned())
+            })?;
+            let child_limit = config
+                .memory_limit_bytes
+                .map(|total| total / u64::from(count));
+            let address_space_limit =
+                config
+                    .vllm_worker_address_space_limit_bytes
+                    .ok_or_else(|| {
+                        EngineError::InvalidConfig(
+                            "isolated vLLM address-space limit is missing".to_owned(),
+                        )
+                    })?;
+            let mut first_info: Option<WorkerLoadInfo> = None;
+            let mut per_worker = Vec::new();
+            let mut batch_invariant = Some(true);
+            for worker_index in 0..capacity {
+                let mut loaded = None;
+                for (attempt, utilization_pct) in attempts.iter().enumerate() {
+                    let mut child_config = config.clone();
+                    child_config.memory_limit_bytes = child_limit;
+                    child_config.vllm_max_num_seqs = Some(1);
+                    child_config.vllm_gpu_memory_utilization_pct = *utilization_pct;
+                    let worker = Arc::new(VllmWorker::spawn_isolated(
+                        &self.python,
+                        child_limit,
+                        address_space_limit,
+                        self.cache_root.as_deref(),
+                        config.vllm_compilation_mode.is_some()
+                            || config.vllm_cudagraph_mode.is_some(),
+                    )?);
+                    // Own each child before sending load, including the failing attempt.
+                    self.isolated_workers.push(Arc::clone(&worker));
+                    let payload = vllm_load_payload(&child_config, model_path);
+                    match worker.call_streaming::<WorkerLoadInfo>(
+                        self.next_request_id(),
+                        "load",
+                        payload.clone(),
+                        &mut |_| Ok(()),
+                        None,
+                        true,
+                        2,
+                    ) {
+                        Ok(info) => {
+                            loaded = Some((info, payload, *utilization_pct));
+                            break;
+                        }
+                        Err(error) if is_vllm_oom_error(&error) && attempt + 1 < attempts.len() => {
+                            worker.terminate();
+                            self.isolated_workers.pop();
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                let (info, payload, utilization_pct) = loaded.ok_or_else(|| {
+                    EngineError::Vllm(
+                        "isolated vLLM load exhausted utilization attempts".to_owned(),
+                    )
+                })?;
+                validate_vllm_execution_report(config, info.execution.as_ref())?;
+                let tokens = info.kv_cache_size_tokens.ok_or_else(|| {
+                    EngineError::InvalidConfig(format!(
+                        "isolated vLLM worker {worker_index} did not report runtime KV token capacity"
+                    ))
+                })?;
+                if tokens < u64::from(config.ctx_size) {
+                    return Err(EngineError::InvalidConfig(format!(
+                        "isolated vLLM worker {worker_index} runtime KV capacity of {tokens} tokens cannot serve ctx_size={}",
+                        config.ctx_size
+                    )));
+                }
+                if let Some(first) = &first_info {
+                    if first.n_vocab != info.n_vocab || first.n_ctx_train != info.n_ctx_train {
+                        return Err(EngineError::Vllm(format!(
+                            "isolated vLLM worker {worker_index} reported inconsistent model metadata"
+                        )));
+                    }
+                }
+                batch_invariant = match (batch_invariant, info.determinism.batch_invariant) {
+                    (Some(false), _) | (_, Some(false)) => Some(false),
+                    (Some(true), Some(true)) => Some(true),
+                    _ => None,
+                };
+                per_worker.push(json!({
+                    "worker_index": worker_index,
+                    "capacity": 1,
+                    "runtime_kv_token_capacity": tokens,
+                    "runtime_full_context_capacity": tokens / u64::from(config.ctx_size),
+                    "memory_limit_bytes": child_limit,
+                    "vllm_worker_address_space_limit_bytes": address_space_limit,
+                    "vllm_max_num_seqs": 1,
+                    "vllm_gpu_memory_utilization_pct": utilization_pct,
+                    "vllm_gpu_memory_utilization_floor_pct": config.vllm_gpu_memory_utilization_floor_pct,
+                    "load_payload": payload,
+                    "execution": info.execution,
+                    "determinism": { "batch_invariant": info.determinism.batch_invariant },
+                }));
+                if first_info.is_none() {
+                    first_info = Some(info);
+                }
+            }
+            let info = first_info.ok_or_else(|| {
+                EngineError::InvalidConfig("isolated vLLM requires at least one worker".to_owned())
+            })?;
+            if !self
+                .isolated_workers
+                .iter()
+                .all(|worker| worker.component_healthy())
+            {
+                return Err(EngineError::Vllm(
+                    "isolated vLLM worker exited before pool load completed".to_owned(),
+                ));
+            }
+            let loaded = LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact.clone(),
+                ctx_size: config.ctx_size,
+                n_ctx_train: if info.n_ctx_train == 0 {
+                    config.ctx_size
+                } else {
+                    info.n_ctx_train
+                },
+                n_vocab: info.n_vocab,
+            };
+            self.concurrent_generation = Some(Arc::new(VllmConcurrentGeneration {
+                dispatch: VllmGenerationDispatch::Isolated(self.isolated_workers.clone()),
+                next_id: Arc::clone(&self.next_id),
+                generation_gate: Arc::clone(&self.generation_gate),
+                generation_epoch: Arc::clone(&self.generation_epoch),
+                expected_epoch: generation_epoch,
+                limiter: Arc::new(GenerationLimiter::new(capacity)),
+            }));
+            self.concurrent_generation_enabled = capacity > 1;
+            self.loaded_generation_capacity = Some(capacity);
+            self.loaded_batch_invariant = batch_invariant;
+            self.loaded_topology = config.vllm_generation_topology;
+            self.loaded_per_worker = per_worker;
+            self.loaded = Some(loaded.clone());
+            Ok(loaded)
+        }
+    }
+
+    impl Drop for VllmBackend {
+        fn drop(&mut self) {
+            // Teardown must also stop active calls, which may hold the generation gate.
+            self.generation_epoch.fetch_add(1, Ordering::AcqRel);
+            self.reset_worker();
+            self.reset_isolated_workers();
+        }
+    }
+
+    enum VllmGenerationDispatch {
+        Shared(Arc<VllmWorker>),
+        Isolated(Vec<Arc<VllmWorker>>),
     }
 
     struct VllmConcurrentGeneration {
-        worker: Arc<VllmWorker>,
+        dispatch: VllmGenerationDispatch,
         next_id: Arc<AtomicU64>,
         generation_gate: Arc<RwLock<()>>,
         generation_epoch: Arc<AtomicU64>,
@@ -8012,6 +8362,13 @@ mod vllm_backend {
         ) -> Result<GenerateOutput> {
             cancellation.check()?;
             request.validate_sampling()?;
+            let _generation = self
+                .generation_gate
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.generation_epoch.load(Ordering::Acquire) != self.expected_epoch {
+                return Err(EngineError::NotLoaded);
+            }
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
                     text: String::new(),
@@ -8020,18 +8377,23 @@ mod vllm_backend {
                 });
             }
 
-            let _generation = self
-                .generation_gate
-                .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if self.generation_epoch.load(Ordering::Acquire) != self.expected_epoch {
-                return Err(EngineError::NotLoaded);
-            }
-            let _permit = self.limiter.acquire(cancellation)?;
+            let permit = self.limiter.acquire(cancellation)?;
+            let (worker, _isolated_guard) = match &self.dispatch {
+                VllmGenerationDispatch::Shared(worker) => (worker.as_ref(), None),
+                VllmGenerationDispatch::Isolated(workers) => {
+                    if !workers.iter().all(|worker| worker.component_healthy()) {
+                        return Err(EngineError::Vllm(
+                            "isolated vLLM worker pool is unhealthy; reload required".to_owned(),
+                        ));
+                    }
+                    let worker = workers[permit.slot].as_ref();
+                    (worker, Some(IsolatedGenerationGuard { worker }))
+                }
+            };
             let route_capacity = usize::try_from(request.max_new_tokens)
                 .unwrap_or(usize::MAX)
                 .saturating_add(1);
-            self.worker.call_streaming(
+            worker.call_streaming(
                 self.next_request_id(),
                 "generate",
                 serde_json::to_value(request)?,
@@ -8043,9 +8405,22 @@ mod vllm_backend {
         }
     }
 
+    struct IsolatedGenerationGuard<'a> {
+        worker: &'a VllmWorker,
+    }
+
+    impl Drop for IsolatedGenerationGuard<'_> {
+        fn drop(&mut self) {
+            // An interrupted protocol exchange must not overlap the next lease.
+            if !self.worker.router.is_idle() {
+                self.worker.terminate();
+            }
+        }
+    }
+
     struct GenerationLimiter {
         capacity: usize,
-        active: Mutex<usize>,
+        active: Mutex<HashSet<usize>>,
         available: Condvar,
     }
 
@@ -8053,7 +8428,7 @@ mod vllm_backend {
         fn new(capacity: usize) -> Self {
             Self {
                 capacity: capacity.max(1),
-                active: Mutex::new(0),
+                active: Mutex::new(HashSet::new()),
                 available: Condvar::new(),
             }
         }
@@ -8069,10 +8444,14 @@ mod vllm_backend {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             loop {
                 cancellation.check()?;
-                if *active < self.capacity {
-                    *active += 1;
+                if active.len() < self.capacity {
+                    let slot = (0..self.capacity)
+                        .find(|slot| !active.contains(slot))
+                        .expect("available generation slot");
+                    active.insert(slot);
                     return Ok(GenerationPermit {
                         limiter: Arc::clone(self),
+                        slot,
                     });
                 }
                 let (next, _) = self
@@ -8086,6 +8465,7 @@ mod vllm_backend {
 
     struct GenerationPermit {
         limiter: Arc<GenerationLimiter>,
+        slot: usize,
     }
 
     impl Drop for GenerationPermit {
@@ -8095,7 +8475,7 @@ mod vllm_backend {
                 .active
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            *active = active.saturating_sub(1);
+            active.remove(&self.slot);
             self.limiter.available.notify_one();
         }
     }
@@ -8125,6 +8505,9 @@ mod vllm_backend {
             self.loaded_generation_capacity = None;
             self.loaded_kv_cache_size_tokens = None;
             self.loaded_kv_full_context_capacity = None;
+            self.loaded_execution = None;
+            self.loaded_topology = None;
+            self.loaded_per_worker.clear();
             let generation_epoch = self
                 .generation_epoch
                 .fetch_add(1, Ordering::AcqRel)
@@ -8132,16 +8515,36 @@ mod vllm_backend {
             self.memory_limit_bytes = config.memory_limit_bytes;
             self.cache_root = config.backend_cache_dir.clone();
 
+            self.reset_isolated_workers();
+            if config.vllm_generation_topology == Some(VllmGenerationTopology::IsolatedWorkers) {
+                self.reset_worker();
+                let result = (|| {
+                    let model_path = vllm_model_path(&config.artifact.path)?;
+                    let attempts = vllm_memory_utilization_attempts(
+                        config.vllm_gpu_memory_utilization_pct,
+                        config.vllm_gpu_memory_utilization_floor_pct,
+                    )?;
+                    self.load_isolated_workers(&config, &model_path, &attempts, generation_epoch)
+                })();
+                if result.is_err() {
+                    self.reset_isolated_workers();
+                }
+                return result;
+            }
+
             let model_path = vllm_model_path(&config.artifact.path)?;
             let attempts = vllm_memory_utilization_attempts(
                 config.vllm_gpu_memory_utilization_pct,
                 config.vllm_gpu_memory_utilization_floor_pct,
             )?;
             let mut info = None;
+            let mut effective_utilization_pct = None;
             for (index, utilization_pct) in attempts.iter().enumerate() {
                 let mut attempt_config = config.clone();
                 attempt_config.vllm_gpu_memory_utilization_pct = *utilization_pct;
-                self.spawn_worker()?;
+                let execution_probe =
+                    config.vllm_compilation_mode.is_some() || config.vllm_cudagraph_mode.is_some();
+                self.spawn_worker(execution_probe)?;
                 match self.call_control::<WorkerLoadInfo>(
                     "load",
                     vllm_load_payload(&attempt_config, &model_path),
@@ -8149,17 +8552,28 @@ mod vllm_backend {
                 ) {
                     Ok(loaded) => {
                         info = Some(loaded);
+                        effective_utilization_pct = *utilization_pct;
                         break;
                     }
                     Err(err) if is_vllm_oom_error(&err) && index + 1 < attempts.len() => {
                         self.reset_worker();
                     }
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        if execution_probe {
+                            self.reset_worker();
+                        }
+                        return Err(err);
+                    }
                 }
             }
             let info = info.ok_or_else(|| {
                 EngineError::Vllm("vLLM load exhausted memory-utilization attempts".to_owned())
             })?;
+            let has_explicit_execution_profile = has_explicit_vllm_execution_properties(&config);
+            if let Err(error) = validate_vllm_execution_report(&config, info.execution.as_ref()) {
+                self.reset_worker();
+                return Err(error);
+            }
             let scheduler_capacity = usize::try_from(effective_vllm_max_num_seqs(&config))
                 .unwrap_or(usize::MAX)
                 .max(1);
@@ -8190,6 +8604,24 @@ mod vllm_backend {
                 .min(scheduler_capacity)
                 .min(runtime_full_context_capacity.unwrap_or(1))
                 .max(1);
+            if config.vllm_generation_topology.is_some() {
+                let mut effective_config = config.clone();
+                effective_config.vllm_gpu_memory_utilization_pct = effective_utilization_pct;
+                self.loaded_per_worker = vec![json!({
+                    "worker_index": 0,
+                    "capacity": execution_capacity,
+                    "runtime_kv_token_capacity": info.kv_cache_size_tokens,
+                    "runtime_full_context_capacity": runtime_full_context_capacity,
+                    "memory_limit_bytes": config.memory_limit_bytes,
+                    "vllm_max_num_seqs": scheduler_capacity,
+                    "vllm_gpu_memory_utilization_pct": effective_utilization_pct,
+                    "vllm_gpu_memory_utilization_floor_pct": config.vllm_gpu_memory_utilization_floor_pct,
+                    "load_payload": vllm_load_payload(&effective_config, &model_path),
+                    "execution": info.execution,
+                    "determinism": { "batch_invariant": info.determinism.batch_invariant },
+                })];
+                self.loaded_topology = config.vllm_generation_topology;
+            }
             let loaded = LoadedModelInfo {
                 backend: self.backend_id().to_owned(),
                 artifact: config.artifact,
@@ -8206,7 +8638,7 @@ mod vllm_backend {
                 .as_ref()
                 .ok_or_else(|| EngineError::Vllm("loaded vLLM worker is missing".to_owned()))?;
             self.concurrent_generation = Some(Arc::new(VllmConcurrentGeneration {
-                worker: Arc::clone(worker),
+                dispatch: VllmGenerationDispatch::Shared(Arc::clone(worker)),
                 next_id: Arc::clone(&self.next_id),
                 generation_gate: Arc::clone(&self.generation_gate),
                 generation_epoch: Arc::clone(&self.generation_epoch),
@@ -8218,6 +8650,9 @@ mod vllm_backend {
             self.loaded_generation_capacity = Some(execution_capacity);
             self.loaded_kv_cache_size_tokens = info.kv_cache_size_tokens;
             self.loaded_kv_full_context_capacity = runtime_full_context_capacity;
+            self.loaded_execution = has_explicit_execution_profile
+                .then_some(info.execution)
+                .flatten();
             debug_assert!(scheduler_capacity >= execution_capacity);
             self.loaded = Some(loaded.clone());
             Ok(loaded)
@@ -8225,17 +8660,25 @@ mod vllm_backend {
 
         fn component_healthy(&mut self) -> bool {
             self.loaded.is_none()
-                || self
-                    .worker
-                    .as_ref()
-                    .is_some_and(|worker| worker.component_healthy())
+                || if self.loaded_topology == Some(VllmGenerationTopology::IsolatedWorkers) {
+                    !self.isolated_workers.is_empty()
+                        && self
+                            .isolated_workers
+                            .iter()
+                            .all(|worker| worker.component_healthy())
+                } else {
+                    self.worker
+                        .as_ref()
+                        .is_some_and(|worker| worker.component_healthy())
+                }
         }
 
         fn process_ids(&self) -> Vec<u32> {
             self.worker
-                .as_ref()
-                .map(|worker| vec![worker.process_id()])
-                .unwrap_or_default()
+                .iter()
+                .chain(self.isolated_workers.iter())
+                .map(|worker| worker.process_id())
+                .collect()
         }
 
         fn loaded_backend_evidence(&self) -> Option<Value> {
@@ -8254,6 +8697,30 @@ mod vllm_backend {
             }
             if let Some(capacity) = self.loaded_kv_full_context_capacity {
                 evidence["generation"]["runtime_full_context_capacity"] = json!(capacity);
+            }
+            if let Some(execution) = &self.loaded_execution {
+                evidence["execution"] = json!(execution);
+            }
+            if let Some(topology) = self.loaded_topology {
+                let workers = self.worker.iter().chain(self.isolated_workers.iter());
+                let per_worker = self
+                    .loaded_per_worker
+                    .iter()
+                    .zip(workers)
+                    .map(|(info, worker)| {
+                        let mut info = info.clone();
+                        info["process_id"] = json!(worker.process_id());
+                        info["healthy"] = json!(worker.component_healthy());
+                        if let Some(containment) = &worker.containment_report {
+                            info["containment"] = json!(containment);
+                        }
+                        info
+                    })
+                    .collect::<Vec<_>>();
+                evidence["generation"]["topology"] = json!(topology);
+                evidence["generation"]["worker_count"] = json!(per_worker.len());
+                evidence["generation"]["per_worker"] = json!(per_worker);
+                evidence["memory_limit_bytes"] = json!(self.memory_limit_bytes);
             }
             Some(evidence)
         }
@@ -8298,13 +8765,184 @@ mod vllm_backend {
         #[serde(default)]
         kv_cache_size_tokens: Option<u64>,
         #[serde(default)]
+        execution: Option<WorkerExecutionInfo>,
+        #[serde(default)]
         determinism: WorkerDeterminismInfo,
+    }
+
+    #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct WorkerExecutionInfo {
+        #[serde(default)]
+        vllm_enforce_eager: Option<bool>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vllm_compilation_mode: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        vllm_cudagraph_mode: Option<String>,
+        #[serde(default)]
+        vllm_linear_backend: Option<String>,
+        #[serde(default)]
+        vllm_moe_backend: Option<String>,
+        #[serde(default)]
+        vllm_mtp_num_speculative_tokens: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        worker_execution_observation: Option<WorkerExecutionObservation>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct WorkerExecutionObservation {
+        source: String,
+        rank_count: u32,
+        world_size: u32,
+        ranks: Vec<WorkerExecutionRank>,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct WorkerExecutionRank {
+        rank: u32,
+        local_rank: u32,
+        world_size: u32,
+        pid: u64,
+        compilation_mode: u32,
+        cudagraph_mode: String,
     }
 
     #[derive(Debug, Default, Deserialize)]
     struct WorkerDeterminismInfo {
         #[serde(default)]
         batch_invariant: Option<bool>,
+    }
+
+    fn validate_vllm_execution_report(
+        config: &LoadConfig,
+        execution: Option<&WorkerExecutionInfo>,
+    ) -> Result<()> {
+        if !has_explicit_vllm_execution_properties(config) {
+            return Ok(());
+        }
+        let execution = execution.ok_or_else(|| {
+            EngineError::Vllm(
+                "vLLM worker did not report effective execution properties".to_owned(),
+            )
+        })?;
+        let enforce_eager = execution.vllm_enforce_eager.ok_or_else(|| {
+            EngineError::Vllm("vLLM worker did not report effective vllm_enforce_eager".to_owned())
+        })?;
+        let expected_enforce_eager = config.vllm_enforce_eager.unwrap_or(true);
+        if enforce_eager != expected_enforce_eager {
+            return Err(EngineError::Vllm(format!(
+                "vLLM worker execution mismatch for vllm_enforce_eager: expected {expected_enforce_eager}, got {enforce_eager}"
+            )));
+        }
+
+        validate_vllm_compilation_config(
+            Some(enforce_eager),
+            execution.vllm_compilation_mode,
+            execution.vllm_cudagraph_mode.as_deref(),
+        )?;
+        if let Some(expected) = config.vllm_compilation_mode {
+            if execution.vllm_compilation_mode != Some(expected) {
+                return Err(EngineError::Vllm(format!(
+                    "vLLM worker execution mismatch for vllm_compilation_mode: expected {expected}, got {:?}",
+                    execution.vllm_compilation_mode
+                )));
+            }
+        }
+        if let Some(expected) = config.vllm_cudagraph_mode.as_deref() {
+            if execution.vllm_cudagraph_mode.as_deref() != Some(expected) {
+                return Err(EngineError::Vllm(format!(
+                    "vLLM worker execution mismatch for vllm_cudagraph_mode: expected {expected}, got {:?}",
+                    execution.vllm_cudagraph_mode
+                )));
+            }
+        }
+        validate_vllm_worker_observation(config, execution)?;
+
+        for (name, expected, actual) in [
+            (
+                "vllm_linear_backend",
+                config.vllm_linear_backend.as_deref(),
+                execution.vllm_linear_backend.as_deref(),
+            ),
+            (
+                "vllm_moe_backend",
+                config.vllm_moe_backend.as_deref(),
+                execution.vllm_moe_backend.as_deref(),
+            ),
+        ] {
+            validate_vllm_kernel_backend(&format!("reported {name}"), actual)?;
+            if let Some(expected) = expected {
+                let actual = actual.ok_or_else(|| {
+                    EngineError::Vllm(format!("vLLM worker did not report effective {name}"))
+                })?;
+                if actual != expected {
+                    return Err(EngineError::Vllm(format!(
+                        "vLLM worker execution mismatch for {name}: expected {expected}, got {actual}"
+                    )));
+                }
+            }
+        }
+
+        if execution.vllm_mtp_num_speculative_tokens != config.vllm_mtp_num_speculative_tokens {
+            return Err(EngineError::Vllm(format!(
+                "vLLM worker execution mismatch for vllm_mtp_num_speculative_tokens: expected {:?}, got {:?}",
+                config.vllm_mtp_num_speculative_tokens,
+                execution.vllm_mtp_num_speculative_tokens
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_vllm_worker_observation(
+        config: &LoadConfig,
+        execution: &WorkerExecutionInfo,
+    ) -> Result<()> {
+        if config.vllm_compilation_mode.is_none() && config.vllm_cudagraph_mode.is_none() {
+            return Ok(());
+        }
+        let invalid = || {
+            EngineError::Vllm(
+                "vLLM explicit compilation profile requires complete, consistent worker execution observations"
+                    .to_owned(),
+            )
+        };
+        let observation = execution
+            .worker_execution_observation
+            .as_ref()
+            .ok_or_else(invalid)?;
+        let world_size = config.vllm_tensor_parallel.unwrap_or(1).max(1);
+        if observation.source != "worker_extension_cls.collective_rpc"
+            || observation.world_size != world_size
+            || observation.rank_count != world_size
+            || observation.ranks.len() != world_size as usize
+        {
+            return Err(invalid());
+        }
+        let mut seen = std::collections::BTreeSet::new();
+        for rank in &observation.ranks {
+            if rank.rank >= world_size
+                || rank.local_rank >= world_size
+                || rank.world_size != world_size
+                || rank.pid == 0
+                || !seen.insert(rank.rank)
+                || Some(rank.compilation_mode) != execution.vllm_compilation_mode
+                || Some(rank.cudagraph_mode.as_str()) != execution.vllm_cudagraph_mode.as_deref()
+            {
+                return Err(invalid());
+            }
+        }
+        Ok(())
+    }
+
+    fn has_explicit_vllm_execution_properties(config: &LoadConfig) -> bool {
+        config.vllm_enforce_eager.is_some()
+            || config.vllm_compilation_mode.is_some()
+            || config.vllm_cudagraph_mode.is_some()
+            || config.vllm_linear_backend.is_some()
+            || config.vllm_moe_backend.is_some()
+            || config.vllm_mtp_num_speculative_tokens.is_some()
     }
 
     #[derive(Debug, Deserialize)]
@@ -8326,6 +8964,65 @@ mod vllm_backend {
         abort_failed: bool,
     }
 
+    #[derive(Debug, Deserialize, Serialize)]
+    #[serde(deny_unknown_fields)]
+    struct IsolatedContainmentReport {
+        mode: String,
+        physical_limit_bytes: Option<u64>,
+        address_space_limit_bytes: Option<u64>,
+        working_set_limit_bytes: Option<u64>,
+        cgroup_path: Option<PathBuf>,
+    }
+
+    #[cfg(any(target_os = "linux", test))]
+    fn linux_isolated_worker_command(
+        python: &Path,
+        physical_limit_bytes: Option<u64>,
+        address_space_limit_bytes: u64,
+        cgroup_root: &Path,
+    ) -> std::process::Command {
+        let mut command = std::process::Command::new("sh");
+        command.arg("-c").arg(r#"physical_bytes="$1"
+address_kib="$2"
+cgroup_root="$3"
+shift 3
+ulimit -v "$address_kib" || exit 127
+address_bytes=$((address_kib * 1024))
+mode=linux-rlimit-as
+physical_cap=null
+cgroup_path=null
+if [ -n "$physical_bytes" ] && [ -f "$cgroup_root/cgroup.controllers" ]; then
+  page_size=$(getconf PAGESIZE) || exit 127
+  physical_bytes=$((physical_bytes / page_size * page_size))
+  [ "$physical_bytes" -gt 0 ] || exit 127
+  cg="$cgroup_root/mayhem-engine-$$"
+  if mkdir "$cg" 2>/dev/null; then
+    if echo "$physical_bytes" > "$cg/memory.max" 2>/dev/null && echo "$$" > "$cg/cgroup.procs" 2>/dev/null; then
+      mode=linux-cgroup-v2+rlimit-as
+      physical_cap="$physical_bytes"
+      cgroup_path="\"$cg\""
+    else
+      rmdir "$cg" 2>/dev/null || true
+    fi
+  fi
+fi
+export MAYHEM_ENGINE_MEMORY_LIMIT_MODE="$mode"
+export MAYHEM_ENGINE_ADDRESS_SPACE_LIMIT_BYTES="$address_bytes"
+printf '{"mode":"%s","physical_limit_bytes":%s,"address_space_limit_bytes":%s,"working_set_limit_bytes":null,"cgroup_path":%s}\n' "$mode" "$physical_cap" "$address_bytes" "$cgroup_path"
+exec "$@""#)
+            .arg("mayhem-vllm-isolated-containment")
+            .arg(physical_limit_bytes.map(|bytes| bytes.to_string()).unwrap_or_default())
+            .arg((address_space_limit_bytes / 1024).to_string())
+            .arg(cgroup_root)
+            .arg(python);
+        if let Some(bytes) = physical_limit_bytes {
+            command.env("MAYHEM_ENGINE_MEMORY_LIMIT_BYTES", bytes.to_string());
+        } else {
+            command.env_remove("MAYHEM_ENGINE_MEMORY_LIMIT_BYTES");
+        }
+        command
+    }
+
     struct VllmWorker {
         process: Mutex<VllmProcess>,
         stdin: Mutex<ChildStdin>,
@@ -8333,26 +9030,60 @@ mod vllm_backend {
         reader: Mutex<Option<JoinHandle<()>>>,
         request_timeout: Option<Duration>,
         cancel_timeout: Duration,
+        containment_report: Option<IsolatedContainmentReport>,
     }
 
     struct VllmProcess {
         child: Child,
         _containment: WorkerContainment,
+        probe_module: Option<OwnedProbeModule>,
         terminated: bool,
     }
 
     impl VllmWorker {
+        fn spawn_isolated(
+            python: &Path,
+            physical_limit_bytes: Option<u64>,
+            address_space_limit_bytes: u64,
+            cache_root: Option<&Path>,
+            execution_probe: bool,
+        ) -> Result<Self> {
+            #[cfg(target_os = "linux")]
+            let command = linux_isolated_worker_command(
+                python,
+                physical_limit_bytes,
+                address_space_limit_bytes,
+                Path::new("/sys/fs/cgroup"),
+            );
+            #[cfg(not(target_os = "linux"))]
+            let command = engine_worker_command(python, physical_limit_bytes);
+            Self::spawn_command(
+                command,
+                python,
+                request_timeout()?,
+                cancel_timeout()?,
+                physical_limit_bytes,
+                cache_root,
+                Some(address_space_limit_bytes),
+                execution_probe,
+            )
+        }
+
         fn spawn(
             python: &Path,
             memory_limit_bytes: Option<u64>,
             cache_root: Option<&Path>,
+            execution_probe: bool,
         ) -> Result<Self> {
-            Self::spawn_with_timeouts(
+            Self::spawn_command(
+                engine_worker_command(python, memory_limit_bytes),
                 python,
                 request_timeout()?,
                 cancel_timeout()?,
                 memory_limit_bytes,
                 cache_root,
+                None,
+                execution_probe,
             )
         }
 
@@ -8372,6 +9103,7 @@ mod vllm_backend {
             )
         }
 
+        #[cfg(test)]
         fn spawn_with_timeouts(
             python: &Path,
             request_timeout: Option<Duration>,
@@ -8379,33 +9111,119 @@ mod vllm_backend {
             memory_limit_bytes: Option<u64>,
             cache_root: Option<&Path>,
         ) -> Result<Self> {
-            let mut command = engine_worker_command(python, memory_limit_bytes);
+            Self::spawn_command(
+                engine_worker_command(python, memory_limit_bytes),
+                python,
+                request_timeout,
+                cancel_timeout,
+                memory_limit_bytes,
+                cache_root,
+                None,
+                false,
+            )
+        }
+
+        fn spawn_command(
+            mut command: std::process::Command,
+            python: &Path,
+            request_timeout: Option<Duration>,
+            cancel_timeout: Duration,
+            memory_limit_bytes: Option<u64>,
+            cache_root: Option<&Path>,
+            isolated_address_space_limit: Option<u64>,
+            execution_probe: bool,
+        ) -> Result<Self> {
             configure_vllm_worker_environment(&mut command, python, cache_root)?;
+            let probe_module = execution_probe.then(OwnedProbeModule::create).transpose()?;
+            if let Some(probe) = &probe_module {
+                probe.configure(&mut command)?;
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
             command
                 .arg("-u")
                 .arg("-c")
-                .arg(WORKER)
+                .arg(if execution_probe {
+                    format!("{IMPORT_PRELUDE}{WORKER}")
+                } else {
+                    WORKER.to_owned()
+                })
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit());
+            if let Some(probe) = &probe_module {
+                command.arg(probe.path());
+            }
             let mut child = command.spawn().map_err(|err| {
                 EngineError::Vllm(format!(
                     "spawning vLLM Python worker with {} failed: {err}",
                     python.display()
                 ))
             })?;
-            let stdin = child
-                .stdin
-                .take()
-                .ok_or_else(|| EngineError::Vllm("opening worker stdin failed".to_owned()))?;
-            let stdout = child
-                .stdout
-                .take()
-                .ok_or_else(|| EngineError::Vllm("opening worker stdout failed".to_owned()))?;
-            let containment =
-                attach_worker_containment(&child, memory_limit_bytes).map_err(|err| {
-                    EngineError::Vllm(format!("applying worker containment failed: {err}"))
-                })?;
+            let setup =
+                (|| {
+                    let stdin = child.stdin.take().ok_or_else(|| {
+                        EngineError::Vllm("opening worker stdin failed".to_owned())
+                    })?;
+                    let stdout = child.stdout.take().ok_or_else(|| {
+                        EngineError::Vllm("opening worker stdout failed".to_owned())
+                    })?;
+                    let containment = attach_worker_containment(&child, memory_limit_bytes)
+                        .map_err(|err| {
+                            EngineError::Vllm(format!("applying worker containment failed: {err}"))
+                        })?;
+                    let stdout = BufReader::new(stdout);
+                    #[cfg(target_os = "linux")]
+                    let mut stdout = stdout;
+                    let containment_report = if isolated_address_space_limit.is_some() {
+                        #[cfg(target_os = "linux")]
+                        {
+                            let mut line = String::new();
+                            stdout.read_line(&mut line)?;
+                            let report = serde_json::from_str::<IsolatedContainmentReport>(&line)
+                                .map_err(|error| {
+                                EngineError::Vllm(format!(
+                                    "isolated containment handshake failed: {error}"
+                                ))
+                            })?;
+                            Some(report)
+                        }
+                        #[cfg(not(target_os = "linux"))]
+                        {
+                            Some(IsolatedContainmentReport {
+                                mode: if cfg!(target_os = "windows") {
+                                    "windows-job-working-set"
+                                } else if cfg!(target_os = "macos") {
+                                    "macos-provider-watchdog"
+                                } else {
+                                    "provider-watchdog"
+                                }
+                                .to_owned(),
+                                physical_limit_bytes: None,
+                                address_space_limit_bytes: None,
+                                working_set_limit_bytes: if cfg!(target_os = "windows") {
+                                    memory_limit_bytes
+                                } else {
+                                    None
+                                },
+                                cgroup_path: None,
+                            })
+                        }
+                    } else {
+                        None
+                    };
+                    Ok((stdin, stdout, containment, containment_report))
+                })();
+            let (stdin, stdout, containment, containment_report) = match setup {
+                Ok(setup) => setup,
+                Err(error) => {
+                    terminate_worker_process(&mut child);
+                    return Err(error);
+                }
+            };
             let router = Arc::new(WorkerRouter::default());
             let reader_router = Arc::clone(&router);
             let reader = thread::spawn(move || read_worker_stdout(stdout, &reader_router));
@@ -8413,6 +9231,7 @@ mod vllm_backend {
                 process: Mutex::new(VllmProcess {
                     child,
                     _containment: containment,
+                    probe_module,
                     terminated: false,
                 }),
                 stdin: Mutex::new(stdin),
@@ -8420,6 +9239,7 @@ mod vllm_backend {
                 reader: Mutex::new(Some(reader)),
                 request_timeout,
                 cancel_timeout,
+                containment_report,
             })
         }
 
@@ -8583,6 +9403,14 @@ mod vllm_backend {
                 .fail("vLLM backend worker was terminated".to_owned());
             terminate_worker_process(&mut process.child);
             process.terminated = true;
+            process.probe_module.take();
+            if let Some(path) = self
+                .containment_report
+                .as_ref()
+                .and_then(|report| report.cgroup_path.as_ref())
+            {
+                let _ = fs::remove_dir(path);
+            }
         }
     }
 
@@ -8609,6 +9437,17 @@ mod vllm_backend {
     }
 
     impl WorkerRouter {
+        fn is_idle(&self) -> bool {
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.failure.is_none()
+                && state.routes.is_empty()
+                && state.abandoned.is_empty()
+                && state.route_failures.is_empty()
+        }
+
         fn register(&self, id: u64, capacity: usize) -> Result<Receiver<WorkerEvent>> {
             let mut state = self
                 .state
@@ -8807,8 +9646,7 @@ mod vllm_backend {
         }
     }
 
-    fn read_worker_stdout(stdout: ChildStdout, router: &WorkerRouter) {
-        let mut stdout = BufReader::new(stdout);
+    fn read_worker_stdout(mut stdout: BufReader<ChildStdout>, router: &WorkerRouter) {
         loop {
             let mut line = String::new();
             match stdout.read_line(&mut line) {
@@ -9064,6 +9902,15 @@ mod vllm_backend {
     }
 
     fn terminate_worker_process(child: &mut Child) {
+        // Containment can introduce a shell parent; terminate its whole owned group.
+        #[cfg(unix)]
+        let _ = std::process::Command::new("/bin/kill")
+            .arg("-KILL")
+            .arg("--")
+            .arg(format!("-{}", child.id()))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
         let _ = child.kill();
         let _ = child.wait();
     }
@@ -9130,6 +9977,24 @@ mod vllm_backend {
         if let Some(pct) = config.vllm_gpu_memory_utilization_pct {
             payload["gpu_memory_utilization"] = json!((pct as f64) / 100.0);
         }
+        if let Some(enforce_eager) = config.vllm_enforce_eager {
+            payload["vllm_enforce_eager"] = json!(enforce_eager);
+        }
+        if let Some(mode) = config.vllm_compilation_mode {
+            payload["vllm_compilation_mode"] = json!(mode);
+        }
+        if let Some(mode) = &config.vllm_cudagraph_mode {
+            payload["vllm_cudagraph_mode"] = json!(mode);
+        }
+        if let Some(linear_backend) = &config.vllm_linear_backend {
+            payload["vllm_linear_backend"] = json!(linear_backend);
+        }
+        if let Some(moe_backend) = &config.vllm_moe_backend {
+            payload["vllm_moe_backend"] = json!(moe_backend);
+        }
+        if let Some(tokens) = config.vllm_mtp_num_speculative_tokens {
+            payload["vllm_mtp_num_speculative_tokens"] = json!(tokens);
+        }
         payload
     }
 
@@ -9186,6 +10051,9 @@ mod vllm_backend {
     fn default_message_kind() -> String {
         "response".to_owned()
     }
+
+    #[cfg(all(test, unix))]
+    mod isolated_tests;
 
     #[cfg(test)]
     #[cfg(unix)]
@@ -9542,6 +10410,374 @@ mod vllm_backend {
             assert!(WORKER.contains("kwargs[\"moe_backend\"] = \"cutlass\""));
             assert!(WORKER.contains("\"kernel_policy\": kernel_policy"));
             assert!(WORKER.contains("required_options.add(\"kv_cache_dtype\")"));
+            assert!(WORKER.contains("optional_bool(payload, \"vllm_enforce_eager\")"));
+            assert!(WORKER.contains("optional_kernel_backend(payload, \"vllm_linear_backend\")"));
+            assert!(WORKER.contains("optional_kernel_backend(payload, \"vllm_moe_backend\")"));
+            assert!(WORKER.contains("\"method\": \"mtp\""));
+            assert!(WORKER.contains("\"execution\": execution_properties"));
+        }
+
+        #[test]
+        fn vllm_worker_execution_evidence_uses_initialized_config() {
+            let test = r#"
+import ast
+import asyncio
+import copy
+import inspect
+import sys
+from enum import Enum
+from types import SimpleNamespace
+
+tree = ast.parse(sys.stdin.read(), "vllm_worker.py")
+nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) or (
+    isinstance(node, ast.Assign)
+    and any(isinstance(target, ast.Name) and target.id.startswith("MAX_")
+            for target in node.targets)
+)]
+namespace = {"asyncio": asyncio, "copy": copy, "inspect": inspect}
+exec(compile(ast.Module(body=nodes, type_ignores=[]), "vllm_worker.py", "exec"), namespace)
+namespace["configure_deterministic_runtime"] = lambda path: None
+namespace["model_uses_nvfp4"] = lambda path: nvfp4
+
+class Backend(Enum):
+    AUTO = "auto"
+    CUTLASS = "flashinfer_cutlass"
+
+class Method(Enum):
+    MTP = "mtp"
+
+class CompilationMode(Enum):
+    NONE = 0
+    VLLM_COMPILE = 3
+
+class CUDAGraphMode(Enum):
+    NONE = 0
+    FULL_DECODE_ONLY = (2, 0)
+
+received_kwargs = []
+class Args:
+    def __init__(self, **kwargs):
+        received_kwargs.append(copy.deepcopy(kwargs))
+        self.__dict__.update(kwargs)
+
+def object_config(value):
+    if isinstance(value, dict):
+        return SimpleNamespace(**{key: object_config(item) for key, item in value.items()})
+    return value
+
+shutdowns = []
+class Engine:
+    def __init__(self, config):
+        self.vllm_config = config
+
+    def shutdown(self):
+        shutdowns.append(self)
+
+def initialize(args):
+    assert namespace["execution_properties"] is None, "published evidence before init"
+    config = {
+        "model_config": {name: getattr(args, name) for name in
+                         ("enforce_eager", "seed", "use_fp64_gumbel")},
+        "kernel_config": {
+            "linear_backend": getattr(args, "linear_backend", "torch"),
+            "moe_backend": getattr(args, "moe_backend", "triton"),
+        },
+        "scheduler_config": {"async_scheduling": args.async_scheduling},
+        "cache_config": {"cache_dtype": getattr(args, "kv_cache_dtype", "auto")},
+        "speculative_config": getattr(args, "speculative_config", None),
+        "compilation_config": getattr(args, "compilation_config", {}),
+    }
+    mutate(config, args)
+    return Engine(object_config(config) if use_objects else config)
+
+class Factory:
+    from_engine_args = staticmethod(initialize)
+
+namespace["import_attr"] = lambda candidates: (
+    Args if candidates[0][1] == "AsyncEngineArgs" else factory
+)
+create_engine = namespace["create_engine"]
+profile = {
+    "path": "/unused/local-checkpoint",
+    "vllm_enforce_eager": False,
+    "vllm_linear_backend": "auto",
+    "vllm_moe_backend": "flashinfer_cutlass",
+    "vllm_mtp_num_speculative_tokens": 4,
+    "kv_cache_dtype": "fp8",
+}
+nvfp4 = False
+mutate = lambda config, args: None
+
+# Both construction APIs must read the post-init config, including enum values.
+for factory in (Factory, initialize):
+    for use_objects in (False, True):
+        def mutate(config, args):
+            config["kernel_config"] = {"linear_backend": Backend.AUTO,
+                                       "moe_backend": Backend.CUTLASS}
+            config["speculative_config"]["method"] = Method.MTP
+        create_engine(profile)
+        assert namespace["execution_properties"] == {
+            key: value for key, value in profile.items() if key.startswith("vllm_")
+        }
+
+factory = Factory
+use_objects = True
+mutate = lambda config, args: None
+create_engine({"path": profile["path"]})
+assert namespace["execution_properties"] == {
+    "vllm_enforce_eager": True,
+    "vllm_linear_backend": "torch",
+    "vllm_moe_backend": "triton",
+    "vllm_mtp_num_speculative_tokens": None,
+}
+nvfp4 = True
+create_engine({"path": profile["path"]})
+assert namespace["execution_properties"]["vllm_linear_backend"] == "cutlass"
+assert namespace["execution_properties"]["vllm_moe_backend"] == "cutlass"
+nvfp4 = False
+
+def rejects(payload, message):
+    before = len(shutdowns)
+    namespace["execution_properties"] = {"stale": True}
+    try:
+        create_engine(payload)
+    except ValueError as error:
+        assert message in str(error), str(error)
+    else:
+        raise AssertionError("accepted changed/missing initialized config: " + message)
+    assert namespace["execution_properties"] is None
+    assert len(shutdowns) == before + 1, "rejected engine was not shut down"
+
+for section, name, value, message in [
+    ("model_config", "enforce_eager", True, "enforce_eager"),
+    ("model_config", "enforce_eager", None, "enforce_eager"),
+    ("model_config", "enforce_eager", 0, "enforce_eager"),
+    ("model_config", "seed", 1, "seed"),
+    ("model_config", "use_fp64_gumbel", False, "use_fp64_gumbel"),
+    ("scheduler_config", "async_scheduling", True, "async_scheduling"),
+    ("cache_config", "cache_dtype", "auto", "kv_cache_dtype"),
+    ("kernel_config", "linear_backend", "cutlass", "linear_backend"),
+    ("kernel_config", "linear_backend", None, "linear_backend"),
+    ("kernel_config", "moe_backend", "auto", "moe_backend"),
+    ("kernel_config", "moe_backend", None, "moe_backend"),
+    ("speculative_config", "method", "eagle", "method"),
+    ("speculative_config", "num_speculative_tokens", 3, "num_speculative_tokens"),
+    ("speculative_config", "num_speculative_tokens", None, "num_speculative_tokens"),
+    ("speculative_config", "num_speculative_tokens", True, "num_speculative_tokens"),
+    ("speculative_config", "num_speculative_tokens", 0, "num_speculative_tokens"),
+    ("speculative_config", "num_speculative_tokens", 33, "num_speculative_tokens"),
+]:
+    def mutate(config, args):
+        # The speculative dict aliases Args, exercising in-place mutation too.
+        config[section][name] = value
+    rejects(profile, message)
+
+for section, message in [("model_config", "enforce_eager"),
+                         ("kernel_config", "backend"),
+                         ("scheduler_config", "async_scheduling"),
+                         ("cache_config", "kv_cache_dtype"),
+                         ("speculative_config", "num_speculative_tokens")]:
+    mutate = lambda config, args: config.pop(section)
+    rejects(profile, message)
+
+# An unavailable optional selector is unknown, never filled from request/defaults.
+mutate = lambda config, args: config.pop("kernel_config")
+create_engine({"path": profile["path"], "vllm_enforce_eager": False})
+assert namespace["execution_properties"]["vllm_linear_backend"] is None
+assert namespace["execution_properties"]["vllm_moe_backend"] is None
+nvfp4 = True
+rejects({"path": profile["path"]}, "backend")
+nvfp4 = False
+
+mutate = lambda config, args: config.update(speculative_config={
+    "method": "mtp", "num_speculative_tokens": 4
+})
+rejects({"path": profile["path"]}, "num_speculative_tokens")
+factory = lambda args: Engine(None)
+rejects(profile, "initialized vllm_config")
+
+def factory(args):
+    raise RuntimeError("initialization failed")
+namespace["execution_properties"] = {"stale": True}
+try:
+    create_engine(profile)
+except RuntimeError:
+    pass
+else:
+    raise AssertionError("initialization failure was swallowed")
+assert namespace["execution_properties"] is None
+
+# Compilation and graphs are independent, explicit-only engine options.
+factory = Factory
+mutate = lambda config, args: None
+compilation_profile = dict(profile, vllm_compilation_mode=0,
+                           vllm_cudagraph_mode="full_decode_only")
+for factory in (Factory, initialize):
+    for use_objects in (False, True):
+        def mutate(config, args):
+            assert args.compilation_config == {"mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY"}
+            assert args.enforce_eager is False
+            config["compilation_config"].update(
+                mode=CompilationMode.NONE, cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY)
+        create_engine(compilation_profile)
+        assert namespace["execution_properties"] == {
+            **{key: value for key, value in profile.items() if key.startswith("vllm_")},
+            "vllm_compilation_mode": 0,
+            "vllm_cudagraph_mode": "FULL_DECODE_ONLY",
+        }
+
+factory = Factory
+mutate = lambda config, args: None
+for payload in ({"path": profile["path"]},
+                dict(profile, vllm_compilation_mode=None, vllm_cudagraph_mode=None)):
+    create_engine(payload)
+    assert "compilation_config" not in received_kwargs[-1]
+    assert "vllm_compilation_mode" not in namespace["execution_properties"]
+    assert "vllm_cudagraph_mode" not in namespace["execution_properties"]
+for name, field, values in [
+    ("vllm_compilation_mode", "mode", range(4)),
+    ("vllm_cudagraph_mode", "cudagraph_mode",
+     ("none", "full_decode_only", "full", "piecewise", "full_and_piecewise",
+      "FULL_DECODE_ONLY", "Full_And_Piecewise")),
+]:
+    for value in values:
+        create_engine(dict(profile, **{name: value}))
+        expected = value.upper() if isinstance(value, str) else value
+        assert received_kwargs[-1]["compilation_config"] == {field: expected}
+        assert namespace["execution_properties"][name] == expected
+
+# Report the initialized companion setting without requiring an unrequested value.
+for option, value, companion, effective_value, evidence in [
+    ("vllm_compilation_mode", 0, "cudagraph_mode", CUDAGraphMode.FULL_DECODE_ONLY,
+     (0, "FULL_DECODE_ONLY")),
+    ("vllm_cudagraph_mode", "none", "mode", CompilationMode.VLLM_COMPILE,
+     (3, "NONE")),
+]:
+    mutate = lambda config, args: config["compilation_config"].update({companion: effective_value})
+    create_engine(dict(profile, **{option: value}))
+    properties = namespace["execution_properties"]
+    assert (properties["vllm_compilation_mode"], properties["vllm_cudagraph_mode"]) == evidence
+mutate = lambda config, args: None
+
+for name, values in [
+    ("vllm_compilation_mode", (True, False, -1, 4, 0.0, "0", [], {})),
+    ("vllm_cudagraph_mode", (True, False, 0, 1.0, "", "unknown", " full", "full ", [], {})),
+]:
+    for value in values:
+        before = len(received_kwargs)
+        namespace["execution_properties"] = {"stale": True}
+        try:
+            create_engine(dict(profile, **{name: value}))
+        except ValueError as error:
+            assert name in str(error), str(error)
+        else:
+            raise AssertionError("accepted invalid " + name + ": " + repr(value))
+        assert len(received_kwargs) == before, "invalid option reached AsyncEngineArgs"
+        assert namespace["execution_properties"] is None
+
+for use_objects in (False, True):
+    for field, values in [("mode", (1, CompilationMode.VLLM_COMPILE, None, True, "0")),
+                          ("cudagraph_mode", ("NONE", CUDAGraphMode.NONE, None, 0))]:
+        for value in values:
+            def mutate(config, args):
+                assert config["compilation_config"] is args.compilation_config
+                config["compilation_config"][field] = value
+            rejects(compilation_profile, field)
+    for field in ("mode", "cudagraph_mode"):
+        mutate = lambda config, args: config["compilation_config"].pop(field)
+        rejects(compilation_profile, field)
+    mutate = lambda config, args: config.pop("compilation_config")
+    rejects(compilation_profile, "compilation_config.mode")
+
+# Unsupported argument APIs must not silently drop an explicit configuration.
+original_accepted_kwargs = namespace["accepted_kwargs"]
+namespace["accepted_kwargs"] = lambda callable_obj, kwargs: {
+    key: value for key, value in kwargs.items() if key != "compilation_config"
+}
+try:
+    create_engine(compilation_profile)
+except ValueError as error:
+    assert "required deterministic engine option(s): compilation_config" in str(error)
+else:
+    raise AssertionError("silently dropped compilation_config")
+finally:
+    namespace["accepted_kwargs"] = original_accepted_kwargs
+
+# Exercise the real async handler with repeated IDs within emitted delta batches.
+prepared = {
+    "empty": False,
+    "engine_prompt": "prompt",
+    "prompt_tokens": [1, 2],
+    "sampling_params": object(),
+    "mm_data": {},
+    "reasoning_active": False,
+}
+
+class StreamingEngine:
+    async def generate(self, *, request_id, prompt, sampling_params):
+        assert request_id == "mayhem-42"
+        assert prompt == prepared["engine_prompt"]
+        assert sampling_params is prepared["sampling_params"]
+        for index, (ids, text) in enumerate(batches):
+            finished = index == len(batches) - 1
+            yield SimpleNamespace(
+                prompt_token_ids=prepared["prompt_tokens"],
+                outputs=[SimpleNamespace(token_ids=ids, text=text,
+                                         finish_reason="stop" if finished else None)],
+                finished=finished,
+            )
+
+sent = []
+namespace.update({
+    "engine": StreamingEngine(),
+    "generation_multiplexer": None,
+    "prepare_generation_request": lambda request_id, payload: prepared,
+    "request_cancelled": lambda request_id: False,
+    "send": sent.append,
+})
+for batches, expected_ids, expected_chunks in [
+    ([([7, 7, 9], "Hello"), ([7, 8], " world")],
+     [7, 7, 9, 7, 8], ["Hello", "", "", " world", ""]),
+    ([([7, 7, 9], "Hello"), ([7, 8], " world"), ([], "!")],
+     [7, 7, 9, 7, 8, -1], ["Hello", "", "", " world", "", "!"]),
+]:
+    sent.clear()
+    result = asyncio.run(namespace["async_handle_generate"](42, {}))
+    assert all(message["id"] == 42 and message["type"] == "token" for message in sent)
+    chunks = [message["chunk"] for message in sent]
+    assert [chunk["token_id"] for chunk in chunks] == expected_ids
+    assert [chunk["index"] for chunk in chunks] == list(range(len(expected_ids)))
+    assert len(chunks) == result["usage"]["completion_tokens"] == len(expected_ids)
+    assert result["usage"]["prompt_tokens"] == 2
+    assert result["usage"]["total_tokens"] == 2 + len(expected_ids)
+    assert result["finish_reason"] == "stop"
+    assert result["text"] == "".join(text for ids, text in batches)
+    streamed_text = "".join(chunk["text"] for chunk in chunks)
+    assert streamed_text == result["text"], (streamed_text, result["text"])
+    assert [chunk["text"] for chunk in chunks] == expected_chunks
+print("ok")
+"#;
+            let mut child = std::process::Command::new("python3")
+                .arg("-c")
+                .arg(test)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("start Python execution-config test");
+            child
+                .stdin
+                .take()
+                .expect("Python stdin")
+                .write_all(WORKER.as_bytes())
+                .expect("write embedded vLLM worker");
+            let output = child.wait_with_output().expect("wait for Python test");
+            assert!(
+                output.status.success(),
+                "vLLM execution-config test failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "ok");
         }
 
         #[test]
@@ -10075,6 +11311,465 @@ printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,
             let payload = vllm_load_payload(&config, Path::new("/tmp/checkpoint"));
             assert_eq!(payload["ctx_size"], json!(131_072));
             assert_eq!(payload["max_num_tokens"], json!(512));
+        }
+
+        #[test]
+        fn vllm_execution_payload_preserves_legacy_absence_and_carries_explicit_values() {
+            let legacy = LoadConfig::vllm_safetensors("/tmp/checkpoint");
+            let legacy_payload = vllm_load_payload(&legacy, Path::new("/tmp/checkpoint"));
+            let legacy_payload = legacy_payload.as_object().expect("load payload object");
+            assert!(!legacy_payload.contains_key("vllm_enforce_eager"));
+            assert!(!legacy_payload.contains_key("vllm_linear_backend"));
+            assert!(!legacy_payload.contains_key("vllm_moe_backend"));
+            assert!(!legacy_payload.contains_key("vllm_mtp_num_speculative_tokens"));
+
+            let mut explicit = LoadConfig::vllm_safetensors("/tmp/checkpoint");
+            explicit.vllm_enforce_eager = Some(false);
+            explicit.vllm_linear_backend = Some("auto".to_owned());
+            explicit.vllm_moe_backend = Some("flashinfer_cutlass".to_owned());
+            explicit.vllm_mtp_num_speculative_tokens = Some(4);
+            validate_load_config(&explicit).expect("valid explicit vLLM execution properties");
+            let payload = vllm_load_payload(&explicit, Path::new("/tmp/checkpoint"));
+            assert_eq!(payload["vllm_enforce_eager"], json!(false));
+            assert_eq!(payload["vllm_linear_backend"], json!("auto"));
+            assert_eq!(payload["vllm_moe_backend"], json!("flashinfer_cutlass"));
+            assert_eq!(payload["vllm_mtp_num_speculative_tokens"], json!(4));
+        }
+
+        #[test]
+        fn vllm_execution_properties_are_strict_and_bounded() {
+            let mut config = LoadConfig::vllm_safetensors("/tmp/checkpoint");
+            config.vllm_linear_backend = Some("CUTLASS".to_owned());
+            assert!(validate_load_config(&config).is_err());
+
+            config.vllm_linear_backend = Some("cutlass-v2".to_owned());
+            assert!(validate_load_config(&config).is_err());
+
+            config.vllm_linear_backend = Some("cutlass".to_owned());
+            config.vllm_mtp_num_speculative_tokens = Some(0);
+            assert!(validate_load_config(&config).is_err());
+
+            config.vllm_mtp_num_speculative_tokens =
+                Some(super::super::VLLM_MAX_MTP_SPECULATIVE_TOKENS + 1);
+            assert!(validate_load_config(&config).is_err());
+
+            config.vllm_mtp_num_speculative_tokens =
+                Some(super::super::VLLM_MAX_MTP_SPECULATIVE_TOKENS);
+            validate_load_config(&config).expect("maximum bounded MTP count is valid");
+
+            let mut non_vllm = LoadConfig::gguf("/tmp/model.gguf");
+            non_vllm.vllm_enforce_eager = Some(false);
+            assert!(validate_load_config(&non_vllm).is_err());
+        }
+
+        #[test]
+        fn vllm_execution_compilation_controls_are_optional_and_bounded() {
+            let mut config = LoadConfig::vllm_safetensors("/tmp/checkpoint");
+            let legacy = serde_json::to_value(&config).unwrap();
+            let payload = vllm_load_payload(&config, Path::new("/tmp/checkpoint"));
+            for field in ["vllm_compilation_mode", "vllm_cudagraph_mode"] {
+                assert!(legacy.get(field).is_none());
+                assert!(payload.get(field).is_none());
+            }
+            let restored: LoadConfig = serde_json::from_value(legacy.clone()).unwrap();
+            assert_eq!(serde_json::to_value(restored).unwrap(), legacy);
+
+            config.vllm_enforce_eager = Some(false);
+            for mode in 0..=3 {
+                config.vllm_compilation_mode = Some(mode);
+                for graph in [
+                    "NONE",
+                    "FULL_DECODE_ONLY",
+                    "FULL",
+                    "PIECEWISE",
+                    "FULL_AND_PIECEWISE",
+                ] {
+                    config.vllm_cudagraph_mode = Some(graph.to_owned());
+                    validate_load_config(&config).unwrap();
+                    let payload = vllm_load_payload(&config, Path::new("/tmp/checkpoint"));
+                    assert_eq!(payload["vllm_compilation_mode"], json!(mode));
+                    assert_eq!(payload["vllm_cudagraph_mode"], json!(graph));
+                }
+            }
+            config.vllm_compilation_mode = Some(4);
+            assert!(validate_load_config(&config).is_err());
+            config.vllm_compilation_mode = Some(0);
+            for graph in ["", "full", "DECODE_ONLY", " FULL", "FULL "] {
+                config.vllm_cudagraph_mode = Some(graph.to_owned());
+                assert!(validate_load_config(&config).is_err(), "{graph:?}");
+            }
+            for eager in [None, Some(true)] {
+                config.vllm_enforce_eager = eager;
+                config.vllm_cudagraph_mode = Some("NONE".to_owned());
+                validate_load_config(&config).unwrap();
+                config.vllm_compilation_mode = Some(1);
+                assert!(validate_load_config(&config).is_err());
+                config.vllm_compilation_mode = Some(0);
+                config.vllm_cudagraph_mode = Some("FULL_DECODE_ONLY".to_owned());
+                assert!(validate_load_config(&config).is_err());
+            }
+            for field in ["vllm_compilation_mode", "vllm_cudagraph_mode"] {
+                let mut non_vllm = LoadConfig::gguf("/tmp/model.gguf");
+                if field == "vllm_compilation_mode" {
+                    non_vllm.vllm_compilation_mode = Some(0);
+                } else {
+                    non_vllm.vllm_cudagraph_mode = Some("NONE".to_owned());
+                }
+                assert!(validate_load_config(&non_vllm).is_err());
+            }
+            for value in [json!(-1), json!(true), json!(0.0), json!("0")] {
+                let mut encoded = legacy.clone();
+                encoded["vllm_compilation_mode"] = value;
+                assert!(serde_json::from_value::<LoadConfig>(encoded).is_err());
+            }
+        }
+
+        #[test]
+        fn vllm_execution_compilation_report_requires_exact_requested_values() {
+            let mut config = LoadConfig::vllm_safetensors("/tmp/checkpoint");
+            config.vllm_enforce_eager = Some(false);
+            config.vllm_compilation_mode = Some(0);
+            config.vllm_cudagraph_mode = Some("FULL_DECODE_ONLY".to_owned());
+            let matching = json!({
+                "vllm_enforce_eager": false,
+                "vllm_compilation_mode": 0,
+                "vllm_cudagraph_mode": "FULL_DECODE_ONLY",
+                "worker_execution_observation": {
+                    "source": "worker_extension_cls.collective_rpc",
+                    "rank_count": 1,
+                    "world_size": 1,
+                    "ranks": [{
+                        "rank": 0, "local_rank": 0, "world_size": 1, "pid": 123,
+                        "compilation_mode": 0, "cudagraph_mode": "FULL_DECODE_ONLY",
+                    }],
+                },
+            });
+            let report: WorkerExecutionInfo = serde_json::from_value(matching.clone()).unwrap();
+            validate_vllm_execution_report(&config, Some(&report)).unwrap();
+            assert_eq!(json!(report)["vllm_compilation_mode"], json!(0));
+            assert_eq!(
+                json!(report)["vllm_cudagraph_mode"],
+                json!("FULL_DECODE_ONLY")
+            );
+            for (field, value) in [
+                ("vllm_compilation_mode", json!(3)),
+                ("vllm_compilation_mode", json!(4)),
+                ("vllm_compilation_mode", Value::Null),
+                ("vllm_cudagraph_mode", json!("NONE")),
+                ("vllm_cudagraph_mode", json!("invalid")),
+                ("vllm_cudagraph_mode", Value::Null),
+            ] {
+                let mut changed = matching.clone();
+                changed[field] = value;
+                let report = serde_json::from_value(changed).unwrap();
+                assert!(
+                    validate_vllm_execution_report(&config, Some(&report)).is_err(),
+                    "{field}"
+                );
+            }
+            for field in ["vllm_compilation_mode", "vllm_cudagraph_mode"] {
+                let mut missing = matching.clone();
+                missing.as_object_mut().unwrap().remove(field);
+                let report = serde_json::from_value(missing).unwrap();
+                assert!(validate_vllm_execution_report(&config, Some(&report)).is_err());
+            }
+            // The worker may report both initialized fields when only one was requested.
+            config.vllm_compilation_mode = None;
+            validate_vllm_execution_report(&config, Some(&report)).unwrap();
+            config.vllm_cudagraph_mode = None;
+            config.vllm_compilation_mode = Some(0);
+            validate_vllm_execution_report(&config, Some(&report)).unwrap();
+            config.vllm_enforce_eager = None;
+            assert!(has_explicit_vllm_execution_properties(&config));
+            assert!(validate_vllm_execution_report(&config, None).is_err());
+            config.vllm_compilation_mode = None;
+            config.vllm_cudagraph_mode = Some("NONE".to_owned());
+            assert!(has_explicit_vllm_execution_properties(&config));
+            assert!(validate_vllm_execution_report(&config, None).is_err());
+        }
+
+        #[test]
+        fn vllm_compilation_observation_requires_all_ranks_and_matches_effective_fields() {
+            let mut config = LoadConfig::vllm_safetensors("/tmp/checkpoint");
+            config.vllm_enforce_eager = Some(false);
+            config.vllm_compilation_mode = Some(0);
+            config.vllm_cudagraph_mode = Some("FULL_DECODE_ONLY".to_owned());
+            config.vllm_tensor_parallel = Some(2);
+            let matching = json!({
+                "vllm_enforce_eager": false,
+                "vllm_compilation_mode": 0,
+                "vllm_cudagraph_mode": "FULL_DECODE_ONLY",
+                "worker_execution_observation": {
+                    "source": "worker_extension_cls.collective_rpc",
+                    "rank_count": 2, "world_size": 2,
+                    "ranks": ([1, 0].map(|rank| json!({
+                        "rank": rank, "local_rank": rank, "world_size": 2,
+                        "pid": 123 + rank, "compilation_mode": 0,
+                        "cudagraph_mode": "FULL_DECODE_ONLY",
+                    }))),
+                },
+            });
+            let report: WorkerExecutionInfo = serde_json::from_value(matching.clone()).unwrap();
+            validate_vllm_execution_report(&config, Some(&report)).unwrap();
+            for (pointer, value) in [
+                ("/worker_execution_observation", Value::Null),
+                ("/worker_execution_observation/source", json!("frontend_config")),
+                ("/worker_execution_observation/rank_count", json!(1)),
+                ("/worker_execution_observation/world_size", json!(1)),
+                ("/worker_execution_observation/ranks", json!([])),
+                ("/worker_execution_observation/ranks/0/rank", json!(0)),
+                ("/worker_execution_observation/ranks/0/rank", json!(2)),
+                ("/worker_execution_observation/ranks/0/local_rank", json!(2)),
+                ("/worker_execution_observation/ranks/0/world_size", json!(1)),
+                ("/worker_execution_observation/ranks/0/pid", json!(0)),
+                ("/worker_execution_observation/ranks/0/compilation_mode", json!(3)),
+                ("/worker_execution_observation/ranks/0/cudagraph_mode", json!("NONE")),
+                ("/worker_execution_observation/ranks/1/compilation_mode", json!(3)),
+                ("/worker_execution_observation/ranks/1/cudagraph_mode", json!("NONE")),
+            ] {
+                let mut changed = matching.clone();
+                *changed.pointer_mut(pointer).unwrap() = value;
+                let changed: WorkerExecutionInfo = serde_json::from_value(changed).unwrap();
+                assert!(
+                    validate_vllm_execution_report(&config, Some(&changed)).is_err(),
+                    "{pointer}"
+                );
+            }
+            let mut missing = matching.clone();
+            missing
+                .as_object_mut()
+                .unwrap()
+                .remove("worker_execution_observation");
+            let missing: WorkerExecutionInfo = serde_json::from_value(missing).unwrap();
+            assert!(validate_vllm_execution_report(&config, Some(&missing)).is_err());
+            for (pointer, value) in [
+                ("/worker_execution_observation/ranks/0/rank", json!(-1)),
+                ("/worker_execution_observation/ranks/0/pid", json!(true)),
+            ] {
+                let mut changed = matching.clone();
+                *changed.pointer_mut(pointer).unwrap() = value;
+                assert!(serde_json::from_value::<WorkerExecutionInfo>(changed).is_err());
+            }
+            let mut missing_field = matching;
+            missing_field["worker_execution_observation"]["ranks"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("compilation_mode");
+            assert!(serde_json::from_value::<WorkerExecutionInfo>(missing_field).is_err());
+            config.vllm_compilation_mode = None;
+            config.vllm_cudagraph_mode = None;
+            validate_vllm_execution_report(&config, Some(&missing)).unwrap();
+            validate_vllm_execution_report(&LoadConfig::vllm_safetensors("/tmp/checkpoint"), None)
+                .unwrap();
+        }
+
+        #[test]
+        fn vllm_execution_report_must_match_explicit_properties() {
+            let mut config = LoadConfig::vllm_safetensors("/tmp/checkpoint");
+            config.vllm_enforce_eager = Some(false);
+            config.vllm_linear_backend = Some("auto".to_owned());
+            config.vllm_moe_backend = Some("cutlass".to_owned());
+            config.vllm_mtp_num_speculative_tokens = Some(4);
+            let matching = WorkerExecutionInfo {
+                vllm_enforce_eager: Some(false),
+                vllm_linear_backend: Some("auto".to_owned()),
+                vllm_moe_backend: Some("cutlass".to_owned()),
+                vllm_mtp_num_speculative_tokens: Some(4),
+                ..WorkerExecutionInfo::default()
+            };
+            validate_vllm_execution_report(&config, Some(&matching))
+                .expect("matching worker execution report");
+
+            let mut mismatched = matching.clone();
+            mismatched.vllm_mtp_num_speculative_tokens = Some(3);
+            let error = validate_vllm_execution_report(&config, Some(&mismatched))
+                .expect_err("mismatched worker execution report");
+            assert!(error.to_string().contains("expected Some(4), got Some(3)"));
+
+            for (field, value) in [
+                ("vllm_enforce_eager", json!(true)),
+                ("vllm_enforce_eager", Value::Null),
+                ("vllm_linear_backend", json!("cutlass")),
+                ("vllm_linear_backend", Value::Null),
+                ("vllm_moe_backend", json!("auto")),
+                ("vllm_moe_backend", Value::Null),
+                ("vllm_mtp_num_speculative_tokens", Value::Null),
+            ] {
+                let mut report = json!(matching);
+                report[field] = value;
+                let report = serde_json::from_value(report).unwrap();
+                let error = validate_vllm_execution_report(&config, Some(&report))
+                    .expect_err("changed or missing required execution property");
+                assert!(error.to_string().contains(field));
+            }
+
+            let error = validate_vllm_execution_report(&config, None)
+                .expect_err("missing worker execution report");
+            assert!(error
+                .to_string()
+                .contains("did not report effective execution properties"));
+
+            let legacy = LoadConfig::vllm_safetensors("/tmp/checkpoint");
+            validate_vllm_execution_report(&legacy, None)
+                .expect("legacy fake workers remain compatible");
+        }
+
+        #[test]
+        fn vllm_execution_report_allows_unknown_unrequested_kernel_backends() {
+            let mut config = LoadConfig::vllm_safetensors("/tmp/checkpoint");
+            config.vllm_enforce_eager = Some(false);
+            let mut report = WorkerExecutionInfo {
+                vllm_enforce_eager: Some(false),
+                ..WorkerExecutionInfo::default()
+            };
+            validate_vllm_execution_report(&config, Some(&report))
+                .expect("unrequested kernel selectors may be unavailable");
+            report.vllm_linear_backend = Some("torch".to_owned());
+            report.vllm_moe_backend = Some("triton".to_owned());
+            validate_vllm_execution_report(&config, Some(&report))
+                .expect("unrequested resolved kernel selectors are retained");
+            report.vllm_linear_backend = Some("INVALID".to_owned());
+            assert!(validate_vllm_execution_report(&config, Some(&report)).is_err());
+        }
+
+        #[test]
+        fn vllm_execution_report_retains_worker_rank_observation() {
+            let observation = json!({
+                "source": "worker_extension_cls.collective_rpc", "rank_count": 1, "world_size": 1,
+                "ranks": [{"rank": 0, "local_rank": 0, "world_size": 1, "pid": 42,
+                           "compilation_mode": 0, "cudagraph_mode": "NONE"}]
+            });
+            let report: WorkerExecutionInfo = serde_json::from_value(json!({
+                "vllm_enforce_eager": false, "vllm_compilation_mode": 0,
+                "vllm_cudagraph_mode": "NONE", "worker_execution_observation": observation
+            }))
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(report).unwrap()["worker_execution_observation"],
+                observation
+            );
+            assert!(serde_json::to_value(WorkerExecutionInfo::default())
+                .unwrap()
+                .get("worker_execution_observation")
+                .is_none());
+        }
+
+        #[test]
+        fn vllm_load_rejects_mismatched_execution_without_retaining_evidence() {
+            let root = unique_test_root("vllm-execution-mismatch");
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            let script = r#"#!/bin/sh
+read load_request
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"execution":{"vllm_enforce_eager":true}}}'
+read shutdown
+"#;
+            fs::create_dir_all(python.parent().unwrap()).unwrap();
+            fs::create_dir_all(model.parent().unwrap()).unwrap();
+            write_fake_vllm_worker(&python, &model, script);
+
+            let mut backend = VllmBackend::with_python(&python).unwrap();
+            let mut config = LoadConfig::vllm_safetensors(&model);
+            config.vllm_enforce_eager = Some(false);
+            config.backend_cache_dir = Some(root.join("cache"));
+            let error = backend.load(config).expect_err("engine changed eager mode");
+            assert!(error.to_string().contains("vllm_enforce_eager"));
+            assert!(backend.loaded_backend_evidence().is_none());
+            assert!(backend.process_ids().is_empty());
+            assert!(backend.concurrent_generation_backend().is_none());
+
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn vllm_legacy_evidence_ignores_execution_report() {
+            let root = unique_test_root("vllm-legacy-evidence");
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            fs::create_dir_all(python.parent().unwrap()).unwrap();
+            fs::create_dir_all(model.parent().unwrap()).unwrap();
+            for execution in [
+                None,
+                Some(json!({
+                    "vllm_enforce_eager": true,
+                    "vllm_linear_backend": "cutlass",
+                    "vllm_moe_backend": "cutlass",
+                    "vllm_mtp_num_speculative_tokens": null,
+                })),
+            ] {
+                let mut result = json!({"n_ctx_train": 4096, "n_vocab": 32000});
+                if let Some(execution) = execution {
+                    result["execution"] = execution;
+                }
+                let response = json!({
+                    "id": 1, "type": "response", "ok": true, "result": result,
+                });
+                let script = format!(
+                    "#!/bin/sh\nread load_request\nprintf '%s\\n' '{response}'\nread shutdown\n"
+                );
+                write_fake_vllm_worker(&python, &model, &script);
+                let mut backend = VllmBackend::with_python(&python).unwrap();
+                let mut config = LoadConfig::vllm_safetensors(&model);
+                config.backend_cache_dir = Some(root.join("cache"));
+                let serialized = serde_json::to_value(&config).unwrap();
+                for field in [
+                    "vllm_enforce_eager",
+                    "vllm_linear_backend",
+                    "vllm_moe_backend",
+                    "vllm_mtp_num_speculative_tokens",
+                ] {
+                    assert!(serialized.get(field).is_none());
+                }
+                backend.load(config).expect("legacy profile loads");
+                assert_eq!(
+                    backend.loaded_backend_evidence().unwrap(),
+                    json!({
+                        "determinism": {"batch_invariant": null},
+                        "generation": {"capacity": 1, "concurrent": false},
+                    })
+                );
+            }
+            let _ = fs::remove_dir_all(root);
+        }
+
+        #[test]
+        fn vllm_load_retains_matching_explicit_execution_evidence() {
+            let root = unique_test_root("vllm-execution-evidence");
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            let script = r#"#!/bin/sh
+read load_request
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"execution":{"vllm_enforce_eager":false,"vllm_linear_backend":"auto","vllm_moe_backend":"cutlass","vllm_mtp_num_speculative_tokens":4}}}'
+read shutdown
+"#;
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::create_dir_all(model.parent().expect("model parent")).unwrap();
+            write_fake_vllm_worker(&python, &model, script);
+
+            let mut backend = VllmBackend::with_python(&python).unwrap();
+            let mut config = LoadConfig::vllm_safetensors(&model);
+            config.ctx_size = 4096;
+            config.vllm_enforce_eager = Some(false);
+            config.vllm_linear_backend = Some("auto".to_owned());
+            config.vllm_moe_backend = Some("cutlass".to_owned());
+            config.vllm_mtp_num_speculative_tokens = Some(4);
+            backend
+                .load(config)
+                .expect("matching execution report loads");
+
+            assert_eq!(
+                backend.loaded_backend_evidence().unwrap()["execution"],
+                json!({
+                    "vllm_enforce_eager": false,
+                    "vllm_linear_backend": "auto",
+                    "vllm_moe_backend": "cutlass",
+                    "vllm_mtp_num_speculative_tokens": 4,
+                })
+            );
+
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
         }
 
         #[test]

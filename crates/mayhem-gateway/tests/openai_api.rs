@@ -1782,11 +1782,20 @@ fn audio_transcription_multipart(fields: &[(&str, &str)]) -> (String, Vec<u8>) {
     (boundary.to_owned(), body)
 }
 
-async fn first_model_id() -> String {
+const OPENAI_TEST_MODEL_ID: &str = "Qwen/Qwen3.8-27B";
+
+async fn openai_test_model_id() -> String {
     let (status, body) = json_request(test_app(), Method::GET, "/v1/models", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["object"], "list");
-    body["data"][0]["id"].as_str().expect("model id").to_owned()
+    body["data"]
+        .as_array()
+        .expect("model data")
+        .iter()
+        .find_map(|model| {
+            (model["id"] == OPENAI_TEST_MODEL_ID).then(|| OPENAI_TEST_MODEL_ID.to_owned())
+        })
+        .expect("explicit OpenAI test model")
 }
 
 #[tokio::test]
@@ -1795,7 +1804,12 @@ async fn production_gateway_without_live_provider_refuses_local_chat_shim() {
     let app = openai_router(state.clone());
     let (status, models) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
-    let model = models["data"][0]["id"].as_str().expect("model id");
+    assert!(models["data"]
+        .as_array()
+        .expect("model data")
+        .iter()
+        .any(|model| model["id"] == OPENAI_TEST_MODEL_ID));
+    let model = OPENAI_TEST_MODEL_ID;
     let request = json!({
         "model": model,
         "messages": [{ "role": "user", "content": "Do not fabricate a local answer." }]
@@ -1831,12 +1845,17 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
     let (status, body) = json_request(test_app(), Method::GET, "/v1/models", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body["object"], "list");
-    assert!(!body["data"].as_array().expect("model data").is_empty());
-    assert_eq!(body["data"][0]["object"], "model");
-    assert_eq!(body["data"][0]["owned_by"], "mayhem");
-    assert_eq!(body["data"][0]["mayhem"]["price_ref_au"]["denom"], "au_usd");
-    assert_eq!(body["data"][0]["mayhem"]["price_ref_au"]["ver"], 1);
-    let rate_units = body["data"][0]["mayhem"]["price_ref_au"]["rate_map"]
+    let model = body["data"]
+        .as_array()
+        .expect("model data")
+        .iter()
+        .find(|model| model["id"] == OPENAI_TEST_MODEL_ID)
+        .expect("explicit OpenAI test model");
+    assert_eq!(model["object"], "model");
+    assert_eq!(model["owned_by"], "mayhem");
+    assert_eq!(model["mayhem"]["price_ref_au"]["denom"], "au_usd");
+    assert_eq!(model["mayhem"]["price_ref_au"]["ver"], 1);
+    let rate_units = model["mayhem"]["price_ref_au"]["rate_map"]
         .as_array()
         .expect("rate map")
         .iter()
@@ -1846,11 +1865,11 @@ async fn models_endpoint_returns_openai_list_shape_with_mayhem_extension() {
         rate_units,
         vec!["input_token", "cached_input_token", "output_token"]
     );
-    assert_eq!(body["data"][0]["mayhem"]["caps"]["tools"], false);
-    assert_eq!(body["data"][0]["mayhem"]["caps"]["ctx"], 0);
-    assert_eq!(body["data"][0]["mayhem"]["registered_caps"]["tools"], true);
+    assert_eq!(model["mayhem"]["caps"]["tools"], false);
+    assert_eq!(model["mayhem"]["caps"]["ctx"], 0);
+    assert_eq!(model["mayhem"]["registered_caps"]["tools"], true);
     assert_eq!(
-        body["data"][0]["mayhem"]["adapter"]["tool_call_strategy"],
+        model["mayhem"]["adapter"]["tool_call_strategy"],
         "qwen_function_xml"
     );
 }
@@ -2952,7 +2971,7 @@ async fn embeddings_endpoint_supports_base64_float32_encoding() {
 
 #[tokio::test]
 async fn embeddings_endpoint_rejects_non_embedding_model() {
-    let model = first_model_id().await;
+    let model = openai_test_model_id().await;
     let (status, body) = json_request(
         test_app(),
         Method::POST,
@@ -4905,7 +4924,7 @@ async fn automatic_transcript_match_probe_records_pass() {
 
 #[tokio::test]
 async fn chat_completion_returns_tool_call_and_accepts_tool_result_followup() {
-    let model = first_model_id().await;
+    let model = openai_test_model_id().await;
     let tool_request = json!({
         "model": model,
         "messages": [{ "role": "user", "content": "Use the weather tool." }],
@@ -4941,7 +4960,7 @@ async fn chat_completion_returns_tool_call_and_accepts_tool_result_followup() {
         .as_str()
         .expect("tool call id");
     let followup = json!({
-        "model": first_model_id().await,
+        "model": openai_test_model_id().await,
         "messages": [
             { "role": "user", "content": "Use the weather tool." },
             { "role": "assistant", "content": null, "tool_calls": body["choices"][0]["message"]["tool_calls"] },
@@ -5431,11 +5450,12 @@ async fn chat_completion_caps_retryable_direct_session_routes_at_four_without_re
 
     let (status, body) = json_request(app, Method::POST, "/v1/chat/completions", request).await;
 
-    assert_eq!(status, StatusCode::BAD_GATEWAY);
-    assert!(body["error"]["message"]
-        .as_str()
-        .expect("error message")
-        .contains("all 4 route attempt(s) failed before spend"));
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(body["error"]["code"], "provider_response_timeout");
+    assert_eq!(body["error"]["category"], "provider_response");
+    assert_eq!(body["error"]["retryable"], true);
+    assert_eq!(body["error"]["safe_detail"]["attempts"], 4);
+    assert_eq!(body["error"]["safe_detail"]["phase"], "pre_spend");
     let calls = calls.lock().expect("calls lock").clone();
     assert_eq!(calls.len(), 4);
     let unique_calls = calls.iter().cloned().collect::<BTreeSet<_>>();
@@ -7318,6 +7338,7 @@ fn test_provider_heartbeat(
         identity_anchor: None,
         inventory_root: None,
         runtime_id: None,
+        execution_mode: None,
         workflow_classes: BTreeMap::new(),
         accepting_new: true,
         caps: HeartbeatCaps {
@@ -7517,7 +7538,7 @@ async fn capability_body_transport_rejects_unknown_fields_and_levels_before_disp
 
 #[tokio::test]
 async fn chat_completion_streams_openai_sse_chunks_with_usage() {
-    let model = first_model_id().await;
+    let model = openai_test_model_id().await;
     let request = json!({
         "model": model,
         "messages": [{ "role": "user", "content": "Stream a short answer." }],
@@ -7642,7 +7663,7 @@ async fn chat_completion_streams_normalized_tool_call_delta() {
 #[tokio::test]
 async fn streaming_dev_chat_is_unbillable_and_stores_no_receipt() {
     let (state, app) = test_state_and_app();
-    let model = first_model_id().await;
+    let model = openai_test_model_id().await;
     let request = json!({
         "model": model,
         "messages": [{ "role": "user", "content": "Stream without billable accounting." }],
@@ -7715,7 +7736,7 @@ async fn refused_receipt_cosign_pauses_session_without_storing_receipt() {
 
 #[tokio::test]
 async fn response_format_json_object_returns_parseable_json_content() {
-    let model = first_model_id().await;
+    let model = openai_test_model_id().await;
     let request = json!({
         "model": model,
         "messages": [{ "role": "user", "content": "Return JSON." }],
@@ -7734,7 +7755,7 @@ async fn response_format_json_object_returns_parseable_json_content() {
 #[tokio::test]
 async fn legacy_completions_return_text_completion_shape_and_stream() {
     let (state, app) = test_state_and_app();
-    let model = first_model_id().await;
+    let model = openai_test_model_id().await;
     let request = json!({ "model": model, "prompt": "Hello", "max_tokens": 8 });
     let (status, body) = json_request(app.clone(), Method::POST, "/v1/completions", request).await;
     assert_eq!(status, StatusCode::OK);
@@ -7747,7 +7768,7 @@ async fn legacy_completions_return_text_completion_shape_and_stream() {
     assert_eq!(body["mayhem"]["dev_session"], true);
     assert_eq!(body["mayhem"]["receipt"], Value::Null);
 
-    let request = json!({ "model": first_model_id().await, "prompt": "Hello", "stream": true });
+    let request = json!({ "model": openai_test_model_id().await, "prompt": "Hello", "stream": true });
     let (status, headers, bytes) =
         raw_request(app, Method::POST, "/v1/completions", Some(request)).await;
     assert_eq!(status, StatusCode::OK);
@@ -8059,7 +8080,7 @@ async fn user_dashboard_renders_live_gateway_data() {
     let connect_path = format!("/mayhem/dashboard/connect{query}");
     let models_path = format!("/mayhem/dashboard/models{query}");
     let app = openai_router(state);
-    let model = first_model_id().await;
+    let model = openai_test_model_id().await;
     let request = json!({
         "model": model,
         "messages": [{"role": "user", "content": "hello"}]

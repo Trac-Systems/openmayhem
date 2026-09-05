@@ -345,6 +345,13 @@ mayhem provider limits set [--max-concurrent N] [--accept-rate R] [--budget <USD
 mayhem provider health                          # green AND the model appears in /v1/models
 ```
 
+**Optional runtime mode:** use `provider serve plan`, `serve add`, or `serve switch`
+with `--execution-mode <mode-id>` only when the exact artifact's signed catalog
+lists that mode. Omit it for baseline behavior. Do not invent runtime overrides,
+copy baseline canaries, or assume independent dispatch transfers to the mode.
+See [optional vLLM execution modes](MODEL-CHEATSHEET.md#optional-vllm-execution-modes)
+for the supervised start sequence and compatibility requirements.
+
 Accepted rails are not enough for buyer routing. A provider can be active,
 room-joined, and heartbeating while staying invisible to buyers if it lacks an
 active verified payout binding for an accepted rail. In that case
