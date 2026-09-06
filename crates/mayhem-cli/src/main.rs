@@ -5,6 +5,7 @@ mod endpoint_calibration;
 mod gemma4;
 mod intercom_runtime;
 mod python_runtime;
+mod provider_output_stream;
 mod release_bundle;
 
 #[cfg(test)]
@@ -82371,6 +82372,7 @@ struct ProviderSessionLiveStreamState {
     next_index: u64,
     receipt_seq: u64,
     last_checkpoint_metered_units: u64,
+    last_checkpoint_reasoning_units: u64,
     delivered_metered_units: u64,
     reasoning_units: u64,
     prompt_tokens: u64,
@@ -82389,6 +82391,7 @@ struct ProviderSessionLiveStream<'a> {
     next_index: u64,
     receipt_seq: u64,
     last_checkpoint_metered_units: u64,
+    last_checkpoint_reasoning_units: u64,
     first_ttft_ms: Option<u64>,
     first_token_at: Option<Instant>,
     last_token_at: Option<Instant>,
@@ -82398,6 +82401,7 @@ struct ProviderSessionLiveStream<'a> {
     streamed_any: bool,
     pending_text: String,
     pending_hidden_reasoning: String,
+    pending_tool_deltas: Vec<Value>,
     pending_token_ids: Vec<i32>,
     visible_text: String,
     hidden_reasoning: String,
@@ -82648,6 +82652,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             next_index: 0,
             receipt_seq: 1,
             last_checkpoint_metered_units: 0,
+            last_checkpoint_reasoning_units: 0,
             first_ttft_ms: None,
             first_token_at: None,
             last_token_at: None,
@@ -82657,6 +82662,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             streamed_any: false,
             pending_text: String::new(),
             pending_hidden_reasoning: String::new(),
+            pending_tool_deltas: Vec::new(),
             pending_token_ids: Vec::new(),
             visible_text: String::new(),
             hidden_reasoning: String::new(),
@@ -82737,10 +82743,26 @@ impl<'a> ProviderSessionLiveStream<'a> {
                 })
             })?;
             self.last_checkpoint_metered_units = self.delivered_metered_units;
+            self.last_checkpoint_reasoning_units = metered_output_units("", &self.hidden_reasoning, &[]);
             self.receipt_seq = self.receipt_seq.saturating_add(1);
         }
         self.poll_client_disconnect()?;
         Ok(())
+    }
+
+    fn tool_stream_id(&self, index: usize) -> String {
+        format!("call-{}", stable_value_hash(&json!({"request": self.request_id, "index": index})))
+    }
+
+    fn append_tool_deltas(&mut self, deltas: Vec<Value>) {
+        for mut delta in deltas {
+            if delta.get("name").is_some() {
+                if let Some(index) = delta.get("index").and_then(Value::as_u64) {
+                    delta["id"] = json!(self.tool_stream_id(index as usize));
+                }
+            }
+            self.pending_tool_deltas.push(delta);
+        }
     }
 
     fn append_filtered_text(&mut self, filtered: ProviderReasoningFilteredText) {
@@ -82790,10 +82812,10 @@ impl<'a> ProviderSessionLiveStream<'a> {
         } else {
             ReceiptUsage::text(self.prompt_tokens, self.last_checkpoint_metered_units)
         };
-        let usage_attribution = if self.last_checkpoint_metered_units == 0 {
+        let usage_attribution = if self.last_checkpoint_reasoning_units == 0 {
             BTreeMap::new()
         } else {
-            provider_reasoning_usage_attribution(&self.hidden_reasoning)
+            BTreeMap::from([("reasoning_output_tokens".to_owned(), self.last_checkpoint_reasoning_units)])
         };
         (usage, usage_attribution, self.receipt_seq)
     }
@@ -82807,6 +82829,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
         if self.pending_text.is_empty()
             && self.pending_hidden_reasoning.is_empty()
             && self.pending_token_ids.is_empty()
+            && self.pending_tool_deltas.is_empty()
         {
             return Ok(());
         }
@@ -82817,22 +82840,42 @@ impl<'a> ProviderSessionLiveStream<'a> {
             self.active.session_id,
             self.request_id
         ));
-        let frame = json!({
-            "t": "s.delta",
-            "rid": self.request_id,
-            "i": self.next_index,
-            "d": &self.pending_text,
-            "reasoning_evidence_delta": &self.pending_hidden_reasoning,
-            "token_ids_delta": &self.pending_token_ids,
-            "tools": null,
-            "fin": null,
-        });
+        // Argument values can become decidable in one large chunk (for
+        // example a union-typed XML parameter). Split the presentation into
+        // bounded protocol frames, keeping call identity on its first fragment.
+        let max_frame_bytes = provider_session_max_frame_bytes();
+        let mut tool_fragments = Vec::new();
+        for delta in &self.pending_tool_deltas {
+            let args = delta.get("arguments").and_then(Value::as_str).unwrap_or_default();
+            let parts = provider_stream_parts(args, (max_frame_bytes / 12).max(1));
+            if parts.is_empty() { tool_fragments.push(delta.clone()); }
+            for (part_index, part) in parts.iter().enumerate() {
+                let mut fragment = if part_index == 0 { delta.clone() }
+                    else { json!({"index":delta["index"]}) };
+                fragment["arguments"] = json!(part);
+                tool_fragments.push(fragment);
+            }
+        }
+        let frames = tool_fragments.len().max(1);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                self.bridge
-                    .session_send(&self.active.remote, &self.active.session_id, frame)
-                    .await
-                    .context("sending live token s.delta")
+                for part_index in 0..frames {
+                    let first = part_index == 0;
+                    let frame = json!({
+                        "t":"s.delta", "rid":self.request_id,
+                        "i":self.next_index + part_index as u64,
+                        "d":if first { self.pending_text.as_str() } else { "" },
+                        "reasoning_evidence_delta":if first { self.pending_hidden_reasoning.as_str() } else { "" },
+                        "token_ids_delta":if first { self.pending_token_ids.as_slice() } else { &[] },
+                        "tool_calls_delta":tool_fragments.get(part_index).map(|delta| vec![delta]).unwrap_or_default(),
+                        "tools":null,"fin":null,
+                    });
+                    ensure!(provider_session_frame_json_len(&frame)? <= max_frame_bytes,
+                        "live output delta exceeds session frame limit");
+                    self.bridge.session_send(&self.active.remote, &self.active.session_id, frame)
+                        .await.context("sending live output s.delta")?;
+                }
+                Ok::<(), anyhow::Error>(())
             })
         })?;
         self.visible_text.push_str(&self.pending_text);
@@ -82844,7 +82887,8 @@ impl<'a> ProviderSessionLiveStream<'a> {
         self.pending_text.clear();
         self.pending_hidden_reasoning.clear();
         self.pending_token_ids.clear();
-        self.next_index = self.next_index.saturating_add(1);
+        self.pending_tool_deltas.clear();
+        self.next_index = self.next_index.saturating_add(frames as u64);
         Ok(())
     }
 
@@ -82894,47 +82938,11 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn send_client_disconnect_receipt(&mut self) -> Result<()> {
-        if self.delivered_metered_units == 0
-            || self.delivered_metered_units == self.last_checkpoint_metered_units
-        {
-            return Ok(());
-        }
-        let usage = ReceiptUsage::text(self.prompt_tokens, self.delivered_metered_units);
-        let usage_attribution = provider_reasoning_usage_attribution(&self.hidden_reasoning);
-        let receipt = provider_session_receipt_for_usage_attribution(
-            self.terms,
-            self.active,
-            self.body,
-            usage,
-            usage_attribution,
-            self.receipt_seq,
-            false,
-            self.runtime_keypair,
-        )
-        .context("building client-disconnect provider session receipt")?;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                send_provider_session_receipt_frame(
-                    self.bridge,
-                    self.active,
-                    self.request_id,
-                    &receipt,
-                    "client_disconnect",
-                )
-                .await?;
-                let _ = wait_for_provider_receipt_ack(
-                    self.bridge,
-                    self.active,
-                    &receipt,
-                    Duration::from_secs(5),
-                    None,
-                )
-                .await;
-                Ok::<(), anyhow::Error>(())
-            })
-        })?;
-        self.last_checkpoint_metered_units = self.delivered_metered_units;
-        self.receipt_seq = self.receipt_seq.saturating_add(1);
+        let (usage, attribution, seq) = self.cancellation_receipt_state();
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async {
+            settle_cancelled_provider_session(self.bridge, self.active, self.request_id,
+                self.terms, self.body, usage, attribution, seq, self.runtime_keypair).await
+        }))?;
         Ok(())
     }
 
@@ -82943,6 +82951,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             next_index: self.next_index,
             receipt_seq: self.receipt_seq,
             last_checkpoint_metered_units: self.last_checkpoint_metered_units,
+            last_checkpoint_reasoning_units: self.last_checkpoint_reasoning_units,
             delivered_metered_units: self.delivered_metered_units,
             reasoning_units: metered_output_units("", &self.hidden_reasoning, &[]),
             prompt_tokens: self.prompt_tokens,
@@ -83055,11 +83064,7 @@ async fn send_provider_session_output(
     if live_stream_state.is_none() {
         let max_frame_bytes = provider_session_max_frame_bytes();
         let delta_bytes = provider_session_text_delta_bytes(max_frame_bytes);
-        let parts = if output.tools.is_empty() {
-            provider_stream_parts(&output.content, delta_bytes)
-        } else {
-            Vec::new()
-        };
+        let parts = provider_stream_parts(&output.content, delta_bytes);
         let reasoning_parts = provider_stream_parts(&output.reasoning_evidence, delta_bytes);
         let token_part_count = output
             .token_ids
@@ -83226,38 +83231,12 @@ async fn send_provider_client_disconnect_receipt_if_requested(
     if !provider_session_client_disconnect_requested(bridge, active).await? {
         return Ok(());
     }
-    if state.delivered_metered_units > 0
-        && state.delivered_metered_units != state.last_checkpoint_metered_units
-    {
-        let usage = ReceiptUsage::text(state.prompt_tokens, state.delivered_metered_units);
-        let usage_attribution = if state.reasoning_units == 0 {
-            BTreeMap::new()
-        } else {
-            BTreeMap::from([("reasoning_output_tokens".to_owned(), state.reasoning_units)])
-        };
-        let receipt = provider_session_receipt_for_usage_attribution(
-            terms,
-            active,
-            body,
-            usage,
-            usage_attribution,
-            state.receipt_seq,
-            false,
-            runtime_keypair,
-        )
-        .context("building client-disconnect provider session receipt")?;
-        send_provider_session_receipt_frame(
-            bridge,
-            active,
-            request_id,
-            &receipt,
-            "client_disconnect",
-        )
-        .await?;
-        let _ =
-            wait_for_provider_receipt_ack(bridge, active, &receipt, Duration::from_secs(5), None)
-                .await;
-    }
+    let usage = if state.last_checkpoint_metered_units == 0 { ReceiptUsage::default() }
+        else { ReceiptUsage::text(state.prompt_tokens, state.last_checkpoint_metered_units) };
+    let attribution = if state.last_checkpoint_reasoning_units == 0 { BTreeMap::new() }
+        else { BTreeMap::from([("reasoning_output_tokens".to_owned(), state.last_checkpoint_reasoning_units)]) };
+    settle_cancelled_provider_session(bridge, active, request_id, terms, body, usage,
+        attribution, state.receipt_seq, runtime_keypair).await?;
     bail!("{PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT}");
 }
 
@@ -84081,12 +84060,12 @@ async fn wait_for_provider_receipt_ack_inner(
     cancellation: Option<&CancellationToken>,
     settling_cancellation: bool,
 ) -> Result<ReceiptAck> {
-    let deadline = Instant::now() + wait;
+    let mut deadline = Instant::now() + wait;
+    let mut cancellation_drain = false;
     loop {
-        if let Some(cancellation) = cancellation {
-            cancellation
-                .check()
-                .context("provider receipt acknowledgement wait cancelled")?;
+        if cancellation.is_some_and(CancellationToken::is_cancelled) && !cancellation_drain {
+            cancellation_drain = true;
+            deadline = deadline.min(Instant::now() + Duration::from_millis(500));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -84136,10 +84115,15 @@ async fn wait_for_provider_receipt_ack_inner(
                         return Ok(receipt_ack);
                     }
                     Some("s.close")
-                        if settling_cancellation
+                        if (settling_cancellation || cancellation.is_some())
                             && frame.get("reason").and_then(Value::as_str)
                                 == Some("client_disconnect") =>
                     {
+                        if !settling_cancellation && !cancellation_drain {
+                            if let Some(token) = cancellation { token.cancel(); }
+                            cancellation_drain = true;
+                            deadline = deadline.min(Instant::now() + Duration::from_millis(500));
+                        }
                         // The liveness monitor has its own subscription. Its
                         // cancellation broadcast can still be queued on this
                         // connection ahead of the final receipt acknowledgement.
@@ -90082,6 +90066,8 @@ fn provider_engine_session_response_with_sampling_bounded(
     );
     let mut reasoning_stream_filter =
         ProviderReasoningOutputFilter::with_delimiters(reasoning_output_mode, reasoning_delimiters);
+    let mut tool_stream_filter = tool_mode.as_ref().map(|mode|
+        provider_output_stream::OutputStream::new(mode.strategy, mode.tools.clone()));
     let mut token_ids = Vec::new();
     let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
     // Existing text models keep the established request-text estimate. A signed
@@ -90092,19 +90078,18 @@ fn provider_engine_session_response_with_sampling_bounded(
         .generate_with_artifacts(
             request,
             &mut |chunk: mayhem_engine::TokenChunk| {
-                if tool_mode.is_none() {
-                    if let Some(stream) = live_stream.as_deref_mut() {
-                        let filtered = reasoning_stream_filter.push_split(&chunk.text);
-                        let mut visible_chunk = chunk.clone();
-                        visible_chunk.text = filtered.visible;
-                        stream
-                            .on_token(visible_chunk, &filtered.hidden, estimated_prompt_tokens)
-                            .map_err(|err| {
-                                mayhem_engine::EngineError::InvalidConfig(format!(
-                                    "provider live stream failed: {err:#}"
-                                ))
-                            })?;
-                    }
+                if let Some(stream) = live_stream.as_deref_mut() {
+                    let filtered = reasoning_stream_filter.push_split(&chunk.text);
+                    let mut visible_chunk = chunk.clone();
+                    visible_chunk.text = if let Some(filter) = tool_stream_filter.as_mut() {
+                        let delta = filter.push(&filtered.visible);
+                        stream.append_tool_deltas(delta.tools);
+                        delta.text
+                    } else { filtered.visible };
+                    stream.on_token(visible_chunk, &filtered.hidden,
+                        protocol_prompt_tokens.unwrap_or(estimated_prompt_tokens))
+                        .map_err(|err| mayhem_engine::EngineError::InvalidConfig(
+                            format!("provider live stream failed: {err:#}")))?;
                 }
                 token_ids.push(chunk.token_id);
                 Ok(())
@@ -90113,16 +90098,17 @@ fn provider_engine_session_response_with_sampling_bounded(
             cancellation,
         )
         .context("generating provider session response with mayhem-engine")?;
-    if tool_mode.is_none() {
-        let trailing = reasoning_stream_filter.finish_split();
-        if !trailing.visible.is_empty() || !trailing.hidden.is_empty() {
-            if let Some(stream) = live_stream.as_deref_mut() {
-                stream.append_filtered_text(trailing);
-            }
+    if let Some(stream) = live_stream.as_deref_mut() {
+        let mut trailing = reasoning_stream_filter.finish_split();
+        if let Some(filter) = tool_stream_filter.as_mut() {
+            let delta = filter.push(&trailing.visible);
+            stream.append_tool_deltas(delta.tools);
+            trailing.visible = delta.text;
         }
+        stream.append_filtered_text(trailing);
     }
     let artifacts = artifact_chunks.finish()?;
-    let tools = tool_mode
+    let mut tools = tool_mode
         .as_ref()
         .and_then(|mode| {
             provider_engine_tool_call_outputs_after_reasoning(
@@ -90154,6 +90140,17 @@ fn provider_engine_session_response_with_sampling_bounded(
             output.text.trim()
         )));
     }
+    let streamed_content = if let (Some(stream), Some(filter)) =
+        (live_stream.as_deref_mut(), tool_stream_filter.as_mut()) {
+        ensure!(filter.emitted_count() <= tools.len(),
+            "provider streamed a tool call that failed final validation");
+        for (index, call) in tools.iter_mut().enumerate().take(filter.emitted_count()) {
+            call["id"] = json!(stream.tool_stream_id(index));
+        }
+        let tail = filter.finish_text(!tools.is_empty());
+        stream.append_filtered_text(ProviderReasoningFilteredText { visible: tail, hidden: String::new() });
+        Some(filter.text.clone())
+    } else { None };
     let completion_tokens = u64::from(output.usage.completion_tokens);
     let reasoning_tokens = u64::from(output.usage.reasoning_tokens).min(completion_tokens);
     let vision_tokens = u64::from(output.usage.vision_tokens);
@@ -90184,11 +90181,14 @@ fn provider_engine_session_response_with_sampling_bounded(
     );
     Ok(ProviderSessionOutput {
         usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
-        content: if tools.is_empty() {
+        content: streamed_content.unwrap_or_else(|| if tools.is_empty() {
             filtered_output.visible
         } else {
-            String::new()
-        },
+            // Native Qwen permits commentary preceding a tool call. Preserve it
+            // in both delivery modes so usage does not depend on stream=true.
+            filtered_output.visible.split_once("<tool_call>")
+                .map(|(text, _)| text.to_owned()).unwrap_or_default()
+        }),
         reasoning_evidence: filtered_output.hidden,
         tools,
         embeddings: None,
@@ -110959,12 +110959,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
 
-        for (settling, reason, valid_signature, send_ack, succeeds) in [
-            (false, "client_disconnect", true, true, false),
-            (true, "client_disconnect", true, true, true),
-            (true, "shutdown", true, true, false),
-            (true, "client_disconnect", false, true, false),
-            (true, "client_disconnect", true, false, false),
+        for (settling, cancellable, reason, valid_signature, send_ack, succeeds) in [
+            (false, false, "client_disconnect", true, true, false),
+            (true, false, "client_disconnect", true, true, true),
+            (true, false, "shutdown", true, true, false),
+            (true, false, "client_disconnect", false, true, false),
+            (true, false, "client_disconnect", true, false, false),
+            (false, true, "client_disconnect", true, true, true),
+            (false, true, "client_disconnect", true, false, false),
         ] {
             let mut terms = test_provider_session_terms();
             terms.min_session_au = 37;
@@ -111029,12 +111031,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             )
             .await
             .unwrap();
+            let cancellation = CancellationToken::new();
+            if cancellable { cancellation.cancel(); }
             let result = wait_for_provider_receipt_ack_inner(
                 &mut bridge,
                 &active,
                 &receipt,
                 Duration::from_millis(150),
-                None,
+                cancellable.then_some(&cancellation),
                 settling,
             )
             .await;

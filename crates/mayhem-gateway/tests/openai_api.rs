@@ -72,6 +72,7 @@ impl GatewaySessionBackend for TestDirectSessionBackend {
             let completion_tokens = 4;
             Ok(GatewaySessionResult {
                 output: ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some(format!(
                         "direct session response from {} via {}",
                         model.id, invocation.session_id
@@ -143,6 +144,7 @@ impl GatewaySessionBackend for SpecialityRecordingBackend {
             let completion_tokens = 4;
             Ok(GatewaySessionResult {
                 output: ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some(format!("speciality response from {}", model.id)),
                     tool_calls: Vec::new(),
                     artifacts: Vec::new(),
@@ -828,6 +830,7 @@ impl GatewaySessionBackend for ToolCallDirectSessionBackend {
             let completion_tokens = 1;
             Ok(GatewaySessionResult {
                 output: ChatOutput {
+                    reasoning_content: String::new(),
                     content: None,
                     tool_calls: vec![
                         ToolCallOutput {
@@ -878,6 +881,7 @@ impl GatewaySessionBackend for ArtifactDirectSessionBackend {
             let image = b"\x89PNG mayhem artifact".to_vec();
             Ok(GatewaySessionResult {
                 output: ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some(String::new()),
                     tool_calls: Vec::new(),
                     artifacts: vec![GatewayArtifactOutput {
@@ -927,6 +931,7 @@ impl GatewaySessionBackend for VisionInspectBackend {
             let prompt_tokens = request.messages.len() as u64;
             Ok(GatewaySessionResult {
                 output: ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some("vision ok".to_owned()),
                     tool_calls: Vec::new(),
                     artifacts: Vec::new(),
@@ -982,6 +987,7 @@ impl GatewaySessionBackend for RetryThenDirectSessionBackend {
             let completion_tokens = 3;
             Ok(GatewaySessionResult {
                 output: ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some(format!(
                         "direct retry response from {} via {}",
                         model.id, provider
@@ -1040,6 +1046,7 @@ impl GatewaySessionBackend for RetryFirstDirectSessionBackend {
             let completion_tokens = 3;
             Ok(GatewaySessionResult {
                 output: ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some(format!(
                         "direct retry response from {} via {}",
                         model.id, provider
@@ -1152,6 +1159,7 @@ impl GatewaySessionBackend for HedgeInspectBackend {
             let completion_tokens = 2;
             Ok(GatewaySessionResult {
                 output: ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some(format!("hedge inspected for {} via {}", model.id, provider)),
                     tool_calls: Vec::new(),
                     artifacts: Vec::new(),
@@ -1214,6 +1222,7 @@ impl GatewaySessionBackend for CanarySubstitutionBackend {
             let completion_tokens = token_ids.len() as u64;
             Ok(GatewaySessionResult {
                 output: ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some(content),
                     tool_calls: Vec::new(),
                     artifacts: Vec::new(),
@@ -1275,6 +1284,7 @@ impl GatewaySessionBackend for SpecialityCanaryBackend {
             let completion_tokens = token_ids.len() as u64;
             Ok(GatewaySessionResult {
                 output: ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some(format!("{effort} speciality canary output")),
                     tool_calls: Vec::new(),
                     artifacts: Vec::new(),
@@ -1352,6 +1362,7 @@ impl GatewaySessionBackend for ContextNeedleBackend {
             let completion_tokens = token_ids.len() as u64;
             Ok(GatewaySessionResult {
                 output: ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some(content),
                     tool_calls: Vec::new(),
                     artifacts: Vec::new(),
