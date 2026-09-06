@@ -82901,12 +82901,13 @@ async fn settle_cancelled_provider_session(
     .context("building cancelled provider session receipt")?;
     send_provider_session_receipt_frame(bridge, active, request_id, &receipt, "client_disconnect")
         .await?;
-    wait_for_provider_receipt_ack(
+    wait_for_provider_receipt_ack_inner(
         bridge,
         active,
         &receipt,
         provider_session_receipt_ack_timeout(active),
         None,
+        true,
     )
     .await
     .context("waiting for cancelled provider session receipt ack")?;
@@ -83997,6 +83998,17 @@ async fn wait_for_provider_receipt_ack(
     wait: Duration,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ReceiptAck> {
+    wait_for_provider_receipt_ack_inner(bridge, active, receipt, wait, cancellation, false).await
+}
+
+async fn wait_for_provider_receipt_ack_inner(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    receipt: &ProviderSignedSessionReceipt,
+    wait: Duration,
+    cancellation: Option<&CancellationToken>,
+    settling_cancellation: bool,
+) -> Result<ReceiptAck> {
     let deadline = Instant::now() + wait;
     loop {
         if let Some(cancellation) = cancellation {
@@ -84050,6 +84062,17 @@ async fn wait_for_provider_receipt_ack(
                             .await?;
                         }
                         return Ok(receipt_ack);
+                    }
+                    Some("s.close")
+                        if settling_cancellation
+                            && frame.get("reason").and_then(Value::as_str)
+                                == Some("client_disconnect") =>
+                    {
+                        // The liveness monitor has its own subscription. Its
+                        // cancellation broadcast can still be queued on this
+                        // connection ahead of the final receipt acknowledgement.
+                        // Keep the original deadline and wait for that signed ACK.
+                        continue;
                     }
                     Some("s.close") => {
                         bail!("session {} closed before s.receipt_ack", active.session_id);
@@ -110711,6 +110734,98 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         verifying_key
             .verify_strict(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_receipt_ack_survives_queued_disconnect_without_weakening_validation() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        for (settling, reason, valid_signature, send_ack, succeeds) in [
+            (false, "client_disconnect", true, true, false),
+            (true, "client_disconnect", true, true, true),
+            (true, "shutdown", true, true, false),
+            (true, "client_disconnect", false, true, false),
+            (true, "client_disconnect", true, false, false),
+        ] {
+            let mut terms = test_provider_session_terms();
+            terms.min_session_au = 37;
+            let mut active = test_active_provider_session(&terms, vec!["image".to_owned()]);
+            let user_key = SigningKey::from_bytes(&[6; 32]);
+            active.user_pubkey = hex_encode(&user_key.verifying_key().to_bytes());
+            let receipt = provider_cancelled_session_receipt(
+                &terms,
+                &active,
+                &json!({
+                    "mayhem_contract": {
+                        "endpoint_family": mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+                    },
+                    "contract_request": {"prompt": "cancelled render"},
+                }),
+                ReceiptUsage::default(),
+                BTreeMap::new(),
+                1,
+                &RuntimeKeypair::from_seed([9; 32]),
+            )
+            .unwrap();
+            let signature = if valid_signature {
+                hex_encode(
+                    &user_key
+                        .sign(&receipt_signing_bytes(&receipt.body).unwrap())
+                        .to_bytes(),
+                )
+            } else {
+                "00".repeat(64)
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let session_id = active.session_id.clone();
+            let remote = active.remote.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let auth: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                socket
+                    .send(Message::Text(
+                        json!({"id": auth["id"], "type": "auth_ok"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                // The monitor consumed its copy; the settlement connection
+                // still sees the original broadcast before the buyer's ACK.
+                let mut frames = vec![json!({"t": "s.close", "reason": reason})];
+                if send_ack {
+                    frames.push(json!({"t": "s.receipt_ack", "session_id": session_id, "seq": 1, "user_sig": signature}));
+                }
+                for frame in frames {
+                    socket.send(Message::Text(json!({"type": "session_frame", "session_id": session_id, "remote": remote, "frame": frame}).to_string().into())).await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+            let mut bridge = ScBridgeClient::connect(
+                ScBridgeConfig::new(format!("ws://{address}"), "test-token").unwrap(),
+            )
+            .await
+            .unwrap();
+            let result = wait_for_provider_receipt_ack_inner(
+                &mut bridge,
+                &active,
+                &receipt,
+                Duration::from_millis(150),
+                None,
+                settling,
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds, "settling={settling}, reason={reason}, valid_signature={valid_signature}, send_ack={send_ack}: {result:?}");
+            if !send_ack {
+                assert!(result.unwrap_err().to_string().contains("timed out"));
+            }
+            server.await.unwrap();
+        }
     }
 
     #[test]
