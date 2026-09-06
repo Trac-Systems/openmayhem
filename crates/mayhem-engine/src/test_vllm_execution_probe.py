@@ -101,13 +101,15 @@ class ObservationTests(unittest.IsolatedAsyncioTestCase):
             "model_ctx": lambda size: size,
             "vocab_size": lambda: 100,
             "runtime_kv_cache_info": lambda: {"size_tokens": 262144, "max_concurrency": 1},
-            "GenerationMultiplexer": lambda *args: object(),
+            "GenerationMultiplexer": lambda *args, **kwargs: object(),
             "send": lambda message: None, "finish_request": lambda request_id: None,
             "check_cancelled": lambda request_id: None,
             "engine": None, "tokenizer": None, "processor": None,
             "generation_multiplexer": None, "execution_properties": None,
+            "engine_health_monitor": None,
             "batch_invariant": False, "kernel_policy": "auto",
         })
+        self.addAsyncCleanup(self.ns["stop_engine_health_monitor"])
         auto = SimpleNamespace(from_pretrained=lambda *args, **kwargs: None)
         self.transformers = patch.dict(sys.modules, {"transformers": SimpleNamespace(
             AutoTokenizer=auto, AutoProcessor=auto

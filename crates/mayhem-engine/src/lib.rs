@@ -9491,6 +9491,15 @@ exec "$@""#)
         }
 
         fn route(&self, message: WorkerMessage) {
+            // A vLLM EngineCore can die while its Python protocol wrapper survives.
+            if message.kind == "fatal" {
+                self.fail(
+                    message.error.unwrap_or_else(|| {
+                        "vLLM engine failed behind its Python worker".to_owned()
+                    }),
+                );
+                return;
+            }
             let id = message.id;
             let terminal = message.kind != "token";
             let sender = {
@@ -10092,6 +10101,58 @@ exec "$@""#)
                 cancelled: false,
                 abort_failed: false,
             }
+        }
+
+        #[test]
+        fn vllm_fatal_engine_event_fails_active_and_future_requests() {
+            let router = Arc::new(WorkerRouter::default());
+            let mut first = WorkerRoute::new(1, Arc::clone(&router), 1).unwrap();
+            let mut second = WorkerRoute::new(2, Arc::clone(&router), 1).unwrap();
+            first.mark_sent();
+            second.mark_sent();
+            let fatal = serde_json::from_value(json!({
+                "id": 0, "type": "fatal", "error": "vLLM engine is unhealthy",
+            }))
+            .unwrap();
+
+            router.route(fatal);
+
+            for route in [&mut first, &mut second] {
+                assert!(matches!(
+                    route.recv().unwrap(),
+                    WorkerEvent::Failure(error) if error == "vLLM engine is unhealthy"
+                ));
+                route.mark_terminal();
+            }
+            assert_eq!(
+                router.failure().as_deref(),
+                Some("vLLM engine is unhealthy")
+            );
+            assert!(router.register(3, 1).is_err());
+        }
+
+        #[test]
+        fn vllm_request_error_does_not_mark_engine_unhealthy() {
+            let router = Arc::new(WorkerRouter::default());
+            let mut request = WorkerRoute::new(1, Arc::clone(&router), 1).unwrap();
+            request.mark_sent();
+            router.route(
+                serde_json::from_value(json!({
+                    "id": 1, "type": "response", "ok": false,
+                    "error": "invalid sampling parameter",
+                }))
+                .unwrap(),
+            );
+            assert!(matches!(
+                request.recv().unwrap(),
+                WorkerEvent::Message(WorkerMessage {
+                    ok: Some(false),
+                    ..
+                })
+            ));
+            request.mark_terminal();
+            assert!(router.failure().is_none());
+            assert!(router.register(2, 1).is_ok());
         }
 
         #[test]
@@ -10731,6 +10792,7 @@ sent = []
 namespace.update({
     "engine": StreamingEngine(),
     "generation_multiplexer": None,
+    "engine_health_monitor": None,
     "prepare_generation_request": lambda request_id, payload: prepared,
     "request_cancelled": lambda request_id: False,
     "send": sent.append,
@@ -11513,7 +11575,10 @@ printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,
             validate_vllm_execution_report(&config, Some(&report)).unwrap();
             for (pointer, value) in [
                 ("/worker_execution_observation", Value::Null),
-                ("/worker_execution_observation/source", json!("frontend_config")),
+                (
+                    "/worker_execution_observation/source",
+                    json!("frontend_config"),
+                ),
                 ("/worker_execution_observation/rank_count", json!(1)),
                 ("/worker_execution_observation/world_size", json!(1)),
                 ("/worker_execution_observation/ranks", json!([])),
@@ -11522,10 +11587,22 @@ printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,
                 ("/worker_execution_observation/ranks/0/local_rank", json!(2)),
                 ("/worker_execution_observation/ranks/0/world_size", json!(1)),
                 ("/worker_execution_observation/ranks/0/pid", json!(0)),
-                ("/worker_execution_observation/ranks/0/compilation_mode", json!(3)),
-                ("/worker_execution_observation/ranks/0/cudagraph_mode", json!("NONE")),
-                ("/worker_execution_observation/ranks/1/compilation_mode", json!(3)),
-                ("/worker_execution_observation/ranks/1/cudagraph_mode", json!("NONE")),
+                (
+                    "/worker_execution_observation/ranks/0/compilation_mode",
+                    json!(3),
+                ),
+                (
+                    "/worker_execution_observation/ranks/0/cudagraph_mode",
+                    json!("NONE"),
+                ),
+                (
+                    "/worker_execution_observation/ranks/1/compilation_mode",
+                    json!(3),
+                ),
+                (
+                    "/worker_execution_observation/ranks/1/cudagraph_mode",
+                    json!("NONE"),
+                ),
             ] {
                 let mut changed = matching.clone();
                 *changed.pointer_mut(pointer).unwrap() = value;

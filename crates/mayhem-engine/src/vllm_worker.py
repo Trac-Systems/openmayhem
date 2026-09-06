@@ -33,6 +33,7 @@ active_request_ids = set()
 cancelled_requests_lock = threading.Lock()
 completed_request_id = 0
 generation_multiplexer = None
+engine_health_monitor = None
 
 
 MAX_KERNEL_BACKEND_LENGTH = 64
@@ -42,6 +43,61 @@ MAX_EXECUTION_PROBE_SECONDS = 10.0
 
 class RequestCancelled(Exception):
     pass
+
+
+class EngineHealthMonitor:
+    error = "vLLM engine health check failed"
+
+    def __init__(self, loaded_engine, emit, interval=1.0):
+        self.engine = loaded_engine
+        self._emit = emit
+        self._interval = interval
+        self._fatal = False
+        self._task = None
+
+    def check(self):
+        if not self._fatal:
+            # AsyncLLM.errored includes EngineCore death even while the wrapper
+            # is running. Do not use check_health fallbacks that may perform RPC.
+            try:
+                errored = getattr(self.engine, "errored", False)
+            except Exception:
+                return False
+            if errored is True:
+                self._fatal = True
+                self._emit({"id": 0, "type": "fatal", "error": self.error})
+        return self._fatal
+
+    def raise_if_dead(self):
+        if self.check():
+            raise RuntimeError(self.error)
+
+    def start(self):
+        if self._task is None:
+            self._task = asyncio.create_task(
+                self._monitor(), name="mayhem-vllm-health"
+            )
+
+    async def _monitor(self):
+        while not self.check():
+            await asyncio.sleep(self._interval)
+
+    async def stop(self):
+        task = self._task
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            self._task = None
+
+
+async def stop_engine_health_monitor():
+    global engine_health_monitor
+    if engine_health_monitor is not None:
+        await engine_health_monitor.stop()
+        engine_health_monitor = None
 
 
 def register_request(request_id):
@@ -95,7 +151,9 @@ async def abort_engine_request(request_id):
 
 
 class GenerationMultiplexer:
-    def __init__(self, capacity, generate, abort, emit, complete, abort_timeout=2.0):
+    def __init__(
+        self, capacity, generate, abort, emit, complete, abort_timeout=2.0, health=None
+    ):
         capacity = int(capacity)
         if capacity < 1:
             raise ValueError("vLLM generation capacity must be positive")
@@ -105,6 +163,7 @@ class GenerationMultiplexer:
         self._emit = emit
         self._complete = complete
         self._abort_timeout = float(abort_timeout)
+        self._health = health
         self._semaphore = asyncio.Semaphore(capacity)
         self._tasks = {}
         self._running = set()
@@ -152,6 +211,8 @@ class GenerationMultiplexer:
         try:
             async with self._semaphore:
                 check_cancelled(request_id)
+                if self._health is not None:
+                    self._health.raise_if_dead()
                 self._running.add(request_id)
                 try:
                     # Cancellation is cooperative: the request marker and the
@@ -165,6 +226,8 @@ class GenerationMultiplexer:
                 {"id": request_id, "type": "response", "ok": True, "result": result}
             )
         except (RequestCancelled, asyncio.CancelledError) as exc:
+            if self._health is not None:
+                self._health.check()
             error = str(exc) or "engine request cancelled"
             abort_failed = request_id in self._abort_failures
             message = {
@@ -178,6 +241,8 @@ class GenerationMultiplexer:
                 message["abort_failed"] = True
             self._emit(message)
         except Exception as exc:
+            if self._health is not None:
+                self._health.check()
             error = str(exc) or repr(exc) or type(exc).__name__
             message = {
                 "id": request_id,
@@ -1283,6 +1348,8 @@ def prepare_generation_request(request_id, payload):
 async def async_handle_generate(request_id, payload):
     prepared = await asyncio.to_thread(prepare_generation_request, request_id, payload)
     check_cancelled(request_id)
+    if engine_health_monitor is not None:
+        engine_health_monitor.raise_if_dead()
     if prepared["empty"]:
         return {
             "text": "",
@@ -1376,10 +1443,14 @@ async def async_handle_generate(request_id, payload):
 
 async def handle_load(payload):
     global engine, tokenizer, processor, ctx_size, model_path, generation_multiplexer
-    global execution_properties
+    global execution_properties, engine_health_monitor
     model_path = str(payload["path"])
     ctx_size = positive_int(payload.get("ctx_size"), 2048)
-    engine = create_engine(payload)
+    initialized_engine = create_engine(payload)
+    await stop_engine_health_monitor()
+    engine = initialized_engine
+    engine_health_monitor = EngineHealthMonitor(engine, send)
+    engine_health_monitor.start()
     if optional_compilation_config(payload):
         initialized_engine = engine
         frontend_properties = execution_properties
@@ -1388,6 +1459,7 @@ async def handle_load(payload):
             observed = await observe_worker_execution(initialized_engine, payload)
             execution_properties = {**frontend_properties, **observed}
         except BaseException as error:
+            await stop_engine_health_monitor()
             engine = tokenizer = processor = generation_multiplexer = None
             try:
                 await shutdown_rejected_engine(initialized_engine)
@@ -1416,6 +1488,7 @@ async def handle_load(payload):
         abort_engine_request,
         send,
         finish_request,
+        health=engine_health_monitor,
     )
     return {
         "n_ctx_train": model_ctx(ctx_size),
@@ -1502,30 +1575,33 @@ def read_requests():
 async def run_worker():
     global generation_multiplexer
 
-    while True:
-        request = await asyncio.to_thread(request_queue.get)
-        if request is None:
-            break
-        request_id = int(request.get("id", 0))
-        op = str(request.get("op", ""))
-        if op == "generate":
-            if generation_multiplexer is None:
-                await emit_control_response(request)
+    try:
+        while True:
+            request = await asyncio.to_thread(request_queue.get)
+            if request is None:
+                break
+            request_id = int(request.get("id", 0))
+            op = str(request.get("op", ""))
+            if op == "generate":
+                if generation_multiplexer is None:
+                    await emit_control_response(request)
+                    continue
+                try:
+                    generation_multiplexer.submit(request_id, request.get("payload") or {})
+                except Exception as exc:
+                    error = str(exc) or repr(exc) or type(exc).__name__
+                    send({"id": request_id, "type": "response", "ok": False, "error": error})
+                    finish_request(request_id)
                 continue
-            try:
-                generation_multiplexer.submit(request_id, request.get("payload") or {})
-            except Exception as exc:
-                error = str(exc) or repr(exc) or type(exc).__name__
-                send({"id": request_id, "type": "response", "ok": False, "error": error})
-                finish_request(request_id)
-            continue
+
+            if generation_multiplexer is not None:
+                await generation_multiplexer.drain()
+            await emit_control_response(request)
 
         if generation_multiplexer is not None:
             await generation_multiplexer.drain()
-        await emit_control_response(request)
-
-    if generation_multiplexer is not None:
-        await generation_multiplexer.drain()
+    finally:
+        await stop_engine_health_monitor()
 
 
 threading.Thread(target=read_requests, name="mayhem-vllm-control", daemon=True).start()

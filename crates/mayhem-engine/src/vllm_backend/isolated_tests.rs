@@ -44,8 +44,13 @@ def complete(request):
         'finish_reason': 'stop'}})
 
 active = None
+fatal_sent = False
 deadline = time.monotonic() + 15
 while time.monotonic() < deadline:
+    if not fatal_sent and (root / f'fatal-{index}').exists():
+        send({'id': 0, 'type': 'fatal', 'error': 'vLLM engine is unhealthy'})
+        fatal_sent = True
+        active = None
     if active and (root / ('release-' + active['payload']['prompt'])).exists():
         complete(active)
         active = None
@@ -89,13 +94,15 @@ struct Fixture {
 
 impl Fixture {
     fn new(plans: Value) -> Self {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = env::temp_dir().join(format!(
-            "mayhem-vllm-isolated-{}-{}",
+            "mayhem-vllm-isolated-{}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         ));
         fs::create_dir_all(root.join("bin")).unwrap();
         fs::create_dir_all(root.join("checkpoint")).unwrap();
@@ -196,6 +203,83 @@ fn generate(
     thread::spawn(move || {
         backend.generate(GenerateRequest::new(prompt), &mut |_| Ok(()), &cancellation)
     })
+}
+
+#[test]
+fn engine_death_behind_live_wrapper_blocks_admission_and_recovers_after_sibling_finishes() {
+    let fixture = Fixture::new(json!([plan(8192), plan(8192)]));
+    let config = fixture.config(2);
+    let mut backend = fixture.backend();
+    backend.load(config.clone()).unwrap();
+    let concurrent = backend.concurrent_generation_backend().unwrap();
+    let healthy_request = generate(
+        Arc::clone(&concurrent),
+        "hold-survivor",
+        CancellationToken::new(),
+    );
+    let healthy_pid = fixture.read("seen-hold-survivor.json")["pid"]
+        .as_u64()
+        .unwrap();
+    let failed_index = if fixture.read("spawn-0.json")["pid"].as_u64() == Some(healthy_pid) {
+        1
+    } else {
+        0
+    };
+    fs::write(fixture.root.join(format!("fatal-{failed_index}")), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while backend.component_healthy() {
+        assert!(
+            Instant::now() < deadline,
+            "fatal engine event was not observed"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(backend.isolated_workers[failed_index]
+        .process
+        .lock()
+        .unwrap()
+        .child
+        .try_wait()
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        backend.isolated_workers[failed_index]
+            .router
+            .failure()
+            .as_deref(),
+        Some("vLLM engine is unhealthy"),
+    );
+    assert!(!healthy_request.is_finished());
+    let error = concurrent
+        .generate(
+            GenerateRequest::new("must-not-dispatch"),
+            &mut |_| Ok(()),
+            &CancellationToken::new(),
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("pool is unhealthy"));
+    assert!(!fixture.root.join("seen-must-not-dispatch.json").exists());
+
+    fixture.release("hold-survivor");
+    assert!(healthy_request
+        .join()
+        .unwrap()
+        .unwrap()
+        .text
+        .ends_with(":hold-survivor"));
+    drop(concurrent);
+    backend.load(config).unwrap();
+    assert!(backend.component_healthy());
+    let recovered = backend.concurrent_generation_backend().unwrap();
+    assert_eq!(recovered.capacity(), 2);
+    assert!(generate(recovered, "recovered", CancellationToken::new())
+        .join()
+        .unwrap()
+        .unwrap()
+        .text
+        .ends_with(":recovered"));
+    drop(backend);
+    fixture.assert_exited(4);
 }
 
 #[test]
