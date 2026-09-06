@@ -28,7 +28,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex, Once,
+    Arc, Mutex, Once, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -60361,6 +60361,7 @@ const RECEIPT_SETTLEMENT_OBSOLETE_RECEIPT_SCHEMA_ERROR: &str =
 #[derive(Clone)]
 struct ReceiptSettlementOutbox {
     directory: PathBuf,
+    fresh_entries: Arc<OnceLock<tokio::sync::mpsc::Sender<PathBuf>>>,
 }
 
 impl std::fmt::Debug for ReceiptSettlementOutbox {
@@ -60484,7 +60485,10 @@ fn receipt_settlement_entry_supersedes(
 
 impl ReceiptSettlementOutbox {
     fn new(directory: PathBuf) -> Result<Self> {
-        let outbox = Self { directory };
+        let outbox = Self {
+            directory,
+            fresh_entries: Arc::new(OnceLock::new()),
+        };
         outbox.ensure_directory()?;
         outbox.compact_entries()?;
         Ok(outbox)
@@ -60829,6 +60833,11 @@ impl ReceiptSettlementOutbox {
         sync_receipt_settlement_directory(&self.directory)?;
         let entry = self.load_entry(&path)?;
         fs2::FileExt::unlock(&lock).context("unlocking receipt settlement outbox")?;
+        if let Some(fresh_entries) = self.fresh_entries.get() {
+            // Only a path is queued, after the signed evidence is durable.
+            // Saturation leaves the normal disk retry responsible for it.
+            let _ = fresh_entries.try_send(entry.path.clone());
+        }
         Ok(entry)
     }
 
@@ -60912,6 +60921,43 @@ impl ReceiptSettlementOutbox {
     }
 
     fn spawn_retry(self: Arc<Self>, rpc: PeerRpcClient) {
+        let (sender, mut fresh_entries) =
+            tokio::sync::mpsc::channel::<PathBuf>(RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES);
+        if self.fresh_entries.set(sender).is_err() {
+            return;
+        }
+        let fresh_outbox = self.clone();
+        let fresh_rpc = rpc.clone();
+        tokio::spawn(async move {
+            let mut submissions = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    path = fresh_entries.recv(),
+                        if submissions.len() < RECEIPT_SETTLEMENT_RETRY_CONCURRENCY => {
+                        let Some(path) = path else { break };
+                        // Another submitter or a newer checkpoint may already
+                        // have removed this path; the durable disk pass remains
+                        // authoritative for pending evidence.
+                        let Ok(entry) = fresh_outbox.load_entry(&path) else { continue };
+                        let outbox = fresh_outbox.clone();
+                        let rpc = fresh_rpc.clone();
+                        submissions.spawn(async move { outbox.submit_entry(&rpc, entry).await });
+                    }
+                    result = submissions.join_next(), if !submissions.is_empty() => {
+                        match result {
+                            Some(Ok(Ok(()))) => {}
+                            Some(Ok(Err(error))) => eprintln!(
+                                "Mayhem retained fresh receipt settlement evidence for retry: {error:#}"
+                            ),
+                            Some(Err(error)) => eprintln!(
+                                "Mayhem fresh receipt settlement worker failed; evidence remains durable: {error}"
+                            ),
+                            None => {}
+                        }
+                    }
+                }
+            }
+        });
         tokio::spawn(async move {
             let mut consecutive_pending = 0_u32;
             loop {
@@ -109997,6 +110043,108 @@ esac
             assert!(delay <= RECEIPT_SETTLEMENT_RETRY_MAX);
         }
         assert!(receipt_settlement_retry_delay(5) > RECEIPT_SETTLEMENT_RETRY_INITIAL);
+    }
+
+    #[tokio::test]
+    async fn fresh_receipt_is_submitted_while_older_relay_is_stalled() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = test_temp_dir("mayhem-receipt-fresh-submission");
+        let outbox = Arc::new(ReceiptSettlementOutbox::new(root.clone()).unwrap());
+        let old = signed_receipt_settlement_feature_for_test(7);
+        let old_entry = outbox.persist(&old).unwrap();
+        let mut receipt = parse_record_usage_receipt_envelope(&old["value"]["receipt"]).unwrap();
+        receipt.body.billing_id = "52".repeat(32);
+        receipt.body.reservation_id = "53".repeat(32);
+        let payload = receipt_signing_bytes(&receipt.body).unwrap();
+        receipt.enclave_sig = hex_encode(&SigningKey::from_bytes(&[32; 32]).sign(&payload).to_bytes());
+        receipt.user_sig = hex_encode(&SigningKey::from_bytes(&[33; 32]).sign(&payload).to_bytes());
+        let key = record_usage_receipt_feature_key(&receipt);
+        let mut value = json!({
+            "op": "record_usage_receipt", "contract_version": CONTRACT_VERSION,
+            "epoch": 7, "payout_revision": receipt.body.payout_revision,
+            "receipt": record_usage_receipt_envelope(&receipt),
+        });
+        value["provider_sig"] = json!(hex_encode(
+            &SigningKey::from_bytes(&[31; 32])
+                .sign(&record_usage_receipt_signing_bytes(&key, &value).unwrap())
+                .to_bytes()
+        ));
+        let fresh = json!({"feature": "mayhem", "key": key, "value": value});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_old, mut old_seen) = tokio::sync::mpsc::channel(1);
+        let release_old = Arc::new(tokio::sync::Notify::new());
+        let server_release = release_old.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let seen_old = seen_old.clone();
+                let release = server_release.clone();
+                requests.spawn(async move {
+                    let mut bytes = Vec::new();
+                    let (header_end, length) = loop {
+                        let mut chunk = [0_u8; 4096];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = bytes.windows(4).position(|x| x == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            let length = headers.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            }).unwrap();
+                            break (end + 4, length);
+                        }
+                    };
+                    while bytes.len() < header_end + length {
+                        let mut chunk = [0_u8; 4096];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&chunk[..n]);
+                    }
+                    let feature: Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                    if feature["value"]["receipt"]["body"]["billing_id"] == "42".repeat(32) {
+                        seen_old.send(()).await.unwrap();
+                        release.notified().await;
+                    }
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").await.unwrap();
+                });
+            }
+            while let Some(result) = requests.join_next().await {
+                result.unwrap();
+            }
+        });
+        outbox
+            .clone()
+            .spawn_retry(PeerRpcClient::new(format!("http://{address}/v1")).unwrap());
+        timeout(Duration::from_secs(3), old_seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let fresh_entry = outbox.persist(&fresh).unwrap();
+        timeout(Duration::from_secs(3), async {
+            while fresh_entry.path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fresh receipt must bypass the stalled disk retry pass");
+        assert!(
+            old_entry.path.exists(),
+            "older evidence must remain durable while its relay is stalled"
+        );
+        release_old.notify_one();
+        server.await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            while old_entry.path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
