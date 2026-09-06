@@ -24968,6 +24968,21 @@ async fn run_live_direct_chat_sse_inner(
         };
         let frame = match frame_result {
             Ok(frame) => frame,
+            Err(err) if is_client_disconnect_error(&err) => {
+                // Explicit job cancellation races the HTTP socket closing.
+                // Preserve the same acknowledged high water on either path;
+                // a bare cancellation error would expect a zero-usage receipt.
+                return Err(client_disconnect_direct_session_error(
+                    &session.request,
+                    &content,
+                    &reasoning_evidence,
+                    tool_calls.clone(),
+                    latest_checkpoint_receipt.as_ref(),
+                    &token_ids,
+                    &watchdog,
+                    now_millis_u64(),
+                ));
+            }
             Err(err) if err.message.starts_with("timed out waiting") => {
                 let now = now_millis_u64();
                 if let Some(ack_frame) = latest_checkpoint_ack_frame.clone() {
