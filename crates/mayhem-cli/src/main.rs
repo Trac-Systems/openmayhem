@@ -5,6 +5,7 @@ mod endpoint_calibration;
 mod gemma4;
 mod intercom_runtime;
 mod python_runtime;
+mod provider_output_stream;
 mod release_bundle;
 
 #[cfg(test)]
@@ -28,7 +29,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex, Once,
+    Arc, Mutex, Once, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -68,10 +69,10 @@ use mayhem_enclave::{
 use mayhem_engine::ComfyUiBackend;
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, CancellationToken,
-    ComfyUiCustomNodePackage, ComfyUiModelFile, ConcurrentGenerationBackend, EngineBackend,
-    EngineError, GenerateRequest, GenerateSpecialityParameter, GenerateSpecialityTarget,
-    GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
-    MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
+    ComfyUiCustomNodePackage, ComfyUiModelFile, ComponentRecovery, ConcurrentGenerationBackend,
+    EngineBackend, EngineError, GenerateRequest, GenerateSpecialityParameter,
+    GenerateSpecialityTarget, GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest,
+    LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, WorkflowGenerationRequest,
     WorkflowInputFile, MTMD_MEDIA_MARKER,
 };
@@ -60361,6 +60362,7 @@ const RECEIPT_SETTLEMENT_OBSOLETE_RECEIPT_SCHEMA_ERROR: &str =
 #[derive(Clone)]
 struct ReceiptSettlementOutbox {
     directory: PathBuf,
+    fresh_entries: Arc<OnceLock<tokio::sync::mpsc::Sender<PathBuf>>>,
 }
 
 impl std::fmt::Debug for ReceiptSettlementOutbox {
@@ -60484,7 +60486,10 @@ fn receipt_settlement_entry_supersedes(
 
 impl ReceiptSettlementOutbox {
     fn new(directory: PathBuf) -> Result<Self> {
-        let outbox = Self { directory };
+        let outbox = Self {
+            directory,
+            fresh_entries: Arc::new(OnceLock::new()),
+        };
         outbox.ensure_directory()?;
         outbox.compact_entries()?;
         Ok(outbox)
@@ -60598,10 +60603,23 @@ impl ReceiptSettlementOutbox {
             paths.len() <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES.saturating_mul(2),
             "receipt settlement outbox exceeded its bounded recovery file count"
         );
+        self.load_physical_entries_at_paths(paths)
+    }
+
+    fn load_physical_entries_at_paths(
+        &self,
+        paths: Vec<PathBuf>,
+    ) -> Result<Vec<ReceiptSettlementOutboxEntry>> {
         let mut entries = Vec::new();
         for path in paths {
             match self.load_entry(&path) {
                 Ok(entry) => entries.push(entry),
+                // A successful publisher or a newer checkpoint can remove an
+                // entry after read_dir. That must not pause paid admission.
+                Err(error)
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) => {}
                 Err(error) => {
                     if let Some(reason) = receipt_settlement_outbox_quarantine_reason(&error) {
                         self.quarantine_unsubmitable_entry(&path, &error, &reason)?;
@@ -60829,6 +60847,11 @@ impl ReceiptSettlementOutbox {
         sync_receipt_settlement_directory(&self.directory)?;
         let entry = self.load_entry(&path)?;
         fs2::FileExt::unlock(&lock).context("unlocking receipt settlement outbox")?;
+        if let Some(fresh_entries) = self.fresh_entries.get() {
+            // Only a path is queued, after the signed evidence is durable.
+            // Saturation leaves the normal disk retry responsible for it.
+            let _ = fresh_entries.try_send(entry.path.clone());
+        }
         Ok(entry)
     }
 
@@ -60912,6 +60935,43 @@ impl ReceiptSettlementOutbox {
     }
 
     fn spawn_retry(self: Arc<Self>, rpc: PeerRpcClient) {
+        let (sender, mut fresh_entries) =
+            tokio::sync::mpsc::channel::<PathBuf>(RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES);
+        if self.fresh_entries.set(sender).is_err() {
+            return;
+        }
+        let fresh_outbox = self.clone();
+        let fresh_rpc = rpc.clone();
+        tokio::spawn(async move {
+            let mut submissions = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    path = fresh_entries.recv(),
+                        if submissions.len() < RECEIPT_SETTLEMENT_RETRY_CONCURRENCY => {
+                        let Some(path) = path else { break };
+                        // Another submitter or a newer checkpoint may already
+                        // have removed this path; the durable disk pass remains
+                        // authoritative for pending evidence.
+                        let Ok(entry) = fresh_outbox.load_entry(&path) else { continue };
+                        let outbox = fresh_outbox.clone();
+                        let rpc = fresh_rpc.clone();
+                        submissions.spawn(async move { outbox.submit_entry(&rpc, entry).await });
+                    }
+                    result = submissions.join_next(), if !submissions.is_empty() => {
+                        match result {
+                            Some(Ok(Ok(()))) => {}
+                            Some(Ok(Err(error))) => eprintln!(
+                                "Mayhem retained fresh receipt settlement evidence for retry: {error:#}"
+                            ),
+                            Some(Err(error)) => eprintln!(
+                                "Mayhem fresh receipt settlement worker failed; evidence remains durable: {error}"
+                            ),
+                            None => {}
+                        }
+                    }
+                }
+            }
+        });
         tokio::spawn(async move {
             let mut consecutive_pending = 0_u32;
             loop {
@@ -60943,6 +61003,19 @@ impl GatewayReceiptSettlementPublisher for ReceiptSettlementOutbox {
     fn queue(&self, feature: &Value) -> std::result::Result<(), String> {
         self.persist(feature)
             .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn has_pending_final_receipts(&self, user: &str, rail: &str) -> std::result::Result<bool, String> {
+        self.load_entries()
+            .map(|entries| {
+                entries.iter().any(|entry| {
+                    let body = &entry.feature["value"]["receipt"]["body"];
+                    entry.final_receipt
+                        && body["user"].as_str() == Some(user)
+                        && body["rail"].as_str() == Some(rail)
+                })
+            })
             .map_err(|error| format!("{error:#}"))
     }
 }
@@ -61315,6 +61388,9 @@ trait ProviderSessionResponder {
     fn component_healthy(&mut self) -> bool {
         true
     }
+    fn recover_component(&mut self) -> Result<ComponentRecovery> {
+        Ok(ComponentRecovery::Unsupported)
+    }
     fn supports_live_text_streaming(&self) -> bool {
         false
     }
@@ -61409,6 +61485,10 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
 
     fn component_healthy(&mut self) -> bool {
         self.backend.component_healthy()
+    }
+
+    fn recover_component(&mut self) -> Result<ComponentRecovery> {
+        self.backend.recover_component().map_err(Into::into)
     }
 
     fn process_ids(&self) -> Vec<u32> {
@@ -78975,7 +79055,27 @@ async fn serve_provider_sessions(
                     "provider engine child exited while idle; no user session caused the failure",
                 );
             }
-            if engine_recovery.retry_due(Instant::now()) && sessions.is_empty() {
+            let mut component_recovery_pending = false;
+            if engine_recovery.retry_due(Instant::now()) {
+                match responder.recover_component() {
+                    Ok(ComponentRecovery::Recovered) => {
+                        engine_recovery.mark_recovered();
+                        engine_watchdog.reset_after_restart();
+                        engine_watchdog_reject = None;
+                        provider_log(
+                            ctx.args,
+                            "Failed provider worker recovered; healthy concurrent requests were preserved.",
+                        );
+                    }
+                    Ok(ComponentRecovery::Pending) => component_recovery_pending = true,
+                    Ok(ComponentRecovery::Unsupported) => {}
+                    Err(err) => engine_recovery.mark_reload_failed(
+                        format!("isolated provider worker recovery failed: {err:#}"),
+                        Instant::now(),
+                    ),
+                }
+            }
+            if !component_recovery_pending && engine_recovery.retry_due(Instant::now()) && sessions.is_empty() {
                 heartbeat_load.set_accepting_new(false);
                 let reason = engine_recovery
                     .reason()
@@ -82272,6 +82372,7 @@ struct ProviderSessionLiveStreamState {
     next_index: u64,
     receipt_seq: u64,
     last_checkpoint_metered_units: u64,
+    last_checkpoint_reasoning_units: u64,
     delivered_metered_units: u64,
     reasoning_units: u64,
     prompt_tokens: u64,
@@ -82290,6 +82391,7 @@ struct ProviderSessionLiveStream<'a> {
     next_index: u64,
     receipt_seq: u64,
     last_checkpoint_metered_units: u64,
+    last_checkpoint_reasoning_units: u64,
     first_ttft_ms: Option<u64>,
     first_token_at: Option<Instant>,
     last_token_at: Option<Instant>,
@@ -82299,6 +82401,7 @@ struct ProviderSessionLiveStream<'a> {
     streamed_any: bool,
     pending_text: String,
     pending_hidden_reasoning: String,
+    pending_tool_deltas: Vec<Value>,
     pending_token_ids: Vec<i32>,
     visible_text: String,
     hidden_reasoning: String,
@@ -82549,6 +82652,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             next_index: 0,
             receipt_seq: 1,
             last_checkpoint_metered_units: 0,
+            last_checkpoint_reasoning_units: 0,
             first_ttft_ms: None,
             first_token_at: None,
             last_token_at: None,
@@ -82558,6 +82662,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             streamed_any: false,
             pending_text: String::new(),
             pending_hidden_reasoning: String::new(),
+            pending_tool_deltas: Vec::new(),
             pending_token_ids: Vec::new(),
             visible_text: String::new(),
             hidden_reasoning: String::new(),
@@ -82638,10 +82743,26 @@ impl<'a> ProviderSessionLiveStream<'a> {
                 })
             })?;
             self.last_checkpoint_metered_units = self.delivered_metered_units;
+            self.last_checkpoint_reasoning_units = metered_output_units("", &self.hidden_reasoning, &[]);
             self.receipt_seq = self.receipt_seq.saturating_add(1);
         }
         self.poll_client_disconnect()?;
         Ok(())
+    }
+
+    fn tool_stream_id(&self, index: usize) -> String {
+        format!("call-{}", stable_value_hash(&json!({"request": self.request_id, "index": index})))
+    }
+
+    fn append_tool_deltas(&mut self, deltas: Vec<Value>) {
+        for mut delta in deltas {
+            if delta.get("name").is_some() {
+                if let Some(index) = delta.get("index").and_then(Value::as_u64) {
+                    delta["id"] = json!(self.tool_stream_id(index as usize));
+                }
+            }
+            self.pending_tool_deltas.push(delta);
+        }
     }
 
     fn append_filtered_text(&mut self, filtered: ProviderReasoningFilteredText) {
@@ -82691,10 +82812,10 @@ impl<'a> ProviderSessionLiveStream<'a> {
         } else {
             ReceiptUsage::text(self.prompt_tokens, self.last_checkpoint_metered_units)
         };
-        let usage_attribution = if self.last_checkpoint_metered_units == 0 {
+        let usage_attribution = if self.last_checkpoint_reasoning_units == 0 {
             BTreeMap::new()
         } else {
-            provider_reasoning_usage_attribution(&self.hidden_reasoning)
+            BTreeMap::from([("reasoning_output_tokens".to_owned(), self.last_checkpoint_reasoning_units)])
         };
         (usage, usage_attribution, self.receipt_seq)
     }
@@ -82708,6 +82829,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
         if self.pending_text.is_empty()
             && self.pending_hidden_reasoning.is_empty()
             && self.pending_token_ids.is_empty()
+            && self.pending_tool_deltas.is_empty()
         {
             return Ok(());
         }
@@ -82718,22 +82840,42 @@ impl<'a> ProviderSessionLiveStream<'a> {
             self.active.session_id,
             self.request_id
         ));
-        let frame = json!({
-            "t": "s.delta",
-            "rid": self.request_id,
-            "i": self.next_index,
-            "d": &self.pending_text,
-            "reasoning_evidence_delta": &self.pending_hidden_reasoning,
-            "token_ids_delta": &self.pending_token_ids,
-            "tools": null,
-            "fin": null,
-        });
+        // Argument values can become decidable in one large chunk (for
+        // example a union-typed XML parameter). Split the presentation into
+        // bounded protocol frames, keeping call identity on its first fragment.
+        let max_frame_bytes = provider_session_max_frame_bytes();
+        let mut tool_fragments = Vec::new();
+        for delta in &self.pending_tool_deltas {
+            let args = delta.get("arguments").and_then(Value::as_str).unwrap_or_default();
+            let parts = provider_stream_parts(args, (max_frame_bytes / 12).max(1));
+            if parts.is_empty() { tool_fragments.push(delta.clone()); }
+            for (part_index, part) in parts.iter().enumerate() {
+                let mut fragment = if part_index == 0 { delta.clone() }
+                    else { json!({"index":delta["index"]}) };
+                fragment["arguments"] = json!(part);
+                tool_fragments.push(fragment);
+            }
+        }
+        let frames = tool_fragments.len().max(1);
         tokio::task::block_in_place(|| {
             tokio::runtime::Handle::current().block_on(async {
-                self.bridge
-                    .session_send(&self.active.remote, &self.active.session_id, frame)
-                    .await
-                    .context("sending live token s.delta")
+                for part_index in 0..frames {
+                    let first = part_index == 0;
+                    let frame = json!({
+                        "t":"s.delta", "rid":self.request_id,
+                        "i":self.next_index + part_index as u64,
+                        "d":if first { self.pending_text.as_str() } else { "" },
+                        "reasoning_evidence_delta":if first { self.pending_hidden_reasoning.as_str() } else { "" },
+                        "token_ids_delta":if first { self.pending_token_ids.as_slice() } else { &[] },
+                        "tool_calls_delta":tool_fragments.get(part_index).map(|delta| vec![delta]).unwrap_or_default(),
+                        "tools":null,"fin":null,
+                    });
+                    ensure!(provider_session_frame_json_len(&frame)? <= max_frame_bytes,
+                        "live output delta exceeds session frame limit");
+                    self.bridge.session_send(&self.active.remote, &self.active.session_id, frame)
+                        .await.context("sending live output s.delta")?;
+                }
+                Ok::<(), anyhow::Error>(())
             })
         })?;
         self.visible_text.push_str(&self.pending_text);
@@ -82745,7 +82887,8 @@ impl<'a> ProviderSessionLiveStream<'a> {
         self.pending_text.clear();
         self.pending_hidden_reasoning.clear();
         self.pending_token_ids.clear();
-        self.next_index = self.next_index.saturating_add(1);
+        self.pending_tool_deltas.clear();
+        self.next_index = self.next_index.saturating_add(frames as u64);
         Ok(())
     }
 
@@ -82795,47 +82938,11 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn send_client_disconnect_receipt(&mut self) -> Result<()> {
-        if self.delivered_metered_units == 0
-            || self.delivered_metered_units == self.last_checkpoint_metered_units
-        {
-            return Ok(());
-        }
-        let usage = ReceiptUsage::text(self.prompt_tokens, self.delivered_metered_units);
-        let usage_attribution = provider_reasoning_usage_attribution(&self.hidden_reasoning);
-        let receipt = provider_session_receipt_for_usage_attribution(
-            self.terms,
-            self.active,
-            self.body,
-            usage,
-            usage_attribution,
-            self.receipt_seq,
-            false,
-            self.runtime_keypair,
-        )
-        .context("building client-disconnect provider session receipt")?;
-        tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                send_provider_session_receipt_frame(
-                    self.bridge,
-                    self.active,
-                    self.request_id,
-                    &receipt,
-                    "client_disconnect",
-                )
-                .await?;
-                let _ = wait_for_provider_receipt_ack(
-                    self.bridge,
-                    self.active,
-                    &receipt,
-                    Duration::from_secs(5),
-                    None,
-                )
-                .await;
-                Ok::<(), anyhow::Error>(())
-            })
-        })?;
-        self.last_checkpoint_metered_units = self.delivered_metered_units;
-        self.receipt_seq = self.receipt_seq.saturating_add(1);
+        let (usage, attribution, seq) = self.cancellation_receipt_state();
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async {
+            settle_cancelled_provider_session(self.bridge, self.active, self.request_id,
+                self.terms, self.body, usage, attribution, seq, self.runtime_keypair).await
+        }))?;
         Ok(())
     }
 
@@ -82844,6 +82951,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             next_index: self.next_index,
             receipt_seq: self.receipt_seq,
             last_checkpoint_metered_units: self.last_checkpoint_metered_units,
+            last_checkpoint_reasoning_units: self.last_checkpoint_reasoning_units,
             delivered_metered_units: self.delivered_metered_units,
             reasoning_units: metered_output_units("", &self.hidden_reasoning, &[]),
             prompt_tokens: self.prompt_tokens,
@@ -82874,12 +82982,13 @@ async fn settle_cancelled_provider_session(
     .context("building cancelled provider session receipt")?;
     send_provider_session_receipt_frame(bridge, active, request_id, &receipt, "client_disconnect")
         .await?;
-    wait_for_provider_receipt_ack(
+    wait_for_provider_receipt_ack_inner(
         bridge,
         active,
         &receipt,
         provider_session_receipt_ack_timeout(active),
         None,
+        true,
     )
     .await
     .context("waiting for cancelled provider session receipt ack")?;
@@ -82955,11 +83064,7 @@ async fn send_provider_session_output(
     if live_stream_state.is_none() {
         let max_frame_bytes = provider_session_max_frame_bytes();
         let delta_bytes = provider_session_text_delta_bytes(max_frame_bytes);
-        let parts = if output.tools.is_empty() {
-            provider_stream_parts(&output.content, delta_bytes)
-        } else {
-            Vec::new()
-        };
+        let parts = provider_stream_parts(&output.content, delta_bytes);
         let reasoning_parts = provider_stream_parts(&output.reasoning_evidence, delta_bytes);
         let token_part_count = output
             .token_ids
@@ -83126,38 +83231,12 @@ async fn send_provider_client_disconnect_receipt_if_requested(
     if !provider_session_client_disconnect_requested(bridge, active).await? {
         return Ok(());
     }
-    if state.delivered_metered_units > 0
-        && state.delivered_metered_units != state.last_checkpoint_metered_units
-    {
-        let usage = ReceiptUsage::text(state.prompt_tokens, state.delivered_metered_units);
-        let usage_attribution = if state.reasoning_units == 0 {
-            BTreeMap::new()
-        } else {
-            BTreeMap::from([("reasoning_output_tokens".to_owned(), state.reasoning_units)])
-        };
-        let receipt = provider_session_receipt_for_usage_attribution(
-            terms,
-            active,
-            body,
-            usage,
-            usage_attribution,
-            state.receipt_seq,
-            false,
-            runtime_keypair,
-        )
-        .context("building client-disconnect provider session receipt")?;
-        send_provider_session_receipt_frame(
-            bridge,
-            active,
-            request_id,
-            &receipt,
-            "client_disconnect",
-        )
-        .await?;
-        let _ =
-            wait_for_provider_receipt_ack(bridge, active, &receipt, Duration::from_secs(5), None)
-                .await;
-    }
+    let usage = if state.last_checkpoint_metered_units == 0 { ReceiptUsage::default() }
+        else { ReceiptUsage::text(state.prompt_tokens, state.last_checkpoint_metered_units) };
+    let attribution = if state.last_checkpoint_reasoning_units == 0 { BTreeMap::new() }
+        else { BTreeMap::from([("reasoning_output_tokens".to_owned(), state.last_checkpoint_reasoning_units)]) };
+    settle_cancelled_provider_session(bridge, active, request_id, terms, body, usage,
+        attribution, state.receipt_seq, runtime_keypair).await?;
     bail!("{PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT}");
 }
 
@@ -83970,12 +84049,23 @@ async fn wait_for_provider_receipt_ack(
     wait: Duration,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ReceiptAck> {
-    let deadline = Instant::now() + wait;
+    wait_for_provider_receipt_ack_inner(bridge, active, receipt, wait, cancellation, false).await
+}
+
+async fn wait_for_provider_receipt_ack_inner(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    receipt: &ProviderSignedSessionReceipt,
+    wait: Duration,
+    cancellation: Option<&CancellationToken>,
+    settling_cancellation: bool,
+) -> Result<ReceiptAck> {
+    let mut deadline = Instant::now() + wait;
+    let mut cancellation_drain = false;
     loop {
-        if let Some(cancellation) = cancellation {
-            cancellation
-                .check()
-                .context("provider receipt acknowledgement wait cancelled")?;
+        if cancellation.is_some_and(CancellationToken::is_cancelled) && !cancellation_drain {
+            cancellation_drain = true;
+            deadline = deadline.min(Instant::now() + Duration::from_millis(500));
         }
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -84023,6 +84113,22 @@ async fn wait_for_provider_receipt_ack(
                             .await?;
                         }
                         return Ok(receipt_ack);
+                    }
+                    Some("s.close")
+                        if (settling_cancellation || cancellation.is_some())
+                            && frame.get("reason").and_then(Value::as_str)
+                                == Some("client_disconnect") =>
+                    {
+                        if !settling_cancellation && !cancellation_drain {
+                            if let Some(token) = cancellation { token.cancel(); }
+                            cancellation_drain = true;
+                            deadline = deadline.min(Instant::now() + Duration::from_millis(500));
+                        }
+                        // The liveness monitor has its own subscription. Its
+                        // cancellation broadcast can still be queued on this
+                        // connection ahead of the final receipt acknowledgement.
+                        // Keep the original deadline and wait for that signed ACK.
+                        continue;
                     }
                     Some("s.close") => {
                         bail!("session {} closed before s.receipt_ack", active.session_id);
@@ -89270,6 +89376,20 @@ fn provider_reasoning_output_mode(
     }
 }
 
+fn provider_constrained_reasoning_output_mode(
+    mode: ProviderReasoningOutputMode,
+    json_grammar_enforced: bool,
+) -> ProviderReasoningOutputMode {
+    // A whole-response JSON grammar cannot emit the prefilled thinking close
+    // marker. Its JSON is the answer/tool call, not an unfinished thought. This
+    // changes presentation only; the prompt and the backend grammar stay intact.
+    if json_grammar_enforced && mode == ProviderReasoningOutputMode::StripPrefilled {
+        ProviderReasoningOutputMode::StripTagged
+    } else {
+        mode
+    }
+}
+
 fn provider_reasoning_speciality_enabled(request: &GenerateRequest) -> Option<bool> {
     request.speciality_parameters.iter().find_map(|speciality| {
         if !provider_reasoning_speciality_control(&speciality.name, &speciality.native_path) {
@@ -89958,8 +90078,12 @@ fn provider_engine_session_response_with_sampling_bounded(
         request.grammar.as_ref(),
         Some(GrammarSpec::ToolCall { .. } | GrammarSpec::JsonSchema { .. })
     );
+    let reasoning_output_mode =
+        provider_constrained_reasoning_output_mode(reasoning_output_mode, json_grammar_enforced);
     let mut reasoning_stream_filter =
         ProviderReasoningOutputFilter::with_delimiters(reasoning_output_mode, reasoning_delimiters);
+    let mut tool_stream_filter = tool_mode.as_ref().map(|mode|
+        provider_output_stream::OutputStream::new(mode.strategy, mode.tools.clone()));
     let mut token_ids = Vec::new();
     let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
     // Existing text models keep the established request-text estimate. A signed
@@ -89970,19 +90094,18 @@ fn provider_engine_session_response_with_sampling_bounded(
         .generate_with_artifacts(
             request,
             &mut |chunk: mayhem_engine::TokenChunk| {
-                if tool_mode.is_none() {
-                    if let Some(stream) = live_stream.as_deref_mut() {
-                        let filtered = reasoning_stream_filter.push_split(&chunk.text);
-                        let mut visible_chunk = chunk.clone();
-                        visible_chunk.text = filtered.visible;
-                        stream
-                            .on_token(visible_chunk, &filtered.hidden, estimated_prompt_tokens)
-                            .map_err(|err| {
-                                mayhem_engine::EngineError::InvalidConfig(format!(
-                                    "provider live stream failed: {err:#}"
-                                ))
-                            })?;
-                    }
+                if let Some(stream) = live_stream.as_deref_mut() {
+                    let filtered = reasoning_stream_filter.push_split(&chunk.text);
+                    let mut visible_chunk = chunk.clone();
+                    visible_chunk.text = if let Some(filter) = tool_stream_filter.as_mut() {
+                        let delta = filter.push(&filtered.visible);
+                        stream.append_tool_deltas(delta.tools);
+                        delta.text
+                    } else { filtered.visible };
+                    stream.on_token(visible_chunk, &filtered.hidden,
+                        protocol_prompt_tokens.unwrap_or(estimated_prompt_tokens))
+                        .map_err(|err| mayhem_engine::EngineError::InvalidConfig(
+                            format!("provider live stream failed: {err:#}")))?;
                 }
                 token_ids.push(chunk.token_id);
                 Ok(())
@@ -89991,16 +90114,17 @@ fn provider_engine_session_response_with_sampling_bounded(
             cancellation,
         )
         .context("generating provider session response with mayhem-engine")?;
-    if tool_mode.is_none() {
-        let trailing = reasoning_stream_filter.finish_split();
-        if !trailing.visible.is_empty() || !trailing.hidden.is_empty() {
-            if let Some(stream) = live_stream.as_deref_mut() {
-                stream.append_filtered_text(trailing);
-            }
+    if let Some(stream) = live_stream.as_deref_mut() {
+        let mut trailing = reasoning_stream_filter.finish_split();
+        if let Some(filter) = tool_stream_filter.as_mut() {
+            let delta = filter.push(&trailing.visible);
+            stream.append_tool_deltas(delta.tools);
+            trailing.visible = delta.text;
         }
+        stream.append_filtered_text(trailing);
     }
     let artifacts = artifact_chunks.finish()?;
-    let tools = tool_mode
+    let mut tools = tool_mode
         .as_ref()
         .and_then(|mode| {
             provider_engine_tool_call_outputs_after_reasoning(
@@ -90032,6 +90156,17 @@ fn provider_engine_session_response_with_sampling_bounded(
             output.text.trim()
         )));
     }
+    let streamed_content = if let (Some(stream), Some(filter)) =
+        (live_stream.as_deref_mut(), tool_stream_filter.as_mut()) {
+        ensure!(filter.emitted_count() <= tools.len(),
+            "provider streamed a tool call that failed final validation");
+        for (index, call) in tools.iter_mut().enumerate().take(filter.emitted_count()) {
+            call["id"] = json!(stream.tool_stream_id(index));
+        }
+        let tail = filter.finish_text(!tools.is_empty());
+        stream.append_filtered_text(ProviderReasoningFilteredText { visible: tail, hidden: String::new() });
+        Some(filter.text.clone())
+    } else { None };
     let completion_tokens = u64::from(output.usage.completion_tokens);
     let reasoning_tokens = u64::from(output.usage.reasoning_tokens).min(completion_tokens);
     let vision_tokens = u64::from(output.usage.vision_tokens);
@@ -90062,11 +90197,14 @@ fn provider_engine_session_response_with_sampling_bounded(
     );
     Ok(ProviderSessionOutput {
         usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
-        content: if tools.is_empty() {
+        content: streamed_content.unwrap_or_else(|| if tools.is_empty() {
             filtered_output.visible
         } else {
-            String::new()
-        },
+            // Native Qwen permits commentary preceding a tool call. Preserve it
+            // in both delivery modes so usage does not depend on stream=true.
+            filtered_output.visible.split_once("<tool_call>")
+                .map(|(text, _)| text.to_owned()).unwrap_or_default()
+        }),
         reasoning_evidence: filtered_output.hidden,
         tools,
         embeddings: None,
@@ -109837,6 +109975,50 @@ esac
     }
 
     #[test]
+    fn receipt_outbox_scan_tolerates_entries_settled_after_directory_listing() {
+        let root = test_temp_dir("mayhem-receipt-outbox-scan-removal");
+        let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
+        let entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        let paths = vec![entry.path.clone()];
+        outbox.remove(&entry).unwrap();
+        assert!(outbox.load_physical_entries_at_paths(paths).unwrap().is_empty());
+        assert!(outbox.admission_available().unwrap());
+
+        let entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        fs::write(&entry.path, b"not valid JSON").unwrap();
+        assert!(outbox
+            .load_physical_entries_at_paths(vec![entry.path])
+            .is_err());
+        assert!(outbox.admission_available().is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_pending_funds_are_scoped_to_final_buyer_and_rail() {
+        let root = test_temp_dir("mayhem-receipt-outbox-pending-funds");
+        let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
+        let checkpoint = signed_receipt_settlement_feature_for_test_at(7, 2, false, 1);
+        let user = checkpoint["value"]["receipt"]["body"]["user"]
+            .as_str()
+            .unwrap();
+        outbox.persist(&checkpoint).unwrap();
+        assert!(!outbox.has_pending_final_receipts(user, "tnk").unwrap());
+        let final_receipt = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        assert!(outbox.has_pending_final_receipts(user, "tnk").unwrap());
+        assert!(!outbox.has_pending_final_receipts(user, "fiat").unwrap());
+        assert!(!outbox.has_pending_final_receipts("another buyer", "tnk").unwrap());
+        outbox.remove(&final_receipt).unwrap();
+        assert!(!outbox.has_pending_final_receipts(user, "tnk").unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn receipt_outbox_quarantines_obsolete_contract_entries_on_recovery() {
         let root = test_temp_dir("mayhem-provider-receipt-outbox-obsolete-contract");
         let directory = root.join("gateway");
@@ -109947,6 +110129,108 @@ esac
             assert!(delay <= RECEIPT_SETTLEMENT_RETRY_MAX);
         }
         assert!(receipt_settlement_retry_delay(5) > RECEIPT_SETTLEMENT_RETRY_INITIAL);
+    }
+
+    #[tokio::test]
+    async fn fresh_receipt_is_submitted_while_older_relay_is_stalled() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = test_temp_dir("mayhem-receipt-fresh-submission");
+        let outbox = Arc::new(ReceiptSettlementOutbox::new(root.clone()).unwrap());
+        let old = signed_receipt_settlement_feature_for_test(7);
+        let old_entry = outbox.persist(&old).unwrap();
+        let mut receipt = parse_record_usage_receipt_envelope(&old["value"]["receipt"]).unwrap();
+        receipt.body.billing_id = "52".repeat(32);
+        receipt.body.reservation_id = "53".repeat(32);
+        let payload = receipt_signing_bytes(&receipt.body).unwrap();
+        receipt.enclave_sig = hex_encode(&SigningKey::from_bytes(&[32; 32]).sign(&payload).to_bytes());
+        receipt.user_sig = hex_encode(&SigningKey::from_bytes(&[33; 32]).sign(&payload).to_bytes());
+        let key = record_usage_receipt_feature_key(&receipt);
+        let mut value = json!({
+            "op": "record_usage_receipt", "contract_version": CONTRACT_VERSION,
+            "epoch": 7, "payout_revision": receipt.body.payout_revision,
+            "receipt": record_usage_receipt_envelope(&receipt),
+        });
+        value["provider_sig"] = json!(hex_encode(
+            &SigningKey::from_bytes(&[31; 32])
+                .sign(&record_usage_receipt_signing_bytes(&key, &value).unwrap())
+                .to_bytes()
+        ));
+        let fresh = json!({"feature": "mayhem", "key": key, "value": value});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_old, mut old_seen) = tokio::sync::mpsc::channel(1);
+        let release_old = Arc::new(tokio::sync::Notify::new());
+        let server_release = release_old.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let seen_old = seen_old.clone();
+                let release = server_release.clone();
+                requests.spawn(async move {
+                    let mut bytes = Vec::new();
+                    let (header_end, length) = loop {
+                        let mut chunk = [0_u8; 4096];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = bytes.windows(4).position(|x| x == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            let length = headers.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            }).unwrap();
+                            break (end + 4, length);
+                        }
+                    };
+                    while bytes.len() < header_end + length {
+                        let mut chunk = [0_u8; 4096];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&chunk[..n]);
+                    }
+                    let feature: Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                    if feature["value"]["receipt"]["body"]["billing_id"] == "42".repeat(32) {
+                        seen_old.send(()).await.unwrap();
+                        release.notified().await;
+                    }
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").await.unwrap();
+                });
+            }
+            while let Some(result) = requests.join_next().await {
+                result.unwrap();
+            }
+        });
+        outbox
+            .clone()
+            .spawn_retry(PeerRpcClient::new(format!("http://{address}/v1")).unwrap());
+        timeout(Duration::from_secs(3), old_seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let fresh_entry = outbox.persist(&fresh).unwrap();
+        timeout(Duration::from_secs(3), async {
+            while fresh_entry.path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fresh receipt must bypass the stalled disk retry pass");
+        assert!(
+            old_entry.path.exists(),
+            "older evidence must remain durable while its relay is stalled"
+        );
+        release_old.notify_one();
+        server.await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            while old_entry.path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -110684,6 +110968,102 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         verifying_key
             .verify_strict(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_receipt_ack_survives_queued_disconnect_without_weakening_validation() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        for (settling, cancellable, reason, valid_signature, send_ack, succeeds) in [
+            (false, false, "client_disconnect", true, true, false),
+            (true, false, "client_disconnect", true, true, true),
+            (true, false, "shutdown", true, true, false),
+            (true, false, "client_disconnect", false, true, false),
+            (true, false, "client_disconnect", true, false, false),
+            (false, true, "client_disconnect", true, true, true),
+            (false, true, "client_disconnect", true, false, false),
+        ] {
+            let mut terms = test_provider_session_terms();
+            terms.min_session_au = 37;
+            let mut active = test_active_provider_session(&terms, vec!["image".to_owned()]);
+            let user_key = SigningKey::from_bytes(&[6; 32]);
+            active.user_pubkey = hex_encode(&user_key.verifying_key().to_bytes());
+            let receipt = provider_cancelled_session_receipt(
+                &terms,
+                &active,
+                &json!({
+                    "mayhem_contract": {
+                        "endpoint_family": mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+                    },
+                    "contract_request": {"prompt": "cancelled render"},
+                }),
+                ReceiptUsage::default(),
+                BTreeMap::new(),
+                1,
+                &RuntimeKeypair::from_seed([9; 32]),
+            )
+            .unwrap();
+            let signature = if valid_signature {
+                hex_encode(
+                    &user_key
+                        .sign(&receipt_signing_bytes(&receipt.body).unwrap())
+                        .to_bytes(),
+                )
+            } else {
+                "00".repeat(64)
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let session_id = active.session_id.clone();
+            let remote = active.remote.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let auth: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                socket
+                    .send(Message::Text(
+                        json!({"id": auth["id"], "type": "auth_ok"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                // The monitor consumed its copy; the settlement connection
+                // still sees the original broadcast before the buyer's ACK.
+                let mut frames = vec![json!({"t": "s.close", "reason": reason})];
+                if send_ack {
+                    frames.push(json!({"t": "s.receipt_ack", "session_id": session_id, "seq": 1, "user_sig": signature}));
+                }
+                for frame in frames {
+                    socket.send(Message::Text(json!({"type": "session_frame", "session_id": session_id, "remote": remote, "frame": frame}).to_string().into())).await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+            let mut bridge = ScBridgeClient::connect(
+                ScBridgeConfig::new(format!("ws://{address}"), "test-token").unwrap(),
+            )
+            .await
+            .unwrap();
+            let cancellation = CancellationToken::new();
+            if cancellable { cancellation.cancel(); }
+            let result = wait_for_provider_receipt_ack_inner(
+                &mut bridge,
+                &active,
+                &receipt,
+                Duration::from_millis(150),
+                cancellable.then_some(&cancellation),
+                settling,
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds, "settling={settling}, reason={reason}, valid_signature={valid_signature}, send_ack={send_ack}: {result:?}");
+            if !send_ack {
+                assert!(result.unwrap_err().to_string().contains("timed out"));
+            }
+            server.await.unwrap();
+        }
     }
 
     #[test]

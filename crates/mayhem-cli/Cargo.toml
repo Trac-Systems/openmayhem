@@ -53,3 +53,7 @@ zip = { version = "=7.2.0", default-features = false, features = ["deflate-flate
 
 [target.'cfg(windows)'.dependencies]
 sysinfo = "0.38"
+
+[dev-dependencies]
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+tokio-tungstenite = { version = "0.28", default-features = false, features = ["connect"] }

@@ -133,6 +133,7 @@ type SharedState = Arc<GatewayState>;
 #[cfg(test)]
 mod durable_streaming_tests;
 mod response_stream;
+mod incremental_output;
 
 mod github_update;
 use github_update::{
@@ -353,6 +354,11 @@ struct GatewayReceiptHistoryPersistence {
 pub trait GatewayReceiptSettlementPublisher: Send + Sync + fmt::Debug {
     fn admission_available(&self) -> Result<bool, String>;
     fn queue(&self, feature: &Value) -> Result<(), String>;
+
+    /// Durable final receipts that may still release this buyer's reserved funds.
+    fn has_pending_final_receipts(&self, _user: &str, _rail: &str) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 #[derive(Debug)]
@@ -3897,6 +3903,7 @@ fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), 
 
 fn chat_job_result(output: &ChatOutput) -> Value {
     json!({
+        "reasoning_content": output.reasoning_content,
         "kind": "chat",
         "content": output.content,
         "tool_calls": output.tool_calls.iter().map(tool_call_value).collect::<Vec<_>>(),
@@ -4178,6 +4185,7 @@ pub struct ScBridgeGatewaySessionBackend {
 
 #[derive(Clone, Debug)]
 pub struct ChatOutput {
+    pub reasoning_content: String,
     pub content: Option<String>,
     pub tool_calls: Vec<ToolCallOutput>,
     pub artifacts: Vec<GatewayArtifactOutput>,
@@ -18814,7 +18822,8 @@ async fn collect_direct_session_output(
     })?;
     Ok(DirectSessionCollected {
         output: ChatOutput {
-            content: tool_calls.is_empty().then_some(content),
+            reasoning_content: incremental_output::reasoning_text(&reasoning_evidence),
+            content: (!content.is_empty() || tool_calls.is_empty()).then_some(content),
             tool_calls,
             artifacts,
             finish_reason,
@@ -19657,6 +19666,7 @@ fn interrupted_direct_session_partial(
     });
     Some(GatewaySessionPartial {
         output: ChatOutput {
+            reasoning_content: String::new(),
             content: tool_calls.is_empty().then_some(content.to_owned()),
             tool_calls,
             artifacts: Vec::new(),
@@ -19742,6 +19752,7 @@ fn client_disconnect_direct_session_error(
         err.message,
         GatewaySessionInterrupted {
             output: ChatOutput {
+                reasoning_content: String::new(),
                 content: tool_calls.is_empty().then_some(content.to_owned()),
                 tool_calls,
                 artifacts: Vec::new(),
@@ -19779,6 +19790,7 @@ fn direct_session_checkpoint_partial(
             });
     GatewaySessionPartial {
         output: ChatOutput {
+            reasoning_content: String::new(),
             content: tool_calls.is_empty().then_some(content.to_owned()),
             tool_calls,
             artifacts: Vec::new(),
@@ -20764,6 +20776,11 @@ async fn cancel_and_settle_direct_session(
                     &invocation.session_id,
                     enclave_pubkey,
                 )?;
+                // A checkpoint sent before the close may still be queued. It
+                // was not acknowledged by the interrupted collector, so do not
+                // advance settlement to it. The provider cancels at its previous
+                // signed high water after its bounded ACK drain.
+                if !receipt.body.final_receipt { continue; }
                 let receipt_ack = record_cancelled_direct_session_receipt(
                     model,
                     invocation,
@@ -22868,6 +22885,23 @@ impl RouteWaitDeadline {
     }
 }
 
+async fn wait_for_pending_receipt_settlement(
+    publisher: Option<&Arc<dyn GatewayReceiptSettlementPublisher>>,
+    user: &str,
+    rail: &str,
+    deadline: RouteWaitDeadline,
+) -> bool {
+    if deadline.remaining().is_zero()
+        || !publisher.is_some_and(|publisher| {
+            publisher.has_pending_final_receipts(user, rail) == Ok(true)
+        })
+    {
+        return false;
+    }
+    tokio::time::sleep(Duration::from_secs(1).min(deadline.remaining())).await;
+    !deadline.remaining().is_zero()
+}
+
 #[derive(Debug)]
 struct RouteAdmissionRecovery {
     deadline: RouteWaitDeadline,
@@ -24120,6 +24154,23 @@ async fn prepare_live_direct_chat_session(
             Err(err) if err.retryable => {
                 record_route_attempt_error(&state, route.as_ref(), attempt_started.elapsed(), &err);
                 if let Some(refusal) = terminal_balance_refusal(&err) {
+                    if wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                    {
+                        // A clean refusal performed no inference and reserved no
+                        // canonical funds. Pending final receipts can release
+                        // the previous request's hold within the route deadline.
+                        recovery.total_attempt_limit =
+                            recovery.total_attempt_limit.saturating_add(1);
+                        billing = billing.after_attempt(None);
+                        attempt_options.billing = Some(billing.clone());
+                        continue;
+                    }
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
@@ -24664,109 +24715,18 @@ where
 
 async fn finish_live_direct_chat_after_client_disconnect(
     session: &mut LiveDirectChatSession,
-    mut err: GatewaySessionError,
+    err: GatewaySessionError,
 ) -> Result<(), GatewaySessionError> {
-    if let Some(partial) = err.partial.take() {
-        session
-            .state
-            .record_partial_provider_receipt(
-                &session.model,
-                &session.request,
-                &session.invocation,
-                &partial,
-            )
-            .map_err(|err| GatewaySessionError::new(err.message))?;
-        let _ = close_direct_session_channel(
-            &mut session.bridge,
-            &session.transport_peer,
-            &session.invocation.session_id,
-            "client_disconnect",
-        )
-        .await;
-        return Ok(());
-    }
-    let _ = close_direct_session_channel(
-        &mut session.bridge,
-        &session.transport_peer,
-        &session.invocation.session_id,
-        "client_disconnect",
-    )
-    .await;
-    if let Some(interrupted) = err.interrupted.take() {
-        if let Some(partial) =
-            wait_for_client_disconnect_provider_receipt(session, *interrupted).await?
-        {
-            let stored = session
-                .state
-                .record_partial_provider_receipt(
-                    &session.model,
-                    &session.request,
-                    &session.invocation,
-                    &partial,
-                )
-                .map_err(|err| GatewaySessionError::new(err.message))?;
-            let _ = send_receipt_ack_and_queue_settlement(
-                &mut session.bridge,
-                &session.transport_peer,
-                &session.invocation,
-                &partial.provider_receipt,
-                &stored.receipt_ack,
-                Some("client_disconnect"),
-                "sending client-disconnect s.receipt_ack",
-            )
-            .await;
-        }
-    }
-    Ok(())
-}
-
-async fn wait_for_client_disconnect_provider_receipt(
-    session: &mut LiveDirectChatSession,
-    interrupted: GatewaySessionInterrupted,
-) -> Result<Option<GatewaySessionPartial>, GatewaySessionError> {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Ok(None);
-        }
-        let frame = match next_session_frame(
-            &mut session.bridge,
-            &session.invocation.session_id,
-            &session.transport_peer,
-            remaining,
-            &["s.receipt", "s.close", "s.error"],
-        )
-        .await
-        {
-            Ok(frame) => frame,
-            Err(err) if err.message.starts_with("timed out waiting") => return Ok(None),
-            Err(err) => return Err(err),
-        };
-        match frame.get("t").and_then(Value::as_str) {
-            Some("s.receipt") => {
-                let receipt = provider_signed_receipt_from_frame(
-                    &frame,
-                    &session.invocation.session_id,
-                    &session.enclave_pubkey,
-                )?;
-                if receipt.body.final_receipt {
-                    continue;
-                }
-                return Ok(Some(GatewaySessionPartial {
-                    output: interrupted.output,
-                    provider_receipt: receipt,
-                    token_ids: interrupted.token_ids,
-                    quality: interrupted.quality,
-                    reason: interrupted.reason,
-                    redispatch_mode: RedispatchMode::FullMessageHistoryClientSide,
-                }));
-            }
-            Some("s.close") => return Ok(None),
-            Some("s.error") => return Ok(None),
-            _ => {}
-        }
-    }
+    // Stop generation but keep the direct channel alive until a final signed
+    // receipt closes the voucher. Only acknowledged checkpoints are chargeable.
+    let (usage, seq) = err.partial.as_ref().map(|partial|
+        (partial.provider_receipt.body.usage.clone(), partial.provider_receipt.body.seq.saturating_add(1)))
+        .unwrap_or_else(|| (ReceiptUsage::default(), 1));
+    cancel_and_settle_direct_session(
+        &mut session.bridge, &session.invocation, &session.transport_peer,
+        &session.provider, &session.model, &session.enclave_pubkey,
+        blake3_hex(chat_prompt_text(&session.request).as_bytes()), usage, seq,
+    ).await
 }
 
 async fn recover_live_direct_chat_after_retryable(
@@ -24924,6 +24884,8 @@ async fn run_live_direct_chat_sse_inner(
 
     let mut content = String::new();
     let mut reasoning_evidence = String::new();
+    let mut reasoning_stream = incremental_output::ReasoningStream::default();
+    let mut tool_stream = incremental_output::ToolStream::default();
     let mut tool_calls = Vec::new();
     let mut finish_reason = None;
     let mut claimed_usage = None;
@@ -25006,6 +24968,21 @@ async fn run_live_direct_chat_sse_inner(
         };
         let frame = match frame_result {
             Ok(frame) => frame,
+            Err(err) if is_client_disconnect_error(&err) => {
+                // Explicit job cancellation races the HTTP socket closing.
+                // Preserve the same acknowledged high water on either path;
+                // a bare cancellation error would expect a zero-usage receipt.
+                return Err(client_disconnect_direct_session_error(
+                    &session.request,
+                    &content,
+                    &reasoning_evidence,
+                    tool_calls.clone(),
+                    latest_checkpoint_receipt.as_ref(),
+                    &token_ids,
+                    &watchdog,
+                    now_millis_u64(),
+                ));
+            }
             Err(err) if err.message.starts_with("timed out waiting") => {
                 let now = now_millis_u64();
                 if let Some(ack_frame) = latest_checkpoint_ack_frame.clone() {
@@ -25140,6 +25117,17 @@ async fn run_live_direct_chat_sse_inner(
                         ));
                     }
                 }
+                let reasoning_delta = reasoning_stream.push(session_delta_reasoning_evidence(&frame)?);
+                let tool_deltas = tool_stream.push(&frame, &session.request, max_text_bytes)?;
+                let mut public_delta = json!({});
+                if !reasoning_delta.is_empty() { public_delta["reasoning_content"] = json!(reasoning_delta); }
+                if !tool_deltas.is_empty() { public_delta["tool_calls"] = json!(tool_deltas); }
+                if public_delta.as_object().is_some_and(|delta| !delta.is_empty()) && !send_sse_value(tx,
+                    chat_chunk(&session.id, session.created, &session.model.id, public_delta, None, None)).await {
+                    return Err(client_disconnect_direct_session_error(&session.request, &content,
+                        &reasoning_evidence, tool_calls.clone(), latest_checkpoint_receipt.as_ref(),
+                        &token_ids, &watchdog, now));
+                }
                 if let Some(receipt) = pending_checkpoint_receipt.take() {
                     if let Some(ack_frame) = maybe_ack_direct_session_checkpoint_receipt(
                         &mut session.bridge,
@@ -25174,7 +25162,7 @@ async fn run_live_direct_chat_sse_inner(
                                 &session.id,
                                 session.created,
                                 &session.model.id,
-                                json!({ "tool_calls": tool_call_delta_values(&next_tool_calls) }),
+                                json!({ "tool_calls": tool_stream.finish(&next_tool_calls)? }),
                                 None,
                                 None,
                             ),
@@ -25197,6 +25185,14 @@ async fn run_live_direct_chat_sse_inner(
                 }
                 collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
+                    if tool_calls.is_empty() { tool_stream.finish(&[])?; }
+                    let tail = reasoning_stream.finish();
+                    if !tail.is_empty() && !send_sse_value(tx, chat_chunk(&session.id, session.created,
+                        &session.model.id, json!({"reasoning_content":tail}), None, None)).await {
+                        return Err(client_disconnect_direct_session_error(&session.request, &content,
+                            &reasoning_evidence, tool_calls.clone(), latest_checkpoint_receipt.as_ref(),
+                            &token_ids, &watchdog, now));
+                    }
                     finish_reason = Some(fin.to_owned());
                     claimed_usage = usage_from_session_delta(&frame);
                     claimed_usage_attribution = usage_attribution_from_session_delta(&frame)?;
@@ -25416,7 +25412,8 @@ async fn run_live_direct_chat_sse_inner(
         ))
     })?;
     let output = ChatOutput {
-        content: tool_calls.is_empty().then_some(content),
+        reasoning_content: incremental_output::reasoning_text(&reasoning_evidence),
+        content: (!content.is_empty() || tool_calls.is_empty()).then_some(content),
         tool_calls,
         artifacts,
         finish_reason,
@@ -28754,6 +28751,11 @@ fn responses_value_from_chat(response: Value) -> Result<Value, ApiError> {
         .ok_or_else(|| ApiError::bad_gateway("chat provider returned no choices", Some("model")))?;
     let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
     let mut output = Vec::new();
+    if let Some(text) = message.get("reasoning_content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
+        output.push(json!({"id":make_id("rs"),"type":"reasoning","status":"completed",
+            "summary":[],"content":[{"type":"reasoning_text","text":text}]}));
+    }
+
     if let Some(text) = message.get("content").and_then(Value::as_str) {
         if !text.is_empty() {
             output.push(json!({
@@ -35337,6 +35339,7 @@ fn dev_chat_output(model: &GatewayModel, request: &ChatCompletionRequest) -> Cha
         .join("\n");
     let output = if let Some(tool_result) = last_tool_result(&request.messages) {
         ChatOutput {
+            reasoning_content: String::new(),
             content: Some(format!("Tool result received: {tool_result}")),
             tool_calls: Vec::new(),
             artifacts: Vec::new(),
@@ -35350,6 +35353,7 @@ fn dev_chat_output(model: &GatewayModel, request: &ChatCompletionRequest) -> Cha
             name,
         };
         ChatOutput {
+            reasoning_content: String::new(),
             content: None,
             tool_calls: vec![tool_call],
             artifacts: Vec::new(),
@@ -35385,6 +35389,7 @@ fn dev_chat_output(model: &GatewayModel, request: &ChatCompletionRequest) -> Cha
             )
         };
         ChatOutput {
+            reasoning_content: String::new(),
             usage: usage_for(&prompt_text, &content),
             content: Some(content),
             tool_calls: Vec::new(),
@@ -35403,10 +35408,10 @@ fn chat_response_value(
     receipt: Option<&StoredReceipt>,
     mayhem_meta: ResponseMayhemMeta<'_>,
 ) -> Value {
-    let message = if !output.tool_calls.is_empty() {
+    let mut message = if !output.tool_calls.is_empty() {
         json!({
             "role": "assistant",
-            "content": null,
+            "content": output.content,
             "tool_calls": output.tool_calls.iter().map(tool_call_value).collect::<Vec<_>>(),
         })
     } else {
@@ -35415,6 +35420,7 @@ fn chat_response_value(
             "content": output.content.clone().unwrap_or_default(),
         })
     };
+    if !output.reasoning_content.is_empty() { message["reasoning_content"] = json!(output.reasoning_content); }
     json!({
         "id": id,
         "object": "chat.completion",
@@ -35463,6 +35469,9 @@ fn chat_stream_chunks(
         None,
         None,
     )];
+    for part in stream_parts(&output.reasoning_content) {
+        if !part.is_empty() { chunks.push(chat_chunk(id, created, model, json!({"reasoning_content":part}), None, None)); }
+    }
     if !output.tool_calls.is_empty() {
         chunks.push(chat_chunk(
             id,
@@ -40958,6 +40967,7 @@ mod tests {
         assert_eq!(checkpointed_stored.receipt.body.seq, 3);
 
         let cached_output = ChatOutput {
+            reasoning_content: String::new(),
             usage: Usage {
                 prompt_tokens: 1_000,
                 completion_tokens: 0,
@@ -43218,6 +43228,7 @@ mod tests {
                     let completion_tokens = visible_output_unit_count("hello ", &[]);
                     let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                     let output = ChatOutput {
+                        reasoning_content: String::new(),
                         content: Some("hello ".to_owned()),
                         tool_calls: Vec::new(),
                         artifacts: Vec::new(),
@@ -43256,6 +43267,7 @@ mod tests {
                 let completion_tokens = visible_output_unit_count("world", &[]);
                 let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                 let output = ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some("world".to_owned()),
                     tool_calls: Vec::new(),
                     artifacts: Vec::new(),
@@ -43313,6 +43325,7 @@ mod tests {
                 let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                 let completion_tokens = visible_output_unit_count("", &tool_calls);
                 let output = ChatOutput {
+                    reasoning_content: String::new(),
                     content: None,
                     tool_calls,
                     artifacts: Vec::new(),
@@ -43371,6 +43384,7 @@ mod tests {
                 };
                 if attempt == 1 {
                     let output = ChatOutput {
+                        reasoning_content: String::new(),
                         content: Some("checkpoint ".to_owned()),
                         tool_calls: Vec::new(),
                         artifacts: Vec::new(),
@@ -43399,6 +43413,7 @@ mod tests {
 
                 let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                 let output = ChatOutput {
+                    reasoning_content: String::new(),
                     content: Some("continued".to_owned()),
                     tool_calls: Vec::new(),
                     artifacts: Vec::new(),
@@ -43453,6 +43468,7 @@ mod tests {
                 };
                 Ok(GatewaySessionResult {
                     output: ChatOutput {
+                        reasoning_content: String::new(),
                         content: Some(content.to_owned()),
                         tool_calls: Vec::new(),
                         artifacts: Vec::new(),
@@ -43516,6 +43532,7 @@ mod tests {
                 let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                 Ok(GatewaySessionResult {
                     output: ChatOutput {
+                        reasoning_content: String::new(),
                         content: Some("recovered".to_owned()),
                         tool_calls: Vec::new(),
                         artifacts: Vec::new(),
@@ -43692,6 +43709,7 @@ mod tests {
                 let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                 Ok(GatewaySessionResult {
                     output: ChatOutput {
+                        reasoning_content: String::new(),
                         content: Some("recovered after close".to_owned()),
                         tool_calls: Vec::new(),
                         artifacts: Vec::new(),
@@ -43986,6 +44004,7 @@ mod tests {
                 let prompt_tokens = rough_tokens(&chat_prompt_text(request));
                 Ok(GatewaySessionResult {
                     output: ChatOutput {
+                        reasoning_content: String::new(),
                         content: Some("ok".to_owned()),
                         tool_calls: Vec::new(),
                         artifacts: Vec::new(),
@@ -50323,6 +50342,44 @@ mod tests {
         assert!(!recovery.has_capacity_waiters());
     }
 
+    #[tokio::test]
+    async fn receipt_settlement_wait_requires_pending_evidence_and_respects_deadline() {
+        #[derive(Debug)]
+        struct PendingPublisher(Result<bool, String>);
+        impl GatewayReceiptSettlementPublisher for PendingPublisher {
+            fn admission_available(&self) -> Result<bool, String> {
+                Ok(true)
+            }
+            fn queue(&self, _: &Value) -> Result<(), String> {
+                unreachable!()
+            }
+            fn has_pending_final_receipts(&self, user: &str, rail: &str) -> Result<bool, String> {
+                assert_eq!((user, rail), ("buyer", "fiat"));
+                self.0.clone()
+            }
+        }
+        for pending in [Ok(false), Err("unreadable durable evidence".to_owned())] {
+            let publisher: Arc<dyn GatewayReceiptSettlementPublisher> =
+                Arc::new(PendingPublisher(pending));
+            assert!(!wait_for_pending_receipt_settlement(
+                Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(5000),
+            ).await);
+        }
+        let publisher: Arc<dyn GatewayReceiptSettlementPublisher> =
+            Arc::new(PendingPublisher(Ok(true)));
+        assert!(!wait_for_pending_receipt_settlement(
+            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(0),
+        ).await);
+        let started = Instant::now();
+        assert!(wait_for_pending_receipt_settlement(
+            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(5000),
+        ).await);
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert!(!wait_for_pending_receipt_settlement(
+            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(20),
+        ).await);
+    }
+
     #[test]
     fn capacity_recovery_tries_new_providers_before_sibling_or_recovered_routes() {
         let mut model = test_routed_model(3);
@@ -50940,6 +50997,7 @@ mod tests {
 
     pub(super) fn test_chat_output() -> ChatOutput {
         ChatOutput {
+            reasoning_content: String::new(),
             content: Some("receipt ok".to_owned()),
             tool_calls: Vec::new(),
             artifacts: Vec::new(),

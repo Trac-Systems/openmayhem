@@ -1,6 +1,6 @@
 use super::{
-    json, make_id, now_secs, stream, AtomicU64, BTreeMap, Ordering, SseEventStream, StreamExt,
-    Value, VecDeque,
+    AtomicU64, BTreeMap, Ordering, SseEventStream, StreamExt, Value, VecDeque, json, make_id,
+    now_secs, stream,
 };
 
 fn response_item_id(prefix: &str) -> String {
@@ -39,6 +39,7 @@ struct ResponseStream {
     response: Value,
     output: Vec<Value>,
     text_index: Option<usize>,
+    reasoning_index: Option<usize>,
     calls: BTreeMap<u64, usize>,
     finish_reason: Option<String>,
     sequence: u64,
@@ -55,6 +56,7 @@ impl ResponseStream {
             }),
             output: Vec::new(),
             text_index: None,
+            reasoning_index: None,
             calls: BTreeMap::new(),
             finish_reason: None,
             sequence: 0,
@@ -108,6 +110,34 @@ impl ResponseStream {
                 self.finish_reason = Some(reason.to_owned());
             }
             let delta = &choice["delta"];
+            if let Some(text) = delta
+                .get("reasoning_content")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                let index = match self.reasoning_index {
+                    Some(index) => index,
+                    None => {
+                        let index = self.output.len();
+                        let item = json!({"id":response_item_id("rs"),"type":"reasoning","status":"in_progress","summary":[],"content":[]});
+                        events.push_back(self.event(
+                            "response.output_item.added",
+                            json!({"output_index":index,"item":item}),
+                        ));
+                        let part = json!({"type":"reasoning_text","text":""});
+                        events.push_back(self.event("response.content_part.added", json!({"output_index":index,"item_id":item["id"],"content_index":0,"part":part})));
+                        let mut item = item;
+                        item["content"] = json!([part]);
+                        self.output.push(item);
+                        self.reasoning_index = Some(index);
+                        index
+                    }
+                };
+                if let Value::String(prior) = &mut self.output[index]["content"][0]["text"] {
+                    prior.push_str(text);
+                }
+                events.push_back(self.event("response.reasoning_text.delta", json!({"output_index":index,"item_id":self.output[index]["id"],"content_index":0,"delta":text})));
+            }
             if let Some(text) = delta
                 .get("content")
                 .and_then(Value::as_str)
@@ -208,6 +238,10 @@ impl ResponseStream {
                 let part = &item["content"][0];
                 events.push_back(self.event("response.output_text.done", json!({"output_index": index, "item_id": item["id"], "content_index": 0, "text": part["text"], "logprobs": []})));
                 events.push_back(self.event("response.content_part.done", json!({"output_index": index, "item_id": item["id"], "content_index": 0, "part": part})));
+            } else if item["type"] == "reasoning" {
+                let part = &item["content"][0];
+                events.push_back(self.event("response.reasoning_text.done", json!({"output_index":index,"item_id":item["id"],"content_index":0,"text":part["text"]})));
+                events.push_back(self.event("response.content_part.done", json!({"output_index":index,"item_id":item["id"],"content_index":0,"part":part})));
             } else {
                 events.push_back(self.event("response.function_call_arguments.done", json!({"output_index": index, "item_id": item["id"], "name": item["name"], "arguments": item["arguments"]})));
             }
@@ -249,6 +283,38 @@ impl ResponseStream {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reasoning_events_precede_answer_and_completion() {
+        let mut adapter = ResponseStream::new("model".into());
+        let mut events = adapter.start();
+        events.extend(adapter.push(chunk(json!({"reasoning_content":"Consider "}), Value::Null)));
+        assert_eq!(
+            events.back().unwrap()["type"],
+            "response.reasoning_text.delta"
+        );
+        assert_eq!(events.back().unwrap()["delta"], "Consider ");
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "response.completed")
+        );
+        events.extend(adapter.push(chunk(
+            json!({"reasoning_content":"the choices."}),
+            Value::Null,
+        )));
+        events.extend(adapter.push(chunk(json!({"content":"Hello"}), json!("stop"))));
+        events.extend(adapter.finish());
+        let output = &events.back().unwrap()["response"]["output"];
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"][0]["text"], "Consider the choices.");
+        assert_eq!(output[1]["content"][0]["text"], "Hello");
+        assert!(
+            events
+                .iter()
+                .any(|event| event["type"] == "response.reasoning_text.done")
+        );
+    }
+
     fn chunk(delta: Value, finish: Value) -> Value {
         json!({"choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
     }
@@ -269,9 +335,11 @@ mod tests {
         )));
         let meta = json!({"billable": true, "receipt": {"session_id": "server-session", "au_owed_cum": "123"}});
         events.extend(adapter.push(json!({"choices": [], "usage": {"prompt_tokens": 7, "completion_tokens": 5, "total_tokens": 12}, "mayhem": meta})));
-        assert!(!events
-            .iter()
-            .any(|event| event["type"] == "response.completed"));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event["type"] == "response.completed")
+        );
         events.extend(adapter.finish());
         for (sequence, event) in events.iter().enumerate() {
             assert_eq!(event["sequence_number"], sequence);
@@ -325,9 +393,11 @@ mod tests {
                 events.back().unwrap()["response"]["incomplete_details"]["reason"],
                 expected
             );
-            assert!(!events
-                .iter()
-                .any(|event| event["type"] == "response.completed"));
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| event["type"] == "response.completed")
+            );
         }
         let mut adapter = ResponseStream::new("model".to_owned());
         adapter.push(chunk(json!({"content": "partial"}), Value::Null));
