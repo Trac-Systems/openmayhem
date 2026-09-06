@@ -466,6 +466,56 @@ mod tests {
     use super::*;
     use crate::{provider_engine_tool_call_outputs, validate_provider_engine_tool_call_outputs};
 
+    #[test]
+    fn constrained_json_streams_as_tools_or_answer_without_false_reasoning() {
+        use crate::{
+            ProviderReasoningOutputFilter, ProviderReasoningOutputMode,
+            provider_constrained_reasoning_output_mode,
+        };
+        let mode = provider_constrained_reasoning_output_mode(
+            ProviderReasoningOutputMode::StripPrefilled,
+            true,
+        );
+        let raw = r#"{"tool":"write","arguments":{"path":"demo.html","content":"hello world"}}"#;
+        let mut reasoning = ProviderReasoningOutputFilter::new(mode);
+        let mut output = OutputStream::new(ProviderEngineToolStrategy::MayhemJson, tools());
+        let mut calls = Vec::new();
+        let mut saw_arguments_before_end = false;
+        for (index, ch) in raw.char_indices() {
+            let filtered = reasoning.push_split(&ch.to_string());
+            assert!(
+                filtered.hidden.is_empty(),
+                "constrained JSON was classified as thinking"
+            );
+            let delta = output.push(&filtered.visible);
+            if !delta.tools.is_empty() && index < raw.len() - 10 {
+                saw_arguments_before_end = true;
+            }
+            collect(delta, &mut calls);
+        }
+        assert!(saw_arguments_before_end);
+        compare(
+            &calls,
+            &provider_engine_tool_call_outputs(
+                raw,
+                ProviderEngineToolStrategy::MayhemJson,
+                &tools(),
+            )
+            .unwrap(),
+        );
+        let mut reasoning = ProviderReasoningOutputFilter::new(mode);
+        let first = reasoning.push_split("{\"answer\":");
+        assert_eq!(first.visible, "{\"answer\":");
+        assert!(first.hidden.is_empty());
+        assert_eq!(
+            provider_constrained_reasoning_output_mode(
+                ProviderReasoningOutputMode::StripPrefilled,
+                false
+            ),
+            ProviderReasoningOutputMode::StripPrefilled
+        );
+    }
+
     fn tools() -> Vec<ToolSpec> {
         vec![ToolSpec::new(
             "write",

@@ -89376,6 +89376,20 @@ fn provider_reasoning_output_mode(
     }
 }
 
+fn provider_constrained_reasoning_output_mode(
+    mode: ProviderReasoningOutputMode,
+    json_grammar_enforced: bool,
+) -> ProviderReasoningOutputMode {
+    // A whole-response JSON grammar cannot emit the prefilled thinking close
+    // marker. Its JSON is the answer/tool call, not an unfinished thought. This
+    // changes presentation only; the prompt and the backend grammar stay intact.
+    if json_grammar_enforced && mode == ProviderReasoningOutputMode::StripPrefilled {
+        ProviderReasoningOutputMode::StripTagged
+    } else {
+        mode
+    }
+}
+
 fn provider_reasoning_speciality_enabled(request: &GenerateRequest) -> Option<bool> {
     request.speciality_parameters.iter().find_map(|speciality| {
         if !provider_reasoning_speciality_control(&speciality.name, &speciality.native_path) {
@@ -90064,6 +90078,8 @@ fn provider_engine_session_response_with_sampling_bounded(
         request.grammar.as_ref(),
         Some(GrammarSpec::ToolCall { .. } | GrammarSpec::JsonSchema { .. })
     );
+    let reasoning_output_mode =
+        provider_constrained_reasoning_output_mode(reasoning_output_mode, json_grammar_enforced);
     let mut reasoning_stream_filter =
         ProviderReasoningOutputFilter::with_delimiters(reasoning_output_mode, reasoning_delimiters);
     let mut tool_stream_filter = tool_mode.as_ref().map(|mode|
