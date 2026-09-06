@@ -24666,6 +24666,24 @@ async fn finish_live_direct_chat_after_client_disconnect(
     session: &mut LiveDirectChatSession,
     mut err: GatewaySessionError,
 ) -> Result<(), GatewaySessionError> {
+    // Tool-bearing requests can be accepted and generate for a long time
+    // before publishing their first delta. Closing the transport here loses
+    // the provider's final cancellation receipt and strands the full voucher
+    // on the ledger. Use the same settlement handshake as non-streaming work.
+    if err.partial.is_none() && err.interrupted.is_none() {
+        return cancel_and_settle_direct_session(
+            &mut session.bridge,
+            &session.invocation,
+            &session.transport_peer,
+            &session.provider,
+            &session.model,
+            &session.enclave_pubkey,
+            blake3_hex(chat_prompt_text(&session.request).as_bytes()),
+            ReceiptUsage::default(),
+            1,
+        )
+        .await;
+    }
     if let Some(partial) = err.partial.take() {
         session
             .state
