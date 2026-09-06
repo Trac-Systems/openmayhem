@@ -353,6 +353,11 @@ struct GatewayReceiptHistoryPersistence {
 pub trait GatewayReceiptSettlementPublisher: Send + Sync + fmt::Debug {
     fn admission_available(&self) -> Result<bool, String>;
     fn queue(&self, feature: &Value) -> Result<(), String>;
+
+    /// Durable final receipts that may still release this buyer's reserved funds.
+    fn has_pending_final_receipts(&self, _user: &str, _rail: &str) -> Result<bool, String> {
+        Ok(false)
+    }
 }
 
 #[derive(Debug)]
@@ -22868,6 +22873,23 @@ impl RouteWaitDeadline {
     }
 }
 
+async fn wait_for_pending_receipt_settlement(
+    publisher: Option<&Arc<dyn GatewayReceiptSettlementPublisher>>,
+    user: &str,
+    rail: &str,
+    deadline: RouteWaitDeadline,
+) -> bool {
+    if deadline.remaining().is_zero()
+        || !publisher.is_some_and(|publisher| {
+            publisher.has_pending_final_receipts(user, rail) == Ok(true)
+        })
+    {
+        return false;
+    }
+    tokio::time::sleep(Duration::from_secs(1).min(deadline.remaining())).await;
+    !deadline.remaining().is_zero()
+}
+
 #[derive(Debug)]
 struct RouteAdmissionRecovery {
     deadline: RouteWaitDeadline,
@@ -24120,6 +24142,23 @@ async fn prepare_live_direct_chat_session(
             Err(err) if err.retryable => {
                 record_route_attempt_error(&state, route.as_ref(), attempt_started.elapsed(), &err);
                 if let Some(refusal) = terminal_balance_refusal(&err) {
+                    if wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                    {
+                        // A clean refusal performed no inference and reserved no
+                        // canonical funds. Pending final receipts can release
+                        // the previous request's hold within the route deadline.
+                        recovery.total_attempt_limit =
+                            recovery.total_attempt_limit.saturating_add(1);
+                        billing = billing.after_attempt(None);
+                        attempt_options.billing = Some(billing.clone());
+                        continue;
+                    }
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
@@ -24666,6 +24705,24 @@ async fn finish_live_direct_chat_after_client_disconnect(
     session: &mut LiveDirectChatSession,
     mut err: GatewaySessionError,
 ) -> Result<(), GatewaySessionError> {
+    // Tool-bearing requests can be accepted and generate for a long time
+    // before publishing their first delta. Closing the transport here loses
+    // the provider's final cancellation receipt and strands the full voucher
+    // on the ledger. Use the same settlement handshake as non-streaming work.
+    if err.partial.is_none() && err.interrupted.is_none() {
+        return cancel_and_settle_direct_session(
+            &mut session.bridge,
+            &session.invocation,
+            &session.transport_peer,
+            &session.provider,
+            &session.model,
+            &session.enclave_pubkey,
+            blake3_hex(chat_prompt_text(&session.request).as_bytes()),
+            ReceiptUsage::default(),
+            1,
+        )
+        .await;
+    }
     if let Some(partial) = err.partial.take() {
         session
             .state
@@ -50321,6 +50378,44 @@ mod tests {
         assert!(!recovery.can_attempt());
         recovery.exhaust(Some(route));
         assert!(!recovery.has_capacity_waiters());
+    }
+
+    #[tokio::test]
+    async fn receipt_settlement_wait_requires_pending_evidence_and_respects_deadline() {
+        #[derive(Debug)]
+        struct PendingPublisher(Result<bool, String>);
+        impl GatewayReceiptSettlementPublisher for PendingPublisher {
+            fn admission_available(&self) -> Result<bool, String> {
+                Ok(true)
+            }
+            fn queue(&self, _: &Value) -> Result<(), String> {
+                unreachable!()
+            }
+            fn has_pending_final_receipts(&self, user: &str, rail: &str) -> Result<bool, String> {
+                assert_eq!((user, rail), ("buyer", "fiat"));
+                self.0.clone()
+            }
+        }
+        for pending in [Ok(false), Err("unreadable durable evidence".to_owned())] {
+            let publisher: Arc<dyn GatewayReceiptSettlementPublisher> =
+                Arc::new(PendingPublisher(pending));
+            assert!(!wait_for_pending_receipt_settlement(
+                Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(5000),
+            ).await);
+        }
+        let publisher: Arc<dyn GatewayReceiptSettlementPublisher> =
+            Arc::new(PendingPublisher(Ok(true)));
+        assert!(!wait_for_pending_receipt_settlement(
+            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(0),
+        ).await);
+        let started = Instant::now();
+        assert!(wait_for_pending_receipt_settlement(
+            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(5000),
+        ).await);
+        assert!(started.elapsed() >= Duration::from_secs(1));
+        assert!(!wait_for_pending_receipt_settlement(
+            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(20),
+        ).await);
     }
 
     #[test]

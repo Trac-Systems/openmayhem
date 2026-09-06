@@ -28,7 +28,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
-    Arc, Mutex, Once,
+    Arc, Mutex, Once, OnceLock,
 };
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -60361,6 +60361,7 @@ const RECEIPT_SETTLEMENT_OBSOLETE_RECEIPT_SCHEMA_ERROR: &str =
 #[derive(Clone)]
 struct ReceiptSettlementOutbox {
     directory: PathBuf,
+    fresh_entries: Arc<OnceLock<tokio::sync::mpsc::Sender<PathBuf>>>,
 }
 
 impl std::fmt::Debug for ReceiptSettlementOutbox {
@@ -60484,7 +60485,10 @@ fn receipt_settlement_entry_supersedes(
 
 impl ReceiptSettlementOutbox {
     fn new(directory: PathBuf) -> Result<Self> {
-        let outbox = Self { directory };
+        let outbox = Self {
+            directory,
+            fresh_entries: Arc::new(OnceLock::new()),
+        };
         outbox.ensure_directory()?;
         outbox.compact_entries()?;
         Ok(outbox)
@@ -60598,10 +60602,23 @@ impl ReceiptSettlementOutbox {
             paths.len() <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES.saturating_mul(2),
             "receipt settlement outbox exceeded its bounded recovery file count"
         );
+        self.load_physical_entries_at_paths(paths)
+    }
+
+    fn load_physical_entries_at_paths(
+        &self,
+        paths: Vec<PathBuf>,
+    ) -> Result<Vec<ReceiptSettlementOutboxEntry>> {
         let mut entries = Vec::new();
         for path in paths {
             match self.load_entry(&path) {
                 Ok(entry) => entries.push(entry),
+                // A successful publisher or a newer checkpoint can remove an
+                // entry after read_dir. That must not pause paid admission.
+                Err(error)
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) => {}
                 Err(error) => {
                     if let Some(reason) = receipt_settlement_outbox_quarantine_reason(&error) {
                         self.quarantine_unsubmitable_entry(&path, &error, &reason)?;
@@ -60829,6 +60846,11 @@ impl ReceiptSettlementOutbox {
         sync_receipt_settlement_directory(&self.directory)?;
         let entry = self.load_entry(&path)?;
         fs2::FileExt::unlock(&lock).context("unlocking receipt settlement outbox")?;
+        if let Some(fresh_entries) = self.fresh_entries.get() {
+            // Only a path is queued, after the signed evidence is durable.
+            // Saturation leaves the normal disk retry responsible for it.
+            let _ = fresh_entries.try_send(entry.path.clone());
+        }
         Ok(entry)
     }
 
@@ -60912,6 +60934,43 @@ impl ReceiptSettlementOutbox {
     }
 
     fn spawn_retry(self: Arc<Self>, rpc: PeerRpcClient) {
+        let (sender, mut fresh_entries) =
+            tokio::sync::mpsc::channel::<PathBuf>(RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES);
+        if self.fresh_entries.set(sender).is_err() {
+            return;
+        }
+        let fresh_outbox = self.clone();
+        let fresh_rpc = rpc.clone();
+        tokio::spawn(async move {
+            let mut submissions = tokio::task::JoinSet::new();
+            loop {
+                tokio::select! {
+                    path = fresh_entries.recv(),
+                        if submissions.len() < RECEIPT_SETTLEMENT_RETRY_CONCURRENCY => {
+                        let Some(path) = path else { break };
+                        // Another submitter or a newer checkpoint may already
+                        // have removed this path; the durable disk pass remains
+                        // authoritative for pending evidence.
+                        let Ok(entry) = fresh_outbox.load_entry(&path) else { continue };
+                        let outbox = fresh_outbox.clone();
+                        let rpc = fresh_rpc.clone();
+                        submissions.spawn(async move { outbox.submit_entry(&rpc, entry).await });
+                    }
+                    result = submissions.join_next(), if !submissions.is_empty() => {
+                        match result {
+                            Some(Ok(Ok(()))) => {}
+                            Some(Ok(Err(error))) => eprintln!(
+                                "Mayhem retained fresh receipt settlement evidence for retry: {error:#}"
+                            ),
+                            Some(Err(error)) => eprintln!(
+                                "Mayhem fresh receipt settlement worker failed; evidence remains durable: {error}"
+                            ),
+                            None => {}
+                        }
+                    }
+                }
+            }
+        });
         tokio::spawn(async move {
             let mut consecutive_pending = 0_u32;
             loop {
@@ -60943,6 +61002,19 @@ impl GatewayReceiptSettlementPublisher for ReceiptSettlementOutbox {
     fn queue(&self, feature: &Value) -> std::result::Result<(), String> {
         self.persist(feature)
             .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn has_pending_final_receipts(&self, user: &str, rail: &str) -> std::result::Result<bool, String> {
+        self.load_entries()
+            .map(|entries| {
+                entries.iter().any(|entry| {
+                    let body = &entry.feature["value"]["receipt"]["body"];
+                    entry.final_receipt
+                        && body["user"].as_str() == Some(user)
+                        && body["rail"].as_str() == Some(rail)
+                })
+            })
             .map_err(|error| format!("{error:#}"))
     }
 }
@@ -82901,12 +82973,13 @@ async fn settle_cancelled_provider_session(
     .context("building cancelled provider session receipt")?;
     send_provider_session_receipt_frame(bridge, active, request_id, &receipt, "client_disconnect")
         .await?;
-    wait_for_provider_receipt_ack(
+    wait_for_provider_receipt_ack_inner(
         bridge,
         active,
         &receipt,
         provider_session_receipt_ack_timeout(active),
         None,
+        true,
     )
     .await
     .context("waiting for cancelled provider session receipt ack")?;
@@ -83997,6 +84070,17 @@ async fn wait_for_provider_receipt_ack(
     wait: Duration,
     cancellation: Option<&CancellationToken>,
 ) -> Result<ReceiptAck> {
+    wait_for_provider_receipt_ack_inner(bridge, active, receipt, wait, cancellation, false).await
+}
+
+async fn wait_for_provider_receipt_ack_inner(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    receipt: &ProviderSignedSessionReceipt,
+    wait: Duration,
+    cancellation: Option<&CancellationToken>,
+    settling_cancellation: bool,
+) -> Result<ReceiptAck> {
     let deadline = Instant::now() + wait;
     loop {
         if let Some(cancellation) = cancellation {
@@ -84050,6 +84134,17 @@ async fn wait_for_provider_receipt_ack(
                             .await?;
                         }
                         return Ok(receipt_ack);
+                    }
+                    Some("s.close")
+                        if settling_cancellation
+                            && frame.get("reason").and_then(Value::as_str)
+                                == Some("client_disconnect") =>
+                    {
+                        // The liveness monitor has its own subscription. Its
+                        // cancellation broadcast can still be queued on this
+                        // connection ahead of the final receipt acknowledgement.
+                        // Keep the original deadline and wait for that signed ACK.
+                        continue;
                     }
                     Some("s.close") => {
                         bail!("session {} closed before s.receipt_ack", active.session_id);
@@ -109864,6 +109959,50 @@ esac
     }
 
     #[test]
+    fn receipt_outbox_scan_tolerates_entries_settled_after_directory_listing() {
+        let root = test_temp_dir("mayhem-receipt-outbox-scan-removal");
+        let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
+        let entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        let paths = vec![entry.path.clone()];
+        outbox.remove(&entry).unwrap();
+        assert!(outbox.load_physical_entries_at_paths(paths).unwrap().is_empty());
+        assert!(outbox.admission_available().unwrap());
+
+        let entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        fs::write(&entry.path, b"not valid JSON").unwrap();
+        assert!(outbox
+            .load_physical_entries_at_paths(vec![entry.path])
+            .is_err());
+        assert!(outbox.admission_available().is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_pending_funds_are_scoped_to_final_buyer_and_rail() {
+        let root = test_temp_dir("mayhem-receipt-outbox-pending-funds");
+        let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
+        let checkpoint = signed_receipt_settlement_feature_for_test_at(7, 2, false, 1);
+        let user = checkpoint["value"]["receipt"]["body"]["user"]
+            .as_str()
+            .unwrap();
+        outbox.persist(&checkpoint).unwrap();
+        assert!(!outbox.has_pending_final_receipts(user, "tnk").unwrap());
+        let final_receipt = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        assert!(outbox.has_pending_final_receipts(user, "tnk").unwrap());
+        assert!(!outbox.has_pending_final_receipts(user, "fiat").unwrap());
+        assert!(!outbox.has_pending_final_receipts("another buyer", "tnk").unwrap());
+        outbox.remove(&final_receipt).unwrap();
+        assert!(!outbox.has_pending_final_receipts(user, "tnk").unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn receipt_outbox_quarantines_obsolete_contract_entries_on_recovery() {
         let root = test_temp_dir("mayhem-provider-receipt-outbox-obsolete-contract");
         let directory = root.join("gateway");
@@ -109974,6 +110113,108 @@ esac
             assert!(delay <= RECEIPT_SETTLEMENT_RETRY_MAX);
         }
         assert!(receipt_settlement_retry_delay(5) > RECEIPT_SETTLEMENT_RETRY_INITIAL);
+    }
+
+    #[tokio::test]
+    async fn fresh_receipt_is_submitted_while_older_relay_is_stalled() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = test_temp_dir("mayhem-receipt-fresh-submission");
+        let outbox = Arc::new(ReceiptSettlementOutbox::new(root.clone()).unwrap());
+        let old = signed_receipt_settlement_feature_for_test(7);
+        let old_entry = outbox.persist(&old).unwrap();
+        let mut receipt = parse_record_usage_receipt_envelope(&old["value"]["receipt"]).unwrap();
+        receipt.body.billing_id = "52".repeat(32);
+        receipt.body.reservation_id = "53".repeat(32);
+        let payload = receipt_signing_bytes(&receipt.body).unwrap();
+        receipt.enclave_sig = hex_encode(&SigningKey::from_bytes(&[32; 32]).sign(&payload).to_bytes());
+        receipt.user_sig = hex_encode(&SigningKey::from_bytes(&[33; 32]).sign(&payload).to_bytes());
+        let key = record_usage_receipt_feature_key(&receipt);
+        let mut value = json!({
+            "op": "record_usage_receipt", "contract_version": CONTRACT_VERSION,
+            "epoch": 7, "payout_revision": receipt.body.payout_revision,
+            "receipt": record_usage_receipt_envelope(&receipt),
+        });
+        value["provider_sig"] = json!(hex_encode(
+            &SigningKey::from_bytes(&[31; 32])
+                .sign(&record_usage_receipt_signing_bytes(&key, &value).unwrap())
+                .to_bytes()
+        ));
+        let fresh = json!({"feature": "mayhem", "key": key, "value": value});
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (seen_old, mut old_seen) = tokio::sync::mpsc::channel(1);
+        let release_old = Arc::new(tokio::sync::Notify::new());
+        let server_release = release_old.clone();
+        let server = tokio::spawn(async move {
+            let mut requests = tokio::task::JoinSet::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let seen_old = seen_old.clone();
+                let release = server_release.clone();
+                requests.spawn(async move {
+                    let mut bytes = Vec::new();
+                    let (header_end, length) = loop {
+                        let mut chunk = [0_u8; 4096];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&chunk[..n]);
+                        if let Some(end) = bytes.windows(4).position(|x| x == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            let length = headers.lines().find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().unwrap())
+                            }).unwrap();
+                            break (end + 4, length);
+                        }
+                    };
+                    while bytes.len() < header_end + length {
+                        let mut chunk = [0_u8; 4096];
+                        let n = stream.read(&mut chunk).await.unwrap();
+                        assert!(n > 0);
+                        bytes.extend_from_slice(&chunk[..n]);
+                    }
+                    let feature: Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
+                    if feature["value"]["receipt"]["body"]["billing_id"] == "42".repeat(32) {
+                        seen_old.send(()).await.unwrap();
+                        release.notified().await;
+                    }
+                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").await.unwrap();
+                });
+            }
+            while let Some(result) = requests.join_next().await {
+                result.unwrap();
+            }
+        });
+        outbox
+            .clone()
+            .spawn_retry(PeerRpcClient::new(format!("http://{address}/v1")).unwrap());
+        timeout(Duration::from_secs(3), old_seen.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        let fresh_entry = outbox.persist(&fresh).unwrap();
+        timeout(Duration::from_secs(3), async {
+            while fresh_entry.path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("fresh receipt must bypass the stalled disk retry pass");
+        assert!(
+            old_entry.path.exists(),
+            "older evidence must remain durable while its relay is stalled"
+        );
+        release_old.notify_one();
+        server.await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            while old_entry.path.exists() {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
@@ -110711,6 +110952,98 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         verifying_key
             .verify_strict(&receipt_signing_bytes(&receipt.body).unwrap(), &signature)
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_receipt_ack_survives_queued_disconnect_without_weakening_validation() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+
+        for (settling, reason, valid_signature, send_ack, succeeds) in [
+            (false, "client_disconnect", true, true, false),
+            (true, "client_disconnect", true, true, true),
+            (true, "shutdown", true, true, false),
+            (true, "client_disconnect", false, true, false),
+            (true, "client_disconnect", true, false, false),
+        ] {
+            let mut terms = test_provider_session_terms();
+            terms.min_session_au = 37;
+            let mut active = test_active_provider_session(&terms, vec!["image".to_owned()]);
+            let user_key = SigningKey::from_bytes(&[6; 32]);
+            active.user_pubkey = hex_encode(&user_key.verifying_key().to_bytes());
+            let receipt = provider_cancelled_session_receipt(
+                &terms,
+                &active,
+                &json!({
+                    "mayhem_contract": {
+                        "endpoint_family": mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+                    },
+                    "contract_request": {"prompt": "cancelled render"},
+                }),
+                ReceiptUsage::default(),
+                BTreeMap::new(),
+                1,
+                &RuntimeKeypair::from_seed([9; 32]),
+            )
+            .unwrap();
+            let signature = if valid_signature {
+                hex_encode(
+                    &user_key
+                        .sign(&receipt_signing_bytes(&receipt.body).unwrap())
+                        .to_bytes(),
+                )
+            } else {
+                "00".repeat(64)
+            };
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let session_id = active.session_id.clone();
+            let remote = active.remote.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let auth: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                socket
+                    .send(Message::Text(
+                        json!({"id": auth["id"], "type": "auth_ok"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                // The monitor consumed its copy; the settlement connection
+                // still sees the original broadcast before the buyer's ACK.
+                let mut frames = vec![json!({"t": "s.close", "reason": reason})];
+                if send_ack {
+                    frames.push(json!({"t": "s.receipt_ack", "session_id": session_id, "seq": 1, "user_sig": signature}));
+                }
+                for frame in frames {
+                    socket.send(Message::Text(json!({"type": "session_frame", "session_id": session_id, "remote": remote, "frame": frame}).to_string().into())).await.unwrap();
+                }
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            });
+            let mut bridge = ScBridgeClient::connect(
+                ScBridgeConfig::new(format!("ws://{address}"), "test-token").unwrap(),
+            )
+            .await
+            .unwrap();
+            let result = wait_for_provider_receipt_ack_inner(
+                &mut bridge,
+                &active,
+                &receipt,
+                Duration::from_millis(150),
+                None,
+                settling,
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds, "settling={settling}, reason={reason}, valid_signature={valid_signature}, send_ack={send_ack}: {result:?}");
+            if !send_ack {
+                assert!(result.unwrap_err().to_string().contains("timed out"));
+            }
+            server.await.unwrap();
+        }
     }
 
     #[test]
