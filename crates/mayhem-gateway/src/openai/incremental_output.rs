@@ -61,6 +61,7 @@ pub(super) fn reasoning_text(evidence: &str) -> String {
 #[derive(Default)]
 pub(super) struct ToolStream {
     calls: Vec<ToolCallOutput>,
+    public_lengths: Vec<usize>,
     bytes: usize,
     finalized: bool,
 }
@@ -132,6 +133,7 @@ impl ToolStream {
                     name: name.to_owned(),
                     arguments: String::new(),
                 });
+                self.public_lengths.push(0);
             } else if delta.get("id").is_some() || delta.get("name").is_some() {
                 return Err(error("tool delta attempted to replace call identity"));
             }
@@ -140,6 +142,12 @@ impl ToolStream {
                 return Err(error("streamed tool arguments exceeded session text limit"));
             }
             self.calls[index].arguments.push_str(arguments);
+            // Some clients execute as soon as input is valid JSON. Retain its
+            // final delimiter until the provider's final schema check succeeds.
+            let arguments = &self.calls[index].arguments;
+            let end = provisional_argument_end(arguments);
+            public["function"]["arguments"] = json!(&arguments[self.public_lengths[index]..end]);
+            self.public_lengths[index] = end;
             output.push(public);
         }
         Ok(output)
@@ -155,7 +163,8 @@ impl ToolStream {
                 if prior.id != call.id || prior.name != call.name {
                     return Err(error("final tool identity differs from streamed call"));
                 }
-                if let Some(tail) = call.arguments.strip_prefix(&prior.arguments) {
+                if call.arguments.starts_with(&prior.arguments) {
+                    let tail = &call.arguments[self.public_lengths[index]..];
                     if !tail.is_empty() {
                         deltas.push(json!({"index":index,"function":{"arguments":tail}}));
                     }
@@ -167,6 +176,10 @@ impl ToolStream {
                     if prior != final_args {
                         return Err(error("final tool arguments differ from streamed call"));
                     }
+                    let tail = &self.calls[index].arguments[self.public_lengths[index]..];
+                    if !tail.is_empty() {
+                        deltas.push(json!({"index":index,"function":{"arguments":tail}}));
+                    }
                 }
             } else {
                 deltas.push(json!({"index":index,"id":call.id,"type":"function","function":{"name":call.name,"arguments":call.arguments}}));
@@ -174,6 +187,24 @@ impl ToolStream {
         }
         self.finalized = true;
         Ok(deltas)
+    }
+}
+
+fn provisional_argument_end(arguments: &str) -> usize {
+    if !arguments.trim_start().starts_with(['{', '[']) {
+        // A scalar can be valid before it is complete (e.g. 1 then 12).
+        return 0;
+    }
+    let mut values = serde_json::Deserializer::from_str(arguments).into_iter::<Value>();
+    if matches!(values.next(), Some(Ok(_))) {
+        arguments[..values.byte_offset()]
+            .trim_end()
+            .char_indices()
+            .last()
+            .map(|(index, _)| index)
+            .unwrap_or(0)
+    } else {
+        arguments.len()
     }
 }
 
@@ -237,7 +268,16 @@ mod tests {
             name: "write".into(),
             arguments: "{\"content\":\"hello world\"}".into(),
         };
-        assert!(stream.finish(&[call.clone()]).unwrap().is_empty());
+        let partial = format!(
+            "{}{}",
+            first[0]["function"]["arguments"].as_str().unwrap(),
+            second[0]["function"]["arguments"].as_str().unwrap()
+        );
+        assert!(serde_json::from_str::<Value>(&partial).is_err());
+        assert_eq!(
+            stream.finish(&[call.clone()]).unwrap()[0]["function"]["arguments"],
+            "}"
+        );
         let mut wrong = call;
         wrong.arguments = "{}".into();
         assert!(stream.finish(&[wrong]).is_err());
@@ -267,5 +307,29 @@ mod tests {
             )
             .unwrap();
         assert!(stream.finish(&[]).is_err());
+    }
+
+    #[test]
+    fn complete_input_waits_for_validation_even_with_trailing_whitespace() {
+        let mut stream = ToolStream::default();
+        let first = stream.push(&json!({"tool_calls_delta":[{"index":0,"id":"x","name":"write","arguments":"{ \"content\" : \"é🦀\" }  "}]}), &request(), 1024).unwrap();
+        let partial = first[0]["function"]["arguments"].as_str().unwrap();
+        assert!(serde_json::from_str::<Value>(partial).is_err());
+        let mut call = ToolCallOutput {
+            id: "x".into(),
+            name: "write".into(),
+            arguments: "{}".into(),
+        };
+        assert!(stream.finish(&[call.clone()]).is_err());
+        call.arguments = r#"{"content":"é🦀"}"#.into();
+        let final_delta = stream.finish(&[call]).unwrap();
+        let complete = format!(
+            "{partial}{}",
+            final_delta[0]["function"]["arguments"].as_str().unwrap()
+        );
+        assert_eq!(
+            serde_json::from_str::<Value>(&complete).unwrap(),
+            json!({"content":"é🦀"})
+        );
     }
 }
