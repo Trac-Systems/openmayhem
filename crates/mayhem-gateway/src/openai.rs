@@ -130,6 +130,10 @@ use tower::limit::ConcurrencyLimitLayer;
 
 type SharedState = Arc<GatewayState>;
 
+#[cfg(test)]
+mod durable_streaming_tests;
+mod response_stream;
+
 mod github_update;
 use github_update::{
     automatic_update_check_enabled, check_github_update, GithubUpdateCache, GithubUpdateCheckConfig,
@@ -3120,6 +3124,7 @@ impl GatewayJobHandle {
             let mut store = store.lock_recover("gateway job vault");
             let pending = store
                 .get(&id, now_secs())?
+                .or_else(|| store.active_recovery(&id).cloned())
                 .ok_or_else(|| format!("gateway job {id} is missing"))?;
             let mut receipt: GatewayJobSettledReceipt = serde_json::from_value(
                 pending
@@ -3138,7 +3143,15 @@ impl GatewayJobHandle {
             }
             let receipt = serde_json::to_value(receipt)
                 .map_err(|err| format!("serializing gateway job {id} recovery state: {err}"))?;
-            store.update_reconciliation_receipt(&id, receipt, now_secs())
+            if store.is_active(&id) {
+                store.update_active_receipt(&id, receipt, now_secs())?;
+                Ok(store
+                    .active_recovery(&id)
+                    .expect("active recovery exists")
+                    .clone())
+            } else {
+                store.update_reconciliation_receipt(&id, receipt, now_secs())
+            }
         })
         .await
         .map_err(|err| {
@@ -3631,7 +3644,10 @@ fn parse_gateway_job_receipt_recovery(
     if recovery.body.session_id != recovery.receipt_ack.session_id
         || recovery.body.seq != recovery.receipt_ack.seq
         || recovery.body.model_id != job.model
-        || !recovery.body.final_receipt
+        || (!recovery.body.final_receipt
+            && !(durable_streaming_endpoint_family(&job.endpoint_family)
+                && recovery.reconciliation.terminal_status == GatewayJobStatus::Cancelled
+                && recovery.reconciliation.ack_reason.as_deref() == Some("checkpoint")))
         || !is_lower_hex_len(&recovery.body.session_id, 64)
         || !is_lower_hex_len(&recovery.body.provider, 64)
         || !is_lower_hex_len(&recovery.body.user, 64)
@@ -5609,6 +5625,7 @@ pub fn openai_router(state: GatewayState) -> Router {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/jobs", get(list_gateway_jobs))
+        .route("/v1/jobs/lookup", get(lookup_gateway_job_by_key))
         .route(
             "/v1/jobs/{job_id}",
             get(retrieve_gateway_job).delete(delete_gateway_job),
@@ -8564,6 +8581,8 @@ async fn prepare_gateway_job_with_cancellation(
     )
     .map_err(|err| ApiError::bad_request(err, Some("Idempotency-Key")))?;
     let request_fingerprint = stable_value_hash(normalized_request);
+    let durable_stream = normalized_request.get("stream").and_then(Value::as_bool) == Some(true)
+        && durable_streaming_endpoint_family(endpoint_family);
     let cancellation = cancellation.unwrap_or_else(GatewayRequestCancellation::new);
     let store = state.jobs.clone();
     let active_cancellations = state.active_job_cancellations.clone();
@@ -8587,7 +8606,7 @@ async fn prepare_gateway_job_with_cancellation(
         let mut cancellations =
             active_cancellations.lock_recover("active gateway job cancellations");
         cancellations.insert(begin_id.clone(), begin_cancellation.clone());
-        let begin = store.begin(
+        let mut begin = store.begin(
             begin_id.clone(),
             begin_endpoint,
             begin_model,
@@ -8595,6 +8614,13 @@ async fn prepare_gateway_job_with_cancellation(
             request_fingerprint,
             now_secs(),
         );
+        if durable_stream && matches!(begin, Ok(BeginGatewayJob::Started)) {
+            if let Err(error) = store.protect_active(&begin_id, now_secs()) {
+                // Do not dispatch after a failed reservation write. Keep the key
+                // active in case the atomic publish succeeded before fsync failed.
+                begin = Err(error);
+            }
+        }
         if !matches!(begin, Ok(BeginGatewayJob::Started))
             && cancellations
                 .get(&begin_id)
@@ -8863,8 +8889,14 @@ fn gateway_job_lookup_metadata(job: &GatewayJobLookup) -> Value {
             endpoint_family,
             model,
             created_at,
+            receipt,
             ..
-        } => gateway_job_in_progress_metadata(id, endpoint_family, model, *created_at),
+        } => {
+            let mut metadata =
+                gateway_job_in_progress_metadata(id, endpoint_family, model, *created_at);
+            metadata["receipt"] = json!(receipt);
+            metadata
+        }
         GatewayJobLookup::Terminal(job) => gateway_job_metadata(job),
     }
 }
@@ -9035,6 +9067,85 @@ async fn retrieve_gateway_job(
     if let Err(err) = authorize_gateway_job(&state, &headers, &job) {
         return err.into_response();
     }
+    gateway_job_lookup_response(job)
+}
+
+fn durable_streaming_endpoint_family(family: &str) -> bool {
+    matches!(
+        family,
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+            | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+            | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+            | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+    )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct GatewayJobKeyLookupQuery {
+    endpoint_family: String,
+}
+
+async fn lookup_gateway_job_by_key(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Query(query): Query<GatewayJobKeyLookupQuery>,
+) -> Response {
+    let owner = match state.authorize_gateway_request(&headers, None) {
+        Ok(owner) => owner,
+        Err(error) => return error.into_response(),
+    };
+    if !durable_streaming_endpoint_family(&query.endpoint_family) {
+        return ApiError::bad_request(
+            "unsupported streaming endpoint family",
+            Some("endpoint_family"),
+        )
+        .into_response();
+    }
+    let key = match headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+    {
+        Some(key) => key,
+        None => {
+            return ApiError::bad_request("Idempotency-Key is required", Some("Idempotency-Key"))
+                .into_response()
+        }
+    };
+    let id = match gateway_job_id(
+        state.receipt_config.user_seed,
+        owner.as_ref().map(|owner| owner.token_id.as_str()),
+        &query.endpoint_family,
+        Some(key),
+    ) {
+        Ok(id) => id,
+        Err(error) => return ApiError::bad_request(error, Some("Idempotency-Key")).into_response(),
+    };
+    let store = state.jobs.clone();
+    let job = match tokio::task::spawn_blocking(move || {
+        store
+            .lock_recover("gateway job vault")
+            .lookup_read_only(&id, now_secs())
+    })
+    .await
+    {
+        Ok(Some(job)) => job,
+        Ok(None) => {
+            return ApiError::not_found("gateway job was not found", Some("job_id")).into_response()
+        }
+        Err(error) => {
+            return ApiError::internal_message(format!("gateway job lookup task failed: {error}"))
+                .into_response()
+        }
+    };
+    // Use the ordinary model and owner authorization, but conceal inaccessible jobs.
+    if authorize_gateway_job(&state, &headers, &job).is_err() {
+        return ApiError::not_found("gateway job was not found", Some("job_id")).into_response();
+    }
+    gateway_job_lookup_response(job)
+}
+
+fn gateway_job_lookup_response(job: GatewayJobLookup) -> Response {
     let status = if matches!(job, GatewayJobLookup::InProgress { .. })
         || matches!(
             &job,
@@ -9271,14 +9382,6 @@ async fn create_chat_completion(
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
-    if request.stream {
-        return match build_chat_completion(state, request, options).await {
-            Ok(ChatResponse::Json(value)) => Json(value).into_response(),
-            Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
-            Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
-            Err(err) => err.into_response(),
-        };
-    }
     let endpoint_family = request
         .endpoint_family
         .as_deref()
@@ -9304,6 +9407,12 @@ async fn create_chat_completion(
     options.job = Some(job.clone());
     let cancellation = job.cancellation();
     options.client_cancellation = Some(cancellation.clone());
+    if request.stream {
+        return gateway_stream_job_response(job, async move {
+            build_chat_completion(state, request, options).await
+        })
+        .await;
+    }
     if gateway_prefers_async_response(&headers) {
         let job_id = job.id.clone();
         spawn_gateway_job_request(job, async move {
@@ -9405,14 +9514,6 @@ async fn create_completion(
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
-    if request.stream {
-        return match build_completion(state, request, normalized_request, options).await {
-            Ok(ChatResponse::Json(value)) => Json(value).into_response(),
-            Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
-            Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
-            Err(err) => err.into_response(),
-        };
-    }
     let job = match prepare_gateway_job(
         &state,
         &headers,
@@ -9431,6 +9532,12 @@ async fn create_completion(
     options.job = Some(job.clone());
     let cancellation = job.cancellation();
     options.client_cancellation = Some(cancellation.clone());
+    if request.stream {
+        return gateway_stream_job_response(job, async move {
+            build_completion(state, request, normalized_request, options).await
+        })
+        .await;
+    }
     if gateway_prefers_async_response(&headers) {
         let job_id = job.id.clone();
         spawn_gateway_job_request(job, async move {
@@ -9486,14 +9593,6 @@ async fn create_response(
         Err(err) => return err.into_response(),
     };
     options.access_token = access_token;
-    if request.stream {
-        return match build_response(state, request, normalized_request, options).await {
-            Ok(ChatResponse::Json(value)) => Json(value).into_response(),
-            Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
-            Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
-            Err(err) => err.into_response(),
-        };
-    }
     let job = match prepare_gateway_job(
         &state,
         &headers,
@@ -9512,6 +9611,12 @@ async fn create_response(
     options.job = Some(job.clone());
     let cancellation = job.cancellation();
     options.client_cancellation = Some(cancellation.clone());
+    if request.stream {
+        return gateway_stream_job_response(job, async move {
+            build_response(state, request, normalized_request, options).await
+        })
+        .await;
+    }
     if gateway_prefers_async_response(&headers) {
         let job_id = job.id.clone();
         spawn_gateway_job_request(job, async move {
@@ -11984,6 +12089,14 @@ async fn mayhem_status(State(state): State<SharedState>, headers: HeaderMap) -> 
         "contract_version": CONTRACT_VERSION,
         "app_version": installed_app_version(),
         "backend": state.session_backend.name(),
+        "durable_streaming_jobs": true,
+        "capabilities": { "durable_streaming_jobs": true },
+        "durable_streaming_endpoint_families": [
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+            mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+            mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT,
+        ],
         "rail": state.receipt_config.rail,
         "dev_session_shim": state.dev_session_shim,
         "models": state.models_snapshot().len(),
@@ -12765,7 +12878,8 @@ fn new_dashboard_token() -> String {
     BASE64_URL_SAFE_NO_PAD.encode(bytes)
 }
 
-type SseEventStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
+// Keep structured chunks until the HTTP boundary so adapters never parse SSE bytes.
+type SseEventStream = Pin<Box<dyn Stream<Item = Option<Value>> + Send>>;
 const LIVE_SSE_MIN_EVENT_BUFFER: usize = 1;
 const LIVE_SSE_MAX_EVENT_BUFFER: usize = 8;
 const LIVE_SSE_DEFAULT_MAX_TOKENS: usize = 1024;
@@ -12893,6 +13007,42 @@ where
     T: Send + 'static,
     F: Future<Output = Result<T, ApiError>> + Send + 'static,
 {
+    spawn_owned_gateway_job_request_with_handoff(job, request, false)
+}
+
+async fn gateway_stream_job_response<F>(job: GatewayJobHandle, request: F) -> Response
+where
+    F: Future<Output = Result<ChatResponse, ApiError>> + Send + 'static,
+{
+    let mut lifetime = GatewayRequestLifetimeGuard::new(job.cancellation());
+    let result = spawn_owned_gateway_job_request_with_handoff(job.clone(), request, true)
+        .await
+        .unwrap_or_else(|error| {
+            Err(ApiError::internal_message(format!(
+                "gateway stream task failed: {error}"
+            )))
+        });
+    lifetime.complete();
+    let mut response = match result {
+        Ok(ChatResponse::Json(value)) => Json(value).into_response(),
+        Ok(ChatResponse::Sse(chunks)) => sse_response(chunks),
+        Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
+        Err(error) => error.into_response(),
+    };
+    // A session may change during failover; only the job is a stable header identity.
+    attach_gateway_job_headers(&mut response, &job.id);
+    response
+}
+
+fn spawn_owned_gateway_job_request_with_handoff<T, F>(
+    job: GatewayJobHandle,
+    request: F,
+    stream_handoff: bool,
+) -> tokio::task::JoinHandle<Result<T, ApiError>>
+where
+    T: Send + 'static,
+    F: Future<Output = Result<T, ApiError>> + Send + 'static,
+{
     let cancellation = job.cancellation();
     tokio::spawn(async move {
         let (result, task_failed) = match tokio::spawn(request).await {
@@ -12914,7 +13064,7 @@ where
             } else {
                 job.persist_failure_if_active(error).await;
             }
-        } else if job.is_active() {
+        } else if !stream_handoff && job.is_active() {
             let error = ApiError::internal_message(
                 "gateway job execution returned without publishing a terminal result",
             );
@@ -20288,6 +20438,7 @@ fn record_direct_session_receipt(
     provider_receipt: &ProviderSignedReceipt,
     receipt_ack: &ReceiptAck,
 ) -> Result<(), GatewaySessionError> {
+    persist_stream_checkpoint_evidence(invocation, provider_receipt, receipt_ack)?;
     invocation
         .receipt_recorder
         .record(StoredReceipt {
@@ -20303,6 +20454,43 @@ fn record_direct_session_receipt(
             access_token: invocation.access_token.clone(),
         })
         .map_err(|error| GatewaySessionError::new(error.message))
+}
+
+fn persist_stream_checkpoint_evidence(
+    invocation: &GatewaySessionInvocation,
+    provider_receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+) -> Result<(), GatewaySessionError> {
+    let Some(job) = invocation
+        .job
+        .as_ref()
+        .filter(|_| !provider_receipt.body.final_receipt)
+    else {
+        return Ok(());
+    };
+    let mut store = job.store.lock_recover("gateway job vault");
+    let Some(recovery) = store.active_recovery(&job.id) else {
+        return Ok(());
+    };
+    let receipt = gateway_job_settled_receipt(
+        invocation,
+        provider_receipt,
+        receipt_ack,
+        GatewayJobStatus::Cancelled,
+        Some("stream interrupted before terminal receipt".to_owned()),
+        Some("checkpoint".to_owned()),
+    )?;
+    if let Some(existing) = recovery.receipt.as_ref() {
+        if ["body", "enclave_sig", "enclave_pubkey", "receipt_ack"]
+            .iter()
+            .all(|key| existing.get(key) == receipt.get(key))
+        {
+            return Ok(());
+        }
+    }
+    store
+        .update_active_receipt(&job.id, receipt, now_secs())
+        .map_err(GatewaySessionError::new)
 }
 
 fn validate_receipt_settlement_feature(
@@ -23679,6 +23867,25 @@ async fn build_chat_completion(
             .await;
         Some(receipt)
     };
+    if let Some(job) = invocation.job.as_ref() {
+        job.persist_completed_if_active(
+            chat_job_result(&output),
+            gateway_job_artifacts(&output.artifacts),
+            receipt.as_ref().map(|receipt| {
+                if request.stream {
+                    json!({
+                        "body": receipt.receipt.body,
+                        "enclave_sig": receipt.receipt.enclave_sig,
+                        "enclave_pubkey": receipt.receipt.enclave_pubkey,
+                        "receipt_ack": receipt.receipt_ack,
+                    })
+                } else {
+                    receipt_summary(receipt)
+                }
+            }),
+        )
+        .await?;
+    }
     if request.stream {
         Ok(ChatResponse::Sse(chat_stream_chunks(
             &id,
@@ -23695,14 +23902,6 @@ async fn build_chat_completion(
     } else {
         let response =
             chat_response_value(&id, created, &model, &output, receipt.as_ref(), mayhem_meta);
-        if let Some(job) = invocation.job.as_ref() {
-            job.persist_completed_if_active(
-                chat_job_result(&output),
-                gateway_job_artifacts(&output.artifacts),
-                receipt.as_ref().map(|receipt| receipt_summary(receipt)),
-            )
-            .await?;
-        }
         Ok(ChatResponse::Json(response))
     }
 }
@@ -24277,9 +24476,37 @@ async fn reopen_direct_session_and_replay_open(
 
 fn live_direct_chat_sse_stream(session: LiveDirectChatSession) -> SseEventStream {
     let capacity = live_sse_event_buffer_capacity(&session.request);
-    let (tx, rx) = tokio::sync::mpsc::channel::<Result<Event, Infallible>>(capacity);
+    let job = session.invocation.job.clone();
+    owned_live_sse_stream(job, capacity, move |tx| async move {
+        run_live_direct_chat_sse(session, tx).await
+    })
+}
+
+fn owned_live_sse_stream<F, Fut>(
+    job: Option<GatewayJobHandle>,
+    capacity: usize,
+    producer: F,
+) -> SseEventStream
+where
+    F: FnOnce(tokio::sync::mpsc::Sender<Option<Value>>) -> Fut + Send + 'static,
+    Fut: Future<Output = Result<(), ApiError>> + Send + 'static,
+{
+    let (tx, rx) = tokio::sync::mpsc::channel(capacity);
     tokio::spawn(async move {
-        run_live_direct_chat_sse(session, tx).await;
+        let request = producer(tx.clone());
+        let task = match job {
+            Some(job) => spawn_owned_gateway_job_request(job, request),
+            None => tokio::spawn(request),
+        };
+        let result = task.await.unwrap_or_else(|error| {
+            Err(ApiError::internal_message(format!(
+                "gateway stream producer failed: {error}"
+            )))
+        });
+        if let Err(error) = result {
+            let _ = send_sse_error(&tx, &error.message).await;
+        }
+        let _ = send_sse_done(&tx).await;
     });
     Box::pin(stream::unfold(rx, |mut rx| async {
         rx.recv().await.map(|event| (event, rx))
@@ -24300,15 +24527,14 @@ fn live_sse_event_buffer_capacity(request: &ChatCompletionRequest) -> usize {
 
 async fn run_live_direct_chat_sse(
     mut session: LiveDirectChatSession,
-    tx: tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
-) {
+    tx: tokio::sync::mpsc::Sender<Option<Value>>,
+) -> Result<(), ApiError> {
     let result = run_live_direct_chat_sse_inner(&mut session, &tx).await;
     match result {
-        Ok(()) => {
-            let _ = send_sse_done(&tx).await;
-        }
+        Ok(()) => Ok(()),
         Err(err) => {
-            let (recovered, attempt_recorded) = if is_client_disconnect_error(&err) {
+            let disconnected = is_client_disconnect_error(&err);
+            let (recovered, attempt_recorded) = if disconnected {
                 (
                     finish_live_direct_chat_after_client_disconnect(&mut session, err).await,
                     true,
@@ -24331,7 +24557,12 @@ async fn run_live_direct_chat_sse(
             };
             match recovered {
                 Ok(()) => {
-                    let _ = send_sse_done(&tx).await;
+                    if disconnected {
+                        if let Some(job) = session.invocation.job.as_ref() {
+                            job.persist_cancelled_if_active("client_disconnect").await;
+                        }
+                    }
+                    Ok(())
                 }
                 Err(err) => {
                     if !attempt_recorded {
@@ -24358,8 +24589,7 @@ async fn run_live_direct_chat_sse(
                         "stream_error",
                     )
                     .await;
-                    let _ = send_sse_error(&tx, &err.message).await;
-                    let _ = send_sse_done(&tx).await;
+                    Err(provider_session_api_error(&err))
                 }
             }
         }
@@ -24541,7 +24771,7 @@ async fn wait_for_client_disconnect_provider_receipt(
 
 async fn recover_live_direct_chat_after_retryable(
     session: &mut LiveDirectChatSession,
-    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    tx: &tokio::sync::mpsc::Sender<Option<Value>>,
     mut err: GatewaySessionError,
 ) -> Result<(), GatewaySessionError> {
     let partial = err.partial.take().map(|partial| *partial);
@@ -24672,7 +24902,7 @@ async fn recover_live_direct_chat_after_retryable(
 
 async fn run_live_direct_chat_sse_inner(
     session: &mut LiveDirectChatSession,
-    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    tx: &tokio::sync::mpsc::Sender<Option<Value>>,
 ) -> Result<(), GatewaySessionError> {
     if !send_sse_value(
         tx,
@@ -24759,7 +24989,7 @@ async fn run_live_direct_chat_sse_inner(
                     now_millis_u64(),
                 ));
             }
-            result = next_session_frame_with_optional_wait(
+            result = next_session_frame_with_client_cancellation(
                 &mut session.bridge,
                 &session.invocation.session_id,
                 &session.transport_peer,
@@ -24771,6 +25001,7 @@ async fn run_live_direct_chat_sse_inner(
                     "s.error",
                     "s.close",
                 ],
+                session.invocation.client_cancellation.as_ref(),
             ) => result,
         };
         let frame = match frame_result {
@@ -25205,6 +25436,17 @@ async fn run_live_direct_chat_sse_inner(
         &session.provider,
         &session.model,
     )?;
+    reconcile_and_persist_completed_invocation_job(
+        &mut session.bridge,
+        &session.transport_peer,
+        &session.invocation,
+        chat_job_result(&output),
+        &output.artifacts,
+        &provider_receipt,
+        &receipt_ack,
+        "sending s.receipt_ack",
+    )
+    .await?;
     let receipt = session
         .state
         .meter_chat_session(
@@ -25215,16 +25457,6 @@ async fn run_live_direct_chat_sse_inner(
             Some(&provider_receipt),
         )
         .map_err(|err| GatewaySessionError::new(err.message))?;
-    send_receipt_ack_and_queue_settlement(
-        &mut session.bridge,
-        &session.transport_peer,
-        &session.invocation,
-        &provider_receipt,
-        &receipt_ack,
-        None,
-        "sending s.receipt_ack",
-    )
-    .await?;
     let _ = close_direct_session_channel(
         &mut session.bridge,
         &session.transport_peer,
@@ -25309,7 +25541,7 @@ async fn run_live_direct_chat_sse_inner(
 }
 
 async fn send_live_chat_tail(
-    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
+    tx: &tokio::sync::mpsc::Sender<Option<Value>>,
     id: &str,
     created: u64,
     model_id: &str,
@@ -25437,17 +25669,11 @@ fn add_partial_usage_to_output(output: &mut ChatOutput, partials: &[GatewaySessi
         .saturating_add(output.usage.completion_tokens);
 }
 
-async fn send_sse_value(
-    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
-    value: Value,
-) -> bool {
-    send_sse_event(tx, Ok(sse_event_from_value(value))).await
+async fn send_sse_value(tx: &tokio::sync::mpsc::Sender<Option<Value>>, value: Value) -> bool {
+    send_sse_event(tx, Some(value)).await
 }
 
-async fn send_sse_error(
-    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
-    message: &str,
-) -> bool {
+async fn send_sse_error(tx: &tokio::sync::mpsc::Sender<Option<Value>>, message: &str) -> bool {
     send_sse_value(
         tx,
         json!({
@@ -25460,20 +25686,20 @@ async fn send_sse_error(
     .await
 }
 
-async fn send_sse_done(tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>) -> bool {
-    send_sse_event(tx, Ok(Event::default().data("[DONE]"))).await
+async fn send_sse_done(tx: &tokio::sync::mpsc::Sender<Option<Value>>) -> bool {
+    send_sse_event(tx, None).await
 }
 
 async fn send_sse_event(
-    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
-    event: Result<Event, Infallible>,
+    tx: &tokio::sync::mpsc::Sender<Option<Value>>,
+    event: Option<Value>,
 ) -> bool {
     send_sse_event_with_timeout(tx, event, live_sse_client_backpressure_timeout()).await
 }
 
 async fn send_sse_event_with_timeout(
-    tx: &tokio::sync::mpsc::Sender<Result<Event, Infallible>>,
-    event: Result<Event, Infallible>,
+    tx: &tokio::sync::mpsc::Sender<Option<Value>>,
+    event: Option<Value>,
     timeout: Option<Duration>,
 ) -> bool {
     if let Some(timeout) = timeout {
@@ -25499,7 +25725,11 @@ fn live_sse_client_backpressure_timeout() -> Option<Duration> {
 }
 
 fn sse_event_from_value(value: Value) -> Event {
-    Event::default()
+    let event = match value.get("type").and_then(Value::as_str) {
+        Some(kind) if kind.starts_with("response.") => Event::default().event(kind),
+        _ => Event::default(),
+    };
+    event
         .json_data(value)
         .unwrap_or_else(|_| Event::default().data("{}"))
 }
@@ -28291,22 +28521,44 @@ async fn build_completion(
     raw_request: Value,
     options: GatewayRequestOptions,
 ) -> Result<ChatResponse, ApiError> {
-    let wants_stream = request.stream;
-    let mut chat = completion_chat_request(request, raw_request)?;
-    chat.stream = false;
+    let chat = completion_chat_request(request, raw_request)?;
     let response = build_chat_completion(state, chat, options).await?;
-    let ChatResponse::Json(response) = response else {
-        return Err(ApiError::bad_gateway(
-            "completion adapter expected a non-streaming provider result",
-            Some("model"),
-        ));
-    };
-    let completion = completion_response_from_chat(response)?;
-    if wants_stream {
-        Ok(ChatResponse::Sse(vec![completion]))
-    } else {
-        Ok(ChatResponse::Json(completion))
+    completion_response_from_chat_response(response)
+}
+
+fn completion_response_from_chat_response(
+    response: ChatResponse,
+) -> Result<ChatResponse, ApiError> {
+    match response {
+        ChatResponse::Json(value) => completion_response_from_chat(value).map(ChatResponse::Json),
+        ChatResponse::Sse(chunks) => Ok(ChatResponse::Sse(
+            chunks.into_iter().map(completion_chunk_from_chat).collect(),
+        )),
+        ChatResponse::SseStream(events) => Ok(ChatResponse::SseStream(Box::pin(
+            events.map(|event| event.map(completion_chunk_from_chat)),
+        ))),
     }
+}
+
+fn completion_chunk_from_chat(mut chunk: Value) -> Value {
+    if chunk.get("object").and_then(Value::as_str) != Some("chat.completion.chunk") {
+        return chunk;
+    }
+    chunk["object"] = json!("text_completion");
+    if let Some(choices) = chunk.get_mut("choices").and_then(Value::as_array_mut) {
+        for choice in choices {
+            if let Some(choice) = choice.as_object_mut() {
+                let delta = choice.remove("delta").unwrap_or(Value::Null);
+                let text = delta
+                    .get("tool_calls")
+                    .map(|calls| json!({"tool_calls": calls}).to_string().into())
+                    .unwrap_or_else(|| delta.get("content").cloned().unwrap_or(json!("")));
+                choice.insert("text".to_owned(), text);
+                choice.entry("logprobs").or_insert(Value::Null);
+            }
+        }
+    }
+    chunk
 }
 
 fn completion_chat_request(
@@ -28330,8 +28582,10 @@ fn completion_chat_request(
         }],
         user: request.user,
         metadata: BTreeMap::new(),
-        stream: false,
-        stream_options: None,
+        stream: request.stream,
+        stream_options: request.stream.then_some(StreamOptions {
+            include_usage: Some(true),
+        }),
         tools: None,
         tool_choice: None,
         parallel_tool_calls: None,
@@ -28395,24 +28649,20 @@ async fn build_response(
     raw_request: Value,
     options: GatewayRequestOptions,
 ) -> Result<ChatResponse, ApiError> {
-    let wants_stream = request.stream;
-    let mut chat = responses_chat_request(request, raw_request)?;
-    chat.stream = false;
+    let model = request.model.clone();
+    let chat = responses_chat_request(request, raw_request)?;
     let response = build_chat_completion(state, chat, options).await?;
-    let ChatResponse::Json(response) = response else {
-        return Err(ApiError::bad_gateway(
-            "responses adapter expected a non-streaming provider result",
-            Some("model"),
-        ));
-    };
-    let response = responses_value_from_chat(response)?;
-    if wants_stream {
-        Ok(ChatResponse::Sse(vec![json!({
-            "type": "response.completed",
-            "response": response,
-        })]))
-    } else {
-        Ok(ChatResponse::Json(response))
+    match response {
+        ChatResponse::Json(value) => responses_value_from_chat(value).map(ChatResponse::Json),
+        ChatResponse::Sse(chunks) => Ok(ChatResponse::SseStream(response_stream::from_chat(
+            Box::pin(stream::iter(
+                chunks.into_iter().map(Some).chain(std::iter::once(None)),
+            )),
+            model,
+        ))),
+        ChatResponse::SseStream(events) => Ok(ChatResponse::SseStream(response_stream::from_chat(
+            events, model,
+        ))),
     }
 }
 
@@ -28447,8 +28697,10 @@ fn responses_chat_request(
         messages,
         user: request.user,
         metadata: request.metadata,
-        stream: false,
-        stream_options: None,
+        stream: request.stream,
+        stream_options: request.stream.then_some(StreamOptions {
+            include_usage: Some(true),
+        }),
         tools: request.tools,
         tool_choice: request.tool_choice,
         parallel_tool_calls: request.parallel_tool_calls,
@@ -33732,7 +33984,8 @@ impl GatewayState {
             receipt_ack,
             access_token: invocation.access_token.clone(),
         };
-        invocation.receipt_recorder.record(stored.clone())?;
+        record_direct_session_receipt(invocation, &partial.provider_receipt, &stored.receipt_ack)
+            .map_err(|error| provider_session_api_error(&error))?;
         Ok(stored)
     }
 
@@ -35442,6 +35695,12 @@ fn sse_response(chunks: Vec<Value>) -> Response {
 }
 
 fn sse_stream_response(events: SseEventStream) -> Response {
+    let events = events.map(|value| {
+        Ok::<_, Infallible>(match value {
+            Some(value) => sse_event_from_value(value),
+            None => Event::default().data("[DONE]"),
+        })
+    });
     let mut response = Sse::new(events).into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
@@ -37795,7 +38054,7 @@ mod tests {
         }
     }
 
-    fn test_receipt_settlement_feature(
+    pub(super) fn test_receipt_settlement_feature(
         provider_receipt: &ProviderSignedReceipt,
         receipt_ack: &ReceiptAck,
     ) -> Value {
@@ -41528,7 +41787,7 @@ mod tests {
         }
     }
 
-    fn test_invocation() -> GatewaySessionInvocation {
+    pub(super) fn test_invocation() -> GatewaySessionInvocation {
         let identity = test_identity();
         let session_id = "aa".repeat(32);
         let enclave_id = mayhem_proto::catalog_enclave_id(&identity);
@@ -41622,7 +41881,7 @@ mod tests {
         }
     }
 
-    fn test_model() -> GatewayModel {
+    pub(super) fn test_model() -> GatewayModel {
         GatewayModel {
             id: test_identity().model_id,
             created: 1,
@@ -42282,7 +42541,7 @@ mod tests {
         assert!(config.audio_fingerprints_by_artifact_root.is_empty());
     }
 
-    fn test_chat_request(model_id: &str) -> ChatCompletionRequest {
+    pub(super) fn test_chat_request(model_id: &str) -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: model_id.to_owned(),
             messages: vec![ChatMessage {
@@ -42842,10 +43101,10 @@ mod tests {
     #[tokio::test]
     async fn live_sse_default_backpressure_waits_for_client_progress() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
-        assert!(send_sse_event_with_timeout(&tx, Ok(Event::default().data("first")), None,).await);
+        assert!(send_sse_event_with_timeout(&tx, Some(json!("first")), None,).await);
 
         let waiting = tokio::spawn(async move {
-            send_sse_event_with_timeout(&tx, Ok(Event::default().data("second")), None).await
+            send_sse_event_with_timeout(&tx, Some(json!("second")), None).await
         });
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert!(!waiting.is_finished());
@@ -50679,7 +50938,7 @@ mod tests {
         assert_eq!(output.len(), 2 * 1024 * 1024);
     }
 
-    fn test_chat_output() -> ChatOutput {
+    pub(super) fn test_chat_output() -> ChatOutput {
         ChatOutput {
             content: Some("receipt ok".to_owned()),
             tool_calls: Vec::new(),
@@ -50975,7 +51234,7 @@ mod tests {
         assert!(abilities.contains(&format!("api:{}", mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE)));
     }
 
-    fn test_provider_receipt(
+    pub(super) fn test_provider_receipt(
         model: &GatewayModel,
         request: &ChatCompletionRequest,
         output: &ChatOutput,
@@ -51093,7 +51352,7 @@ mod tests {
         }
     }
 
-    fn test_provider_receipt_with_finality(
+    pub(super) fn test_provider_receipt_with_finality(
         model: &GatewayModel,
         request: &ChatCompletionRequest,
         output: &ChatOutput,

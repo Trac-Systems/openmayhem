@@ -104,7 +104,7 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 test('checked-in Intercom release identity verifies exact sorted contract code bytes', () => {
   const identity = verifyReleaseIdentity({ rootDir: INTERCOM_ROOT });
 
-  assert.equal(identity.releaseVersion, '0.2.170');
+  assert.equal(identity.releaseVersion, '0.2.171');
   assert.equal(identity.contractVersion, 21);
   assert.match(identity.contractCodeSha256, /^[0-9a-f]{64}$/);
   assert.deepEqual(

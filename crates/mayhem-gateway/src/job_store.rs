@@ -129,7 +129,7 @@ impl From<&StoredGatewayJob> for StoredGatewayJobSummary {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ActiveGatewayJob {
     id: String,
     endpoint_family: String,
@@ -137,6 +137,7 @@ struct ActiveGatewayJob {
     owner_token_id: Option<String>,
     request_fingerprint: String,
     created_at: u64,
+    recovery: Option<StoredGatewayJob>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -154,6 +155,7 @@ pub(crate) enum GatewayJobLookup {
         model: String,
         owner_token_id: Option<String>,
         created_at: u64,
+        receipt: Option<Value>,
     },
     Terminal(StoredGatewayJob),
 }
@@ -261,9 +263,88 @@ impl GatewayJobStore {
                 owner_token_id,
                 request_fingerprint,
                 created_at: now,
+                recovery: None,
             },
         );
         Ok(BeginGatewayJob::Started)
+    }
+
+    // Persist a conservative terminal fallback before inference starts. While this
+    // process owns the job it remains active; reopening the vault never dispatches it.
+    pub(crate) fn protect_active(&mut self, id: &str, now: u64) -> Result<(), String> {
+        let active = self
+            .active
+            .get(id)
+            .ok_or_else(|| format!("job {id} is not active"))?;
+        if active.recovery.is_some() {
+            return Ok(());
+        }
+        let recovery = StoredGatewayJob {
+            schema_version: JOB_SCHEMA_VERSION,
+            id: active.id.clone(),
+            endpoint_family: active.endpoint_family.clone(),
+            model: active.model.clone(),
+            owner_token_id: active.owner_token_id.clone(),
+            request_fingerprint: active.request_fingerprint.clone(),
+            status: GatewayJobStatus::Failed,
+            created_at: active.created_at,
+            finished_at: now,
+            expires_at: now.saturating_add(self.ttl_seconds),
+            result: None,
+            artifacts: Vec::new(),
+            receipt: None,
+            error: Some("gateway execution interrupted; billing outcome is unknown without a signed receipt; do not redispatch this request".to_owned()),
+            error_info: Some(GatewayJobErrorInfo {
+                code: "gateway_execution_interrupted".to_owned(),
+                category: "execution_unknown".to_owned(),
+                retryable: false,
+            }),
+        };
+        self.persist_active_recovery(recovery)
+    }
+
+    pub(crate) fn active_recovery(&self, id: &str) -> Option<&StoredGatewayJob> {
+        self.active.get(id)?.recovery.as_ref()
+    }
+
+    pub(crate) fn update_active_receipt(
+        &mut self,
+        id: &str,
+        receipt: Value,
+        now: u64,
+    ) -> Result<(), String> {
+        let Some(mut recovery) = self.active_recovery(id).cloned() else {
+            return Ok(());
+        };
+        recovery.status = GatewayJobStatus::ReconciliationPending;
+        recovery.receipt = Some(receipt);
+        recovery.finished_at = now;
+        recovery.error = Some(
+            "stream interrupted before terminal receipt; checkpoint reconciliation is pending"
+                .to_owned(),
+        );
+        recovery.error_info = None;
+        self.persist_active_recovery(recovery)
+    }
+
+    fn persist_active_recovery(&mut self, recovery: StoredGatewayJob) -> Result<(), String> {
+        let id = recovery.id.clone();
+        let sealed = seal_job(&self.key, &recovery)?;
+        self.make_room_for_bytes(sealed.len(), Some(&id))?;
+        self.persist(&id, &sealed, self.sealed_sizes.contains_key(&id))?;
+        let previous = self
+            .sealed_sizes
+            .insert(id.clone(), sealed.len())
+            .unwrap_or(0);
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(previous)
+            .saturating_add(sealed.len());
+        self.active
+            .get_mut(&id)
+            .expect("active recovery owner exists")
+            .recovery = Some(recovery);
+        Ok(())
     }
 
     fn make_room_for_job(&mut self) -> Result<(), String> {
@@ -337,7 +418,7 @@ impl GatewayJobStore {
             .get(id)
             .cloned()
             .ok_or_else(|| format!("job {id} is not active"))?;
-        let job = StoredGatewayJob {
+        let mut job = StoredGatewayJob {
             schema_version: JOB_SCHEMA_VERSION,
             id: active.id,
             endpoint_family: active.endpoint_family,
@@ -354,6 +435,15 @@ impl GatewayJobStore {
             error,
             error_info,
         };
+        if matches!(
+            status,
+            GatewayJobStatus::Failed | GatewayJobStatus::Cancelled
+        ) {
+            if let Some(recovery) = active.recovery.filter(|job| job.receipt.is_some()) {
+                job.status = recovery.status;
+                job.receipt = recovery.receipt;
+            }
+        }
         let sealed = seal_job(&self.key, &job)?;
         if sealed.len() > self.max_bytes {
             return Err(format!(
@@ -363,11 +453,17 @@ impl GatewayJobStore {
                 self.max_bytes
             ));
         }
-        self.make_room_for_bytes(sealed.len(), None)?;
-        self.persist_new(&job.id, &sealed)?;
+        self.make_room_for_bytes(sealed.len(), Some(id))?;
+        self.persist(&job.id, &sealed, self.sealed_sizes.contains_key(id))?;
         self.active.remove(id);
-        self.total_bytes = self.total_bytes.saturating_add(sealed.len());
-        self.sealed_sizes.insert(job.id.clone(), sealed.len());
+        let previous = self
+            .sealed_sizes
+            .insert(job.id.clone(), sealed.len())
+            .unwrap_or(0);
+        self.total_bytes = self
+            .total_bytes
+            .saturating_sub(previous)
+            .saturating_add(sealed.len());
         self.records.insert(job.id.clone(), job.clone());
         if job.status == GatewayJobStatus::ReconciliationPending {
             self.reconciling.insert(job.id.clone());
@@ -495,16 +591,22 @@ impl GatewayJobStore {
         now: u64,
     ) -> Result<Option<GatewayJobLookup>, String> {
         self.purge_expired(now)?;
+        Ok(self.lookup_read_only(id, now))
+    }
+
+    pub(crate) fn lookup_read_only(&self, id: &str, now: u64) -> Option<GatewayJobLookup> {
         if let Some(job) = self.records.get(id) {
-            return Ok(Some(GatewayJobLookup::Terminal(job.clone())));
+            return (job.status == GatewayJobStatus::ReconciliationPending || job.expires_at > now)
+                .then(|| GatewayJobLookup::Terminal(job.clone()));
         }
-        Ok(self.active.get(id).map(|job| GatewayJobLookup::InProgress {
+        self.active.get(id).map(|job| GatewayJobLookup::InProgress {
             id: job.id.clone(),
             endpoint_family: job.endpoint_family.clone(),
             model: job.model.clone(),
             owner_token_id: job.owner_token_id.clone(),
             created_at: job.created_at,
-        }))
+            receipt: job.recovery.as_ref().and_then(|job| job.receipt.clone()),
+        })
     }
 
     pub(crate) fn pending_reconciliations(
@@ -702,10 +804,6 @@ impl GatewayJobStore {
             self.remove_sealed_record(&evict)?;
         }
         Ok(())
-    }
-
-    fn persist_new(&self, id: &str, sealed: &[u8]) -> Result<(), String> {
-        self.persist(id, sealed, false)
     }
 
     fn persist_replace(&self, id: &str, sealed: &[u8]) -> Result<(), String> {
@@ -1034,6 +1132,162 @@ fn sync_directory(directory: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn durable_stream_active_checkpoint_is_pinned_and_replacement_bytes_are_exact() {
+        let root = tempfile::tempdir().unwrap();
+        let seed = [31; 32];
+        let mut store =
+            GatewayJobStore::durable(seed, root.path().to_owned(), 1, 64 * 1024, 1, 10).unwrap();
+        let id = gateway_job_id(
+            seed,
+            Some("owner"),
+            "openai_chat_completions",
+            Some("stream"),
+        )
+        .unwrap();
+        store
+            .begin(
+                id.clone(),
+                "openai_chat_completions".to_owned(),
+                "model".to_owned(),
+                Some("owner".to_owned()),
+                "fingerprint".to_owned(),
+                10,
+            )
+            .unwrap();
+        store.protect_active(&id, 10).unwrap();
+        assert_eq!(
+            store.total_bytes,
+            fs::metadata(job_path(root.path(), &id)).unwrap().len() as usize
+        );
+        assert_eq!(
+            store.total_bytes,
+            store.sealed_sizes.values().sum::<usize>()
+        );
+        let checkpoint = serde_json::json!({"body": {"session_id": "first-session", "final_receipt": false}, "receipt_ack": {"user_sig": "signed"}});
+        for _ in 0..3 {
+            store
+                .update_active_receipt(&id, checkpoint.clone(), 11)
+                .unwrap();
+            assert_eq!(
+                store.total_bytes,
+                fs::metadata(job_path(root.path(), &id)).unwrap().len() as usize
+            );
+            assert_eq!(
+                store.total_bytes,
+                store.sealed_sizes.values().sum::<usize>()
+            );
+        }
+        assert!(store
+            .begin(
+                "job_pressure".to_owned(),
+                "chat".to_owned(),
+                "model".to_owned(),
+                None,
+                "other".to_owned(),
+                100
+            )
+            .is_err());
+        assert!(matches!(
+            store.lookup(&id, 100).unwrap(),
+            Some(GatewayJobLookup::InProgress { .. })
+        ));
+        let before = fs::read(job_path(root.path(), &id)).unwrap();
+        store.max_bytes = store.total_bytes;
+        assert!(store
+            .update_active_receipt(
+                &id,
+                serde_json::json!({"large": "x".repeat(64 * 1024)}),
+                100
+            )
+            .is_err());
+        assert_eq!(fs::read(job_path(root.path(), &id)).unwrap(), before);
+        drop(store);
+        let mut reopened =
+            GatewayJobStore::durable(seed, root.path().to_owned(), 1, 64 * 1024, 1, 100).unwrap();
+        let pending = reopened.get(&id, 100).unwrap().unwrap();
+        assert_eq!(pending.status, GatewayJobStatus::ReconciliationPending);
+        assert_eq!(pending.receipt, Some(checkpoint));
+        assert_eq!(
+            reopened.total_bytes,
+            reopened.sealed_sizes.values().sum::<usize>()
+        );
+        reopened
+            .begin(
+                "job_pressure".to_owned(),
+                "chat".to_owned(),
+                "model".to_owned(),
+                None,
+                "other".to_owned(),
+                100,
+            )
+            .unwrap();
+        finish(&mut reopened, "job_pressure", 100);
+        assert!(reopened.get(&id, 1000).unwrap().is_some());
+        assert_eq!(
+            reopened.total_bytes,
+            reopened.sealed_sizes.values().sum::<usize>()
+        );
+        reopened
+            .finish_reconciliation(&id, GatewayJobStatus::Cancelled, None, 1000)
+            .unwrap();
+        assert_eq!(
+            reopened.total_bytes,
+            fs::metadata(job_path(root.path(), &id)).unwrap().len() as usize
+        );
+    }
+
+    #[test]
+    fn durable_stream_reservation_restarts_without_rerun_and_read_only_lookup_does_not_purge() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store =
+            GatewayJobStore::durable([32; 32], root.path().to_owned(), 1, 64 * 1024, 10, 1)
+                .unwrap();
+        store
+            .begin(
+                "job_stream".to_owned(),
+                "chat".to_owned(),
+                "model".to_owned(),
+                Some("owner".to_owned()),
+                "hash".to_owned(),
+                1,
+            )
+            .unwrap();
+        store.protect_active("job_stream", 1).unwrap();
+        drop(store);
+        let mut reopened =
+            GatewayJobStore::durable([32; 32], root.path().to_owned(), 1, 64 * 1024, 10, 2)
+                .unwrap();
+        assert!(matches!(
+            reopened
+                .begin(
+                    "job_stream".to_owned(),
+                    "chat".to_owned(),
+                    "model".to_owned(),
+                    Some("owner".to_owned()),
+                    "hash".to_owned(),
+                    2
+                )
+                .unwrap(),
+            BeginGatewayJob::Existing(_)
+        ));
+        assert!(reopened
+            .begin(
+                "job_stream".to_owned(),
+                "chat".to_owned(),
+                "model".to_owned(),
+                Some("other".to_owned()),
+                "hash".to_owned(),
+                2
+            )
+            .is_err());
+        let bytes = reopened.total_bytes;
+        assert!(reopened.lookup_read_only("job_stream", 12).is_none());
+        assert_eq!(reopened.records.len(), 1);
+        assert_eq!(reopened.total_bytes, bytes);
+        assert!(job_path(root.path(), "job_stream").exists());
+    }
 
     fn finish(store: &mut GatewayJobStore, id: &str, now: u64) -> StoredGatewayJob {
         store
