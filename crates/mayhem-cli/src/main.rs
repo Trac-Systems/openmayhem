@@ -68,10 +68,10 @@ use mayhem_enclave::{
 use mayhem_engine::ComfyUiBackend;
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, CancellationToken,
-    ComfyUiCustomNodePackage, ComfyUiModelFile, ConcurrentGenerationBackend, EngineBackend,
-    EngineError, GenerateRequest, GenerateSpecialityParameter, GenerateSpecialityTarget,
-    GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
-    MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
+    ComfyUiCustomNodePackage, ComfyUiModelFile, ComponentRecovery, ConcurrentGenerationBackend,
+    EngineBackend, EngineError, GenerateRequest, GenerateSpecialityParameter,
+    GenerateSpecialityTarget, GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest,
+    LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, WorkflowGenerationRequest,
     WorkflowInputFile, MTMD_MEDIA_MARKER,
 };
@@ -61315,8 +61315,8 @@ trait ProviderSessionResponder {
     fn component_healthy(&mut self) -> bool {
         true
     }
-    fn recover_component(&mut self) -> Result<bool> {
-        Ok(false)
+    fn recover_component(&mut self) -> Result<ComponentRecovery> {
+        Ok(ComponentRecovery::Unsupported)
     }
     fn supports_live_text_streaming(&self) -> bool {
         false
@@ -61414,7 +61414,7 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         self.backend.component_healthy()
     }
 
-    fn recover_component(&mut self) -> Result<bool> {
+    fn recover_component(&mut self) -> Result<ComponentRecovery> {
         self.backend.recover_component().map_err(Into::into)
     }
 
@@ -78982,9 +78982,10 @@ async fn serve_provider_sessions(
                     "provider engine child exited while idle; no user session caused the failure",
                 );
             }
+            let mut component_recovery_pending = false;
             if engine_recovery.retry_due(Instant::now()) {
                 match responder.recover_component() {
-                    Ok(true) => {
+                    Ok(ComponentRecovery::Recovered) => {
                         engine_recovery.mark_recovered();
                         engine_watchdog.reset_after_restart();
                         engine_watchdog_reject = None;
@@ -78993,14 +78994,15 @@ async fn serve_provider_sessions(
                             "Failed provider worker recovered; healthy concurrent requests were preserved.",
                         );
                     }
-                    Ok(false) => {}
+                    Ok(ComponentRecovery::Pending) => component_recovery_pending = true,
+                    Ok(ComponentRecovery::Unsupported) => {}
                     Err(err) => engine_recovery.mark_reload_failed(
                         format!("isolated provider worker recovery failed: {err:#}"),
                         Instant::now(),
                     ),
                 }
             }
-            if engine_recovery.retry_due(Instant::now()) && sessions.is_empty() {
+            if !component_recovery_pending && engine_recovery.retry_due(Instant::now()) && sessions.is_empty() {
                 heartbeat_load.set_accepting_new(false);
                 let reason = engine_recovery
                     .reason()

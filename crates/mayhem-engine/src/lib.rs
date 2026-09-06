@@ -1514,6 +1514,13 @@ pub trait ConcurrentGenerationBackend: Send + Sync {
     ) -> Result<GenerateOutput>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComponentRecovery {
+    Unsupported,
+    Pending,
+    Recovered,
+}
+
 pub trait EngineBackend {
     fn backend_id(&self) -> &'static str;
     fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo>;
@@ -1524,9 +1531,9 @@ pub trait EngineBackend {
         true
     }
     /// Repair failed components without interrupting healthy concurrent calls.
-    /// False means that a full reload is still required after requests drain.
-    fn recover_component(&mut self) -> Result<bool> {
-        Ok(false)
+    /// Poll without waiting for model loading; unsupported backends require a drained reload.
+    fn recover_component(&mut self) -> Result<ComponentRecovery> {
+        Ok(ComponentRecovery::Unsupported)
     }
     fn process_ids(&self) -> Vec<u32> {
         Vec::new()
@@ -8019,7 +8026,7 @@ mod vllm_backend {
         attach_worker_containment, effective_vllm_max_num_seqs, engine_worker_command,
         select_runtime_compatible_cuda_home, validate_load_config,
         validate_vllm_compilation_config, validate_vllm_kernel_backend, verify_artifact,
-        vllm_safetensors_payload_path, ArtifactFormat, CancellationToken,
+        vllm_safetensors_payload_path, ArtifactFormat, CancellationToken, ComponentRecovery,
         ConcurrentGenerationBackend, EngineBackend, EngineError, FinishReason, GenerateOutput,
         GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization,
         UsageCounters, VllmGenerationTopology, WorkerContainment,
@@ -8055,6 +8062,7 @@ mod vllm_backend {
         python: PathBuf,
         worker: Option<Arc<VllmWorker>>,
         isolated_workers: Vec<Arc<VllmWorker>>,
+        isolated_recovery: Option<IsolatedWorkerRecovery>,
         loaded: Option<LoadedModelInfo>,
         next_id: Arc<AtomicU64>,
         memory_limit_bytes: Option<u64>,
@@ -8085,6 +8093,7 @@ mod vllm_backend {
                 python: python.into(),
                 worker: None,
                 isolated_workers: Vec::new(),
+                isolated_recovery: None,
                 loaded: None,
                 next_id: Arc::new(AtomicU64::new(1)),
                 memory_limit_bytes: None,
@@ -8162,6 +8171,7 @@ mod vllm_backend {
         }
 
         fn reset_isolated_workers(&mut self) {
+            self.isolated_recovery.take();
             for worker in self.isolated_workers.drain(..) {
                 worker.terminate();
             }
@@ -8485,6 +8495,26 @@ mod vllm_backend {
         }
     }
 
+    struct IsolatedWorkerRecovery {
+        index: usize,
+        worker: Option<Arc<VllmWorker>>,
+        loading: Option<JoinHandle<Result<WorkerLoadInfo>>>,
+        _permit: GenerationPermit,
+    }
+
+    impl Drop for IsolatedWorkerRecovery {
+        fn drop(&mut self) {
+            // A reload, shutdown, or rejected replacement owns and reaps the
+            // pending worker too; a successful publication takes it first.
+            if let Some(worker) = self.worker.take() {
+                worker.terminate();
+            }
+            if let Some(loading) = self.loading.take() {
+                let _ = loading.join();
+            }
+        }
+    }
+
     struct GenerationPermit {
         limiter: Arc<GenerationLimiter>,
         slot: usize,
@@ -8695,26 +8725,81 @@ mod vllm_backend {
                 }
         }
 
-        fn recover_component(&mut self) -> Result<bool> {
+        fn recover_component(&mut self) -> Result<ComponentRecovery> {
             if self.loaded_topology != Some(VllmGenerationTopology::IsolatedWorkers) {
-                return Ok(false);
+                return Ok(ComponentRecovery::Unsupported);
             }
             let Some(concurrent) = self.concurrent_generation.clone() else {
-                return Ok(false);
+                return Ok(ComponentRecovery::Unsupported);
             };
             let VllmGenerationDispatch::Isolated(dispatch) = &concurrent.dispatch else {
-                return Ok(false);
+                return Ok(ComponentRecovery::Unsupported);
             };
-            let loaded = self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+            if let Some(recovery) = &self.isolated_recovery {
+                if !recovery
+                    .loading
+                    .as_ref()
+                    .is_some_and(JoinHandle::is_finished)
+                {
+                    return Ok(ComponentRecovery::Pending);
+                }
+                let mut recovery = self.isolated_recovery.take().unwrap();
+                let info = recovery.loading.take().unwrap().join().map_err(|_| {
+                    EngineError::Vllm("isolated worker recovery task panicked".to_owned())
+                })??;
+                let index = recovery.index;
+                let evidence = &self.loaded_per_worker[index];
+                let loaded = self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+                let tokens = info.kv_cache_size_tokens.unwrap_or(0);
+                let expected_execution: Option<WorkerExecutionInfo> =
+                    serde_json::from_value(evidence["execution"].clone())?;
+                let mut comparable_execution = info.execution.clone();
+                if let (Some(actual), Some(expected)) = (
+                    comparable_execution
+                        .as_mut()
+                        .and_then(|e| e.worker_execution_observation.as_mut()),
+                    expected_execution
+                        .as_ref()
+                        .and_then(|e| e.worker_execution_observation.as_ref()),
+                ) {
+                    for (actual_rank, expected_rank) in actual.ranks.iter_mut().zip(&expected.ranks)
+                    {
+                        if actual_rank.pid != 0 {
+                            actual_rank.pid = expected_rank.pid;
+                        }
+                    }
+                }
+                let worker = recovery.worker.as_ref().unwrap();
+                if info.n_vocab != loaded.n_vocab
+                    || (info.n_ctx_train != 0 && info.n_ctx_train != loaded.n_ctx_train)
+                    || tokens < u64::from(loaded.ctx_size)
+                    || comparable_execution != expected_execution
+                    || info.determinism.batch_invariant
+                        != evidence["determinism"]["batch_invariant"].as_bool()
+                    || !worker.component_healthy()
+                {
+                    return Err(EngineError::Vllm(
+                        "replacement isolated worker does not match the loaded execution contract"
+                            .to_owned(),
+                    ));
+                }
+                let worker = recovery.worker.take().unwrap();
+                dispatch.write().unwrap_or_else(|p| p.into_inner())[index] = Arc::clone(&worker);
+                self.isolated_workers[index] = worker;
+                self.loaded_per_worker[index]["execution"] = json!(info.execution);
+                self.loaded_per_worker[index]["runtime_kv_token_capacity"] = json!(tokens);
+                self.loaded_per_worker[index]["runtime_full_context_capacity"] =
+                    json!(tokens / u64::from(loaded.ctx_size));
+            }
             for index in 0..self.isolated_workers.len() {
                 let old = &self.isolated_workers[index];
                 if old.component_healthy() {
                     continue;
                 }
-                // A failing call must finish releasing its route and slot first.
-                // Healthy slots remain leased and keep their original worker.
-                let Some(_permit) = concurrent.limiter.try_acquire_slot(index) else {
-                    return Ok(false);
+                // Wait for the failed request to release its own slot. Other
+                // slots remain usable through existing concurrent handles.
+                let Some(permit) = concurrent.limiter.try_acquire_slot(index) else {
+                    return Ok(ComponentRecovery::Pending);
                 };
                 let evidence = &self.loaded_per_worker[index];
                 let payload = evidence["load_payload"].clone();
@@ -8741,57 +8826,28 @@ mod vllm_backend {
                     self.cache_root.as_deref(),
                     execution_probe,
                 )?);
-                let info = worker.call_streaming::<WorkerLoadInfo>(
-                    self.next_request_id(),
-                    "load",
-                    payload,
-                    &mut |_| Ok(()),
-                    None,
-                    true,
-                    2,
-                )?;
-                let tokens = info.kv_cache_size_tokens.unwrap_or(0);
-                let expected_execution: Option<WorkerExecutionInfo> =
-                    serde_json::from_value(evidence["execution"].clone())?;
-                let mut comparable_execution = info.execution.clone();
-                if let (Some(actual), Some(expected)) = (
-                    comparable_execution
-                        .as_mut()
-                        .and_then(|e| e.worker_execution_observation.as_mut()),
-                    expected_execution
-                        .as_ref()
-                        .and_then(|e| e.worker_execution_observation.as_ref()),
-                ) {
-                    for (actual_rank, expected_rank) in actual.ranks.iter_mut().zip(&expected.ranks)
-                    {
-                        if actual_rank.pid != 0 {
-                            actual_rank.pid = expected_rank.pid;
-                        }
-                    }
-                }
-                if info.n_vocab != loaded.n_vocab
-                    || (info.n_ctx_train != 0 && info.n_ctx_train != loaded.n_ctx_train)
-                    || tokens < u64::from(loaded.ctx_size)
-                    || comparable_execution != expected_execution
-                    || info.determinism.batch_invariant
-                        != evidence["determinism"]["batch_invariant"].as_bool()
-                    || !worker.component_healthy()
-                {
-                    return Err(EngineError::Vllm(
-                        "replacement isolated worker does not match the loaded execution contract"
-                            .to_owned(),
-                    ));
-                }
-                // Publishing only after validation preserves the pool's epoch and
-                // existing concurrent handles without replacing any healthy worker.
-                dispatch.write().unwrap_or_else(|p| p.into_inner())[index] = Arc::clone(&worker);
-                self.isolated_workers[index] = worker;
-                self.loaded_per_worker[index]["execution"] = json!(info.execution);
-                self.loaded_per_worker[index]["runtime_kv_token_capacity"] = json!(tokens);
-                self.loaded_per_worker[index]["runtime_full_context_capacity"] =
-                    json!(tokens / u64::from(loaded.ctx_size));
+                let loading_worker = Arc::clone(&worker);
+                let id = self.next_request_id();
+                let loading = thread::spawn(move || {
+                    loading_worker.call_streaming::<WorkerLoadInfo>(
+                        id,
+                        "load",
+                        payload,
+                        &mut |_| Ok(()),
+                        None,
+                        true,
+                        2,
+                    )
+                });
+                self.isolated_recovery = Some(IsolatedWorkerRecovery {
+                    index,
+                    worker: Some(worker),
+                    loading: Some(loading),
+                    _permit: permit,
+                });
+                return Ok(ComponentRecovery::Pending);
             }
-            Ok(self.component_healthy())
+            Ok(ComponentRecovery::Recovered)
         }
 
         fn process_ids(&self) -> Vec<u32> {
