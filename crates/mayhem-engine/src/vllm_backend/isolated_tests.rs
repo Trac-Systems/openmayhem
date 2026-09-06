@@ -65,6 +65,8 @@ while time.monotonic() < deadline:
         break
     if op == 'load':
         record(f'load-{index}.json', request)
+        while plan.get('hold_load') and not (root / f'release-load-{index}').exists():
+            time.sleep(0.01)
         record(f'loaded-{index}.json', True)
         if plan.get('remove_executable'):
             Path(__file__).unlink()
@@ -829,4 +831,197 @@ fn isolated_topology_transitions_preserve_shared_dispatch_and_gate_reload() {
     ));
     drop(backend);
     fixture.assert_exited(4);
+}
+
+#[test]
+fn isolated_recovery_replaces_only_dead_slot_while_sibling_generates() {
+    let fixture = Fixture::new(json!([plan(8192), plan(8192), plan(8192)]));
+    let mut backend = fixture.backend();
+    backend.load(fixture.config(2)).unwrap();
+    let concurrent = backend.concurrent_generation_backend().unwrap();
+    let healthy = generate(
+        Arc::clone(&concurrent),
+        "hold-live-recovery",
+        CancellationToken::new(),
+    );
+    let healthy_pid = fixture.read("seen-hold-live-recovery.json")["pid"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        fixture.read("spawn-0.json")["pid"].as_u64(),
+        Some(healthy_pid)
+    );
+    fs::write(fixture.root.join("fatal-1"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while backend.component_healthy() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        finish_recovery(&mut backend).unwrap(),
+        ComponentRecovery::Recovered
+    );
+    assert!(!healthy.is_finished());
+    assert_eq!(backend.process_ids()[0] as u64, healthy_pid);
+    let replacement_pid = fixture.read("spawn-2.json")["pid"].as_u64().unwrap();
+    let output = generate(
+        Arc::clone(&concurrent),
+        "after-live-recovery",
+        CancellationToken::new(),
+    )
+    .join()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        output.text,
+        format!("{replacement_pid}:after-live-recovery")
+    );
+    fixture.release("hold-live-recovery");
+    assert_eq!(
+        healthy.join().unwrap().unwrap().text,
+        format!("{healthy_pid}:hold-live-recovery")
+    );
+    assert!(backend.component_healthy());
+    drop(concurrent);
+    drop(backend);
+    fixture.assert_exited(3);
+}
+
+#[test]
+fn isolated_recovery_rejects_reduced_capacity_and_retries_without_touching_sibling() {
+    let fixture = Fixture::new(json!([plan(8192), plan(8192), plan(1024), plan(8192)]));
+    let mut backend = fixture.backend();
+    backend.load(fixture.config(2)).unwrap();
+    let concurrent = backend.concurrent_generation_backend().unwrap();
+    let healthy = generate(
+        Arc::clone(&concurrent),
+        "hold-invalid-recovery",
+        CancellationToken::new(),
+    );
+    let healthy_pid = fixture.read("seen-hold-invalid-recovery.json")["pid"]
+        .as_u64()
+        .unwrap();
+    fs::write(fixture.root.join("fatal-1"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while backend.component_healthy() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(finish_recovery(&mut backend)
+        .unwrap_err()
+        .to_string()
+        .contains("execution contract"));
+    assert!(!healthy.is_finished());
+    assert_eq!(backend.process_ids()[0] as u64, healthy_pid);
+    assert!(!backend.component_healthy());
+    assert_eq!(
+        finish_recovery(&mut backend).unwrap(),
+        ComponentRecovery::Recovered
+    );
+    assert!(!healthy.is_finished());
+    assert!(generate(
+        Arc::clone(&concurrent),
+        "after-recovery-retry",
+        CancellationToken::new()
+    )
+    .join()
+    .unwrap()
+    .unwrap()
+    .text
+    .ends_with(":after-recovery-retry"));
+    fixture.release("hold-invalid-recovery");
+    assert!(healthy.join().unwrap().is_ok());
+    drop(concurrent);
+    drop(backend);
+    fixture.assert_exited(4);
+}
+
+#[test]
+fn isolated_recovery_updates_execution_process_identity() {
+    let with_pid = |pid| {
+        let mut value = plan(8192);
+        value["load"]["result"]["execution"] = json!({
+            "worker_execution_observation": {
+                "source": "vllm-worker-rpc", "rank_count": 1, "world_size": 1,
+                "ranks": [{"rank": 0, "local_rank": 0, "world_size": 1, "pid": pid,
+                    "compilation_mode": 0, "cudagraph_mode": "NONE"}]
+            }
+        });
+        value
+    };
+    let fixture = Fixture::new(json!([with_pid(100), with_pid(101), with_pid(200)]));
+    let mut backend = fixture.backend();
+    backend.load(fixture.config(2)).unwrap();
+    fs::write(fixture.root.join("fatal-0"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while backend.component_healthy() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        finish_recovery(&mut backend).unwrap(),
+        ComponentRecovery::Recovered
+    );
+    let evidence = backend.loaded_backend_evidence().unwrap();
+    assert_eq!(
+        evidence["generation"]["per_worker"][0]["execution"]["worker_execution_observation"]
+            ["ranks"][0]["pid"],
+        200
+    );
+    drop(backend);
+    fixture.assert_exited(3);
+}
+
+fn finish_recovery(backend: &mut VllmBackend) -> Result<ComponentRecovery> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let status = backend.recover_component()?;
+        if status != ComponentRecovery::Pending {
+            return Ok(status);
+        }
+        assert!(Instant::now() < deadline, "recovery timed out");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn isolated_recovery_loading_is_nonblocking_and_drop_reaps_pending_worker() {
+    let mut slow = plan(8192);
+    slow["hold_load"] = json!(true);
+    let fixture = Fixture::new(json!([plan(8192), plan(8192), slow]));
+    let mut backend = fixture.backend();
+    backend.load(fixture.config(2)).unwrap();
+    let cancel = CancellationToken::new();
+    let healthy = generate(
+        backend.concurrent_generation_backend().unwrap(),
+        "hold-loading",
+        cancel.clone(),
+    );
+    fixture.read("seen-hold-loading.json");
+    fs::write(fixture.root.join("fatal-1"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while backend.component_healthy() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(
+        backend.recover_component().unwrap(),
+        ComponentRecovery::Pending
+    );
+    fixture.read("load-2.json");
+    let start = Instant::now();
+    assert_eq!(
+        backend.recover_component().unwrap(),
+        ComponentRecovery::Pending
+    );
+    assert!(start.elapsed() < Duration::from_millis(100));
+    // Keep the replacement blocked and cancel a healthy request through the
+    // original handle before shutting down the still-loading backend.
+    cancel.cancel();
+    assert!(matches!(
+        healthy.join().unwrap(),
+        Err(EngineError::Cancelled)
+    ));
+    drop(backend);
+    fixture.assert_exited(3);
 }
