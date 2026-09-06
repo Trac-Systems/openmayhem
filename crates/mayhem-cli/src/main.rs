@@ -60602,10 +60602,23 @@ impl ReceiptSettlementOutbox {
             paths.len() <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES.saturating_mul(2),
             "receipt settlement outbox exceeded its bounded recovery file count"
         );
+        self.load_physical_entries_at_paths(paths)
+    }
+
+    fn load_physical_entries_at_paths(
+        &self,
+        paths: Vec<PathBuf>,
+    ) -> Result<Vec<ReceiptSettlementOutboxEntry>> {
         let mut entries = Vec::new();
         for path in paths {
             match self.load_entry(&path) {
                 Ok(entry) => entries.push(entry),
+                // A successful publisher or a newer checkpoint can remove an
+                // entry after read_dir. That must not pause paid admission.
+                Err(error)
+                    if error
+                        .downcast_ref::<io::Error>()
+                        .is_some_and(|error| error.kind() == io::ErrorKind::NotFound) => {}
                 Err(error) => {
                     if let Some(reason) = receipt_settlement_outbox_quarantine_reason(&error) {
                         self.quarantine_unsubmitable_entry(&path, &error, &reason)?;
@@ -60989,6 +61002,19 @@ impl GatewayReceiptSettlementPublisher for ReceiptSettlementOutbox {
     fn queue(&self, feature: &Value) -> std::result::Result<(), String> {
         self.persist(feature)
             .map(|_| ())
+            .map_err(|error| format!("{error:#}"))
+    }
+
+    fn has_pending_final_receipts(&self, user: &str, rail: &str) -> std::result::Result<bool, String> {
+        self.load_entries()
+            .map(|entries| {
+                entries.iter().any(|entry| {
+                    let body = &entry.feature["value"]["receipt"]["body"];
+                    entry.final_receipt
+                        && body["user"].as_str() == Some(user)
+                        && body["rail"].as_str() == Some(rail)
+                })
+            })
             .map_err(|error| format!("{error:#}"))
     }
 }
@@ -109929,6 +109955,50 @@ esac
         let entries = restarted.load_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].feature, feature);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_scan_tolerates_entries_settled_after_directory_listing() {
+        let root = test_temp_dir("mayhem-receipt-outbox-scan-removal");
+        let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
+        let entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        let paths = vec![entry.path.clone()];
+        outbox.remove(&entry).unwrap();
+        assert!(outbox.load_physical_entries_at_paths(paths).unwrap().is_empty());
+        assert!(outbox.admission_available().unwrap());
+
+        let entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        fs::write(&entry.path, b"not valid JSON").unwrap();
+        assert!(outbox
+            .load_physical_entries_at_paths(vec![entry.path])
+            .is_err());
+        assert!(outbox.admission_available().is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_pending_funds_are_scoped_to_final_buyer_and_rail() {
+        let root = test_temp_dir("mayhem-receipt-outbox-pending-funds");
+        let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
+        let checkpoint = signed_receipt_settlement_feature_for_test_at(7, 2, false, 1);
+        let user = checkpoint["value"]["receipt"]["body"]["user"]
+            .as_str()
+            .unwrap();
+        outbox.persist(&checkpoint).unwrap();
+        assert!(!outbox.has_pending_final_receipts(user, "tnk").unwrap());
+        let final_receipt = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        assert!(outbox.has_pending_final_receipts(user, "tnk").unwrap());
+        assert!(!outbox.has_pending_final_receipts(user, "fiat").unwrap());
+        assert!(!outbox.has_pending_final_receipts("another buyer", "tnk").unwrap());
+        outbox.remove(&final_receipt).unwrap();
+        assert!(!outbox.has_pending_final_receipts(user, "tnk").unwrap());
         let _ = fs::remove_dir_all(root);
     }
 
