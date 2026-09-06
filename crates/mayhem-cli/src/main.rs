@@ -61315,6 +61315,9 @@ trait ProviderSessionResponder {
     fn component_healthy(&mut self) -> bool {
         true
     }
+    fn recover_component(&mut self) -> Result<bool> {
+        Ok(false)
+    }
     fn supports_live_text_streaming(&self) -> bool {
         false
     }
@@ -61409,6 +61412,10 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
 
     fn component_healthy(&mut self) -> bool {
         self.backend.component_healthy()
+    }
+
+    fn recover_component(&mut self) -> Result<bool> {
+        self.backend.recover_component().map_err(Into::into)
     }
 
     fn process_ids(&self) -> Vec<u32> {
@@ -78974,6 +78981,24 @@ async fn serve_provider_sessions(
                 engine_recovery.mark_failed(
                     "provider engine child exited while idle; no user session caused the failure",
                 );
+            }
+            if engine_recovery.retry_due(Instant::now()) {
+                match responder.recover_component() {
+                    Ok(true) => {
+                        engine_recovery.mark_recovered();
+                        engine_watchdog.reset_after_restart();
+                        engine_watchdog_reject = None;
+                        provider_log(
+                            ctx.args,
+                            "Failed provider worker recovered; healthy concurrent requests were preserved.",
+                        );
+                    }
+                    Ok(false) => {}
+                    Err(err) => engine_recovery.mark_reload_failed(
+                        format!("isolated provider worker recovery failed: {err:#}"),
+                        Instant::now(),
+                    ),
+                }
             }
             if engine_recovery.retry_due(Instant::now()) && sessions.is_empty() {
                 heartbeat_load.set_accepting_new(false);

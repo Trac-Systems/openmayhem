@@ -830,3 +830,134 @@ fn isolated_topology_transitions_preserve_shared_dispatch_and_gate_reload() {
     drop(backend);
     fixture.assert_exited(4);
 }
+
+#[test]
+fn isolated_recovery_replaces_only_dead_slot_while_sibling_generates() {
+    let fixture = Fixture::new(json!([plan(8192), plan(8192), plan(8192)]));
+    let mut backend = fixture.backend();
+    backend.load(fixture.config(2)).unwrap();
+    let concurrent = backend.concurrent_generation_backend().unwrap();
+    let healthy = generate(
+        Arc::clone(&concurrent),
+        "hold-live-recovery",
+        CancellationToken::new(),
+    );
+    let healthy_pid = fixture.read("seen-hold-live-recovery.json")["pid"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(
+        fixture.read("spawn-0.json")["pid"].as_u64(),
+        Some(healthy_pid)
+    );
+    fs::write(fixture.root.join("fatal-1"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while backend.component_healthy() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(backend.recover_component().unwrap());
+    assert!(!healthy.is_finished());
+    assert_eq!(backend.process_ids()[0] as u64, healthy_pid);
+    let replacement_pid = fixture.read("spawn-2.json")["pid"].as_u64().unwrap();
+    let output = generate(
+        Arc::clone(&concurrent),
+        "after-live-recovery",
+        CancellationToken::new(),
+    )
+    .join()
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        output.text,
+        format!("{replacement_pid}:after-live-recovery")
+    );
+    fixture.release("hold-live-recovery");
+    assert_eq!(
+        healthy.join().unwrap().unwrap().text,
+        format!("{healthy_pid}:hold-live-recovery")
+    );
+    assert!(backend.component_healthy());
+    drop(concurrent);
+    drop(backend);
+    fixture.assert_exited(3);
+}
+
+#[test]
+fn isolated_recovery_rejects_reduced_capacity_and_retries_without_touching_sibling() {
+    let fixture = Fixture::new(json!([plan(8192), plan(8192), plan(1024), plan(8192)]));
+    let mut backend = fixture.backend();
+    backend.load(fixture.config(2)).unwrap();
+    let concurrent = backend.concurrent_generation_backend().unwrap();
+    let healthy = generate(
+        Arc::clone(&concurrent),
+        "hold-invalid-recovery",
+        CancellationToken::new(),
+    );
+    let healthy_pid = fixture.read("seen-hold-invalid-recovery.json")["pid"]
+        .as_u64()
+        .unwrap();
+    fs::write(fixture.root.join("fatal-1"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while backend.component_healthy() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(backend
+        .recover_component()
+        .unwrap_err()
+        .to_string()
+        .contains("execution contract"));
+    assert!(!healthy.is_finished());
+    assert_eq!(backend.process_ids()[0] as u64, healthy_pid);
+    assert!(!backend.component_healthy());
+    assert!(backend.recover_component().unwrap());
+    assert!(!healthy.is_finished());
+    assert!(generate(
+        Arc::clone(&concurrent),
+        "after-recovery-retry",
+        CancellationToken::new()
+    )
+    .join()
+    .unwrap()
+    .unwrap()
+    .text
+    .ends_with(":after-recovery-retry"));
+    fixture.release("hold-invalid-recovery");
+    assert!(healthy.join().unwrap().is_ok());
+    drop(concurrent);
+    drop(backend);
+    fixture.assert_exited(4);
+}
+
+#[test]
+fn isolated_recovery_updates_execution_process_identity() {
+    let with_pid = |pid| {
+        let mut value = plan(8192);
+        value["load"]["result"]["execution"] = json!({
+            "worker_execution_observation": {
+                "source": "vllm-worker-rpc", "rank_count": 1, "world_size": 1,
+                "ranks": [{"rank": 0, "local_rank": 0, "world_size": 1, "pid": pid,
+                    "compilation_mode": 0, "cudagraph_mode": "NONE"}]
+            }
+        });
+        value
+    };
+    let fixture = Fixture::new(json!([with_pid(100), with_pid(101), with_pid(200)]));
+    let mut backend = fixture.backend();
+    backend.load(fixture.config(2)).unwrap();
+    fs::write(fixture.root.join("fatal-0"), b"").unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while backend.component_healthy() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(backend.recover_component().unwrap());
+    let evidence = backend.loaded_backend_evidence().unwrap();
+    assert_eq!(
+        evidence["generation"]["per_worker"][0]["execution"]["worker_execution_observation"]
+            ["ranks"][0]["pid"],
+        200
+    );
+    drop(backend);
+    fixture.assert_exited(3);
+}
