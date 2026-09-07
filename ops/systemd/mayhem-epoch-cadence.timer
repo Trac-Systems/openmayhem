@@ -1,9 +1,10 @@
 [Unit]
-Description=Hourly OpenMayhem epoch settlement cadence
+Description=OpenMayhem settlement progress polling
 
 [Timer]
-OnCalendar=*-*-* *:07:00
-Persistent=true
+OnBootSec=30s
+OnUnitInactiveSec=5s
+AccuracySec=1s
 Unit=mayhem-epoch-cadence.service
 
 [Install]

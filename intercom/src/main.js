@@ -1680,6 +1680,43 @@ directSession.start();
 await sidechannel.start();
 console.log('Sidechannel: ready');
 
+let checkpointWorker = null;
+let checkpointRetry = null;
+let checkpointClosing = false;
+if (env.MAYHEM_WRITER_CHECKPOINTS === '1') {
+  const directory = String(env.MAYHEM_WRITER_CHECKPOINT_DIR ?? '').trim();
+  if (!directory || !path.isAbsolute(directory)) {
+    throw new Error('Paid checkpoints require an absolute MAYHEM_WRITER_CHECKPOINT_DIR.');
+  }
+  const [{ CheckpointJournal, WriterCheckpointWorker }, { WriterCheckpointTransport }] = await Promise.all([
+    import('./writer-checkpoint-worker.js'), import('./writer-checkpoint-transport.js'),
+  ]);
+  const hrtime = typeof Bare !== 'undefined'
+    ? (await import('bare-hrtime')).default : process.hrtime;
+  const startCheckpoints = async () => {
+    if (checkpointClosing) return;
+    let journal;
+    try {
+      journal = new CheckpointJournal(directory);
+      checkpointWorker = new WriterCheckpointWorker({ journal,
+        transport: new WriterCheckpointTransport({ peer, feature: mayhemFeature, releaseIdentity }),
+        monotonicNow: () => Number(hrtime.bigint() / 1000000n),
+        reserveAu: env.MAYHEM_WRITER_CHECKPOINT_RESERVE_AU ?? '5000000000000000000',
+      });
+      peer.writerCheckpointStatus = () => checkpointWorker.status();
+      await checkpointWorker.start();
+      console.log('Writer paid checkpoints: enabled, one UTC slot every 30 seconds.');
+    } catch (error) {
+      journal?.close();
+      checkpointWorker = null;
+      peer.writerCheckpointStatus = () => ({ enabled: true, status: 'initialization_failed', error: error.message });
+      console.error('Writer checkpoint startup delayed:', error.message);
+      if (!checkpointClosing) checkpointRetry = setTimeout(startCheckpoints, 5000);
+    }
+  };
+  await startCheckpoints();
+}
+
 if (headless) {
   console.log('Terminal: disabled (headless)');
 } else {
@@ -1689,6 +1726,9 @@ if (headless) {
 
 if (keepAlive) {
   const close = async () => {
+    checkpointClosing = true;
+    clearTimeout(checkpointRetry);
+    try { await checkpointWorker?.stop(); } catch (_e) {}
     if (msbDirectPeerTimer) clearInterval(msbDirectPeerTimer);
     try {
       rpcServer?.close?.();

@@ -1397,6 +1397,10 @@ test('paged targeted apply is bounded, commit-bound, complete, and idempotent', 
   const secondHead = (
     await ctx.storage.get(`receipt/head/${secondReservation.value.voucher.billing_id}/0`)
   ).value;
+  const cutoff = await execute(ctx.contract, ctx.storage, 'epochFreeze', {
+    op: 'epoch_freeze', epoch: 1, at: 3600,
+  }, ctx.admin.publicKey, 99);
+  assert.equal(cutoff.ok, true, cutoff.message);
   const commit = await commitEpoch(ctx, { count: 2, useAu: '300' });
 
   const incompleteClose = await targetedApplyValue(ctx, {
@@ -1435,6 +1439,16 @@ test('paged targeted apply is bounded, commit-bound, complete, and idempotent', 
   assert.equal(pending.pending_receipt_index_count, 2);
   assert.equal(pending.pending_receipt_index_revision, 2);
 
+  const arriving = await submitReservation(ctx, {
+    sessionId: 'f1'.repeat(32), billingId: 'f2'.repeat(32), reservationId: 'f3'.repeat(32),
+    epoch: 2,
+  });
+  assert.equal(arriving.result.ok, true, arriving.result.message);
+  const arrivingReceipt = await submitReceipt(ctx, receiptValue(ctx, arriving, { final: true }));
+  assert.equal(arrivingReceipt.result.ok, true, arrivingReceipt.result.message);
+  assert.equal((await ctx.storage.get('receipt/epoch/2/index')).value.count, 1);
+  assert.equal((await ctx.storage.get('receipt/epoch/1/index')).value.count, 2);
+
   const receiptIndexKey = 'receipt/epoch/1/index';
   const frozenIndex = (await ctx.storage.get(receiptIndexKey)).value;
   await ctx.storage.put(receiptIndexKey, {
@@ -1450,7 +1464,7 @@ test('paged targeted apply is bounded, commit-bound, complete, and idempotent', 
   });
   assert.match(
     (await submitTargetedApply(ctx, changedSnapshotPage)).result.message,
-    /receipt snapshot changed between pages/i
+    /canonical epoch freeze|receipt snapshot changed between pages/i
   );
   await ctx.storage.put(receiptIndexKey, frozenIndex);
 
@@ -1643,6 +1657,99 @@ test('atomic commit plus page zero safely replaces an unapplied stale commit', a
   assert.equal(page1Replay.result.ok, true, page1Replay.result.message);
   assert.equal(page1Replay.result.idempotent, true);
   assert.equal((await ctx.storage.get(liabilityKey)).value.total_au, '17');
+});
+
+test('v22 freezes receipt ingress without waiting for traffic and resumes across restart', async () => {
+  const ctx = await setupContract();
+  const first = await submitReservation(ctx);
+  const late = await submitReservation(ctx, {
+    sessionId: '78'.repeat(32), billingId: '79'.repeat(32), reservationId: '7a'.repeat(32),
+  });
+  assert.equal((await submitReceipt(ctx, receiptValue(ctx, first, { final: true }))).result.ok, true);
+  assert.equal((await submitReceipt(ctx, receiptValue(ctx, late))).result.ok, true);
+  const economicBefore = await ctx.storage.get('epoch/apply/state');
+  const frozen = await execute(ctx.contract, ctx.storage, 'epochFreeze', {
+    op: 'epoch_freeze', epoch: 1, at: 3600,
+  }, ctx.admin.publicKey, 200);
+  assert.equal(frozen.ok, true, frozen.message);
+  assert.equal(frozen.freeze.receipt_index.count, 1);
+  assert.deepEqual(await ctx.storage.get('epoch/apply/state'), economicBefore,
+    'freeze must not age economic state');
+  ctx.storage = MemoryStorage.fromSnapshotBytes(ctx.storage.snapshotBytes());
+  const retried = await execute(ctx.contract, ctx.storage, 'epochFreeze', {
+    op: 'epoch_freeze', epoch: 1, at: 3700,
+  }, ctx.admin.publicKey, 201);
+  assert.equal(retried.idempotent, true);
+  assert.deepEqual(retried.freeze, frozen.freeze);
+  assert.equal((await submitReceipt(ctx, receiptValue(ctx, late, { seq: 2, final: true }))).result.ok, true);
+  const lateHead = (await ctx.storage.get(`receipt/head/${late.value.voucher.billing_id}/0`)).value;
+  assert.equal(lateHead.settlement_epoch, 2);
+  assert.equal(lateHead.billing_epoch, 1);
+  assert.deepEqual((await ctx.storage.get('receipt/epoch/1/index')).value, frozen.freeze.receipt_index);
+  const firstHead = (await ctx.storage.get(`receipt/head/${first.value.voucher.billing_id}/0`)).value;
+  const commit = await commitEpoch(ctx, { count: 1, useAu: '100' });
+  const apply = await targetedApplyValue(ctx, { heads: [firstHead], commitHash: commit.commit_hash });
+  const result = await submitTargetedApply(ctx, apply);
+  assert.equal(result.result.ok, true, result.result.message);
+  const replay = await submitTargetedApply(ctx, apply);
+  assert.equal(replay.result.idempotent, true);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au, '99900');
+  assert.equal(await ctx.storage.get(`receipt/consumed/${lateHead.billing_id}/0`), null);
+
+  const secondFreeze = await execute(ctx.contract, ctx.storage, 'epochFreeze', {
+    op: 'epoch_freeze', epoch: 2, at: 7200,
+  }, ctx.admin.publicKey, 202);
+  assert.equal(secondFreeze.ok, true, secondFreeze.message);
+  const secondCommit = await commitEpoch(ctx, { epoch: 2, count: 1, useAu: '100', txNo: 203 });
+  const secondApply = await targetedApplyValue(ctx, { heads: [lateHead], commitHash: secondCommit.commit_hash });
+  assert.equal((await submitTargetedApply(ctx, secondApply)).result.ok, true);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au, '99800');
+  assert.equal((await ctx.storage.get('epoch/apply/state')).value.updated_epoch, 2);
+});
+
+test('v22 cancellation after an empty cutoff enters the next batch with original signed terms', async () => {
+  const ctx = await setupContract();
+  const reservation = await submitReservation(ctx);
+  assert.equal((await submitReceipt(ctx, receiptValue(ctx, reservation))).result.ok, true);
+  const headKey = `receipt/head/${reservation.value.voucher.billing_id}/0`;
+  const prior = (await ctx.storage.get(headKey)).value;
+  const frozen = await execute(ctx.contract, ctx.storage, 'epochFreeze', {
+    op: 'epoch_freeze', epoch: 1, at: 3600,
+  }, ctx.admin.publicKey, 210);
+  assert.equal(frozen.ok, true, frozen.message);
+  assert.equal(frozen.freeze.receipt_index.count, 0);
+  assert.equal((await submitClose(ctx, closeValue(ctx, reservation, { head: prior }))).result.ok, true);
+  const closed = (await ctx.storage.get(headKey)).value;
+  assert.equal(closed.settlement_epoch, 2);
+  assert.equal(closed.billing_epoch, 1);
+  assert.deepEqual(closed.receipt, prior.receipt);
+  assert.equal(await ctx.storage.get('receipt/epoch/1/index'), null);
+  const seal = { op: 'epoch_seal_empty', epoch: 1, at: 3600, reason_hash: 'ac'.repeat(32) };
+  const wrongTime = await execute(ctx.contract, ctx.storage, 'epochSealEmpty', {
+    ...seal, at: 3601,
+  }, ctx.admin.publicKey, 211);
+  assert.match(wrongTime.message, /canonical epoch freeze/);
+  assert.equal((await execute(ctx.contract, ctx.storage, 'epochSealEmpty', seal,
+    ctx.admin.publicKey, 212)).ok, true);
+  const skippedFreeze = await execute(ctx.contract, ctx.storage, 'epochSealEmpty', {
+    ...seal, epoch: 2, at: 7200,
+  }, ctx.admin.publicKey, 213);
+  assert.equal(skippedFreeze instanceof Error, true);
+});
+
+test('v22 freeze rejects unauthorized, out of order and premature closure without writes', async () => {
+  const ctx = await setupContract();
+  const before = ctx.storage.snapshotBytes();
+  for (const [epoch, at, sender] of [
+    [1, 3600, ctx.user.publicKey], [2, 7200, ctx.admin.publicKey],
+    [1, 3599, ctx.admin.publicKey],
+  ]) {
+    const rejected = await execute(ctx.contract, ctx.storage, 'epochFreeze', {
+      op: 'epoch_freeze', epoch, at,
+    }, sender, 220);
+    assert.equal(rejected instanceof Error, true);
+    assert.equal(ctx.storage.snapshotBytes(), before);
+  }
 });
 
 test('empty epoch seal treats absent metadata as empty and rejects indexed receipts', async () => {

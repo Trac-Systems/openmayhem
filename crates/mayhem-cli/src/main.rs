@@ -781,6 +781,8 @@ enum AdminCommands {
     FiatChargeback(AdminFiatChargebackArgs),
     /// Anchor recomputed epoch roots permissionlessly.
     EpochCommit(AdminEpochCommitArgs),
+    /// Atomically close receipt ingress for an elapsed settlement epoch.
+    EpochFreeze(AdminEpochFreezeArgs),
     /// Admin-seal one elapsed empty/unsubmittable epoch so later epochs can settle.
     EpochSealEmpty(AdminEpochSealEmptyArgs),
     /// Apply admin-verified epoch debits/earnings and ev/* roots.
@@ -5544,6 +5546,19 @@ struct AdminEpochCommitArgs {
     /// Path to a JSON object containing recomputed epoch totals.
     #[arg(long, value_name = "PATH")]
     totals_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Parser)]
+struct AdminEpochFreezeArgs {
+    #[command(flatten)]
+    tx: AdminTxArgs,
+
+    #[arg(long)]
+    epoch: u64,
+
+    /// Closure time in Unix seconds; retries retain the canonical first cutoff.
+    #[arg(long)]
+    at: u64,
 }
 
 #[derive(Debug, Parser)]
@@ -33924,6 +33939,7 @@ fn admin_tx_args(command: &AdminCommands) -> &AdminTxArgs {
         AdminCommands::FiatDeposit(args) => &args.tx,
         AdminCommands::FiatChargeback(args) => &args.tx,
         AdminCommands::EpochCommit(args) => &args.tx,
+        AdminCommands::EpochFreeze(args) => &args.tx,
         AdminCommands::EpochSealEmpty(args) => &args.tx,
         AdminCommands::EpochApply(args) => &args.tx,
     }
@@ -34040,6 +34056,20 @@ fn admin_command_payload(command: &AdminCommands) -> Result<(&'static str, Value
             Ok(("fiatChargeback", admin_fiat_chargeback_payload(args)?))
         }
         AdminCommands::EpochCommit(args) => Ok(("epochCommit", admin_epoch_commit_payload(args)?)),
+        AdminCommands::EpochFreeze(args) => {
+            ensure!(
+                args.epoch > 0 && args.epoch < 9_007_199_254_740_991,
+                "epoch must be a positive canonical integer below the overflow boundary"
+            );
+            ensure!(
+                args.at <= 9_007_199_254_740_991,
+                "at exceeds the canonical integer range"
+            );
+            Ok((
+                "epochFreeze",
+                json!({ "op": "epoch_freeze", "epoch": args.epoch, "at": args.at }),
+            ))
+        }
         AdminCommands::EpochSealEmpty(args) => {
             Ok(("epochSealEmpty", admin_epoch_seal_empty_payload(args)?))
         }
@@ -103175,7 +103205,7 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 21);
+        assert_eq!(CONTRACT_VERSION, 22);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 11);
     }
@@ -110375,7 +110405,7 @@ esac
         let expected_message = concat!(
             "mayhem-targeted-spend-reservation-v1",
             "{\"payout_revision\":\"9999999999999999999999999999999999999999999999999999999999999999\",",
-            "\"reservation\":{\"at\":25200,\"contract_version\":21,\"ctx_bracket\":\"le8k\",",
+            "\"reservation\":{\"at\":25200,\"contract_version\":22,\"ctx_bracket\":\"le8k\",",
             "\"ctx_bracket_table_ver\":1,",
             "\"enclave_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"enclave_pubkey\":\"5555555555555555555555555555555555555555555555555555555555555555\",",
@@ -110417,7 +110447,7 @@ esac
                 "hold/targeted/tnk/",
                 "2222222222222222222222222222222222222222222222222222222222222222/7/",
                 "1111111111111111111111111111111111111111111111111111111111111111/",
-                "cacdf4212d8c6f252d2efaf8a7874397f170ff562a2e13b3d82c31d5108dba1f"
+                "1b3c8d504db55092eb4d3283bcce99e3ec0478fa98218645338ff9dbb1bd9896"
             )
         );
     }

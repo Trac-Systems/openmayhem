@@ -177,6 +177,8 @@ export async function getMayhemStatus(peer, metadata = {}) {
       admin: admin?.value ?? null,
       chatStatus: chatStatus?.value ?? null,
     },
+    writerCheckpoint: typeof peer.writerCheckpointStatus === 'function'
+      ? peer.writerCheckpointStatus() : { enabled: false },
     msb: {
       ready: true,
       bootstrapHex: peer.msbClient.bootstrapHex,

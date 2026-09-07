@@ -340,7 +340,8 @@ const server = http.createServer((req, res) => {
   res.end();
 });
 server.listen(0, '127.0.0.1', () => {
-  fs.writeFileSync(portPath, String(server.address().port));
+  fs.writeFileSync(portPath + '.tmp', String(server.address().port));
+  fs.renameSync(portPath + '.tmp', portPath);
 });
 `, { mode: 0o600 });
   const server = spawn(process.execPath, [rpcServerPath, rpcStatePath, rpcPortPath], {
@@ -356,6 +357,20 @@ server.listen(0, '127.0.0.1', () => {
   writeExecutable(path.join(bin, 'mock-mayhem'), `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >>"$MOCK_MAYHEM_LOG"
+if [[ "\${2:-}" == "epoch-freeze" ]]; then
+  python3 - "$MOCK_RPC_STATE" "$@" <<'PYMOCK'
+import json, sys
+p = sys.argv[1]
+args = sys.argv[2:]
+epoch = int(args[args.index("--epoch") + 1])
+at = int(args[args.index("--at") + 1])
+s = json.load(open(p))
+s["records"][f"epoch/freeze/{epoch}"] = {"type": "epoch_receipt_freeze", "epoch": epoch,
+    "at": at, "receipt_index": s["records"].get(f"receipt/epoch/{epoch}/index", {"epoch": epoch})}
+json.dump(s, open(p, "w"))
+PYMOCK
+  exit 0
+fi
 sim=0
 recomputed=''
 at=''
@@ -455,7 +470,8 @@ test('finalizer atomically commits page zero then submits bounded exact targeted
     ),
     true,
   );
-  assert.equal(fs.existsSync(ctx.mayhemLog), false, 'page zero must not use a standalone commit');
+  assert.match(fs.readFileSync(ctx.mayhemLog, 'utf8'), /epoch-freeze/);
+  assert.doesNotMatch(fs.readFileSync(ctx.mayhemLog, 'utf8'), /epoch-commit/);
   assert.equal(
     fs.existsSync(path.join(ctx.stateDir, 'cadence.last-advance')),
     false,
@@ -522,7 +538,7 @@ test('metadata drift aborts before atomic targeted page zero starts', async (t) 
   t.after(() => ctx.close());
   const result = ctx.run();
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /metadata changed after snapshot/);
+  assert.match(result.stderr, /metadata differs from the closed snapshot/);
   assert.equal(ctx.state().features.length, 0);
   assert.equal(ctx.state().apply.updated_epoch, 0);
   assert.equal(ctx.state().apply.pending_epoch, null);

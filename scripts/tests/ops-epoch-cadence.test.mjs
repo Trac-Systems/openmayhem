@@ -47,6 +47,7 @@ async function harness({
   fs.mkdirSync(stateDir, { recursive: true });
   fs.mkdirSync(scripts, { recursive: true });
   fs.mkdirSync(bin, { recursive: true });
+  fs.copyFileSync(path.join(ROOT, 'scripts/ops-freeze-epoch.py'), path.join(scripts, 'ops-freeze-epoch.py'));
   fs.writeFileSync(rpcState, `${JSON.stringify({
     apply: {
       updated_epoch: 0,
@@ -72,7 +73,8 @@ const server = http.createServer((req, res) => {
   const key = url.searchParams.get('key');
   const state = JSON.parse(fs.readFileSync(statePath, 'utf8'));
   let value;
-  if (key === 'epoch/apply/state') value = state.apply;
+  if (key?.startsWith('epoch/freeze/')) value = state.freezes?.[key.split('/').at(-1)] ?? null;
+  else if (key === 'epoch/apply/state') value = state.apply;
   else if (/^epoch\\/commit\\/\\d+$/.test(key ?? '')) {
     value = state.commits?.[key.split('/').at(-1)] ?? null;
   } else if (/^epoch\\/seal\\/\\d+$/.test(key ?? '')) {
@@ -87,7 +89,8 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({ key, confirmed: true, value }));
 });
 server.listen(0, '127.0.0.1', () => {
-  fs.writeFileSync(portPath, String(server.address().port));
+  fs.writeFileSync(portPath + '.tmp', String(server.address().port));
+  fs.renameSync(portPath + '.tmp', portPath);
 });
 `, { mode: 0o600 });
   const server = spawn(process.execPath, [rpcServer, rpcState, rpcPort], {
@@ -135,6 +138,19 @@ exit 91
   writeExecutable(path.join(bin, 'mock-mayhem'), `#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\\n' "$*" >>"$MOCK_MAYHEM_LOG"
+if [[ "\${2:-}" == "epoch-freeze" ]]; then
+  python3 - "$MOCK_RPC_STATE" "$@" <<'PYMOCK'
+import json, sys
+p = sys.argv[1]
+args = sys.argv[2:]
+epoch = int(args[args.index("--epoch") + 1])
+s = json.load(open(p))
+s.setdefault("freezes", {})[str(epoch)] = {"type": "epoch_receipt_freeze", "epoch": epoch,
+    "at": 1000, "receipt_index": {"epoch": epoch}}
+json.dump(s, open(p, "w"))
+PYMOCK
+  exit 0
+fi
 sim=0
 for arg in "$@"; do [[ "$arg" == "--sim" ]] && sim=1; done
 if (( sim == 0 )); then
@@ -165,8 +181,6 @@ printf '%s\\n' '{"ok":true}'
     MAYHEM_ADMIN_HOME: path.join(root, 'admin-home'),
     MAYHEM_SOURCE_DIR: source,
     MAYHEM_CADENCE_STATE_DIR: stateDir,
-    MAYHEM_RECEIPT_QUIET_SECONDS: '1',
-    MAYHEM_CADENCE_BOOT_ID: 'test-boot',
     MOCK_RPC_STATE: rpcState,
     MOCK_FINALIZER_LOG: finalizerLog,
     MOCK_MAYHEM_LOG: mayhemLog,
@@ -196,70 +210,52 @@ function runCadence(ctx) {
   });
 }
 
-function expireQuietWindow(ctx) {
-  const file = path.join(ctx.stateDir, 'cadence.receipt-quiet.json');
-  const value = JSON.parse(fs.readFileSync(file, 'utf8'));
-  value.observed_at = 0;
-  fs.writeFileSync(file, `${JSON.stringify(value)}\n`, { mode: 0o600 });
-}
-
 function assertAdvanceStamp(ctx) {
   const file = path.join(ctx.stateDir, 'cadence.last-advance');
   assert.equal(fs.readFileSync(file, 'utf8'), '1000\n');
   assert.equal(fs.statSync(file).mode & 0o777, 0o600);
 }
 
-test('nonempty canonical metadata quiets once then invokes only the finalizer', async (t) => {
+test('nonempty canonical metadata freezes and finalizes on the first poll', async (t) => {
   const ctx = await harness({ count: 2 });
   t.after(() => ctx.close());
   const first = runCadence(ctx);
   assert.equal(first.status, 0, first.stderr);
-  assert.match(first.stdout, /awaiting 1s quiet/);
-  assert.equal(fs.existsSync(ctx.finalizerLog), false);
-
-  expireQuietWindow(ctx);
+  assert.match(first.stdout, /invoking exact-key finalizer/);
+  assert.match(fs.readFileSync(ctx.mayhemLog, 'utf8'), /epoch-freeze/);
+  assert.equal(fs.readFileSync(ctx.finalizerLog, 'utf8').trim(), '1');
+  assert.equal(fs.existsSync(ctx.payoutLog), false);
+  assertAdvanceStamp(ctx);
   const second = runCadence(ctx);
   assert.equal(second.status, 0, second.stderr);
-  assert.match(second.stdout, /invoking exact-key finalizer/);
-  assert.equal(fs.readFileSync(ctx.finalizerLog, 'utf8').trim(), '1');
-  assert.equal(fs.existsSync(ctx.payoutLog), false, 'payout maturity must not gate finalization');
-  assertAdvanceStamp(ctx);
-
-  const third = runCadence(ctx);
-  assert.equal(third.status, 0, third.stderr);
-  assert.match(third.stdout, /window has not elapsed/);
+  assert.match(second.stdout, /window has not elapsed/);
   assert.equal(fs.readFileSync(ctx.finalizerLog, 'utf8').trim(), '1');
 });
 
-test('null canonical index quiets once then seals the epoch empty', async (t) => {
+test('null canonical index closes then seals the empty economic epoch', async (t) => {
   const ctx = await harness({ count: 0 });
   t.after(() => ctx.close());
-  assert.equal(runCadence(ctx).status, 0);
-  expireQuietWindow(ctx);
   const result = runCadence(ctx);
   assert.equal(result.status, 0, result.stderr);
   assert.equal(fs.existsSync(ctx.finalizerLog), false);
   const calls = fs.readFileSync(ctx.mayhemLog, 'utf8').trim().split('\n');
-  assert.equal(calls.length, 2);
-  assert.match(calls[0], /epoch-seal-empty.*--sim/);
-  assert.doesNotMatch(calls[1], /--sim/);
+  assert.equal(calls.length, 3);
+  assert.match(calls[0], /epoch-freeze/);
+  assert.match(calls[1], /epoch-seal-empty.*--sim/);
+  assert.doesNotMatch(calls[2], /--sim/);
   assert.equal(fs.existsSync(ctx.payoutLog), false);
   assertAdvanceStamp(ctx);
 });
 
-test('metadata revision or updated_at change resets the quiet window', async (t) => {
+test('old quiet-window state cannot starve settlement after the contract cutoff', async (t) => {
   const ctx = await harness({ count: 2 });
   t.after(() => ctx.close());
-  assert.equal(runCadence(ctx).status, 0);
-  expireQuietWindow(ctx);
-  const state = JSON.parse(fs.readFileSync(ctx.rpcState, 'utf8'));
-  state.indexes['1'].revision += 1;
-  state.indexes['1'].updated_at = 'c'.repeat(64);
-  fs.writeFileSync(ctx.rpcState, `${JSON.stringify(state)}\n`);
+  fs.writeFileSync(path.join(ctx.stateDir, 'cadence.receipt-quiet.json'), JSON.stringify({
+    epoch: 1, observed_at: 9999999, metadata_hash: 'stale',
+  }));
   const result = runCadence(ctx);
   assert.equal(result.status, 0, result.stderr);
-  assert.match(result.stdout, /awaiting 1s quiet/);
-  assert.equal(fs.existsSync(ctx.finalizerLog), false);
+  assert.match(result.stdout, /finalized non-empty epoch 1/);
 });
 
 test('restart resumes a pending targeted page without waiting for payout maturity', async (t) => {
@@ -358,10 +354,10 @@ test('first v17 cadence step derives time from immutable v16 commit or seal', as
       const result = runCadence(ctx);
       assert.equal(result.status, 0, result.stderr);
       assert.match(result.stdout, /bootstrap: using confirmed epoch 1 settlement timestamp 900/);
-      assert.match(result.stdout, /awaiting 1s quiet/);
-      assert.equal(fs.existsSync(ctx.finalizerLog), false);
+      assert.match(result.stdout, /finalized non-empty epoch 2/);
+      assert.equal(fs.readFileSync(ctx.finalizerLog, 'utf8').trim(), '2');
       const after = JSON.parse(fs.readFileSync(ctx.rpcState, 'utf8'));
-      assert.equal(Object.hasOwn(after.apply, 'last_settlement_unix'), false);
+      assert.equal(after.apply.last_settlement_unix, 1000);
     });
   }
 });

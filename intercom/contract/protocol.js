@@ -1,5 +1,7 @@
 import { Protocol } from 'trac-peer';
-import { CONTRACT_VERSION } from './contract.js';
+import b4a from 'b4a';
+import { createHash } from 'trac-peer/src/utils/types.js';
+import MayhemContract, { CONTRACT_VERSION } from './contract.js';
 
 const DEFAULT_MAYHEM_TX_MAX_BYTES = 64_000;
 const DEFAULT_MAYHEM_FEATURE_MAX_BYTES = 64_000;
@@ -121,6 +123,59 @@ class MayhemProtocol extends Protocol {
       sim,
       surrogate
     );
+  }
+
+  async preparePaidTransaction(value) {
+    const dispatch = this.versionedTransactionObject(value);
+    const peer = this.peer;
+    if (!peer.base.writable || !peer.wallet.publicKey || !peer.wallet.secretKey || !peer.writerLocalKey) {
+      throw new Error('Paid transaction preparation requires the initialized writable peer.');
+    }
+    const enabled = await peer.base.view.get('txen');
+    if (enabled !== null && enabled.value !== true) throw new Error('Paid transactions are disabled.');
+    const hex = (value) => b4a.isBuffer(value) ? b4a.toString(value, 'hex') : String(value).toLowerCase();
+    const surrogate = {
+      nonce: this.generateNonce(), address: hex(peer.wallet.publicKey),
+      txv: await peer.msbClient.getTxvHex(), iw: hex(peer.writerLocalKey),
+      ch: await createHash(this.safeJsonStringify(dispatch)),
+      bs: hex(peer.config.bootstrap), mbs: peer.msbClient.bootstrapHex,
+    };
+    surrogate.tx = await this.generateTx(peer.msbClient.networkId, surrogate.txv,
+      surrogate.iw, surrogate.ch, surrogate.bs, surrogate.mbs, surrogate.nonce);
+    surrogate.signature = hex(peer.wallet.sign(b4a.from(surrogate.tx, 'hex')));
+    const payload = {
+      type: 12, address: peer.msbClient.pubKeyHexToAddress(surrogate.address),
+      txo: { tx: surrogate.tx, txv: surrogate.txv, iw: surrogate.iw, in: surrogate.nonce,
+        ch: surrogate.ch, is: surrogate.signature, bs: surrogate.bs, mbs: surrogate.mbs },
+    };
+    // No transmission here. The caller must fsync this entire object before it
+    // invokes broadcastTransaction with the exact persisted surrogate.
+    return { schema_version: 1, network_id: peer.msbClient.networkId, dispatch, surrogate, payload };
+  }
+
+  async broadcastPreparedTransaction(prepared) {
+    // Preserve the persisted dispatch bytes, including its contract revision.
+    return await super.broadcastTransaction(prepared.dispatch, false, prepared.surrogate);
+  }
+
+  async simulatePreparedTransaction(prepared) {
+    await this.peer.msbClient.validateTransaction(prepared.payload);
+    const view = this.peer.base.view.checkout(this.peer.base.view.core.signedLength);
+    const writes = new Map();
+    const storage = {
+      get: async (key) => writes.has(key)
+        ? (writes.get(key) === null ? null : { value: writes.get(key) }) : await view.get(key),
+      put: async (key, value) => { writes.set(key, value); },
+      del: async (key) => { writes.set(key, null); },
+    };
+    try {
+      // Never run background simulation on the live consensus contract instance:
+      // its mutable address/value/storage fields belong to the active apply.
+      const isolated = new MayhemContract(this, this.peer.contract?.instance?.config ?? {});
+      return await isolated.execute({ type: 'tx', key: prepared.surrogate.tx,
+        value: { dispatch: prepared.dispatch, ipk: prepared.surrogate.address, wp: '0'.repeat(64) },
+      }, storage);
+    } finally { await view.close(); }
   }
 
   featMaxBytes() {
@@ -306,6 +361,15 @@ class MayhemProtocol extends Protocol {
     }
     if (json?.op === 'apply_targeted_epoch' ||
         json?.op === 'commit_apply_targeted_epoch_page0') return null;
+    if (json?.op === 'prepare_state_checkpoint') {
+      return { type: 'prepareStateCheckpoint', value: json };
+    }
+    if (json?.op === 'state_checkpoint') {
+      return { type: 'stateCheckpoint', value: json };
+    }
+    if (json?.op === 'epoch_freeze') {
+      return { type: 'epochFreeze', value: json };
+    }
     if (json?.op === 'epoch_commit') {
       return {
         type: 'epochCommit',

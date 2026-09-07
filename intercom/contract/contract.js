@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 21;
+export const CONTRACT_VERSION = 22;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -885,7 +885,14 @@ const ctxBracketForTokens = (tokens, table = CTX_BRACKETS) => {
 
 class MayhemContract extends Contract {
   async execute(op, storage) {
-    return await super.execute(validateMayhemOperationContractVersion(op), storage);
+    // Admin Feature envelopes temporarily impersonate a command execution. Keep
+    // the actual consensus operation kind separately for paid-only operations.
+    this._mayhemExecutionType = op?.type;
+    try {
+      return await super.execute(validateMayhemOperationContractVersion(op), storage);
+    } finally {
+      this._mayhemExecutionType = null;
+    }
   }
 
   constructor(protocol, options = {}) {
@@ -1353,6 +1360,34 @@ class MayhemContract extends Contract {
         session_receipt_hash: { type: 'string', min: 1, max: 128, optional: true },
         evidence_hash: { type: 'string', min: 1, max: 128, optional: true },
         auditor_sig: { type: 'string', min: 1, max: 128, optional: true },
+      },
+    });
+
+    this.addSchema('prepareStateCheckpoint', {
+      value: {
+        $$strict: true, $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        slot: { type: 'number', integer: true, min: 1 },
+        observed_at: { type: 'number', integer: true, min: 0 },
+        contract_code_sha256: { type: 'string', min: 64, max: 64 },
+      },
+    });
+    this.addSchema('stateCheckpoint', {
+      value: {
+        $$strict: true, $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        slot: { type: 'number', integer: true, min: 1 },
+        snapshot_hash: { type: 'string', min: 64, max: 64 },
+      },
+    });
+
+    this.addSchema('epochFreeze', {
+      value: {
+        $$strict: true,
+        $$type: 'object',
+        op: { type: 'string', min: 1, max: 64 },
+        epoch: { type: 'number', integer: true, min: 1 },
+        at: { type: 'number', integer: true, min: 0 },
       },
     });
 
@@ -3349,6 +3384,9 @@ class MayhemContract extends Contract {
   }
 
   async nextReceiptEpochIndex(epoch, billingId, billingAttempt) {
+    if (await this.get(`epoch/freeze/${epoch}`)) {
+      return new Error('Cannot append receipts to a frozen settlement epoch.');
+    }
     const indexKey = this.receiptEpochIndexKey(epoch);
     const existingIndex = await this.get(indexKey);
     const index = existingIndex ?? {
@@ -3452,12 +3490,209 @@ class MayhemContract extends Contract {
     };
   }
 
-  receiptSettlementEpoch(applyState) {
+  async receiptSettlementEpoch(applyState) {
     const base = applyState.pending_epoch ?? applyState.updated_epoch;
     if (!Number.isSafeInteger(base) || base < 0 || base >= Number.MAX_SAFE_INTEGER) {
       return new Error('Receipt settlement epoch overflow.');
     }
-    return base + 1;
+    const cursor = await this.get('receipt/ingress');
+    if (cursor === null) return base + 1;
+    if (cursor.type !== 'receipt_ingress' ||
+        !Number.isSafeInteger(cursor.next_epoch) || cursor.next_epoch < 1 ||
+        !Number.isSafeInteger(cursor.activated_epoch) || cursor.activated_epoch < 1 ||
+        cursor.activated_epoch >= cursor.next_epoch ||
+        cursor.next_epoch > base + 2) {
+      return new Error('Canonical receipt ingress cursor is invalid.');
+    }
+    return Math.max(base + 1, cursor.next_epoch);
+  }
+
+  async prepareStateCheckpoint() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateExactCommandValue(
+      ['op', 'slot', 'observed_at', 'contract_code_sha256'], 'prepare_state_checkpoint'
+    );
+    if (shapeError) return shapeError;
+    const { slot, observed_at: observedAt, contract_code_sha256: codeHash } = this.value;
+    if (!Number.isSafeInteger(slot) || slot < 1 || !Number.isSafeInteger(slot * 30) ||
+        !Number.isSafeInteger(observedAt) || observedAt < slot * 30 ||
+        !this.isHexBytes(codeHash, 32) || codeHash !== codeHash.toLowerCase()) {
+      return new Error('Invalid checkpoint slot, observation time or release hash.');
+    }
+    const key = `checkpoint/prepared/${slot}`;
+    const existing = await this.get(key);
+    if (existing !== null) {
+      return { ok: true, op: 'prepareStateCheckpoint', idempotent: true, snapshot: existing };
+    }
+    const previous = await this.get('checkpoint/current');
+    const preparing = await this.get('checkpoint/preparing');
+    if (preparing && preparing.slot !== slot && preparing.slot > (previous?.slot ?? 0)) {
+      return new Error('An earlier checkpoint preparation is still awaiting its paid transaction.');
+    }
+    if (previous && (slot !== previous.slot + 1 || observedAt < previous.observed_at)) {
+      return new Error('Checkpoint preparation must follow the last paid slot and observation time.');
+    }
+    const applyState = await this.epochApplyStateRecord();
+    const ingress = await this.receiptSettlementEpoch(applyState);
+    if (ingress instanceof Error) return ingress;
+    const completed = applyState.updated_epoch > 0
+      ? await this.epochApplyAnchor(applyState.updated_epoch) : null;
+    if (completed instanceof Error) return completed;
+    if (applyState.updated_epoch > 0 && completed === null) {
+      return new Error('Completed settlement anchor is unavailable for checkpoint.');
+    }
+    const catalog = await this.get('catalog/current');
+    const state = {
+      completed_settlement: completed,
+      pending_apply: applyState.pending_epoch == null ? null : {
+        epoch: applyState.pending_epoch, next_page: applyState.pending_next_page,
+        apply_hash: applyState.last_apply_hash,
+      },
+      receipt_ingress_epoch: ingress,
+      open_receipt_index: await this.get(this.receiptEpochIndexKey(ingress)),
+      frozen_receipts: await this.get(`epoch/freeze/${applyState.updated_epoch + 1}`),
+      catalog_hash: catalog?.catalog_hash ?? null,
+      catalog_version: catalog?.ver ?? catalog?.version ?? null,
+      contract_version: CONTRACT_VERSION,
+      // The writer supplies its startup-verified release manifest digest. This
+      // attests the publisher's code identity; canonical state is read here.
+      contract_code_sha256: codeHash,
+    };
+    const stateHash = await this.opaqueHash('mayhem-checkpoint-state-v1', state);
+    const body = {
+      type: 'state_checkpoint_snapshot', schema_version: 1, slot,
+      scheduled_at: slot * 30, observed_at: observedAt,
+      previous_tx: previous?.tx ?? null,
+      state, state_hash: stateHash,
+      no_change: previous?.state_hash === stateHash,
+      prepared_by: this.address,
+    };
+    const snapshot = {
+      ...body, snapshot_hash: await this.opaqueHash('mayhem-checkpoint-snapshot-v1', body),
+    };
+    await this.put(key, snapshot);
+    await this.put('checkpoint/preparing', { slot, snapshot_hash: snapshot.snapshot_hash });
+    return { ok: true, op: 'prepareStateCheckpoint', idempotent: false, snapshot };
+  }
+
+  async stateCheckpoint() {
+    if (this._mayhemExecutionType !== 'tx' || this.isFeature() || !this.isHexBytes(this.tx, 32)) {
+      return new Error('State checkpoints require a paid MSB transaction; free admin Features are forbidden.');
+    }
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateExactCommandValue(
+      ['op', 'slot', 'snapshot_hash'], 'state_checkpoint'
+    );
+    if (shapeError) return shapeError;
+    const { slot, snapshot_hash: snapshotHash } = this.value;
+    if (!Number.isSafeInteger(slot) || slot < 1 || !this.isHexBytes(snapshotHash, 32)) {
+      return new Error('Invalid paid checkpoint identity.');
+    }
+    const key = `checkpoint/slot/${slot}`;
+    const existing = await this.get(key);
+    if (existing !== null) {
+      return existing.tx === this.tx && existing.snapshot_hash === snapshotHash
+        ? { ok: true, op: 'stateCheckpoint', idempotent: true, checkpoint: existing }
+        : new Error('Checkpoint slot already has a paid transaction.');
+    }
+    const snapshot = await this.get(`checkpoint/prepared/${slot}`);
+    if (!snapshot || snapshot.type !== 'state_checkpoint_snapshot' ||
+        snapshot.slot !== slot || snapshot.snapshot_hash !== snapshotHash ||
+        snapshot.prepared_by !== this.address) {
+      return new Error('Matching canonical checkpoint snapshot required.');
+    }
+    const previous = await this.get('checkpoint/current');
+    if (snapshot.previous_tx !== (previous?.tx ?? null) ||
+        (previous && slot !== previous.slot + 1)) {
+      return new Error('Paid checkpoint predecessor does not match canonical history.');
+    }
+    const checkpoint = {
+      type: 'paid_state_checkpoint', schema_version: 1, slot,
+      scheduled_at: snapshot.scheduled_at, observed_at: snapshot.observed_at,
+      snapshot_hash: snapshotHash, state_hash: snapshot.state_hash,
+      no_change: snapshot.no_change, previous_tx: snapshot.previous_tx,
+      tx: this.tx, paid_by: this.address,
+    };
+    await this.put(key, checkpoint);
+    await this.put('checkpoint/current', checkpoint);
+    return { ok: true, op: 'stateCheckpoint', idempotent: false, checkpoint };
+  }
+
+  async epochFreeze() {
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    const shapeError = this.validateExactCommandValue(['op', 'epoch', 'at'], 'epoch_freeze');
+    if (shapeError) return shapeError;
+    const { epoch, at } = this.value;
+    if (!Number.isSafeInteger(epoch) || epoch < 1 || epoch >= Number.MAX_SAFE_INTEGER ||
+        !Number.isSafeInteger(at) || at < 0) {
+      return new Error('Invalid epoch freeze identity or timestamp.');
+    }
+    const key = `epoch/freeze/${epoch}`;
+    const existing = await this.get(key);
+    if (existing !== null) {
+      return { ok: true, op: 'epochFreeze', idempotent: true, freeze: existing };
+    }
+    const applyState = await this.epochApplyStateRecord();
+    const orderError = this.validateEpochApplyPageOrder(applyState, epoch, 0);
+    if (orderError) return orderError;
+    const params = await this.activeParamsAt(at, ['epoch_seconds']);
+    const cadenceError = await this.validateEpochCadenceTime(
+      applyState, epoch, 0, at, params.epoch_seconds
+    );
+    if (cadenceError) return cadenceError;
+    if (at < epoch * params.epoch_seconds) {
+      return new Error('Epoch freeze is not active until the epoch window ends.');
+    }
+    const ingress = await this.receiptSettlementEpoch(applyState);
+    if (ingress instanceof Error) return ingress;
+    if (ingress !== epoch) return new Error('Epoch freeze must close the open receipt batch.');
+    const metadata = this.normalizeReceiptEpochIndexMetadata(
+      (await this.get(this.receiptEpochIndexKey(epoch))) ?? {
+        type: 'canonical_receipt_epoch_index', epoch, count: 0,
+        page_size: RECEIPT_EPOCH_INDEX_PAGE_SIZE, page_count: 0,
+        revision: 0, updated_at: null,
+      }, epoch, { allowEmpty: true }
+    );
+    if (metadata instanceof Error) return metadata;
+    const body = {
+      type: 'epoch_receipt_freeze', epoch, at, epoch_seconds: params.epoch_seconds,
+      previous_apply_hash: applyState.last_apply_hash ?? null,
+      receipt_index: metadata, frozen_by: this.address,
+    };
+    const freeze = {
+      ...body, freeze_hash: await this.opaqueHash('mayhem-epoch-receipt-freeze-v1', body),
+      frozen_at: this.tx,
+    };
+    const cursor = await this.get('receipt/ingress');
+    // Both writes are in the same consensus apply. No external observation or
+    // receipt append can interleave with this cutoff.
+    await this.put(key, freeze);
+    await this.put('receipt/ingress', {
+      type: 'receipt_ingress', next_epoch: epoch + 1,
+      activated_epoch: cursor?.activated_epoch ?? epoch,
+      freeze_hash: freeze.freeze_hash, updated_at: this.tx,
+    });
+    return { ok: true, op: 'epochFreeze', idempotent: false, freeze };
+  }
+
+  async validateFrozenEpoch(epoch, at, receiptIndex) {
+    const cursor = await this.get('receipt/ingress');
+    const freeze = await this.get(`epoch/freeze/${epoch}`);
+    // Legacy already-open/partially-applied epochs remain recoverable. Once
+    // ingress is activated, every subsequent epoch requires a canonical cutoff.
+    if (freeze === null) {
+      return cursor && epoch >= cursor.activated_epoch
+        ? new Error('Canonical epoch freeze required before settlement.') : null;
+    }
+    if (freeze.type !== 'epoch_receipt_freeze' || freeze.epoch !== epoch ||
+        freeze.at !== at ||
+        stableJson(freeze.receipt_index) !== stableJson(receiptIndex)) {
+      return new Error('Settlement does not match its canonical epoch freeze.');
+    }
+    return null;
   }
 
   async normalizeTargetedSpendSummaryRecord(record, user, rail) {
@@ -4099,7 +4334,7 @@ class MayhemContract extends Contract {
       return new Error('A closed targeted reservation cannot advance.');
     }
     const applyState = await this.epochApplyStateRecord();
-    const settlementEpoch = this.receiptSettlementEpoch(applyState);
+    const settlementEpoch = await this.receiptSettlementEpoch(applyState);
     if (settlementEpoch instanceof Error) return settlementEpoch;
     if (body.billing_epoch > settlementEpoch) {
       return new Error('Receipt billing epoch is in the future.');
@@ -4327,7 +4562,7 @@ class MayhemContract extends Contract {
     }
 
     const applyState = await this.epochApplyStateRecord();
-    const settlementEpoch = this.receiptSettlementEpoch(applyState);
+    const settlementEpoch = await this.receiptSettlementEpoch(applyState);
     if (settlementEpoch instanceof Error) return settlementEpoch;
     if (normalized.billing_epoch > settlementEpoch) {
       return new Error('Close usage reservation billing epoch is in the future.');
@@ -9931,6 +10166,8 @@ class MayhemContract extends Contract {
     if (stableJson(currentReceiptIndex) !== stableJson(receiptIndex)) {
       return new Error('Canonical receipt epoch index changed after the apply snapshot.');
     }
+    const freezeError = await this.validateFrozenEpoch(value.epoch, value.at, receiptIndex);
+    if (freezeError) return freezeError;
     const epochCommit = options.commitTransition?.record ??
       await this.get(`epoch/commit/${value.epoch}`);
     if (!epochCommit ||
@@ -10909,6 +11146,12 @@ class MayhemContract extends Contract {
       }
     }
 
+    const freezeError = await this.validateFrozenEpoch(this.value.epoch, this.value.at,
+      receiptIndex ?? {
+        type: 'canonical_receipt_epoch_index', epoch: this.value.epoch, count: 0,
+        page_size: RECEIPT_EPOCH_INDEX_PAGE_SIZE, page_count: 0, revision: 0, updated_at: null,
+      });
+    if (freezeError) return freezeError;
     const notYetActiveAt = this.value.epoch * params.epoch_seconds;
     if (this.value.at < notYetActiveAt) {
       return new Error('Empty epoch seal is not active until the epoch window ends.');
