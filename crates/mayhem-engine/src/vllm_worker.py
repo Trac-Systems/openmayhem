@@ -913,6 +913,54 @@ def make_sampling_params(payload, speciality_sampling_kwargs=None):
     return SamplingParams(**required_sampling_kwargs(SamplingParams, kwargs, requested))
 
 
+def align_hybrid_prefill_args(args):
+    """Resolve vLLM's hybrid cache block before allocating scheduler buffers."""
+    if getattr(args, "mamba_cache_mode", None) != "align":
+        return
+
+    from vllm.config.cache import CacheConfig
+    from vllm.config.vllm import set_current_vllm_config
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.selector import get_attn_backend
+
+    config = args.create_engine_config()
+    model = config.model_config
+    if not model.is_hybrid:
+        return
+    cache = config.cache_config
+    # Platform.update_block_size_for_backend needs instantiated attention layers.
+    # Use the same selector and page-size calculation with model metadata here,
+    # before the engine creates its buffers or maps the model weights.
+    with set_current_vllm_config(config):
+        backend = get_attn_backend(
+            head_size=model.get_head_size(),
+            dtype=model.dtype,
+            kv_cache_dtype=cache.cache_dtype,
+            use_mla=model.use_mla,
+            num_heads=model.get_num_attention_heads(config.parallel_config),
+        )
+        if not cache.user_specified_block_size:
+            cache.block_size = backend.get_preferred_block_size(
+                CacheConfig.DEFAULT_BLOCK_SIZE
+            )
+        current_platform._align_hybrid_block_size(config, backend)
+    block_size = cache.block_size
+    if not isinstance(block_size, int) or block_size <= 0:
+        raise ValueError("vLLM did not resolve a positive hybrid cache block size")
+    changes = {}
+    for name in ("max_num_batched_tokens", "long_prefill_token_threshold"):
+        previous = getattr(config.scheduler_config, name)
+        if previous < block_size and (name == "max_num_batched_tokens" or previous > 0):
+            setattr(args, name, block_size)
+            changes[name] = {"requested": previous, "effective": block_size}
+    if changes:
+        print(json.dumps({
+            "event": "prefix_cache_prefill_alignment",
+            "block_size": block_size,
+            "changes": changes,
+        }), file=sys.stderr, flush=True)
+
+
 def create_engine(payload):
     global execution_properties, kernel_policy
 
@@ -1025,6 +1073,7 @@ def create_engine(payload):
         if name != "worker_extension_cls"
     })
     args = AsyncEngineArgs(**accepted_engine_kwargs)
+    align_hybrid_prefill_args(args)
     if hasattr(AsyncLLM, "from_engine_args"):
         initialized_engine = AsyncLLM.from_engine_args(args)
     else:

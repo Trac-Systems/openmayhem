@@ -10753,6 +10753,7 @@ exec(compile(ast.Module(body=nodes, type_ignores=[]), "vllm_worker.py", "exec"),
 namespace["configure_deterministic_runtime"] = lambda path: None
 namespace["model_uses_nvfp4"] = lambda path: nvfp4
 namespace["model_uses_hybrid_attention"] = lambda path: hybrid
+namespace["align_hybrid_prefill_args"] = lambda args: None
 hybrid = False
 
 class Backend(Enum):
