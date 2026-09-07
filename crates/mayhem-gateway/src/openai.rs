@@ -134,6 +134,7 @@ type SharedState = Arc<GatewayState>;
 mod durable_streaming_tests;
 mod response_stream;
 mod incremental_output;
+mod failure_recovery;
 
 mod github_update;
 use github_update::{
@@ -3347,7 +3348,7 @@ fn gateway_job_settled_receipt(
 ) -> Result<Value, GatewaySessionError> {
     if !matches!(
         terminal_status,
-        GatewayJobStatus::Completed | GatewayJobStatus::Cancelled
+        GatewayJobStatus::Completed | GatewayJobStatus::Cancelled | GatewayJobStatus::Failed
     ) {
         return Err(GatewaySessionError::new(
             "gateway job receipt recovery has an invalid terminal status",
@@ -3691,7 +3692,7 @@ fn parse_gateway_job_receipt_recovery(
         || !is_lower_hex_len(&recovery.reconciliation.transport_peer, 64)
         || !matches!(
             recovery.reconciliation.terminal_status,
-            GatewayJobStatus::Completed | GatewayJobStatus::Cancelled
+            GatewayJobStatus::Completed | GatewayJobStatus::Cancelled | GatewayJobStatus::Failed
         )
     {
         return Err(GatewaySessionError::new(format!(
@@ -3792,10 +3793,27 @@ async fn reconcile_pending_gateway_job_once(
     if job.status != GatewayJobStatus::ReconciliationPending {
         return Ok(());
     }
+    if job.receipt.as_ref().is_some_and(|raw| (raw.get("body").is_none() && raw.get("reservation").is_some()) || raw.get("canonical_settlement").is_some()) {
+        return failure_recovery::reconcile(state, &job).await;
+    }
     let mut recovery = parse_gateway_job_receipt_recovery(&job)?;
+    if !recovery.body.final_receipt {
+        if let (Some(feature), Some(publisher)) = (
+            recovery.reconciliation.settlement_feature.as_ref(), state.receipt_settlement_publisher.as_ref().as_ref(),
+        ) {
+            publisher.queue(feature).map_err(GatewaySessionError::new)?;
+        }
+        return failure_recovery::reconcile(state, &job).await;
+    }
     let feature = match recovery.reconciliation.settlement_feature.clone() {
         Some(feature) => feature,
-        None => transport.deliver(&recovery).await?,
+        None => match transport.deliver(&recovery).await {
+            Ok(feature) => feature,
+            Err(error) => {
+                if failure_recovery::reconcile(state, &job).await.is_ok() { return Ok(()); }
+                return Err(error);
+            }
+        },
     };
     validate_stored_receipt_settlement_feature(
         &recovery.provider_receipt(),
@@ -3863,8 +3881,9 @@ async fn reconcile_pending_gateway_jobs_pass(
     state: &GatewayState,
     transport: &dyn GatewayReceiptAckRecoveryTransport,
     max_jobs: usize,
+    after: &mut String,
 ) -> Result<GatewayReceiptAckRecoveryPass, String> {
-    let pending = state
+    let mut pending = state
         .jobs
         .lock_recover("gateway job vault")
         .pending_reconciliations(now_secs())?;
@@ -3872,7 +3891,11 @@ async fn reconcile_pending_gateway_jobs_pass(
         pending: pending.len(),
         ..GatewayReceiptAckRecoveryPass::default()
     };
+    pending.sort_by(|a, b| a.id.cmp(&b.id));
+    let pivot = pending.partition_point(|job| job.id.as_str() <= after.as_str());
+    pending.rotate_left(pivot);
     for job in pending.into_iter().take(max_jobs.max(1)) {
+        *after = job.id.clone();
         pass.attempted += 1;
         match reconcile_pending_gateway_job_once(state, &job.id, transport).await {
             Ok(()) => pass.completed += 1,
@@ -3894,9 +3917,8 @@ fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), 
         .jobs
         .lock_recover("gateway job vault")
         .pending_reconciliations(now_secs())?;
-    if pending.is_empty() {
-        return Ok(());
-    }
+    if pending.is_empty() && (state.session_backend.bridge_stream_config().is_none()
+        || state.receipt_settlement_publisher.as_ref().is_none()) { return Ok(()); }
     let config = state
         .session_backend
         .bridge_stream_config()
@@ -3919,11 +3941,13 @@ fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), 
     let state = state.clone();
     tokio::spawn(async move {
         let mut retry = Duration::from_secs(1);
+        let mut after = String::new();
         loop {
             let pass = match reconcile_pending_gateway_jobs_pass(
                 &state,
                 transport.as_ref(),
                 GATEWAY_RECEIPT_ACK_RECOVERY_MAX_JOBS_PER_PASS,
+                &mut after,
             )
             .await
             {
@@ -3936,7 +3960,9 @@ fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), 
                 }
             };
             if pass.pending == 0 {
-                return;
+                retry = Duration::from_secs(1);
+                tokio::time::sleep(Duration::from_secs(5)).await;
+                continue;
             }
 
             // Durable receipt recovery uses SC-Bridge too; pace it so old jobs
@@ -14928,7 +14954,11 @@ fn request_scoped_api_error(error: &GatewaySessionError) -> Option<ApiError> {
                 "The request does not satisfy the provider contract for this endpoint.",
             )
         };
-        ApiError::bad_request(message, Some("model")).with_public_error(code, category, false)
+        if code == "provider_model_output_invalid" {
+            ApiError::bad_gateway(message, None).with_public_error(code, category, false)
+        } else {
+            ApiError::bad_request(message, Some("model")).with_public_error(code, category, false)
+        }
     })
 }
 
@@ -15730,6 +15760,7 @@ impl ScBridgeGatewaySessionBackend {
             transport_body.clone(),
             direct_chat_contract_request(request, &transport_body),
         )?;
+        failure_recovery::persist_reservation(invocation)?;
         send_direct_session_request_frames(
             &mut bridge,
             direct_peer,
@@ -15781,6 +15812,9 @@ impl ScBridgeGatewaySessionBackend {
                 return Err(err);
             }
             Err(err) => {
+                if err.failure_class.is_request_scoped()
+                    || invocation.job.as_ref().is_some_and(|job| !job.is_active())
+                { return Err(err); }
                 if let Some(partial) = err.partial.as_ref() {
                     let receipt_ack = direct_session_partial_receipt_ack(
                         request, invocation, partial, provider, model,
@@ -15942,6 +15976,7 @@ impl ScBridgeGatewaySessionBackend {
             transport_body.clone(),
             embedding_contract_request(request, &transport_body),
         )?;
+        failure_recovery::persist_reservation(invocation)?;
         send_direct_session_request_frames(
             &mut bridge,
             direct_peer,
@@ -15960,6 +15995,7 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             &inputs,
             &accept_info.enclave_pubkey,
+            invocation, model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16110,6 +16146,7 @@ impl ScBridgeGatewaySessionBackend {
         .chars()
         .take(32)
         .collect::<String>();
+        failure_recovery::persist_reservation(invocation)?;
         send_direct_session_request_frames(
             &mut bridge,
             direct_peer,
@@ -16128,6 +16165,7 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
+            invocation, model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16268,6 +16306,7 @@ impl ScBridgeGatewaySessionBackend {
             audio_speech_contract_request(request, &transport_body),
         )?;
         let request_id = request_id_for_body(&invocation.session_id, &request_body);
+        failure_recovery::persist_reservation(invocation)?;
         send_direct_session_request_frames(
             &mut bridge,
             direct_peer,
@@ -16286,6 +16325,7 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
+            invocation, model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16426,6 +16466,7 @@ impl ScBridgeGatewaySessionBackend {
             request.contract_request.clone(),
         )?;
         let request_id = request_id_for_body(&invocation.session_id, &request_body);
+        failure_recovery::persist_reservation(invocation)?;
         send_direct_session_request_frames(
             &mut bridge,
             direct_peer,
@@ -16444,6 +16485,7 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
+            invocation, model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16584,6 +16626,7 @@ impl ScBridgeGatewaySessionBackend {
             request.workflow_output.as_ref(),
         )?;
         let request_id = request_id_for_body(&invocation.session_id, &request_body);
+        failure_recovery::persist_reservation(invocation)?;
         send_direct_session_request_frames(
             &mut bridge,
             direct_peer,
@@ -16602,6 +16645,7 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
+            invocation, model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -18746,6 +18790,12 @@ async fn collect_direct_session_output(
                     &format!("session {session_id}"),
                     false,
                 );
+                settle_failed_direct_session_frame(
+                    bridge, invocation, model, enclave_pubkey, &frame,
+                    latest_checkpoint_receipt.as_ref(),
+                    blake3_hex(chat_prompt_text(request).as_bytes()),
+                ).await?;
+                if frame.get("receipt").is_some() { return Err(error); }
                 if error.failure_class.is_request_scoped() {
                     return Err(error);
                 }
@@ -18945,6 +18995,8 @@ async fn collect_direct_session_embedding_output(
     failover: GatewayFailoverInvocation,
     inputs: &[String],
     enclave_pubkey: &str,
+    invocation: &GatewaySessionInvocation,
+    model: &GatewayModel,
     client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectEmbeddingSessionCollected, GatewaySessionError> {
     let mut embeddings = None;
@@ -19020,6 +19072,10 @@ async fn collect_direct_session_embedding_output(
                 )?);
             }
             Some("s.error") => {
+                settle_failed_direct_session_frame(
+                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    blake3_hex(embedding_prompt_text(inputs).as_bytes()),
+                ).await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("embedding session {session_id}"),
@@ -19092,6 +19148,8 @@ async fn collect_direct_session_image_generation_output(
     failover: GatewayFailoverInvocation,
     request: &ImageGenerationRequest,
     enclave_pubkey: &str,
+    invocation: &GatewaySessionInvocation,
+    model: &GatewayModel,
     client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectImageGenerationSessionCollected, GatewaySessionError> {
     let mut finish_seen = false;
@@ -19153,6 +19211,10 @@ async fn collect_direct_session_image_generation_output(
                 )?);
             }
             Some("s.error") => {
+                settle_failed_direct_session_frame(
+                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    image_generation_prompt_hash(request),
+                ).await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("image session {session_id}"),
@@ -19227,6 +19289,8 @@ async fn collect_direct_session_audio_speech_output(
     failover: GatewayFailoverInvocation,
     request: &AudioSpeechRequest,
     enclave_pubkey: &str,
+    invocation: &GatewaySessionInvocation,
+    model: &GatewayModel,
     client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectAudioSpeechSessionCollected, GatewaySessionError> {
     let mut finish_seen = false;
@@ -19288,6 +19352,10 @@ async fn collect_direct_session_audio_speech_output(
                 )?);
             }
             Some("s.error") => {
+                settle_failed_direct_session_frame(
+                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    audio_speech_prompt_hash(request),
+                ).await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("audio speech session {session_id}"),
@@ -19353,6 +19421,8 @@ async fn collect_direct_session_artifact_generation_output(
     failover: GatewayFailoverInvocation,
     request: &ArtifactGenerationRequest,
     enclave_pubkey: &str,
+    invocation: &GatewaySessionInvocation,
+    model: &GatewayModel,
     client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectArtifactGenerationSessionCollected, GatewaySessionError> {
     let mut finish_seen = false;
@@ -19414,6 +19484,10 @@ async fn collect_direct_session_artifact_generation_output(
                 )?);
             }
             Some("s.error") => {
+                settle_failed_direct_session_frame(
+                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    artifact_generation_prompt_hash(request),
+                ).await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!(
@@ -19501,6 +19575,8 @@ async fn collect_direct_session_audio_transcription_output(
     failover: GatewayFailoverInvocation,
     request: &AudioTranscriptionRequest,
     enclave_pubkey: &str,
+    invocation: &GatewaySessionInvocation,
+    model: &GatewayModel,
     client_cancellation: Option<&GatewayRequestCancellation>,
 ) -> Result<DirectAudioTranscriptionSessionCollected, GatewaySessionError> {
     let mut content = String::new();
@@ -19597,6 +19673,10 @@ async fn collect_direct_session_audio_transcription_output(
                 )?);
             }
             Some("s.error") => {
+                settle_failed_direct_session_frame(
+                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    audio_transcription_prompt_hash(request),
+                ).await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("audio transcription session {session_id}"),
@@ -20747,6 +20827,90 @@ async fn receive_and_queue_receipt_settlement(
     invocation
         .receipt_recorder
         .queue_settlement_feature(feature)
+}
+
+fn failed_direct_session_receipt_ack(
+    model: &GatewayModel,
+    invocation: &GatewaySessionInvocation,
+    receipt: &ProviderSignedReceipt,
+    checkpoint: Option<&ProviderSignedReceipt>,
+    prompt_hash: String,
+) -> Result<ReceiptAck, GatewaySessionError> {
+    if !invocation.receipt_cosign_enabled {
+        return Err(GatewaySessionError::new("failed session receipt co-signing is disabled"));
+    }
+    let (usage, attribution, seq) = checkpoint.map(|checkpoint| (
+        checkpoint.body.usage.clone(), checkpoint.body.usage_attribution.clone(),
+        checkpoint.body.seq.saturating_add(1),
+    )).unwrap_or_else(|| (
+        invocation.spend_voucher.body.billing_prior_usage.clone(), BTreeMap::new(), 1,
+    ));
+    let amount = calculate_locked_au_owed(invocation, &usage);
+    if amount <= invocation.spend_voucher.body.billing_prior_au_owed_cum
+        || receipt.body.usage_attribution != attribution
+    {
+        return Err(GatewaySessionError::new(
+            "failed session receipt must preserve acknowledged usage and attribution",
+        ));
+    }
+    ensure_final_receipt_within_voucher(invocation, amount)?;
+    validate_provider_receipt(model, invocation, receipt, ExpectedProviderReceipt {
+        provider: invocation.provider_pubkey_required()?, seq, final_receipt: true,
+        au_owed_cum: amount, usage, prompt_hash,
+    })?;
+    receipt_ack_for_body(&invocation.receipt_user_seed, &receipt.body)
+        .map_err(|error| GatewaySessionError::new(format!("signing failed session receipt: {error}")))
+}
+
+async fn settle_failed_direct_session_frame(
+    bridge: &mut ScBridgeClient,
+    invocation: &GatewaySessionInvocation,
+    model: &GatewayModel,
+    enclave_pubkey: &str,
+    frame: &Value,
+    checkpoint: Option<&ProviderSignedReceipt>,
+    prompt_hash: String,
+) -> Result<(), GatewaySessionError> {
+    if frame.get("receipt").is_none() { return Ok(()); }
+    let receipt = provider_signed_receipt_from_frame(
+        frame, &invocation.session_id, enclave_pubkey,
+    )?;
+    let ack = failed_direct_session_receipt_ack(model, invocation, &receipt, checkpoint, prompt_hash)?;
+    let failure = provider_reported_session_error(frame, "failed generation", false);
+    let public_error = provider_session_api_error(&failure);
+    if let Some(job) = invocation.job.as_ref() {
+        job.mark_settlement_reconciliation_started();
+        let recovery = gateway_job_settled_receipt(
+            invocation, &receipt, &ack, GatewayJobStatus::Failed,
+            Some(public_error.message.clone()), Some("provider_failure".to_owned()),
+        )?;
+        let store = job.store.clone();
+        let id = job.id.clone();
+        let message = public_error.message.clone();
+        let info = GatewayJobErrorInfo {
+            code: public_error.public_code.to_owned(),
+            category: public_error.category.to_owned(), retryable: false,
+        };
+        tokio::task::spawn_blocking(move || store.lock_recover("gateway job vault")
+            .complete_with_error_info(&id, GatewayJobStatus::ReconciliationPending,
+                None, Vec::new(), Some(recovery), Some(message), Some(info), now_secs()))
+            .await.map_err(|error| GatewaySessionError::new(error.to_string()))?
+            .map_err(GatewaySessionError::new)?;
+    }
+    record_direct_session_receipt(invocation, &receipt, &ack)?;
+    send_receipt_ack_and_queue_settlement(
+        bridge, invocation.direct_peer()?, invocation, &receipt, &ack,
+        Some("provider_failure"), "acknowledging failed generation accounting",
+    ).await.map_err(|error| {
+        // Accounting recovery already owns the signed evidence. Keep the
+        // generation failure visible instead of encouraging a paid retry.
+        eprintln!("Failed generation accounting handoff remains pending: {}", error.message);
+        failure.clone()
+    })?;
+    if let Some(job) = invocation.job.as_ref() {
+        job.finish_reconciliation(GatewayJobStatus::Failed, Some(public_error.message)).await?;
+    }
+    Ok(())
 }
 
 async fn record_cancelled_direct_session_receipt(
@@ -24393,6 +24557,7 @@ async fn open_live_direct_chat_session(
             direct_chat_contract_request(request, &transport_body),
         )?;
         let byte_limit = direct_session_request_byte_limit(invocation, &request_body)?;
+        failure_recovery::persist_reservation(invocation)?;
         send_direct_session_request_frames(
             &mut bridge,
             direct_peer,
@@ -24632,7 +24797,7 @@ where
             )))
         });
         if let Err(error) = result {
-            let _ = send_sse_error(&tx, &error.message).await;
+            let _ = send_sse_value(&tx, error.public_error_value()).await;
         }
         let _ = send_sse_done(&tx).await;
     });
@@ -25353,6 +25518,12 @@ async fn run_live_direct_chat_sse_inner(
                     &format!("session {}", session.invocation.session_id),
                     false,
                 );
+                settle_failed_direct_session_frame(
+                    &mut session.bridge, &session.invocation, &session.model,
+                    &session.enclave_pubkey, &frame, latest_checkpoint_receipt.as_ref(),
+                    blake3_hex(chat_prompt_text(&session.request).as_bytes()),
+                ).await?;
+                if frame.get("receipt").is_some() { return Err(error); }
                 if error.failure_class.is_request_scoped() {
                     return Err(error);
                 }
@@ -25745,19 +25916,6 @@ fn add_partial_usage_to_output(output: &mut ChatOutput, partials: &[GatewaySessi
 
 async fn send_sse_value(tx: &tokio::sync::mpsc::Sender<Option<Value>>, value: Value) -> bool {
     send_sse_event(tx, Some(value)).await
-}
-
-async fn send_sse_error(tx: &tokio::sync::mpsc::Sender<Option<Value>>, message: &str) -> bool {
-    send_sse_value(
-        tx,
-        json!({
-            "error": {
-                "message": message,
-                "type": "mayhem_stream_error",
-            },
-        }),
-    )
-    .await
 }
 
 async fn send_sse_done(tx: &tokio::sync::mpsc::Sender<Option<Value>>) -> bool {
@@ -41438,6 +41596,149 @@ mod tests {
     }
 
     #[test]
+    fn canonical_failure_recovery_rejects_unconfirmed_or_mismatched_closure() {
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let invocation = test_invocation();
+        let receipt = test_provider_receipt_with_finality(&model, &request, &test_chat_output(), &invocation, 18, false);
+        let ack = receipt_ack_for_body(&invocation.receipt_user_seed, &receipt.body).unwrap();
+        let binding = json!(receipt.body);
+        let proof = failure_recovery::test_closed_proof(&receipt, &ack);
+        assert!(failure_recovery::verify_closed(&binding, &proof).unwrap().is_some());
+        for (pointer, wrong) in [
+            ("/close/confirmed", json!(false)), ("/head/confirmed", json!(false)),
+            ("/reservation/value/status", json!("active")),
+            ("/close/value/session_id", json!("ef".repeat(32))),
+            ("/close/value/retained_au", json!("0")),
+            ("/close/value/latest_receipt_seq", json!(19)),
+            ("/head/value/settlement_ready", json!(false)),
+            ("/head/value/receipt/user_sig", json!("00".repeat(64))),
+        ] {
+            let mut invalid = proof.clone();
+            *invalid.pointer_mut(pointer).unwrap() = wrong;
+            assert!(failure_recovery::verify_closed(&binding, &invalid).is_err(), "accepted {pointer}");
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_generation_wire_handoff_survives_lost_reply_and_restart() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        for lost_handoff in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let dir = root.path().join("jobs");
+            let seed = test_user_seed();
+            let state = GatewayState::fixture().with_receipt_user_seed(seed)
+                .with_job_store_dir(dir.clone()).unwrap();
+            let model = test_model();
+            let job = match prepare_gateway_job(&state, &HeaderMap::new(),
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS, &model.id,
+                &json!({"model": model.id, "messages": []}), &None).await.unwrap() {
+                PreparedGatewayJob::Started(job) => job,
+                _ => panic!("fresh job expected"),
+            };
+            let id = job.id.clone();
+            let mut invocation = test_invocation();
+            invocation.transport_peer = Some("ab".repeat(32));
+            invocation.job = Some(job);
+            let publisher = Arc::new(RecordingReceiptSettlementPublisher::default());
+            invocation.receipt_recorder.settlement_publisher = Arc::new(Some(publisher.clone()));
+            let request = test_chat_request(&model.id);
+            let output = test_chat_output();
+            let checkpoint = test_provider_receipt_with_finality(&model, &request, &output, &invocation, 18, false);
+            let terminal = test_provider_receipt_with_finality(&model, &request, &output, &invocation, 19, true);
+            let ack = receipt_ack_for_body(&seed, &terminal.body).unwrap();
+            let feature = test_receipt_settlement_feature(&terminal, &ack);
+            let mut wire = json!(terminal.body);
+            wire["enclave_sig"] = json!(terminal.enclave_sig);
+            let failure = json!({"t": "s.error", "v": 1, "session_id": invocation.session_id,
+                "seq": 19, "code": "model_output_invalid", "message": "unadvertised tool call: bash", "receipt": wire});
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let session = invocation.session_id.clone();
+            let remote = invocation.transport_peer.clone().unwrap();
+            let expected_ack = ack.clone();
+            let sent_feature = feature.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let auth: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                socket.send(Message::Text(json!({"id": auth["id"], "type": "auth_ok"}).to_string().into())).await.unwrap();
+                let sent: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(sent["type"], "session_send");
+                assert_eq!(sent["frame"]["t"], "s.receipt_ack");
+                assert_eq!(sent["frame"]["user_sig"], expected_ack.user_sig);
+                assert_eq!(sent["frame"]["seq"], 19);
+                socket.send(Message::Text(json!({"id": sent["id"], "type": "session_sent"}).to_string().into())).await.unwrap();
+                let frame = if lost_handoff { json!({"t": "s.close", "session_id": session}) }
+                    else { json!({"t": "s.receipt_settlement", "session_id": session, "seq": 19, "feature": sent_feature}) };
+                socket.send(Message::Text(json!({"type": "session_frame", "remote": remote,
+                    "session_id": session, "frame": frame}).to_string().into())).await.unwrap();
+            });
+            let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(format!("ws://{address}"), "test-token").unwrap()).await.unwrap();
+            let result = settle_failed_direct_session_frame(&mut bridge, &invocation, &model,
+                &terminal.enclave_pubkey, &failure, Some(&checkpoint), blake3_hex(chat_prompt_text(&request).as_bytes())).await;
+            server.await.unwrap();
+            if lost_handoff {
+                let error = result.unwrap_err();
+                assert!(!error.retryable);
+                assert_eq!(provider_session_api_error(&error).public_code, "provider_model_output_invalid");
+            } else { result.unwrap(); }
+            let stored = state.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
+            assert_eq!(stored.status, if lost_handoff { GatewayJobStatus::ReconciliationPending } else { GatewayJobStatus::Failed });
+            assert_eq!(stored.error_info.as_ref().unwrap().code, "provider_model_output_invalid");
+            assert_eq!(stored.receipt.as_ref().unwrap()["body"]["usage"], json!(checkpoint.body.usage));
+            drop(invocation); drop(state);
+            let restarted = GatewayState::fixture().with_receipt_user_seed(seed)
+                .with_job_store_dir(dir).unwrap().with_receipt_settlement_publisher(publisher.clone());
+            let transport = RecordingReceiptAckRecoveryTransport { expected_ack: ack, feature,
+                deliveries: Arc::new(Mutex::new(Vec::new())) };
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
+            assert_eq!(restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().status, GatewayJobStatus::Failed);
+            assert_eq!(publisher.features.lock_recover("test publisher").len(), 1);
+        }
+    }
+
+    #[test]
+    fn failed_direct_session_accepts_only_exact_acknowledged_usage() {
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let invocation = test_invocation();
+        let output = test_chat_output();
+        let checkpoint = test_provider_receipt_with_finality(
+            &model, &request, &output, &invocation, 18, false,
+        );
+        let terminal = test_provider_receipt_with_finality(
+            &model, &request, &output, &invocation, 19, true,
+        );
+        let prompt_hash = blake3_hex(chat_prompt_text(&request).as_bytes());
+        let ack = failed_direct_session_receipt_ack(
+            &model, &invocation, &terminal, Some(&checkpoint), prompt_hash.clone(),
+        ).unwrap();
+        assert_eq!(ack.seq, 19);
+        for mutation in ["usage", "amount", "sequence", "finality", "attribution", "session"] {
+            let mut invalid = terminal.clone();
+            match mutation {
+                "usage" => invalid.body.usage = ReceiptUsage::text(1, 99),
+                "amount" => invalid.body.au_owed_cum += 1,
+                "sequence" => invalid.body.seq += 1,
+                "finality" => invalid.body.final_receipt = false,
+                "attribution" => { invalid.body.usage_attribution.insert("reasoning_output_tokens".into(), 1); },
+                "session" => invalid.body.session_id = "ef".repeat(32),
+                _ => unreachable!(),
+            }
+            invalid.enclave_sig = sign_hex(&test_enclave_seed(), &receipt_signing_bytes(&invalid.body).unwrap());
+            assert!(failed_direct_session_receipt_ack(
+                &model, &invocation, &invalid, Some(&checkpoint), prompt_hash.clone(),
+            ).is_err(), "accepted {mutation}");
+        }
+        assert!(failed_direct_session_receipt_ack(
+            &model, &invocation, &terminal, None, prompt_hash,
+        ).is_err(), "unacknowledged output must not become a charge");
+    }
+
+    #[test]
     fn client_disconnect_uses_last_checkpoint_partial_without_redispatch_marker() {
         let model = test_model();
         let request = test_chat_request(&model.id);
@@ -47424,7 +47725,7 @@ mod tests {
             .with_receipt_settlement_publisher(publisher.clone());
         let transport = RecordingAnyReceiptAckRecoveryTransport::default();
 
-        let first = reconcile_pending_gateway_jobs_pass(&restarted, &transport, 1)
+        let first = reconcile_pending_gateway_jobs_pass(&restarted, &transport, 1, &mut String::new())
             .await
             .unwrap();
         assert_eq!(
@@ -47460,7 +47761,7 @@ mod tests {
             1
         );
 
-        let second = reconcile_pending_gateway_jobs_pass(&restarted, &transport, 8)
+        let second = reconcile_pending_gateway_jobs_pass(&restarted, &transport, 8, &mut String::new())
             .await
             .unwrap();
         assert_eq!(second.pending, 2);
@@ -49859,7 +50160,9 @@ mod tests {
                     "{collector} cooled the route for {code}"
                 );
                 let api_error = request_scoped_api_error(&error).expect("request-scoped API error");
-                assert_eq!(api_error.status, StatusCode::BAD_REQUEST, "{collector}");
+                assert_eq!(api_error.status,
+                    if code == "model_output_invalid" { StatusCode::BAD_GATEWAY } else { StatusCode::BAD_REQUEST },
+                    "{collector}");
             }
 
             let entry = state

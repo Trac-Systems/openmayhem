@@ -6,6 +6,7 @@ mod gemma4;
 mod intercom_runtime;
 mod python_runtime;
 mod provider_output_stream;
+mod provider_failure_recovery;
 mod release_bundle;
 
 #[cfg(test)]
@@ -61283,6 +61284,7 @@ struct ActiveProviderSession {
     max_spend_au: MoneyAu,
     receipt_settlement: Option<Arc<ProviderReceiptSettlement>>,
     accept_replay: Option<ProviderSessionAcceptReplay>,
+    reservation_recovery: Option<Arc<provider_failure_recovery::AttemptGuard>>,
 }
 
 fn provider_session_replay_decision(
@@ -64048,6 +64050,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             password: password.clone(),
             enclave_pubkey: runtime_keypair.public_key_hex(),
         });
+        provider_failure_recovery::spawn(receipt_settlement.clone(), rpc.clone(), wallet.public_key.clone());
         serve_provider_sessions(
             ProviderSessionContext {
                 args: &args,
@@ -81736,7 +81739,9 @@ where
                         max_spend_au: spend_voucher.body.max_spend_au,
                         receipt_settlement: Some(runtime.receipt_settlement.clone()),
                         accept_replay: None,
+                        reservation_recovery: None,
                     };
+                    active.reservation_recovery = provider_failure_recovery::begin(&active, terms)?.map(Arc::new);
                     let ts = unix_epoch_millis()?;
                     let open_head =
                         session_frame_head(&frame).context("hashing s.open frame for s.accept")?;
@@ -82209,15 +82214,38 @@ where
                     ));
                     let error_code = provider_response_error_code(&err);
                     let error_message = provider_response_error_message(&err);
-                    send_provider_session_error(
+                    let (usage, attribution, receipt_seq) = live_stream
+                        .as_ref()
+                        .map(ProviderSessionLiveStream::cancellation_receipt_state)
+                        .unwrap_or_else(|| (ReceiptUsage::default(), BTreeMap::new(), 1));
+                    let failed_receipt = provider_failed_session_receipt(
+                        terms, &active, &body, usage, attribution, receipt_seq,
+                        runtime.runtime_keypair,
+                    )?;
+                    send_provider_session_failure(
                         bridge,
-                        &active.remote,
-                        &active.session_id,
+                        &active,
                         request_id,
                         error_code,
                         &error_message,
+                        failed_receipt.as_ref(),
                     )
                     .await?;
+                    if let Some(receipt) = failed_receipt.as_ref() {
+                        // Publication may fail after the buyer durably signs. Its
+                        // recovery job and our settlement outbox retain that ACK.
+                        match wait_for_provider_receipt_ack_inner(
+                            bridge, &active, receipt,
+                            provider_session_receipt_ack_timeout(&active), None, true,
+                        ).await {
+                            Ok(_) => lock_provider_protection(protection).record_usage(
+                                &receipt.body.usage, receipt.body.au_owed_cum,
+                            ),
+                            Err(error) => provider_session_debug(format!(
+                                "failed-session receipt handoff pending for {session_id}: {error:#}"
+                            )),
+                        }
+                    }
                     send_provider_session_close(
                         bridge,
                         &active.remote,
@@ -83025,6 +83053,47 @@ impl<'a> ProviderSessionLiveStream<'a> {
             prompt_tokens: self.prompt_tokens,
         })
     }
+}
+
+fn provider_failed_session_receipt(
+    terms: &ProviderSessionTerms,
+    active: &ActiveProviderSession,
+    body: &Value,
+    usage: ReceiptUsage,
+    attribution: BTreeMap<String, u64>,
+    seq: u64,
+    runtime_keypair: &RuntimeKeypair,
+) -> Result<Option<ProviderSignedSessionReceipt>> {
+    // A provider failure never invents the minimum work quantum used for a
+    // buyer cancellation. Only the last acknowledged checkpoint is billable.
+    // A zero-spend failure is closed through canonical reservation recovery.
+    let receipt = provider_session_receipt_for_usage_attribution(
+        terms, active, body, usage, attribution, seq, true, runtime_keypair,
+    )?;
+    Ok((receipt.body.au_owed_cum > active.billing_prior_au_owed_cum).then_some(receipt))
+}
+
+async fn send_provider_session_failure(
+    bridge: &mut ScBridgeClient,
+    active: &ActiveProviderSession,
+    request_id: &str,
+    code: &str,
+    message: &str,
+    receipt: Option<&ProviderSignedSessionReceipt>,
+) -> Result<()> {
+    let mut frame = json!({
+        "t": "s.error", "v": 1, "session_id": active.session_id,
+        "rid": request_id, "code": code, "message": message,
+    });
+    if let Some(receipt) = receipt {
+        // Error and accounting travel in one frame: no wait for a successful
+        // final delta, and no chance to mistake the receipt for a valid answer.
+        frame["seq"] = json!(receipt.body.seq);
+        frame["receipt"] = json!(receipt);
+    }
+    bridge.session_send(&active.remote, &active.session_id, frame).await
+        .context("sending provider failure and terminal accounting")?;
+    Ok(())
 }
 
 async fn settle_cancelled_provider_session(
@@ -111111,6 +111180,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
+                        reservation_recovery: None,
         };
         let body = json!({
             "messages": [
@@ -111204,6 +111274,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
+                        reservation_recovery: None,
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "large atto receipt" }],
@@ -111332,6 +111403,141 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn provider_failure_close_retries_exact_submission_until_confirmed() {
+        let root = test_temp_dir("provider-failure-close");
+        let outbox = Arc::new(ReceiptSettlementOutbox::new(root.join("provider")).unwrap());
+        let terms = test_provider_session_terms();
+        let mut active = test_active_provider_session(&terms, vec!["text".into()]);
+        let settlement = Arc::new(ProviderReceiptSettlement { outbox,
+            keypair_path: root.join("unused-key"), password: String::new(), enclave_pubkey: "aa".repeat(32) });
+        active.receipt_settlement = Some(settlement.clone());
+        let guard = provider_failure_recovery::begin(&active, &terms).unwrap();
+        let path = root.join("provider/reservation-recovery").join(format!("{}.json", active.reservation_id));
+        let binding = read_private_json_optional(&path).unwrap().unwrap()["binding"].clone();
+        let mut value = mayhem_proto::usage_reservation_close_value(&binding, None, false, 1234, "provider_session_ended").unwrap();
+        value["actor_sig"] = json!("aa".repeat(64));
+        let feature = mayhem_proto::usage_reservation_close_feature(value).unwrap();
+        write_private_json_once(&path.with_extension("close"), &feature).unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let expected_feature = feature.clone();
+        let server = thread::spawn(move || {
+            let mut posts = 0;
+            for _ in 0..8 {
+                let (mut stream, _) = listener.accept().unwrap();
+                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buffer = [0u8; 8192];
+                    let n = stream.read(&mut buffer).unwrap();
+                    assert!(n > 0);
+                    request.extend_from_slice(&buffer[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&request[..end]);
+                        let size = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:")
+                            .and_then(|s| s.trim().parse::<usize>().ok())).unwrap_or(0);
+                        if request.len() >= end + 4 + size { break; }
+                    }
+                }
+                let end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                let headers = String::from_utf8_lossy(&request[..end]);
+                let (status, body) = if headers.starts_with("POST ") {
+                    assert_eq!(serde_json::from_slice::<Value>(&request[end + 4..]).unwrap(), expected_feature);
+                    posts += 1;
+                    (if posts == 1 { "503 Service Unavailable" } else { "200 OK" }, json!({"ok": posts > 1}))
+                } else {
+                    let target = headers.split_whitespace().nth(1).unwrap();
+                    let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+                    let key = url.query_pairs().find(|(k, _)| k == "key").unwrap().1.into_owned();
+                    let mut value = binding.clone();
+                    if key.starts_with("receipt/head/") { value = Value::Null; }
+                    else if key.starts_with("receipt/reservation-close/") {
+                        value["type"] = json!("targeted_reservation_close");
+                    } else {
+                        value["type"] = json!("receipt_reservation_identity");
+                        value["status"] = json!(if posts > 1 { "closed" } else { "active" });
+                    }
+                    ("200 OK", json!({"key": key, "confirmed": true, "value": value}))
+                };
+                let body = body.to_string();
+                write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+                stream.flush().unwrap();
+            }
+            assert_eq!(posts, 2);
+        });
+        let rpc = PeerRpcClient::new(format!("http://{address}")).unwrap();
+        assert!(!provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path).await.unwrap());
+        drop(guard);
+        assert!(provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path).await.is_err());
+        assert_eq!(read_private_json_optional(&path.with_extension("close")).unwrap().unwrap(), feature);
+        assert!(!provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path).await.unwrap());
+        assert!(path.exists(), "a submission response is not confirmation");
+        assert!(provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path).await.unwrap());
+        assert!(!path.exists());
+        server.join().unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_failure_journal_retains_evidence_and_cannot_close_running_compute() {
+        let root = test_temp_dir("provider-failure-journal");
+        let outbox = Arc::new(ReceiptSettlementOutbox::new(root.join("provider")).unwrap());
+        let terms = test_provider_session_terms();
+        let mut active = test_active_provider_session(&terms, vec!["text".into()]);
+        active.receipt_settlement = Some(Arc::new(ProviderReceiptSettlement {
+            outbox, keypair_path: root.join("unused-test-key"), password: String::new(),
+            enclave_pubkey: RuntimeKeypair::from_seed([9; 32]).public_key_hex(),
+        }));
+        let guard = provider_failure_recovery::begin(&active, &terms).unwrap().unwrap();
+        let path = root.join("provider/reservation-recovery").join(format!("{}.json", active.reservation_id));
+        let evidence = read_private_json_optional(&path).unwrap().unwrap();
+        assert_eq!(evidence["binding"]["session_id"], active.session_id);
+        assert!(evidence.get("prompt").is_none());
+        let lock = fs::OpenOptions::new().read(true).write(true).open(path.with_extension("lock")).unwrap();
+        assert!(fs2::FileExt::try_lock_exclusive(&lock).is_err(), "running generation must retain ownership");
+        assert!(provider_failure_recovery::begin(&active, &terms).is_err(), "a duplicate must not execute");
+        drop(guard);
+        assert!(fs2::FileExt::try_lock_exclusive(&lock).is_ok(), "return or unwind must enable recovery");
+        assert_eq!(read_private_json_optional(&path).unwrap().unwrap(), evidence);
+        drop(lock);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn provider_failed_session_preserves_acknowledged_reasoning_usage() {
+        let terms = test_provider_session_terms();
+        let active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        let body = json!({"messages": [{"role": "user", "content": "read only"}]});
+        let usage = ReceiptUsage::text(33_239, 167);
+        let attribution = BTreeMap::from([("reasoning_output_tokens".to_owned(), 159)]);
+        let keypair = RuntimeKeypair::from_seed([9; 32]);
+        let checkpoint = provider_session_receipt_for_usage_attribution(
+            &terms, &active, &body, usage.clone(), attribution.clone(), 18, false, &keypair,
+        ).unwrap();
+        let terminal = provider_failed_session_receipt(
+            &terms, &active, &body, usage, attribution, 19, &keypair,
+        ).unwrap().unwrap();
+        assert!(terminal.body.final_receipt);
+        assert_eq!(terminal.body.seq, 19);
+        assert_eq!(terminal.body.usage, checkpoint.body.usage);
+        assert_eq!(terminal.body.usage_attribution, checkpoint.body.usage_attribution);
+        assert_eq!(terminal.body.au_owed_cum, checkpoint.body.au_owed_cum);
+        assert_eq!(terminal.body.prompt_hash, checkpoint.body.prompt_hash);
+    }
+
+    #[test]
+    fn provider_failed_session_without_metering_does_not_invent_work() {
+        let mut terms = test_provider_session_terms();
+        terms.per_req_au = 0;
+        terms.min_session_au = 0;
+        let active = test_active_provider_session(&terms, vec!["text".to_owned()]);
+        assert!(provider_failed_session_receipt(
+            &terms, &active, &json!({"messages": []}), ReceiptUsage::default(),
+            BTreeMap::new(), 1, &RuntimeKeypair::from_seed([9; 32]),
+        ).unwrap().is_none());
     }
 
     #[test]
@@ -111478,6 +111684,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
+                        reservation_recovery: None,
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "hello mayhem" }],
@@ -111610,6 +111817,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
+                        reservation_recovery: None,
         };
         assert_eq!(
             provider_session_receipt_ack_timeout(&active),
@@ -111660,6 +111868,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
+                        reservation_recovery: None,
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "hello mayhem" }],
@@ -118701,6 +118910,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                     max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
+                        reservation_recovery: None,
                 },
             );
         }
@@ -118764,6 +118974,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                     max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
+                        reservation_recovery: None,
                 },
             );
             pending_requests.insert(id.to_owned(), Instant::now() + Duration::from_secs(30));
@@ -118826,6 +119037,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                     max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
+                        reservation_recovery: None,
                 },
             );
             pending_requests.insert(id.to_owned(), Instant::now() + Duration::from_secs(30));
@@ -130696,6 +130908,7 @@ State initialization...
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
+                        reservation_recovery: None,
         }
     }
 

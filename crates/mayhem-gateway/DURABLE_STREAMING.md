@@ -82,3 +82,36 @@ Responses emits response/item/content lifecycle events, text/function-argument
 deltas and done events, then `response.completed`, `response.incomplete`, or
 `response.failed`. Every event has a sequence number and stable item identities.
 Successful terminal `response.mayhem` carries the internal usage receipt metadata.
+
+## Failed generation and reservation closure
+
+A provider error may carry a signed final receipt for exactly the last
+acknowledged usage and attribution. It does not add a cancellation quantum.
+The gateway durably stages that receipt and its original non-retryable error
+before sending the buyer ACK. A lost settlement handoff remains recoverable,
+and successful accounting leaves the job `failed`.
+
+Before accepted compute starts, the provider journals the reservation binding
+under `receipt-settlement/provider/reservation-recovery`. An OS lock prevents
+closure while the accepted session still owns it. When the session ends or the
+process exits, background recovery delivers queued receipts and submits the
+existing provider-authorized reservation close. Submissions persist before
+sending and are removed only after exact confirmed closure. Delayed canonical
+head changes rebuild stale submissions. Journal admission is bounded.
+
+The gateway also persists the accepted signed voucher, including the logical
+billing baseline on failover. Recovery checks exact confirmed reservation,
+close record and canonical receipt head bindings and signatures. A partial
+receipt remains `final: false`; `canonical_settlement` carries the separate
+proof that it is now terminal. An absent head plus confirmed zero-retention
+closure proves this attempt spent zero. Missing state or a network timeout
+does not. If the provider never returns, buyer-authorized expiry uses the
+canonical expiry epoch plus receipt grace, never wall-clock age.
+
+Recovery continues after an initially empty queue and rotates bounded batches.
+The website stores closure proof before settling confirmed cumulative usage
+or releasing zero-spend holds. It preserves failed execution status and the
+specific error; ledger operations remain idempotent. Normal final receipts
+and existing reservation-close contract operations are unchanged. Older
+provider attempts need their ended-session binding restored to the recovery
+journal, or canonical expiry, before they can automatically close.

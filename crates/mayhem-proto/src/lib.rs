@@ -12,6 +12,11 @@ mod comfy_workflow;
 mod endpoint_contract;
 mod parts_catalog;
 mod validated_audio;
+mod reservation_close;
+pub use reservation_close::{
+    canonical_usage_receipt_hash, reservation_binding_matches, usage_reservation_close_feature,
+    usage_reservation_close_signing_bytes, usage_reservation_close_value, RESERVATION_BINDING_FIELDS,
+};
 
 pub use comfy_workflow::{
     comfy_outcome_class_definition_hash, derive_comfy_workflow, valid_comfy_pricing_unit,
