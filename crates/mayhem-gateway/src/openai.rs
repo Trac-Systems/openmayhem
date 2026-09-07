@@ -3700,7 +3700,7 @@ fn parse_gateway_job_receipt_recovery(
             ))
         })?;
     if let Some(feature) = recovery.reconciliation.settlement_feature.as_ref() {
-        validate_receipt_settlement_feature_for_receipt(
+        validate_stored_receipt_settlement_feature(
             &provider_receipt,
             &recovery.receipt_ack,
             feature,
@@ -3766,22 +3766,41 @@ async fn reconcile_pending_gateway_job_once(
         Some(feature) => feature,
         None => transport.deliver(&recovery).await?,
     };
-    validate_receipt_settlement_feature_for_receipt(
+    validate_stored_receipt_settlement_feature(
         &recovery.provider_receipt(),
         &recovery.receipt_ack,
         &feature,
     )?;
     recovery = persist_gateway_job_recovery_feature(state, id, recovery, feature.clone()).await?;
-    let publisher = state
-        .receipt_settlement_publisher
-        .as_ref()
-        .as_ref()
-        .ok_or_else(|| {
-            GatewaySessionError::new("gateway receipt settlement publisher is not configured")
+    if feature.pointer("/value/contract_version").and_then(Value::as_u64)
+        == Some(u64::from(CONTRACT_VERSION))
+    {
+        let publisher = state
+            .receipt_settlement_publisher
+            .as_ref()
+            .as_ref()
+            .ok_or_else(|| {
+                GatewaySessionError::new("gateway receipt settlement publisher is not configured")
+            })?;
+        publisher.queue(&feature).map_err(|err| {
+            GatewaySessionError::new(format!("queueing receipt settlement failed: {err}"))
         })?;
-    publisher.queue(&feature).map_err(|err| {
-        GatewaySessionError::new(format!("queueing receipt settlement failed: {err}"))
-    })?;
+    } else {
+        // Historical signed bytes must never be rewritten or resubmitted under
+        // the new revision. Retire local recovery only with exact ledger proof.
+        let rpc = state.canary_probe_contract_rpc.as_ref().as_ref().ok_or_else(|| {
+            GatewaySessionError::retryable("historical receipt recovery requires canonical ledger access")
+        })?;
+        let key = format!("receipt/head/{}/{}", recovery.body.billing_id, recovery.body.billing_attempt);
+        let record = rpc.state(Some(&key), Some(true)).await.map_err(|err| {
+            GatewaySessionError::retryable(format!("historical receipt confirmation failed: {err}"))
+        })?;
+        if !confirmed_receipt_recovery_matches(&record, &key, &feature) {
+            return Err(GatewaySessionError::retryable(
+                "historical receipt is awaiting exact confirmed settlement evidence",
+            ));
+        }
+    }
     let status = recovery.reconciliation.terminal_status;
     let error = recovery.reconciliation.terminal_error;
     let jobs = state.jobs.clone();
@@ -3798,6 +3817,15 @@ async fn reconcile_pending_gateway_job_once(
         ))
     })?;
     Ok(())
+}
+
+fn confirmed_receipt_recovery_matches(record: &Value, key: &str, feature: &Value) -> bool {
+    record.get("confirmed").and_then(Value::as_bool) == Some(true)
+        && record.get("key").and_then(Value::as_str) == Some(key)
+        && record.pointer("/value/type").and_then(Value::as_str) == Some("canonical_receipt_head")
+        && record.pointer("/value/settlement_ready").and_then(Value::as_bool) == Some(true)
+        && record.pointer("/value/feature_key") == feature.get("key")
+        && record.pointer("/value/receipt") == feature.pointer("/value/receipt")
 }
 
 async fn reconcile_pending_gateway_jobs_pass(
@@ -3851,7 +3879,9 @@ fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), 
         );
     }
     for job in &pending {
-        parse_gateway_job_receipt_recovery(job).map_err(|err| err.message)?;
+        if let Err(err) = parse_gateway_job_receipt_recovery(job) {
+            eprintln!("Gateway receipt recovery for {} remains pending: {}", job.id, err.message);
+        }
     }
     let transport: Arc<dyn GatewayReceiptAckRecoveryTransport> =
         Arc::new(ScBridgeReceiptAckRecoveryTransport { config });
@@ -20527,6 +20557,21 @@ fn validate_receipt_settlement_feature_for_receipt(
     receipt_ack: &ReceiptAck,
     feature: &Value,
 ) -> Result<(), GatewaySessionError> {
+    if feature.pointer("/value/contract_version").and_then(Value::as_u64)
+        != Some(u64::from(CONTRACT_VERSION))
+    {
+        return Err(GatewaySessionError::new(
+            "receipt settlement feature has the wrong operation or contract version",
+        ));
+    }
+    validate_stored_receipt_settlement_feature(provider_receipt, receipt_ack, feature)
+}
+
+fn validate_stored_receipt_settlement_feature(
+    provider_receipt: &ProviderSignedReceipt,
+    receipt_ack: &ReceiptAck,
+    feature: &Value,
+) -> Result<(), GatewaySessionError> {
     if feature.get("feature").and_then(Value::as_str) != Some("mayhem") {
         return Err(GatewaySessionError::new(
             "receipt settlement feature must target mayhem",
@@ -20541,8 +20586,8 @@ fn validate_receipt_settlement_feature_for_receipt(
         .filter(|value| value.is_object())
         .ok_or_else(|| GatewaySessionError::new("receipt settlement feature is missing value"))?;
     if value.get("op").and_then(Value::as_str) != Some("record_usage_receipt")
-        || value.get("contract_version").and_then(Value::as_u64)
-            != Some(u64::from(CONTRACT_VERSION))
+        || !value.get("contract_version").and_then(Value::as_u64)
+            .is_some_and(|version| version > 0 && version <= u64::from(CONTRACT_VERSION))
     {
         return Err(GatewaySessionError::new(
             "receipt settlement feature has the wrong operation or contract version",
@@ -47138,6 +47183,137 @@ mod tests {
             1
         );
         assert_eq!(restarted.ledger_balance_au(), balance_before);
+    }
+
+    #[tokio::test]
+    async fn contract_upgrade_recovers_only_exact_confirmed_receipts_without_republishing() {
+        let root = tempfile::tempdir().unwrap();
+        let jobs_dir = root.path().join("jobs");
+        let seed = test_user_seed();
+        let state = GatewayState::fixture()
+            .with_receipt_user_seed(seed)
+            .with_job_store_dir(jobs_dir.clone())
+            .unwrap();
+        let model = test_model();
+        let job = match prepare_gateway_job(
+            &state,
+            &HeaderMap::new(),
+            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+            &model.id,
+            &json!({"model": model.id, "prompt": "contract upgrade recovery"}),
+            &None,
+        )
+        .await
+        .unwrap()
+        {
+            PreparedGatewayJob::Started(job) => job,
+            _ => panic!("fresh job expected"),
+        };
+        let id = job.id.clone();
+        let mut invocation = test_invocation();
+        invocation.transport_peer = Some("ab".repeat(32));
+        invocation.job = Some(job);
+        let output = test_chat_output();
+        let provider_receipt = test_provider_receipt(
+            &model, &test_chat_request(&model.id), &output, &invocation,
+        );
+        let ack = receipt_ack_for_body(&seed, &provider_receipt.body).unwrap();
+        let result = chat_job_result(&output);
+        stage_completed_invocation_job(
+            &invocation, result.clone(), &output.artifacts, &provider_receipt, &ack,
+        )
+        .await
+        .unwrap();
+        let mut feature = test_receipt_settlement_feature(&provider_receipt, &ack);
+        feature["value"]["contract_version"] = json!(CONTRACT_VERSION - 1);
+        assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_err());
+        feature["value"]["provider_sig"] = json!(sign_hex(
+            &test_provider_seed(),
+            &record_usage_receipt_signing_bytes(feature["key"].as_str().unwrap(), &feature["value"]).unwrap(),
+        ));
+        assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_ok());
+        assert!(validate_receipt_settlement_feature_for_receipt(&provider_receipt, &ack, &feature).is_err());
+        invocation.job.as_ref().unwrap()
+            .persist_reconciliation_settlement_feature(feature.clone()).await.unwrap();
+        // An incompatible durable job cannot take down otherwise healthy admission.
+        let startup = state.clone()
+            .with_receipt_settlement_publisher(Arc::new(RecordingReceiptSettlementPublisher::default()))
+            .with_session_backend(Arc::new(ScBridgeGatewaySessionBackend::new(
+                ScBridgeGatewaySessionConfig::new("ws://127.0.0.1:1", "test-token"),
+            )));
+        let stored = startup.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
+        let mut malformed = stored.receipt.unwrap();
+        malformed["reconciliation"]["settlement_feature"]["value"]["contract_version"] = json!(CONTRACT_VERSION + 1);
+        startup.jobs.lock_recover("test jobs").update_reconciliation_receipt(&id, malformed, now_secs()).unwrap();
+        assert!(spawn_pending_gateway_job_reconciliation(&startup).is_ok());
+        let mut restored = startup.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().receipt.unwrap();
+        restored["reconciliation"]["settlement_feature"] = feature.clone();
+        startup.jobs.lock_recover("test jobs").update_reconciliation_receipt(&id, restored, now_secs()).unwrap();
+        drop(startup);
+        drop(invocation);
+        drop(state);
+
+        let publisher = Arc::new(RecordingReceiptSettlementPublisher::default());
+        let restarted = GatewayState::fixture()
+            .with_receipt_user_seed(seed)
+            .with_job_store_dir(jobs_dir.clone())
+            .unwrap()
+            .with_receipt_settlement_publisher(publisher.clone());
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let transport = RecordingReceiptAckRecoveryTransport {
+            expected_ack: ack, feature: feature.clone(), deliveries: deliveries.clone(),
+        };
+        assert!(reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.is_err());
+        let key = format!("receipt/head/{}/{}", provider_receipt.body.billing_id, provider_receipt.body.billing_attempt);
+        let confirmed = json!({
+            "key": key, "confirmed": true, "signed_length": 123,
+            "value": {
+                "type": "canonical_receipt_head", "settlement_ready": true,
+                "feature_key": feature["key"], "receipt": feature["value"]["receipt"],
+            },
+        });
+        let response = Arc::new(Mutex::new(confirmed.clone()));
+        let handler_response = response.clone();
+        let app = axum::Router::new().route("/v1/state", axum::routing::get(move |axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>| {
+            let response = handler_response.clone();
+            async move {
+                assert_eq!(query.get("confirmed").map(String::as_str), Some("true"));
+                axum::Json(response.lock_recover("test canonical response").clone())
+            }
+        }));
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let restarted = restarted.with_canary_probe_contract_rpc(PeerRpcClient::new(format!("http://{address}/v1")).unwrap());
+        let balance = restarted.ledger_balance_au();
+        for (pointer, wrong) in [
+            ("/confirmed", json!(false)),
+            ("/key", json!("receipt/head/wrong/0")),
+            ("/value/type", json!("unconfirmed_receipt")),
+            ("/value/settlement_ready", json!(false)),
+            ("/value/feature_key", json!("receipt/submit/wrong")),
+            ("/value/receipt", json!({})),
+        ] {
+            let mut invalid = confirmed.clone();
+            *invalid.pointer_mut(pointer).unwrap() = wrong;
+            *response.lock_recover("test canonical response") = invalid;
+            assert!(reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.is_err());
+            assert_eq!(restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().status, GatewayJobStatus::ReconciliationPending);
+        }
+        *response.lock_recover("test canonical response") = confirmed;
+        reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
+        reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
+        let completed = restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
+        assert_eq!(completed.status, GatewayJobStatus::Completed);
+        assert_eq!(completed.result, Some(result));
+        assert_eq!(completed.receipt.as_ref().unwrap().pointer("/reconciliation/settlement_feature"), Some(&feature));
+        assert!(publisher.features.lock_recover("test published features").is_empty());
+        assert!(deliveries.lock_recover("test deliveries").is_empty());
+        assert_eq!(restarted.ledger_balance_au(), balance);
+        drop(restarted);
+        let reopened = GatewayState::fixture().with_receipt_user_seed(seed).with_job_store_dir(jobs_dir).unwrap();
+        assert_eq!(reopened.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().status, GatewayJobStatus::Completed);
+        server.abort();
     }
 
     #[tokio::test]

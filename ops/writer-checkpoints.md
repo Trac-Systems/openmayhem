@@ -1,8 +1,13 @@
 # Writer settlement and paid checkpoints
 
-Core v0.2.174 uses contract revision 22. Upgrade all participating peers before
+Core v0.2.174 introduced contract revision 22; v0.2.175 retains that contract. Upgrade all participating peers before
 enabling the new writer operations. Keep the existing wallet, stores, model
 configuration, catalog and economic parameters.
+
+Historical gateway job recovery validates the original co-signed receipt and
+provider Feature signature. Earlier revisions are never rewritten or requeued: an
+exact confirmed canonical receipt head is required before finishing local recovery.
+Unconfirmed or incompatible records remain pending without preventing gateway startup.
 
 ## Two independent clocks
 
