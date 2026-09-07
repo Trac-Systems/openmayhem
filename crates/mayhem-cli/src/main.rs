@@ -59110,6 +59110,7 @@ struct ProviderMemoryBudget {
     reserve_bytes: u64,
     claimed_bytes: u64,
     worker_limit_bytes: u64,
+    worker_address_space_limit_bytes: u64,
     budget_bytes: u64,
 }
 
@@ -59125,6 +59126,7 @@ impl ProviderMemoryBudget {
             reserve_bytes: 0,
             claimed_bytes: 0,
             worker_limit_bytes: 0,
+            worker_address_space_limit_bytes: 0,
             budget_bytes: 0,
         }
     }
@@ -72638,6 +72640,20 @@ fn provider_memory_budget(
         .available_bytes
         .saturating_sub(reserve_bytes)
         .saturating_sub(claimed_bytes);
+    // Some unified NVIDIA probes have no dedicated-memory total and their
+    // allocation pool falls back to available RAM. Virtual mappings must use
+    // the machine's real total instead of inheriting that availability fallback.
+    let dedicated_total = hardware.gpus.iter()
+        .filter(|gpu| gpu.vendor == GpuVendor::Nvidia
+            && !nvidia_gpu_uses_host_unified_memory(hardware, gpu))
+        .filter_map(|gpu| gpu.memory_bytes)
+        .fold(0u64, u64::saturating_add);
+    let address_basis = hardware.memory.total_bytes.max(dedicated_total);
+    let (address_reserve, _) = provider_memory_reserve_bytes(
+        args.memory_reserve.as_deref(), address_basis, pool.unified,
+    )?;
+    let worker_address_space_limit_bytes = address_basis
+        .saturating_sub(address_reserve).max(worker_limit_bytes);
     let mut budget_bytes = worker_limit_bytes;
     if enclave.backend == "vllm" {
         let admin_max_pct = enclave_vllm_gpu_memory_utilization_pct(&enclave.caps)?;
@@ -72655,6 +72671,7 @@ fn provider_memory_budget(
         reserve_bytes,
         claimed_bytes,
         worker_limit_bytes,
+        worker_address_space_limit_bytes,
         budget_bytes,
     })
 }
@@ -86330,10 +86347,8 @@ fn provider_engine_load_config(
         // not the host's remaining resident-memory budget. Keep this finite
         // envelope stable when another provider is already resident at restart.
         let memory = &selected.feasibility.memory_budget;
-        config.vllm_worker_address_space_limit_bytes = Some(
-            memory.total_bytes.max(memory.available_bytes)
-                .saturating_sub(memory.reserve_bytes).max(memory.worker_limit_bytes),
-        ).filter(|bytes| *bytes > 0);
+        config.vllm_worker_address_space_limit_bytes = Some(memory.worker_address_space_limit_bytes)
+            .filter(|bytes| *bytes > 0);
         let isolated = generation_execution_uses_isolated_workers(selected.generation_execution_profile.as_ref());
         if isolated {
             ensure!(selected.execution_mode.is_some(),
@@ -86344,7 +86359,6 @@ fn provider_engine_load_config(
                 "isolated worker count differs from its admitted allocation");
             config.vllm_generation_topology = Some(mayhem_engine::VllmGenerationTopology::IsolatedWorkers);
             config.vllm_max_num_seqs = Some(1);
-            config.vllm_worker_address_space_limit_bytes = config.memory_limit_bytes;
             config.memory_limit_bytes = Some(config.memory_limit_bytes
                 .unwrap_or(selected.feasibility.estimated_required_bytes)
                 .min(selected.feasibility.estimated_required_bytes));
@@ -105851,6 +105865,7 @@ status: linked
                     reserve_bytes: GIB_BYTES,
                     claimed_bytes: 0,
                     worker_limit_bytes: budget_gib * GIB_BYTES,
+                    worker_address_space_limit_bytes: budget_gib * GIB_BYTES,
                     budget_bytes: budget_gib * GIB_BYTES,
                 },
             },
@@ -106462,6 +106477,30 @@ status: linked
         model.canary.verification_method = CANARY_VERIFICATION_TOKEN_FINGERPRINT.to_owned();
 
         preflight_calibration_prompt_resources(&model, &document.prompts).unwrap();
+    }
+
+    #[test]
+    fn unified_vllm_virtual_limit_uses_real_total_when_gpu_probe_has_no_total() {
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.host.os = "linux".to_owned();
+        hardware.host.arch = "aarch64".to_owned();
+        hardware.memory.total_bytes = 128 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(112 * GIB_BYTES);
+        hardware.memory.unified_memory = true;
+        hardware.gpus[0].memory_bytes = None;
+        hardware.gpus[0].unified_memory = true;
+        let mut selected = test_auto_fit_candidate('a', "test/vllm", "text", 1, 2, 1, 30.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.enclave.caps = json!({"vllm_gpu_memory_utilization_pct":40});
+        selected.verdict.backend = "vllm".to_owned();
+        let args = test_provider_start_args();
+        let first = provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args).unwrap();
+        hardware.memory.available_bytes = Some(80 * GIB_BYTES);
+        let restarted = provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args).unwrap();
+        assert!(restarted.worker_limit_bytes < first.worker_limit_bytes);
+        assert_eq!(restarted.worker_address_space_limit_bytes, first.worker_address_space_limit_bytes);
+        assert!(restarted.worker_address_space_limit_bytes > 92 * GIB_BYTES);
+        assert!(restarted.worker_limit_bytes < 80 * GIB_BYTES);
     }
 
     #[test]
@@ -117301,17 +117340,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(isolated_config.memory_limit_bytes,
             Some(isolated.feasibility.estimated_required_bytes));
         assert_eq!(isolated_config.vllm_worker_address_space_limit_bytes,
-            Some(isolated.feasibility.memory_budget.worker_limit_bytes));
+            Some(isolated.feasibility.memory_budget.worker_address_space_limit_bytes));
         isolated.execution_mode = None;
         assert!(provider_engine_load_config(
             &mode_args, &isolated, &artifact_paths, &ProviderBackendRuntime::default(),
         ).is_err());
         assert_eq!(config.vllm_generation_topology, None);
         assert_eq!(config.vllm_worker_address_space_limit_bytes,
-            Some(selected.feasibility.memory_budget.total_bytes
-                .max(selected.feasibility.memory_budget.available_bytes)
-                .saturating_sub(selected.feasibility.memory_budget.reserve_bytes)
-                .max(selected.feasibility.memory_budget.worker_limit_bytes)));
+            Some(selected.feasibility.memory_budget.worker_address_space_limit_bytes));
         let mut resident_selected = selected.clone();
         resident_selected.feasibility.memory_budget.available_bytes /= 2;
         resident_selected.feasibility.memory_budget.worker_limit_bytes /= 2;
