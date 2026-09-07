@@ -183,7 +183,7 @@ def state(key):
 
 metadata = state(f"receipt/epoch/{epoch}/index")
 if metadata != snapshot.get("metadata"):
-    raise SystemExit("canonical receipt metadata changed after snapshot; retry after the quiet window")
+    raise SystemExit("canonical receipt metadata differs from the closed snapshot")
 PY
 }
 
@@ -393,6 +393,12 @@ if [[ "$epoch" != "$next_epoch" && "$epoch" != "$updated_epoch" ]]; then
     exit 1
 fi
 
+frozen_at=""
+if [[ -z "$pending_epoch" && "$epoch" == "$next_epoch" ]]; then
+    export MAYHEM_RPC_URL="$RPC_URL" MAYHEM_BIN MAYHEM_ADMIN_HOME="$ADMIN_HOME"
+    frozen_at="$(python3 "$SOURCE_DIR/scripts/ops-freeze-epoch.py" "$epoch")"
+fi
+
 run_dir="$STATE_DIR/epochs/epoch-$epoch"
 if [[ -z "$pending_epoch" && "$epoch" == "$next_epoch" && \
       -f "$run_dir/canonical-receipts.json" ]]; then
@@ -408,7 +414,17 @@ with urllib.request.urlopen(f"{rpc}/state?{query}", timeout=10) as response:
     record = json.load(response)
 if not isinstance(record, dict) or record.get("confirmed") is not True:
     raise SystemExit("canonical receipt index is not confirmed")
-if record.get("value") != snapshot.get("metadata"):
+freeze_key = f"epoch/freeze/{epoch}"
+freeze_query = urllib.parse.urlencode({"key": freeze_key, "confirmed": "true"})
+with urllib.request.urlopen(f"{rpc}/state?{freeze_query}", timeout=10) as response:
+    freeze_record = json.load(response)
+if freeze_record.get("confirmed") is not True:
+    raise SystemExit("epoch freeze is not confirmed")
+freeze = freeze_record.get("value")
+from pathlib import Path
+at_file = Path(snapshot_path).with_name("finalization-at")
+retained_at = int(at_file.read_text()) if at_file.exists() else None
+if record.get("value") != snapshot.get("metadata") or (freeze and freeze.get("at") != retained_at):
     raise SystemExit(42)
 PY
     snapshot_status=$?
@@ -470,7 +486,7 @@ if [[ -n "$pending_epoch" ]]; then
 fi
 
 if [[ ! -f "$run_dir/finalization-at" ]]; then
-    date +%s >"$run_dir/finalization-at.tmp"
+    printf '%s\n' "${frozen_at:-$(date +%s)}" >"$run_dir/finalization-at.tmp"
     mv "$run_dir/finalization-at.tmp" "$run_dir/finalization-at"
 fi
 at="$(cat "$run_dir/finalization-at")"

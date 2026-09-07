@@ -1,6 +1,7 @@
 import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
 import ReadyResource from 'ready-resource';
+import { blake3 } from '@tracsystems/blake3';
 import PartialTransactionValidator from 'trac-msb/src/core/network/protocols/shared/validators/PartialTransactionValidator.js';
 import PartialBootstrapDeploymentValidator from 'trac-msb/src/core/network/protocols/shared/validators/PartialBootstrapDeploymentValidator.js';
 import {
@@ -142,6 +143,34 @@ export class MsbClient extends ReadyResource {
         } finally {
             await viewSession.close();
         }
+    }
+
+    async getUnexecutedContextChange(txHex, preparedTxv) {
+        // A live/unsigned validator sequence alone cannot retire an uncertain
+        // payment. Bind non-execution to the view named by a SIGNED system state
+        // that has already moved beyond the transaction's validator context.
+        const base = this.#msb.state.base;
+        const system = base.system;
+        const systemLength = system?.core?.signedLength;
+        if (!Number.isSafeInteger(systemLength) || systemLength < 1) return null;
+        const info = await system.getIndexedInfo(systemLength);
+        if (!Array.isArray(info?.indexers) || info.indexers.length === 0) return null;
+        const txv = b4a.toString(await blake3(b4a.concat(info.indexers.map((entry) => entry.key))), 'hex');
+        if (txv === preparedTxv || txv !== await this.getTxvHex()) return null;
+        const viewKey = b4a.toString(base.view.core.key, 'hex');
+        const linked = info.views?.find((view) => b4a.toString(view.key, 'hex') === viewKey);
+        if (!linked || !Number.isSafeInteger(linked.length) || linked.length < 1 ||
+            linked.length > this.getSignedLength()) return null;
+        if (await this.getSignedAtLength(txHex, linked.length) !== null) return null;
+        // Recheck the latest signed view too. A payment observed at either
+        // boundary must be reconciled, never replaced with a fresh fee.
+        const currentLength = this.getSignedLength();
+        if (await this.getSignedAtLength(txHex, currentLength) !== null) return null;
+        return { type: 'unexecuted_at_signed_context_change', tx: txHex,
+            previous_txv: preparedTxv, txv,
+            system_key: b4a.toString(system.core.key, 'hex'), system_signed_length: systemLength,
+            view_key: viewKey, linked_view_signed_length: linked.length,
+            checked_view_signed_length: currentLength };
     }
 
     async validateTransaction(payload) {

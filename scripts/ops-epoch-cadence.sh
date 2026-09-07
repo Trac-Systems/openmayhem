@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # OpenMayhem epoch settlement cadence (runs on the admin server via systemd timer).
 #
-# Canonical contract receipt metadata is the sole receipt source. A persisted
-# quiet window lets both durable outboxes flush final checkpoints; it resets
-# when the exact metadata identity changes and after a machine reboot. Payout maturity and
-# retries are deliberately handled by the separate payout-worker timer.
+# Canonical receipt ingress closes atomically before export. Later receipts enter
+# the next batch, so settlement never waits for quiet traffic. Economic windows
+# and the separate payout worker retain their existing timing.
 set -euo pipefail
 
 umask 077
@@ -16,13 +15,6 @@ SOURCE_DIR="${MAYHEM_SOURCE_DIR:-/opt/mayhem/source}"
 STATE_DIR="${MAYHEM_CADENCE_STATE_DIR:-/opt/mayhem/.mayhem-local/settlement}"
 LOG_FILE="$STATE_DIR/cadence.log"
 STAMP_FILE="$STATE_DIR/cadence.last-advance"
-QUIET_STATE_FILE="$STATE_DIR/cadence.receipt-quiet.json"
-QUIET_SECONDS="${MAYHEM_RECEIPT_QUIET_SECONDS:-30}"
-BOOT_ID="${MAYHEM_CADENCE_BOOT_ID:-}"
-if [[ -z "$BOOT_ID" && -r /proc/sys/kernel/random/boot_id ]]; then
-    BOOT_ID="$(cat /proc/sys/kernel/random/boot_id)"
-fi
-BOOT_ID="${BOOT_ID:-unknown-boot}"
 
 mkdir -p "$STATE_DIR"
 # Refuse to act before we can record what we did: an unwritable state dir must
@@ -231,10 +223,6 @@ PY
         exit 1
     }
 fi
-if ! positive_integer "$QUIET_SECONDS" || (( QUIET_SECONDS > 300 )); then
-    log "abort: MAYHEM_RECEIPT_QUIET_SECONDS must be within 1..300"
-    exit 1
-fi
 target=$((updated_epoch + 1))
 if [[ -n "$pending_epoch" ]]; then
     if ! positive_integer "$pending_epoch" || [[ "$pending_epoch" != "$target" ]]; then
@@ -289,6 +277,16 @@ if (( now < last_settlement_unix + epoch_seconds )); then
     log "skip: epoch $target window has not elapsed (canonical settlement $last_settlement_unix)"
     exit 0
 fi
+
+# Persist the boundary in the contract before observing any receipt metadata.
+# The original timestamp survives timeout/restart and is used for every page.
+export MAYHEM_RPC_URL="$RPC_URL" MAYHEM_BIN MAYHEM_ADMIN_HOME="$ADMIN_HOME"
+frozen_at="$(python3 "$SOURCE_DIR/scripts/ops-freeze-epoch.py" "$target")" || {
+    log "abort: canonical receipt freeze failed for epoch $target"
+    exit 1
+}
+positive_integer "$frozen_at" || { log "abort: invalid canonical freeze time"; exit 1; }
+now="$frozen_at"
 
 metadata_summary="$(python3 - "$RPC_URL" "$target" <<'PY'
 import hashlib, json, sys, urllib.parse, urllib.request
@@ -365,65 +363,13 @@ if ! non_negative_integer "$receipt_count" || [[ ! "$receipt_metadata_hash" =~ ^
     exit 1
 fi
 
-quiet_status="$(python3 - "$QUIET_STATE_FILE" "$target" "$receipt_count" \
-    "$receipt_metadata_hash" "$now" "$QUIET_SECONDS" "$BOOT_ID" <<'PY'
-import json, os, sys
-path, epoch, count, metadata_hash, now, quiet, boot_id = sys.argv[1:]
-expected = {
-    "epoch": int(epoch),
-    "count": int(count),
-    "metadata_hash": metadata_hash,
-    "boot_id": boot_id,
-}
-now = int(now)
-quiet = int(quiet)
-prior = None
-try:
-    prior = json.load(open(path))
-except (FileNotFoundError, json.JSONDecodeError, OSError):
-    pass
-same = isinstance(prior, dict) and all(prior.get(key) == value for key, value in expected.items())
-if not same:
-    state = {**expected, "observed_at": now}
-    tmp = f"{path}.tmp"
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "w", closefd=False) as target:
-            json.dump(state, target, sort_keys=True)
-            target.write("\n")
-            target.flush()
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    os.replace(tmp, path)
-    directory = os.open(os.path.dirname(path), os.O_RDONLY)
-    try:
-        os.fsync(directory)
-    finally:
-        os.close(directory)
-    print("wait")
-else:
-    observed_at = prior.get("observed_at")
-    if not isinstance(observed_at, int) or observed_at < 0:
-        raise SystemExit("persisted receipt quiet state is malformed")
-    print("ready" if now >= observed_at + quiet else "wait")
-PY
-)" || {
-    log "abort: canonical receipt quiet-window state is invalid"
-    exit 1
-}
-if [[ "$quiet_status" != "ready" ]]; then
-    log "skip: epoch $target receipt set count=$receipt_count metadata=$receipt_metadata_hash is awaiting ${QUIET_SECONDS}s quiet"
-    exit 0
-fi
-
 if [[ "$receipt_count" != "0" ]]; then
     log "finalize: canonical epoch $target has $receipt_count receipt(s); invoking exact-key finalizer"
     if ! "$SOURCE_DIR/scripts/ops-settle-epoch.sh" "$target"; then
         log "abort: canonical receipt finalizer failed for epoch $target"
         exit 1
     fi
-    finalized_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state")"
+    finalized_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state&confirmed=true")"
     finalized_epoch="$(printf '%s' "$finalized_state" | json_field value.updated_epoch)"
     finalized_settlement_unix="$(
         printf '%s' "$finalized_state" | json_field value.last_settlement_unix
@@ -461,7 +407,7 @@ if ! submit_out="$("$MAYHEM_BIN" "${seal_args[@]}" 2>&1)"; then
     exit 1
 fi
 
-after_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state")"
+after_state="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/apply/state&confirmed=true")"
 after_epoch="$(printf '%s' "$after_state" | json_field value.updated_epoch)"
 after_settlement_unix="$(printf '%s' "$after_state" | json_field value.last_settlement_unix)"
 if [[ "$after_epoch" != "$target" ]]; then

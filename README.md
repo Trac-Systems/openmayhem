@@ -83,12 +83,13 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.173` streams reasoning, answers, and tool arguments during text generation,
-including requests with tools attached. It also fixes cancellation settlement and
-isolated worker recovery. Existing catalog entries and calibration profiles are
-preserved; provider operators install this Core update to receive the changes.
+`v0.2.174` closes settlement receipt batches while traffic continues and adds an
+admin writer checkpoint every 30 seconds, including idle periods. Each enabled
+checkpoint pays a real MSB transaction fee and retains its signed transaction for
+recovery. Contract revision 22 requires every participating Core peer to update.
+Billing periods, catalog entries and model calibrations retain their current settings.
 
-`v0.2.173` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.174` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -97,7 +98,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.173
+git checkout --detach v0.2.174
 ./install.sh --from-source
 ```
 
@@ -106,7 +107,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.173
+git checkout --detach v0.2.174
 .\install.ps1 -FromSource
 ```
 
@@ -1083,7 +1084,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.173` is source-only. The GitHub release contains the tagged source, not
+`v0.2.174` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -1091,7 +1092,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.173
+git checkout --detach v0.2.174
 ./install.sh --from-source
 ```
 
@@ -1100,7 +1101,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.173
+git checkout --detach v0.2.174
 .\install.ps1 -FromSource
 ```
 
