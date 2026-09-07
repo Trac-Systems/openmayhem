@@ -81553,18 +81553,26 @@ where
             provider_session_debug(format!("provider side session {session_id} opened"));
             let session_rail = provider_session_frame_rail(&frame).unwrap_or_default();
             let contract = read_contract_catalog(runtime.rpc).await?;
-            let validation_terms = ProviderSessionTerms {
-                ctx_bracket_schedule: contract.ctx_bracket_schedule.clone(),
-                ..terms.clone()
-            };
+            let mut admission_terms = terms.clone();
+            let price_decision = refresh_provider_session_price_terms(
+                &contract,
+                &mut admission_terms,
+                unix_epoch_seconds()?,
+            );
+            // Only this new admission uses refreshed prices. Active sessions and
+            // identical s.open replays above retain their signed, locked terms.
+            let terms = &admission_terms;
             let policy_binding =
-                provider_session_attestation_policy_binding(&frame, &validation_terms, runtime);
-            let static_decision = match &policy_binding {
-                Ok(_) => provider_session_open_decision(&frame, &validation_terms),
-                Err(error) => ProviderSessionDecision::Reject {
-                    code: "ATTESTATION_POLICY",
-                    reason: error.to_string(),
+                provider_session_attestation_policy_binding(&frame, terms, runtime);
+            let static_decision = match price_decision {
+                ProviderSessionDecision::Accept => match &policy_binding {
+                    Ok(_) => provider_session_open_decision(&frame, terms),
+                    Err(error) => ProviderSessionDecision::Reject {
+                        code: "ATTESTATION_POLICY",
+                        reason: error.to_string(),
+                    },
                 },
+                reject => reject,
             };
             let decision = match static_decision {
                 ProviderSessionDecision::Accept => {
@@ -87736,6 +87744,55 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
     })
 }
 
+fn refresh_provider_session_price_terms(
+    contract: &ContractCatalog,
+    terms: &mut ProviderSessionTerms,
+    at: u64,
+) -> ProviderSessionDecision {
+    let reject = |reason: &str| ProviderSessionDecision::Reject {
+        code: "PRICE_VER",
+        reason: reason.to_owned(),
+    };
+    let Some(enclave) = contract.enclaves.iter().find(|enclave| {
+        enclave.enclave_id == terms.enclave_id && enclave.model_id == terms.model_id
+    }) else {
+        return reject("admin enclave is no longer present for this model");
+    };
+    let (ctx_bracket, ctx_bracket_table_ver) = if enclave.model_class == DEFAULT_MODEL_CLASS {
+        let Some((bracket, version)) = ctx_bracket_for_tokens_in_schedule(
+            u32::try_from(terms.ctx).unwrap_or(u32::MAX),
+            &contract.ctx_bracket_schedule,
+            at,
+        ) else {
+            return reject("current admin context table does not cover provider served context");
+        };
+        (Some(bracket), Some(version))
+    } else {
+        (None, None)
+    };
+    let Some(price) = find_active_au_usd_price_schedule_at(
+        &contract.prices,
+        &terms.enclave_id,
+        ctx_bracket.as_deref(),
+        at,
+    )
+    .filter(|schedule| schedule.model_id == terms.model_id)
+    .and_then(|schedule| active_au_usd_price_at(schedule, at))
+    .filter(|price| {
+        price.ctx_bracket_table_ver == ctx_bracket_table_ver && price.effective_at <= at
+    }) else {
+        return reject("no active admin price matches provider served context and context table");
+    };
+    terms.price_ver = price.ver;
+    terms.rate_map = price.rate_map.clone();
+    terms.per_req_au = price.per_req_au;
+    terms.min_session_au = price.min_session_au;
+    terms.ctx_bracket = ctx_bracket;
+    terms.ctx_bracket_table_ver = ctx_bracket_table_ver;
+    terms.ctx_bracket_schedule = contract.ctx_bracket_schedule.clone();
+    ProviderSessionDecision::Accept
+}
+
 fn provider_session_contract_decision(
     contract: &ContractCatalog,
     terms: &ProviderSessionTerms,
@@ -87827,7 +87884,12 @@ fn provider_session_contract_decision(
     let Some(schedule) = contract
         .prices
         .iter()
-        .find(|price| price.enclave_id == terms.enclave_id)
+        .find(|price| {
+            price.enclave_id == terms.enclave_id
+                && price.model_id == terms.model_id
+                && price.ctx_bracket == terms.ctx_bracket
+                && price.ctx_bracket_table_ver == terms.ctx_bracket_table_ver
+        })
     else {
         return reject(
             "PRICE_VER",
@@ -110450,6 +110512,118 @@ esac
                 "1b3c8d504db55092eb4d3283bcce99e3ec0478fa98218645338ff9dbb1bd9896"
             )
         );
+    }
+
+    #[test]
+    fn provider_session_price_refresh_accepts_new_prices_without_changing_active_sessions() {
+        let startup = test_provider_session_terms();
+        let mut active = test_active_provider_session(&startup, vec!["text".to_owned()]);
+        let original_open = test_session_open_frame(&startup);
+        let accept_frame = json!({"t": "s.accept", "session_id": active.session_id});
+        active.accept_replay = Some(ProviderSessionAcceptReplay {
+            open_head: session_frame_head(&original_open).unwrap(),
+            accept_frame: accept_frame.clone(),
+        });
+        let mut contract = test_contract(&"aa".repeat(32));
+        let price = contract.prices[0].current.as_mut().unwrap();
+        price.ver = 5;
+        price.rate_map = text_generation_rate_map(3, 7);
+        price.per_req_au = 11;
+        price.min_session_au = 17;
+        let mut refreshed = startup.clone();
+        assert_eq!(
+            refresh_provider_session_price_terms(&contract, &mut refreshed, 100),
+            ProviderSessionDecision::Accept
+        );
+        let new_open = test_session_open_frame(&refreshed);
+        assert!(matches!(
+            provider_session_open_decision(&new_open, &startup),
+            ProviderSessionDecision::Reject { code: "PRICE_VER", .. }
+        ));
+        assert_eq!(provider_session_open_decision(&new_open, &refreshed), ProviderSessionDecision::Accept);
+        assert_eq!(refreshed.price_ver, 5);
+        assert_eq!(refreshed.rate_map, text_generation_rate_map(3, 7));
+        assert_eq!(refreshed.per_req_au, 11);
+        assert_eq!(refreshed.min_session_au, 17);
+        assert_eq!(active.price_ver, startup.price_ver);
+        assert_eq!(active.locked_rate_map, normalize_rate_map(startup.rate_map.clone()));
+        assert!(matches!(provider_session_replay_decision(&active, &original_open).unwrap(),
+            ProviderSessionReplayDecision::Cached(frame) if frame == accept_frame));
+        let mut forged = refreshed.clone();
+        forged.rate_map = text_generation_rate_map(1, 1);
+        assert!(matches!(provider_session_open_decision(&test_session_open_frame(&forged), &refreshed),
+            ProviderSessionDecision::Reject { code: "VOUCHER", .. }));
+        assert!(matches!(provider_session_open_decision(&original_open, &refreshed),
+            ProviderSessionDecision::Reject { code: "PRICE_VER", .. }));
+    }
+
+    #[test]
+    fn provider_session_price_refresh_respects_activation_and_context_market() {
+        let startup = test_provider_session_terms();
+        let mut contract = test_contract(&"aa".repeat(32));
+        let mut pending = contract.prices[0].current.clone().unwrap();
+        pending.ver = 9;
+        pending.effective_at = 200;
+        contract.prices[0].pending = Some(pending);
+        let mut other_market = contract.prices[0].clone();
+        other_market.ctx_bracket = Some("le128k".to_owned());
+        other_market.current.as_mut().unwrap().ctx_bracket = other_market.ctx_bracket.clone();
+        other_market.current.as_mut().unwrap().ver = 99;
+        other_market.pending = None;
+        contract.prices.insert(0, other_market);
+        let mut before = startup.clone();
+        assert_eq!(refresh_provider_session_price_terms(&contract, &mut before, 199), ProviderSessionDecision::Accept);
+        assert_eq!(before.price_ver, 1);
+        let mut after = startup;
+        assert_eq!(refresh_provider_session_price_terms(&contract, &mut after, 200), ProviderSessionDecision::Accept);
+        assert_eq!(after.price_ver, 9);
+        assert_eq!(after.ctx_bracket, before.ctx_bracket);
+        assert_eq!(provider_session_contract_decision(&contract, &after, &contract.rooms[..1], "fiat"), ProviderSessionDecision::Accept);
+    }
+
+    #[test]
+    fn provider_session_price_refresh_rejects_missing_or_noncanonical_prices() {
+        let startup = test_provider_session_terms();
+        for case in ["missing", "provider", "model", "denom", "table", "future"] {
+            let mut contract = test_contract(&"aa".repeat(32));
+            match case {
+                "missing" => contract.prices.clear(),
+                "provider" => contract.prices[0].current.as_mut().unwrap().set_by_role = Some("provider".to_owned()),
+                "model" => contract.prices[0].model_id = "other/model".to_owned(),
+                "denom" => contract.prices[0].denom = "tnk".to_owned(),
+                "table" => {
+                    contract.prices[0].ctx_bracket_table_ver = Some(99);
+                    contract.prices[0].current.as_mut().unwrap().ctx_bracket_table_ver = Some(99);
+                }
+                "future" => contract.prices[0].current.as_mut().unwrap().effective_at = 201,
+                _ => unreachable!(),
+            }
+            let mut refreshed = startup.clone();
+            assert!(matches!(refresh_provider_session_price_terms(&contract, &mut refreshed, 200),
+                ProviderSessionDecision::Reject { code: "PRICE_VER", .. }), "{case}");
+            assert_eq!(refreshed.price_ver, startup.price_ver);
+            assert_eq!(refreshed.rate_map, startup.rate_map);
+        }
+    }
+
+    #[test]
+    fn provider_session_price_refresh_supports_media_without_context_prices() {
+        let mut contract = test_contract(&"aa".repeat(32));
+        contract.enclaves[0].model_class = "image-generation".to_owned();
+        let schedule = &mut contract.prices[0];
+        schedule.ctx_bracket = None;
+        schedule.ctx_bracket_table_ver = None;
+        let price = schedule.current.as_mut().unwrap();
+        price.ctx_bracket = None;
+        price.ctx_bracket_table_ver = None;
+        price.ver = 6;
+        price.rate_map = vec![RateMapEntry { unit: "image".to_owned(), per_unit_au: 10, granularity: 1 }];
+        let mut terms = test_provider_session_terms();
+        assert_eq!(refresh_provider_session_price_terms(&contract, &mut terms, 200), ProviderSessionDecision::Accept);
+        assert_eq!(terms.price_ver, 6);
+        assert_eq!(terms.ctx_bracket, None);
+        assert_eq!(terms.ctx_bracket_table_ver, None);
+        assert_eq!(terms.rate_map[0].unit, "image");
     }
 
     #[test]
