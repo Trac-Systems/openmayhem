@@ -481,7 +481,7 @@ impl GatewayJobStore {
     ) -> Result<StoredGatewayJob, String> {
         if !matches!(
             status,
-            GatewayJobStatus::Completed | GatewayJobStatus::Cancelled
+            GatewayJobStatus::Completed | GatewayJobStatus::Cancelled | GatewayJobStatus::Failed
         ) {
             return Err(format!(
                 "job {id} reconciliation cannot finish as {}",
@@ -702,7 +702,7 @@ impl GatewayJobStore {
             if path.extension().and_then(|value| value.to_str()) != Some(JOB_FILE_SUFFIX) {
                 continue;
             }
-            let sealed = fs::read(&path)
+            let mut sealed = fs::read(&path)
                 .map_err(|err| format!("reading encrypted job {}: {err}", path.display()))?;
             let id = path
                 .file_stem()
@@ -714,9 +714,22 @@ impl GatewayJobStore {
                     )
                 })?;
             validate_job_id(id)?;
-            let job = open_job(&self.key, id, &sealed)?;
+            let mut job = open_job(&self.key, id, &sealed)?;
             if job.schema_version != JOB_SCHEMA_VERSION || job.id != id {
                 return Err(format!("encrypted job {id} has invalid identity or schema"));
+            }
+            // Older builds marked interrupted checkpoints cancelled before
+            // their reservation was closed. Restore those jobs to recovery;
+            // never rewrite the signed receipt's finality bit.
+            if job.status != GatewayJobStatus::ReconciliationPending
+                && job.receipt.as_ref().is_some_and(|receipt|
+                    receipt.pointer("/body/final") == Some(&Value::Bool(false))
+                        && receipt.get("canonical_settlement").is_none())
+            {
+                job.status = GatewayJobStatus::ReconciliationPending;
+                let repaired = seal_job(&self.key, &job)?;
+                self.persist_replace(id, &repaired)?;
+                sealed = repaired;
             }
             if job.status == GatewayJobStatus::ReconciliationPending {
                 self.reconciling.insert(id.to_owned());
