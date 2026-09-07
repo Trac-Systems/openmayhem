@@ -579,6 +579,12 @@ fn route_operational_state(data: &DashboardData, entry: &ProviderTableEntry) -> 
             tone: "warn",
             explanation: "The gateway circuit breaker is cooling this route down".to_owned(),
         },
+        BaselineRouteState::PrefixCachingRequired => RouteState {
+            kind: RouteStateKind::Waiting,
+            label: "Provider update required",
+            tone: "warn",
+            explanation: "The provider has not confirmed that prefix caching is enabled".to_owned(),
+        },
         BaselineRouteState::AttestationPolicyNotReady => RouteState {
             kind: RouteStateKind::Waiting,
             label: "Verification policy unavailable",

@@ -14442,6 +14442,7 @@ fn heartbeat_for_route(
 ) -> ProviderHeartbeat {
     let price = route_price_ref_au(model, Some(candidate));
     ProviderHeartbeat {
+        prefix_caching: Some(true),
         t: "hb".to_owned(),
         v: crate::HEARTBEAT_SCHEMA_VERSION,
         contract_version: CONTRACT_VERSION,

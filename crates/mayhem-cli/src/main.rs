@@ -59324,6 +59324,7 @@ struct HeartbeatContext<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProviderLoadSnapshot {
+    prefix_caching: bool,
     active_slots: u64,
     active_requests: u64,
     free_slots: u64,
@@ -59339,6 +59340,7 @@ struct ProviderLoadSnapshot {
 impl Default for ProviderLoadSnapshot {
     fn default() -> Self {
         Self {
+            prefix_caching: false,
             active_slots: 0,
             active_requests: 0,
             free_slots: 0,
@@ -59365,6 +59367,7 @@ impl ProviderLoadSnapshot {
     fn from_sessions(sessions: &HashMap<String, ActiveProviderSession>, max_sessions: u32) -> Self {
         let active_slots = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
         Self {
+            prefix_caching: false,
             active_slots,
             active_requests: 0,
             free_slots: u64::from(max_sessions).saturating_sub(active_slots),
@@ -59381,6 +59384,7 @@ impl ProviderLoadSnapshot {
 
 #[derive(Clone, Debug)]
 struct ProviderHeartbeatLoad {
+    prefix_caching: Arc<AtomicBool>,
     active_slots: Arc<AtomicU64>,
     exclusive_session_active: Arc<AtomicBool>,
     active_requests: Arc<AtomicU64>,
@@ -59398,6 +59402,7 @@ impl Default for ProviderHeartbeatLoad {
     fn default() -> Self {
         let (changes, _) = tokio::sync::watch::channel(0);
         Self {
+            prefix_caching: Arc::new(AtomicBool::new(false)),
             active_slots: Arc::new(AtomicU64::new(0)),
             exclusive_session_active: Arc::new(AtomicBool::new(false)),
             active_requests: Arc::new(AtomicU64::new(0)),
@@ -59472,6 +59477,7 @@ impl ProviderHeartbeatLoad {
             value => Some(value),
         };
         ProviderLoadSnapshot {
+            prefix_caching: self.prefix_caching.load(Ordering::Acquire),
             active_slots,
             active_requests,
             free_slots,
@@ -61410,6 +61416,7 @@ enum ProviderSessionDecision {
 }
 
 trait ProviderSessionResponder {
+    fn prefix_caching_enabled(&self) -> bool { false }
     fn mode(&self) -> &'static str;
     /// Independently dispatchable requests, not the engine's theoretical batch capacity.
     fn concurrent_session_capacity(&self) -> u32 {
@@ -61493,6 +61500,7 @@ struct EngineProviderSessionResponder {
 }
 
 impl ProviderSessionResponder for EngineProviderSessionResponder {
+    fn prefix_caching_enabled(&self) -> bool { self.backend.prefix_caching_enabled() }
     fn mode(&self) -> &'static str {
         "mayhem-engine"
     }
@@ -78117,6 +78125,9 @@ async fn send_provider_heartbeat_round(
             "ts": ts,
             "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, provider_pubkey, ts, seq).as_bytes()).to_hex().to_string(),
         });
+        if load.prefix_caching {
+            heartbeat["prefix_caching"] = json!(true);
+        }
         if let Some(mode) = &selected.execution_mode {
             heartbeat["execution_mode"] = serde_json::to_value(&mode.binding)?;
         }
@@ -78913,6 +78924,7 @@ async fn serve_provider_sessions(
 
     let heartbeat_enabled = !ctx.args.no_heartbeat && !ctx.rooms.is_empty();
     let heartbeat_load = ProviderHeartbeatLoad::new(&ctx.selected.modality_capacities);
+    heartbeat_load.prefix_caching.store(responder.prefix_caching_enabled(), Ordering::Release);
     let runtime_floor_monitor = ProviderRuntimeFloorMonitor::new(ctx.args, ctx.home, ctx.selected)?;
     let engine_watchdog_restart_after_millis = configured_nonnegative_millis(
         "MAYHEM_PROVIDER_ENGINE_WATCHDOG_RESTART_AFTER_MS",
@@ -79085,6 +79097,7 @@ async fn serve_provider_sessions(
                     "provider engine child exited while idle; no user session caused the failure",
                 );
             }
+            heartbeat_load.prefix_caching.store(responder.prefix_caching_enabled(), Ordering::Release);
             let mut component_recovery_pending = false;
             if engine_recovery.retry_due(Instant::now()) {
                 match responder.recover_component() {
@@ -85102,6 +85115,10 @@ fn provider_session_responder_with_modality_health(
 )> {
     let terms = provider_session_terms(ctx)?;
     let mut responder = provider_session_responder(ctx)?;
+    if ctx.selected.model.model_class == DEFAULT_MODEL_CLASS {
+        ensure!(responder.prefix_caching_enabled(),
+            "LLM provider admission requires initialized prefix caching; upgrade to a cache-capable runtime");
+    }
     if let Some(health) =
         provider_workflow_admission_modality_health(ctx.selected, ctx.workflow_admission.as_ref())
     {
@@ -119494,6 +119511,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(
             load.snapshot(4),
             ProviderLoadSnapshot {
+                prefix_caching: false,
                 active_slots: 2,
                 active_requests: 0,
                 free_slots: 2,
@@ -120040,6 +120058,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     #[test]
     fn provider_heartbeat_tok_s_uses_labeled_cold_start_prior_until_measured() {
         let snapshot = ProviderLoadSnapshot {
+            prefix_caching: false,
             active_slots: 0,
             active_requests: 0,
             free_slots: 0,

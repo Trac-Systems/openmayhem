@@ -191,7 +191,7 @@ fn assert_process_exited(pid: u64) {
 
 fn plan(tokens: u64) -> Value {
     json!({"load": {"ok": true, "result": {
-        "n_vocab": 32000, "n_ctx_train": 4096, "kv_cache_size_tokens": tokens,
+        "prefix_caching": true, "n_vocab": 32000, "n_ctx_train": 4096, "kv_cache_size_tokens": tokens,
         "determinism": {"batch_invariant": true},
     }}})
 }
@@ -528,7 +528,7 @@ fn isolated_load_is_sequential_and_reports_each_capacity_and_containment_share()
 
 #[test]
 fn isolated_partial_failure_never_aggregates_kv_or_keeps_fewer_workers() {
-    let missing = json!({"load": {"ok": true, "result": {"n_vocab": 32000, "n_ctx_train": 4096}}});
+    let missing = json!({"load": {"ok": true, "result": {"prefix_caching": true, "n_vocab": 32000, "n_ctx_train": 4096}}});
     let failure = json!({"load": {"ok": false, "error": "mock load failed"}});
     for second in [plan(4095), missing, failure] {
         let fixture = Fixture::new(json!([plan(40960), second]));
@@ -544,6 +544,40 @@ fn isolated_partial_failure_never_aggregates_kv_or_keeps_fewer_workers() {
     let mut backend = fixture.backend();
     assert!(backend.load(fixture.config(1)).is_err());
     fixture.assert_exited(1);
+}
+
+#[test]
+fn prefix_caching_missing_or_false_rejects_every_pool_worker_and_recovery() {
+    for value in [Value::Null, json!(false)] {
+        let mut bad = plan(8192);
+        if value.is_null() {
+            bad["load"]["result"].as_object_mut().unwrap().remove("prefix_caching");
+        } else {
+            bad["load"]["result"]["prefix_caching"] = value;
+        }
+        for index in [0, 1] {
+            let fixture = Fixture::new(if index == 0 { json!([bad.clone()]) } else { json!([plan(8192), bad.clone()]) });
+            let mut backend = fixture.backend();
+            assert!(backend.load(fixture.config(2)).unwrap_err().to_string().contains("prefix caching"));
+            assert!(!backend.prefix_caching_enabled());
+            assert!(backend.process_ids().is_empty());
+            fixture.assert_exited(index + 1);
+        }
+        let fixture = Fixture::new(json!([plan(8192), plan(8192), bad, plan(8192)]));
+        let mut backend = fixture.backend();
+        backend.load(fixture.config(2)).unwrap();
+        fs::write(fixture.root.join("fatal-1"), b"").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backend.component_healthy() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(finish_recovery(&mut backend).unwrap_err().to_string().contains("prefix caching"));
+        assert!(!backend.component_healthy());
+        assert_eq!(finish_recovery(&mut backend).unwrap(), ComponentRecovery::Recovered);
+        drop(backend);
+        fixture.assert_exited(4);
+    }
 }
 
 #[test]

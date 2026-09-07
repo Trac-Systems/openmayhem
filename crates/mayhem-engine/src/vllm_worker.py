@@ -608,6 +608,8 @@ def effective_execution_properties(initialized_engine, required_kwargs):
         "kv_cache_dtype": enum_value(
             config_value(config_value(config, "cache_config"), "cache_dtype")
         ),
+        "enable_prefix_caching": config_value(config_value(config, "cache_config"), "enable_prefix_caching"),
+        "mamba_cache_mode": config_value(config_value(config, "cache_config"), "mamba_cache_mode"),
     }
     if "compilation_config" in required_kwargs:
         compilation = config_value(config, "compilation_config")
@@ -960,6 +962,12 @@ def create_engine(payload):
         "use_fp64_gumbel",
         "async_scheduling",
     }
+    # Required for every provider, including models whose vLLM default is off.
+    kwargs["enable_prefix_caching"] = True
+    required_options.add("enable_prefix_caching")
+    if model_uses_hybrid_attention(path):
+        kwargs["mamba_cache_mode"] = "align"
+        required_options.add("mamba_cache_mode")
     if requested_compilation_config:
         kwargs["compilation_config"] = requested_compilation_config
         required_options.add("compilation_config")
@@ -1345,6 +1353,14 @@ def prepare_generation_request(request_id, payload):
     }
 
 
+def log_prefix_cache_request(request_id, prompt_tokens, cached_tokens):
+    import json
+    import sys
+    print(json.dumps({"event": "prefix_cache_request", "request_id": request_id,
+        "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens}),
+        file=sys.stderr, flush=True)
+
+
 async def async_handle_generate(request_id, payload):
     prepared = await asyncio.to_thread(prepare_generation_request, request_id, payload)
     check_cancelled(request_id)
@@ -1368,6 +1384,7 @@ async def async_handle_generate(request_id, payload):
     reasoning_tokens = 0
     reasoning_active = prepared["reasoning_active"]
     actual_prompt_tokens = len(prompt_tokens)
+    cached_prompt_tokens = 0
     multiplexer = generation_multiplexer
     if multiplexer is not None:
         multiplexer.engine_started(request_id)
@@ -1381,6 +1398,7 @@ async def async_handle_generate(request_id, payload):
                 await abort_engine_request(request_id)
                 raise RequestCancelled("engine request cancelled")
             output_prompt_ids = getattr(output, "prompt_token_ids", None)
+            cached_prompt_tokens = max(cached_prompt_tokens, int(getattr(output, "num_cached_tokens", 0) or 0))
             if output_prompt_ids is not None:
                 actual_prompt_tokens = max(actual_prompt_tokens, len(output_prompt_ids))
             for completion in getattr(output, "outputs", []) or []:
@@ -1419,6 +1437,8 @@ async def async_handle_generate(request_id, payload):
             multiplexer.engine_stopped(request_id)
 
     check_cancelled(request_id)
+
+    log_prefix_cache_request(request_id, actual_prompt_tokens, cached_prompt_tokens)
 
     if completion_tokens == 0 and text:
         completion_tokens = 1
@@ -1495,6 +1515,7 @@ async def handle_load(payload):
         "n_vocab": int(vocab_size()),
         "kv_cache_size_tokens": kv_cache["size_tokens"],
         "kv_cache_max_concurrency": kv_cache["max_concurrency"],
+        "prefix_caching": config_value(config_value(engine.vllm_config, "cache_config"), "enable_prefix_caching") is True,
         "execution": execution_properties,
         "determinism": {
             "async_scheduling": False,

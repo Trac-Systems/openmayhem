@@ -1510,6 +1510,7 @@ fn fixture_heartbeat(
     let active = (route_index % 3) as u32;
     let max = 6;
     ProviderHeartbeat {
+        prefix_caching: Some(true),
         t: "hb".to_owned(),
         v: crate::HEARTBEAT_SCHEMA_VERSION,
         contract_version: CONTRACT_VERSION,

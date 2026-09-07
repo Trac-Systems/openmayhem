@@ -157,12 +157,25 @@ pub(crate) fn ensure_vllm_python(
     home: &Path,
     runtime: Option<VllmRuntime>,
 ) -> Result<PythonRuntime> {
-    match runtime {
+    let runtime = match runtime {
         None => ensure_backend_python(home, "vllm"),
         Some(VllmRuntime::FlashinferSpeculativeMetadataV1) => {
             ensure_backend_python(home, VLLM_SPECMETA_BACKEND)
         }
-    }
+    }?;
+    let backup = home.join("runtime-patches").join("vllm-prefix-v1");
+    fs::create_dir_all(&backup)?;
+    let lock = OpenOptions::new().create(true).truncate(false).write(true)
+        .open(backup.join("install.lock"))?;
+    lock.lock_exclusive()?;
+    let output = Command::new(&runtime.python)
+        .arg("-B").arg("-c")
+        .arg(include_str!("../../../scripts/vllm-prefix-runtime.py"))
+        .arg("--backup").arg(&backup).arg("--apply")
+        .output().context("applying mandatory vLLM prefix runtime correction")?;
+    ensure!(output.status.success(), "vLLM prefix runtime correction failed: {}",
+        String::from_utf8_lossy(&output.stderr));
+    Ok(runtime)
 }
 
 #[derive(Clone, Copy, Debug)]
