@@ -1,6 +1,6 @@
 use crate::{EngineError, Result};
 use llama_cpp_2::{
-    context::{LlamaContext, session::LlamaStateSeqFlags},
+    context::{session::LlamaStateSeqFlags, LlamaContext},
     token::LlamaToken,
 };
 
@@ -10,6 +10,8 @@ use llama_cpp_2::{
 pub(super) struct PrefixCache {
     max_bytes: usize,
     tokens: Vec<LlamaToken>,
+    previous_prompt: Vec<LlamaToken>,
+    capture_len: usize,
     state: Option<tempfile::NamedTempFile>,
     last: (usize, usize),
 }
@@ -19,6 +21,8 @@ impl PrefixCache {
         Self {
             max_bytes,
             tokens: Vec::new(),
+            previous_prompt: Vec::new(),
+            capture_len: 0,
             state: None,
             last: (0, 0),
         }
@@ -47,6 +51,8 @@ impl PrefixCache {
 
     pub(super) fn clear(&mut self) {
         self.tokens = Vec::new();
+        self.previous_prompt = Vec::new();
+        self.capture_len = 0;
         self.state = None;
         self.last = (0, 0);
     }
@@ -55,11 +61,38 @@ impl PrefixCache {
         self.last
     }
 
+    pub(super) fn capture_len(&self) -> usize {
+        self.capture_len
+    }
+
     pub(super) fn restore(
         &mut self,
         ctx: &mut LlamaContext<'_>,
         prompt: &[LlamaToken],
+        batch_size: usize,
     ) -> Result<usize> {
+        // Chat templates can rewrite an earlier assistant/thinking suffix on
+        // continuation. Learn the stable boundary from successive full prompts,
+        // so recurrent/SWA caches do not require an unsupported rollback on every
+        // turn. New/unrelated prompts still seed an almost-complete snapshot.
+        let stable = self
+            .previous_prompt
+            .iter()
+            .zip(prompt)
+            .take_while(|(a, b)| a == b)
+            .count()
+            .min(prompt.len().saturating_sub(1));
+        let boundary = if stable > 0 {
+            stable
+        } else {
+            prompt.len().saturating_sub(1)
+        };
+        // Checkpoint only at the same batch boundaries used by cold prefill.
+        // Splitting an additional one-token decode can select different native
+        // kernels and change quantized-model output even with a greedy sampler.
+        self.capture_len = boundary / batch_size * batch_size;
+        self.previous_prompt.clear();
+        self.previous_prompt.extend_from_slice(prompt);
         // Always decode at least the final token to produce logits for this
         // request. Samplers and output decoding state are never reused.
         let common = self
@@ -69,6 +102,7 @@ impl PrefixCache {
             .take_while(|(a, b)| a == b)
             .count()
             .min(prompt.len().saturating_sub(1));
+        let common = common / batch_size * batch_size;
         self.last = (prompt.len(), 0);
         if common == 0 || self.state.is_none() {
             return Ok(0);
@@ -112,7 +146,16 @@ impl PrefixCache {
         // peak snapshot memory within the operator's configured bound.
         self.state = None;
         self.tokens = Vec::new();
-        if size == 0 || size.saturating_add(token_bytes) > self.max_bytes {
+        let history_bytes = self
+            .previous_prompt
+            .capacity()
+            .saturating_mul(std::mem::size_of::<LlamaToken>());
+        if size == 0
+            || size
+                .saturating_add(token_bytes)
+                .saturating_add(history_bytes)
+                > self.max_bytes
+        {
             eprintln!(
                 "prefix_cache_store backend=llama.cpp prompt_tokens={} cached_tokens={} stored_bytes=0 limit_bytes={}",
                 self.last.0, self.last.1, self.max_bytes

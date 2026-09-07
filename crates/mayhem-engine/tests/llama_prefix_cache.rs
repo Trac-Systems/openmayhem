@@ -5,8 +5,8 @@ use mayhem_engine::{
 
 #[test]
 #[ignore = "requires an explicit local native model; run on the owned provider before rollout"]
-fn prefix_reuse_matches_cold_generation_and_discards_changed_tail()
--> Result<(), Box<dyn std::error::Error>> {
+fn prefix_reuse_matches_cold_generation_and_discards_changed_tail(
+) -> Result<(), Box<dyn std::error::Error>> {
     let path = std::env::var("MAYHEM_PREFIX_CACHE_TEST_MODEL")?;
     let mut config = LoadConfig::gguf(path);
     config.ctx_size = 8192;
@@ -30,7 +30,7 @@ fn prefix_reuse_matches_cold_generation_and_discards_changed_tail()
     let warm = generate(&mut backend, &prompt)?;
     let (total, cached) = backend.prefix_cache_tokens();
     assert!(
-        cached > 1000 && cached == total - 1,
+        cached > 1000 && cached < total && cached % config.batch_size as usize == 0,
         "cache not reused: {total}/{cached}"
     );
     assert_eq!(cold.text, warm.text, "warm cache changed greedy output");
@@ -60,6 +60,23 @@ fn prefix_reuse_matches_cold_generation_and_discards_changed_tail()
     assert_eq!(
         warm_changed.text, cold_changed.text,
         "stale suffix influenced output"
+    );
+    backend.set_prefix_cache_limit(2 * 1024 * 1024 * 1024);
+    let chat_start = format!("{prefix}\nUser: What color is the notebook?\nAssistant:\n<think>");
+    let chat_second = format!("{prefix}\nUser: What color is the notebook?\nAssistant: green\nUser: Reply with the color again.\nAssistant:\n<think>");
+    let chat_third = format!("{prefix}\nUser: What color is the notebook?\nAssistant: green\nUser: Reply with only the color.\nAssistant:\n<think>");
+    generate(&mut backend, &chat_start)?;
+    generate(&mut backend, &chat_second)?;
+    let warm_chat = generate(&mut backend, &chat_third)?;
+    assert!(
+        backend.prefix_cache_tokens().1 > 1000,
+        "changing chat suffixes must learn a reusable recurrent/SWA checkpoint"
+    );
+    backend.set_prefix_cache_limit(0);
+    let cold_chat = generate(&mut backend, &chat_third)?;
+    assert_eq!(
+        warm_chat.text, cold_chat.text,
+        "learned prefix changed greedy output"
     );
     backend.set_prefix_cache_limit(2 * 1024 * 1024 * 1024);
     generate(&mut backend, &prompt)?;

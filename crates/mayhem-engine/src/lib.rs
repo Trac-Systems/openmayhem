@@ -6021,15 +6021,22 @@ mod llama_cpp_backend {
                 });
             }
 
-            let cached_tokens = self.prefix_cache.lock().unwrap_or_else(|p| p.into_inner())
-                .restore(&mut ctx, &prompt_tokens)?;
+            let (cached_tokens, capture_len) = {
+                let mut cache = self.prefix_cache.lock().unwrap_or_else(|p| p.into_inner());
+                let batch_size = ctx.n_batch() as usize;
+                let cached = cache.restore(&mut ctx, &prompt_tokens, batch_size)?;
+                (cached, cache.capture_len().max(cached))
+            };
             let last_prompt_index = prompt_tokens.len().checked_sub(1).ok_or_else(|| {
                 EngineError::InvalidConfig("llama.cpp prompt tokenization produced no tokens".into())
             })?;
-            let remaining_prefix = last_prompt_index - cached_tokens;
-            let batch_ranges = if remaining_prefix == 0 { Vec::new() } else {
-                llama_prompt_batch_ranges(remaining_prefix, ctx.n_batch())?
-            };
+            let mut batch_ranges = Vec::new();
+            for (start, end) in [(cached_tokens, capture_len), (capture_len, last_prompt_index)] {
+                if end > start {
+                    batch_ranges.extend(llama_prompt_batch_ranges(end - start, ctx.n_batch())?
+                        .into_iter().map(|range| start + range.start..start + range.end));
+                }
+            }
             let batch_capacity = batch_ranges
                 .iter()
                 .map(|range| range.len())
@@ -6037,10 +6044,10 @@ mod llama_cpp_backend {
                 .unwrap_or(1);
             let mut batch = LlamaBatch::new(batch_capacity, 1);
             for range in batch_ranges {
+                let end = range.end;
                 cancellation.check()?;
                 batch.clear();
-                for offset in range {
-                    let index = cached_tokens + offset;
+                for index in range {
                     batch.add(
                         prompt_tokens[index],
                         i32::try_from(index).map_err(|err| {
@@ -6052,14 +6059,12 @@ mod llama_cpp_backend {
                 }
                 ctx.decode(&mut batch)?;
                 cancellation.check()?;
+                if end == capture_len && capture_len > cached_tokens {
+                    self.prefix_cache.lock().unwrap_or_else(|p| p.into_inner())
+                        .save(&ctx, &prompt_tokens[..capture_len])?;
+                }
             }
 
-            // Snapshot before the final prompt token. Recurrent/SWA models can
-            // reuse this exact state without a rollback, including identical turns.
-            if remaining_prefix > 0 {
-                self.prefix_cache.lock().unwrap_or_else(|p| p.into_inner())
-                    .save(&ctx, &prompt_tokens[..last_prompt_index])?;
-            }
             eprintln!("prefix_cache backend=llama.cpp prompt_tokens={} cached_tokens={}",
                 prompt_tokens.len(), cached_tokens);
             cancellation.check()?;
