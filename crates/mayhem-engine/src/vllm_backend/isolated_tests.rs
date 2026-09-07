@@ -336,9 +336,30 @@ fn isolated_address_envelope_is_explicit_finite_and_not_a_worker_payload_propert
     config.vllm_worker_address_space_limit_bytes = Some(104_630_093_824);
     config.vllm_generation_topology = None;
     config.vllm_concurrent_generation_capacity = None;
-    assert!(validate_load_config(&config).is_err());
+    validate_load_config(&config).unwrap();
     config.vllm_worker_address_space_limit_bytes = None;
     validate_load_config(&config).unwrap();
+}
+
+#[test]
+fn shared_worker_preserves_separate_memory_limits_on_reload() {
+    let fixture = Fixture::new(json!([plan(8192), plan(8192)]));
+    let mut config = fixture.config(1);
+    config.vllm_generation_topology = None;
+    config.vllm_concurrent_generation_capacity = None;
+    config.memory_limit_bytes = Some(1024 * 1024 * 1024);
+    let mut backend = fixture.backend();
+    backend.load(config.clone()).unwrap();
+    #[cfg(target_os = "linux")]
+    assert_eq!(backend.worker.as_ref().unwrap().containment_report.as_ref().unwrap()
+        .address_space_limit_bytes, config.vllm_worker_address_space_limit_bytes);
+    config.vllm_worker_address_space_limit_bytes = Some(96 * 1024 * 1024 * 1024);
+    backend.load(config.clone()).unwrap();
+    #[cfg(target_os = "linux")]
+    assert_eq!(backend.worker.as_ref().unwrap().containment_report.as_ref().unwrap()
+        .address_space_limit_bytes, config.vllm_worker_address_space_limit_bytes);
+    drop(backend);
+    fixture.assert_exited(2);
 }
 
 #[test]

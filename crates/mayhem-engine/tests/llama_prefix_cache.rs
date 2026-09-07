@@ -35,9 +35,26 @@ fn prefix_reuse_matches_cold_generation_and_discards_changed_tail()
     );
     assert_eq!(cold.text, warm.text, "warm cache changed greedy output");
     assert_eq!(cold.usage.prompt_tokens, warm.usage.prompt_tokens);
+    let appended = format!("{prompt}\nReply with only the color.");
+    let warm_appended = generate(&mut backend, &appended)?;
+    assert!(
+        backend.prefix_cache_tokens().1 > 1000,
+        "appended turn missed the shared prefix"
+    );
+    backend.set_prefix_cache_limit(0);
+    let cold_appended = generate(&mut backend, &appended)?;
+    assert_eq!(
+        warm_appended.text, cold_appended.text,
+        "appended prefix changed greedy output"
+    );
+    backend.set_prefix_cache_limit(2 * 1024 * 1024 * 1024);
+    generate(&mut backend, &prompt)?;
     let changed = format!("{prefix}\nQuestion: What color is the pencil?\nAnswer:");
     let warm_changed = generate(&mut backend, &changed)?;
-    assert!(backend.prefix_cache_tokens().1 > 1000);
+    // Recurrent/SWA models cannot necessarily roll back inside a snapshot.
+    // They must fall back to an equivalent cold result, without stale suffixes.
+    let changed_cached = backend.prefix_cache_tokens().1;
+    assert!(changed_cached == 0 || changed_cached > 1000);
     backend.set_prefix_cache_limit(0);
     let cold_changed = generate(&mut backend, &changed)?;
     assert_eq!(

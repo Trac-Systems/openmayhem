@@ -86326,6 +86326,14 @@ fn provider_engine_load_config(
     }
     if selected.artifact.engine == "vllm" {
         config.vllm_tensor_parallel = Some(enclave_tp_degree(&selected.enclave.caps)?);
+        // CUDA reservations and a mapped checkpoint consume virtual addresses,
+        // not the host's remaining resident-memory budget. Keep this finite
+        // envelope stable when another provider is already resident at restart.
+        let memory = &selected.feasibility.memory_budget;
+        config.vllm_worker_address_space_limit_bytes = Some(
+            memory.total_bytes.max(memory.available_bytes)
+                .saturating_sub(memory.reserve_bytes).max(memory.worker_limit_bytes),
+        ).filter(|bytes| *bytes > 0);
         let isolated = generation_execution_uses_isolated_workers(selected.generation_execution_profile.as_ref());
         if isolated {
             ensure!(selected.execution_mode.is_some(),
@@ -117299,7 +117307,22 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             &mode_args, &isolated, &artifact_paths, &ProviderBackendRuntime::default(),
         ).is_err());
         assert_eq!(config.vllm_generation_topology, None);
-        assert_eq!(config.vllm_worker_address_space_limit_bytes, None);
+        assert_eq!(config.vllm_worker_address_space_limit_bytes,
+            Some(selected.feasibility.memory_budget.total_bytes
+                .max(selected.feasibility.memory_budget.available_bytes)
+                .saturating_sub(selected.feasibility.memory_budget.reserve_bytes)
+                .max(selected.feasibility.memory_budget.worker_limit_bytes)));
+        let mut resident_selected = selected.clone();
+        resident_selected.feasibility.memory_budget.available_bytes /= 2;
+        resident_selected.feasibility.memory_budget.worker_limit_bytes /= 2;
+        let restarted = provider_engine_load_config(
+            &args, &resident_selected, &artifact_paths, &ProviderBackendRuntime::default(),
+        ).unwrap();
+        assert_eq!(restarted.vllm_worker_address_space_limit_bytes,
+            config.vllm_worker_address_space_limit_bytes,
+            "another resident model must not shrink the virtual-address envelope");
+        assert_eq!(restarted.memory_limit_bytes,
+            Some(resident_selected.feasibility.memory_budget.worker_limit_bytes));
         let _ = fs::remove_dir_all(temp);
     }
 

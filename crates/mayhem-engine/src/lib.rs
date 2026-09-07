@@ -2209,14 +2209,14 @@ fn validate_load_config(config: &LoadConfig) -> Result<()> {
             "vllm_concurrent_generation_capacity cannot exceed vllm_max_num_seqs".to_owned(),
         ));
     }
-    if config.vllm_worker_address_space_limit_bytes.is_some()
-        && config.vllm_generation_topology != Some(VllmGenerationTopology::IsolatedWorkers)
-    {
+    if config.vllm_worker_address_space_limit_bytes
+        .is_some_and(|bytes| bytes < 1024 || bytes > i64::MAX as u64) {
         return Err(EngineError::InvalidConfig(
-            "vllm_worker_address_space_limit_bytes requires isolated vLLM workers".to_owned(),
+            "vllm_worker_address_space_limit_bytes must be a finite limit of at least 1024 bytes".to_owned(),
         ));
     }
     let has_vllm_execution_properties = config.vllm_generation_topology.is_some()
+        || config.vllm_worker_address_space_limit_bytes.is_some()
         || config.vllm_enforce_eager.is_some()
         || config.vllm_compilation_mode.is_some()
         || config.vllm_cudagraph_mode.is_some()
@@ -8114,6 +8114,7 @@ mod vllm_backend {
         loaded: Option<LoadedModelInfo>,
         next_id: Arc<AtomicU64>,
         memory_limit_bytes: Option<u64>,
+        worker_address_space_limit_bytes: Option<u64>,
         cache_root: Option<PathBuf>,
         generation_gate: Arc<RwLock<()>>,
         generation_epoch: Arc<AtomicU64>,
@@ -8145,6 +8146,7 @@ mod vllm_backend {
                 loaded: None,
                 next_id: Arc::new(AtomicU64::new(1)),
                 memory_limit_bytes: None,
+                worker_address_space_limit_bytes: None,
                 cache_root: None,
                 generation_gate: Arc::new(RwLock::new(())),
                 generation_epoch: Arc::new(AtomicU64::new(0)),
@@ -8182,12 +8184,17 @@ mod vllm_backend {
                 }
             }
             self.reset_worker();
-            let worker = Arc::new(VllmWorker::spawn(
-                &self.python,
-                self.memory_limit_bytes,
-                self.cache_root.as_deref(),
-                execution_probe,
-            )?);
+            let worker = Arc::new(if let Some(address_limit) = self.worker_address_space_limit_bytes {
+                VllmWorker::spawn_isolated(
+                    &self.python, self.memory_limit_bytes, address_limit,
+                    self.cache_root.as_deref(), execution_probe,
+                )?
+            } else {
+                VllmWorker::spawn(
+                    &self.python, self.memory_limit_bytes,
+                    self.cache_root.as_deref(), execution_probe,
+                )?
+            });
             self.worker = Some(Arc::clone(&worker));
             Ok(worker)
         }
@@ -8613,7 +8620,12 @@ mod vllm_backend {
                 .generation_epoch
                 .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1);
+            if self.memory_limit_bytes != config.memory_limit_bytes
+                || self.worker_address_space_limit_bytes != config.vllm_worker_address_space_limit_bytes {
+                self.reset_worker();
+            }
             self.memory_limit_bytes = config.memory_limit_bytes;
+            self.worker_address_space_limit_bytes = config.vllm_worker_address_space_limit_bytes;
             self.cache_root = config.backend_cache_dir.clone();
 
             self.reset_isolated_workers();
