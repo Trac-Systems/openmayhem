@@ -7324,6 +7324,7 @@ fn test_provider_heartbeat(
     ttft_ms: u64,
 ) -> ProviderHeartbeat {
     ProviderHeartbeat {
+        prefix_caching: Some(true),
         t: "hb".to_owned(),
         v: HEARTBEAT_SCHEMA_VERSION,
         contract_version: CONTRACT_VERSION,

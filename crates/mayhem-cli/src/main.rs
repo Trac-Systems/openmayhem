@@ -59110,6 +59110,7 @@ struct ProviderMemoryBudget {
     reserve_bytes: u64,
     claimed_bytes: u64,
     worker_limit_bytes: u64,
+    worker_address_space_limit_bytes: u64,
     budget_bytes: u64,
 }
 
@@ -59125,6 +59126,7 @@ impl ProviderMemoryBudget {
             reserve_bytes: 0,
             claimed_bytes: 0,
             worker_limit_bytes: 0,
+            worker_address_space_limit_bytes: 0,
             budget_bytes: 0,
         }
     }
@@ -59324,6 +59326,7 @@ struct HeartbeatContext<'a> {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProviderLoadSnapshot {
+    prefix_caching: bool,
     active_slots: u64,
     active_requests: u64,
     free_slots: u64,
@@ -59339,6 +59342,7 @@ struct ProviderLoadSnapshot {
 impl Default for ProviderLoadSnapshot {
     fn default() -> Self {
         Self {
+            prefix_caching: false,
             active_slots: 0,
             active_requests: 0,
             free_slots: 0,
@@ -59365,6 +59369,7 @@ impl ProviderLoadSnapshot {
     fn from_sessions(sessions: &HashMap<String, ActiveProviderSession>, max_sessions: u32) -> Self {
         let active_slots = u64::try_from(sessions.len()).unwrap_or(u64::MAX);
         Self {
+            prefix_caching: false,
             active_slots,
             active_requests: 0,
             free_slots: u64::from(max_sessions).saturating_sub(active_slots),
@@ -59381,6 +59386,7 @@ impl ProviderLoadSnapshot {
 
 #[derive(Clone, Debug)]
 struct ProviderHeartbeatLoad {
+    prefix_caching: Arc<AtomicBool>,
     active_slots: Arc<AtomicU64>,
     exclusive_session_active: Arc<AtomicBool>,
     active_requests: Arc<AtomicU64>,
@@ -59398,6 +59404,7 @@ impl Default for ProviderHeartbeatLoad {
     fn default() -> Self {
         let (changes, _) = tokio::sync::watch::channel(0);
         Self {
+            prefix_caching: Arc::new(AtomicBool::new(false)),
             active_slots: Arc::new(AtomicU64::new(0)),
             exclusive_session_active: Arc::new(AtomicBool::new(false)),
             active_requests: Arc::new(AtomicU64::new(0)),
@@ -59472,6 +59479,7 @@ impl ProviderHeartbeatLoad {
             value => Some(value),
         };
         ProviderLoadSnapshot {
+            prefix_caching: self.prefix_caching.load(Ordering::Acquire),
             active_slots,
             active_requests,
             free_slots,
@@ -61410,6 +61418,7 @@ enum ProviderSessionDecision {
 }
 
 trait ProviderSessionResponder {
+    fn prefix_caching_enabled(&self) -> bool { false }
     fn mode(&self) -> &'static str;
     /// Independently dispatchable requests, not the engine's theoretical batch capacity.
     fn concurrent_session_capacity(&self) -> u32 {
@@ -61493,6 +61502,7 @@ struct EngineProviderSessionResponder {
 }
 
 impl ProviderSessionResponder for EngineProviderSessionResponder {
+    fn prefix_caching_enabled(&self) -> bool { self.backend.prefix_caching_enabled() }
     fn mode(&self) -> &'static str {
         "mayhem-engine"
     }
@@ -72630,6 +72640,20 @@ fn provider_memory_budget(
         .available_bytes
         .saturating_sub(reserve_bytes)
         .saturating_sub(claimed_bytes);
+    // Some unified NVIDIA probes have no dedicated-memory total and their
+    // allocation pool falls back to available RAM. Virtual mappings must use
+    // the machine's real total instead of inheriting that availability fallback.
+    let dedicated_total = hardware.gpus.iter()
+        .filter(|gpu| gpu.vendor == GpuVendor::Nvidia
+            && !nvidia_gpu_uses_host_unified_memory(hardware, gpu))
+        .filter_map(|gpu| gpu.memory_bytes)
+        .fold(0u64, u64::saturating_add);
+    let address_basis = hardware.memory.total_bytes.max(dedicated_total);
+    let (address_reserve, _) = provider_memory_reserve_bytes(
+        args.memory_reserve.as_deref(), address_basis, pool.unified,
+    )?;
+    let worker_address_space_limit_bytes = address_basis
+        .saturating_sub(address_reserve).max(worker_limit_bytes);
     let mut budget_bytes = worker_limit_bytes;
     if enclave.backend == "vllm" {
         let admin_max_pct = enclave_vllm_gpu_memory_utilization_pct(&enclave.caps)?;
@@ -72647,6 +72671,7 @@ fn provider_memory_budget(
         reserve_bytes,
         claimed_bytes,
         worker_limit_bytes,
+        worker_address_space_limit_bytes,
         budget_bytes,
     })
 }
@@ -78117,6 +78142,9 @@ async fn send_provider_heartbeat_round(
             "ts": ts,
             "nonce": blake3::hash(format!("{}:{}:{}:{}", room.room_id, provider_pubkey, ts, seq).as_bytes()).to_hex().to_string(),
         });
+        if load.prefix_caching {
+            heartbeat["prefix_caching"] = json!(true);
+        }
         if let Some(mode) = &selected.execution_mode {
             heartbeat["execution_mode"] = serde_json::to_value(&mode.binding)?;
         }
@@ -78913,6 +78941,7 @@ async fn serve_provider_sessions(
 
     let heartbeat_enabled = !ctx.args.no_heartbeat && !ctx.rooms.is_empty();
     let heartbeat_load = ProviderHeartbeatLoad::new(&ctx.selected.modality_capacities);
+    heartbeat_load.prefix_caching.store(responder.prefix_caching_enabled(), Ordering::Release);
     let runtime_floor_monitor = ProviderRuntimeFloorMonitor::new(ctx.args, ctx.home, ctx.selected)?;
     let engine_watchdog_restart_after_millis = configured_nonnegative_millis(
         "MAYHEM_PROVIDER_ENGINE_WATCHDOG_RESTART_AFTER_MS",
@@ -79085,6 +79114,7 @@ async fn serve_provider_sessions(
                     "provider engine child exited while idle; no user session caused the failure",
                 );
             }
+            heartbeat_load.prefix_caching.store(responder.prefix_caching_enabled(), Ordering::Release);
             let mut component_recovery_pending = false;
             if engine_recovery.retry_due(Instant::now()) {
                 match responder.recover_component() {
@@ -85102,6 +85132,10 @@ fn provider_session_responder_with_modality_health(
 )> {
     let terms = provider_session_terms(ctx)?;
     let mut responder = provider_session_responder(ctx)?;
+    if ctx.selected.model.model_class == DEFAULT_MODEL_CLASS {
+        ensure!(responder.prefix_caching_enabled(),
+            "LLM provider admission requires initialized prefix caching; upgrade to a cache-capable runtime");
+    }
     if let Some(health) =
         provider_workflow_admission_modality_health(ctx.selected, ctx.workflow_admission.as_ref())
     {
@@ -86309,6 +86343,12 @@ fn provider_engine_load_config(
     }
     if selected.artifact.engine == "vllm" {
         config.vllm_tensor_parallel = Some(enclave_tp_degree(&selected.enclave.caps)?);
+        // CUDA reservations and a mapped checkpoint consume virtual addresses,
+        // not the host's remaining resident-memory budget. Keep this finite
+        // envelope stable when another provider is already resident at restart.
+        let memory = &selected.feasibility.memory_budget;
+        config.vllm_worker_address_space_limit_bytes = Some(memory.worker_address_space_limit_bytes)
+            .filter(|bytes| *bytes > 0);
         let isolated = generation_execution_uses_isolated_workers(selected.generation_execution_profile.as_ref());
         if isolated {
             ensure!(selected.execution_mode.is_some(),
@@ -86319,7 +86359,6 @@ fn provider_engine_load_config(
                 "isolated worker count differs from its admitted allocation");
             config.vllm_generation_topology = Some(mayhem_engine::VllmGenerationTopology::IsolatedWorkers);
             config.vllm_max_num_seqs = Some(1);
-            config.vllm_worker_address_space_limit_bytes = config.memory_limit_bytes;
             config.memory_limit_bytes = Some(config.memory_limit_bytes
                 .unwrap_or(selected.feasibility.estimated_required_bytes)
                 .min(selected.feasibility.estimated_required_bytes));
@@ -105826,6 +105865,7 @@ status: linked
                     reserve_bytes: GIB_BYTES,
                     claimed_bytes: 0,
                     worker_limit_bytes: budget_gib * GIB_BYTES,
+                    worker_address_space_limit_bytes: budget_gib * GIB_BYTES,
                     budget_bytes: budget_gib * GIB_BYTES,
                 },
             },
@@ -106437,6 +106477,30 @@ status: linked
         model.canary.verification_method = CANARY_VERIFICATION_TOKEN_FINGERPRINT.to_owned();
 
         preflight_calibration_prompt_resources(&model, &document.prompts).unwrap();
+    }
+
+    #[test]
+    fn unified_vllm_virtual_limit_uses_real_total_when_gpu_probe_has_no_total() {
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.host.os = "linux".to_owned();
+        hardware.host.arch = "aarch64".to_owned();
+        hardware.memory.total_bytes = 128 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(112 * GIB_BYTES);
+        hardware.memory.unified_memory = true;
+        hardware.gpus[0].memory_bytes = None;
+        hardware.gpus[0].unified_memory = true;
+        let mut selected = test_auto_fit_candidate('a', "test/vllm", "text", 1, 2, 1, 30.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.enclave.caps = json!({"vllm_gpu_memory_utilization_pct":40});
+        selected.verdict.backend = "vllm".to_owned();
+        let args = test_provider_start_args();
+        let first = provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args).unwrap();
+        hardware.memory.available_bytes = Some(80 * GIB_BYTES);
+        let restarted = provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args).unwrap();
+        assert!(restarted.worker_limit_bytes < first.worker_limit_bytes);
+        assert_eq!(restarted.worker_address_space_limit_bytes, first.worker_address_space_limit_bytes);
+        assert!(restarted.worker_address_space_limit_bytes > 92 * GIB_BYTES);
+        assert!(restarted.worker_limit_bytes < 80 * GIB_BYTES);
     }
 
     #[test]
@@ -117276,13 +117340,25 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(isolated_config.memory_limit_bytes,
             Some(isolated.feasibility.estimated_required_bytes));
         assert_eq!(isolated_config.vllm_worker_address_space_limit_bytes,
-            Some(isolated.feasibility.memory_budget.worker_limit_bytes));
+            Some(isolated.feasibility.memory_budget.worker_address_space_limit_bytes));
         isolated.execution_mode = None;
         assert!(provider_engine_load_config(
             &mode_args, &isolated, &artifact_paths, &ProviderBackendRuntime::default(),
         ).is_err());
         assert_eq!(config.vllm_generation_topology, None);
-        assert_eq!(config.vllm_worker_address_space_limit_bytes, None);
+        assert_eq!(config.vllm_worker_address_space_limit_bytes,
+            Some(selected.feasibility.memory_budget.worker_address_space_limit_bytes));
+        let mut resident_selected = selected.clone();
+        resident_selected.feasibility.memory_budget.available_bytes /= 2;
+        resident_selected.feasibility.memory_budget.worker_limit_bytes /= 2;
+        let restarted = provider_engine_load_config(
+            &args, &resident_selected, &artifact_paths, &ProviderBackendRuntime::default(),
+        ).unwrap();
+        assert_eq!(restarted.vllm_worker_address_space_limit_bytes,
+            config.vllm_worker_address_space_limit_bytes,
+            "another resident model must not shrink the virtual-address envelope");
+        assert_eq!(restarted.memory_limit_bytes,
+            Some(resident_selected.feasibility.memory_budget.worker_limit_bytes));
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -119494,6 +119570,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(
             load.snapshot(4),
             ProviderLoadSnapshot {
+                prefix_caching: false,
                 active_slots: 2,
                 active_requests: 0,
                 free_slots: 2,
@@ -120040,6 +120117,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     #[test]
     fn provider_heartbeat_tok_s_uses_labeled_cold_start_prior_until_measured() {
         let snapshot = ProviderLoadSnapshot {
+            prefix_caching: false,
             active_slots: 0,
             active_requests: 0,
             free_slots: 0,

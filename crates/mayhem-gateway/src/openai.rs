@@ -2620,6 +2620,8 @@ pub fn normalize_endpoint_request_for_provider(
     contract: &EndpointFamilyContract,
     raw_request: &Value,
 ) -> Result<EndpointRequestNormalization, String> {
+    let prepared = normalize_chat_client_metadata(contract, raw_request)?;
+    let raw_request = prepared.as_ref();
     mayhem_proto::validate_endpoint_request(contract, raw_request).map_err(|violations| {
         violations
             .iter()
@@ -2715,6 +2717,35 @@ pub fn normalize_endpoint_request_for_provider(
         ),
         normalized_request,
     })
+}
+
+// Client storage/cache hints do not change model inference or its signed
+// calibration contract. We do not provide the stored-completions API, and
+// prefix reuse is automatic from token identity rather than a client key.
+fn normalize_chat_client_metadata<'a>(
+    contract: &EndpointFamilyContract,
+    request: &'a Value,
+) -> Result<std::borrow::Cow<'a, Value>, String> {
+    if contract.family != mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+        || (request.get("store").is_none() && request.get("prompt_cache_key").is_none()) {
+        return Ok(std::borrow::Cow::Borrowed(request));
+    }
+    if let Some(value) = request.get("store") {
+        if !value.is_null() && value != &Value::Bool(false) {
+            return Err("store: stored completions are not supported; use false or omit it".to_owned());
+        }
+    }
+    if let Some(value) = request.get("prompt_cache_key") {
+        if !value.is_null() && !value.as_str().is_some_and(|key| key.len() <= 1024) {
+            return Err("prompt_cache_key: expected a string of at most 1024 bytes".to_owned());
+        }
+    }
+    let mut normalized = request.clone();
+    if let Some(object) = normalized.as_object_mut() {
+        object.remove("store");
+        object.remove("prompt_cache_key");
+    }
+    Ok(std::borrow::Cow::Owned(normalized))
 }
 
 fn changed_supplied_endpoint_path(raw: &Value, normalized: &Value, path: &str) -> Option<String> {
@@ -14442,6 +14473,7 @@ fn heartbeat_for_route(
 ) -> ProviderHeartbeat {
     let price = route_price_ref_au(model, Some(candidate));
     ProviderHeartbeat {
+        prefix_caching: Some(true),
         t: "hb".to_owned(),
         v: crate::HEARTBEAT_SCHEMA_VERSION,
         contract_version: CONTRACT_VERSION,
@@ -38803,6 +38835,27 @@ mod tests {
         .expect("HF request normalization");
         assert!(normalized.normalized_request.get("metadata").is_none());
         assert_eq!(normalized.normalized_request["stream"], false);
+    }
+
+    #[test]
+    fn opencode_cache_hints_preserve_inference_contract_and_reject_storage() {
+        let contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        ).unwrap();
+        let raw = json!({"model":"test/model", "messages":[{"role":"user","content":"hello"}]});
+        let expected = normalize_endpoint_request_for_provider(&contract, &raw).unwrap();
+        for cache_key in [json!("session-a"), json!("session-b"), Value::Null] {
+            let mut with_hints = raw.clone();
+            with_hints["store"] = json!(false);
+            with_hints["prompt_cache_key"] = cache_key;
+            assert_eq!(normalize_endpoint_request_for_provider(&contract, &with_hints).unwrap(), expected);
+        }
+        for (key, value) in [("store",json!(true)), ("store",json!("false")),
+            ("prompt_cache_key",json!({"arbitrary":"object"})), ("unknown_unsigned_field",json!(true))] {
+            let mut invalid = raw.clone();
+            invalid[key] = value;
+            assert!(normalize_endpoint_request_for_provider(&contract, &invalid).is_err());
+        }
     }
 
     #[test]

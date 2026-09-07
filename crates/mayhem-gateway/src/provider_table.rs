@@ -187,6 +187,7 @@ pub enum BaselineRouteState {
     ConsentVersion,
     CircuitOpen,
     AttestationPolicyNotReady,
+    PrefixCachingRequired,
     HeartbeatMissing,
     HeartbeatStale,
     TransportPeerMissing,
@@ -254,6 +255,7 @@ pub struct ModalityRequestLoad {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum IneligibilityReason {
+    PrefixCachingRequired,
     ConsentVersion,
     Reputation,
     AttestationPolicy,
@@ -451,6 +453,7 @@ impl BaselineRouteState {
     fn ineligibility_reason(self) -> Option<IneligibilityReason> {
         match self {
             Self::Live => None,
+            Self::PrefixCachingRequired => Some(IneligibilityReason::PrefixCachingRequired),
             Self::ConsentVersion => Some(IneligibilityReason::ConsentVersion),
             Self::CircuitOpen => Some(IneligibilityReason::CircuitOpen),
             Self::AttestationPolicyNotReady => Some(IneligibilityReason::AttestationPolicy),
@@ -862,6 +865,14 @@ pub fn baseline_route_state(
         .is_none_or(|age| age > requirements.heartbeat_ttl_millis)
     {
         return BaselineRouteState::HeartbeatStale;
+    }
+    // The signed catalog's output-token pricing identifies generation routes.
+    // Use contract data so a heartbeat cannot evade this by hiding text capability.
+    if entry.contract.ref_rate_map.iter().chain(&entry.contract.rate_map)
+        .any(|rate| rate.unit == mayhem_proto::USAGE_OUTPUT_TOKEN)
+        && heartbeat.prefix_caching != Some(true)
+    {
+        return BaselineRouteState::PrefixCachingRequired;
     }
     if requirements.requires_transport_peer && heartbeat.transport_peer.is_none() {
         return BaselineRouteState::TransportPeerMissing;
@@ -1550,6 +1561,7 @@ mod tests {
     ) -> ProviderHeartbeat {
         let key = key_for(idx);
         ProviderHeartbeat {
+            prefix_caching: Some(true),
             t: "hb".to_owned(),
             v: crate::HEARTBEAT_SCHEMA_VERSION,
             contract_version: mayhem_proto::CONTRACT_VERSION,
@@ -1595,6 +1607,7 @@ mod tests {
     fn heartbeat(ts: u64, epoch: u64, head: &str) -> ProviderHeartbeat {
         let key = key();
         ProviderHeartbeat {
+            prefix_caching: Some(true),
             t: "hb".to_owned(),
             v: crate::HEARTBEAT_SCHEMA_VERSION,
             contract_version: mayhem_proto::CONTRACT_VERSION,
@@ -2240,6 +2253,30 @@ mod tests {
             .expect("attestation cache");
         assert_eq!(attestation.epoch, 8);
         assert_eq!(attestation.head, "33".repeat(32));
+    }
+
+    #[test]
+    fn prefix_caching_is_required_for_every_generation_provider() {
+        let now = 1_000_000;
+        let mut entry = entry_for(1, now, 0.2, 100);
+        let request = eligible_request(now + 1);
+        assert!(evaluate_eligibility(&entry, &request).is_ok());
+        for evidence in [None, Some(false)] {
+            entry.heartbeat.as_mut().unwrap().prefix_caching = evidence;
+            assert_eq!(evaluate_eligibility(&entry, &request),
+                Err(IneligibilityReason::PrefixCachingRequired));
+            // Withholding text in a heartbeat does not bypass the signed catalog.
+            entry.heartbeat.as_mut().unwrap().caps.served_modalities.clear();
+            assert_eq!(baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),
+                BaselineRouteState::PrefixCachingRequired);
+        }
+        entry.heartbeat.as_mut().unwrap().prefix_caching = Some(true);
+        assert_eq!(baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)), BaselineRouteState::Live);
+        // Media and embedding routes do not have an output-token tariff.
+        entry.heartbeat.as_mut().unwrap().prefix_caching = None;
+        entry.contract.rate_map.retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
+        entry.contract.ref_rate_map.retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
+        assert_eq!(baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)), BaselineRouteState::Live);
     }
 
     #[test]

@@ -63,7 +63,7 @@ class ObservationTests(unittest.IsolatedAsyncioTestCase):
                     "model_config": {name: getattr(args, name) for name in
                                      ("enforce_eager", "seed", "use_fp64_gumbel")},
                     "scheduler_config": {"async_scheduling": args.async_scheduling},
-                    "kernel_config": {}, "cache_config": {},
+                    "kernel_config": {}, "cache_config": {"enable_prefix_caching": args.enable_prefix_caching},
                     "compilation_config": getattr(args, "compilation_config", {}),
                     "parallel_config": {"world_size": test.world_size or args.tensor_parallel_size,
                                         "tensor_parallel_size": args.tensor_parallel_size,
@@ -97,6 +97,7 @@ class ObservationTests(unittest.IsolatedAsyncioTestCase):
             "import_attr": lambda candidates: Args if candidates[0][1] == "AsyncEngineArgs" else Engine,
             "configure_deterministic_runtime": lambda path: None,
             "model_uses_nvfp4": lambda path: False,
+            "model_uses_hybrid_attention": lambda path: False,
             "get_tokenizer": lambda: None,
             "model_ctx": lambda size: size,
             "vocab_size": lambda: 100,

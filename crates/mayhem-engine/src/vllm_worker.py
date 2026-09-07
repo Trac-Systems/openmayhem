@@ -608,6 +608,8 @@ def effective_execution_properties(initialized_engine, required_kwargs):
         "kv_cache_dtype": enum_value(
             config_value(config_value(config, "cache_config"), "cache_dtype")
         ),
+        "enable_prefix_caching": config_value(config_value(config, "cache_config"), "enable_prefix_caching"),
+        "mamba_cache_mode": config_value(config_value(config, "cache_config"), "mamba_cache_mode"),
     }
     if "compilation_config" in required_kwargs:
         compilation = config_value(config, "compilation_config")
@@ -911,6 +913,54 @@ def make_sampling_params(payload, speciality_sampling_kwargs=None):
     return SamplingParams(**required_sampling_kwargs(SamplingParams, kwargs, requested))
 
 
+def align_hybrid_prefill_args(args):
+    """Resolve vLLM's hybrid cache block before allocating scheduler buffers."""
+    if getattr(args, "mamba_cache_mode", None) != "align":
+        return
+
+    from vllm.config.cache import CacheConfig
+    from vllm.config.vllm import set_current_vllm_config
+    from vllm.platforms import current_platform
+    from vllm.v1.attention.selector import get_attn_backend
+
+    config = args.create_engine_config()
+    model = config.model_config
+    if not model.is_hybrid:
+        return
+    cache = config.cache_config
+    # Platform.update_block_size_for_backend needs instantiated attention layers.
+    # Use the same selector and page-size calculation with model metadata here,
+    # before the engine creates its buffers or maps the model weights.
+    with set_current_vllm_config(config):
+        backend = get_attn_backend(
+            head_size=model.get_head_size(),
+            dtype=model.dtype,
+            kv_cache_dtype=cache.cache_dtype,
+            use_mla=model.use_mla,
+            num_heads=model.get_num_attention_heads(config.parallel_config),
+        )
+        if not cache.user_specified_block_size:
+            cache.block_size = backend.get_preferred_block_size(
+                CacheConfig.DEFAULT_BLOCK_SIZE
+            )
+        current_platform._align_hybrid_block_size(config, backend)
+    block_size = cache.block_size
+    if not isinstance(block_size, int) or block_size <= 0:
+        raise ValueError("vLLM did not resolve a positive hybrid cache block size")
+    changes = {}
+    for name in ("max_num_batched_tokens", "long_prefill_token_threshold"):
+        previous = getattr(config.scheduler_config, name)
+        if previous < block_size and (name == "max_num_batched_tokens" or previous > 0):
+            setattr(args, name, block_size)
+            changes[name] = {"requested": previous, "effective": block_size}
+    if changes:
+        print(json.dumps({
+            "event": "prefix_cache_prefill_alignment",
+            "block_size": block_size,
+            "changes": changes,
+        }), file=sys.stderr, flush=True)
+
+
 def create_engine(payload):
     global execution_properties, kernel_policy
 
@@ -960,6 +1010,12 @@ def create_engine(payload):
         "use_fp64_gumbel",
         "async_scheduling",
     }
+    # Required for every provider, including models whose vLLM default is off.
+    kwargs["enable_prefix_caching"] = True
+    required_options.add("enable_prefix_caching")
+    if model_uses_hybrid_attention(path):
+        kwargs["mamba_cache_mode"] = "align"
+        required_options.add("mamba_cache_mode")
     if requested_compilation_config:
         kwargs["compilation_config"] = requested_compilation_config
         required_options.add("compilation_config")
@@ -1017,6 +1073,7 @@ def create_engine(payload):
         if name != "worker_extension_cls"
     })
     args = AsyncEngineArgs(**accepted_engine_kwargs)
+    align_hybrid_prefill_args(args)
     if hasattr(AsyncLLM, "from_engine_args"):
         initialized_engine = AsyncLLM.from_engine_args(args)
     else:
@@ -1345,6 +1402,14 @@ def prepare_generation_request(request_id, payload):
     }
 
 
+def log_prefix_cache_request(request_id, prompt_tokens, cached_tokens):
+    import json
+    import sys
+    print(json.dumps({"event": "prefix_cache_request", "request_id": request_id,
+        "prompt_tokens": prompt_tokens, "cached_tokens": cached_tokens}),
+        file=sys.stderr, flush=True)
+
+
 async def async_handle_generate(request_id, payload):
     prepared = await asyncio.to_thread(prepare_generation_request, request_id, payload)
     check_cancelled(request_id)
@@ -1368,6 +1433,7 @@ async def async_handle_generate(request_id, payload):
     reasoning_tokens = 0
     reasoning_active = prepared["reasoning_active"]
     actual_prompt_tokens = len(prompt_tokens)
+    cached_prompt_tokens = 0
     multiplexer = generation_multiplexer
     if multiplexer is not None:
         multiplexer.engine_started(request_id)
@@ -1381,6 +1447,7 @@ async def async_handle_generate(request_id, payload):
                 await abort_engine_request(request_id)
                 raise RequestCancelled("engine request cancelled")
             output_prompt_ids = getattr(output, "prompt_token_ids", None)
+            cached_prompt_tokens = max(cached_prompt_tokens, int(getattr(output, "num_cached_tokens", 0) or 0))
             if output_prompt_ids is not None:
                 actual_prompt_tokens = max(actual_prompt_tokens, len(output_prompt_ids))
             for completion in getattr(output, "outputs", []) or []:
@@ -1419,6 +1486,8 @@ async def async_handle_generate(request_id, payload):
             multiplexer.engine_stopped(request_id)
 
     check_cancelled(request_id)
+
+    log_prefix_cache_request(request_id, actual_prompt_tokens, cached_prompt_tokens)
 
     if completion_tokens == 0 and text:
         completion_tokens = 1
@@ -1495,6 +1564,7 @@ async def handle_load(payload):
         "n_vocab": int(vocab_size()),
         "kv_cache_size_tokens": kv_cache["size_tokens"],
         "kv_cache_max_concurrency": kv_cache["max_concurrency"],
+        "prefix_caching": config_value(config_value(engine.vllm_config, "cache_config"), "enable_prefix_caching") is True,
         "execution": execution_properties,
         "determinism": {
             "async_scheduling": False,

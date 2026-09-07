@@ -217,6 +217,9 @@ pub struct VerifiedAttestation {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ProviderHeartbeat {
+    /// Signed runtime observation; legacy/missing evidence is not eligible for LLM serving.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prefix_caching: Option<bool>,
     pub t: String,
     pub v: u32,
     pub contract_version: u32,
@@ -3475,6 +3478,25 @@ mod tests {
         })
         .expect_err("tampered heartbeat must fail");
         assert!(matches!(err, GatewayError::BadHeartbeatSignature { .. }));
+    }
+
+    #[test]
+    fn prefix_cache_heartbeat_evidence_is_signed_and_legacy_is_unknown() {
+        let key = SigningKey::from_bytes(&[77_u8; 32]);
+        let provider = hex::encode(key.verifying_key().to_bytes());
+        let now = 1_800_000_000_000;
+        let mut heartbeat = signed_heartbeat(&key, &provider, now, "ab");
+        assert_eq!(serde_json::from_value::<ProviderHeartbeat>(heartbeat.clone()).unwrap().prefix_caching, None);
+        heartbeat["prefix_caching"] = json!(true);
+        assert!(matches!(verify_heartbeat_signature(&heartbeat, &provider, heartbeat["sig"].as_str().unwrap()),
+            Err(GatewayError::BadHeartbeatSignature { .. })));
+        let mut body = heartbeat.clone();
+        body.as_object_mut().unwrap().remove("sig");
+        heartbeat["sig"] = json!(hex::encode(key.sign(&heartbeat_signing_payload(&body).unwrap()).to_bytes()));
+        verify_heartbeat_signature(&heartbeat, &provider, heartbeat["sig"].as_str().unwrap()).unwrap();
+        assert_eq!(serde_json::from_value::<ProviderHeartbeat>(heartbeat.clone()).unwrap().prefix_caching, Some(true));
+        heartbeat["prefix_caching"] = json!(false);
+        assert!(verify_heartbeat_signature(&heartbeat, &provider, heartbeat["sig"].as_str().unwrap()).is_err());
     }
 
     #[test]

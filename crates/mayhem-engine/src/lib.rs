@@ -1524,6 +1524,10 @@ pub enum ComponentRecovery {
 pub trait EngineBackend {
     fn backend_id(&self) -> &'static str;
     fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo>;
+    /// True only after the backend has initialized required prefix reuse.
+    fn prefix_caching_enabled(&self) -> bool {
+        false
+    }
     fn loaded_backend_evidence(&self) -> Option<Value> {
         None
     }
@@ -2205,14 +2209,14 @@ fn validate_load_config(config: &LoadConfig) -> Result<()> {
             "vllm_concurrent_generation_capacity cannot exceed vllm_max_num_seqs".to_owned(),
         ));
     }
-    if config.vllm_worker_address_space_limit_bytes.is_some()
-        && config.vllm_generation_topology != Some(VllmGenerationTopology::IsolatedWorkers)
-    {
+    if config.vllm_worker_address_space_limit_bytes
+        .is_some_and(|bytes| bytes < 1024 || bytes > i64::MAX as u64) {
         return Err(EngineError::InvalidConfig(
-            "vllm_worker_address_space_limit_bytes requires isolated vLLM workers".to_owned(),
+            "vllm_worker_address_space_limit_bytes must be a finite limit of at least 1024 bytes".to_owned(),
         ));
     }
     let has_vllm_execution_properties = config.vllm_generation_topology.is_some()
+        || config.vllm_worker_address_space_limit_bytes.is_some()
         || config.vllm_enforce_eager.is_some()
         || config.vllm_compilation_mode.is_some()
         || config.vllm_cudagraph_mode.is_some()
@@ -5736,6 +5740,8 @@ cp "{}" "$out"
 
 #[cfg(feature = "llama-cpp")]
 mod llama_cpp_backend {
+    mod prefix_cache;
+    use prefix_cache::PrefixCache;
     use base64::{engine::general_purpose, Engine as _};
     use encoding_rs::UTF_8;
     use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams, LlamaPoolingType};
@@ -5784,6 +5790,7 @@ mod llama_cpp_backend {
         loaded: Option<LoadedModelInfo>,
         config: Option<LoadConfig>,
         media_python: PathBuf,
+        prefix_cache: std::sync::Mutex<PrefixCache>,
     }
 
     impl LlamaCppBackend {
@@ -5807,6 +5814,7 @@ mod llama_cpp_backend {
                 loaded: None,
                 config: None,
                 media_python: python.as_ref().to_path_buf(),
+                prefix_cache: std::sync::Mutex::new(PrefixCache::from_env()?),
             })
         }
 
@@ -5816,6 +5824,17 @@ mod llama_cpp_backend {
 
         fn config(&self) -> Result<&LoadConfig> {
             self.config.as_ref().ok_or(EngineError::NotLoaded)
+        }
+
+        /// Test/embedding cache budget; provider admission rejects disabled caching.
+        pub fn set_prefix_cache_limit(&mut self, max_bytes: usize) {
+            *self.prefix_cache.get_mut().unwrap_or_else(|p| p.into_inner()) =
+                PrefixCache::new(max_bytes);
+        }
+
+        /// Last text request's total and reused prompt tokens, for runtime checks.
+        pub fn prefix_cache_tokens(&self) -> (usize, usize) {
+            self.prefix_cache.lock().unwrap_or_else(|p| p.into_inner()).last_tokens()
         }
     }
 
@@ -5883,6 +5902,7 @@ mod llama_cpp_backend {
         }
 
         fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
+            self.prefix_cache.get_mut().unwrap_or_else(|p| p.into_inner()).clear();
             validate_load_config(&config)?;
             if config.artifact.format != ArtifactFormat::Gguf {
                 return Err(EngineError::InvalidConfig(format!(
@@ -5952,6 +5972,11 @@ mod llama_cpp_backend {
             Ok(info)
         }
 
+        fn prefix_caching_enabled(&self) -> bool {
+            self.loaded.is_some()
+                && self.prefix_cache.lock().unwrap_or_else(|p| p.into_inner()).enabled()
+        }
+
         fn tokenize(&self, text: &str) -> Result<Tokenization> {
             let tokens = self.model()?.str_to_token(text, AddBos::Always)?;
             Ok(Tokenization {
@@ -5996,15 +6021,30 @@ mod llama_cpp_backend {
                 });
             }
 
-            let batch_ranges = llama_prompt_batch_ranges(prompt_tokens.len(), ctx.n_batch())?;
+            let (cached_tokens, capture_len) = {
+                let mut cache = self.prefix_cache.lock().unwrap_or_else(|p| p.into_inner());
+                let batch_size = ctx.n_batch() as usize;
+                let cached = cache.restore(&mut ctx, &prompt_tokens, batch_size)?;
+                (cached, cache.capture_len().max(cached))
+            };
+            let last_prompt_index = prompt_tokens.len().checked_sub(1).ok_or_else(|| {
+                EngineError::InvalidConfig("llama.cpp prompt tokenization produced no tokens".into())
+            })?;
+            let mut batch_ranges = Vec::new();
+            for (start, end) in [(cached_tokens, capture_len), (capture_len, last_prompt_index)] {
+                if end > start {
+                    batch_ranges.extend(llama_prompt_batch_ranges(end - start, ctx.n_batch())?
+                        .into_iter().map(|range| start + range.start..start + range.end));
+                }
+            }
             let batch_capacity = batch_ranges
                 .iter()
                 .map(|range| range.len())
                 .max()
                 .unwrap_or(1);
             let mut batch = LlamaBatch::new(batch_capacity, 1);
-            let last_prompt_index = prompt_tokens.len().saturating_sub(1);
             for range in batch_ranges {
+                let end = range.end;
                 cancellation.check()?;
                 batch.clear();
                 for index in range {
@@ -6019,7 +6059,20 @@ mod llama_cpp_backend {
                 }
                 ctx.decode(&mut batch)?;
                 cancellation.check()?;
+                if end == capture_len && capture_len > cached_tokens {
+                    self.prefix_cache.lock().unwrap_or_else(|p| p.into_inner())
+                        .save(&ctx, &prompt_tokens[..capture_len])?;
+                }
             }
+
+            eprintln!("prefix_cache backend=llama.cpp prompt_tokens={} cached_tokens={}",
+                prompt_tokens.len(), cached_tokens);
+            cancellation.check()?;
+            batch.clear();
+            batch.add(prompt_tokens[last_prompt_index], i32::try_from(last_prompt_index)
+                .map_err(|err| EngineError::InvalidConfig(format!("prompt position overflow: {err}")))?, &[0], true)?;
+            ctx.decode(&mut batch)?;
+            cancellation.check()?;
 
             let mut sampler = make_sampler(model, &request)?;
             let mut decoder = UTF_8.new_decoder();
@@ -8066,6 +8119,7 @@ mod vllm_backend {
         loaded: Option<LoadedModelInfo>,
         next_id: Arc<AtomicU64>,
         memory_limit_bytes: Option<u64>,
+        worker_address_space_limit_bytes: Option<u64>,
         cache_root: Option<PathBuf>,
         generation_gate: Arc<RwLock<()>>,
         generation_epoch: Arc<AtomicU64>,
@@ -8097,6 +8151,7 @@ mod vllm_backend {
                 loaded: None,
                 next_id: Arc::new(AtomicU64::new(1)),
                 memory_limit_bytes: None,
+                worker_address_space_limit_bytes: None,
                 cache_root: None,
                 generation_gate: Arc::new(RwLock::new(())),
                 generation_epoch: Arc::new(AtomicU64::new(0)),
@@ -8134,12 +8189,17 @@ mod vllm_backend {
                 }
             }
             self.reset_worker();
-            let worker = Arc::new(VllmWorker::spawn(
-                &self.python,
-                self.memory_limit_bytes,
-                self.cache_root.as_deref(),
-                execution_probe,
-            )?);
+            let worker = Arc::new(if let Some(address_limit) = self.worker_address_space_limit_bytes {
+                VllmWorker::spawn_isolated(
+                    &self.python, self.memory_limit_bytes, address_limit,
+                    self.cache_root.as_deref(), execution_probe,
+                )?
+            } else {
+                VllmWorker::spawn(
+                    &self.python, self.memory_limit_bytes,
+                    self.cache_root.as_deref(), execution_probe,
+                )?
+            });
             self.worker = Some(Arc::clone(&worker));
             Ok(worker)
         }
@@ -8247,6 +8307,7 @@ mod vllm_backend {
                         "isolated vLLM load exhausted utilization attempts".to_owned(),
                     )
                 })?;
+                validate_vllm_prefix_caching(&info)?;
                 validate_vllm_execution_report(config, info.execution.as_ref())?;
                 let tokens = info.kv_cache_size_tokens.ok_or_else(|| {
                     EngineError::InvalidConfig(format!(
@@ -8564,7 +8625,12 @@ mod vllm_backend {
                 .generation_epoch
                 .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1);
+            if self.memory_limit_bytes != config.memory_limit_bytes
+                || self.worker_address_space_limit_bytes != config.vllm_worker_address_space_limit_bytes {
+                self.reset_worker();
+            }
             self.memory_limit_bytes = config.memory_limit_bytes;
+            self.worker_address_space_limit_bytes = config.vllm_worker_address_space_limit_bytes;
             self.cache_root = config.backend_cache_dir.clone();
 
             self.reset_isolated_workers();
@@ -8622,7 +8688,8 @@ mod vllm_backend {
                 EngineError::Vllm("vLLM load exhausted memory-utilization attempts".to_owned())
             })?;
             let has_explicit_execution_profile = has_explicit_vllm_execution_properties(&config);
-            if let Err(error) = validate_vllm_execution_report(&config, info.execution.as_ref()) {
+            if let Err(error) = validate_vllm_prefix_caching(&info)
+                .and_then(|()| validate_vllm_execution_report(&config, info.execution.as_ref())) {
                 self.reset_worker();
                 return Err(error);
             }
@@ -8747,6 +8814,7 @@ mod vllm_backend {
                 let info = recovery.loading.take().unwrap().join().map_err(|_| {
                     EngineError::Vllm("isolated worker recovery task panicked".to_owned())
                 })??;
+                validate_vllm_prefix_caching(&info)?;
                 let index = recovery.index;
                 let evidence = &self.loaded_per_worker[index];
                 let loaded = self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
@@ -8858,6 +8926,10 @@ mod vllm_backend {
                 .collect()
         }
 
+        fn prefix_caching_enabled(&self) -> bool {
+            self.loaded.is_some()
+        }
+
         fn loaded_backend_evidence(&self) -> Option<Value> {
             self.loaded.as_ref()?;
             let mut evidence = json!({
@@ -8936,6 +9008,8 @@ mod vllm_backend {
     #[derive(Debug, Deserialize)]
     struct WorkerLoadInfo {
         #[serde(default)]
+        prefix_caching: bool,
+        #[serde(default)]
         n_ctx_train: u32,
         #[serde(default)]
         n_vocab: i32,
@@ -8990,6 +9064,13 @@ mod vllm_backend {
     struct WorkerDeterminismInfo {
         #[serde(default)]
         batch_invariant: Option<bool>,
+    }
+
+    fn validate_vllm_prefix_caching(info: &WorkerLoadInfo) -> Result<()> {
+        if !info.prefix_caching {
+            return Err(EngineError::Vllm("vLLM worker did not confirm mandatory prefix caching".into()));
+        }
+        Ok(())
     }
 
     fn validate_vllm_execution_report(
@@ -10676,6 +10757,9 @@ namespace = {"asyncio": asyncio, "copy": copy, "inspect": inspect}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "vllm_worker.py", "exec"), namespace)
 namespace["configure_deterministic_runtime"] = lambda path: None
 namespace["model_uses_nvfp4"] = lambda path: nvfp4
+namespace["model_uses_hybrid_attention"] = lambda path: hybrid
+namespace["align_hybrid_prefill_args"] = lambda args: None
+hybrid = False
 
 class Backend(Enum):
     AUTO = "auto"
@@ -10721,7 +10805,9 @@ def initialize(args):
             "moe_backend": getattr(args, "moe_backend", "triton"),
         },
         "scheduler_config": {"async_scheduling": args.async_scheduling},
-        "cache_config": {"cache_dtype": getattr(args, "kv_cache_dtype", "auto")},
+        "cache_config": {"cache_dtype": getattr(args, "kv_cache_dtype", "auto"),
+                         "enable_prefix_caching": args.enable_prefix_caching,
+                         "mamba_cache_mode": getattr(args, "mamba_cache_mode", None)},
         "speculative_config": getattr(args, "speculative_config", None),
         "compilation_config": getattr(args, "compilation_config", {}),
     }
@@ -10786,6 +10872,18 @@ def rejects(payload, message):
     assert namespace["execution_properties"] is None
     assert len(shutdowns) == before + 1, "rejected engine was not shut down"
 
+for disabled in (False, None, 1):
+    mutate = lambda config, args: config["cache_config"].update(enable_prefix_caching=disabled)
+    rejects(profile, "enable_prefix_caching")
+hybrid = True
+mutate = lambda config, args: None
+create_engine(profile)
+assert received_kwargs[-1]["mamba_cache_mode"] == "align"
+mutate = lambda config, args: config["cache_config"].update(mamba_cache_mode="none")
+rejects(profile, "mamba_cache_mode")
+hybrid = False
+mutate = lambda config, args: None
+
 for section, name, value, message in [
     ("model_config", "enforce_eager", True, "enforce_eager"),
     ("model_config", "enforce_eager", None, "enforce_eager"),
@@ -10813,7 +10911,7 @@ for section, name, value, message in [
 for section, message in [("model_config", "enforce_eager"),
                          ("kernel_config", "backend"),
                          ("scheduler_config", "async_scheduling"),
-                         ("cache_config", "kv_cache_dtype"),
+                         ("cache_config", "enable_prefix_caching"),
                          ("speculative_config", "num_speculative_tokens")]:
     mutate = lambda config, args: config.pop(section)
     rejects(profile, message)
@@ -11051,7 +11149,7 @@ print("ok")
                 &python,
                 r#"#!/bin/sh
 read load_request
-printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000}}'
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"prefix_caching":true,"n_ctx_train":4096,"n_vocab":32000}}'
 read first_generate
 printf '%s\n' '{"id":2,"type":"token","chunk":{"index":0,"token_id":10,"text":"first"}}'
 printf '%s\n' '{"id":2,"type":"response","ok":true,"result":{"text":"first","usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"finish_reason":"stop"}}'
@@ -11121,7 +11219,7 @@ printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"second","us
                 &python,
                 r#"#!/bin/sh
 read load_request
-printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000}}'
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"prefix_caching":true,"n_ctx_train":4096,"n_vocab":32000}}'
 read first_generate
 read first_cancel
 printf '%s\n' '{"id":2,"type":"response","cancelled":true}'
@@ -11190,7 +11288,7 @@ printf '%s\n' '{"id":3,"type":"response","ok":true,"result":{"text":"second","us
             fs::create_dir_all(model.parent().expect("model parent")).unwrap();
             let script = r#"#!/bin/sh
 read load_request
-printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"kv_cache_size_tokens":12288,"determinism":{"batch_invariant":false}}}'
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"prefix_caching":true,"n_ctx_train":4096,"n_vocab":32000,"kv_cache_size_tokens":12288,"determinism":{"batch_invariant":false}}}'
 read first_generate
 : > "__FIRST_SEEN__"
 read second_generate
@@ -11286,7 +11384,7 @@ read shutdown
             fs::create_dir_all(model.parent().expect("model parent")).unwrap();
             let script = r#"#!/bin/sh
 read load_request
-printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"kv_cache_size_tokens":8192}}'
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"prefix_caching":true,"n_ctx_train":4096,"n_vocab":32000,"kv_cache_size_tokens":8192}}'
 read first_generate
 : > "__FIRST_SEEN__"
 read second_generate
@@ -11372,7 +11470,7 @@ read shutdown
             fs::create_dir_all(model.parent().expect("model parent")).unwrap();
             let script = r#"#!/bin/sh
 read load_request
-printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"determinism":{"batch_invariant":true}}}'
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"prefix_caching":true,"n_ctx_train":4096,"n_vocab":32000,"determinism":{"batch_invariant":true}}}'
 read first_generate
 : > "__FIRST_SEEN__"
 sleep 1
@@ -11452,7 +11550,7 @@ read shutdown
             fs::create_dir_all(model.parent().expect("model parent")).unwrap();
             let script = r#"#!/bin/sh
 read load_request
-printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"kv_cache_size_tokens":6144}}'
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"prefix_caching":true,"n_ctx_train":4096,"n_vocab":32000,"kv_cache_size_tokens":6144}}'
 read shutdown
 "#;
             write_fake_vllm_worker(&python, &model, script);
@@ -11492,7 +11590,7 @@ read shutdown
             fs::create_dir_all(model.parent().expect("model parent")).unwrap();
             let script = r#"#!/bin/sh
 read load_request
-printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000}}'
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"prefix_caching":true,"n_ctx_train":4096,"n_vocab":32000}}'
 "#;
             write_fake_vllm_worker(&python, &model, script);
 
@@ -11915,7 +12013,7 @@ printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,
             let model = root.join("checkpoint/model.safetensors");
             let script = r#"#!/bin/sh
 read load_request
-printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"execution":{"vllm_enforce_eager":true}}}'
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"prefix_caching":true,"n_ctx_train":4096,"n_vocab":32000,"execution":{"vllm_enforce_eager":true}}}'
 read shutdown
 "#;
             fs::create_dir_all(python.parent().unwrap()).unwrap();
@@ -11952,7 +12050,7 @@ read shutdown
                     "vllm_mtp_num_speculative_tokens": null,
                 })),
             ] {
-                let mut result = json!({"n_ctx_train": 4096, "n_vocab": 32000});
+                let mut result = json!({"prefix_caching": true, "n_ctx_train": 4096, "n_vocab": 32000});
                 if let Some(execution) = execution {
                     result["execution"] = execution;
                 }
@@ -11994,7 +12092,7 @@ read shutdown
             let model = root.join("checkpoint/model.safetensors");
             let script = r#"#!/bin/sh
 read load_request
-printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000,"execution":{"vllm_enforce_eager":false,"vllm_linear_backend":"auto","vllm_moe_backend":"cutlass","vllm_mtp_num_speculative_tokens":4}}}'
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"prefix_caching":true,"n_ctx_train":4096,"n_vocab":32000,"execution":{"vllm_enforce_eager":false,"vllm_linear_backend":"auto","vllm_moe_backend":"cutlass","vllm_mtp_num_speculative_tokens":4}}}'
 read shutdown
 "#;
             fs::create_dir_all(python.parent().expect("python parent")).unwrap();
@@ -12056,7 +12154,7 @@ if [ ! -f "__STATE__" ]; then
   : > "__STATE__"
   printf '%s\n' '{"id":1,"type":"response","ok":false,"error":"CUDA out of memory"}'
 else
-  printf '%s\n' '{"id":2,"type":"response","ok":true,"result":{"n_ctx_train":4096,"n_vocab":32000}}'
+  printf '%s\n' '{"id":2,"type":"response","ok":true,"result":{"prefix_caching":true,"n_ctx_train":4096,"n_vocab":32000}}'
 fi
 "#
             .replace("__STATE__", &state.display().to_string())
