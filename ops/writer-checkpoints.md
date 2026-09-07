@@ -1,6 +1,6 @@
 # Writer settlement and paid checkpoints
 
-Core v0.2.174 introduced contract revision 22; v0.2.175 retains that contract. Upgrade all participating peers before
+Core v0.2.174 introduced contract revision 22; v0.2.176 retains that contract. The peer reads checkpoint environment settings in both Node and Pear/Bare. Upgrade all participating peers before
 enabling the new writer operations. Keep the existing wallet, stores, model
 configuration, catalog and economic parameters.
 

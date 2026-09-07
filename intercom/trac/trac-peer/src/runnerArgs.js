@@ -1,3 +1,5 @@
+import process from "process";
+
 export const toArgMap = (argv) => {
   const out = {};
   for (let i = 0; i < argv.length; i++) {
@@ -35,4 +37,3 @@ export const getPearRuntime = () => {
 
   return { argv, env, storeLabel, flags };
 };
-
