@@ -18757,6 +18757,8 @@ fn calibration_endpoint_attribute_is_handled(
                 | "negative_prompt"
                 | "steps"
                 | "cfg_scale"
+                | "input_reference"
+                | "strength"
                 | "shift"
                 | "seed"
                 | "scheduler"
@@ -25244,6 +25246,13 @@ fn calibrate_image_perceptual_hash_prompt(
     _include_output: bool,
 ) -> Result<CanaryCalibrationPromptReport> {
     let mut request = EngineImageGenerationRequest::new(canary_prompt_text(prompt)?);
+    request.input_reference = prompt.endpoint_attributes.get("input_reference")
+        .and_then(Value::as_str).map(str::to_owned);
+    request.strength = prompt.endpoint_attributes.get("strength")
+        .and_then(Value::as_f64).map(|value| value as f32);
+    request.negative_prompt = prompt.negative_prompt.as_ref().and_then(Value::as_str).map(str::to_owned);
+    let reference = request.input_reference.as_deref().map(mayhem_proto::image_reference_metadata)
+        .transpose().map_err(anyhow::Error::msg)?;
     request.seed = Some(prompt.seed.unwrap_or(seed));
     request.image_count = 1;
     if let Some((width, height)) = prompt
@@ -25288,8 +25297,10 @@ fn calibrate_image_perceptual_hash_prompt(
         CanaryCalibrationResourceItem {
             unit: "pixel".to_owned(),
             item_count: 1,
-            item_bytes: u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX),
-            item_units: u64::from(width).saturating_mul(u64::from(height)),
+            item_bytes: u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX)
+                .max(reference.map_or(0, |image| image.bytes)),
+            item_units: u64::from(width).saturating_mul(u64::from(height))
+                .max(reference.map_or(0, |image| image.pixels)),
         },
     )]);
     Ok(CanaryCalibrationPromptReport {
@@ -81030,13 +81041,18 @@ fn provider_session_modality_load(
             let request = provider_session_request_result(
                 provider_image_generation_request_from_body(family, body),
             )?;
+            let reference = provider_session_request_result(
+                request.input_reference.as_deref().map(mayhem_proto::image_reference_metadata)
+                    .transpose().map_err(anyhow::Error::msg),
+            )?;
             Ok(BTreeMap::from([(
                 "image".to_owned(),
                 ModalityRequestLoad {
                     item_count: request.image_count,
-                    max_item_bytes: 1,
+                    max_item_bytes: reference.map_or(1, |image| image.bytes),
                     max_item_units: u64::from(request.width)
-                        .saturating_mul(u64::from(request.height)),
+                        .saturating_mul(u64::from(request.height))
+                        .max(reference.map_or(0, |image| image.pixels)),
                 },
             )]))
         }
@@ -85411,6 +85427,9 @@ fn provider_canary_self_test_body(
                 ("cfg_scale", prompt.cfg_scale.map(Value::from)),
                 ("shift", prompt.shift.map(Value::from)),
                 ("seed", prompt.seed.map(Value::from)),
+                ("negative_prompt", prompt.negative_prompt.clone()),
+                ("input_reference", prompt.endpoint_attributes.get("input_reference").cloned()),
+                ("strength", prompt.endpoint_attributes.get("strength").cloned()),
             ] {
                 if let Some(value) = value {
                     object.insert(name.to_owned(), value);
@@ -90835,6 +90854,14 @@ fn provider_image_generation_request_from_body(
         provider_image_generation_size(body)?
     };
     let mut request = EngineImageGenerationRequest::new(prompt);
+    request.input_reference = body
+        .get("input_reference")
+        .map(|value| value.as_str().map(str::to_owned).context("input_reference must be a data URL string"))
+        .transpose()?;
+    request.strength = body
+        .get("strength")
+        .map(|value| value.as_f64().map(|value| value as f32).context("strength must be a number"))
+        .transpose()?;
     request.image_count = image_count;
     request.steps = u32::try_from(steps).context("image_generation steps overflowed u32")?;
     request.guidance_scale = cfg_scale;
@@ -113238,6 +113265,24 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(explicit["steps"], 9);
         assert_eq!(explicit["cfg_scale"], 0.0);
         assert_eq!(explicit["seed"], 11);
+        let reference = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(
+            include_bytes!("../../mayhem-engine/tests/fixtures/reference.png"),
+        ));
+        let reference_prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "reference", "prompt": "a compass on a map", "input_reference": reference,
+            "strength": 0.6, "negative_prompt": "blur", "cfg_scale": 1.0,
+        })).unwrap();
+        let body = provider_canary_self_test_body(&model, &reference_prompt).unwrap();
+        let mut sealed = provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+        provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter).unwrap();
+        let request = provider_image_generation_request_from_body(
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS, &sealed["contract_request"],
+        ).unwrap();
+        assert_eq!(request.input_reference.as_deref(), Some(reference.as_str()));
+        assert_eq!(request.strength, Some(0.6));
+        assert_eq!(request.negative_prompt.as_deref(), Some("blur"));
+        sealed["contract_request"]["strength"] = json!(0.7);
+        assert!(provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter).is_err());
     }
 
     #[test]
@@ -113965,6 +114010,35 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             mayhem_proto::generate_endpoint_calibration_cases(contract)
                 .unwrap_or_else(|error| panic!("{}: {error}", contract.family));
         }
+    }
+
+    #[test]
+    fn candidate_z_image_reference_endpoint_calibration_is_complete() {
+        let catalog = catalog::load_document(&repo_path("catalog/models.json").unwrap()).unwrap();
+        let mut model = catalog.models.iter().find(|model| model.model_id == "tongyi/z-image-turbo").unwrap().clone();
+        let family = mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS;
+        let template = mayhem_proto::endpoint_family_contract_template(family).unwrap();
+        let contract = model.adapter.endpoint_families.iter_mut().find(|contract| contract.family == family).unwrap();
+        for name in ["input_reference", "strength"] {
+            contract.request_attributes.push(name.to_owned());
+            contract.request_attribute_specs.insert(name.to_owned(), template.request_attribute_specs[name].clone());
+        }
+        let reference = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(
+            include_bytes!("../../mayhem-engine/tests/fixtures/reference.png"),
+        ));
+        let prompts: Vec<CanaryPrompt> = vec![serde_json::from_value(json!({
+            "id": "image-reference-p1", "prompt": "A sculpture", "input_reference": reference,
+            "strength": 0.6, "size": "1024x1024", "steps": 9, "cfg_scale": 0.0,
+        })).unwrap()];
+        catalog_endpoint_calibration_preflight(&model, &prompts).unwrap();
+        let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![ArtifactChunk {
+            artifact_id: "image-1".to_owned(), index: 0, content_type: "image/png".to_owned(),
+            bytes: include_bytes!("../../mayhem-engine/tests/fixtures/reference.png").to_vec(), final_chunk: true,
+        }]).with_repeated_image_artifact();
+        let (artifact_name, artifact) = model.artifacts.iter().next().unwrap();
+        let report = catalog_endpoint_calibration_report(&mut backend, &model, artifact_name, artifact, &prompts, None);
+        let failures = report.families.iter().flat_map(|family| &family.cases).filter(|case| !case.ok).collect::<Vec<_>>();
+        assert!(report.ok, "{failures:#?}");
     }
 
     #[test]
@@ -115689,6 +115763,42 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         .unwrap_err()
         .to_string()
         .contains("signed image endpoint defaults did not resolve size"));
+    }
+
+    #[test]
+    fn provider_image_reference_preserves_bytes_strength_and_admission_load() {
+        let family = mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS;
+        let contract = mayhem_proto::endpoint_family_contract_template(family).unwrap();
+        let reference = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(
+            include_bytes!("../../mayhem-engine/tests/fixtures/reference.png"),
+        ));
+        let mut body = json!({
+            "prompt": "a blue sculpture", "n": 1, "width": 64, "height": 64,
+            "steps": 9, "cfg_scale": 0.0, "input_reference": reference, "strength": 0.6,
+        });
+        let request = provider_image_generation_request_from_body(family, &body).unwrap();
+        assert_eq!(request.input_reference.as_deref(), Some(reference.as_str()));
+        assert_eq!(request.strength, Some(0.6));
+        let load = provider_session_modality_load(
+            &contract, family, &body, &json!({"kind": "image_generation"}), None, &["image".to_owned()],
+        ).unwrap();
+        assert_eq!(load["image"].item_count, 1);
+        assert_eq!(load["image"].max_item_units, 64 * 64);
+        assert_eq!(load["image"].max_item_bytes, mayhem_proto::image_reference_metadata(&reference).unwrap().bytes);
+
+        for invalid in [json!({"image_url": reference}), json!("https://example.test/image.png"), json!(null)] {
+            body["input_reference"] = invalid;
+            assert!(provider_image_generation_request_from_body(family, &body).is_err());
+        }
+        body["input_reference"] = json!(reference);
+        for invalid in [json!("0.6"), json!(1.01), json!(-0.01), json!(null)] {
+            body["strength"] = invalid;
+            assert!(provider_image_generation_request_from_body(family, &body).is_err());
+        }
+        body.as_object_mut().unwrap().remove("strength");
+        assert!(provider_image_generation_request_from_body(family, &body).is_err());
+        body.as_object_mut().unwrap().remove("input_reference");
+        assert!(provider_image_generation_request_from_body(family, &body).is_ok());
     }
 
     #[test]
@@ -124600,6 +124710,29 @@ State initialization...
         assert_eq!(request.step_count, Some(50));
         assert_eq!(request.request["guidance_scale"], 7.0);
         assert_eq!(request.request["seed"], 99);
+    }
+
+    #[test]
+    fn image_reference_canary_calibration_preserves_input_and_negative_prompt() {
+        let bytes = include_bytes!("../../mayhem-engine/tests/fixtures/reference.png").to_vec();
+        let reference = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
+        let prompt: CanaryPrompt = serde_json::from_value(json!({
+            "id": "image-reference-p1", "prompt": "A blue sculpture", "input_reference": reference,
+            "strength": 0.6, "negative_prompt": "blur", "cfg_scale": 1.0, "steps": 9,
+            "seed": 7, "size": "64x64",
+        })).unwrap();
+        let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![ArtifactChunk {
+            artifact_id: "image-1".to_owned(), index: 0, content_type: "image/png".to_owned(),
+            bytes: bytes.clone(), final_chunk: true,
+        }]);
+        let report = calibrate_image_perceptual_hash_prompt(&mut backend, &prompt, 42, false).unwrap();
+        let request = backend.last_image_request.unwrap();
+        assert_eq!(request.input_reference.as_deref(), Some(reference.as_str()));
+        assert_eq!(request.strength, Some(0.6));
+        assert_eq!(request.negative_prompt.as_deref(), Some("blur"));
+        assert_eq!(request.seed, Some(7));
+        assert_eq!(report.resource_items["image"].item_bytes, bytes.len() as u64);
+        assert_eq!(report.resource_items["image"].item_units, 48);
     }
 
     #[test]

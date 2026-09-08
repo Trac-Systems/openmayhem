@@ -2385,6 +2385,10 @@ pub struct ImageGenerationRequest {
     pub model: String,
     pub prompt: String,
     #[serde(default)]
+    pub input_reference: Option<String>,
+    #[serde(default)]
+    pub strength: Option<f64>,
+    #[serde(default)]
     pub background: Option<String>,
     #[serde(default)]
     pub moderation: Option<String>,
@@ -10959,6 +10963,8 @@ fn hf_image_generation_request(
         ));
     }
     Ok(ImageGenerationRequest {
+        input_reference: None,
+        strength: None,
         model: model_id.to_owned(),
         prompt,
         background: None,
@@ -17507,6 +17513,8 @@ fn direct_session_image_generation_request_body(request: &ImageGenerationRequest
             .expect("validated image request has an admin-signed response format"),
         "endpoint_family": image_generation_endpoint_family(request),
     });
+    set_optional_json(&mut body, "input_reference", request.input_reference.as_ref().map(|value| json!(value)));
+    set_optional_json(&mut body, "strength", request.strength.map(|value| json!(value)));
     set_optional_json(
         &mut body,
         "background",
@@ -27803,6 +27811,9 @@ fn request_requirements_for_image_generation(
     let (width, height) = parse_image_generation_size(request)
         .expect("validated image request has admin-signed dimensions");
     let image_count = image_generation_count(request);
+    let reference = request.input_reference.as_deref()
+        .map(mayhem_proto::image_reference_metadata).transpose()
+        .expect("validated image reference has bounded content");
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
         requires_transport_peer: !state.dev_session_shim,
@@ -27818,8 +27829,9 @@ fn request_requirements_for_image_generation(
             "image".to_owned(),
             ModalityRequestLoad {
                 item_count: image_count,
-                max_item_bytes: 1,
-                max_item_units: u64::from(width).saturating_mul(u64::from(height)),
+                max_item_bytes: reference.map_or(1, |image| image.bytes),
+                max_item_units: u64::from(width).saturating_mul(u64::from(height))
+                    .max(reference.map_or(0, |image| image.pixels)),
             },
         )]),
         // Artifact endpoints bound prompt size through their calibrated endpoint
@@ -34935,6 +34947,11 @@ fn canary_image_generation_request(
         "model": model.id,
         "prompt": canary_image_prompt_text(prompt),
     });
+    for name in ["input_reference", "strength", "negative_prompt"] {
+        if let Some(value) = prompt.endpoint_attributes.get(name) {
+            raw[name] = value.clone();
+        }
+    }
     set_optional_json(
         &mut raw,
         "size",
@@ -36917,6 +36934,16 @@ fn validate_image_generation_request(
     model: &GatewayModel,
     request: &ImageGenerationRequest,
 ) -> Result<(), ApiError> {
+    if let Some(reference) = &request.input_reference {
+        mayhem_proto::image_reference_metadata(reference)
+            .map_err(|message| ApiError::bad_request(message, Some("input_reference")))?;
+        if request.strength.is_none() {
+            return Err(ApiError::bad_request("input_reference requires strength", Some("strength")));
+        }
+    }
+    if request.strength.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+        return Err(ApiError::bad_request("strength must be between 0 and 1", Some("strength")));
+    }
     if request.prompt.trim().is_empty() {
         return Err(ApiError::bad_request(
             "prompt must not be empty",
@@ -39528,6 +39555,8 @@ mod tests {
         let state = GatewayState::from_models(vec![model.clone()]);
 
         let small_image = ImageGenerationRequest {
+            input_reference: None,
+            strength: None,
             model: model.id.clone(),
             prompt: "small".to_owned(),
             background: None,
@@ -43410,6 +43439,38 @@ mod tests {
         assert!(preserved.usage.input_tokens() > latest_only.usage.input_tokens());
     }
 
+    #[test]
+    fn image_reference_is_validated_bound_to_hash_and_included_in_capacity() {
+        let model = test_model();
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let reference = test_png_data_url_with_size(96, 80);
+        let request: ImageGenerationRequest = serde_json::from_value(json!({
+            "model": model.id, "prompt": "A blue sculpture", "width": 64, "height": 64,
+            "n": 1, "steps": 9, "cfg_scale": 0.0, "response_format": "b64_json",
+            "input_reference": reference, "strength": 0.5,
+        })).unwrap();
+        validate_image_generation_request(&model, &request).unwrap();
+        let transport = direct_session_image_generation_request_body(&request);
+        assert_eq!(transport["input_reference"], reference);
+        assert_eq!(transport["strength"], 0.5);
+        let load = request_requirements_for_image_generation(&state, &model, &request, 0, None, None);
+        assert_eq!(load.modality_load["image"].max_item_units, 96 * 80);
+        assert_eq!(load.modality_load["image"].max_item_bytes,
+            mayhem_proto::image_reference_metadata(&reference).unwrap().bytes);
+        let hash = image_generation_prompt_hash(&request);
+        let mut changed = request.clone();
+        changed.input_reference = Some(test_png_data_url_with_size(80, 96));
+        assert_ne!(hash, image_generation_prompt_hash(&changed));
+        changed = request.clone();
+        changed.strength = Some(0.75);
+        assert_ne!(hash, image_generation_prompt_hash(&changed));
+        changed.input_reference = Some("https://example.test/private.png".to_owned());
+        assert!(validate_image_generation_request(&model, &changed).is_err());
+        changed = request;
+        changed.strength = Some(1.1);
+        assert!(validate_image_generation_request(&model, &changed).is_err());
+    }
+
     fn test_png_data_url() -> String {
         test_png_data_url_with_size(1, 1)
     }
@@ -44993,6 +45054,8 @@ mod tests {
         .is_empty());
 
         let image_request = ImageGenerationRequest {
+            input_reference: None,
+            strength: None,
             model: model.id.clone(),
             prompt: "quiet launch panel".to_owned(),
             background: None,
@@ -50317,6 +50380,8 @@ mod tests {
             }
             FocusedRouteRunner::Image => {
                 let request = ImageGenerationRequest {
+                    input_reference: None,
+                    strength: None,
                     model: model.id.clone(),
                     prompt: "a precise test image".to_owned(),
                     background: None,

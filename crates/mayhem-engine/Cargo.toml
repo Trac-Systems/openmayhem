@@ -34,6 +34,7 @@ flate2 = { version = "1", optional = true }
 jsonschema = { version = "0.53.0", default-features = false }
 llama-cpp-2 = { version = "0.1.150", optional = true, default-features = false, features = ["common", "sampler"] }
 mayhem-enclave = { path = "../mayhem-enclave", optional = true }
+mayhem-proto = { path = "../mayhem-proto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"

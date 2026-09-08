@@ -401,6 +401,8 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "negative_prompt",
                 "steps",
                 "cfg_scale",
+                "input_reference",
+                "strength",
                 "shift",
                 "seed",
                 "scheduler",
@@ -865,6 +867,7 @@ fn endpoint_interaction_groups(family: &str) -> Vec<Vec<String>> {
             &["quality", "size", "steps", "cfg_scale", "shift"],
             &["width", "height"],
             &["negative_prompt", "scheduler", "seed"],
+            &["input_reference", "strength", "width", "height"],
         ],
         ENDPOINT_HF_TEXT_TO_IMAGE => &[
             &[
@@ -1243,6 +1246,14 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
         }
         "parameters.reference_audio.content_type" if family == ENDPOINT_HF_TEXT_TO_SPEECH => {
             tts_reference_audio_content_type_spec()
+        }
+        "input_reference" if family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => {
+            // Encoded image bounds belong to the decoded media validator and
+            // measured provider capacity, not synthetic text-length fixtures.
+            marker_string_spec(json!("$IMAGE_DATA_URL"))
+        }
+        "strength" if family == ENDPOINT_OPENAI_IMAGE_GENERATIONS => {
+            with_default(number_spec(0.0, 1.0, 0.6), json!(0.6))
         }
         "input_reference" => union_spec(
             &[EndpointValueType::String, EndpointValueType::Object],
@@ -3167,6 +3178,9 @@ fn add_calibration_companion_mutations(
 
     if path.starts_with("messages.content.") {
         add("messages.role", json!("user"));
+    }
+    if contract.family == ENDPOINT_OPENAI_IMAGE_GENERATIONS && path == "strength" {
+        add("input_reference", json!("$IMAGE_DATA_URL"));
     }
     if let Some(root) = endpoint_inline_audio_root(&contract.family, path) {
         add(&format!("{root}.data"), json!("$AUDIO_BASE64"));
@@ -5642,6 +5656,22 @@ mod tests {
         .unwrap();
         assert_eq!(normalized["parameters"]["width"], json!(768));
         assert_eq!(normalized["parameters"]["height"], json!(1024));
+    }
+
+    #[test]
+    fn openai_image_reference_has_explicit_default_and_binds_the_reference() {
+        let contract = endpoint_family_contract_template(ENDPOINT_OPENAI_IMAGE_GENERATIONS).unwrap();
+        let raw = json!({"model":"test/image", "prompt":"a compass", "size":"1024x1024", "input_reference":"$IMAGE_DATA_URL"});
+        let normalized = materialize_endpoint_request_defaults(&contract, &raw).unwrap();
+        assert_eq!(normalized["input_reference"], raw["input_reference"]);
+        assert_eq!(normalized["strength"], json!(0.6));
+        validate_endpoint_request(&contract, &normalized).unwrap();
+        let mut invalid = normalized.clone();
+        invalid["strength"] = json!(1.01);
+        assert!(validate_endpoint_request(&contract, &invalid).is_err());
+        invalid = normalized;
+        invalid["input_reference"] = json!({"image_url":"$IMAGE_DATA_URL"});
+        assert!(validate_endpoint_request(&contract, &invalid).is_err());
     }
 
     #[test]
