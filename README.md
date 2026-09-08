@@ -83,19 +83,20 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.180` carries validated PNG/JPEG references and image-change strength
-through image-generation requests to the native engine. Models expose these
-controls through their measured, signed catalog contracts. Workflow uploads
-restore existing input files after completion or failure and recover interrupted
-transfers on the next request. See [image references](crates/mayhem-engine/IMAGE_REFERENCES.md).
+`v0.2.181` lets clients correct schema-invalid, non-strict tool arguments in the
+existing conversation while preserving streamed output. Explicit strict tools
+retain schema enforcement, and clients must validate every call before execution.
+Live providers remain visible when capacity is busy; the model catalog reports
+presence separately from request availability and its exclusion reason.
 
 Automatic [failure recovery](crates/mayhem-gateway/DURABLE_STREAMING.md)
-and contract revision 22 remain in effect.
+and [image references](crates/mayhem-engine/IMAGE_REFERENCES.md) remain available.
+Contract revision 22 is unchanged.
 
 LLM admission continues to require initialized prefix caching introduced in
 v0.2.178. See [runtime details and limits](crates/mayhem-engine/PREFIX_CACHING.md).
 
-`v0.2.180` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.181` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -104,7 +105,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.180
+git checkout --detach v0.2.181
 ./install.sh --from-source
 ```
 
@@ -113,7 +114,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.180
+git checkout --detach v0.2.181
 .\install.ps1 -FromSource
 ```
 
@@ -938,6 +939,20 @@ paths, raw graphs, or session transport details.
 | `service_unavailable` | `routing` | yes | Generic temporary service/routing unavailability when no narrower code matched. |
 | `internal_error` | `internal` | yes | Gateway-side internal failure. Retry once; report if repeated. |
 
+Tool calls are proposals for the client to validate before execution. For an
+advertised function without `strict: true`, Core returns structured JSON-object
+arguments even when they do not satisfy the function's parameter schema. The
+client must reject invalid arguments and can return a tool error for a bounded
+correction in its existing conversation. Do not execute an invalid call or
+replay an entire paid request to repair its arguments.
+
+Set `function.strict: true` in Chat tool definitions, or `strict: true` in flat
+Responses function definitions, to require schema-valid generated arguments.
+Strict schema violations, unadvertised tools, malformed JSON and non-object
+arguments remain output errors. Required-tool grammars remain constrained by
+the advertised schemas. Tool results and corrections use the ordinary usage,
+receipt and task-budget flow; a correction is a new model turn.
+
 ### ComfyUI workflows
 
 When the signed catalog exposes a workflow-enabled model, users call the same
@@ -1090,7 +1105,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.180` is source-only. The GitHub release contains the tagged source, not
+`v0.2.181` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -1098,7 +1113,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.180
+git checkout --detach v0.2.181
 ./install.sh --from-source
 ```
 
@@ -1107,7 +1122,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.180
+git checkout --detach v0.2.181
 .\install.ps1 -FromSource
 ```
 

@@ -1074,6 +1074,10 @@ pub struct ToolSpec {
     pub description: Option<String>,
     #[serde(default = "default_tool_parameters")]
     pub parameters: Value,
+    /// Require the provider's generated arguments to satisfy the schema.
+    /// Tool executors must validate arguments even when this is false.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub strict: bool,
 }
 
 impl ToolSpec {
@@ -1082,6 +1086,7 @@ impl ToolSpec {
             name: name.into(),
             description: None,
             parameters,
+            strict: false,
         }
     }
 }
@@ -14048,6 +14053,23 @@ mod tests {
                 validate_tool_call_arguments(&tool, &json!({})),
                 Err(EngineError::InvalidConfig(_))
             ));
+        }
+    }
+
+    #[test]
+    fn tool_strict_flag_round_trips_without_weakening_executor_validation() {
+        let mut tool = ToolSpec::new("edit_file", json!({
+            "type":"object", "properties":{"old_text":{"type":"string", "minLength":1}},
+            "required":["old_text"]
+        }));
+        for strict in [false, true] {
+            tool.strict = strict;
+            let encoded = serde_json::to_value(&tool).unwrap();
+            assert_eq!(encoded.get("strict").and_then(Value::as_bool), strict.then_some(true));
+            let decoded: ToolSpec = serde_json::from_value(encoded).unwrap();
+            assert_eq!(decoded, tool);
+            assert!(validate_tool_call_arguments(&decoded, &json!({"old_text":""})).is_err());
+            validate_tool_call_arguments(&decoded, &json!({"old_text":"original"})).unwrap();
         }
     }
 

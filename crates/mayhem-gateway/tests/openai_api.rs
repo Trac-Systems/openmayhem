@@ -1927,6 +1927,9 @@ async fn av3_missing_policy_filters_tier2_and_routes_tier1_fallback() {
         mayhem["registered_route_candidates"][0]["dispatch_eligible"],
         false
     );
+    assert_eq!(mayhem["registered_route_candidates"][0]["presence"], "online");
+    assert_eq!(mayhem["registered_route_candidates"][0]["availability"], "unavailable");
+    assert_eq!(mayhem["registered_route_candidates"][0]["availability_reason"], "attestation_policy");
     let tier1 = &mayhem["route_candidates"][0]["attestation_verification"];
     assert_eq!(tier1["policy_required"], false);
     assert_eq!(tier1["locally_ready"], true);
@@ -2200,6 +2203,172 @@ async fn av3_ready_source_built_route_and_dashboard_report_local_policy_truth() 
         .expect("evidence facts")
         .iter()
         .any(|fact| fact["label"] == "Local verification" && fact["value"] == "Ready"));
+}
+
+#[tokio::test]
+async fn models_endpoint_reports_busy_image_presence_and_immediate_capacity_release() {
+    let mut model = routed_image_generation_test_model();
+    let mut second = model.mayhem.route_candidates[0].clone();
+    second.provider = "56".repeat(32);
+    model.mayhem.route_candidates.push(second);
+    model.mayhem.providers_online = 2;
+    let mut heartbeats = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .map(|candidate| {
+            let mut heartbeat =
+                test_provider_heartbeat(&model, candidate, 0.2, 1, 1, None, 150);
+            heartbeat.accepting_new = false;
+            heartbeat.q.free_slots = 0;
+            let capacity = heartbeat.caps.modality_capacity.get_mut("image").unwrap();
+            capacity.max_inflight_items = 1;
+            capacity.active_items = 1;
+            capacity.max_items_per_request = 1;
+            heartbeat
+        })
+        .collect::<Vec<_>>();
+    let state =
+        GatewayState::from_models(vec![model]).with_provider_heartbeats(heartbeats.clone());
+    let app = openai_router(state.clone());
+    let (status, body) =
+        json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
+    assert_eq!(status, StatusCode::OK);
+    let mayhem = &body["data"][0]["mayhem"];
+    assert_eq!(mayhem["providers_online"], 2);
+    assert_eq!(mayhem["providers_available"], 0);
+    assert_eq!(mayhem["providers_busy"], 2);
+    assert_eq!(mayhem["availability"], "busy");
+    assert_eq!(mayhem["route_count"], 0);
+    for route in mayhem["registered_route_candidates"].as_array().unwrap() {
+        assert_eq!(route["presence"], "online");
+        assert_eq!(route["availability"], "busy");
+        assert_eq!(route["availability_reason"], "at_capacity");
+        assert_eq!(route["dispatch_eligible"], false);
+        assert_eq!(route["caps"]["max_image_width"], 1024);
+        assert_eq!(
+            route["caps"]["modality_capacity"]["image"]["max_items_per_request"],
+            1
+        );
+        assert_eq!(
+            route["caps"]["modality_capacity"]["image"]["active_items"],
+            1
+        );
+    }
+    let (_, live) = json_request(
+        app.clone(),
+        Method::GET,
+        "/v1/models?live=true",
+        Value::Null,
+    )
+    .await;
+    assert!(live["data"].as_array().unwrap().is_empty());
+
+    let released = &mut heartbeats[0];
+    released.ts += 1;
+    released.nonce = "image-capacity-released".to_owned();
+    released.accepting_new = true;
+    released.slots.active = 0;
+    released.q.free_slots = 1;
+    released
+        .caps
+        .modality_capacity
+        .get_mut("image")
+        .unwrap()
+        .active_items = 0;
+    state.ingest_provider_heartbeat(released.clone(), current_test_millis());
+    let (_, body) = json_request(app, Method::GET, "/v1/models?live=true", Value::Null).await;
+    let mayhem = &body["data"][0]["mayhem"];
+    assert_eq!(mayhem["providers_online"], 2);
+    assert_eq!(mayhem["providers_available"], 1);
+    assert_eq!(mayhem["providers_busy"], 1);
+    assert_eq!(mayhem["availability"], "available");
+    assert_eq!(mayhem["route_candidates"][0]["availability"], "available");
+    assert_eq!(
+        mayhem["route_candidates"][0]["availability_reason"],
+        Value::Null
+    );
+}
+
+#[tokio::test]
+async fn models_endpoint_reports_capacity_policy_and_stale_reasons_separately() {
+    for (case, availability, reason) in [
+        ("modality_full", "busy", "modality_capacity"),
+        ("modality_missing", "unavailable", "modality_capacity"),
+        ("not_accepting", "unavailable", "not_accepting"),
+        ("idle_draining", "unavailable", "not_accepting"),
+        ("idle_disabled", "unavailable", "not_accepting"),
+        ("idle_no_slots", "unavailable", "at_capacity"),
+        ("explicit_saturation", "busy", "saturated"),
+        ("rail", "unavailable", "selector_filter"),
+        ("stale", "offline", "heartbeat_stale"),
+        ("missing", "offline", "heartbeat_missing"),
+    ] {
+        let mut model = routed_image_generation_test_model();
+        if case == "rail" {
+            model.mayhem.route_candidates[0].accepted_rails = vec!["tap".to_owned()];
+        }
+        let mut heartbeat = test_provider_heartbeat(
+            &model,
+            &model.mayhem.route_candidates[0],
+            0.2,
+            0,
+            4,
+            None,
+            150,
+        );
+        match case {
+            "modality_full" => {
+                let capacity = heartbeat.caps.modality_capacity.get_mut("image").unwrap();
+                capacity.active_items = capacity.max_inflight_items;
+            }
+            "modality_missing" => {
+                heartbeat.caps.modality_capacity.clear();
+            }
+            "not_accepting" => {
+                heartbeat.accepting_new = false;
+            }
+            "idle_draining" | "idle_disabled" => {
+                heartbeat.accepting_new = false;
+                heartbeat.q.free_slots = 0;
+                if case == "idle_disabled" {
+                    heartbeat.slots.max = 0;
+                }
+            }
+            "idle_no_slots" => {
+                heartbeat.q.free_slots = 0;
+            }
+            "explicit_saturation" => {
+                heartbeat.sat = 1.0;
+            }
+            _ => {}
+        }
+        let state =
+            GatewayState::from_models(vec![model]).with_provider_heartbeat_ttl_millis(60_000);
+        if case != "missing" {
+            let received_at =
+                current_test_millis().saturating_sub(if case == "stale" { 60_001 } else { 0 });
+            state.ingest_provider_heartbeat(heartbeat, received_at);
+        }
+        let (_, body) =
+            json_request(openai_router(state), Method::GET, "/v1/models", Value::Null).await;
+        let mayhem = &body["data"][0]["mayhem"];
+        let route = &mayhem["registered_route_candidates"][0];
+        assert_eq!(route["availability"], availability, "{case}");
+        assert_eq!(route["availability_reason"], reason, "{case}");
+        assert_eq!(route["dispatch_eligible"], false, "{case}");
+        assert_eq!(mayhem["providers_available"], 0, "{case}");
+        assert_eq!(
+            mayhem["providers_online"],
+            if availability == "offline" { 0 } else { 1 },
+            "{case}"
+        );
+        assert_eq!(
+            mayhem["providers_busy"],
+            if availability == "busy" { 1 } else { 0 },
+            "{case}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -2550,7 +2719,8 @@ async fn models_api_and_market_dashboard_share_selector_live_counts() {
     let mayhem = &body["data"][0]["mayhem"];
     assert_eq!(mayhem["registered_provider_count"], 6);
     assert_eq!(mayhem["registered_route_count"], 6);
-    assert_eq!(mayhem["providers_online"], 3);
+    assert_eq!(mayhem["providers_online"], 6);
+    assert_eq!(mayhem["providers_available"], 3);
     assert_eq!(mayhem["route_count"], 3);
     let market = &mayhem["markets"][0];
     assert_eq!(market["registered_provider_count"], 6);
@@ -2585,7 +2755,8 @@ async fn models_api_and_market_dashboard_share_selector_live_counts() {
     assert_eq!(status, StatusCode::OK);
     let mayhem = &body["data"][0]["mayhem"];
     assert_eq!(mayhem["registered_provider_count"], 6);
-    assert_eq!(mayhem["providers_online"], 2);
+    assert_eq!(mayhem["providers_online"], 6);
+    assert_eq!(mayhem["providers_available"], 2);
     assert_eq!(mayhem["route_count"], 2);
     assert!(mayhem["markets"].as_array().is_some_and(Vec::is_empty));
     let market = &mayhem["registered_markets"][0];

@@ -6562,9 +6562,12 @@ fn gateway_route_attestation_readiness(
 }
 
 fn gateway_registered_route_value(
+    state: &GatewayState,
+    model: &GatewayModel,
     candidate: &GatewayRouteCandidate,
     entries: &[ProviderTableEntry],
     dispatch_eligible: bool,
+    now_millis: u64,
 ) -> Value {
     let mut value = serde_json::to_value(candidate).unwrap_or(Value::Null);
     let Some(object) = value.as_object_mut() else {
@@ -6572,6 +6575,35 @@ fn gateway_registered_route_value(
     };
     let readiness = gateway_route_attestation_readiness(candidate, entries);
     object.insert("dispatch_eligible".to_owned(), json!(dispatch_eligible));
+    let entry = dashboard_entry_for_route(entries, candidate);
+    let fresh = entry
+        .is_some_and(|entry| entry.has_fresh_heartbeat(state.provider_heartbeat_ttl_millis));
+    let presence = if fresh {
+        "online"
+    } else if entry.is_some() {
+        "offline"
+    } else {
+        "unknown"
+    };
+    let (availability, reason) = gateway_route_availability(
+        state,
+        model,
+        candidate,
+        entry,
+        dispatch_eligible,
+        now_millis,
+    );
+    object.insert("presence".to_owned(), json!(presence));
+    object.insert("availability".to_owned(), json!(availability));
+    object.insert("availability_reason".to_owned(), json!(reason));
+    object.insert(
+        "heartbeat_age_millis".to_owned(),
+        json!(entry.and_then(|entry| entry.heartbeat_age_millis)),
+    );
+    object.insert(
+        "heartbeat_ttl_millis".to_owned(),
+        json!(state.provider_heartbeat_ttl_millis),
+    );
     object.insert(
         "attestation_verification".to_owned(),
         serde_json::to_value(readiness).unwrap_or_else(|_| {
@@ -6584,16 +6616,116 @@ fn gateway_registered_route_value(
             })
         }),
     );
+    if fresh {
+        if let Some(entry) = entry {
+            gateway_apply_heartbeat_route_caps(
+                &mut value,
+                GatewayLiveRoute { candidate, entry },
+            );
+        }
+    }
     value
 }
 
-fn gateway_live_route_value(route: GatewayLiveRoute<'_>, entries: &[ProviderTableEntry]) -> Value {
-    let mut value = gateway_registered_route_value(route.candidate, entries, true);
+fn gateway_route_availability(
+    state: &GatewayState,
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+    entry: Option<&ProviderTableEntry>,
+    dispatch_eligible: bool,
+    now_millis: u64,
+) -> (&'static str, Option<&'static str>) {
+    let Some(entry) = entry else {
+        return ("unknown", Some("provider_snapshot_missing"));
+    };
+    if !entry.has_fresh_heartbeat(state.provider_heartbeat_ttl_millis) {
+        return (
+            "offline",
+            Some(if entry.heartbeat_age_millis.is_some() {
+                "heartbeat_stale"
+            } else {
+                "heartbeat_missing"
+            }),
+        );
+    }
+    if dispatch_eligible {
+        return ("available", None);
+    }
+    let heartbeat = entry.heartbeat.as_ref().expect("fresh heartbeat");
+    let mut unavailable_reason = "no_supported_request_shape";
+    for requirements in
+        gateway_reporting_requirements_for_route(state, model, candidate, now_millis)
+    {
+        let Some(reason) = selector_route_exclusion_reason(
+            state,
+            candidate,
+            entry,
+            None,
+            None,
+            &requirements,
+            now_millis,
+        ) else {
+            // The dispatch snapshot is authoritative if a concurrent policy change differs.
+            return ("unknown", Some("availability_changed"));
+        };
+        let full_slots =
+            heartbeat.slots.active >= heartbeat.slots.max || heartbeat.q.free_slots == 0;
+        let occupied = heartbeat.slots.active > 0
+            || heartbeat.q.engine_backlog > 0
+            || heartbeat
+                .caps
+                .modality_capacity
+                .values()
+                .any(|capacity| capacity.active_items > 0);
+        let explicit_saturation = reason == "saturated"
+            && baseline_route_state(entry, &BaselineRouteRequirements::from(&requirements))
+                == BaselineRouteState::Saturated;
+        if explicit_saturation
+            || (matches!(reason, "saturated" | "not_accepting") && full_slots && occupied)
+        {
+            return (
+                "busy",
+                Some(if explicit_saturation {
+                    "saturated"
+                } else {
+                    "at_capacity"
+                }),
+            );
+        }
+        if reason == "modality_capacity"
+            && requirements.modality_load.iter().any(|(modality, load)| {
+                heartbeat
+                    .caps
+                    .modality_capacity
+                    .get(modality)
+                    .is_some_and(|capacity| {
+                        capacity.active_items > 0
+                            && load.item_count <= capacity.max_items_per_request
+                            && load.max_item_bytes <= capacity.max_item_bytes
+                            && load.max_item_units <= capacity.max_item_units
+                            && load.item_count <= capacity.max_inflight_items
+                            && capacity.active_items.saturating_add(load.item_count)
+                                > capacity.max_inflight_items
+                    })
+            })
+        {
+            return ("busy", Some("modality_capacity"));
+        }
+        unavailable_reason = if reason == "saturated" {
+            "at_capacity"
+        } else {
+            reason
+        };
+    }
+    ("unavailable", Some(unavailable_reason))
+}
+
+fn gateway_apply_heartbeat_route_caps(value: &mut Value, route: GatewayLiveRoute<'_>) {
     let Some(object) = value.as_object_mut() else {
-        return value;
+        return;
     };
     let Some(heartbeat) = route.entry.heartbeat.as_ref() else {
-        return value;
+        return;
     };
     let served_modalities = gateway_live_route_modalities(route);
     let served_specialities = gateway_live_route_specialities(route);
@@ -6623,15 +6755,6 @@ fn gateway_live_route_value(route: GatewayLiveRoute<'_>, entries: &[ProviderTabl
         serde_json::to_value(&heartbeat.caps.modality_capacity).unwrap_or_else(|_| json!({})),
     );
     object.insert("caps".to_owned(), Value::Object(caps));
-    value
-}
-
-fn gateway_live_provider_count(live_routes: &[GatewayLiveRoute<'_>]) -> u32 {
-    let providers = live_routes
-        .iter()
-        .map(|route| route.candidate.provider.as_str())
-        .collect::<BTreeSet<_>>();
-    u32::try_from(providers.len()).unwrap_or(u32::MAX)
 }
 
 fn gateway_live_room_count(live_routes: &[GatewayLiveRoute<'_>]) -> u32 {
@@ -6937,7 +7060,16 @@ fn gateway_model_info_value(
     let live_caps = gateway_live_model_caps(model, &live_routes);
     let live_route_values = live_routes
         .iter()
-        .map(|route| gateway_live_route_value(*route, entries))
+        .map(|route| {
+            gateway_registered_route_value(
+                state,
+                model,
+                route.candidate,
+                entries,
+                true,
+                now_millis,
+            )
+        })
         .collect::<Vec<_>>();
     let registered_route_values = model
         .mayhem
@@ -6945,12 +7077,47 @@ fn gateway_model_info_value(
         .iter()
         .map(|candidate| {
             gateway_registered_route_value(
+                state,
+                model,
                 candidate,
                 entries,
                 live_route_keys.contains(&route_key(candidate)),
+                now_millis,
             )
         })
         .collect::<Vec<_>>();
+    let providers_with = |field: &str, expected: &str| {
+        registered_route_values
+            .iter()
+            .filter(|route| route[field] == expected)
+            .filter_map(|route| route["provider"].as_str())
+            .collect::<BTreeSet<_>>()
+    };
+    let online_providers = providers_with("presence", "online");
+    let available_providers = providers_with("availability", "available");
+    let busy_providers = providers_with("availability", "busy");
+    let availability = ["available", "busy", "unavailable", "unknown", "offline"]
+        .into_iter()
+        .find(|value| {
+            registered_route_values
+                .iter()
+                .any(|route| route["availability"] == *value)
+        })
+        .unwrap_or("unknown");
+    object.insert("providers_online".to_owned(), json!(online_providers.len()));
+    object.insert(
+        "providers_available".to_owned(),
+        json!(available_providers.len()),
+    );
+    object.insert(
+        "providers_busy".to_owned(),
+        json!(busy_providers.difference(&available_providers).count()),
+    );
+    object.insert("availability".to_owned(), json!(availability));
+    object.insert(
+        "availability_observed_at_millis".to_owned(),
+        json!(now_millis),
+    );
     object.insert(
         "registered_provider_count".to_owned(),
         json!(model.mayhem.providers_online),
@@ -6983,10 +7150,6 @@ fn gateway_model_info_value(
     object.insert(
         "registered_route_candidates".to_owned(),
         Value::Array(registered_route_values),
-    );
-    object.insert(
-        "providers_online".to_owned(),
-        json!(gateway_live_provider_count(&live_routes)),
     );
     object.insert(
         "route_count".to_owned(),
@@ -28697,10 +28860,44 @@ fn selector_route_is_eligible(
     requirements: &RequestRequirements,
     now_millis: u64,
 ) -> bool {
-    route_matches_selector_filters(candidate, min_att_tier, quant, &state.receipt_config.rail)
-        && !state.route_provider_in_cooloff(candidate, now_millis)
-        && route_execution_mode_is_eligible(state, candidate, entry)
-        && crate::provider_table::evaluate_eligibility(entry, requirements).is_ok()
+    selector_route_exclusion_reason(
+        state,
+        candidate,
+        entry,
+        min_att_tier,
+        quant,
+        requirements,
+        now_millis,
+    )
+    .is_none()
+}
+
+fn selector_route_exclusion_reason(
+    state: &GatewayState,
+    candidate: &GatewayRouteCandidate,
+    entry: &ProviderTableEntry,
+    min_att_tier: Option<u8>,
+    quant: Option<&str>,
+    requirements: &RequestRequirements,
+    now_millis: u64,
+) -> Option<&'static str> {
+    if !route_matches_selector_filters(
+        candidate,
+        min_att_tier,
+        quant,
+        &state.receipt_config.rail,
+    ) {
+        return Some("selector_filter");
+    }
+    if state.route_provider_in_cooloff(candidate, now_millis) {
+        return Some("provider_cooloff");
+    }
+    if !route_execution_mode_is_eligible(state, candidate, entry) {
+        return Some("execution_mode");
+    }
+    crate::provider_table::evaluate_eligibility(entry, requirements)
+        .err()
+        .map(|reason| reason.code())
 }
 
 fn route_execution_mode_is_eligible(
