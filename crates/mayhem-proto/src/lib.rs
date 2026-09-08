@@ -12,6 +12,8 @@ mod comfy_workflow;
 mod endpoint_contract;
 mod parts_catalog;
 mod validated_audio;
+mod validated_image;
+pub use validated_image::{image_reference_metadata, ImageReferenceMetadata};
 mod reservation_close;
 pub use reservation_close::{
     canonical_usage_receipt_hash, reservation_binding_matches, usage_reservation_close_feature,

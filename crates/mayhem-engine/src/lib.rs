@@ -784,6 +784,10 @@ pub struct EmbeddingRequest {
 pub struct ImageGenerationRequest {
     pub prompt: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_reference: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub strength: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub negative_prompt: Option<String>,
     #[serde(default = "default_image_count")]
     pub image_count: u32,
@@ -810,6 +814,8 @@ impl ImageGenerationRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
         Self {
             prompt: prompt.into(),
+            input_reference: None,
+            strength: None,
             negative_prompt: None,
             image_count: default_image_count(),
             width: default_image_width(),
@@ -824,6 +830,17 @@ impl ImageGenerationRequest {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if let Some(reference) = &self.input_reference {
+            mayhem_proto::image_reference_metadata(reference).map_err(EngineError::InvalidRequest)?;
+            let strength = self.strength.ok_or_else(|| EngineError::InvalidRequest(
+                "image reference requires an explicit strength".to_owned(),
+            ))?;
+            if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
+                return Err(EngineError::InvalidRequest("image strength must be between 0 and 1".to_owned()));
+            }
+        } else if self.strength.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
+            return Err(EngineError::InvalidRequest("image strength must be between 0 and 1".to_owned()));
+        }
         if self.prompt.trim().is_empty() {
             return Err(EngineError::InvalidConfig(
                 "image prompt must not be empty".to_owned(),
@@ -4025,6 +4042,7 @@ mod stable_diffusion_cpp_backend {
 
         fn request_images_once(
             &mut self,
+            endpoint: &str,
             encoded_body: &[u8],
             image_count: u32,
             width: u32,
@@ -4035,7 +4053,7 @@ mod stable_diffusion_cpp_backend {
             let response = http_request(
                 address,
                 "POST",
-                "/sdapi/v1/txt2img",
+                endpoint,
                 Some(encoded_body),
                 max_image_response_bytes(image_count, width, height)?,
                 None,
@@ -4289,6 +4307,11 @@ mod stable_diffusion_cpp_backend {
                 ));
             }
             let image_count = request.image_count;
+            let endpoint = if request.input_reference.is_some() {
+                "/sdapi/v1/img2img"
+            } else {
+                "/sdapi/v1/txt2img"
+            };
             let width = request.width;
             let height = request.height;
             let steps = request.steps;
@@ -4323,6 +4346,10 @@ mod stable_diffusion_cpp_backend {
             let object = body
                 .as_object_mut()
                 .expect("stable-diffusion request body is an object");
+            if let Some(reference) = request.input_reference {
+                object.insert("init_images".to_owned(), json!([reference]));
+                object.insert("denoising_strength".to_owned(), json!(request.strength));
+            }
             if let Some(negative_prompt) = request.negative_prompt {
                 object.insert("negative_prompt".to_owned(), Value::String(negative_prompt));
             }
@@ -4352,6 +4379,7 @@ mod stable_diffusion_cpp_backend {
                 self,
                 |backend| {
                     backend.request_images_once(
+                        endpoint,
                         &encoded_body,
                         image_count,
                         width,
@@ -5120,6 +5148,37 @@ mod stable_diffusion_tests {
     use super::*;
 
     #[test]
+    fn image_reference_reaches_img2img_with_exact_bytes_and_strength() {
+        let root = tempfile::tempdir().unwrap();
+        let model = root.path().join("model.safetensors");
+        fs::write(&model, stable_empty_safetensors()).unwrap();
+        let reference = format!("data:image/png;base64,{}", general_purpose::STANDARD.encode(
+            include_bytes!("../tests/fixtures/reference.png"),
+        ));
+        let expected = json!({ "prompt": "A blue sculpture", "width": 64, "height": 64,
+            "steps": 2, "cfg_scale": 1.0, "seed": 7, "batch_size": 1,
+            "init_images": [reference], "denoising_strength": 0.5 });
+        let image = include_bytes!("../tests/fixtures/reference.png").to_vec();
+        let (address, server) = serve_sdapi_once(expected, vec![image.clone()]);
+        let mut backend = StableDiffusionCppBackend::with_ready_server(
+            LoadConfig::stable_diffusion_checkpoint(&model), address,
+        ).unwrap();
+        let mut request = ImageGenerationRequest::new("A blue sculpture");
+        request.width = 64;
+        request.height = 64;
+        request.steps = 2;
+        request.guidance_scale = 1.0;
+        request.seed = Some(7);
+        request.input_reference = Some(reference);
+        assert!(request.validate().is_err(), "reference strength must be explicit");
+        request.strength = Some(0.5);
+        let mut output = Vec::new();
+        backend.generate_image(request, &mut |chunk: ArtifactChunk| { output.extend(chunk.bytes); Ok(()) }, &CancellationToken::new()).unwrap();
+        server.join().unwrap();
+        assert_eq!(output, image);
+    }
+
+    #[test]
     fn stable_diffusion_cpp_backend_uses_one_native_request_and_emits_every_image() {
         let root =
             std::env::temp_dir().join(format!("mayhem-engine-sd-test-{}", std::process::id()));
@@ -5448,7 +5507,12 @@ mod stable_diffusion_tests {
         let address = listener.local_addr().unwrap();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            let body = read_http_request_body(&mut stream);
+            let endpoint = if expected_body.get("init_images").is_some() {
+                "/sdapi/v1/img2img"
+            } else {
+                "/sdapi/v1/txt2img"
+            };
+            let body = read_http_request_body_at(&mut stream, endpoint);
             assert_eq!(
                 serde_json::from_slice::<Value>(&body).unwrap(),
                 expected_body
@@ -5475,10 +5539,14 @@ mod stable_diffusion_tests {
     }
 
     fn read_http_request_body(stream: &mut TcpStream) -> Vec<u8> {
+        read_http_request_body_at(stream, "/sdapi/v1/txt2img")
+    }
+
+    fn read_http_request_body_at(stream: &mut TcpStream, endpoint: &str) -> Vec<u8> {
         let mut reader = BufReader::new(stream);
         let mut request_line = String::new();
         reader.read_line(&mut request_line).unwrap();
-        assert_eq!(request_line, "POST /sdapi/v1/txt2img HTTP/1.1\r\n");
+        assert_eq!(request_line, format!("POST {endpoint} HTTP/1.1\r\n"));
         let mut content_length = None;
         loop {
             let mut line = String::new();
