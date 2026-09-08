@@ -83,19 +83,19 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.179` recovers accounting automatically when a provider fails after
-accepting a request. Failed generation carries the exact acknowledged usage;
-durable provider and gateway recovery closes abandoned reservations from
-confirmed ledger evidence. The model's original error remains visible.
-Upgrade providers and gateways; website deployments also need the matching
-API repair and its additive settlement-evidence database migration. Existing
-catalog calibrations, pricing, and contract revision 22 remain valid.
-See [failure recovery](crates/mayhem-gateway/DURABLE_STREAMING.md).
+`v0.2.180` carries validated PNG/JPEG references and image-change strength
+through image-generation requests to the native engine. Models expose these
+controls through their measured, signed catalog contracts. Workflow uploads
+restore existing input files after completion or failure and recover interrupted
+transfers on the next request. See [image references](crates/mayhem-engine/IMAGE_REFERENCES.md).
+
+Automatic [failure recovery](crates/mayhem-gateway/DURABLE_STREAMING.md)
+and contract revision 22 remain in effect.
 
 LLM admission continues to require initialized prefix caching introduced in
 v0.2.178. See [runtime details and limits](crates/mayhem-engine/PREFIX_CACHING.md).
 
-`v0.2.179` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.180` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -104,7 +104,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.179
+git checkout --detach v0.2.180
 ./install.sh --from-source
 ```
 
@@ -113,7 +113,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.179
+git checkout --detach v0.2.180
 .\install.ps1 -FromSource
 ```
 
@@ -1090,7 +1090,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.179` is source-only. The GitHub release contains the tagged source, not
+`v0.2.180` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -1098,7 +1098,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.179
+git checkout --detach v0.2.180
 ./install.sh --from-source
 ```
 
@@ -1107,7 +1107,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.179
+git checkout --detach v0.2.180
 .\install.ps1 -FromSource
 ```
 
