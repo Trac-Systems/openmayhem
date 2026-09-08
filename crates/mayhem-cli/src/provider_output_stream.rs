@@ -1,5 +1,5 @@
 //! Incremental presentation of engine output. Prompt construction, token IDs and
-//! the authoritative, schema-checked final tool parser remain unchanged.
+//! the authoritative final tool parser retain the same tool identities.
 use super::{ProviderEngineToolStrategy, ToolSpec, provider_qwen_xml_parameter_value};
 use serde_json::{Value, json};
 
@@ -101,7 +101,7 @@ impl OutputStream {
             };
             for (index, (name, arguments)) in previews.into_iter().enumerate() {
                 // Unadvertised names never become public calls. The existing
-                // final parser still validates the entire call and its schema.
+                // final parser validates call structure and explicit strict schemas.
                 if !self.tools.iter().any(|tool| tool.name == name) {
                     break;
                 }
@@ -627,5 +627,40 @@ mod tests {
                 assert_eq!(output, text);
             }
         }
+    }
+
+    #[test]
+    fn schema_invalid_nonstrict_edit_keeps_reasoning_and_streamed_arguments_for_correction() {
+        use crate::{ProviderReasoningOutputFilter, ProviderReasoningOutputMode};
+        let tools = vec![ToolSpec::new("edit_file", json!({
+            "type":"object", "additionalProperties":false,
+            "properties":{"path":{"type":"string"}, "old_text":{"type":"string", "minLength":1},
+                "new_text":{"type":"string"}}, "required":["path","old_text","new_text"]
+        }))];
+        let raw = "<tool_call><function=edit_file><parameter=path>app.js</parameter><parameter=old_text></parameter><parameter=new_text>private replacement</parameter></function></tool_call>";
+        let generated = format!("Reasoning before the edit. </think>{raw}");
+        let mut reasoning = ProviderReasoningOutputFilter::new(ProviderReasoningOutputMode::StripPrefilled);
+        let mut stream = OutputStream::new(ProviderEngineToolStrategy::QwenFunctionXml, tools.clone());
+        let mut calls = Vec::new();
+        let mut hidden = String::new();
+        let mut delivered_before_end = false;
+        for (index, ch) in generated.char_indices() {
+            let filtered = reasoning.push_split(&ch.to_string());
+            hidden.push_str(&filtered.hidden);
+            let delta = stream.push(&filtered.visible);
+            delivered_before_end |= !delta.tools.is_empty() && index < generated.len() - 5;
+            collect(delta, &mut calls);
+        }
+        assert!(hidden.contains("Reasoning before the edit."));
+        assert!(delivered_before_end);
+        let expected = provider_engine_tool_call_outputs(raw, ProviderEngineToolStrategy::QwenFunctionXml, &tools).unwrap();
+        compare(&calls, &expected);
+        validate_provider_engine_tool_call_outputs(&expected, &tools).unwrap();
+        let arguments: Value = serde_json::from_str(expected[0]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(arguments["old_text"], "");
+        assert_eq!(arguments["new_text"], "private replacement");
+        assert!(mayhem_engine::validate_tool_call_arguments(&tools[0], &arguments).is_err());
+        assert_eq!(stream.emitted_count(), 1);
+        assert!(stream.finish_text(true).is_empty());
     }
 }

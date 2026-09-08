@@ -91502,6 +91502,9 @@ fn provider_engine_template_tools(tools: &[ToolSpec]) -> Vec<Value> {
             if let Some(description) = &tool.description {
                 function.insert("description".to_owned(), json!(description));
             }
+            if tool.strict {
+                function.insert("strict".to_owned(), json!(true));
+            }
             json!({"type": "function", "function": function})
         })
         .collect()
@@ -92207,6 +92210,11 @@ fn provider_engine_tool_specs(body: &Value) -> Result<Vec<ToolSpec>> {
             .get("description")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        spec.strict = match function.get("strict") {
+            None | Some(Value::Null) => false,
+            Some(Value::Bool(strict)) => *strict,
+            Some(_) => bail!("tool strict must be a boolean"),
+        };
         specs.push(spec);
     }
     if !specs.is_empty() {
@@ -92383,11 +92391,23 @@ fn validate_provider_engine_tool_call_outputs(calls: &[Value], tools: &[ToolSpec
                 "provider engine returned malformed arguments for tool {name}"
             ))
         })?;
-        mayhem_engine::validate_tool_call_arguments(tool, &arguments).map_err(|_| {
-            provider_session_output_error(format!(
-                "provider engine returned arguments that do not satisfy the schema for tool {name}"
-            ))
-        })?;
+        if !arguments.is_object() {
+            return Err(provider_session_output_error(format!(
+                "provider engine returned non-object arguments for tool {name}"
+            )));
+        }
+        // Non-strict calls are model proposals, not tool execution. Deliver the
+        // actual arguments so the caller can reject them and request a bounded
+        // correction without losing the streamed result or replaying paid work.
+        // Strict calls retain the provider's schema guarantee. Never include
+        // validator values here: edit arguments can contain private source text.
+        if tool.strict {
+            mayhem_engine::validate_tool_call_arguments(tool, &arguments).map_err(|_| {
+                provider_session_output_error(format!(
+                    "provider engine returned arguments that do not satisfy the schema for tool {name}"
+                ))
+            })?;
+        }
     }
     Ok(())
 }
@@ -117054,7 +117074,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_engine_session_response_rejects_schema_invalid_auto_tool_arguments() {
+    fn provider_engine_session_response_preserves_nonstrict_tools_and_enforces_strict_schema() {
         let adapter = catalog::CatalogAdapter {
             tool_call_strategy: "openai_tool_calls".to_owned(),
             ..catalog::CatalogAdapter::default()
@@ -117062,7 +117082,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let mut backend = FakeEngineBackend::new(
             r#"{ "tool_calls": [{ "id": "call-openai", "type": "function", "function": { "name": "read_file", "arguments": {"path":"index.html","content":"not allowed"} } }] }"#,
         );
-        let body = json!({
+        let mut body = json!({
             "messages": [{ "role": "user", "content": "read a file" }],
             "tools": [{
                 "type": "function",
@@ -117079,11 +117099,21 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             "tool_choice": "auto"
         });
 
+        let output = provider_engine_session_response(&mut backend, &adapter, &body, None).unwrap();
+        assert_eq!(output.finish_reason, "tool_calls");
+        assert_eq!(output.tools[0]["id"], "call-openai");
+        assert_eq!(serde_json::from_str::<Value>(output.tools[0]["arguments"].as_str().unwrap()).unwrap(),
+            json!({"path":"index.html","content":"not allowed"}));
+        assert_eq!(output.completion_tokens, 2);
+        assert_eq!(output.usage.output_tokens(), 2);
+        assert_eq!(output.tools.len(), 1);
+        body["tools"][0]["function"]["strict"] = json!(true);
         let error = provider_engine_session_response(&mut backend, &adapter, &body, None)
-            .expect_err("schema-invalid automatic tool arguments must fail closed");
+            .expect_err("explicit strict tool schemas must fail closed");
 
         assert!(format!("{error:#}")
             .contains("arguments that do not satisfy the schema for tool read_file"));
+        assert_eq!(backend.last_request.unwrap().tools[0]["function"]["strict"], true);
     }
 
     #[test]
@@ -120748,7 +120778,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[test]
     fn provider_tool_parser_preserves_openai_grammar_call_and_schema_validation() {
-        let tools = vec![ToolSpec::new(
+        let mut tools = vec![ToolSpec::new(
             "write",
             json!({
                 "type": "object",
@@ -120756,6 +120786,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "required": ["path"],
             }),
         )];
+        tools[0].strict = true;
         for (arguments, valid) in [(json!({"path": "README.md"}), true), (json!({}), false)] {
             let text =
                 json!({"tool_calls": [{"function": {"name": "write", "arguments": arguments}}]})
@@ -121026,7 +121057,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn qwen_xml_parameters_leave_invalid_values_for_existing_guard() {
+    fn qwen_xml_parameters_leave_invalid_values_for_executor_and_strict_guard() {
         for (schema, raw) in [
             (json!({ "type": "integer" }), "1.5"),
             (json!({ "type": "boolean" }), "TRUE"),
@@ -121041,7 +121072,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ),
             (json!({ "type": "integer", "minimum": 1 }), "0"),
         ] {
-            let tools = vec![ToolSpec::new(
+            let mut tools = vec![ToolSpec::new(
                 "typed",
                 json!({
                     "type": "object", "properties": { "value": schema }, "required": ["value"]
@@ -121054,6 +121085,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 &tools,
             )
             .unwrap();
+            validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap();
+            tools[0].strict = true;
             let error = validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap_err();
             assert!(
                 error.to_string().contains("do not satisfy the schema"),
@@ -121064,7 +121097,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[test]
     fn qwen_xml_parameters_do_not_invent_missing_required_arguments() {
-        let tools = vec![ToolSpec::new(
+        let mut tools = vec![ToolSpec::new(
             "write_file",
             json!({
                 "type": "object",
@@ -121079,7 +121112,85 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let arguments: Value =
             serde_json::from_str(calls[0]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(arguments, json!({ "content": "123" }));
+        validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap();
+        assert!(mayhem_engine::validate_tool_call_arguments(&tools[0], &arguments).is_err());
+        tools[0].strict = true;
         assert!(validate_provider_engine_tool_call_outputs(&calls, &tools).is_err());
+    }
+
+    #[test]
+    fn provider_tool_strict_setting_survives_chat_and_responses_definitions() {
+        for nested in [false, true] {
+            for strict in [None, Some(Value::Null), Some(json!(false)), Some(json!(true))] {
+                let mut function = json!({"name":"edit_file", "parameters":{
+                    "type":"object", "properties":{"path":{"type":"string"}}, "required":["path"]
+                }});
+                if let Some(value) = &strict { function["strict"] = value.clone(); }
+                let tool = if nested { json!({"type":"function", "function":function}) }
+                    else { function["type"] = json!("function"); function };
+                let specs = provider_engine_tool_specs(&json!({"tools":[tool]})).unwrap();
+                let required = strict == Some(json!(true));
+                assert_eq!(specs[0].strict, required);
+                let template = provider_engine_template_tools(&specs);
+                assert_eq!(template[0]["function"]["strict"].as_bool().unwrap_or(false), required);
+                let reparsed = provider_engine_tool_specs(&json!({"tools":template})).unwrap();
+                assert_eq!(reparsed, specs);
+                let calls = vec![provider_normalized_tool_call(None, "edit_file".to_owned(), "{}".to_owned())];
+                assert_eq!(validate_provider_engine_tool_call_outputs(&calls, &specs).is_err(), required);
+                // Required-tool grammars remain schema-constrained in either mode.
+                assert!(mayhem_engine::tool_call_json_schema(&specs).unwrap()["$defs"]["tool_0_parameters"]["required"]
+                    .as_array().unwrap().contains(&json!("path")));
+                assert_eq!(provider_openai_tool_calls_json_schema(&specs, false)["$defs"]["tool_0_parameters"]["required"], json!(["path"]));
+            }
+        }
+        for invalid in [json!("true"), json!(1), json!({})] {
+            assert!(provider_engine_tool_specs(&json!({"tools":[{"type":"function",
+                "function":{"name":"edit_file", "parameters":{"type":"object"}, "strict":invalid}}]})).is_err());
+        }
+    }
+
+    #[test]
+    fn provider_tool_nonstrict_schema_errors_preserve_edit_arguments_in_all_formats() {
+        let mut tools = vec![ToolSpec::new("edit_file", json!({
+            "type":"object", "additionalProperties":false,
+            "properties":{"path":{"type":"string"}, "old_text":{"type":"string", "minLength":1},
+                "new_text":{"type":"string"}}, "required":["path","old_text","new_text"]
+        }))];
+        let expected = json!({"path":"app.js", "old_text":"", "new_text":"private source"});
+        for (strategy, raw) in [
+            (ProviderEngineToolStrategy::MayhemJson,
+                r#"{"tool":"edit_file","arguments":{"path":"app.js","old_text":"","new_text":"private source"}}"#),
+            (ProviderEngineToolStrategy::OpenAiToolCalls,
+                r#"{"tool_calls":[{"function":{"name":"edit_file","arguments":{"path":"app.js","old_text":"","new_text":"private source"}}}]}"#),
+            (ProviderEngineToolStrategy::QwenFunctionXml,
+                "<tool_call><function=edit_file><parameter=path>app.js</parameter><parameter=old_text></parameter><parameter=new_text>private source</parameter></function></tool_call>"),
+            (ProviderEngineToolStrategy::GemmaFunctionCall,
+                "<|tool_call>call:edit_file{path:<|\"|>app.js<|\"|>,old_text:<|\"|><|\"|>,new_text:<|\"|>private source<|\"|>}<tool_call|>"),
+        ] {
+            tools[0].strict = false;
+            let calls = provider_engine_tool_call_outputs(raw, strategy, &tools).unwrap();
+            let arguments: Value = serde_json::from_str(calls[0]["arguments"].as_str().unwrap()).unwrap();
+            assert_eq!(arguments, expected, "{strategy:?}");
+            validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap();
+            assert!(mayhem_engine::validate_tool_call_arguments(&tools[0], &arguments).is_err());
+            tools[0].strict = true;
+            let error = validate_provider_engine_tool_call_outputs(&calls, &tools).unwrap_err();
+            assert!(!error.to_string().contains("private source"));
+            assert!(error.to_string().contains("do not satisfy the schema"));
+        }
+    }
+
+    #[test]
+    fn provider_tool_nonstrict_does_not_accept_unknown_names_or_unstructured_arguments() {
+        let mut tools = vec![ToolSpec::new("edit_file", json!({"type":"object"}))];
+        for strict in [false, true] {
+            tools[0].strict = strict;
+            for (name, arguments) in [("edit_file", "not JSON"), ("edit_file", "[]"),
+                ("edit_file", "null"), ("edit_file", "7"), ("unknown_tool", "{}")] {
+                let calls = vec![provider_normalized_tool_call(None, name.to_owned(), arguments.to_owned())];
+                assert!(validate_provider_engine_tool_call_outputs(&calls, &tools).is_err());
+            }
+        }
     }
 
     #[test]

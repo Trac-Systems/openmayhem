@@ -171,6 +171,16 @@ pub struct ProviderTableEntry {
     pub attestation_head: Option<AttestationHeadCacheEntry>,
 }
 
+impl ProviderTableEntry {
+    /// Presence is independent of admission, capacity, and attestation policy.
+    pub fn has_fresh_heartbeat(&self, heartbeat_ttl_millis: u64) -> bool {
+        self.heartbeat.is_some()
+            && self
+                .heartbeat_age_millis
+                .is_some_and(|age| age <= heartbeat_ttl_millis)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct BaselineRouteRequirements {
     pub current_rules_ver: u64,
@@ -277,6 +287,36 @@ pub enum IneligibilityReason {
     ThroughputFloor,
     Workflow,
     ExecutionMode,
+}
+
+impl IneligibilityReason {
+    /// Stable public reason codes; never include local policy or transport details.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::ConsentVersion => "consent_version",
+            Self::Reputation => "reputation",
+            Self::AttestationPolicy => "attestation_policy",
+            Self::HeartbeatMissing => "heartbeat_missing",
+            Self::HeartbeatStale => "heartbeat_stale",
+            Self::TransportPeerMissing => "transport_peer_missing",
+            Self::Draining => "not_accepting",
+            Self::Saturated => "saturated",
+            Self::Capabilities => "capabilities",
+            Self::Speciality => "speciality",
+            Self::ModalityCapacity => "modality_capacity",
+            Self::Price => "price",
+            Self::ProviderMinAsk => "provider_min_ask",
+            Self::ProbationConcurrentLimit => "probation_concurrent_limit",
+            Self::ProbationPriceCap => "probation_price_cap",
+            Self::AttestationMissing => "attestation_missing",
+            Self::AttestationStale => "attestation_stale",
+            Self::CircuitOpen => "circuit_open",
+            Self::ThroughputFloor => "throughput_floor",
+            Self::Workflow => "workflow",
+            Self::ExecutionMode => "execution_mode",
+            Self::PrefixCachingRequired => "prefix_caching_required",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -2277,6 +2317,23 @@ mod tests {
         entry.contract.rate_map.retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
         entry.contract.ref_rate_map.retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
         assert_eq!(baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)), BaselineRouteState::Live);
+    }
+
+    #[test]
+    fn heartbeat_presence_is_independent_of_admission_and_expires_at_ttl() {
+        let now = 1_000_000;
+        let mut entry = entry_for(1, now, 0.2, 100);
+        let ttl = DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS;
+        entry.heartbeat.as_mut().expect("heartbeat").accepting_new = false;
+        entry.contract.attestation_policy =
+            RouteAttestationPolicyReadiness::unavailable(2, "local policy unavailable");
+        entry.heartbeat_age_millis = Some(ttl);
+        assert!(entry.has_fresh_heartbeat(ttl));
+        entry.heartbeat_age_millis = Some(ttl + 1);
+        assert!(!entry.has_fresh_heartbeat(ttl));
+        entry.heartbeat_age_millis = Some(0);
+        entry.heartbeat = None;
+        assert!(!entry.has_fresh_heartbeat(ttl));
     }
 
     #[test]
