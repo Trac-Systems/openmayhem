@@ -34604,7 +34604,7 @@ fn canary_expected_perceptual_hashes(
     config: &GatewayCanaryModelConfig,
     invocation: &GatewaySessionInvocation,
 ) -> Option<BTreeMap<String, String>> {
-    invocation
+    let mut expected = invocation
         .attestation
         .as_ref()
         .and_then(|attestation| {
@@ -34619,7 +34619,15 @@ fn canary_expected_perceptual_hashes(
                 .is_none()
                 .then(|| config.default_perceptual_hashes.clone())
                 .flatten()
-        })
+        })?;
+    let runtime_prompts = config
+        .prompts
+        .iter()
+        .filter(|prompt| !prompt.calibration_only)
+        .map(|prompt| prompt.id.as_str())
+        .collect::<BTreeSet<_>>();
+    expected.retain(|prompt_id, _| runtime_prompts.contains(prompt_id.as_str()));
+    (!expected.is_empty()).then_some(expected)
 }
 
 fn canary_expected_embedding_vectors(

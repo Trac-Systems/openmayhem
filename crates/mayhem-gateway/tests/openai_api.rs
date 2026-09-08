@@ -8705,3 +8705,51 @@ fn assert_no_external_urls(html: &str) {
         );
     }
 }
+
+#[tokio::test]
+async fn automatic_image_probe_excludes_calibration_only_reference_cases() {
+    let bytes = png_average_hash_fixture(false);
+    let hash = image_average_hash_hex(&bytes).unwrap();
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let mut registry = test_image_canary_registry(hash.clone());
+    let config = registry.models.get_mut("admin/image-fixture").unwrap();
+    let mut offline = config.prompts[0].clone();
+    offline.id = "offline-reference-boundary".to_owned();
+    offline.calibration_only = true;
+    offline.prompt = Some("must never run for a customer".to_owned());
+    config.prompts.push(offline);
+    config
+        .perceptual_hashes_by_artifact_root
+        .get_mut(&"aa".repeat(32))
+        .unwrap()
+        .insert("offline-reference-boundary".to_owned(), hash);
+    let state = test_gateway_state_from_models(vec![routed_image_generation_test_model()])
+        .with_canary_registry(registry)
+        .with_canary_probe_policy(GatewayCanaryProbePolicy::every_session_for_tests())
+        .with_session_backend(Arc::new(ImageCanarySessionBackend {
+            user_bytes: bytes.clone(),
+            canary_bytes: bytes,
+            requests: requests.clone(),
+        }));
+    let (status, _) = json_request(
+        openai_router(state.clone()),
+        Method::POST,
+        "/v1/images/generations",
+        json!({"model": "admin/image-fixture", "prompt": "a user image", "n": 1,
+            "size": "64x64", "steps": 1, "response_format": "b64_json"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        2,
+        "one user request and one runtime probe"
+    );
+    assert_eq!(state.receipts().len(), 2);
+    let probes = state.probes();
+    assert_eq!(probes.len(), 1);
+    assert!(
+        probes[0].pass,
+        "offline hashes must not produce a false mismatch"
+    );
+}

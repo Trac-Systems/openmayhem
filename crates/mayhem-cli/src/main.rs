@@ -24409,7 +24409,8 @@ fn canary_set_matrix_check(
             if !prompt.calibration_only {
                 runtime_prompt_count = runtime_prompt_count.saturating_add(1);
             }
-        } else if prompt.calibration_only
+        } else if (prompt.calibration_only
+            && model.canary.verification_method != CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH)
             || prompt.expected_transcript.is_some()
             || prompt.minimum_audio_seconds.is_some()
             || prompt.require_word_timestamps
@@ -24420,13 +24421,20 @@ fn canary_set_matrix_check(
                 prompt.id
             ));
         }
+        if model.canary.verification_method == CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH
+            && !prompt.calibration_only
+        {
+            runtime_prompt_count = runtime_prompt_count.saturating_add(1);
+        }
         prompt_ids.push(prompt.id.clone());
     }
-    if model.canary.verification_method == CANARY_VERIFICATION_TRANSCRIPT_MATCH
-        && runtime_prompt_count == 0
+    if matches!(
+        model.canary.verification_method.as_str(),
+        CANARY_VERIFICATION_TRANSCRIPT_MATCH | CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH
+    ) && runtime_prompt_count == 0
     {
         return Err(format!(
-            "STT canary set {set_id} must contain at least one runtime probe"
+            "canary set {set_id} must contain at least one runtime probe"
         ));
     }
     if model.model_class == DEFAULT_MODEL_CLASS && !model.sampling.is_empty() {
@@ -85111,6 +85119,7 @@ fn provider_modality_self_test_plan(
     let mut missing = served.clone();
     let mut candidates = prompts
         .iter()
+        .filter(|prompt| !prompt.calibration_only)
         .filter_map(|prompt| {
             let modalities = provider_canary_prompt_modalities(&ctx.selected.model, prompt);
             (!modalities.is_empty() && modalities.iter().all(|modality| served.contains(modality)))
@@ -85149,17 +85158,14 @@ fn provider_modality_self_test_plan(
         .into_iter()
         .map(|(prompt, modalities)| {
             let body = provider_canary_self_test_body(&ctx.selected.model, prompt)?;
-            let body = provider_seal_local_contract_request(
-                &body,
-                adapter,
-                &ctx.selected.model.model_id,
-            )
-            .with_context(|| {
-                format!(
-                    "functional modality canary {} violates its signed endpoint contract",
-                    prompt.id
-                )
-            })?;
+            let body =
+                provider_seal_local_contract_request(&body, adapter, &ctx.selected.model.model_id)
+                    .with_context(|| {
+                        format!(
+                            "functional modality canary {} violates its signed endpoint contract",
+                            prompt.id
+                        )
+                    })?;
             Ok(ProviderModalitySelfTestCase {
                 prompt_id: prompt.id.clone(),
                 modalities: modalities.into_iter().collect(),
@@ -114010,6 +114016,40 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             mayhem_proto::generate_endpoint_calibration_cases(contract)
                 .unwrap_or_else(|error| panic!("{}: {error}", contract.family));
         }
+    }
+
+    #[test]
+    fn image_canary_matrix_keeps_offline_reference_boundaries_out_of_runtime_probes() {
+        let catalog = catalog::load_document(&repo_path("catalog/models.json").unwrap()).unwrap();
+        let mut model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "tongyi/z-image-turbo")
+            .unwrap()
+            .clone();
+        model.canary.set_id = "test-image-calibration-only".to_owned();
+        let runtime = json!({"id": "runtime", "prompt": "A red cube", "seed": 7});
+        let offline =
+            json!({"id": "offline", "prompt": "A red cube", "seed": 7, "calibration_only": true});
+        let directory =
+            test_canary_dir_with_prompts(&model.canary.set_id, json!([runtime, offline]));
+        assert_eq!(
+            canary_set_matrix_check(&directory, &model)
+                .unwrap()
+                .prompt_count,
+            2
+        );
+        let directory = test_canary_dir_with_prompts(&model.canary.set_id, json!([offline]));
+        assert!(canary_set_matrix_check(&directory, &model)
+            .unwrap_err()
+            .contains("at least one runtime probe"));
+        let mut invalid = offline.clone();
+        invalid["expected_transcript"] = json!("not an image attribute");
+        let directory =
+            test_canary_dir_with_prompts(&model.canary.set_id, json!([runtime, invalid]));
+        assert!(canary_set_matrix_check(&directory, &model)
+            .unwrap_err()
+            .contains("STT-only"));
     }
 
     #[test]

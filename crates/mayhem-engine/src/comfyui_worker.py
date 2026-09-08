@@ -1,9 +1,11 @@
 import asyncio
 import base64
 import contextlib
+import errno
 import json
 import os
 import sys
+import tempfile
 import time
 import traceback
 import uuid
@@ -81,7 +83,7 @@ def resolve_output_file(item):
         "temp": base_dir / "temp",
     }.get(kind, base_dir / "output")
     candidate = (root / subfolder / filename).resolve()
-    if not str(candidate).startswith(str(root.resolve())):
+    if not candidate.is_relative_to(root.resolve()):
         raise RuntimeError("ComfyUI output path escaped its output root")
     if candidate.is_file():
         return candidate
@@ -101,34 +103,140 @@ def safe_input_file_path(filename):
             raise ValueError("workflow input file filename contains unsupported characters")
     root = (base_dir / "input").resolve()
     candidate = (root / filename).resolve()
-    if not str(candidate).startswith(str(root)):
+    if not candidate.is_relative_to(root):
         raise ValueError("workflow input file escaped the input root")
     return candidate
 
 
+def input_transfer_root():
+    root = (base_dir / "input").resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    # A sibling keeps atomic replacement on the input drive, while callers
+    # cannot address journals or backups through workflow input filenames.
+    transfers = root.parent / ".mayhem-input-transfers"
+    transfers.mkdir(exist_ok=True)
+    return transfers
+
+
+def restore_input_transfer(backup_root):
+    manifest = backup_root / "manifest.json"
+    records = []
+    if manifest.exists():
+        if manifest.stat().st_size > 256 * 1024:
+            raise RuntimeError("workflow input recovery journal exceeds its bound")
+        records = json.loads(manifest.read_text(encoding="utf-8"))
+        if not isinstance(records, list) or len(records) > 1024:
+            raise RuntimeError("invalid workflow input recovery journal")
+    errors = []
+    for index in reversed(range(len(records))):
+        try:
+            record = records[index]
+            path = safe_input_file_path(record["filename"])
+            backup = backup_root / str(index)
+            if record["original"] is True:
+                if backup.exists():
+                    backup.replace(path)
+                # No backup means either the original was not yet moved, or
+                # restoration completed before a previous recovery stopped.
+            elif record["original"] is False:
+                path.unlink(missing_ok=True)
+            else:
+                raise ValueError("invalid workflow input recovery record")
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            errors.append(error)
+    if errors:
+        raise RuntimeError(f"workflow input cleanup failed; backups retained at {backup_root}") from errors[0]
+    manifest.unlink(missing_ok=True)
+    (backup_root / "manifest.next").unlink(missing_ok=True)
+    backup_root.rmdir()
+
+
+def recover_input_transfers():
+    transfers = input_transfer_root()
+    for pending in sorted(transfers.iterdir()):
+        if pending.name.startswith("request-") and pending.is_dir():
+            restore_input_transfer(pending)
+
+
+@contextlib.contextmanager
+def input_transfer_lock():
+    # Two workers can share a runtime cache. Hold an OS lock through generation
+    # so one worker cannot recover or overwrite another worker's active inputs.
+    with (input_transfer_root() / ".lock").open("a+b") as lock:
+        if lock.seek(0, os.SEEK_END) == 0:
+            lock.write(b"\0")
+            lock.flush()
+        lock.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            while True:
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    time.sleep(0.1)
+        else:
+            import fcntl
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 @contextlib.contextmanager
 def materialized_input_files(payload):
+    with input_transfer_lock():
+        with staged_input_files(payload):
+            yield
+
+
+@contextlib.contextmanager
+def staged_input_files(payload):
+    # Cancellation can terminate this worker, bypassing finally. Recover its
+    # journals before another graph can read any input left by that request.
+    recover_input_transfers()
+    backup_root = Path(tempfile.mkdtemp(prefix="request-", dir=input_transfer_root()))
     written = []
-    for item in payload.get("input_files") or []:
-        if not isinstance(item, dict):
-            raise ValueError("workflow input_files entries must be objects")
-        filename = item.get("filename")
-        path = safe_input_file_path(filename)
-        encoded = item.get("data_base64")
-        if not isinstance(encoded, str) or not encoded:
-            raise ValueError(f"workflow input file {filename} is missing data_base64")
-        data = base64.b64decode(encoded, validate=True)
-        if not data:
-            raise ValueError(f"workflow input file {filename} is empty")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-        written.append(path)
+    seen = set()
     try:
+        for item in payload.get("input_files") or []:
+            if not isinstance(item, dict):
+                raise ValueError("workflow input_files entries must be objects")
+            filename = item.get("filename")
+            path = safe_input_file_path(filename)
+            if path in seen:
+                raise ValueError(f"duplicate workflow input file {filename}")
+            seen.add(path)
+            encoded = item.get("data_base64")
+            if not isinstance(encoded, str) or not encoded:
+                raise ValueError(f"workflow input file {filename} is missing data_base64")
+            data = base64.b64decode(encoded, validate=True)
+            if not data:
+                raise ValueError(f"workflow input file {filename} is empty")
+            path.parent.mkdir(parents=True, exist_ok=True)
+            original = path.exists()
+            if original:
+                if not path.is_file():
+                    raise ValueError(f"workflow input file {filename} is not a file")
+            written.append({"filename": filename, "original": original})
+            # Commit the recovery record before changing any caller/provider
+            # bytes. Atomic replacement makes interrupted journals readable.
+            journal = backup_root / "manifest.next"
+            journal.write_text(json.dumps(written), encoding="utf-8")
+            journal.replace(backup_root / "manifest.json")
+            if original:
+                path.replace(backup_root / str(len(written) - 1))
+            path.write_bytes(data)
         yield
     finally:
-        for path in written:
-            with contextlib.suppress(FileNotFoundError):
-                path.unlink()
+        restore_input_transfer(backup_root)
 
 
 def collect_artifacts(prompt_id, history):

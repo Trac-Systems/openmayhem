@@ -31,3 +31,19 @@ The calibration matrix uses a real image fixture for strength boundary cases;
 it must not substitute padded text for an encoded image. Functional image
 canaries preserve reference, strength and negative prompt, and account for
 source as well as output bytes/pixels.
+Image boundary cases marked `calibration_only` remain in signed calibration
+evidence, while runtime probes use the remaining functional cases. A set must
+retain at least one runtime probe.
+
+## Workflow reference files
+
+ComfyUI consumes request-carried files through its input directory for the
+duration of the graph. Uploads replace matching provider fixtures temporarily;
+the original bytes are restored after success, validation failure or execution
+failure. Invalid later attachments cannot strand earlier uploads.
+
+A journal outside the public input directory permits the next worker to restore
+files after process termination. An OS lock prevents workers sharing a runtime
+cache from recovering or overwriting another worker's active inputs. Recovery
+errors stop the request and retain backups. Input and output path checks use
+path components, including resolved symlinks, rather than string prefixes.
