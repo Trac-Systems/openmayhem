@@ -532,10 +532,12 @@ python3 scripts/verify-comfy-cheatsheet.py \
 | `image.heavy.le1_2mp` | Image heavy <=1.2MP | image | heavy | megapixel_step | {"max_megapixels":"1.2","max_steps":60,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
 | `image.heavy.le4_5mp` | Image heavy <=4.5MP | image | heavy | megapixel_step | {"max_megapixels":"4.5","max_steps":60,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
 | `image.heavy.le17mp` | Image heavy <=17MP | image | heavy | megapixel_step | {"max_megapixels":"17","max_steps":60,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
-| `video.light.le0_5mpf` | Video light <=0.5MP/frame | video | light | megapixel_step | {"max_megapixels_per_frame":"0.5","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
-| `video.light.le2_2mpf` | Video light <=2.2MP/frame | video | light | megapixel_step | {"max_megapixels_per_frame":"2.2","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
-| `video.heavy.le0_5mpf` | Video heavy <=0.5MP/frame | video | heavy | megapixel_step | {"max_megapixels_per_frame":"0.5","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
-| `video.heavy.le2_2mpf` | Video heavy <=2.2MP/frame | video | heavy | megapixel_step | {"max_megapixels_per_frame":"2.2","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `video.light.le0_5mpf` | Video light <=0.5MP/frame | video | light | pixel_frame | {"max_megapixels_per_frame":"0.5","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `video.light.le2_2mpf` | Video light <=2.2MP/frame | video | light | pixel_frame | {"max_megapixels_per_frame":"2.2","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `video.heavy.le0_5mpf` | Video heavy <=0.5MP/frame | video | heavy | pixel_frame | {"max_megapixels_per_frame":"0.5","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `video.heavy.le2_2mpf` | Video heavy <=2.2MP/frame | video | heavy | pixel_frame | {"max_megapixels_per_frame":"2.2","max_seconds":30,"max_frames":720,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `video.minimax_h3.lowvram_t2v_i2v` | MiniMax H3 low-VRAM text/image-to-video with native audio | video | minimax-h3-lowvram | pixel_frame | {"max_megapixels_per_frame":"1","max_seconds":10,"max_frames":243,"trained_frames_min":240,"trained_frames_max":243,"fps":24,"allowed_steps":[4,6,8],"default_steps":4,"native_max_width":736,"native_max_height":1280,"output_modalities":["video","audio"],"reference_media":["image"],"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+| `video.minimax_h3.lowvram_r2v` | MiniMax H3 low-VRAM reference-to-video with native audio | video | minimax-h3-lowvram | pixel_frame | {"max_megapixels_per_frame":"1","max_seconds":10,"max_frames":243,"trained_frames_min":240,"trained_frames_max":243,"fps":24,"allowed_steps":[4],"default_steps":4,"native_max_width":736,"native_max_height":1280,"output_modalities":["video","audio"],"reference_media":["image","video"],"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
 | `upscale.conv.le24mp` | Convolutional upscale/restore <=24MP | image | upscale-conv | megapixel | {"max_output_megapixels":"24","priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
 | `upscale.conv.le512mp` | Convolutional upscale/restore <=512MP | image | upscale-conv | megapixel | {"max_output_megapixels":"512","priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
 | `upscale.diffusion` | Diffusion upscale/restore | image | upscale-diffusion | megapixel_step | {"max_output_megapixels":"17","max_steps":60,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
@@ -544,6 +546,43 @@ python3 scripts/verify-comfy-cheatsheet.py \
 | `audio.stt` | Speech to text | audio | stt | audio_second | {"max_audio_seconds":3600,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
 | `video.lipsync` | Lip sync | video | lipsync | frame | {"max_frames":720,"max_seconds":30,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
 | `compute.norm` | Normalized residual compute | image | residual | compute_second | {"max_compute_seconds":600,"priority_scalars":{"economy":"0.5","standard":"1","priority":"2"}} |
+
+### Video metering unit
+
+Video outcome classes bill in `pixel_frame`: exactly
+`width * height * frames * artifact_count`, with no rounding anywhere in the
+count. Rate maps carry `granularity: 1000000`, so `per_unit_au` reads as
+atto-USD per megapixel-frame.
+
+A price is `per_req_au + ceil(pixel_frames * per_unit_au / granularity)`.
+
+The six generic video classes keep the rate they had, converted mechanically
+(`ceil(old per_unit_au / 1000)`) and charging no fixed component, so a frame of
+exactly 1,000,000 pixels costs what it did under the old unit and every smaller
+frame costs proportionally less.
+
+The two MiniMax H3 low-VRAM classes carry their own tariff instead: a fixed
+per-request component of `4300000000000000` atto-USD plus `1067672950634057`
+atto-USD per megapixel-frame, anchored so a 736x1280 clip of five seconds at
+24 fps prices at exactly `$0.125`. **H3 low-VRAM 736x1280 clips shorter than
+five seconds cost slightly more than before because of the fixed per-request
+component** (one second: 28440 micro-USD against 25001 before). Every other
+admitted job on every video class is cheaper than or equal to the old price.
+
+`megapixel_step` is image-only. It rounded each frame's area up to a whole
+megapixel before multiplying by frames, so every canvas under one megapixel
+billed the same: 256x256 and 736x1280 cost an identical amount for the same
+duration. A video outcome priced in `megapixel_step`, or in any unit the meter
+does not know, now fails admission closed instead of being quoted at some
+arbitrary quantity.
+
+`frames` is the quoted duration frame count: an explicit frame length if the
+graph declares one, otherwise `seconds * fps`. The pinned MiniMax H3 worker
+aligns its own execution to `17n + 5` frames (243 executed for a quoted 240 at
+ten seconds and 24 fps). That alignment is NOT billed; the customer pays for the
+duration that was quoted.
+
+`video.lipsync` keeps `frame`, which never had the rounding problem.
 
 ## Class Fit Matrix
 

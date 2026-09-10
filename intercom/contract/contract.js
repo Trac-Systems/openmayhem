@@ -5,7 +5,7 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 22;
+export const CONTRACT_VERSION = 23;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -307,6 +307,10 @@ const MODEL_CLASS_RATE_UNITS = Object.freeze({
   workflow: new Set([
     'megapixel_step',
     'megapixel',
+    // Exact integer pixel-frames (width * height * frames * artifact_count).
+    // Video workflow classes price in this unit; `megapixel_step` rounds each
+    // frame up to a whole megapixel and is image-only.
+    'pixel_frame',
     'compute_second',
     'audio_second',
     'input_character',

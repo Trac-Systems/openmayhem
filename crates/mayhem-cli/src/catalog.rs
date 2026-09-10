@@ -14,7 +14,7 @@ use mayhem_proto::{
     EndpointValueType, ModelSpecialityDescriptor, MoneyAu, DEFAULT_MODEL_CLASS,
     ENDPOINT_OPENAI_CHAT_COMPLETIONS, USAGE_AUDIO_SECOND, USAGE_COMPUTE_SECOND, USAGE_FRAME,
     USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_MEGAPIXEL, USAGE_MEGAPIXEL_STEP,
-    USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    USAGE_OUTPUT_TOKEN, USAGE_PIXEL_FRAME, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -2422,6 +2422,7 @@ fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
         MODEL_CLASS_WORKFLOW => &[
             USAGE_MEGAPIXEL_STEP,
             USAGE_MEGAPIXEL,
+            USAGE_PIXEL_FRAME,
             USAGE_COMPUTE_SECOND,
             USAGE_AUDIO_SECOND,
             USAGE_INPUT_CHARACTER,

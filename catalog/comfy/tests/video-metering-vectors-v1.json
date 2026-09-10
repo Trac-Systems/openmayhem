@@ -1,0 +1,1037 @@
+{
+ "schema": "openmayhem.video-metering-vectors",
+ "version": 2,
+ "generated": "2026-09-10",
+ "source_commit": "fe937e74d93e3d4f30775348eb3c067088d9fa60",
+ "rules": {
+  "pixel_frame_count": "width*height*frames*artifact_count, exact integer, no rounding",
+  "frames": "explicit frames if given, else seconds*fps",
+  "price_au": "new_per_req_au + ceil(count*per_unit_au/granularity), integer arithmetic (u128 / bigint)",
+  "price_micro": "ceil(price_au/1e12) (website microFromAu rounds up)",
+  "tariffs": "six generic video classes: per_unit_au = ceil(old per_unit_au / 1000) at granularity 1_000_000, per_req_au 0. The two H3 low-VRAM classes: per_req_au 4300000000000000 plus per_unit_au 1067672950634057 per megapixel-frame, so 736x1280 x 5 s x 24 fps prices at 125000 micro-USD",
+  "old_*": "the pre-fix formula, for before/after assertions only; not implemented in new code",
+  "price_rises_vs_old": "true only for 736x1280 H3 low-VRAM clips shorter than 5 s; every other case is cheaper than or equal to the old formula. Tests assert this field per case"
+ },
+ "cases": [
+  {
+   "label": "lowvram 360P portrait 352x608 1s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 352,
+   "height": 608,
+   "fps": 24,
+   "seconds": 1,
+   "frames": 24,
+   "artifact_count": 1,
+   "pixels_per_frame": 214016,
+   "pixel_frame_count": 5136384,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "9783978260869561",
+   "new_price_micro": "9784",
+   "old_usage_megapixel_step": 24,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "25000000000000001",
+   "old_price_micro": "25001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 360P portrait 352x608 5s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 352,
+   "height": 608,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 214016,
+   "pixel_frame_count": 25681920,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "31719891304347802",
+   "new_price_micro": "31720",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "125000000000000001",
+   "old_price_micro": "125001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 360P portrait 352x608 10s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 352,
+   "height": 608,
+   "fps": 24,
+   "seconds": 10,
+   "frames": 240,
+   "artifact_count": 1,
+   "pixels_per_frame": 214016,
+   "pixel_frame_count": 51363840,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "59139782608695603",
+   "new_price_micro": "59140",
+   "old_usage_megapixel_step": 240,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "250000000000000001",
+   "old_price_micro": "250001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 416P portrait 416x736 1s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 416,
+   "height": 736,
+   "fps": 24,
+   "seconds": 1,
+   "frames": 24,
+   "artifact_count": 1,
+   "pixels_per_frame": 306176,
+   "pixel_frame_count": 7348224,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "12145499999999993",
+   "new_price_micro": "12146",
+   "old_usage_megapixel_step": 24,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "25000000000000001",
+   "old_price_micro": "25001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 416P portrait 416x736 5s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 416,
+   "height": 736,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 306176,
+   "pixel_frame_count": 36741120,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "43527499999999965",
+   "new_price_micro": "43528",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "125000000000000001",
+   "old_price_micro": "125001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 416P portrait 416x736 10s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 416,
+   "height": 736,
+   "fps": 24,
+   "seconds": 10,
+   "frames": 240,
+   "artifact_count": 1,
+   "pixels_per_frame": 306176,
+   "pixel_frame_count": 73482240,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "82754999999999929",
+   "new_price_micro": "82755",
+   "old_usage_megapixel_step": 240,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "250000000000000001",
+   "old_price_micro": "250001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 480P portrait 480x864 1s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 480,
+   "height": 864,
+   "fps": 24,
+   "seconds": 1,
+   "frames": 24,
+   "artifact_count": 1,
+   "pixels_per_frame": 414720,
+   "pixel_frame_count": 9953280,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "14926847826086947",
+   "new_price_micro": "14927",
+   "old_usage_megapixel_step": 24,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "25000000000000001",
+   "old_price_micro": "25001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 480P portrait 480x864 5s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 480,
+   "height": 864,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 414720,
+   "pixel_frame_count": 49766400,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "57434239130434735",
+   "new_price_micro": "57435",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "125000000000000001",
+   "old_price_micro": "125001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 480P portrait 480x864 10s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 480,
+   "height": 864,
+   "fps": 24,
+   "seconds": 10,
+   "frames": 240,
+   "artifact_count": 1,
+   "pixels_per_frame": 414720,
+   "pixel_frame_count": 99532800,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "110568478260869469",
+   "new_price_micro": "110569",
+   "old_usage_megapixel_step": 240,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "250000000000000001",
+   "old_price_micro": "250001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 540P portrait 544x960 1s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 544,
+   "height": 960,
+   "fps": 24,
+   "seconds": 1,
+   "frames": 24,
+   "artifact_count": 1,
+   "pixels_per_frame": 522240,
+   "pixel_frame_count": 12533760,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "17681956521739119",
+   "new_price_micro": "17682",
+   "old_usage_megapixel_step": 24,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "25000000000000001",
+   "old_price_micro": "25001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 540P portrait 544x960 5s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 544,
+   "height": 960,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 522240,
+   "pixel_frame_count": 62668800,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "71209782608695592",
+   "new_price_micro": "71210",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "125000000000000001",
+   "old_price_micro": "125001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 540P portrait 544x960 10s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 544,
+   "height": 960,
+   "fps": 24,
+   "seconds": 10,
+   "frames": 240,
+   "artifact_count": 1,
+   "pixels_per_frame": 522240,
+   "pixel_frame_count": 125337600,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "138119565217391183",
+   "new_price_micro": "138120",
+   "old_usage_megapixel_step": 240,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "250000000000000001",
+   "old_price_micro": "250001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 640P portrait 640x1152 1s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 640,
+   "height": 1152,
+   "fps": 24,
+   "seconds": 1,
+   "frames": 24,
+   "artifact_count": 1,
+   "pixels_per_frame": 737280,
+   "pixel_frame_count": 17694720,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "23192173913043462",
+   "new_price_micro": "23193",
+   "old_usage_megapixel_step": 24,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "25000000000000001",
+   "old_price_micro": "25001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 640P portrait 640x1152 5s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 640,
+   "height": 1152,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 737280,
+   "pixel_frame_count": 88473600,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "98760869565217306",
+   "new_price_micro": "98761",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "125000000000000001",
+   "old_price_micro": "125001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 640P portrait 640x1152 10s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 640,
+   "height": 1152,
+   "fps": 24,
+   "seconds": 10,
+   "frames": 240,
+   "artifact_count": 1,
+   "pixels_per_frame": 737280,
+   "pixel_frame_count": 176947200,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "193221739130434611",
+   "new_price_micro": "193222",
+   "old_usage_megapixel_step": 240,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "250000000000000001",
+   "old_price_micro": "250001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 720P portrait 736x1280 1s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 736,
+   "height": 1280,
+   "fps": 24,
+   "seconds": 1,
+   "frames": 24,
+   "artifact_count": 1,
+   "pixels_per_frame": 942080,
+   "pixel_frame_count": 22609920,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "28439999999999979",
+   "new_price_micro": "28440",
+   "old_usage_megapixel_step": 24,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "25000000000000001",
+   "old_price_micro": "25001",
+   "price_rises_vs_old": true
+  },
+  {
+   "label": "lowvram 720P portrait 736x1280 5s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 736,
+   "height": 1280,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 942080,
+   "pixel_frame_count": 113049600,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "124999999999999891",
+   "new_price_micro": "125000",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "125000000000000001",
+   "old_price_micro": "125001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 720P portrait 736x1280 10s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 736,
+   "height": 1280,
+   "fps": 24,
+   "seconds": 10,
+   "frames": 240,
+   "artifact_count": 1,
+   "pixels_per_frame": 942080,
+   "pixel_frame_count": 226099200,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "245699999999999781",
+   "new_price_micro": "245700",
+   "old_usage_megapixel_step": 240,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "250000000000000001",
+   "old_price_micro": "250001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram custom256 portrait 256x256 1s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 256,
+   "height": 256,
+   "fps": 24,
+   "seconds": 1,
+   "frames": 24,
+   "artifact_count": 1,
+   "pixels_per_frame": 65536,
+   "pixel_frame_count": 1572864,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "5979304347826086",
+   "new_price_micro": "5980",
+   "old_usage_megapixel_step": 24,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "25000000000000001",
+   "old_price_micro": "25001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram custom256 portrait 256x256 5s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 256,
+   "height": 256,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 65536,
+   "pixel_frame_count": 7864320,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "12696521739130428",
+   "new_price_micro": "12697",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "125000000000000001",
+   "old_price_micro": "125001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram custom256 portrait 256x256 10s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 256,
+   "height": 256,
+   "fps": 24,
+   "seconds": 10,
+   "frames": 240,
+   "artifact_count": 1,
+   "pixels_per_frame": 65536,
+   "pixel_frame_count": 15728640,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "21093043478260855",
+   "new_price_micro": "21094",
+   "old_usage_megapixel_step": 240,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "250000000000000001",
+   "old_price_micro": "250001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 720P portrait 736x1280 4s (shorter than 5 s)",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 736,
+   "height": 1280,
+   "fps": 24,
+   "seconds": 4,
+   "frames": 96,
+   "artifact_count": 1,
+   "pixels_per_frame": 942080,
+   "pixel_frame_count": 90439680,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "100859999999999913",
+   "new_price_micro": "100860",
+   "old_usage_megapixel_step": 96,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "100000000000000001",
+   "old_price_micro": "100001",
+   "price_rises_vs_old": true
+  },
+  {
+   "label": "lowvram 720P landscape 1280x736 5s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 1280,
+   "height": 736,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 942080,
+   "pixel_frame_count": 113049600,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "124999999999999891",
+   "new_price_micro": "125000",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "125000000000000001",
+   "old_price_micro": "125001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 608x352 1s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 608,
+   "height": 352,
+   "fps": 24,
+   "seconds": 1,
+   "frames": 24,
+   "artifact_count": 1,
+   "pixels_per_frame": 214016,
+   "pixel_frame_count": 5136384,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "9783978260869561",
+   "new_price_micro": "9784",
+   "old_usage_megapixel_step": 24,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "25000000000000001",
+   "old_price_micro": "25001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 736x416 1s",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 736,
+   "height": 416,
+   "fps": 24,
+   "seconds": 1,
+   "frames": 24,
+   "artifact_count": 1,
+   "pixels_per_frame": 306176,
+   "pixel_frame_count": 7348224,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "12145499999999993",
+   "new_price_micro": "12146",
+   "old_usage_megapixel_step": 24,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "25000000000000001",
+   "old_price_micro": "25001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 540P 5s artifact_count 2",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 544,
+   "height": 960,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 2,
+   "pixels_per_frame": 522240,
+   "pixel_frame_count": 125337600,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "138119565217391183",
+   "new_price_micro": "138120",
+   "old_usage_megapixel_step": 240,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "250000000000000001",
+   "old_price_micro": "250001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram r2v 540P 5s",
+   "class_id": "video.minimax_h3.lowvram_r2v",
+   "width": 544,
+   "height": 960,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 522240,
+   "pixel_frame_count": 62668800,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "71209782608695592",
+   "new_price_micro": "71210",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "125000000000000001",
+   "old_price_micro": "125001",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "heavy exact 1,000,000 px boundary 5s",
+   "class_id": "video.heavy.le2_2mpf",
+   "width": 1000,
+   "height": 1000,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 1000000,
+   "pixel_frame_count": 120000000,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "103500000000000",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "0",
+   "new_price_au": "12420000000000000",
+   "new_price_micro": "12420",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "103500000000000000",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "12420000000000000",
+   "old_price_micro": "12420",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "heavy >1MP 1280x1280 5s",
+   "class_id": "video.heavy.le2_2mpf",
+   "width": 1280,
+   "height": 1280,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 1638400,
+   "pixel_frame_count": 196608000,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "103500000000000",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "0",
+   "new_price_au": "20348928000000000",
+   "new_price_micro": "20349",
+   "old_usage_megapixel_step": 240,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "103500000000000000",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "24840000000000000",
+   "old_price_micro": "24840",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "heavy 1,001,000 px just over boundary 1s",
+   "class_id": "video.heavy.le2_2mpf",
+   "width": 1000,
+   "height": 1001,
+   "fps": 24,
+   "seconds": 1,
+   "frames": 24,
+   "artifact_count": 1,
+   "pixels_per_frame": 1001000,
+   "pixel_frame_count": 24024000,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "103500000000000",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "0",
+   "new_price_au": "2486484000000000",
+   "new_price_micro": "2487",
+   "old_usage_megapixel_step": 48,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "103500000000000000",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "4968000000000000",
+   "old_price_micro": "4968",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "light 640x360 30fps 4s",
+   "class_id": "video.light.le0_5mpf",
+   "width": 640,
+   "height": 360,
+   "fps": 30,
+   "seconds": 4,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 230400,
+   "pixel_frame_count": 27648000,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "36000000000000",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "0",
+   "new_price_au": "995328000000000",
+   "new_price_micro": "996",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "36000000000000000",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "4320000000000000",
+   "old_price_micro": "4320",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "h3 heavy 1024x576 5s",
+   "class_id": "video.minimax_h3.t2v_i2v",
+   "width": 1024,
+   "height": 576,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 589824,
+   "pixel_frame_count": 70778880,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "694444444444445",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "0",
+   "new_price_au": "49152000000000040",
+   "new_price_micro": "49153",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "694444444444444444",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "83333333333333334",
+   "old_price_micro": "83334",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "h3 r2v 720P 5s",
+   "class_id": "video.minimax_h3.r2v",
+   "width": 736,
+   "height": 1280,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 120,
+   "artifact_count": 1,
+   "pixels_per_frame": 942080,
+   "pixel_frame_count": 113049600,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "103500000000000",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "0",
+   "new_price_au": "11700633600000000",
+   "new_price_micro": "11701",
+   "old_usage_megapixel_step": 120,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "103500000000000000",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "12420000000000000",
+   "old_price_micro": "12420",
+   "price_rises_vs_old": false
+  },
+  {
+   "label": "lowvram 720P explicit frames=124 (worker-aligned, NOT default billing)",
+   "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+   "width": 736,
+   "height": 1280,
+   "fps": 24,
+   "seconds": 5,
+   "frames": 124,
+   "artifact_count": 1,
+   "pixels_per_frame": 942080,
+   "pixel_frame_count": 116817920,
+   "new_rate": {
+    "unit": "pixel_frame",
+    "per_unit_au": "1067672950634057",
+    "granularity": 1000000
+   },
+   "new_per_req_au": "4300000000000000",
+   "new_price_au": "129023333333333220",
+   "new_price_micro": "129024",
+   "old_usage_megapixel_step": 124,
+   "old_rate": {
+    "unit": "megapixel_step",
+    "per_unit_au": "1041666666666666667",
+    "granularity": 1000
+   },
+   "old_per_req_au": "0",
+   "old_price_au": "129166666666666667",
+   "old_price_micro": "129167",
+   "price_rises_vs_old": false
+  }
+ ]
+}
