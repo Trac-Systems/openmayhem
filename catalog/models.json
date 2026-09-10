@@ -24780,7 +24780,9 @@
               "steps",
               "cfg_scale",
               "shift",
-              "seed"
+              "seed",
+              "input_reference",
+              "strength"
             ],
             "required_request_attributes": [
               "model",
@@ -24947,6 +24949,28 @@
                   42,
                   4294967295
                 ]
+              },
+              "input_reference": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "$IMAGE_DATA_URL"
+                ]
+              },
+              "strength": {
+                "value_types": [
+                  "number"
+                ],
+                "default": 0.6,
+                "minimum": 0,
+                "maximum": 1,
+                "calibration_values": [
+                  0,
+                  0.35,
+                  0.6,
+                  1
+                ]
               }
             },
             "response_attribute_specs": {
@@ -24975,7 +24999,7 @@
                   "integer"
                 ],
                 "minimum": 0,
-                "maximum": 18446744073709552000,
+                "maximum": 1.8446744073709552e+19,
                 "calibration_values": [
                   1
                 ]
@@ -25035,6 +25059,15 @@
                 "cfg_scale",
                 "shift",
                 "seed"
+              ],
+              [
+                "input_reference",
+                "strength",
+                "width",
+                "height",
+                "steps",
+                "cfg_scale",
+                "negative_prompt"
               ]
             ],
             "speciality_mappings": {}
@@ -25245,26 +25278,27 @@
           "image"
         ],
         "evidence": [
-          "Pinned Tongyi-MAI/Z-Image-Turbo card, creator inference, official Space, ZImagePipeline, and stable-diffusion.cpp a8a91b24 expose text-to-image generation with a 1024x1024 default, official 576..2048 resolution envelope divisible by 16, user-selectable 7..9 public steps (9 maps to 8 DiT forwards), guidance 0..49 with default 0, negative prompting that becomes active above guidance 0, 1..4 images, seed control, and flow shift 1..10 with default 3."
+          "Pinned Tongyi-MAI/Z-Image-Turbo card, creator inference, official Space, ZImagePipeline, and stable-diffusion.cpp a8a91b24 expose text-to-image generation with a 1024x1024 default, official 576..2048 resolution envelope divisible by 16, user-selectable 7..9 public steps (9 maps to 8 DiT forwards), guidance 0..49 with default 0, negative prompting that becomes active above guidance 0, 1..4 images, seed control, and flow shift 1..10 with default 3.",
+          "Image-to-image reference support through the same pinned Turbo weights and stable-diffusion.cpp img2img endpoint: one PNG/JPEG input_reference and strength 0..1, default 0.6. Source and render resource load is admitted together. Measured reference canaries cover distinct source images, strength boundaries, negative prompting and the source-byte limit; all 264 endpoint calibration cases passed."
         ],
         "calibrated_fingerprints": {
           "gguf-q4_k": {
-            "image": "c497478338bcf0bf46dece355946e20a870e5b92b155fd512c46839db83b4495"
+            "image": "8cae9c674b3281cbf7946b8b80dde447a1b33d9411390404cb591a950bcaf0b6"
           }
         },
         "resource_profiles": {
           "gguf-q4_k": {
             "image": {
               "unit": "pixel",
-              "measurement_source": "process_rss; pool=system_memory; host available memory; --memory-reserve override 15% = 9.46GiB",
-              "max_item_bytes": 1457895,
+              "measurement_source": "process_tree_rss; pool=system_memory; conservative maximum measured working set across image canaries",
+              "max_item_bytes": 4195716,
               "max_item_units": 1048576,
-              "measured_item_bytes": 1457895,
+              "measured_item_bytes": 4195716,
               "measured_item_units": 1048576,
-              "measured_working_set_bytes": 407236608,
-              "calibration_baseline_memory_bytes": 308359168,
-              "calibration_peak_memory_bytes": 715595776,
-              "calibration_f13_budget_bytes": 49719441203,
+              "measured_working_set_bytes": 2254110720,
+              "calibration_baseline_memory_bytes": 495869952,
+              "calibration_peak_memory_bytes": 2749980672,
+              "calibration_f13_budget_bytes": 45610047283,
               "default_max_inflight_items": 1,
               "default_max_items_per_request": 1
             }
@@ -25281,13 +25315,20 @@
       },
       "sampling": {},
       "canary": {
-        "set_id": "canary-z-image-launch-v1",
+        "set_id": "canary-z-image-reference-v2",
         "match_min": 0.9,
         "verification_method": "seed_perceptual_hash",
         "verification_tolerance_bps": 1500,
         "perceptual_hashes": {
           "gguf-q4_k": {
-            "z-image-red-cube-studio-seed7": "a0000303c3c73f07"
+            "z-image-red-cube-studio-seed7": "a0000303c3c73f07",
+            "z-image-reference-layout-a-seed7": "ff8f8f8981f1ffff",
+            "z-image-reference-layout-b-seed7": "f9f1f1f19f0f1fff",
+            "z-image-reference-max-bytes": "ff8f8f8981f1ffff",
+            "z-image-reference-negative-prompt": "ff8f8f8981f1ffff",
+            "z-image-reference-strength-035": "ff8f8f8981f1ffff",
+            "z-image-reference-strength-one": "ff3c1800081c3eff",
+            "z-image-reference-strength-zero": "ff8f8f8981f1ffff"
           }
         }
       },
