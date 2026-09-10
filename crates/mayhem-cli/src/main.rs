@@ -103428,7 +103428,7 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 22);
+        assert_eq!(CONTRACT_VERSION, 23);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 11);
     }
@@ -103696,7 +103696,7 @@ status: linked
         let tx = admin_contract_tx_digest(&prepared_command, &admin, &nonce, false, &context);
         assert_eq!(
             tx,
-            "2e60ee6c323d431422f9c77f862a9893e57e11c11bde71fe69c7b170ecd2d600"
+            "2854d37a2b5d7917ebd1902fa7d1c33617c69272f379d76168c641d0c6789260"
         );
         assert_eq!(
             admin_contract_tx_feature(
@@ -110653,7 +110653,7 @@ esac
         let expected_message = concat!(
             "mayhem-targeted-spend-reservation-v1",
             "{\"payout_revision\":\"9999999999999999999999999999999999999999999999999999999999999999\",",
-            "\"reservation\":{\"at\":25200,\"contract_version\":22,\"ctx_bracket\":\"le8k\",",
+            "\"reservation\":{\"at\":25200,\"contract_version\":23,\"ctx_bracket\":\"le8k\",",
             "\"ctx_bracket_table_ver\":1,",
             "\"enclave_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"enclave_pubkey\":\"5555555555555555555555555555555555555555555555555555555555555555\",",
@@ -110695,7 +110695,7 @@ esac
                 "hold/targeted/tnk/",
                 "2222222222222222222222222222222222222222222222222222222222222222/7/",
                 "1111111111111111111111111111111111111111111111111111111111111111/",
-                "1b3c8d504db55092eb4d3283bcce99e3ec0478fa98218645338ff9dbb1bd9896"
+                "d5c7857df0f3dc20e9284d7691d6563e372fb44670e1217a61d194abd6538d42"
             )
         );
     }

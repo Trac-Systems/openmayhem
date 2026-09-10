@@ -104,8 +104,8 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 test('checked-in Intercom release identity verifies exact sorted contract code bytes', () => {
   const identity = verifyReleaseIdentity({ rootDir: INTERCOM_ROOT });
 
-  assert.equal(identity.releaseVersion, '0.2.181');
-  assert.equal(identity.contractVersion, 22);
+  assert.equal(identity.releaseVersion, '0.2.182');
+  assert.equal(identity.contractVersion, 23);
   assert.match(identity.contractCodeSha256, /^[0-9a-f]{64}$/);
   assert.deepEqual(
     identity.files.map((file) => file.path),
@@ -323,7 +323,7 @@ test('health exposes only a verified Intercom contract identity', async (t) => {
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), {
     ok: true,
-    contract_version: 22,
+    contract_version: 23,
     contract_code_sha256: releaseIdentity.contractCodeSha256,
   });
 });

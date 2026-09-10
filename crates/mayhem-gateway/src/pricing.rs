@@ -1,7 +1,7 @@
 use mayhem_proto::{
     MoneyAu, ReceiptUsage, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_COMPUTE_SECOND,
     USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_MEGAPIXEL,
-    USAGE_MEGAPIXEL_STEP, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    USAGE_MEGAPIXEL_STEP, USAGE_OUTPUT_TOKEN, USAGE_PIXEL_FRAME, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 
 pub use mayhem_proto::RateMapEntry;
@@ -143,8 +143,12 @@ pub fn cancellation_settlement_usage(
 fn cancellation_unit_rank(unit: &str) -> u8 {
     match unit {
         // These are the smallest bounded compute units for their model classes.
+        // `pixel_frame` is the finest of them: one pixel-frame is a millionth of a
+        // megapixel-frame, so a video schedule priced only in `pixel_frame` has a
+        // near-zero cancellation quantum. Video classes that need a real
+        // dispatch-and-cancel floor must carry `per_req_au` / `min_session_au`.
         USAGE_STEP | USAGE_AUDIO_SECOND | USAGE_FRAME | USAGE_MEGAPIXEL_STEP
-        | USAGE_COMPUTE_SECOND => 0,
+        | USAGE_PIXEL_FRAME | USAGE_COMPUTE_SECOND => 0,
         USAGE_INPUT_TOKEN | USAGE_VIDEO_SECOND | USAGE_MEGAPIXEL => 1,
         USAGE_INPUT_CHARACTER => 2,
         USAGE_OUTPUT_TOKEN | USAGE_IMAGE => 3,

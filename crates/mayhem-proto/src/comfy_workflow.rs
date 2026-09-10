@@ -7,7 +7,7 @@ use serde_json::{Number, Value};
 use crate::{
     stable_json_bytes, ReceiptUsage, WorkflowOutputBinding, USAGE_AUDIO_SECOND,
     USAGE_COMPUTE_SECOND, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_MEGAPIXEL,
-    USAGE_MEGAPIXEL_STEP, USAGE_STEP, USAGE_VIDEO_SECOND,
+    USAGE_MEGAPIXEL_STEP, USAGE_PIXEL_FRAME, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 
 pub const COMFY_WORKFLOW_DERIVATION_SCHEMA_VERSION: u32 = 1;
@@ -198,6 +198,7 @@ pub fn valid_comfy_pricing_unit(unit: &str) -> bool {
         unit,
         USAGE_MEGAPIXEL_STEP
             | USAGE_MEGAPIXEL
+            | USAGE_PIXEL_FRAME
             | USAGE_COMPUTE_SECOND
             | USAGE_AUDIO_SECOND
             | USAGE_INPUT_CHARACTER
@@ -357,7 +358,7 @@ pub fn derive_comfy_workflow(
     infer_linked_image_dimensions(nodes, policy, &mut metrics)?;
 
     let outcome_spec = metrics.into_outcome_spec(policy)?;
-    let quoted_usage = workflow_usage_from_outcome(&outcome_spec, policy.pricing_unit.as_deref());
+    let quoted_usage = workflow_usage_from_outcome(&outcome_spec, policy.pricing_unit.as_deref())?;
     let workflow_output = workflow_output_from_outcome(&outcome_spec);
     let graph_hash = graph_hash(graph)?;
     Ok(ComfyWorkflowDerivation {
@@ -966,7 +967,7 @@ fn numeric_f64(value: &Value) -> Option<f64> {
 fn workflow_usage_from_outcome(
     outcome: &ComfyWorkflowOutcomeSpec,
     pricing_unit: Option<&str>,
-) -> ReceiptUsage {
+) -> Result<ReceiptUsage, ComfyWorkflowDerivationError> {
     if let Some(unit) = pricing_unit {
         return workflow_usage_for_pricing_unit(outcome, unit);
     }
@@ -1006,25 +1007,68 @@ fn workflow_usage_from_outcome(
     if let Some(steps) = outcome.steps {
         units.insert(USAGE_STEP.to_owned(), steps.max(1) * artifact_count);
     }
-    ReceiptUsage::from_units(units)
+    Ok(ReceiptUsage::from_units(units))
 }
 
-fn workflow_usage_for_pricing_unit(outcome: &ComfyWorkflowOutcomeSpec, unit: &str) -> ReceiptUsage {
+fn outcome_is_video(outcome: &ComfyWorkflowOutcomeSpec) -> bool {
+    outcome
+        .output_modalities
+        .iter()
+        .any(|value| value == "video")
+}
+
+/// Canonical billable quantity for a priced outcome.
+///
+/// Every unit here is an exact integer count. Unknown units and unit/modality
+/// combinations that this meter cannot express fail closed: quoting one unit for
+/// work the tariff does not describe is a pricing defect, not a fallback.
+fn workflow_usage_for_pricing_unit(
+    outcome: &ComfyWorkflowOutcomeSpec,
+    unit: &str,
+) -> Result<ReceiptUsage, ComfyWorkflowDerivationError> {
     let artifact_count = outcome.artifact_count.max(1);
     let count = match unit {
-        USAGE_MEGAPIXEL_STEP => ceil_megapixels(outcome)
-            .saturating_mul(
-                if outcome
-                    .output_modalities
-                    .iter()
-                    .any(|value| value == "video")
-                {
-                    outcome.frames.unwrap_or(1).max(1)
-                } else {
-                    outcome.steps.unwrap_or(1).max(1)
-                },
-            )
-            .saturating_mul(artifact_count),
+        // Image-only. Video outcomes must be priced in `pixel_frame`: rounding a
+        // sub-megapixel frame up to a whole megapixel before multiplying by frames
+        // charged every admitted low-VRAM canvas the same amount.
+        USAGE_MEGAPIXEL_STEP => {
+            if outcome_is_video(outcome) {
+                return Err(ComfyWorkflowDerivationError::InvalidPolicy(format!(
+                    "pricing unit {USAGE_MEGAPIXEL_STEP} is image-only; \
+                     a video outcome must be priced in {USAGE_PIXEL_FRAME}"
+                )));
+            }
+            ceil_megapixels(outcome)
+                .saturating_mul(outcome.steps.unwrap_or(1).max(1))
+                .saturating_mul(artifact_count)
+        }
+        // Exact pixel-frames. `frames` is the quoted duration frame count
+        // (explicit `frames`, else `seconds * fps`). A worker that internally
+        // aligns to its own trained frame grid (the MiniMax H3 `17n + 5` rule,
+        // e.g. 124 executed frames for a quoted 120) does NOT change this count;
+        // the customer is billed for what was quoted, never for a surcharge
+        // revealed after dispatch.
+        USAGE_PIXEL_FRAME => {
+            if !outcome_is_video(outcome) {
+                return Err(ComfyWorkflowDerivationError::InvalidPolicy(format!(
+                    "pricing unit {USAGE_PIXEL_FRAME} is video-only; \
+                     a non-video outcome must be priced in {USAGE_MEGAPIXEL_STEP}"
+                )));
+            }
+            let pixels_per_frame = outcome
+                .width
+                .unwrap_or(1)
+                .max(1)
+                .checked_mul(outcome.height.unwrap_or(1).max(1));
+            let count = pixels_per_frame
+                .and_then(|pixels| pixels.checked_mul(outcome.frames.unwrap_or(1).max(1)))
+                .and_then(|pixel_frames| pixel_frames.checked_mul(artifact_count));
+            count.ok_or_else(|| {
+                ComfyWorkflowDerivationError::OutcomeOverflow(
+                    "pixel_frame count overflows a 64-bit counter".to_owned(),
+                )
+            })?
+        }
         USAGE_MEGAPIXEL => ceil_megapixels(outcome).saturating_mul(artifact_count),
         USAGE_FRAME => outcome
             .frames
@@ -1054,11 +1098,16 @@ fn workflow_usage_for_pricing_unit(outcome: &ComfyWorkflowOutcomeSpec, unit: &st
             .unwrap_or(1)
             .max(1)
             .saturating_mul(artifact_count),
-        _ => 1_u64.saturating_mul(artifact_count),
+        unknown => {
+            return Err(ComfyWorkflowDerivationError::InvalidPolicy(format!(
+                "unsupported pricing_unit {unknown}"
+            )))
+        }
     };
-    ReceiptUsage::from_units([(unit.to_owned(), count.max(1))])
+    Ok(ReceiptUsage::from_units([(unit.to_owned(), count.max(1))]))
 }
 
+/// Whole billable megapixels of one frame, rounded up. Image lane only.
 fn ceil_megapixels(outcome: &ComfyWorkflowOutcomeSpec) -> u64 {
     let pixels = outcome
         .width
@@ -1253,7 +1302,7 @@ mod tests {
                     part("minimax_h3_audio_vae_fp32.safetensors", "vae", "74"),
                 ),
             ]),
-            pricing_unit: Some(USAGE_MEGAPIXEL_STEP.to_owned()),
+            pricing_unit: Some(USAGE_PIXEL_FRAME.to_owned()),
             max_width: 1_344,
             max_height: 768,
             max_frames: 362,
@@ -1267,7 +1316,11 @@ mod tests {
             vec!["audio".to_owned(), "video".to_owned()]
         );
         assert_eq!(derivation.outcome_spec.frames, Some(124));
-        assert_eq!(derivation.quoted_usage.get(USAGE_MEGAPIXEL_STEP), 124);
+        // 896 * 512 * 124 frames * 1 artifact, exact.
+        assert_eq!(
+            derivation.quoted_usage.get(USAGE_PIXEL_FRAME),
+            896 * 512 * 124
+        );
 
         let mut unbound = request.clone();
         unbound["input_files"] = json!([]);
@@ -1481,11 +1534,35 @@ mod tests {
         assert_eq!(upscaler.quoted_usage.get(USAGE_MEGAPIXEL), 2);
         assert_eq!(upscaler.quoted_usage.units().len(), 1);
 
+        // `megapixel_step` is image-only: it rounds each frame's area up to a whole
+        // megapixel, which billed every sub-megapixel canvas the same amount.
         let mut video_policy = av_policy();
         video_policy.pricing_unit = Some(USAGE_MEGAPIXEL_STEP.to_owned());
+        assert_eq!(
+            derive_comfy_workflow(&av_graph(), &video_policy).unwrap_err(),
+            ComfyWorkflowDerivationError::InvalidPolicy(
+                "pricing unit megapixel_step is image-only; a video outcome must be priced in \
+                 pixel_frame"
+                    .to_owned()
+            )
+        );
+
+        video_policy.pricing_unit = Some(USAGE_PIXEL_FRAME.to_owned());
         let video = derive_comfy_workflow(&av_graph(), &video_policy).unwrap();
-        assert_eq!(video.quoted_usage.get(USAGE_MEGAPIXEL_STEP), 96);
+        // 768 * 512 * 96 frames * 1 artifact, exact; steps never enter the unit.
+        assert_eq!(video.quoted_usage.get(USAGE_PIXEL_FRAME), 768 * 512 * 96);
         assert_eq!(video.quoted_usage.units().len(), 1);
+
+        // `pixel_frame` is video-only for the same reason, in reverse.
+        image_policy.pricing_unit = Some(USAGE_PIXEL_FRAME.to_owned());
+        assert_eq!(
+            derive_comfy_workflow(&image_graph(), &image_policy).unwrap_err(),
+            ComfyWorkflowDerivationError::InvalidPolicy(
+                "pricing unit pixel_frame is video-only; a non-video outcome must be priced in \
+                 megapixel_step"
+                    .to_owned()
+            )
+        );
 
         video_policy.pricing_unit = Some(USAGE_AUDIO_SECOND.to_owned());
         let audio = derive_comfy_workflow(&av_graph(), &video_policy).unwrap();
@@ -1733,7 +1810,7 @@ mod tests {
                     part("seedvr2_ema_vae_fp16.safetensors", "vae", "66"),
                 ),
             ]),
-            pricing_unit: Some(USAGE_MEGAPIXEL_STEP.to_owned()),
+            pricing_unit: Some(USAGE_PIXEL_FRAME.to_owned()),
             max_width: 1_792,
             max_height: 1_024,
             max_frames: 124,
@@ -1776,7 +1853,11 @@ mod tests {
             derivation.outcome_spec.output_modalities,
             vec!["audio".to_owned(), "video".to_owned()]
         );
-        assert_eq!(derivation.quoted_usage.get(USAGE_MEGAPIXEL_STEP), 248);
+        // The 2x upscale branch doubles the billed canvas: 1792 * 1024 * 124 frames.
+        assert_eq!(
+            derivation.quoted_usage.get(USAGE_PIXEL_FRAME),
+            1_792 * 1_024 * 124
+        );
     }
 
     #[test]
@@ -1828,7 +1909,7 @@ mod tests {
     #[test]
     fn derives_video_frames_from_seconds_and_fps_when_length_is_absent() {
         let mut policy = av_policy();
-        policy.pricing_unit = Some(USAGE_MEGAPIXEL_STEP.to_owned());
+        policy.pricing_unit = Some(USAGE_PIXEL_FRAME.to_owned());
         policy
             .whitelisted_nodes
             .extend(["MiniMaxH3Easy", "BasicScheduler", "CreateVideo"].map(str::to_owned));
@@ -1860,9 +1941,14 @@ mod tests {
         });
 
         let derivation = derive_comfy_workflow(&graph, &policy).unwrap();
+        // Ten seconds at 24 fps quotes 240 frames. The pinned worker aligns its
+        // execution to 17n + 5 (243 frames here); that alignment is NOT billed.
         assert_eq!(derivation.outcome_spec.frames, Some(240));
         assert_eq!(derivation.outcome_spec.duration_seconds, Some(10));
-        assert_eq!(derivation.quoted_usage.get(USAGE_MEGAPIXEL_STEP), 240);
+        assert_eq!(
+            derivation.quoted_usage.get(USAGE_PIXEL_FRAME),
+            736 * 1_280 * 240
+        );
     }
 
     #[test]

@@ -1399,6 +1399,97 @@ test('MayhemContract validates workflow outcome-class governed rate units', asyn
   assert.equal(result.ok, true, result.message);
 });
 
+test('MayhemContract prices video workflow classes in exact pixel-frames', async () => {
+  const admin = await makeIdentity();
+  const storage = new MemoryStorage({ admin: admin.publicKey });
+  const protocol = { peer: { wallet: makeVerifier(admin.wallet) } };
+  const contract = new MayhemContract(protocol, {});
+  const videoEnclave = {
+    ...enclaveRegistration,
+    enclave_id: 'a'.repeat(64),
+    model_id: 'video.minimax_h3.lowvram_t2v_i2v',
+    model_class: 'workflow',
+    caps: {
+      video: true,
+      audio: true,
+      output_modality: 'video',
+      output_modalities: ['video', 'audio'],
+      modality_set: ['audio', 'video'],
+      speciality_levels: {},
+    },
+  };
+  // The published H3 low-VRAM tariff: a fixed per-request component plus a rate
+  // per megapixel-frame, anchored so 736x1280 for five seconds prices at $0.125.
+  const pixelFrameRateMap = [
+    { unit: 'pixel_frame', per_unit_au: '1067672950634057', granularity: 1000000 },
+  ];
+  const perReqAu = '4300000000000000';
+
+  let result = await execute(
+    contract,
+    storage,
+    'registerEnclave',
+    videoEnclave,
+    admin.publicKey,
+    1
+  );
+  assert.equal(result.ok, true, result.message);
+
+  result = await execute(
+    contract,
+    storage,
+    'setModelRef',
+    {
+      op: 'set_model_ref',
+      model_id: videoEnclave.model_id,
+      model_class: 'workflow',
+      rate_map: pixelFrameRateMap,
+    },
+    admin.publicKey,
+    2
+  );
+  assert.equal(result.ok, true, result.message);
+
+  result = await execute(
+    contract,
+    storage,
+    'setPrice',
+    {
+      op: 'set_price',
+      enclave_id: videoEnclave.enclave_id,
+      rate_map: pixelFrameRateMap,
+      per_req_au: perReqAu,
+      min_session_au: '0',
+      effective_at: 0,
+    },
+    admin.publicKey,
+    3
+  );
+  assert.equal(result.ok, true, result.message);
+
+  // 544x960 for 120 frames is 62,668,800 pixel-frames; 736x1280 is 113,049,600.
+  // Under megapixel_step both billed 120 units and cost the same.
+  assert.equal(
+    contract.usageAuForLockedTerms(pixelFrameRateMap, perReqAu, '0', {
+      pixel_frame: 62668800,
+    }),
+    '71209782608695592'
+  );
+  assert.equal(
+    contract.usageAuForLockedTerms(pixelFrameRateMap, perReqAu, '0', {
+      pixel_frame: 113049600,
+    }),
+    '124999999999999891'
+  );
+
+  const imageUnit = contract.validateRateMap(
+    [{ unit: 'input_token', per_unit_au: '1', granularity: 1 }],
+    'workflow',
+    'set_price rate_map'
+  );
+  assert.match(imageUnit.message, /input_token is not allowed for model_class workflow/i);
+});
+
 test('MayhemContract floats workflow outcome-class markets from settled utilization', async () => {
   const { contract, storage, provider, admin } = await setupRegisteredEnclave();
   const user = await makeIdentity();

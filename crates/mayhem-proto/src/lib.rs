@@ -52,7 +52,7 @@ pub use validated_audio::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
-pub const CONTRACT_VERSION: u32 = 22;
+pub const CONTRACT_VERSION: u32 = 23;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const ATTESTATION_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -309,6 +309,10 @@ pub const USAGE_VIDEO_SECOND: &str = "video_second";
 pub const USAGE_FRAME: &str = "frame";
 pub const USAGE_MEGAPIXEL_STEP: &str = "megapixel_step";
 pub const USAGE_MEGAPIXEL: &str = "megapixel";
+/// Exact integer pixel-frames: width * height * frames * artifact_count, no rounding.
+/// Video workflow metering unit. Rate maps price it with `granularity: 1_000_000`, so
+/// `per_unit_au` reads as atto-USD per megapixel-frame.
+pub const USAGE_PIXEL_FRAME: &str = "pixel_frame";
 pub const USAGE_COMPUTE_SECOND: &str = "compute_second";
 pub const DEFAULT_VIDEO_GENERATION_FPS: u64 = 24;
 pub const ENDPOINT_OPENAI_CHAT_COMPLETIONS: &str = "openai_chat_completions";

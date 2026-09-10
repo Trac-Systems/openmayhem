@@ -27075,7 +27075,7 @@
         ],
         "runtime_id": "comfyui-v0.30.1",
         "outcome_class": "video.heavy.le0_5mpf",
-        "pricing_unit": "megapixel_step",
+        "pricing_unit": "pixel_frame",
         "inventory_root": "f2fae1953b9e327f264120b931a512a417910770a3bb357fae51e74c40933849",
         "max_nodes": 48,
         "max_width": 768,
@@ -27107,9 +27107,9 @@
         "ver": 1,
         "rate_map": [
           {
-            "unit": "megapixel_step",
-            "per_unit_au": "90000000000000000",
-            "granularity": 1000
+            "unit": "pixel_frame",
+            "per_unit_au": "90000000000000",
+            "granularity": 1000000
           }
         ],
         "per_req_au": "0",
@@ -27151,10 +27151,10 @@
             "revision": "79ac7f5c078c44cce04a65430f17daeabe32307e"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.t2v_i2v.json",
-          "artifact_root": "2092da076ac52d4eccddbb2c33a2e71175b589ec9ec715d029839649f4ef6026",
+          "artifact_root": "e53c7154beb16ecb6ce6c7462d5c3a27e3ba3bc2c030070bc13b52f74ea4f782",
           "artifact_root_kind": "blake3_merkle_v1",
           "weights_bytes": 796,
-          "source_sha256": "9044ce8d187ece691f033d1f3edb39e54e5e902bee695aaff2ac84a55db51403",
+          "source_sha256": "4b0ea7d5ee483dc2d0651703db0ea6d8164bd119d9c53f9fbd1a53d9f2b7ab8b",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for MiniMax H3 text/image-to-video providers with native audio and an optional SeedVR2 2x branch; payload bytes are required through the signed parts inventory."
         }
@@ -27953,12 +27953,12 @@
           "title": "MiniMax H3 text/image-to-video with native audio",
           "media": "video",
           "lane": "heavy",
-          "pricing_unit": "megapixel_step",
+          "pricing_unit": "pixel_frame",
           "rate_map": [
             {
-              "unit": "megapixel_step",
-              "per_unit_au": "694444444444444444",
-              "granularity": 1000
+              "unit": "pixel_frame",
+              "per_unit_au": "694444444444445",
+              "granularity": 1000000
             }
           ],
           "per_req_au": "0",
@@ -27986,7 +27986,7 @@
             ]
           }
         },
-        "pricing_unit": "megapixel_step",
+        "pricing_unit": "pixel_frame",
         "inventory_root": "1165f3bb28092852c60cdc61d524bb280a45eca39017147484adf9e1d9816ec6",
         "max_nodes": 32,
         "max_width": 1792,
@@ -28019,9 +28019,9 @@
         "ver": 1,
         "rate_map": [
           {
-            "unit": "megapixel_step",
-            "per_unit_au": "694444444444444444",
-            "granularity": 1000
+            "unit": "pixel_frame",
+            "per_unit_au": "694444444444445",
+            "granularity": 1000000
           }
         ],
         "per_req_au": "0",
@@ -28063,10 +28063,10 @@
             "revision": "d5b5d1f8d397168f440f1857224c6e27af1dd9b4"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.r2v.json",
-          "artifact_root": "bd74f0f78c91cea5455815dc91058486ed5194e859a2aa61b1d9bf172102e6bf",
+          "artifact_root": "d6083b18a9602be1fe08584bb1de4bb9f322773df2b727ad3ea2418ada893e64",
           "artifact_root_kind": "blake3_merkle_v1",
           "weights_bytes": 625,
-          "source_sha256": "68ccfedcb4738cb1c4b311c3e6f84105fd8640f5883fcd7e7bd195fa88994a33",
+          "source_sha256": "ce8f988232a1df7ebd3d3c5f06aa2194acaf86bd4d8db7f86065756aae4cb04d",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for MiniMax H3 reference-to-video providers with request-bound reference media; payload bytes are required through the signed parts inventory."
         }
@@ -28617,12 +28617,12 @@
           "title": "MiniMax H3 reference-to-video with native audio",
           "media": "video",
           "lane": "heavy",
-          "pricing_unit": "megapixel_step",
+          "pricing_unit": "pixel_frame",
           "rate_map": [
             {
-              "unit": "megapixel_step",
-              "per_unit_au": "103500000000000000",
-              "granularity": 1000
+              "unit": "pixel_frame",
+              "per_unit_au": "103500000000000",
+              "granularity": 1000000
             }
           ],
           "per_req_au": "0",
@@ -28641,7 +28641,7 @@
             }
           }
         },
-        "pricing_unit": "megapixel_step",
+        "pricing_unit": "pixel_frame",
         "inventory_root": "b055bb6987c130f4b249638cd5fb85206c5942aa158ac872807071201d5e91a9",
         "max_nodes": 40,
         "max_width": 1344,
@@ -28673,9 +28673,9 @@
         "ver": 1,
         "rate_map": [
           {
-            "unit": "megapixel_step",
-            "per_unit_au": "103500000000000000",
-            "granularity": 1000
+            "unit": "pixel_frame",
+            "per_unit_au": "103500000000000",
+            "granularity": 1000000
           }
         ],
         "per_req_au": "0",
@@ -28717,10 +28717,10 @@
             "revision": "d287a50f4dedb9621f1d78c177e0b694d25c1f8e"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.spectrum.json",
-          "artifact_root": "70ff781774f1fa02e1556ca413daea8ae52024df2465fd77d711ffe5baaeb829",
+          "artifact_root": "da3e767f80b9c8798ad8dd76aac97a1fb13b7e041a226a0a07ca401771e26ed3",
           "artifact_root_kind": "blake3_merkle_v1",
           "weights_bytes": 644,
-          "source_sha256": "abc1397cf1b42d67a2f9ca25ece21cbe59b6863439555e523688a0f544683250",
+          "source_sha256": "ac47adab4ff69a0fa499437507d15d7ec2820c5ad326447a15184d63534c2a20",
           "download_check": false,
           "notes": "Draft signed Comfy outcome-class definition for the optional MiniMax H3 Spectrum audio-quality workflow; public serving requires a retained paid A/V fingerprint proof."
         }
@@ -29248,12 +29248,12 @@
           "title": "MiniMax H3 Spectrum audio-quality workflow",
           "media": "video",
           "lane": "heavy",
-          "pricing_unit": "megapixel_step",
+          "pricing_unit": "pixel_frame",
           "rate_map": [
             {
-              "unit": "megapixel_step",
-              "per_unit_au": "103500000000000000",
-              "granularity": 1000
+              "unit": "pixel_frame",
+              "per_unit_au": "103500000000000",
+              "granularity": 1000000
             }
           ],
           "per_req_au": "0",
@@ -29272,7 +29272,7 @@
             }
           }
         },
-        "pricing_unit": "megapixel_step",
+        "pricing_unit": "pixel_frame",
         "inventory_root": "0d2750e48d9b6d087233b85c0298d50323a9debc507a26cfafff99f951692864",
         "max_nodes": 32,
         "max_width": 1344,
@@ -29304,9 +29304,9 @@
         "ver": 1,
         "rate_map": [
           {
-            "unit": "megapixel_step",
-            "per_unit_au": "103500000000000000",
-            "granularity": 1000
+            "unit": "pixel_frame",
+            "per_unit_au": "103500000000000",
+            "granularity": 1000000
           }
         ],
         "per_req_au": "0",
@@ -29348,10 +29348,10 @@
             "revision": "3fae8359db18e4d3ac4d498bc032dcbe39fe0b9e"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.lowvram_t2v_i2v.json",
-          "artifact_root": "a2983450a18594705465d0e7277ba79505fb79d04fe213eac10cb3c34ffbcf95",
+          "artifact_root": "97a766e5427a3113f364e7cfaa038a46d4de18a52f966a116a1a5f8c02301c73",
           "artifact_root_kind": "blake3_merkle_v1",
           "weights_bytes": 1061,
-          "source_sha256": "3056eb861c45f82547536faf4e202c431981134a30195be45bb63fb867a975f9",
+          "source_sha256": "5873fa3555b8af1542ce27bdc61f04aea184006f5e43d814a4860290acd782ba",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for the converted low-VRAM MiniMax H3 text/image-to-video lane. The workflow uses the W4A8 FL2VA model, INT8 video VAE, native audio VAE, 4/6/8-step turbo LoRAs, and pinned low-VRAM custom nodes through the signed parts inventory."
         }
@@ -30398,20 +30398,20 @@
           "lane": "minimax-h3-lowvram",
           "media": "video",
           "min_session_au": "0",
-          "per_req_au": "0",
-          "pricing_unit": "megapixel_step",
+          "per_req_au": "4300000000000000",
+          "pricing_unit": "pixel_frame",
           "rate_map": [
             {
-              "granularity": 1000,
-              "per_unit_au": "1041666666666666667",
-              "unit": "megapixel_step"
+              "granularity": 1000000,
+              "per_unit_au": "1067672950634057",
+              "unit": "pixel_frame"
             }
           ],
           "schema": "openmayhem.comfy.outcome-class-grid.v1",
           "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-published",
           "title": "MiniMax H3 low-VRAM text/image-to-video with native audio"
         },
-        "pricing_unit": "megapixel_step",
+        "pricing_unit": "pixel_frame",
         "inventory_root": "f5ea23a6e3557c7ec434b264c16608cce3ce19c908f26eec54c347252761a72c",
         "max_nodes": 32,
         "max_width": 736,
@@ -30450,12 +30450,12 @@
         "ver": 1,
         "rate_map": [
           {
-            "granularity": 1000,
-            "per_unit_au": "1041666666666666667",
-            "unit": "megapixel_step"
+            "granularity": 1000000,
+            "per_unit_au": "1067672950634057",
+            "unit": "pixel_frame"
           }
         ],
-        "per_req_au": "0",
+        "per_req_au": "4300000000000000",
         "min_session_au": "0"
       }
     },
@@ -30494,10 +30494,10 @@
             "revision": "3fae8359db18e4d3ac4d498bc032dcbe39fe0b9e"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.lowvram_r2v.json",
-          "artifact_root": "c3824980a72ebc769d3eda4e60e2e5d1c8a89964c4afab5495d57ffe656789e0",
+          "artifact_root": "86d11490fb0890c0ad0fc16ba6a8ee6e6ea6d66eddb66fb0804f01ab510af6c0",
           "artifact_root_kind": "blake3_merkle_v1",
           "weights_bytes": 1053,
-          "source_sha256": "a17f0104694d366b498b62b83026d69d58e0074bdea6f07daea7d752adbcad6e",
+          "source_sha256": "0e728b9254dfa204e6548d96dbdb90b27cfe1457352f9260776f74e1eb43863b",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for the converted low-VRAM MiniMax H3 reference-to-video lane. The workflow uses the W4A8 REF2VA model, INT8 video VAE, native audio VAE, 4-step reference-video turbo LoRA, and pinned low-VRAM custom nodes through the signed parts inventory."
         }
@@ -31127,20 +31127,20 @@
           "lane": "minimax-h3-lowvram",
           "media": "video",
           "min_session_au": "0",
-          "per_req_au": "0",
-          "pricing_unit": "megapixel_step",
+          "per_req_au": "4300000000000000",
+          "pricing_unit": "pixel_frame",
           "rate_map": [
             {
-              "granularity": 1000,
-              "per_unit_au": "1041666666666666667",
-              "unit": "megapixel_step"
+              "granularity": 1000000,
+              "per_unit_au": "1067672950634057",
+              "unit": "pixel_frame"
             }
           ],
           "schema": "openmayhem.comfy.outcome-class-grid.v1",
           "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-published",
           "title": "MiniMax H3 low-VRAM reference-to-video with native audio"
         },
-        "pricing_unit": "megapixel_step",
+        "pricing_unit": "pixel_frame",
         "inventory_root": "cd8657f770f09a4fe7baaaf9a8cc2c42560c5282279bae1512fed30467f2d0dc",
         "max_nodes": 32,
         "max_width": 736,
@@ -31175,12 +31175,12 @@
         "ver": 1,
         "rate_map": [
           {
-            "granularity": 1000,
-            "per_unit_au": "1041666666666666667",
-            "unit": "megapixel_step"
+            "granularity": 1000000,
+            "per_unit_au": "1067672950634057",
+            "unit": "pixel_frame"
           }
         ],
-        "per_req_au": "0",
+        "per_req_au": "4300000000000000",
         "min_session_au": "0"
       }
     },
