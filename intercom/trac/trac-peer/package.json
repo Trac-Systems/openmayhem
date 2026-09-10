@@ -1,7 +1,7 @@
 {
   "name": "trac-peer",
   "main": "src/index.js",
-  "version": "0.4.7",
+  "version": "0.4.9",
   "type": "module",
   "pear": {
     "name": "trac-peer",
@@ -100,7 +100,7 @@
     "timers": "npm:bare-node-timers",
     "tls": "npm:bare-node-tls",
     "trac-crypto-api": "^0.1.5",
-    "trac-msb": "^0.2.19",
+    "trac-msb": "^0.2.21",
     "trac-wallet": "^1.0.4",
     "url": "npm:bare-node-url",
     "util": "npm:bare-node-util",

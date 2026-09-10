@@ -888,12 +888,15 @@ const ctxBracketForTokens = (tokens, table = CTX_BRACKETS) => {
 };
 
 class MayhemContract extends Contract {
-  async execute(op, storage) {
+  // The base class runs one execution at a time and calls executeQueued() from
+  // inside that queue, so the per-operation fields set here belong to the call
+  // that is running and cannot be overwritten by an overlapping one.
+  async executeQueued(op, storage) {
     // Admin Feature envelopes temporarily impersonate a command execution. Keep
     // the actual consensus operation kind separately for paid-only operations.
     this._mayhemExecutionType = op?.type;
     try {
-      return await super.execute(validateMayhemOperationContractVersion(op), storage);
+      return await super.executeQueued(validateMayhemOperationContractVersion(op), storage);
     } finally {
       this._mayhemExecutionType = null;
     }

@@ -373,8 +373,8 @@ class ValidatorObserverService {
      * Rules:
      * - Skips invalid/malformed entries.
      * - Skips non-admin indexers.
-     * - Deduplicates nodes by mapping their latest state to a unique address.
-     * - Removes stale connections for nodes flagged with 'isRemoved'.
+     * - Deduplicates active writers by wallet address.
+     * - Removes stale connections only when no active writer remains for an address.
      * - Includes only valid and active writer nodes.
      * @param {Object} adminEntry - The current admin node entry.
      * @returns {Promise<Array<Object>>} A promise resolving to the deduplicated array of active writers.
@@ -385,13 +385,13 @@ class ValidatorObserverService {
             this.#keyDecodeCache.clear();
         }
 
-        // Map is used for deduplication, ensuring that each node physical address
-        // occupies only a single slot despite the append-only nature of Autobase
+        // Historical writer keys can share an address with an active replacement.
         const activeMap = new Map();
+        const removedMap = new Map();
 
         try {
             for await (const { key, value } of this.#state.base.system.list()) {
-                if (!this.#shouldRun()) break;
+                if (!this.#shouldRun()) return Array.from(activeMap.values());
 
                 if (!key || b4a.byteLength(key) !== WRITER_BYTE_LENGTH) continue;
                 if (!value) continue;
@@ -426,15 +426,19 @@ class ValidatorObserverService {
 
                 if (value.isIndexer && addr !== adminEntry?.address) continue;
 
-                // Handles soft-delete: drops stale connections and removes the node from the pool
                 if (value.isRemoved) {
-                    this.#enforceNoStaleConnections(publicKey);
-                    activeMap.delete(addr);
+                    removedMap.set(addr, publicKey);
                     continue;
                 }
 
-                // Registers or overwrites to maintain a single source of truth per machine
                 activeMap.set(addr, { key, address: addr, publicKey, publicKeyHex });
+            }
+
+            // Writer iteration order does not represent key age. Only a complete scan
+            // can establish that a removed writer has no active replacement.
+            for (const [addr, publicKey] of removedMap) {
+                if (!this.#shouldRun()) break;
+                if (!activeMap.has(addr)) this.#enforceNoStaleConnections(publicKey);
             }
         } catch (err) {
             this.#logger.error(`Autobase writer scan error: ${err.message}`);

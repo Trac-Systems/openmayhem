@@ -88,6 +88,55 @@ function createBaseMocks(overrides = {}) {
     };
 }
 
+function createWriterHistoryMocks(writers, initiallyConnected = false) {
+    const publicKey = b4a.alloc(32, 41);
+    const publicKeyHex = b4a.toString(publicKey, "hex");
+    const address = tracCryptoApi.address.encode("trac", publicKey);
+    const addressBuffer = b4a.from(address, "ascii");
+    const identities = new Map(writers.map(({ key }) => [b4a.toString(key, "hex"), addressBuffer]));
+    const connected = new Set(initiallyConnected ? [publicKeyHex] : []);
+    const observations = { scans: 0, attempts: [], removed: [] };
+
+    const mocks = createBaseMocks({
+        network: {
+            validatorConnectionManager: {
+                connected: (key) => connected.has(b4a.toString(key, "hex")),
+                connectedValidators: () => Array.from(connected),
+                remove: (key) => {
+                    const hex = b4a.toString(key, "hex");
+                    observations.removed.push(hex);
+                    connected.delete(hex);
+                },
+            },
+            tryConnect: async (key, role) => {
+                observations.attempts.push({ key, role });
+                connected.add(key);
+                return "connected";
+            },
+        },
+        state: {
+            getRegisteredWriterKey: async (key) => identities.get(key),
+            base: {
+                system: {
+                    list: async function* () {
+                        for (const writer of writers) yield writer;
+                        observations.scans++;
+                    },
+                },
+            },
+        },
+        config: {
+            addressLength: addressBuffer.length,
+            writersShortCacheTTL: 20,
+            writersLongCacheTTL: 20,
+            bootstrapTimeout: 1000,
+        },
+    });
+    tracCryptoApi.address.decode = originalDecode;
+
+    return { ...mocks, publicKeyHex, connected, observations };
+}
+
 test("connects successfully (happy path)", async (t) => {
     const clock = sinon.useFakeTimers({ now: 0 });
 
@@ -773,5 +822,151 @@ test("clears memory cache when exceeding MAX_KEY_DECODE_CACHE_SIZE", async (t) =
         clock.restore();
         sinon.restore();
         await cleanup(service);
+    }
+});
+
+
+for (const history of [
+    { name: "removed key before active key", removed: [true, false] },
+    { name: "active key before removed key", removed: [false, true] },
+    { name: "multiple removed keys around active key", removed: [true, false, true] },
+]) {
+    for (const initiallyConnected of [false, true]) {
+        const initialState = initiallyConnected ? "connected" : "disconnected";
+        test(`preserves validator after key replacement: ${history.name}, initially ${initialState}`, async (t) => {
+            const clock = sinon.useFakeTimers({ now: 0 });
+            const writers = history.removed.map((isRemoved, index) => ({
+                key: b4a.alloc(32, index + 1),
+                value: { isRemoved },
+            }));
+            const { network, state, config, publicKeyHex, connected, observations } =
+                createWriterHistoryMocks(writers, initiallyConnected);
+            const service = new ValidatorObserverService(network, state, "self", config);
+
+            try {
+                await service.start();
+                await clock.tickAsync(100);
+
+                t.ok(observations.scans >= 3, "checks multiple fresh scans after the writer cache expires");
+                t.alike(observations.removed, [], "historical removed keys never disconnect the active wallet");
+                t.alike(
+                    observations.attempts,
+                    initiallyConnected ? [] : [{ key: publicKeyHex, role: "validator" }],
+                    "connects an eligible wallet once and retains its connection"
+                );
+                t.ok(connected.has(publicKeyHex), "the active wallet remains connected");
+            } finally {
+                await cleanup(service);
+                clock.restore();
+                sinon.restore();
+            }
+        });
+    }
+}
+
+test("disconnects a rotated validator after its last active writer is removed", async (t) => {
+    const clock = sinon.useFakeTimers({ now: 0 });
+    const writers = [
+        { key: b4a.alloc(32, 1), value: { isRemoved: true } },
+        { key: b4a.alloc(32, 2), value: { isRemoved: false } },
+        { key: b4a.alloc(32, 3), value: { isRemoved: true } },
+    ];
+    const { network, state, config, publicKeyHex, connected, observations } =
+        createWriterHistoryMocks(writers, true);
+    const service = new ValidatorObserverService(network, state, "self", config);
+
+    try {
+        await service.start();
+        await clock.tickAsync(50);
+        t.alike(observations.removed, [], "retains the wallet while its replacement key is active");
+
+        writers[1].value.isRemoved = true;
+        const scansBeforeRemoval = observations.scans;
+        await clock.tickAsync(100);
+
+        t.ok(observations.scans > scansBeforeRemoval, "refreshes writer history after removal");
+        t.alike(observations.removed, [publicKeyHex], "disconnects the wallet once after its last writer is removed");
+        t.alike(observations.attempts, [], "does not reconnect a wallet with only removed writers");
+        t.absent(connected.has(publicKeyHex), "the removed wallet no longer has a connection");
+    } finally {
+        await cleanup(service);
+        clock.restore();
+        sinon.restore();
+    }
+});
+
+test("keeps a validator connected when its writer history scan fails before the active replacement", async (t) => {
+    const clock = sinon.useFakeTimers({ now: 0 });
+    const writers = [
+        { key: b4a.alloc(32, 1), value: { isRemoved: true } },
+        { key: b4a.alloc(32, 2), value: { isRemoved: false } },
+    ];
+    const { network, state, config, publicKeyHex, connected, observations } =
+        createWriterHistoryMocks(writers, true);
+    let failedScans = 0;
+    state.base.system.list = async function* () {
+        yield writers[0];
+        failedScans++;
+        throw new Error("Writer history unavailable before active replacement");
+    };
+    const service = new ValidatorObserverService(network, state, "self", config);
+
+    try {
+        await service.start();
+        await clock.tickAsync(20);
+
+        t.ok(failedScans > 0, "scan fails after processing the historical removed writer");
+        t.alike(observations.removed, [], "incomplete writer history does not invalidate an existing connection");
+        t.alike(observations.attempts, [], "does not reconnect an existing connection");
+        t.ok(connected.has(publicKeyHex), "the active wallet remains connected");
+    } finally {
+        await cleanup(service);
+        clock.restore();
+        sinon.restore();
+    }
+});
+
+test("keeps a validator connected when stopped before scanning its active replacement", async (t) => {
+    const clock = sinon.useFakeTimers({ now: 0 });
+    const writers = [
+        { key: b4a.alloc(32, 1), value: { isRemoved: true } },
+        { key: b4a.alloc(32, 2), value: { isRemoved: false } },
+    ];
+    const { network, state, config, publicKeyHex, connected, observations } =
+        createWriterHistoryMocks(writers, true);
+    let resumeScan;
+    const scanPaused = new Promise((resolve) => { resumeScan = resolve; });
+    let waitingForReplacement = false;
+    let iteratorClosed = false;
+    state.base.system.list = async function* () {
+        try {
+            yield writers[0];
+            waitingForReplacement = true;
+            await scanPaused;
+            yield writers[1];
+        } finally {
+            iteratorClosed = true;
+        }
+    };
+    const service = new ValidatorObserverService(network, state, "self", config);
+
+    try {
+        await service.start();
+        await clock.tickAsync(0);
+        t.ok(waitingForReplacement, "pauses the scan after processing the historical removed writer");
+
+        await service.stopValidatorObserver(false);
+        resumeScan();
+        await clock.tickAsync(0);
+
+        t.ok(iteratorClosed, "the interrupted scan closes its iterator");
+        t.alike(observations.removed, [], "interrupted writer history does not invalidate an existing connection");
+        t.alike(observations.attempts, [], "does not attempt connections after stopping");
+        t.ok(connected.has(publicKeyHex), "the active wallet remains connected");
+    } finally {
+        resumeScan();
+        await cleanup(service);
+        clock.restore();
+        sinon.restore();
     }
 });

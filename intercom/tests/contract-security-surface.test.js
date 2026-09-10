@@ -718,3 +718,283 @@ test('rejected admin feature transactions cannot replay partial contract writes'
   assert.equal((await storage.get('test/partial-admin-write')).value.executions, 1);
   assert.equal((await storage.get(`fr/${'bb'.repeat(64)}`)).value.status, 'rejected');
 });
+
+const nextTick = () => new Promise((resolve) => setImmediate(resolve));
+const settleAll = async () => {
+  for (let index = 0; index < 4; index += 1) await nextTick();
+};
+const deferred = () => {
+  let resolve = null;
+  const promise = new Promise((settle) => { resolve = settle; });
+  return { promise, resolve };
+};
+
+const overlapProbeContract = (release) => {
+  const contract = new MayhemContract({ peer: {} }, {});
+  contract.addFunction('overlapProbe');
+  contract.overlapProbe = async function overlapProbe() {
+    const entered = {
+      tag: this.value.tag,
+      tx: this.tx,
+      address: this.address,
+      type: this.op.type,
+    };
+    if (entered.tag === 'held') await release.promise;
+    const resumed = {
+      tag: this.value.tag,
+      tx: this.tx,
+      address: this.address,
+      type: this.op.type,
+    };
+    await this.put(`probe/${resumed.tag}`, resumed);
+    const stored = await this.get(`probe/${resumed.tag}`);
+    return { ok: true, entered, resumed, stored };
+  };
+  return contract;
+};
+
+test('overlapping contract executions each keep their own operation, sender and storage', async () => {
+  const held = await makeIdentity();
+  const other = await makeIdentity();
+  const release = deferred();
+  const contract = overlapProbeContract(release);
+  const heldStorage = new MemoryStorage();
+  const otherStorage = new MemoryStorage();
+
+  const heldRun = execute(
+    contract,
+    heldStorage,
+    'overlapProbe',
+    { op: 'overlap_probe', tag: 'held' },
+    held.publicKey,
+    701
+  );
+  await settleAll();
+  const otherRun = execute(
+    contract,
+    otherStorage,
+    'overlapProbe',
+    { op: 'overlap_probe', tag: 'other' },
+    other.publicKey,
+    702
+  );
+  await settleAll();
+  release.resolve();
+  const [heldResult, otherResult] = await Promise.all([heldRun, otherRun]);
+
+  assert.equal(heldResult.ok, true);
+  assert.equal(otherResult.ok, true);
+  assert.deepEqual(heldResult.entered, {
+    tag: 'held',
+    tx: makeTxKey(701),
+    address: held.publicKey,
+    type: 'overlapProbe',
+  });
+  assert.deepEqual(heldResult.resumed, heldResult.entered);
+  assert.deepEqual(otherResult.entered, {
+    tag: 'other',
+    tx: makeTxKey(702),
+    address: other.publicKey,
+    type: 'overlapProbe',
+  });
+  assert.deepEqual(otherResult.resumed, otherResult.entered);
+  assert.deepEqual(heldResult.stored, heldResult.resumed);
+  assert.deepEqual(otherResult.stored, otherResult.resumed);
+  assert.deepEqual([...heldStorage.values.keys()], ['probe/held']);
+  assert.deepEqual([...otherStorage.values.keys()], ['probe/other']);
+
+  const sequentialRelease = deferred();
+  sequentialRelease.resolve();
+  const sequentialContract = overlapProbeContract(sequentialRelease);
+  const sequentialHeldStorage = new MemoryStorage();
+  const sequentialOtherStorage = new MemoryStorage();
+  const sequentialHeld = await execute(
+    sequentialContract,
+    sequentialHeldStorage,
+    'overlapProbe',
+    { op: 'overlap_probe', tag: 'held' },
+    held.publicKey,
+    701
+  );
+  const sequentialOther = await execute(
+    sequentialContract,
+    sequentialOtherStorage,
+    'overlapProbe',
+    { op: 'overlap_probe', tag: 'other' },
+    other.publicKey,
+    702
+  );
+  assert.deepEqual(heldResult, sequentialHeld);
+  assert.deepEqual(otherResult, sequentialOther);
+  assert.equal(heldStorage.snapshotBytes(), sequentialHeldStorage.snapshotBytes());
+  assert.equal(otherStorage.snapshotBytes(), sequentialOtherStorage.snapshotBytes());
+});
+
+test('overlapping executions each keep their own sender', async () => {
+  const admin = await makeIdentity();
+  const caller = await makeIdentity();
+  const simRelease = deferred();
+  const applyRelease = deferred();
+  const contract = new MayhemContract({ peer: {} }, {});
+  contract.addFunction('adminGuardedProbe');
+  contract.adminGuardedProbe = async function adminGuardedProbe() {
+    const tag = this.value.tag;
+    await (tag === 'sim' ? simRelease.promise : applyRelease.promise);
+    const adminError = await this.requireAdmin();
+    if (adminError) return adminError;
+    await this.put(`probe/${tag}`, { address: this.address });
+    return { ok: true, tag, address: this.address };
+  };
+
+  const applyStorage = new MemoryStorage({ admin: admin.publicKey });
+  const simStorage = new MemoryStorage({ admin: admin.publicKey });
+  const simRun = execute(
+    contract,
+    simStorage,
+    'adminGuardedProbe',
+    { op: 'admin_guarded_probe', tag: 'sim' },
+    caller.publicKey,
+    703
+  );
+  await settleAll();
+  const applyRun = execute(
+    contract,
+    applyStorage,
+    'adminGuardedProbe',
+    { op: 'admin_guarded_probe', tag: 'apply' },
+    admin.publicKey,
+    704
+  );
+  await settleAll();
+  simRelease.resolve();
+  await settleAll();
+  applyRelease.resolve();
+  const [simResult, applyResult] = await Promise.all([simRun, applyRun]);
+
+  assert.ok(simResult instanceof Error);
+  assert.match(simResult.message, /Admin required/);
+  assert.equal(applyResult.ok, true);
+  assert.equal(applyResult.address, admin.publicKey);
+  assert.deepEqual([...simStorage.values.keys()], ['admin']);
+  assert.deepEqual([...applyStorage.values.keys()], ['admin', 'probe/apply']);
+});
+
+test('a simulation overlapping an apply leaves the applied record unchanged', async () => {
+  const admin = await makeIdentity();
+  const caller = await makeIdentity();
+  const applyRelease = deferred();
+  const contract = new MayhemContract({ peer: {} }, {});
+  contract.addFunction('recordProbe');
+  contract.recordProbe = async function recordProbe() {
+    const marker = await this.get('probe/marker');
+    if (this.value.tag === 'apply') await applyRelease.promise;
+    const record = {
+      tag: this.value.tag,
+      effective_at: this.value.effective_at,
+      marker: marker.marker,
+      updated_at: this.tx,
+      set_by: this.address,
+    };
+    await this.put(`record/${record.tag}`, record);
+    return { ok: true, record };
+  };
+
+  const applyStorage = new MemoryStorage({ 'probe/marker': { marker: 'apply' } });
+  const simStorage = new MemoryStorage({ 'probe/marker': { marker: 'sim' } });
+  const applyRun = execute(
+    contract,
+    applyStorage,
+    'recordProbe',
+    { op: 'record_probe', tag: 'apply', effective_at: 1789064942 },
+    admin.publicKey,
+    705
+  );
+  await settleAll();
+  const simRun = execute(
+    contract,
+    simStorage,
+    'recordProbe',
+    { op: 'record_probe', tag: 'sim', effective_at: 1789064943 },
+    caller.publicKey,
+    706
+  );
+  await settleAll();
+  applyRelease.resolve();
+  const [applyResult, simResult] = await Promise.all([applyRun, simRun]);
+
+  assert.deepEqual(applyResult, {
+    ok: true,
+    record: {
+      tag: 'apply',
+      effective_at: 1789064942,
+      marker: 'apply',
+      updated_at: makeTxKey(705),
+      set_by: admin.publicKey,
+    },
+  });
+  assert.deepEqual(simResult, {
+    ok: true,
+    record: {
+      tag: 'sim',
+      effective_at: 1789064943,
+      marker: 'sim',
+      updated_at: makeTxKey(706),
+      set_by: caller.publicKey,
+    },
+  });
+  assert.deepEqual(
+    (await applyStorage.get('record/apply')).value,
+    applyResult.record
+  );
+  assert.deepEqual([...applyStorage.values.keys()], ['probe/marker', 'record/apply']);
+  assert.deepEqual([...simStorage.values.keys()], ['probe/marker', 'record/sim']);
+});
+
+test('overlapping executions each keep their own execution type', async () => {
+  const caller = await makeIdentity();
+  const other = await makeIdentity();
+  const release = deferred();
+  const contract = new MayhemContract({ peer: {} }, {});
+  contract.addFunction('executionTypeProbe');
+  contract.executionTypeProbe = async function executionTypeProbe() {
+    const entered = this._mayhemExecutionType;
+    await release.promise;
+    return { ok: true, entered, resumed: this._mayhemExecutionType };
+  };
+  contract.messageHandler(async function messageProbe() {
+    return { ok: true, seen: this._mayhemExecutionType };
+  });
+
+  const paidStorage = new MemoryStorage();
+  const messageStorage = new MemoryStorage();
+  const paidRun = execute(
+    contract,
+    paidStorage,
+    'executionTypeProbe',
+    { op: 'execution_type_probe' },
+    caller.publicKey,
+    707
+  );
+  await settleAll();
+  const messageRun = contract.execute(
+    {
+      type: 'msg',
+      key: 'probe-message',
+      value: {
+        dispatch: {
+          type: 'probe_message',
+          address: other.publicKey,
+          value: { op: 'probe_message' },
+        },
+      },
+    },
+    messageStorage
+  );
+  await settleAll();
+  release.resolve();
+  const [paidResult, messageResult] = await Promise.all([paidRun, messageRun]);
+
+  assert.deepEqual(paidResult, { ok: true, entered: 'tx', resumed: 'tx' });
+  assert.deepEqual(messageResult, { ok: true, seen: 'msg' });
+  assert.equal(contract._mayhemExecutionType, null);
+});

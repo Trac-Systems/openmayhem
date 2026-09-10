@@ -165,7 +165,7 @@ async function loadNetwork(options = {}) {
     };
     await network.replicate({}, store, wallet);
 
-    return { network, swarmInstance, connectionManagerInstance, store };
+    return { network, swarmInstance, connectionManagerInstance, store, wallet };
 }
 
 function deferred() {
@@ -239,7 +239,7 @@ if (isBareRuntime) {
             setupEntered.resolve();
             await resumeSetup.promise;
         });
-        const { network, swarmInstance } = await loadNetwork({ store, setupProtomuxMessages });
+        const { network, swarmInstance, wallet } = await loadNetwork({ store, setupProtomuxMessages });
         const connection = new EventEmitter();
         connection.remotePublicKey = b4a.alloc(32, 4);
         connection.destroy = sinon.stub();
@@ -254,5 +254,12 @@ if (isBareRuntime) {
 
         t.is(store.replicate.callCount, 0, 'late connection should not replicate after network close begins');
         t.is(connection.destroy.callCount, 1, 'late connection should be destroyed');
+        await t.exception(
+            () => network.replicate({}, store, wallet),
+            /Network is closing or already closed/,
+            'replication should reject after network close'
+        );
+        t.is(network.swarm, null, 'closed network should not create a new swarm');
+        t.is(swarmInstance.destroy.callCount, 1, 'only the original swarm should be destroyed');
     });
 }
