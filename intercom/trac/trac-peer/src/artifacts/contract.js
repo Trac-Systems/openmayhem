@@ -20,9 +20,36 @@ class Contract {
         this.value = null;
         this.assert = assert;
         this.check = new Check();
+        this.execute_queue = null;
     }
 
+    /**
+     * A contract instance keeps the state of the running call (address,
+     * validator_address, is_feature, is_message, tx, op, value, storage) in
+     * instance fields, and handlers re-read those fields after every await. Two
+     * executions in flight on one instance therefore interleave their working
+     * state, which on a busy peer produced a simulation result with fields
+     * missing and a "get(key): storage undefined" throw in the call that resumed
+     * afterwards. Autobase apply is sequential, but Protocol.simulateTransaction
+     * executes on the same live instance from outside the apply loop, so calls
+     * are queued here and the body in executeQueued() runs one call at a time.
+     */
     async execute(op, storage){
+        const previous = this.execute_queue === null ? Promise.resolve() : this.execute_queue;
+        let finish = null;
+        const finished = new Promise((resolve) => { finish = resolve; });
+        const queued = previous.then(() => finished);
+        this.execute_queue = queued;
+        await previous;
+        try {
+            return await this.executeQueued(op, storage);
+        } finally {
+            finish();
+            if(this.execute_queue === queued) this.execute_queue = null;
+        }
+    }
+
+    async executeQueued(op, storage){
         this.address = null;
         this.validator_address = null;
         this.is_message = false;

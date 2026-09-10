@@ -177,8 +177,12 @@ class Network extends ReadyResource {
         store,
         wallet,
     ) {
+        this.#assertCanReplicate();
+
         if (!this.#swarm) {
             const { wallet: wrappedWallet, keyPair } = await this.#getOrGenerateWallet(store, wallet);
+            this.#assertCanReplicate();
+
             this.#wallet = wrappedWallet
             this.#validatorMessageOrchestrator.setWallet(this.#wallet);
 
@@ -203,6 +207,8 @@ class Network extends ReadyResource {
             );
             this.#validatorHealthCheckService = new ValidatorHealthCheckService(this.#config);
             await this.#validatorHealthCheckService.ready();
+            this.#assertCanReplicate();
+
             this.#validatorConnectionManager.subscribeToHealthChecks(this.#validatorHealthCheckService);
 
             this.#logger.info(`Channel: ${b4a.toString(this.#config.channel)}`);
@@ -385,6 +391,12 @@ class Network extends ReadyResource {
         clearTimeout(timeoutId);
         this.#pendingConnections.delete(publicKeyHex);
         return true;
+    }
+
+    #assertCanReplicate() {
+        if (this.#closing || this.closed) {
+            throw new Error('Network is closing or already closed');
+        }
     }
 
     #destroyConnection(connection) {
