@@ -26374,13 +26374,13 @@
             "kind": "huggingface",
             "publisher_key": "huggingface-repo",
             "repo": "TracNetwork/openmayhem-parts-index",
-            "revision": "2539e9a49409ece931c115dab81e0873f57ae12d"
+            "revision": "f6fcf5a8d52ef0bf522a3c585ecc7deaa0ab3994"
           },
           "path": "comfy/outcome-classes/v1/video.heavy.le0_5mpf.json",
-          "artifact_root": "9343ccbbe2828225fcb1da06323ba97cae0be8bb1dd4bc8aa9b54079ebd4b7f3",
+          "artifact_root": "91427bcf38c0ffb8a0ece553a7d02edc0820a33a722bd9dafaf35c42e0e1e5df",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 666,
-          "source_sha256": "f789ff8ee4b471c2f706bd00a3c3f6074a89683657009939c5a5319e1a7ca8a7",
+          "weights_bytes": 660,
+          "source_sha256": "c245d7cf31d487df98cc67724a6f2dfbd8764d9263628bd51a969717c44570a9",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for bounded LTX 2.3 audio-video workflow providers; concrete payload bytes are required through the workflow parts inventory."
         }
@@ -27148,12 +27148,12 @@
             "kind": "huggingface",
             "publisher_key": "huggingface-repo",
             "repo": "TracNetwork/openmayhem-parts-index",
-            "revision": "79ac7f5c078c44cce04a65430f17daeabe32307e"
+            "revision": "f6fcf5a8d52ef0bf522a3c585ecc7deaa0ab3994"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.t2v_i2v.json",
           "artifact_root": "e53c7154beb16ecb6ce6c7462d5c3a27e3ba3bc2c030070bc13b52f74ea4f782",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 796,
+          "weights_bytes": 1006,
           "source_sha256": "4b0ea7d5ee483dc2d0651703db0ea6d8164bd119d9c53f9fbd1a53d9f2b7ab8b",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for MiniMax H3 text/image-to-video providers with native audio and an optional SeedVR2 2x branch; payload bytes are required through the signed parts inventory."
@@ -28060,12 +28060,12 @@
             "kind": "huggingface",
             "publisher_key": "huggingface-repo",
             "repo": "TracNetwork/openmayhem-parts-index",
-            "revision": "d5b5d1f8d397168f440f1857224c6e27af1dd9b4"
+            "revision": "f6fcf5a8d52ef0bf522a3c585ecc7deaa0ab3994"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.r2v.json",
           "artifact_root": "d6083b18a9602be1fe08584bb1de4bb9f322773df2b727ad3ea2418ada893e64",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 625,
+          "weights_bytes": 780,
           "source_sha256": "ce8f988232a1df7ebd3d3c5f06aa2194acaf86bd4d8db7f86065756aae4cb04d",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for MiniMax H3 reference-to-video providers with request-bound reference media; payload bytes are required through the signed parts inventory."
@@ -28714,12 +28714,12 @@
             "kind": "huggingface",
             "publisher_key": "huggingface-repo",
             "repo": "TracNetwork/openmayhem-parts-index",
-            "revision": "d287a50f4dedb9621f1d78c177e0b694d25c1f8e"
+            "revision": "f6fcf5a8d52ef0bf522a3c585ecc7deaa0ab3994"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.spectrum.json",
           "artifact_root": "da3e767f80b9c8798ad8dd76aac97a1fb13b7e041a226a0a07ca401771e26ed3",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 644,
+          "weights_bytes": 799,
           "source_sha256": "ac47adab4ff69a0fa499437507d15d7ec2820c5ad326447a15184d63534c2a20",
           "download_check": false,
           "notes": "Draft signed Comfy outcome-class definition for the optional MiniMax H3 Spectrum audio-quality workflow; public serving requires a retained paid A/V fingerprint proof."
@@ -29345,12 +29345,12 @@
             "kind": "huggingface",
             "publisher_key": "huggingface-repo",
             "repo": "TracNetwork/openmayhem-parts-index",
-            "revision": "3fae8359db18e4d3ac4d498bc032dcbe39fe0b9e"
+            "revision": "f6fcf5a8d52ef0bf522a3c585ecc7deaa0ab3994"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.lowvram_t2v_i2v.json",
           "artifact_root": "97a766e5427a3113f364e7cfaa038a46d4de18a52f966a116a1a5f8c02301c73",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 1061,
+          "weights_bytes": 1070,
           "source_sha256": "5873fa3555b8af1542ce27bdc61f04aea184006f5e43d814a4860290acd782ba",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for the converted low-VRAM MiniMax H3 text/image-to-video lane. The workflow uses the W4A8 FL2VA model, INT8 video VAE, native audio VAE, 4/6/8-step turbo LoRAs, and pinned low-VRAM custom nodes through the signed parts inventory."
@@ -30491,12 +30491,12 @@
             "kind": "huggingface",
             "publisher_key": "huggingface-repo",
             "repo": "TracNetwork/openmayhem-parts-index",
-            "revision": "3fae8359db18e4d3ac4d498bc032dcbe39fe0b9e"
+            "revision": "f6fcf5a8d52ef0bf522a3c585ecc7deaa0ab3994"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.lowvram_r2v.json",
           "artifact_root": "86d11490fb0890c0ad0fc16ba6a8ee6e6ea6d66eddb66fb0804f01ab510af6c0",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 1053,
+          "weights_bytes": 1062,
           "source_sha256": "0e728b9254dfa204e6548d96dbdb90b27cfe1457352f9260776f74e1eb43863b",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for the converted low-VRAM MiniMax H3 reference-to-video lane. The workflow uses the W4A8 REF2VA model, INT8 video VAE, native audio VAE, 4-step reference-video turbo LoRA, and pinned low-VRAM custom nodes through the signed parts inventory."
