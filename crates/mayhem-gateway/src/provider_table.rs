@@ -1055,6 +1055,9 @@ pub fn evaluate_eligibility(
     {
         return Err(IneligibilityReason::Price);
     }
+    // Both sides of this comparison are the standardized 1,000-unit basket of the schedule,
+    // so a floor is granularity-independent and a provider that advertises the basket of its
+    // own price always clears it.
     if MoneyAu::from(provider_min_ask_au) > market_rate_au {
         return Err(IneligibilityReason::ProviderMinAsk);
     }
@@ -1511,7 +1514,7 @@ fn better_p2c_index(candidates: &[SelectionCandidate], left: usize, right: usize
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mayhem_proto::USAGE_AUDIO_SECOND;
+    use mayhem_proto::{USAGE_AUDIO_SECOND, USAGE_MEGAPIXEL_STEP, USAGE_PIXEL_FRAME};
 
     use crate::text_generation_rate_map;
     use crate::{
@@ -1815,6 +1818,138 @@ mod tests {
         let candidates = eligible_candidates(&[entry], &request, &SelectionWeights::default());
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].estimated_price_au, 1_500);
+    }
+
+    fn fine_grained_video_rate_map() -> Vec<RateMapEntry> {
+        vec![RateMapEntry {
+            unit: USAGE_PIXEL_FRAME.to_owned(),
+            per_unit_au: 1_067_672_950_634_057,
+            granularity: 1_000_000,
+        }]
+    }
+
+    #[test]
+    fn provider_floor_and_market_rate_share_one_basket_at_any_quote_size() {
+        let now = 1_000_000;
+        let coarse_rate_map = vec![RateMapEntry {
+            unit: USAGE_MEGAPIXEL_STEP.to_owned(),
+            per_unit_au: 1_041_666_666_666_666_667,
+            granularity: 1_000,
+        }];
+        let coarse_basis = rate_gate_basis_au(&coarse_rate_map, 0, 0);
+        assert_eq!(coarse_basis, 1_041_666_666_666_666_667);
+
+        let mut entry = entry_for(1, now, 0.2, 100);
+        entry.contract.rate_map = coarse_rate_map.clone();
+        entry.contract.ref_rate_map = coarse_rate_map;
+        let request = RequestRequirements {
+            requires_tools: false,
+            requires_json: false,
+            min_ctx: 1,
+            input_tokens: 1,
+            output_tokens: 0,
+            usage: ReceiptUsage::from_units([(USAGE_MEGAPIXEL_STEP, 1_000)]),
+            max_price_au: Some(coarse_basis),
+            ..eligible_request(now + 1)
+        };
+        entry.heartbeat.as_mut().unwrap().min_ask_au = coarse_basis;
+        assert_eq!(
+            evaluate_eligibility(&entry, &request),
+            Ok(1_041_666_666_666_666_667)
+        );
+
+        let fine_rate_map = fine_grained_video_rate_map();
+        let fine_basis = rate_gate_basis_au(&fine_rate_map, 0, 0);
+        assert_eq!(fine_basis, 1_067_672_950_635);
+
+        let mut entry = entry_for(1, now, 0.2, 100);
+        entry.contract.rate_map = fine_rate_map.clone();
+        entry.contract.ref_rate_map = fine_rate_map;
+        let request = RequestRequirements {
+            requires_tools: false,
+            requires_json: false,
+            min_ctx: 1,
+            input_tokens: 1,
+            output_tokens: 0,
+            usage: ReceiptUsage::from_units([(USAGE_PIXEL_FRAME, 2_000_000)]),
+            max_price_au: Some(fine_basis),
+            ..eligible_request(now + 1)
+        };
+
+        let mut advertises_own_basket = entry.clone();
+        advertises_own_basket.heartbeat.as_mut().unwrap().min_ask_au = fine_basis;
+        assert_eq!(
+            evaluate_eligibility(&advertises_own_basket, &request),
+            Ok(2_135_345_901_268_114),
+            "a provider that advertises the basket of its own price serves that price"
+        );
+
+        let mut replaced_derivation = entry.clone();
+        replaced_derivation.heartbeat.as_mut().unwrap().min_ask_au = 1_067_672_950_634_057;
+        assert_eq!(
+            evaluate_eligibility(&replaced_derivation, &request),
+            Err(IneligibilityReason::ProviderMinAsk),
+            "the replaced floor rule read a per-million quote as a per-thousand basket"
+        );
+
+        let mut floor_above_market = entry.clone();
+        floor_above_market.heartbeat.as_mut().unwrap().min_ask_au = fine_basis + 1;
+        assert_eq!(
+            evaluate_eligibility(&floor_above_market, &request),
+            Err(IneligibilityReason::ProviderMinAsk)
+        );
+
+        let mut floor_below_market = entry.clone();
+        floor_below_market.heartbeat.as_mut().unwrap().min_ask_au = fine_basis - 1;
+        assert_eq!(
+            evaluate_eligibility(&floor_below_market, &request),
+            Ok(2_135_345_901_268_114)
+        );
+    }
+
+    #[test]
+    fn workflow_class_floors_score_on_the_same_basket() {
+        let now = 1_000_000;
+        let mut entry = entry_for(1, now, 0.2, 100);
+        make_workflow_route(&mut entry);
+        let fine_rate_map = fine_grained_video_rate_map();
+        let fine_basis = rate_gate_basis_au(&fine_rate_map, 0, 0);
+        entry.contract.rate_map = fine_rate_map.clone();
+        entry.contract.ref_rate_map = fine_rate_map;
+        let request = RequestRequirements {
+            usage: ReceiptUsage::from_units([(USAGE_PIXEL_FRAME, 1_000_000)]),
+            max_price_au: Some(fine_basis),
+            ..workflow_request(now + 1)
+        };
+
+        let mut advertises_own_basket = entry.clone();
+        advertises_own_basket
+            .heartbeat
+            .as_mut()
+            .unwrap()
+            .workflow_classes
+            .get_mut("image.workflow")
+            .unwrap()
+            .min_ask_au = fine_basis;
+        assert_eq!(
+            evaluate_eligibility(&advertises_own_basket, &request),
+            Ok(1_067_672_950_634_057)
+        );
+
+        let mut replaced_derivation = entry.clone();
+        replaced_derivation
+            .heartbeat
+            .as_mut()
+            .unwrap()
+            .workflow_classes
+            .get_mut("image.workflow")
+            .unwrap()
+            .min_ask_au = 1_067_672_950_634_057;
+        assert_eq!(
+            evaluate_eligibility(&replaced_derivation, &request),
+            Err(IneligibilityReason::ProviderMinAsk),
+            "a workflow class floor is the same basket as the model floor"
+        );
     }
 
     #[test]

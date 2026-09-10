@@ -6086,22 +6086,17 @@ fn gateway_model_registered_modalities(model: &GatewayModel) -> BTreeSet<String>
     modalities
 }
 
+/// The dearest number a `max_price_au` listing filter can meet for this model, on the same
+/// standardized 1,000-unit basket the routing gate and provider floors are quoted on.
 fn gateway_model_max_listed_price_au(model: &GatewayModel) -> MoneyAu {
-    let mut max_price = model
-        .mayhem
-        .price_ref_au
-        .per_req_au
-        .max(model.mayhem.price_ref_au.min_session_au);
-    for entry in &model.mayhem.price_ref_au.rate_map {
-        max_price = max_price.max(entry.per_unit_au);
-    }
+    let mut max_price = price_rate_gate_basis_au(&model.mayhem.price_ref_au);
     for candidate in &model.mayhem.route_candidates {
-        max_price = max_price.max(candidate.min_ask_au);
-        let price = route_price_ref_au(model, Some(candidate));
-        max_price = max_price.max(price.per_req_au).max(price.min_session_au);
-        for entry in &price.rate_map {
-            max_price = max_price.max(entry.per_unit_au);
-        }
+        max_price = max_price
+            .max(candidate.min_ask_au)
+            .max(price_rate_gate_basis_au(route_price_ref_au(
+                model,
+                Some(candidate),
+            )));
     }
     max_price
 }
@@ -49991,6 +49986,47 @@ mod tests {
         assert_eq!(
             gateway_contract_tx_digest(&prepared_command, &"01".repeat(32), &context).unwrap(),
             "d0418782738f7c76472480d7ceb0c1ae8161ef201265abc8f9b3b764fe8aeaab"
+        );
+    }
+
+    #[test]
+    fn model_listing_price_filter_reads_the_same_basket_as_the_routing_gate() {
+        let mut model = test_routed_model(1);
+        model.mayhem.price_ref_au.rate_map = vec![RateMapEntry {
+            unit: mayhem_proto::USAGE_PIXEL_FRAME.to_owned(),
+            per_unit_au: 1_067_672_950_634_057,
+            granularity: 1_000_000,
+        }];
+        model.mayhem.price_ref_au.per_req_au = 0;
+        model.mayhem.price_ref_au.min_session_au = 0;
+        let market_rate_au = price_rate_gate_basis_au(&model.mayhem.price_ref_au);
+        assert_eq!(market_rate_au, 1_067_672_950_635);
+        assert_eq!(gateway_model_max_listed_price_au(&model), market_rate_au);
+
+        let at_market = ModelsQuery {
+            max_price_au: Some(market_rate_au),
+            ..ModelsQuery::default()
+        };
+        assert!(
+            gateway_model_matches_models_query(&model, &[], &at_market),
+            "a model is listed at the price its routes are admitted at"
+        );
+
+        let under_market = ModelsQuery {
+            max_price_au: Some(market_rate_au - 1),
+            ..ModelsQuery::default()
+        };
+        assert!(!gateway_model_matches_models_query(
+            &model,
+            &[],
+            &under_market
+        ));
+
+        model.mayhem.route_candidates[0].min_ask_au = market_rate_au + 1;
+        assert_eq!(
+            gateway_model_max_listed_price_au(&model),
+            market_rate_au + 1,
+            "a provider floor is quoted on the basket too, so it lists on the same scale"
         );
     }
 

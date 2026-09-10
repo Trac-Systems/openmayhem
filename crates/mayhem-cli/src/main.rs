@@ -517,6 +517,9 @@ enum ProviderCommands {
         command: ProviderStripeCommands,
     },
     /// Inspect or set this provider's local min-ask per admin-created market.
+    ///
+    /// Floors are read in atto-USD per standardized 1,000-unit basket of the market's priced
+    /// units, so the same number means the same thing however finely a unit is quoted.
     MinAsk {
         #[command(subcommand)]
         command: ProviderMinAskCommands,
@@ -642,9 +645,9 @@ enum ProviderStripeCommands {
 
 #[derive(Debug, Subcommand)]
 enum ProviderMinAskCommands {
-    /// Read the configured local min-ask floor.
+    /// Read the configured local min-ask floor in atto-USD per 1,000-unit basket.
     Get(ProviderMinAskGetArgs),
-    /// Set the configured local min-ask floor.
+    /// Set the configured local min-ask floor in atto-USD per 1,000-unit basket.
     Set(ProviderMinAskSetArgs),
 }
 
@@ -5960,7 +5963,9 @@ struct ProviderMinAskSetArgs {
     /// Market target: default, enclave id, model id, model:T<tier>, or workflow outcome class.
     target: String,
 
-    /// Local provider floor in integer atto-USD. 0 accepts the admin market price.
+    /// Local provider floor in integer atto-USD per standardized 1,000-unit basket of the
+    /// market's priced units, the same basis the network admits routes on. 0 advertises the
+    /// current admin price for this market, which always clears.
     au: MoneyAu,
 
     /// Print a machine-readable report.
@@ -6677,7 +6682,8 @@ struct ProviderStartArgs {
     #[arg(long, default_value_t = 1)]
     heartbeat_count: u32,
 
-    /// Provider floor for accepted sessions in atto-USD. 0 accepts the current market price.
+    /// Provider floor for accepted sessions in atto-USD per standardized 1,000-unit basket of
+    /// the market's priced units. 0 advertises the current market price.
     #[arg(long, default_value_t = 0)]
     min_ask_au: MoneyAu,
 
@@ -7018,6 +7024,9 @@ struct ConfigNetwork {
 struct ConfigProvider {
     engine_backend: Option<String>,
     gpu_layers: Option<u32>,
+    /// `[provider.min_ask]`: market target to price floor, in atto-USD per standardized
+    /// 1,000-unit basket of that market's priced units. An absent entry advertises the
+    /// current admin price for the market.
     #[serde(default, deserialize_with = "deserialize_optional_money_au_map")]
     min_ask: Option<BTreeMap<String, MoneyAu>>,
     limits: Option<ConfigProviderLimits>,
@@ -65815,7 +65824,7 @@ fn provider_min_ask_get(args: ProviderMinAskGetArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if let Some(target) = target.as_deref() {
         match value {
-            Some(au) => println!("{target}: {au} au_usd"),
+            Some(au) => println!("{target}: {au} au_usd per 1,000-unit basket"),
             None => println!("{target}: not set"),
         }
     } else {
@@ -65824,10 +65833,10 @@ fn provider_min_ask_get(args: ProviderMinAskGetArgs) -> Result<()> {
             report["path"].as_str().unwrap_or("")
         );
         if table.is_empty() {
-            println!("(empty; providers accept the admin market price)");
+            println!("(empty; providers advertise the admin market price)");
         } else {
             for (target, au) in table {
-                println!("{target}: {au} au_usd");
+                println!("{target}: {au} au_usd per 1,000-unit basket");
             }
         }
     }
@@ -65855,7 +65864,7 @@ fn provider_min_ask_set(args: ProviderMinAskSetArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "Set provider min-ask {} = {} au_usd in {}",
+            "Set provider min-ask {} = {} au_usd per 1,000-unit basket in {}",
             report["target"].as_str().unwrap_or(""),
             args.au,
             report["path"].as_str().unwrap_or("")
@@ -78543,6 +78552,13 @@ fn provider_heartbeat_caps(selected: &ProviderCandidate) -> ModelCaps {
     caps
 }
 
+/// The price floor this provider advertises for a market, in atto-USD per standardized
+/// 1,000-unit basket.
+///
+/// A configured floor is advertised exactly as configured. Without one the provider
+/// advertises the basket of its own active price, which is the number the routing gate
+/// compares the floor against, so an auto-derived floor never blocks the provider's own
+/// price no matter how finely its units are quoted.
 fn provider_heartbeat_min_ask_au(
     selected: &ProviderCandidate,
     configured_min_ask_au: MoneyAu,
@@ -78553,15 +78569,7 @@ fn provider_heartbeat_min_ask_au(
     let Some(price) = selected.price.as_ref().and_then(active_au_usd_price_now) else {
         return 0;
     };
-    price
-        .rate_map
-        .iter()
-        .map(|entry| entry.per_unit_au)
-        .chain(std::iter::once(price.per_req_au))
-        .chain(std::iter::once(price.min_session_au))
-        .filter(|value| *value > 0)
-        .min()
-        .unwrap_or(0)
+    rate_gate_basis_au(&price.rate_map, price.per_req_au, price.min_session_au)
 }
 
 #[derive(Clone)]
@@ -118956,8 +118964,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(provider_workflow_admission_modality_health(&selected, None).is_none());
     }
 
-    #[test]
-    fn provider_heartbeat_min_ask_falls_back_to_positive_rate_map() {
+    fn priced_workflow_provider_candidate(
+        rate_map: Vec<RateMapEntry>,
+        per_req_au: MoneyAu,
+        min_session_au: MoneyAu,
+    ) -> ProviderCandidate {
         let root = "aa".repeat(32);
         let catalog = test_catalog(&root);
         let contract = test_contract(&root);
@@ -118998,16 +119009,26 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .as_mut()
             .and_then(|schedule| schedule.current.as_mut())
             .expect("test price schedule");
-        price.min_session_au = 0;
-        price.per_req_au = 0;
-        price.rate_map = vec![RateMapEntry {
-            unit: "image".to_owned(),
-            per_unit_au: 11,
-            granularity: 1,
-        }];
+        price.min_session_au = min_session_au;
+        price.per_req_au = per_req_au;
+        price.rate_map = rate_map;
+        selected
+    }
+
+    fn priced_rate_map(unit: &str, per_unit_au: MoneyAu, granularity: u64) -> Vec<RateMapEntry> {
+        vec![RateMapEntry {
+            unit: unit.to_owned(),
+            per_unit_au,
+            granularity,
+        }]
+    }
+
+    #[test]
+    fn provider_heartbeat_min_ask_advertises_the_gate_basket_of_its_own_price() {
+        let selected = priced_workflow_provider_candidate(priced_rate_map("image", 11, 1), 0, 0);
 
         let heartbeat_min_ask = provider_heartbeat_min_ask_au(&selected, 0);
-        assert_eq!(heartbeat_min_ask, 11);
+        assert_eq!(heartbeat_min_ask, 11_000);
         let classes = provider_heartbeat_workflow_classes(
             &selected,
             heartbeat_min_ask,
@@ -119020,7 +119041,92 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             )),
         )
         .expect("Comfy endpoint should advertise workflow class");
-        assert_eq!(classes["image.workflow"]["min_ask_au"], json!("11"));
+        assert_eq!(classes["image.workflow"]["min_ask_au"], json!("11000"));
+    }
+
+    #[test]
+    fn provider_heartbeat_min_ask_clears_its_own_price_at_any_quote_size() {
+        let cases: Vec<(Vec<RateMapEntry>, MoneyAu, MoneyAu, MoneyAu)> = vec![
+            (
+                priced_rate_map(
+                    mayhem_proto::USAGE_MEGAPIXEL_STEP,
+                    1_041_666_666_666_666_667,
+                    1_000,
+                ),
+                0,
+                0,
+                1_041_666_666_666_666_667,
+            ),
+            (
+                priced_rate_map(
+                    mayhem_proto::USAGE_PIXEL_FRAME,
+                    1_067_672_950_634_057,
+                    1_000_000,
+                ),
+                0,
+                0,
+                1_067_672_950_635,
+            ),
+            (
+                priced_rate_map(
+                    mayhem_proto::USAGE_PIXEL_FRAME,
+                    1_067_672_950_634_057,
+                    1_000_000,
+                ),
+                250_000,
+                0,
+                1_067_672_950_635,
+            ),
+            (text_generation_rate_map(20, 60), 0, 0, 85),
+            (priced_rate_map("image", 0, 1), 250_000, 400_000, 400_000),
+            (priced_rate_map("image", 0, 1), 250_000, 0, 250_000),
+        ];
+
+        for (rate_map, per_req_au, min_session_au, expected_floor_au) in cases {
+            let selected =
+                priced_workflow_provider_candidate(rate_map.clone(), per_req_au, min_session_au);
+            let floor_au = provider_heartbeat_min_ask_au(&selected, 0);
+            let market_rate_au = rate_gate_basis_au(&rate_map, per_req_au, min_session_au);
+
+            assert_eq!(floor_au, expected_floor_au);
+            assert_eq!(
+                floor_au, market_rate_au,
+                "an unconfigured provider advertises exactly the basket the gate scores"
+            );
+            assert!(
+                floor_au <= market_rate_au,
+                "an unconfigured provider must never block its own current price"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_heartbeat_min_ask_keeps_a_configured_floor_exactly_as_configured() {
+        let selected = priced_workflow_provider_candidate(
+            priced_rate_map(
+                mayhem_proto::USAGE_PIXEL_FRAME,
+                1_067_672_950_634_057,
+                1_000_000,
+            ),
+            0,
+            0,
+        );
+        let market_rate_au = 1_067_672_950_635;
+
+        assert_eq!(
+            provider_heartbeat_min_ask_au(&selected, market_rate_au + 1),
+            market_rate_au + 1,
+            "a floor above the market basket is advertised, and the provider sits out"
+        );
+        assert_eq!(
+            provider_heartbeat_min_ask_au(&selected, market_rate_au - 1),
+            market_rate_au - 1
+        );
+        assert_eq!(
+            provider_heartbeat_min_ask_au(&selected, 1_067_672_950_634_057),
+            1_067_672_950_634_057,
+            "a floor quoted per million items is still the operator's own number"
+        );
     }
 
     #[test]
@@ -119053,7 +119159,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         }];
         schedule.pending = Some(pending);
 
-        assert_eq!(provider_heartbeat_min_ask_au(&selected, 0), 7);
+        assert_eq!(provider_heartbeat_min_ask_au(&selected, 0), 7_000);
     }
 
     #[test]

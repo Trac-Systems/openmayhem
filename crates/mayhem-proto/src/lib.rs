@@ -1423,6 +1423,56 @@ pub struct RateMapEntry {
     pub granularity: u64,
 }
 
+/// One standardized 1,000-unit basket of every metered unit a rate map prices, in atto-USD.
+///
+/// Each entry contributes `ceil(per_unit_au * 1_000 / granularity)`, so how finely a unit is
+/// quoted never moves the number: a unit sold per 1,000 items and a unit sold per 1,000,000
+/// items land on the same scale and compare directly.
+pub fn rate_map_cost_basis_per_1k(rate_map: &[RateMapEntry]) -> MoneyAu {
+    rate_map.iter().fold(0u128, |acc, entry| {
+        if entry.granularity == 0 {
+            acc
+        } else {
+            acc.saturating_add(ceil_div_money_au(
+                entry.per_unit_au.saturating_mul(1_000),
+                MoneyAu::from(entry.granularity),
+            ))
+        }
+    })
+}
+
+/// The single scalar basis every price floor and price cap in this protocol is quoted on:
+/// the standardized 1,000-unit basket of a schedule's metered units.
+///
+/// Request volume never enters it. The fixed per-request and per-session charges stay out of
+/// it while any metered unit carries a price; a schedule that meters nothing still needs a
+/// comparable number, so it falls back to the larger of those two fixed charges.
+///
+/// A user's maximum price, a provider's minimum ask and the routing gate that compares them
+/// all read this one function. A provider that has not configured a floor advertises exactly
+/// this value for its own active price, so its own price always clears its own floor, at any
+/// granularity.
+pub fn rate_gate_basis_au(
+    rate_map: &[RateMapEntry],
+    per_req_au: MoneyAu,
+    min_session_au: MoneyAu,
+) -> MoneyAu {
+    let rate_basis = rate_map_cost_basis_per_1k(rate_map);
+    if rate_basis == 0 {
+        per_req_au.max(min_session_au)
+    } else {
+        rate_basis
+    }
+}
+
+fn ceil_div_money_au(value: MoneyAu, divisor: MoneyAu) -> MoneyAu {
+    if value == 0 || divisor == 0 {
+        0
+    } else {
+        value.div_ceil(divisor)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WorkflowBinding {
     pub endpoint_family: String,
@@ -3127,6 +3177,114 @@ mod tests {
     #[test]
     fn exposes_crate_name() {
         assert_eq!(CRATE_NAME, "mayhem-proto");
+    }
+
+    fn rate(unit: &str, per_unit_au: MoneyAu, granularity: u64) -> RateMapEntry {
+        RateMapEntry {
+            unit: unit.to_owned(),
+            per_unit_au,
+            granularity,
+        }
+    }
+
+    /// The floor rule this basis replaced: the smallest positive number anywhere in the
+    /// schedule, with the quote size that number is priced against thrown away.
+    fn smallest_positive_price_component_au(
+        rate_map: &[RateMapEntry],
+        per_req_au: MoneyAu,
+        min_session_au: MoneyAu,
+    ) -> MoneyAu {
+        rate_map
+            .iter()
+            .map(|entry| entry.per_unit_au)
+            .chain([per_req_au, min_session_au])
+            .filter(|value| *value > 0)
+            .min()
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn basket_is_the_same_scale_at_every_quote_size() {
+        assert_eq!(
+            rate_map_cost_basis_per_1k(&[rate(
+                USAGE_MEGAPIXEL_STEP,
+                1_041_666_666_666_666_667,
+                1_000
+            )]),
+            1_041_666_666_666_666_667
+        );
+        assert_eq!(
+            rate_map_cost_basis_per_1k(&[rate(
+                USAGE_PIXEL_FRAME,
+                1_067_672_950_634_057,
+                1_000_000
+            )]),
+            1_067_672_950_635,
+            "a price quoted per million items still scores per thousand items"
+        );
+        assert_eq!(
+            rate_map_cost_basis_per_1k(&[rate(USAGE_IMAGE, 11, 1)]),
+            11_000
+        );
+        assert_eq!(
+            rate_map_cost_basis_per_1k(&[rate(USAGE_IMAGE, 11, 0)]),
+            0,
+            "an entry that cannot be priced contributes nothing"
+        );
+        assert_eq!(rate_map_cost_basis_per_1k(&[]), 0);
+    }
+
+    #[test]
+    fn basket_adds_every_priced_unit_and_rounds_up() {
+        let mixed = vec![
+            rate(USAGE_INPUT_TOKEN, 20, 1_000),
+            rate(USAGE_OUTPUT_TOKEN, 60, 1_000),
+            rate(USAGE_PIXEL_FRAME, 1, 3),
+        ];
+
+        assert_eq!(rate_map_cost_basis_per_1k(&mixed), 20 + 60 + 334);
+    }
+
+    #[test]
+    fn gate_basis_keeps_fixed_charges_out_of_a_metered_schedule() {
+        let metered = vec![rate(USAGE_PIXEL_FRAME, 1_067_672_950_634_057, 1_000_000)];
+
+        assert_eq!(rate_gate_basis_au(&metered, 0, 0), 1_067_672_950_635);
+        assert_eq!(
+            rate_gate_basis_au(&metered, 7_000, 9_000),
+            1_067_672_950_635,
+            "per-request and per-session charges never enter a metered basket"
+        );
+        assert_eq!(
+            rate_gate_basis_au(&[], 7_000, 9_000),
+            9_000,
+            "a schedule that meters nothing falls back to its larger fixed charge"
+        );
+        assert_eq!(rate_gate_basis_au(&[], 7_000, 0), 7_000);
+        assert_eq!(rate_gate_basis_au(&[], 0, 0), 0);
+    }
+
+    #[test]
+    fn the_replaced_floor_rule_priced_itself_out_of_finely_quoted_markets() {
+        let coarse = vec![rate(USAGE_MEGAPIXEL_STEP, 1_041_666_666_666_666_667, 1_000)];
+        let fine = vec![rate(USAGE_PIXEL_FRAME, 1_067_672_950_634_057, 1_000_000)];
+
+        assert_eq!(
+            smallest_positive_price_component_au(&coarse, 0, 0),
+            rate_gate_basis_au(&coarse, 0, 0),
+            "the replaced rule only ever matched the gate while every unit was quoted per 1,000"
+        );
+
+        let fine_basis = rate_gate_basis_au(&fine, 0, 0);
+        assert_eq!(fine_basis, 1_067_672_950_635);
+        assert_eq!(
+            smallest_positive_price_component_au(&fine, 0, 0),
+            1_067_672_950_634_057
+        );
+        assert!(
+            smallest_positive_price_component_au(&fine, 0, 0) > fine_basis,
+            "the replaced rule asked 1,000 times the basket the gate scores"
+        );
     }
 
     #[test]
