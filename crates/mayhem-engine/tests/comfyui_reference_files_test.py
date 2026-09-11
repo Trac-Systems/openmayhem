@@ -8,7 +8,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -22,6 +24,18 @@ def load_file_scope(base_dir):
     namespace = {"base_dir": base_dir, "base64": base64, "contextlib": contextlib,
                  "tempfile": tempfile, "Path": Path, "json": json,
                  "os": os, "time": time, "errno": errno}
+    exec(compile(ast.Module(body=functions, type_ignores=[]), source.name, "exec"), namespace)
+    return namespace
+
+
+def load_model_path_scope(aliases):
+    source = Path(__file__).resolve().parents[1] / "src" / "comfyui_worker.py"
+    tree = ast.parse(source.read_text(), source.name)
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "normalize_workflow_model_paths"
+    ]
+    namespace = {"model_path_aliases": aliases}
     exec(compile(ast.Module(body=functions, type_ignores=[]), source.name, "exec"), namespace)
     return namespace
 
@@ -138,6 +152,48 @@ with scope['materialized_input_files']({'input_files': [helpers['reference'](b's
             self.scope["safe_input_file_path"]("alias/file.png")
         with self.assertRaisesRegex(RuntimeError, "escaped"):
             self.scope["resolve_output_file"]({"type": "input", "subfolder": "alias", "filename": "file.png"})
+
+
+class ComfyModelPathTests(unittest.TestCase):
+    def test_only_advertised_model_picker_values_use_native_separator(self):
+        native = "Krea2\\example.safetensors"
+        scope = load_model_path_scope({"Krea2/example.safetensors": native})
+
+        class Loader:
+            @staticmethod
+            def INPUT_TYPES():
+                return {"required": {"lora_name": ([native],)}}
+
+        class TextEncoder:
+            @staticmethod
+            def INPUT_TYPES():
+                return {"required": {"text": ("STRING", {"multiline": True})}}
+
+        nodes = types.ModuleType("nodes")
+        nodes.NODE_CLASS_MAPPINGS = {
+            "LoraLoaderModelOnly": Loader,
+            "CLIPTextEncode": TextEncoder,
+        }
+        workflow = {
+            "loader": {
+                "class_type": "LoraLoaderModelOnly",
+                "inputs": {"lora_name": "Krea2/example.safetensors"},
+            },
+            "prompt": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {"text": "Krea2/example.safetensors"},
+            },
+            "unknown": {
+                "class_type": "UnknownNode",
+                "inputs": {"model_name": "Krea2/example.safetensors"},
+            },
+        }
+        with mock.patch.dict(sys.modules, {"nodes": nodes}):
+            scope["normalize_workflow_model_paths"](workflow)
+
+        self.assertEqual(workflow["loader"]["inputs"]["lora_name"], native)
+        self.assertEqual(workflow["prompt"]["inputs"]["text"], "Krea2/example.safetensors")
+        self.assertEqual(workflow["unknown"]["inputs"]["model_name"], "Krea2/example.safetensors")
 
 
 if __name__ == "__main__":
