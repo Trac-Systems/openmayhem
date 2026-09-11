@@ -5,9 +5,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Number, Value};
 
 use crate::{
-    stable_json_bytes, ReceiptUsage, WorkflowOutputBinding, USAGE_AUDIO_SECOND,
-    USAGE_COMPUTE_SECOND, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_MEGAPIXEL,
-    USAGE_MEGAPIXEL_STEP, USAGE_PIXEL_FRAME, USAGE_STEP, USAGE_VIDEO_SECOND,
+    stable_json_bytes, ComfyWorkflowDimensionBounds, ComfyWorkflowGraphConstraints, ReceiptUsage,
+    WorkflowOutputBinding, USAGE_AUDIO_SECOND, USAGE_COMPUTE_SECOND, USAGE_FRAME, USAGE_IMAGE,
+    USAGE_INPUT_CHARACTER, USAGE_MEGAPIXEL, USAGE_MEGAPIXEL_STEP, USAGE_PIXEL_FRAME, USAGE_STEP,
+    USAGE_VIDEO_SECOND,
 };
 
 pub const COMFY_WORKFLOW_DERIVATION_SCHEMA_VERSION: u32 = 1;
@@ -67,6 +68,10 @@ pub struct ComfyWorkflowCatalogPolicy {
     pub allowed_steps: Vec<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_artifacts: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dimension_bounds: Option<ComfyWorkflowDimensionBounds>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_constraints: Option<ComfyWorkflowGraphConstraints>,
 }
 
 pub fn comfy_outcome_class_definition_hash(
@@ -162,7 +167,7 @@ impl ComfyWorkflowCatalogPolicy {
                 )));
             }
         }
-        Ok(ComfyWorkflowDerivationPolicy {
+        let policy = ComfyWorkflowDerivationPolicy {
             whitelisted_nodes,
             parts_by_name,
             pricing_unit: self.pricing_unit.clone(),
@@ -177,7 +182,11 @@ impl ComfyWorkflowCatalogPolicy {
             max_steps,
             allowed_steps,
             max_artifacts: self.max_artifacts.unwrap_or(defaults.max_artifacts).max(1),
-        })
+            dimension_bounds: self.dimension_bounds.clone(),
+            graph_constraints: self.graph_constraints.clone(),
+        };
+        policy.validate_constraints()?;
+        Ok(policy)
     }
 
     pub fn runtime_id(&self) -> &str {
@@ -222,6 +231,8 @@ pub struct ComfyWorkflowDerivationPolicy {
     pub max_steps: u64,
     pub allowed_steps: BTreeSet<u64>,
     pub max_artifacts: u64,
+    pub dimension_bounds: Option<ComfyWorkflowDimensionBounds>,
+    pub graph_constraints: Option<ComfyWorkflowGraphConstraints>,
 }
 
 impl Default for ComfyWorkflowDerivationPolicy {
@@ -238,7 +249,21 @@ impl Default for ComfyWorkflowDerivationPolicy {
             max_steps: DEFAULT_COMFY_WORKFLOW_MAX_STEPS,
             allowed_steps: BTreeSet::new(),
             max_artifacts: DEFAULT_COMFY_WORKFLOW_MAX_ARTIFACTS,
+            dimension_bounds: None,
+            graph_constraints: None,
         }
+    }
+}
+
+impl ComfyWorkflowDerivationPolicy {
+    fn validate_constraints(&self) -> Result<(), ComfyWorkflowDerivationError> {
+        if let Some(bounds) = &self.dimension_bounds {
+            bounds.validate(self.max_width, self.max_height)?;
+        }
+        if let Some(constraints) = &self.graph_constraints {
+            constraints.validate(&self.whitelisted_nodes, &self.parts_by_name, self.max_nodes)?;
+        }
+        Ok(())
     }
 }
 
@@ -302,6 +327,7 @@ pub fn derive_comfy_workflow(
     graph: &Value,
     policy: &ComfyWorkflowDerivationPolicy,
 ) -> Result<ComfyWorkflowDerivation, ComfyWorkflowDerivationError> {
+    policy.validate_constraints()?;
     let nodes = graph.as_object().ok_or_else(|| {
         ComfyWorkflowDerivationError::InvalidGraph("graph must be a JSON object".to_owned())
     })?;
@@ -326,6 +352,9 @@ pub fn derive_comfy_workflow(
     let mut node_set = BTreeSet::new();
     let mut parts_required = BTreeMap::<String, ComfyWorkflowPartRef>::new();
     let mut metrics = OutcomeMetrics::default();
+    if let Some(constraints) = &policy.graph_constraints {
+        constraints.check(nodes, &policy.parts_by_name, &mut parts_required)?;
+    }
 
     for (node_id, node) in nodes {
         let node_object = node.as_object().ok_or_else(|| {
@@ -568,6 +597,9 @@ impl OutcomeMetrics {
         });
         let steps = self.steps;
         let artifact_count = self.artifact_count.unwrap_or(1).max(1);
+        if let Some(bounds) = &policy.dimension_bounds {
+            bounds.check(width, height)?;
+        }
 
         if width.is_some_and(|value| value > policy.max_width) {
             return Err(ComfyWorkflowDerivationError::OutcomeOverflow(format!(

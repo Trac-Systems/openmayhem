@@ -9,6 +9,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod comfy_workflow;
+mod comfy_workflow_constraints;
+mod comfy_workflow_media;
 mod endpoint_contract;
 mod parts_catalog;
 mod validated_audio;
@@ -26,6 +28,15 @@ pub use comfy_workflow::{
     ComfyWorkflowDerivation, ComfyWorkflowDerivationError, ComfyWorkflowDerivationPolicy,
     ComfyWorkflowOutcomeSpec, ComfyWorkflowPartRef, COMFY_WORKFLOW_DERIVATION_SCHEMA_VERSION,
     DEFAULT_COMFY_WORKFLOW_RUNTIME_ID,
+};
+pub use comfy_workflow_constraints::{
+    ComfyWorkflowDimensionBounds, ComfyWorkflowGraphConstraints, ComfyWorkflowInputConstraint,
+    ComfyWorkflowInputType, ComfyWorkflowLinkSource, ComfyWorkflowNodeRole,
+    ComfyWorkflowValueSource,
+};
+pub use comfy_workflow_media::{
+    ComfyWorkflowLoraDisplay, ComfyWorkflowMedia, ComfyWorkflowPreset, ComfyWorkflowPresetInput,
+    ComfyWorkflowPresetValue,
 };
 pub use endpoint_contract::{
     artifact_generation_inline_audio_load, artifact_generation_input_characters,

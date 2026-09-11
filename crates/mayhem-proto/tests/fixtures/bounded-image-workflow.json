@@ -1,0 +1,35 @@
+{
+  "policy": {
+    "whitelisted_nodes": ["EmptyImage", "SaveImage"],
+    "runtime_id": "comfyui-v0.30.1",
+    "outcome_class": "image.test.bounded",
+    "pricing_unit": "megapixel_step",
+    "max_width": 512,
+    "max_height": 512,
+    "max_artifacts": 4,
+    "dimension_bounds": {"min_width": 16, "min_height": 16, "max_pixels": 65536, "width_multiple": 16, "height_multiple": 16},
+    "graph_constraints": {
+      "output_role": "output",
+      "roles": {
+        "canvas": {
+          "class_type": "EmptyImage", "min_count": 1, "max_count": 1,
+          "inputs": {
+            "width": {"value_type": "integer", "required": true, "minimum": 16, "maximum": 512},
+            "height": {"value_type": "integer", "required": true, "minimum": 16, "maximum": 512},
+            "batch_size": {"value_type": "integer", "required": true, "minimum": 1, "maximum": 4},
+            "color": {"value_type": "integer", "required": true, "fixed": 0}
+          }
+        },
+        "output": {
+          "class_type": "SaveImage", "min_count": 1, "max_count": 1,
+          "inputs": {"images": {"value_type": "link", "required": true, "sources": [{"role": "canvas", "output": 0}]}}
+        }
+      }
+    }
+  },
+  "workflow": {
+    "1": {"class_type": "EmptyImage", "inputs": {"width": 256, "height": 256, "batch_size": 4, "color": 0}},
+    "2": {"class_type": "SaveImage", "inputs": {"images": ["1", 0]}}
+  },
+  "expected_units": 4
+}
