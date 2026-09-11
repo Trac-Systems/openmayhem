@@ -27,6 +27,7 @@ runner = None
 session = None
 base_dir = None
 control_mode = None
+model_path_aliases = {}
 
 
 def prefer_internal_queue_control():
@@ -41,6 +42,40 @@ def comfy_path(path):
         if text.startswith("\\\\?\\"):
             return text[4:]
     return text
+
+
+def normalize_workflow_model_paths(workflow):
+    if not model_path_aliases:
+        return
+    import nodes
+
+    for node in workflow.values():
+        if not isinstance(node, dict):
+            continue
+        class_type = node.get("class_type")
+        inputs = node.get("inputs")
+        node_class = nodes.NODE_CLASS_MAPPINGS.get(class_type)
+        if node_class is None or not isinstance(inputs, dict):
+            continue
+        try:
+            input_types = node_class.INPUT_TYPES()
+        except Exception:
+            continue
+        if not isinstance(input_types, dict):
+            continue
+        specs = {}
+        for group in ("required", "optional", "hidden"):
+            values = input_types.get(group)
+            if isinstance(values, dict):
+                specs.update(values)
+        for name, value in inputs.items():
+            native = model_path_aliases.get(value) if isinstance(value, str) else None
+            spec = specs.get(name)
+            if native is None or not isinstance(spec, (list, tuple)) or not spec:
+                continue
+            choices = spec[0]
+            if isinstance(choices, (list, tuple, set)) and native in choices:
+                inputs[name] = native
 
 
 def reply(message_id, ok, result=None, error=None):
@@ -357,12 +392,19 @@ def patch_comfy_quantized_offload_probe():
 
 
 def load(payload):
-    global prompt_server, base_dir, control_mode
+    global prompt_server, base_dir, control_mode, model_path_aliases
     runtime_root = Path(comfy_path(Path(payload["runtime_root"]).resolve()))
     base_dir = Path(comfy_path(Path(payload["base_dir"]).resolve()))
     socket_path = Path(comfy_path(Path(payload["socket_path"]).resolve()))
     device = payload.get("device", "auto")
     custom_node_whitelist = payload.get("custom_node_whitelist", [])
+    aliases = payload.get("model_path_aliases", {})
+    if not isinstance(aliases, dict) or any(
+        not isinstance(key, str) or not isinstance(value, str)
+        for key, value in aliases.items()
+    ):
+        raise ValueError("ComfyUI model_path_aliases must be a string map")
+    model_path_aliases = aliases
     for path in (base_dir / "input", base_dir / "output", base_dir / "temp", base_dir / "user"):
         path.mkdir(parents=True, exist_ok=True)
     socket_path.parent.mkdir(parents=True, exist_ok=True)
@@ -446,6 +488,7 @@ async def run_workflow(payload):
         workflow = payload["workflow"]
         if not isinstance(workflow, dict):
             raise ValueError("workflow must be an object")
+        normalize_workflow_model_paths(workflow)
         client_id = payload.get("client_id") or "mayhem-comfyui"
         timeout_ms = int(payload.get("timeout_ms") or 300000)
         async with session.post(
@@ -489,6 +532,7 @@ async def run_workflow_internal(payload):
         workflow = payload["workflow"]
         if not isinstance(workflow, dict):
             raise ValueError("workflow must be an object")
+        normalize_workflow_model_paths(workflow)
         client_id = payload.get("client_id") or "mayhem-comfyui"
         timeout_ms = int(payload.get("timeout_ms") or 300000)
         prompt_id = str(uuid.uuid4())

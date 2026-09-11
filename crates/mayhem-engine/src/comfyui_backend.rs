@@ -13,6 +13,7 @@ use mayhem_enclave::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::Digest as _;
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
@@ -136,6 +137,8 @@ impl EngineBackend for ComfyUiBackend {
             ))
         })?;
         materialize_comfyui_model_files(&cache_root, &config.comfyui_model_files)?;
+        let model_path_aliases =
+            comfyui_model_path_aliases(&config.comfyui_model_files, std::path::MAIN_SEPARATOR)?;
         materialize_comfyui_custom_nodes(&cache_root, &config.comfyui_custom_nodes)?;
         let python = env::var_os(PYTHON_ENV)
             .map(PathBuf::from)
@@ -166,6 +169,7 @@ impl EngineBackend for ComfyUiBackend {
                 "socket_path": socket_path,
                 "device": device,
                 "custom_node_whitelist": custom_node_whitelist,
+                "model_path_aliases": model_path_aliases,
             }),
         )?;
         let response: WorkerLoadResult =
@@ -329,6 +333,33 @@ fn materialize_comfyui_model_files(
             })?;
     }
     Ok(())
+}
+
+fn comfyui_model_path_aliases(
+    files: &[super::ComfyUiModelFile],
+    separator: char,
+) -> Result<BTreeMap<String, String>> {
+    let mut aliases = BTreeMap::new();
+    for file in files {
+        let components = file
+            .model_path
+            .components()
+            .map(|component| match component {
+                Component::Normal(value) => value.to_str().ok_or_else(|| {
+                    EngineError::ComfyUi("ComfyUI model path must be UTF-8".to_owned())
+                }),
+                _ => Err(EngineError::ComfyUi(
+                    "ComfyUI model path must contain only normal components".to_owned(),
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let canonical = components.join("/");
+        let native = components.join(&separator.to_string());
+        if canonical != native {
+            aliases.insert(canonical, native);
+        }
+    }
+    Ok(aliases)
 }
 
 fn materialize_comfyui_custom_nodes(
@@ -1239,6 +1270,30 @@ mod tests {
     #[test]
     fn comfyui_device_defaults_to_runtime_auto_selection() {
         assert_eq!(default_comfyui_device(), "auto");
+    }
+
+    #[test]
+    fn model_paths_use_native_separators_only_at_execution() {
+        let files = vec![super::super::ComfyUiModelFile {
+            source: PathBuf::from("payload.safetensors"),
+            model_subdir: PathBuf::from("loras"),
+            model_path: PathBuf::from("Krea2/example.safetensors"),
+        }];
+        let aliases = comfyui_model_path_aliases(&files, '\\').unwrap();
+        assert_eq!(
+            aliases.get("Krea2/example.safetensors").map(String::as_str),
+            Some("Krea2\\example.safetensors")
+        );
+    }
+
+    #[test]
+    fn model_paths_remain_canonical_with_forward_separator() {
+        let files = vec![super::super::ComfyUiModelFile {
+            source: PathBuf::from("payload.safetensors"),
+            model_subdir: PathBuf::from("loras"),
+            model_path: PathBuf::from("Krea2/example.safetensors"),
+        }];
+        assert!(comfyui_model_path_aliases(&files, '/').unwrap().is_empty());
     }
 
     #[test]
