@@ -7323,6 +7323,7 @@ fn routed_test_model_with_providers(providers: &[String]) -> GatewayModel {
             sampling: SamplingProfile::default(),
             failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
             workflow: None,
+            workflow_media: None,
             source: "contract".to_owned(),
             kyb_identities: Vec::new(),
             markets: Vec::new(),

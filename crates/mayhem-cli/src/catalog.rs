@@ -324,6 +324,8 @@ pub(crate) struct CatalogModel {
     pub(crate) sampling: CatalogSamplingProfile,
     #[serde(default)]
     pub(crate) workflow: Option<mayhem_proto::ComfyWorkflowCatalogPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) workflow_media: Option<mayhem_proto::ComfyWorkflowMedia>,
     pub(crate) canary: CanaryRef,
     pub(crate) price_ref_au: PriceRef,
 }
@@ -1800,6 +1802,19 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
 }
 
 fn validate_comfy_workflow_policy(model: &CatalogModel, errors: &mut Vec<String>) {
+    if let Some(media) = &model.workflow_media {
+        match model.workflow.as_ref() {
+            Some(policy) => {
+                if let Err(err) = media.validate(policy) {
+                    errors.push(format!("{} {err}", model.model_id));
+                }
+            }
+            None => errors.push(format!(
+                "{} workflow_media requires signed workflow policy",
+                model.model_id
+            )),
+        }
+    }
     let has_comfy_endpoint = model
         .adapter
         .endpoint_families
@@ -9065,6 +9080,7 @@ mod tests {
             },
             sampling: CatalogSamplingProfile::default(),
             workflow: None,
+            workflow_media: None,
             canary: CanaryRef {
                 set_id: "canary-launch-v1".to_owned(),
                 match_min: 0.9,
@@ -10634,6 +10650,7 @@ mod tests {
             },
             sampling: CatalogSamplingProfile::default(),
             workflow: None,
+            workflow_media: None,
             canary,
             price_ref_au: PriceRef {
                 denom: "au_usd".to_owned(),

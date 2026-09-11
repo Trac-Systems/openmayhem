@@ -834,6 +834,8 @@ pub struct MayhemModelInfo {
     pub failover: GatewayFailoverPolicyConfig,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workflow: Option<mayhem_proto::ComfyWorkflowCatalogPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow_media: Option<mayhem_proto::ComfyWorkflowMedia>,
     pub source: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kyb_identities: Vec<ProviderKybInfo>,
@@ -4436,7 +4438,12 @@ impl GatewayState {
             .filter_map(|model| model_from_catalog_value(model, created))
             .collect::<Vec<_>>();
         let canaries = canary_registry_from_catalog_root(&root, &embedded_canary_sets());
-        if models.is_empty() {
+        if models.is_empty()
+            && root
+                .get("models")
+                .and_then(Value::as_array)
+                .is_none_or(Vec::is_empty)
+        {
             Ok(Self::fixture())
         } else {
             Ok(Self::with_models_and_canaries(models, canaries))
@@ -4540,6 +4547,7 @@ impl GatewayState {
                 sampling: SamplingProfile::default(),
                 failover: GatewayFailoverPolicyConfig::default(),
                 workflow: None,
+                workflow_media: None,
                 source: "local-fixture".to_owned(),
                 kyb_identities: Vec::new(),
                 markets: Vec::new(),
@@ -36176,6 +36184,16 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
     let price = model.get("price_ref_au").unwrap_or(&Value::Null);
     let rate_map = price_rate_map_from_catalog_value(price);
     let tiers = attestation_tiers_from_catalog_value(model);
+    let workflow = comfy_workflow_policy_from_catalog_value(model).ok()?;
+    let workflow_media = match model.get("workflow_media") {
+        None => None,
+        Some(value) => {
+            let media: mayhem_proto::ComfyWorkflowMedia =
+                serde_json::from_value(value.clone()).ok()?;
+            media.validate(workflow.as_ref()?).ok()?;
+            Some(media)
+        }
+    };
     Some(GatewayModel {
         id,
         created,
@@ -36255,7 +36273,8 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
             speciality_calibrations: speciality_calibrations_from_catalog_value(model),
             sampling: sampling_profile_from_catalog_value(model),
             failover: failover_policy_from_catalog_value(model),
-            workflow: comfy_workflow_policy_from_catalog_value(model),
+            workflow,
+            workflow_media,
             source: "catalog".to_owned(),
             kyb_identities: Vec::new(),
             markets: Vec::new(),
@@ -36266,12 +36285,29 @@ fn model_from_catalog_value(model: &Value, created: u64) -> Option<GatewayModel>
 
 fn comfy_workflow_policy_from_catalog_value(
     model: &Value,
-) -> Option<mayhem_proto::ComfyWorkflowCatalogPolicy> {
-    model
+) -> Result<Option<mayhem_proto::ComfyWorkflowCatalogPolicy>, String> {
+    let Some(value) = model
         .get("workflow")
         .or_else(|| model.get("comfy_workflow"))
-        .cloned()
-        .and_then(|value| serde_json::from_value(value).ok())
+    else {
+        return Ok(None);
+    };
+    let declares_workflow = model
+        .pointer("/adapter/endpoint_families")
+        .and_then(Value::as_array)
+        .is_some_and(|families| {
+            families.iter().any(|family| {
+                family.get("family").and_then(Value::as_str)
+                    == Some(mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS)
+            })
+        });
+    if value.is_null() && !declares_workflow {
+        return Ok(None);
+    }
+    let policy: mayhem_proto::ComfyWorkflowCatalogPolicy = serde_json::from_value(value.clone())
+        .map_err(|err| format!("invalid signed workflow policy: {err}"))?;
+    policy.derivation_policy().map_err(|err| err.to_string())?;
+    Ok(Some(policy))
 }
 
 fn sampling_profile_from_catalog_value(model: &Value) -> SamplingProfile {
@@ -42564,6 +42600,7 @@ mod tests {
                 sampling: SamplingProfile::default(),
                 failover: GatewayFailoverPolicyConfig::default(),
                 workflow: None,
+                workflow_media: None,
                 source: "test".to_owned(),
                 kyb_identities: Vec::new(),
                 markets: Vec::new(),
@@ -49685,6 +49722,89 @@ mod tests {
             });
         }
         model
+    }
+
+    #[test]
+    fn comfy_workflow_constraints_catalog_and_request_fail_closed() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../mayhem-proto/tests/fixtures/bounded-image-workflow.json"
+        ))
+        .unwrap();
+        let policy: mayhem_proto::ComfyWorkflowCatalogPolicy =
+            serde_json::from_value(fixture["policy"].clone()).unwrap();
+        let expected = mayhem_proto::derive_comfy_workflow(
+            &fixture["workflow"],
+            &policy.derivation_policy().unwrap(),
+        )
+        .unwrap();
+        let request = artifact_generation_request_with_workflow_policy(
+            "test/bounded",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({"workflow":fixture["workflow"],"response_format":"artifact"}),
+            VideoRequestPreparation::default(),
+            Some(&policy),
+        )
+        .unwrap();
+        let binding = request.workflow.unwrap();
+        assert_eq!(binding.graph_hash, expected.graph_hash);
+        assert_eq!(binding.quoted_usage, expected.quoted_usage);
+        assert_eq!(
+            binding.quoted_usage.get(mayhem_proto::USAGE_MEGAPIXEL_STEP),
+            fixture["expected_units"].as_u64().unwrap()
+        );
+        let mut graph = fixture["workflow"].clone();
+        graph["1"]["inputs"]["width"] = json!(257);
+        assert!(artifact_generation_request_with_workflow_policy(
+            "test/bounded",
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            json!({"workflow":graph,"response_format":"artifact"}),
+            VideoRequestPreparation::default(),
+            Some(&policy),
+        )
+        .is_err());
+        let endpoint = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        )
+        .unwrap();
+        let mut catalog = json!({"model_id":"test/bounded","workflow":fixture["policy"],
+            "adapter":{"endpoint_families":[endpoint],"chat_template_id":"generic_chatml","tool_call_strategy":"none","reasoning_passthrough":"preserve","modality_set":["image"]},
+            "workflow_media":{"schema_version":1,"kind":"image","family":"test","loras":[]}});
+        let model = model_from_catalog_value(&catalog, 1).expect("valid signed metadata");
+        let serialized = serde_json::to_value(model).unwrap();
+        assert_eq!(
+            serialized["mayhem"]["workflow"],
+            serde_json::to_value(&policy).unwrap()
+        );
+        assert_eq!(
+            serialized["mayhem"]["workflow_media"],
+            catalog["workflow_media"]
+        );
+        catalog["workflow_media"]["loras"] = json!([{"id":"unsigned","name":"unsigned"}]);
+        assert!(model_from_catalog_value(&catalog, 1).is_none());
+        catalog.as_object_mut().unwrap().remove("workflow_media");
+        for bad in [
+            Value::Null,
+            json!({"whitelisted_nodes":[]}),
+            json!({"whitelisted_nodes":["SaveImage"],"unknown":true}),
+        ] {
+            catalog["workflow"] = bad;
+            assert!(comfy_workflow_policy_from_catalog_value(&catalog).is_err());
+            assert!(model_from_catalog_value(&catalog, 1).is_none());
+        }
+        assert!(comfy_workflow_policy_from_catalog_value(&json!({}))
+            .unwrap()
+            .is_none());
+        let state =
+            GatewayState::from_catalog_json(&json!({"models":[catalog]}).to_string()).unwrap();
+        assert!(
+            state.models_snapshot().is_empty(),
+            "malformed catalog cannot activate fixture routes"
+        );
+        assert!(
+            comfy_workflow_policy_from_catalog_value(&json!({"workflow":null}))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]

@@ -71584,6 +71584,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                 sampling: SamplingProfile::default(),
                 failover: mayhem_gateway::openai::GatewayFailoverPolicyConfig::default(),
                 workflow,
+                workflow_media: None,
                 source: "contract".to_owned(),
                 kyb_identities,
                 markets,
@@ -71949,6 +71950,7 @@ fn filter_gateway_models_by_app_version(
             model.mayhem.adapter = gateway_shape_adapter(&catalog_model.adapter);
             model.mayhem.sampling = gateway_sampling_profile(&catalog_model.sampling);
             model.mayhem.workflow = catalog_model.workflow.clone();
+            model.mayhem.workflow_media = catalog_model.workflow_media.clone();
             if let Some(min_app_version) = catalog_model.min_app_version.as_deref() {
                 model.mayhem.min_app_version = Some(min_app_version.to_owned());
                 if let Some(gate) = model_app_version_gate(&model.id, Some(min_app_version))? {
@@ -131180,6 +131182,34 @@ State initialization...
         terms
     }
 
+    #[test]
+    fn comfy_workflow_constraints_provider_binding_matches_shared_fixture() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../mayhem-proto/tests/fixtures/bounded-image-workflow.json"
+        ))
+        .unwrap();
+        let policy: mayhem_proto::ComfyWorkflowCatalogPolicy =
+            serde_json::from_value(fixture["policy"].clone()).unwrap();
+        let expected = mayhem_proto::derive_comfy_workflow(
+            &fixture["workflow"],
+            &policy.derivation_policy().unwrap(),
+        )
+        .unwrap();
+        let mut body = json!({"workflow":fixture["workflow"]});
+        let binding = provider_comfy_workflow_binding(&body, Some(&policy)).unwrap();
+        assert_eq!(binding.graph_hash, expected.graph_hash);
+        assert_eq!(binding.quoted_usage, expected.quoted_usage);
+        assert_eq!(
+            binding.quoted_usage.get(mayhem_proto::USAGE_MEGAPIXEL_STEP),
+            fixture["expected_units"].as_u64().unwrap()
+        );
+        body["workflow"]["1"]["inputs"]["width"] = json!(257);
+        assert!(provider_comfy_workflow_binding(&body, Some(&policy)).is_err());
+        body["workflow"]["1"]["inputs"]["width"] = json!(256);
+        body["workflow"]["1"]["inputs"]["batch_size"] = json!(5);
+        assert!(provider_comfy_workflow_binding(&body, Some(&policy)).is_err());
+    }
+
     fn test_provider_comfy_workflow_policy() -> mayhem_proto::ComfyWorkflowCatalogPolicy {
         mayhem_proto::ComfyWorkflowCatalogPolicy {
             whitelisted_nodes: vec![
@@ -133656,6 +133686,7 @@ State initialization...
                 },
                 sampling: catalog::CatalogSamplingProfile::default(),
                 workflow: None,
+                workflow_media: None,
                 canary: catalog::CanaryRef {
                     set_id: "test-canary".to_owned(),
                     match_min: 0.9,
