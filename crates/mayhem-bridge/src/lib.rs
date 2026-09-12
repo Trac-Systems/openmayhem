@@ -95,8 +95,9 @@ pub struct ScBridgeConfig {
     pub max_message_bytes: usize,
     pub max_queued_events: usize,
     pub max_queued_bytes: usize,
-    /// Upper bound on how long one request/reply operation may await its bridge
-    /// reply. `None` preserves the historical wait-forever behavior. The bridge is a
+    /// Upper bound on the WebSocket connection handshake and on how long one
+    /// request/reply operation may await its bridge reply. `None` preserves the
+    /// historical wait-forever behavior. The bridge is a
     /// loopback socket, so a reply that never arrives means the peer-side handler is
     /// stuck (for example a direct-session send waiting on remote drain); callers that
     /// must stay responsive (the provider session loop) set this so one dead session
@@ -176,8 +177,13 @@ impl ScBridgeClient {
             .max_message_size(Some(config.max_message_bytes))
             .max_frame_size(Some(config.max_message_bytes))
             .max_write_buffer_size(config.max_message_bytes.saturating_mul(2).max(256 * 1024));
-        let (stream, _) =
-            connect_async_with_config(config.url.as_str(), Some(websocket_config), false).await?;
+        let connect = connect_async_with_config(config.url.as_str(), Some(websocket_config), false);
+        let (stream, _) = match config.operation_deadline {
+            Some(deadline) => timeout(deadline, connect)
+                .await
+                .map_err(|_| BridgeError::Timeout)??,
+            None => connect.await?,
+        };
         let (write, read) = stream.split();
         let mut client = Self {
             write,
@@ -1023,6 +1029,38 @@ mod tests {
         assert_eq!(event["type"], "session_closed");
         assert_eq!(event["reason"], "remote closed");
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn operation_deadline_bounds_websocket_handshake_and_authentication() {
+        for complete_handshake in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                if complete_handshake {
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    let _auth = socket.next().await.unwrap().unwrap();
+                    std::future::pending::<()>().await;
+                } else {
+                    let _stream = stream;
+                    std::future::pending::<()>().await;
+                }
+            });
+            let result = timeout(
+                Duration::from_secs(2),
+                ScBridgeClient::connect(
+                    ScBridgeConfig::new(format!("ws://{address}"), "token")
+                        .unwrap()
+                        .with_operation_deadline(Some(Duration::from_millis(100))),
+                ),
+            )
+            .await
+            .expect("configured deadline must bound connection setup");
+            assert!(matches!(result, Err(BridgeError::Timeout)));
+            server.abort();
+            let _ = server.await;
+        }
     }
 
     #[tokio::test]
