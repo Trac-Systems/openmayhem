@@ -19,6 +19,7 @@ import {
   execute,
   executeFeature,
   makeIdentity,
+  makeFeatureOperation,
   makeTxKey,
   makeVerifier,
   seedCurrentAdminPrice,
@@ -447,14 +448,12 @@ async function submitReceipt(ctx, value) {
   if (key instanceof Error) {
     return { key: null, value, result: key };
   }
-  const result = await executeFeature(
-    ctx.contract,
-    ctx.storage,
-    'mayhem_feature',
-    key,
-    value,
-    ctx.provider.publicKey
-  );
+  // Exercise the same current-version dispatch the canonical relay writes,
+  // including when its nested receipt evidence was signed under v23.
+  const operation = makeFeatureOperation('mayhem_feature', key, value, ctx.provider.publicKey);
+  operation.value.dispatch.contract_version = CONTRACT_VERSION;
+  ctx.contract._mayhemLastFeatureResult = undefined;
+  const result = await ctx.contract.execute(operation, ctx.storage);
   return { key, value, result: result ?? ctx.contract._mayhemLastFeatureResult };
 }
 
@@ -1890,4 +1889,74 @@ test('canonical receipt metadata rejects count and revision overflow', async () 
     (await submitReceipt(revisionOverflow, higher)).result.message,
     /revision overflow/i
   );
+});
+
+
+test('v24 settles retained v191 context receipts without rewriting signatures or billing', async () => {
+  for (const contractVersion of [23, CONTRACT_VERSION]) {
+    const ctx = await setupContract();
+    const reservation = await submitReservation(ctx);
+    const value = receiptValue(ctx, reservation, {
+      final: true,
+      bodyOverrides: { usage_attribution: { context_input_tokens: 1200 } },
+      outerOverrides: { contract_version: contractVersion },
+    });
+    const original = JSON.stringify(value);
+    // Model a retained outbox crossing a process restart with its signed bytes intact.
+    const recovered = JSON.parse(original);
+    const recorded = await submitReceipt(ctx, recovered);
+    assert.equal(recorded.result.ok, true, recorded.result.message);
+    assert.equal(JSON.stringify(recovered), original);
+    const billingId = recovered.receipt.body.billing_id;
+    const head = (await ctx.storage.get(`receipt/head/${billingId}/0`)).value;
+    assert.equal(head.feature_key, recorded.key);
+    assert.deepEqual(head.receipt, recovered.receipt);
+    assert.deepEqual(head.receipt.body.usage, { input_token: 10 });
+    assert.equal(head.receipt.body.au_owed_cum, '100');
+    assert.equal(head.receipt.body.usage_attribution.context_input_tokens, 1200);
+    assert.equal(head.settlement_ready, true);
+    ctx.storage = MemoryStorage.fromSnapshotBytes(ctx.storage.snapshotBytes());
+    assert.equal((await submitReceipt(ctx, recovered)).result.idempotent, true);
+    const commit = await commitEpoch(ctx, { count: 1, useAu: '100' });
+    const apply = await targetedApplyValue(ctx, { heads: [head], commitHash: commit.commit_hash });
+    const applied = await submitTargetedApply(ctx, apply);
+    assert.equal(applied.result.ok, true, applied.result.message);
+    assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au, '99900');
+    assert.equal((await submitTargetedApply(ctx, apply)).result.idempotent, true);
+    assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au, '99900');
+    assert.ok(await ctx.storage.get(`receipt/consumed/${billingId}/0`));
+    if (contractVersion === 23) {
+      const rewritten = { ...recovered, contract_version: CONTRACT_VERSION };
+      const rejected = await submitReceipt(ctx, rewritten);
+      assert.notEqual(rejected.result.ok, true);
+      assert.match(rejected.result.message, /signature/i);
+    }
+  }
+});
+
+test('v24 context recovery bounds telemetry and admits no other legacy operations', async () => {
+  const ctx = await setupContract();
+  const reservation = await submitReservation(ctx);
+  for (const count of [0, -1, 1.5, 8193, Number.MAX_SAFE_INTEGER + 1]) {
+    const invalid = receiptValue(ctx, reservation, {
+      final: true,
+      bodyOverrides: { usage_attribution: { context_input_tokens: count } },
+      outerOverrides: { contract_version: 23 },
+    });
+    const rejected = await submitReceipt(ctx, invalid);
+    assert.ok(rejected.result instanceof Error, `invalid context count ${count}`);
+    assert.match(rejected.result.message, /attribution/i);
+  }
+  for (const contractVersion of [22, 25]) {
+    const invalid = receiptValue(ctx, reservation, {
+      final: true,
+      outerOverrides: { contract_version: contractVersion },
+    });
+    assert.match((await submitReceipt(ctx, invalid)).result.message, /contract version/i);
+  }
+  const legacyReservation = reservationValue(ctx);
+  legacyReservation.contract_version = 23;
+  const rejected = await ctx.contract.normalizeTargetedSpendReserveValue(legacyReservation);
+  assert.ok(rejected instanceof Error);
+  assert.match(rejected.message, /contract version/i);
 });
