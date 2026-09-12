@@ -1176,6 +1176,134 @@ test('feature relay collapses in-flight duplicates and retries one cached result
   await writerFeature.stop();
 });
 
+for (const timing of ['in-flight', 'after-first-ack']) {
+  test(`feature relay acknowledges both receipt transports ${timing} with one application`, async () => {
+    const writer = peerFor(adminKey, { writable: true });
+    const writerFeature = new MayhemFeature(writer.peer, {
+      resultRetryMs: 5,
+      resultRetryMax: 4,
+    });
+    writerFeature.key = 'mayhem';
+    const participants = [providerKey, otherKey].map((key) => {
+      const participant = peerFor(key);
+      const feature = new MayhemFeature(participant.peer, { timeoutMs: 500, retryMs: 1_000 });
+      feature.key = 'mayhem';
+      connect(participant.peer, feature, writer.peer, writerFeature);
+      return { key, feature };
+    });
+    const deliveries = new Map();
+    writer.peer.sidechannel = {
+      started: true,
+      connectDirectPeer: async () => true,
+      verifyPayload: verifyRelayPayload,
+      broadcast(channel, message) {
+        if (message.control !== 'mayhem_feature_result') return true;
+        deliveries.set(message.to, (deliveries.get(message.to) ?? 0) + 1);
+        // Losing the buyer's first result must not be hidden by the provider ACK.
+        if (message.to === otherKey && deliveries.get(otherKey) === 1) return true;
+        for (const participant of participants) {
+          queueMicrotask(() => participant.feature.handleSidechannelMessage(
+            channel, relayPayload(adminKey, message)
+          ));
+        }
+        return true;
+      },
+    };
+    let releaseApply;
+    const applyGate = new Promise((resolve) => { releaseApply = resolve; });
+    let markApplyStarted;
+    const applyStarted = new Promise((resolve) => { markApplyStarted = resolve; });
+    const append = writer.peer.base.append;
+    writer.peer.base.append = async (operation) => {
+      markApplyStarted();
+      await applyGate;
+      return append(operation);
+    };
+    const key = 'receipt/submit/shared-provider-and-buyer';
+    const value = {
+      op: 'record_usage_receipt',
+      receipt: { body: { provider: providerKey } },
+      provider_sig: '11'.repeat(64),
+    };
+    const providerResult = participants[0].feature.relay(key, value);
+    await applyStarted;
+    let buyerResult;
+    if (timing === 'in-flight') {
+      buyerResult = participants[1].feature.relay(key, value);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      releaseApply();
+    } else {
+      releaseApply();
+      assert.equal((await providerResult).ok, true);
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      buyerResult = participants[1].feature.relay(key, value);
+    }
+    const results = await Promise.all([providerResult, buyerResult]);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    try {
+      assert.deepEqual(results.map((result) => result.ok), [true, true]);
+      assert.equal(results[0].request_id, results[1].request_id);
+      assert.equal(writer.appended.length, 1);
+      assert.equal(deliveries.get(providerKey), 1);
+      assert.equal(deliveries.get(otherKey), 2);
+      const cached = writerFeature.processed.get(results[0].request_id);
+      assert.equal(cached.acked, true);
+      assert.equal(cached.otherTransports.get(otherKey).acked, true);
+      assert.equal(cached.otherTransports.get(otherKey).resultTimer, null);
+    } finally {
+      await Promise.all(participants.map(({ feature }) => feature.stop()));
+      await writerFeature.stop();
+    }
+  });
+}
+
+test('feature relay retryable failure does not wait for an offline co-sender ACK', async () => {
+  const writer = peerFor(adminKey, { writable: true });
+  const feature = new MayhemFeature(writer.peer, { resultRetryMs: 1_000 });
+  feature.key = 'mayhem';
+  writer.peer.sidechannel = {
+    started: true,
+    verifyPayload: verifyRelayPayload,
+    broadcast: () => true,
+  };
+  let finishFirst;
+  const first = new Promise((resolve) => { finishFirst = resolve; });
+  let calls = 0;
+  feature._applyRelayed = async () => {
+    calls += 1;
+    return calls === 1 ? first : { ok: true, status: 'applied' };
+  };
+  const key = `consent/${providerKey}/1/rules-hash`;
+  const value = consentValue();
+  const requestId = requestIdFor('mayhem', key, value);
+  const request = {
+    control: 'mayhem_feature_request', version: 1,
+    request_id: requestId, feature: 'mayhem', key, value,
+  };
+  try {
+    const pending = feature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, relayPayload(providerKey, request));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await feature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, relayPayload(otherKey, request));
+    finishFirst({ ok: false, accepted: false, status: 'error', message: 'retryable failure' });
+    await pending;
+    const cached = feature.processed.get(requestId);
+    const otherDelivery = cached.otherTransports.get(otherKey);
+    await feature._handleResultAck(relayPayload(providerKey, {
+      control: 'mayhem_feature_result_ack', version: 1, to: adminKey,
+      request_id: requestId, result_digest: cached.result.resultDigest,
+    }));
+    assert.equal(cached.acked, true);
+    assert.equal(otherDelivery.acked, false);
+    assert.notEqual(otherDelivery.resultTimer, null);
+    await feature.handleSidechannelMessage(MAYHEM_RELAY_CHANNEL, relayPayload(providerKey, request));
+    assert.equal(calls, 2);
+    assert.equal(feature.processed.get(requestId).result.message.response.ok, true);
+    assert.equal(otherDelivery.resultTimer, null);
+  } finally {
+    await feature.stop();
+  }
+});
+
 test('feature relay releases a writer append that never resolves so the signed request can retry', async () => {
   const participant = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
@@ -3255,6 +3383,55 @@ test('Stripe service relay rejects a signed request replayed through another tra
     /Invalid Mayhem service request signature/
   );
   assert.equal(broadcasts, 0);
+});
+
+test('service relay keeps separately authorized transports distinct and acknowledges both', async () => {
+  const signer = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  let calls = 0;
+  const writerFeature = new MayhemFeature(writer.peer, {
+    resultRetryMs: 5,
+    async serviceHandler() {
+      calls += 1;
+      return { ok: true, checkout_session: { url: 'https://checkout.stripe.com/c/pay/test' } };
+    },
+  });
+  writerFeature.key = 'mayhem';
+  const participants = [providerKey, otherKey].map((key) => {
+    const participant = peerFor(key);
+    const feature = new MayhemFeature(participant.peer, { timeoutMs: 500, retryMs: 1_000 });
+    feature.key = 'mayhem';
+    connect(participant.peer, feature, writer.peer, writerFeature);
+    return { key, feature };
+  });
+  writer.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      for (const { feature } of participants) {
+        queueMicrotask(() => feature.handleSidechannelMessage(channel, relayPayload(adminKey, message)));
+      }
+      return true;
+    },
+  };
+  try {
+    const results = await Promise.all(participants.map(({ key, feature }) => feature.requestService(
+      'stripe_checkout',
+      signedServiceValue(signer.peer, 'stripe_checkout', stripeCheckoutValue(), key)
+    )));
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.deepEqual(results.map((result) => result.ok), [true, true]);
+    assert.notEqual(results[0].request_id, results[1].request_id);
+    assert.equal(calls, 2);
+    assert.equal(writer.appended.length, 0);
+    for (const result of results) {
+      assert.equal(writerFeature.serviceProcessed.get(result.request_id).acked, true);
+    }
+  } finally {
+    await Promise.all(participants.map(({ feature }) => feature.stop()));
+    await writerFeature.stop();
+  }
 });
 
 test('Stripe service relay binds the request identity and deduplicates retries', async () => {
