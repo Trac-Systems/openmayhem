@@ -699,13 +699,14 @@ You don't set the market price; the market does. What you set is your own floor 
 
 ```bash
 mayhem provider min-ask set <model:T1> 120000     # serve only when the market clears above this
+mayhem provider min-ask clear <model:T1>          # drop the floor and follow the market again
 mayhem provider limits set --max-concurrent 4 --accept-rate 30/min --budget 5000000/day
 mayhem provider limits set --enclave <model-or-enclave> --max-concurrent 1 --budget 1000000/day
 mayhem provider drain             # finish in-flight work, accept nothing new, sign off clean
 mayhem provider drain --enclave <enclave-id>
 ```
 
-A min-ask is one number per market, quoted in atto-USD for a standardized 1,000-unit basket of that market's priced units. That is the same basis the network scores the market price on, so your number means the same thing whether the market sells tokens, steps or frames, and however finely the admin quotes them. Leave it unset and you serve at whatever the market clears at.
+A min-ask is one number per market, quoted in atto-USD for a standardized 1,000-unit basket of that market's priced units. That is the same basis the network scores the market price on, so your number means the same thing whether the market sells tokens, steps or frames, and however finely the admin quotes them. Leave it unset and you serve at whatever the market clears at. A floor you set or clear reaches your running provider at its next heartbeat, no restart needed.
 
 `limits set` is the casual-provider safety kit: cap concurrent sessions, cap the accept rate, and cap total spend served per day (`--budget`), so your electricity bill stays bounded without babysitting the box. Add `--enclave` to scope limits to one served model; memory and disk reserves stay machine-level. Refusals from these limits are clean protocol events and never damage your reputation. Reputation tracks one thing, delivering what you advertised — a slow machine that advertises 15 tok/s and hits it scores perfectly.
 
@@ -723,7 +724,7 @@ mayhem provider rails get
 | `mayhem provider rails set/get` | which payment rails you accept |
 | `mayhem provider payout set/get/rotate` | bind or rotate a provider-signed TAP/TNK destination |
 | `mayhem provider stripe onboard/adopt/rotate/relink/status` | create, adopt an existing Standard account, replace, reuse, or inspect a verified Stripe Connect payout binding |
-| `mayhem provider min-ask set/get` | your price floor per market, per 1,000-unit basket |
+| `mayhem provider min-ask set/get/clear` | your price floor per market, per 1,000-unit basket; applies live |
 | `mayhem provider limits set` | concurrency / accept-rate / daily budget caps |
 | `mayhem provider drain` | graceful sign-off |
 | `mayhem provider serve plan/add/remove` | see what fits this machine; add/remove served models live |
