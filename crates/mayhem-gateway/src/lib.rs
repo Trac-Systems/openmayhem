@@ -2823,10 +2823,11 @@ fn validate_heartbeat_fields(heartbeat: &ProviderHeartbeat) -> Result<()> {
                 reason: format!("{class} must be a safe bounded class id"),
             });
         }
-        if summary.min_ask_au == 0 || summary.max_concurrent == 0 {
+        // An ask of 0 follows the market price; only the capacity must be positive.
+        if summary.max_concurrent == 0 {
             return Err(GatewayError::BadHeartbeatField {
                 field: "workflow_classes",
-                reason: format!("{class} must have a positive ask and capacity"),
+                reason: format!("{class} must have a positive capacity"),
             });
         }
         if summary.active > summary.max_concurrent {
@@ -3658,6 +3659,53 @@ mod tests {
         })
         .expect_err("tampered workflow inventory root must fail");
         assert!(matches!(err, GatewayError::BadHeartbeatSignature { .. }));
+    }
+
+    #[test]
+    fn heartbeat_accepts_workflow_class_that_follows_the_market() {
+        let signing_key = SigningKey::from_bytes(&[9_u8; 32]);
+        let provider = hex::encode(signing_key.verifying_key().to_bytes());
+        let now = 1_800_000_000_000;
+        let mut heartbeat = signed_heartbeat(&signing_key, &provider, now, "b1");
+        heartbeat["runtime_id"] = json!("comfyui.cuda124");
+        heartbeat["workflow_classes"] = json!({
+            "image.batch": {
+                "min_ask_au": "0",
+                "max_concurrent": 2,
+                "active": 0
+            }
+        });
+        resign_heartbeat(&signing_key, &mut heartbeat);
+
+        let accepted = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &heartbeat,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect("a workflow class with ask 0 follows the market");
+        assert_eq!(accepted.min_ask_au, 0);
+        assert_eq!(accepted.workflow_classes["image.batch"].min_ask_au, 0);
+
+        let mut no_capacity = heartbeat;
+        no_capacity["workflow_classes"]["image.batch"]["max_concurrent"] = json!(0);
+        resign_heartbeat(&signing_key, &mut no_capacity);
+        let err = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &no_capacity,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .expect_err("a workflow class without capacity is invalid");
+        assert!(matches!(
+            err,
+            GatewayError::BadHeartbeatField {
+                field: "workflow_classes",
+                ..
+            }
+        ));
     }
 
     #[test]

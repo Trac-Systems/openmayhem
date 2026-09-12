@@ -649,6 +649,8 @@ enum ProviderMinAskCommands {
     Get(ProviderMinAskGetArgs),
     /// Set the configured local min-ask floor in atto-USD per 1,000-unit basket.
     Set(ProviderMinAskSetArgs),
+    /// Remove the configured local min-ask floor for a market.
+    Clear(ProviderMinAskClearArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -5964,9 +5966,23 @@ struct ProviderMinAskSetArgs {
     target: String,
 
     /// Local provider floor in integer atto-USD per standardized 1,000-unit basket of the
-    /// market's priced units, the same basis the network admits routes on. 0 advertises the
-    /// current admin price for this market, which always clears.
+    /// market's priced units, the same basis the network admits routes on. 0 follows the
+    /// market price.
     au: MoneyAu,
+
+    /// Print a machine-readable report.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Parser)]
+struct ProviderMinAskClearArgs {
+    /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+
+    /// Market target: default, enclave id, model id, model:T<tier>, or workflow outcome class.
+    target: String,
 
     /// Print a machine-readable report.
     #[arg(long)]
@@ -6683,7 +6699,8 @@ struct ProviderStartArgs {
     heartbeat_count: u32,
 
     /// Provider floor for accepted sessions in atto-USD per standardized 1,000-unit basket of
-    /// the market's priced units. 0 advertises the current market price.
+    /// the market's priced units. A `[provider.min_ask]` entry for the served market takes
+    /// precedence and is re-read while the provider runs. 0 follows the market price.
     #[arg(long, default_value_t = 0)]
     min_ask_au: MoneyAu,
 
@@ -7024,11 +7041,6 @@ struct ConfigNetwork {
 struct ConfigProvider {
     engine_backend: Option<String>,
     gpu_layers: Option<u32>,
-    /// `[provider.min_ask]`: market target to price floor, in atto-USD per standardized
-    /// 1,000-unit basket of that market's priced units. An absent entry advertises the
-    /// current admin price for the market.
-    #[serde(default, deserialize_with = "deserialize_optional_money_au_map")]
-    min_ask: Option<BTreeMap<String, MoneyAu>>,
     limits: Option<ConfigProviderLimits>,
     enclave_limits: Option<BTreeMap<String, ConfigProviderLimits>>,
 }
@@ -7083,26 +7095,6 @@ where
         .map(parse_decimal_money_au)
         .transpose()
         .map_err(serde::de::Error::custom)
-}
-
-fn deserialize_optional_money_au_map<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Option<BTreeMap<String, MoneyAu>>, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = Option::<BTreeMap<String, String>>::deserialize(deserializer)?;
-    value
-        .map(|map| {
-            map.into_iter()
-                .map(|(key, value)| {
-                    parse_decimal_money_au(&value)
-                        .map(|au| (key, au))
-                        .map_err(serde::de::Error::custom)
-                })
-                .collect()
-        })
-        .transpose()
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -7242,6 +7234,7 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
         ProviderCommands::MinAsk { command } => match command {
             ProviderMinAskCommands::Get(args) => provider_min_ask_get(args),
             ProviderMinAskCommands::Set(args) => provider_min_ask_set(args),
+            ProviderMinAskCommands::Clear(args) => provider_min_ask_clear(args),
         },
         ProviderCommands::Limits { command } => match command {
             ProviderLimitsCommands::Get(args) => provider_limits_get(args),
@@ -59350,6 +59343,7 @@ struct HeartbeatContext<'a> {
     tpm_activation_hello: Option<&'a mayhem_proto::TpmActivateCredentialHello>,
     workflow_inventory_root: Option<&'a str>,
     workflow_admission: Option<&'a ProviderComfyAdmission>,
+    min_ask: &'a ProviderMinAskSource,
     max_sessions: u32,
 }
 
@@ -60402,7 +60396,7 @@ struct ProviderSessionHeartbeatTask {
     tpm_activation_hello: Option<mayhem_proto::TpmActivateCredentialHello>,
     workflow_inventory_root: Option<String>,
     workflow_admission: Option<ProviderComfyAdmission>,
-    min_ask_au: MoneyAu,
+    min_ask: ProviderMinAskSource,
     max_sessions: u32,
     load: ProviderHeartbeatLoad,
     bridge_operation_timeout: Duration,
@@ -61260,6 +61254,7 @@ struct ProviderSessionRuntime<'a> {
     boot_epoch: u64,
     tpm_activation_hello: Option<&'a mayhem_proto::TpmActivateCredentialHello>,
     receipt_settlement: Arc<ProviderReceiptSettlement>,
+    min_ask: ProviderMinAskSource,
 }
 
 #[derive(Clone, Debug)]
@@ -63834,6 +63829,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let device_key = attestation_material.device_key.as_deref();
     write_provider_load_progress_stage(&args, "prepare attestation", "attest", "complete", 100);
 
+    let min_ask = ProviderMinAskSource::new(&home, &selected, args.min_ask_au)?;
     let session_context = ProviderSessionContext {
         args: &args,
         home: &home,
@@ -63931,6 +63927,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
             tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
             workflow_inventory_root: workflow_inventory_root.as_deref(),
             workflow_admission: session_context.workflow_admission.as_ref(),
+            min_ask: &min_ask,
             max_sessions: protection_config.max_sessions,
         })
         .await?
@@ -64011,7 +64008,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         },
         "rules": &rules,
         "market": {
-            "min_ask_au": money_au_json(args.min_ask_au),
+            "min_ask_au": money_au_json(min_ask.current()),
         },
         "context": {
             "served_ctx": selected.served_ctx,
@@ -64113,6 +64110,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
                 boot_epoch: attestation.report.boot_epoch,
                 tpm_activation_hello: attestation_material.tpm_activation_hello.as_ref(),
                 receipt_settlement,
+                min_ask,
             },
             responder,
         )
@@ -65824,7 +65822,7 @@ fn provider_min_ask_get(args: ProviderMinAskGetArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else if let Some(target) = target.as_deref() {
         match value {
-            Some(au) => println!("{target}: {au} au_usd per 1,000-unit basket"),
+            Some(au) => println!("{target}: {}", provider_min_ask_display(au)),
             None => println!("{target}: not set"),
         }
     } else {
@@ -65833,10 +65831,10 @@ fn provider_min_ask_get(args: ProviderMinAskGetArgs) -> Result<()> {
             report["path"].as_str().unwrap_or("")
         );
         if table.is_empty() {
-            println!("(empty; providers advertise the admin market price)");
+            println!("(no floors set; providers follow the market price)");
         } else {
             for (target, au) in table {
-                println!("{target}: {au} au_usd per 1,000-unit basket");
+                println!("{target}: {}", provider_min_ask_display(au));
             }
         }
     }
@@ -65864,9 +65862,55 @@ fn provider_min_ask_set(args: ProviderMinAskSetArgs) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         println!(
-            "Set provider min-ask {} = {} au_usd per 1,000-unit basket in {}",
+            "Set provider min-ask {} = {} in {}",
             report["target"].as_str().unwrap_or(""),
-            args.au,
+            provider_min_ask_display(args.au),
+            report["path"].as_str().unwrap_or("")
+        );
+    }
+    Ok(())
+}
+
+fn provider_min_ask_clear(args: ProviderMinAskClearArgs) -> Result<()> {
+    let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+    let home = absolutize(home)?;
+    let path = config_path_for_home(&home);
+    let target = normalize_provider_market_target(&args.target)?;
+    let mut config = read_config_toml_value(&path)?;
+    let cleared = match config
+        .get_mut("provider")
+        .and_then(|provider| provider.get_mut("min_ask"))
+    {
+        Some(table) => table
+            .as_table_mut()
+            .context("min_ask exists in config.toml but is not a table")?
+            .remove(&target)
+            .is_some(),
+        None => false,
+    };
+    if cleared {
+        write_config_toml_value(&path, &config)?;
+    }
+    let report = json!({
+        "ok": true,
+        "action": "provider.min_ask.clear",
+        "home": home,
+        "path": path,
+        "target": target,
+        "cleared": cleared,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if cleared {
+        println!(
+            "Cleared provider min-ask {} in {}",
+            report["target"].as_str().unwrap_or(""),
+            report["path"].as_str().unwrap_or("")
+        );
+    } else {
+        println!(
+            "Provider min-ask {} was not set in {}",
+            report["target"].as_str().unwrap_or(""),
             report["path"].as_str().unwrap_or("")
         );
     }
@@ -66376,16 +66420,128 @@ fn provider_market_config_keys(selected: &ProviderCandidate) -> Vec<String> {
     keys
 }
 
-fn provider_config_min_ask(
-    config: Option<&MayhemConfig>,
-    selected: &ProviderCandidate,
-) -> Option<MoneyAu> {
-    let min_ask = config
-        .and_then(|config| config.provider.as_ref())
-        .and_then(|provider| provider.min_ask.as_ref())?;
-    provider_market_config_keys(selected)
-        .into_iter()
-        .find_map(|key| min_ask.get(&key).copied())
+/// The provider's explicit price floor for the market it serves, in atto-USD per standardized
+/// 1,000-unit basket.
+///
+/// The `[provider.min_ask]` entry for the market wins, then the `--min-ask-au` start value,
+/// then 0. A floor of 0 follows the market price, so market repricing never takes the
+/// provider out of routing. Every resolution re-reads `config.toml`, the file
+/// `mayhem provider min-ask set/clear` edit, so a changed floor reaches the next heartbeat and
+/// the next session admission without a restart.
+#[derive(Clone, Debug)]
+struct ProviderMinAskSource {
+    config_path: PathBuf,
+    market_keys: Vec<String>,
+    start_min_ask_au: MoneyAu,
+    state: Arc<Mutex<ProviderMinAskState>>,
+}
+
+#[derive(Debug)]
+struct ProviderMinAskState {
+    min_ask_au: MoneyAu,
+    read_failed: bool,
+}
+
+impl ProviderMinAskSource {
+    fn new(home: &Path, selected: &ProviderCandidate, start_min_ask_au: MoneyAu) -> Result<Self> {
+        let config_path = config_path_for_home(home);
+        let market_keys = provider_market_config_keys(selected);
+        let min_ask_au = resolve_provider_min_ask_au(&config_path, &market_keys, start_min_ask_au)?;
+        Ok(Self {
+            config_path,
+            market_keys,
+            start_min_ask_au,
+            state: Arc::new(Mutex::new(ProviderMinAskState {
+                min_ask_au,
+                read_failed: false,
+            })),
+        })
+    }
+
+    /// The floor from the most recent resolution.
+    fn current(&self) -> MoneyAu {
+        self.lock_state().min_ask_au
+    }
+
+    /// Re-reads the config and returns the effective floor. A failed read keeps the last known
+    /// floor and warns once, until the config reads cleanly again.
+    fn resolve(&self) -> MoneyAu {
+        let resolved = resolve_provider_min_ask_au(
+            &self.config_path,
+            &self.market_keys,
+            self.start_min_ask_au,
+        );
+        let mut state = self.lock_state();
+        match resolved {
+            Ok(min_ask_au) => {
+                if min_ask_au != state.min_ask_au {
+                    eprintln!(
+                        "provider price floor is now {} (was {})",
+                        provider_min_ask_display(min_ask_au),
+                        provider_min_ask_display(state.min_ask_au)
+                    );
+                }
+                state.min_ask_au = min_ask_au;
+                state.read_failed = false;
+            }
+            Err(err) => {
+                if !state.read_failed {
+                    eprintln!(
+                        "warning: provider min-ask config could not be read; keeping price floor {}: {err:#}",
+                        provider_min_ask_display(state.min_ask_au)
+                    );
+                }
+                state.read_failed = true;
+            }
+        }
+        state.min_ask_au
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ProviderMinAskState> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+fn resolve_provider_min_ask_au(
+    config_path: &Path,
+    market_keys: &[String],
+    start_min_ask_au: MoneyAu,
+) -> Result<MoneyAu> {
+    let config = read_config_toml_value(config_path)?;
+    Ok(provider_min_ask_for_market(&config, market_keys)?.unwrap_or(start_min_ask_au))
+}
+
+/// The `[provider.min_ask]` entry for the first of `market_keys` present in the config.
+fn provider_min_ask_for_market(
+    config: &toml::Value,
+    market_keys: &[String],
+) -> Result<Option<MoneyAu>> {
+    let Some(min_ask) = toml_get_path(config, "provider.min_ask") else {
+        return Ok(None);
+    };
+    let min_ask = min_ask
+        .as_table()
+        .context("min_ask exists in config.toml but is not a table")?;
+    let Some((key, value)) = market_keys
+        .iter()
+        .find_map(|key| min_ask.get(key).map(|value| (key, value)))
+    else {
+        return Ok(None);
+    };
+    toml_value_money_au(value)
+        .with_context(|| format!("provider.min_ask {key:?} must be a decimal atto-USD string"))
+        .map(Some)
+}
+
+/// Human-readable price floor; 0 follows the market price.
+fn provider_min_ask_display(min_ask_au: MoneyAu) -> String {
+    if min_ask_au == 0 {
+        "follows market".to_owned()
+    } else {
+        format!("{min_ask_au} au_usd per 1,000-unit basket")
+    }
 }
 
 fn provider_config_enclave_limits(
@@ -66405,11 +66561,6 @@ fn apply_provider_config_defaults(
     config: Option<&MayhemConfig>,
     selected: &ProviderCandidate,
 ) {
-    if args.min_ask_au == 0 {
-        if let Some(min_ask_au) = provider_config_min_ask(config, selected) {
-            args.min_ask_au = min_ask_au;
-        }
-    }
     let cli_max_sessions = args.max_sessions.is_some();
     let cli_accept_rate = args.accept_rate_per_minute != 0;
     let cli_budget_au = args.serve_budget_au != 0;
@@ -78062,7 +78213,7 @@ async fn emit_provider_heartbeats(ctx: HeartbeatContext<'_>) -> Result<Vec<Value
                 ctx.tpm_activation_hello,
                 ctx.workflow_inventory_root,
                 ctx.workflow_admission,
-                ctx.args.min_ask_au,
+                ctx.min_ask.resolve(),
                 ctx.max_sessions,
                 Some(transport_peer.as_str()),
                 seq,
@@ -78098,7 +78249,6 @@ async fn send_provider_heartbeat_round(
     let mut sent = Vec::new();
     let caps = provider_heartbeat_caps(selected);
     let (tok_s, tok_s_source) = provider_heartbeat_tok_s(&load, selected.verdict.est_tok_s);
-    let heartbeat_min_ask_au = provider_heartbeat_min_ask_au(selected, min_ask_au);
     let mut modality_capacity = selected.modality_capacities.clone();
     for (modality, active_items) in &load.modality_active_items {
         let capacity = modality_capacity
@@ -78158,7 +78308,7 @@ async fn send_provider_heartbeat_round(
                 .and_then(|price| price.current.as_ref())
                 .map(|price| price.ver)
                 .unwrap_or(0),
-            "min_ask_au": money_au_json(heartbeat_min_ask_au),
+            "min_ask_au": money_au_json(min_ask_au),
             "caps": {
                 "tools": caps.tools,
                 "json": caps.json,
@@ -78183,7 +78333,7 @@ async fn send_provider_heartbeat_round(
         }
         if let Some(workflow_classes) = provider_heartbeat_workflow_classes(
             selected,
-            heartbeat_min_ask_au,
+            min_ask_au,
             max_sessions,
             &load,
             workflow_admission,
@@ -78220,7 +78370,7 @@ async fn send_provider_heartbeat_round(
             "room_id": room.room_id,
             "sidechannel": room.sidechannel,
             "seq": seq,
-            "min_ask_au": money_au_json(heartbeat_min_ask_au),
+            "min_ask_au": money_au_json(min_ask_au),
             "max_sessions": max_sessions,
             "transport_peer": transport_peer,
             "accepting_new": load.accepting_new,
@@ -78475,7 +78625,7 @@ async fn run_provider_session_heartbeat_connection(
                 ctx.tpm_activation_hello.as_ref(),
                 ctx.workflow_inventory_root.as_deref(),
                 ctx.workflow_admission.as_ref(),
-                ctx.min_ask_au,
+                ctx.min_ask.resolve(),
                 ctx.max_sessions,
                 Some(transport_peer.as_str()),
                 seq,
@@ -78554,26 +78704,6 @@ fn provider_heartbeat_caps(selected: &ProviderCandidate) -> ModelCaps {
     caps
 }
 
-/// The price floor this provider advertises for a market, in atto-USD per standardized
-/// 1,000-unit basket.
-///
-/// A configured floor is advertised exactly as configured. Without one the provider
-/// advertises the basket of its own active price, which is the number the routing gate
-/// compares the floor against, so an auto-derived floor never blocks the provider's own
-/// price no matter how finely its units are quoted.
-fn provider_heartbeat_min_ask_au(
-    selected: &ProviderCandidate,
-    configured_min_ask_au: MoneyAu,
-) -> MoneyAu {
-    if configured_min_ask_au > 0 {
-        return configured_min_ask_au;
-    }
-    let Some(price) = selected.price.as_ref().and_then(active_au_usd_price_now) else {
-        return 0;
-    };
-    rate_gate_basis_au(&price.rate_map, price.per_req_au, price.min_session_au)
-}
-
 #[derive(Clone)]
 struct OwnedProviderSessionRuntime {
     rpc: PeerRpcClient,
@@ -78589,6 +78719,7 @@ struct OwnedProviderSessionRuntime {
     boot_epoch: u64,
     tpm_activation_hello: Option<mayhem_proto::TpmActivateCredentialHello>,
     receipt_settlement: Arc<ProviderReceiptSettlement>,
+    min_ask: ProviderMinAskSource,
 }
 
 impl OwnedProviderSessionRuntime {
@@ -78607,6 +78738,7 @@ impl OwnedProviderSessionRuntime {
             boot_epoch: runtime.boot_epoch,
             tpm_activation_hello: runtime.tpm_activation_hello.cloned(),
             receipt_settlement: Arc::clone(&runtime.receipt_settlement),
+            min_ask: runtime.min_ask.clone(),
         }
     }
 
@@ -78625,6 +78757,7 @@ impl OwnedProviderSessionRuntime {
             boot_epoch: self.boot_epoch,
             tpm_activation_hello: self.tpm_activation_hello.as_ref(),
             receipt_settlement: Arc::clone(&self.receipt_settlement),
+            min_ask: self.min_ask.clone(),
         }
     }
 }
@@ -78874,7 +79007,7 @@ async fn serve_provider_sessions(
     runtime: ProviderSessionRuntime<'_>,
     mut responder: Box<dyn ProviderSessionResponder>,
 ) -> Result<()> {
-    let terms = provider_session_terms(&ctx)?;
+    let terms = provider_session_terms(&ctx, runtime.min_ask.current())?;
     let configured_protection =
         ProviderProtectionConfig::from_provider_args(ctx.args, ctx.selected)?;
     let execution_capacity = if terms.generation_execution_profile.is_some() {
@@ -78949,7 +79082,7 @@ async fn serve_provider_sessions(
     provider_log(
         ctx.args,
             &format!(
-            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} ctx_bracket {} table v{} min_ask ${} max_sessions {}{}",
+            "Provider session server listening on {} for enclave {} across {} canonical room(s) with {} at startup price v{} {} ctx_bracket {} table v{} min_ask {} max_sessions {}{}",
             sc_bridge_url,
             terms.enclave_id,
             ctx.rooms.len(),
@@ -78958,7 +79091,7 @@ async fn serve_provider_sessions(
             format_rate_map(&terms.rate_map),
             terms.ctx_bracket.as_deref().unwrap_or("base"),
             terms.ctx_bracket_table_ver.unwrap_or(0),
-            au_to_usd_amount(terms.min_ask_au),
+            provider_min_ask_display(terms.min_ask_au),
             protection_config.max_sessions,
             if protection_config.max_sessions < configured_protection.max_sessions {
                 format!(
@@ -79006,7 +79139,7 @@ async fn serve_provider_sessions(
         tpm_activation_hello: ctx.tpm_activation_hello.cloned(),
         workflow_inventory_root: ctx.workflow_inventory_root.clone(),
         workflow_admission: ctx.workflow_admission.clone(),
-        min_ask_au: ctx.args.min_ask_au,
+        min_ask: runtime.min_ask.clone(),
         max_sessions: protection_config.max_sessions,
         load: heartbeat_load.clone(),
         bridge_operation_timeout,
@@ -81626,8 +81759,10 @@ where
                 &mut admission_terms,
                 unix_epoch_seconds()?,
             );
-            // Only this new admission uses refreshed prices. Active sessions and
-            // identical s.open replays above retain their signed, locked terms.
+            admission_terms.min_ask_au = runtime.min_ask.resolve();
+            // Only this new admission uses refreshed prices and the current price floor.
+            // Active sessions and identical s.open replays above retain their signed,
+            // locked terms.
             let terms = &admission_terms;
             let policy_binding =
                 provider_session_attestation_policy_binding(&frame, terms, runtime);
@@ -85231,7 +85366,8 @@ fn provider_session_responder_with_modality_health(
     Box<dyn ProviderSessionResponder>,
     Vec<ProviderModalityHealthReport>,
 )> {
-    let terms = provider_session_terms(ctx)?;
+    // The start-up self-test admits no sessions, so no price floor applies to its terms.
+    let terms = provider_session_terms(ctx, 0)?;
     let mut responder = provider_session_responder(ctx)?;
     if ctx.selected.model.model_class == DEFAULT_MODEL_CLASS {
         ensure!(responder.prefix_caching_enabled(),
@@ -87815,7 +87951,10 @@ fn trt_kv_cache_dtype_for_artifact(
     }
 }
 
-fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSessionTerms> {
+fn provider_session_terms(
+    ctx: &ProviderSessionContext<'_>,
+    min_ask_au: MoneyAu,
+) -> Result<ProviderSessionTerms> {
     let started_at = unix_epoch_seconds()?;
     let price = ctx
         .selected
@@ -87878,7 +88017,7 @@ fn provider_session_terms(ctx: &ProviderSessionContext<'_>) -> Result<ProviderSe
         rate_map: price.rate_map.clone(),
         per_req_au: price.per_req_au,
         min_session_au: price.min_session_au,
-        min_ask_au: ctx.args.min_ask_au,
+        min_ask_au,
         rules_ver: ctx.rules.ver,
         ctx: ctx.selected.served_ctx,
         ctx_bracket,
@@ -93397,8 +93536,19 @@ fn write_config_toml_value(path: &Path, value: &toml::Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
     }
-    write_private_file(path, toml::to_string_pretty(value)?.as_bytes())
-        .with_context(|| format!("writing {}", path.display()))?;
+    // A running provider re-reads this file for its price floor, so the new config replaces
+    // the old one in a single rename and a reader never sees a truncated file. A symlinked
+    // config is replaced at its target.
+    let path = if fs::symlink_metadata(path).is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        fs::canonicalize(path).with_context(|| format!("resolving {}", path.display()))?
+    } else {
+        path.to_path_buf()
+    };
+    let temporary_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    write_private_file(&temporary_path, toml::to_string_pretty(value)?.as_bytes())
+        .with_context(|| format!("writing {}", temporary_path.display()))?;
+    fs::rename(&temporary_path, &path).with_context(|| format!("publishing {}", path.display()))?;
     Ok(())
 }
 
@@ -96345,7 +96495,10 @@ mod tests {
         let mut args = test_provider_start_args();
         apply_provider_resource_config_defaults(&mut args, Some(&config));
         apply_provider_config_defaults(&mut args, Some(&config), &selected);
-        assert_eq!(args.min_ask_au, 700);
+        assert_eq!(
+            args.min_ask_au, 0,
+            "config floors are resolved live and never copied into the start flag"
+        );
         assert_eq!(args.max_sessions, Some(4));
         assert_eq!(args.accept_rate_per_minute, 12);
         assert_eq!(args.serve_budget_au, 0);
@@ -96374,7 +96527,7 @@ mod tests {
             outcome_class: Some("image.custom.512".to_owned()),
             ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
         });
-        let workflow_config: MayhemConfig = toml::from_str(
+        let workflow_config: toml::Value = toml::from_str(
             r#"
             [provider.min_ask]
             "test/model@4bit:T1" = "700"
@@ -96382,13 +96535,20 @@ mod tests {
             "#,
         )
         .unwrap();
-        let mut workflow_args = test_provider_start_args();
-        apply_provider_config_defaults(
-            &mut workflow_args,
-            Some(&workflow_config),
-            &workflow_selected,
+        assert_eq!(
+            provider_min_ask_for_market(&workflow_config, &provider_market_config_keys(&selected))
+                .unwrap(),
+            Some(700)
         );
-        assert_eq!(workflow_args.min_ask_au, 900);
+        assert_eq!(
+            provider_min_ask_for_market(
+                &workflow_config,
+                &provider_market_config_keys(&workflow_selected)
+            )
+            .unwrap(),
+            Some(900),
+            "a workflow outcome class floor wins over the model floor"
+        );
     }
 
     #[test]
@@ -98025,6 +98185,27 @@ mod tests {
         };
         assert_eq!(args.target, "test/model:T3");
         assert_eq!(args.au, 900);
+        assert!(args.json);
+
+        let min_ask_clear = Cli::try_parse_from([
+            "mayhem",
+            "provider",
+            "min-ask",
+            "clear",
+            "test/model:T3",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Provider { command, .. } = min_ask_clear.command else {
+            panic!("expected provider command");
+        };
+        let ProviderCommands::MinAsk { command } = *command else {
+            panic!("expected min-ask command");
+        };
+        let ProviderMinAskCommands::Clear(args) = command else {
+            panic!("expected min-ask clear");
+        };
+        assert_eq!(args.target, "test/model:T3");
         assert!(args.json);
 
         let limits = Cli::try_parse_from([
@@ -114632,7 +114813,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             tpm_activation_hello: None, workflow_inventory_root: None, workflow_admission: None,
             rules: &rules,
         };
-        let terms = provider_session_terms(&ctx).unwrap();
+        let terms = provider_session_terms(&ctx, 0).unwrap();
         assert_eq!(serde_json::to_value(&terms.adapter).unwrap(), adapter_before);
         let mut responder = EngineProviderSessionResponder {
             backend: Box::new(FakeEngineBackend::new("image described").with_backend_id("vllm")),
@@ -114669,7 +114850,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(provider_response_error_code(&error), "request_invalid");
 
         let baseline_ctx = ProviderSessionContext { selected: &baseline, ..ctx };
-        let baseline_terms = provider_session_terms(&baseline_ctx).unwrap();
+        let baseline_terms = provider_session_terms(&baseline_ctx, 0).unwrap();
         let baseline_cases = provider_modality_self_test_plan(
             &baseline_ctx, &baseline_terms.adapter, &canaries,
         ).unwrap();
@@ -119025,15 +119206,76 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         }]
     }
 
-    #[test]
-    fn provider_heartbeat_min_ask_advertises_the_gate_basket_of_its_own_price() {
-        let selected = priced_workflow_provider_candidate(priced_rate_map("image", 11, 1), 0, 0);
+    /// One candidate per priced model class: text tokens, images, audio seconds, video frames.
+    fn provider_min_ask_class_candidates() -> Vec<ProviderCandidate> {
+        vec![
+            priced_workflow_provider_candidate(text_generation_rate_map(20, 60), 0, 0),
+            priced_workflow_provider_candidate(priced_rate_map("image", 11, 1), 0, 0),
+            priced_workflow_provider_candidate(
+                priced_rate_map(mayhem_proto::USAGE_AUDIO_SECOND, 250, 1),
+                0,
+                0,
+            ),
+            priced_workflow_provider_candidate(
+                priced_rate_map(
+                    mayhem_proto::USAGE_PIXEL_FRAME,
+                    1_067_672_950_634_057,
+                    1_000_000,
+                ),
+                250_000,
+                0,
+            ),
+        ]
+    }
 
-        let heartbeat_min_ask = provider_heartbeat_min_ask_au(&selected, 0);
-        assert_eq!(heartbeat_min_ask, 11_000);
+    fn provider_min_ask_target(selected: &ProviderCandidate) -> String {
+        format!(
+            "{}:T{}",
+            selected.enclave.model_id, selected.enclave.att_tier
+        )
+    }
+
+    fn set_provider_min_ask_for_test(home: &Path, target: &str, au: MoneyAu) {
+        provider_min_ask_set(ProviderMinAskSetArgs {
+            home: Some(home.to_path_buf()),
+            target: target.to_owned(),
+            au,
+            json: true,
+        })
+        .unwrap();
+    }
+
+    fn clear_provider_min_ask_for_test(home: &Path, target: &str) {
+        provider_min_ask_clear(ProviderMinAskClearArgs {
+            home: Some(home.to_path_buf()),
+            target: target.to_owned(),
+            json: true,
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn provider_min_ask_is_zero_when_nothing_is_configured() {
+        let home = test_temp_dir("min-ask-unset");
+        for selected in provider_min_ask_class_candidates() {
+            let min_ask = ProviderMinAskSource::new(&home, &selected, 0).unwrap();
+            assert_eq!(min_ask.current(), 0);
+            assert_eq!(
+                min_ask.resolve(),
+                0,
+                "an unconfigured provider follows the market whatever its price"
+            );
+            assert_eq!(
+                provider_min_ask_display(min_ask.current()),
+                "follows market"
+            );
+        }
+
+        let selected = priced_workflow_provider_candidate(priced_rate_map("image", 11, 1), 0, 0);
+        let min_ask = ProviderMinAskSource::new(&home, &selected, 0).unwrap();
         let classes = provider_heartbeat_workflow_classes(
             &selected,
-            heartbeat_min_ask,
+            min_ask.resolve(),
             1,
             &ProviderLoadSnapshot::idle(1),
             Some(&test_provider_comfy_admission(
@@ -119043,125 +119285,174 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             )),
         )
         .expect("Comfy endpoint should advertise workflow class");
-        assert_eq!(classes["image.workflow"]["min_ask_au"], json!("11000"));
+        assert_eq!(classes["image.workflow"]["min_ask_au"], json!("0"));
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn provider_heartbeat_min_ask_clears_its_own_price_at_any_quote_size() {
-        let cases: Vec<(Vec<RateMapEntry>, MoneyAu, MoneyAu, MoneyAu)> = vec![
-            (
-                priced_rate_map(
-                    mayhem_proto::USAGE_MEGAPIXEL_STEP,
-                    1_041_666_666_666_666_667,
-                    1_000,
-                ),
-                0,
-                0,
-                1_041_666_666_666_666_667,
-            ),
-            (
-                priced_rate_map(
-                    mayhem_proto::USAGE_PIXEL_FRAME,
-                    1_067_672_950_634_057,
-                    1_000_000,
-                ),
-                0,
-                0,
-                1_067_672_950_635,
-            ),
-            (
-                priced_rate_map(
-                    mayhem_proto::USAGE_PIXEL_FRAME,
-                    1_067_672_950_634_057,
-                    1_000_000,
-                ),
-                250_000,
-                0,
-                1_067_672_950_635,
-            ),
-            (text_generation_rate_map(20, 60), 0, 0, 85),
-            (priced_rate_map("image", 0, 1), 250_000, 400_000, 400_000),
-            (priced_rate_map("image", 0, 1), 250_000, 0, 250_000),
-        ];
+    fn provider_min_ask_sends_explicit_floors_exactly_as_configured() {
+        for selected in provider_min_ask_class_candidates() {
+            let target = provider_min_ask_target(&selected);
 
-        for (rate_map, per_req_au, min_session_au, expected_floor_au) in cases {
-            let selected =
-                priced_workflow_provider_candidate(rate_map.clone(), per_req_au, min_session_au);
-            let floor_au = provider_heartbeat_min_ask_au(&selected, 0);
-            let market_rate_au = rate_gate_basis_au(&rate_map, per_req_au, min_session_au);
-
-            assert_eq!(floor_au, expected_floor_au);
+            let flag_home = test_temp_dir("min-ask-flag");
+            let flag_only =
+                ProviderMinAskSource::new(&flag_home, &selected, 1_067_672_950_634_057).unwrap();
             assert_eq!(
-                floor_au, market_rate_au,
-                "an unconfigured provider advertises exactly the basket the gate scores"
+                flag_only.resolve(),
+                1_067_672_950_634_057,
+                "the start flag is sent exactly as given"
             );
-            assert!(
-                floor_au <= market_rate_au,
-                "an unconfigured provider must never block its own current price"
+
+            let config_home = test_temp_dir("min-ask-config");
+            set_provider_min_ask_for_test(&config_home, &target, 1_067_672_950_635);
+            let config_only = ProviderMinAskSource::new(&config_home, &selected, 0).unwrap();
+            assert_eq!(config_only.current(), 1_067_672_950_635);
+            assert_eq!(
+                config_only.resolve(),
+                1_067_672_950_635,
+                "a config floor is sent exactly as configured"
             );
+
+            let both = ProviderMinAskSource::new(&config_home, &selected, 900).unwrap();
+            assert_eq!(
+                both.resolve(),
+                1_067_672_950_635,
+                "a config floor wins over the start flag"
+            );
+
+            let _ = fs::remove_dir_all(&flag_home);
+            let _ = fs::remove_dir_all(&config_home);
         }
     }
 
     #[test]
-    fn provider_heartbeat_min_ask_keeps_a_configured_floor_exactly_as_configured() {
-        let selected = priced_workflow_provider_candidate(
-            priced_rate_map(
-                mayhem_proto::USAGE_PIXEL_FRAME,
-                1_067_672_950_634_057,
-                1_000_000,
-            ),
-            0,
-            0,
-        );
-        let market_rate_au = 1_067_672_950_635;
+    fn provider_min_ask_follows_config_changes_without_restart() {
+        let selected = priced_workflow_provider_candidate(priced_rate_map("image", 11, 1), 0, 0);
+        let target = provider_min_ask_target(&selected);
+        let home = test_temp_dir("min-ask-live");
+        let min_ask = ProviderMinAskSource::new(&home, &selected, 0).unwrap();
+        let flagged = ProviderMinAskSource::new(&home, &selected, 700).unwrap();
+        assert_eq!(min_ask.resolve(), 0);
+        assert_eq!(flagged.resolve(), 700);
 
+        set_provider_min_ask_for_test(&home, &target, 120_000);
         assert_eq!(
-            provider_heartbeat_min_ask_au(&selected, market_rate_au + 1),
-            market_rate_au + 1,
-            "a floor above the market basket is advertised, and the provider sits out"
+            min_ask.resolve(),
+            120_000,
+            "a floor set while the provider runs applies at the next resolution"
+        );
+        assert_eq!(min_ask.current(), 120_000);
+        assert_eq!(flagged.resolve(), 120_000);
+
+        set_provider_min_ask_for_test(&home, &target, 0);
+        assert_eq!(min_ask.resolve(), 0, "an explicit 0 follows the market");
+        assert_eq!(
+            flagged.resolve(),
+            0,
+            "an explicit 0 in config wins over the start flag"
+        );
+
+        set_provider_min_ask_for_test(&home, "default", 5);
+        set_provider_min_ask_for_test(&home, &target, 9);
+        assert_eq!(
+            min_ask.resolve(),
+            9,
+            "the market entry wins over the default entry"
+        );
+        clear_provider_min_ask_for_test(&home, &target);
+        assert_eq!(
+            min_ask.resolve(),
+            5,
+            "clearing the market entry falls back to the default entry"
+        );
+        clear_provider_min_ask_for_test(&home, "default");
+        assert_eq!(
+            min_ask.resolve(),
+            0,
+            "with every entry cleared the provider follows the market"
         );
         assert_eq!(
-            provider_heartbeat_min_ask_au(&selected, market_rate_au - 1),
-            market_rate_au - 1
+            flagged.resolve(),
+            700,
+            "with every entry cleared the start flag applies again"
         );
-        assert_eq!(
-            provider_heartbeat_min_ask_au(&selected, 1_067_672_950_634_057),
-            1_067_672_950_634_057,
-            "a floor quoted per million items is still the operator's own number"
-        );
+        clear_provider_min_ask_for_test(&home, "default");
+        assert!(provider_min_ask_table(
+            &read_config_toml_value(&config_path_for_home(&home)).unwrap()
+        )
+        .is_empty());
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
-    fn provider_heartbeat_min_ask_uses_due_pending_admin_price() {
-        let root = "aa".repeat(32);
-        let contract = test_workflow_contract(&root);
-        let catalog = test_catalog(&root);
-        let hardware = test_hardware(FixtureProfile::LinuxNvidia);
-        let mut args = test_provider_start_args();
-        args.engine_backend = "comfyui".to_owned();
-        let mut selected = build_provider_candidates(&contract, &catalog, &hardware, &args)
-            .unwrap()
-            .remove(0);
-        let schedule = selected.price.as_mut().expect("test price schedule");
-        let current = schedule.current.as_mut().expect("current price");
-        current.min_session_au = 0;
-        current.per_req_au = 0;
-        current.rate_map = vec![RateMapEntry {
-            unit: "image".to_owned(),
-            per_unit_au: 99,
-            granularity: 1,
-        }];
-        let mut pending = current.clone();
-        pending.ver = current.ver + 1;
-        pending.effective_at = 0;
-        pending.rate_map = vec![RateMapEntry {
-            unit: "image".to_owned(),
-            per_unit_au: 7,
-            granularity: 1,
-        }];
-        schedule.pending = Some(pending);
+    fn provider_min_ask_keeps_the_last_floor_while_the_config_cannot_be_read() {
+        let selected = priced_workflow_provider_candidate(priced_rate_map("image", 11, 1), 0, 0);
+        let target = provider_min_ask_target(&selected);
+        let home = test_temp_dir("min-ask-unreadable");
+        set_provider_min_ask_for_test(&home, &target, 120_000);
+        let min_ask = ProviderMinAskSource::new(&home, &selected, 0).unwrap();
+        assert_eq!(min_ask.resolve(), 120_000);
 
-        assert_eq!(provider_heartbeat_min_ask_au(&selected, 0), 7_000);
+        let config_path = config_path_for_home(&home);
+        fs::write(&config_path, "[provider.min_ask\n").unwrap();
+        assert_eq!(
+            min_ask.resolve(),
+            120_000,
+            "a failed read keeps the last known floor"
+        );
+        assert!(min_ask.lock_state().read_failed);
+        assert_eq!(min_ask.resolve(), 120_000);
+        assert!(
+            ProviderMinAskSource::new(&home, &selected, 0).is_err(),
+            "a start with an unreadable config fails instead of guessing a floor"
+        );
+
+        fs::write(
+            &config_path,
+            format!("[provider.min_ask]\n{target:?} = 7\n"),
+        )
+        .unwrap();
+        assert_eq!(
+            min_ask.resolve(),
+            120_000,
+            "a malformed floor for this market keeps the last known floor"
+        );
+
+        fs::write(
+            &config_path,
+            format!("[provider.min_ask]\n{target:?} = \"250\"\n"),
+        )
+        .unwrap();
+        assert_eq!(min_ask.resolve(), 250);
+        assert!(!min_ask.lock_state().read_failed);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn config_write_replaces_a_symlinked_config_at_its_target() {
+        let home = test_temp_dir("config-symlink");
+        let shared = home.join("shared.toml");
+        fs::write(&shared, "").unwrap();
+        let link = config_path_for_home(&home);
+        std::os::unix::fs::symlink(&shared, &link).unwrap();
+
+        set_provider_min_ask_for_test(&home, "default", 42);
+
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(
+            provider_min_ask_table(&read_config_toml_value(&shared).unwrap()).get("default"),
+            Some(&42)
+        );
+        assert!(fs::read_dir(&home).unwrap().all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("tmp-")));
+        let _ = fs::remove_dir_all(&home);
     }
 
     #[test]
@@ -119214,7 +119505,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
-    fn provider_heartbeat_min_ask_au_uses_decimal_string_shape() {
+    fn provider_min_ask_uses_decimal_string_shape() {
         let heartbeat = json!({
             "min_ask_au": money_au_json(123_456_789_000_000_000),
         });
@@ -119222,6 +119513,11 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(
             heartbeat.get("min_ask_au").and_then(Value::as_str),
             Some("123456789000000000")
+        );
+        assert_eq!(
+            money_au_json(0),
+            json!("0"),
+            "a floor that follows the market is sent as \"0\""
         );
     }
 

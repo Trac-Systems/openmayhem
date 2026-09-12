@@ -1055,10 +1055,10 @@ pub fn evaluate_eligibility(
     {
         return Err(IneligibilityReason::Price);
     }
-    // Both sides of this comparison are the standardized 1,000-unit basket of the schedule,
-    // so a floor is granularity-independent and a provider that advertises the basket of its
-    // own price always clears it.
-    if MoneyAu::from(provider_min_ask_au) > market_rate_au {
+    // A floor of 0 follows the market price and is never compared, so repricing alone never
+    // refuses a provider. An explicit floor and the market rate are both the standardized
+    // 1,000-unit basket of the schedule, so the comparison is granularity-independent.
+    if provider_min_ask_au > 0 && MoneyAu::from(provider_min_ask_au) > market_rate_au {
         return Err(IneligibilityReason::ProviderMinAsk);
     }
     if let Some(floor) = request
@@ -1876,20 +1876,20 @@ mod tests {
             ..eligible_request(now + 1)
         };
 
-        let mut advertises_own_basket = entry.clone();
-        advertises_own_basket.heartbeat.as_mut().unwrap().min_ask_au = fine_basis;
+        let mut floor_at_market = entry.clone();
+        floor_at_market.heartbeat.as_mut().unwrap().min_ask_au = fine_basis;
         assert_eq!(
-            evaluate_eligibility(&advertises_own_basket, &request),
+            evaluate_eligibility(&floor_at_market, &request),
             Ok(2_135_345_901_268_114),
-            "a provider that advertises the basket of its own price serves that price"
+            "an explicit floor at the market basket admits"
         );
 
-        let mut replaced_derivation = entry.clone();
-        replaced_derivation.heartbeat.as_mut().unwrap().min_ask_au = 1_067_672_950_634_057;
+        let mut per_quote_floor = entry.clone();
+        per_quote_floor.heartbeat.as_mut().unwrap().min_ask_au = 1_067_672_950_634_057;
         assert_eq!(
-            evaluate_eligibility(&replaced_derivation, &request),
+            evaluate_eligibility(&per_quote_floor, &request),
             Err(IneligibilityReason::ProviderMinAsk),
-            "the replaced floor rule read a per-million quote as a per-thousand basket"
+            "a floor is a 1,000-unit basket, not a per-million quote"
         );
 
         let mut floor_above_market = entry.clone();
@@ -1922,8 +1922,8 @@ mod tests {
             ..workflow_request(now + 1)
         };
 
-        let mut advertises_own_basket = entry.clone();
-        advertises_own_basket
+        let mut floor_at_market = entry.clone();
+        floor_at_market
             .heartbeat
             .as_mut()
             .unwrap()
@@ -1932,12 +1932,12 @@ mod tests {
             .unwrap()
             .min_ask_au = fine_basis;
         assert_eq!(
-            evaluate_eligibility(&advertises_own_basket, &request),
+            evaluate_eligibility(&floor_at_market, &request),
             Ok(1_067_672_950_634_057)
         );
 
-        let mut replaced_derivation = entry.clone();
-        replaced_derivation
+        let mut per_quote_floor = entry.clone();
+        per_quote_floor
             .heartbeat
             .as_mut()
             .unwrap()
@@ -1946,10 +1946,110 @@ mod tests {
             .unwrap()
             .min_ask_au = 1_067_672_950_634_057;
         assert_eq!(
-            evaluate_eligibility(&replaced_derivation, &request),
+            evaluate_eligibility(&per_quote_floor, &request),
             Err(IneligibilityReason::ProviderMinAsk),
             "a workflow class floor is the same basket as the model floor"
         );
+    }
+
+    #[test]
+    fn zero_floor_follows_the_market_at_any_price() {
+        let now = 1_000_000;
+        let mut request = eligible_request(now + 1);
+        request.max_price_au = None;
+        for (input_au, output_au) in [
+            (20, 60),
+            (1, 1),
+            (1_000_000_000_000_000, 3_000_000_000_000_000),
+        ] {
+            let mut entry = entry_for(1, now, 0.2, 100);
+            entry.contract.rate_map = text_generation_rate_map(input_au, output_au);
+            entry.contract.ref_rate_map = entry.contract.rate_map.clone();
+            assert_eq!(entry.heartbeat.as_ref().unwrap().min_ask_au, 0);
+            assert!(
+                evaluate_eligibility(&entry, &request).is_ok(),
+                "a provider without a floor serves at {input_au}/{output_au} au per token"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_floor_refuses_above_the_market_and_admits_at_or_below_it() {
+        let now = 1_000_000;
+        let mut request = eligible_request(now + 1);
+        request.max_price_au = None;
+        let entry = entry_for(1, now, 0.2, 100);
+        let market_rate_au = rate_gate_basis_au(
+            &entry.contract.rate_map,
+            entry.contract.per_req_au,
+            entry.contract.min_session_au,
+        );
+        let admitted = evaluate_eligibility(&entry, &request);
+        assert!(admitted.is_ok());
+        let with_floor = |entry: &ProviderTableEntry, floor_au: MoneyAu| {
+            let mut entry = entry.clone();
+            entry.heartbeat.as_mut().unwrap().min_ask_au = floor_au;
+            evaluate_eligibility(&entry, &request)
+        };
+        assert_eq!(
+            with_floor(&entry, market_rate_au + 1),
+            Err(IneligibilityReason::ProviderMinAsk)
+        );
+        assert_eq!(with_floor(&entry, market_rate_au), admitted);
+        assert_eq!(with_floor(&entry, market_rate_au - 1), admitted);
+        assert_eq!(with_floor(&entry, 1), admitted);
+
+        let mut repriced = entry.clone();
+        repriced.contract.rate_map = text_generation_rate_map(1, 1);
+        repriced.contract.ref_rate_map = repriced.contract.rate_map.clone();
+        assert_eq!(
+            with_floor(&repriced, market_rate_au),
+            Err(IneligibilityReason::ProviderMinAsk),
+            "an explicit floor still sits the provider out after the market drops below it"
+        );
+        assert!(
+            with_floor(&repriced, 0).is_ok(),
+            "without a floor the provider stays routable after the market drops"
+        );
+    }
+
+    #[test]
+    fn workflow_class_zero_floor_follows_the_market_at_any_price() {
+        let now = 1_000_000;
+        let mut request = workflow_request(now + 1);
+        request.max_price_au = None;
+        for per_unit_au in [100, 1, 1_000_000_000_000_000_000] {
+            let mut entry = entry_for(1, now, 0.2, 100);
+            make_workflow_route(&mut entry);
+            entry.contract.rate_map[0].per_unit_au = per_unit_au;
+            entry.contract.ref_rate_map = entry.contract.rate_map.clone();
+            entry
+                .heartbeat
+                .as_mut()
+                .unwrap()
+                .workflow_classes
+                .get_mut("image.workflow")
+                .unwrap()
+                .min_ask_au = 0;
+            assert!(
+                evaluate_eligibility(&entry, &request).is_ok(),
+                "a workflow class without a floor serves at {per_unit_au} au per image"
+            );
+
+            let mut floor_above_market = entry.clone();
+            floor_above_market
+                .heartbeat
+                .as_mut()
+                .unwrap()
+                .workflow_classes
+                .get_mut("image.workflow")
+                .unwrap()
+                .min_ask_au = rate_gate_basis_au(&entry.contract.rate_map, 0, 0) + 1;
+            assert_eq!(
+                evaluate_eligibility(&floor_above_market, &request),
+                Err(IneligibilityReason::ProviderMinAsk)
+            );
+        }
     }
 
     #[test]
