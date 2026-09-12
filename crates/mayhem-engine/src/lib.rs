@@ -9290,9 +9290,33 @@ mod vllm_backend {
         #[serde(default)]
         chunk: Option<TokenChunk>,
         #[serde(default)]
+        error_code: Option<String>,
+        #[serde(default)]
+        prompt_tokens: Option<usize>,
+        #[serde(default)]
+        ctx_size: Option<u32>,
+        #[serde(default)]
         cancelled: bool,
         #[serde(default)]
         abort_failed: bool,
+    }
+
+    fn worker_response_error(message: WorkerMessage) -> EngineError {
+        if message.error_code.as_deref() == Some("context_length_exceeded") {
+            if let (Some(prompt_tokens), Some(ctx_size)) = (message.prompt_tokens, message.ctx_size) {
+                if ctx_size > 0 && prompt_tokens >= ctx_size as usize {
+                    return EngineError::PromptTooLong {
+                        prompt_tokens,
+                        ctx_size,
+                    };
+                }
+            }
+        }
+        EngineError::Vllm(
+            message
+                .error
+                .unwrap_or_else(|| "worker returned an unknown error".to_owned()),
+        )
     }
 
     #[derive(Debug, Deserialize, Serialize)]
@@ -9695,11 +9719,7 @@ exec "$@""#)
                         message.result.unwrap_or(Value::Null),
                     )?);
                 }
-                return Err(EngineError::Vllm(
-                    message
-                        .error
-                        .unwrap_or_else(|| "worker returned an unknown error".to_owned()),
-                ));
+                return Err(worker_response_error(message));
             }
         }
 
@@ -10411,6 +10431,9 @@ exec "$@""#)
                 ok: None,
                 result: None,
                 error: None,
+                error_code: None,
+                prompt_tokens: None,
+                ctx_size: None,
                 chunk: Some(TokenChunk {
                     index,
                     token_id: i32::try_from(index).unwrap_or(i32::MAX),
@@ -10428,9 +10451,43 @@ exec "$@""#)
                 ok: Some(true),
                 result: Some(json!({})),
                 error: None,
+                error_code: None,
+                prompt_tokens: None,
+                ctx_size: None,
                 chunk: None,
                 cancelled: false,
                 abort_failed: false,
+            }
+        }
+
+        #[test]
+        fn vllm_context_error_is_typed_without_reclassifying_engine_faults() {
+            let message = serde_json::from_value(json!({
+                "id": 1, "ok": false, "error_code": "context_length_exceeded",
+                "error": "prompt too long", "prompt_tokens": 8192, "ctx_size": 8192,
+            }))
+            .unwrap();
+            assert!(matches!(
+                worker_response_error(message),
+                EngineError::PromptTooLong {
+                    prompt_tokens: 8192,
+                    ctx_size: 8192
+                }
+            ));
+            for fields in [
+                json!({}),
+                json!({"error_code": "context_length_exceeded"}),
+                json!({"error_code": "context_length_exceeded", "prompt_tokens": 4, "ctx_size": 8192}),
+            ] {
+                let mut message = json!({"id": 1, "ok": false, "error": "engine failed"});
+                message
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(fields.as_object().unwrap().clone());
+                assert!(matches!(
+                    worker_response_error(serde_json::from_value(message).unwrap()),
+                    EngineError::Vllm(_)
+                ));
             }
         }
 

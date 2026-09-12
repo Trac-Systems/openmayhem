@@ -80,11 +80,10 @@ impl ResponseStream {
 
     fn push(&mut self, chunk: Value) -> VecDeque<Value> {
         if let Some(error) = chunk.get("error") {
-            return self.fail(
-                error
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("stream failed"),
+            return self.fail_with_error(
+                error.get("message").and_then(Value::as_str).unwrap_or("stream failed"),
+                error.get("code").and_then(Value::as_str).filter(|code| !code.is_empty()).unwrap_or("server_error"),
+                error.get("retryable").and_then(Value::as_bool),
             );
         }
         if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
@@ -268,9 +267,21 @@ impl ResponseStream {
     }
 
     fn fail(&mut self, message: &str) -> VecDeque<Value> {
+        self.fail_with_error(message, "server_error", None)
+    }
+
+    fn fail_with_error(
+        &mut self,
+        message: &str,
+        code: &str,
+        retryable: Option<bool>,
+    ) -> VecDeque<Value> {
         self.terminal = true;
         self.response["status"] = json!("failed");
-        self.response["error"] = json!({"code": "server_error", "message": message});
+        self.response["error"] = json!({"code": code, "message": message});
+        if let Some(retryable) = retryable {
+            self.response["error"]["retryable"] = json!(retryable);
+        }
         for item in &mut self.output {
             item["status"] = json!("incomplete");
         }
@@ -282,6 +293,27 @@ impl ResponseStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn context_error_code_and_retryability_survive_stream_conversion() {
+        let mut adapter = ResponseStream::new("model".into());
+        adapter.start();
+        adapter.push(chunk(json!({"content":"partial"}), Value::Null));
+        let events = adapter.push(json!({"error": {"code":"context_length_exceeded",
+            "message":"Compact the conversation", "retryable":false}}));
+        let response = &events.back().unwrap()["response"];
+        assert_eq!(events.back().unwrap()["type"], "response.failed");
+        assert_eq!(response["error"]["code"], "context_length_exceeded");
+        assert_eq!(response["error"]["retryable"], false);
+        assert_eq!(response["output"][0]["status"], "incomplete");
+        assert!(adapter.terminal); // from_chat stops polling after the terminal event.
+        let mut adapter = ResponseStream::new("model".into());
+        let events = adapter.push(json!({"error":{"message":"failed"}}));
+        assert_eq!(
+            events.back().unwrap()["response"]["error"]["code"],
+            "server_error"
+        );
+    }
 
     #[test]
     fn reasoning_events_precede_answer_and_completion() {

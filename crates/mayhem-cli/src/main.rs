@@ -78601,6 +78601,29 @@ fn provider_response_error_code(error: &anyhow::Error) -> &'static str {
     }
 }
 
+fn provider_request_supports_context_usage(body: &Value) -> bool {
+    body.get("mayhem_contract")
+        .and_then(|value| value.get("context_usage"))
+        .and_then(Value::as_u64)
+        == Some(1)
+}
+
+fn provider_response_error_code_for_request(error: &anyhow::Error, body: &Value) -> &'static str {
+    if provider_request_supports_context_usage(body)
+        && error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<EngineError>(),
+                Some(EngineError::PromptTooLong { .. })
+            )
+        })
+    {
+        "context_length_exceeded"
+    } else {
+        // Old gateways already understand request_invalid as terminal/buyer-local.
+        provider_response_error_code(error)
+    }
+}
+
 fn provider_response_error_message(error: &anyhow::Error) -> String {
     error
         .chain()
@@ -82222,7 +82245,7 @@ where
                     provider_session_debug(format!(
                             "request modality/capacity validation failed for session {session_id}: {err:#}"
                         ));
-                    let error_code = provider_response_error_code(&err);
+                    let error_code = provider_response_error_code_for_request(&err, &body);
                     let error_message = provider_response_error_message(&err);
                     send_provider_session_error(
                         bridge,
@@ -82450,7 +82473,7 @@ where
                     provider_session_debug(format!(
                         "response failed for session {session_id}: {err_text}"
                     ));
-                    let error_code = provider_response_error_code(&err);
+                    let error_code = provider_response_error_code_for_request(&err, &body);
                     let error_message = provider_response_error_message(&err);
                     let (usage, attribution, receipt_seq) = live_stream
                         .as_ref()
@@ -89404,11 +89427,15 @@ fn validate_provider_session_output(
         artifact_bytes <= max_artifact_bytes,
         "provider artifacts exceed the session byte budget"
     );
+    if let Some(tokens) = output.usage_attribution.get("context_input_tokens") {
+        ensure!(*tokens > 0 && *tokens <= u64::from(terms.ctx),
+            "provider context input tokens exceed served context");
+    }
     for axis in output.usage_attribution.keys() {
         ensure!(
             matches!(
                 axis.as_str(),
-                "reasoning_output_tokens" | "vision_input_tokens" | "audio_input_tokens"
+                "reasoning_output_tokens" | "vision_input_tokens" | "audio_input_tokens" | "context_input_tokens"
             ),
             "provider output contains unsupported usage attribution {axis}"
         );
@@ -90619,6 +90646,11 @@ fn provider_engine_session_response_with_sampling_bounded(
         .saturating_add(vision_tokens)
         .saturating_add(audio_tokens);
     let mut usage_attribution = BTreeMap::new();
+    // Negotiated, signed context telemetry is independent of canonical billing
+    // units. Older gateways reject unknown attribution axes, so opt in explicitly.
+    if provider_request_supports_context_usage(body) && output.usage.prompt_tokens > 0 {
+        usage_attribution.insert("context_input_tokens".to_owned(), u64::from(output.usage.prompt_tokens));
+    }
     if reasoning_tokens > 0 {
         usage_attribution.insert("reasoning_output_tokens".to_owned(), reasoning_tokens);
     }
@@ -115692,6 +115724,59 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider_response_error_code(&engine_error),
             "provider_response_failed"
         );
+    }
+
+    #[test]
+    fn provider_context_usage_is_negotiated_and_preserves_billing() {
+        let adapter = test_provider_session_terms().adapter;
+        let body = json!({"messages": [{"role": "user", "content": "two words"}], "max_tokens": 8});
+        let mut sealed = provider_test_seal_contract_request(&body, &adapter).unwrap();
+        let mut backend = FakeEngineBackend::new("ok");
+        backend.output.usage.prompt_tokens = 1200;
+        let mut outputs = Vec::new();
+        for negotiated in [false, true] {
+            if negotiated {
+                sealed["mayhem_contract"]["context_usage"] = json!(1);
+            }
+            let mut output = provider_engine_session_response_with_sampling(
+                &mut backend,
+                None,
+                &adapter,
+                &catalog::CatalogSamplingProfile::default(),
+                None,
+                &sealed,
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            normalize_provider_visible_output_usage(&sealed, &mut output).unwrap();
+            assert_eq!(
+                output.usage_attribution.get("context_input_tokens"),
+                negotiated.then_some(&1200)
+            );
+            outputs.push(output);
+        }
+        assert_eq!(outputs[0].usage, outputs[1].usage);
+        assert_eq!(outputs[1].prompt_tokens, 2);
+        let error = anyhow::Error::new(EngineError::PromptTooLong {
+            prompt_tokens: 8192,
+            ctx_size: 8192,
+        })
+        .context("generating provider response");
+        assert_eq!(provider_response_error_code(&error), "request_invalid");
+        assert_eq!(
+            provider_response_error_code_for_request(&error, &sealed),
+            "context_length_exceeded"
+        );
+        sealed["mayhem_contract"]
+            .as_object_mut()
+            .unwrap()
+            .remove("context_usage");
+        assert_eq!(
+            provider_response_error_code_for_request(&error, &sealed),
+            "request_invalid"
+        );
+        assert!(provider_response_error_message(&error).contains("8192"));
     }
 
     #[test]

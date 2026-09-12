@@ -7,6 +7,7 @@ import json
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import wave
@@ -43,6 +44,39 @@ MAX_EXECUTION_PROBE_SECONDS = 10.0
 
 class RequestCancelled(Exception):
     pass
+
+
+class PromptTooLong(ValueError):
+    def __init__(self, prompt_tokens, context_size):
+        self.prompt_tokens = int(prompt_tokens)
+        self.ctx_size = int(context_size)
+        super().__init__(
+            f"prompt has {self.prompt_tokens} tokens, leaving no room in ctx_size={self.ctx_size}"
+        )
+
+
+def request_error_fields(exc):
+    # vLLM v0.24 validates again after multimodal expansion. Match only its
+    # explicit decoder-context ValueError, never arbitrary engine/OOM failures.
+    # https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/v1/engine/input_processor.py
+    if isinstance(exc, ValueError) and not isinstance(exc, PromptTooLong):
+        match = re.match(
+            r"The decoder prompt \(length (\d+)\) "
+            r"(?:is |plus the number of requested output tokens \(at least 1\) is )"
+            r"longer than the maximum model length of (\d+)\.", str(exc)
+        )
+        if match:
+            prompt_tokens, context_size = map(int, match.groups())
+            if context_size > 0 and prompt_tokens >= context_size:
+                exc = PromptTooLong(prompt_tokens, context_size)
+    # Keep deterministic context exhaustion distinct from engine/process faults.
+    if isinstance(exc, PromptTooLong):
+        return {
+            "error_code": "context_length_exceeded",
+            "prompt_tokens": exc.prompt_tokens,
+            "ctx_size": exc.ctx_size,
+        }
+    return {}
 
 
 class EngineHealthMonitor:
@@ -249,6 +283,7 @@ class GenerationMultiplexer:
                 "type": "response",
                 "ok": False,
                 "error": error,
+                **request_error_fields(exc),
             }
             if request_id in self._abort_failures:
                 message["cancelled"] = True
@@ -1386,9 +1421,7 @@ def prepare_generation_request(request_id, payload):
     prompt_tokens = encode_text(prompt)
     check_cancelled(request_id)
     if prompt_tokens and len(prompt_tokens) >= ctx_size:
-        raise ValueError(
-            f"prompt has {len(prompt_tokens)} tokens, leaving no room in ctx_size={ctx_size}"
-        )
+        raise PromptTooLong(len(prompt_tokens), ctx_size)
     if max_tokens <= 0:
         return {"empty": True}
 
@@ -1618,7 +1651,8 @@ async def emit_control_response(request):
         )
     except Exception as exc:
         error = str(exc) or repr(exc) or type(exc).__name__
-        send({"id": request_id, "type": "response", "ok": False, "error": error})
+        send({"id": request_id, "type": "response", "ok": False, "error": error,
+              **request_error_fields(exc)})
     finally:
         finish_request(request_id)
 
@@ -1660,7 +1694,8 @@ async def run_worker():
                     generation_multiplexer.submit(request_id, request.get("payload") or {})
                 except Exception as exc:
                     error = str(exc) or repr(exc) or type(exc).__name__
-                    send({"id": request_id, "type": "response", "ok": False, "error": error})
+                    send({"id": request_id, "type": "response", "ok": False, "error": error,
+                          **request_error_fields(exc)})
                     finish_request(request_id)
                 continue
 
