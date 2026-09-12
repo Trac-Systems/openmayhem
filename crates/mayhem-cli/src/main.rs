@@ -60545,6 +60545,56 @@ fn receipt_settlement_entry_supersedes(
     Ok(true)
 }
 
+fn receipt_settlement_head_key(entry: &ReceiptSettlementOutboxEntry) -> Result<String> {
+    let body = entry
+        .feature
+        .pointer("/value/receipt/body")
+        .context("receipt settlement entry is missing its signed receipt body")?;
+    let billing_id = body
+        .get("billing_id")
+        .and_then(Value::as_str)
+        .context("receipt settlement entry is missing its billing id")?;
+    let billing_attempt = body
+        .get("billing_attempt")
+        .and_then(Value::as_u64)
+        .context("receipt settlement entry is missing its billing attempt")?;
+    Ok(format!("receipt/head/{billing_id}/{billing_attempt}"))
+}
+
+fn confirmed_receipt_settlement_record_matches(
+    record: &Value,
+    key: &str,
+    entry: &ReceiptSettlementOutboxEntry,
+) -> bool {
+    record.get("confirmed").and_then(Value::as_bool) == Some(true)
+        && record.get("key").and_then(Value::as_str) == Some(key)
+        && record.pointer("/value/type").and_then(Value::as_str)
+            == Some("canonical_receipt_head")
+        && record
+            .pointer("/value/settlement_ready")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && record.pointer("/value/feature_key") == entry.feature.get("key")
+        && record.pointer("/value/receipt") == entry.feature.pointer("/value/receipt")
+}
+
+async fn confirmed_receipt_settlement_entry(
+    rpc: &PeerRpcClient,
+    entry: &ReceiptSettlementOutboxEntry,
+) -> Result<bool> {
+    let key = receipt_settlement_head_key(entry)?;
+    let record = timeout(
+        RECEIPT_SETTLEMENT_SUBMIT_TIMEOUT,
+        rpc.state(Some(&key), Some(true)),
+    )
+    .await
+    .context("confirmed receipt settlement lookup timed out")?
+    .context("reading confirmed receipt settlement evidence")?;
+    Ok(confirmed_receipt_settlement_record_matches(
+        &record, &key, entry,
+    ))
+}
+
 impl ReceiptSettlementOutbox {
     fn new(directory: PathBuf) -> Result<Self> {
         let outbox = Self {
@@ -60949,18 +60999,37 @@ impl ReceiptSettlementOutbox {
         rpc: &PeerRpcClient,
         entry: ReceiptSettlementOutboxEntry,
     ) -> Result<()> {
-        let response = timeout(
+        let relay = timeout(
             RECEIPT_SETTLEMENT_SUBMIT_TIMEOUT,
             rpc.submit_feature(entry.feature.clone()),
         )
-        .await
-        .context("receipt settlement relay timed out")?
-        .context("submitting receipt settlement through participant relay")?;
-        ensure!(
-            response.get("ok").and_then(Value::as_bool) == Some(true),
-            "receipt settlement relay did not confirm canonical evidence: {response}"
-        );
-        self.remove(&entry)
+        .await;
+        if matches!(
+            &relay,
+            Ok(Ok(response)) if response.get("ok").and_then(Value::as_bool) == Some(true)
+        ) {
+            return self.remove(&entry);
+        }
+
+        // A relay acknowledgement is transport evidence, not the source of
+        // truth.  The writer can commit the receipt and lose only its answer;
+        // retaining that already-canonical entry forever eventually blocks all
+        // new paid work.  Retire it only when the confirmed ledger head proves
+        // the exact signed feature landed.  Any missing or mismatched field
+        // fails closed and leaves the durable outbox entry untouched.
+        if confirmed_receipt_settlement_entry(rpc, &entry).await? {
+            return self.remove(&entry);
+        }
+
+        match relay {
+            Err(error) => Err(error).context("receipt settlement relay timed out"),
+            Ok(Err(error)) => {
+                Err(error).context("submitting receipt settlement through participant relay")
+            }
+            Ok(Ok(response)) => Err(anyhow!(
+                "receipt settlement relay did not confirm canonical evidence: {response}"
+            )),
+        }
     }
 
     async fn flush_once(&self, rpc: &PeerRpcClient) -> Result<usize> {
@@ -110440,6 +110509,36 @@ esac
         let entries = restarted.load_entries().unwrap();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].feature, feature);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_retires_only_exact_confirmed_canonical_evidence() {
+        let root = test_temp_dir("mayhem-receipt-outbox-canonical-proof");
+        let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
+        let entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        let key = receipt_settlement_head_key(&entry).unwrap();
+        let mut record = json!({
+            "confirmed": true,
+            "key": key,
+            "value": {
+                "type": "canonical_receipt_head",
+                "settlement_ready": true,
+                "feature_key": entry.feature["key"],
+                "receipt": entry.feature["value"]["receipt"],
+            },
+        });
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record, &key, &entry
+        ));
+
+        record["value"]["receipt"]["body"]["seq"] = json!(99);
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &record, &key, &entry
+        ));
+        assert!(entry.path.exists(), "a mismatch must leave durable evidence");
         let _ = fs::remove_dir_all(root);
     }
 

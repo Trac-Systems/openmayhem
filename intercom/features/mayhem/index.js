@@ -1014,7 +1014,7 @@ class MayhemFeature extends Feature {
     for (const [key, entry] of map) {
       if (entry.pending === true) continue;
       if (entry.at >= cutoff && map.size <= this.cacheMax) break;
-      this._clearServiceResultRetry(entry);
+      this._clearProcessedResultRetries(entry);
       map.delete(key);
     }
   }
@@ -1028,6 +1028,27 @@ class MayhemFeature extends Feature {
       entry.deliveryStarted = false;
       entry.deliveryToken = (entry.deliveryToken ?? 0) + 1;
     }
+  }
+
+  _clearProcessedResultRetries(entry) {
+    this._clearServiceResultRetry(entry);
+    for (const delivery of entry?.otherTransports?.values() ?? []) {
+      this._clearServiceResultRetry(delivery);
+    }
+  }
+
+  _featureResultAcknowledged(cached) {
+    return cached.acked === true &&
+      [...(cached.otherTransports?.values() ?? [])].every((delivery) => delivery.acked === true);
+  }
+
+  _featureExtraTransportLimitReached() {
+    let count = 0;
+    for (const entry of this.processed.values()) {
+      count += entry.otherTransports?.size ?? 0;
+      if (count >= this.cacheMax) return true;
+    }
+    return false;
   }
 
   _processedInFlight(map) {
@@ -1084,13 +1105,16 @@ class MayhemFeature extends Feature {
 
     this._pruneProcessed();
     let cached = this.processed.get(expectedId);
+    const previousDelivery = cached?.transport === transport
+      ? cached
+      : cached?.otherTransports?.get(transport);
     if (
       cached &&
       !cached.pending &&
-      cached.acked === true &&
+      previousDelivery?.acked === true &&
       !relayResponseCacheable(cachedRelayResponse(cached))
     ) {
-      this._clearServiceResultRetry(cached);
+      this._clearProcessedResultRetries(cached);
       this.processed.delete(expectedId);
       cached = null;
     }
@@ -1124,6 +1148,7 @@ class MayhemFeature extends Feature {
         pending: true,
         promise,
         transport,
+        otherTransports: new Map(),
         result: null,
         resultTimer: null,
       };
@@ -1132,9 +1157,27 @@ class MayhemFeature extends Feature {
     }
     if (!created) {
       cached.at = Date.now();
+      let delivery = cached.transport === transport ? cached : cached.otherTransports.get(transport);
+      if (!delivery) {
+        // The provider and buyer intentionally relay the same signed receipt.
+        // Deduplicate its application, but acknowledge each transport separately.
+        if (cached.otherTransports.size >= this.pendingMax ||
+            this._featureExtraTransportLimitReached()) {
+          const busy = this._prepareFeatureResult(
+            expectedId,
+            transport,
+            relayError('Admin feature relay transport limit reached; retry this signed request.', expectedId)
+          );
+          this.peer.sidechannel.broadcast(this.channel, busy.message);
+          return;
+        }
+        delivery = { transport, result: null, resultTimer: null };
+        cached.otherTransports.set(transport, delivery);
+      }
       if (cached.pending) return;
-      this._clearServiceResultRetry(cached);
-      this._startFeatureResultDelivery(expectedId, cached);
+      delivery.result = this._prepareFeatureResult(expectedId, transport, cached.result.message.response);
+      this._clearServiceResultRetry(delivery);
+      this._startFeatureResultDelivery(expectedId, delivery);
       return;
     }
     const result = await cached.promise;
@@ -1142,6 +1185,12 @@ class MayhemFeature extends Feature {
     cached.pending = false;
     cached.at = Date.now();
     this._startFeatureResultDelivery(expectedId, cached);
+    for (const delivery of cached.otherTransports.values()) {
+      delivery.result = this._prepareFeatureResult(
+        expectedId, delivery.transport, result.message.response
+      );
+      this._startFeatureResultDelivery(expectedId, delivery);
+    }
   }
 
   async _validateProviderPayoutBinding(key, value, admin) {
@@ -1476,7 +1525,8 @@ class MayhemFeature extends Feature {
       !cached.acked &&
       cached.deliveryStarted &&
       cached.deliveryToken === deliveryToken &&
-      this.processed.get(requestId) === cached
+      (this.processed.get(requestId) === cached ||
+        this.processed.get(requestId)?.otherTransports?.get(cached.transport) === cached)
     );
     const schedule = () => {
       if (!active() || cached.resultAttempts >= this.resultRetryMax) {
@@ -1528,12 +1578,16 @@ class MayhemFeature extends Feature {
     if (!this.peer.base?.writable) return;
     const message = payload.message;
     const requestId = String(message.request_id || '');
-    const cached = this.processed.get(requestId);
+    const processed = this.processed.get(requestId);
+    const transport = normalizeKey(payload.from);
+    const cached = processed?.transport === transport
+      ? processed
+      : processed?.otherTransports?.get(transport);
     if (!cached?.result) return;
     const admin = await this._adminKey();
     const self = normalizeKey(this.peer?.wallet?.publicKey);
-    const transport = normalizeKey(payload.from);
     if (
+      this.processed.get(requestId) !== processed ||
       message.version !== RELAY_VERSION ||
       normalizeKey(message.to) !== self ||
       self !== admin ||
@@ -1545,8 +1599,11 @@ class MayhemFeature extends Feature {
     }
     cached.acked = true;
     cached.at = Date.now();
+    processed.at = cached.at;
     this._clearServiceResultRetry(cached);
-    if (!relayResponseCacheable(cachedRelayResponse(cached))) {
+    if (!relayResponseCacheable(cachedRelayResponse(cached)) &&
+        this._featureResultAcknowledged(processed)) {
+      this._clearProcessedResultRetries(processed);
       this.processed.delete(requestId);
     }
   }
@@ -1968,7 +2025,7 @@ class MayhemFeature extends Feature {
     }
     this.pending.clear();
     for (const cached of this.processed.values()) {
-      this._clearServiceResultRetry(cached);
+      this._clearProcessedResultRetries(cached);
     }
     this.processed.clear();
     this.completed.clear();
