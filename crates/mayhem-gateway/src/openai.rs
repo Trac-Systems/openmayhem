@@ -15083,7 +15083,7 @@ fn provider_reported_session_error(
         .unwrap_or("provider returned s.error");
     let message = format!("provider returned {code} on {session_context}: {message}");
     match code {
-        "request_invalid" | "request_chunk_failed" | "request_reassembly_failed" => {
+        "context_length_exceeded" | "request_invalid" | "request_chunk_failed" | "request_reassembly_failed" => {
             GatewaySessionError::buyer_local(message)
         }
         "model_output_invalid" => GatewaySessionError::request_scoped(message),
@@ -15095,7 +15095,13 @@ fn provider_reported_session_error(
 fn request_scoped_api_error(error: &GatewaySessionError) -> Option<ApiError> {
     error.failure_class.is_request_scoped().then(|| {
         let lower = error.message.to_ascii_lowercase();
-        let (code, category, message) = if lower.contains("receive rate") {
+        let (code, category, message) = if lower.contains("context_length_exceeded") {
+            (
+                "context_length_exceeded",
+                "request_validation",
+                "The rendered conversation exceeds the provider's context limit. Compact the conversation or reduce the input and try again.",
+            )
+        } else if lower.contains("receive rate") {
             (
                 "client_receive_rate_exceeded",
                 "client_connection",
@@ -17590,6 +17596,13 @@ fn seal_direct_session_request_body_with_workflow_output(
         "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(&contract_request),
         "transport_request_fingerprint": transport_request_fingerprint,
     });
+    if matches!(endpoint_family,
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+        | mayhem_proto::ENDPOINT_OPENAI_RESPONSES | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT) {
+        // Opt in without changing model-visible input or signed billing units.
+        // Older providers ignore this; new providers emit only to opted-in gateways.
+        sealed["mayhem_contract"]["context_usage"] = json!(1);
+    }
     if let Some(workflow_output) = workflow_output {
         sealed["mayhem_contract"]["workflow_output"] = serde_json::to_value(workflow_output)
             .map_err(|err| {
@@ -21607,6 +21620,11 @@ fn validate_provider_receipt(
     }
     let body = provider_receipt.body.clone();
     validate_usage_attribution(&body.usage, &body.usage_attribution)?;
+    if let Some(tokens) = body.usage_attribution.get("context_input_tokens") {
+        if *tokens == 0 || *tokens > u64::from(invocation.served_ctx) {
+            return Err(GatewaySessionError::new("provider context input tokens exceed served context"));
+        }
+    }
     let checks = [
         (
             body.session_id == invocation.session_id,
@@ -21854,7 +21872,7 @@ fn validate_usage_attribution(
     for axis in attribution.keys() {
         if !matches!(
             axis.as_str(),
-            "reasoning_output_tokens" | "vision_input_tokens" | "audio_input_tokens"
+            "reasoning_output_tokens" | "vision_input_tokens" | "audio_input_tokens" | "context_input_tokens"
         ) {
             return Err(GatewaySessionError::new(format!(
                 "unsupported provider usage attribution {axis}"
@@ -23195,7 +23213,7 @@ fn chat_context_capacity_error(
     }
     let required_ctx = effective_context_floor(
         options.min_ctx,
-        rough_tokens(&chat_prompt_text(request)),
+        chat_context_input_tokens(request),
         chat_output_headroom_tokens(request),
     );
     let now_millis = now_millis_u64();
@@ -27743,7 +27761,7 @@ fn request_requirements_for_chat(
             request.endpoint_request.as_ref(),
         )),
         modality_load,
-        min_ctx: effective_context_floor(explicit_min_ctx, input_tokens, output_tokens),
+        min_ctx: effective_context_floor(explicit_min_ctx, chat_context_input_tokens(request), output_tokens),
         input_tokens,
         output_tokens,
         usage,
@@ -27841,6 +27859,59 @@ fn chat_modality_load(
     load
 }
 
+/// Routing estimate, deliberately separate from canonical billing. The gateway
+/// does not load model tokenizers: the provider validates the final native
+/// template and reports its exact token count. Include model-visible structure
+/// and media instead of treating whitespace-delimited billing units as tokens.
+fn chat_context_input_tokens(request: &ChatCompletionRequest) -> u64 {
+    fn text_tokens(text: &str) -> u64 {
+        // Byte-based estimation also accounts for compact JSON/code and scripts
+        // with no whitespace. This is a routing estimate, not a tokenizer bound.
+        rough_tokens(text).max((text.len() as u64).div_ceil(4))
+    }
+    let mut tokens = 8_u64; // generation prefix
+    for message in &request.messages {
+        let mut context_message = message.clone();
+        if let Some(parts) = context_message.content.as_array_mut() {
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) == Some("video") {
+                    *part = json!({"type": "text", "text": "[video]"});
+                }
+            }
+        }
+        tokens =
+            tokens
+                .saturating_add(6)
+                .saturating_add(text_tokens(&chat_accounting_message_text(
+                    &context_message,
+                    request.preserve_reasoning_content,
+                )));
+        if let Some(calls) = message.extra.get("tool_calls") {
+            tokens = tokens.saturating_add(text_tokens(&calls.to_string()));
+        }
+    }
+    if let Some(tools) = request.tools.as_ref().filter(|tools| !tools.is_empty()) {
+        tokens = tokens
+            .saturating_add(128)
+            .saturating_add(text_tokens(&json!(tools).to_string()));
+    }
+    if let Ok(media) = chat_media_stats(&request.messages, &GatewayMediaLimits::schema_ceiling()) {
+        // Approximate visual patches and audio frames; actual processor expansion
+        // remains authoritative. Never tokenize inline base64 transport payloads.
+        tokens = tokens.saturating_add(
+            u64::from(media.image_count)
+                .saturating_mul(media.image_max_pixels.div_ceil(28 * 28).max(1)),
+        );
+        tokens = tokens.saturating_add(
+            u64::from(media.video_count)
+                .saturating_mul(media.video_max_frames)
+                .saturating_mul(1024),
+        );
+        tokens = tokens.saturating_add(media.audio_seconds.saturating_mul(50));
+    }
+    tokens
+}
+
 fn chat_output_headroom_tokens(request: &ChatCompletionRequest) -> u64 {
     u64::from(
         request
@@ -27857,7 +27928,7 @@ fn exact_conversation_floor_after_partials(
 ) -> u32 {
     let rough_floor = effective_context_floor(
         user_min_ctx,
-        rough_tokens(&chat_prompt_text(request)),
+        chat_context_input_tokens(request),
         chat_output_headroom_tokens(request),
     );
     let exact_floor = partials
@@ -33112,8 +33183,7 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = chat_prompt_text(request);
-        let input_tokens = rough_tokens(&prompt_text);
-        let failover = self.failover_thresholds_for_model(model, options, input_tokens);
+        let failover = self.failover_thresholds_for_model(model, options, chat_context_input_tokens(request));
         let session_id = session_id_for(&model.id, &prompt_text);
         let billing = options
             .billing
@@ -36091,6 +36161,14 @@ fn chat_usage_value(usage: &Usage, receipt: Option<&StoredReceipt>) -> Value {
         return value;
     };
     let attribution = &receipt.receipt.body.usage_attribution;
+    // API token telemetry describes the rendered model input. Receipt usage and
+    // all internal reconciliation continue using buyer-verifiable billing units.
+    if let Some(prompt_tokens) = attribution.get("context_input_tokens") {
+        if *prompt_tokens > 0 && *prompt_tokens <= u64::from(receipt.receipt.body.served_ctx) {
+            value["prompt_tokens"] = json!(prompt_tokens);
+            value["total_tokens"] = json!(prompt_tokens.saturating_add(usage.completion_tokens));
+        }
+    }
     if let Some(reasoning_tokens) = attribution.get("reasoning_output_tokens") {
         value["completion_tokens_details"] = json!({
             "reasoning_tokens": reasoning_tokens,
@@ -44232,10 +44310,12 @@ mod tests {
     #[derive(Debug)]
     struct ProviderReportedFailureBackend {
         code: &'static str,
+        attempts: Arc<Mutex<usize>>,
     }
 
     impl ProviderReportedFailureBackend {
         fn error(&self, context: &str, retryable: bool) -> GatewaySessionError {
+            *self.attempts.lock().unwrap() += 1;
             if clean_provider_reject_code(self.code) {
                 let reason = if self.code == "BALANCE" {
                     "Insufficient unreserved credit balance."
@@ -45879,6 +45959,176 @@ mod tests {
         assert_eq!(state.served_ctx_for_route(&model, Some(routes[0])), 262_144);
     }
 
+    #[test]
+    fn context_estimate_includes_compact_text_tools_history_and_reasoning() {
+        let mut request = test_chat_request("test/model");
+        request.messages[0].content = json!("a".repeat(4000));
+        let content_only = chat_context_input_tokens(&request);
+        assert!(content_only >= 1000);
+        assert_eq!(rough_tokens(&chat_prompt_text(&request)), 1);
+        request.tools = Some(vec![json!({"type":"function", "function":{
+            "name":"write", "description":"d".repeat(4000), "parameters":{"type":"object"}}})]);
+        let with_tools = chat_context_input_tokens(&request);
+        assert!(with_tools >= content_only + 1000);
+        request.messages.push(
+            serde_json::from_value(json!({"role":"assistant", "content":null,
+            "reasoning_content":"r".repeat(4000), "tool_calls":[{"id":"call-1","type":"function",
+                "function":{"name":"write","arguments":"a".repeat(4000)}}]}))
+            .unwrap(),
+        );
+        let with_calls = chat_context_input_tokens(&request);
+        assert!(with_calls >= with_tools + 1000);
+        request.preserve_reasoning_content = true;
+        assert!(chat_context_input_tokens(&request) >= with_calls + 1000);
+    }
+
+    #[test]
+    fn context_estimate_accounts_for_image_dimensions_without_base64_tokens() {
+        let mut request = test_chat_request("test/model");
+        let mut estimates = Vec::new();
+        for side in [28, 560] {
+            request.messages[0].content = json!([{"type":"image_url", "image_url":{
+                "url":test_png_data_url_with_size(side, side)}}]);
+            estimates.push(chat_context_input_tokens(&request));
+        }
+        assert_eq!(estimates[1] - estimates[0], 399);
+    }
+
+    #[tokio::test]
+    async fn context_usage_changes_api_telemetry_without_changing_receipt_billing() {
+        let model = test_model();
+        let state = GatewayState::fixture();
+        let request = test_chat_request(&model.id);
+        let output = test_chat_output();
+        let invocation = test_invocation();
+        let mut provider_receipt = test_provider_receipt(&model, &request, &output, &invocation);
+        let billed_usage = provider_receipt.body.usage.clone();
+        let billed_amount = provider_receipt.body.au_owed_cum;
+        provider_receipt
+            .body
+            .usage_attribution
+            .insert("context_input_tokens".to_owned(), 1200);
+        provider_receipt.enclave_sig = sign_hex(
+            &test_enclave_seed(),
+            &receipt_signing_bytes(&provider_receipt.body).unwrap(),
+        );
+        let stored = state
+            .meter_chat_session(
+                &model,
+                &request,
+                &output,
+                &invocation,
+                Some(&provider_receipt),
+            )
+            .unwrap();
+        let wire = chat_usage_value(&output.usage, Some(&stored));
+        assert_eq!(wire["prompt_tokens"], 1200);
+        assert_eq!(wire["total_tokens"], 1200 + output.usage.completion_tokens);
+        assert_eq!(stored.receipt.body.usage, billed_usage);
+        assert_eq!(stored.receipt.body.au_owed_cum, billed_amount);
+        assert_ne!(output.usage.prompt_tokens, 1200);
+        assert_eq!(
+            chat_usage_value(&output.usage, None)["prompt_tokens"],
+            output.usage.prompt_tokens
+        );
+        let mut legacy = stored.clone();
+        legacy
+            .receipt
+            .body
+            .usage_attribution
+            .remove("context_input_tokens");
+        assert_eq!(
+            chat_usage_value(&output.usage, Some(&legacy))["prompt_tokens"],
+            output.usage.prompt_tokens
+        );
+        let meta = ResponseMayhemMeta {
+            backend: "test",
+            direct_session: true,
+            billable: true,
+            dev_session: false,
+            hedge: invocation.hedge.clone(),
+        };
+        let chat = chat_response_value("chat-1", 0, &model, &output, Some(&stored), meta.clone());
+        assert_eq!(chat["usage"]["prompt_tokens"], 1200);
+        assert_eq!(
+            completion_response_from_chat(chat.clone()).unwrap()["usage"]["prompt_tokens"],
+            1200
+        );
+        assert_eq!(
+            responses_value_from_chat(chat).unwrap()["usage"]["input_tokens"],
+            1200
+        );
+        let chunks = chat_stream_chunks("chat-1", 0, &model.id, &output, Some(&stored), meta, true);
+        assert_eq!(chunks.last().unwrap()["usage"]["prompt_tokens"], 1200);
+        assert_eq!(
+            completion_chunk_from_chat(chunks.last().unwrap().clone())["usage"]["prompt_tokens"],
+            1200
+        );
+        let source = Box::pin(stream::iter(
+            chunks.into_iter().map(Some).chain(std::iter::once(None)),
+        ));
+        let events = response_stream::from_chat(source, model.id.clone())
+            .collect::<Vec<_>>()
+            .await;
+        assert_eq!(
+            events.last().unwrap().as_ref().unwrap()["response"]["usage"]["input_tokens"],
+            1200
+        );
+        for invalid in [0, u64::from(invocation.served_ctx) + 1] {
+            let mut bad_receipt = provider_receipt.clone();
+            bad_receipt
+                .body
+                .usage_attribution
+                .insert("context_input_tokens".into(), invalid);
+            bad_receipt.enclave_sig = sign_hex(
+                &test_enclave_seed(),
+                &receipt_signing_bytes(&bad_receipt.body).unwrap(),
+            );
+            let error = direct_session_receipt_ack(
+                &request,
+                &output,
+                &invocation,
+                &bad_receipt,
+                invocation.provider_pubkey.as_deref().unwrap(),
+                &model,
+            )
+            .unwrap_err();
+            assert!(error.message.contains("context input tokens"));
+        }
+    }
+
+    #[tokio::test]
+    async fn context_exhaustion_is_terminal_and_does_not_penalize_provider() {
+        let model = test_routed_model(3);
+        let attempts = Arc::new(Mutex::new(0));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(Arc::new(
+            ProviderReportedFailureBackend {
+                code: "context_length_exceeded",
+                attempts: Arc::clone(&attempts),
+            },
+        ));
+        let error = focused_route_runner_error(
+            run_chat_with_route_retry(
+                &state,
+                &model,
+                &test_chat_request(&model.id),
+                GatewayRequestOptions::default(),
+            )
+            .await,
+        );
+        assert_eq!(
+            *attempts.lock().unwrap(),
+            1,
+            "equivalent routes must not retry an oversized request"
+        );
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.public_code, "context_length_exceeded");
+        assert!(!error.retryable);
+        assert!(error.message.contains("Compact"));
+        assert!(!state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64()));
+        assert!(state.reputation_events().is_empty());
+    }
+
     #[tokio::test]
     async fn context_capacity_failure_is_plain_and_does_not_touch_provider_reputation() {
         let mut model = test_routed_model(1);
@@ -45903,7 +46153,7 @@ mod tests {
         };
 
         assert_eq!(err.status, StatusCode::SERVICE_UNAVAILABLE);
-        assert!(err.message.contains("needs at least 9064 context tokens"));
+        assert!(err.message.contains("needs at least 11328 context tokens"));
         assert!(err.message.contains(&model.id));
         assert!(!err.message.contains("PromptTooLong"));
         assert!(!err.message.contains("attempt"));
@@ -45931,7 +46181,7 @@ mod tests {
             }),
         );
         let mut request = test_chat_request(&model.id);
-        request.messages[0].content = json!("word ".repeat(7_600));
+        request.messages[0].content = json!("x ".repeat(7_600));
         request.max_tokens = Some(512);
         let options = GatewayRequestOptions {
             max_wait_ms: 0,
@@ -50693,6 +50943,7 @@ mod tests {
 
             for (code, expected_class) in [
                 ("request_invalid", GatewaySessionFailureClass::BuyerLocal),
+                ("context_length_exceeded", GatewaySessionFailureClass::BuyerLocal),
                 (
                     "request_chunk_failed",
                     GatewaySessionFailureClass::BuyerLocal,
@@ -50852,7 +51103,7 @@ mod tests {
     ) -> (GatewayState, GatewayModel, ApiError) {
         let model = focused_route_runner_model(runner);
         let state = test_gateway_state_from_models(vec![model.clone()])
-            .with_session_backend(Arc::new(ProviderReportedFailureBackend { code }));
+            .with_session_backend(Arc::new(ProviderReportedFailureBackend { code, attempts: Arc::default() }));
         let options = GatewayRequestOptions {
             max_wait_ms: 0,
             ..GatewayRequestOptions::default()

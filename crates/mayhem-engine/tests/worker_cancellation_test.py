@@ -2,6 +2,7 @@ import ast
 import asyncio
 import math
 import pathlib
+import re
 import threading
 import unittest
 
@@ -31,10 +32,12 @@ def load_cancellation_scope(worker_name):
                 retained.append(node)
         elif isinstance(node, ast.ClassDef) and node.name in {
             "RequestCancelled",
+            "PromptTooLong",
             "GenerationMultiplexer",
         }:
             retained.append(node)
         elif isinstance(node, ast.FunctionDef) and node.name in {
+            "request_error_fields",
             "register_request",
             "mark_cancelled",
             "finish_request",
@@ -46,7 +49,7 @@ def load_cancellation_scope(worker_name):
         }:
             retained.append(node)
 
-    namespace = {"asyncio": asyncio, "math": math, "threading": threading}
+    namespace = {"asyncio": asyncio, "math": math, "threading": threading, "re": re}
     module = ast.Module(body=retained, type_ignores=[])
     exec(compile(module, worker_path.name, "exec"), namespace)
     return namespace
