@@ -42,6 +42,7 @@ const DEFAULT_RESULT_CONNECT_GRACE_MS = 25;
 const DEFAULT_RESULT_TIMEOUT_MS = 15_000;
 const DEFAULT_RESULT_WAIT_MAX_MS = 60_000;
 const DEFAULT_RESULT_POLL_MS = 50;
+const DEFAULT_APPLY_TIMEOUT_MS = 60_000;
 const DEFAULT_CACHE_TTL_MS = 300_000;
 const DEFAULT_CACHE_MAX = 2_048;
 const DEFAULT_PENDING_MAX = 256;
@@ -417,6 +418,9 @@ class MayhemFeature extends Feature {
     this.resultPollMs = Number.isSafeInteger(config.resultPollMs) && config.resultPollMs > 0
       ? config.resultPollMs
       : DEFAULT_RESULT_POLL_MS;
+    this.applyTimeoutMs = Number.isSafeInteger(config.applyTimeoutMs) && config.applyTimeoutMs > 0
+      ? config.applyTimeoutMs
+      : DEFAULT_APPLY_TIMEOUT_MS;
     this.cacheTtlMs = Number.isSafeInteger(config.cacheTtlMs)
       ? config.cacheTtlMs
       : DEFAULT_CACHE_TTL_MS;
@@ -1034,6 +1038,17 @@ class MayhemFeature extends Feature {
     return count;
   }
 
+  _boundWriterWork(work, timeoutResponse) {
+    let timer = null;
+    const timeout = new Promise((resolve) => {
+      timer = setTimeout(() => resolve(timeoutResponse()), this.applyTimeoutMs);
+      if (typeof timer?.unref === 'function') timer.unref();
+    });
+    return Promise.race([work, timeout]).finally(() => {
+      if (timer !== null) clearTimeout(timer);
+    });
+  }
+
   async _handleRequest(payload) {
     if (!this.peer.base?.writable) return;
     const admin = await this._adminKey();
@@ -1093,9 +1108,17 @@ class MayhemFeature extends Feature {
     let created = false;
     if (!cached) {
       const relayedValue = message.value;
-      const promise = this._applyRelayed(message.key, relayedValue, expectedId).catch((error) =>
+      const work = this._applyRelayed(message.key, relayedValue, expectedId).catch((error) =>
         relayError(error?.message || 'Admin writer failed to apply relayed feature.', expectedId)
       ).then((response) => this._prepareFeatureResult(expectedId, transport, response));
+      const promise = this._boundWriterWork(
+        work,
+        () => this._prepareFeatureResult(
+          expectedId,
+          transport,
+          relayError('Admin writer apply timed out; retry this signed request.', expectedId)
+        )
+      );
       cached = {
         at: Date.now(),
         pending: true,
