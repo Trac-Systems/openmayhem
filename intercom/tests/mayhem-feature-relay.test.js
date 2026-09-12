@@ -1176,6 +1176,73 @@ test('feature relay collapses in-flight duplicates and retries one cached result
   await writerFeature.stop();
 });
 
+test('feature relay releases a writer append that never resolves so the signed request can retry', async () => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const participantFeature = new MayhemFeature(participant.peer, {
+    timeoutMs: 500,
+    retryMs: 100,
+  });
+  const writerFeature = new MayhemFeature(writer.peer, {
+    applyTimeoutMs: 20,
+    resultRetryMs: 5,
+    resultRetryMax: 2,
+  });
+  participantFeature.key = 'mayhem';
+  writerFeature.key = 'mayhem';
+
+  let appends = 0;
+  writer.peer.base.append = async (operation) => {
+    appends += 1;
+    if (appends === 1) return await new Promise(() => {});
+    writer.appended.push(operation);
+    writer.state.set(`fr/${operation.value.dispatch.hash}`, {
+      type: 'feature_result',
+      status: 'applied',
+      ok: true,
+      result: { ok: true, op: operation.value.dispatch.value.op },
+    });
+  };
+
+  participant.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      queueMicrotask(() => writerFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(providerKey, message)
+      ));
+      return true;
+    },
+  };
+  writer.peer.sidechannel = {
+    started: true,
+    connectDirectPeer: async () => true,
+    verifyPayload: verifyRelayPayload,
+    broadcast(channel, message) {
+      queueMicrotask(() => participantFeature.handleSidechannelMessage(
+        channel,
+        relayPayload(adminKey, message)
+      ));
+      return true;
+    },
+  };
+
+  const key = `consent/${providerKey}/1/rules-hash`;
+  const value = consentValue();
+  const first = await participantFeature.relay(key, value);
+  assert.equal(first.ok, false);
+  assert.match(first.message, /apply timed out/);
+
+  const second = await participantFeature.relay(key, value);
+  assert.equal(second.ok, true);
+  assert.equal(second.status, 'applied');
+  assert.equal(appends, 2);
+  await participantFeature.stop();
+  await writerFeature.stop();
+});
+
 test('feature result uses joined channel even when direct reconnect is unavailable', async () => {
   const participant = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
