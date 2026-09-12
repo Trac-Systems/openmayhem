@@ -13401,6 +13401,10 @@ struct GatewayRequestOptions {
     job: Option<GatewayJobHandle>,
     billing: Option<GatewayBillingContext>,
     execution_mode_expectation: Option<GatewayExecutionModeExpectation>,
+    /// `Prefer: respond-async` makes a streaming response an observer of the
+    /// durable job. Losing that observer must not cancel provider execution;
+    /// the caller can recover the terminal result through `/v1/jobs`.
+    continue_after_stream_disconnect: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -13425,6 +13429,7 @@ impl Default for GatewayRequestOptions {
             job: None,
             billing: None,
             execution_mode_expectation: None,
+            continue_after_stream_disconnect: false,
         }
     }
 }
@@ -15152,6 +15157,7 @@ impl GatewayRequestOptions {
             job: None,
             billing: None,
             execution_mode_expectation: None,
+            continue_after_stream_disconnect: gateway_prefers_async_response(headers),
         })
     }
 }
@@ -24998,18 +25004,20 @@ async fn run_live_direct_chat_sse(
                     true,
                 )
             } else if err.retryable && (err.partial.is_some() || err.before_first_output) {
-                // The redispatch opens fresh provider sessions from a task the
-                // HTTP response no longer owns; stop the moment the end user
-                // hangs up instead of retrying on behalf of nobody.
-                (
+                let recovered = if session.options.continue_after_stream_disconnect {
+                    recover_live_direct_chat_after_retryable(&mut session, &tx, err).await
+                } else {
+                    // Ordinary streaming calls stop retrying when their caller
+                    // leaves. Durable stream observers explicitly keep the job
+                    // alive and recover its result through the job endpoint.
                     tokio::select! {
                         _ = tx.closed() => Err(GatewaySessionError::new(
                             "end-user disconnected during redispatch; abandoning session retry",
                         )),
                         recovered = recover_live_direct_chat_after_retryable(&mut session, &tx, err) => recovered,
-                    },
-                    true,
-                )
+                    }
+                };
+                (recovered, true)
             } else {
                 (Err(err), false)
             };
@@ -25271,7 +25279,8 @@ async fn run_live_direct_chat_sse_inner(
     session: &mut LiveDirectChatSession,
     tx: &tokio::sync::mpsc::Sender<Option<Value>>,
 ) -> Result<(), GatewaySessionError> {
-    if !send_sse_value(
+    if !send_live_sse_value(
+        session.options.continue_after_stream_disconnect,
         tx,
         chat_chunk(
             &session.id,
@@ -25345,20 +25354,8 @@ async fn run_live_direct_chat_sse_inner(
         } else {
             remaining_millis
         };
-        let frame_result = tokio::select! {
-            _ = tx.closed() => {
-                return Err(client_disconnect_direct_session_error(
-                    &session.request,
-                    &content,
-                    &reasoning_evidence,
-                    tool_calls.clone(),
-                    latest_checkpoint_receipt.as_ref(),
-                    &token_ids,
-                    &watchdog,
-                    now_millis_u64(),
-                ));
-            }
-            result = next_session_frame_with_client_cancellation(
+        let frame_result = if session.options.continue_after_stream_disconnect {
+            next_session_frame_with_client_cancellation(
                 &mut session.bridge,
                 &session.invocation.session_id,
                 &session.transport_peer,
@@ -25371,7 +25368,37 @@ async fn run_live_direct_chat_sse_inner(
                     "s.close",
                 ],
                 session.invocation.client_cancellation.as_ref(),
-            ) => result,
+            )
+            .await
+        } else {
+            tokio::select! {
+                _ = tx.closed() => {
+                    return Err(client_disconnect_direct_session_error(
+                        &session.request,
+                        &content,
+                        &reasoning_evidence,
+                        tool_calls.clone(),
+                        latest_checkpoint_receipt.as_ref(),
+                        &token_ids,
+                        &watchdog,
+                        now_millis_u64(),
+                    ));
+                }
+                result = next_session_frame_with_client_cancellation(
+                    &mut session.bridge,
+                    &session.invocation.session_id,
+                    &session.transport_peer,
+                    wait_millis.map(Duration::from_millis),
+                    &[
+                        "s.delta",
+                        "s.delta_chunk",
+                        "s.receipt",
+                        "s.error",
+                        "s.close",
+                    ],
+                    session.invocation.client_cancellation.as_ref(),
+                ) => result,
+            }
         };
         let frame = match frame_result {
             Ok(frame) => frame,
@@ -25499,7 +25526,8 @@ async fn run_live_direct_chat_sse_inner(
                 )?;
                 if let Some(delta) = session_delta_text(&frame)? {
                     if !delta.is_empty()
-                        && !send_sse_value(
+                        && !send_live_sse_value(
+                            session.options.continue_after_stream_disconnect,
                             tx,
                             chat_chunk(
                                 &session.id,
@@ -25529,7 +25557,7 @@ async fn run_live_direct_chat_sse_inner(
                 let mut public_delta = json!({});
                 if !reasoning_delta.is_empty() { public_delta["reasoning_content"] = json!(reasoning_delta); }
                 if !tool_deltas.is_empty() { public_delta["tool_calls"] = json!(tool_deltas); }
-                if public_delta.as_object().is_some_and(|delta| !delta.is_empty()) && !send_sse_value(tx,
+                if public_delta.as_object().is_some_and(|delta| !delta.is_empty()) && !send_live_sse_value(session.options.continue_after_stream_disconnect, tx,
                     chat_chunk(&session.id, session.created, &session.model.id, public_delta, None, None)).await {
                     return Err(client_disconnect_direct_session_error(&session.request, &content,
                         &reasoning_evidence, tool_calls.clone(), latest_checkpoint_receipt.as_ref(),
@@ -25563,7 +25591,8 @@ async fn run_live_direct_chat_sse_inner(
                     if let Some(next_tool_calls) =
                         tool_calls_from_session_delta_resolving(&frame, &mut delta_payload_chunks)?
                     {
-                        if !send_sse_value(
+                        if !send_live_sse_value(
+                            session.options.continue_after_stream_disconnect,
                             tx,
                             chat_chunk(
                                 &session.id,
@@ -25594,7 +25623,7 @@ async fn run_live_direct_chat_sse_inner(
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
                     if tool_calls.is_empty() { tool_stream.finish(&[])?; }
                     let tail = reasoning_stream.finish();
-                    if !tail.is_empty() && !send_sse_value(tx, chat_chunk(&session.id, session.created,
+                    if !tail.is_empty() && !send_live_sse_value(session.options.continue_after_stream_disconnect, tx, chat_chunk(&session.id, session.created,
                         &session.model.id, json!({"reasoning_content":tail}), None, None)).await {
                         return Err(client_disconnect_direct_session_error(&session.request, &content,
                             &reasoning_evidence, tool_calls.clone(), latest_checkpoint_receipt.as_ref(),
@@ -26081,6 +26110,14 @@ fn add_partial_usage_to_output(output: &mut ChatOutput, partials: &[GatewaySessi
 
 async fn send_sse_value(tx: &tokio::sync::mpsc::Sender<Option<Value>>, value: Value) -> bool {
     send_sse_event(tx, Some(value)).await
+}
+
+async fn send_live_sse_value(
+    continue_after_disconnect: bool,
+    tx: &tokio::sync::mpsc::Sender<Option<Value>>,
+    value: Value,
+) -> bool {
+    send_sse_value(tx, value).await || continue_after_disconnect
 }
 
 async fn send_sse_done(tx: &tokio::sync::mpsc::Sender<Option<Value>>) -> bool {
@@ -40226,6 +40263,12 @@ mod tests {
         assert_eq!(options.max_price_au, Some(1_234));
         assert_eq!(options.max_wait_ms, 0);
         assert_eq!(options.quant.as_deref(), Some("int4"));
+        assert!(!options.continue_after_stream_disconnect);
+
+        headers.insert("prefer", HeaderValue::from_static("respond-async"));
+        let options = GatewayRequestOptions::from_headers(&headers).expect("async header parses");
+        assert!(options.continue_after_stream_disconnect);
+        headers.remove("prefer");
 
         headers.insert("x-mayhem-quant", HeaderValue::from_static("Q2_0"));
         let options = GatewayRequestOptions::from_headers(&headers).expect("Q2 header parses");
@@ -40274,6 +40317,15 @@ mod tests {
         headers.insert("x-mayhem-quant", HeaderValue::from_static("potato"));
         let err = GatewayRequestOptions::from_headers(&headers).expect_err("bad quant rejects");
         assert_eq!(err.param, Some("X-Mayhem-Quant"));
+    }
+
+    #[tokio::test]
+    async fn durable_live_sender_tolerates_a_lost_observer() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        assert!(!send_live_sse_value(false, &tx, json!({"delta": "lost"})).await);
+        assert!(send_live_sse_value(true, &tx, json!({"delta": "persist"})).await);
     }
 
     #[test]
