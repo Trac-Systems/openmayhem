@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "release_version": "0.2.191",
-  "contract_version": 23,
-  "contract_code_sha256": "76d01e010530f517249875ba9e7cabd7afaac0bdb654fa3a1db7ba534babb684",
+  "release_version": "0.2.192",
+  "contract_version": 24,
+  "contract_code_sha256": "6845166afc50347391e863f9923acb5c01c2abd748d0f5427e36769555393982",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "365330d5a94be2c8a3afdbeb2766e052c1ab3324f39880d7940d0a9a91b9a0bc"
+      "sha256": "695c8010aa8f61fcedeb277f4251f0c6bd670bdb1c2a133b2da175900f45dd08"
     },
     {
       "path": "contract/protocol.js",

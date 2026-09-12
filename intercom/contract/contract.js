@@ -5,7 +5,10 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import PeerWallet from 'trac-wallet';
 
-export const CONTRACT_VERSION = 23;
+export const CONTRACT_VERSION = 24;
+// Recovery is limited to unchanged schema-11 receipt evidence already signed by
+// v23 participants. No other prior-version operation is admitted.
+const RECOVERABLE_RECEIPT_CONTRACT_VERSION = 23;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -3212,7 +3215,8 @@ class MayhemContract extends Contract {
     if (value.op !== 'record_usage_receipt') {
       return new Error('Invalid record usage receipt op.');
     }
-    if (value.contract_version !== CONTRACT_VERSION) {
+    if (value.contract_version !== CONTRACT_VERSION &&
+        value.contract_version !== RECOVERABLE_RECEIPT_CONTRACT_VERSION) {
       return new Error('Invalid record usage receipt contract version.');
     }
     if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) {
@@ -3252,7 +3256,9 @@ class MayhemContract extends Contract {
     }
     return {
       op: 'record_usage_receipt',
-      contract_version: CONTRACT_VERSION,
+      // The outer version participates in the provider signature and feature key.
+      // Never rewrite retained v23 evidence while executing under a v24 dispatch.
+      contract_version: value.contract_version,
       epoch: value.epoch,
       payout_revision: value.payout_revision,
       receipt: canonicalReceipt,
@@ -22305,6 +22311,7 @@ class MayhemContract extends Contract {
       return new Error('Receipt usage attribution must be an object.');
     }
     const allowed = new Set([
+      'context_input_tokens',
       'reasoning_output_tokens',
       'vision_input_tokens',
       'audio_input_tokens',
@@ -22522,6 +22529,11 @@ class MayhemContract extends Contract {
     if (usageAttribution instanceof Error) return usageAttribution;
     if (stableJson(usageAttribution) !== stableJson(body.usage_attribution ?? {})) {
       return new Error('Receipt usage attribution must be canonical.');
+    }
+    // Rendered context telemetry is not a billable usage axis. It may exceed
+    // canonical input units, but cannot exceed the signed served context.
+    if ((usageAttribution.context_input_tokens ?? 0) > body.served_ctx) {
+      return new Error('Receipt context attribution exceeds served context.');
     }
     if ((usageAttribution.reasoning_output_tokens ?? 0) > (usage.output_token ?? 0)) {
       return new Error('Receipt reasoning attribution exceeds billed output tokens.');

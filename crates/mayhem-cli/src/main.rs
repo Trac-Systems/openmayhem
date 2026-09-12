@@ -114,6 +114,7 @@ use mayhem_proto::{
     metered_output_units, parse_record_usage_receipt_envelope, payload_chunk_at,
     payload_chunk_manifest, reassemble_json_payload, receipt_signing_bytes,
     record_usage_receipt_envelope, record_usage_receipt_feature_key,
+    record_usage_receipt_feature_key_for_contract, RECOVERABLE_RECEIPT_CONTRACT_VERSION,
     record_usage_receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
     spend_voucher_signing_bytes, stable_json_bytes, tools_only_model_input_prompt_units,
     validate_ctx_bracket_schedule, validated_audio_metadata, validated_wav_audio_metadata,
@@ -61213,10 +61214,12 @@ fn validate_receipt_settlement_feature(feature: &Value) -> Result<String> {
         .get("value")
         .filter(|value| value.is_object())
         .context("receipt settlement feature is missing value")?;
+    let contract_version = value.get("contract_version").and_then(Value::as_u64);
     ensure!(
         value.get("op").and_then(Value::as_str) == Some("record_usage_receipt")
-            && value.get("contract_version").and_then(Value::as_u64)
-                == Some(u64::from(CONTRACT_VERSION)),
+            && matches!(contract_version, Some(version)
+                if version == u64::from(CONTRACT_VERSION)
+                    || version == u64::from(RECOVERABLE_RECEIPT_CONTRACT_VERSION)),
         "receipt settlement feature has the wrong operation or contract version"
     );
     let receipt = parse_record_usage_receipt_envelope(
@@ -61233,7 +61236,8 @@ fn validate_receipt_settlement_feature(feature: &Value) -> Result<String> {
         "receipt settlement outer binding does not match its signed receipt"
     );
     ensure!(
-        key == record_usage_receipt_feature_key(&receipt),
+        key == record_usage_receipt_feature_key_for_contract(
+            &receipt, contract_version.expect("validated receipt contract version") as u32),
         "receipt settlement feature key is not canonical"
     );
     let provider_signature = value
@@ -103720,7 +103724,7 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 23);
+        assert_eq!(CONTRACT_VERSION, 24);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 11);
     }
@@ -110412,6 +110416,19 @@ esac
         final_receipt: bool,
         output_tokens: u64,
     ) -> Value {
+        signed_receipt_settlement_feature_for_test_version(
+            epoch, seq, final_receipt, output_tokens, CONTRACT_VERSION, None,
+        )
+    }
+
+    fn signed_receipt_settlement_feature_for_test_version(
+        epoch: u64,
+        seq: u64,
+        final_receipt: bool,
+        output_tokens: u64,
+        contract_version: u32,
+        context_input_tokens: Option<u64>,
+    ) -> Value {
         let provider_key = SigningKey::from_bytes(&[31_u8; 32]);
         let enclave_key = SigningKey::from_bytes(&[32_u8; 32]);
         let user_key = SigningKey::from_bytes(&[33_u8; 32]);
@@ -110449,7 +110466,9 @@ esac
             workflow: None,
             workflow_output: None,
             usage: ReceiptUsage::text(1, output_tokens),
-            usage_attribution: BTreeMap::new(),
+            usage_attribution: context_input_tokens
+                .map(|tokens| BTreeMap::from([("context_input_tokens".to_owned(), tokens)]))
+                .unwrap_or_default(),
             au_owed_cum: MoneyAu::from(output_tokens),
             prompt_hash: "46".repeat(32),
             ts: 1_783_517_300,
@@ -110461,11 +110480,11 @@ esac
             enclave_pubkey: hex_encode(&enclave_key.verifying_key().to_bytes()),
             user_sig: hex_encode(&user_key.sign(&receipt_payload).to_bytes()),
         };
-        let key = record_usage_receipt_feature_key(&receipt);
+        let key = record_usage_receipt_feature_key_for_contract(&receipt, contract_version);
         let receipt_envelope = record_usage_receipt_envelope(&receipt);
         let mut value = json!({
             "op": "record_usage_receipt",
-            "contract_version": CONTRACT_VERSION,
+            "contract_version": contract_version,
             "epoch": epoch,
             "payout_revision": receipt.body.payout_revision,
             "receipt": receipt_envelope,
@@ -110619,12 +110638,70 @@ esac
     }
 
     #[test]
+    fn receipt_outbox_recovers_v191_context_receipts_without_resigning_or_rebilling() {
+        let root = test_temp_dir("mayhem-v191-receipt-recovery");
+        let feature = signed_receipt_settlement_feature_for_test_version(
+            7, 1, true, 2, RECOVERABLE_RECEIPT_CONTRACT_VERSION, Some(768),
+        );
+        let receipt = parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
+        assert_eq!(receipt.body.usage.input_tokens(), 1);
+        assert_eq!(receipt.body.usage_attribution["context_input_tokens"], 768);
+        assert_ne!(feature["key"], record_usage_receipt_feature_key(&receipt));
+        for kind in ["provider", "gateway"] {
+            let directory = root.join(kind);
+            fs::create_dir_all(&directory).unwrap();
+            let path = ReceiptSettlementOutbox::new(directory.clone()).unwrap()
+                .entry_path(&feature).unwrap();
+            let bytes = serde_json::to_vec(&json!({
+                "schema_version": RECEIPT_SETTLEMENT_OUTBOX_SCHEMA_VERSION,
+                "feature": feature,
+            })).unwrap();
+            fs::write(&path, &bytes).unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+            let outbox = ReceiptSettlementOutbox::new(directory.clone()).unwrap();
+            let entries = outbox.load_entries().unwrap();
+            assert_eq!(entries.len(), 1, "legacy signed evidence must not be quarantined");
+            assert_eq!(entries[0].feature, feature);
+            let persisted = fs::read(&entries[0].path).unwrap();
+            drop(outbox);
+            let restarted = ReceiptSettlementOutbox::new(directory).unwrap();
+            let entry = restarted.load_entries().unwrap().remove(0);
+            assert_eq!(fs::read(&entry.path).unwrap(), persisted);
+            let key = receipt_settlement_head_key(&entry).unwrap();
+            let mut record = json!({
+                "confirmed": true, "key": key,
+                "value": {
+                    "type": "canonical_receipt_head", "settlement_ready": true,
+                    "feature_key": feature["key"], "receipt": feature["value"]["receipt"],
+                },
+            });
+            assert!(confirmed_receipt_settlement_record_matches(&record, &key, &entry));
+            record["value"]["receipt"]["body"]["usage_attribution"]["context_input_tokens"] = json!(767);
+            assert!(!confirmed_receipt_settlement_record_matches(&record, &key, &entry));
+            assert!(entry.path.exists());
+        }
+        let mut rewritten = feature.clone();
+        rewritten["value"]["contract_version"] = json!(CONTRACT_VERSION);
+        rewritten["key"] = json!(record_usage_receipt_feature_key(&receipt));
+        assert!(validate_receipt_settlement_feature(&rewritten).unwrap_err()
+            .to_string().contains("provider signature failed"));
+        let mut unsupported = feature;
+        unsupported["value"]["contract_version"] = json!(22);
+        assert!(validate_receipt_settlement_feature(&unsupported).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn receipt_outbox_quarantines_obsolete_contract_entries_on_recovery() {
         let root = test_temp_dir("mayhem-provider-receipt-outbox-obsolete-contract");
         let directory = root.join("gateway");
         fs::create_dir_all(&directory).unwrap();
         let mut feature = signed_receipt_settlement_feature_for_test(7);
-        feature["value"]["contract_version"] = json!(CONTRACT_VERSION.saturating_sub(1));
+        feature["value"]["contract_version"] = json!(RECOVERABLE_RECEIPT_CONTRACT_VERSION - 1);
         let stale_path = directory.join("obsolete-contract-entry.json");
         fs::write(
             &stale_path,
@@ -110975,7 +111052,7 @@ esac
         let expected_message = concat!(
             "mayhem-targeted-spend-reservation-v1",
             "{\"payout_revision\":\"9999999999999999999999999999999999999999999999999999999999999999\",",
-            "\"reservation\":{\"at\":25200,\"contract_version\":23,\"ctx_bracket\":\"le8k\",",
+            "\"reservation\":{\"at\":25200,\"contract_version\":24,\"ctx_bracket\":\"le8k\",",
             "\"ctx_bracket_table_ver\":1,",
             "\"enclave_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"enclave_pubkey\":\"5555555555555555555555555555555555555555555555555555555555555555\",",

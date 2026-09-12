@@ -63,7 +63,9 @@ pub use validated_audio::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
-pub const CONTRACT_VERSION: u32 = 23;
+pub const CONTRACT_VERSION: u32 = 24;
+/// Only retained schema-11 receipt settlement features may use this prior version.
+pub const RECOVERABLE_RECEIPT_CONTRACT_VERSION: u32 = 23;
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const ATTESTATION_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -1833,8 +1835,17 @@ pub struct ReceiptAck {
 }
 
 pub fn record_usage_receipt_feature_key(receipt: &SessionReceipt) -> String {
+    record_usage_receipt_feature_key_for_contract(receipt, CONTRACT_VERSION)
+}
+
+/// Reconstruct an original receipt key without rewriting its signed version.
+/// Callers accepting retained evidence must gate the allowed contract versions.
+pub fn record_usage_receipt_feature_key_for_contract(
+    receipt: &SessionReceipt,
+    contract_version: u32,
+) -> String {
     let evidence = serde_json::json!({
-        "contract_version": CONTRACT_VERSION,
+        "contract_version": contract_version,
         "epoch": receipt.body.billing_epoch,
         "payout_revision": receipt.body.payout_revision,
         "receipt": record_usage_receipt_envelope(receipt),
