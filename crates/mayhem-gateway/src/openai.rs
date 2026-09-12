@@ -3585,11 +3585,7 @@ impl GatewayReceiptAckRecoveryTransport for ScBridgeReceiptAckRecoveryTransport 
             let session_id = recovery.body.session_id.as_str();
             let direct_peer = recovery.reconciliation.transport_peer.as_str();
             let timeout = Duration::from_millis(recovery.reconciliation.open_timeout_millis.max(1));
-            let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-                &self.config.url,
-                self.config.token.clone(),
-            )?)
-            .await?;
+            let mut bridge = ScBridgeClient::connect(self.config.bridge_config()?).await?;
             bridge.session_subscribe([session_id]).await?;
             bridge.peer_connect(direct_peer, timeout).await?;
             let opened = bridge.session_open(direct_peer, session_id).await?;
@@ -8846,8 +8842,6 @@ async fn prepare_gateway_job_with_cancellation(
     )
     .map_err(|err| ApiError::bad_request(err, Some("Idempotency-Key")))?;
     let request_fingerprint = stable_value_hash(normalized_request);
-    let durable_stream = normalized_request.get("stream").and_then(Value::as_bool) == Some(true)
-        && durable_streaming_endpoint_family(endpoint_family);
     let cancellation = cancellation.unwrap_or_else(GatewayRequestCancellation::new);
     let store = state.jobs.clone();
     let active_cancellations = state.active_job_cancellations.clone();
@@ -8879,7 +8873,7 @@ async fn prepare_gateway_job_with_cancellation(
             request_fingerprint,
             now_secs(),
         );
-        if durable_stream && matches!(begin, Ok(BeginGatewayJob::Started)) {
+        if matches!(begin, Ok(BeginGatewayJob::Started)) {
             if let Err(error) = store.protect_active(&begin_id, now_secs()) {
                 // Do not dispatch after a failed reservation write. Keep the key
                 // active in case the atomic publish succeeded before fsync failed.
@@ -15545,6 +15539,13 @@ impl GatewaySessionBackend for LocalOpenAiShapeBackend {
 }
 
 impl ScBridgeGatewaySessionConfig {
+    // This bounds local bridge control operations independently of model generation
+    // deadlines, while allowing the peer's session-open/connect waits to finish.
+    fn bridge_config(&self) -> Result<ScBridgeConfig, BridgeError> {
+        Ok(ScBridgeConfig::new(&self.url, self.token.clone())?
+            .with_operation_deadline(Some(Duration::from_secs(180))))
+    }
+
     pub fn new(url: impl Into<String>, token: impl Into<String>) -> Self {
         Self {
             url: url.into(),
@@ -15667,11 +15668,7 @@ impl ScBridgeGatewaySessionBackend {
         &self,
         invocation: &GatewayTpmActivationInvocation,
     ) -> Result<ActivatedTpmIdentity, GatewaySessionError> {
-        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-            &self.config.url,
-            self.config.token.clone(),
-        )?)
-        .await?;
+        let mut bridge = ScBridgeClient::connect(self.config.bridge_config()?).await?;
         bridge
             .peer_connect(&invocation.transport_peer, self.config.open_timeout)
             .await
@@ -15791,11 +15788,7 @@ impl ScBridgeGatewaySessionBackend {
         let provider = invocation.provider_pubkey_required()?;
         let direct_peer = invocation.direct_peer()?;
         let started = Instant::now();
-        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-            &self.config.url,
-            self.config.token.clone(),
-        )?)
-        .await?;
+        let mut bridge = ScBridgeClient::connect(self.config.bridge_config()?).await?;
         bridge
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
@@ -15844,11 +15837,7 @@ impl ScBridgeGatewaySessionBackend {
     ) -> Result<GatewaySessionResult, GatewaySessionError> {
         let provider = invocation.provider_pubkey_required()?;
         let direct_peer = invocation.direct_peer()?;
-        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-            &self.config.url,
-            self.config.token.clone(),
-        )?)
-        .await?;
+        let mut bridge = ScBridgeClient::connect(self.config.bridge_config()?).await?;
         bridge
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
@@ -16060,11 +16049,7 @@ impl ScBridgeGatewaySessionBackend {
         let direct_peer = invocation.direct_peer()?;
         let inputs =
             embedding_input_texts_from_value(&request.input).map_err(GatewaySessionError::new)?;
-        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-            &self.config.url,
-            self.config.token.clone(),
-        )?)
-        .await?;
+        let mut bridge = ScBridgeClient::connect(self.config.bridge_config()?).await?;
         bridge
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
@@ -16230,11 +16215,7 @@ impl ScBridgeGatewaySessionBackend {
     ) -> Result<GatewayImageGenerationResult, GatewaySessionError> {
         let provider = invocation.provider_pubkey_required()?;
         let direct_peer = invocation.direct_peer()?;
-        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-            &self.config.url,
-            self.config.token.clone(),
-        )?)
-        .await?;
+        let mut bridge = ScBridgeClient::connect(self.config.bridge_config()?).await?;
         bridge
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
@@ -16400,11 +16381,7 @@ impl ScBridgeGatewaySessionBackend {
     ) -> Result<GatewayAudioSpeechResult, GatewaySessionError> {
         let provider = invocation.provider_pubkey_required()?;
         let direct_peer = invocation.direct_peer()?;
-        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-            &self.config.url,
-            self.config.token.clone(),
-        )?)
-        .await?;
+        let mut bridge = ScBridgeClient::connect(self.config.bridge_config()?).await?;
         bridge
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
@@ -16560,11 +16537,7 @@ impl ScBridgeGatewaySessionBackend {
     ) -> Result<GatewayAudioTranscriptionResult, GatewaySessionError> {
         let provider = invocation.provider_pubkey_required()?;
         let direct_peer = invocation.direct_peer()?;
-        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-            &self.config.url,
-            self.config.token.clone(),
-        )?)
-        .await?;
+        let mut bridge = ScBridgeClient::connect(self.config.bridge_config()?).await?;
         bridge
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
@@ -16720,11 +16693,7 @@ impl ScBridgeGatewaySessionBackend {
     ) -> Result<GatewayArtifactGenerationResult, GatewaySessionError> {
         let provider = invocation.provider_pubkey_required()?;
         let direct_peer = invocation.direct_peer()?;
-        let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(
-            &self.config.url,
-            self.config.token.clone(),
-        )?)
-        .await?;
+        let mut bridge = ScBridgeClient::connect(self.config.bridge_config()?).await?;
         bridge
             .session_subscribe([invocation.session_id.as_str()])
             .await?;
@@ -24642,8 +24611,7 @@ async fn open_live_direct_chat_session(
 > {
     let provider = invocation.provider_pubkey_required()?;
     let direct_peer = invocation.direct_peer()?;
-    let mut bridge =
-        ScBridgeClient::connect(ScBridgeConfig::new(&config.url, config.token.clone())?).await?;
+    let mut bridge = ScBridgeClient::connect(config.bridge_config()?).await?;
     bridge
         .session_subscribe([invocation.session_id.as_str()])
         .await?;
@@ -48475,6 +48443,177 @@ mod tests {
             state.receipt_count(),
             receipt_count,
             "retrieval cannot rebill"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_image_job_is_durable_before_completion_and_cannot_redispatch_after_restart() {
+        use tower::ServiceExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let jobs_dir = root.path().join("jobs");
+        let seed = test_user_seed();
+        let model = image_job_test_model();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let backend = Arc::new(DisconnectCompletesImageBackend {
+            started: started.clone(),
+            cancelled: Arc::new(tokio::sync::Notify::new()),
+        });
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_receipt_user_seed(seed)
+            .with_job_store_dir(jobs_dir.clone())
+            .unwrap()
+            .with_dev_session_shim()
+            .with_session_backend(backend);
+        let request = |prompt: &str| {
+            axum::http::Request::builder()
+                .method("POST")
+                .uri("/v1/images/generations")
+                .header("content-type", "application/json")
+                .header("prefer", "respond-async")
+                .header("idempotency-key", "async-image-restart")
+                .body(Body::from(
+                    json!({"model": model.id, "prompt": prompt, "size": "1024x1024", "steps": 9})
+                        .to_string(),
+                ))
+                .unwrap()
+        };
+        let response = openai_router(state.clone())
+            .oneshot(request("durable async image"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let body: Value = serde_json::from_slice(
+            &axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        let id = body["id"].as_str().unwrap();
+        {
+            let mut jobs = state.jobs.lock_recover("test jobs");
+            assert!(jobs.is_active(id));
+            assert!(jobs.active_recovery(id).is_some());
+            assert!(jobs.get(id, now_secs()).unwrap().is_none());
+        }
+        tokio::time::timeout(Duration::from_secs(2), started.notified())
+            .await
+            .expect("image inference started and is waiting for cancellation");
+        let retry = openai_router(state.clone())
+            .oneshot(request("durable async image"))
+            .await
+            .unwrap();
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+
+        // Recreate state while the original inference is still unfinished. Only
+        // the encrypted recovery record is available to this new gateway.
+        let restarted = GatewayState::from_models(vec![model.clone()])
+            .with_receipt_user_seed(seed)
+            .with_job_store_dir(jobs_dir)
+            .unwrap();
+        let poll = openai_router(restarted.clone())
+            .oneshot(
+                axum::http::Request::builder()
+                    .uri(format!("/v1/jobs/{id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(poll.status(), StatusCode::OK);
+        let recovered: Value = serde_json::from_slice(
+            &axum::body::to_bytes(poll.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recovered["status"], "failed");
+        assert_eq!(
+            recovered["error_info"]["code"],
+            "gateway_execution_interrupted"
+        );
+        assert_eq!(recovered["error_info"]["retryable"], false);
+        assert!(recovered["receipt"].is_null());
+        for prompt in ["durable async image", "conflicting request"] {
+            let retry = openai_router(restarted.clone())
+                .oneshot(request(prompt))
+                .await
+                .unwrap();
+            assert_eq!(retry.status(), StatusCode::CONFLICT);
+        }
+        assert!(!restarted.jobs.lock_recover("test jobs").is_active(id));
+        assert!(restarted
+            .active_job_cancellations
+            .lock_recover("test cancellations")
+            .is_empty());
+        assert!(state.jobs.lock_recover("test jobs").is_active(id));
+    }
+
+    #[tokio::test]
+    async fn every_started_job_has_a_recovery_record_including_streams() {
+        let root = tempfile::tempdir().unwrap();
+        let seed = test_user_seed();
+        let state = GatewayState::fixture()
+            .with_receipt_user_seed(seed)
+            .with_job_store_dir(root.path())
+            .unwrap();
+        for (index, (family, stream)) in [
+            (mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS, true),
+            (mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS, true),
+            (mayhem_proto::ENDPOINT_OPENAI_RESPONSES, true),
+            (mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT, true),
+            (mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS, false),
+            (mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS, false),
+            (mayhem_proto::ENDPOINT_OPENAI_VIDEOS, false),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                "idempotency-key",
+                format!("recovery-{index}").parse().unwrap(),
+            );
+            let request = json!({"model": "test-model", "stream": stream});
+            let job =
+                match prepare_gateway_job(&state, &headers, family, "test-model", &request, &None)
+                    .await
+                    .unwrap()
+                {
+                    PreparedGatewayJob::Started(job) => job,
+                    _ => panic!("fresh request must start"),
+                };
+            assert!(state
+                .jobs
+                .lock_recover("test jobs")
+                .active_recovery(&job.id)
+                .is_some());
+            assert!(matches!(
+                prepare_gateway_job(&state, &headers, family, "test-model", &request, &None)
+                    .await
+                    .unwrap(),
+                PreparedGatewayJob::InProgress(id) if id == job.id
+            ));
+            let restarted = GatewayState::fixture()
+                .with_receipt_user_seed(seed)
+                .with_job_store_dir(root.path())
+                .unwrap();
+            assert!(matches!(
+                prepare_gateway_job(&restarted, &headers, family, "test-model", &request, &None)
+                    .await
+                    .unwrap(),
+                PreparedGatewayJob::Existing(recovered)
+                    if recovered.id == job.id && recovered.status == GatewayJobStatus::Failed
+            ));
+        }
+    }
+
+    #[test]
+    fn gateway_bridge_control_operations_have_a_bounded_deadline() {
+        let config = ScBridgeGatewaySessionConfig::new("ws://127.0.0.1:9000", "test-token");
+        assert_eq!(
+            config.bridge_config().unwrap().operation_deadline,
+            Some(Duration::from_secs(180))
         );
     }
 
