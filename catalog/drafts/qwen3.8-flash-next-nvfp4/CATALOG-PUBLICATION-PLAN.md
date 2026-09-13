@@ -56,10 +56,10 @@ the operator already has such a license.
   auxiliary n-gram embeddings and MTP component must be described in notes
   rather than added to this field.
 - `tier`: `launch`
-- `min_app_version`: `0.2.201`, the first release that preserves the signed PLE
+- `min_app_version`: `0.2.202`, the first release that preserves the signed PLE
   reader wheel filename during offline installation, maps managed preparation
-  containers to the provider uid/gid, and accepts the signed source Git identity
-  in the managed runtime.
+  containers to the provider uid/gid, accepts the signed source Git identity,
+  and validates all signed reasoning preflight controls together.
 - `provenance.license`: `qwen-community-1.0`
 - `provenance.license_sha256`:
   `a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08`
