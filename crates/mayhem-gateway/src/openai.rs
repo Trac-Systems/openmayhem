@@ -1902,6 +1902,7 @@ pub struct GatewayCanaryModelConfig {
     pub prompts: Vec<GatewayCanaryPrompt>,
     pub fingerprints_by_artifact_root: BTreeMap<String, String>,
     pub token_prefixes_by_artifact_root: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
+    pub openai_compatible_artifact_roots: BTreeSet<String>,
     pub perceptual_hashes_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
     pub embedding_vectors_by_artifact_root: BTreeMap<String, BTreeMap<String, Vec<f32>>>,
     pub transcripts_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
@@ -13729,6 +13730,7 @@ fn canary_registry_from_catalog_root(
         }
         let mut fingerprints_by_artifact_root = BTreeMap::new();
         let mut token_prefixes_by_artifact_root = BTreeMap::new();
+        let mut openai_compatible_artifact_roots = BTreeSet::new();
         let mut perceptual_hashes_by_artifact_root = BTreeMap::new();
         let mut embedding_vectors_by_artifact_root = BTreeMap::new();
         let mut transcripts_by_artifact_root = BTreeMap::new();
@@ -13739,6 +13741,11 @@ fn canary_registry_from_catalog_root(
         if let Some(artifacts) = model.get("artifacts").and_then(Value::as_object) {
             for (artifact_name, artifact) in artifacts {
                 if let Some(artifact_root) = artifact.get("artifact_root").and_then(Value::as_str) {
+                    if artifact.get("engine").and_then(Value::as_str)
+                        == Some("openai-compatible")
+                    {
+                        openai_compatible_artifact_roots.insert(artifact_root.to_owned());
+                    }
                     if let Some(calibrations) = speciality_calibrations.get(artifact_name) {
                         speciality_calibrations_by_artifact_root
                             .insert(artifact_root.to_owned(), calibrations.clone());
@@ -13796,6 +13803,7 @@ fn canary_registry_from_catalog_root(
                 prompts,
                 fingerprints_by_artifact_root,
                 token_prefixes_by_artifact_root,
+                openai_compatible_artifact_roots,
                 perceptual_hashes_by_artifact_root,
                 embedding_vectors_by_artifact_root,
                 transcripts_by_artifact_root,
@@ -31723,8 +31731,13 @@ impl GatewayState {
                 .run_chat(model, &request, &invocation)
                 .await
                 .map_err(|err| provider_session_api_error(&err))?;
-            let token_fingerprint = token_fingerprint(result.token_ids.iter().copied()).digest;
-            observed_tokens.insert(prompt.id.clone(), result.token_ids.clone());
+            let token_ids = catalog_canary_result_units(
+                config,
+                route.as_ref().map(|route| route.artifact_root.as_str()),
+                &result,
+            );
+            let token_fingerprint = token_fingerprint(token_ids.iter().copied()).digest;
+            observed_tokens.insert(prompt.id.clone(), token_ids.clone());
             let receipt = self.meter_chat_session(
                 model,
                 &request,
@@ -31738,8 +31751,8 @@ impl GatewayState {
             prompt_reports.push(json!({
                 "prompt_id": prompt.id,
                 "request": request,
-                "token_count": result.token_ids.len(),
-                "token_ids": result.token_ids,
+                "token_count": token_ids.len(),
+                "token_ids": token_ids,
                 "token_fingerprint": token_fingerprint,
                 "session_id": invocation.session_id,
                 "receipt_hash": receipt_hash,
@@ -32017,8 +32030,12 @@ impl GatewayState {
                             Some("model"),
                         )
                     })?;
-                    let observed_prefix = result
-                        .token_ids
+                    let token_ids = catalog_canary_result_units(
+                        config,
+                        Some(route.artifact_root.as_str()),
+                        &result,
+                    );
+                    let observed_prefix = token_ids
                         .iter()
                         .copied()
                         .take(expected_prefix.len())
@@ -32026,7 +32043,7 @@ impl GatewayState {
                     let observed_prompt_fingerprint =
                         token_fingerprint(observed_prefix.iter().copied()).digest;
                     let full_output_fingerprint =
-                        token_fingerprint(result.token_ids.iter().copied()).digest;
+                        token_fingerprint(token_ids.iter().copied()).digest;
                     observed_prefixes.insert(prompt.id.clone(), observed_prefix);
                     let receipt = self.meter_chat_session(
                         model,
@@ -32052,8 +32069,8 @@ impl GatewayState {
                         "prompt_id": prompt.id,
                         "request": request,
                         "selected_specialities": invocation.spend_voucher.body.required_specialities,
-                        "token_count": result.token_ids.len(),
-                        "token_ids": result.token_ids,
+                        "token_count": token_ids.len(),
+                        "token_ids": token_ids,
                         "stable_prefix_fingerprint": observed_prompt_fingerprint,
                         "full_output_fingerprint": full_output_fingerprint,
                         "session_id": invocation.session_id,
@@ -34823,6 +34840,24 @@ fn canary_served_route(
             candidate.provider == provider && candidate.enclave_id == invocation.enclave_id
         })
         .cloned()
+}
+
+fn catalog_canary_result_units(
+    config: &GatewayCanaryModelConfig,
+    artifact_root: Option<&str>,
+    result: &GatewaySessionResult,
+) -> Vec<i32> {
+    if artifact_root.is_some_and(|root| {
+        config.openai_compatible_artifact_roots.contains(root)
+    }) {
+        let reconstructed = mayhem_proto::openai_compatible_canary_output(
+            &result.output.reasoning_content,
+            result.output.content.as_deref().unwrap_or_default(),
+        );
+        mayhem_proto::openai_compatible_canary_units(&reconstructed)
+    } else {
+        result.token_ids.clone()
+    }
 }
 
 fn canary_request_options(invocation: &GatewaySessionInvocation) -> GatewayRequestOptions {
@@ -43365,6 +43400,7 @@ mod tests {
             prompts: Vec::new(),
             fingerprints_by_artifact_root: BTreeMap::new(),
             token_prefixes_by_artifact_root: BTreeMap::new(),
+            openai_compatible_artifact_roots: BTreeSet::new(),
             perceptual_hashes_by_artifact_root: BTreeMap::new(),
             embedding_vectors_by_artifact_root: BTreeMap::new(),
             transcripts_by_artifact_root: BTreeMap::new(),
@@ -50523,6 +50559,7 @@ mod tests {
             }],
             fingerprints_by_artifact_root: BTreeMap::new(),
             token_prefixes_by_artifact_root: BTreeMap::new(),
+            openai_compatible_artifact_roots: BTreeSet::new(),
             perceptual_hashes_by_artifact_root: BTreeMap::from([(
                 "ab".repeat(32),
                 BTreeMap::from([("fixed-workflow-image".to_owned(), expected_hash)]),

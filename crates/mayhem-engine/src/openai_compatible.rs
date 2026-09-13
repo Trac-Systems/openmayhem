@@ -1228,13 +1228,8 @@ impl StreamCollector {
 
     fn finish(mut self, events: &mpsc::Sender<StreamEvent>) -> Result<GenerateOutput> {
         self.close_reasoning(events)?;
-        let mut output = String::new();
-        if !self.reasoning.is_empty() {
-            output.push_str("<think>");
-            output.push_str(&self.reasoning);
-            output.push_str("</think>");
-        }
-        output.push_str(&self.text);
+        let mut output =
+            mayhem_proto::openai_compatible_canary_output(&self.reasoning, &self.text);
         if !self.tool_calls.is_empty() {
             let calls = self
                 .tool_calls
@@ -1722,13 +1717,7 @@ mod tests {
     }
 
     #[test]
-    fn pseudo_token_fingerprints_bind_equal_length_delta_content() {
-        let sequence = |parts: &[(StreamTextKind, &str)]| {
-            parts
-                .iter()
-                .map(|(kind, text)| openai_compatible_pseudo_token_id(*kind, text))
-                .collect::<Vec<_>>()
-        };
+    fn canonical_canary_units_ignore_sse_segmentation_and_bind_content() {
         let fingerprint = |tokens: &[i32]| {
             let mut hasher = blake3::Hasher::new();
             for token in tokens {
@@ -1736,27 +1725,39 @@ mod tests {
             }
             hasher.finalize().to_hex().to_string()
         };
-        let left_parts = [
-            (StreamTextKind::Reasoning, "inspect alpha"),
-            (StreamTextKind::Content, "answer alpha"),
-        ];
-        let right_parts = [
-            (StreamTextKind::Reasoning, "inspect beta"),
-            (StreamTextKind::Content, "answer beta"),
-        ];
-        let left = sequence(&left_parts);
-        let left_repeat = sequence(&left_parts);
-        let right = sequence(&right_parts);
+        let collect = |deltas: &[Value]| {
+            let (events, _receiver) = mpsc::channel();
+            let mut collector = StreamCollector::default();
+            for delta in deltas {
+                collector.push(delta.clone(), &events).unwrap();
+            }
+            collector.finish(&events).unwrap().text
+        };
+        let split = collect(&[
+            json!({"choices":[{"delta":{"reasoning_content":"inspect "}}]}),
+            json!({"choices":[{"delta":{"reasoning_content":"alpha"}}]}),
+            json!({"choices":[{"delta":{"content":"answer "}}]}),
+            json!({"choices":[{"delta":{"content":"α"}}]}),
+        ]);
+        let joined = collect(&[
+            json!({"choices":[{"delta":{"reasoning_content":"inspect alpha"}}]}),
+            json!({"choices":[{"delta":{"content":"answer α"}}]}),
+        ]);
+        let different = collect(&[
+            json!({"choices":[{"delta":{"reasoning_content":"inspect bravo"}}]}),
+            json!({"choices":[{"delta":{"content":"answer β"}}]}),
+        ]);
+        let split_units = mayhem_proto::openai_compatible_canary_units(&split);
+        let joined_units = mayhem_proto::openai_compatible_canary_units(&joined);
+        let different_units = mayhem_proto::openai_compatible_canary_units(&different);
 
-        assert!(left.iter().all(|token| *token != 0));
-        assert_eq!(left, left_repeat);
-        assert_ne!(left, right);
-        assert_eq!(fingerprint(&left), fingerprint(&left_repeat));
-        assert_ne!(fingerprint(&left), fingerprint(&right));
-        assert_ne!(
-            openai_compatible_pseudo_token_id(StreamTextKind::Reasoning, "same"),
-            openai_compatible_pseudo_token_id(StreamTextKind::Content, "same")
-        );
+        assert_eq!(split, "<think>inspect alpha</think>answer α");
+        assert_eq!(split, joined);
+        assert_eq!(split_units, joined_units);
+        assert_eq!(fingerprint(&split_units), fingerprint(&joined_units));
+        assert_eq!(split_units.len(), different_units.len());
+        assert_ne!(split_units, different_units);
+        assert_ne!(fingerprint(&split_units), fingerprint(&different_units));
     }
 
     #[test]

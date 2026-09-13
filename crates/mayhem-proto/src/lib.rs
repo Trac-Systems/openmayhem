@@ -63,6 +63,28 @@ pub use validated_audio::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
+
+/// Reconstruct the text used by OpenAI-compatible canary evidence without
+/// retaining transport-specific SSE delta boundaries.
+pub fn openai_compatible_canary_output(reasoning: &str, content: &str) -> String {
+    let mut output = String::new();
+    if !reasoning.is_empty() {
+        output.push_str("<think>");
+        output.push_str(reasoning);
+        output.push_str("</think>");
+    }
+    output.push_str(content);
+    output
+}
+
+/// Return Unicode scalar values for the reconstructed OpenAI-compatible
+/// canary output. These units are evidence-only and do not affect metering.
+pub fn openai_compatible_canary_units(reconstructed_output: &str) -> Vec<i32> {
+    reconstructed_output
+        .chars()
+        .map(|scalar| i32::try_from(u32::from(scalar)).expect("Unicode scalar fits i32"))
+        .collect()
+}
 pub const CONTRACT_VERSION: u32 = 25;
 /// Retained schema-11 receipt settlement features accepted across the v25 upgrade.
 pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24];

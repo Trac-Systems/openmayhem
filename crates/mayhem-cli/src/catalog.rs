@@ -1756,7 +1756,7 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
                 ("tools", model.caps.tools),
                 ("json", model.caps.json),
                 ("image", model.caps.vision || model.caps.image),
-                ("video", model.caps.video),
+                ("video", model_has_input_modality(model, "video")),
             ] {
                 if advertised != binding.capabilities.contains(capability) {
                     errors.push(format!(
@@ -4647,6 +4647,19 @@ fn adapter_modality_allowed(model: &CatalogModel, modality: &str) -> bool {
         .any(|detected| detected == modality)
 }
 
+fn model_has_input_modality(model: &CatalogModel, modality: &str) -> bool {
+    model
+        .adapter
+        .modality_set
+        .iter()
+        .any(|entry| entry == modality)
+        && model
+            .modality_assessment
+            .detected
+            .iter()
+            .any(|entry| entry == modality)
+}
+
 fn validate_artifact(
     model_id: &str,
     tier: &str,
@@ -5081,6 +5094,41 @@ fn validate_artifact_with_engine_policy(
                 if profile.quantized_start_tokens != 0 {
                     errors.push(format!(
                         "{model_id}/{name} vLLM KV-cache quantized_start_tokens must be 0"
+                    ));
+                }
+            }
+            "openai-compatible" => {
+                let signed_dtype = artifact
+                    .openai_compatible
+                    .as_ref()
+                    .and_then(|binding| binding.server_info_checks.get("/kv_cache_dtype"))
+                    .and_then(Value::as_str);
+                if signed_dtype != Some(profile.dtype.as_str()) {
+                    errors.push(format!(
+                        "{model_id}/{name} OpenAI-compatible KV-cache dtype {} must match the signed /server_info /kv_cache_dtype check",
+                        profile.dtype
+                    ));
+                }
+                let expected_bits = vllm_kv_cache_expected_bits(&profile.dtype);
+                match expected_bits {
+                    Some(bits) if bits == profile.bits => {}
+                    Some(bits) => errors.push(format!(
+                        "{model_id}/{name} OpenAI-compatible KV-cache dtype {} requires bits={bits}, got {}",
+                        profile.dtype, profile.bits
+                    )),
+                    None => errors.push(format!(
+                        "{model_id}/{name} has unsupported OpenAI-compatible KV-cache dtype {}",
+                        profile.dtype
+                    )),
+                }
+                if profile.group_size != 1 {
+                    errors.push(format!(
+                        "{model_id}/{name} OpenAI-compatible KV-cache group_size must be 1"
+                    ));
+                }
+                if profile.quantized_start_tokens != 0 {
+                    errors.push(format!(
+                        "{model_id}/{name} OpenAI-compatible KV-cache quantized_start_tokens must be 0"
                     ));
                 }
             }
@@ -10759,6 +10807,77 @@ mod tests {
                 rate_map: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn openai_compatible_kv_metadata_and_video_input_validate() {
+        let draft_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../catalog/drafts/qwen3.8-flash-next-nvfp4/artifact-binding.values.json");
+        let draft: Value = serde_json::from_slice(
+            &fs::read(&draft_path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", draft_path.display())),
+        )
+        .expect("artifact binding draft JSON");
+        let artifact: CatalogArtifact = serde_json::from_value(draft["artifact"].clone())
+            .expect("OpenAI-compatible artifact binding");
+
+        let mut artifact_errors = Vec::new();
+        validate_artifact(
+            "Qwen/Qwen3.8-Flash-Next",
+            "launch",
+            "nvfp4",
+            &artifact,
+            &mut artifact_errors,
+        );
+        assert!(artifact_errors.is_empty(), "{artifact_errors:#?}");
+
+        let mut drifted = artifact.clone();
+        drifted
+            .openai_compatible
+            .as_mut()
+            .unwrap()
+            .server_info_checks
+            .insert("/kv_cache_dtype".to_owned(), Value::String("bfloat16".to_owned()));
+        artifact_errors.clear();
+        validate_artifact(
+            "Qwen/Qwen3.8-Flash-Next",
+            "launch",
+            "nvfp4",
+            &drifted,
+            &mut artifact_errors,
+        );
+        assert!(artifact_errors.iter().any(|error| error.contains(
+            "KV-cache dtype fp8_e4m3 must match the signed /server_info /kv_cache_dtype check"
+        )));
+
+        let catalog = repository_catalog();
+        let mut model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "Qwen/Qwen3.8-27B")
+            .expect("Qwen3.8 multimodal fixture")
+            .clone();
+        model.model_id = "Qwen/Qwen3.8-Flash-Next".to_owned();
+        model.caps.video = false;
+        assert!(model_has_input_modality(&model, "video"));
+        model.artifacts = BTreeMap::from([("nvfp4".to_owned(), artifact)]);
+        let mut model_errors = Vec::new();
+        validate_model(&model, &mut model_errors);
+        assert!(!model_errors.iter().any(|error| {
+            error.contains("openai_compatible capability video must match model caps")
+                || error.contains("caps.video output")
+                || error.contains("declares a KV-cache profile for unsupported engine")
+        }), "{model_errors:#?}");
+
+        model
+            .adapter
+            .modality_set
+            .retain(|modality| modality != "video");
+        model_errors.clear();
+        validate_model(&model, &mut model_errors);
+        assert!(model_errors.iter().any(|error| {
+            error.contains("openai_compatible capability video must match model caps")
+        }));
     }
 
     fn hex_string(bytes: &[u8]) -> String {

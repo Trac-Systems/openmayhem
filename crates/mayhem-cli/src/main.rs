@@ -25364,17 +25364,23 @@ fn calibrate_token_canary_prompt_with_speciality(
     )?;
     request.seed = Some(prompt.seed.unwrap_or(seed));
     let max_tokens = request.max_new_tokens;
-    let mut token_ids = Vec::new();
+    let use_canonical_openai_units = backend.backend_id() == "openai-compatible";
+    let mut streamed_token_ids = Vec::new();
     let output = backend
         .generate(
             request,
             &mut |chunk: mayhem_engine::TokenChunk| {
-                token_ids.push(chunk.token_id);
+                streamed_token_ids.push(chunk.token_id);
                 Ok(())
             },
             &CancellationToken::new(),
         )
         .with_context(|| format!("generating canary prompt {}", prompt.id))?;
+    let token_ids = if use_canonical_openai_units {
+        mayhem_proto::openai_compatible_canary_units(&output.text)
+    } else {
+        streamed_token_ids
+    };
     if token_ids.is_empty() {
         bail!("canary prompt {} produced no tokens", prompt.id);
     }
