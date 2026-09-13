@@ -12,6 +12,7 @@ import Protomux from 'protomux'
 import c from 'compact-encoding'
 import { MsbClient } from './msbClient.js';
 import { handlerFor } from './operations/index.js';
+import { canonicalReplayView } from './base/canonical-replay.js';
 import TransactionPool from './transaction/transactionPool.js';
 import { TransactionObserver } from './tasks/transactionObserver.js';
 import { Updater } from './tasks/updater.js';
@@ -93,27 +94,31 @@ export class Peer extends ReadyResource {
             },
             apply: async (nodes, view, base) => {
                 const batch = view.batch()
-                const context = {
-                    wallet: this.wallet,
-                    protocolInstance: this.protocol.instance,
-                    contractInstance: this.contract.instance,
-                    // Acceptance proofs read the signed canonical session, not
-                    // the atomic apply view that may be replaying an older prefix.
-                    canonicalView: this.base?.view,
-                    msbClient: this.msbClient,
-                    config: this.config
-                }
-
-                for (const node of nodes) {
-                    const op = node.value
-                    const handler = handlerFor(node, context)
-                    if (handler) {
-                        await handler.handle(op, batch, base, node)
+                const canonicalView = canonicalReplayView(this.base);
+                try {
+                    if (canonicalView) await canonicalView.ready();
+                    const context = {
+                        wallet: this.wallet,
+                        protocolInstance: this.protocol.instance,
+                        contractInstance: this.contract.instance,
+                        canonicalView,
+                        msbClient: this.msbClient,
+                        config: this.config
                     }
-                }
 
-                await batch.flush();
-                await batch.close();
+                    for (const node of nodes) {
+                        const op = node.value
+                        const handler = handlerFor(node, context)
+                        if (handler) {
+                            await handler.handle(op, batch, base, node)
+                        }
+                    }
+
+                    await batch.flush();
+                } finally {
+                    await batch.close();
+                    if (canonicalView) await canonicalView.close();
+                }
             }
         })
         this.base.on('warning', (e) => console.log(e))

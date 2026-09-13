@@ -10,7 +10,7 @@ import {safeEncodeApplyOperation} from 'trac-msb/src/utils/protobuf/operationHel
 import {FEE} from 'trac-msb/src/core/state/utils/transaction.js';
 import Wallet from 'trac-peer/src/wallet.js';
 import { FeatureOperation, FeatureCheck } from 'trac-peer/src/operations/feature/index.js';
-import { canonicalReplayContext, consumeCanonicalReplayContext } from 'trac-peer/src/base/canonical-replay.js';
+import { canonicalReplayContext, consumeCanonicalReplayContext, canonicalReplayView } from 'trac-peer/src/base/canonical-replay.js';
 import {adminWriterDiagnostics,appliedViewProof} from '../src/rpc.js';
 import MayhemContract from '../contract/contract.js';
 import Contract23 from '../contract/history/v23.js';import Contract24 from '../contract/history/v24.js';
@@ -71,4 +71,61 @@ test('ordinary historical TX requires exact canonical index and original signed 
  const changed=structuredClone(f.op);changed.value.dispatch.value.values.price_min_bps=2;assert.equal(await canonicalReplayContext(changed,storage,{...f.node,value:changed},f.view),null);
  assert.equal(await canonicalReplayContext(f.op,storage,{...f.node,optimistic:true},f.view),null);
  }finally{await f.close();}
+});
+
+for (const version of [23, 24]) test(`persisted remote v${version} Feature reads signed default view ahead of apply batch`, async () => {
+ const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mayhem-remote-history-'));
+ const wallet=new Wallet();await wallet.ready;await wallet.generateKeyPair();
+ const old=new (version===23?Contract23:Contract24)(protocol,{});
+ const opened=new Set(), streams=[];
+ async function open(name,key,contract,broken=false){
+  const store=new Corestore(path.join(dir,name));let base;
+  const state={store,contract,error:null,observations:[]};
+  base=new Autobase(store,key,{ackInterval:0,fastForward:false,valueEncoding:'json',
+   open:s=>new Hyperbee(s.get('view'),{extension:false,keyEncoding:'utf-8',valueEncoding:'json'}),
+   async apply(nodes,view){
+    const batch=view.batch(),canonical=broken?base.view:canonicalReplayView(base);
+    try{
+     if(canonical)await canonical.ready();
+     for(const node of nodes){
+      if(node.value?.type==='seed'){await batch.put('admin',wallet.publicKey);continue;}
+      if(node.value?.type!=='feature')continue;
+      state.observations.push({remote:!b4a.equals(node.from.key,base.local.key),nodeLength:node.length,inputSignedLength:node.from.signedLength,publicLength:base.view.core.signedLength,canonicalLength:canonical.core.signedLength,applyLength:view.core.length});
+      await handler(wallet,contract,canonical).handle(node.value,batch,base,node);
+     }
+     await batch.flush();
+    }finally{await batch.close();if(canonical&&!broken)await canonical.close();}
+   }});
+  state.base=base;base.on('error',e=>{state.error=e;});await base.ready();opened.add(state);return state;
+ }
+ async function close(state){await state.base.close();await state.store.close();opened.delete(state);}
+ function connect(left,right){const a=left.store.replicate(true),b=right.store.replicate(false);a.pipe(b).pipe(a);const close=()=>{a.destroy();b.destroy();};streams.push(close);return close;}
+ async function until(check){for(let i=0;i<250;i++){if(await check())return;await delay(10);}assert.fail('Remote replay did not reach its expected terminal state');}
+ try{
+  const writer=await open('writer',null,old);await writer.base.append({type:'seed'});await writer.base.update();
+  // Both followers persist the earlier prefix, then go offline before the old
+  // writer accepts the Feature. Reopening them invokes real remote Autobase
+  // apply nodes; no synthetic node.from=base.local or borrowed writer view.
+  for(const name of ['broken','fixed']){
+   const follower=await open(name,writer.base.key,old);const disconnect=connect(writer,follower);
+   await until(async()=>!!await follower.base.view.get('admin'));disconnect();await close(follower);
+  }
+  const value={op:'rate_oracle',tnk_usd_au:'50000000000000000',source:'gate-spot',ts:3600},key='mayhem_'+await old.rateFeatureKey(value),nonce='remote-'+version;
+  const op={type:'feature',key,value:{dispatch:{type:'mayhem_feature',contract_version:version,key,address:wallet.publicKey,value,nonce,hash:wallet.sign(JSON.stringify(value)+nonce)}}};
+  await writer.base.append(op);await writer.base.update();
+  const expected=(await writer.base.view.core.treeHash()).toString('hex');
+  const broken=await open('broken',writer.base.key,new MayhemContract(protocol,{}),true);const disconnectBroken=connect(writer,broken);
+  await until(()=>broken.error);assert.match(broken.error.message,new RegExp('expected CONTRACT_VERSION 25, got '+version));
+  assert(broken.observations.some(x=>x.remote&&x.inputSignedLength>=x.nodeLength&&x.publicLength===x.applyLength));
+  disconnectBroken();await close(broken);
+  const current=new MayhemContract(protocol,{}),fixed=await open('fixed',writer.base.key,current);connect(writer,fixed);
+  await until(async()=>fixed.error||!!await fixed.base.view.get('fr/'+op.value.dispatch.hash));assert.equal(fixed.error,null);
+  assert(fixed.observations.some(x=>x.remote&&x.inputSignedLength>=x.nodeLength&&x.canonicalLength>x.publicLength&&x.publicLength===x.applyLength));
+  assert.equal((await fixed.base.view.core.treeHash()).toString('hex'),expected,'Real follower must reproduce the complete historical signed tree');
+  assert.equal((await collect(fixed.base.view)).snapshotBytes(),(await collect(writer.base.view)).snapshotBytes());
+  assert.equal(current._mayhemReplayStatus.completed,1);
+  await writer.base.append(op);await writer.base.update();await delay(50);await fixed.base.update();
+  assert.equal(current._mayhemReplayStatus.completed,1,'Repeated signed input must not apply twice');
+  assert.equal((await fixed.base.view.core.treeHash()).toString('hex'),expected);
+ }finally{for(const close of streams)close();for(const state of opened)await close(state);fs.rmSync(dir,{recursive:true,force:true});}
 });
