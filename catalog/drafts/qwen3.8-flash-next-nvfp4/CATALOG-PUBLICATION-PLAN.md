@@ -56,7 +56,7 @@ the operator already has such a license.
   auxiliary n-gram embeddings and MTP component must be described in notes
   rather than added to this field.
 - `tier`: `launch`
-- `min_app_version`: `0.2.209`, which retains the signed deterministic Triton
+- `min_app_version`: `0.2.210`, which retains the signed deterministic Triton
   runtime mapping and verifies SGLang's lazily created prefix-cache counter by
   treating only the pre-replay absence as zero. The identical replay must
   expose the signed counter and increase it; all other managed-runtime
@@ -75,6 +75,10 @@ the operator already has such a license.
   presence penalty 0, repeat penalty 1.
 - Thinking-off sampling: temperature 0.7, top-p 0.8, top-k 20, min-p 0,
   presence penalty 1.5, repeat penalty 1.
+- All four endpoint families retain the `min_p` request field for protocol
+  compatibility while constraining its schema to `minimum=maximum=0` and the
+  single calibration value `0`. The qualified speculative runtime rejects
+  nonzero `min_p`, so the inherited 27B range is not advertised.
 - Thinking controls: `enable_thinking=true` and `preserve_thinking=true` by
   default; `reasoning_effort` is `low|medium|xhigh` with `xhigh` as the catalog
   default.
@@ -230,7 +234,7 @@ The signed overlap probe retains `concurrency_max_tokens: 4096` with
 the first-token barriers are held, requires an observed value of at least two
 and first content from both requests, then cancels the bounded probes.
 
-Core v0.2.209 reconstructs reasoning as `<think>…</think>` followed by visible
+Core v0.2.210 reconstructs reasoning as `<think>…</think>` followed by visible
 content, then derives canonical Unicode-scalar units for calibration and live
 catalog verification. The fingerprints remain stable across upstream stream
 segmentation while normal delivery and billing remain unchanged.

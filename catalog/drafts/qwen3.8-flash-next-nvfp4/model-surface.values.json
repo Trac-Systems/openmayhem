@@ -7,7 +7,7 @@
     "family": "qwen3.8",
     "params_b": 125,
     "tier": "launch",
-    "min_app_version": "0.2.209",
+    "min_app_version": "0.2.210",
     "provenance": {
       "source": {
         "kind": "huggingface",
@@ -97,6 +97,35 @@
         "to": [
           "Qwen/Qwen3.8-Flash-Next"
         ]
+      },
+      {
+        "json_path_suffix": "request_attribute_specs.min_p",
+        "apply_to_endpoint_families": [
+          "openai_chat_completions",
+          "openai_completions",
+          "openai_responses",
+          "hf_multimodal_chat"
+        ],
+        "from": {
+          "value_types": [
+            "number"
+          ],
+          "minimum": 0,
+          "maximum": 1,
+          "calibration_values": [
+            0.05
+          ]
+        },
+        "to": {
+          "value_types": [
+            "number"
+          ],
+          "minimum": 0,
+          "maximum": 0,
+          "calibration_values": [
+            0
+          ]
+        }
       }
     ],
     "endpoint_families": [
