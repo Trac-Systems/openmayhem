@@ -1,0 +1,64 @@
+{
+  "schema_version": 1,
+  "kind": "pennyroyal_flash_next_frspec_v1",
+  "profile_version": 1,
+  "public_model_id": "Qwen/Qwen3.8-Flash-Next",
+  "artifact": {
+    "repo": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+    "revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
+    "snapshot_manifest_sidecar": "snapshot_manifest",
+    "snapshot_manifest_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
+    "file_count": 419,
+    "total_bytes": 135253622894
+  },
+  "source": {
+    "sidecar": "pennyroyal_source",
+    "format": "pennyroyal_source_bundle_tar_gzip_v1",
+    "root_layout": "source",
+    "revision": "2c675da096939cb01102f8f4871bda3db55f7f28",
+    "archive_bytes": 64070181,
+    "archive_sha256": "776f6d4b1883c78c7d1eaafa23a936fe82d6cc2220bfb9631ec3598b5e342df4"
+  },
+  "proofs": {
+    "launcher_sha256": "eb37c7d2699ff89963932dd56afcd5612e72a83b9f3d5efab871c64b189e4657",
+    "chat_template_sha256": "e57684bae4156211a55473c5a63be976a405a37ab5be5ae0e5abf1df5349c4b2",
+    "frspec_map_sha256": "becfa41d394b86c26c632bea8f3c6ea64bbb76d7b238d8673c06afae21269f25",
+    "frspec_manifest_sha256": "5f5e778589c7740167b34f7c084ae418bd00497ef81026f29f2ac835b278bbd9",
+    "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "ple_plugin_source_inventory_sha256": "34ddf6eff174cf1bc3938930a595c4e544f46e1951cf166695a3324d491a8c5f",
+    "seccomp_sha256": "c7a33fb8ae1f8346356a61ce833d579c45acf2bc94967c6763634e81010ff816"
+  },
+  "ple": {
+    "materialization": "derive_from_signed_snapshot_v1",
+    "source_config_sha256": "e765305daba0951974308f4d32c075b52a6a45974730d273f2216718a994d624",
+    "source_index_sha256": "da5ca9c3b65e48e151329e64e141c2fa700bf2f99aec53cc014e4b52a6ff7a84",
+    "table_relpath": "ple/layer-0.bin",
+    "table_bytes": 51200245760,
+    "table_sha256": "b070f9644adf93794d8a1030584ab705809387e64396a9327a68fa3a3a6666b3",
+    "table_rows": 320001536,
+    "table_columns": 160,
+    "table_dtype": "float8_e4m3fn",
+    "portable_manifest_bytes": 2563,
+    "portable_manifest_sha256": "f3a5a692d577457a1b6166ec17b3006ebc55804812400ac3a7bfaa3ce5af75bd",
+    "reader_version": "0.2.0+pennyroyal2"
+  },
+  "runtime": {
+    "image": "lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1",
+    "security_profile": {
+      "kind": "docker_29_1_3_default_plus_io_uring_v1",
+      "sidecar": "seccomp_profile",
+      "bytes": 16286,
+      "sha256": "c7a33fb8ae1f8346356a61ce833d579c45acf2bc94967c6763634e81010ff816"
+    },
+    "resource_profile": "single_sm120_96g_hostnet_hostipc_v1",
+    "launch_profile": "pennyroyal_flash_next_frspec_524k_nvme_v1",
+    "provider_max_concurrent": 2,
+    "scheduler_max_running_requests": 4,
+    "reasoning_default": "xhigh",
+    "reasoning_overrides": [
+      "low",
+      "medium",
+      "xhigh"
+    ]
+  }
+}

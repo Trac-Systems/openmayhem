@@ -1,0 +1,91 @@
+{
+  "schema_version": 1,
+  "status": "blocked_pending_focused_runtime_canaries",
+  "artifact_engine": "openai-compatible",
+  "openai_compatible": {
+    "schema_version": 1,
+    "runtime_id": "pennyroyal",
+    "runtime_version": "2.5.0",
+    "runtime_revision": "2c675da096939cb01102f8f4871bda3db55f7f28",
+    "implementation": "sglang",
+    "implementation_version": "0.0.0.dev1+gd91c3682b",
+    "container_image_digest": "sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1",
+    "served_model": "Qwen/Qwen3.8-Flash-Next",
+    "native_context": 262144,
+    "served_context": 524288,
+    "max_concurrent": 2,
+    "capabilities": [
+      "cancellation",
+      "image",
+      "json",
+      "prefix_cache",
+      "reasoning",
+      "streaming",
+      "tools",
+      "video"
+    ],
+    "preflight": {
+      "non_reasoning_chat_template_kwargs": {
+        "enable_thinking": false
+      },
+      "reasoning_chat_template_kwargs": {
+        "enable_thinking": true,
+        "preserve_thinking": true,
+        "reasoning_effort": "xhigh"
+      },
+      "streaming_max_tokens": 32,
+      "tools_max_tokens": 384,
+      "json_max_tokens": 256,
+      "reasoning_max_tokens": 1024,
+      "cache_max_tokens": 32,
+      "cancellation_max_tokens": 4096,
+      "concurrency_max_tokens": 4096,
+      "cancellation_idle_metrics": [
+        "sglang:num_queue_reqs",
+        "sglang:num_running_reqs"
+      ],
+      "concurrency_active_metric": "sglang:num_running_reqs"
+    },
+    "server_info_checks": {
+      "/chunked_prefill_size": 4096,
+      "/context_length": 524288,
+      "/default_chat_template_kwargs/enable_thinking": true,
+      "/default_chat_template_kwargs/preserve_thinking": true,
+      "/default_chat_template_kwargs/reasoning_effort": "xhigh",
+      "/disable_cuda_graph": false,
+      "/disable_radix_cache": false,
+      "/dtype": "bfloat16",
+      "/enable_hierarchical_cache": true,
+      "/hicache_io_backend": "kernel",
+      "/hicache_size": 32,
+      "/hicache_storage_backend": "nixl",
+      "/kv_cache_dtype": "fp8_e4m3",
+      "/load_format": "safetensors",
+      "/max_mamba_cache_size": 24,
+      "/max_running_requests": 4,
+      "/max_total_num_tokens": 824384,
+      "/max_total_tokens": 824384,
+      "/page_size": 64,
+      "/quantization": "modelopt_fp4",
+      "/reasoning_parser": "qwen3",
+      "/served_model_name": "Qwen/Qwen3.8-Flash-Next",
+      "/speculative_algorithm": "EAGLE",
+      "/speculative_eagle_topk": 1,
+      "/speculative_num_draft_tokens": 4,
+      "/speculative_num_steps": 3,
+      "/tool_call_parser": "qwen3_coder",
+      "/version": "0.0.0.dev1+gd91c3682b"
+    },
+    "prefix_cache_metric": "sglang:cached_tokens_total",
+    "lifecycle": "managed_or_verified_attach",
+    "snapshot_manifest_sidecar": "snapshot_manifest",
+    "snapshot_manifest_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
+    "runtime_recipe_sidecar": "runtime_recipe",
+    "runtime_recipe_sha256": "da68f39d1f631b3e69774147d779d4c28b430938428679f42dfa8f7ba1f3c1a3",
+    "model_snapshot_file_count": 419
+  },
+  "publication_blockers": [
+    "Rerun focused native-provider identity and functional canaries after changing the served model name from pennyroyal to Qwen/Qwen3.8-Flash-Next and the default reasoning effort from medium to xhigh.",
+    "Validate every server_info_checks pointer against the native provider's final attached runtime response."
+  ]
+}
