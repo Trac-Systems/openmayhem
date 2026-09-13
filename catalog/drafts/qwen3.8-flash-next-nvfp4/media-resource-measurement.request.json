@@ -4,8 +4,8 @@
   "model_id": "Qwen/Qwen3.8-Flash-Next",
   "artifact_root_kind": "blake3_merkle_v1",
   "artifact_root": "78191c28fa91602e536baa8ede39891d6d500615086ce2ba42cb920c3b46eabe",
-  "mirror_revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
-  "runtime_recipe_sha256": "6c4e24903656268db5385e5e225d11e0666d3573719cf99cb6f468ef29749c67",
+  "mirror_revision": "398100a9198b145aea3670140064a13a6ec41069",
+  "runtime_recipe_sha256": "b4ed3ace8fcf513c6e79b9a1efe30700a6603ff853354181485cadc7c5297c5d",
   "route_envelope": {
     "max_input_files_total": 3,
     "media_items_processed_per_turn": 1,

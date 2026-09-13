@@ -11,9 +11,9 @@ must not be used to mutate the live ledger.
 - Calibrated upstream artifact:
   `RadixArk/Qwen3.8-Flash-Next-NVFP4@7b719225242aacd3dbd3f9407468c2ee9a9d2594`.
 - Immutable catalog mirror:
-  `TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4@5cc87d1eceade9cef91f143a184dee7e6475bc8d`.
+  `TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4@398100a9198b145aea3670140064a13a6ec41069`.
   Independent post-upload verification found exactly 425 files and
-  135,318,119,812 bytes, with no path, size, or content-identity mismatch.
+  135,318,119,956 bytes, with no path, size, or content-identity mismatch.
 - Calibrated snapshot: 419 files and 135,253,622,894 bytes. Its unchanged
   `download-manifest.json` has SHA-256
   `5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374`.
@@ -56,13 +56,11 @@ the operator already has such a license.
   auxiliary n-gram embeddings and MTP component must be described in notes
   rather than added to this field.
 - `tier`: `launch`
-- `min_app_version`: `0.2.206`, the first release that preserves the signed PLE
-  reader wheel filename during offline installation, maps managed preparation
-  containers to the provider uid/gid, accepts the signed source Git identity,
-  validates all signed reasoning preflight controls together, observes the
-  signed concurrency gauge while bounded probe workers remain live, derives
-  boundary-independent OpenAI-compatible calibration units, accepts signed
-  runtime KV-cache metadata, and separates video input from video output caps.
+- `min_app_version`: `0.2.207`, the first release whose signed Flash-Next
+  launch profile enables deterministic inference with the compatible Triton
+  linear-attention prefill backend while preserving FlashInfer decode, radix
+  cache, hierarchical cache, and the previously validated managed-runtime
+  admission controls.
 - `provenance.license`: `qwen-community-1.0`
 - `provenance.license_sha256`:
   `a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08`
@@ -104,17 +102,17 @@ binding is prepared in `runtime-binding.template.json`. It pins Pennyroyal
 The binding uses lifecycle `managed_or_verified_attach`, advertises maximum
 concurrency 2, and contains no endpoint or host location.
 
-The retained direct runtime advertised backend model name `pennyroyal` and set
-the startup `reasoning_effort` default to `medium`. Both conflict with the
-public contract. The managed recipe must use served model name
-`Qwen/Qwen3.8-Flash-Next` and startup default `xhigh`; `/v1/models` and signed
-`/server_info` checks must agree. This semantic-only recipe correction requires
-a focused identity and functional canary rerun before activation.
+The managed wrapper changes the qualified source argv only to use the public
+served model name, the `xhigh` reasoning default, deterministic inference, and
+the required Triton linear-attention prefill backend. FlashInfer decode and the
+radix and hierarchical cache settings remain fixed. Signed `/server_info`
+checks bind these effective settings, and focused performance, resource,
+concurrency, and speciality evidence must be collected from this final profile.
 
-The final typed recipe is 3,204 bytes, SHA-256
-`6c4e24903656268db5385e5e225d11e0666d3573719cf99cb6f468ef29749c67`,
+The final typed recipe is 3,348 bytes, SHA-256
+`b4ed3ace8fcf513c6e79b9a1efe30700a6603ff853354181485cadc7c5297c5d`,
 and Merkle root
-`a41292018608f3f50dac61e20220e91b1ce0c9f92d0fd60842f85dbbaa801576`.
+`4f956b22efec695341cb05044330eeaa3bcc81d8b97283b8f5a3591618becfe1`.
 Its plugin source inventory contains 23 files, 3 directories, and 135,708
 bytes, with inventory SHA-256
 `b5bd6371a3974e2fa0e21ea37537a15a4262d8cc01d3315a8fac551d72cce259`.
@@ -231,7 +229,7 @@ The signed overlap probe retains `concurrency_max_tokens: 4096` with
 the first-token barriers are held, requires an observed value of at least two
 and first content from both requests, then cancels the bounded probes.
 
-Core v0.2.206 reconstructs reasoning as `<think>…</think>` followed by visible
+Core v0.2.207 reconstructs reasoning as `<think>…</think>` followed by visible
 content, then derives canonical Unicode-scalar units for calibration and live
 catalog verification. The fingerprints remain stable across upstream stream
 segmentation while normal delivery and billing remain unchanged.

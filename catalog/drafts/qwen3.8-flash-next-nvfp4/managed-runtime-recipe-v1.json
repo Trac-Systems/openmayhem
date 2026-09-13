@@ -60,7 +60,10 @@
       "sha256": "c7a33fb8ae1f8346356a61ce833d579c45acf2bc94967c6763634e81010ff816"
     },
     "resource_profile": "single_sm120_96g_hostnet_hostipc_v1",
-    "launch_profile": "pennyroyal_flash_next_frspec_524k_nvme_v1",
+    "launch_profile": "pennyroyal_flash_next_frspec_524k_nvme_deterministic_v1",
+    "deterministic_inference": true,
+    "linear_attn_prefill_backend": "triton",
+    "linear_attn_decode_backend": "flashinfer",
     "provider_max_concurrent": 2,
     "scheduler_max_running_requests": 4,
     "reasoning_default": "xhigh",

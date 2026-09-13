@@ -18,7 +18,7 @@
     "source": {
       "kind": "huggingface",
       "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-      "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
+      "revision": "398100a9198b145aea3670140064a13a6ec41069",
       "publisher_key": "huggingface-repo"
     },
     "upstream_source": {
@@ -42,7 +42,7 @@
         "source": {
           "kind": "huggingface",
           "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-          "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
+          "revision": "398100a9198b145aea3670140064a13a6ec41069",
           "publisher_key": "huggingface-repo"
         },
         "path": "runtime/pennyroyal-v2.5.0-source-2c675da096939cb01102f8f4871bda3db55f7f28.tar.gz",
@@ -55,20 +55,20 @@
         "source": {
           "kind": "huggingface",
           "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-          "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
+          "revision": "398100a9198b145aea3670140064a13a6ec41069",
           "publisher_key": "huggingface-repo"
         },
         "path": "runtime/managed-runtime-recipe-v1.json",
-        "artifact_root": "a41292018608f3f50dac61e20220e91b1ce0c9f92d0fd60842f85dbbaa801576",
+        "artifact_root": "4f956b22efec695341cb05044330eeaa3bcc81d8b97283b8f5a3591618becfe1",
         "artifact_root_kind": "blake3_merkle_v1",
-        "weights_bytes": 3204,
-        "source_sha256": "6c4e24903656268db5385e5e225d11e0666d3573719cf99cb6f468ef29749c67"
+        "weights_bytes": 3348,
+        "source_sha256": "b4ed3ace8fcf513c6e79b9a1efe30700a6603ff853354181485cadc7c5297c5d"
       },
       "seccomp_profile": {
         "source": {
           "kind": "huggingface",
           "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-          "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
+          "revision": "398100a9198b145aea3670140064a13a6ec41069",
           "publisher_key": "huggingface-repo"
         },
         "path": "runtime/docker-29.1.3-ple-io-uring.json",
@@ -81,7 +81,7 @@
         "source": {
           "kind": "huggingface",
           "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-          "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
+          "revision": "398100a9198b145aea3670140064a13a6ec41069",
           "publisher_key": "huggingface-repo"
         },
         "path": "download-manifest.json",
@@ -94,7 +94,7 @@
         "source": {
           "kind": "huggingface",
           "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-          "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
+          "revision": "398100a9198b145aea3670140064a13a6ec41069",
           "publisher_key": "huggingface-repo"
         },
         "path": "runtime/sglang_ssd_stream-0.2.0+pennyroyal2-cp312-cp312-linux_x86_64.whl",
@@ -162,11 +162,9 @@
         "/hicache_size": 32,
         "/hicache_storage_backend": "nixl",
         "/kv_cache_dtype": "fp8_e4m3",
-        "/load_format": "safetensors",
         "/max_mamba_cache_size": 24,
         "/max_running_requests": 4,
         "/max_total_num_tokens": 824384,
-        "/max_total_tokens": 824384,
         "/page_size": 64,
         "/quantization": "modelopt_fp4",
         "/reasoning_parser": "qwen3",
@@ -176,14 +174,20 @@
         "/speculative_num_draft_tokens": 4,
         "/speculative_num_steps": 3,
         "/tool_call_parser": "qwen3_coder",
-        "/version": "0.0.0.dev1+gd91c3682b"
+        "/version": "0.0.0.dev1+gd91c3682b",
+        "/attention_backend": "flashinfer",
+        "/enable_deterministic_inference": true,
+        "/linear_attn_decode_backend": "flashinfer",
+        "/linear_attn_prefill_backend": "triton",
+        "/mamba_radix_cache_strategy": "extra_buffer",
+        "/sampling_backend": "pytorch"
       },
       "prefix_cache_metric": "sglang:cached_tokens_total",
       "lifecycle": "managed_or_verified_attach",
       "snapshot_manifest_sidecar": "snapshot_manifest",
       "snapshot_manifest_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
       "runtime_recipe_sidecar": "runtime_recipe",
-      "runtime_recipe_sha256": "6c4e24903656268db5385e5e225d11e0666d3573719cf99cb6f468ef29749c67",
+      "runtime_recipe_sha256": "b4ed3ace8fcf513c6e79b9a1efe30700a6603ff853354181485cadc7c5297c5d",
       "model_snapshot_file_count": 419
     }
   },
