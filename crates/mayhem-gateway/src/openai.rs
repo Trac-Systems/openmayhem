@@ -98,7 +98,7 @@ use mayhem_proto::{
     default_ctx_bracket_schedule, default_model_class, metered_output_units,
     parse_record_usage_receipt_envelope, payload_chunk_at, payload_chunk_manifest,
     receipt_signing_bytes, record_usage_receipt_feature_key_for_contract,
-    record_usage_receipt_signing_bytes, RECOVERABLE_RECEIPT_CONTRACT_VERSION,
+    record_usage_receipt_signing_bytes, RECOVERABLE_RECEIPT_CONTRACT_VERSION, receipt_contract_version_is_supported,
     session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
     stable_json_bytes, tools_only_model_input_prompt_units, validate_transcription_result,
     validated_audio_metadata, validated_wav_audio_metadata, vllm_execution_mode_binding,
@@ -3825,8 +3825,7 @@ async fn reconcile_pending_gateway_job_once(
     )?;
     recovery = persist_gateway_job_recovery_feature(state, id, recovery, feature.clone()).await?;
     if feature.pointer("/value/contract_version").and_then(Value::as_u64)
-        .is_some_and(|version| version == u64::from(CONTRACT_VERSION)
-            || version == u64::from(RECOVERABLE_RECEIPT_CONTRACT_VERSION))
+        .is_some_and(receipt_contract_version_is_supported)
     {
         let publisher = state
             .receipt_settlement_publisher
@@ -48251,85 +48250,87 @@ mod tests {
 
     #[tokio::test]
     async fn contract_upgrade_resubmits_v191_context_receipts_without_rewriting() {
-        let root = tempfile::tempdir().unwrap();
-        let jobs_dir = root.path().join("jobs");
-        let seed = test_user_seed();
-        let state = GatewayState::fixture()
-            .with_receipt_user_seed(seed)
-            .with_job_store_dir(jobs_dir.clone())
+        for recovery_version in [23, 24] {
+            let root = tempfile::tempdir().unwrap();
+            let jobs_dir = root.path().join("jobs");
+            let seed = test_user_seed();
+            let state = GatewayState::fixture()
+                .with_receipt_user_seed(seed)
+                .with_job_store_dir(jobs_dir.clone())
+                .unwrap();
+            let model = test_model();
+            let job = match prepare_gateway_job(
+                &state,
+                &HeaderMap::new(),
+                mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+                &model.id,
+                &json!({"model": model.id, "prompt": "contract upgrade recovery"}),
+                &None,
+            )
+            .await
+            .unwrap()
+            {
+                PreparedGatewayJob::Started(job) => job,
+                _ => panic!("fresh job expected"),
+            };
+            let id = job.id.clone();
+            let mut invocation = test_invocation();
+            invocation.transport_peer = Some("ab".repeat(32));
+            invocation.job = Some(job);
+            let output = test_chat_output();
+            let mut provider_receipt = test_provider_receipt(
+                &model, &test_chat_request(&model.id), &output, &invocation,
+            );
+            let billed_usage = provider_receipt.body.usage.clone();
+            provider_receipt.body.usage_attribution.insert("context_input_tokens".into(), 1200);
+            provider_receipt.enclave_sig = sign_hex(
+                &test_enclave_seed(), &receipt_signing_bytes(&provider_receipt.body).unwrap(),
+            );
+            let ack = receipt_ack_for_body(&seed, &provider_receipt.body).unwrap();
+            let result = chat_job_result(&output);
+            stage_completed_invocation_job(
+                &invocation, result.clone(), &output.artifacts, &provider_receipt, &ack,
+            )
+            .await
             .unwrap();
-        let model = test_model();
-        let job = match prepare_gateway_job(
-            &state,
-            &HeaderMap::new(),
-            mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
-            &model.id,
-            &json!({"model": model.id, "prompt": "contract upgrade recovery"}),
-            &None,
-        )
-        .await
-        .unwrap()
-        {
-            PreparedGatewayJob::Started(job) => job,
-            _ => panic!("fresh job expected"),
-        };
-        let id = job.id.clone();
-        let mut invocation = test_invocation();
-        invocation.transport_peer = Some("ab".repeat(32));
-        invocation.job = Some(job);
-        let output = test_chat_output();
-        let mut provider_receipt = test_provider_receipt(
-            &model, &test_chat_request(&model.id), &output, &invocation,
-        );
-        let billed_usage = provider_receipt.body.usage.clone();
-        provider_receipt.body.usage_attribution.insert("context_input_tokens".into(), 1200);
-        provider_receipt.enclave_sig = sign_hex(
-            &test_enclave_seed(), &receipt_signing_bytes(&provider_receipt.body).unwrap(),
-        );
-        let ack = receipt_ack_for_body(&seed, &provider_receipt.body).unwrap();
-        let result = chat_job_result(&output);
-        stage_completed_invocation_job(
-            &invocation, result.clone(), &output.artifacts, &provider_receipt, &ack,
-        )
-        .await
-        .unwrap();
-        let mut feature = test_receipt_settlement_feature(&provider_receipt, &ack);
-        feature["value"]["contract_version"] = json!(RECOVERABLE_RECEIPT_CONTRACT_VERSION);
-        assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_err());
-        let historical_receipt = parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
-        feature["key"] = json!(record_usage_receipt_feature_key_for_contract(
-            &historical_receipt, RECOVERABLE_RECEIPT_CONTRACT_VERSION,
-        ));
-        feature["value"]["provider_sig"] = json!(sign_hex(
-            &test_provider_seed(),
-            &record_usage_receipt_signing_bytes(feature["key"].as_str().unwrap(), &feature["value"]).unwrap(),
-        ));
-        assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_ok());
-        assert!(validate_receipt_settlement_feature_for_receipt(&provider_receipt, &ack, &feature).is_err());
-        invocation.job.as_ref().unwrap()
-            .persist_reconciliation_settlement_feature(feature.clone()).await.unwrap();
-        drop(invocation);
-        drop(state);
-        let publisher = Arc::new(RecordingReceiptSettlementPublisher::default());
-        let restarted = GatewayState::fixture()
-            .with_receipt_user_seed(seed)
-            .with_job_store_dir(jobs_dir.clone()).unwrap()
-            .with_receipt_settlement_publisher(publisher.clone());
-        let deliveries = Arc::new(Mutex::new(Vec::new()));
-        let transport = RecordingReceiptAckRecoveryTransport {
-            expected_ack: ack, feature: feature.clone(), deliveries: deliveries.clone(),
-        };
-        let balance = restarted.ledger_balance_au();
-        reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-        reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-        let completed = restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
-        assert_eq!(completed.status, GatewayJobStatus::Completed);
-        assert_eq!(completed.result, Some(result));
-        assert_eq!(completed.receipt.as_ref().unwrap().pointer("/reconciliation/settlement_feature"), Some(&feature));
-        assert_eq!(*publisher.features.lock_recover("test published features"), vec![feature]);
-        assert!(deliveries.lock_recover("test deliveries").is_empty(), "no model or ACK redispatch");
-        assert_eq!(restarted.ledger_balance_au(), balance);
-        assert_eq!(provider_receipt.body.usage, billed_usage);
+            let mut feature = test_receipt_settlement_feature(&provider_receipt, &ack);
+            feature["value"]["contract_version"] = json!(recovery_version);
+            assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_err());
+            let historical_receipt = parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
+            feature["key"] = json!(record_usage_receipt_feature_key_for_contract(
+                &historical_receipt, recovery_version,
+            ));
+            feature["value"]["provider_sig"] = json!(sign_hex(
+                &test_provider_seed(),
+                &record_usage_receipt_signing_bytes(feature["key"].as_str().unwrap(), &feature["value"]).unwrap(),
+            ));
+            assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_ok());
+            assert!(validate_receipt_settlement_feature_for_receipt(&provider_receipt, &ack, &feature).is_err());
+            invocation.job.as_ref().unwrap()
+                .persist_reconciliation_settlement_feature(feature.clone()).await.unwrap();
+            drop(invocation);
+            drop(state);
+            let publisher = Arc::new(RecordingReceiptSettlementPublisher::default());
+            let restarted = GatewayState::fixture()
+                .with_receipt_user_seed(seed)
+                .with_job_store_dir(jobs_dir.clone()).unwrap()
+                .with_receipt_settlement_publisher(publisher.clone());
+            let deliveries = Arc::new(Mutex::new(Vec::new()));
+            let transport = RecordingReceiptAckRecoveryTransport {
+                expected_ack: ack, feature: feature.clone(), deliveries: deliveries.clone(),
+            };
+            let balance = restarted.ledger_balance_au();
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
+            let completed = restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
+            assert_eq!(completed.status, GatewayJobStatus::Completed);
+            assert_eq!(completed.result, Some(result));
+            assert_eq!(completed.receipt.as_ref().unwrap().pointer("/reconciliation/settlement_feature"), Some(&feature));
+            assert_eq!(*publisher.features.lock_recover("test published features"), vec![feature]);
+            assert!(deliveries.lock_recover("test deliveries").is_empty(), "no model or ACK redispatch");
+            assert_eq!(restarted.ledger_balance_au(), balance);
+            assert_eq!(provider_receipt.body.usage, billed_usage);
+        }
     }
 
     #[tokio::test]

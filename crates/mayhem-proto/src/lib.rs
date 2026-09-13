@@ -63,9 +63,17 @@ pub use validated_audio::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
-pub const CONTRACT_VERSION: u32 = 24;
-/// Only retained schema-11 receipt settlement features may use this prior version.
+pub const CONTRACT_VERSION: u32 = 25;
+/// Retained schema-11 receipt settlement features accepted across the v25 upgrade.
+pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24];
+/// Historical fixture version; use receipt_contract_version_is_supported for admission.
 pub const RECOVERABLE_RECEIPT_CONTRACT_VERSION: u32 = 23;
+pub fn receipt_contract_version_is_supported(version: u64) -> bool {
+    version == u64::from(CONTRACT_VERSION)
+        || RECOVERABLE_RECEIPT_CONTRACT_VERSIONS
+            .iter()
+            .any(|prior| version == u64::from(*prior))
+}
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const ATTESTATION_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -5381,5 +5389,18 @@ mod tests {
             after_final.push(chunks[1].clone()).unwrap_err(),
             PayloadChunkError::ChunkAfterFinal { .. }
         ));
+    }
+}
+
+#[cfg(test)]
+mod market_version_bridge_tests {
+    #[test]
+    fn receipt_recovery_accepts_v23_v24_and_v25_only() {
+        for version in [23, 24, 25] {
+            assert!(super::receipt_contract_version_is_supported(version));
+        }
+        for version in [0, 22, 26, u64::MAX] {
+            assert!(!super::receipt_contract_version_is_supported(version));
+        }
     }
 }

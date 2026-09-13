@@ -37,18 +37,12 @@ const EPOCH_OPERATING_PARAM_VALUES = {
   fee_bps: 1_200,
   dispute_deposit_au: '2000000',
   payout_min_au: '500000',
-  price_min_bps: 2_000,
+  price_min_bps: 2_500,
   price_max_bps: 30_000,
   price_rate_limit_seconds: 900,
-  market_target_utilization_bps: 7_500,
   market_ema_alpha_bps: 4_000,
   market_gain_bps: 6_000,
   market_max_step_bps: 1_500,
-  market_cold_start_min_providers: 5,
-  market_provider_epoch_target_au: '2000000',
-  market_max_utilization_bps: 60_000,
-  market_below_target_discount_bps: 1_000,
-  market_above_target_slope_bps: 20_000,
   epoch_seconds: 7_200,
   challenge_epochs: 3,
   max_apply_batch: 2_500,
@@ -297,8 +291,8 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
         rate_staleness_seconds: 120,
         uptime_tick_seconds: 1_800,
         price_rate_limit_seconds: 900,
-        market_target_utilization_bps: 7_500,
-        market_provider_epoch_target_au: '2000000',
+        market_gain_bps: 7_500,
+        market_ema_alpha_bps: 2_000,
         param_activation_delay_seconds: 3_600,
       },
     }),
@@ -325,8 +319,8 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
       'rate_staleness_seconds',
       'uptime_tick_seconds',
       'price_rate_limit_seconds',
-      'market_target_utilization_bps',
-      'market_provider_epoch_target_au',
+      'market_gain_bps',
+      'market_ema_alpha_bps',
       'param_activation_delay_seconds',
     ]),
     outsider.publicKey,
@@ -346,8 +340,8 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
     rate_staleness_seconds: 120,
     uptime_tick_seconds: 1_800,
     price_rate_limit_seconds: 900,
-    market_target_utilization_bps: 7_500,
-    market_provider_epoch_target_au: '2000000',
+    market_gain_bps: 7_500,
+    market_ema_alpha_bps: 2_000,
     param_activation_delay_seconds: 3_600,
   });
 });
@@ -365,7 +359,7 @@ test('MayhemContract epoch and market epoch controls are admin-governed params',
   );
   assert.deepEqual(
     contractEpochAdminParamKeys().sort(),
-    Object.keys(definitions).sort()
+    Object.keys(definitions).filter((key) => !definitions[key].deprecated).sort()
   );
   assert.deepEqual(
     Object.keys(epochDefinitions).sort(),

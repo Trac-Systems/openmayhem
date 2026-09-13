@@ -421,8 +421,9 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
       ctx_bracket: priceCtxBracket,
       ctx_bracket_table_ver: priceCtxBracketTableVer,
       ver: 2,
-      utilization_bps: 50_000,
-      ema_utilization_bps: 8_500,
+      momentum_bps: 10_000,
+      activity_rate: null,
+      ema_activity_rate: null,
       active_supply: 1,
       active_demand_au: '10000000',
       frozen: true,
@@ -434,7 +435,7 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
 
   const schedule = await storage.get(priceKey);
   assert.equal(schedule.value.current.ver, 2);
-  assert.equal(schedule.value.current.price_source, 'admin_seed_cold_start');
+  assert.equal(schedule.value.current.price_source, 'market_activity_hold');
   assert.deepEqual(schedule.value.current.rate_map, textRateMap(18, 55));
   const priceRoot = (await storage.get('ev/price/1')).value;
   assert.equal(priceRoot.merkle_root, applied.price_root);
@@ -487,178 +488,7 @@ test('MayhemContract epochApply counts settled-work supply, not idle joined wall
   assert.equal(derivation.controller.frozen, true);
 });
 
-test('MayhemContract epochApply floats market price from settled usage with clamp and damping', async () => {
-  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
-  const user = await makeIdentity();
-  const providerTwo = await makeIdentity();
 
-  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
-  assert.equal(seeded.ok, true, seeded.message);
-  const joined = await execute(
-    contract,
-    storage,
-    'joinEnclave',
-    providerJoin,
-    provider.publicKey,
-    6
-  );
-  assert.equal(joined.ok, true, joined.message);
-  await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 7);
-  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
-
-  const highDemandValue = {
-    op: 'epoch_apply',
-    epoch: 1,
-    at: 43_201,
-    debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
-    earnings: [
-      { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
-      { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
-    ],
-    market_usage: [makeMarketUsage(2_000_000, 4, { provider_count: 2 })],
-  };
-  await seedSpendHoldsForApply(storage, highDemandValue);
-  const highDemand = await executeEpochApplyFeature(
-    contract,
-    storage,
-    highDemandValue,
-    admin.publicKey
-  );
-  assert.equal(highDemand.ok, true, highDemand.message);
-  assert.deepEqual(
-    { ...highDemand.market_prices[0], derivation_hash: '<hash>' },
-    {
-      enclave_id: enclaveId,
-      ctx_bracket: priceCtxBracket,
-      ctx_bracket_table_ver: priceCtxBracketTableVer,
-      ver: 2,
-      utilization_bps: 10_000,
-      ema_utilization_bps: 8_875,
-      active_supply: 2,
-      active_demand_au: '2000000',
-      frozen: false,
-      derivation_hash: '<hash>',
-    }
-  );
-  assertHash(highDemand.market_prices[0].derivation_hash);
-  let schedule = await storage.get(priceKey);
-  const raised = schedule.value.current;
-  assert.equal(raised.ver, 2);
-  assert.equal(raised.price_source, 'market_float');
-  assert.equal(raised.seed.ver, 1);
-  assert.equal(rateFor(raised.rate_map, 'input_token'), '19');
-  assert.equal(rateFor(raised.rate_map, 'output_token'), '60');
-  assert.ok(Number(rateFor(raised.rate_map, 'input_token')) <= Math.floor(18 * 1.1));
-  assert.ok(Number(rateFor(raised.rate_map, 'output_token')) <= Math.floor(55 * 1.1));
-
-  const lowDemandValue = {
-    op: 'epoch_apply',
-    epoch: 2,
-    at: 46_801,
-    debits: [{ rail: 'fiat', user: user.publicKey, au: '10000' }],
-    earnings: [
-      { rail: 'fiat', provider: provider.publicKey, gross_au: '5000' },
-      { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '5000' },
-    ],
-    market_usage: [makeMarketUsage(10_000, 1, { provider_count: 2 })],
-  };
-  await seedSpendHoldsForApply(storage, lowDemandValue);
-  const lowDemand = await executeEpochApplyFeature(
-    contract,
-    storage,
-    lowDemandValue,
-    admin.publicKey
-  );
-  assert.equal(lowDemand.ok, true, lowDemand.message);
-  schedule = await storage.get(priceKey);
-  const lowered = schedule.value.current;
-  assert.equal(lowered.ver, 3);
-  assert.equal(rateFor(lowered.rate_map, 'input_token'), '18');
-  assert.ok(Number(rateFor(lowered.rate_map, 'output_token')) < Number(rateFor(raised.rate_map, 'output_token')));
-
-  const reseed = await execute(
-    contract,
-    storage,
-    'setPrice',
-    makePrice({ rate_map: textRateMap(19, 56), effective_at: 43_202 }),
-    admin.publicKey,
-    10
-  );
-  assert.equal(reseed.ok, true, reseed.message);
-  assert.equal(reseed.ver, 4);
-});
-
-test('MayhemContract clamps sustained market steps to the active absolute model-reference band', async () => {
-  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
-  const user = await makeIdentity();
-  const tuned = await execute(
-    contract,
-    storage,
-    'setParams',
-    {
-      op: 'set_params',
-      submitted_at: 0,
-      effective_at: DAY_SECONDS,
-      values: {
-        price_min_bps: 5_000,
-        price_max_bps: 10_000,
-        market_cold_start_min_providers: 1,
-      },
-    },
-    admin.publicKey,
-    5
-  );
-  assert.equal(tuned.ok, true, tuned.message);
-  const seeded = await execute(
-    contract,
-    storage,
-    'setPrice',
-    makePrice({ effective_at: DAY_SECONDS }),
-    admin.publicKey,
-    6
-  );
-  assert.equal(seeded.ok, true, seeded.message);
-  const joined = await execute(
-    contract,
-    storage,
-    'joinEnclave',
-    providerJoin,
-    provider.publicKey,
-    7
-  );
-  assert.equal(joined.ok, true, joined.message);
-  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 100_000_000));
-
-  for (let epoch = 1; epoch <= 8; epoch += 1) {
-    const applyValue = {
-      op: 'epoch_apply',
-      epoch,
-      at: DAY_SECONDS + epoch * 3_600,
-      debits: [{ rail: 'fiat', user: user.publicKey, au: '1000000' }],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' }],
-      market_usage: [makeMarketUsage(1_000_000, 4)],
-    };
-    await seedSpendHoldsForApply(storage, applyValue);
-    const applied = await executeEpochApplyFeature(
-      contract,
-      storage,
-      applyValue,
-      admin.publicKey
-    );
-    assert.equal(applied.ok, true, applied.message);
-    const current = (await storage.get(priceKey)).value.current;
-    assert.ok(BigInt(rateFor(current.rate_map, 'input_token')) <= 20n);
-    assert.ok(BigInt(rateFor(current.rate_map, 'output_token')) <= 60n);
-  }
-
-  const current = (await storage.get(priceKey)).value.current;
-  assert.equal(rateFor(current.rate_map, 'input_token'), '20');
-  assert.equal(rateFor(current.rate_map, 'output_token'), '60');
-  assert.equal(contract.validateRateMapBounds(current.rate_map, textRateMap(20, 60), {
-    price_min_bps: 5_000,
-    price_max_bps: 10_000,
-  }), null);
-});
 
 test('MayhemContract market price math supports sub-micro atto price steps', async () => {
   const { contract } = await setupRegisteredEnclave();
@@ -766,9 +596,6 @@ test('MayhemContract market price derivation uses active admin-tuned epoch param
       submitted_at: 0,
       effective_at: DAY_SECONDS,
       values: {
-        market_target_utilization_bps: 7_500,
-        market_provider_epoch_target_au: '2000000',
-        market_cold_start_min_providers: 1,
         market_gain_bps: 10_000,
         market_max_step_bps: 10_000,
       },
@@ -810,195 +637,17 @@ test('MayhemContract market price derivation uses active admin-tuned epoch param
   assert.equal(applied.ok, true, applied.message);
   const derivation = (await storage.get(priceEvidenceKey)).value;
   assert.deepEqual(derivation.controller.constants, {
-    target_utilization_bps: 7_500,
+    schema_version: 2,
     ema_alpha_bps: 2_500,
     gain_bps: 10_000,
     max_step_bps: 10_000,
-    cold_start_min_providers: 1,
-    provider_epoch_target_au: '2000000',
-    max_utilization_bps: 50_000,
-    below_target_discount_bps: 2_500,
-    above_target_slope_bps: 15_000,
+    max_momentum_bps: 50_000,
   });
-  assert.equal(derivation.controller.utilization_bps, 5_000);
+  assert.equal(derivation.controller.momentum_bps, 10_000);
+  assert.equal(derivation.controller.frozen_reason, 'missing_canonical_activity');
 });
 
-test('MayhemContract anchors committed price derivations with epoch evidence roots', async () => {
-  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
-  const user = await makeIdentity();
-  const providerTwo = await makeIdentity();
-  const submitter = await makeIdentity();
 
-  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
-  assert.equal(seeded.ok, true, seeded.message);
-  const joined = await execute(
-    contract,
-    storage,
-    'joinEnclave',
-    providerJoin,
-    provider.publicKey,
-    6
-  );
-  assert.equal(joined.ok, true, joined.message);
-  await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 7);
-  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
-
-  const applyValue = {
-    op: 'epoch_apply',
-    epoch: 1,
-    at: 43_201,
-    debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
-    earnings: [
-      { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
-      { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
-    ],
-    market_usage: [makeMarketUsage(2_000_000, 1, { provider_count: 2 })],
-  };
-  const usageRoot = '2'.repeat(64);
-  const roots = {
-    dep: '1'.repeat(64),
-    use: usageRoot,
-    earn: '3'.repeat(64),
-    fee: '4'.repeat(64),
-    price: '0'.repeat(64),
-  };
-  const totals = {
-    dep_count: 0,
-    dep_au: '0',
-    use_count: 1,
-    use_au: '2000000',
-    provider_count: 2,
-    earn_au: '1700000',
-    fee_au: '300000',
-    fee_cum_au: '300000',
-    burn_au: '0',
-    burn_cum_au: '0',
-    price_count: 1,
-  };
-
-  const simStorage = MemoryStorage.fromSnapshotBytes(storage.snapshotBytes());
-  await seedSpendHoldsForApply(simStorage, applyValue);
-  const simApply = await executeEpochApplyFeature(contract, simStorage, applyValue, admin.publicKey);
-  assert.equal(simApply.ok, true, simApply.message);
-  const simDerivation = (await simStorage.get(priceEvidenceKey)).value;
-  roots.price = await contract.priceDerivationRoot([
-    {
-      ...simDerivation,
-      usage: {
-        ...simDerivation.usage,
-        usage_root: usageRoot,
-      },
-    },
-  ]);
-
-  const commit = await execute(
-    contract,
-    storage,
-    'epochCommit',
-    { op: 'epoch_commit', epoch: 1, at: 43_201, roots, totals },
-    submitter.publicKey,
-    20
-  );
-  assert.equal(commit.ok, true, commit.message);
-
-  await seedSpendHoldsForApply(storage, applyValue);
-  const applied = await executeEpochApplyFeature(
-    contract,
-    storage,
-    { ...applyValue, roots, totals },
-    admin.publicKey
-  );
-  assert.equal(applied.ok, true, applied.message);
-  assert.equal(applied.price_root, roots.price);
-
-  const priceRoot = (await storage.get('ev/price/1')).value;
-  assert.equal(priceRoot.type, 'price_root');
-  assert.equal(priceRoot.merkle_root, roots.price);
-  assert.equal(priceRoot.price_count, 1);
-  const derivation = (await storage.get(priceEvidenceKey)).value;
-  assert.equal(derivation.price_root, roots.price);
-  assert.equal(derivation.usage.usage_root, usageRoot);
-  assert.equal(derivation.controller.utilization_bps, 10_000);
-});
-
-test('MayhemContract fraudProof voids a fabricated price derivation root', async () => {
-  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
-  const providerTwo = await makeIdentity();
-  const submitter = await makeIdentity();
-  const prover = await makeIdentity();
-
-  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
-  assert.equal(seeded.ok, true, seeded.message);
-  const joined = await execute(
-    contract,
-    storage,
-    'joinEnclave',
-    providerJoin,
-    provider.publicKey,
-    6
-  );
-  assert.equal(joined.ok, true, joined.message);
-  await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 7);
-
-  const roots = {
-    dep: '1'.repeat(64),
-    use: '2'.repeat(64),
-    earn: '3'.repeat(64),
-    fee: '4'.repeat(64),
-    price: 'f'.repeat(64),
-  };
-  const totals = {
-    dep_count: 0,
-    dep_au: '0',
-    use_count: 1,
-    use_au: '2000000',
-    provider_count: 1,
-    earn_au: '1700000',
-    fee_au: '300000',
-    fee_cum_au: '300000',
-    burn_au: '0',
-    burn_cum_au: '0',
-    price_count: 1,
-  };
-  const commit = await execute(
-    contract,
-    storage,
-    'epochCommit',
-    { op: 'epoch_commit', epoch: 1, at: 43_201, roots, totals },
-    submitter.publicKey,
-    20
-  );
-  assert.equal(commit.ok, true, commit.message);
-
-  const proof = await execute(
-    contract,
-    storage,
-    'fraudProof',
-    {
-      op: 'fraud_proof',
-      epoch: 1,
-      proof_epoch: 2,
-      at: 46_801,
-      reason: 'price_derivation',
-      price_usage: makeMarketUsage(2_000_000, 1),
-    },
-    prover.publicKey,
-    21
-  );
-  assert.equal(proof.ok, true, proof.message);
-  assert.equal(proof.banned_submitter, submitter.publicKey);
-
-  const commitRecord = (await storage.get('epoch/commit/1')).value;
-  assert.equal(commitRecord.status, 'void');
-  assert.equal(commitRecord.fraud_reason, 'price_derivation');
-  const fraudRecord = (await storage.get(`ev/fraud/1/${proof.proof_hash}`)).value;
-  assert.equal(fraudRecord.committed_price_root, roots.price);
-  assertHash(fraudRecord.expected_price_root);
-  assertHash(fraudRecord.price_derivation_hash);
-  assert.equal(fraudRecord.price_derivation.enclave_id, enclaveId);
-  assert.equal(fraudRecord.price_derivation.ctx_bracket, priceCtxBracket);
-  assert.equal(fraudRecord.price_derivation.usage.active_demand_au, '2000000');
-});
 
 test('MayhemContract keeps one enclave price while conserving mixed rail settlement', async () => {
   const { contract, storage, provider, admin } = await setupRegisteredEnclave();
@@ -1088,11 +737,12 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
       ctx_bracket: priceCtxBracket,
       ctx_bracket_table_ver: priceCtxBracketTableVer,
       ver: 2,
-      utilization_bps: 5_000,
-      ema_utilization_bps: 7_625,
+      momentum_bps: 10_000,
+      activity_rate: null,
+      ema_activity_rate: null,
       active_supply: 2,
       active_demand_au: '1000000',
-      frozen: false,
+      frozen: true,
       derivation_hash: applied.market_prices[0].derivation_hash,
     },
   ]);
@@ -1100,7 +750,7 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
 
   const schedule = await storage.get(priceKey);
   assert.equal(schedule.value.current.ver, 2);
-  assert.equal(schedule.value.current.price_source, 'market_float');
+  assert.equal(schedule.value.current.price_source, 'market_activity_hold');
   assert.equal(await storage.get(`price/${enclaveId}/fiat`), null);
   assert.equal(await storage.get(`price/${enclaveId}/tap`), null);
   assert.equal(await storage.get(`price/${enclaveId}`), null);
@@ -1490,155 +1140,6 @@ test('MayhemContract prices video workflow classes in exact pixel-frames', async
   assert.match(imageUnit.message, /input_token is not allowed for model_class workflow/i);
 });
 
-test('MayhemContract floats workflow outcome-class markets from settled utilization', async () => {
-  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
-  const user = await makeIdentity();
-  const providerTwo = await makeIdentity();
-  const workflowEnclaveId = 'e'.repeat(64);
-  const workflowModelId = 'image.light.le1_2mp';
-  const workflowRateMap = [
-    { unit: 'megapixel_step', per_unit_au: '200000000000000', granularity: 1000 },
-  ];
-  const workflowEnclave = {
-    ...enclaveRegistration,
-    enclave_id: workflowEnclaveId,
-    model_id: workflowModelId,
-    model_class: 'workflow',
-    caps: {
-      image: true,
-      output_modality: 'image',
-      output_modalities: ['image'],
-      modality_set: ['image'],
-      speciality_levels: {},
-    },
-  };
-  const workflowJoin = {
-    ...providerJoin,
-    enclave_id: workflowEnclaveId,
-    served_ctx: 0,
-    served_modalities: ['image'],
-    served_specialities: {},
-    ctx_bracket: null,
-    ctx_bracket_table_ver: null,
-  };
-
-  for (const op of [
-    {
-      type: 'registerEnclave',
-      value: workflowEnclave,
-      sender: admin.publicKey,
-      txNo: 5,
-    },
-    {
-      type: 'setModelRef',
-      value: {
-        op: 'set_model_ref',
-        model_id: workflowModelId,
-        model_class: 'workflow',
-        rate_map: workflowRateMap,
-      },
-      sender: admin.publicKey,
-      txNo: 6,
-    },
-    {
-      type: 'setPrice',
-      value: {
-        op: 'set_price',
-        enclave_id: workflowEnclaveId,
-        rate_map: workflowRateMap,
-        per_req_au: '0',
-        min_session_au: '0',
-        effective_at: 21_600,
-      },
-      sender: admin.publicKey,
-      txNo: 7,
-    },
-    {
-      type: 'joinEnclave',
-      value: workflowJoin,
-      sender: provider.publicKey,
-      txNo: 8,
-    },
-  ]) {
-    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
-    assert.equal(result.ok, true, result.message);
-  }
-
-  for (const op of [
-    {
-      type: 'consent',
-      value: {
-        op: 'consent',
-        ver: 1,
-        hash: rulesHash,
-        sig: signConsent(providerTwo.wallet, 1, rulesHash),
-      },
-      sender: providerTwo.publicKey,
-      txNo: 9,
-    },
-    {
-      type: 'registerProvider',
-      value: providerRegistration,
-      sender: providerTwo.publicKey,
-      txNo: 10,
-    },
-    {
-      type: 'joinEnclave',
-      value: workflowJoin,
-      sender: providerTwo.publicKey,
-      txNo: 11,
-    },
-  ]) {
-    const result = await execute(contract, storage, op.type, op.value, op.sender, op.txNo);
-    assert.equal(result.ok, true, result.message);
-  }
-  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
-
-  const applyValue = {
-    op: 'epoch_apply',
-    epoch: 1,
-    at: 43_201,
-    debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
-    earnings: [
-      { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
-      { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
-    ],
-    market_usage: [{
-      enclave_id: workflowEnclaveId,
-      demand_au: '2000000',
-      session_count: 4,
-      provider_count: 2,
-    }],
-  };
-  await seedSpendHoldsForApply(storage, applyValue);
-  const applied = await executeEpochApplyFeature(contract, storage, applyValue, admin.publicKey);
-  assert.equal(applied.ok, true, applied.message);
-  assert.equal(applied.market_prices.length, 1);
-  assert.deepEqual(
-    { ...applied.market_prices[0], derivation_hash: '<hash>' },
-    {
-      enclave_id: workflowEnclaveId,
-      ver: 2,
-      utilization_bps: 10_000,
-      ema_utilization_bps: 8_875,
-      active_supply: 2,
-      active_demand_au: '2000000',
-      frozen: false,
-      derivation_hash: '<hash>',
-    }
-  );
-  assertHash(applied.market_prices[0].derivation_hash);
-
-  const schedule = (await storage.get(`price/${workflowEnclaveId}`)).value;
-  assert.equal(schedule.current.price_source, 'market_float');
-  assert.equal(schedule.current.model_id, workflowModelId);
-  assert.equal(rateFor(schedule.current.rate_map, 'megapixel_step'), '220000000000000');
-  assert.equal(schedule.current.seed.rate_map[0].unit, 'megapixel_step');
-  const derivation = (await storage.get(`ev/price/1/${workflowEnclaveId}`)).value;
-  assert.equal(derivation.controller.frozen, false);
-  assert.equal(derivation.controller.active_supply, 2);
-  assert.equal(derivation.usage.active_demand_au, '2000000');
-});
 
 test('MayhemContract rejects unsafe enclave identifiers in price reads and writes', async () => {
   const provider = await makeIdentity();

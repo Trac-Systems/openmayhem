@@ -82,3 +82,14 @@ test('mainnet Pear command wires private auth files and the loopback Stripe work
   assert.match(command, /--stripe-worker-url http:\/\/127\.0\.0\.1:11436/);
   assert.doesNotMatch(command, /--sc-bridge-token /);
 });
+
+
+test('mainnet source manifests retain exact 25%-400% bands and omit deprecated price targets',()=>{
+  for (const name of ['mainnet.json','mainnet.template.json']) {
+    const manifest=JSON.parse(fs.readFileSync(new URL('../../config/beta/'+name,import.meta.url),'utf8'));
+    assert.equal(manifest.contract.params.price_min_bps,2500);
+    assert.equal(manifest.contract.params.price_max_bps,40000);
+    assert.equal(manifest.contract.params.market_provider_epoch_target_au,undefined);
+    assert.equal(manifest.contract.params.market_target_utilization_bps,undefined);
+  }
+});

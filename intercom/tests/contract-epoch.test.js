@@ -700,6 +700,8 @@ test('MayhemContract admin can seal one elapsed empty epoch and unblock later se
   assert.equal(sealed.seal_hash.length, 64);
   assert.deepEqual((await storage.get('epoch/seal/1')).value, {
     type: 'epoch_empty_seal',
+    market_price_count: 0,
+    market_price_root: await contract.priceDerivationRoot([]),
     epoch: 1,
     at: 3_600,
     epoch_seconds: 3_600,
@@ -843,6 +845,7 @@ test('MayhemContract binds active admin epoch timing into commit and apply evide
   assert.equal(commit.ok, true, commit.message);
   assert.deepEqual((await storage.get('epoch/commit/1')).value, {
     type: 'epoch_commit',
+    pricing_schema_version: 2,
     epoch: 1,
     epoch_seconds: 7_200,
     roots: roll.roots,

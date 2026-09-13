@@ -1,62 +1,24 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import {runMarketSimulation,validateMarketSimulation,formatMarketSimulationMarkdown,marketConstants} from '../scripts/market-sim.mjs';
 
-import {
-  runMarketSimulation,
-  validateMarketSimulation,
-  formatMarketSimulationMarkdown,
-  marketConstants,
-} from '../scripts/market-sim.mjs';
-
-test('market simulation uses the live contract controller constants', () => {
-  const report = runMarketSimulation();
-
-  assert.deepEqual(report.constants, marketConstants());
+test('market simulation uses live activity constants and respects step/hard bands',()=>{
+  const report=runMarketSimulation();assert.deepEqual(report.constants,marketConstants());
+  const result=validateMarketSimulation(report);assert.equal(result.ok,true,result.failures.join('\n'));
 });
-
-test('market simulation scenarios satisfy the F7 launch-gate invariants', () => {
-  const report = runMarketSimulation();
-  const validation = validateMarketSimulation(report);
-
-  assert.equal(validation.ok, true, validation.failures.join('\n'));
-  for (const scenario of Object.values(report.scenarios)) {
-    assert.ok(
-      scenario.summary.max_step_bps <= report.constants.max_step_bps,
-      `${scenario.name} exceeded per-epoch price clamp`
-    );
-    assert.ok(
-      scenario.summary.last_price_range_bps <= 350,
-      `${scenario.name} kept oscillating in the final window`
-    );
-  }
+test('one-provider and empty markets respond after a single baseline epoch',()=>{
+  const r=runMarketSimulation();
+  assert.ok(BigInt(r.scenarios.one_provider.rows[19].price_au)>BigInt(r.seed_price_au));
+  assert.ok(BigInt(r.scenarios.one_provider.rows[39].price_au)<BigInt(r.scenarios.one_provider.rows[38].price_au));
+  assert.equal(BigInt(r.scenarios.empty.summary.final_price_au),BigInt(r.seed_price_au)/4n);
+  assert.ok(BigInt(r.scenarios.empty.rows[20].price_au)<BigInt(r.scenarios.empty.rows[19].price_au), 'consecutive empty epochs keep decreasing');
 });
-
-test('thin-liquidity simulation remains pinned at P0 below S_min', () => {
-  const report = runMarketSimulation();
-  const thin = report.scenarios.thin_liquidity;
-
-  assert.equal(thin.summary.frozen_epochs, thin.epochs);
-  assert.equal(thin.summary.max_price_au, report.seed_price_au);
-  assert.equal(thin.summary.min_price_au, report.seed_price_au);
-  assert.ok(thin.rows.every((row) => row.frozen && row.price_au === report.seed_price_au));
+test('spend and phantom-provider changes do not alter market activity',()=>{
+  const r=runMarketSimulation();
+  for(const name of ['spend_spike','phantom_supply']) assert.ok(r.scenarios[name].rows.every(row=>row.price_au===r.seed_price_au));
 });
-
-test('one-epoch demand and phantom-supply attacks are bounded and recover', () => {
-  const report = runMarketSimulation();
-
-  for (const name of ['adversarial_spike', 'phantom_supply']) {
-    const scenario = report.scenarios[name];
-    assert.ok(scenario.summary.max_step_bps <= report.constants.max_step_bps);
-    assert.ok(scenario.summary.final_price_deviation_bps <= 400);
-    assert.ok(scenario.summary.final_ema_deviation_bps <= 650);
-  }
-});
-
-test('market simulation report renders the selected constants and pass verdict', () => {
-  const report = runMarketSimulation();
-  const markdown = formatMarketSimulationMarkdown(report);
-
-  assert.match(markdown, /target_utilization_bps/);
-  assert.match(markdown, /max_step_bps/);
-  assert.match(markdown, /Validation: PASS/);
+test('simulation describes activity without a dollar utilization target',()=>{
+  const markdown=formatMarketSimulationMarkdown(runMarketSimulation());
+  assert.match(markdown,/Settled activity momentum/);assert.match(markdown,/max_step_bps/);assert.match(markdown,/Validation: PASS/);
+  assert.doesNotMatch(markdown,/target_utilization_bps|provider_epoch_target_au/);
 });

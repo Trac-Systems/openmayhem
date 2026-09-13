@@ -23,6 +23,20 @@ parts, policies, and current class status live in
   verify, load, pass canary, and publish fresh heartbeats before starting the
   next worker.
 
+## Market activity calibration
+
+Contract v25 may attach admin-signed `activity_calibration` to a model reference.
+Every priced dimension requires a positive measured reference-work weight and the
+hash of its calibration evidence. Text separates prefill and decode work; media
+and workflows use their signed billed dimensions. Provider-advertised capacity
+is not a pricing input. Existing references without complete machine-readable
+weights compare each dimension against the immediately previous epoch’s actual
+activity, so no class waits
+indefinitely for calibration. Explicit null clears a bad calibration; omission
+preserves it. Changing weights establishes a fresh baseline for one epoch.
+See [the schema and algorithm](docs/knowledge/market/pricing-controller.md) and
+[the coordinated v25 migration](docs/market-activity-pricing-v25.md).
+
 ## Model Calibration
 
 A non-Comfy model is calibrated only after:
