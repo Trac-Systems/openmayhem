@@ -3217,6 +3217,12 @@ impl GatewayJobHandle {
             code: error.public_code.to_owned(),
             category: error.category.to_owned(),
             retryable: error.retryable,
+            phase: error
+                .safe_detail
+                .as_ref()
+                .and_then(|detail| detail.get("reservation_relay_phase"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         };
         let message = error.message.clone();
         let persisted = tokio::task::spawn_blocking(move || {
@@ -17146,12 +17152,31 @@ fn route_attempt_error_code(last_error: Option<&str>) -> (&'static str, &'static
     ("provider_attempts_failed", "provider_response", true)
 }
 
+fn reservation_relay_phase(last_error: Option<&str>) -> Option<&'static str> {
+    let message = last_error?;
+    let marker = "[reservation_relay_phase=";
+    let start = message.find(marker)? + marker.len();
+    let phase = message.get(start..)?.split_once(']')?.0;
+    match phase {
+        "transport_unavailable" => Some("transport_unavailable"),
+        "health_proof_unavailable" => Some("health_proof_unavailable"),
+        "protocol_incompatible" => Some("protocol_incompatible"),
+        "transport_changed" => Some("transport_changed"),
+        "transport_rejoin_failed" => Some("transport_rejoin_failed"),
+        "transport_recovering" => Some("transport_recovering"),
+        "request_send" => Some("request_send"),
+        "admin_ack" => Some("admin_ack"),
+        _ => None,
+    }
+}
+
 fn route_attempts_failed_error(
     attempts_made: usize,
     last_error: Option<String>,
     phase: &'static str,
 ) -> ApiError {
     let (code, category, retryable) = route_attempt_error_code(last_error.as_deref());
+    let reservation_relay_phase = reservation_relay_phase(last_error.as_deref());
     let message = match code {
         "request_exceeds_provider_capacity" => {
             "The request exceeds the signed capacity envelope of every otherwise eligible provider."
@@ -17190,12 +17215,15 @@ fn route_attempts_failed_error(
         "provider_verification_failed" => StatusCode::BAD_GATEWAY,
         _ => StatusCode::BAD_GATEWAY,
     };
-    ApiError::new(status, message, Some("model"), code, category, retryable).with_safe_detail(
-        json!({
-            "attempts": attempts_made,
-            "phase": phase,
-        }),
-    )
+    let mut safe_detail = json!({
+        "attempts": attempts_made,
+        "phase": phase,
+    });
+    if let Some(reservation_relay_phase) = reservation_relay_phase {
+        safe_detail["reservation_relay_phase"] = json!(reservation_relay_phase);
+    }
+    ApiError::new(status, message, Some("model"), code, category, retryable)
+        .with_safe_detail(safe_detail)
 }
 
 fn verify_provider_receipt_signature(
@@ -21063,7 +21091,7 @@ async fn settle_failed_direct_session_frame(
         let message = public_error.message.clone();
         let info = GatewayJobErrorInfo {
             code: public_error.public_code.to_owned(),
-            category: public_error.category.to_owned(), retryable: false,
+            category: public_error.category.to_owned(), retryable: false, phase: None,
         };
         tokio::task::spawn_blocking(move || store.lock_recover("gateway job vault")
             .complete_with_error_info(&id, GatewayJobStatus::ReconciliationPending,
@@ -38397,8 +38425,7 @@ mod tests {
         let error = route_attempts_failed_error(
             1,
             Some(
-                "provider rejected session abc123 with BALANCE: spend reservation did not complete"
-                    .to_owned(),
+                "provider rejected session abc123 [reservation_relay_phase=admin_ack] with BALANCE: spend reservation did not complete".to_owned(),
             ),
             "pre_spend",
         );
@@ -38411,6 +38438,10 @@ mod tests {
         assert!(!message.contains("provider rejected"));
         assert_eq!(value["error"]["safe_detail"]["attempts"], 1);
         assert_eq!(value["error"]["safe_detail"]["phase"], "pre_spend");
+        assert_eq!(
+            value["error"]["safe_detail"]["reservation_relay_phase"],
+            "admin_ack"
+        );
     }
 
     #[test]

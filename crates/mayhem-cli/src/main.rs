@@ -89576,6 +89576,22 @@ async fn provider_session_spend_reservation_decision(
     if submitted.get("ok").and_then(Value::as_bool) == Some(true) {
         return Ok(ProviderSessionDecision::Accept);
     }
+    let relay_phase = submitted
+        .get("phase")
+        .and_then(Value::as_str)
+        .filter(|phase| {
+            matches!(
+                *phase,
+                "transport_unavailable"
+                    | "health_proof_unavailable"
+                    | "protocol_incompatible"
+                    | "transport_changed"
+                    | "transport_rejoin_failed"
+                    | "transport_recovering"
+                    | "request_send"
+                    | "admin_ack"
+            )
+        });
     let reason = submitted
         .get("message")
         .and_then(Value::as_str)
@@ -89588,8 +89604,11 @@ async fn provider_session_spend_reservation_decision(
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| submitted.to_string());
+    let phase_marker = relay_phase
+        .map(|phase| format!(" [reservation_relay_phase={phase}]"))
+        .unwrap_or_default();
     Ok(reject(format!(
-        "contract spend reservation rejected before serving: {reason}"
+        "contract spend reservation rejected before serving{phase_marker}: {reason}"
     )))
 }
 
