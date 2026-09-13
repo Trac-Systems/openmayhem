@@ -25,7 +25,7 @@
     "frspec_map_sha256": "becfa41d394b86c26c632bea8f3c6ea64bbb76d7b238d8673c06afae21269f25",
     "frspec_manifest_sha256": "5f5e778589c7740167b34f7c084ae418bd00497ef81026f29f2ac835b278bbd9",
     "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
-    "ple_plugin_source_inventory_sha256": "34ddf6eff174cf1bc3938930a595c4e544f46e1951cf166695a3324d491a8c5f",
+    "ple_plugin_source_inventory_sha256": "b5bd6371a3974e2fa0e21ea37537a15a4262d8cc01d3315a8fac551d72cce259",
     "seccomp_sha256": "c7a33fb8ae1f8346356a61ce833d579c45acf2bc94967c6763634e81010ff816"
   },
   "ple": {

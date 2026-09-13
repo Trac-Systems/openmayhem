@@ -18,7 +18,7 @@
     "source": {
       "kind": "huggingface",
       "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-      "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+      "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
       "publisher_key": "huggingface-repo"
     },
     "upstream_source": {
@@ -42,7 +42,7 @@
         "source": {
           "kind": "huggingface",
           "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-          "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+          "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
           "publisher_key": "huggingface-repo"
         },
         "path": "runtime/pennyroyal-v2.5.0-source-2c675da096939cb01102f8f4871bda3db55f7f28.tar.gz",
@@ -55,20 +55,20 @@
         "source": {
           "kind": "huggingface",
           "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-          "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+          "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
           "publisher_key": "huggingface-repo"
         },
         "path": "runtime/managed-runtime-recipe-v1.json",
-        "artifact_root": "9c9ba2e9fe4b0cd4570ae5deeb58a363ee904b7a62e4bd02f6b77487f02c4666",
+        "artifact_root": "a41292018608f3f50dac61e20220e91b1ce0c9f92d0fd60842f85dbbaa801576",
         "artifact_root_kind": "blake3_merkle_v1",
         "weights_bytes": 3204,
-        "source_sha256": "7f248046c72b771620da09f36d9cf554134cc70789c3e832017f8d29dbd5b41c"
+        "source_sha256": "6c4e24903656268db5385e5e225d11e0666d3573719cf99cb6f468ef29749c67"
       },
       "seccomp_profile": {
         "source": {
           "kind": "huggingface",
           "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-          "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+          "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
           "publisher_key": "huggingface-repo"
         },
         "path": "runtime/docker-29.1.3-ple-io-uring.json",
@@ -81,7 +81,7 @@
         "source": {
           "kind": "huggingface",
           "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-          "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+          "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
           "publisher_key": "huggingface-repo"
         },
         "path": "download-manifest.json",
@@ -94,7 +94,7 @@
         "source": {
           "kind": "huggingface",
           "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-          "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+          "revision": "5cc87d1eceade9cef91f143a184dee7e6475bc8d",
           "publisher_key": "huggingface-repo"
         },
         "path": "runtime/sglang_ssd_stream-0.2.0+pennyroyal2-cp312-cp312-linux_x86_64.whl",
@@ -183,7 +183,7 @@
       "snapshot_manifest_sidecar": "snapshot_manifest",
       "snapshot_manifest_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
       "runtime_recipe_sidecar": "runtime_recipe",
-      "runtime_recipe_sha256": "7f248046c72b771620da09f36d9cf554134cc70789c3e832017f8d29dbd5b41c",
+      "runtime_recipe_sha256": "6c4e24903656268db5385e5e225d11e0666d3573719cf99cb6f468ef29749c67",
       "model_snapshot_file_count": 419
     }
   },

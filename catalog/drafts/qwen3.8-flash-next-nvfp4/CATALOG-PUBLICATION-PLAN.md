@@ -11,7 +11,7 @@ must not be used to mutate the live ledger.
 - Calibrated upstream artifact:
   `RadixArk/Qwen3.8-Flash-Next-NVFP4@7b719225242aacd3dbd3f9407468c2ee9a9d2594`.
 - Immutable catalog mirror:
-  `TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4@29292a09675f9b82e4c0b7b5c0ad028fe58ee52e`.
+  `TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4@5cc87d1eceade9cef91f143a184dee7e6475bc8d`.
   Independent post-upload verification found exactly 425 files and
   135,318,119,812 bytes, with no path, size, or content-identity mismatch.
 - Calibrated snapshot: 419 files and 135,253,622,894 bytes. Its unchanged
@@ -105,9 +105,14 @@ public contract. The managed recipe must use served model name
 a focused identity and functional canary rerun before activation.
 
 The final typed recipe is 3,204 bytes, SHA-256
-`7f248046c72b771620da09f36d9cf554134cc70789c3e832017f8d29dbd5b41c`,
+`6c4e24903656268db5385e5e225d11e0666d3573719cf99cb6f468ef29749c67`,
 and Merkle root
-`9c9ba2e9fe4b0cd4570ae5deeb58a363ee904b7a62e4bd02f6b77487f02c4666`.
+`a41292018608f3f50dac61e20220e91b1ce0c9f92d0fd60842f85dbbaa801576`.
+Its plugin source inventory contains 23 files, 3 directories, and 135,708
+bytes, with inventory SHA-256
+`b5bd6371a3974e2fa0e21ea37537a15a4262d8cc01d3315a8fac551d72cce259`.
+The earlier inventory included a generated `Cargo.lock` that is absent from the
+signed clean source bundle and is superseded.
 Its Pennyroyal source bundle is 64,070,181 bytes, SHA-256
 `776f6d4b1883c78c7d1eaafa23a936fe82d6cc2220bfb9631ec3598b5e342df4`,
 and Merkle root
