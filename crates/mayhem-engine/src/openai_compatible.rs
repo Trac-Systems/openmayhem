@@ -702,7 +702,7 @@ fn preflight_request(
         .speciality_parameters
         .extend(chat_template_kwargs.iter().map(|(native_path, value)| {
             crate::GenerateSpecialityParameter {
-                name: "runtime_preflight".to_owned(),
+                name: native_path.clone(),
                 level: "signed".to_owned(),
                 target: GenerateSpecialityTarget::ChatTemplateKwarg,
                 native_path: native_path.clone(),
@@ -1631,6 +1631,31 @@ mod tests {
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["tools"][0]["function"]["name"], "lookup");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn preflight_reasoning_controls_have_unique_safe_names() {
+        let controls = BTreeMap::from([
+            ("enable_thinking".to_owned(), json!(true)),
+            ("preserve_thinking".to_owned(), json!(true)),
+            ("reasoning_effort".to_owned(), json!("xhigh")),
+        ]);
+        let request = preflight_request("reason", 1024, &controls);
+
+        request.validate_sampling().unwrap();
+        assert_eq!(request.speciality_parameters.len(), 3);
+        assert_eq!(
+            request
+                .speciality_parameters
+                .iter()
+                .map(|parameter| (parameter.name.as_str(), parameter.native_path.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("enable_thinking", "enable_thinking"),
+                ("preserve_thinking", "preserve_thinking"),
+                ("reasoning_effort", "reasoning_effort"),
+            ]
+        );
     }
 
     #[test]
