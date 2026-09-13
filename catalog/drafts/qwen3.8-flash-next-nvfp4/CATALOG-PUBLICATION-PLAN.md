@@ -11,9 +11,9 @@ must not be used to mutate the live ledger.
 - Calibrated upstream artifact:
   `RadixArk/Qwen3.8-Flash-Next-NVFP4@7b719225242aacd3dbd3f9407468c2ee9a9d2594`.
 - Immutable catalog mirror:
-  `TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4@398100a9198b145aea3670140064a13a6ec41069`.
+  `TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4@2a6083b51de60a2a9bf035e66960e2ff7278b5ce`.
   Independent post-upload verification found exactly 425 files and
-  135,318,119,956 bytes, with no path, size, or content-identity mismatch.
+  135,318,119,991 bytes, with no path, size, or content-identity mismatch.
 - Calibrated snapshot: 419 files and 135,253,622,894 bytes. Its unchanged
   `download-manifest.json` has SHA-256
   `5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374`.
@@ -56,11 +56,11 @@ the operator already has such a license.
   auxiliary n-gram embeddings and MTP component must be described in notes
   rather than added to this field.
 - `tier`: `launch`
-- `min_app_version`: `0.2.207`, the first release whose signed Flash-Next
+- `min_app_version`: `0.2.208`, the first release whose signed Flash-Next
   launch profile enables deterministic inference with the compatible Triton
-  linear-attention prefill backend while preserving FlashInfer decode, radix
-  cache, hierarchical cache, and the previously validated managed-runtime
-  admission controls.
+  main-attention and linear-attention prefill backends while preserving
+  FlashInfer linear-attention decode, radix cache, hierarchical cache, and the
+  previously validated managed-runtime admission controls.
 - `provenance.license`: `qwen-community-1.0`
 - `provenance.license_sha256`:
   `a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08`
@@ -104,15 +104,16 @@ concurrency 2, and contains no endpoint or host location.
 
 The managed wrapper changes the qualified source argv only to use the public
 served model name, the `xhigh` reasoning default, deterministic inference, and
-the required Triton linear-attention prefill backend. FlashInfer decode and the
-radix and hierarchical cache settings remain fixed. Signed `/server_info`
-checks bind these effective settings, and focused performance, resource,
-concurrency, and speciality evidence must be collected from this final profile.
+the required Triton main-attention and linear-attention prefill backends.
+FlashInfer linear-attention decode and the radix and hierarchical cache settings
+remain fixed. Signed `/server_info` checks bind these effective settings, and
+focused performance, resource, concurrency, and speciality evidence must be
+collected from this final profile.
 
-The final typed recipe is 3,348 bytes, SHA-256
-`b4ed3ace8fcf513c6e79b9a1efe30700a6603ff853354181485cadc7c5297c5d`,
+The final typed recipe is 3,383 bytes, SHA-256
+`04ac7099a3193d30d12742c9f5df4c6244484c80f9935658d5ba643d48de6250`,
 and Merkle root
-`4f956b22efec695341cb05044330eeaa3bcc81d8b97283b8f5a3591618becfe1`.
+`27e2aa4fbe7e77adb6e68008f08cd38322231127c5cbda58032e43ea590095c2`.
 Its plugin source inventory contains 23 files, 3 directories, and 135,708
 bytes, with inventory SHA-256
 `b5bd6371a3974e2fa0e21ea37537a15a4262d8cc01d3315a8fac551d72cce259`.
@@ -229,7 +230,7 @@ The signed overlap probe retains `concurrency_max_tokens: 4096` with
 the first-token barriers are held, requires an observed value of at least two
 and first content from both requests, then cancels the bounded probes.
 
-Core v0.2.207 reconstructs reasoning as `<think>…</think>` followed by visible
+Core v0.2.208 reconstructs reasoning as `<think>…</think>` followed by visible
 content, then derives canonical Unicode-scalar units for calibration and live
 catalog verification. The fingerprints remain stable across upstream stream
 segmentation while normal delivery and billing remain unchanged.

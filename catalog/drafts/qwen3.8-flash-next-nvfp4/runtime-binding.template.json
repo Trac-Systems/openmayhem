@@ -73,7 +73,7 @@
       "/speculative_num_steps": 3,
       "/tool_call_parser": "qwen3_coder",
       "/version": "0.0.0.dev1+gd91c3682b",
-      "/attention_backend": "flashinfer",
+      "/attention_backend": "triton",
       "/enable_deterministic_inference": true,
       "/linear_attn_decode_backend": "flashinfer",
       "/linear_attn_prefill_backend": "triton",
@@ -85,11 +85,11 @@
     "snapshot_manifest_sidecar": "snapshot_manifest",
     "snapshot_manifest_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
     "runtime_recipe_sidecar": "runtime_recipe",
-    "runtime_recipe_sha256": "b4ed3ace8fcf513c6e79b9a1efe30700a6603ff853354181485cadc7c5297c5d",
+    "runtime_recipe_sha256": "04ac7099a3193d30d12742c9f5df4c6244484c80f9935658d5ba643d48de6250",
     "model_snapshot_file_count": 419
   },
   "publication_blockers": [
-    "Rerun focused native-provider identity and functional canaries after changing the served model name from pennyroyal to Qwen/Qwen3.8-Flash-Next and the default reasoning effort from medium to xhigh.",
-    "Validate every server_info_checks pointer against the native provider's final attached runtime response."
+    "Collect the focused performance, resource, concurrency, and speciality report from the exact v0.2.208 deterministic Triton runtime profile.",
+    "Validate every server_info_checks pointer against the final managed runtime response."
   ]
 }

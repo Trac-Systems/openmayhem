@@ -62,6 +62,7 @@
     "resource_profile": "single_sm120_96g_hostnet_hostipc_v1",
     "launch_profile": "pennyroyal_flash_next_frspec_524k_nvme_deterministic_v1",
     "deterministic_inference": true,
+    "attention_backend": "triton",
     "linear_attn_prefill_backend": "triton",
     "linear_attn_decode_backend": "flashinfer",
     "provider_max_concurrent": 2,

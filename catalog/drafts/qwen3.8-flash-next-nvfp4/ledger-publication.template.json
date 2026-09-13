@@ -6,7 +6,7 @@
   "model_class": "text-generation",
   "verified_mirror": {
     "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-    "revision": "398100a9198b145aea3670140064a13a6ec41069",
+    "revision": "2a6083b51de60a2a9bf035e66960e2ff7278b5ce",
     "file_count": 425,
     "total_bytes": 135318119812,
     "model_snapshot_file_count": 419,
