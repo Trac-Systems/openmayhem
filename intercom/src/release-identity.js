@@ -6,8 +6,15 @@ export const RELEASE_MANIFEST_PATH = 'contract/release.json';
 export const INTERCOM_BUNDLE_ASSET_PREFIX = 'share/mayhem/intercom/';
 export const CONTRACT_CODE_PATHS = Object.freeze([
   'contract/contract.js',
+  'contract/history/v23.js',
+  'contract/history/v24.js',
   'contract/protocol.js',
   'features/mayhem/index.js',
+  'trac/trac-peer/src/artifacts/contract.js',
+  'trac/trac-peer/src/base/canonical-replay.js',
+  'trac/trac-peer/src/index.js',
+  'trac/trac-peer/src/operations/feature/index.js',
+  'trac/trac-peer/src/operations/tx/index.js',
 ]);
 
 const CONTRACT_CODE_DIGEST_DOMAIN = 'mayhem-intercom-contract-code-v1\0';

@@ -97,6 +97,9 @@ export class Peer extends ReadyResource {
                     wallet: this.wallet,
                     protocolInstance: this.protocol.instance,
                     contractInstance: this.contract.instance,
+                    // Acceptance proofs read the signed canonical session, not
+                    // the atomic apply view that may be replaying an older prefix.
+                    canonicalView: this.base?.view,
                     msbClient: this.msbClient,
                     config: this.config
                 }

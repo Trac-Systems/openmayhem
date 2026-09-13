@@ -1,3 +1,4 @@
+import { canonicalReplayContext } from '../../base/canonical-replay.js';
 import { BaseCheck } from '../../base/check.js';
 import b4a from 'b4a';
 import { safeDecodeApplyOperation } from 'trac-msb/src/utils/protobuf/operationHelpers.js';
@@ -8,6 +9,7 @@ export class TxOperation {
     #wallet
     #protocolInstance
     #contractInstance
+    #canonicalView
     #msbClient
     #config
 
@@ -15,6 +17,7 @@ export class TxOperation {
         wallet,
         protocolInstance,
         contractInstance,
+        canonicalView,
         msbClient,
         config
     }) {
@@ -22,6 +25,7 @@ export class TxOperation {
         this.#wallet = wallet
         this.#protocolInstance = protocolInstance
         this.#contractInstance = contractInstance
+        this.#canonicalView = canonicalView
         this.#msbClient = msbClient
         this.#config = config
     }
@@ -88,7 +92,8 @@ export class TxOperation {
         if (null !== await batch.get(`tx/${op.key}`)) return;
         // Execute contract and index deterministic result into subnet state
         const err = this.#protocolInstance.getError(
-            await this.#contractInstance.execute(op, batch)
+            await this.#contractInstance.execute(op, batch,
+                    await canonicalReplayContext(op, batch, node, this.#canonicalView))
         );
         let errValue = null;
         if(null !== err) {
