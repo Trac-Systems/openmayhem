@@ -23101,12 +23101,6 @@ fn validate_calibration_prompt_method_value(
 ) {
     match method {
         "token_fingerprint" => {
-            if prompt.token_count != prompt.completion_tokens as usize {
-                errors.push(format!(
-                    "prompt {} token_count {} does not match completion_tokens {}",
-                    prompt.prompt_id, prompt.token_count, prompt.completion_tokens
-                ));
-            }
             if prompt.token_count != prompt.token_ids.len() {
                 errors.push(format!(
                     "prompt {} token_count {} does not match token_ids length {}",
@@ -125377,7 +125371,9 @@ State initialization...
         report.artifact_binding = catalog_canary_artifact_binding(artifact);
         report.canary_set_sha256 = canary_sha.clone();
         report.prompts[0].max_tokens = 8;
-        report.prompts[0].completion_tokens = 8;
+        // OpenAI-compatible backends can report tokenizer usage while the
+        // reproducibility witness uses content-derived canonical units.
+        report.prompts[0].completion_tokens = 3;
         report.prompts[0].token_count = tokens.len();
         report.prompts[0].token_ids = tokens.clone();
         report.prompts[0].token_prefix = tokens.clone();
