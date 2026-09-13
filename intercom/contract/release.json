@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "release_version": "0.2.196",
+  "release_version": "0.2.197",
   "contract_version": 25,
-  "contract_code_sha256": "cf44bcc8c6cfa463be08937c74f7b8593ee3b8220e212c995faf792a400d8bad",
+  "contract_code_sha256": "cf2d19a4a4d36d7f08af86ee01fbbf90ad3734ef5b9ab7075445768f557d599c",
   "files": [
     {
       "path": "contract/contract.js",
@@ -30,11 +30,11 @@
     },
     {
       "path": "trac/trac-peer/src/base/canonical-replay.js",
-      "sha256": "8504822476bd77347a8e0f8004a7a53350420650a2547c7ca7161bf2144cffa9"
+      "sha256": "2406503c12eaf226cbe065b96613d523b01bb24c52fe34142b5efc7bc98ccd07"
     },
     {
       "path": "trac/trac-peer/src/index.js",
-      "sha256": "7bcfa01d986e5e040c7fb4a60e93e7f9272f20e3aa161d91582d8aa84fc68941"
+      "sha256": "e0f7879141fa9227f12f2a2b9e7281ae47c70220fc929c4970ee565eef36f08e"
     },
     {
       "path": "trac/trac-peer/src/operations/feature/index.js",
