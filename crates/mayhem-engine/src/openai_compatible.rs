@@ -732,14 +732,28 @@ fn verify_prefix_cache(loaded: &Arc<LoadedBackend>) -> Result<()> {
         &mut crate::NoopTokenSink,
         &CancellationToken::new(),
     )?;
-    let between = prometheus_metric_sum(&get_text(loaded, "metrics")?, metric)?;
+    let between = get_text(loaded, "metrics")?;
     generate(
         Arc::clone(loaded),
         request,
         &mut crate::NoopTokenSink,
         &CancellationToken::new(),
     )?;
-    let after = prometheus_metric_sum(&get_text(loaded, "metrics")?, metric)?;
+    let after = get_text(loaded, "metrics")?;
+    verify_prefix_cache_metric_increase(metric, &between, &after)
+}
+
+fn verify_prefix_cache_metric_increase(
+    metric: &str,
+    between_metrics: &str,
+    after_metrics: &str,
+) -> Result<()> {
+    // SGLang creates the labeled counter only after the first cache hit. The
+    // warm request can therefore leave the signed series absent; that is an
+    // exact zero baseline. The replay must materialize the same signed series
+    // and increase it, so absence after replay remains a hard failure.
+    let between = prometheus_metric_sum_optional(between_metrics, metric)?.unwrap_or(0.0);
+    let after = prometheus_metric_sum(after_metrics, metric)?;
     if after <= between {
         return Err(backend_error(format!(
             "prefix cache metric {metric} did not increase during repeated-prefix preflight"
@@ -1477,6 +1491,14 @@ fn validate_loopback_base_url(value: &str) -> Result<Url> {
 }
 
 fn prometheus_metric_sum(metrics: &str, metric: &str) -> Result<f64> {
+    prometheus_metric_sum_optional(metrics, metric)?.ok_or_else(|| {
+        backend_error(format!(
+            "/metrics omitted signed prefix cache metric {metric}"
+        ))
+    })
+}
+
+fn prometheus_metric_sum_optional(metrics: &str, metric: &str) -> Result<Option<f64>> {
     let mut found = false;
     let mut total = 0.0;
     for line in metrics.lines() {
@@ -1498,12 +1520,7 @@ fn prometheus_metric_sum(metrics: &str, metric: &str) -> Result<f64> {
         found = true;
         total += value;
     }
-    if !found {
-        return Err(backend_error(format!(
-            "/metrics omitted signed prefix cache metric {metric}"
-        )));
-    }
-    Ok(total)
+    Ok(found.then_some(total))
 }
 
 fn parse_usage(value: &Value) -> UsageCounters {
@@ -1815,6 +1832,17 @@ mod tests {
             prometheus_metric_sum(metrics, "sglang:cached_tokens_total").unwrap(),
             19.0
         );
+    }
+
+    #[test]
+    fn prefix_cache_proof_accepts_lazy_zero_baseline_but_requires_replay_increase() {
+        let metric = "sglang:cached_tokens_total";
+        let absent = "# HELP sglang:num_running_reqs running\nsglang:num_running_reqs 0\n";
+        let first_hit = "sglang:cached_tokens_total{rank=\"0\",source=\"gpu\"} 25472\n";
+
+        verify_prefix_cache_metric_increase(metric, absent, first_hit).unwrap();
+        assert!(verify_prefix_cache_metric_increase(metric, absent, absent).is_err());
+        assert!(verify_prefix_cache_metric_increase(metric, first_hit, first_hit).is_err());
     }
 
     fn spawn_sse_server(chunks: Vec<Vec<u8>>, hold_open: bool) -> String {
