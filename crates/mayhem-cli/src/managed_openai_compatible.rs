@@ -30,6 +30,11 @@ const NIXL_CONFIG: &str = "configs/pennyroyal/nixl-posix-frspec.toml";
 const PLE_PREPARER: &str = "scripts/pennyroyal/prepare_ple_nvme.py";
 const PLE_CHECKER: &str = "scripts/pennyroyal/check_ple_nvme.py";
 const PLE_PLUGIN_SOURCE: &str = "tools/ple_nvme/ssd_stream";
+const PLE_READER_WHEEL_FILENAME: &str =
+    "sglang_ssd_stream-0.2.0+pennyroyal2-cp312-cp312-linux_x86_64.whl";
+const PLE_READER_WHEEL_BYTES: u64 = 292_987;
+const PLE_READER_WHEEL_SHA256: &str =
+    "5fd3bf79524aec7068729e99823a8278e4f3bd7dcacd222f2c55f4395454112f";
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
@@ -95,6 +100,19 @@ pub(crate) struct RecipePle {
     portable_manifest_bytes: u64,
     portable_manifest_sha256: String,
     reader_version: String,
+    reader_wheel: RecipeReaderWheel,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RecipeReaderWheel {
+    sidecar: String,
+    filename: String,
+    bytes: u64,
+    sha256: String,
+    python_tag: String,
+    abi_tag: String,
+    platform_tag: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -295,7 +313,12 @@ pub(crate) fn prepare_managed_runtime(
         )
     })?;
     verify_file(source_archive, source.archive_bytes, &source.archive_sha256)?;
-    aggregate_disk_preflight(&managed_root, source.archive_bytes, ple.table_bytes)?;
+    aggregate_disk_preflight(
+        &managed_root,
+        source.archive_bytes,
+        ple.reader_wheel.bytes,
+        ple.table_bytes,
+    )?;
     let source_dir = materialize_source_archive(&managed_root, source_archive, &source)?;
     verify_source_proofs(&source_dir, inputs.snapshot_dir, &proofs, &ple)?;
     let seccomp_sidecar = inputs
@@ -317,13 +340,23 @@ pub(crate) fn prepare_managed_runtime(
         inputs.enclave_id,
         inputs.runtime_revision,
     )?;
+    let plugin_wheel = inputs
+        .sidecars
+        .get(&ple.reader_wheel.sidecar)
+        .context("typed runtime PLE reader wheel sidecar was not downloaded")?;
+    verify_file(
+        plugin_wheel,
+        ple.reader_wheel.bytes,
+        &ple.reader_wheel.sha256,
+    )?;
     let plugin_dir = materialize_plugin(
         inputs.docker,
         &managed_root,
-        &source_dir,
+        plugin_wheel,
         inputs.recipe_sha256,
         inputs.provider_id,
         inputs.enclave_id,
+        &ple.reader_wheel,
         &ple.reader_version,
     )?;
     let prepared_model = materialize_ple(
@@ -550,6 +583,7 @@ fn validate_recipe(
         ple.portable_manifest_bytes > 0 && ple.reader_version == "0.2.0+pennyroyal2",
         "runtime recipe PLE reader profile is unsupported"
     );
+    validate_reader_wheel(&ple.reader_wheel, &ple.reader_version)?;
     ensure!(
         runtime.image == IMAGE
             && inputs.container_image_digest
@@ -578,6 +612,35 @@ fn validate_recipe(
         runtime.reasoning_default == "xhigh"
             && runtime.reasoning_overrides == ["low", "medium", "xhigh"],
         "runtime recipe reasoning controls are unsupported"
+    );
+    Ok(())
+}
+
+fn validate_reader_wheel(wheel: &RecipeReaderWheel, version: &str) -> Result<()> {
+    ensure!(
+        wheel.sidecar == "ple_plugin_wheel",
+        "runtime recipe selects an unsupported PLE reader wheel sidecar"
+    );
+    ensure!(
+        wheel.bytes == PLE_READER_WHEEL_BYTES && wheel.sha256 == PLE_READER_WHEEL_SHA256,
+        "runtime recipe PLE reader wheel differs from the qualified fixed artifact"
+    );
+    ensure!(
+        wheel.python_tag == "cp312"
+            && wheel.abi_tag == "cp312"
+            && matches!(
+                wheel.platform_tag.as_str(),
+                "linux_x86_64" | "manylinux_2_28_x86_64"
+            ),
+        "runtime recipe PLE reader wheel is not compatible with the fixed CPython 3.12 Linux x86_64 image"
+    );
+    let expected = format!(
+        "sglang_ssd_stream-{version}-{}-{}-{}.whl",
+        wheel.python_tag, wheel.abi_tag, wheel.platform_tag
+    );
+    ensure!(
+        wheel.filename == expected && wheel.filename == PLE_READER_WHEEL_FILENAME,
+        "runtime recipe PLE reader wheel filename does not match its signed version/tags"
     );
     Ok(())
 }
@@ -909,10 +972,16 @@ fn write_seccomp(
     Ok(path)
 }
 
-fn aggregate_disk_preflight(root: &Path, source_bytes: u64, table_bytes: u64) -> Result<()> {
+fn aggregate_disk_preflight(
+    root: &Path,
+    source_bytes: u64,
+    wheel_bytes: u64,
+    table_bytes: u64,
+) -> Result<()> {
     const CACHE_RESERVE: u64 = 64 * 1024 * 1024 * 1024;
     let required = source_bytes
-        .checked_add(table_bytes)
+        .checked_add(wheel_bytes)
+        .and_then(|bytes| bytes.checked_add(table_bytes))
         .and_then(|bytes| bytes.checked_add(CACHE_RESERVE))
         .context("managed runtime disk requirement overflowed u64")?;
     let available = fs2::available_space(root)
@@ -990,40 +1059,29 @@ fn path_to_posix(path: &Path) -> String {
 fn materialize_plugin(
     docker: &Path,
     root: &Path,
-    source: &Path,
+    wheel_path: &Path,
     recipe_sha: &str,
     provider: &str,
     enclave: &str,
+    wheel: &RecipeReaderWheel,
     version: &str,
 ) -> Result<PathBuf> {
-    let destination = root.join(format!("plugin-{}", safe_component(version)));
-    if plugin_version(&destination).as_deref() == Some(version) {
-        return Ok(destination);
+    let destination = root.join(format!(
+        "plugin-{}-{}",
+        safe_component(version),
+        &wheel.sha256[..16]
+    ));
+    if destination.exists() {
+        ensure!(
+            fs::symlink_metadata(&destination)?.file_type().is_dir(),
+            "managed plugin cache has an unsafe type"
+        );
+        fs::remove_dir_all(&destination)
+            .context("removing the prior Core-owned PLE plugin cache")?;
     }
-    ensure!(
-        !destination.exists(),
-        "managed plugin cache failed signed version validation"
-    );
     let staging = root.join(format!(".plugin.partial-{}", random_hex(8)?));
     fs::create_dir(&staging)?;
-    let build_home = root.join("plugin-build-home");
-    let build_tmp = root.join("plugin-build-tmp");
-    let build_cache = root.join("plugin-build-cache");
-    for directory in [&build_home, &build_tmp, &build_cache] {
-        fs::create_dir_all(directory)?;
-        set_private_directory(directory)?;
-    }
-    let command = vec![
-        "uv".to_owned(),
-        "pip".to_owned(),
-        "install".to_owned(),
-        "--python".to_owned(),
-        "/usr/bin/python3".to_owned(),
-        "--target".to_owned(),
-        "/mayhem/plugin".to_owned(),
-        "--no-deps".to_owned(),
-        "/mayhem/source/tools/ple_nvme/ssd_stream".to_owned(),
-    ];
+    let command = plugin_install_command();
     let result = (|| -> Result<()> {
         run_owned_one_shot_capture(
             docker,
@@ -1033,25 +1091,15 @@ fn materialize_plugin(
             provider,
             enclave,
             &[
-                (source, "/mayhem/source", true),
+                (wheel_path, "/mayhem/wheel/plugin.whl", true),
                 (&staging, "/mayhem/plugin", false),
-                (&build_home, "/mayhem/build-home", false),
-                (&build_tmp, "/mayhem/build-tmp", false),
-                (&build_cache, "/mayhem/build-cache", false),
             ],
-            &[
-                ("HOME", "/mayhem/build-home"),
-                ("TMPDIR", "/mayhem/build-tmp"),
-                ("UV_CACHE_DIR", "/mayhem/build-cache/uv"),
-                ("CARGO_HOME", "/mayhem/build-cache/cargo"),
-                ("CARGO_TARGET_DIR", "/mayhem/build-cache/cargo-target"),
-                ("CARGO_BUILD_JOBS", "2"),
-            ],
+            &[],
             &command,
         )?;
         ensure!(
             plugin_version(&staging).as_deref() == Some(version),
-            "managed PLE plugin build returned the wrong version"
+            "managed PLE plugin wheel installed the wrong version"
         );
         fs::rename(&staging, &destination).context("atomically installing managed PLE plugin")?;
         Ok(())
@@ -1061,6 +1109,22 @@ fn materialize_plugin(
     }
     result?;
     Ok(destination)
+}
+
+fn plugin_install_command() -> Vec<String> {
+    vec![
+        "uv".to_owned(),
+        "pip".to_owned(),
+        "install".to_owned(),
+        "--offline".to_owned(),
+        "--no-cache".to_owned(),
+        "--python".to_owned(),
+        "/usr/bin/python3".to_owned(),
+        "--target".to_owned(),
+        "/mayhem/plugin".to_owned(),
+        "--no-deps".to_owned(),
+        "/mayhem/wheel/plugin.whl".to_owned(),
+    ]
 }
 
 fn materialize_ple(
@@ -2027,6 +2091,29 @@ mod tests {
         assert!(mount_arg(Path::new("/safe/path"), "/mayhem/model", true).is_ok());
         assert!(mount_arg(Path::new("/unsafe,path"), "/mayhem/model", true).is_err());
         assert!(mount_arg(Path::new("relative"), "/mayhem/model", true).is_err());
+    }
+
+    #[test]
+    fn reader_wheel_is_exact_and_installs_without_network_or_dependency_resolution() {
+        let wheel = RecipeReaderWheel {
+            sidecar: "ple_plugin_wheel".to_owned(),
+            filename: PLE_READER_WHEEL_FILENAME.to_owned(),
+            bytes: PLE_READER_WHEEL_BYTES,
+            sha256: PLE_READER_WHEEL_SHA256.to_owned(),
+            python_tag: "cp312".to_owned(),
+            abi_tag: "cp312".to_owned(),
+            platform_tag: "linux_x86_64".to_owned(),
+        };
+        validate_reader_wheel(&wheel, "0.2.0+pennyroyal2").unwrap();
+        let command = plugin_install_command();
+        assert!(command.iter().any(|argument| argument == "--offline"));
+        assert!(command.iter().any(|argument| argument == "--no-cache"));
+        assert!(command.iter().any(|argument| argument == "--no-deps"));
+        assert_eq!(command.last().unwrap(), "/mayhem/wheel/plugin.whl");
+
+        let mut wrong_platform = wheel;
+        wrong_platform.platform_tag = "linux_aarch64".to_owned();
+        assert!(validate_reader_wheel(&wrong_platform, "0.2.0+pennyroyal2").is_err());
     }
 
     #[test]
