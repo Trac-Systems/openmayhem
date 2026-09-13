@@ -147,6 +147,7 @@ function addMarketUsage(map, body, sessionId, amount) {
     ...(ctxBracket ? { ctx_bracket: ctxBracket } : {}),
     ...(ctxBracketTableVer ? { ctx_bracket_table_ver: ctxBracketTableVer } : {}),
     demand_au: 0n,
+    settled_usage: {},
     sessions: new Set(),
     providers: new Set(),
   };
@@ -156,6 +157,15 @@ function addMarketUsage(map, body, sessionId, amount) {
   const next = current.demand_au + amount;
   safeAu(next, 'market demand_au', { allowZero: true });
   current.demand_au = next;
+  const paidUnits = new Set(body.locked_rate_map.map((row) => canonicalUsageUnit(row.unit)));
+  const usage = normalizeReceiptUsage(body.usage);
+  const prior = normalizeReceiptUsage(body.billing_prior_usage);
+  for (const unit of new Set([...Object.keys(usage), ...Object.keys(prior)])) {
+    const delta = BigInt(usage[unit] ?? 0) - BigInt(prior[unit] ?? 0);
+    if (delta < 0n) throw new Error('settled activity regressed below billing baseline');
+    if (delta > 0n && paidUnits.has(unit)) current.settled_usage[unit] =
+      (BigInt(current.settled_usage[unit] ?? '0') + delta).toString();
+  }
   current.sessions.add(sessionId);
   current.providers.add(body.provider);
   map.set(key, current);
@@ -1142,6 +1152,10 @@ export async function recomputeEpoch(bundle) {
     earnings,
     allocations,
     market_usage,
+    market_activity: market_usage.map((row) => ({ ...row,
+      settled_usage: stableValue(marketUsageMap.get(marketUsageKey(row.enclave_id, row.ctx_bracket ?? null)).settled_usage),
+      source: 'canonical_signed_receipt_usage',
+    })),
     receipt_index: receiptIndex.metadata,
     apply_page_limits: {
       max_allocations: pageLimits.maxAllocations,

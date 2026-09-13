@@ -228,8 +228,8 @@ function validateParams(add, params, warnings) {
     }
     if (value !== def.default) warnings.push(`contract.params.${key} differs from contract default ${def.default}`);
   }
-  if (params.market_max_utilization_bps < params.market_target_utilization_bps) {
-    add('error', 'contract.params.market_max_utilization_bps must be >= market_target_utilization_bps');
+  if (params.price_min_bps > params.price_max_bps) {
+    add('error', 'contract.params.price_min_bps must not exceed price_max_bps');
   }
 }
 

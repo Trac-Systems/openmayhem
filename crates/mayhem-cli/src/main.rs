@@ -114,7 +114,7 @@ use mayhem_proto::{
     metered_output_units, parse_record_usage_receipt_envelope, payload_chunk_at,
     payload_chunk_manifest, reassemble_json_payload, receipt_signing_bytes,
     record_usage_receipt_envelope, record_usage_receipt_feature_key,
-    record_usage_receipt_feature_key_for_contract, RECOVERABLE_RECEIPT_CONTRACT_VERSION,
+    record_usage_receipt_feature_key_for_contract, RECOVERABLE_RECEIPT_CONTRACT_VERSION, receipt_contract_version_is_supported,
     record_usage_receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
     spend_voucher_signing_bytes, stable_json_bytes, tools_only_model_input_prompt_units,
     validate_ctx_bracket_schedule, validated_audio_metadata, validated_wav_audio_metadata,
@@ -50109,12 +50109,11 @@ fn price_derivation_summary(derivation: &Value) -> String {
         .or_else(|| derivation_u64(derivation, &["price_ver"]))
         .map(|value| format!("v{value}"))
         .unwrap_or_else(|| "price".to_owned());
-    let utilization = derivation_u64(derivation, &["controller", "utilization_bps"])
+    let momentum = derivation_u64(derivation, &["controller", "momentum_bps"])
         .map(format_bps)
         .unwrap_or_else(|| "?".to_owned());
-    let demand = derivation_money_au(derivation, &["usage", "active_demand_au"])
-        .map(|au| format!("${}", au_to_usd_amount(au)))
-        .unwrap_or_else(|| "unknown demand".to_owned());
+    let basis = derivation_str(derivation, &["controller", "activity_basis"])
+        .unwrap_or("historical pricing");
     let sessions = derivation_u64(derivation, &["usage", "session_count"])
         .map(|value| value.to_string())
         .unwrap_or_else(|| "?".to_owned());
@@ -50131,7 +50130,7 @@ fn price_derivation_summary(derivation: &Value) -> String {
         .map(|value| format!(" leaf={}", short_hash(value)))
         .unwrap_or_default();
     format!(
-        "price = f(seed {seed_ver}, U {utilization}, demand {demand}, {sessions} sessions, supply {supply}) -> {result_ver}; epoch {epoch}; {source}{root}{leaf}"
+        "price {result_ver}; activity momentum {momentum}; {basis}; epoch {epoch}; {sessions} settled sessions; {supply} providers; seed {seed_ver}; {source}{root}{leaf}"
     )
 }
 
@@ -61218,8 +61217,7 @@ fn validate_receipt_settlement_feature(feature: &Value) -> Result<String> {
     ensure!(
         value.get("op").and_then(Value::as_str) == Some("record_usage_receipt")
             && matches!(contract_version, Some(version)
-                if version == u64::from(CONTRACT_VERSION)
-                    || version == u64::from(RECOVERABLE_RECEIPT_CONTRACT_VERSION)),
+                if receipt_contract_version_is_supported(version)),
         "receipt settlement feature has the wrong operation or contract version"
     );
     let receipt = parse_record_usage_receipt_envelope(
@@ -103724,7 +103722,7 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 24);
+        assert_eq!(CONTRACT_VERSION, 25);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 11);
     }
@@ -109025,13 +109023,13 @@ esac
                 "session_count": 2u64
             },
             "controller": {
-                "source": "admin_seed_cold_start",
+                "source": "canonical_settled_work",
                 "active_supply": 1u64,
-                "utilization_bps": 1_000u64,
-                "ema_utilization_bps": 1_000u64,
+                "momentum_bps": 10_000u64,
+                "activity_basis": "relative_dimension_vector_v1",
                 "multiplier_bps": 10_000u64,
                 "frozen": true,
-                "frozen_reason": "cold_start"
+                "frozen_reason": "activity_baseline_bootstrap"
             },
             "seed_price": {
                 "ver": 1u64,
@@ -110638,6 +110636,22 @@ esac
     }
 
     #[test]
+    fn receipt_settlement_version_bridge_preserves_v23_v24_and_v25_signatures() {
+        for version in [23, 24, 25] {
+            let feature = signed_receipt_settlement_feature_for_test_version(
+                7, 1, true, 2, version, Some(768),
+            );
+            assert!(validate_receipt_settlement_feature(&feature).is_ok(), "version {version}");
+        }
+        for version in [22, 26] {
+            let feature = signed_receipt_settlement_feature_for_test_version(
+                7, 1, true, 2, version, Some(768),
+            );
+            assert!(validate_receipt_settlement_feature(&feature).is_err(), "version {version}");
+        }
+    }
+
+    #[test]
     fn receipt_outbox_recovers_v191_context_receipts_without_resigning_or_rebilling() {
         let root = test_temp_dir("mayhem-v191-receipt-recovery");
         let feature = signed_receipt_settlement_feature_for_test_version(
@@ -111052,7 +111066,7 @@ esac
         let expected_message = concat!(
             "mayhem-targeted-spend-reservation-v1",
             "{\"payout_revision\":\"9999999999999999999999999999999999999999999999999999999999999999\",",
-            "\"reservation\":{\"at\":25200,\"contract_version\":24,\"ctx_bracket\":\"le8k\",",
+            "\"reservation\":{\"at\":25200,\"contract_version\":25,\"ctx_bracket\":\"le8k\",",
             "\"ctx_bracket_table_ver\":1,",
             "\"enclave_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"enclave_pubkey\":\"5555555555555555555555555555555555555555555555555555555555555555\",",

@@ -420,6 +420,9 @@ async function seedCanonicalReceiptEpoch(
       incremental_au: String(au),
       receipt: {
         body: {
+          usage: { input_token: Number(au) },
+          billing_prior_usage: {},
+          locked_rate_map: [{ unit: 'input_token', per_unit_au: '1', granularity: 1 }],
           session_id: voucher.session_id,
           provider: voucher.provider,
           enclave_id: voucher.enclave_id,

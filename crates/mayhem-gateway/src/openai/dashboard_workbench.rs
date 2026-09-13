@@ -1478,17 +1478,18 @@ fn fixture_price(base: &PriceRefAu, model_index: usize) -> PriceRefAu {
                 .collect::<Vec<_>>();
             json!({
                 "epoch": epoch,
-                "price_source": "market_float",
+                "price_source": "market_activity_momentum",
                 "ctx_bracket": if epoch % 4 == 0 { "32k" } else { "base" },
                 "usage": {
                     "active_demand_au": (650_000_000_000_000_000_u128 + u128::from(epoch - 40) * 95_000_000_000_000_000).to_string(),
-                    "settled_work_au": (400_000_000_000_000_000_u128 + u128::from(epoch - 40) * 70_000_000_000_000_000).to_string(),
+                    "settled_usage": { "input_token": (4_000 + (epoch - 40) * 700).to_string() },
                     "session_count": 7 + epoch - 40,
                 },
                 "controller": {
-                    "source": "market_float",
+                    "source": "canonical_settled_work",
                     "active_supply": 3 + model_index,
-                    "utilization_bps": 6_900 + (epoch - 40) * 155,
+                    "momentum_bps": 9_500 + (epoch - 40) * 155,
+                    "activity_basis": "relative_dimension_vector_v1",
                     "frozen": false,
                 },
                 "seed_price": {"ver": 1, "rate_map": historical_rates},

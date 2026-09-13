@@ -2427,16 +2427,17 @@ async function main() {
     const maxDownStep = maxDownStepRaw > 0n ? maxDownStepRaw : 1n;
     const assertions = {
       high_used_two_active_providers: highMarket.active_supply === 2,
-      high_not_cold_start: highMarket.frozen === false,
-      high_price_source_market_float: highRecord?.price_source === 'market_float',
+      high_activity_initialized: highMarket.activity_initialized === true,
+      high_price_source_activity: ['market_activity_momentum', 'market_activity_hold'].includes(highRecord?.price_source),
       high_price_version_advanced: Number(highRecord?.ver || 0) > Number(initialPrice?.current?.ver || 0),
-      high_price_moved_up: highOutputAu > initialOutputAu,
+      high_price_follows_baseline: highMarket.frozen
+        ? highOutputAu === initialOutputAu : highOutputAu > initialOutputAu,
       high_move_within_clamp: highOutputAu <= maxUp,
       high_usage_from_settled_receipts:
         highSettlement.recomputed.market_usage?.[0]?.demand_au === highMarket.active_demand_au,
       low_used_two_active_providers: lowMarket.active_supply === 2,
-      low_not_cold_start: lowMarket.frozen === false,
-      low_price_source_market_float: lowRecord?.price_source === 'market_float',
+      low_activity_initialized: lowMarket.activity_initialized === true && lowMarket.frozen === false,
+      low_price_source_activity: ['market_activity_momentum', 'market_activity_hold'].includes(lowRecord?.price_source),
       low_price_version_advanced: Number(lowRecord?.ver || 0) > Number(highRecord?.ver || 0),
       low_price_moved_down: lowOutputAu < highOutputAu,
       low_move_within_clamp: highOutputAu - lowOutputAu <= maxDownStep,

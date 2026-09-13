@@ -1656,6 +1656,19 @@ test('atomic commit plus page zero safely replaces an unapplied stale commit', a
   assert.equal(page1Replay.result.ok, true, page1Replay.result.message);
   assert.equal(page1Replay.result.idempotent, true);
   assert.equal((await ctx.storage.get(liabilityKey)).value.total_au, '17');
+  const usageMarker = (await ctx.storage.get(`epoch/market-usage/1/${ENCLAVE_ID}/ctx/le8k`)).value;
+  assert.deepEqual(usageMarker.settled_usage, { input_token: '2' });
+  const frozen = await execute(ctx.contract, ctx.storage, 'epochFreeze', {
+    op: 'epoch_freeze', epoch: 2, at: 7200,
+  }, ctx.admin.publicKey, 300);
+  assert.equal(frozen.ok, true, frozen.message);
+  const empty = await execute(ctx.contract, ctx.storage, 'epochSealEmpty', {
+    op: 'epoch_seal_empty', epoch: 2, at: 7200, reason_hash: 'aa'.repeat(32),
+  }, ctx.admin.publicKey, 301);
+  assert.equal(empty.ok, true, empty.message);
+  const dormant = (await ctx.storage.get(`price/${ENCLAVE_ID}/le8k`)).value.current;
+  assert.equal(dormant.rate_map[0].per_unit_au, '9');
+  assert.deepEqual(dormant.market.settled_usage, {});
 });
 
 test('v22 freezes receipt ingress without waiting for traffic and resumes across restart', async () => {
@@ -1947,7 +1960,7 @@ test('v24 context recovery bounds telemetry and admits no other legacy operation
     assert.ok(rejected.result instanceof Error, `invalid context count ${count}`);
     assert.match(rejected.result.message, /attribution/i);
   }
-  for (const contractVersion of [22, 25]) {
+  for (const contractVersion of [22, CONTRACT_VERSION + 1]) {
     const invalid = receiptValue(ctx, reservation, {
       final: true,
       outerOverrides: { contract_version: contractVersion },
@@ -1959,4 +1972,37 @@ test('v24 context recovery bounds telemetry and admits no other legacy operation
   const rejected = await ctx.contract.normalizeTargetedSpendReserveValue(legacyReservation);
   assert.ok(rejected instanceof Error);
   assert.match(rejected.message, /contract version/i);
+});
+
+test('v25 price fraud proof pins signed canonical work and survives later calibration changes', async () => {
+  const ctx = await setupContract();
+  const reservation = await submitReservation(ctx);
+  const receipt = await submitReceipt(ctx, receiptValue(ctx, reservation, { final: true }));
+  assert.equal(receipt.result.ok, true, receipt.result.message);
+  const head = (await ctx.storage.get(`receipt/head/${reservation.value.voucher.billing_id}/0`)).value;
+  const frozen = await execute(ctx.contract, ctx.storage, 'epochFreeze', {
+    op: 'epoch_freeze', epoch: 1, at: 3600,
+  }, ctx.admin.publicKey, 95);
+  assert.equal(frozen.ok, true, frozen.message);
+  const roots = { dep: '91'.repeat(32), use: await ctx.contract.merkleRoot('use', [await ctx.contract.usageLeafHash(head.receipt)]),
+    earn: '93'.repeat(32), fee: '94'.repeat(32), price: 'ff'.repeat(32) };
+  const totals = { dep_count: 0, dep_au: '0', use_count: 1, use_au: '100', provider_count: 1,
+    earn_au: '85', fee_au: '15', fee_cum_au: '15', burn_au: '0', burn_cum_au: '0', price_count: 1 };
+  const committed = await execute(ctx.contract, ctx.storage, 'epochCommit', {
+    op: 'epoch_commit', epoch: 1, at: 3600, roots, totals,
+  }, ctx.submitter.publicKey, 96);
+  assert.equal(committed.ok, true, committed.message);
+  const commit = (await ctx.storage.get('epoch/commit/1')).value;
+  assert.ok(commit.expected_activity_evidence);
+  const proof = { op: 'fraud_proof', epoch: 1, proof_epoch: 2, at: 7200, reason: 'price_derivation',
+    price_usage: commit.expected_activity_evidence.price_usage };
+  await ctx.storage.put('epoch/commit/1', { ...commit, roots: { ...roots, price: commit.expected_activity_evidence.expected_price_root } });
+  const honest = await execute(ctx.contract, ctx.storage, 'fraudProof', proof, ctx.user.publicKey, 97);
+  assert.match(honest.message, /does not contradict/);
+  await ctx.storage.put('epoch/commit/1', commit);
+  const ref = (await ctx.storage.get(`modelref/${MODEL_ID}`)).value;
+  await ctx.storage.put(`modelref/${MODEL_ID}`, { ...ref, ver: 99, activity_calibration: { invalid: true } });
+  const challenged = await execute(ctx.contract, ctx.storage, 'fraudProof', proof, ctx.user.publicKey, 98);
+  assert.equal(challenged.ok, true, challenged.message);
+  assert.equal((await ctx.storage.get('epoch/commit/1')).value.status, 'void');
 });
