@@ -1,0 +1,126 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://openmayhem.dev/schema/qwen3.8-flash-next-media-resource-evidence-v1.json",
+  "title": "Qwen3.8 Flash-Next media resource evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "model_id",
+    "artifact_root",
+    "mirror_revision",
+    "runtime_recipe_sha256",
+    "profiles"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "model_id": {
+      "const": "Qwen/Qwen3.8-Flash-Next"
+    },
+    "artifact_root": {
+      "const": "78191c28fa91602e536baa8ede39891d6d500615086ce2ba42cb920c3b46eabe"
+    },
+    "mirror_revision": {
+      "const": "924b34c8e7a08647e6c2657a80729907d0aff007"
+    },
+    "runtime_recipe_sha256": {
+      "const": "da68f39d1f631b3e69774147d779d4c28b430938428679f42dfa8f7ba1f3c1a3"
+    },
+    "profiles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "image",
+        "video"
+      ],
+      "properties": {
+        "image": {
+          "$ref": "#/$defs/profile"
+        },
+        "video": {
+          "$ref": "#/$defs/profile"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "positiveInteger": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "profile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "unit",
+        "measurement_source",
+        "max_item_bytes",
+        "max_item_units",
+        "measured_item_bytes",
+        "measured_item_units",
+        "measured_working_set_bytes",
+        "calibration_baseline_memory_bytes",
+        "calibration_peak_memory_bytes",
+        "calibration_f13_budget_bytes",
+        "default_max_inflight_items",
+        "default_max_items_per_request",
+        "evidence_sha256",
+        "response_token_fingerprint"
+      ],
+      "properties": {
+        "unit": {
+          "enum": [
+            "pixel",
+            "frame"
+          ]
+        },
+        "measurement_source": {
+          "type": "string",
+          "minLength": 1
+        },
+        "max_item_bytes": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "max_item_units": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "measured_item_bytes": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "measured_item_units": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "measured_working_set_bytes": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "calibration_baseline_memory_bytes": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "calibration_peak_memory_bytes": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "calibration_f13_budget_bytes": {
+          "$ref": "#/$defs/positiveInteger"
+        },
+        "default_max_inflight_items": {
+          "const": 1
+        },
+        "default_max_items_per_request": {
+          "const": 1
+        },
+        "evidence_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "response_token_fingerprint": {
+          "$ref": "#/$defs/sha256"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "status": "pending_managed_runtime_measurement",
+  "model_id": "Qwen/Qwen3.8-Flash-Next",
+  "artifact_root_kind": "blake3_merkle_v1",
+  "artifact_root": "78191c28fa91602e536baa8ede39891d6d500615086ce2ba42cb920c3b46eabe",
+  "mirror_revision": "924b34c8e7a08647e6c2657a80729907d0aff007",
+  "runtime_recipe_sha256": "da68f39d1f631b3e69774147d779d4c28b430938428679f42dfa8f7ba1f3c1a3",
+  "route_envelope": {
+    "max_input_files_total": 3,
+    "media_items_processed_per_turn": 1,
+    "default_max_inflight_media_items": 1,
+    "default_max_media_items_per_request": 1
+  },
+  "probes": [
+    {
+      "modality": "image",
+      "unit": "pixel",
+      "max_output_tokens": 128,
+      "measure": [
+        "input_file_bytes",
+        "input_item_units",
+        "idle_vram_bytes",
+        "peak_vram_bytes",
+        "working_set_delta_bytes",
+        "response_token_fingerprint"
+      ]
+    },
+    {
+      "modality": "video",
+      "unit": "frame",
+      "max_output_tokens": 128,
+      "measure": [
+        "input_file_bytes",
+        "input_item_units",
+        "idle_vram_bytes",
+        "peak_vram_bytes",
+        "working_set_delta_bytes",
+        "response_token_fingerprint"
+      ]
+    }
+  ],
+  "acceptance": {
+    "runtime_identity_must_match": true,
+    "measure_each_modality_in_isolation": true,
+    "return_to_signed_idle_metrics_before_next_probe": true,
+    "working_set_delta_formula": "peak_vram_bytes-idle_vram_bytes",
+    "f13_budget_formula": "ceil(peak_vram_bytes/0.85)",
+    "evidence_sha256_required": true,
+    "portable_profile_signoff_required": true
+  }
+}
