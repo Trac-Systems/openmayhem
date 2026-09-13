@@ -40,7 +40,16 @@
     "table_dtype": "float8_e4m3fn",
     "portable_manifest_bytes": 2563,
     "portable_manifest_sha256": "f3a5a692d577457a1b6166ec17b3006ebc55804812400ac3a7bfaa3ce5af75bd",
-    "reader_version": "0.2.0+pennyroyal2"
+    "reader_version": "0.2.0+pennyroyal2",
+    "reader_wheel": {
+      "sidecar": "ple_plugin_wheel",
+      "filename": "sglang_ssd_stream-0.2.0+pennyroyal2-cp312-cp312-linux_x86_64.whl",
+      "bytes": 292987,
+      "sha256": "5fd3bf79524aec7068729e99823a8278e4f3bd7dcacd222f2c55f4395454112f",
+      "python_tag": "cp312",
+      "abi_tag": "cp312",
+      "platform_tag": "linux_x86_64"
+    }
   },
   "runtime": {
     "image": "lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1",

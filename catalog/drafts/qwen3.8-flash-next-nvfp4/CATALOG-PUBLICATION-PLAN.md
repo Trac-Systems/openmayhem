@@ -11,9 +11,9 @@ must not be used to mutate the live ledger.
 - Calibrated upstream artifact:
   `RadixArk/Qwen3.8-Flash-Next-NVFP4@7b719225242aacd3dbd3f9407468c2ee9a9d2594`.
 - Immutable catalog mirror:
-  `TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4@924b34c8e7a08647e6c2657a80729907d0aff007`.
-  Independent post-upload verification found exactly 424 files and
-  135,317,826,474 bytes, with no path, size, or content-identity mismatch.
+  `TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4@29292a09675f9b82e4c0b7b5c0ad028fe58ee52e`.
+  Independent post-upload verification found exactly 425 files and
+  135,318,119,812 bytes, with no path, size, or content-identity mismatch.
 - Calibrated snapshot: 419 files and 135,253,622,894 bytes. Its unchanged
   `download-manifest.json` has SHA-256
   `5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374`.
@@ -104,10 +104,10 @@ public contract. The managed recipe must use served model name
 `/server_info` checks must agree. This semantic-only recipe correction requires
 a focused identity and functional canary rerun before activation.
 
-The final typed recipe is 2,853 bytes, SHA-256
-`da68f39d1f631b3e69774147d779d4c28b430938428679f42dfa8f7ba1f3c1a3`,
+The final typed recipe is 3,204 bytes, SHA-256
+`7f248046c72b771620da09f36d9cf554134cc70789c3e832017f8d29dbd5b41c`,
 and Merkle root
-`0477b26b2972ea8005429ca3fc32fd00836c55811221aca4607cceba5f6279eb`.
+`9c9ba2e9fe4b0cd4570ae5deeb58a363ee904b7a62e4bd02f6b77487f02c4666`.
 Its Pennyroyal source bundle is 64,070,181 bytes, SHA-256
 `776f6d4b1883c78c7d1eaafa23a936fe82d6cc2220bfb9631ec3598b5e342df4`,
 and Merkle root
@@ -118,6 +118,17 @@ The 16,286-byte Docker 29.1.3 seccomp profile has SHA-256
 `c7a33fb8ae1f8346356a61ce833d579c45acf2bc94967c6763634e81010ff816`
 and Merkle root
 `f3ad6f80ad1ef9702ba87171fd18890d655cfd0df21553b3827c5846dec5a915`.
+
+The PLE reader is supplied as the 292,987-byte platform wheel
+`sglang_ssd_stream-0.2.0+pennyroyal2-cp312-cp312-linux_x86_64.whl`, SHA-256
+`5fd3bf79524aec7068729e99823a8278e4f3bd7dcacd222f2c55f4395454112f`,
+and Merkle root
+`c53a31e21cd48728e6a6d71b9c7a63927f062efe77c2661dee4d37d4803321ac`.
+The recipe restricts it to CPython 3.12, the CPython 3.12 ABI, and
+`linux_x86_64`, and installs it offline without dependencies. An empty-cache
+offline install, import, and full PLE checker passed. The earlier source-build
+recipe depended on build tooling acquired during qualification and cannot
+satisfy clean-provider materialization; its recipe identity is superseded.
 
 The recipe deterministically derives, rather than downloads, its PLE table from
 the signed model snapshot. The expected result is 51,200,245,760 bytes,
@@ -187,12 +198,15 @@ the final native provider and gateway using the final mirror revision and exact
 runtime recipe. Record new token fingerprints and prefixes with exact matching;
 none of the Qwen3.8-27B fingerprints may be copied.
 
-The long 260k concurrency-two qualification need not be repeated if the final
-419-file snapshot, directory artifact root, container, runtime revision, recipe,
-and scheduling settings are byte-for-byte unchanged. The native-provider path
-must still run a cheap two-request overlap probe to prove independent Core
-dispatch. Repeat the long proof if any weight, loader, recipe, capacity, token
-pool, scheduling, cache, or context setting changes.
+The long 260k concurrency-two qualification need not be repeated when the final
+419-file snapshot, directory artifact root, container, runtime revision,
+executable plugin source, capacity, and scheduling settings remain unchanged.
+The switch from an on-provider source build to the signed wheel is acceptable
+for reuse only after its empty-cache install, import, and PLE checker evidence
+is retained and the final native-provider path passes a cheap two-request
+overlap probe. Repeat the long proof if any weight, loader behavior, executable
+plugin source, capacity, token pool, scheduling, cache, or context setting
+changes.
 
 ## Exact semantic catalog diff
 
@@ -213,14 +227,14 @@ their order remain byte-for-byte semantically unchanged. The old signature is
 not edited during preparation; release tooling replaces it only after the
 complete catalog validates and an authorized signer signs it.
 
-The model artifact has exactly four catalog sidecars: the unchanged snapshot
-manifest, the typed runtime recipe, the Pennyroyal source bundle, and the
-recipe-referenced seccomp profile. The 419 model files are not represented as
-individual catalog sidecars.
+The model artifact has exactly five catalog sidecars: the unchanged snapshot
+manifest, the typed runtime recipe, the Pennyroyal source bundle, the signed
+PLE reader wheel, and the recipe-referenced seccomp profile. The 419 model
+files are not represented as individual catalog sidecars.
 
 ## Ledger and release gates
 
-1. Preserve the verified mirror revision. Its exact 424-object set has all 419
+1. Preserve the verified mirror revision. Its exact 425-object set has all 419
    manifest rows matching path, size, and content identity, with the manifest
    sidecar and `LICENSE` also matching their official bytes. Repeat this
    verification immediately before catalog signing to detect remote drift.
@@ -230,9 +244,9 @@ individual catalog sidecars.
    registration. The framed directory stream SHA-256 is
    `e59e92ab3ce981a018c412134707d12bd293bd54d8ab42ba30c5f1037d0031ae`
    over 135,253,645,960 stream bytes.
-3. Bind the four exact sidecars: `snapshot_manifest`, `runtime_recipe`,
-   `pennyroyal_source`, and `seccomp_profile`. All are already present at the
-   final mirror revision.
+3. Bind the five exact sidecars: `snapshot_manifest`, `runtime_recipe`,
+   `pennyroyal_source`, `ple_plugin_wheel`, and `seccomp_profile`. All are
+   already present at the final mirror revision.
 4. Complete portable text F13 and image/video resource profiles.
 5. Install the generalized `openai-compatible` Core implementation and validate
    every signed `server_info_checks` pointer against the attached runtime.
