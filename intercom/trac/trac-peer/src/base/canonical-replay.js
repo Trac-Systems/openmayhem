@@ -1,5 +1,19 @@
 import b4a from 'b4a';
+import Hyperbee from 'hyperbee';
 import { jsonStringify } from '../utils/types.js';
+
+// Autobase's public `base.view` is a session on its named apply batch. During
+// remote replay that batch still describes the earlier materialized prefix,
+// even when the authenticated default view core already carries the indexers'
+// later signed result. Acceptance evidence must read that default core instead.
+// The caller owns this read-only session and closes it after the apply batch.
+export function canonicalReplayView(base) {
+    const core = base?._viewStore?.byName?.get('view')?.core;
+    if (!core || typeof core.session !== 'function') return null;
+    return new Hyperbee(core.session({ writable: false }), {
+        extension: false, keyEncoding: 'utf-8', valueEncoding: 'json'
+    });
+}
 
 // Capabilities never come from a dispatch or RPC field. They are minted only
 // after the operation handler has authenticated a consensus input and the
