@@ -7,6 +7,7 @@
     "family": "qwen3.8",
     "params_b": 125,
     "tier": "launch",
+    "min_app_version": "0.2.199",
     "provenance": {
       "source": {
         "kind": "huggingface",
