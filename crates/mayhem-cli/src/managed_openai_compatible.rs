@@ -1081,7 +1081,8 @@ fn materialize_plugin(
     }
     let staging = root.join(format!(".plugin.partial-{}", random_hex(8)?));
     fs::create_dir(&staging)?;
-    let command = plugin_install_command();
+    let wheel_container_path = format!("/mayhem/wheel/{}", wheel.filename);
+    let command = plugin_install_command(&wheel_container_path);
     let result = (|| -> Result<()> {
         run_owned_one_shot_capture(
             docker,
@@ -1091,7 +1092,7 @@ fn materialize_plugin(
             provider,
             enclave,
             &[
-                (wheel_path, "/mayhem/wheel/plugin.whl", true),
+                (wheel_path, wheel_container_path.as_str(), true),
                 (&staging, "/mayhem/plugin", false),
             ],
             &[],
@@ -1111,7 +1112,7 @@ fn materialize_plugin(
     Ok(destination)
 }
 
-fn plugin_install_command() -> Vec<String> {
+fn plugin_install_command(wheel_container_path: &str) -> Vec<String> {
     vec![
         "uv".to_owned(),
         "pip".to_owned(),
@@ -1123,7 +1124,7 @@ fn plugin_install_command() -> Vec<String> {
         "--target".to_owned(),
         "/mayhem/plugin".to_owned(),
         "--no-deps".to_owned(),
-        "/mayhem/wheel/plugin.whl".to_owned(),
+        wheel_container_path.to_owned(),
     ]
 }
 
@@ -2105,11 +2106,13 @@ mod tests {
             platform_tag: "linux_x86_64".to_owned(),
         };
         validate_reader_wheel(&wheel, "0.2.0+pennyroyal2").unwrap();
-        let command = plugin_install_command();
+        let wheel_container_path = format!("/mayhem/wheel/{}", wheel.filename);
+        let command = plugin_install_command(&wheel_container_path);
         assert!(command.iter().any(|argument| argument == "--offline"));
         assert!(command.iter().any(|argument| argument == "--no-cache"));
         assert!(command.iter().any(|argument| argument == "--no-deps"));
-        assert_eq!(command.last().unwrap(), "/mayhem/wheel/plugin.whl");
+        assert_eq!(command.last().unwrap(), &wheel_container_path);
+        assert!(wheel_container_path.ends_with(PLE_READER_WHEEL_FILENAME));
 
         let mut wrong_platform = wheel;
         wrong_platform.platform_tag = "linux_aarch64".to_owned();
