@@ -1469,6 +1469,7 @@ fn service_create_args(inputs: ServiceCreateInputs<'_>) -> Result<Vec<String>> {
         format!("--security-opt=seccomp={}", inputs.seccomp.display()),
         "--entrypoint=/usr/bin/bash".to_owned(),
     ];
+    args.push(owned_container_user_arg(inputs.managed_root)?);
     for (name, value) in inputs.labels {
         args.push(format!("--label={name}={value}"));
     }
@@ -1654,7 +1655,7 @@ fn run_owned_one_shot_capture(
 }
 
 #[cfg(unix)]
-fn owned_container_identity_args(root: &Path) -> Result<[String; 3]> {
+fn owned_container_user_arg(root: &Path) -> Result<String> {
     use std::os::unix::fs::MetadataExt as _;
 
     let metadata = fs::metadata(root)
@@ -1663,16 +1664,20 @@ fn owned_container_identity_args(root: &Path) -> Result<[String; 3]> {
         metadata.is_dir(),
         "managed runtime owner path is not a directory"
     );
-    Ok([
-        format!("--user={}:{}", metadata.uid(), metadata.gid()),
-        "--env=HOME=/tmp".to_owned(),
-        "--env=TMPDIR=/tmp".to_owned(),
-    ])
+    Ok(format!("--user={}:{}", metadata.uid(), metadata.gid()))
 }
 
 #[cfg(not(unix))]
-fn owned_container_identity_args(_root: &Path) -> Result<[String; 3]> {
-    bail!("managed one-shot containers require a Unix host")
+fn owned_container_user_arg(_root: &Path) -> Result<String> {
+    bail!("managed containers require a Unix host")
+}
+
+fn owned_container_identity_args(root: &Path) -> Result<[String; 3]> {
+    Ok([
+        owned_container_user_arg(root)?,
+        "--env=HOME=/tmp".to_owned(),
+        "--env=TMPDIR=/tmp".to_owned(),
+    ])
 }
 
 fn reconcile_previous_runtime(docker: &Path, root: &Path, _lock: &File) -> Result<()> {
@@ -2092,6 +2097,10 @@ mod tests {
                 "{required}"
             );
         }
+        #[cfg(unix)]
+        assert!(args
+            .iter()
+            .any(|argument| argument == &owned_container_user_arg(&root).unwrap()));
         assert_eq!(args.last().unwrap(), &format!("/mayhem/source/{LAUNCHER}"));
         fs::remove_dir_all(root).unwrap();
     }
