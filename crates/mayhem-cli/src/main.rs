@@ -18168,6 +18168,19 @@ fn collect_endpoint_media_fixture_substitutions(
                 .entry("$IMAGE_DATA_URL".to_owned())
                 .or_insert_with(|| json!(value));
         }
+        Value::String(value) if value.starts_with("data:video/") => {
+            if let Some((metadata, encoded)) = value.split_once(',') {
+                if metadata.ends_with(";base64")
+                    && base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .is_ok()
+                {
+                    substitutions
+                        .entry("$VIDEO_BASE64".to_owned())
+                        .or_insert_with(|| json!(encoded));
+                }
+            }
+        }
         Value::Array(items) => {
             for item in items {
                 collect_endpoint_media_fixture_substitutions(item, substitutions);
@@ -114929,6 +114942,26 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 .unwrap();
 
         catalog_endpoint_calibration_preflight(model, &prompts).unwrap();
+    }
+
+    #[test]
+    fn endpoint_calibration_extracts_video_fixture_from_data_url() {
+        let mut substitutions = BTreeMap::new();
+        collect_endpoint_media_fixture_substitutions(
+            &json!({
+                "type": "video_url",
+                "video_url": {"url": "data:video/mp4;base64,aGVsbG8="}
+            }),
+            &mut substitutions,
+        );
+        assert_eq!(substitutions.get("$VIDEO_BASE64"), Some(&json!("aGVsbG8=")));
+
+        let mut invalid = BTreeMap::new();
+        collect_endpoint_media_fixture_substitutions(
+            &json!({"video_url": {"url": "data:video/mp4;base64,not-base64"}}),
+            &mut invalid,
+        );
+        assert!(!invalid.contains_key("$VIDEO_BASE64"));
     }
 
     #[test]
