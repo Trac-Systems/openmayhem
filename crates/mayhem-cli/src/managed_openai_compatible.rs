@@ -123,6 +123,7 @@ pub(crate) struct RecipeRuntime {
     resource_profile: String,
     launch_profile: String,
     deterministic_inference: bool,
+    attention_backend: String,
     linear_attn_prefill_backend: String,
     linear_attn_decode_backend: String,
     provider_max_concurrent: u32,
@@ -604,6 +605,7 @@ fn validate_recipe(
             && runtime.resource_profile == RESOURCE_PROFILE
             && runtime.launch_profile == LAUNCH_PROFILE
             && runtime.deterministic_inference
+            && runtime.attention_backend == "triton"
             && runtime.linear_attn_prefill_backend == "triton"
             && runtime.linear_attn_decode_backend == "flashinfer",
         "runtime recipe selects an unsupported launch/security/resource profile"
@@ -1322,6 +1324,7 @@ replace("--default-chat-template-kwargs",
         '{{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"medium"}}',
         '{{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}}')
 replace("--linear-attn-prefill-backend", "flashinfer", "triton")
+args.extend(["--attention-backend", "triton"])
 args.append("--enable-deterministic-inference")
 if args != effective:
     raise SystemExit("deterministic launcher argument vector mismatch")
@@ -1378,6 +1381,10 @@ fn effective_launcher_args(model_id: &str, port: u16) -> Vec<String> {
         assert_eq!(args.get(value).map(String::as_str), Some(old));
         args[value] = new;
     }
+    args.extend([
+        "--attention-backend".to_owned(),
+        "triton".to_owned(),
+    ]);
     args.push("--enable-deterministic-inference".to_owned());
     args
 }
@@ -2172,6 +2179,7 @@ mod tests {
             Some("--enable-deterministic-inference")
         );
         for (flag, expected) in [
+            ("--attention-backend", "triton"),
             ("--linear-attn-prefill-backend", "triton"),
             ("--linear-attn-decode-backend", "flashinfer"),
             ("--mamba-radix-cache-strategy", "extra_buffer"),
@@ -2203,7 +2211,7 @@ mod tests {
                 ),
             ]
         );
-        assert_eq!(effective.len(), source.len() + 1);
+        assert_eq!(effective.len(), source.len() + 3);
     }
 
     #[test]
