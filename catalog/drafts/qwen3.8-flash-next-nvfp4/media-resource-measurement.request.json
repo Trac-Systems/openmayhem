@@ -48,5 +48,15 @@
     "f13_budget_formula": "ceil(peak_vram_bytes/0.85)",
     "evidence_sha256_required": true,
     "portable_profile_signoff_required": true
+  },
+  "canary_set": {
+    "id": "canary-qwen3.8-flash-next-speciality-v1",
+    "source_sha256": "fcbfe62df2f134d2d32413769a7a716e928b0a5ca5382efbbbb8ddb98b92785b",
+    "prompt_count": 3,
+    "video_input_bytes": 17042,
+    "video_input_sha256": "365754adff9583755e7c2bbd7f5cc0a0c614902c0ffd2ddb57ef4395b2238581",
+    "video_fps": 8.0,
+    "video_num_frames": 16,
+    "video_wire_part": "video_url"
   }
 }

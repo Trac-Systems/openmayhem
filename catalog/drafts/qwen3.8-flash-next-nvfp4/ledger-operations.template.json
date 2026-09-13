@@ -356,7 +356,7 @@
       "nonce": "qwen3-8-flash-next-nvfp4-tier1-v1",
       "label": "qwen3.8-flash-next-tier1",
       "policy": {
-        "canary_set": "canary-qwen3.8-flash-next-nvfp4-v1"
+        "canary_set": "canary-qwen3.8-flash-next-speciality-v1"
       }
     },
     {
@@ -366,7 +366,7 @@
       "nonce": "qwen3-8-flash-next-nvfp4-tier2-v1",
       "label": "qwen3.8-flash-next-tier2",
       "policy": {
-        "canary_set": "canary-qwen3.8-flash-next-nvfp4-v1"
+        "canary_set": "canary-qwen3.8-flash-next-speciality-v1"
       }
     }
   ],

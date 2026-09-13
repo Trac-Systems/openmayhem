@@ -200,13 +200,19 @@ budget, and default inflight limits.
 
 ## Canary and reuse policy
 
-Create `canary-qwen3.8-flash-next-nvfp4-v1` by preserving the intent of all 14
-Qwen3.8-27B cases: two deterministic text cases, tool routing, JSON, three
-reasoning levels, both thinking-history settings, image, video, thinking-on and
-thinking-off sampling, and temperature upper boundary. Run every case through
-the final native provider and gateway using the final mirror revision and exact
-runtime recipe. Record new token fingerprints and prefixes with exact matching;
-none of the Qwen3.8-27B fingerprints may be copied.
+Use the three-prompt `canary-qwen3.8-flash-next-speciality-v1` input at source
+SHA-256 `fcbfe62df2f134d2d32413769a7a716e928b0a5ca5382efbbbb8ddb98b92785b`.
+Its deterministic text prompt assesses all seven signed speciality levels, and
+its isolated image and video prompts measure the missing resource profiles and
+new response fingerprints. Retain the direct 9-of-9 functional evidence for
+unchanged capabilities. No Qwen3.8-27B fingerprint is copied.
+
+The video prompt uses the OpenAI-compatible `video_url.url` data URL accepted by
+the pinned SGLang schema. Its nested object also retains the same base64 payload,
+MIME type, frame rate, and frame count so Core can attribute the signed resource
+profile: 17,042 bytes, SHA-256
+`365754adff9583755e7c2bbd7f5cc0a0c614902c0ffd2ddb57ef4395b2238581`,
+8 fps, and 16 frames.
 
 The long 260k concurrency-two qualification need not be repeated when the final
 419-file snapshot, directory artifact root, container, runtime revision,

@@ -151,25 +151,33 @@
     "calibrated": {}
   },
   "canary_plan": {
-    "set_id": "canary-qwen3.8-flash-next-nvfp4-v1",
+    "set_id": "canary-qwen3.8-flash-next-speciality-v1",
+    "source_sha256": "fcbfe62df2f134d2d32413769a7a716e928b0a5ca5382efbbbb8ddb98b92785b",
     "match_min": 0.9,
     "verification_method": "token_fingerprint",
     "prompt_ids": [
-      "qwen38-text-deterministic-a",
-      "qwen38-text-deterministic-b",
-      "qwen38-tool-routing",
-      "qwen38-json-object",
-      "qwen38-reasoning-xhigh",
-      "qwen38-reasoning-medium",
-      "qwen38-reasoning-low",
-      "qwen38-preserve-thinking-true",
-      "qwen38-preserve-thinking-false",
-      "qwen38-image-understanding",
-      "qwen38-video-understanding",
-      "qwen38-sampling-thinking",
-      "qwen38-sampling-non-thinking",
-      "qwen38-temperature-upper-boundary"
+      "qwen38-flash-phase-a-speciality",
+      "qwen38-flash-phase-a-image-resource",
+      "qwen38-flash-phase-a-video-resource"
     ],
+    "video_input": {
+      "part_type": "video_url",
+      "data_url_mime": "video/mp4",
+      "input_bytes": 17042,
+      "input_sha256": "365754adff9583755e7c2bbd7f5cc0a0c614902c0ffd2ddb57ef4395b2238581",
+      "fps": 8.0,
+      "num_frames": 16,
+      "resource_attribution_fields": [
+        "data",
+        "content_type",
+        "fps",
+        "num_frames"
+      ]
+    },
+    "reuse": {
+      "unchanged_capabilities": "retained_direct_9_of_9",
+      "long_context_c2": "retained"
+    },
     "fingerprints": {},
     "token_prefixes": {}
   },
