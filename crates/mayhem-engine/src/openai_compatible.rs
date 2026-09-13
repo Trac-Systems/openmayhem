@@ -863,43 +863,85 @@ fn verify_concurrency(loaded: &Arc<LoadedBackend>) -> Result<()> {
         }));
     }
     drop(started_tx);
-    for _ in 0..count {
-        started_rx.recv_timeout(PREFLIGHT_TIMEOUT).map_err(|_| {
-            backend_error(format!(
-                "runtime did not stream {} requests concurrently",
-                loaded.runtime.max_concurrent
-            ))
-        })?;
-    }
-    let active = prometheus_metric_sum(
-        &get_text(loaded, "metrics")?,
-        &loaded.runtime.preflight.concurrency_active_metric,
-    )?;
-    if active < count as f64 {
-        for release in releases {
-            let _ = release.send(());
-        }
-        for handle in handles {
-            let _ = handle.join();
-        }
-        return Err(backend_error(format!(
-            "runtime scheduler exposed {active} active requests while signed concurrency requires {count}"
-        )));
-    }
+    let proof = wait_for_concurrency_proof(
+        count,
+        &started_rx,
+        PREFLIGHT_TIMEOUT,
+        Duration::from_millis(100),
+        || {
+            prometheus_metric_sum(
+                &get_text(loaded, "metrics")?,
+                &loaded.runtime.preflight.concurrency_active_metric,
+            )
+        },
+    );
     for release in releases {
         let _ = release.send(());
     }
+    let mut worker_error = None;
     for handle in handles {
         match handle.join() {
             Ok(Err(EngineError::Cancelled)) | Ok(Ok(_)) => {}
-            Ok(Err(error)) => return Err(error),
-            Err(_) => return Err(backend_error("concurrency preflight worker panicked")),
+            Ok(Err(error)) if worker_error.is_none() => worker_error = Some(error),
+            Err(_) if worker_error.is_none() => {
+                worker_error = Some(backend_error("concurrency preflight worker panicked"));
+            }
+            Ok(Err(_)) | Err(_) => {}
         }
+    }
+    proof?;
+    if let Some(error) = worker_error {
+        return Err(error);
     }
     if loaded.runtime.capabilities.contains("cancellation") {
         wait_for_scheduler_idle(loaded)?;
     }
     Ok(())
+}
+
+fn wait_for_concurrency_proof<F>(
+    count: usize,
+    started_rx: &mpsc::Receiver<usize>,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut active_sample: F,
+) -> Result<()>
+where
+    F: FnMut() -> Result<f64>,
+{
+    let deadline = std::time::Instant::now() + timeout;
+    let mut started = BTreeSet::new();
+    let mut peak_active = 0.0_f64;
+    let mut observed_active = false;
+    loop {
+        loop {
+            match started_rx.try_recv() {
+                Ok(index) if index < count => {
+                    started.insert(index);
+                }
+                Ok(_) => {
+                    return Err(backend_error(
+                        "concurrency preflight worker reported an invalid index",
+                    ));
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            }
+        }
+        let active = active_sample()?;
+        peak_active = peak_active.max(active);
+        observed_active |= active >= count as f64;
+        if observed_active && started.len() == count {
+            return Ok(());
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(backend_error(format!(
+                "runtime did not prove {count} concurrent requests: first content from {}/{count}, peak signed active metric {peak_active}",
+                started.len()
+            )));
+        }
+        thread::sleep(poll_interval);
+    }
 }
 
 fn generate(
@@ -1656,6 +1698,29 @@ mod tests {
                 ("reasoning_effort", "reasoning_effort"),
             ]
         );
+    }
+
+    #[test]
+    fn concurrency_proof_polls_past_a_delayed_active_metric_sample() {
+        let (started_tx, started_rx) = mpsc::channel();
+        started_tx.send(0).unwrap();
+        started_tx.send(1).unwrap();
+        let mut samples = [0.0, 0.0, 2.0].into_iter();
+        let mut polls = 0;
+
+        wait_for_concurrency_proof(
+            2,
+            &started_rx,
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || {
+                polls += 1;
+                Ok(samples.next().unwrap_or(2.0))
+            },
+        )
+        .unwrap();
+
+        assert_eq!(polls, 3);
     }
 
     #[test]
