@@ -1280,7 +1280,7 @@ fn chat_request_body(model: &str, request: GenerateRequest) -> Result<Value> {
     let messages = if request.messages.is_empty() {
         vec![json!({"role": "user", "content": request.prompt})]
     } else {
-        request.messages
+        normalize_openai_chat_messages(request.messages)?
     };
     let mut body = Map::from_iter([
         ("model".to_owned(), json!(model)),
@@ -1361,6 +1361,70 @@ fn chat_request_body(model: &str, request: GenerateRequest) -> Result<Value> {
         );
     }
     Ok(Value::Object(body))
+}
+
+fn normalize_openai_chat_messages(mut messages: Vec<Value>) -> Result<Vec<Value>> {
+    for (message_index, message) in messages.iter_mut().enumerate() {
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for (part_index, part) in parts.iter_mut().enumerate() {
+            if part.get("type").and_then(Value::as_str) != Some("video") {
+                continue;
+            }
+            let video = part
+                .get("video")
+                .and_then(Value::as_object)
+                .ok_or_else(|| {
+                    EngineError::InvalidRequest(format!(
+                        "message {message_index} content part {part_index} has no video descriptor"
+                    ))
+                })?;
+            let url = match (
+                video.get("url").and_then(Value::as_str),
+                video.get("data").and_then(Value::as_str),
+            ) {
+                (Some(url), None) if !url.trim().is_empty() => url.to_owned(),
+                (None, Some(data)) if !data.is_empty() => {
+                    let content_type = video
+                        .get("content_type")
+                        .and_then(Value::as_str)
+                        .filter(|content_type| valid_video_content_type(content_type))
+                        .ok_or_else(|| {
+                            EngineError::InvalidRequest(format!(
+                                "message {message_index} content part {part_index} has no valid video content_type"
+                            ))
+                        })?;
+                    format!("data:{content_type};base64,{data}")
+                }
+                (Some(_), Some(_)) => {
+                    return Err(EngineError::InvalidRequest(format!(
+                        "message {message_index} content part {part_index} has ambiguous video data and url"
+                    )));
+                }
+                _ => {
+                    return Err(EngineError::InvalidRequest(format!(
+                        "message {message_index} content part {part_index} has no usable video data or url"
+                    )));
+                }
+            };
+            *part = json!({"type": "video_url", "video_url": {"url": url}});
+        }
+    }
+    Ok(messages)
+}
+
+fn valid_video_content_type(content_type: &str) -> bool {
+    content_type.strip_prefix("video/").is_some_and(|subtype| {
+        !subtype.is_empty()
+            && subtype.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric()
+                    || matches!(
+                        byte,
+                        b'!' | b'#' | b'$' | b'&' | b'^' | b'_' | b'.' | b'+' | b'-'
+                    )
+            })
+    })
 }
 
 fn openai_tool(tool: ToolSpec) -> Value {
@@ -1731,6 +1795,60 @@ mod tests {
         assert_eq!(body["tool_choice"], "required");
         assert_eq!(body["tools"][0]["function"]["name"], "lookup");
         assert_eq!(body["chat_template_kwargs"]["enable_thinking"], true);
+    }
+
+    #[test]
+    fn request_normalizes_hf_video_inside_mixed_chat_content() {
+        let mut request = GenerateRequest::new("unused");
+        request.messages = vec![json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Compare the inputs."},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}},
+                {"type": "video", "video": {
+                    "data": "dmlkZW8=",
+                    "content_type": "video/mp4",
+                    "num_frames": 8,
+                    "fps": 2
+                }},
+                {"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}}
+            ]
+        })];
+
+        let body = chat_request_body("org/model", request).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            json!({"type": "text", "text": "Compare the inputs."})
+        );
+        assert_eq!(
+            content[1],
+            json!({"type": "image_url", "image_url": {"url": "data:image/png;base64,aW1hZ2U="}})
+        );
+        assert_eq!(
+            content[2],
+            json!({"type": "video_url", "video_url": {"url": "data:video/mp4;base64,dmlkZW8="}})
+        );
+        assert_eq!(
+            content[3],
+            json!({"type": "input_audio", "input_audio": {"data": "UklGRg==", "format": "wav"}})
+        );
+    }
+
+    #[test]
+    fn request_rejects_ambiguous_or_unsafe_hf_video_descriptors() {
+        for video in [
+            json!({"data": "dmlkZW8=", "url": "https://example.test/video.mp4", "content_type": "video/mp4"}),
+            json!({"data": "dmlkZW8=", "content_type": "text/plain"}),
+            json!({"frames": ["ZnJhbWU="]}),
+        ] {
+            let mut request = GenerateRequest::new("unused");
+            request.messages = vec![json!({
+                "role": "user",
+                "content": [{"type": "video", "video": video}]
+            })];
+            assert!(chat_request_body("org/model", request).is_err(), "{video}");
+        }
     }
 
     #[test]

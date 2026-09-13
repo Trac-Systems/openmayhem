@@ -17330,6 +17330,7 @@ fn calibration_token_prefixes(
 struct CatalogEndpointCalibrationFixtures {
     audio: Option<Vec<u8>>,
     audio_by_content_type: BTreeMap<&'static str, &'static [u8]>,
+    video_base64: Option<String>,
     workflow_input_files: Option<Value>,
 }
 
@@ -17633,13 +17634,24 @@ fn catalog_endpoint_calibration_report(
     mut behavioral_witness: Option<EndpointCalibrationBehavioralWitness>,
 ) -> EndpointCalibrationReport {
     let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, prompts);
+    let forced_tool_max_output_tokens = artifact
+        .openai_compatible
+        .as_ref()
+        .map(|binding| binding.preflight.tools_max_tokens)
+        .unwrap_or(ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS);
     let mut execution_cache = BTreeMap::<(String, String), EndpointCalibrationExecution>::new();
     run_endpoint_calibration_matrix_with_materializer(
         &model.adapter.endpoint_families,
         &substitutions,
         |contract, case, request| {
-            catalog_endpoint_calibration_materialize_request(contract, case, request, &fixtures)
-                .map_err(|error| format!("{error:#}"))
+            catalog_endpoint_calibration_materialize_request_with_tool_budget(
+                contract,
+                case,
+                request,
+                &fixtures,
+                forced_tool_max_output_tokens,
+            )
+            .map_err(|error| format!("{error:#}"))
         },
         |contract, _case, request| {
             let cache_key = (
@@ -17660,6 +17672,7 @@ fn catalog_endpoint_calibration_report(
                     request,
                     &fixtures,
                     &mut behavioral_witness,
+                    forced_tool_max_output_tokens,
                 )?
             } else {
                 catalog_endpoint_calibration_execute_unsupported_artifact_case(
@@ -17856,6 +17869,7 @@ fn catalog_endpoint_calibration_fixtures(
     let mut substitutions = BTreeMap::from([("$MODEL".to_owned(), json!(model.model_id))]);
     let mut fixtures = CatalogEndpointCalibrationFixtures {
         audio: None,
+        video_base64: None,
         workflow_input_files: None,
         audio_by_content_type: BTreeMap::from([
             ("audio/aac", CALIBRATION_AUDIO_AAC),
@@ -17915,14 +17929,34 @@ fn catalog_endpoint_calibration_fixtures(
             }
         }
     }
+    fixtures.video_base64 = substitutions
+        .get("$VIDEO_BASE64")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     (substitutions, fixtures)
 }
 
 fn catalog_endpoint_calibration_materialize_request(
     contract: &mayhem_proto::EndpointFamilyContract,
     case: &mayhem_proto::EndpointCalibrationCase,
+    request: Value,
+    fixtures: &CatalogEndpointCalibrationFixtures,
+) -> Result<Value> {
+    catalog_endpoint_calibration_materialize_request_with_tool_budget(
+        contract,
+        case,
+        request,
+        fixtures,
+        ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS,
+    )
+}
+
+fn catalog_endpoint_calibration_materialize_request_with_tool_budget(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    case: &mayhem_proto::EndpointCalibrationCase,
     mut request: Value,
     fixtures: &CatalogEndpointCalibrationFixtures,
+    forced_tool_max_output_tokens: u32,
 ) -> Result<Value> {
     if matches!(
         contract.family.as_str(),
@@ -17930,7 +17964,18 @@ fn catalog_endpoint_calibration_materialize_request(
             | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
             | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
     ) {
-        return catalog_endpoint_calibration_materialize_tool_request(contract, case, request);
+        request = catalog_endpoint_calibration_materialize_tool_request(
+            contract,
+            case,
+            request,
+            forced_tool_max_output_tokens,
+        )?;
+        if contract.family == mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT {
+            request = catalog_endpoint_calibration_materialize_hf_video_request(
+                contract, case, request, fixtures,
+            )?;
+        }
+        return Ok(request);
     }
     if contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
         return catalog_endpoint_calibration_materialize_workflow_request(case, request, fixtures);
@@ -18039,10 +18084,145 @@ fn catalog_endpoint_calibration_materialize_request(
     Ok(request)
 }
 
+fn catalog_endpoint_calibration_materialize_hf_video_request(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    case: &mayhem_proto::EndpointCalibrationCase,
+    mut request: Value,
+    fixtures: &CatalogEndpointCalibrationFixtures,
+) -> Result<Value> {
+    let mutates_parent = case.mutations.iter().any(|mutation| {
+        matches!(
+            mutation.path.as_str(),
+            "messages" | "messages.content" | "messages.content.video"
+        )
+    });
+    let mutates = |path: &str| case.mutations.iter().any(|mutation| mutation.path == path);
+    if !case.expect_accept || mutates_parent {
+        return Ok(request);
+    }
+    let data_mutated = mutates("messages.content.video.data");
+    let content_type_mutated = mutates("messages.content.video.content_type");
+
+    let needs_companion = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+        .any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("video")
+                && part
+                    .get("video")
+                    .and_then(Value::as_object)
+                    .is_some_and(|video| {
+                        (!data_mutated && !video.contains_key("data") && !video.contains_key("url"))
+                            || (!content_type_mutated && !video.contains_key("content_type"))
+                    })
+        });
+    if !needs_companion {
+        return Ok(request);
+    }
+
+    let signed = catalog_endpoint_calibration_signed_hf_video_fixture(contract, fixtures)
+        .with_context(|| {
+            format!(
+                "accepted HF video calibration case {} has no complete signed video fixture",
+                case.case_id
+            )
+        })?;
+    for message in request
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("video") {
+                continue;
+            }
+            let Some(video) = part.get_mut("video").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            if !data_mutated && !video.contains_key("data") && !video.contains_key("url") {
+                video.insert("data".to_owned(), signed["data"].clone());
+            }
+            if !content_type_mutated && !video.contains_key("content_type") {
+                video.insert("content_type".to_owned(), signed["content_type"].clone());
+            }
+        }
+    }
+    Ok(request)
+}
+
+fn catalog_endpoint_calibration_signed_hf_video_fixture(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    fixtures: &CatalogEndpointCalibrationFixtures,
+) -> Option<Map<String, Value>> {
+    let values = &contract
+        .request_attribute_specs
+        .get("messages")?
+        .calibration_values;
+    for value in values {
+        let Some(messages) = value.as_array() else {
+            continue;
+        };
+        for message in messages {
+            let Some(parts) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) != Some("video") {
+                    continue;
+                }
+                let Some(video) = part.get("video").and_then(Value::as_object) else {
+                    continue;
+                };
+                let Some(content_type) =
+                    video
+                        .get("content_type")
+                        .and_then(Value::as_str)
+                        .filter(|content_type| {
+                            content_type
+                                .strip_prefix("video/")
+                                .is_some_and(|subtype| !subtype.is_empty())
+                        })
+                else {
+                    continue;
+                };
+                let Some(data) = video.get("data").and_then(Value::as_str) else {
+                    continue;
+                };
+                let data = if data == "$VIDEO_BASE64" {
+                    fixtures.video_base64.as_deref()?
+                } else {
+                    data
+                };
+                if data.is_empty()
+                    || base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .is_err()
+                {
+                    continue;
+                }
+                return Some(Map::from_iter([
+                    ("data".to_owned(), json!(data)),
+                    ("content_type".to_owned(), json!(content_type)),
+                ]));
+            }
+        }
+    }
+    None
+}
+
 fn catalog_endpoint_calibration_materialize_tool_request(
     contract: &mayhem_proto::EndpointFamilyContract,
     case: &mayhem_proto::EndpointCalibrationCase,
     mut request: Value,
+    forced_tool_max_output_tokens: u32,
 ) -> Result<Value> {
     // Supply a companion fixture, never repair an explicit tools value or omission test.
     if !case.expect_accept
@@ -18057,7 +18237,8 @@ fn catalog_endpoint_calibration_materialize_tool_request(
     let choice = request.get("tool_choice");
     let named = choice
         .and_then(Value::as_object)
-        .and_then(provider_engine_named_tool_choice);
+        .and_then(provider_engine_named_tool_choice)
+        .map(str::to_owned);
     if named.is_none() && !matches!(choice.and_then(Value::as_str), Some("required" | "any")) {
         return Ok(request);
     }
@@ -18076,7 +18257,7 @@ fn catalog_endpoint_calibration_materialize_tool_request(
                     provider_engine_tool_definition(tool)
                         .and_then(|function| function.get("name"))
                         .and_then(Value::as_str)
-                        .is_some_and(|name| named.is_none_or(|chosen| chosen == name))
+                        .is_some_and(|name| named.as_deref().is_none_or(|chosen| chosen == name))
                 })
             });
             if !matches_choice {
@@ -18093,7 +18274,82 @@ fn catalog_endpoint_calibration_materialize_tool_request(
             )
         })?;
     request["tools"] = tools.clone();
+    let selected_tool = named
+        .as_deref()
+        .or_else(|| {
+            tools.as_array().and_then(|tools| {
+                tools.iter().find_map(|tool| {
+                    provider_engine_tool_definition(tool)
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                })
+            })
+        })
+        .context("forced-tool calibration fixture has no named function")?;
+    catalog_endpoint_calibration_strengthen_tool_request(
+        &contract.family,
+        case,
+        &mut request,
+        selected_tool,
+        forced_tool_max_output_tokens,
+    )?;
     Ok(request)
+}
+
+fn catalog_endpoint_calibration_strengthen_tool_request(
+    endpoint_family: &str,
+    case: &mayhem_proto::EndpointCalibrationCase,
+    request: &mut Value,
+    selected_tool: &str,
+    forced_tool_max_output_tokens: u32,
+) -> Result<()> {
+    let instruction = format!(
+        "Call the {selected_tool} function now with arguments that satisfy its schema. Return the function call immediately; do not answer in prose."
+    );
+    let (prompt_path, budget_path) = match endpoint_family {
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+        | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => ("messages", "max_tokens"),
+        mayhem_proto::ENDPOINT_OPENAI_RESPONSES => ("input", "max_output_tokens"),
+        other => bail!("endpoint family {other} has no forced-tool calibration prompt"),
+    };
+    if !case
+        .mutations
+        .iter()
+        .any(|mutation| mutation.path == prompt_path || mutation.path.starts_with(&format!("{prompt_path}.")))
+    {
+        match endpoint_family {
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+            | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => request
+                .get_mut("messages")
+                .and_then(Value::as_array_mut)
+                .context("forced-tool calibration request has no messages array")?
+                .push(json!({"role": "user", "content": instruction})),
+            mayhem_proto::ENDPOINT_OPENAI_RESPONSES => match request.get_mut("input") {
+                Some(Value::String(input)) => {
+                    input.push_str("\n\n");
+                    input.push_str(&instruction);
+                }
+                Some(Value::Array(input)) => {
+                    input.push(json!({"role": "user", "content": instruction}));
+                }
+                _ => bail!("forced-tool calibration Responses request has no usable input"),
+            },
+            _ => unreachable!(),
+        }
+    }
+    if !case
+        .mutations
+        .iter()
+        .any(|mutation| mutation.path == budget_path)
+        && request
+            .get(budget_path)
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            < u64::from(forced_tool_max_output_tokens)
+    {
+        request[budget_path] = json!(forced_tool_max_output_tokens);
+    }
+    Ok(())
 }
 
 fn catalog_endpoint_calibration_materialize_workflow_request(
@@ -18220,7 +18476,12 @@ fn catalog_endpoint_calibration_execute(
     request: &Value,
     fixtures: &CatalogEndpointCalibrationFixtures,
     behavioral_witness: &mut Option<EndpointCalibrationBehavioralWitness>,
+    forced_tool_max_output_tokens: u32,
 ) -> Result<EndpointCalibrationExecution, String> {
+    let output_token_cap = catalog_endpoint_calibration_output_token_cap(
+        request,
+        forced_tool_max_output_tokens,
+    );
     let transport = catalog_endpoint_calibration_transport(contract, request, fixtures)
         .map_err(|error| format!("building provider transport: {error:#}"))?;
     let (translation, mut handled_request_attributes) =
@@ -18271,7 +18532,7 @@ fn catalog_endpoint_calibration_execute(
                     model.workflow.as_ref(),
                     &sealed,
                     None,
-                    Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
+                    Some(output_token_cap),
                     &CancellationToken::new(),
                 )
                 .map_err(|error| format!("executing provider request: {error:#}"))?;
@@ -18301,7 +18562,7 @@ fn catalog_endpoint_calibration_execute(
                 model.workflow.as_ref(),
                 &sealed,
                 None,
-                Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
+                Some(output_token_cap),
                 &CancellationToken::new(),
             )
             .map_err(|error| format!("executing provider request: {error:#}"))?;
@@ -18373,6 +18634,29 @@ fn catalog_endpoint_calibration_execute_unsupported_artifact_case(
 }
 
 const ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS: u32 = 128;
+const ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS: u32 = 384;
+
+fn catalog_endpoint_calibration_output_token_cap(
+    request: &Value,
+    forced_tool_max_output_tokens: u32,
+) -> u32 {
+    let choice = request.get("tool_choice");
+    let forced = matches!(choice.and_then(Value::as_str), Some("required" | "any"))
+        || choice
+            .and_then(Value::as_object)
+            .and_then(provider_engine_named_tool_choice)
+            .is_some();
+    if forced
+        && request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        forced_tool_max_output_tokens
+    } else {
+        ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS
+    }
+}
 
 fn provider_engine_session_media_validation(
     backend: &mut dyn EngineBackend,
@@ -114959,6 +115243,184 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn qwen_endpoint_calibration_materializes_partial_hf_video_rows() {
+        fn video_descriptor(request: &Value) -> &Map<String, Value> {
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_array))
+                .flatten()
+                .find(|part| part.get("type").and_then(Value::as_str) == Some("video"))
+                .and_then(|part| part.get("video"))
+                .and_then(Value::as_object)
+                .unwrap()
+        }
+
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "Qwen/Qwen3.8-27B")
+            .expect("Qwen 3.8 catalog model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+        let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, &prompts);
+        let contract = model
+            .adapter
+            .endpoint_families
+            .iter()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT)
+            .unwrap();
+        let expected_attributes = vec![
+            "messages.content.type".to_owned(),
+            "messages.content.video.fps".to_owned(),
+            "messages.content.video.num_frames".to_owned(),
+            "messages.role".to_owned(),
+        ];
+        let cases = mayhem_proto::generate_endpoint_calibration_cases(contract).unwrap();
+        let partial = cases
+            .iter()
+            .filter(|case| case.expect_accept && case.attributes == expected_attributes)
+            .collect::<Vec<_>>();
+        assert_eq!(partial.len(), 7);
+        let expected_shapes = BTreeMap::from([
+            (("0.01".to_owned(), 1_u64), 1_usize),
+            (("8".to_owned(), 1_u64), 3_usize),
+            (("8".to_owned(), 16_u64), 1_usize),
+            (("8".to_owned(), 1024_u64), 1_usize),
+            (("240.0".to_owned(), 1_u64), 1_usize),
+        ]);
+        let mut observed_shapes = BTreeMap::new();
+        for case in &partial {
+            let raw = mayhem_proto::materialize_endpoint_calibration_request(case, &substitutions)
+                .unwrap();
+            let raw_video = video_descriptor(&raw);
+            assert_eq!(
+                raw_video.keys().cloned().collect::<BTreeSet<_>>(),
+                BTreeSet::from(["fps".to_owned(), "num_frames".to_owned()])
+            );
+            *observed_shapes
+                .entry((
+                    raw_video["fps"].to_string(),
+                    raw_video["num_frames"].as_u64().unwrap(),
+                ))
+                .or_insert(0) += 1;
+            let fps = raw_video["fps"].clone();
+            let num_frames = raw_video["num_frames"].clone();
+            let materialized =
+                catalog_endpoint_calibration_materialize_request(contract, case, raw, &fixtures)
+                    .unwrap();
+            let video = video_descriptor(&materialized);
+            assert_eq!(video["fps"], fps);
+            assert_eq!(video["num_frames"], num_frames);
+            assert_eq!(video["data"], substitutions["$VIDEO_BASE64"]);
+            assert_eq!(video["content_type"], "video/mp4");
+            assert_eq!(video.len(), 4);
+            mayhem_proto::validate_endpoint_request(contract, &materialized).unwrap();
+            let normalized = normalize_endpoint_calibration_request(contract, &materialized)
+                .unwrap()
+                .normalized_request;
+            let transport =
+                catalog_endpoint_calibration_transport(contract, &normalized, &fixtures).unwrap();
+            let (translation, handled) =
+                catalog_endpoint_calibration_translation(model, contract, &normalized, &transport)
+                    .unwrap();
+            assert_eq!(translation["messages"], materialized["messages"]);
+            assert!(handled.contains("messages.content.video.data"));
+            assert!(handled.contains("messages.content.video.content_type"));
+        }
+        assert_eq!(observed_shapes, expected_shapes);
+
+        let case = partial[0];
+        let mut raw =
+            mayhem_proto::materialize_endpoint_calibration_request(case, &substitutions).unwrap();
+        let named_choice =
+            contract.request_attribute_specs["tool_choice"].calibration_values[2].clone();
+        raw["tool_choice"] = named_choice.clone();
+        let mut media_and_tool = case.clone();
+        media_and_tool
+            .mutations
+            .push(mayhem_proto::EndpointCalibrationMutation {
+                path: "tool_choice".to_owned(),
+                value: mayhem_proto::EndpointCalibrationValue::Literal {
+                    value: named_choice,
+                },
+            });
+        let composed = catalog_endpoint_calibration_materialize_request(
+            contract,
+            &media_and_tool,
+            raw.clone(),
+            &fixtures,
+        )
+        .unwrap();
+        assert_eq!(
+            video_descriptor(&composed)["data"],
+            substitutions["$VIDEO_BASE64"]
+        );
+        assert!(composed["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()));
+        assert_eq!(
+            composed["max_tokens"],
+            ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS
+        );
+
+        let mut rejected = case.clone();
+        rejected.expect_accept = false;
+        assert_eq!(
+            catalog_endpoint_calibration_materialize_request(
+                contract,
+                &rejected,
+                raw.clone(),
+                &fixtures,
+            )
+            .unwrap(),
+            raw
+        );
+
+        for (path, key, explicit) in [
+            (
+                "messages.content.video.data",
+                "data",
+                json!("explicit-video-data"),
+            ),
+            (
+                "messages.content.video.content_type",
+                "content_type",
+                json!("video/webm"),
+            ),
+        ] {
+            let mut explicit_case = case.clone();
+            explicit_case
+                .mutations
+                .push(mayhem_proto::EndpointCalibrationMutation {
+                    path: path.to_owned(),
+                    value: mayhem_proto::EndpointCalibrationValue::Literal {
+                        value: explicit.clone(),
+                    },
+                });
+            let mut explicit_request =
+                mayhem_proto::materialize_endpoint_calibration_request(case, &substitutions)
+                    .unwrap();
+            video_descriptor(&explicit_request);
+            explicit_request["messages"][0]["content"][0]["video"][key] = explicit.clone();
+            let materialized = catalog_endpoint_calibration_materialize_request(
+                contract,
+                &explicit_case,
+                explicit_request,
+                &fixtures,
+            )
+            .unwrap();
+            assert_eq!(video_descriptor(&materialized)[key], explicit);
+        }
+
+    }
+
+    #[test]
     fn qwen_endpoint_calibration_preserves_reasoning_history() {
         let catalog_path = repo_path("catalog/models.json").unwrap();
         let catalog = catalog::load_document(&catalog_path).unwrap();
@@ -115071,12 +115533,48 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 &fixtures,
             )
             .unwrap();
-            let mut expected = raw.clone();
-            expected["tools"] =
+            let expected_tools =
                 contract.request_attribute_specs["tools"].calibration_values[0].clone();
             assert_eq!(
-                request, expected,
-                "{family}: only add the signed tools companion"
+                request["tools"], expected_tools,
+                "{family}: add the signed tools companion"
+            );
+            let budget_path = if family == mayhem_proto::ENDPOINT_OPENAI_RESPONSES {
+                "max_output_tokens"
+            } else {
+                "max_tokens"
+            };
+            assert_eq!(
+                request[budget_path],
+                ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS,
+                "{family}: allow default reasoning to reach the required call"
+            );
+            assert_eq!(
+                catalog_endpoint_calibration_output_token_cap(
+                    &request,
+                    ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS,
+                ),
+                ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS
+            );
+            assert!(
+                request.to_string().contains(&format!(
+                    "Call the {name} function now with arguments that satisfy its schema"
+                )),
+                "{family}: request the selected tool directly"
+            );
+            let bound_budget = 512;
+            let bound_request = catalog_endpoint_calibration_materialize_request_with_tool_budget(
+                contract,
+                case,
+                raw.clone(),
+                &fixtures,
+                bound_budget,
+            )
+            .unwrap();
+            assert_eq!(bound_request[budget_path], bound_budget);
+            assert_eq!(
+                catalog_endpoint_calibration_output_token_cap(&bound_request, bound_budget),
+                bound_budget
             );
             let normalized = normalize_endpoint_calibration_request(contract, &request)
                 .unwrap()
@@ -115117,9 +115615,17 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 .unwrap();
                 let forced = !matches!(choice.as_str(), Some("auto" | "none"));
                 if forced {
-                    variant["tools"] = request["tools"].clone();
+                    assert_eq!(materialized["tools"], request["tools"]);
+                    assert_eq!(
+                        materialized[budget_path],
+                        ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS
+                    );
+                    assert!(materialized.to_string().contains(&format!(
+                        "Call the {name} function now with arguments that satisfy its schema"
+                    )));
+                } else {
+                    assert_eq!(materialized, variant);
                 }
-                assert_eq!(materialized, variant);
                 let (translation, _) = catalog_endpoint_calibration_translation(
                     model,
                     contract,
