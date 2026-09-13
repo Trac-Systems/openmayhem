@@ -1605,6 +1605,7 @@ fn run_owned_one_shot_capture(
                 .context("managed one-shot command is empty")?
         ),
     ];
+    args.extend(owned_container_identity_args(root)?);
     for (name, value) in &labels {
         args.push(format!("--label={name}={value}"));
     }
@@ -1650,6 +1651,28 @@ fn run_owned_one_shot_capture(
         bounded(&output.stderr)
     );
     Ok(output)
+}
+
+#[cfg(unix)]
+fn owned_container_identity_args(root: &Path) -> Result<[String; 3]> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let metadata = fs::metadata(root)
+        .with_context(|| format!("reading managed runtime owner for {}", root.display()))?;
+    ensure!(
+        metadata.is_dir(),
+        "managed runtime owner path is not a directory"
+    );
+    Ok([
+        format!("--user={}:{}", metadata.uid(), metadata.gid()),
+        "--env=HOME=/tmp".to_owned(),
+        "--env=TMPDIR=/tmp".to_owned(),
+    ])
+}
+
+#[cfg(not(unix))]
+fn owned_container_identity_args(_root: &Path) -> Result<[String; 3]> {
+    bail!("managed one-shot containers require a Unix host")
 }
 
 fn reconcile_previous_runtime(docker: &Path, root: &Path, _lock: &File) -> Result<()> {
@@ -2117,6 +2140,25 @@ mod tests {
         let mut wrong_platform = wheel;
         wrong_platform.platform_tag = "linux_aarch64".to_owned();
         assert!(validate_reader_wheel(&wrong_platform, "0.2.0+pennyroyal2").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn one_shot_containers_write_as_the_managed_runtime_owner() {
+        use std::os::unix::fs::MetadataExt as _;
+
+        let root =
+            std::env::temp_dir().join(format!("mayhem-one-shot-owner-{}", random_hex(8).unwrap()));
+        fs::create_dir(&root).unwrap();
+        let metadata = fs::metadata(&root).unwrap();
+        let args = owned_container_identity_args(&root).unwrap();
+        assert_eq!(
+            args[0],
+            format!("--user={}:{}", metadata.uid(), metadata.gid())
+        );
+        assert_eq!(args[1], "--env=HOME=/tmp");
+        assert_eq!(args[2], "--env=TMPDIR=/tmp");
+        fs::remove_dir(&root).unwrap();
     }
 
     #[test]
