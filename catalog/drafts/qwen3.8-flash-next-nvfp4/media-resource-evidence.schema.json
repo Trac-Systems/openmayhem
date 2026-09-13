@@ -23,10 +23,10 @@
       "const": "78191c28fa91602e536baa8ede39891d6d500615086ce2ba42cb920c3b46eabe"
     },
     "mirror_revision": {
-      "const": "924b34c8e7a08647e6c2657a80729907d0aff007"
+      "const": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e"
     },
     "runtime_recipe_sha256": {
-      "const": "da68f39d1f631b3e69774147d779d4c28b430938428679f42dfa8f7ba1f3c1a3"
+      "const": "7f248046c72b771620da09f36d9cf554134cc70789c3e832017f8d29dbd5b41c"
     },
     "profiles": {
       "type": "object",

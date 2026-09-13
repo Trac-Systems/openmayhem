@@ -6,9 +6,9 @@
   "model_class": "text-generation",
   "verified_mirror": {
     "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
-    "revision": "924b34c8e7a08647e6c2657a80729907d0aff007",
-    "file_count": 424,
-    "total_bytes": 135317826474,
+    "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+    "file_count": 425,
+    "total_bytes": 135318119812,
     "model_snapshot_file_count": 419,
     "model_snapshot_total_bytes": 135253622894,
     "snapshot_manifest_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374"
@@ -91,7 +91,7 @@
   ],
   "prepublication_gates": [
     "Repeat exact verification of the immutable mirror revision immediately before signing.",
-    "Retain the verified 419-file directory artifact root and all four exact sidecar identities.",
+    "Retain the verified 419-file directory artifact root and all five exact sidecar identities.",
     "Resolve portable text F13 and media resource profiles.",
     "Complete canonical served-model/xhigh native-provider and paid-gateway canaries.",
     "Record applicable commercial hosted-use license compliance.",

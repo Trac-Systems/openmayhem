@@ -81,7 +81,7 @@
     "snapshot_manifest_sidecar": "snapshot_manifest",
     "snapshot_manifest_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
     "runtime_recipe_sidecar": "runtime_recipe",
-    "runtime_recipe_sha256": "da68f39d1f631b3e69774147d779d4c28b430938428679f42dfa8f7ba1f3c1a3",
+    "runtime_recipe_sha256": "7f248046c72b771620da09f36d9cf554134cc70789c3e832017f8d29dbd5b41c",
     "model_snapshot_file_count": 419
   },
   "publication_blockers": [
