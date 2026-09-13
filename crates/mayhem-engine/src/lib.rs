@@ -15,6 +15,12 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+mod openai_compatible;
+pub use openai_compatible::{
+    OpenAiCompatibleBackend, OpenAiCompatibleBackendConfig, OpenAiCompatibleLifecycle,
+    OpenAiCompatiblePreflightProfile, OpenAiCompatibleRuntimeBinding,
+};
+
 pub const CRATE_NAME: &str = "mayhem-engine";
 pub const DEFAULT_CONTEXT_SIZE: u32 = 2048;
 pub const DEFAULT_BATCH_SIZE: u32 = 512;
@@ -90,6 +96,8 @@ pub enum EngineError {
     WhisperCpp(String),
     #[error("piper backend error: {0}")]
     Piper(String),
+    #[error("OpenAI-compatible backend error: {0}")]
+    OpenAiCompatible(String),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("JSON error: {0}")]
@@ -222,6 +230,7 @@ pub enum ArtifactFormat {
     MlxSafetensors,
     TensorRtLlmCheckpoint,
     VllmSafetensors,
+    OpenAiCompatibleModel,
     TransformersSafetensors,
     AceStepSafetensors,
     ChatterboxSafetensors,
@@ -239,6 +248,7 @@ impl ArtifactFormat {
             Self::MlxSafetensors => b"",
             Self::TensorRtLlmCheckpoint => b"",
             Self::VllmSafetensors => b"",
+            Self::OpenAiCompatibleModel => b"",
             Self::TransformersSafetensors => b"",
             Self::AceStepSafetensors => b"",
             Self::ChatterboxSafetensors => b"",
@@ -256,6 +266,7 @@ impl ArtifactFormat {
             Self::MlxSafetensors => "MLX safetensors",
             Self::TensorRtLlmCheckpoint => "TensorRT-LLM checkpoint",
             Self::VllmSafetensors => "vLLM safetensors",
+            Self::OpenAiCompatibleModel => "OpenAI-compatible model artifact",
             Self::TransformersSafetensors => "Transformers safetensors",
             Self::AceStepSafetensors => "ACE-Step safetensors",
             Self::ChatterboxSafetensors => "Chatterbox safetensors",
@@ -354,6 +365,15 @@ impl ModelArtifact {
         Self {
             path: path.into(),
             format: ArtifactFormat::VllmSafetensors,
+            sha256: None,
+            sha256_path: None,
+        }
+    }
+
+    pub fn openai_compatible_model(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::OpenAiCompatibleModel,
             sha256: None,
             sha256_path: None,
         }
@@ -583,6 +603,13 @@ impl LoadConfig {
     pub fn vllm_safetensors(path: impl Into<PathBuf>) -> Self {
         Self {
             artifact: ModelArtifact::vllm_safetensors(path),
+            ..Self::default()
+        }
+    }
+
+    pub fn openai_compatible_model(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::openai_compatible_model(path),
             ..Self::default()
         }
     }
@@ -1564,6 +1591,11 @@ pub trait EngineBackend {
     fn process_ids(&self) -> Vec<u32> {
         Vec::new()
     }
+    /// True when backend recovery requires its owning provider process to exit
+    /// so an external supervisor can recreate all managed runtime state.
+    fn requires_owner_restart(&self) -> bool {
+        false
+    }
     fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
         None
     }
@@ -2016,6 +2048,11 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
             payload
         }
         ArtifactFormat::VllmSafetensors => {
+            let payload = vllm_safetensors_payload_path(&artifact.path)?;
+            verify_safetensors_header_as(&payload, artifact.format.label())?;
+            payload
+        }
+        ArtifactFormat::OpenAiCompatibleModel => {
             let payload = vllm_safetensors_payload_path(&artifact.path)?;
             verify_safetensors_header_as(&payload, artifact.format.label())?;
             payload

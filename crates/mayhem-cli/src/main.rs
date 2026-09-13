@@ -4,6 +4,7 @@ mod catalog;
 mod endpoint_calibration;
 mod gemma4;
 mod intercom_runtime;
+mod managed_openai_compatible;
 mod python_runtime;
 mod provider_output_stream;
 mod provider_failure_recovery;
@@ -8936,6 +8937,9 @@ fn backend_requirement_hint(backend: &str) -> &'static str {
             "TensorRT-LLM requires a compatible NVIDIA GPU; NVFP4 artifacts require Blackwell-class compute capability"
         }
         "vllm" => "vLLM launch artifacts require a compatible NVIDIA GPU",
+        "openai-compatible" => {
+            "managed OpenAI-compatible launch artifacts require the signed container runtime and compatible accelerator"
+        }
         "llama.cpp" => "llama.cpp requires enough RAM and a compatible CPU/GPU runtime",
         "stable-diffusion.cpp" => {
             "stable-diffusion.cpp requires enough local RAM and preferably a local accelerator"
@@ -16043,7 +16047,7 @@ fn catalog_calibrate_canary(mut args: CatalogCalibrateCanaryArgs) -> Result<()> 
     validate_calibration_args_for_artifact(artifact, &args)?;
     let calibration_memory = calibration_memory_context(artifact, &artifact_path, &args)?;
     preflight_catalog_calibration_managed_runtime(artifact, &args)?;
-    verify_calibration_artifact_matches_catalog(artifact, &artifact_path)?;
+    verify_calibration_artifact_matches_catalog(artifact, &artifact_path, &artifact_sidecar_paths)?;
     verify_calibration_sidecars_match_catalog(artifact, &artifact_sidecar_paths)?;
     let prompts = load_canary_prompts_checked(
         Some(&canaries_dir),
@@ -19184,7 +19188,36 @@ fn catalog_endpoint_calibration_response(
 fn verify_calibration_artifact_matches_catalog(
     artifact: &catalog::CatalogArtifact,
     artifact_path: &Path,
+    sidecar_paths: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
+    if artifact.engine == "openai-compatible" {
+        let binding = artifact
+            .openai_compatible
+            .as_ref()
+            .context("openai-compatible artifact is missing its signed runtime binding")?;
+        let manifest_path = sidecar_paths
+            .get(&binding.snapshot_manifest_sidecar)
+            .context("openai-compatible calibration requires its snapshot manifest sidecar")?;
+        let manifest: OpenAiCompatibleSnapshotManifest = serde_json::from_slice(
+            &fs::read(manifest_path)
+                .with_context(|| format!("reading {}", manifest_path.display()))?,
+        )
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+        validate_openai_compatible_snapshot_manifest_for_artifact(artifact, binding, &manifest)?;
+        validate_openai_compatible_snapshot_directory(
+            artifact_path,
+            &manifest,
+            DEFAULT_CHUNK_SIZE,
+        )?;
+        let merkle = build_artifact_merkle_manifest(artifact_path, DEFAULT_CHUNK_SIZE)?;
+        ensure!(
+            merkle.root == artifact.artifact_root,
+            "openai-compatible calibration snapshot root mismatch; expected {}, got {}",
+            artifact.artifact_root,
+            merkle.root
+        );
+        return Ok(());
+    }
     if artifact.engine == "comfyui" {
         let metadata = fs::metadata(artifact_path)
             .with_context(|| format!("stat {}", artifact_path.display()))?;
@@ -24025,7 +24058,7 @@ fn catalog_canary_matrix_report(
                     }
                     match artifact.engine.as_str() {
                         "llama.cpp" | "mlx" | "needle-cpu" => "token-prefix-local-calibration",
-                        "trt-llm" | "vllm" | "needle-gpu" => {
+                        "trt-llm" | "vllm" | "openai-compatible" | "needle-gpu" => {
                             "token-prefix-hardware-calibration"
                         }
                         other => {
@@ -24633,6 +24666,16 @@ fn preflight_catalog_calibration_managed_runtime(
     artifact: &catalog::CatalogArtifact,
     args: &CatalogCalibrateCanaryArgs,
 ) -> Result<()> {
+    if artifact.engine == "openai-compatible" {
+        artifact
+            .openai_compatible
+            .as_ref()
+            .context("openai-compatible calibration is missing its signed runtime binding")?;
+        validate_managed_openai_hardware(&probe(ProbeOptions::default()))?;
+        resolve_executable(Path::new("docker"))
+            .context("managed openai-compatible calibration requires Docker on PATH")?;
+        return Ok(());
+    }
     if !matches!(
         artifact.engine.as_str(),
         "mlx"
@@ -24658,6 +24701,74 @@ fn preflight_catalog_calibration_managed_runtime(
         )
     })?;
     Ok(())
+}
+
+struct ProcessBoundOpenAiBackend {
+    backend: mayhem_engine::OpenAiCompatibleBackend,
+    process_id: u32,
+    // The runtime owner must outlive every calibration request. Dropping the
+    // wrapper stops only the exact container identity it created.
+    _runtime: Option<Arc<managed_openai_compatible::ManagedOpenAiRuntime>>,
+}
+
+impl EngineBackend for ProcessBoundOpenAiBackend {
+    fn backend_id(&self) -> &'static str {
+        self.backend.backend_id()
+    }
+
+    fn load(
+        &mut self,
+        config: LoadConfig,
+    ) -> mayhem_engine::Result<mayhem_engine::LoadedModelInfo> {
+        self.backend.load(config)
+    }
+
+    fn prefix_caching_enabled(&self) -> bool {
+        self.backend.prefix_caching_enabled()
+    }
+
+    fn loaded_backend_evidence(&self) -> Option<Value> {
+        self.backend.loaded_backend_evidence()
+    }
+
+    fn component_healthy(&mut self) -> bool {
+        self.backend.component_healthy()
+    }
+
+    fn process_ids(&self) -> Vec<u32> {
+        calibration_process_parent_rows()
+            .map(|parents| process_tree_ids_from_parent_rows(&[self.process_id], &parents))
+            .unwrap_or_else(|_| vec![self.process_id])
+    }
+
+    fn requires_owner_restart(&self) -> bool {
+        self._runtime.is_some()
+    }
+
+    fn recover_component(&mut self) -> mayhem_engine::Result<ComponentRecovery> {
+        Ok(if self.backend.component_healthy() {
+            ComponentRecovery::Recovered
+        } else {
+            ComponentRecovery::Unsupported
+        })
+    }
+
+    fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
+        self.backend.concurrent_generation_backend()
+    }
+
+    fn tokenize(&self, text: &str) -> mayhem_engine::Result<mayhem_engine::Tokenization> {
+        self.backend.tokenize(text)
+    }
+
+    fn generate(
+        &mut self,
+        request: GenerateRequest,
+        sink: &mut dyn mayhem_engine::TokenSink,
+        cancellation: &CancellationToken,
+    ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
+        self.backend.generate(request, sink, cancellation)
+    }
 }
 
 fn catalog_calibration_backend(
@@ -24816,6 +24927,7 @@ fn catalog_calibration_backend(
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
+        "openai-compatible" => LoadConfig::openai_compatible_model(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
         "comfyui" => LoadConfig::comfyui_runtime(artifact_path),
         "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
@@ -24887,7 +24999,7 @@ fn catalog_calibration_backend(
     if artifact.engine == "sulphur" {
         bind_sulphur_primary_hash_path(&mut config.artifact, artifact)?;
     }
-    if artifact.engine != "comfyui" {
+    if !matches!(artifact.engine.as_str(), "comfyui" | "openai-compatible") {
         if let Some(sha256) = &artifact.source_sha256 {
             config.artifact = config.artifact.with_sha256(sha256.clone());
         }
@@ -24993,6 +25105,71 @@ fn catalog_calibration_backend(
             backend
                 .load(config)
                 .context("loading vLLM canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
+        "openai-compatible" => {
+            let binding = artifact
+                .openai_compatible
+                .clone()
+                .context("openai-compatible calibration is missing its signed runtime binding")?;
+            validate_managed_openai_hardware(&probe(ProbeOptions::default()))?;
+            let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+            let home = absolutize(home)?;
+            fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+            let docker = resolve_executable(Path::new("docker"))
+                .context("managed openai-compatible calibration requires Docker on PATH")?;
+            let recipe_path = sidecar_paths
+                .get(&binding.runtime_recipe_sidecar)
+                .context("openai-compatible calibration requires its runtime recipe sidecar")?;
+            let upstream = artifact
+                .upstream_source
+                .as_ref()
+                .unwrap_or(&artifact.source);
+            let root_prefix = artifact
+                .artifact_root
+                .get(..16)
+                .unwrap_or(artifact.artifact_root.as_str());
+            let enclave_id = format!("calibration-{root_prefix}");
+            let managed = Arc::new(
+                managed_openai_compatible::prepare_managed_runtime(
+                    managed_openai_compatible::ManagedRuntimeInputs {
+                        home: &home,
+                        docker: &docker,
+                        provider_id: "catalog-calibration",
+                        enclave_id: &enclave_id,
+                        public_model_id: &model.model_id,
+                        artifact_repo: &upstream.repo,
+                        artifact_revision: &upstream.revision,
+                        snapshot_manifest_sidecar: &binding.snapshot_manifest_sidecar,
+                        snapshot_manifest_sha256: &binding.snapshot_manifest_sha256,
+                        snapshot_file_count: binding.model_snapshot_file_count,
+                        snapshot_total_bytes: artifact.weights_bytes,
+                        runtime_revision: &binding.runtime_revision,
+                        container_image_digest: &binding.container_image_digest,
+                        max_concurrent: binding.max_concurrent,
+                        recipe_sha256: &binding.runtime_recipe_sha256,
+                        recipe_path,
+                        snapshot_dir: artifact_path,
+                        sidecars: sidecar_paths,
+                    },
+                )
+                .context("starting the signed managed OpenAI-compatible calibration runtime")?,
+            );
+            let mut backend = ProcessBoundOpenAiBackend {
+                backend: mayhem_engine::OpenAiCompatibleBackend::new(
+                    mayhem_engine::OpenAiCompatibleBackendConfig {
+                        base_url: managed.base_url().to_owned(),
+                        runtime: binding,
+                        readiness_timeout: Duration::from_secs(3_600),
+                    },
+                )
+                .context("initializing the managed OpenAI-compatible calibration backend")?,
+                process_id: managed.process_id(),
+                _runtime: Some(managed),
+            };
+            backend
+                .load(config)
+                .context("loading the managed OpenAI-compatible calibration backend")?;
             Ok(Box::new(backend))
         }
         "stable-diffusion.cpp" => {
@@ -59244,6 +59421,28 @@ struct ProviderArtifactPaths {
     sidecars: BTreeMap<String, PathBuf>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiCompatibleSnapshotManifest {
+    schema: u32,
+    source: String,
+    repo: String,
+    source_revision: String,
+    canonical_hf_revision: String,
+    total_bytes: u64,
+    files: Vec<OpenAiCompatibleSnapshotFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiCompatibleSnapshotFile {
+    path: String,
+    size: u64,
+    sha256: String,
+    hf_oid: String,
+    hf_oid_kind: String,
+}
+
 const PROVIDER_COMFY_WORKFLOW_DEFINITION_ARTIFACT: &str = "__workflow_class_definition";
 
 #[derive(Clone, Debug)]
@@ -61308,6 +61507,14 @@ struct ProviderBackendRuntime {
     cache_dir: Option<PathBuf>,
     external_binary: Option<PathBuf>,
     stable_diffusion_backend: Option<String>,
+    #[serde(skip_serializing)]
+    openai_compatible_url: Option<String>,
+    #[serde(skip_serializing)]
+    openai_compatible_pid: Option<u32>,
+    #[serde(skip_serializing)]
+    openai_compatible_docker: Option<PathBuf>,
+    #[serde(skip_serializing)]
+    managed_openai_compatible: Option<Arc<managed_openai_compatible::ManagedOpenAiRuntime>>,
 }
 
 #[derive(Clone)]
@@ -61532,6 +61739,9 @@ trait ProviderSessionResponder {
     fn process_ids(&self) -> Vec<u32> {
         Vec::new()
     }
+    fn requires_owner_restart(&self) -> bool {
+        false
+    }
     fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
         None
     }
@@ -61629,6 +61839,10 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
 
     fn process_ids(&self) -> Vec<u32> {
         self.backend.process_ids()
+    }
+
+    fn requires_owner_restart(&self) -> bool {
+        self.backend.requires_owner_restart()
     }
 
     fn respond(
@@ -62877,6 +63091,14 @@ fn provider_backend_runtime_child_env(
         }
         "whisper.cpp" => insert_path("MAYHEM_WHISPER_CPP_BIN", runtime.external_binary.as_deref()),
         "piper" => insert_path("MAYHEM_PIPER_BIN", runtime.external_binary.as_deref()),
+        "openai-compatible" => {
+            if let Some(url) = runtime.openai_compatible_url.as_ref() {
+                child_env.insert("MAYHEM_OPENAI_COMPATIBLE_URL".to_owned(), url.clone());
+                if let Some(pid) = runtime.openai_compatible_pid {
+                    child_env.insert("MAYHEM_OPENAI_COMPATIBLE_PID".to_owned(), pid.to_string());
+                }
+            }
+        }
         _ => {}
     }
     child_env
@@ -63346,9 +63568,211 @@ fn provider_backend_runtime_preflight_for_backend(
                 .or(gpu_layers);
             provider_llama_accelerator_preflight(effective_gpu_layers, hardware)?;
         }
+        "openai-compatible" => {
+            let binding = artifact
+                .and_then(|artifact| artifact.openai_compatible.as_ref())
+                .context("openai-compatible artifact is missing its signed runtime binding")?;
+            validate_managed_openai_hardware(hardware)?;
+            if let Ok(url) = env::var("MAYHEM_OPENAI_COMPATIBLE_URL") {
+                mayhem_engine::OpenAiCompatibleBackend::new(
+                    mayhem_engine::OpenAiCompatibleBackendConfig {
+                        base_url: url.clone(),
+                        runtime: binding.clone(),
+                        readiness_timeout: Duration::ZERO,
+                    },
+                )
+                .context("validating the exact-identity loopback attach runtime binding")?;
+                runtime.openai_compatible_pid = Some(verified_openai_attach_pid(&url)?);
+                runtime.openai_compatible_url = Some(url);
+            } else {
+                runtime.openai_compatible_docker = Some(
+                    resolve_executable(Path::new("docker"))
+                        .context("managed openai-compatible serving requires Docker on PATH")?,
+                );
+            }
+        }
         other => bail!("unsupported local provider session backend {other}"),
     }
     Ok(runtime)
+}
+
+fn validate_managed_openai_hardware(hardware: &HardwareReport) -> Result<()> {
+    const MIN_QUALIFIED_VRAM: u64 = 97_887 * 1024 * 1024;
+    const CONTAINER_MEMORY_LIMIT: u64 = 104 * 1024 * 1024 * 1024;
+    ensure!(
+        hardware.memory.total_bytes >= CONTAINER_MEMORY_LIMIT,
+        "managed openai-compatible resource profile requires at least 104 GiB host memory"
+    );
+    let nvidia = hardware
+        .gpus
+        .iter()
+        .filter(|gpu| gpu.vendor == GpuVendor::Nvidia)
+        .collect::<Vec<_>>();
+    ensure!(
+        nvidia.len() == 1,
+        "managed openai-compatible profile requires exactly one NVIDIA GPU"
+    );
+    let gpu = nvidia[0];
+    ensure!(
+        gpu.compute_capability.as_deref() == Some("12.0")
+            && gpu.dedicated_memory_bytes.or(gpu.memory_bytes).unwrap_or(0)
+                >= MIN_QUALIFIED_VRAM
+            && gpu.supports_nvfp4
+            && gpu.supports_fp8,
+        "managed openai-compatible profile requires one compute-capability 12.0 NVIDIA GPU with at least 97887 MiB usable VRAM and NVFP4/FP8 support"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verified_openai_attach_pid(base_url: &str) -> Result<u32> {
+    let pid = env::var("MAYHEM_OPENAI_COMPATIBLE_PID")
+        .context("advanced OpenAI-compatible attach requires MAYHEM_OPENAI_COMPATIBLE_PID")?
+        .parse::<u32>()
+        .context("MAYHEM_OPENAI_COMPATIBLE_PID must be a positive decimal PID")?;
+    ensure!(pid > 0, "MAYHEM_OPENAI_COMPATIBLE_PID must be positive");
+    let url = reqwest::Url::parse(base_url).context("parsing OpenAI-compatible attach URL")?;
+    let port = url
+        .port()
+        .context("OpenAI-compatible attach URL must include its loopback port")?;
+    let expected_ip = url
+        .host_str()
+        .context("OpenAI-compatible attach URL must include a host")?
+        .parse::<IpAddr>()
+        .context("OpenAI-compatible attach URL must use an IP literal")?;
+    ensure!(
+        expected_ip.is_loopback(),
+        "OpenAI-compatible attach URL must use a literal loopback address"
+    );
+    let expected_v4 = match expected_ip {
+        IpAddr::V4(address) => Some(address.octets()),
+        IpAddr::V6(_) => None,
+    };
+    let mut socket_inodes = BTreeSet::new();
+    for (path, ipv6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
+        let Ok(table) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in table.lines().skip(1) {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 10 || fields[3] != "0A" {
+                continue;
+            }
+            let Some((address, encoded_port)) = fields[1].split_once(':') else {
+                continue;
+            };
+            let Ok(candidate_port) = u16::from_str_radix(encoded_port, 16) else {
+                continue;
+            };
+            if candidate_port != port {
+                continue;
+            }
+            let address_matches = if ipv6 {
+                expected_v4.is_none()
+                    && address.eq_ignore_ascii_case("00000000000000000000000001000000")
+            } else if let Some(octets) = expected_v4 {
+                address.eq_ignore_ascii_case(&format!(
+                    "{:02X}{:02X}{:02X}{:02X}",
+                    octets[3], octets[2], octets[1], octets[0]
+                ))
+            } else {
+                false
+            };
+            if address_matches {
+                socket_inodes.insert(fields[9].to_owned());
+            }
+        }
+    }
+    ensure!(
+        !socket_inodes.is_empty(),
+        "the attach endpoint is not listening on its exact loopback address and port"
+    );
+    let process_ids = process_tree_ids_from_parent_rows(&[pid], &calibration_process_parent_rows()?);
+    let owns_socket = process_ids.iter().any(|candidate| {
+        fs::read_dir(format!("/proc/{candidate}/fd"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .filter_map(|target| target.to_str().map(str::to_owned))
+            .filter_map(|target| {
+                target
+                    .strip_prefix("socket:[")
+                    .and_then(|value| value.strip_suffix(']'))
+                    .map(str::to_owned)
+            })
+            .any(|inode| socket_inodes.contains(&inode))
+    });
+    ensure!(
+        owns_socket,
+        "MAYHEM_OPENAI_COMPATIBLE_PID and its descendants do not own the exact loopback listener"
+    );
+    Ok(pid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verified_openai_attach_pid(_base_url: &str) -> Result<u32> {
+    bail!("advanced OpenAI-compatible attach PID verification is supported only on Linux")
+}
+
+fn activate_provider_managed_openai_runtime(
+    home: &Path,
+    provider_id: &str,
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+    backend_runtime: &mut ProviderBackendRuntime,
+) -> Result<()> {
+    if selected.artifact.engine != "openai-compatible"
+        || backend_runtime.openai_compatible_url.is_some()
+    {
+        return Ok(());
+    }
+    let binding = selected
+        .artifact
+        .openai_compatible
+        .as_ref()
+        .context("openai-compatible artifact is missing its signed runtime binding")?;
+    let docker = backend_runtime
+        .openai_compatible_docker
+        .as_deref()
+        .context("managed openai-compatible runtime preflight did not resolve Docker")?;
+    let recipe_path = artifact_paths
+        .sidecars
+        .get(&binding.runtime_recipe_sidecar)
+        .context("downloaded openai-compatible runtime recipe is missing")?;
+    let upstream = selected
+        .artifact
+        .upstream_source
+        .as_ref()
+        .unwrap_or(&selected.artifact.source);
+    let managed = managed_openai_compatible::prepare_managed_runtime(
+        managed_openai_compatible::ManagedRuntimeInputs {
+            home,
+            docker,
+            provider_id,
+            enclave_id: &selected.enclave.enclave_id,
+            public_model_id: &selected.model.model_id,
+            artifact_repo: &upstream.repo,
+            artifact_revision: &upstream.revision,
+            snapshot_manifest_sidecar: &binding.snapshot_manifest_sidecar,
+            snapshot_manifest_sha256: &binding.snapshot_manifest_sha256,
+            snapshot_file_count: binding.model_snapshot_file_count,
+            snapshot_total_bytes: selected.artifact.weights_bytes,
+            runtime_revision: &binding.runtime_revision,
+            container_image_digest: &binding.container_image_digest,
+            max_concurrent: binding.max_concurrent,
+            recipe_sha256: &binding.runtime_recipe_sha256,
+            recipe_path,
+            snapshot_dir: &artifact_paths.primary,
+            sidecars: &artifact_paths.sidecars,
+        },
+    )
+    .context("starting the signed managed OpenAI-compatible runtime")?;
+    backend_runtime.openai_compatible_url = Some(managed.base_url().to_owned());
+    backend_runtime.openai_compatible_pid = Some(managed.process_id());
+    backend_runtime.managed_openai_compatible = Some(Arc::new(managed));
+    Ok(())
 }
 
 fn validate_chatterbox_device_request(
@@ -63729,7 +64153,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     if let Some(message) = &selected.feasibility.message {
         provider_log(&args, message);
     }
-    let backend_runtime = if args.serve_sessions {
+    let mut backend_runtime = if args.serve_sessions {
         provider_log(
             &args,
             &format!(
@@ -63764,6 +64188,15 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         .unwrap_or_else(|| home.join("downloads"));
     let downloads_dir = absolutize(downloads_dir)?;
     let artifact_paths = download_provider_artifact(&args, &downloads_dir, &selected).await?;
+    if args.serve_sessions {
+        activate_provider_managed_openai_runtime(
+            &home,
+            &wallet.public_key,
+            &selected,
+            &artifact_paths,
+            &mut backend_runtime,
+        )?;
+    }
 
     provider_log(&args, "Verifying and sealing the enclave artifact");
     write_provider_load_progress_stage(&args, "seal enclave artifact", "seal", "running", 0);
@@ -73572,8 +74005,9 @@ fn provider_vllm_generation_execution_capacity(
         return Ok(1);
     };
     ensure!(
-        artifact.engine == "vllm" && profile.engine == artifact.engine,
-        "generation execution profiles only authorize their exact vLLM artifact"
+        matches!(artifact.engine.as_str(), "vllm" | "openai-compatible")
+            && profile.engine == artifact.engine,
+        "generation execution profiles only authorize their exact supported artifact"
     );
     ensure!(
         profile.independent_dispatch,
@@ -73585,6 +74019,22 @@ fn provider_vllm_generation_execution_capacity(
         .unwrap_or(verdict.max_sessions)
         .min(verdict.max_sessions)
         .max(1);
+    if artifact.engine == "openai-compatible" {
+        ensure!(
+            profile.topology.is_none(),
+            "openai-compatible managed runtimes use shared continuous batching"
+        );
+        let signed_capacity = artifact
+            .openai_compatible
+            .as_ref()
+            .context("openai-compatible artifact is missing its signed runtime binding")?
+            .max_concurrent;
+        ensure!(
+            profile.max_concurrent == Some(signed_capacity),
+            "generation profile capacity does not match signed openai-compatible runtime capacity"
+        );
+        return Ok(provider_capacity.min(signed_capacity).max(1));
+    }
     // A signed max_batch_size is an optional artifact ceiling, not a default
     // hardware limit. Profiled vLLM artifacts without one scale to the local
     // provider's proven memory and hwprobe capacity.
@@ -76081,7 +76531,7 @@ fn provider_candidate_modalities(candidate: &ProviderCandidate) -> Vec<String> {
 
 fn backend_rank(backend: &str) -> u8 {
     match backend {
-        "vllm" => 4,
+        "vllm" | "openai-compatible" => 4,
         "trt-llm" => 3,
         "mlx" => 2,
         "comfyui" => 2,
@@ -76188,6 +76638,9 @@ fn download_provider_artifact_blocking(
     downloads_dir: &Path,
     selected: &ProviderCandidate,
 ) -> Result<ProviderArtifactPaths> {
+    if selected.artifact.engine == "openai-compatible" {
+        return download_openai_compatible_snapshot(args, downloads_dir, selected);
+    }
     if selected.artifact.engine == "comfyui" {
         let path = args.artifact.as_ref().with_context(|| {
             format!(
@@ -76291,6 +76744,318 @@ fn download_provider_artifact_blocking(
     }
 
     Ok(ProviderArtifactPaths { primary, sidecars })
+}
+
+fn download_openai_compatible_snapshot(
+    args: &ProviderStartArgs,
+    downloads_dir: &Path,
+    selected: &ProviderCandidate,
+) -> Result<ProviderArtifactPaths> {
+    let binding = selected
+        .artifact
+        .openai_compatible
+        .as_ref()
+        .context("openai-compatible artifact is missing its signed runtime binding")?;
+    fs::create_dir_all(downloads_dir)
+        .with_context(|| format!("creating {}", downloads_dir.display()))?;
+
+    let mut sidecars = BTreeMap::new();
+    for (name, sidecar) in &selected.artifact.sidecars {
+        let ledger_sidecar = selected
+            .enclave
+            .artifact_sidecars
+            .get(name)
+            .with_context(|| format!("admin enclave is missing catalog sidecar {name}"))?;
+        let path = download_provider_sidecar_artifact(
+            args,
+            downloads_dir,
+            selected,
+            name,
+            sidecar,
+            ledger_sidecar,
+        )?;
+        sidecars.insert(name.clone(), path);
+    }
+    let manifest_path = sidecars
+        .get(&binding.snapshot_manifest_sidecar)
+        .context("downloaded openai-compatible snapshot manifest is missing")?;
+    let manifest: OpenAiCompatibleSnapshotManifest = serde_json::from_slice(
+        &fs::read(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    validate_openai_compatible_snapshot_manifest(selected, &manifest)?;
+
+    let snapshot_dir = if let Some(path) = args.artifact.as_ref() {
+        let path = absolutize(path.clone())?;
+        require_local_artifact_path_supported(&path, selected)?;
+        ensure!(
+            path.is_dir(),
+            "openai-compatible local artifact must be the complete signed snapshot directory"
+        );
+        path
+    } else {
+        let directory = downloads_dir.join(format!(
+            "snapshot-{}-{}",
+            safe_path_component(&selected.enclave.artifact_root),
+            safe_path_component(&selected.artifact_name)
+        ));
+        let _download_lock = lock_openai_compatible_snapshot_download(&directory)?;
+        if directory.is_dir()
+            && validate_openai_compatible_snapshot_directory(&directory, &manifest, args.chunk_size)
+                .is_ok()
+            && build_artifact_merkle_manifest(&directory, args.chunk_size)?.root
+                == selected.enclave.artifact_root
+        {
+            return Ok(ProviderArtifactPaths {
+                primary: directory,
+                sidecars,
+            });
+        }
+        ensure!(
+            !directory.exists(),
+            "canonical snapshot cache {} exists but failed signed validation; remove it before retrying",
+            directory.display()
+        );
+        let staging = downloads_dir.join(format!(
+            ".{}.partial",
+            directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("openai-compatible-snapshot")
+        ));
+        fs::create_dir_all(&staging).with_context(|| {
+            format!("creating snapshot staging directory {}", staging.display())
+        })?;
+        let missing_bytes = manifest.files.iter().try_fold(0u64, |total, file| {
+            let path = staging.join(validate_catalog_artifact_relative_path(&file.path)?);
+            let reusable = path.is_file()
+                && fs::metadata(&path)?.len() == file.size
+                && file_sha256_hex(&path)? == file.sha256;
+            Ok::<_, anyhow::Error>(if reusable {
+                total
+            } else {
+                total
+                    .checked_add(file.size)
+                    .context("snapshot missing-byte total overflowed u64")?
+            })
+        })?;
+        if missing_bytes > 0 {
+            provider_download_disk_preflight(
+                args,
+                &staging.join(".capacity-check"),
+                missing_bytes,
+                &format!("{} complete model snapshot", selected.artifact_name),
+            )?;
+        }
+        for file in &manifest.files {
+            let relative = validate_catalog_artifact_relative_path(&file.path)?;
+            let destination = staging.join(&relative);
+            if destination.is_file()
+                && fs::metadata(&destination)?.len() == file.size
+                && file_sha256_hex(&destination)? == file.sha256
+            {
+                continue;
+            }
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            download_provider_huggingface_file(
+                args,
+                &selected.artifact.source,
+                &file.path,
+                destination,
+                file.size,
+                None,
+                Some(&file.sha256),
+                &format!("{}/{} snapshot file", selected.artifact_name, file.path),
+            )?;
+        }
+        validate_openai_compatible_snapshot_directory(&staging, &manifest, args.chunk_size)?;
+        let digest = build_artifact_merkle_manifest(&staging, args.chunk_size)?;
+        ensure!(
+            digest.root == selected.enclave.artifact_root
+                && digest.root == selected.artifact.artifact_root,
+            "openai-compatible staged snapshot root mismatch; expected {}, got {}",
+            selected.enclave.artifact_root,
+            digest.root
+        );
+        fs::rename(&staging, &directory).with_context(|| {
+            format!(
+                "atomically installing verified snapshot {} at {}",
+                staging.display(),
+                directory.display()
+            )
+        })?;
+        directory
+    };
+
+    validate_openai_compatible_snapshot_directory(&snapshot_dir, &manifest, args.chunk_size)?;
+    let digest = build_artifact_merkle_manifest(&snapshot_dir, args.chunk_size)?;
+    ensure!(
+        digest.root == selected.enclave.artifact_root
+            && digest.root == selected.artifact.artifact_root,
+        "openai-compatible snapshot directory root mismatch; expected {}, got {}",
+        selected.enclave.artifact_root,
+        digest.root
+    );
+    Ok(ProviderArtifactPaths {
+        primary: snapshot_dir,
+        sidecars,
+    })
+}
+
+fn lock_openai_compatible_snapshot_download(directory: &Path) -> Result<fs::File> {
+    let file_name = directory
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("openai-compatible snapshot cache has no UTF-8 file name")?;
+    let lock_path = directory.with_file_name(format!(".{file_name}.download.lock"));
+    let mut options = fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(&lock_path)
+        .with_context(|| format!("opening snapshot download lock {}", lock_path.display()))?;
+    fs2::FileExt::lock_exclusive(&lock)
+        .with_context(|| format!("locking snapshot download {}", lock_path.display()))?;
+    Ok(lock)
+}
+
+fn validate_openai_compatible_snapshot_manifest(
+    selected: &ProviderCandidate,
+    manifest: &OpenAiCompatibleSnapshotManifest,
+) -> Result<()> {
+    let binding = selected
+        .artifact
+        .openai_compatible
+        .as_ref()
+        .context("openai-compatible artifact is missing its signed runtime binding")?;
+    validate_openai_compatible_snapshot_manifest_for_artifact(&selected.artifact, binding, manifest)
+}
+
+fn validate_openai_compatible_snapshot_manifest_for_artifact(
+    artifact: &catalog::CatalogArtifact,
+    binding: &mayhem_engine::OpenAiCompatibleRuntimeBinding,
+    manifest: &OpenAiCompatibleSnapshotManifest,
+) -> Result<()> {
+    ensure!(manifest.schema == 1, "snapshot manifest schema must be 1");
+    ensure!(
+        manifest.source == "modelscope",
+        "snapshot manifest source must preserve the calibrated modelscope identity"
+    );
+    let upstream = artifact
+        .upstream_source
+        .as_ref()
+        .unwrap_or(&artifact.source);
+    ensure!(
+        manifest.repo == upstream.repo && manifest.canonical_hf_revision == upstream.revision,
+        "snapshot manifest upstream identity does not match the signed catalog source"
+    );
+    ensure!(
+        !manifest.source_revision.trim().is_empty()
+            && manifest.source_revision.len() <= 128
+            && !manifest.source_revision.chars().any(char::is_control),
+        "snapshot manifest source_revision is invalid"
+    );
+    ensure!(
+        manifest.files.len() == binding.model_snapshot_file_count as usize,
+        "snapshot manifest contains {} files; signed runtime binding requires {}",
+        manifest.files.len(),
+        binding.model_snapshot_file_count
+    );
+    let mut prior = None::<&str>;
+    let mut total = 0u64;
+    for file in &manifest.files {
+        let relative = validate_catalog_artifact_relative_path(&file.path)?;
+        ensure!(
+            relative.to_string_lossy() == file.path,
+            "snapshot manifest path is not normalized: {}",
+            file.path
+        );
+        if let Some(prior) = prior {
+            ensure!(
+                prior < file.path.as_str(),
+                "snapshot manifest paths must be strictly sorted and unique"
+            );
+        }
+        prior = Some(&file.path);
+        ensure!(file.size > 0, "snapshot file {} has zero size", file.path);
+        ensure!(
+            is_lowercase_hex_len(&file.sha256, 64),
+            "snapshot file {} has invalid sha256",
+            file.path
+        );
+        match file.hf_oid_kind.as_str() {
+            "git_blob_sha1" => ensure!(
+                is_lowercase_hex_len(&file.hf_oid, 40),
+                "snapshot file {} has invalid git blob oid",
+                file.path
+            ),
+            "sha256" => ensure!(
+                is_lowercase_hex_len(&file.hf_oid, 64),
+                "snapshot file {} has invalid LFS oid",
+                file.path
+            ),
+            other => bail!(
+                "snapshot file {} has unsupported hf_oid_kind {other}",
+                file.path
+            ),
+        }
+        total = total
+            .checked_add(file.size)
+            .context("snapshot manifest byte total overflowed u64")?;
+    }
+    ensure!(
+        total == manifest.total_bytes && total == artifact.weights_bytes,
+        "snapshot manifest total_bytes {total} does not match its header/catalog"
+    );
+    Ok(())
+}
+
+fn validate_openai_compatible_snapshot_directory(
+    root: &Path,
+    manifest: &OpenAiCompatibleSnapshotManifest,
+    _chunk_size: usize,
+) -> Result<()> {
+    let expected = manifest
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut entries = Vec::new();
+    collect_directory_artifact_entries(root, root, &mut entries)?;
+    let actual = entries
+        .iter()
+        .filter_map(|entry| match entry.kind {
+            DirectoryArtifactEntryKind::File { .. } => Some(entry.rel.as_str()),
+            DirectoryArtifactEntryKind::Directory => None,
+        })
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        actual == expected,
+        "openai-compatible snapshot directory must contain exactly the signed manifest files"
+    );
+    for file in &manifest.files {
+        let path = root.join(validate_catalog_artifact_relative_path(&file.path)?);
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("stat snapshot file {}", path.display()))?;
+        ensure!(
+            metadata.is_file() && metadata.len() == file.size,
+            "snapshot file {} size/type mismatch",
+            file.path
+        );
+        ensure!(
+            file_sha256_hex(&path)? == file.sha256,
+            "snapshot file {} sha256 mismatch",
+            file.path
+        );
+    }
+    Ok(())
 }
 
 fn provider_seal_artifact_path<'a>(
@@ -76436,9 +77201,14 @@ fn require_local_artifact_path_supported(
     source: &Path,
     selected: &ProviderCandidate,
 ) -> Result<()> {
-    if source.is_dir() && selected.artifact.engine != "comfyui" {
+    if source.is_dir()
+        && !matches!(
+            selected.artifact.engine.as_str(),
+            "comfyui" | "openai-compatible"
+        )
+    {
         bail!(
-            "local directory artifacts are only supported for ComfyUI runtimes; {} uses engine {}",
+            "local directory artifacts are only supported for directory-backed engines; {} uses engine {}",
             selected.model.model_id,
             selected.artifact.engine
         );
@@ -76469,7 +77239,7 @@ fn download_provider_primary_artifact(
         &selected.artifact.path,
         destination,
         selected.artifact.weights_bytes,
-        &selected.enclave.artifact_root,
+        Some(&selected.enclave.artifact_root),
         selected.artifact.source_sha256.as_deref(),
         &format!("{} artifact", selected.artifact_name),
     )
@@ -76538,7 +77308,7 @@ fn download_provider_sidecar_artifact(
         &sidecar.path,
         destination,
         ledger_sidecar.weights_bytes,
-        &ledger_sidecar.artifact_root,
+        Some(&ledger_sidecar.artifact_root),
         Some(&sidecar.source_sha256),
         &format!("{}/{} sidecar", selected.artifact_name, name),
     )
@@ -76551,7 +77321,7 @@ fn download_provider_huggingface_file(
     remote_path: &str,
     destination: PathBuf,
     expected_bytes: u64,
-    expected_root: &str,
+    expected_root: Option<&str>,
     expected_sha256: Option<&str>,
     label: &str,
 ) -> Result<PathBuf> {
@@ -76686,11 +77456,13 @@ fn download_provider_huggingface_file(
                 downloaded.display()
             )
         })?;
-        if manifest.root != expected_root {
-            bail!(
-                "downloaded {label} root mismatch; expected admin artifact root {expected_root}, got {}",
-                manifest.root
-            );
+        if let Some(expected_root) = expected_root {
+            if manifest.root != expected_root {
+                bail!(
+                    "downloaded {label} root mismatch; expected admin artifact root {expected_root}, got {}",
+                    manifest.root
+                );
+            }
         }
         if let Some(expected_sha256) = expected_sha256 {
             let actual_sha256 = file_sha256_hex(&downloaded)?;
@@ -79387,7 +80159,15 @@ async fn serve_provider_sessions(
                         );
                     }
                     Ok(ComponentRecovery::Pending) => component_recovery_pending = true,
+                    Ok(ComponentRecovery::Unsupported) if responder.requires_owner_restart() => {
+                        bail!("managed provider runtime exited; retiring this worker so its supervisor can reconcile and restart the owned runtime")
+                    }
                     Ok(ComponentRecovery::Unsupported) => {}
+                    Err(err) if responder.requires_owner_restart() => {
+                        return Err(err).context(
+                            "managed provider runtime recovery failed; retiring this worker for supervised restart",
+                        )
+                    }
                     Err(err) => engine_recovery.mark_reload_failed(
                         format!("isolated provider worker recovery failed: {err:#}"),
                         Instant::now(),
@@ -79493,6 +80273,9 @@ async fn serve_provider_sessions(
                     heartbeat_load.set_accepting_new(false);
                     let restart_reason = reject.reason.clone();
                     engine_watchdog_reject = Some(reject);
+                    if responder.requires_owner_restart() {
+                        bail!("managed provider runtime requires supervised restart after watchdog pressure: {restart_reason}");
+                    }
                     match reload_provider_session_responder(
                         &mut responder,
                         restart_reason,
@@ -85317,6 +86100,50 @@ fn provider_session_responder(
                 backend: Box::new(backend),
             }))
         }
+        "openai-compatible" => {
+            let base_url = ctx
+                .backend_runtime
+                .openai_compatible_url
+                .clone()
+                .context("openai-compatible runtime preflight did not resolve its loopback URL")?;
+            let runtime = ctx
+                .selected
+                .artifact
+                .openai_compatible
+                .clone()
+                .context("openai-compatible artifact is missing its signed runtime binding")?;
+            let mut backend = mayhem_engine::OpenAiCompatibleBackend::new(
+                mayhem_engine::OpenAiCompatibleBackendConfig {
+                    base_url,
+                    runtime,
+                    readiness_timeout: if ctx
+                        .backend_runtime
+                        .managed_openai_compatible
+                        .is_some()
+                    {
+                        Duration::from_secs(3_600)
+                    } else {
+                        Duration::ZERO
+                    },
+                },
+            )
+            .context("initializing openai-compatible provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "openai-compatible engine preflight", || {
+                backend
+                    .load(load_config)
+                    .context("loading openai-compatible provider session engine")
+            })?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(ProcessBoundOpenAiBackend {
+                    backend,
+                    process_id: ctx
+                        .backend_runtime
+                        .openai_compatible_pid
+                        .context("OpenAI-compatible provider runtime has no verified host PID")?,
+                    _runtime: ctx.backend_runtime.managed_openai_compatible.clone(),
+                }),
+            }))
+        }
         other => bail!(
             "provider session engine for {other} is not wired locally yet; do not serve this enclave until its admin-approved engine adapter is available"
         ),
@@ -86500,6 +87327,8 @@ fn provider_engine_load_config(
         materialized_trt_engine_dir = Some(layout.engine_dir);
     } else if selected.artifact.engine == "vllm" {
         artifact_path_buf = materialize_vllm_artifacts(selected, artifact_paths)?;
+    } else if selected.artifact.engine == "openai-compatible" {
+        artifact_path_buf = materialize_openai_compatible_artifacts(selected, artifact_paths)?;
     } else if selected.artifact.engine == "mlx" {
         artifact_path_buf = materialize_mlx_artifacts(selected, artifact_paths)?;
     } else if selected.artifact.engine == "ace-step" {
@@ -86535,6 +87364,7 @@ fn provider_engine_load_config(
         "mlx" => ModelArtifact::mlx_safetensors(artifact_path),
         "trt-llm" => ModelArtifact::trt_llm_checkpoint(artifact_path),
         "vllm" => ModelArtifact::vllm_safetensors(artifact_path),
+        "openai-compatible" => ModelArtifact::openai_compatible_model(artifact_path),
         "stable-diffusion.cpp" => ModelArtifact::stable_diffusion_checkpoint(artifact_path),
         "comfyui" => ModelArtifact::comfyui_runtime(artifact_path),
         "ace-step" => ModelArtifact::ace_step_safetensors(artifact_path),
@@ -86549,7 +87379,10 @@ fn provider_engine_load_config(
     if selected.artifact.engine == "sulphur" {
         bind_sulphur_primary_hash_path(&mut artifact, &selected.artifact)?;
     }
-    let artifact = if selected.artifact.engine != "comfyui" {
+    let artifact = if !matches!(
+        selected.artifact.engine.as_str(),
+        "comfyui" | "openai-compatible"
+    ) {
         if let Some(sha256) = &selected.artifact.source_sha256 {
             artifact.with_sha256(sha256.clone())
         } else {
@@ -86563,6 +87396,7 @@ fn provider_engine_load_config(
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
+        "openai-compatible" => LoadConfig::openai_compatible_model(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
         "comfyui" => LoadConfig::comfyui_runtime(artifact_path),
         "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
@@ -86980,6 +87814,19 @@ fn materialize_vllm_artifacts(
         &selected.artifact,
         artifact_paths,
     )
+}
+
+fn materialize_openai_compatible_artifacts(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    ensure!(
+        artifact_paths.primary.is_dir(),
+        "openai-compatible artifact {}/{} must be a verified snapshot directory",
+        selected.model.model_id,
+        selected.artifact_name
+    );
+    Ok(artifact_paths.primary.clone())
 }
 
 fn materialize_vllm_layout(
@@ -93271,6 +94118,12 @@ fn synthetic_provider_token_ids(count: u64) -> Vec<i32> {
 
 fn is_hex_len(value: &str, len: usize) -> bool {
     value.len() == len && value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_lowercase_hex_len(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value == value.to_ascii_lowercase()
 }
 
 fn is_safe_key_part(value: &str) -> bool {
@@ -106991,6 +107844,7 @@ status: linked
             engine: "vllm".to_owned(),
             topology: None,
             independent_dispatch: true,
+            max_concurrent: None,
             request_modalities: vec![vec!["text".to_owned()]],
             proof_sha256: "ab".repeat(32),
         };
@@ -107093,6 +107947,7 @@ status: linked
             engine: "vllm".to_owned(),
             topology: Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers),
             independent_dispatch: true,
+            max_concurrent: None,
             request_modalities: vec![vec!["text".to_owned()]],
             proof_sha256: "ab".repeat(32),
         }
@@ -117914,6 +118769,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 engine: "vllm".to_owned(),
                 topology: None,
                 independent_dispatch: true,
+                max_concurrent: None,
                 request_modalities: vec![vec!["text".to_owned()]],
                 proof_sha256: "ab".repeat(32),
             },
@@ -120920,6 +121776,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             engine: "vllm".to_owned(),
             topology: None,
             independent_dispatch: true,
+            max_concurrent: None,
             request_modalities: vec![vec!["text".to_owned()]],
             proof_sha256: "aa".repeat(32),
         });
@@ -124558,7 +125415,8 @@ State initialization...
         let mut artifact = test_catalog(&merkle.root).models[0].artifacts["gguf-q4_k_m"].clone();
         artifact.weights_bytes = merkle.total_bytes;
 
-        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap();
+        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path, &BTreeMap::new())
+            .unwrap();
     }
 
     #[test]
@@ -124571,8 +125429,12 @@ State initialization...
             test_catalog(&"aa".repeat(32)).models[0].artifacts["gguf-q4_k_m"].clone();
         artifact.weights_bytes = merkle.total_bytes;
 
-        let err =
-            verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap_err();
+        let err = verify_calibration_artifact_matches_catalog(
+            &artifact,
+            &artifact_path,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("local artifact root mismatch"));
     }
@@ -124593,9 +125455,11 @@ State initialization...
         artifact.weights_bytes = fs::metadata(&artifact_path).unwrap().len();
         artifact.source_sha256 = Some(sha256_bytes_hex(&stable_definition));
 
-        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap();
+        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path, &BTreeMap::new())
+            .unwrap();
         artifact.weights_bytes = stable_definition.len() as u64;
-        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap();
+        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path, &BTreeMap::new())
+            .unwrap();
 
         let wrong_path = dir.join("wrong-workflow-class.json");
         let wrong = json!({
@@ -124610,8 +125474,12 @@ State initialization...
         write_json_file(&wrong_path, &wrong).unwrap();
         let mut wrong_sized_artifact = artifact.clone();
         wrong_sized_artifact.weights_bytes = stable_json_bytes(&wrong).unwrap().len() as u64;
-        let err = verify_calibration_artifact_matches_catalog(&wrong_sized_artifact, &wrong_path)
-            .unwrap_err();
+        let err = verify_calibration_artifact_matches_catalog(
+            &wrong_sized_artifact,
+            &wrong_path,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("local Comfy workflow-class hash mismatch"),
@@ -126945,6 +127813,7 @@ State initialization...
                 engine: "vllm".to_owned(),
                 topology: None,
                 independent_dispatch: true,
+                max_concurrent: None,
                 request_modalities: vec![vec!["text".to_owned()]],
                 proof_sha256: "ab".repeat(32),
             },
@@ -127062,6 +127931,7 @@ State initialization...
                         engine: "vllm".to_owned(),
                         topology: None,
                         independent_dispatch: true,
+                        max_concurrent: None,
                         request_modalities: vec![vec!["text".to_owned()]],
                         proof_sha256: independent_proof,
                     },
@@ -128399,6 +129269,7 @@ State initialization...
             "mlx-4bit".to_owned(),
             catalog::CatalogArtifact {
                 engine: "mlx".to_owned(),
+                openai_compatible: None,
                 stable_diffusion_cpp: None,
                 mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
                 kv_cache: None,
@@ -128514,6 +129385,7 @@ State initialization...
             "nvfp4".to_owned(),
             catalog::CatalogArtifact {
                 engine: "trt-llm".to_owned(),
+                openai_compatible: None,
                 stable_diffusion_cpp: None,
                 mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
                 kv_cache: None,
@@ -128717,6 +129589,7 @@ State initialization...
             "mlx-4bit".to_owned(),
             catalog::CatalogArtifact {
                 engine: "mlx".to_owned(),
+                openai_compatible: None,
                 stable_diffusion_cpp: None,
                 mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
                 kv_cache: None,
@@ -134177,6 +135050,7 @@ State initialization...
             "gguf-q4_k_m".to_owned(),
             catalog::CatalogArtifact {
                 engine: "llama.cpp".to_owned(),
+                openai_compatible: None,
                 stable_diffusion_cpp: None,
                 mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
                 kv_cache: None,
@@ -134665,6 +135539,7 @@ State initialization...
         );
         catalog::CatalogArtifact {
             engine: "vllm".to_owned(),
+            openai_compatible: None,
             stable_diffusion_cpp: None,
             mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
             kv_cache: None,

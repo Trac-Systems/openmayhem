@@ -148,6 +148,8 @@ pub(crate) struct CatalogGenerationExecutionProfile {
     pub(crate) schema_version: u32,
     pub(crate) engine: String,
     pub(crate) independent_dispatch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_concurrent: Option<u32>,
     pub(crate) request_modalities: Vec<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) topology: Option<mayhem_proto::GenerationExecutionTopology>,
@@ -453,6 +455,8 @@ pub(crate) struct ConversionRef {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CatalogArtifact {
     pub(crate) engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) openai_compatible: Option<mayhem_engine::OpenAiCompatibleRuntimeBinding>,
     #[serde(default)]
     pub(crate) stable_diffusion_cpp: Option<mayhem_engine::StableDiffusionCppConfig>,
     #[serde(default)]
@@ -1029,6 +1033,14 @@ fn validate_generation_execution_profiles(catalog: &CatalogDocument, errors: &mu
                         profile.engine, artifact.engine
                     ));
                 }
+                if let Some(binding) = artifact.openai_compatible.as_ref() {
+                    if profile.max_concurrent != Some(binding.max_concurrent) {
+                        errors.push(format!(
+                            "{label}.max_concurrent {:?} must equal the signed openai_compatible runtime capacity {}",
+                            profile.max_concurrent, binding.max_concurrent
+                        ));
+                    }
+                }
                 Some(model)
             }
             Some(bindings) => {
@@ -1064,11 +1076,24 @@ fn validate_generation_execution_profile_values(
     if profile.schema_version != 1 {
         errors.push(format!("{label}.schema_version must be 1"));
     }
-    if profile.engine != "vllm" {
-        errors.push(format!("{label}.engine must be vllm"));
+    if !matches!(profile.engine.as_str(), "vllm" | "openai-compatible") {
+        errors.push(format!("{label}.engine must be vllm or openai-compatible"));
     }
     if !profile.independent_dispatch {
         errors.push(format!("{label}.independent_dispatch must be true"));
+    }
+    if profile
+        .max_concurrent
+        .is_some_and(|capacity| !(1..=64).contains(&capacity))
+    {
+        errors.push(format!(
+            "{label}.max_concurrent must be between 1 and 64 when present"
+        ));
+    }
+    if profile.engine == "openai-compatible" && profile.max_concurrent.is_none() {
+        errors.push(format!(
+            "{label}.max_concurrent is required for openai-compatible"
+        ));
     }
     if !is_lower_hex_len(&profile.proof_sha256, 64) {
         errors.push(format!(
@@ -1109,7 +1134,7 @@ fn validate_generation_execution_profile_values(
         let normalized = normalized.into_iter().collect::<Vec<_>>();
         if !normalized.iter().any(|modality| modality == "text") {
             errors.push(format!(
-                "{set_label} must include text for vLLM generation dispatch"
+                "{set_label} must include text for generation dispatch"
             ));
         }
         if &normalized != modality_set {
@@ -1720,6 +1745,27 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
             !future_model,
             errors,
         );
+        if let Some(binding) = artifact.openai_compatible.as_ref() {
+            if u64::from(binding.native_context) != model.caps.ctx_max {
+                errors.push(format!(
+                    "{}/{} openai_compatible.native_context {} must equal caps.ctx_max {}",
+                    model.model_id, name, binding.native_context, model.caps.ctx_max
+                ));
+            }
+            for (capability, advertised) in [
+                ("tools", model.caps.tools),
+                ("json", model.caps.json),
+                ("image", model.caps.vision || model.caps.image),
+                ("video", model.caps.video),
+            ] {
+                if advertised != binding.capabilities.contains(capability) {
+                    errors.push(format!(
+                        "{}/{} openai_compatible capability {capability} must match model caps",
+                        model.model_id, name
+                    ));
+                }
+            }
+        }
     }
     if model.caps.ctx_max == 0 {
         errors.push(format!("{} caps.ctx_max must be positive", model.model_id));
@@ -4636,12 +4682,58 @@ fn validate_artifact_with_engine_policy(
                 | "transformers-asr"
                 | "whisper.cpp"
                 | "piper"
+                | "openai-compatible"
         )
     {
         errors.push(format!(
             "{model_id}/{name} has unsupported engine {}",
             artifact.engine
         ));
+    }
+    match (&*artifact.engine, artifact.openai_compatible.as_ref()) {
+        ("openai-compatible", Some(binding)) => {
+            if let Err(error) = binding.validate() {
+                errors.push(format!(
+                    "{model_id}/{name} invalid openai_compatible runtime binding: {error}"
+                ));
+            }
+            match artifact.sidecars.get(&binding.runtime_recipe_sidecar) {
+                Some(recipe) if recipe.source_sha256 == binding.runtime_recipe_sha256 => {}
+                Some(_) => errors.push(format!(
+                    "{model_id}/{name} runtime recipe sidecar hash does not match openai_compatible.runtime_recipe_sha256"
+                )),
+                None => errors.push(format!(
+                    "{model_id}/{name} is missing openai_compatible runtime recipe sidecar {}",
+                    binding.runtime_recipe_sidecar
+                )),
+            }
+            match artifact.sidecars.get(&binding.snapshot_manifest_sidecar) {
+                Some(manifest) if manifest.source_sha256 == binding.snapshot_manifest_sha256 => {
+                    if artifact.path != manifest.path
+                        || artifact.source_sha256.as_deref()
+                            != Some(manifest.source_sha256.as_str())
+                    {
+                        errors.push(format!(
+                            "{model_id}/{name} primary path/hash must bind the same snapshot manifest object as openai_compatible.snapshot_manifest_sidecar"
+                        ));
+                    }
+                }
+                Some(_) => errors.push(format!(
+                    "{model_id}/{name} snapshot manifest sidecar hash does not match openai_compatible.snapshot_manifest_sha256"
+                )),
+                None => errors.push(format!(
+                    "{model_id}/{name} is missing openai_compatible snapshot manifest sidecar {}",
+                    binding.snapshot_manifest_sidecar
+                )),
+            }
+        }
+        ("openai-compatible", None) => errors.push(format!(
+            "{model_id}/{name} openai-compatible engine requires a signed openai_compatible runtime binding"
+        )),
+        (_, Some(_)) => errors.push(format!(
+            "{model_id}/{name} openai_compatible runtime binding requires engine openai-compatible"
+        )),
+        _ => {}
     }
     validate_source(
         model_id,
@@ -4708,7 +4800,10 @@ fn validate_artifact_with_engine_policy(
             ));
         }
     }
-    if matches!(artifact.engine.as_str(), "trt-llm" | "vllm") && artifact.min_compute_cap.is_none()
+    if matches!(
+        artifact.engine.as_str(),
+        "trt-llm" | "vllm" | "openai-compatible"
+    ) && artifact.min_compute_cap.is_none()
     {
         errors.push(format!(
             "{model_id}/{name} {} artifact needs min_compute_cap",
@@ -6159,6 +6254,7 @@ mod tests {
                 schema_version: 1,
                 engine: "vllm".to_owned(),
                 independent_dispatch: true,
+                max_concurrent: None,
                 request_modalities: vec![vec!["text".to_owned()]],
                 topology: None,
                 proof_sha256: "a".repeat(64),
@@ -6630,6 +6726,7 @@ mod tests {
                 schema_version: 1,
                 engine: "vllm".to_owned(),
                 independent_dispatch: true,
+                max_concurrent: None,
                 request_modalities: vec![vec!["text".to_owned()]],
                 topology: None,
                 proof_sha256: "e".repeat(64),
@@ -9103,6 +9200,7 @@ mod tests {
         };
         let mut artifact = CatalogArtifact {
             engine: "llama.cpp".to_owned(),
+            openai_compatible: None,
             stable_diffusion_cpp: None,
             mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
             kv_cache: None,
@@ -9392,6 +9490,7 @@ mod tests {
     fn artifact_kv_cache_profile_is_validated_as_signed_runtime_data() {
         let mut artifact = CatalogArtifact {
             engine: "llama.cpp".to_owned(),
+            openai_compatible: None,
             stable_diffusion_cpp: None,
             mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
             kv_cache: Some(CatalogKvCacheProfile {
@@ -10567,6 +10666,7 @@ mod tests {
                 "fixture".to_owned(),
                 CatalogArtifact {
                     engine: engine.to_owned(),
+                    openai_compatible: None,
                     stable_diffusion_cpp: (engine == "stable-diffusion.cpp")
                         .then_some(mayhem_engine::StableDiffusionCppConfig::default()),
                     mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
