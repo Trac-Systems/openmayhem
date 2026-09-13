@@ -178,6 +178,7 @@
       "schema_version": 1,
       "engine": "openai-compatible",
       "independent_dispatch": true,
+      "max_concurrent": 2,
       "request_modalities": [
         [
           "text"
