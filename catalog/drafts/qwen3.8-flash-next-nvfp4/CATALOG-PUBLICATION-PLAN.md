@@ -56,7 +56,7 @@ the operator already has such a license.
   auxiliary n-gram embeddings and MTP component must be described in notes
   rather than added to this field.
 - `tier`: `launch`
-- `min_app_version`: `0.2.205`, the first release that preserves the signed PLE
+- `min_app_version`: `0.2.206`, the first release that preserves the signed PLE
   reader wheel filename during offline installation, maps managed preparation
   containers to the provider uid/gid, accepts the signed source Git identity,
   validates all signed reasoning preflight controls together, observes the
@@ -231,7 +231,7 @@ The signed overlap probe retains `concurrency_max_tokens: 4096` with
 the first-token barriers are held, requires an observed value of at least two
 and first content from both requests, then cancels the bounded probes.
 
-Core v0.2.205 reconstructs reasoning as `<think>…</think>` followed by visible
+Core v0.2.206 reconstructs reasoning as `<think>…</think>` followed by visible
 content, then derives canonical Unicode-scalar units for calibration and live
 catalog verification. The fingerprints remain stable across upstream stream
 segmentation while normal delivery and billing remain unchanged.
