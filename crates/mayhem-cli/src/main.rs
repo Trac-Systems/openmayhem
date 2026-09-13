@@ -19848,17 +19848,20 @@ fn calibration_memory_bytes(
     match context.probe {
         CalibrationMemoryProbe::ProcessRss => {
             let mut total = 0_u64;
-            let mut missing = Vec::new();
+            let mut live = 0_usize;
             for pid in process_ids {
                 match provider_process_rss_bytes(*pid) {
-                    Some(bytes) => total = total.saturating_add(bytes),
-                    None => missing.push(*pid),
+                    Some(bytes) => {
+                        live += 1;
+                        total = total.saturating_add(bytes);
+                    }
+                    None => {}
                 }
             }
             ensure!(
-                missing.is_empty(),
+                live > 0,
                 "failed to read calibration RSS for pid(s) {}",
-                missing
+                process_ids
                     .iter()
                     .map(u32::to_string)
                     .collect::<Vec<_>>()
@@ -126590,6 +126593,33 @@ State initialization...
         assert_eq!(value, 7);
         assert!(baseline > 0);
         assert!(peak >= baseline);
+    }
+
+    #[test]
+    fn calibration_process_rss_tolerates_exited_descendants() {
+        let context = CalibrationMemoryContext {
+            f13_budget_bytes: u64::MAX,
+            source: "test-process-rss".to_owned(),
+            probe: CalibrationMemoryProbe::ProcessRss,
+            chatterbox_device: None,
+            vllm_replica_limit_bytes: None,
+        };
+        let missing_pid = u32::MAX;
+
+        assert!(
+            calibration_memory_bytes(&context, &[std::process::id(), missing_pid]).unwrap() > 0
+        );
+        let error = calibration_memory_bytes(&context, &[missing_pid])
+            .expect_err("an all-exited process set must not produce an RSS measurement");
+        assert!(error.to_string().contains("failed to read calibration RSS"));
+
+        let error = measure_calibration_memory(&context, &[missing_pid], || {
+            Err::<(), _>(anyhow!("operation failure remains authoritative"))
+        })
+        .expect_err("the operation failure must be returned");
+        assert!(error
+            .to_string()
+            .contains("operation failure remains authoritative"));
     }
 
     #[test]
