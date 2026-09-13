@@ -18,7 +18,7 @@ const SOURCE_LAYOUT: &str = "source";
 const MATERIALIZATION: &str = "derive_from_signed_snapshot_v1";
 const SECURITY_PROFILE: &str = "docker_29_1_3_default_plus_io_uring_v1";
 const RESOURCE_PROFILE: &str = "single_sm120_96g_hostnet_hostipc_v1";
-const LAUNCH_PROFILE: &str = "pennyroyal_flash_next_frspec_524k_nvme_v1";
+const LAUNCH_PROFILE: &str = "pennyroyal_flash_next_frspec_524k_nvme_deterministic_v1";
 const SECCOMP: &[u8] = include_bytes!("../assets/docker-29.1.3-ple-io-uring.json");
 const SECCOMP_SHA256: &str = "c7a33fb8ae1f8346356a61ce833d579c45acf2bc94967c6763634e81010ff816";
 
@@ -122,6 +122,9 @@ pub(crate) struct RecipeRuntime {
     security_profile: RecipeSecurityProfile,
     resource_profile: String,
     launch_profile: String,
+    deterministic_inference: bool,
+    linear_attn_prefill_backend: String,
+    linear_attn_decode_backend: String,
     provider_max_concurrent: u32,
     scheduler_max_running_requests: u32,
     reasoning_default: String,
@@ -599,7 +602,10 @@ fn validate_recipe(
             && runtime.security_profile.bytes == SECCOMP.len() as u64
             && runtime.security_profile.sha256 == SECCOMP_SHA256
             && runtime.resource_profile == RESOURCE_PROFILE
-            && runtime.launch_profile == LAUNCH_PROFILE,
+            && runtime.launch_profile == LAUNCH_PROFILE
+            && runtime.deterministic_inference
+            && runtime.linear_attn_prefill_backend == "triton"
+            && runtime.linear_attn_decode_backend == "flashinfer",
         "runtime recipe selects an unsupported launch/security/resource profile"
     );
     ensure!(
@@ -1289,6 +1295,7 @@ fn plugin_version(root: &Path) -> Option<String> {
 fn write_launch_wrapper(root: &Path, model_id: &str, port: u16) -> Result<PathBuf> {
     let model = serde_json::to_string(model_id)?;
     let expected = serde_json::to_string(&qualified_launcher_args())?;
+    let effective = serde_json::to_string(&effective_launcher_args(model_id, port))?;
     let script = format!(
         r#"#!/usr/bin/python3
 import os
@@ -1296,6 +1303,7 @@ import sys
 
 args = sys.argv[1:]
 expected = {expected}
+effective = {effective}
 if args != expected:
     raise SystemExit("qualified launcher argument vector mismatch")
 
@@ -1313,6 +1321,10 @@ replace("--served-model-name", "pennyroyal", {model})
 replace("--default-chat-template-kwargs",
         '{{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"medium"}}',
         '{{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}}')
+replace("--linear-attn-prefill-backend", "flashinfer", "triton")
+args.append("--enable-deterministic-inference")
+if args != effective:
+    raise SystemExit("deterministic launcher argument vector mismatch")
 os.execv("/usr/local/bin/sglang", ["sglang", *args])
 "#,
     );
@@ -1329,6 +1341,45 @@ os.execv("/usr/local/bin/sglang", ["sglang", *args])
         fs::set_permissions(&path, fs::Permissions::from_mode(0o500))?;
     }
     Ok(path)
+}
+
+fn effective_launcher_args(model_id: &str, port: u16) -> Vec<String> {
+    let mut args = qualified_launcher_args()
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    for (flag, old, new) in [
+        ("--host", "0.0.0.0", "127.0.0.1".to_owned()),
+        ("--port", "8001", port.to_string()),
+        ("--served-model-name", "pennyroyal", model_id.to_owned()),
+        (
+            "--default-chat-template-kwargs",
+            r#"{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"medium"}"#,
+            r#"{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}"#
+                .to_owned(),
+        ),
+        (
+            "--linear-attn-prefill-backend",
+            "flashinfer",
+            "triton".to_owned(),
+        ),
+    ] {
+        let positions = args
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| (value == flag).then_some(index))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            positions.len(),
+            1,
+            "qualified launcher flag mismatch: {flag}"
+        );
+        let value = positions[0] + 1;
+        assert_eq!(args.get(value).map(String::as_str), Some(old));
+        args[value] = new;
+    }
+    args.push("--enable-deterministic-inference".to_owned());
+    args
 }
 
 fn qualified_launcher_args() -> Vec<&'static str> {
@@ -2056,6 +2107,9 @@ mod tests {
         assert!(wrapper.contains("replace(\"--port\", \"8001\", \"32123\")"));
         assert!(wrapper.contains("Qwen/Qwen3.8-Flash-Next"));
         assert!(wrapper.contains("\"reasoning_effort\":\"xhigh\""));
+        assert!(wrapper
+            .contains("replace(\"--linear-attn-prefill-backend\", \"flashinfer\", \"triton\")"));
+        assert!(wrapper.contains("args.append(\"--enable-deterministic-inference\")"));
         assert!(wrapper.contains("/usr/local/bin/sglang"));
         let rejected = Command::new(&wrapper_path)
             .args(["serve", "--unexpected"])
@@ -2103,6 +2157,53 @@ mod tests {
             .any(|argument| argument == &owned_container_user_arg(&root).unwrap()));
         assert_eq!(args.last().unwrap(), &format!("/mayhem/source/{LAUNCHER}"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deterministic_flash_next_profile_changes_only_the_signed_runtime_controls() {
+        let source = qualified_launcher_args()
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let effective = effective_launcher_args("Qwen/Qwen3.8-Flash-Next", 32123);
+
+        assert_eq!(
+            effective.last().map(String::as_str),
+            Some("--enable-deterministic-inference")
+        );
+        for (flag, expected) in [
+            ("--linear-attn-prefill-backend", "triton"),
+            ("--linear-attn-decode-backend", "flashinfer"),
+            ("--mamba-radix-cache-strategy", "extra_buffer"),
+            ("--hicache-storage-backend", "nixl"),
+        ] {
+            let index = effective.iter().position(|value| value == flag).unwrap();
+            assert_eq!(effective[index + 1], expected);
+        }
+        assert!(!effective
+            .iter()
+            .any(|value| value == "--disable-radix-cache"));
+
+        let changed = source
+            .iter()
+            .zip(&effective)
+            .filter(|(before, after)| before != after)
+            .map(|(before, after)| (before.as_str(), after.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changed,
+            [
+                ("pennyroyal", "Qwen/Qwen3.8-Flash-Next"),
+                ("0.0.0.0", "127.0.0.1"),
+                ("8001", "32123"),
+                ("flashinfer", "triton"),
+                (
+                    r#"{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"medium"}"#,
+                    r#"{"enable_thinking":true,"preserve_thinking":true,"reasoning_effort":"xhigh"}"#,
+                ),
+            ]
+        );
+        assert_eq!(effective.len(), source.len() + 1);
     }
 
     #[test]
