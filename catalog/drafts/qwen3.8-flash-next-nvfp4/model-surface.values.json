@@ -152,7 +152,7 @@
   },
   "canary_plan": {
     "set_id": "canary-qwen3.8-flash-next-speciality-v1",
-    "source_sha256": "7b8f34333fbef44820b381c67075a3112a7d50050684e924564e90f000e6e3a2",
+    "source_sha256": "022130e8714f46f641595d0a39444c734bd107223a52362f198f01b75bcdcb36",
     "match_min": 0.9,
     "verification_method": "token_fingerprint",
     "prompt_ids": [

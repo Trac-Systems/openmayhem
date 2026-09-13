@@ -203,7 +203,7 @@ budget, and default inflight limits.
 ## Canary and reuse policy
 
 Use the three-prompt `canary-qwen3.8-flash-next-speciality-v1` input at source
-SHA-256 `7b8f34333fbef44820b381c67075a3112a7d50050684e924564e90f000e6e3a2`.
+SHA-256 `022130e8714f46f641595d0a39444c734bd107223a52362f198f01b75bcdcb36`.
 Its deterministic text prompt assesses all seven signed speciality levels, and
 its isolated image and video prompts measure the missing resource profiles and
 new response fingerprints. Retain the direct 9-of-9 functional evidence for
