@@ -56,11 +56,11 @@ the operator already has such a license.
   auxiliary n-gram embeddings and MTP component must be described in notes
   rather than added to this field.
 - `tier`: `launch`
-- `min_app_version`: `0.2.208`, the first release whose signed Flash-Next
-  launch profile enables deterministic inference with the compatible Triton
-  main-attention and linear-attention prefill backends while preserving
-  FlashInfer linear-attention decode, radix cache, hierarchical cache, and the
-  previously validated managed-runtime admission controls.
+- `min_app_version`: `0.2.209`, which retains the signed deterministic Triton
+  runtime mapping and verifies SGLang's lazily created prefix-cache counter by
+  treating only the pre-replay absence as zero. The identical replay must
+  expose the signed counter and increase it; all other managed-runtime
+  admission controls remain unchanged.
 - `provenance.license`: `qwen-community-1.0`
 - `provenance.license_sha256`:
   `a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08`
@@ -230,7 +230,7 @@ The signed overlap probe retains `concurrency_max_tokens: 4096` with
 the first-token barriers are held, requires an observed value of at least two
 and first content from both requests, then cancels the bounded probes.
 
-Core v0.2.208 reconstructs reasoning as `<think>…</think>` followed by visible
+Core v0.2.209 reconstructs reasoning as `<think>…</think>` followed by visible
 content, then derives canonical Unicode-scalar units for calibration and live
 catalog verification. The fingerprints remain stable across upstream stream
 segmentation while normal delivery and billing remain unchanged.
