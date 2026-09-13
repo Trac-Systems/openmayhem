@@ -126,6 +126,35 @@
             0
           ]
         }
+      },
+      {
+        "json_path_suffix": "request_attribute_specs.top_k",
+        "apply_to_endpoint_families": [
+          "openai_chat_completions",
+          "openai_completions",
+          "openai_responses",
+          "hf_multimodal_chat"
+        ],
+        "from": {
+          "value_types": [
+            "integer"
+          ],
+          "minimum": 0,
+          "maximum": 1000000,
+          "calibration_values": [
+            20
+          ]
+        },
+        "to": {
+          "value_types": [
+            "integer"
+          ],
+          "minimum": 1,
+          "maximum": 1000000,
+          "calibration_values": [
+            20
+          ]
+        }
       }
     ],
     "endpoint_families": [

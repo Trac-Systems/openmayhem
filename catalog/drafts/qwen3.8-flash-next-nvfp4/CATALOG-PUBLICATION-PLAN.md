@@ -79,6 +79,9 @@ the operator already has such a license.
   compatibility while constraining its schema to `minimum=maximum=0` and the
   single calibration value `0`. The qualified speculative runtime rejects
   nonzero `min_p`, so the inherited 27B range is not advertised.
+- All four endpoint families retain `top_k` with minimum `1`, maximum
+  `1000000`, and calibration value `20`. Endpoint calibration consequently
+  generates `minimum_valid=1` and rejects `0` as the below-minimum boundary.
 - Thinking controls: `enable_thinking=true` and `preserve_thinking=true` by
   default; `reasoning_effort` is `low|medium|xhigh` with `xhigh` as the catalog
   default.
