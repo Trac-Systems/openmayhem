@@ -40,3 +40,18 @@ Explicit nonempty price commitments support one market and at most 128 canonical
 The activity index is bounded at 5000 markets and must be provisioned before traffic resumes. Retired market history remains immutable; future topology/context changes require active schedule/index review. Reaching the bound rejects new indexed markets before price or settlement writes. There is no automatic proof that all possible future market schedules were included in an old snapshot.
 
 Reference work is not hardware occupancy. Dimension fallback equal-weights relative changes and may respond differently when the workload mix changes; measured admin weights improve comparability. Completed activity cannot reveal saturated unmet demand. Self-funded wash work remains possible and is limited by settlement costs, step bounds and hard price bands, not an unverifiable claim about intent.
+
+## Paid checkpoints prepared before the upgrade
+
+Release 0.2.195 allows a contract v24 paid state checkpoint to finish under v25
+when its exact slot, snapshot hash and administrator match a canonical v24
+preparation. Both snapshot hash layers are checked. The subnet still verifies the
+original signed MSB payment and exact versioned dispatch; a recovery flag or local
+journal alone grants no compatibility. Existing transaction indexing and checkpoint
+slot identity prevent duplicate application or a second checkpoint for that slot.
+
+The v25 gate still rejects fresh v24 commands and Features. Historical receipt
+recovery continues to accept the original signed v23/v24 envelopes. This exception
+does not authorize arbitrary old contract commands or reinterpret their semantics.
+Preserve checkpoint journals and canonical preparation records during upgrades;
+never rewrite a persisted paid dispatch to the new contract version.
