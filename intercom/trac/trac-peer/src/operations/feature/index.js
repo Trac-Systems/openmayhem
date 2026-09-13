@@ -1,3 +1,4 @@
+import { canonicalReplayContext } from '../../base/canonical-replay.js';
 import { BaseCheck } from '../../base/check.js';
 import b4a from 'b4a';
 import { jsonStringify } from '../../utils/types.js';
@@ -7,12 +8,14 @@ export class FeatureOperation {
     #wallet
     #protocolInstance
     #contractInstance
+    #canonicalView
 
-    constructor(validator, { wallet, protocolInstance, contractInstance }) {
+    constructor(validator, { wallet, protocolInstance, contractInstance, canonicalView }) {
         this.#validator = validator
         this.#wallet = wallet
         this.#protocolInstance = protocolInstance
         this.#contractInstance = contractInstance
+        this.#canonicalView = canonicalView
     }
     async handle(op, batch, base, node) {
         if(false === this.#validator.validateNode(node)) return;
@@ -25,7 +28,8 @@ export class FeatureOperation {
             null === await batch.get(`sh/${op.value.dispatch.hash}`)){
             const verified = this.#wallet.verify(op.value.dispatch.hash, `${strDispatchValue}${op.value.dispatch.nonce}`, admin.value);
             if(true === verified) {
-                await this.#contractInstance.execute(op, batch);
+                await this.#contractInstance.execute(op, batch,
+                    await canonicalReplayContext(op, batch, node, this.#canonicalView));
                 await batch.put(`sh/${op.value.dispatch.hash}`, '');
                 //console.log(`Feature ${op.key} appended`);
             }

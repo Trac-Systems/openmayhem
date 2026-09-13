@@ -1,12 +1,20 @@
 {
   "schema": 1,
-  "release_version": "0.2.195",
+  "release_version": "0.2.196",
   "contract_version": 25,
-  "contract_code_sha256": "26b2315a345218b7c6c728ee4825c7b224d8f7b04f98a6a7edddcbdcc0bf6ec2",
+  "contract_code_sha256": "cf44bcc8c6cfa463be08937c74f7b8593ee3b8220e212c995faf792a400d8bad",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "bcb4a90f155da7460173551a69e2df322517c5432d8d11249c4f06dfe96cc489"
+      "sha256": "70f956c9163f6cfaea90a31197204785e74f54562b16cca816ee9faacbd2a087"
+    },
+    {
+      "path": "contract/history/v23.js",
+      "sha256": "365330d5a94be2c8a3afdbeb2766e052c1ab3324f39880d7940d0a9a91b9a0bc"
+    },
+    {
+      "path": "contract/history/v24.js",
+      "sha256": "695c8010aa8f61fcedeb277f4251f0c6bd670bdb1c2a133b2da175900f45dd08"
     },
     {
       "path": "contract/protocol.js",
@@ -15,6 +23,26 @@
     {
       "path": "features/mayhem/index.js",
       "sha256": "89fe96672e71e9df3c4cfcf275addd0f69b75a8518e6cef51c2941fc4028db9f"
+    },
+    {
+      "path": "trac/trac-peer/src/artifacts/contract.js",
+      "sha256": "033c13b290d3cd0975b0938777ca52e8b4ce08bbdf46f86013c40bc80a848238"
+    },
+    {
+      "path": "trac/trac-peer/src/base/canonical-replay.js",
+      "sha256": "8504822476bd77347a8e0f8004a7a53350420650a2547c7ca7161bf2144cffa9"
+    },
+    {
+      "path": "trac/trac-peer/src/index.js",
+      "sha256": "7bcfa01d986e5e040c7fb4a60e93e7f9272f20e3aa161d91582d8aa84fc68941"
+    },
+    {
+      "path": "trac/trac-peer/src/operations/feature/index.js",
+      "sha256": "699dc1eb5c74785551f5e2199292ed1e033a3b35e4803088ccbaf063f7a8812d"
+    },
+    {
+      "path": "trac/trac-peer/src/operations/tx/index.js",
+      "sha256": "13828ee3a6edb24c089e855d8aa68287be9e64ce2305c290bc4f85098ebee62e"
     }
   ]
 }

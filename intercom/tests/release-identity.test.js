@@ -104,7 +104,7 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 test('checked-in Intercom release identity verifies exact sorted contract code bytes', () => {
   const identity = verifyReleaseIdentity({ rootDir: INTERCOM_ROOT });
 
-  assert.equal(identity.releaseVersion, '0.2.195');
+  assert.equal(identity.releaseVersion, '0.2.196');
   assert.equal(identity.contractVersion, 25);
   assert.match(identity.contractCodeSha256, /^[0-9a-f]{64}$/);
   assert.deepEqual(
@@ -215,15 +215,9 @@ test('startup verifier fails loudly when the explicit release manifest is missin
 test('bundle manifest covers the complete runtime tree in deterministic path order', (t) => {
   const rootDir = bundleFixtureRoot(t);
   const manifest = createIntercomBundleManifest({ rootDir });
-  const expectedPaths = [
-    'contract/contract.js',
-    'contract/protocol.js',
-    'contract/release.json',
-    'features/mayhem/index.js',
-    'features/relay/index.js',
-    'package.json',
-    'src/main.js',
-  ].map((relativePath) => `${INTERCOM_BUNDLE_ASSET_PREFIX}${relativePath}`);
+  const expectedPaths = [...CONTRACT_CODE_PATHS, RELEASE_MANIFEST_PATH,
+    'features/relay/index.js', 'package.json', 'src/main.js'].sort()
+    .map((relativePath) => `${INTERCOM_BUNDLE_ASSET_PREFIX}${relativePath}`);
 
   assert.deepEqual(manifest.assets.map((asset) => asset.path), expectedPaths);
   assert.ok(manifest.assets.every((asset) => SHA256_PATTERN.test(asset.sha256)));
@@ -338,4 +332,12 @@ test('health has no compatibility fallback when release identity is unavailable'
 
   assert.equal(response.status, 500);
   assert.deepEqual(await response.json(), { error: 'An internal error occurred.' });
+});
+
+test('release identity binds retained implementations and replay admission code', (t) => {
+  for (const name of ['contract/history/v23.js', 'contract/history/v24.js', 'trac/trac-peer/src/base/canonical-replay.js']) {
+    const rootDir = fixtureRoot(t);
+    fs.appendFileSync(path.join(rootDir, name), '\n// changed replay semantics\n');
+    assert.throws(() => verifyReleaseIdentity({ rootDir }), /mismatch/);
+  }
 });

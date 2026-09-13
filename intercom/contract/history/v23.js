@@ -3,16 +3,9 @@ import { blake3 } from '@tracsystems/blake3';
 import { keccak256 } from 'ethereum-cryptography/keccak';
 import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
-import { consumeCanonicalReplayContext } from 'trac-peer/src/base/canonical-replay.js';
 import PeerWallet from 'trac-wallet';
-import ContractV23 from './history/v23.js';
-import ContractV24 from './history/v24.js';
 
-export const CONTRACT_VERSION = 25;
-// Recovery is limited to unchanged schema-11 receipt evidence already signed by
-// v23 or v24 participants. New prior-version operations are not admitted;
-// separately authenticated canonical replay does not constitute new admission.
-const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24]);
+export const CONTRACT_VERSION = 23;
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -127,18 +120,18 @@ const PARAM_DEFINITIONS = Object.freeze({
   max_open_disputes_per_opener: { default: DEFAULT_MAX_OPEN_DISPUTES_PER_OPENER, min: 1, max: 1_000 },
   dispute_opener_fault_forfeit_bps: { default: DEFAULT_DISPUTE_OPENER_FAULT_FORFEIT_BPS, min: 1, max: 9_999 },
   payout_min_au: { default: ONE_USD_AU, min: ZERO_AU, money: true },
-  price_min_bps: { default: 2_500, min: 2_500, max: 40_000 },
-  price_max_bps: { default: 40_000, min: 2_500, max: 40_000 },
+  price_min_bps: { default: 2_500, min: 1, max: 1_000_000 },
+  price_max_bps: { default: 40_000, min: 1, max: 1_000_000 },
   price_rate_limit_seconds: { default: DEFAULT_PRICE_RATE_LIMIT_SECONDS, min: 0, max: 365 * DAY_SECONDS },
-  market_target_utilization_bps: { default: DEFAULT_MARKET_PRICE_TARGET_UTILIZATION_BPS, min: 1, max: 9_999, deprecated: true },
+  market_target_utilization_bps: { default: DEFAULT_MARKET_PRICE_TARGET_UTILIZATION_BPS, min: 1, max: 9_999 },
   market_ema_alpha_bps: { default: DEFAULT_MARKET_PRICE_EMA_ALPHA_BPS, min: 1, max: 10_000 },
   market_gain_bps: { default: DEFAULT_MARKET_PRICE_GAIN_BPS, min: 1, max: 10_000 },
   market_max_step_bps: { default: DEFAULT_MARKET_PRICE_MAX_STEP_BPS, min: 1, max: 10_000 },
-  market_cold_start_min_providers: { default: DEFAULT_MARKET_PRICE_COLD_START_MIN_PROVIDERS, min: 0, max: 1_000_000, deprecated: true },
-  market_provider_epoch_target_au: { default: DEFAULT_MARKET_PRICE_PROVIDER_EPOCH_TARGET_AU, min: '1', money: true, deprecated: true },
-  market_max_utilization_bps: { default: DEFAULT_MARKET_PRICE_MAX_UTILIZATION_BPS, min: 1, max: 1_000_000, deprecated: true },
-  market_below_target_discount_bps: { default: DEFAULT_MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS, min: 0, max: 10_000, deprecated: true },
-  market_above_target_slope_bps: { default: DEFAULT_MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS, min: 0, max: 1_000_000, deprecated: true },
+  market_cold_start_min_providers: { default: DEFAULT_MARKET_PRICE_COLD_START_MIN_PROVIDERS, min: 0, max: 1_000_000 },
+  market_provider_epoch_target_au: { default: DEFAULT_MARKET_PRICE_PROVIDER_EPOCH_TARGET_AU, min: '1', money: true },
+  market_max_utilization_bps: { default: DEFAULT_MARKET_PRICE_MAX_UTILIZATION_BPS, min: 1, max: 1_000_000 },
+  market_below_target_discount_bps: { default: DEFAULT_MARKET_PRICE_BELOW_TARGET_DISCOUNT_BPS, min: 0, max: 10_000 },
+  market_above_target_slope_bps: { default: DEFAULT_MARKET_PRICE_ABOVE_TARGET_SLOPE_BPS, min: 0, max: 1_000_000 },
   epoch_seconds: { default: 3_600, min: 60, max: 86_400 },
   reservation_max_lifetime_epochs: { default: 24, min: 1, max: 1_000_000 },
   reservation_receipt_grace_epochs: { default: 6, min: 0, max: 1_000_000 },
@@ -179,9 +172,15 @@ const EPOCH_ADMIN_PARAM_KEYS = Object.freeze([
   'price_min_bps',
   'price_max_bps',
   'price_rate_limit_seconds',
+  'market_target_utilization_bps',
   'market_ema_alpha_bps',
   'market_gain_bps',
   'market_max_step_bps',
+  'market_cold_start_min_providers',
+  'market_provider_epoch_target_au',
+  'market_max_utilization_bps',
+  'market_below_target_discount_bps',
+  'market_above_target_slope_bps',
   'epoch_seconds',
   'reservation_max_lifetime_epochs',
   'reservation_receipt_grace_epochs',
@@ -892,66 +891,15 @@ class MayhemContract extends Contract {
   // The base class runs one execution at a time and calls executeQueued() from
   // inside that queue, so the per-operation fields set here belong to the call
   // that is running and cannot be overwritten by an overlapping one.
-  async executeQueued(op, storage, consensusContext = null) {
+  async executeQueued(op, storage) {
     // Admin Feature envelopes temporarily impersonate a command execution. Keep
     // the actual consensus operation kind separately for paid-only operations.
     this._mayhemExecutionType = op?.type;
     try {
-      const versioned = versionedMayhemOperation(op);
-      const canonicalReplay = consumeCanonicalReplayContext(consensusContext, op, storage);
-      const historical = versioned.present && (
-        ([23, 24].includes(versioned.version) && canonicalReplay) ||
-        (versioned.version === 24 && await this.isPreparedCheckpointReplay(op, storage))
-      );
-      if (historical) {
-        // Replaying with today's pricing/receipt methods would produce a
-        // different signed view. Retained implementations preserve the exact
-        // historical transition, and never participate in new admission.
-        const Implementation = versioned.version === 23 ? ContractV23 : ContractV24;
-        this._historicalContracts ??= new Map();
-        if (!this._historicalContracts.has(versioned.version)) {
-          this._historicalContracts.set(versioned.version, new Implementation(this.protocol, this.config));
-        }
-        const previous = this._mayhemReplayStatus;
-        this._mayhemReplayStatus = { active: true, completed: previous?.completed ?? 0,
-          contractVersion: versioned.version, canonicalSignedLength: canonicalReplay?.signedLength ?? null };
-        try {
-          const result = await this._historicalContracts.get(versioned.version).execute(op, storage);
-          this._mayhemReplayStatus.completed++;
-          return result;
-        } finally { this._mayhemReplayStatus.active = false; }
-      }
       return await super.executeQueued(validateMayhemOperationContractVersion(op), storage);
     } finally {
       this._mayhemExecutionType = null;
     }
-  }
-
-  // Compatibility is attached to canonical preparation evidence, never a
-  // caller-supplied replay flag. TxOperation verifies the original MSB payment
-  // and exact dispatch hash before entering consensus execution here.
-  async isPreparedCheckpointReplay(op, storage) {
-    const dispatch = op?.value?.dispatch;
-    const value = dispatch?.value;
-    if (op?.type !== 'tx' || dispatch?.type !== 'stateCheckpoint' ||
-        value?.op !== 'state_checkpoint' || value.contract_version !== 24 ||
-        !Number.isSafeInteger(value.slot) || value.slot < 1 ||
-        !this.isHexBytes(op.key, 32) || !this.isHexBytes(value.snapshot_hash, 32)) return false;
-    const read = async (key) => (await storage.get(key))?.value ?? null;
-    const admin = await read('admin');
-    const snapshot = await read(`checkpoint/prepared/${value.slot}`);
-    if (op.value.ipk !== admin || !snapshot ||
-        snapshot.type !== 'state_checkpoint_snapshot' || snapshot.schema_version !== 1 ||
-        snapshot.slot !== value.slot || snapshot.prepared_by !== admin ||
-        snapshot.state?.contract_version !== 24 || snapshot.snapshot_hash !== value.snapshot_hash) return false;
-    const { snapshot_hash: snapshotHash, ...body } = snapshot;
-    if (await this.opaqueHash('mayhem-checkpoint-state-v1', snapshot.state) !== snapshot.state_hash ||
-        await this.opaqueHash('mayhem-checkpoint-snapshot-v1', body) !== snapshotHash) return false;
-    const existing = await read(`checkpoint/slot/${value.slot}`);
-    if (existing) return existing.tx === op.key && existing.snapshot_hash === snapshotHash &&
-      existing.paid_by === admin;
-    const preparing = await read('checkpoint/preparing');
-    return preparing?.slot === value.slot && preparing.snapshot_hash === snapshotHash;
   }
 
   constructor(protocol, options = {}) {
@@ -1146,16 +1094,6 @@ class MayhemContract extends Contract {
       },
     });
 
-    this.addSchema('migrateMarketPricing', {
-      value: {
-        $$strict: true,
-        $$type: 'object',
-        op: { type: 'string', min: 1, max: 64 },
-        at: { type: 'number', integer: true, min: 0 },
-        markets: { type: 'array', min: 0, max: 128, items: { type: 'any' } },
-      },
-    });
-
     this.addSchema('setModelRef', {
       value: {
         $$strict: true,
@@ -1165,7 +1103,6 @@ class MayhemContract extends Contract {
         model_class: { type: 'string', min: 1, max: 64 },
         rate_map: { type: 'array', min: 1, max: RATE_MAP_MAX_ENTRIES, items: { type: 'any' } },
         source_hash: { type: 'string', min: 1, max: 128, optional: true },
-        activity_calibration: { type: 'any', optional: true },
       },
     });
 
@@ -3275,8 +3212,7 @@ class MayhemContract extends Contract {
     if (value.op !== 'record_usage_receipt') {
       return new Error('Invalid record usage receipt op.');
     }
-    if (value.contract_version !== CONTRACT_VERSION &&
-        !RECOVERABLE_RECEIPT_CONTRACT_VERSIONS.has(value.contract_version)) {
+    if (value.contract_version !== CONTRACT_VERSION) {
       return new Error('Invalid record usage receipt contract version.');
     }
     if (!Number.isSafeInteger(value.epoch) || value.epoch < 1) {
@@ -3316,9 +3252,7 @@ class MayhemContract extends Contract {
     }
     return {
       op: 'record_usage_receipt',
-      // The outer version participates in the provider signature and feature key.
-      // Never rewrite retained v23 evidence while executing under a v24 dispatch.
-      contract_version: value.contract_version,
+      contract_version: CONTRACT_VERSION,
       epoch: value.epoch,
       payout_revision: value.payout_revision,
       receipt: canonicalReceipt,
@@ -8377,12 +8311,6 @@ class MayhemContract extends Contract {
 
     const key = `modelref/${this.value.model_id}`;
     const current = await this.get(key);
-    const calibration = Object.hasOwn(this.value, 'activity_calibration')
-      ? this.value.activity_calibration : current?.activity_calibration;
-    if (calibration) {
-      const error = this.validateActivityCalibration(calibration, this.modelClassFor(this.value), this.value.rate_map);
-      if (error) return error;
-    }
     const record = {
       model_id: this.value.model_id,
       model_class: this.modelClassFor(this.value),
@@ -8390,9 +8318,6 @@ class MayhemContract extends Contract {
       rate_map: this.normalizeRateMap(this.value.rate_map),
       ver: (current?.ver ?? 0) + 1,
       source_hash: this.value.source_hash ?? null,
-      ...(calibration ? {
-        activity_calibration: cloneValue(calibration),
-      } : {}),
       updated_at: this.tx,
       set_by: this.address,
       set_by_role: 'admin',
@@ -10120,8 +10045,6 @@ class MayhemContract extends Contract {
         derivations: priceDerivations,
       });
     }
-    const activityIndexError = await this.writeActivityMarketIndex(marketPriceUpdates);
-    if (activityIndexError instanceof Error) return activityIndexError;
     for (const update of marketPriceUpdates) {
       await this.put(update.schedule_key, update.schedule);
       await this.put(update.record_key, update.record);
@@ -10152,9 +10075,8 @@ class MayhemContract extends Contract {
           ctx_bracket_table_ver: update.ctx_bracket_table_ver,
         } : {}),
         ver: update.ver,
-        momentum_bps: update.momentum_bps,
-        activity_rate: update.activity_rate,
-        ema_activity_rate: update.ema_activity_rate,
+        utilization_bps: update.utilization_bps,
+        ema_utilization_bps: update.ema_utilization_bps,
         active_supply: update.active_supply,
         active_demand_au: update.active_demand_au,
         frozen: update.frozen,
@@ -10316,7 +10238,6 @@ class MayhemContract extends Contract {
             ctx_bracket_table_ver: usage.ctx_bracket_table_ver,
           } : {}),
           demand_au: demandAu,
-          settled_usage: usage.settled_usage,
           session_count: usage.session_count,
           providers,
         });
@@ -10698,7 +10619,6 @@ class MayhemContract extends Contract {
               ctx_bracket_table_ver: usage.ctx_bracket_table_ver,
             } : {}),
             demand_au: ZERO_AU,
-            settled_usage: {},
             session_count: 0,
             provider_count: 0,
             first_page: page,
@@ -10770,11 +10690,8 @@ class MayhemContract extends Contract {
             providerCount instanceof Error) {
           return new Error('Bounded receipt market usage marker overflow.');
         }
-        const settledUsage = this.addSettledUsage(marker.settled_usage, usage.settled_usage);
-        if (settledUsage instanceof Error) return settledUsage;
         const nextMarker = {
           ...marker,
-          settled_usage: settledUsage,
           demand_au: demandAu,
           session_count: sessionCount,
           provider_count: providerCount,
@@ -10972,27 +10889,12 @@ class MayhemContract extends Contract {
     });
     if (guardian instanceof Error) return guardian;
 
-    const canonicalActivity = new Map();
-    if (Array.isArray(options.canonicalMarketUsage)) {
-      for (const usage of options.canonicalMarketUsage) canonicalActivity.set(
-        this.priceMarketKey(usage.enclave_id, usage.ctx_bracket ?? null), usage);
-    }
-    if (boundedReceiptSettlement && lastPage) {
-      for (const usage of marketUsageMap.values()) {
-        const ctxKey = usage.ctx_bracket ? `ctx/${usage.ctx_bracket}` : 'base';
-        const markerKey = `epoch/market-usage/${value.epoch}/${usage.enclave_id}/${ctxKey}`;
-        const marker = epochMarketUsageUpdates.find((u) => u.key === markerKey)?.value ?? await this.get(markerKey);
-        canonicalActivity.set(this.priceMarketKey(usage.enclave_id, usage.ctx_bracket ?? null), marker);
-      }
-    }
     let marketPriceUpdates = [];
     if (marketUsageProvided) {
       marketPriceUpdates = await this.computeMarketPriceUpdates(marketUsageMap, {
         epoch: value.epoch,
         at: value.at,
         epochSeconds: params.epoch_seconds,
-        canonicalActivity,
-        includeDormant: boundedReceiptSettlement && lastPage,
       });
       if (marketPriceUpdates instanceof Error) return marketPriceUpdates;
     }
@@ -11146,8 +11048,6 @@ class MayhemContract extends Contract {
         derivations: priceDerivations,
       });
     }
-    const activityIndexError = await this.writeActivityMarketIndex(marketPriceUpdates);
-    if (activityIndexError instanceof Error) return activityIndexError;
     for (const update of marketPriceUpdates) {
       await this.put(update.schedule_key, update.schedule);
       await this.put(update.record_key, update.record);
@@ -11178,9 +11078,8 @@ class MayhemContract extends Contract {
           ctx_bracket_table_ver: update.ctx_bracket_table_ver,
         } : {}),
         ver: update.ver,
-        momentum_bps: update.momentum_bps,
-        activity_rate: update.activity_rate,
-        ema_activity_rate: update.ema_activity_rate,
+        utilization_bps: update.utilization_bps,
+        ema_utilization_bps: update.ema_utilization_bps,
         active_supply: update.active_supply,
         active_demand_au: update.active_demand_au,
         frozen: update.frozen,
@@ -11275,24 +11174,8 @@ class MayhemContract extends Contract {
     const pageOrderError = this.validateEpochApplyPageOrder(applyState, this.value.epoch, 0);
     if (pageOrderError) return pageOrderError;
 
-    const activityUpdates = await this.computeMarketPriceUpdates(new Map(), {
-      epoch: this.value.epoch, at: this.value.at, epochSeconds: params.epoch_seconds,
-      canonicalActivity: new Map(), includeDormant: true,
-    });
-    if (activityUpdates instanceof Error) return activityUpdates;
-    const usageRoot = await this.merkleRoot('use', []);
-    const activityDerivations = await this.priceDerivationsFromMarketUpdates(activityUpdates, {
-      epoch: this.value.epoch, at: this.value.at, epochSeconds: params.epoch_seconds, usageRoot,
-    });
-    if (activityDerivations instanceof Error) return activityDerivations;
-    if ((await this.get(`market/price/${this.value.epoch}`)) !== null) {
-      return new Error('Empty epoch market price evidence already exists.');
-    }
-    const activityRoot = await this.priceDerivationRoot(activityDerivations);
     const sealValue = {
       type: 'epoch_empty_seal',
-      market_price_root: activityRoot,
-      market_price_count: activityDerivations.length,
       epoch: this.value.epoch,
       at: this.value.at,
       epoch_seconds: params.epoch_seconds,
@@ -11329,16 +11212,6 @@ class MayhemContract extends Contract {
     const challengeAnchor = await this.prepareCanaryChallengeAnchor(nextApplyState);
     if (challengeAnchor instanceof Error) return challengeAnchor;
 
-    await this.writeBoundedMarketPriceEvidence({
-      epoch: this.value.epoch, at: this.value.at, epochSeconds: params.epoch_seconds,
-      usageRoot, derivations: activityDerivations,
-    });
-    const activityIndexError = await this.writeActivityMarketIndex(activityUpdates);
-    if (activityIndexError instanceof Error) return activityIndexError;
-    for (const update of activityUpdates) {
-      await this.put(update.schedule_key, update.schedule);
-      await this.put(update.record_key, update.record);
-    }
     await this.put(key, record);
     await this.writePreparedAnchor(previousChallengeAnchor);
     await this.put('epoch/apply/state', nextApplyState);
@@ -11386,14 +11259,8 @@ class MayhemContract extends Contract {
       return new Error('Epoch commit already exists.');
     }
 
-    const activityEvidence = await this.prepareCommittedActivityEvidence({
-      epoch: this.value.epoch, at: this.value.at, epochSeconds: params.epoch_seconds, roots, totals,
-    });
-    if (activityEvidence instanceof Error) return activityEvidence;
     const record = {
       type: 'epoch_commit',
-      pricing_schema_version: 2,
-      ...(activityEvidence ? { expected_activity_evidence: activityEvidence } : {}),
       epoch: this.value.epoch,
       epoch_seconds: params.epoch_seconds,
       roots,
@@ -17300,7 +17167,6 @@ class MayhemContract extends Contract {
           ctx_bracket_table_ver: receiptBody.ctx_bracket_table_ver,
         } : {}),
         demand_au: ZERO_AU,
-        settled_usage: {},
         session_count: 0,
         providers: new Set(),
       };
@@ -17317,11 +17183,6 @@ class MayhemContract extends Contract {
       if (marketDemandAu instanceof Error || marketSessionCount instanceof Error) {
         return new Error('Canonical receipt market usage overflow.');
       }
-      const increment = this.incrementalSettledUsage(receiptBody);
-      if (increment instanceof Error) return increment;
-      const settledUsage = this.addSettledUsage(currentMarket.settled_usage, increment);
-      if (settledUsage instanceof Error) return settledUsage;
-      currentMarket.settled_usage = settledUsage;
       currentMarket.demand_au = marketDemandAu;
       currentMarket.session_count = marketSessionCount;
       currentMarket.providers.add(allocation.provider);
@@ -17468,7 +17329,6 @@ class MayhemContract extends Contract {
             ctx_bracket_table_ver: entry.ctx_bracket_table_ver,
           } : {}),
           demand_au: entry.demand_au,
-          settled_usage: entry.settled_usage,
           session_count: entry.session_count,
           providers: Array.from(entry.providers).sort(compareCodepoint),
         })),
@@ -17498,7 +17358,7 @@ class MayhemContract extends Contract {
 
   async paramRecord(key) {
     const existing = await this.get(`params/${key}`);
-    if (existing) return this.sanitizeMarketBoundRecord(key, existing);
+    if (existing) return existing;
     return {
       key,
       current: {
@@ -17529,7 +17389,6 @@ class MayhemContract extends Contract {
     for (const key of keys) {
       const value = values[key];
       const def = PARAM_DEFINITIONS[key];
-      if (def.deprecated) return new Error(`Parameter ${key} is deprecated and read-only.`);
       if (def.money) {
         const au = this.normalizeAu(value, `Parameter ${key}`, { allowZero: def.min === ZERO_AU });
         if (au instanceof Error) return au;
@@ -17568,6 +17427,9 @@ class MayhemContract extends Contract {
     if (params.price_min_bps > params.price_max_bps) {
       return new Error('price_min_bps must not exceed price_max_bps.');
     }
+    if (params.market_max_utilization_bps < params.market_target_utilization_bps) {
+      return new Error('market_max_utilization_bps must be >= market_target_utilization_bps.');
+    }
     return null;
   }
 
@@ -17579,9 +17441,6 @@ class MayhemContract extends Contract {
     if (rateError) return rateError;
     if (value.source_hash !== undefined && !this.isSafeKeyPart(value.source_hash)) {
       return new Error('Invalid model reference source hash.');
-    }
-    if (value.activity_calibration !== undefined && value.activity_calibration !== null) {
-      return this.validateActivityCalibration(value.activity_calibration, this.modelClassFor(value), value.rate_map);
     }
     return null;
   }
@@ -18574,266 +18433,83 @@ class MayhemContract extends Contract {
     return null;
   }
 
-  sanitizeMarketBoundRecord(key, record) {
-    if (key !== 'price_min_bps' && key !== 'price_max_bps') return record;
-    const safe = (entry) => Number.isSafeInteger(entry?.value) &&
-      entry.value >= 2_500 && entry.value <= 40_000;
-    const next = cloneValue(record);
-    if (!safe(next.current)) next.current = {
-      ...next.current, value: PARAM_DEFINITIONS[key].default,
-      policy_repair: 'market_activity_v2_hard_bounds',
-    };
-    if (next.pending && !safe(next.pending)) next.pending = null;
-    return next;
-  }
-
-  async migrateMarketPricing() {
-    const adminError = await this.requireAdmin();
-    if (adminError) return adminError;
-    const shape = this.validateExactCommandValue(['op', 'at', 'markets'], 'migrate_market_pricing');
-    if (shape) return shape;
-    if (!Number.isSafeInteger(this.value.at) || this.value.at < 0 ||
-        !Array.isArray(this.value.markets) || this.value.markets.length > 128) {
-      return new Error('Migration requires a timestamp and at most 128 active market rows.');
-    }
-    const key = 'market/activity/migration-v2';
-    const existing = await this.get(key);
-    const state = await this.epochApplyStateRecord();
-    if (state.pending_epoch !== null && state.pending_epoch !== undefined) {
-      return new Error('Market pricing migration requires a completed epoch boundary.');
-    }
-    const priorIndex = await this.get('market/activity/index') ?? [];
-    const index = new Map(priorIndex.map((row) => [
-      this.priceMarketKey(row.enclave_id, row.ctx_bracket ?? null), row,
-    ]));
-    const seen = new Set();
-    for (const row of this.value.markets) {
-      const fields = ['enclave_id', ...(row?.ctx_bracket !== undefined
-        ? ['ctx_bracket', 'ctx_bracket_table_ver'] : [])];
-      const rowShape = this.validateExactObjectKeys(row, fields, 'Migration market');
-      if (rowShape) return rowShape;
-      if (!this.isSafeKeyPart(row.enclave_id)) return new Error('Invalid migration market enclave.');
-      const enclave = await this.get(`enclave/${row.enclave_id}`);
-      if (!enclave || enclave.status !== 'active') return new Error('Migration market enclave is not active.');
-      const ctx = await this.priceCtxMetaForEnclave(enclave, row.ctx_bracket, this.value.at, 'Migration market');
-      if (ctx instanceof Error) return ctx;
-      if ((ctx?.ctx_bracket_table_ver ?? null) !== (row.ctx_bracket_table_ver ?? null)) {
-        return new Error('Migration market context table version is not active.');
-      }
-      const marketKey = this.priceMarketKey(row.enclave_id, row.ctx_bracket ?? null);
-      if (seen.has(marketKey)) return new Error('Duplicate migration market.');
-      seen.add(marketKey);
-      const schedule = await this.priceSchedule(this.priceScheduleKey(row.enclave_id, row.ctx_bracket ?? null), enclave, ctx);
-      const price = this.priceActiveEntry(schedule, this.value.at);
-      if (!price || this.priceSeedEntry(price)?.set_by_role !== 'admin' ||
-          !(await this.get(`modelref/${enclave.model_id}`))) {
-        return new Error('Migration market requires an active admin price and model reference.');
-      }
-      index.set(marketKey, cloneValue(row));
-    }
-    if (index.size > DEFAULT_MAX_MARKET_USAGE_ENTRIES) return new Error('Migration market index capacity exceeded.');
-    const repairs = [];
-    for (const name of ['price_min_bps', 'price_max_bps']) {
-      const before = await this.get(`params/${name}`);
-      if (!before) continue;
-      const after = this.sanitizeMarketBoundRecord(name, before);
-      if (stableJson(before) !== stableJson(after)) repairs.push({ key: name, before, after });
-    }
-    const nextIndex = Array.from(index.values()).sort((a, b) =>
-      compareCodepoint(a.enclave_id, b.enclave_id) || compareCodepoint(a.ctx_bracket ?? '', b.ctx_bracket ?? ''));
-    if (existing && repairs.length === 0 && stableJson(priorIndex) === stableJson(nextIndex)) {
-      return { ok: true, op: 'migrateMarketPricing', idempotent: true, market_count: index.size };
-    }
-    // Complete validation before any writes. Historical params/update records stay immutable.
-    for (const repair of repairs) await this.put(`params/${repair.key}`, repair.after);
-    await this.put('market/activity/index', nextIndex);
-    await this.put(key, {
-      schema_version: 2, contract_version: CONTRACT_VERSION,
-      hard_min_bps: 2_500, hard_max_bps: 40_000,
-      previous_applied_epoch: state.updated_epoch ?? 0,
-      repairs: [...(existing?.repairs ?? []), ...repairs], market_count: index.size,
-      migrated_at: existing?.migrated_at ?? this.tx, updated_at: this.tx, migrated_by: this.address,
-    });
-    return { ok: true, op: 'migrateMarketPricing', idempotent: false, repaired: repairs.length, market_count: index.size };
-  }
-
-  validateActivityCalibration(value, modelClass, rateMap = null) {
-    const shape = this.validateExactObjectKeys(value,
-      ['schema_version', 'source_hash', 'dimensions'], 'Activity calibration');
-    if (shape) return shape;
-    if (value.schema_version !== 1 || !this.isHexBytes(value.source_hash, 32) ||
-        !Array.isArray(value.dimensions) || value.dimensions.length < 1 ||
-        value.dimensions.length > RATE_MAP_MAX_ENTRIES) {
-      return new Error('Invalid activity calibration metadata.');
-    }
-    const allowed = MODEL_CLASS_RATE_UNITS[modelClass];
-    const seen = new Set();
-    let positive = false;
-    for (const row of value.dimensions) {
-      const error = this.validateExactObjectKeys(row, ['unit', 'units', 'work_us'],
-        'Activity calibration dimension');
-      if (error) return error;
-      if (!allowed?.has(row.unit) || seen.has(row.unit) ||
-          !/^[1-9][0-9]{0,17}$/.test(row.units) ||
-          !/^[1-9][0-9]{0,17}$/.test(row.work_us)) {
-        return new Error('Invalid activity calibration dimension.');
-      }
-      seen.add(row.unit);
-      positive ||= BigInt(row.work_us) > 0n;
-      if ((row.unit === 'input_token' || row.unit === 'output_token') &&
-          BigInt(row.work_us) === 0n) {
-        return new Error('Token activity calibration requires positive prefill/decode work.');
-      }
-    }
-    if (rateMap && stableJson([...seen].sort(compareCodepoint)) !==
-        stableJson(rateMap.map((row) => row.unit).sort(compareCodepoint))) {
-      return new Error('Activity calibration must cover every model reference rate unit exactly.');
-    }
-    if (!positive || (modelClass === DEFAULT_MODEL_CLASS &&
-        (!seen.has('input_token') || !seen.has('output_token')))) {
-      return new Error('Activity calibration requires calibrated workload dimensions.');
-    }
-    if (stableJson(value.dimensions) !== stableJson(value.dimensions.slice().sort(
-      (a, b) => compareCodepoint(a.unit, b.unit)))) {
-      return new Error('Activity calibration dimensions must be sorted.');
-    }
-    return null;
-  }
-
-  incrementalSettledUsage(body) {
-    const usage = this.normalizeReceiptUsage(body.usage);
-    const prior = this.normalizeReceiptUsage(body.billing_prior_usage);
-    if (usage instanceof Error || prior instanceof Error) {
-      return new Error('Canonical receipt activity usage is invalid.');
-    }
-    const billed = this.normalizeLockedRateMap(body.locked_rate_map, 'activity locked rates');
-    if (billed instanceof Error) return billed;
-    const paidUnits = new Set(billed.map((row) => row.unit));
-    const result = {};
-    for (const unit of new Set([...Object.keys(usage), ...Object.keys(prior)])) {
-      const count = BigInt(usage[unit] ?? 0) - BigInt(prior[unit] ?? 0);
-      if (count < 0n) return new Error('Canonical receipt activity regressed below billing baseline.');
-      if (count > 0n && paidUnits.has(unit)) result[unit] = count.toString();
-    }
-    return stableValue(result);
-  }
-
-  addSettledUsage(left, right) {
-    if (!left || !right || typeof left !== 'object' || typeof right !== 'object' ||
-        Array.isArray(left) || Array.isArray(right)) return new Error('Invalid settled activity units.');
-    const result = {};
-    for (const unit of new Set([...Object.keys(left), ...Object.keys(right)])) {
-      if (!this.isSafeKeyPart(unit)) return new Error('Invalid settled activity unit.');
-      const a = this.parseAu(left[unit] ?? '0', 'settled activity count');
-      const b = this.parseAu(right[unit] ?? '0', 'settled activity count');
-      if (a instanceof Error || b instanceof Error) return new Error('Invalid settled activity count.');
-      const sum = this.safeAddAu(a.toString(), b.toString());
-      if (sum instanceof Error) return sum;
-      if (sum !== '0') result[unit] = sum;
-    }
-    return stableValue(result);
-  }
-
-  calibratedActivityWork(usage, calibration) {
-    const dimensions = new Map(calibration.dimensions.map((row) => [row.unit, row]));
-    let work = 0n;
-    for (const [unit, count] of Object.entries(usage)) {
-      const dimension = dimensions.get(unit);
-      if (!dimension) return new Error('Settled unit is missing its signed activity calibration.');
-      const n = this.parseAu(count, 'settled activity count');
-      if (n instanceof Error) return n;
-      // Round once per epoch/axis, not per receipt or page (split-resistant).
-      work += (n * BigInt(dimension.work_us) * 1_000_000n) / BigInt(dimension.units);
-    }
-    return work.toString(); // picoseconds of calibrated reference work.
-  }
-
-  marketActivityMomentum(currentRate, previousRate, constants) {
-    const current = BigInt(currentRate);
-    const previous = BigInt(previousRate);
-    const raw = previous > 0n ? current * 10_000n / previous
-      : (current > 0n ? BigInt(constants.max_momentum_bps) : 0n);
-    return Number(raw > BigInt(constants.max_momentum_bps)
-      ? BigInt(constants.max_momentum_bps) : raw);
-  }
-
-  marketActivityEma(previousRate, currentRate, constants) {
-    return ((BigInt(previousRate) * BigInt(10_000 - constants.ema_alpha_bps) +
-      BigInt(currentRate) * BigInt(constants.ema_alpha_bps)) / 10_000n).toString();
-  }
-
-  marketActivityVector(usage, epochSeconds) {
-    return Object.fromEntries(Object.entries(usage).map(([unit, count]) => [
-      unit, (BigInt(count) * 1_000_000_000_000n / BigInt(epochSeconds)).toString(),
-    ]));
-  }
-
-  marketVectorMomentum(current, previous, constants) {
-    const units = [...new Set([...Object.keys(current), ...Object.keys(previous)])]
-      .filter((unit) => BigInt(current[unit] ?? '0') > 0n || BigInt(previous[unit] ?? '0') > 0n)
-      .sort(compareCodepoint);
-    if (!units.length) return 0;
-    let sum = 0n;
-    for (const unit of units) sum += BigInt(this.marketActivityMomentum(
-      current[unit] ?? '0', previous[unit] ?? '0', constants));
-    return Number(sum / BigInt(units.length));
-  }
-
-  marketVectorEma(previous, current, constants) {
-    return Object.fromEntries([...new Set([...Object.keys(current), ...Object.keys(previous)])]
-      .sort(compareCodepoint).map((unit) => [unit, this.marketActivityEma(
-        previous[unit] ?? '0', current[unit] ?? '0', constants)]));
-  }
-
-  async activityMarketEntries(usageMap, includeDormant) {
-    const entries = this.mapMarketUsageEntriesForHash(usageMap);
-    const known = await this.get('market/activity/index') ?? [];
-    if (!Array.isArray(known) || known.length > DEFAULT_MAX_MARKET_USAGE_ENTRIES) {
-      return new Error('Market activity index exceeds its deterministic bound.');
-    }
-    const keys = new Set(entries.map((row) => this.priceMarketKey(row.enclave_id, row.ctx_bracket ?? null)));
-    for (const row of known) {
-      const key = this.priceMarketKey(row.enclave_id, row.ctx_bracket ?? null);
-      if (includeDormant && !keys.has(key)) entries.push({ ...row, demand_au: '0', session_count: 0, provider_count: 0, _activity_dormant: true });
-    }
-    if (new Set([...keys, ...known.map((row) => this.priceMarketKey(row.enclave_id, row.ctx_bracket ?? null))]).size > DEFAULT_MAX_MARKET_USAGE_ENTRIES) {
-      return new Error('Market activity index capacity exceeded.');
-    }
-    return entries.sort((a, b) => compareCodepoint(a.enclave_id, b.enclave_id) ||
-      compareCodepoint(a.ctx_bracket ?? '', b.ctx_bracket ?? ''));
-  }
-
-  async writeActivityMarketIndex(updates) {
-    const index = new Map((await this.get('market/activity/index') ?? []).map((row) => [
-      this.priceMarketKey(row.enclave_id, row.ctx_bracket ?? null), row,
-    ]));
-    for (const update of updates) {
-      if (!update.record.market.activity_initialized) continue;
-      index.set(update.market_key, {
-        enclave_id: update.enclave_id,
-        ...(update.ctx_bracket ? { ctx_bracket: update.ctx_bracket,
-          ctx_bracket_table_ver: update.ctx_bracket_table_ver } : {}),
-      });
-    }
-    if (index.size > DEFAULT_MAX_MARKET_USAGE_ENTRIES) return new Error('Market activity index overflow.');
-    if (updates.length) await this.put('market/activity/index', Array.from(index.values()).sort(
-      (a, b) => compareCodepoint(a.enclave_id, b.enclave_id) ||
-        compareCodepoint(a.ctx_bracket ?? '', b.ctx_bracket ?? '')));
-  }
-
   marketPriceParamKeys() {
-    return ['price_min_bps', 'price_max_bps', 'market_ema_alpha_bps',
-      'market_gain_bps', 'market_max_step_bps'];
+    return [
+      'price_min_bps',
+      'price_max_bps',
+      'market_target_utilization_bps',
+      'market_ema_alpha_bps',
+      'market_gain_bps',
+      'market_max_step_bps',
+      'market_cold_start_min_providers',
+      'market_provider_epoch_target_au',
+      'market_max_utilization_bps',
+      'market_below_target_discount_bps',
+      'market_above_target_slope_bps',
+    ];
   }
 
   marketPriceConstants(params) {
     return {
-      schema_version: 2,
+      target_utilization_bps: params.market_target_utilization_bps,
       ema_alpha_bps: params.market_ema_alpha_bps,
       gain_bps: params.market_gain_bps,
       max_step_bps: params.market_max_step_bps,
-      max_momentum_bps: 50_000,
+      cold_start_min_providers: params.market_cold_start_min_providers,
+      provider_epoch_target_au: params.market_provider_epoch_target_au,
+      max_utilization_bps: params.market_max_utilization_bps,
+      below_target_discount_bps: params.market_below_target_discount_bps,
+      above_target_slope_bps: params.market_above_target_slope_bps,
     };
+  }
+
+  marketUtilizationBps(demandAu, activeSupply, constants) {
+    const demand = this.parseAu(demandAu, 'market demand');
+    if (demand instanceof Error) return new Error('Invalid market demand.');
+    if (!Number.isSafeInteger(activeSupply) || activeSupply < 0) {
+      return new Error('Invalid market active supply.');
+    }
+    if (activeSupply === 0) return 0;
+    const providerEpochTarget = this.parseAu(
+      constants.provider_epoch_target_au,
+      'market provider epoch target',
+      { allowZero: false }
+    );
+    if (providerEpochTarget instanceof Error) {
+      return new Error('Invalid market supply capacity.');
+    }
+    const capacityAu = BigInt(activeSupply) * providerEpochTarget;
+    if (capacityAu <= 0n) return new Error('Invalid market supply capacity.');
+    const util = (demand * 10_000n) / capacityAu;
+    const capped = util > BigInt(constants.max_utilization_bps)
+      ? BigInt(constants.max_utilization_bps)
+      : util;
+    return Number(capped);
+  }
+
+  marketEmaUtilizationBps(previousEmaBps, utilizationBps, constants) {
+    const previous = Number.isSafeInteger(previousEmaBps)
+      ? previousEmaBps
+      : constants.target_utilization_bps;
+    return Math.floor(
+      (
+        previous * (10_000 - constants.ema_alpha_bps) +
+        utilizationBps * constants.ema_alpha_bps
+      ) / 10_000
+    );
+  }
+
+  marketCurveMultiplierBps(utilizationBps, constants) {
+    if (utilizationBps <= constants.target_utilization_bps) {
+      const shortfall = constants.target_utilization_bps - utilizationBps;
+      return 10_000 - Math.floor(
+        (shortfall * constants.below_target_discount_bps) /
+        constants.target_utilization_bps
+      );
+    }
+    const excess = utilizationBps - constants.target_utilization_bps;
+    const denominator = 10_000 - constants.target_utilization_bps;
+    return 10_000 + Math.floor((excess * constants.above_target_slope_bps) / denominator);
   }
 
   scalePriceTerm(term, multiplierBps) {
@@ -18917,8 +18593,8 @@ class MayhemContract extends Contract {
       }
       const denominator = BigInt(reference.granularity) * 10_000n;
       const scaledReference = referencePrice * BigInt(entry.granularity);
-      const lowerNumerator = scaledReference * BigInt(Math.max(2_500, params.price_min_bps));
-      const upperNumerator = scaledReference * BigInt(Math.min(40_000, params.price_max_bps));
+      const lowerNumerator = scaledReference * BigInt(params.price_min_bps);
+      const upperNumerator = scaledReference * BigInt(params.price_max_bps);
       const lower = (lowerNumerator + denominator - 1n) / denominator;
       const upper = upperNumerator / denominator;
       if (lower > upper) return new Error(`Model reference bounds cannot represent unit ${entry.unit}.`);
@@ -18941,143 +18617,135 @@ class MayhemContract extends Contract {
     const epoch = context.epoch ?? this.value.epoch;
     const epochSeconds = context.epochSeconds ?? null;
     const tx = context.tx ?? this.tx;
-    if (!Number.isSafeInteger(epochSeconds) || epochSeconds < 1) {
-      return new Error('Market activity requires a calibrated epoch duration.');
-    }
     const marketParams = await this.activeParamsAt(at, this.marketPriceParamKeys());
     const constants = this.marketPriceConstants(marketParams);
-    const entries = await this.activityMarketEntries(marketUsageMap, context.includeDormant === true);
-    if (entries instanceof Error) return entries;
     const updates = [];
-    for (const usage of entries) {
-      const marketKey = this.priceMarketKey(usage.enclave_id, usage.ctx_bracket ?? null);
+    for (const usage of this.mapMarketUsageEntriesForHash(marketUsageMap)) {
       const enclave = await this.get(`enclave/${usage.enclave_id}`);
-      // Retired markets have no new orders and leave their immutable history intact.
-      if ((!enclave || enclave.status !== 'active') && usage.session_count === 0) continue;
       if (!enclave || enclave.status !== 'active') return new Error('Market usage enclave is not active.');
       const ctxMeta = await this.priceCtxMetaForEnclave(enclave, usage.ctx_bracket, at, 'Market usage');
-      if (ctxMeta instanceof Error) {
-        if (usage._activity_dormant) continue;
-        return ctxMeta;
-      }
+      if (ctxMeta instanceof Error) return ctxMeta;
       if (ctxMeta && usage.ctx_bracket_table_ver !== undefined && usage.ctx_bracket_table_ver !== ctxMeta.ctx_bracket_table_ver) {
-        if (usage._activity_dormant) continue;
         return new Error('Market usage context bracket table version is not active for the epoch.');
       }
       const scheduleKey = this.priceScheduleKey(usage.enclave_id, ctxMeta?.ctx_bracket ?? null);
-      const schedule = this.priceScheduleAt(await this.priceSchedule(scheduleKey, enclave, ctxMeta), at);
+      const storedSchedule = await this.priceSchedule(scheduleKey, enclave, ctxMeta);
+      const schedule = this.priceScheduleAt(storedSchedule, at);
       const current = this.priceActiveEntry(schedule, at);
       if (!current) return new Error('Market usage enclave has no admin price seed.');
       const seed = this.priceSeedEntry(current);
-      if (!seed || seed.set_by_role !== 'admin') return new Error('Market price requires an admin seed.');
+      if (!seed || seed.set_by_role !== 'admin') {
+        return new Error('Market price requires an admin seed.');
+      }
       const modelRef = await this.get(`modelref/${enclave.model_id}`);
       if (!modelRef) return new Error('Market price model reference not found.');
-      const previousMarket = current.market ?? {};
-      if (previousMarket.schema_version === 2 && previousMarket.epoch >= epoch) {
-        return new Error('Market activity epoch must increase exactly once per settled epoch.');
-      }
-      const canonical = context.canonicalActivity?.get(marketKey) ??
-        (context.includeDormant && usage.session_count === 0 ? { settled_usage: {} } : null);
-      const settledUsage = canonical?.settled_usage ?? null;
-      const calibration = modelRef.activity_calibration ?? null;
-      const calibrationError = calibration && this.validateActivityCalibration(calibration, modelRef.model_class, modelRef.rate_map);
-      if (calibrationError) return calibrationError;
-      const calibrationHash = calibration
-        ? await this.opaqueHash('mayhem-market-activity-calibration-v1', calibration) : null;
-      const work = calibration && settledUsage !== null
-        ? this.calibratedActivityWork(settledUsage, calibration) : null;
-      if (work instanceof Error) return work;
-      const activityRate = work === null ? null : (BigInt(work) / BigInt(epochSeconds)).toString();
-      const vector = settledUsage === null ? null : this.marketActivityVector(settledUsage, epochSeconds);
-      // With no machine-readable calibration, compare each signed dimension only
-      // against its own history. No synthetic GPU capacity or monetary weights.
-      const activityBasis = work === null ? 'relative_dimension_vector_v1' : 'calibrated_work_v1';
-      const initialized = previousMarket.schema_version === 2 &&
-        previousMarket.activity_initialized === true &&
-        previousMarket.calibration_hash === calibrationHash &&
-        previousMarket.activity_basis === activityBasis &&
-        previousMarket.epoch === epoch - 1;
-      const previousEma = initialized ? previousMarket.ema_activity_rate : activityRate;
+
       const activeSupply = usage.provider_count;
-      if (canonical && canonical.session_count !== undefined &&
-          (canonical.session_count !== usage.session_count ||
-            canonical.demand_au !== usage.demand_au ||
-            (canonical.provider_count ?? canonical.providers?.length) !== usage.provider_count)) {
-        return new Error('Market activity totals do not match canonical receipt evidence.');
-      }
-      // Nonzero direction follows the previous epoch; empty epochs keep decaying.
-      // EMA is telemetry only; the bootstrap still holds for one epoch.
-      const rawMomentum = initialized && vector !== null
-        ? activityBasis === 'calibrated_work_v1'
-          ? this.marketActivityMomentum(activityRate, previousMarket.activity_rate, constants)
-          : this.marketVectorMomentum(vector, previousMarket.activity_vector, constants)
-        : 10_000;
-      const frozenReason = settledUsage === null ? 'missing_canonical_activity'
-        : !initialized ? 'activity_baseline_bootstrap' : null;
-      const frozen = frozenReason !== null;
-      const multiplierBps = frozen ? 10_000 : rawMomentum;
-      const activityInitialized = vector !== null;
-      const emaActivityRate = activityRate === null ? null : initialized
-        ? this.marketActivityEma(previousEma, activityRate, constants) : activityRate;
-      // Momentum moves the current price. The admin seed is provenance, not a dollar target.
-      const desiredRateMap = this.scaleRateMap(current.rate_map, multiplierBps);
-      const desiredPerReqAu = this.scalePriceTerm(current.per_req_au, multiplierBps);
-      const desiredMinSessionAu = this.scalePriceTerm(current.min_session_au, multiplierBps);
-      const nextTerms = {
-        rate_map: this.stepRateMap(current.rate_map, desiredRateMap, constants),
-        per_req_au: this.stepPriceTerm(current.per_req_au, desiredPerReqAu, constants),
-        min_session_au: this.stepPriceTerm(current.min_session_au, desiredMinSessionAu, constants),
-      };
-      for (const term of Object.values(nextTerms)) if (term instanceof Error) return term;
-      for (const field of ['per_req_au', 'min_session_au']) {
-        const lower = BigInt(this.scalePriceTerm(seed[field], 2_500));
-        const upper = BigInt(this.scalePriceTerm(seed[field], 40_000));
-        const amount = BigInt(nextTerms[field]);
-        nextTerms[field] = (amount < lower ? lower : amount > upper ? upper : amount).toString();
-      }
+      const previousMarket = current.market && typeof current.market === 'object'
+        ? current.market
+        : {};
+      const utilizationBps = this.marketUtilizationBps(usage.demand_au, activeSupply, constants);
+      if (utilizationBps instanceof Error) return utilizationBps;
+      const frozen = activeSupply < constants.cold_start_min_providers;
+      const emaUtilizationBps = frozen
+        ? constants.target_utilization_bps
+        : this.marketEmaUtilizationBps(previousMarket.ema_utilization_bps, utilizationBps, constants);
+      const multiplierBps = frozen
+        ? 10_000
+        : this.marketCurveMultiplierBps(emaUtilizationBps, constants);
+      const desiredRateMap = this.scaleRateMap(seed.rate_map, multiplierBps);
+      if (desiredRateMap instanceof Error) return desiredRateMap;
+      const desiredPerReqAu = this.scalePriceTerm(seed.per_req_au, multiplierBps);
+      if (desiredPerReqAu instanceof Error) return desiredPerReqAu;
+      const desiredMinSessionAu = this.scalePriceTerm(seed.min_session_au, multiplierBps);
+      if (desiredMinSessionAu instanceof Error) return desiredMinSessionAu;
+
+      const nextTerms = frozen
+        ? {
+            rate_map: cloneValue(seed.rate_map),
+            per_req_au: seed.per_req_au,
+            min_session_au: seed.min_session_au,
+          }
+        : {
+            rate_map: this.stepRateMap(current.rate_map, desiredRateMap, constants),
+            per_req_au: this.stepPriceTerm(current.per_req_au, desiredPerReqAu, constants),
+            min_session_au: this.stepPriceTerm(current.min_session_au, desiredMinSessionAu, constants),
+          };
+      if (nextTerms.rate_map instanceof Error) return nextTerms.rate_map;
+      if (nextTerms.per_req_au instanceof Error) return nextTerms.per_req_au;
+      if (nextTerms.min_session_au instanceof Error) return nextTerms.min_session_au;
       nextTerms.rate_map = this.clampRateMapBounds(nextTerms.rate_map, modelRef.rate_map, marketParams);
       if (nextTerms.rate_map instanceof Error) return nextTerms.rate_map;
+      const latest = this.priceLatestEntry(schedule);
       const record = {
-        enclave_id: current.enclave_id, model_id: current.model_id, denom: PRICE_DENOMINATION,
-        ver: (this.priceLatestEntry(schedule)?.ver ?? 0) + 1,
-        ...nextTerms, effective_at: at, effective_from: tx, updated_at: tx,
-        set_by: seed.set_by, set_by_role: 'admin',
-        ...(ctxMeta ? { ctx_bracket: ctxMeta.ctx_bracket,
-          ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver } : {}),
-        price_source: frozen ? 'market_activity_hold' : 'market_activity_momentum', seed,
+        enclave_id: current.enclave_id,
+        model_id: current.model_id,
+        denom: PRICE_DENOMINATION,
+        ver: latest ? latest.ver + 1 : 1,
+        rate_map: nextTerms.rate_map,
+        per_req_au: nextTerms.per_req_au,
+        min_session_au: nextTerms.min_session_au,
+        effective_at: at,
+        effective_from: tx,
+        updated_at: tx,
+        set_by: seed.set_by,
+        set_by_role: 'admin',
+        ...(ctxMeta ? {
+          ctx_bracket: ctxMeta.ctx_bracket,
+          ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+        } : {}),
+        price_source: frozen ? 'admin_seed_cold_start' : 'market_float',
+        seed,
         market: {
-          schema_version: 2, source: 'canonical_settled_work', epoch, epoch_seconds: epochSeconds,
+          schema_version: 1,
+          source: 'settled_epoch_usage',
+          epoch,
+          epoch_seconds: epochSeconds,
           active_supply: activeSupply,
-          // Gross AU remains accounting evidence only; it never enters the controller.
-          active_demand_au: usage.demand_au, session_count: usage.session_count,
-          settled_usage: settledUsage, calibration_hash: calibrationHash,
-          activity_basis: activityBasis, activity_vector: vector,
-          previous_activity_vector: initialized ? previousMarket.activity_vector : vector,
-          previous_activity_rate: initialized ? previousMarket.activity_rate : activityRate,
-          previous_ema_activity_vector: initialized ? previousMarket.ema_activity_vector : vector,
-          ema_activity_vector: vector === null ? null : initialized
-            ? this.marketVectorEma(previousMarket.ema_activity_vector, vector, constants) : vector,
-          calibration: cloneValue(calibration), modelref_ver: modelRef.ver ?? null,
-          calibrated_work_ps: work, activity_rate: activityRate,
-          previous_ema_activity_rate: previousEma, ema_activity_rate: emaActivityRate,
-          activity_initialized: activityInitialized, momentum_bps: rawMomentum,
-          multiplier_bps: multiplierBps, frozen, frozen_reason: frozenReason, constants,
-          desired_rate_map: desiredRateMap, desired_per_req_au: desiredPerReqAu,
+          active_demand_au: usage.demand_au,
+          session_count: usage.session_count,
+          ...(ctxMeta ? {
+            ctx_bracket: ctxMeta.ctx_bracket,
+            ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+          } : {}),
+          utilization_bps: utilizationBps,
+          ema_utilization_bps: emaUtilizationBps,
+          multiplier_bps: multiplierBps,
+          desired_rate_map: desiredRateMap,
+          desired_per_req_au: desiredPerReqAu,
           desired_min_session_au: desiredMinSessionAu,
-          previous_price_ver: current.ver, previous_rate_map: cloneValue(current.rate_map),
-          previous_per_req_au: current.per_req_au, previous_min_session_au: current.min_session_au,
+          frozen,
+          frozen_reason: frozen ? 'cold_start_min_providers' : null,
+          constants,
+          previous_price_ver: current.ver,
+          previous_rate_map: cloneValue(current.rate_map),
+          previous_per_req_au: current.per_req_au,
+          previous_min_session_au: current.min_session_au,
           seed_price_ver: seed.ver,
         },
       };
+      const updatedSchedule = {
+        ...schedule,
+        current: record,
+      };
       updates.push({
         enclave_id: usage.enclave_id,
-        ...(ctxMeta ? { ctx_bracket: ctxMeta.ctx_bracket,
-          ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver } : {}),
-        market_key: marketKey, ver: record.ver, rate_map: record.rate_map,
-        momentum_bps: rawMomentum, activity_rate: activityRate, ema_activity_rate: emaActivityRate,
-        active_supply: activeSupply, active_demand_au: usage.demand_au, frozen,
-        schedule_key: scheduleKey, schedule: { ...schedule, current: record },
-        record_key: this.priceRecordKey(usage.enclave_id, record.ver, ctxMeta?.ctx_bracket ?? null), record,
+        ...(ctxMeta ? {
+          ctx_bracket: ctxMeta.ctx_bracket,
+          ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver,
+        } : {}),
+        market_key: this.priceMarketKey(usage.enclave_id, ctxMeta?.ctx_bracket ?? null),
+        ver: record.ver,
+        rate_map: record.rate_map,
+        utilization_bps: utilizationBps,
+        ema_utilization_bps: emaUtilizationBps,
+        active_supply: activeSupply,
+        active_demand_au: usage.demand_au,
+        frozen,
+        schedule_key: scheduleKey,
+        schedule: updatedSchedule,
+        record_key: this.priceRecordKey(usage.enclave_id, record.ver, ctxMeta?.ctx_bracket ?? null),
+        record,
       });
     }
     return updates;
@@ -19275,8 +18943,8 @@ class MayhemContract extends Contract {
     const priceScaled = pricePerUnit * BigInt(ref.granularity) * 10_000n;
     const refScaled = refPerUnit * BigInt(price.granularity);
     return (
-      priceScaled >= refScaled * BigInt(Math.max(2_500, params.price_min_bps)) &&
-      priceScaled <= refScaled * BigInt(Math.min(40_000, params.price_max_bps))
+      priceScaled >= refScaled * BigInt(params.price_min_bps) &&
+      priceScaled <= refScaled * BigInt(params.price_max_bps)
     );
   }
 
@@ -22637,7 +22305,6 @@ class MayhemContract extends Contract {
       return new Error('Receipt usage attribution must be an object.');
     }
     const allowed = new Set([
-      'context_input_tokens',
       'reasoning_output_tokens',
       'vision_input_tokens',
       'audio_input_tokens',
@@ -22856,11 +22523,6 @@ class MayhemContract extends Contract {
     if (stableJson(usageAttribution) !== stableJson(body.usage_attribution ?? {})) {
       return new Error('Receipt usage attribution must be canonical.');
     }
-    // Rendered context telemetry is not a billable usage axis. It may exceed
-    // canonical input units, but cannot exceed the signed served context.
-    if ((usageAttribution.context_input_tokens ?? 0) > body.served_ctx) {
-      return new Error('Receipt context attribution exceeds served context.');
-    }
     if ((usageAttribution.reasoning_output_tokens ?? 0) > (usage.output_token ?? 0)) {
       return new Error('Receipt reasoning attribution exceeds billed output tokens.');
     }
@@ -22995,7 +22657,7 @@ class MayhemContract extends Contract {
     }
     return {
       type: 'price_derivation',
-      schema_version: 2,
+      schema_version: 1,
       epoch,
       at,
       epoch_seconds: epochSeconds,
@@ -23010,8 +22672,6 @@ class MayhemContract extends Contract {
       price_source: record.price_source,
       usage: {
         usage_root: usageRoot,
-        settled_usage: cloneValue(market.settled_usage),
-        calibrated_work_ps: market.calibrated_work_ps,
         active_demand_au: market.active_demand_au,
         session_count: market.session_count,
         ...(record.ctx_bracket ? {
@@ -23022,20 +22682,8 @@ class MayhemContract extends Contract {
       controller: {
         source: market.source,
         active_supply: market.active_supply,
-        activity_basis: market.activity_basis,
-        activity_vector: cloneValue(market.activity_vector),
-        previous_activity_vector: cloneValue(market.previous_activity_vector),
-        previous_activity_rate: market.previous_activity_rate,
-        previous_ema_activity_vector: cloneValue(market.previous_ema_activity_vector),
-        ema_activity_vector: cloneValue(market.ema_activity_vector),
-        momentum_bps: market.momentum_bps,
-        activity_rate: market.activity_rate,
-        previous_ema_activity_rate: market.previous_ema_activity_rate,
-        ema_activity_rate: market.ema_activity_rate,
-        activity_initialized: market.activity_initialized,
-        calibration_hash: market.calibration_hash,
-        calibration: cloneValue(market.calibration),
-        modelref_ver: market.modelref_ver,
+        utilization_bps: market.utilization_bps,
+        ema_utilization_bps: market.ema_utilization_bps,
         multiplier_bps: market.multiplier_bps,
         frozen: market.frozen,
         frozen_reason: market.frozen_reason,
@@ -23115,104 +22763,57 @@ class MayhemContract extends Contract {
     return entries[0];
   }
 
-  async prepareCommittedActivityEvidence({ epoch, at, epochSeconds, roots, totals }) {
-    if (totals.price_count === 0) return null;
-    if (totals.price_count !== 1) {
-      return new Error('Nonempty activity price commitments require one market; use bounded receipt pages for larger settlements.');
-    }
-    const index = this.normalizeReceiptEpochIndexMetadata(
-      await this.get(this.receiptEpochIndexKey(epoch)), epoch);
-    if (index instanceof Error) return index;
-    if (index.count > 128 || index.count !== totals.use_count) {
-      return new Error('Activity price commitment requires at most 128 canonical receipts; use bounded receipt pages.');
-    }
-    const freeze = await this.validateFrozenEpoch(epoch, at, index);
-    if (freeze) return freeze;
-    const markets = new Map(); const leaves = []; const seen = new Set();
-    for (let page = 0; page < index.page_count; page++) {
-      const record = await this.get(this.receiptEpochPageKey(epoch, page));
-      if (record?.type !== 'canonical_receipt_epoch_page' || record.epoch !== epoch ||
-          record.page !== page || !Array.isArray(record.identities)) {
-        return new Error('Activity commitment receipt page is invalid.');
-      }
-      for (const identity of record.identities) {
-        const identityKey = `${identity.billing_id}/${identity.billing_attempt}`;
-        if (seen.has(identityKey)) return new Error('Activity commitment duplicates a canonical receipt.');
-        seen.add(identityKey);
-        const head = await this.get(this.receiptHeadKey(identity.billing_id, identity.billing_attempt));
-        if (head?.type !== 'canonical_receipt_head' || head.epoch !== epoch ||
-            head.settlement_epoch !== epoch || head.settlement_ready !== true ||
-            head.billing_id !== identity.billing_id || head.billing_attempt !== identity.billing_attempt) {
-          return new Error('Activity commitment requires canonical final receipt heads.');
-        }
-        const body = head.receipt.body;
-        const marketKey = this.priceMarketKey(body.enclave_id, body.ctx_bracket ?? null);
-        const row = markets.get(marketKey) ?? {
-          enclave_id: body.enclave_id,
-          ...(body.ctx_bracket ? { ctx_bracket: body.ctx_bracket,
-            ctx_bracket_table_ver: body.ctx_bracket_table_ver } : {}),
-          demand_au: '0', session_count: 0, providers: new Set(), settled_usage: {},
-        };
-        const increment = this.incrementalSettledUsage(body);
-        if (increment instanceof Error) return increment;
-        row.settled_usage = this.addSettledUsage(row.settled_usage, increment);
-        row.demand_au = this.safeAddAu(row.demand_au, head.incremental_au);
-        if (row.settled_usage instanceof Error || row.demand_au instanceof Error) {
-          return new Error('Activity commitment work overflow.');
-        }
-        row.session_count++; row.providers.add(head.provider);
-        markets.set(marketKey, row);
-        leaves.push(await this.usageLeafHash(head.receipt));
-      }
-    }
-    if (seen.size !== index.count || markets.size !== 1 || leaves.some((leaf) => leaf instanceof Error)) {
-      return new Error('Activity price commitment must cover exactly one complete canonical receipt market.');
-    }
-    if (await this.merkleRoot('use', leaves) !== roots.use) {
-      return new Error('Activity price commitment usage root differs from canonical signed receipts.');
-    }
-    const canonical = new Map(); const usage = new Map();
-    for (const [key, row] of markets) {
-      const { providers, settled_usage, ...publicRow } = row;
-      publicRow.provider_count = providers.size;
-      if (publicRow.demand_au !== totals.use_au) return new Error('Activity commitment gross total mismatch.');
-      usage.set(key, publicRow);
-      canonical.set(key, { ...publicRow, settled_usage });
-    }
-    const updates = await this.computeMarketPriceUpdates(usage, {
-      epoch, at, epochSeconds, canonicalActivity: canonical, includeDormant: false,
-    });
-    if (updates instanceof Error) return updates;
-    const derivations = await this.priceDerivationsFromMarketUpdates(updates,
-      { epoch, at, epochSeconds, usageRoot: roots.use });
-    if (derivations instanceof Error) return derivations;
-    return { price_usage: this.mapMarketUsageEntriesForHash(usage)[0],
-      derivation: derivations[0], expected_price_root: await this.priceDerivationRoot(derivations) };
-  }
-
   async validatePriceDerivationFraudProof(commit) {
     if (commit.status === 'void') return new Error('Epoch commit is already void.');
     if (this.value.proof_epoch > commit.provisional_until_epoch) {
       return new Error('Epoch commit challenge window has closed.');
     }
-    const evidence = commit.expected_activity_evidence;
-    if (commit.totals.price_count !== 1 || !evidence) {
-      return new Error('Price activity proof requires canonical work evidence pinned by its commitment.');
+    if (commit.totals.price_count !== 1) {
+      return new Error('Price derivation proof requires a single committed price derivation.');
     }
     const priceUsage = this.normalizePriceProofUsage(this.value.price_usage);
     if (priceUsage instanceof Error) return priceUsage;
-    if (stableJson(priceUsage) !== stableJson(evidence.price_usage)) {
-      return new Error('Price activity proof usage differs from canonical commitment evidence.');
+    if (this.compareAu(commit.totals.use_au, priceUsage.demand_au) !== 0) {
+      return new Error('Price derivation proof usage does not match committed usage total.');
     }
-    const expected = await this.priceDerivationRoot([evidence.derivation]);
-    if (expected !== evidence.expected_price_root) return new Error('Pinned activity evidence is inconsistent.');
-    if (expected === commit.roots.price) return new Error('Price activity proof does not contradict committed price root.');
-    return { price_usage: priceUsage, enclave_id: priceUsage.enclave_id,
-      ...(priceUsage.ctx_bracket ? { ctx_bracket: priceUsage.ctx_bracket,
-        ctx_bracket_table_ver: priceUsage.ctx_bracket_table_ver } : {}),
-      expected_price_root: expected, committed_price_root: commit.roots.price,
-      price_derivation_hash: evidence.derivation.derivation_hash,
-      price_derivation: cloneValue(evidence.derivation) };
+    if (commit.totals.use_count !== priceUsage.session_count) {
+      return new Error('Price derivation proof session count does not match committed usage count.');
+    }
+
+    const usageMap = new Map([[this.priceMarketKey(priceUsage.enclave_id, priceUsage.ctx_bracket ?? null), priceUsage]]);
+    const updates = await this.computeMarketPriceUpdates(usageMap, {
+      epoch: commit.epoch,
+      at: commit.at,
+      epochSeconds: commit.epoch_seconds ?? null,
+      tx: commit.submitted_at,
+    });
+    if (updates instanceof Error) return updates;
+    const derivations = await this.priceDerivationsFromMarketUpdates(updates, {
+      epoch: commit.epoch,
+      at: commit.at,
+      epochSeconds: commit.epoch_seconds ?? null,
+      usageRoot: commit.roots.use,
+    });
+    if (derivations instanceof Error) return derivations;
+    if (derivations.length !== 1) {
+      return new Error('Price derivation proof did not produce one expected derivation.');
+    }
+    const expectedPriceRoot = await this.priceDerivationRoot(derivations);
+    if (expectedPriceRoot === commit.roots.price) {
+      return new Error('Price derivation proof does not contradict committed price root.');
+    }
+    return {
+      price_usage: priceUsage,
+      enclave_id: priceUsage.enclave_id,
+      ...(priceUsage.ctx_bracket ? {
+        ctx_bracket: priceUsage.ctx_bracket,
+        ctx_bracket_table_ver: priceUsage.ctx_bracket_table_ver,
+      } : {}),
+      expected_price_root: expectedPriceRoot,
+      committed_price_root: commit.roots.price,
+      price_derivation_hash: derivations[0].derivation_hash,
+      price_derivation: derivations[0],
+    };
   }
 
   async validateEpochApplyTotals({
@@ -24535,10 +24136,6 @@ class MayhemContract extends Contract {
       sealed_by: value.sealed_by,
       sealed_by_role: value.sealed_by_role,
       totals: value.totals,
-      ...(value.market_price_root !== undefined ? {
-        market_price_root: value.market_price_root,
-        market_price_count: value.market_price_count,
-      } : {}),
     };
   }
 

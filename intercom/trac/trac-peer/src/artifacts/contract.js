@@ -34,7 +34,7 @@ class Contract {
      * executes on the same live instance from outside the apply loop, so calls
      * are queued here and the body in executeQueued() runs one call at a time.
      */
-    async execute(op, storage){
+    async execute(op, storage, consensusContext = null){
         const previous = this.execute_queue === null ? Promise.resolve() : this.execute_queue;
         let finish = null;
         const finished = new Promise((resolve) => { finish = resolve; });
@@ -42,7 +42,7 @@ class Contract {
         this.execute_queue = queued;
         await previous;
         try {
-            return await this.executeQueued(op, storage);
+            return await this.executeQueued(op, storage, consensusContext);
         } finally {
             finish();
             if(this.execute_queue === queued) this.execute_queue = null;

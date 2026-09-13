@@ -146,7 +146,7 @@ export async function getStatePrefix(
   };
 }
 
-export async function getMayhemStatus(peer, metadata = {}) {
+export async function getMayhemStatus(peer, metadata = {}, { appliedViewLength = null } = {}) {
   const peerMsbAddress = peer.msbClient.pubKeyHexToAddress(peer.wallet.publicKey);
   const admin = peer.base?.view ? await peer.base.view.get('admin') : null;
   const chatStatus = peer.base?.view ? await peer.base.view.get('chat_status') : null;
@@ -177,6 +177,7 @@ export async function getMayhemStatus(peer, metadata = {}) {
       admin: admin?.value ?? null,
       chatStatus: chatStatus?.value ?? null,
     },
+    consensus: { ...adminWriterDiagnostics(peer), applied_view_proof: await appliedViewProof(peer, appliedViewLength) },
     writerCheckpoint: typeof peer.writerCheckpointStatus === 'function'
       ? peer.writerCheckpointStatus() : { enabled: false },
     msb: {
@@ -251,6 +252,18 @@ const safeBooleanCall = (target, method) => {
   }
 };
 
+export async function appliedViewProof(peer, requestedLength = null) {
+  if (requestedLength === null) return null;
+  const length = Number(requestedLength);
+  if (!Number.isSafeInteger(length) || length < 1) throw new Error('Invalid applied_view_length.');
+  // This is the mutable apply state's atomic view, not the sparse signed read
+  // session exposed by base.view. Its prefix hash proves materialized history.
+  const core = peer?.base?._applyState?.view?.core;
+  if (!core || core.length < length || typeof core.treeHash !== 'function') return null;
+  return { length, applied_length: core.length, fork: Number(core.fork ?? 0),
+    tree_hash: b4a.toString(await core.treeHash(length), 'hex') };
+}
+
 export const adminWriterDiagnostics = (peer) => {
   const base = peer?.base;
   const writer = base?.localWriter;
@@ -263,6 +276,8 @@ export const adminWriterDiagnostics = (peer) => {
   return {
     contract: {
       apply_stage: typeof applyStage === 'string' ? applyStage : null,
+      execution_queued: peer?.contract?.instance?.execute_queue != null,
+      replay: peer?.contract?.instance?._mayhemReplayStatus ?? { active: false, completed: 0 },
     },
     base: {
       writable: base?.writable === true,
@@ -478,7 +493,10 @@ export const createServer = (
         });
       }
       if (req.method === 'GET' && requestPath === '/v1/status') {
-        return respond(200, await getMayhemStatus(peer, statusMetadata));
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        return respond(200, await getMayhemStatus(peer, statusMetadata, {
+          appliedViewLength: url.searchParams.get('applied_view_length'),
+        }));
       }
       if (req.method === 'GET' && requestPath === '/v1/state') {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
