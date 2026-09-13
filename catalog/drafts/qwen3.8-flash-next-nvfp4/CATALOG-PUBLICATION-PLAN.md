@@ -56,10 +56,11 @@ the operator already has such a license.
   auxiliary n-gram embeddings and MTP component must be described in notes
   rather than added to this field.
 - `tier`: `launch`
-- `min_app_version`: `0.2.202`, the first release that preserves the signed PLE
+- `min_app_version`: `0.2.203`, the first release that preserves the signed PLE
   reader wheel filename during offline installation, maps managed preparation
   containers to the provider uid/gid, accepts the signed source Git identity,
-  and validates all signed reasoning preflight controls together.
+  validates all signed reasoning preflight controls together, and observes the
+  signed concurrency gauge while bounded probe workers remain live.
 - `provenance.license`: `qwen-community-1.0`
 - `provenance.license_sha256`:
   `a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08`
@@ -216,6 +217,11 @@ is retained and the final native-provider path passes a cheap two-request
 overlap probe. Repeat the long proof if any weight, loader behavior, executable
 plugin source, capacity, token pool, scheduling, cache, or context setting
 changes.
+
+The signed overlap probe retains `concurrency_max_tokens: 4096` with
+`ignore_eos` enforced by Core. Core v0.2.203 polls the signed active gauge while
+the first-token barriers are held, requires an observed value of at least two
+and first content from both requests, then cancels the bounded probes.
 
 ## Exact semantic catalog diff
 
