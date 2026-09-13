@@ -1905,8 +1905,8 @@ test('canonical receipt metadata rejects count and revision overflow', async () 
 });
 
 
-test('v24 settles retained v191 context receipts without rewriting signatures or billing', async () => {
-  for (const contractVersion of [23, CONTRACT_VERSION]) {
+test('v25 settles retained v23/v24 context receipts without rewriting signatures or billing', async () => {
+  for (const contractVersion of [23, 24, CONTRACT_VERSION]) {
     const ctx = await setupContract();
     const reservation = await submitReservation(ctx);
     const value = receiptValue(ctx, reservation, {
@@ -1938,7 +1938,7 @@ test('v24 settles retained v191 context receipts without rewriting signatures or
     assert.equal((await submitTargetedApply(ctx, apply)).result.idempotent, true);
     assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au, '99900');
     assert.ok(await ctx.storage.get(`receipt/consumed/${billingId}/0`));
-    if (contractVersion === 23) {
+    if (contractVersion !== CONTRACT_VERSION) {
       const rewritten = { ...recovered, contract_version: CONTRACT_VERSION };
       const rejected = await submitReceipt(ctx, rewritten);
       assert.notEqual(rejected.result.ok, true);

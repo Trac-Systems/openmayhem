@@ -96,6 +96,10 @@ class MayhemProtocol extends Protocol {
     if (!value || typeof value !== 'object' || Array.isArray(value)) {
       return [value];
     }
+    // Historical paid recovery must retain the exact signed revision and bytes.
+    // Do not let the legacy unversioned hash fallback relabel an old payment.
+    if (value.value?.contract_version !== undefined &&
+        value.value.contract_version !== CONTRACT_VERSION) return [value];
     const candidates = [value, stableValue(value)];
     if (value.value && typeof value.value === 'object' && !Array.isArray(value.value) &&
         Object.hasOwn(value.value, 'contract_version')) {

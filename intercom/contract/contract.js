@@ -893,10 +893,42 @@ class MayhemContract extends Contract {
     // the actual consensus operation kind separately for paid-only operations.
     this._mayhemExecutionType = op?.type;
     try {
-      return await super.executeQueued(validateMayhemOperationContractVersion(op), storage);
+      const versioned = versionedMayhemOperation(op);
+      const historical = versioned.present && versioned.version === 24 &&
+        await this.isPreparedCheckpointReplay(op, storage);
+      return await super.executeQueued(
+        validateMayhemOperationContractVersion(op, historical ? 24 : CONTRACT_VERSION), storage
+      );
     } finally {
       this._mayhemExecutionType = null;
     }
+  }
+
+  // Compatibility is attached to canonical preparation evidence, never a
+  // caller-supplied replay flag. TxOperation verifies the original MSB payment
+  // and exact dispatch hash before entering consensus execution here.
+  async isPreparedCheckpointReplay(op, storage) {
+    const dispatch = op?.value?.dispatch;
+    const value = dispatch?.value;
+    if (op?.type !== 'tx' || dispatch?.type !== 'stateCheckpoint' ||
+        value?.op !== 'state_checkpoint' || value.contract_version !== 24 ||
+        !Number.isSafeInteger(value.slot) || value.slot < 1 ||
+        !this.isHexBytes(op.key, 32) || !this.isHexBytes(value.snapshot_hash, 32)) return false;
+    const read = async (key) => (await storage.get(key))?.value ?? null;
+    const admin = await read('admin');
+    const snapshot = await read(`checkpoint/prepared/${value.slot}`);
+    if (op.value.ipk !== admin || !snapshot ||
+        snapshot.type !== 'state_checkpoint_snapshot' || snapshot.schema_version !== 1 ||
+        snapshot.slot !== value.slot || snapshot.prepared_by !== admin ||
+        snapshot.state?.contract_version !== 24 || snapshot.snapshot_hash !== value.snapshot_hash) return false;
+    const { snapshot_hash: snapshotHash, ...body } = snapshot;
+    if (await this.opaqueHash('mayhem-checkpoint-state-v1', snapshot.state) !== snapshot.state_hash ||
+        await this.opaqueHash('mayhem-checkpoint-snapshot-v1', body) !== snapshotHash) return false;
+    const existing = await read(`checkpoint/slot/${value.slot}`);
+    if (existing) return existing.tx === op.key && existing.snapshot_hash === snapshotHash &&
+      existing.paid_by === admin;
+    const preparing = await read('checkpoint/preparing');
+    return preparing?.slot === value.slot && preparing.snapshot_hash === snapshotHash;
   }
 
   constructor(protocol, options = {}) {

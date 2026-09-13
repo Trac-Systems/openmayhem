@@ -115,6 +115,18 @@ export class WriterCheckpointTransport {
     if (JSON.stringify(payload) !== JSON.stringify(expectedPayload)) {
       throw new Error('Persisted MSB payload differs from its signed preparation.');
     }
+    if (dispatch.value.contract_version !== CONTRACT_VERSION) {
+      const replay = { type: 'tx', key: s.tx, value: {
+        dispatch, ipk: s.address,
+      } };
+      const storage = { get: async (key) => {
+        const value = await this.state(key);
+        return value === null ? null : { value };
+      } };
+      if (!await this.peer.contract.instance.isPreparedCheckpointReplay(replay, storage)) {
+        throw new Error('Persisted paid checkpoint has no matching historical canonical preparation.');
+      }
+    }
     return identity;
   }
 
@@ -146,6 +158,7 @@ export class WriterCheckpointTransport {
   }
 
   async reconcileSubnet(prepared, proof) {
+    await this.validatePrepared(prepared);
     const tx = prepared.surrogate.tx;
     const slot = prepared.dispatch.value.slot;
     const checkpoint = await this.state(`checkpoint/slot/${slot}`);
