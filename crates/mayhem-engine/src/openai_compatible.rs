@@ -986,12 +986,10 @@ fn generate(
             break Err(EngineError::Cancelled);
         }
         match events_rx.recv_timeout(REQUEST_POLL_INTERVAL) {
-            Ok(StreamEvent::Text(text)) => {
+            Ok(StreamEvent::Text { kind, text }) => {
                 let chunk = TokenChunk {
                     index,
-                    // OpenAI-compatible SSE does not portably expose token IDs.
-                    // The final usage counter remains the billing authority.
-                    token_id: 0,
+                    token_id: openai_compatible_pseudo_token_id(kind, &text),
                     text,
                 };
                 index = index.saturating_add(1);
@@ -1017,8 +1015,41 @@ fn generate(
     result
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StreamTextKind {
+    Content,
+    Reasoning,
+    Synthetic,
+}
+
+impl StreamTextKind {
+    fn domain(self) -> &'static [u8] {
+        match self {
+            Self::Content => b"content",
+            Self::Reasoning => b"reasoning",
+            Self::Synthetic => b"synthetic",
+        }
+    }
+}
+
+fn openai_compatible_pseudo_token_id(kind: StreamTextKind, text: &str) -> i32 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mayhem-openai-compatible-sse-pseudo-token-v1\0");
+    hasher.update(kind.domain());
+    hasher.update(b"\0");
+    hasher.update(&u64::try_from(text.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(text.as_bytes());
+    let bytes: [u8; 4] = hasher.finalize().as_bytes()[..4].try_into().unwrap();
+    let token_id = i32::from_be_bytes(bytes);
+    if token_id == 0 {
+        1
+    } else {
+        token_id
+    }
+}
+
 enum StreamEvent {
-    Text(String),
+    Text { kind: StreamTextKind, text: String },
     Complete(GenerateOutput),
     Error(EngineError),
 }
@@ -1129,12 +1160,18 @@ impl StreamCollector {
                     if !self.reasoning_open {
                         self.reasoning_open = true;
                         events
-                            .send(StreamEvent::Text("<think>".to_owned()))
+                            .send(StreamEvent::Text {
+                                kind: StreamTextKind::Synthetic,
+                                text: "<think>".to_owned(),
+                            })
                             .map_err(|_| EngineError::Cancelled)?;
                     }
                     self.reasoning.push_str(reasoning);
                     events
-                        .send(StreamEvent::Text(reasoning.to_owned()))
+                        .send(StreamEvent::Text {
+                            kind: StreamTextKind::Reasoning,
+                            text: reasoning.to_owned(),
+                        })
                         .map_err(|_| EngineError::Cancelled)?;
                 }
             }
@@ -1143,7 +1180,10 @@ impl StreamCollector {
                     self.close_reasoning(events)?;
                     self.text.push_str(content);
                     events
-                        .send(StreamEvent::Text(content.to_owned()))
+                        .send(StreamEvent::Text {
+                            kind: StreamTextKind::Content,
+                            text: content.to_owned(),
+                        })
                         .map_err(|_| EngineError::Cancelled)?;
                 }
             }
@@ -1177,7 +1217,10 @@ impl StreamCollector {
         if self.reasoning_open && !self.reasoning_closed {
             self.reasoning_closed = true;
             events
-                .send(StreamEvent::Text("</think>".to_owned()))
+                .send(StreamEvent::Text {
+                    kind: StreamTextKind::Synthetic,
+                    text: "</think>".to_owned(),
+                })
                 .map_err(|_| EngineError::Cancelled)?;
         }
         Ok(())
@@ -1209,7 +1252,10 @@ impl StreamCollector {
                 .collect::<Vec<_>>();
             let envelope = serde_json::to_string(&json!({"tool_calls": calls}))?;
             events
-                .send(StreamEvent::Text(envelope.clone()))
+                .send(StreamEvent::Text {
+                    kind: StreamTextKind::Synthetic,
+                    text: envelope.clone(),
+                })
                 .map_err(|_| EngineError::Cancelled)?;
             output.push_str(&envelope);
         }
@@ -1676,6 +1722,44 @@ mod tests {
     }
 
     #[test]
+    fn pseudo_token_fingerprints_bind_equal_length_delta_content() {
+        let sequence = |parts: &[(StreamTextKind, &str)]| {
+            parts
+                .iter()
+                .map(|(kind, text)| openai_compatible_pseudo_token_id(*kind, text))
+                .collect::<Vec<_>>()
+        };
+        let fingerprint = |tokens: &[i32]| {
+            let mut hasher = blake3::Hasher::new();
+            for token in tokens {
+                hasher.update(&token.to_be_bytes());
+            }
+            hasher.finalize().to_hex().to_string()
+        };
+        let left_parts = [
+            (StreamTextKind::Reasoning, "inspect alpha"),
+            (StreamTextKind::Content, "answer alpha"),
+        ];
+        let right_parts = [
+            (StreamTextKind::Reasoning, "inspect beta"),
+            (StreamTextKind::Content, "answer beta"),
+        ];
+        let left = sequence(&left_parts);
+        let left_repeat = sequence(&left_parts);
+        let right = sequence(&right_parts);
+
+        assert!(left.iter().all(|token| *token != 0));
+        assert_eq!(left, left_repeat);
+        assert_ne!(left, right);
+        assert_eq!(fingerprint(&left), fingerprint(&left_repeat));
+        assert_ne!(fingerprint(&left), fingerprint(&right));
+        assert_ne!(
+            openai_compatible_pseudo_token_id(StreamTextKind::Reasoning, "same"),
+            openai_compatible_pseudo_token_id(StreamTextKind::Content, "same")
+        );
+    }
+
+    #[test]
     fn preflight_reasoning_controls_have_unique_safe_names() {
         let controls = BTreeMap::from([
             ("enable_thinking".to_owned(), json!(true)),
@@ -1874,7 +1958,7 @@ mod tests {
         let mut complete = None;
         for event in rx {
             match event {
-                StreamEvent::Text(part) => text.push_str(&part),
+                StreamEvent::Text { text: part, .. } => text.push_str(&part),
                 StreamEvent::Complete(output) => complete = Some(output),
                 StreamEvent::Error(error) => panic!("unexpected stream error: {error}"),
             }
