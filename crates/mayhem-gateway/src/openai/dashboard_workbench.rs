@@ -1054,7 +1054,32 @@ fn showcase_state_with_receipts(model_count: usize, receipt_count: usize) -> Gat
 
 fn workbench_playground_models(count: usize) -> Vec<GatewayModel> {
     let mut models = workbench_models(count);
+    let embedded = GatewayState::from_embedded_catalog().models_snapshot();
+    if let Some(model) = models.get_mut(1) {
+        if let Some(template) = embedded
+            .iter()
+            .find(|candidate| candidate.id == "google/gemma-4-E4B-it")
+        {
+            model.id = template.id.clone();
+            model.owned_by = template.owned_by.clone();
+            model.mayhem.family = template.mayhem.family.clone();
+            model.mayhem.model_class = template.mayhem.model_class.clone();
+            model.mayhem.adapter = template.mayhem.adapter.clone();
+            model.mayhem.caps = template.mayhem.caps.clone();
+            model.mayhem.sampling = template.mayhem.sampling.clone();
+            for candidate in &mut model.mayhem.route_candidates {
+                candidate.served_modalities = model.mayhem.caps.output_modalities.clone();
+            }
+        }
+    }
     if let Some(model) = models.get_mut(2) {
+        if let Some(template) = embedded
+            .iter()
+            .find(|candidate| candidate.id == "tongyi/z-image-turbo")
+        {
+            model.mayhem.adapter = template.mayhem.adapter.clone();
+            model.mayhem.caps = template.mayhem.caps.clone();
+        }
         model.id = "tongyi/z-image-turbo".to_owned();
         model.owned_by = "Tongyi-MAI".to_owned();
         model.mayhem.family = "z-image".to_owned();
@@ -1069,6 +1094,13 @@ fn workbench_playground_models(count: usize) -> Vec<GatewayModel> {
         }
     }
     if let Some(model) = models.get_mut(3) {
+        if let Some(template) = embedded
+            .iter()
+            .find(|candidate| candidate.id == "ResembleAI/chatterbox")
+        {
+            model.mayhem.adapter = template.mayhem.adapter.clone();
+            model.mayhem.caps = template.mayhem.caps.clone();
+        }
         model.id = "hexgrad/kokoro-82m".to_owned();
         model.owned_by = "Hexgrad".to_owned();
         model.mayhem.family = "kokoro".to_owned();
@@ -1287,11 +1319,17 @@ fn workbench_fixture_dir(name: &str) -> PathBuf {
 
 fn workbench_models(count: usize) -> Vec<GatewayModel> {
     let embedded = GatewayState::from_embedded_catalog().models_snapshot();
-    let seeds = if embedded.is_empty() {
-        GatewayState::fixture().models_snapshot()
+    let mut seeds = if embedded.is_empty() {
+        GatewayState::fixture().models_snapshot().as_ref().clone()
     } else {
-        embedded
+        embedded.as_ref().clone()
     };
+    if let Some(index) = seeds
+        .iter()
+        .position(|model| model.id == "Qwen/Qwen3.8-27B")
+    {
+        seeds.swap(0, index);
+    }
     (0..count)
         .map(|index| {
             let mut model = seeds[index % seeds.len()].clone();

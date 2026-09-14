@@ -2050,6 +2050,7 @@ fn private_open(path: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt as _;
         return OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .mode(0o600)
@@ -2060,6 +2061,7 @@ fn private_open(path: &Path) -> Result<File> {
     {
         OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(path)
