@@ -1262,8 +1262,7 @@ impl StreamCollector {
 
     fn finish(mut self, events: &mpsc::Sender<StreamEvent>) -> Result<GenerateOutput> {
         self.close_reasoning(events)?;
-        let mut output =
-            mayhem_proto::openai_compatible_canary_output(&self.reasoning, &self.text);
+        let mut output = mayhem_proto::openai_compatible_canary_output(&self.reasoning, &self.text);
         if !self.tool_calls.is_empty() {
             let calls = self
                 .tool_calls

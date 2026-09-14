@@ -725,9 +725,10 @@ impl GatewayJobStore {
             // their reservation was closed. Restore those jobs to recovery;
             // never rewrite the signed receipt's finality bit.
             if job.status != GatewayJobStatus::ReconciliationPending
-                && job.receipt.as_ref().is_some_and(|receipt|
+                && job.receipt.as_ref().is_some_and(|receipt| {
                     receipt.pointer("/body/final") == Some(&Value::Bool(false))
-                        && receipt.get("canonical_settlement").is_none())
+                        && receipt.get("canonical_settlement").is_none()
+                })
             {
                 job.status = GatewayJobStatus::ReconciliationPending;
                 let repaired = seal_job(&self.key, &job)?;

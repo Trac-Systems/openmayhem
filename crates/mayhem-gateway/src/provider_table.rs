@@ -908,7 +908,11 @@ pub fn baseline_route_state(
     }
     // The signed catalog's output-token pricing identifies generation routes.
     // Use contract data so a heartbeat cannot evade this by hiding text capability.
-    if entry.contract.ref_rate_map.iter().chain(&entry.contract.rate_map)
+    if entry
+        .contract
+        .ref_rate_map
+        .iter()
+        .chain(&entry.contract.rate_map)
         .any(|rate| rate.unit == mayhem_proto::USAGE_OUTPUT_TOKEN)
         && heartbeat.prefix_caching != Some(true)
     {
@@ -2538,20 +2542,42 @@ mod tests {
         assert!(evaluate_eligibility(&entry, &request).is_ok());
         for evidence in [None, Some(false)] {
             entry.heartbeat.as_mut().unwrap().prefix_caching = evidence;
-            assert_eq!(evaluate_eligibility(&entry, &request),
-                Err(IneligibilityReason::PrefixCachingRequired));
+            assert_eq!(
+                evaluate_eligibility(&entry, &request),
+                Err(IneligibilityReason::PrefixCachingRequired)
+            );
             // Withholding text in a heartbeat does not bypass the signed catalog.
-            entry.heartbeat.as_mut().unwrap().caps.served_modalities.clear();
-            assert_eq!(baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),
-                BaselineRouteState::PrefixCachingRequired);
+            entry
+                .heartbeat
+                .as_mut()
+                .unwrap()
+                .caps
+                .served_modalities
+                .clear();
+            assert_eq!(
+                baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),
+                BaselineRouteState::PrefixCachingRequired
+            );
         }
         entry.heartbeat.as_mut().unwrap().prefix_caching = Some(true);
-        assert_eq!(baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)), BaselineRouteState::Live);
+        assert_eq!(
+            baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),
+            BaselineRouteState::Live
+        );
         // Media and embedding routes do not have an output-token tariff.
         entry.heartbeat.as_mut().unwrap().prefix_caching = None;
-        entry.contract.rate_map.retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
-        entry.contract.ref_rate_map.retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
-        assert_eq!(baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)), BaselineRouteState::Live);
+        entry
+            .contract
+            .rate_map
+            .retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
+        entry
+            .contract
+            .ref_rate_map
+            .retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
+        assert_eq!(
+            baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),
+            BaselineRouteState::Live
+        );
     }
 
     #[test]

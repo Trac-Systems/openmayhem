@@ -858,15 +858,25 @@ impl ImageGenerationRequest {
 
     pub fn validate(&self) -> Result<()> {
         if let Some(reference) = &self.input_reference {
-            mayhem_proto::image_reference_metadata(reference).map_err(EngineError::InvalidRequest)?;
-            let strength = self.strength.ok_or_else(|| EngineError::InvalidRequest(
-                "image reference requires an explicit strength".to_owned(),
-            ))?;
+            mayhem_proto::image_reference_metadata(reference)
+                .map_err(EngineError::InvalidRequest)?;
+            let strength = self.strength.ok_or_else(|| {
+                EngineError::InvalidRequest(
+                    "image reference requires an explicit strength".to_owned(),
+                )
+            })?;
             if !strength.is_finite() || !(0.0..=1.0).contains(&strength) {
-                return Err(EngineError::InvalidRequest("image strength must be between 0 and 1".to_owned()));
+                return Err(EngineError::InvalidRequest(
+                    "image strength must be between 0 and 1".to_owned(),
+                ));
             }
-        } else if self.strength.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
-            return Err(EngineError::InvalidRequest("image strength must be between 0 and 1".to_owned()));
+        } else if self
+            .strength
+            .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+        {
+            return Err(EngineError::InvalidRequest(
+                "image strength must be between 0 and 1".to_owned(),
+            ));
         }
         if self.prompt.trim().is_empty() {
             return Err(EngineError::InvalidConfig(
@@ -2268,10 +2278,13 @@ fn validate_load_config(config: &LoadConfig) -> Result<()> {
             "vllm_concurrent_generation_capacity cannot exceed vllm_max_num_seqs".to_owned(),
         ));
     }
-    if config.vllm_worker_address_space_limit_bytes
-        .is_some_and(|bytes| bytes < 1024 || bytes > i64::MAX as u64) {
+    if config
+        .vllm_worker_address_space_limit_bytes
+        .is_some_and(|bytes| bytes < 1024 || bytes > i64::MAX as u64)
+    {
         return Err(EngineError::InvalidConfig(
-            "vllm_worker_address_space_limit_bytes must be a finite limit of at least 1024 bytes".to_owned(),
+            "vllm_worker_address_space_limit_bytes must be a finite limit of at least 1024 bytes"
+                .to_owned(),
         ));
     }
     let has_vllm_execution_properties = config.vllm_generation_topology.is_some()
@@ -5194,17 +5207,20 @@ mod stable_diffusion_tests {
         let root = tempfile::tempdir().unwrap();
         let model = root.path().join("model.safetensors");
         fs::write(&model, stable_empty_safetensors()).unwrap();
-        let reference = format!("data:image/png;base64,{}", general_purpose::STANDARD.encode(
-            include_bytes!("../tests/fixtures/reference.png"),
-        ));
+        let reference = format!(
+            "data:image/png;base64,{}",
+            general_purpose::STANDARD.encode(include_bytes!("../tests/fixtures/reference.png"),)
+        );
         let expected = json!({ "prompt": "A blue sculpture", "width": 64, "height": 64,
             "steps": 2, "cfg_scale": 1.0, "seed": 7, "batch_size": 1,
             "init_images": [reference], "denoising_strength": 0.5 });
         let image = include_bytes!("../tests/fixtures/reference.png").to_vec();
         let (address, server) = serve_sdapi_once(expected, vec![image.clone()]);
         let mut backend = StableDiffusionCppBackend::with_ready_server(
-            LoadConfig::stable_diffusion_checkpoint(&model), address,
-        ).unwrap();
+            LoadConfig::stable_diffusion_checkpoint(&model),
+            address,
+        )
+        .unwrap();
         let mut request = ImageGenerationRequest::new("A blue sculpture");
         request.width = 64;
         request.height = 64;
@@ -5212,10 +5228,22 @@ mod stable_diffusion_tests {
         request.guidance_scale = 1.0;
         request.seed = Some(7);
         request.input_reference = Some(reference);
-        assert!(request.validate().is_err(), "reference strength must be explicit");
+        assert!(
+            request.validate().is_err(),
+            "reference strength must be explicit"
+        );
         request.strength = Some(0.5);
         let mut output = Vec::new();
-        backend.generate_image(request, &mut |chunk: ArtifactChunk| { output.extend(chunk.bytes); Ok(()) }, &CancellationToken::new()).unwrap();
+        backend
+            .generate_image(
+                request,
+                &mut |chunk: ArtifactChunk| {
+                    output.extend(chunk.bytes);
+                    Ok(())
+                },
+                &CancellationToken::new(),
+            )
+            .unwrap();
         server.join().unwrap();
         assert_eq!(output, image);
     }
@@ -5851,7 +5879,6 @@ cp "{}" "$out"
 #[cfg(feature = "llama-cpp")]
 mod llama_cpp_backend {
     mod prefix_cache;
-    use prefix_cache::PrefixCache;
     use base64::{engine::general_purpose, Engine as _};
     use encoding_rs::UTF_8;
     use llama_cpp_2::context::params::{KvCacheType, LlamaContextParams, LlamaPoolingType};
@@ -5865,6 +5892,7 @@ mod llama_cpp_backend {
     };
     use llama_cpp_2::sampling::LlamaSampler;
     use llama_cpp_2::token::LlamaToken;
+    use prefix_cache::PrefixCache;
 
     use super::{
         tool_call_json_schema, validate_load_config, verify_artifact, ArtifactFormat,
@@ -5938,13 +5966,18 @@ mod llama_cpp_backend {
 
         /// Test/embedding cache budget; provider admission rejects disabled caching.
         pub fn set_prefix_cache_limit(&mut self, max_bytes: usize) {
-            *self.prefix_cache.get_mut().unwrap_or_else(|p| p.into_inner()) =
-                PrefixCache::new(max_bytes);
+            *self
+                .prefix_cache
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner()) = PrefixCache::new(max_bytes);
         }
 
         /// Last text request's total and reused prompt tokens, for runtime checks.
         pub fn prefix_cache_tokens(&self) -> (usize, usize) {
-            self.prefix_cache.lock().unwrap_or_else(|p| p.into_inner()).last_tokens()
+            self.prefix_cache
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .last_tokens()
         }
     }
 
@@ -6012,7 +6045,10 @@ mod llama_cpp_backend {
         }
 
         fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
-            self.prefix_cache.get_mut().unwrap_or_else(|p| p.into_inner()).clear();
+            self.prefix_cache
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .clear();
             validate_load_config(&config)?;
             if config.artifact.format != ArtifactFormat::Gguf {
                 return Err(EngineError::InvalidConfig(format!(
@@ -6084,7 +6120,11 @@ mod llama_cpp_backend {
 
         fn prefix_caching_enabled(&self) -> bool {
             self.loaded.is_some()
-                && self.prefix_cache.lock().unwrap_or_else(|p| p.into_inner()).enabled()
+                && self
+                    .prefix_cache
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .enabled()
         }
 
         fn tokenize(&self, text: &str) -> Result<Tokenization> {
@@ -6138,13 +6178,21 @@ mod llama_cpp_backend {
                 (cached, cache.capture_len().max(cached))
             };
             let last_prompt_index = prompt_tokens.len().checked_sub(1).ok_or_else(|| {
-                EngineError::InvalidConfig("llama.cpp prompt tokenization produced no tokens".into())
+                EngineError::InvalidConfig(
+                    "llama.cpp prompt tokenization produced no tokens".into(),
+                )
             })?;
             let mut batch_ranges = Vec::new();
-            for (start, end) in [(cached_tokens, capture_len), (capture_len, last_prompt_index)] {
+            for (start, end) in [
+                (cached_tokens, capture_len),
+                (capture_len, last_prompt_index),
+            ] {
                 if end > start {
-                    batch_ranges.extend(llama_prompt_batch_ranges(end - start, ctx.n_batch())?
-                        .into_iter().map(|range| start + range.start..start + range.end));
+                    batch_ranges.extend(
+                        llama_prompt_batch_ranges(end - start, ctx.n_batch())?
+                            .into_iter()
+                            .map(|range| start + range.start..start + range.end),
+                    );
                 }
             }
             let batch_capacity = batch_ranges
@@ -6170,17 +6218,28 @@ mod llama_cpp_backend {
                 ctx.decode(&mut batch)?;
                 cancellation.check()?;
                 if end == capture_len && capture_len > cached_tokens {
-                    self.prefix_cache.lock().unwrap_or_else(|p| p.into_inner())
+                    self.prefix_cache
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
                         .save(&ctx, &prompt_tokens[..capture_len])?;
                 }
             }
 
-            eprintln!("prefix_cache backend=llama.cpp prompt_tokens={} cached_tokens={}",
-                prompt_tokens.len(), cached_tokens);
+            eprintln!(
+                "prefix_cache backend=llama.cpp prompt_tokens={} cached_tokens={}",
+                prompt_tokens.len(),
+                cached_tokens
+            );
             cancellation.check()?;
             batch.clear();
-            batch.add(prompt_tokens[last_prompt_index], i32::try_from(last_prompt_index)
-                .map_err(|err| EngineError::InvalidConfig(format!("prompt position overflow: {err}")))?, &[0], true)?;
+            batch.add(
+                prompt_tokens[last_prompt_index],
+                i32::try_from(last_prompt_index).map_err(|err| {
+                    EngineError::InvalidConfig(format!("prompt position overflow: {err}"))
+                })?,
+                &[0],
+                true,
+            )?;
             ctx.decode(&mut batch)?;
             cancellation.check()?;
 
@@ -8299,17 +8358,24 @@ mod vllm_backend {
                 }
             }
             self.reset_worker();
-            let worker = Arc::new(if let Some(address_limit) = self.worker_address_space_limit_bytes {
-                VllmWorker::spawn_isolated(
-                    &self.python, self.memory_limit_bytes, address_limit,
-                    self.cache_root.as_deref(), execution_probe,
-                )?
-            } else {
-                VllmWorker::spawn(
-                    &self.python, self.memory_limit_bytes,
-                    self.cache_root.as_deref(), execution_probe,
-                )?
-            });
+            let worker = Arc::new(
+                if let Some(address_limit) = self.worker_address_space_limit_bytes {
+                    VllmWorker::spawn_isolated(
+                        &self.python,
+                        self.memory_limit_bytes,
+                        address_limit,
+                        self.cache_root.as_deref(),
+                        execution_probe,
+                    )?
+                } else {
+                    VllmWorker::spawn(
+                        &self.python,
+                        self.memory_limit_bytes,
+                        self.cache_root.as_deref(),
+                        execution_probe,
+                    )?
+                },
+            );
             self.worker = Some(Arc::clone(&worker));
             Ok(worker)
         }
@@ -8736,7 +8802,9 @@ mod vllm_backend {
                 .fetch_add(1, Ordering::AcqRel)
                 .wrapping_add(1);
             if self.memory_limit_bytes != config.memory_limit_bytes
-                || self.worker_address_space_limit_bytes != config.vllm_worker_address_space_limit_bytes {
+                || self.worker_address_space_limit_bytes
+                    != config.vllm_worker_address_space_limit_bytes
+            {
                 self.reset_worker();
             }
             self.memory_limit_bytes = config.memory_limit_bytes;
@@ -8799,7 +8867,8 @@ mod vllm_backend {
             })?;
             let has_explicit_execution_profile = has_explicit_vllm_execution_properties(&config);
             if let Err(error) = validate_vllm_prefix_caching(&info)
-                .and_then(|()| validate_vllm_execution_report(&config, info.execution.as_ref())) {
+                .and_then(|()| validate_vllm_execution_report(&config, info.execution.as_ref()))
+            {
                 self.reset_worker();
                 return Err(error);
             }
@@ -9178,7 +9247,9 @@ mod vllm_backend {
 
     fn validate_vllm_prefix_caching(info: &WorkerLoadInfo) -> Result<()> {
         if !info.prefix_caching {
-            return Err(EngineError::Vllm("vLLM worker did not confirm mandatory prefix caching".into()));
+            return Err(EngineError::Vllm(
+                "vLLM worker did not confirm mandatory prefix caching".into(),
+            ));
         }
         Ok(())
     }
@@ -9340,7 +9411,8 @@ mod vllm_backend {
 
     fn worker_response_error(message: WorkerMessage) -> EngineError {
         if message.error_code.as_deref() == Some("context_length_exceeded") {
-            if let (Some(prompt_tokens), Some(ctx_size)) = (message.prompt_tokens, message.ctx_size) {
+            if let (Some(prompt_tokens), Some(ctx_size)) = (message.prompt_tokens, message.ctx_size)
+            {
                 if ctx_size > 0 && prompt_tokens >= ctx_size as usize {
                     return EngineError::PromptTooLong {
                         prompt_tokens,
@@ -12217,7 +12289,8 @@ read shutdown
                     "vllm_mtp_num_speculative_tokens": null,
                 })),
             ] {
-                let mut result = json!({"prefix_caching": true, "n_ctx_train": 4096, "n_vocab": 32000});
+                let mut result =
+                    json!({"prefix_caching": true, "n_ctx_train": 4096, "n_vocab": 32000});
                 if let Some(execution) = execution {
                     result["execution"] = execution;
                 }
@@ -14152,14 +14225,20 @@ mod tests {
 
     #[test]
     fn tool_strict_flag_round_trips_without_weakening_executor_validation() {
-        let mut tool = ToolSpec::new("edit_file", json!({
-            "type":"object", "properties":{"old_text":{"type":"string", "minLength":1}},
-            "required":["old_text"]
-        }));
+        let mut tool = ToolSpec::new(
+            "edit_file",
+            json!({
+                "type":"object", "properties":{"old_text":{"type":"string", "minLength":1}},
+                "required":["old_text"]
+            }),
+        );
         for strict in [false, true] {
             tool.strict = strict;
             let encoded = serde_json::to_value(&tool).unwrap();
-            assert_eq!(encoded.get("strict").and_then(Value::as_bool), strict.then_some(true));
+            assert_eq!(
+                encoded.get("strict").and_then(Value::as_bool),
+                strict.then_some(true)
+            );
             let decoded: ToolSpec = serde_json::from_value(encoded).unwrap();
             assert_eq!(decoded, tool);
             assert!(validate_tool_call_arguments(&decoded, &json!({"old_text":""})).is_err());

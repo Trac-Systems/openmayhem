@@ -1,7 +1,7 @@
 //! Incremental presentation of engine output. Prompt construction, token IDs and
 //! the authoritative final tool parser retain the same tool identities.
-use super::{ProviderEngineToolStrategy, ToolSpec, provider_qwen_xml_parameter_value};
-use serde_json::{Value, json};
+use super::{provider_qwen_xml_parameter_value, ProviderEngineToolStrategy, ToolSpec};
+use serde_json::{json, Value};
 
 #[derive(Default, Debug)]
 pub(super) struct Delta {
@@ -128,9 +128,7 @@ impl OutputStream {
     pub fn finish_text(&mut self, has_tools: bool) -> String {
         let tail = if has_tools {
             String::new()
-        } else if self.in_tools
-            && self.strategy == ProviderEngineToolStrategy::OpenAiToolCalls
-        {
+        } else if self.in_tools && self.strategy == ProviderEngineToolStrategy::OpenAiToolCalls {
             // Once a canonical native tool envelope begins, never expose a
             // malformed or truncated remainder as assistant text.
             String::new()
@@ -476,8 +474,8 @@ mod tests {
     #[test]
     fn constrained_json_streams_as_tools_or_answer_without_false_reasoning() {
         use crate::{
-            ProviderReasoningOutputFilter, ProviderReasoningOutputMode,
-            provider_constrained_reasoning_output_mode,
+            provider_constrained_reasoning_output_mode, ProviderReasoningOutputFilter,
+            ProviderReasoningOutputMode,
         };
         let mode = provider_constrained_reasoning_output_mode(
             ProviderReasoningOutputMode::StripPrefilled,
@@ -688,15 +686,20 @@ mod tests {
     #[test]
     fn schema_invalid_nonstrict_edit_keeps_reasoning_and_streamed_arguments_for_correction() {
         use crate::{ProviderReasoningOutputFilter, ProviderReasoningOutputMode};
-        let tools = vec![ToolSpec::new("edit_file", json!({
-            "type":"object", "additionalProperties":false,
-            "properties":{"path":{"type":"string"}, "old_text":{"type":"string", "minLength":1},
-                "new_text":{"type":"string"}}, "required":["path","old_text","new_text"]
-        }))];
+        let tools = vec![ToolSpec::new(
+            "edit_file",
+            json!({
+                "type":"object", "additionalProperties":false,
+                "properties":{"path":{"type":"string"}, "old_text":{"type":"string", "minLength":1},
+                    "new_text":{"type":"string"}}, "required":["path","old_text","new_text"]
+            }),
+        )];
         let raw = "<tool_call><function=edit_file><parameter=path>app.js</parameter><parameter=old_text></parameter><parameter=new_text>private replacement</parameter></function></tool_call>";
         let generated = format!("Reasoning before the edit. </think>{raw}");
-        let mut reasoning = ProviderReasoningOutputFilter::new(ProviderReasoningOutputMode::StripPrefilled);
-        let mut stream = OutputStream::new(ProviderEngineToolStrategy::QwenFunctionXml, tools.clone());
+        let mut reasoning =
+            ProviderReasoningOutputFilter::new(ProviderReasoningOutputMode::StripPrefilled);
+        let mut stream =
+            OutputStream::new(ProviderEngineToolStrategy::QwenFunctionXml, tools.clone());
         let mut calls = Vec::new();
         let mut hidden = String::new();
         let mut delivered_before_end = false;
@@ -709,10 +712,16 @@ mod tests {
         }
         assert!(hidden.contains("Reasoning before the edit."));
         assert!(delivered_before_end);
-        let expected = provider_engine_tool_call_outputs(raw, ProviderEngineToolStrategy::QwenFunctionXml, &tools).unwrap();
+        let expected = provider_engine_tool_call_outputs(
+            raw,
+            ProviderEngineToolStrategy::QwenFunctionXml,
+            &tools,
+        )
+        .unwrap();
         compare(&calls, &expected);
         validate_provider_engine_tool_call_outputs(&expected, &tools).unwrap();
-        let arguments: Value = serde_json::from_str(expected[0]["arguments"].as_str().unwrap()).unwrap();
+        let arguments: Value =
+            serde_json::from_str(expected[0]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(arguments["old_text"], "");
         assert_eq!(arguments["new_text"], "private replacement");
         assert!(mayhem_engine::validate_tool_call_arguments(&tools[0], &arguments).is_err());

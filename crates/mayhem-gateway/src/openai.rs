@@ -91,14 +91,12 @@ use mayhem_attestation::{
 use mayhem_bridge::{
     sc_bridge_session_transport, BridgeError, PeerRpcClient, ScBridgeClient, ScBridgeConfig,
 };
-#[cfg(test)]
-use mayhem_proto::{record_usage_receipt_envelope, record_usage_receipt_feature_key};
 use mayhem_proto::{
     artifact_generation_inline_audio_load, ctx_bracket_for_tokens_in_schedule,
     default_ctx_bracket_schedule, default_model_class, metered_output_units,
     parse_record_usage_receipt_envelope, payload_chunk_at, payload_chunk_manifest,
-    receipt_signing_bytes, record_usage_receipt_feature_key_for_contract,
-    record_usage_receipt_signing_bytes, RECOVERABLE_RECEIPT_CONTRACT_VERSION, receipt_contract_version_is_supported,
+    receipt_contract_version_is_supported, receipt_signing_bytes,
+    record_usage_receipt_feature_key_for_contract, record_usage_receipt_signing_bytes,
     session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
     stable_json_bytes, tools_only_model_input_prompt_units, validate_transcription_result,
     validated_audio_metadata, validated_wav_audio_metadata, vllm_execution_mode_binding,
@@ -115,14 +113,16 @@ use mayhem_proto::{
     DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
-    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
-    TRANSPORT_MAX_OUTPUT_DURATION_SECONDS, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
-    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
-    USAGE_STEP, USAGE_VIDEO_SECOND,
+    RECOVERABLE_RECEIPT_CONTRACT_VERSION, SESSION_RECEIPT_SCHEMA_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
+    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 #[cfg(test)]
 use mayhem_proto::{chunk_json_payload, visible_output_units};
+#[cfg(test)]
+use mayhem_proto::{record_usage_receipt_envelope, record_usage_receipt_feature_key};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest as _, Sha256};
@@ -133,9 +133,9 @@ type SharedState = Arc<GatewayState>;
 
 #[cfg(test)]
 mod durable_streaming_tests;
-mod response_stream;
-mod incremental_output;
 mod failure_recovery;
+mod incremental_output;
+mod response_stream;
 
 mod github_update;
 use github_update::{
@@ -2736,12 +2736,15 @@ fn normalize_chat_client_metadata<'a>(
     request: &'a Value,
 ) -> Result<std::borrow::Cow<'a, Value>, String> {
     if contract.family != mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
-        || (request.get("store").is_none() && request.get("prompt_cache_key").is_none()) {
+        || (request.get("store").is_none() && request.get("prompt_cache_key").is_none())
+    {
         return Ok(std::borrow::Cow::Borrowed(request));
     }
     if let Some(value) = request.get("store") {
         if !value.is_null() && value != &Value::Bool(false) {
-            return Err("store: stored completions are not supported; use false or omit it".to_owned());
+            return Err(
+                "store: stored completions are not supported; use false or omit it".to_owned(),
+            );
         }
     }
     if let Some(value) = request.get("prompt_cache_key") {
@@ -3803,13 +3806,17 @@ async fn reconcile_pending_gateway_job_once(
     if job.status != GatewayJobStatus::ReconciliationPending {
         return Ok(());
     }
-    if job.receipt.as_ref().is_some_and(|raw| (raw.get("body").is_none() && raw.get("reservation").is_some()) || raw.get("canonical_settlement").is_some()) {
+    if job.receipt.as_ref().is_some_and(|raw| {
+        (raw.get("body").is_none() && raw.get("reservation").is_some())
+            || raw.get("canonical_settlement").is_some()
+    }) {
         return failure_recovery::reconcile(state, &job).await;
     }
     let mut recovery = parse_gateway_job_receipt_recovery(&job)?;
     if !recovery.body.final_receipt {
         if let (Some(feature), Some(publisher)) = (
-            recovery.reconciliation.settlement_feature.as_ref(), state.receipt_settlement_publisher.as_ref().as_ref(),
+            recovery.reconciliation.settlement_feature.as_ref(),
+            state.receipt_settlement_publisher.as_ref().as_ref(),
         ) {
             publisher.queue(feature).map_err(GatewaySessionError::new)?;
         }
@@ -3820,7 +3827,9 @@ async fn reconcile_pending_gateway_job_once(
         None => match transport.deliver(&recovery).await {
             Ok(feature) => feature,
             Err(error) => {
-                if failure_recovery::reconcile(state, &job).await.is_ok() { return Ok(()); }
+                if failure_recovery::reconcile(state, &job).await.is_ok() {
+                    return Ok(());
+                }
                 return Err(error);
             }
         },
@@ -3831,7 +3840,9 @@ async fn reconcile_pending_gateway_job_once(
         &feature,
     )?;
     recovery = persist_gateway_job_recovery_feature(state, id, recovery, feature.clone()).await?;
-    if feature.pointer("/value/contract_version").and_then(Value::as_u64)
+    if feature
+        .pointer("/value/contract_version")
+        .and_then(Value::as_u64)
         .is_some_and(receipt_contract_version_is_supported)
     {
         let publisher = state
@@ -3847,10 +3858,19 @@ async fn reconcile_pending_gateway_job_once(
     } else {
         // Historical signed bytes must never be rewritten or resubmitted under
         // the new revision. Retire local recovery only with exact ledger proof.
-        let rpc = state.canary_probe_contract_rpc.as_ref().as_ref().ok_or_else(|| {
-            GatewaySessionError::retryable("historical receipt recovery requires canonical ledger access")
-        })?;
-        let key = format!("receipt/head/{}/{}", recovery.body.billing_id, recovery.body.billing_attempt);
+        let rpc = state
+            .canary_probe_contract_rpc
+            .as_ref()
+            .as_ref()
+            .ok_or_else(|| {
+                GatewaySessionError::retryable(
+                    "historical receipt recovery requires canonical ledger access",
+                )
+            })?;
+        let key = format!(
+            "receipt/head/{}/{}",
+            recovery.body.billing_id, recovery.body.billing_attempt
+        );
         let record = rpc.state(Some(&key), Some(true)).await.map_err(|err| {
             GatewaySessionError::retryable(format!("historical receipt confirmation failed: {err}"))
         })?;
@@ -3882,7 +3902,10 @@ fn confirmed_receipt_recovery_matches(record: &Value, key: &str, feature: &Value
     record.get("confirmed").and_then(Value::as_bool) == Some(true)
         && record.get("key").and_then(Value::as_str) == Some(key)
         && record.pointer("/value/type").and_then(Value::as_str) == Some("canonical_receipt_head")
-        && record.pointer("/value/settlement_ready").and_then(Value::as_bool) == Some(true)
+        && record
+            .pointer("/value/settlement_ready")
+            .and_then(Value::as_bool)
+            == Some(true)
         && record.pointer("/value/feature_key") == feature.get("key")
         && record.pointer("/value/receipt") == feature.pointer("/value/receipt")
 }
@@ -3927,8 +3950,12 @@ fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), 
         .jobs
         .lock_recover("gateway job vault")
         .pending_reconciliations(now_secs())?;
-    if pending.is_empty() && (state.session_backend.bridge_stream_config().is_none()
-        || state.receipt_settlement_publisher.as_ref().is_none()) { return Ok(()); }
+    if pending.is_empty()
+        && (state.session_backend.bridge_stream_config().is_none()
+            || state.receipt_settlement_publisher.as_ref().is_none())
+    {
+        return Ok(());
+    }
     let config = state
         .session_backend
         .bridge_stream_config()
@@ -3943,7 +3970,10 @@ fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), 
     }
     for job in &pending {
         if let Err(err) = parse_gateway_job_receipt_recovery(job) {
-            eprintln!("Gateway receipt recovery for {} remains pending: {}", job.id, err.message);
+            eprintln!(
+                "Gateway receipt recovery for {} remains pending: {}",
+                job.id, err.message
+            );
         }
     }
     let transport: Arc<dyn GatewayReceiptAckRecoveryTransport> =
@@ -6583,8 +6613,8 @@ fn gateway_registered_route_value(
     let readiness = gateway_route_attestation_readiness(candidate, entries);
     object.insert("dispatch_eligible".to_owned(), json!(dispatch_eligible));
     let entry = dashboard_entry_for_route(entries, candidate);
-    let fresh = entry
-        .is_some_and(|entry| entry.has_fresh_heartbeat(state.provider_heartbeat_ttl_millis));
+    let fresh =
+        entry.is_some_and(|entry| entry.has_fresh_heartbeat(state.provider_heartbeat_ttl_millis));
     let presence = if fresh {
         "online"
     } else if entry.is_some() {
@@ -6625,10 +6655,7 @@ fn gateway_registered_route_value(
     );
     if fresh {
         if let Some(entry) = entry {
-            gateway_apply_heartbeat_route_caps(
-                &mut value,
-                GatewayLiveRoute { candidate, entry },
-            );
+            gateway_apply_heartbeat_route_caps(&mut value, GatewayLiveRoute { candidate, entry });
         }
     }
     value
@@ -7068,14 +7095,7 @@ fn gateway_model_info_value(
     let live_route_values = live_routes
         .iter()
         .map(|route| {
-            gateway_registered_route_value(
-                state,
-                model,
-                route.candidate,
-                entries,
-                true,
-                now_millis,
-            )
+            gateway_registered_route_value(state, model, route.candidate, entries, true, now_millis)
         })
         .collect::<Vec<_>>();
     let registered_route_values = model
@@ -13747,9 +13767,7 @@ fn canary_registry_from_catalog_root(
         if let Some(artifacts) = model.get("artifacts").and_then(Value::as_object) {
             for (artifact_name, artifact) in artifacts {
                 if let Some(artifact_root) = artifact.get("artifact_root").and_then(Value::as_str) {
-                    if artifact.get("engine").and_then(Value::as_str)
-                        == Some("openai-compatible")
-                    {
+                    if artifact.get("engine").and_then(Value::as_str) == Some("openai-compatible") {
                         openai_compatible_artifact_roots.insert(artifact_root.to_owned());
                     }
                     if let Some(calibrations) = speciality_calibrations.get(artifact_name) {
@@ -15103,9 +15121,10 @@ fn provider_reported_session_error(
         .unwrap_or("provider returned s.error");
     let message = format!("provider returned {code} on {session_context}: {message}");
     match code {
-        "context_length_exceeded" | "request_invalid" | "request_chunk_failed" | "request_reassembly_failed" => {
-            GatewaySessionError::buyer_local(message)
-        }
+        "context_length_exceeded"
+        | "request_invalid"
+        | "request_chunk_failed"
+        | "request_reassembly_failed" => GatewaySessionError::buyer_local(message),
         "model_output_invalid" => GatewaySessionError::request_scoped(message),
         _ if retryable => GatewaySessionError::retryable(message),
         _ => GatewaySessionError::new(message),
@@ -16002,7 +16021,9 @@ impl ScBridgeGatewaySessionBackend {
             Err(err) => {
                 if err.failure_class.is_request_scoped()
                     || invocation.job.as_ref().is_some_and(|job| !job.is_active())
-                { return Err(err); }
+                {
+                    return Err(err);
+                }
                 if let Some(partial) = err.partial.as_ref() {
                     let receipt_ack = direct_session_partial_receipt_ack(
                         request, invocation, partial, provider, model,
@@ -16179,7 +16200,8 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             &inputs,
             &accept_info.enclave_pubkey,
-            invocation, model,
+            invocation,
+            model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16345,7 +16367,8 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
-            invocation, model,
+            invocation,
+            model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16501,7 +16524,8 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
-            invocation, model,
+            invocation,
+            model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16657,7 +16681,8 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
-            invocation, model,
+            invocation,
+            model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16813,7 +16838,8 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
-            invocation, model,
+            invocation,
+            model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -17639,9 +17665,13 @@ fn seal_direct_session_request_body_with_workflow_output(
         "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(&contract_request),
         "transport_request_fingerprint": transport_request_fingerprint,
     });
-    if matches!(endpoint_family,
-        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
-        | mayhem_proto::ENDPOINT_OPENAI_RESPONSES | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT) {
+    if matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+            | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+            | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+            | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+    ) {
         // Opt in without changing model-visible input or signed billing units.
         // Older providers ignore this; new providers emit only to opted-in gateways.
         sealed["mayhem_contract"]["context_usage"] = json!(1);
@@ -17704,8 +17734,16 @@ fn direct_session_image_generation_request_body(request: &ImageGenerationRequest
             .expect("validated image request has an admin-signed response format"),
         "endpoint_family": image_generation_endpoint_family(request),
     });
-    set_optional_json(&mut body, "input_reference", request.input_reference.as_ref().map(|value| json!(value)));
-    set_optional_json(&mut body, "strength", request.strength.map(|value| json!(value)));
+    set_optional_json(
+        &mut body,
+        "input_reference",
+        request.input_reference.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "strength",
+        request.strength.map(|value| json!(value)),
+    );
     set_optional_json(
         &mut body,
         "background",
@@ -18990,11 +19028,18 @@ async fn collect_direct_session_output(
                     false,
                 );
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
                     latest_checkpoint_receipt.as_ref(),
                     blake3_hex(chat_prompt_text(request).as_bytes()),
-                ).await?;
-                if frame.get("receipt").is_some() { return Err(error); }
+                )
+                .await?;
+                if frame.get("receipt").is_some() {
+                    return Err(error);
+                }
                 if error.failure_class.is_request_scoped() {
                     return Err(error);
                 }
@@ -19272,9 +19317,15 @@ async fn collect_direct_session_embedding_output(
             }
             Some("s.error") => {
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
+                    None,
                     blake3_hex(embedding_prompt_text(inputs).as_bytes()),
-                ).await?;
+                )
+                .await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("embedding session {session_id}"),
@@ -19411,9 +19462,15 @@ async fn collect_direct_session_image_generation_output(
             }
             Some("s.error") => {
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
+                    None,
                     image_generation_prompt_hash(request),
-                ).await?;
+                )
+                .await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("image session {session_id}"),
@@ -19552,9 +19609,15 @@ async fn collect_direct_session_audio_speech_output(
             }
             Some("s.error") => {
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
+                    None,
                     audio_speech_prompt_hash(request),
-                ).await?;
+                )
+                .await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("audio speech session {session_id}"),
@@ -19684,9 +19747,15 @@ async fn collect_direct_session_artifact_generation_output(
             }
             Some("s.error") => {
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
+                    None,
                     artifact_generation_prompt_hash(request),
-                ).await?;
+                )
+                .await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!(
@@ -19873,9 +19942,15 @@ async fn collect_direct_session_audio_transcription_output(
             }
             Some("s.error") => {
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
+                    None,
                     audio_transcription_prompt_hash(request),
-                ).await?;
+                )
+                .await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("audio transcription session {session_id}"),
@@ -20868,7 +20943,9 @@ fn validate_receipt_settlement_feature_for_receipt(
     receipt_ack: &ReceiptAck,
     feature: &Value,
 ) -> Result<(), GatewaySessionError> {
-    if feature.pointer("/value/contract_version").and_then(Value::as_u64)
+    if feature
+        .pointer("/value/contract_version")
+        .and_then(Value::as_u64)
         != Some(u64::from(CONTRACT_VERSION))
     {
         return Err(GatewaySessionError::new(
@@ -20897,7 +20974,9 @@ fn validate_stored_receipt_settlement_feature(
         .filter(|value| value.is_object())
         .ok_or_else(|| GatewaySessionError::new("receipt settlement feature is missing value"))?;
     if value.get("op").and_then(Value::as_str) != Some("record_usage_receipt")
-        || !value.get("contract_version").and_then(Value::as_u64)
+        || !value
+            .get("contract_version")
+            .and_then(Value::as_u64)
             .is_some_and(|version| version > 0 && version <= u64::from(CONTRACT_VERSION))
     {
         return Err(GatewaySessionError::new(
@@ -20930,7 +21009,9 @@ fn validate_stored_receipt_settlement_feature(
     }
     // A durable receipt's original version participates in its signed feature
     // key. Historical evidence is never silently re-keyed to this release.
-    let contract_version = value["contract_version"].as_u64().expect("validated contract version") as u32;
+    let contract_version = value["contract_version"]
+        .as_u64()
+        .expect("validated contract version") as u32;
     if key != record_usage_receipt_feature_key_for_contract(&expected_receipt, contract_version) {
         return Err(GatewaySessionError::new(
             "receipt settlement feature key is not canonical",
@@ -21039,14 +21120,25 @@ fn failed_direct_session_receipt_ack(
     prompt_hash: String,
 ) -> Result<ReceiptAck, GatewaySessionError> {
     if !invocation.receipt_cosign_enabled {
-        return Err(GatewaySessionError::new("failed session receipt co-signing is disabled"));
+        return Err(GatewaySessionError::new(
+            "failed session receipt co-signing is disabled",
+        ));
     }
-    let (usage, attribution, seq) = checkpoint.map(|checkpoint| (
-        checkpoint.body.usage.clone(), checkpoint.body.usage_attribution.clone(),
-        checkpoint.body.seq.saturating_add(1),
-    )).unwrap_or_else(|| (
-        invocation.spend_voucher.body.billing_prior_usage.clone(), BTreeMap::new(), 1,
-    ));
+    let (usage, attribution, seq) = checkpoint
+        .map(|checkpoint| {
+            (
+                checkpoint.body.usage.clone(),
+                checkpoint.body.usage_attribution.clone(),
+                checkpoint.body.seq.saturating_add(1),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                invocation.spend_voucher.body.billing_prior_usage.clone(),
+                BTreeMap::new(),
+                1,
+            )
+        });
     let amount = calculate_locked_au_owed(invocation, &usage);
     if amount <= invocation.spend_voucher.body.billing_prior_au_owed_cum
         || receipt.body.usage_attribution != attribution
@@ -21056,12 +21148,22 @@ fn failed_direct_session_receipt_ack(
         ));
     }
     ensure_final_receipt_within_voucher(invocation, amount)?;
-    validate_provider_receipt(model, invocation, receipt, ExpectedProviderReceipt {
-        provider: invocation.provider_pubkey_required()?, seq, final_receipt: true,
-        au_owed_cum: amount, usage, prompt_hash,
-    })?;
-    receipt_ack_for_body(&invocation.receipt_user_seed, &receipt.body)
-        .map_err(|error| GatewaySessionError::new(format!("signing failed session receipt: {error}")))
+    validate_provider_receipt(
+        model,
+        invocation,
+        receipt,
+        ExpectedProviderReceipt {
+            provider: invocation.provider_pubkey_required()?,
+            seq,
+            final_receipt: true,
+            au_owed_cum: amount,
+            usage,
+            prompt_hash,
+        },
+    )?;
+    receipt_ack_for_body(&invocation.receipt_user_seed, &receipt.body).map_err(|error| {
+        GatewaySessionError::new(format!("signing failed session receipt: {error}"))
+    })
 }
 
 async fn settle_failed_direct_session_frame(
@@ -21073,44 +21175,75 @@ async fn settle_failed_direct_session_frame(
     checkpoint: Option<&ProviderSignedReceipt>,
     prompt_hash: String,
 ) -> Result<(), GatewaySessionError> {
-    if frame.get("receipt").is_none() { return Ok(()); }
-    let receipt = provider_signed_receipt_from_frame(
-        frame, &invocation.session_id, enclave_pubkey,
-    )?;
-    let ack = failed_direct_session_receipt_ack(model, invocation, &receipt, checkpoint, prompt_hash)?;
+    if frame.get("receipt").is_none() {
+        return Ok(());
+    }
+    let receipt =
+        provider_signed_receipt_from_frame(frame, &invocation.session_id, enclave_pubkey)?;
+    let ack =
+        failed_direct_session_receipt_ack(model, invocation, &receipt, checkpoint, prompt_hash)?;
     let failure = provider_reported_session_error(frame, "failed generation", false);
     let public_error = provider_session_api_error(&failure);
     if let Some(job) = invocation.job.as_ref() {
         job.mark_settlement_reconciliation_started();
         let recovery = gateway_job_settled_receipt(
-            invocation, &receipt, &ack, GatewayJobStatus::Failed,
-            Some(public_error.message.clone()), Some("provider_failure".to_owned()),
+            invocation,
+            &receipt,
+            &ack,
+            GatewayJobStatus::Failed,
+            Some(public_error.message.clone()),
+            Some("provider_failure".to_owned()),
         )?;
         let store = job.store.clone();
         let id = job.id.clone();
         let message = public_error.message.clone();
         let info = GatewayJobErrorInfo {
             code: public_error.public_code.to_owned(),
-            category: public_error.category.to_owned(), retryable: false, phase: None,
+            category: public_error.category.to_owned(),
+            retryable: false,
+            phase: None,
         };
-        tokio::task::spawn_blocking(move || store.lock_recover("gateway job vault")
-            .complete_with_error_info(&id, GatewayJobStatus::ReconciliationPending,
-                None, Vec::new(), Some(recovery), Some(message), Some(info), now_secs()))
-            .await.map_err(|error| GatewaySessionError::new(error.to_string()))?
-            .map_err(GatewaySessionError::new)?;
+        tokio::task::spawn_blocking(move || {
+            store
+                .lock_recover("gateway job vault")
+                .complete_with_error_info(
+                    &id,
+                    GatewayJobStatus::ReconciliationPending,
+                    None,
+                    Vec::new(),
+                    Some(recovery),
+                    Some(message),
+                    Some(info),
+                    now_secs(),
+                )
+        })
+        .await
+        .map_err(|error| GatewaySessionError::new(error.to_string()))?
+        .map_err(GatewaySessionError::new)?;
     }
     record_direct_session_receipt(invocation, &receipt, &ack)?;
     send_receipt_ack_and_queue_settlement(
-        bridge, invocation.direct_peer()?, invocation, &receipt, &ack,
-        Some("provider_failure"), "acknowledging failed generation accounting",
-    ).await.map_err(|error| {
+        bridge,
+        invocation.direct_peer()?,
+        invocation,
+        &receipt,
+        &ack,
+        Some("provider_failure"),
+        "acknowledging failed generation accounting",
+    )
+    .await
+    .map_err(|error| {
         // Accounting recovery already owns the signed evidence. Keep the
         // generation failure visible instead of encouraging a paid retry.
-        eprintln!("Failed generation accounting handoff remains pending: {}", error.message);
+        eprintln!(
+            "Failed generation accounting handoff remains pending: {}",
+            error.message
+        );
         failure.clone()
     })?;
     if let Some(job) = invocation.job.as_ref() {
-        job.finish_reconciliation(GatewayJobStatus::Failed, Some(public_error.message)).await?;
+        job.finish_reconciliation(GatewayJobStatus::Failed, Some(public_error.message))
+            .await?;
     }
     Ok(())
 }
@@ -21223,7 +21356,9 @@ async fn cancel_and_settle_direct_session(
                 // was not acknowledged by the interrupted collector, so do not
                 // advance settlement to it. The provider cancels at its previous
                 // signed high water after its bounded ACK drain.
-                if !receipt.body.final_receipt { continue; }
+                if !receipt.body.final_receipt {
+                    continue;
+                }
                 let receipt_ack = record_cancelled_direct_session_receipt(
                     model,
                     invocation,
@@ -21668,7 +21803,9 @@ fn validate_provider_receipt(
     validate_usage_attribution(&body.usage, &body.usage_attribution)?;
     if let Some(tokens) = body.usage_attribution.get("context_input_tokens") {
         if *tokens == 0 || *tokens > u64::from(invocation.served_ctx) {
-            return Err(GatewaySessionError::new("provider context input tokens exceed served context"));
+            return Err(GatewaySessionError::new(
+                "provider context input tokens exceed served context",
+            ));
         }
     }
     let checks = [
@@ -21918,7 +22055,10 @@ fn validate_usage_attribution(
     for axis in attribution.keys() {
         if !matches!(
             axis.as_str(),
-            "reasoning_output_tokens" | "vision_input_tokens" | "audio_input_tokens" | "context_input_tokens"
+            "reasoning_output_tokens"
+                | "vision_input_tokens"
+                | "audio_input_tokens"
+                | "context_input_tokens"
         ) {
             return Err(GatewaySessionError::new(format!(
                 "unsupported provider usage attribution {axis}"
@@ -23340,9 +23480,8 @@ async fn wait_for_pending_receipt_settlement(
     deadline: RouteWaitDeadline,
 ) -> bool {
     if deadline.remaining().is_zero()
-        || !publisher.is_some_and(|publisher| {
-            publisher.has_pending_final_receipts(user, rail) == Ok(true)
-        })
+        || !publisher
+            .is_some_and(|publisher| publisher.has_pending_final_receipts(user, rail) == Ok(true))
     {
         return false;
     }
@@ -25169,14 +25308,28 @@ async fn finish_live_direct_chat_after_client_disconnect(
 ) -> Result<(), GatewaySessionError> {
     // Stop generation but keep the direct channel alive until a final signed
     // receipt closes the voucher. Only acknowledged checkpoints are chargeable.
-    let (usage, seq) = err.partial.as_ref().map(|partial|
-        (partial.provider_receipt.body.usage.clone(), partial.provider_receipt.body.seq.saturating_add(1)))
+    let (usage, seq) = err
+        .partial
+        .as_ref()
+        .map(|partial| {
+            (
+                partial.provider_receipt.body.usage.clone(),
+                partial.provider_receipt.body.seq.saturating_add(1),
+            )
+        })
         .unwrap_or_else(|| (ReceiptUsage::default(), 1));
     cancel_and_settle_direct_session(
-        &mut session.bridge, &session.invocation, &session.transport_peer,
-        &session.provider, &session.model, &session.enclave_pubkey,
-        blake3_hex(chat_prompt_text(&session.request).as_bytes()), usage, seq,
-    ).await
+        &mut session.bridge,
+        &session.invocation,
+        &session.transport_peer,
+        &session.provider,
+        &session.model,
+        &session.enclave_pubkey,
+        blake3_hex(chat_prompt_text(&session.request).as_bytes()),
+        usage,
+        seq,
+    )
+    .await
 }
 
 async fn recover_live_direct_chat_after_retryable(
@@ -25587,16 +25740,43 @@ async fn run_live_direct_chat_sse_inner(
                         ));
                     }
                 }
-                let reasoning_delta = reasoning_stream.push(session_delta_reasoning_evidence(&frame)?);
+                let reasoning_delta =
+                    reasoning_stream.push(session_delta_reasoning_evidence(&frame)?);
                 let tool_deltas = tool_stream.push(&frame, &session.request, max_text_bytes)?;
                 let mut public_delta = json!({});
-                if !reasoning_delta.is_empty() { public_delta["reasoning_content"] = json!(reasoning_delta); }
-                if !tool_deltas.is_empty() { public_delta["tool_calls"] = json!(tool_deltas); }
-                if public_delta.as_object().is_some_and(|delta| !delta.is_empty()) && !send_live_sse_value(session.options.continue_after_stream_disconnect, tx,
-                    chat_chunk(&session.id, session.created, &session.model.id, public_delta, None, None)).await {
-                    return Err(client_disconnect_direct_session_error(&session.request, &content,
-                        &reasoning_evidence, tool_calls.clone(), latest_checkpoint_receipt.as_ref(),
-                        &token_ids, &watchdog, now));
+                if !reasoning_delta.is_empty() {
+                    public_delta["reasoning_content"] = json!(reasoning_delta);
+                }
+                if !tool_deltas.is_empty() {
+                    public_delta["tool_calls"] = json!(tool_deltas);
+                }
+                if public_delta
+                    .as_object()
+                    .is_some_and(|delta| !delta.is_empty())
+                    && !send_live_sse_value(
+                        session.options.continue_after_stream_disconnect,
+                        tx,
+                        chat_chunk(
+                            &session.id,
+                            session.created,
+                            &session.model.id,
+                            public_delta,
+                            None,
+                            None,
+                        ),
+                    )
+                    .await
+                {
+                    return Err(client_disconnect_direct_session_error(
+                        &session.request,
+                        &content,
+                        &reasoning_evidence,
+                        tool_calls.clone(),
+                        latest_checkpoint_receipt.as_ref(),
+                        &token_ids,
+                        &watchdog,
+                        now,
+                    ));
                 }
                 if let Some(receipt) = pending_checkpoint_receipt.take() {
                     if let Some(ack_frame) = maybe_ack_direct_session_checkpoint_receipt(
@@ -25656,13 +25836,35 @@ async fn run_live_direct_chat_sse_inner(
                 }
                 collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
-                    if tool_calls.is_empty() { tool_stream.finish(&[])?; }
+                    if tool_calls.is_empty() {
+                        tool_stream.finish(&[])?;
+                    }
                     let tail = reasoning_stream.finish();
-                    if !tail.is_empty() && !send_live_sse_value(session.options.continue_after_stream_disconnect, tx, chat_chunk(&session.id, session.created,
-                        &session.model.id, json!({"reasoning_content":tail}), None, None)).await {
-                        return Err(client_disconnect_direct_session_error(&session.request, &content,
-                            &reasoning_evidence, tool_calls.clone(), latest_checkpoint_receipt.as_ref(),
-                            &token_ids, &watchdog, now));
+                    if !tail.is_empty()
+                        && !send_live_sse_value(
+                            session.options.continue_after_stream_disconnect,
+                            tx,
+                            chat_chunk(
+                                &session.id,
+                                session.created,
+                                &session.model.id,
+                                json!({"reasoning_content":tail}),
+                                None,
+                                None,
+                            ),
+                        )
+                        .await
+                    {
+                        return Err(client_disconnect_direct_session_error(
+                            &session.request,
+                            &content,
+                            &reasoning_evidence,
+                            tool_calls.clone(),
+                            latest_checkpoint_receipt.as_ref(),
+                            &token_ids,
+                            &watchdog,
+                            now,
+                        ));
                     }
                     finish_reason = Some(fin.to_owned());
                     claimed_usage = usage_from_session_delta(&frame);
@@ -25748,11 +25950,18 @@ async fn run_live_direct_chat_sse_inner(
                     false,
                 );
                 settle_failed_direct_session_frame(
-                    &mut session.bridge, &session.invocation, &session.model,
-                    &session.enclave_pubkey, &frame, latest_checkpoint_receipt.as_ref(),
+                    &mut session.bridge,
+                    &session.invocation,
+                    &session.model,
+                    &session.enclave_pubkey,
+                    &frame,
+                    latest_checkpoint_receipt.as_ref(),
                     blake3_hex(chat_prompt_text(&session.request).as_bytes()),
-                ).await?;
-                if frame.get("receipt").is_some() { return Err(error); }
+                )
+                .await?;
+                if frame.get("receipt").is_some() {
+                    return Err(error);
+                }
                 if error.failure_class.is_request_scoped() {
                     return Err(error);
                 }
@@ -27838,7 +28047,11 @@ fn request_requirements_for_chat(
             request.endpoint_request.as_ref(),
         )),
         modality_load,
-        min_ctx: effective_context_floor(explicit_min_ctx, chat_context_input_tokens(request), output_tokens),
+        min_ctx: effective_context_floor(
+            explicit_min_ctx,
+            chat_context_input_tokens(request),
+            output_tokens,
+        ),
         input_tokens,
         output_tokens,
         usage,
@@ -28093,8 +28306,11 @@ fn request_requirements_for_image_generation(
     let (width, height) = parse_image_generation_size(request)
         .expect("validated image request has admin-signed dimensions");
     let image_count = image_generation_count(request);
-    let reference = request.input_reference.as_deref()
-        .map(mayhem_proto::image_reference_metadata).transpose()
+    let reference = request
+        .input_reference
+        .as_deref()
+        .map(mayhem_proto::image_reference_metadata)
+        .transpose()
         .expect("validated image reference has bounded content");
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
@@ -28112,7 +28328,8 @@ fn request_requirements_for_image_generation(
             ModalityRequestLoad {
                 item_count: image_count,
                 max_item_bytes: reference.map_or(1, |image| image.bytes),
-                max_item_units: u64::from(width).saturating_mul(u64::from(height))
+                max_item_units: u64::from(width)
+                    .saturating_mul(u64::from(height))
                     .max(reference.map_or(0, |image| image.pixels)),
             },
         )]),
@@ -29000,12 +29217,7 @@ fn selector_route_exclusion_reason(
     requirements: &RequestRequirements,
     now_millis: u64,
 ) -> Option<&'static str> {
-    if !route_matches_selector_filters(
-        candidate,
-        min_att_tier,
-        quant,
-        &state.receipt_config.rail,
-    ) {
+    if !route_matches_selector_filters(candidate, min_att_tier, quant, &state.receipt_config.rail) {
         return Some("selector_filter");
     }
     if state.route_provider_in_cooloff(candidate, now_millis) {
@@ -29314,9 +29526,15 @@ fn responses_value_from_chat(response: Value) -> Result<Value, ApiError> {
         .ok_or_else(|| ApiError::bad_gateway("chat provider returned no choices", Some("model")))?;
     let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
     let mut output = Vec::new();
-    if let Some(text) = message.get("reasoning_content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        output.push(json!({"id":make_id("rs"),"type":"reasoning","status":"completed",
-            "summary":[],"content":[{"type":"reasoning_text","text":text}]}));
+    if let Some(text) = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        output.push(
+            json!({"id":make_id("rs"),"type":"reasoning","status":"completed",
+            "summary":[],"content":[{"type":"reasoning_text","text":text}]}),
+        );
     }
 
     if let Some(text) = message.get("content").and_then(Value::as_str) {
@@ -33269,7 +33487,8 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = chat_prompt_text(request);
-        let failover = self.failover_thresholds_for_model(model, options, chat_context_input_tokens(request));
+        let failover =
+            self.failover_thresholds_for_model(model, options, chat_context_input_tokens(request));
         let session_id = session_id_for(&model.id, &prompt_text);
         let billing = options
             .billing
@@ -34875,9 +35094,7 @@ fn catalog_canary_result_units(
     artifact_root: Option<&str>,
     result: &GatewaySessionResult,
 ) -> Vec<i32> {
-    if artifact_root.is_some_and(|root| {
-        config.openai_compatible_artifact_roots.contains(root)
-    }) {
+    if artifact_root.is_some_and(|root| config.openai_compatible_artifact_roots.contains(root)) {
         let reconstructed = mayhem_proto::openai_compatible_canary_output(
             &result.output.reasoning_content,
             result.output.content.as_deref().unwrap_or_default(),
@@ -36022,7 +36239,9 @@ fn chat_response_value(
             "content": output.content.clone().unwrap_or_default(),
         })
     };
-    if !output.reasoning_content.is_empty() { message["reasoning_content"] = json!(output.reasoning_content); }
+    if !output.reasoning_content.is_empty() {
+        message["reasoning_content"] = json!(output.reasoning_content);
+    }
     json!({
         "id": id,
         "object": "chat.completion",
@@ -36072,7 +36291,16 @@ fn chat_stream_chunks(
         None,
     )];
     for part in stream_parts(&output.reasoning_content) {
-        if !part.is_empty() { chunks.push(chat_chunk(id, created, model, json!({"reasoning_content":part}), None, None)); }
+        if !part.is_empty() {
+            chunks.push(chat_chunk(
+                id,
+                created,
+                model,
+                json!({"reasoning_content":part}),
+                None,
+                None,
+            ));
+        }
     }
     if !output.tool_calls.is_empty() {
         chunks.push(chat_chunk(
@@ -37324,11 +37552,20 @@ fn validate_image_generation_request(
         mayhem_proto::image_reference_metadata(reference)
             .map_err(|message| ApiError::bad_request(message, Some("input_reference")))?;
         if request.strength.is_none() {
-            return Err(ApiError::bad_request("input_reference requires strength", Some("strength")));
+            return Err(ApiError::bad_request(
+                "input_reference requires strength",
+                Some("strength"),
+            ));
         }
     }
-    if request.strength.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
-        return Err(ApiError::bad_request("strength must be between 0 and 1", Some("strength")));
+    if request
+        .strength
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(ApiError::bad_request(
+            "strength must be between 0 and 1",
+            Some("strength"),
+        ));
     }
     if request.prompt.trim().is_empty() {
         return Err(ApiError::bad_request(
@@ -39415,17 +39652,25 @@ mod tests {
     fn opencode_cache_hints_preserve_inference_contract_and_reject_storage() {
         let contract = mayhem_proto::endpoint_family_contract_template(
             mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
-        ).unwrap();
+        )
+        .unwrap();
         let raw = json!({"model":"test/model", "messages":[{"role":"user","content":"hello"}]});
         let expected = normalize_endpoint_request_for_provider(&contract, &raw).unwrap();
         for cache_key in [json!("session-a"), json!("session-b"), Value::Null] {
             let mut with_hints = raw.clone();
             with_hints["store"] = json!(false);
             with_hints["prompt_cache_key"] = cache_key;
-            assert_eq!(normalize_endpoint_request_for_provider(&contract, &with_hints).unwrap(), expected);
+            assert_eq!(
+                normalize_endpoint_request_for_provider(&contract, &with_hints).unwrap(),
+                expected
+            );
         }
-        for (key, value) in [("store",json!(true)), ("store",json!("false")),
-            ("prompt_cache_key",json!({"arbitrary":"object"})), ("unknown_unsigned_field",json!(true))] {
+        for (key, value) in [
+            ("store", json!(true)),
+            ("store", json!("false")),
+            ("prompt_cache_key", json!({"arbitrary":"object"})),
+            ("unknown_unsigned_field", json!(true)),
+        ] {
             let mut invalid = raw.clone();
             invalid[key] = value;
             assert!(normalize_endpoint_request_for_provider(&contract, &invalid).is_err());
@@ -42033,13 +42278,23 @@ mod tests {
         let model = test_model();
         let request = test_chat_request(&model.id);
         let invocation = test_invocation();
-        let receipt = test_provider_receipt_with_finality(&model, &request, &test_chat_output(), &invocation, 18, false);
+        let receipt = test_provider_receipt_with_finality(
+            &model,
+            &request,
+            &test_chat_output(),
+            &invocation,
+            18,
+            false,
+        );
         let ack = receipt_ack_for_body(&invocation.receipt_user_seed, &receipt.body).unwrap();
         let binding = json!(receipt.body);
         let proof = failure_recovery::test_closed_proof(&receipt, &ack);
-        assert!(failure_recovery::verify_closed(&binding, &proof).unwrap().is_some());
+        assert!(failure_recovery::verify_closed(&binding, &proof)
+            .unwrap()
+            .is_some());
         for (pointer, wrong) in [
-            ("/close/confirmed", json!(false)), ("/head/confirmed", json!(false)),
+            ("/close/confirmed", json!(false)),
+            ("/head/confirmed", json!(false)),
             ("/reservation/value/status", json!("active")),
             ("/close/value/session_id", json!("ef".repeat(32))),
             ("/close/value/retained_au", json!("0")),
@@ -42049,7 +42304,10 @@ mod tests {
         ] {
             let mut invalid = proof.clone();
             *invalid.pointer_mut(pointer).unwrap() = wrong;
-            assert!(failure_recovery::verify_closed(&binding, &invalid).is_err(), "accepted {pointer}");
+            assert!(
+                failure_recovery::verify_closed(&binding, &invalid).is_err(),
+                "accepted {pointer}"
+            );
         }
     }
 
@@ -42061,12 +42319,22 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("jobs");
             let seed = test_user_seed();
-            let state = GatewayState::fixture().with_receipt_user_seed(seed)
-                .with_job_store_dir(dir.clone()).unwrap();
+            let state = GatewayState::fixture()
+                .with_receipt_user_seed(seed)
+                .with_job_store_dir(dir.clone())
+                .unwrap();
             let model = test_model();
-            let job = match prepare_gateway_job(&state, &HeaderMap::new(),
-                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS, &model.id,
-                &json!({"model": model.id, "messages": []}), &None).await.unwrap() {
+            let job = match prepare_gateway_job(
+                &state,
+                &HeaderMap::new(),
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                &model.id,
+                &json!({"model": model.id, "messages": []}),
+                &None,
+            )
+            .await
+            .unwrap()
+            {
                 PreparedGatewayJob::Started(job) => job,
                 _ => panic!("fresh job expected"),
             };
@@ -42078,8 +42346,22 @@ mod tests {
             invocation.receipt_recorder.settlement_publisher = Arc::new(Some(publisher.clone()));
             let request = test_chat_request(&model.id);
             let output = test_chat_output();
-            let checkpoint = test_provider_receipt_with_finality(&model, &request, &output, &invocation, 18, false);
-            let terminal = test_provider_receipt_with_finality(&model, &request, &output, &invocation, 19, true);
+            let checkpoint = test_provider_receipt_with_finality(
+                &model,
+                &request,
+                &output,
+                &invocation,
+                18,
+                false,
+            );
+            let terminal = test_provider_receipt_with_finality(
+                &model,
+                &request,
+                &output,
+                &invocation,
+                19,
+                true,
+            );
             let ack = receipt_ack_for_body(&seed, &terminal.body).unwrap();
             let feature = test_receipt_settlement_feature(&terminal, &ack);
             let mut wire = json!(terminal.body);
@@ -42095,40 +42377,123 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                let auth: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-                socket.send(Message::Text(json!({"id": auth["id"], "type": "auth_ok"}).to_string().into())).await.unwrap();
-                let sent: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                let auth: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                socket
+                    .send(Message::Text(
+                        json!({"id": auth["id"], "type": "auth_ok"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let sent: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
                 assert_eq!(sent["type"], "session_send");
                 assert_eq!(sent["frame"]["t"], "s.receipt_ack");
                 assert_eq!(sent["frame"]["user_sig"], expected_ack.user_sig);
                 assert_eq!(sent["frame"]["seq"], 19);
-                socket.send(Message::Text(json!({"id": sent["id"], "type": "session_sent"}).to_string().into())).await.unwrap();
-                let frame = if lost_handoff { json!({"t": "s.close", "session_id": session}) }
-                    else { json!({"t": "s.receipt_settlement", "session_id": session, "seq": 19, "feature": sent_feature}) };
-                socket.send(Message::Text(json!({"type": "session_frame", "remote": remote,
-                    "session_id": session, "frame": frame}).to_string().into())).await.unwrap();
+                socket
+                    .send(Message::Text(
+                        json!({"id": sent["id"], "type": "session_sent"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let frame = if lost_handoff {
+                    json!({"t": "s.close", "session_id": session})
+                } else {
+                    json!({"t": "s.receipt_settlement", "session_id": session, "seq": 19, "feature": sent_feature})
+                };
+                socket
+                    .send(Message::Text(
+                        json!({"type": "session_frame", "remote": remote,
+                    "session_id": session, "frame": frame})
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
             });
-            let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(format!("ws://{address}"), "test-token").unwrap()).await.unwrap();
-            let result = settle_failed_direct_session_frame(&mut bridge, &invocation, &model,
-                &terminal.enclave_pubkey, &failure, Some(&checkpoint), blake3_hex(chat_prompt_text(&request).as_bytes())).await;
+            let mut bridge = ScBridgeClient::connect(
+                ScBridgeConfig::new(format!("ws://{address}"), "test-token").unwrap(),
+            )
+            .await
+            .unwrap();
+            let result = settle_failed_direct_session_frame(
+                &mut bridge,
+                &invocation,
+                &model,
+                &terminal.enclave_pubkey,
+                &failure,
+                Some(&checkpoint),
+                blake3_hex(chat_prompt_text(&request).as_bytes()),
+            )
+            .await;
             server.await.unwrap();
             if lost_handoff {
                 let error = result.unwrap_err();
                 assert!(!error.retryable);
-                assert_eq!(provider_session_api_error(&error).public_code, "provider_model_output_invalid");
-            } else { result.unwrap(); }
-            let stored = state.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
-            assert_eq!(stored.status, if lost_handoff { GatewayJobStatus::ReconciliationPending } else { GatewayJobStatus::Failed });
-            assert_eq!(stored.error_info.as_ref().unwrap().code, "provider_model_output_invalid");
-            assert_eq!(stored.receipt.as_ref().unwrap()["body"]["usage"], json!(checkpoint.body.usage));
-            drop(invocation); drop(state);
-            let restarted = GatewayState::fixture().with_receipt_user_seed(seed)
-                .with_job_store_dir(dir).unwrap().with_receipt_settlement_publisher(publisher.clone());
-            let transport = RecordingReceiptAckRecoveryTransport { expected_ack: ack, feature,
-                deliveries: Arc::new(Mutex::new(Vec::new())) };
-            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-            assert_eq!(restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().status, GatewayJobStatus::Failed);
+                assert_eq!(
+                    provider_session_api_error(&error).public_code,
+                    "provider_model_output_invalid"
+                );
+            } else {
+                result.unwrap();
+            }
+            let stored = state
+                .jobs
+                .lock_recover("test jobs")
+                .get(&id, now_secs())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.status,
+                if lost_handoff {
+                    GatewayJobStatus::ReconciliationPending
+                } else {
+                    GatewayJobStatus::Failed
+                }
+            );
+            assert_eq!(
+                stored.error_info.as_ref().unwrap().code,
+                "provider_model_output_invalid"
+            );
+            assert_eq!(
+                stored.receipt.as_ref().unwrap()["body"]["usage"],
+                json!(checkpoint.body.usage)
+            );
+            drop(invocation);
+            drop(state);
+            let restarted = GatewayState::fixture()
+                .with_receipt_user_seed(seed)
+                .with_job_store_dir(dir)
+                .unwrap()
+                .with_receipt_settlement_publisher(publisher.clone());
+            let transport = RecordingReceiptAckRecoveryTransport {
+                expected_ack: ack,
+                feature,
+                deliveries: Arc::new(Mutex::new(Vec::new())),
+            };
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                .await
+                .unwrap();
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                .await
+                .unwrap();
+            assert_eq!(
+                restarted
+                    .jobs
+                    .lock_recover("test jobs")
+                    .get(&id, now_secs())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                GatewayJobStatus::Failed
+            );
             assert_eq!(publisher.features.lock_recover("test publisher").len(), 1);
         }
     }
@@ -42139,36 +42504,64 @@ mod tests {
         let request = test_chat_request(&model.id);
         let invocation = test_invocation();
         let output = test_chat_output();
-        let checkpoint = test_provider_receipt_with_finality(
-            &model, &request, &output, &invocation, 18, false,
-        );
-        let terminal = test_provider_receipt_with_finality(
-            &model, &request, &output, &invocation, 19, true,
-        );
+        let checkpoint =
+            test_provider_receipt_with_finality(&model, &request, &output, &invocation, 18, false);
+        let terminal =
+            test_provider_receipt_with_finality(&model, &request, &output, &invocation, 19, true);
         let prompt_hash = blake3_hex(chat_prompt_text(&request).as_bytes());
         let ack = failed_direct_session_receipt_ack(
-            &model, &invocation, &terminal, Some(&checkpoint), prompt_hash.clone(),
-        ).unwrap();
+            &model,
+            &invocation,
+            &terminal,
+            Some(&checkpoint),
+            prompt_hash.clone(),
+        )
+        .unwrap();
         assert_eq!(ack.seq, 19);
-        for mutation in ["usage", "amount", "sequence", "finality", "attribution", "session"] {
+        for mutation in [
+            "usage",
+            "amount",
+            "sequence",
+            "finality",
+            "attribution",
+            "session",
+        ] {
             let mut invalid = terminal.clone();
             match mutation {
                 "usage" => invalid.body.usage = ReceiptUsage::text(1, 99),
                 "amount" => invalid.body.au_owed_cum += 1,
                 "sequence" => invalid.body.seq += 1,
                 "finality" => invalid.body.final_receipt = false,
-                "attribution" => { invalid.body.usage_attribution.insert("reasoning_output_tokens".into(), 1); },
+                "attribution" => {
+                    invalid
+                        .body
+                        .usage_attribution
+                        .insert("reasoning_output_tokens".into(), 1);
+                }
                 "session" => invalid.body.session_id = "ef".repeat(32),
                 _ => unreachable!(),
             }
-            invalid.enclave_sig = sign_hex(&test_enclave_seed(), &receipt_signing_bytes(&invalid.body).unwrap());
-            assert!(failed_direct_session_receipt_ack(
-                &model, &invocation, &invalid, Some(&checkpoint), prompt_hash.clone(),
-            ).is_err(), "accepted {mutation}");
+            invalid.enclave_sig = sign_hex(
+                &test_enclave_seed(),
+                &receipt_signing_bytes(&invalid.body).unwrap(),
+            );
+            assert!(
+                failed_direct_session_receipt_ack(
+                    &model,
+                    &invocation,
+                    &invalid,
+                    Some(&checkpoint),
+                    prompt_hash.clone(),
+                )
+                .is_err(),
+                "accepted {mutation}"
+            );
         }
-        assert!(failed_direct_session_receipt_ack(
-            &model, &invocation, &terminal, None, prompt_hash,
-        ).is_err(), "unacknowledged output must not become a charge");
+        assert!(
+            failed_direct_session_receipt_ack(&model, &invocation, &terminal, None, prompt_hash,)
+                .is_err(),
+            "unacknowledged output must not become a charge"
+        );
     }
 
     #[test]
@@ -43854,15 +44247,21 @@ mod tests {
             "model": model.id, "prompt": "A blue sculpture", "width": 64, "height": 64,
             "n": 1, "steps": 9, "cfg_scale": 0.0, "response_format": "b64_json",
             "input_reference": reference, "strength": 0.5,
-        })).unwrap();
+        }))
+        .unwrap();
         validate_image_generation_request(&model, &request).unwrap();
         let transport = direct_session_image_generation_request_body(&request);
         assert_eq!(transport["input_reference"], reference);
         assert_eq!(transport["strength"], 0.5);
-        let load = request_requirements_for_image_generation(&state, &model, &request, 0, None, None);
+        let load =
+            request_requirements_for_image_generation(&state, &model, &request, 0, None, None);
         assert_eq!(load.modality_load["image"].max_item_units, 96 * 80);
-        assert_eq!(load.modality_load["image"].max_item_bytes,
-            mayhem_proto::image_reference_metadata(&reference).unwrap().bytes);
+        assert_eq!(
+            load.modality_load["image"].max_item_bytes,
+            mayhem_proto::image_reference_metadata(&reference)
+                .unwrap()
+                .bytes
+        );
         let hash = image_generation_prompt_hash(&request);
         let mut changed = request.clone();
         changed.input_reference = Some(test_png_data_url_with_size(80, 96));
@@ -46224,12 +46623,12 @@ mod tests {
     async fn context_exhaustion_is_terminal_and_does_not_penalize_provider() {
         let model = test_routed_model(3);
         let attempts = Arc::new(Mutex::new(0));
-        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(Arc::new(
-            ProviderReportedFailureBackend {
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(ProviderReportedFailureBackend {
                 code: "context_length_exceeded",
                 attempts: Arc::clone(&attempts),
-            },
-        ));
+            }),
+        );
         let error = focused_route_runner_error(
             run_chat_with_route_retry(
                 &state,
@@ -46248,7 +46647,9 @@ mod tests {
         assert_eq!(error.public_code, "context_length_exceeded");
         assert!(!error.retryable);
         assert!(error.message.contains("Compact"));
-        assert!(!state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64()));
+        assert!(
+            !state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64())
+        );
         assert!(state.reputation_events().is_empty());
     }
 
@@ -48209,45 +48610,90 @@ mod tests {
         invocation.transport_peer = Some("ab".repeat(32));
         invocation.job = Some(job);
         let output = test_chat_output();
-        let provider_receipt = test_provider_receipt(
-            &model, &test_chat_request(&model.id), &output, &invocation,
-        );
+        let provider_receipt =
+            test_provider_receipt(&model, &test_chat_request(&model.id), &output, &invocation);
         let ack = receipt_ack_for_body(&seed, &provider_receipt.body).unwrap();
         let result = chat_job_result(&output);
         stage_completed_invocation_job(
-            &invocation, result.clone(), &output.artifacts, &provider_receipt, &ack,
+            &invocation,
+            result.clone(),
+            &output.artifacts,
+            &provider_receipt,
+            &ack,
         )
         .await
         .unwrap();
         let mut feature = test_receipt_settlement_feature(&provider_receipt, &ack);
         feature["value"]["contract_version"] = json!(RECOVERABLE_RECEIPT_CONTRACT_VERSION - 1);
-        assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_err());
-        let historical_receipt = parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
+        assert!(
+            validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_err()
+        );
+        let historical_receipt =
+            parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
         feature["key"] = json!(record_usage_receipt_feature_key_for_contract(
-            &historical_receipt, RECOVERABLE_RECEIPT_CONTRACT_VERSION - 1,
+            &historical_receipt,
+            RECOVERABLE_RECEIPT_CONTRACT_VERSION - 1,
         ));
         feature["value"]["provider_sig"] = json!(sign_hex(
             &test_provider_seed(),
-            &record_usage_receipt_signing_bytes(feature["key"].as_str().unwrap(), &feature["value"]).unwrap(),
+            &record_usage_receipt_signing_bytes(
+                feature["key"].as_str().unwrap(),
+                &feature["value"]
+            )
+            .unwrap(),
         ));
-        assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_ok());
-        assert!(validate_receipt_settlement_feature_for_receipt(&provider_receipt, &ack, &feature).is_err());
-        invocation.job.as_ref().unwrap()
-            .persist_reconciliation_settlement_feature(feature.clone()).await.unwrap();
+        assert!(
+            validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_ok()
+        );
+        assert!(
+            validate_receipt_settlement_feature_for_receipt(&provider_receipt, &ack, &feature)
+                .is_err()
+        );
+        invocation
+            .job
+            .as_ref()
+            .unwrap()
+            .persist_reconciliation_settlement_feature(feature.clone())
+            .await
+            .unwrap();
         // An incompatible durable job cannot take down otherwise healthy admission.
-        let startup = state.clone()
-            .with_receipt_settlement_publisher(Arc::new(RecordingReceiptSettlementPublisher::default()))
+        let startup = state
+            .clone()
+            .with_receipt_settlement_publisher(Arc::new(
+                RecordingReceiptSettlementPublisher::default(),
+            ))
             .with_session_backend(Arc::new(ScBridgeGatewaySessionBackend::new(
                 ScBridgeGatewaySessionConfig::new("ws://127.0.0.1:1", "test-token"),
             )));
-        let stored = startup.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
+        let stored = startup
+            .jobs
+            .lock_recover("test jobs")
+            .get(&id, now_secs())
+            .unwrap()
+            .unwrap();
         let mut malformed = stored.receipt.unwrap();
-        malformed["reconciliation"]["settlement_feature"]["value"]["contract_version"] = json!(CONTRACT_VERSION + 1);
-        startup.jobs.lock_recover("test jobs").update_reconciliation_receipt(&id, malformed, now_secs()).unwrap();
+        malformed["reconciliation"]["settlement_feature"]["value"]["contract_version"] =
+            json!(CONTRACT_VERSION + 1);
+        startup
+            .jobs
+            .lock_recover("test jobs")
+            .update_reconciliation_receipt(&id, malformed, now_secs())
+            .unwrap();
         assert!(spawn_pending_gateway_job_reconciliation(&startup).is_ok());
-        let mut restored = startup.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().receipt.unwrap();
+        let mut restored = startup
+            .jobs
+            .lock_recover("test jobs")
+            .get(&id, now_secs())
+            .unwrap()
+            .unwrap()
+            .receipt
+            .unwrap();
         restored["reconciliation"]["settlement_feature"] = feature.clone();
-        startup.jobs.lock_recover("test jobs").update_reconciliation_receipt(&id, restored, now_secs()).unwrap();
+        startup
+            .jobs
+            .lock_recover("test jobs")
+            .update_reconciliation_receipt(&id, restored, now_secs())
+            .unwrap();
         drop(startup);
         drop(invocation);
         drop(state);
@@ -48260,10 +48706,19 @@ mod tests {
             .with_receipt_settlement_publisher(publisher.clone());
         let deliveries = Arc::new(Mutex::new(Vec::new()));
         let transport = RecordingReceiptAckRecoveryTransport {
-            expected_ack: ack, feature: feature.clone(), deliveries: deliveries.clone(),
+            expected_ack: ack,
+            feature: feature.clone(),
+            deliveries: deliveries.clone(),
         };
-        assert!(reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.is_err());
-        let key = format!("receipt/head/{}/{}", provider_receipt.body.billing_id, provider_receipt.body.billing_attempt);
+        assert!(
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                .await
+                .is_err()
+        );
+        let key = format!(
+            "receipt/head/{}/{}",
+            provider_receipt.body.billing_id, provider_receipt.body.billing_attempt
+        );
         let confirmed = json!({
             "key": key, "confirmed": true, "signed_length": 123,
             "value": {
@@ -48273,17 +48728,26 @@ mod tests {
         });
         let response = Arc::new(Mutex::new(confirmed.clone()));
         let handler_response = response.clone();
-        let app = axum::Router::new().route("/v1/state", axum::routing::get(move |axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>| {
-            let response = handler_response.clone();
-            async move {
-                assert_eq!(query.get("confirmed").map(String::as_str), Some("true"));
-                axum::Json(response.lock_recover("test canonical response").clone())
-            }
-        }));
+        let app = axum::Router::new().route(
+            "/v1/state",
+            axum::routing::get(
+                move |axum::extract::Query(query): axum::extract::Query<
+                    BTreeMap<String, String>,
+                >| {
+                    let response = handler_response.clone();
+                    async move {
+                        assert_eq!(query.get("confirmed").map(String::as_str), Some("true"));
+                        axum::Json(response.lock_recover("test canonical response").clone())
+                    }
+                },
+            ),
+        );
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let restarted = restarted.with_canary_probe_contract_rpc(PeerRpcClient::new(format!("http://{address}/v1")).unwrap());
+        let restarted = restarted.with_canary_probe_contract_rpc(
+            PeerRpcClient::new(format!("http://{address}/v1")).unwrap(),
+        );
         let balance = restarted.ledger_balance_au();
         for (pointer, wrong) in [
             ("/confirmed", json!(false)),
@@ -48296,22 +48760,66 @@ mod tests {
             let mut invalid = confirmed.clone();
             *invalid.pointer_mut(pointer).unwrap() = wrong;
             *response.lock_recover("test canonical response") = invalid;
-            assert!(reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.is_err());
-            assert_eq!(restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().status, GatewayJobStatus::ReconciliationPending);
+            assert!(
+                reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                restarted
+                    .jobs
+                    .lock_recover("test jobs")
+                    .get(&id, now_secs())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                GatewayJobStatus::ReconciliationPending
+            );
         }
         *response.lock_recover("test canonical response") = confirmed;
-        reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-        reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-        let completed = restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
+        reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+            .await
+            .unwrap();
+        reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+            .await
+            .unwrap();
+        let completed = restarted
+            .jobs
+            .lock_recover("test jobs")
+            .get(&id, now_secs())
+            .unwrap()
+            .unwrap();
         assert_eq!(completed.status, GatewayJobStatus::Completed);
         assert_eq!(completed.result, Some(result));
-        assert_eq!(completed.receipt.as_ref().unwrap().pointer("/reconciliation/settlement_feature"), Some(&feature));
-        assert!(publisher.features.lock_recover("test published features").is_empty());
+        assert_eq!(
+            completed
+                .receipt
+                .as_ref()
+                .unwrap()
+                .pointer("/reconciliation/settlement_feature"),
+            Some(&feature)
+        );
+        assert!(publisher
+            .features
+            .lock_recover("test published features")
+            .is_empty());
         assert!(deliveries.lock_recover("test deliveries").is_empty());
         assert_eq!(restarted.ledger_balance_au(), balance);
         drop(restarted);
-        let reopened = GatewayState::fixture().with_receipt_user_seed(seed).with_job_store_dir(jobs_dir).unwrap();
-        assert_eq!(reopened.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().status, GatewayJobStatus::Completed);
+        let reopened = GatewayState::fixture()
+            .with_receipt_user_seed(seed)
+            .with_job_store_dir(jobs_dir)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .jobs
+                .lock_recover("test jobs")
+                .get(&id, now_secs())
+                .unwrap()
+                .unwrap()
+                .status,
+            GatewayJobStatus::Completed
+        );
         server.abort();
     }
 
@@ -48345,56 +48853,110 @@ mod tests {
             invocation.transport_peer = Some("ab".repeat(32));
             invocation.job = Some(job);
             let output = test_chat_output();
-            let mut provider_receipt = test_provider_receipt(
-                &model, &test_chat_request(&model.id), &output, &invocation,
-            );
+            let mut provider_receipt =
+                test_provider_receipt(&model, &test_chat_request(&model.id), &output, &invocation);
             let billed_usage = provider_receipt.body.usage.clone();
-            provider_receipt.body.usage_attribution.insert("context_input_tokens".into(), 1200);
+            provider_receipt
+                .body
+                .usage_attribution
+                .insert("context_input_tokens".into(), 1200);
             provider_receipt.enclave_sig = sign_hex(
-                &test_enclave_seed(), &receipt_signing_bytes(&provider_receipt.body).unwrap(),
+                &test_enclave_seed(),
+                &receipt_signing_bytes(&provider_receipt.body).unwrap(),
             );
             let ack = receipt_ack_for_body(&seed, &provider_receipt.body).unwrap();
             let result = chat_job_result(&output);
             stage_completed_invocation_job(
-                &invocation, result.clone(), &output.artifacts, &provider_receipt, &ack,
+                &invocation,
+                result.clone(),
+                &output.artifacts,
+                &provider_receipt,
+                &ack,
             )
             .await
             .unwrap();
             let mut feature = test_receipt_settlement_feature(&provider_receipt, &ack);
             feature["value"]["contract_version"] = json!(recovery_version);
-            assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_err());
-            let historical_receipt = parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
+            assert!(
+                validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature)
+                    .is_err()
+            );
+            let historical_receipt =
+                parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
             feature["key"] = json!(record_usage_receipt_feature_key_for_contract(
-                &historical_receipt, recovery_version,
+                &historical_receipt,
+                recovery_version,
             ));
             feature["value"]["provider_sig"] = json!(sign_hex(
                 &test_provider_seed(),
-                &record_usage_receipt_signing_bytes(feature["key"].as_str().unwrap(), &feature["value"]).unwrap(),
+                &record_usage_receipt_signing_bytes(
+                    feature["key"].as_str().unwrap(),
+                    &feature["value"]
+                )
+                .unwrap(),
             ));
-            assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_ok());
-            assert!(validate_receipt_settlement_feature_for_receipt(&provider_receipt, &ack, &feature).is_err());
-            invocation.job.as_ref().unwrap()
-                .persist_reconciliation_settlement_feature(feature.clone()).await.unwrap();
+            assert!(
+                validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature)
+                    .is_ok()
+            );
+            assert!(validate_receipt_settlement_feature_for_receipt(
+                &provider_receipt,
+                &ack,
+                &feature
+            )
+            .is_err());
+            invocation
+                .job
+                .as_ref()
+                .unwrap()
+                .persist_reconciliation_settlement_feature(feature.clone())
+                .await
+                .unwrap();
             drop(invocation);
             drop(state);
             let publisher = Arc::new(RecordingReceiptSettlementPublisher::default());
             let restarted = GatewayState::fixture()
                 .with_receipt_user_seed(seed)
-                .with_job_store_dir(jobs_dir.clone()).unwrap()
+                .with_job_store_dir(jobs_dir.clone())
+                .unwrap()
                 .with_receipt_settlement_publisher(publisher.clone());
             let deliveries = Arc::new(Mutex::new(Vec::new()));
             let transport = RecordingReceiptAckRecoveryTransport {
-                expected_ack: ack, feature: feature.clone(), deliveries: deliveries.clone(),
+                expected_ack: ack,
+                feature: feature.clone(),
+                deliveries: deliveries.clone(),
             };
             let balance = restarted.ledger_balance_au();
-            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-            let completed = restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                .await
+                .unwrap();
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                .await
+                .unwrap();
+            let completed = restarted
+                .jobs
+                .lock_recover("test jobs")
+                .get(&id, now_secs())
+                .unwrap()
+                .unwrap();
             assert_eq!(completed.status, GatewayJobStatus::Completed);
             assert_eq!(completed.result, Some(result));
-            assert_eq!(completed.receipt.as_ref().unwrap().pointer("/reconciliation/settlement_feature"), Some(&feature));
-            assert_eq!(*publisher.features.lock_recover("test published features"), vec![feature]);
-            assert!(deliveries.lock_recover("test deliveries").is_empty(), "no model or ACK redispatch");
+            assert_eq!(
+                completed
+                    .receipt
+                    .as_ref()
+                    .unwrap()
+                    .pointer("/reconciliation/settlement_feature"),
+                Some(&feature)
+            );
+            assert_eq!(
+                *publisher.features.lock_recover("test published features"),
+                vec![feature]
+            );
+            assert!(
+                deliveries.lock_recover("test deliveries").is_empty(),
+                "no model or ACK redispatch"
+            );
             assert_eq!(restarted.ledger_balance_au(), balance);
             assert_eq!(provider_receipt.body.usage, billed_usage);
         }
@@ -48455,9 +49017,10 @@ mod tests {
             .with_receipt_settlement_publisher(publisher.clone());
         let transport = RecordingAnyReceiptAckRecoveryTransport::default();
 
-        let first = reconcile_pending_gateway_jobs_pass(&restarted, &transport, 1, &mut String::new())
-            .await
-            .unwrap();
+        let first =
+            reconcile_pending_gateway_jobs_pass(&restarted, &transport, 1, &mut String::new())
+                .await
+                .unwrap();
         assert_eq!(
             first,
             GatewayReceiptAckRecoveryPass {
@@ -48491,9 +49054,10 @@ mod tests {
             1
         );
 
-        let second = reconcile_pending_gateway_jobs_pass(&restarted, &transport, 8, &mut String::new())
-            .await
-            .unwrap();
+        let second =
+            reconcile_pending_gateway_jobs_pass(&restarted, &transport, 8, &mut String::new())
+                .await
+                .unwrap();
         assert_eq!(second.pending, 2);
         assert_eq!(second.attempted, 2);
         assert_eq!(second.completed, 2);
@@ -51156,7 +51720,10 @@ mod tests {
 
             for (code, expected_class) in [
                 ("request_invalid", GatewaySessionFailureClass::BuyerLocal),
-                ("context_length_exceeded", GatewaySessionFailureClass::BuyerLocal),
+                (
+                    "context_length_exceeded",
+                    GatewaySessionFailureClass::BuyerLocal,
+                ),
                 (
                     "request_chunk_failed",
                     GatewaySessionFailureClass::BuyerLocal,
@@ -51187,9 +51754,15 @@ mod tests {
                     "{collector} cooled the route for {code}"
                 );
                 let api_error = request_scoped_api_error(&error).expect("request-scoped API error");
-                assert_eq!(api_error.status,
-                    if code == "model_output_invalid" { StatusCode::BAD_GATEWAY } else { StatusCode::BAD_REQUEST },
-                    "{collector}");
+                assert_eq!(
+                    api_error.status,
+                    if code == "model_output_invalid" {
+                        StatusCode::BAD_GATEWAY
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
+                    "{collector}"
+                );
             }
 
             let entry = state
@@ -51315,8 +51888,12 @@ mod tests {
         code: &'static str,
     ) -> (GatewayState, GatewayModel, ApiError) {
         let model = focused_route_runner_model(runner);
-        let state = test_gateway_state_from_models(vec![model.clone()])
-            .with_session_backend(Arc::new(ProviderReportedFailureBackend { code, attempts: Arc::default() }));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(ProviderReportedFailureBackend {
+                code,
+                attempts: Arc::default(),
+            }),
+        );
         let options = GatewayRequestOptions {
             max_wait_ms: 0,
             ..GatewayRequestOptions::default()
@@ -51922,23 +52499,47 @@ mod tests {
         for pending in [Ok(false), Err("unreadable durable evidence".to_owned())] {
             let publisher: Arc<dyn GatewayReceiptSettlementPublisher> =
                 Arc::new(PendingPublisher(pending));
-            assert!(!wait_for_pending_receipt_settlement(
-                Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(5000),
-            ).await);
+            assert!(
+                !wait_for_pending_receipt_settlement(
+                    Some(&publisher),
+                    "buyer",
+                    "fiat",
+                    RouteWaitDeadline::new(5000),
+                )
+                .await
+            );
         }
         let publisher: Arc<dyn GatewayReceiptSettlementPublisher> =
             Arc::new(PendingPublisher(Ok(true)));
-        assert!(!wait_for_pending_receipt_settlement(
-            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(0),
-        ).await);
+        assert!(
+            !wait_for_pending_receipt_settlement(
+                Some(&publisher),
+                "buyer",
+                "fiat",
+                RouteWaitDeadline::new(0),
+            )
+            .await
+        );
         let started = Instant::now();
-        assert!(wait_for_pending_receipt_settlement(
-            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(5000),
-        ).await);
+        assert!(
+            wait_for_pending_receipt_settlement(
+                Some(&publisher),
+                "buyer",
+                "fiat",
+                RouteWaitDeadline::new(5000),
+            )
+            .await
+        );
         assert!(started.elapsed() >= Duration::from_secs(1));
-        assert!(!wait_for_pending_receipt_settlement(
-            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(20),
-        ).await);
+        assert!(
+            !wait_for_pending_receipt_settlement(
+                Some(&publisher),
+                "buyer",
+                "fiat",
+                RouteWaitDeadline::new(20),
+            )
+            .await
+        );
     }
 
     #[test]

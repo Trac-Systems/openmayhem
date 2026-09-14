@@ -113,8 +113,7 @@ pub(crate) struct CatalogDocument {
     #[serde(default)]
     pub(crate) vllm_execution_profiles: BTreeMap<String, CatalogVllmExecutionProfile>,
     #[serde(default)]
-    pub(crate) vllm_execution_modes:
-        BTreeMap<String, BTreeMap<String, CatalogVllmExecutionMode>>,
+    pub(crate) vllm_execution_modes: BTreeMap<String, BTreeMap<String, CatalogVllmExecutionMode>>,
     pub(crate) models: Vec<CatalogModel>,
 }
 
@@ -215,7 +214,9 @@ pub(crate) fn execution_mode_model(
     artifact_name: &str,
     mode: &CatalogVllmExecutionMode,
 ) -> Result<CatalogModel> {
-    let artifact = model.artifacts.get(artifact_name)
+    let artifact = model
+        .artifacts
+        .get(artifact_name)
         .with_context(|| format!("unknown execution mode artifact {artifact_name}"))?;
     if artifact.engine != "vllm" || mode.schema_version != 1 {
         bail!("execution mode requires a vllm artifact and schema version 1");
@@ -253,33 +254,42 @@ pub(crate) fn execution_mode_model(
 
     let mut effective = model.clone();
     effective.artifacts.retain(|name, _| name == artifact_name);
-    effective.adapter.endpoint_families.retain(|contract| mode.requests.endpoint_families
-        .iter().any(|policy| policy.family == contract.family));
+    effective.adapter.endpoint_families.retain(|contract| {
+        mode.requests
+            .endpoint_families
+            .iter()
+            .any(|policy| policy.family == contract.family)
+    });
     for contract in &mut effective.adapter.endpoint_families {
-        let restrictions = mode.requests.endpoint_families.iter()
-            .find(|policy| policy.family == contract.family).expect("retained mode family");
+        let restrictions = mode
+            .requests
+            .endpoint_families
+            .iter()
+            .find(|policy| policy.family == contract.family)
+            .expect("retained mode family");
         for (path, restriction) in &restrictions.request_attribute_specs {
             let mut spec = restriction.clone();
             let original = &contract.request_attribute_specs[path];
             if let Some(default) = &original.default {
                 mayhem_proto::validate_endpoint_attribute_value(&spec, default)
                     .map_err(anyhow::Error::msg)
-                    .with_context(|| format!("execution mode cannot serve inherited default for {path}"))?;
+                    .with_context(|| {
+                        format!("execution mode cannot serve inherited default for {path}")
+                    })?;
                 spec.default = Some(default.clone());
             }
             contract.request_attribute_specs.insert(path.clone(), spec);
         }
     }
     effective.canary = mode.canary.clone();
-    effective.modality_assessment.calibrated_fingerprints = BTreeMap::from([
-        (artifact_name.to_owned(), mode.modality_fingerprints.clone()),
-    ]);
-    effective.modality_assessment.resource_profiles = BTreeMap::from([
-        (artifact_name.to_owned(), mode.resource_profiles.clone()),
-    ]);
-    effective.speciality_assessment.calibrated = BTreeMap::from([
-        (artifact_name.to_owned(), mode.speciality_calibrations.clone()),
-    ]);
+    effective.modality_assessment.calibrated_fingerprints =
+        BTreeMap::from([(artifact_name.to_owned(), mode.modality_fingerprints.clone())]);
+    effective.modality_assessment.resource_profiles =
+        BTreeMap::from([(artifact_name.to_owned(), mode.resource_profiles.clone())]);
+    effective.speciality_assessment.calibrated = BTreeMap::from([(
+        artifact_name.to_owned(),
+        mode.speciality_calibrations.clone(),
+    )]);
     Ok(effective)
 }
 
@@ -6492,8 +6502,8 @@ mod tests {
     #[test]
     fn generation_execution_profile_topology_rejects_unknown_values_in_root_and_mode() {
         let (catalog, root, _) = catalog_with_optional_vllm_mode();
-        let mode =
-            serde_json::to_value(catalog.vllm_execution_mode(&root, "throughput").unwrap()).unwrap();
+        let mode = serde_json::to_value(catalog.vllm_execution_mode(&root, "throughput").unwrap())
+            .unwrap();
         for value in [
             serde_json::json!("unknown"),
             serde_json::json!("IsolatedWorkers"),
@@ -7031,7 +7041,10 @@ mod tests {
         let effective = execution_mode_model(model, &artifact_name, &mode).unwrap();
 
         assert_eq!(effective.adapter.endpoint_families.len(), 1);
-        assert_eq!(effective.adapter.endpoint_families[0].family, expected_family);
+        assert_eq!(
+            effective.adapter.endpoint_families[0].family,
+            expected_family
+        );
     }
 
     #[test]
@@ -7208,9 +7221,16 @@ mod tests {
         let mode = missing.vllm_execution_mode(&root, "throughput").unwrap();
         assert!(mode.profile.speculative_decoding.is_some());
         assert!(mode.generation_execution_profile.is_none());
-        let model = missing.models.iter().find(|model| {
-            model.artifacts.values().any(|artifact| artifact.artifact_root == root)
-        }).unwrap();
+        let model = missing
+            .models
+            .iter()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == root)
+            })
+            .unwrap();
         execution_mode_model(model, &artifact_name, mode).unwrap();
 
         let mut invalid = catalog.clone();
@@ -7275,7 +7295,10 @@ mod tests {
             .models
             .iter()
             .find(|model| {
-                model.artifacts.values().any(|artifact| artifact.artifact_root == root)
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == root)
             })
             .unwrap();
         let effective = execution_mode_model(model, &artifact_name, mode).unwrap();
@@ -7321,10 +7344,9 @@ mod tests {
         }
 
         let mut invalid_root = catalog.clone();
-        invalid_root.generation_execution_profiles.insert(
-            root,
-            mode.generation_execution_profile.clone().unwrap(),
-        );
+        invalid_root
+            .generation_execution_profiles
+            .insert(root, mode.generation_execution_profile.clone().unwrap());
         validate_catalog(&invalid_root, &mut errors);
         assert_eq!(errors.len(), 1, "{errors:#?}");
         assert!(errors[0].contains("isolated_workers requires an authenticated execution mode"));
@@ -7436,7 +7458,10 @@ mod tests {
                     .models
                     .iter()
                     .find(|model| {
-                        model.artifacts.values().any(|artifact| artifact.artifact_root == root)
+                        model
+                            .artifacts
+                            .values()
+                            .any(|artifact| artifact.artifact_root == root)
                     })
                     .unwrap();
                 assert!(execution_mode_model(
@@ -7489,10 +7514,12 @@ mod tests {
         );
         assert_ne!(mode.binding(&root, "different").unwrap(), binding);
         let mut changed_runtime = mode.clone();
-        changed_runtime.profile.runtime = Some(
-            crate::python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1,
+        changed_runtime.profile.runtime =
+            Some(crate::python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1);
+        assert_ne!(
+            changed_runtime.binding(&root, "throughput").unwrap(),
+            binding
         );
-        assert_ne!(changed_runtime.binding(&root, "throughput").unwrap(), binding);
         let mut changed = mode.clone();
         changed
             .profile
@@ -7632,14 +7659,21 @@ mod tests {
         assert_eq!(serde_json::to_value(restored).unwrap(), legacy);
 
         for mode in 0..=3 {
-            for graph in ["NONE", "FULL_DECODE_ONLY", "FULL", "PIECEWISE", "FULL_AND_PIECEWISE"] {
+            for graph in [
+                "NONE",
+                "FULL_DECODE_ONLY",
+                "FULL",
+                "PIECEWISE",
+                "FULL_AND_PIECEWISE",
+            ] {
                 let profile = catalog.vllm_execution_profiles.get_mut(&root).unwrap();
                 profile.compilation_mode = Some(mode);
                 profile.cudagraph_mode = Some(graph.to_owned());
                 let encoded = serde_json::to_value(&*profile).unwrap();
                 assert_eq!(encoded["compilation_mode"], serde_json::json!(mode));
                 assert_eq!(encoded["cudagraph_mode"], serde_json::json!(graph));
-                let restored: CatalogVllmExecutionProfile = serde_json::from_value(encoded).unwrap();
+                let restored: CatalogVllmExecutionProfile =
+                    serde_json::from_value(encoded).unwrap();
                 assert_eq!(*profile, restored);
                 let mut errors = Vec::new();
                 validate_vllm_execution_profiles(&catalog, &mut errors);
@@ -7949,18 +7983,24 @@ mod tests {
 
         let mut explicit_default = source.clone();
         explicit_default["runtime"] = serde_json::Value::Null;
-        let default: CatalogVllmExecutionProfile = serde_json::from_value(explicit_default).unwrap();
+        let default: CatalogVllmExecutionProfile =
+            serde_json::from_value(explicit_default).unwrap();
         assert_eq!(default, legacy);
         assert_eq!(serde_json::to_value(default).unwrap(), source);
 
         let mut selected_source = source;
         selected_source["runtime"] = serde_json::json!("flashinfer_speculative_metadata_v1");
-        let selected: CatalogVllmExecutionProfile = serde_json::from_value(selected_source.clone()).unwrap();
-        assert_eq!(selected.runtime, Some(crate::python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1));
+        let selected: CatalogVllmExecutionProfile =
+            serde_json::from_value(selected_source.clone()).unwrap();
+        assert_eq!(
+            selected.runtime,
+            Some(crate::python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1)
+        );
         assert_eq!(serde_json::to_value(selected).unwrap(), selected_source);
 
         selected_source["runtime"] = serde_json::json!("unknown_runtime");
-        let error = serde_json::from_value::<CatalogVllmExecutionProfile>(selected_source).unwrap_err();
+        let error =
+            serde_json::from_value::<CatalogVllmExecutionProfile>(selected_source).unwrap_err();
         assert!(error.to_string().contains("unknown variant"), "{error}");
     }
 
@@ -10837,7 +10877,10 @@ mod tests {
             .as_mut()
             .unwrap()
             .server_info_checks
-            .insert("/kv_cache_dtype".to_owned(), Value::String("bfloat16".to_owned()));
+            .insert(
+                "/kv_cache_dtype".to_owned(),
+                Value::String("bfloat16".to_owned()),
+            );
         artifact_errors.clear();
         validate_artifact(
             "Qwen/Qwen3.8-Flash-Next",
@@ -10863,11 +10906,14 @@ mod tests {
         model.artifacts = BTreeMap::from([("nvfp4".to_owned(), artifact)]);
         let mut model_errors = Vec::new();
         validate_model(&model, &mut model_errors);
-        assert!(!model_errors.iter().any(|error| {
-            error.contains("openai_compatible capability video must match model caps")
-                || error.contains("caps.video output")
-                || error.contains("declares a KV-cache profile for unsupported engine")
-        }), "{model_errors:#?}");
+        assert!(
+            !model_errors.iter().any(|error| {
+                error.contains("openai_compatible capability video must match model caps")
+                    || error.contains("caps.video output")
+                    || error.contains("declares a KV-cache profile for unsupported engine")
+            }),
+            "{model_errors:#?}"
+        );
 
         model
             .adapter

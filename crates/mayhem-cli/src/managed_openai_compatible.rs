@@ -1381,10 +1381,7 @@ fn effective_launcher_args(model_id: &str, port: u16) -> Vec<String> {
         assert_eq!(args.get(value).map(String::as_str), Some(old));
         args[value] = new;
     }
-    args.extend([
-        "--attention-backend".to_owned(),
-        "triton".to_owned(),
-    ]);
+    args.extend(["--attention-backend".to_owned(), "triton".to_owned()]);
     args.push("--enable-deterministic-inference".to_owned());
     args
 }
