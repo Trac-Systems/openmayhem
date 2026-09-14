@@ -91889,13 +91889,15 @@ fn provider_engine_session_response_with_sampling_bounded(
     );
     Ok(ProviderSessionOutput {
         usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
-        content: streamed_content.unwrap_or_else(|| if tools.is_empty() {
-            filtered_output.visible
-        } else {
-            // Native Qwen permits commentary preceding a tool call. Preserve it
-            // in both delivery modes so usage does not depend on stream=true.
-            filtered_output.visible.split_once("<tool_call>")
-                .map(|(text, _)| text.to_owned()).unwrap_or_default()
+        content: streamed_content.unwrap_or_else(|| {
+            if tools.is_empty() {
+                filtered_output.visible
+            } else {
+                provider_engine_visible_content_before_tools(
+                    &filtered_output.visible,
+                    tool_mode.as_ref().expect("tool output requires tool mode").strategy,
+                )
+            }
         }),
         reasoning_evidence: filtered_output.hidden,
         tools,
@@ -93832,6 +93834,28 @@ fn provider_engine_tool_call_outputs(
     Some(calls)
 }
 
+fn provider_engine_visible_content_before_tools(
+    text: &str,
+    strategy: ProviderEngineToolStrategy,
+) -> String {
+    match strategy {
+        // Native Qwen permits commentary preceding a tool call. Preserve it
+        // in both delivery modes so usage does not depend on stream=true.
+        ProviderEngineToolStrategy::QwenFunctionXml => text
+            .split_once("<tool_call>")
+            .map(|(content, _)| content.to_owned())
+            .unwrap_or_default(),
+        ProviderEngineToolStrategy::OpenAiToolCalls => {
+            provider_openai_tool_call_outputs_with_prefix(text)
+                .map(|(prefix, _)| text[..prefix].to_owned())
+                .unwrap_or_default()
+        }
+        ProviderEngineToolStrategy::MayhemJson | ProviderEngineToolStrategy::GemmaFunctionCall => {
+            String::new()
+        }
+    }
+}
+
 fn validate_provider_engine_tool_call_outputs(calls: &[Value], tools: &[ToolSpec]) -> Result<()> {
     for call in calls {
         let name = call.get("name").and_then(Value::as_str).ok_or_else(|| {
@@ -93913,14 +93937,36 @@ fn provider_mayhem_json_tool_call_value(value: &Value) -> Option<Value> {
 }
 
 fn provider_openai_tool_call_outputs(text: &str) -> Option<Vec<Value>> {
-    let value: Value = serde_json::from_str(text.trim()).ok()?;
+    provider_openai_tool_call_outputs_with_prefix(text).map(|(_, calls)| calls)
+}
+
+fn provider_openai_tool_call_outputs_with_prefix(text: &str) -> Option<(usize, Vec<Value>)> {
+    if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
+        return provider_openai_tool_call_outputs_from_value(&value).map(|calls| (0, calls));
+    }
+    let trimmed = text.trim_end();
+    for (index, _) in trimmed.rmatch_indices('{') {
+        let Ok(value) = serde_json::from_str::<Value>(&trimmed[index..]) else {
+            continue;
+        };
+        if value.get("tool_calls").and_then(Value::as_array).is_none() {
+            continue;
+        }
+        if let Some(calls) = provider_openai_tool_call_outputs_from_value(&value) {
+            return Some((index, calls));
+        }
+    }
+    None
+}
+
+fn provider_openai_tool_call_outputs_from_value(value: &Value) -> Option<Vec<Value>> {
     if let Some(calls) = value.get("tool_calls").and_then(Value::as_array) {
         if calls.is_empty() {
             return None;
         }
         return calls.iter().map(provider_openai_tool_call_value).collect();
     }
-    Some(vec![provider_openai_tool_call_value(&value)?])
+    Some(vec![provider_openai_tool_call_value(value)?])
 }
 
 fn provider_openai_tool_call_value(call: &Value) -> Option<Value> {
@@ -122997,6 +123043,29 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(calls[0]["arguments"], r#"{"filePath":"one.txt"}"#);
         assert_eq!(calls[1]["id"], "call-openai-2");
         assert_eq!(calls[1]["arguments"], r#"{"filePath":"two.txt"}"#);
+    }
+
+    #[test]
+    fn provider_openai_tool_calls_after_commentary_keep_only_the_commentary_visible() {
+        let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
+        let text = concat!(
+            "Plan saved.\n\n",
+            r#"{"tool_calls":[{"function":{"name":"write","arguments":{"path":"app.js"}}}]}"#,
+        );
+        let calls = provider_engine_tool_call_outputs(
+            text,
+            ProviderEngineToolStrategy::OpenAiToolCalls,
+            &tools,
+        )
+        .expect("tool call after commentary");
+        assert_eq!(calls[0]["name"], "write");
+        assert_eq!(
+            provider_engine_visible_content_before_tools(
+                text,
+                ProviderEngineToolStrategy::OpenAiToolCalls,
+            ),
+            "Plan saved.\n\n"
+        );
     }
 
     #[test]

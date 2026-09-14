@@ -1346,6 +1346,11 @@ reserve to ComfyUI so a workflow provider can offload more model state to system
 memory while leaving measured GPU headroom for another local workload. Leave it
 unset unless the host has a calibrated coexistence profile.
 
+The `0.2.218` source release preserves assistant commentary before native
+OpenAI-compatible tool calls while streaming the calls as structured deltas;
+partial tool envelopes now fail closed instead of appearing as chat text. It
+also keeps ComfyUI request journals deletable inside the Windows sandbox.
+
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
 local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON

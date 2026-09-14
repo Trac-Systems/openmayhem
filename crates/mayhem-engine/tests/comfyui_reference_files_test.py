@@ -10,6 +10,7 @@ import tempfile
 import time
 import types
 import unittest
+import uuid
 from unittest import mock
 from pathlib import Path
 
@@ -23,7 +24,7 @@ def load_file_scope(base_dir):
     functions = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in names]
     namespace = {"base_dir": base_dir, "base64": base64, "contextlib": contextlib,
                  "tempfile": tempfile, "Path": Path, "json": json,
-                 "os": os, "time": time, "errno": errno}
+                 "os": os, "time": time, "errno": errno, "uuid": uuid}
     exec(compile(ast.Module(body=functions, type_ignores=[]), source.name, "exec"), namespace)
     return namespace
 

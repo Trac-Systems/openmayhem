@@ -59,6 +59,7 @@ impl OutputStream {
             }
             if !self.in_tools {
                 let marker = match self.strategy {
+                    ProviderEngineToolStrategy::OpenAiToolCalls => "{\"tool_calls\"",
                     ProviderEngineToolStrategy::QwenFunctionXml => "<tool_call>",
                     ProviderEngineToolStrategy::GemmaFunctionCall => "<|tool_call>call:",
                     _ => "",
@@ -126,6 +127,12 @@ impl OutputStream {
 
     pub fn finish_text(&mut self, has_tools: bool) -> String {
         let tail = if has_tools {
+            String::new()
+        } else if self.in_tools
+            && self.strategy == ProviderEngineToolStrategy::OpenAiToolCalls
+        {
+            // Once a canonical native tool envelope begins, never expose a
+            // malformed or truncated remainder as assistant text.
             String::new()
         } else if self.in_tools && self.emitted.is_empty() {
             std::mem::take(&mut self.tool_text)
@@ -603,6 +610,55 @@ mod tests {
             ProviderEngineToolStrategy::GemmaFunctionCall,
             "<|tool_call>call:write{path:<|\"|>index.html<|\"|>,content:<|\"|>é🦀 \\\"quoted\\\"<|\"|>,data:[1,2,{x:true}]}<tool_call|>",
         );
+    }
+
+    #[test]
+    fn openai_tool_envelope_after_commentary_streams_without_leaking_json() {
+        let raw = concat!(
+            "Plan saved. Now writing the files.\n\n",
+            r#"{"tool_calls":[{"id":"native","type":"function","function":{"name":"write","arguments":"{\"path\":\"src/app.js\",\"content\":\"hello\"}"}}]}"#,
+        );
+        let expected = provider_engine_tool_call_outputs(
+            raw,
+            ProviderEngineToolStrategy::OpenAiToolCalls,
+            &tools(),
+        )
+        .expect("tool call after commentary");
+        let mut stream = OutputStream::new(ProviderEngineToolStrategy::OpenAiToolCalls, tools());
+        let mut visible = String::new();
+        let mut calls = Vec::new();
+        let mut streamed_before_end = false;
+        for (index, ch) in raw.char_indices() {
+            let delta = stream.push(&ch.to_string());
+            visible.push_str(&delta.text);
+            streamed_before_end |= !delta.tools.is_empty() && index < raw.len() - 5;
+            collect(delta, &mut calls);
+        }
+        visible.push_str(&stream.finish_text(true));
+        assert_eq!(visible, "Plan saved. Now writing the files.\n\n");
+        assert!(streamed_before_end);
+        compare(&calls, &expected);
+    }
+
+    #[test]
+    fn malformed_openai_tool_envelope_after_commentary_fails_closed() {
+        let raw = concat!(
+            "I will write it now.\n\n",
+            r#"{"tool_calls":[{"function":{"name":"write","arguments":"{\"path\":""#,
+        );
+        let mut stream = OutputStream::new(ProviderEngineToolStrategy::OpenAiToolCalls, tools());
+        let mut visible = String::new();
+        for ch in raw.chars() {
+            visible.push_str(&stream.push(&ch.to_string()).text);
+        }
+        visible.push_str(&stream.finish_text(false));
+        assert_eq!(visible, "I will write it now.\n\n");
+        assert!(provider_engine_tool_call_outputs(
+            raw,
+            ProviderEngineToolStrategy::OpenAiToolCalls,
+            &tools(),
+        )
+        .is_none());
     }
 
     #[test]

@@ -6,7 +6,6 @@ import json
 import math
 import os
 import sys
-import tempfile
 import time
 import traceback
 import uuid
@@ -229,7 +228,11 @@ def input_transfer_lock():
 @contextlib.contextmanager
 def materialized_input_files(payload):
     with input_transfer_lock():
-        with staged_input_files(payload):
+        if payload.get("input_files"):
+            with staged_input_files(payload):
+                yield
+        else:
+            recover_input_transfers()
             yield
 
 
@@ -238,7 +241,17 @@ def staged_input_files(payload):
     # Cancellation can terminate this worker, bypassing finally. Recover its
     # journals before another graph can read any input left by that request.
     recover_input_transfers()
-    backup_root = Path(tempfile.mkdtemp(prefix="request-", dir=input_transfer_root()))
+    # tempfile.mkdtemp uses mode 0o700. Python 3.12 maps that mode to a
+    # restrictive Windows DACL, so an AppContainer worker can create the
+    # journal and then lose DELETE access to it. A normal mkdir inherits the
+    # writable-tree ACL installed by the sandbox.
+    while True:
+        backup_root = input_transfer_root() / f"request-{uuid.uuid4().hex}"
+        try:
+            backup_root.mkdir()
+            break
+        except FileExistsError:
+            continue
     written = []
     seen = set()
     try:
