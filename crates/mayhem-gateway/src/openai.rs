@@ -5894,6 +5894,7 @@ pub async fn serve(bind: SocketAddr, mut state: GatewayState) -> std::io::Result
     let listener = TcpListener::bind(bind).await?;
     spawn_pending_gateway_job_reconciliation(&state)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    failure_recovery::spawn_ledger_reservation_sweep(&state);
     axum::serve(listener, openai_router(state)).await
 }
 
@@ -42316,6 +42317,105 @@ mod tests {
                 "accepted {pointer}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_reservation_sweep_expires_orphaned_hold_without_local_job() {
+        let seed = test_user_seed();
+        let state = GatewayState::fixture().with_receipt_user_seed(seed);
+        let invocation = test_invocation();
+        let mut session = serde_json::to_value(&invocation.spend_voucher.body).unwrap();
+        session["type"] = json!("targeted_spend_session");
+        let user = verifying_key_hex(&seed);
+        let rail = invocation.spend_voucher.body.rail.clone();
+        let reservation_id = invocation.spend_voucher.body.reservation_id.clone();
+        let billing_id = invocation.spend_voucher.body.billing_id.clone();
+        let billing_attempt = invocation.spend_voucher.body.billing_attempt;
+        let prefix = format!("hold/targeted-session/{rail}/{user}/");
+        let session_key = format!("{prefix}{}", invocation.session_id);
+        let mut reservation = session.clone();
+        reservation["status"] = json!("active");
+        let submitted = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let submitted_handler = submitted.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/state",
+                axum::routing::get(
+                    move |axum::extract::Query(query): axum::extract::Query<
+                        BTreeMap<String, String>,
+                    >| {
+                        let session = session.clone();
+                        let reservation = reservation.clone();
+                        let prefix = prefix.clone();
+                        let session_key = session_key.clone();
+                        let reservation_id = reservation_id.clone();
+                        let billing_id = billing_id.clone();
+                        async move {
+                            assert_eq!(query.get("confirmed").map(String::as_str), Some("true"));
+                            let response = if query.get("key").map(String::as_str)
+                                == Some("epoch/apply/state")
+                            {
+                                json!({"key": "epoch/apply/state", "confirmed": true,
+                                    "signed_length": 123, "value": {"updated_epoch": 37}})
+                            } else if query.get("prefix").map(String::as_str)
+                                == Some(prefix.as_str())
+                            {
+                                assert_eq!(query.get("signed_length").map(String::as_str), Some("123"));
+                                json!({"prefix": prefix, "confirmed": true, "signed_length": 123,
+                                    "values": [{"key": session_key, "value": session}],
+                                    "truncated": false})
+                            } else if query.get("key").map(String::as_str)
+                                == Some(format!("receipt/reservation/{reservation_id}").as_str())
+                            {
+                                json!({"key": format!("receipt/reservation/{reservation_id}"),
+                                    "confirmed": true, "signed_length": 123, "value": reservation})
+                            } else if query.get("key").map(String::as_str)
+                                == Some(format!("receipt/head/{billing_id}/{billing_attempt}").as_str())
+                            {
+                                json!({"key": format!("receipt/head/{billing_id}/{billing_attempt}"),
+                                    "confirmed": true, "signed_length": 123, "value": null})
+                            } else {
+                                panic!("unexpected canonical state query: {query:?}");
+                            };
+                            axum::Json(response)
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1/contract/feature",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let submitted = submitted_handler.clone();
+                    async move {
+                        submitted
+                            .lock_recover("submitted reservation expiries")
+                            .push(body);
+                        axum::Json(json!({"ok": true}))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rpc = PeerRpcClient::new(format!("http://{address}/v1")).unwrap();
+
+        let pass = failure_recovery::sweep_ledger_reservations_once(&state, &rpc, 32)
+            .await
+            .unwrap();
+        assert_eq!(pass.discovered, 1);
+        assert_eq!(pass.eligible, 1);
+        assert_eq!(pass.submitted, 1);
+        let submitted = submitted.lock_recover("submitted reservation expiries");
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0]["value"]["op"], "expire_usage_reservation");
+        assert_eq!(submitted[0]["value"]["reason"], "gateway_ledger_sweep");
+        assert_eq!(submitted[0]["value"]["actor"], user);
+        assert_eq!(submitted[0]["value"]["actor_role"], "user");
+        assert_eq!(
+            submitted[0]["value"]["actor_sig"].as_str().map(str::len),
+            Some(128)
+        );
+        server.abort();
     }
 
     #[tokio::test]
