@@ -30535,7 +30535,7 @@ fn provider_comfy_workflow_inventory_resident_bytes(
         .iter()
         .map(|part| (part.part_id.as_str(), part))
         .collect::<BTreeMap<_, _>>();
-    let mut total = 0_u64;
+    let mut verified = BTreeMap::<String, (String, u64)>::new();
     for required in &policy.parts {
         let part = by_part_id.get(required.part_id.as_str()).with_context(|| {
             format!(
@@ -30550,7 +30550,56 @@ fn provider_comfy_workflow_inventory_resident_bytes(
             model.model_id,
             required.part_id
         );
-        total = total.saturating_add(part.record.size_bytes);
+        verified.insert(
+            required.name.clone(),
+            (required.part_id.clone(), part.record.size_bytes),
+        );
+    }
+    let Some(constraints) = policy.graph_constraints.as_ref() else {
+        return Ok(verified.values().fold(0_u64, |total, (_, size)| {
+            total.saturating_add(*size)
+        }));
+    };
+
+    // `policy.parts` is the complete selectable inventory. Optional workflow roles can expose
+    // many signed choices while bounding how many are resident in one request (for example, a
+    // catalog of LoRAs with a four-loader maximum). Memory admission must still verify every
+    // advertised part above, but charging the resident set for every alternative makes a bounded
+    // workflow impossible to serve on hardware that safely fits its signed maximum.
+    let mut referenced = BTreeSet::new();
+    let mut total = 0_u64;
+    for role in constraints.roles.values() {
+        for input in role.inputs.values() {
+            if input.value_type != mayhem_proto::ComfyWorkflowInputType::Part
+                || input.part_names.is_empty()
+            {
+                continue;
+            }
+            let mut candidates = Vec::with_capacity(input.part_names.len());
+            for name in &input.part_names {
+                let (part_id, size) = verified.get(name).with_context(|| {
+                    format!(
+                        "Comfy workflow {} graph references part {} outside its signed parts envelope",
+                        model.model_id, name
+                    )
+                })?;
+                referenced.insert(part_id.clone());
+                candidates.push(*size);
+            }
+            candidates.sort_unstable_by(|left, right| right.cmp(left));
+            total = candidates
+                .into_iter()
+                .take(role.max_count)
+                .fold(total, u64::saturating_add);
+        }
+    }
+    // Parts that are not request-selectable graph inputs are runtime/system parts and remain
+    // resident requirements. This also preserves the prior conservative behavior for custom-node
+    // packages and fixed workflow assets.
+    for (part_id, size) in verified.values() {
+        if !referenced.contains(part_id) {
+            total = total.saturating_add(*size);
+        }
     }
     Ok(total)
 }
@@ -102161,6 +102210,139 @@ status: linked
         assert_eq!(
             files.model_files[0].model_path,
             PathBuf::from("tiny-upscaler.bin")
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn provider_comfy_memory_counts_bounded_optional_part_residency() {
+        let temp = test_temp_dir("mayhem-provider-comfy-bounded-residency");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        let payload_dir = temp.join("payloads");
+        let cache_dir = temp.join("cache");
+        let home = temp.join("home");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&payload_dir).unwrap();
+        let mut records = Vec::new();
+        for (index, size) in [100_usize, 10, 20, 30, 40, 50].into_iter().enumerate() {
+            let payload_path = payload_dir.join(format!("part-{index}.bin"));
+            fs::write(&payload_path, vec![index as u8; size]).unwrap();
+            let mut record = test_comfy_part_record_for_payload(
+                if index == 0 {
+                    "base.safetensors"
+                } else {
+                    [
+                        "",
+                        "lora-1.safetensors",
+                        "lora-2.safetensors",
+                        "lora-3.safetensors",
+                        "lora-4.safetensors",
+                        "lora-5.safetensors",
+                    ][index]
+                },
+                &payload_path,
+                8,
+            );
+            record.part_type = if index == 0 { "checkpoint" } else { "lora" }.to_owned();
+            record.part_id = mayhem_proto::derive_comfy_part_id(
+                &record.part_type,
+                &record.name,
+                &record.sha256,
+            );
+            record.validate().unwrap();
+            let record_path = source_dir.join(format!("record-{index}.json"));
+            write_json_file(&record_path, &record).unwrap();
+            records.push((record, record_path));
+        }
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: records.iter().map(|(_, path)| path.clone()).collect(),
+            output_dir: layout_dir.clone(),
+            index_ver: 25,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 1,
+            outcome_classes_ver: 1,
+        })
+        .unwrap();
+        provider_parts_add(ProviderPartsPullArgs {
+            home: Some(home.clone()),
+            layout_dir,
+            part_ids: records
+                .iter()
+                .map(|(record, _)| record.part_id.clone())
+                .collect(),
+            all: false,
+            payload_dir: Some(payload_dir),
+            hf_token_file: None,
+            source_token_file: None,
+            cache_dir: Some(cache_dir),
+            disk_reserve: None,
+            offline: true,
+            require_payload: false,
+            chunk_size: 8,
+            json: true,
+        })
+        .unwrap();
+        let mut model = test_catalog(&"aa".repeat(32)).models[0].clone();
+        model.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        )
+        .unwrap()];
+        let lora_names = records[1..]
+            .iter()
+            .map(|(record, _)| record.name.clone())
+            .collect::<Vec<_>>();
+        let graph_constraints = serde_json::from_value(json!({
+            "output_role": "base",
+            "roles": {
+                "base": {
+                    "class_type": "UNETLoader",
+                    "min_count": 1,
+                    "max_count": 1,
+                    "inputs": {
+                        "unet_name": {
+                            "value_type": "part",
+                            "required": true,
+                            "part_type": "checkpoint",
+                            "part_names": [records[0].0.name.clone()]
+                        }
+                    }
+                },
+                "user_lora": {
+                    "class_type": "LoraLoaderModelOnly",
+                    "min_count": 0,
+                    "max_count": 2,
+                    "inputs": {
+                        "lora_name": {
+                            "value_type": "part",
+                            "required": true,
+                            "part_type": "lora",
+                            "part_names": lora_names,
+                            "distinct": true
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        model.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["UNETLoader".to_owned(), "LoraLoaderModelOnly".to_owned()],
+            parts: records
+                .iter()
+                .map(|(record, _)| mayhem_proto::ComfyWorkflowPartRef {
+                    part_id: record.part_id.clone(),
+                    name: record.name.clone(),
+                    part_type: record.part_type.clone(),
+                    sha256: record.sha256.clone(),
+                    scale: None,
+                })
+                .collect(),
+            graph_constraints: Some(graph_constraints),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+        assert_eq!(
+            provider_comfy_workflow_inventory_resident_bytes(Some(&home), &model).unwrap(),
+            100 + 50 + 40
         );
         let _ = fs::remove_dir_all(temp);
     }

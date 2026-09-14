@@ -1351,6 +1351,11 @@ OpenAI-compatible tool calls while streaming the calls as structured deltas;
 partial tool envelopes now fail closed instead of appearing as chat text. It
 also keeps ComfyUI request journals deletable inside the Windows sandbox.
 
+The `0.2.219` source release admits signed workflow inventory against the
+maximum parts one request can select. Providers still verify every advertised
+part, while optional model-part catalogs no longer consume memory admission as
+if every choice were loaded together.
+
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
 local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON
