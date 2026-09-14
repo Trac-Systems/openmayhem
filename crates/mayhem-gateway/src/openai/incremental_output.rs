@@ -1,4 +1,4 @@
-use super::{ChatCompletionRequest, GatewaySessionError, ToolCallOutput, Value, json};
+use super::{json, ChatCompletionRequest, GatewaySessionError, ToolCallOutput, Value};
 
 /// Presentation only: receipt accounting continues to use the exact evidence
 /// bytes, including native delimiters, and never charges this second view twice.
@@ -292,11 +292,9 @@ mod tests {
             json!({"index":0,"name":"write","arguments":"{"}),
             json!({"index":0,"id":"x","name":"write","arguments":"x".repeat(1024)}),
         ] {
-            assert!(
-                ToolStream::default()
-                    .push(&json!({"tool_calls_delta":[delta]}), &request, 1024)
-                    .is_err()
-            );
+            assert!(ToolStream::default()
+                .push(&json!({"tool_calls_delta":[delta]}), &request, 1024)
+                .is_err());
         }
         let mut stream = ToolStream::default();
         stream

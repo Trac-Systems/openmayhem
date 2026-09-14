@@ -19,7 +19,8 @@ pub use validated_image::{image_reference_metadata, ImageReferenceMetadata};
 mod reservation_close;
 pub use reservation_close::{
     canonical_usage_receipt_hash, reservation_binding_matches, usage_reservation_close_feature,
-    usage_reservation_close_signing_bytes, usage_reservation_close_value, RESERVATION_BINDING_FIELDS,
+    usage_reservation_close_signing_bytes, usage_reservation_close_value,
+    RESERVATION_BINDING_FIELDS,
 };
 
 pub use comfy_workflow::{
@@ -63,6 +64,28 @@ pub use validated_audio::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
+
+/// Reconstruct the text used by OpenAI-compatible canary evidence without
+/// retaining transport-specific SSE delta boundaries.
+pub fn openai_compatible_canary_output(reasoning: &str, content: &str) -> String {
+    let mut output = String::new();
+    if !reasoning.is_empty() {
+        output.push_str("<think>");
+        output.push_str(reasoning);
+        output.push_str("</think>");
+    }
+    output.push_str(content);
+    output
+}
+
+/// Return Unicode scalar values for the reconstructed OpenAI-compatible
+/// canary output. These units are evidence-only and do not affect metering.
+pub fn openai_compatible_canary_units(reconstructed_output: &str) -> Vec<i32> {
+    reconstructed_output
+        .chars()
+        .map(|scalar| i32::try_from(u32::from(scalar)).expect("Unicode scalar fits i32"))
+        .collect()
+}
 pub const CONTRACT_VERSION: u32 = 25;
 /// Retained schema-11 receipt settlement features accepted across the v25 upgrade.
 pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24];
@@ -3454,10 +3477,9 @@ mod tests {
             "request_modalities": [["text"]],
             "proof_sha256": "33".repeat(32),
         });
-        let profile: SerializedGenerationExecutionProfile = serde_json::from_value(
-            serialized_mode["generation_execution_profile"].clone(),
-        )
-        .unwrap();
+        let profile: SerializedGenerationExecutionProfile =
+            serde_json::from_value(serialized_mode["generation_execution_profile"].clone())
+                .unwrap();
         let legacy_profile_bytes = br#"{"schema_version":1,"engine":"vllm","independent_dispatch":true,"request_modalities":[["text"]]}"#;
         assert_eq!(profile.topology, None);
         assert_eq!(serde_json::to_vec(&profile).unwrap(), legacy_profile_bytes);
@@ -3513,12 +3535,10 @@ mod tests {
         let mut hashes = BTreeSet::from([legacy.policy_hash]);
         for topology in ["shared_worker", "isolated_workers"] {
             mode["generation_execution_profile"]["topology"] = json!(topology);
-            let binding =
-                vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
+            let binding = vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
             assert!(hashes.insert(binding.policy_hash.clone()));
             let mut changed_proof = mode.clone();
-            changed_proof["generation_execution_profile"]["proof_sha256"] =
-                json!("44".repeat(32));
+            changed_proof["generation_execution_profile"]["proof_sha256"] = json!("44".repeat(32));
             assert_eq!(
                 vllm_execution_mode_binding(&artifact_root, "throughput", &changed_proof).unwrap(),
                 binding
@@ -3616,7 +3636,10 @@ mod tests {
         let profile: SerializedVllmExecutionProfile =
             serde_json::from_value(mode["profile"].clone()).unwrap();
         assert_eq!(profile.runtime, None);
-        assert!(serde_json::to_value(profile).unwrap().get("runtime").is_none());
+        assert!(serde_json::to_value(profile)
+            .unwrap()
+            .get("runtime")
+            .is_none());
 
         mode["profile"]["runtime"] = Value::Null;
         assert_eq!(
@@ -3626,15 +3649,24 @@ mod tests {
         let profile: SerializedVllmExecutionProfile =
             serde_json::from_value(mode["profile"].clone()).unwrap();
         assert_eq!(profile.runtime, None);
-        assert!(serde_json::to_value(profile).unwrap().get("runtime").is_none());
+        assert!(serde_json::to_value(profile)
+            .unwrap()
+            .get("runtime")
+            .is_none());
 
         let runtime = VllmRuntime::FlashinferSpeculativeMetadataV1;
-        assert_eq!(serde_json::to_value(runtime).unwrap(), json!("flashinfer_speculative_metadata_v1"));
+        assert_eq!(
+            serde_json::to_value(runtime).unwrap(),
+            json!("flashinfer_speculative_metadata_v1")
+        );
         mode["profile"]["runtime"] = serde_json::to_value(runtime).unwrap();
         let profile: SerializedVllmExecutionProfile =
             serde_json::from_value(mode["profile"].clone()).unwrap();
         assert_eq!(profile.runtime, Some(runtime));
-        assert_eq!(serde_json::to_value(profile).unwrap()["runtime"], mode["profile"]["runtime"]);
+        assert_eq!(
+            serde_json::to_value(profile).unwrap()["runtime"],
+            mode["profile"]["runtime"]
+        );
         let selected = vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
         assert_ne!(selected, baseline);
         mode["profile"]["proof_sha256"] = json!("ff".repeat(32));
@@ -3643,7 +3675,11 @@ mod tests {
             selected
         );
 
-        for invalid in [json!("unknown_runtime"), json!(1), json!({"runtime": "flashinfer_speculative_metadata_v1"})] {
+        for invalid in [
+            json!("unknown_runtime"),
+            json!(1),
+            json!({"runtime": "flashinfer_speculative_metadata_v1"}),
+        ] {
             mode["profile"]["runtime"] = invalid;
             assert!(vllm_execution_mode_binding(&artifact_root, "throughput", &mode).is_err());
         }

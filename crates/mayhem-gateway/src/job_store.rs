@@ -63,6 +63,8 @@ pub(crate) struct GatewayJobErrorInfo {
     pub(crate) code: String,
     pub(crate) category: String,
     pub(crate) retryable: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) phase: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -298,6 +300,7 @@ impl GatewayJobStore {
                 code: "gateway_execution_interrupted".to_owned(),
                 category: "execution_unknown".to_owned(),
                 retryable: false,
+                phase: None,
             }),
         };
         self.persist_active_recovery(recovery)
@@ -722,9 +725,10 @@ impl GatewayJobStore {
             // their reservation was closed. Restore those jobs to recovery;
             // never rewrite the signed receipt's finality bit.
             if job.status != GatewayJobStatus::ReconciliationPending
-                && job.receipt.as_ref().is_some_and(|receipt|
+                && job.receipt.as_ref().is_some_and(|receipt| {
                     receipt.pointer("/body/final") == Some(&Value::Bool(false))
-                        && receipt.get("canonical_settlement").is_none())
+                        && receipt.get("canonical_settlement").is_none()
+                })
             {
                 job.status = GatewayJobStatus::ReconciliationPending;
                 let repaired = seal_job(&self.key, &job)?;
@@ -1334,6 +1338,7 @@ mod tests {
             code: "provider_model_output_invalid".to_owned(),
             category: "provider_response".to_owned(),
             retryable: false,
+            phase: Some("admin_ack".to_owned()),
         };
         for id in ["legacy", "typed"] {
             store
