@@ -1,0 +1,79 @@
+{
+  "schema_version": 1,
+  "model_id": "Qwen/Qwen3.8-Flash-Next",
+  "artifact_source": {
+    "repo": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+    "revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
+    "manifest_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374"
+  },
+  "runtime": {
+    "runtime_id": "pennyroyal",
+    "runtime_version": "2.5.0",
+    "runtime_revision": "2c675da096939cb01102f8f4871bda3db55f7f28",
+    "implementation": "sglang",
+    "implementation_version": "0.0.0.dev1+gd91c3682b",
+    "container_image_digest": "sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1"
+  },
+  "measurements": {
+    "concurrent_long_context": {
+      "evidence_sha256": "adc3b7256a75f32f112a74ce1b453fab16e007013803ded94695dca02f3ccba8",
+      "requests": [
+        {
+          "prompt_tokens": 260000,
+          "completion_tokens": 1024,
+          "prefill_work_us": 20916100,
+          "post_first_token_decode_units": 1023,
+          "post_first_token_decode_work_us": 25546400
+        },
+        {
+          "prompt_tokens": 260000,
+          "completion_tokens": 1024,
+          "prefill_work_us": 40523900,
+          "post_first_token_decode_units": 1023,
+          "post_first_token_decode_work_us": 6470100
+        }
+      ],
+      "aggregate": {
+        "input_token": {
+          "units": 520000,
+          "work_us": 61440000
+        },
+        "output_token": {
+          "units": 2046,
+          "work_us": 32016500
+        }
+      },
+      "interpretation": "Reference work is the sum of per-request phase time from the retained concurrency-two run. Input work includes time to first token. Output work uses the measured post-first-token intervals."
+    },
+    "cached_input": {
+      "evidence_sha256": "dac1c0a092f87f3024d62cecefec8ea5ff506479654e0ff0a08f2187f64e69ca",
+      "cached_input_tokens": 25472,
+      "work_us": 232011,
+      "uncached_input_tokens_in_request": 49,
+      "output_tokens_in_request": 14,
+      "interpretation": "Conservative upper bound: the complete second-request elapsed time is assigned to cached-input work because the retained response does not isolate the 49 uncached input tokens and 14 output tokens."
+    }
+  },
+  "activity_calibration_dimensions": [
+    {
+      "unit": "cached_input_token",
+      "units": "25472",
+      "work_us": "232011"
+    },
+    {
+      "unit": "input_token",
+      "units": "520000",
+      "work_us": "61440000"
+    },
+    {
+      "unit": "output_token",
+      "units": "2046",
+      "work_us": "32016500"
+    }
+  ],
+  "limitations": [
+    "The long-context prompts were synthetic retrieval probes and are not a quality benchmark.",
+    "The concurrent run measures shared scheduling, so the two per-request prefill and decode rates are intentionally aggregated as reference work.",
+    "The cached-input measurement is a conservative upper bound and needs operator acceptance before ledger publication."
+  ]
+}

@@ -5660,7 +5660,8 @@ mod tests {
 
     #[test]
     fn openai_image_reference_has_explicit_default_and_binds_the_reference() {
-        let contract = endpoint_family_contract_template(ENDPOINT_OPENAI_IMAGE_GENERATIONS).unwrap();
+        let contract =
+            endpoint_family_contract_template(ENDPOINT_OPENAI_IMAGE_GENERATIONS).unwrap();
         let raw = json!({"model":"test/image", "prompt":"a compass", "size":"1024x1024", "input_reference":"$IMAGE_DATA_URL"});
         let normalized = materialize_endpoint_request_defaults(&contract, &raw).unwrap();
         assert_eq!(normalized["input_reference"], raw["input_reference"]);

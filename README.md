@@ -1340,6 +1340,26 @@ modality health immediately instead of rerunning an expensive functional canary
 before their first room heartbeat. The Comfy runtime default device is `auto`;
 explicit `MAYHEM_COMFYUI_DEVICE=cpu` still forces CPU for hosts that need it.
 
+The `0.2.217` source release adds an optional
+`MAYHEM_COMFYUI_RESERVE_VRAM_GB` provider setting. It passes a bounded VRAM
+reserve to ComfyUI so a workflow provider can offload more model state to system
+memory while leaving measured GPU headroom for another local workload. Leave it
+unset unless the host has a calibrated coexistence profile.
+
+The `0.2.218` source release preserves assistant commentary before native
+OpenAI-compatible tool calls while streaming the calls as structured deltas;
+partial tool envelopes now fail closed instead of appearing as chat text. It
+also keeps ComfyUI request journals deletable inside the Windows sandbox.
+
+The `0.2.219` source release admits signed workflow inventory against the
+maximum parts one request can select. Providers still verify every advertised
+part, while optional model-part catalogs no longer consume memory admission as
+if every choice were loaded together.
+
+The `0.2.220` source release recovers expired inference reservations from the
+canonical ledger even when a gateway's local job record is unavailable. Any
+confirmed partial receipt is retained when the expired reservation closes.
+
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
 local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON
