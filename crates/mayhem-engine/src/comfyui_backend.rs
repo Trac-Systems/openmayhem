@@ -32,6 +32,7 @@ const WORKER_STDIN_BOOTSTRAP: &str = concat!(
 const WORKER_PROTOCOL_PREFIX: &str = "__mayhem_comfyui_worker_v1__";
 const PYTHON_ENV: &str = "MAYHEM_COMFYUI_PYTHON";
 const DEVICE_ENV: &str = "MAYHEM_COMFYUI_DEVICE";
+const VRAM_RESERVE_GB_ENV: &str = "MAYHEM_COMFYUI_RESERVE_VRAM_GB";
 const ARTIFACT_CHUNK_BYTES: usize = 256 * 1024;
 const WORKER_STDERR_TAIL_BYTES: usize = 64 * 1024;
 const MAX_WORKER_REQUEST_LINE_BYTES: usize = 64 * 1024 * 1024;
@@ -144,6 +145,10 @@ impl EngineBackend for ComfyUiBackend {
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("python3"));
         let device = env::var(DEVICE_ENV).unwrap_or_else(|_| default_comfyui_device().to_owned());
+        let vram_reserve_gb = env::var(VRAM_RESERVE_GB_ENV)
+            .ok()
+            .map(|value| parse_comfyui_vram_reserve_gb(&value))
+            .transpose()?;
         let socket_dir = short_socket_dir();
         let custom_node_whitelist = config
             .comfyui_custom_nodes
@@ -168,6 +173,7 @@ impl EngineBackend for ComfyUiBackend {
                 "base_dir": base_dir,
                 "socket_path": socket_path,
                 "device": device,
+                "vram_reserve_gb": vram_reserve_gb,
                 "custom_node_whitelist": custom_node_whitelist,
                 "model_path_aliases": model_path_aliases,
             }),
@@ -188,6 +194,7 @@ impl EngineBackend for ComfyUiBackend {
             "object_info_classes": response.object_info_classes,
             "node_classes_hash": sha256_json(&response.node_classes)?,
             "device": device,
+            "vram_reserve_gb": vram_reserve_gb,
         });
         self.loaded = Some(LoadedComfyUi { evidence });
         self.worker = Some(worker);
@@ -1207,6 +1214,20 @@ fn default_comfyui_device() -> &'static str {
     "auto"
 }
 
+fn parse_comfyui_vram_reserve_gb(value: &str) -> Result<f64> {
+    let reserve = value.parse::<f64>().map_err(|_| {
+        EngineError::ComfyUi(format!(
+            "{VRAM_RESERVE_GB_ENV} must be a finite number between 0 and 1024"
+        ))
+    })?;
+    if !reserve.is_finite() || !(0.0..=1024.0).contains(&reserve) {
+        return Err(EngineError::ComfyUi(format!(
+            "{VRAM_RESERVE_GB_ENV} must be a finite number between 0 and 1024"
+        )));
+    }
+    Ok(reserve)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1270,6 +1291,14 @@ mod tests {
     #[test]
     fn comfyui_device_defaults_to_runtime_auto_selection() {
         assert_eq!(default_comfyui_device(), "auto");
+    }
+
+    #[test]
+    fn comfyui_vram_reserve_requires_a_bounded_finite_number() {
+        assert_eq!(parse_comfyui_vram_reserve_gb("12").unwrap(), 12.0);
+        for invalid in ["", "-1", "nan", "inf", "1025"] {
+            assert!(parse_comfyui_vram_reserve_gb(invalid).is_err(), "{invalid}");
+        }
     }
 
     #[test]

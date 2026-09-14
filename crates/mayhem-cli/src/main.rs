@@ -63385,8 +63385,13 @@ fn provider_backend_runtime_child_env(
         }
         "comfyui" => {
             insert_path("MAYHEM_COMFYUI_PYTHON", runtime.python.as_deref());
-            if let Ok(device) = env::var("MAYHEM_COMFYUI_DEVICE") {
-                child_env.insert("MAYHEM_COMFYUI_DEVICE".to_owned(), device);
+            for name in [
+                "MAYHEM_COMFYUI_DEVICE",
+                "MAYHEM_COMFYUI_RESERVE_VRAM_GB",
+            ] {
+                if let Ok(value) = env::var(name) {
+                    child_env.insert(name.to_owned(), value);
+                }
             }
         }
         "whisper.cpp" => insert_path("MAYHEM_WHISPER_CPP_BIN", runtime.external_binary.as_deref()),

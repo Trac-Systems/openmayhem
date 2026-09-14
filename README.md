@@ -1340,6 +1340,12 @@ modality health immediately instead of rerunning an expensive functional canary
 before their first room heartbeat. The Comfy runtime default device is `auto`;
 explicit `MAYHEM_COMFYUI_DEVICE=cpu` still forces CPU for hosts that need it.
 
+The `0.2.217` source release adds an optional
+`MAYHEM_COMFYUI_RESERVE_VRAM_GB` provider setting. It passes a bounded VRAM
+reserve to ComfyUI so a workflow provider can offload more model state to system
+memory while leaving measured GPU headroom for another local workload. Leave it
+unset unless the host has a calibrated coexistence profile.
+
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
 local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON
