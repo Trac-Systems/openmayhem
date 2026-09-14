@@ -5482,6 +5482,11 @@ impl GatewayState {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "dashboard-workbench"))]
+    fn record_workbench_probe(&self, probe: StoredProbeEvent) {
+        self.probes.lock_recover("probe store").push(probe);
+    }
+
     fn paused_session_count(&self) -> usize {
         self.paused_sessions
             .lock_recover("paused session store")

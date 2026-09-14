@@ -6894,6 +6894,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                     "aa".repeat(32),
                     BTreeMap::from([("fixed-probe".to_owned(), expected_tokens.to_vec())]),
                 )]),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::new(),
@@ -6959,6 +6960,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::from([(
                     "aa".repeat(32),
                     BTreeMap::from([("fixed-image".to_owned(), expected_hash)]),
@@ -7027,6 +7029,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 embedding_vectors_by_artifact_root: BTreeMap::from([(
                     "aa".repeat(32),
@@ -7099,6 +7102,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                 prompts: vec![runtime_prompt, calibration_prompt],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::from([(
@@ -7173,6 +7177,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::new(),
@@ -7257,6 +7262,7 @@ fn test_music_audio_fingerprint_canary_registry(
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::new(),

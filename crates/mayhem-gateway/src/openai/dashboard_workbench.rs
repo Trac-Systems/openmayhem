@@ -1034,7 +1034,7 @@ fn scale_state() -> GatewayState {
             .route_candidates
             .first()
             .expect("scale workbench model has a provider route");
-        state.record_probe(workbench_probe(
+        state.record_workbench_probe(workbench_probe(
             model,
             candidate,
             format!("workbench-scale-probe-{:02}", index + 1),
@@ -1159,7 +1159,7 @@ fn showcase_state_from_models_with_receipts(
             .first()
             .map(|candidate| (model, candidate))
     }) {
-        state.record_probe(workbench_probe(
+        state.record_workbench_probe(workbench_probe(
             model,
             candidate,
             "workbench-probe-latest".to_owned(),
