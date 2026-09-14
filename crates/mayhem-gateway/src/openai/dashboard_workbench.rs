@@ -1614,6 +1614,7 @@ fn fixture_receipt(
         served_ctx: model.mayhem.caps.ctx,
         required_modalities: Vec::new(),
         required_specialities: BTreeMap::new(),
+        workflow: None,
         ctx_bracket: Some("base".to_owned()),
         ctx_bracket_table_ver: Some(1),
         max_spend_au: 5 * AU_PER_USD,
@@ -1649,6 +1650,8 @@ fn fixture_receipt(
         ctx_bracket: Some("base".to_owned()),
         ctx_bracket_table_ver: Some(1),
         rules_ver: 1,
+        workflow: None,
+        workflow_output: None,
         usage,
         usage_attribution: BTreeMap::from([(
             "reasoning_tokens".to_owned(),
