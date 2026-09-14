@@ -48,6 +48,12 @@ pub struct OpenAiCompatibleRuntimeBinding {
     pub native_context: u32,
     pub served_context: u32,
     pub max_concurrent: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibrated_peak_gpu_memory_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub calibrated_peak_host_memory_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_measurement_source: Option<String>,
     pub model_snapshot_file_count: u32,
     pub snapshot_manifest_sidecar: String,
     pub snapshot_manifest_sha256: String,
@@ -148,6 +154,20 @@ impl OpenAiCompatibleRuntimeBinding {
             return Err(invalid(
                 "runtime binding max_concurrent must be between 1 and 64",
             ));
+        }
+        match (
+            self.calibrated_peak_gpu_memory_bytes,
+            self.calibrated_peak_host_memory_bytes,
+            self.memory_measurement_source.as_deref(),
+        ) {
+            (None, None, None) => {}
+            (Some(gpu), Some(host), Some(source))
+                if gpu > 0 && host > 0 && !source.trim().is_empty() && source.len() <= 1024 => {}
+            _ => {
+                return Err(invalid(
+                    "runtime binding calibrated GPU/host peak bytes and memory measurement source must be supplied together",
+                ));
+            }
         }
         if self.model_snapshot_file_count == 0 {
             return Err(invalid(
@@ -1705,6 +1725,9 @@ mod tests {
             native_context: 262_144,
             served_context: 524_288,
             max_concurrent: 2,
+            calibrated_peak_gpu_memory_bytes: None,
+            calibrated_peak_host_memory_bytes: None,
+            memory_measurement_source: None,
             model_snapshot_file_count: 419,
             snapshot_manifest_sidecar: "snapshot_manifest".to_owned(),
             snapshot_manifest_sha256: "de".repeat(32),

@@ -73521,7 +73521,7 @@ fn provider_memory_pool(
                 "host available unified memory",
             )
         },
-        "vllm" => {
+        "vllm" | "openai-compatible" => {
             if let Some(total) =
                 known_total_nvidia_vllm_memory_bytes(hardware).filter(|total| *total > 0)
             {
@@ -73853,6 +73853,19 @@ fn provider_memory_estimate(
     served_ctx: u64,
     workflow_inventory_bytes: u64,
 ) -> Result<ProviderMemoryEstimate> {
+    if let Some(peak) = artifact
+        .openai_compatible
+        .as_ref()
+        .and_then(|runtime| runtime.calibrated_peak_gpu_memory_bytes)
+    {
+        return Ok(ProviderMemoryEstimate {
+            required_bytes: peak,
+            weights_bytes: peak,
+            kv_bytes: 0,
+            overhead_bytes: 0,
+            media_bytes: 0,
+        });
+    }
     let weights_bytes =
         catalog_artifact_resident_bytes(artifact).saturating_add(workflow_inventory_bytes);
     let kv_bytes =
@@ -73887,6 +73900,13 @@ fn provider_model_memory_fit(
     requested_ctx: u64,
     workflow_inventory_bytes: u64,
 ) -> Result<mayhem_hwprobe::ModelMemoryFit> {
+    if let Some(peak) = artifact
+        .openai_compatible
+        .as_ref()
+        .and_then(|runtime| runtime.calibrated_peak_gpu_memory_bytes)
+    {
+        return Ok(model_memory_fit(usable_bytes, peak, 0, 0, requested_ctx));
+    }
     let weights_bytes =
         catalog_artifact_resident_bytes(artifact).saturating_add(workflow_inventory_bytes);
     let overhead_bytes = (weights_bytes / 5).max(512 * 1024 * 1024).saturating_add(
@@ -74115,6 +74135,30 @@ fn provider_context_feasibility(
     let requested_ctx = resolve_provider_served_ctx(model, args.ctx)?;
     let workflow_inventory_bytes =
         provider_comfy_workflow_inventory_resident_bytes(args.home.as_deref(), model)?;
+    if let Some(host_peak) = artifact
+        .openai_compatible
+        .as_ref()
+        .and_then(|runtime| runtime.calibrated_peak_host_memory_bytes)
+    {
+        let available = hardware
+            .memory
+            .available_bytes
+            .unwrap_or(hardware.memory.total_bytes);
+        let (reserve, _) = provider_memory_reserve_bytes(
+            args.memory_reserve.as_deref(),
+            hardware.memory.total_bytes.max(available),
+            false,
+        )?;
+        let usable = available.saturating_sub(reserve);
+        ensure!(
+            host_peak <= usable,
+            "model {} needs {} calibrated peak host memory but only {} is usable after reserve {}",
+            model.model_id,
+            human_bytes(host_peak),
+            human_bytes(usable),
+            human_bytes(reserve)
+        );
+    }
     if enclave.model_class != DEFAULT_MODEL_CLASS || requested_ctx == 0 {
         let memory_budget = provider_memory_budget(hardware, verdict, enclave, args)?;
         let estimate = provider_memory_estimate(
