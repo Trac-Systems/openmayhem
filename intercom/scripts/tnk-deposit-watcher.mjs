@@ -17,6 +17,7 @@ import {
   readLocalNetwork,
   sleep,
 } from './msb-local-common.mjs';
+import { waitForMinimumSignedLength } from './msb-reader-catchup.mjs';
 
 const scriptPath = fileURLToPath(import.meta.url);
 const DEFAULT_CURSOR = path.resolve('.mayhem-local', 'tnk-deposit-watcher.json');
@@ -399,17 +400,22 @@ export async function waitForDepositState(match, {
   return { verified: false, state };
 }
 
-async function scanMsbTransfers(msb, {
+export async function scanMsbTransfers(msb, {
   fromSignedLength,
   finalitySignedLengths,
   chunkSize,
   timeoutSec,
+  minimumSignedLength = fromSignedLength + 1,
+  sleepImpl = sleep,
 }) {
-  let confirmedLength = msb.state.getSignedLength();
-  for (let waited = 0; confirmedLength === 0 && waited < timeoutSec; waited += 1) {
-    await sleep(1000);
-    confirmedLength = msb.state.getSignedLength();
-  }
+  // ready() means the local Core opened; it does not mean a reused reader
+  // store has caught up to the network. Waiting only for nonzero permanently
+  // stranded an old cursor after a long service stop.
+  const confirmedLength = await waitForMinimumSignedLength(msb.state, {
+    minimumSignedLength,
+    timeoutSec,
+    sleepImpl,
+  });
   const safeEnd = Math.max(0, confirmedLength - finalitySignedLengths);
   if (safeEnd <= fromSignedLength) {
     return { confirmedLength, safeEnd, transfers: [] };
