@@ -54,6 +54,13 @@ function readJson(file, fallback = {}) {
   return JSON.parse(fs.readFileSync(file, 'utf8'));
 }
 
+async function closeMsb(msb) {
+  await Promise.race([
+    Promise.resolve().then(() => msb.close()).catch(() => undefined),
+    sleep(10_000),
+  ]);
+}
+
 function sha256(value) {
   return createHash('sha256').update(String(value)).digest('hex');
 }
@@ -408,7 +415,7 @@ async function tnkOperationalStatus(config) {
       checked_at: new Date().toISOString(),
     };
   } finally {
-    try { await msb.close(); } catch {}
+    await closeMsb(msb);
   }
 }
 
@@ -556,7 +563,7 @@ async function discoverTnkIncoming(config, intents) {
       updated_at: new Date().toISOString(),
     });
   } finally {
-    try { await msb.close(); } catch {}
+    await closeMsb(msb);
   }
 }
 
@@ -643,7 +650,7 @@ async function verifyTnkCustomerTransfer(intent, config) {
     }
     return evidence;
   } finally {
-    try { await msb.close(); } catch {}
+    await closeMsb(msb);
   }
 }
 
@@ -829,6 +836,7 @@ async function bridgeTap(config, work, checkpoint, rpc) {
 }
 
 async function processWork(config, work) {
+  console.log(JSON.stringify({ event: 'crypto_payment_processing', intent_id: work.intent.id, rail: work.intent.rail }));
   const checkpointFile = config.checkpointFile(work.intent.id);
   const checkpoint = readJson(checkpointFile, { schema_version: 1, intent_id: work.intent.id });
   if (checkpoint.intent_id !== work.intent.id) throw new ReviewWork('malformed_transfer');
@@ -845,12 +853,14 @@ async function processWork(config, work) {
   }
   checkpoint.external_evidence = serializeEvidence(external);
   atomicJson(checkpointFile, checkpoint);
+  console.log(JSON.stringify({ event: 'crypto_payment_external_verified', intent_id: work.intent.id, rail: work.intent.rail }));
   if (work.intent.late_submission) {
     throw new ReviewWork('late_submission', external);
   }
   const core = work.intent.rail === 'TAP'
     ? await bridgeTap(config, work, checkpoint, rpc ?? new TapRpc(config.tapRpcUrls, config.tapChainId))
     : await bridgeTnk(config, work, checkpoint);
+  console.log(JSON.stringify({ event: 'crypto_payment_core_backed', intent_id: work.intent.id, rail: work.intent.rail }));
   await config.api.evidence(work, { ...external, core });
   checkpoint.credited = true;
   checkpoint.credited_at = new Date().toISOString();
