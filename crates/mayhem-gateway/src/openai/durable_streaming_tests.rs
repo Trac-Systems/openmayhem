@@ -434,22 +434,49 @@ async fn checkpoint_evidence_survives_failure_restart_and_history_rotation() {
             .body
             .final_receipt
     );
-    assert!(reconcile_pending_gateway_job_once(&restarted, &job.id, &NoDelivery).await.is_err());
-    assert_eq!(restarted.jobs.lock_recover("jobs").get(&job.id, now_secs()).unwrap().unwrap().status,
-        GatewayJobStatus::ReconciliationPending, "a partial receipt alone is not terminal accounting");
+    assert!(
+        reconcile_pending_gateway_job_once(&restarted, &job.id, &NoDelivery)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        restarted
+            .jobs
+            .lock_recover("jobs")
+            .get(&job.id, now_secs())
+            .unwrap()
+            .unwrap()
+            .status,
+        GatewayJobStatus::ReconciliationPending,
+        "a partial receipt alone is not terminal accounting"
+    );
     let proof = failure_recovery::test_closed_proof(&receipt, &ack);
-    let app = axum::Router::new().route("/v1/state", axum::routing::get(
-        move |axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>| {
-            let proof = proof.clone();
-            async move {
-                let key = query.get("key").unwrap();
-                axum::Json(proof.as_object().unwrap().values().find(|state| state["key"].as_str() == Some(key.as_str())).unwrap().clone())
-            }
-        }));
+    let app = axum::Router::new().route(
+        "/v1/state",
+        axum::routing::get(
+            move |axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>| {
+                let proof = proof.clone();
+                async move {
+                    let key = query.get("key").unwrap();
+                    axum::Json(
+                        proof
+                            .as_object()
+                            .unwrap()
+                            .values()
+                            .find(|state| state["key"].as_str() == Some(key.as_str()))
+                            .unwrap()
+                            .clone(),
+                    )
+                }
+            },
+        ),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let restarted = restarted.with_canary_probe_contract_rpc(PeerRpcClient::new(format!("http://{address}/v1")).unwrap());
+    let restarted = restarted.with_canary_probe_contract_rpc(
+        PeerRpcClient::new(format!("http://{address}/v1")).unwrap(),
+    );
     let publisher = Arc::new(TestPublisher::default());
     let restarted = restarted.with_receipt_settlement_publisher(publisher.clone());
     reconcile_pending_gateway_job_once(&restarted, &job.id, &NoDelivery)

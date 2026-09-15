@@ -1597,7 +1597,10 @@ async def handle_load(payload):
         "n_vocab": int(vocab_size()),
         "kv_cache_size_tokens": kv_cache["size_tokens"],
         "kv_cache_max_concurrency": kv_cache["max_concurrency"],
-        "prefix_caching": config_value(config_value(engine.vllm_config, "cache_config"), "enable_prefix_caching") is True,
+        "prefix_caching": config_value(
+            config_value(config_value(engine, "vllm_config"), "cache_config"),
+            "enable_prefix_caching",
+        ) is True,
         "execution": execution_properties,
         "determinism": {
             "async_scheduling": False,
