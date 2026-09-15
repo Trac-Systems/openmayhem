@@ -1598,6 +1598,12 @@ pub trait EngineBackend {
     fn recover_component(&mut self) -> Result<ComponentRecovery> {
         Ok(ComponentRecovery::Unsupported)
     }
+    /// Ask an idle engine to release cached model and allocator memory without
+    /// tearing down the provider process. Backends that do not retain large
+    /// caches can leave this unsupported.
+    fn reclaim_idle_memory(&mut self) -> Result<bool> {
+        Ok(false)
+    }
     fn process_ids(&self) -> Vec<u32> {
         Vec::new()
     }

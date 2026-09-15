@@ -619,6 +619,17 @@ async def shutdown():
         await runner.cleanup()
 
 
+async def reclaim_memory():
+    if prompt_server is None:
+        return {"requested": False}
+    # This is the same supported path as ComfyUI's /free endpoint. The prompt
+    # worker owns its executor caches, so flags let it reset those caches and
+    # unload model weights on the correct thread after the queue is idle.
+    prompt_server.prompt_queue.set_flag("unload_models", True)
+    prompt_server.prompt_queue.set_flag("free_memory", True)
+    return {"requested": True}
+
+
 def dispatch(message):
     op = message.get("op")
     payload = message.get("payload")
@@ -626,6 +637,8 @@ def dispatch(message):
         return load(payload)
     if op == "run_workflow":
         return loop.run_until_complete(run_workflow(payload))
+    if op == "reclaim_memory":
+        return loop.run_until_complete(reclaim_memory())
     if op == "shutdown":
         loop.run_until_complete(shutdown())
         return {"shutdown": True}

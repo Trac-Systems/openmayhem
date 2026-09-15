@@ -86,6 +86,12 @@ struct WorkerWorkflowResult {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct WorkerMemoryReclaimResult {
+    requested: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WorkerArtifact {
     artifact_id: String,
     content_type: String,
@@ -216,6 +222,15 @@ impl EngineBackend for ComfyUiBackend {
             .as_ref()
             .map(|worker| vec![worker.child.id()])
             .unwrap_or_default()
+    }
+
+    fn reclaim_idle_memory(&mut self) -> Result<bool> {
+        let id = Self::next_request_id();
+        self.worker()?.send(id, "reclaim_memory", Value::Null)?;
+        let response: WorkerMemoryReclaimResult =
+            self.worker()?
+                .wait_response(id, LOAD_TIMEOUT, &CancellationToken::new())?;
+        Ok(response.requested)
     }
 
     fn tokenize(&self, _text: &str) -> Result<Tokenization> {

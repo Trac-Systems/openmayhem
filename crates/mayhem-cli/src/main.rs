@@ -321,6 +321,7 @@ const F13_DISK_RESERVE_FLOOR_BYTES: u64 = 2 * GIB_BYTES;
 const PROVIDER_MACOS_MEMORY_PRESSURE_STOP_LEVEL: i32 = 2;
 const DEFAULT_PROVIDER_ENGINE_WATCHDOG_RESTART_AFTER_MILLIS: u64 = 0;
 const DEFAULT_PROVIDER_ENGINE_WATCHDOG_RESTART_COOLDOWN_MILLIS: u64 = 30_000;
+const DEFAULT_PROVIDER_IDLE_MEMORY_RECLAIM_COOLDOWN_MILLIS: u64 = 30_000;
 const F13_MEMORY_CLAIM_TTL_SECONDS: u64 = 24 * 60 * 60;
 const VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT: u32 = 90;
 const VLLM_MEMORY_UTILIZATION_CUSHION_PCT: u32 = 5;
@@ -62143,6 +62144,9 @@ trait ProviderSessionResponder {
     fn recover_component(&mut self) -> Result<ComponentRecovery> {
         Ok(ComponentRecovery::Unsupported)
     }
+    fn reclaim_idle_memory(&mut self) -> Result<bool> {
+        Ok(false)
+    }
     fn supports_live_text_streaming(&self) -> bool {
         false
     }
@@ -62247,6 +62251,10 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
 
     fn recover_component(&mut self) -> Result<ComponentRecovery> {
         self.backend.recover_component().map_err(Into::into)
+    }
+
+    fn reclaim_idle_memory(&mut self) -> Result<bool> {
+        self.backend.reclaim_idle_memory().map_err(Into::into)
     }
 
     fn process_ids(&self) -> Vec<u32> {
@@ -80599,6 +80607,7 @@ async fn serve_provider_sessions(
     let mut draining = false;
     let mut local_drain_request = None::<ProviderDrainRequest>;
     let mut runtime_floor_reject: Option<ProviderRuntimeFloorRejection> = None;
+    let mut last_idle_memory_reclaim_at = None::<Instant>;
     let mut engine_watchdog_reject: Option<ProviderRuntimeFloorRejection> = None;
     let mut engine_recovery = ProviderEngineRecovery::new(
         provider_heartbeat_reconnect_initial,
@@ -80800,6 +80809,33 @@ async fn serve_provider_sessions(
                     None => {}
                 }
                 runtime_floor_reject = next_runtime_floor_reject;
+            }
+            if runtime_floor_reject.is_some()
+                && sessions.is_empty()
+                && last_idle_memory_reclaim_at.is_none_or(|last| {
+                    Instant::now().saturating_duration_since(last)
+                        >= Duration::from_millis(
+                            DEFAULT_PROVIDER_IDLE_MEMORY_RECLAIM_COOLDOWN_MILLIS,
+                        )
+                })
+            {
+                match responder.reclaim_idle_memory() {
+                    Ok(true) => {
+                        last_idle_memory_reclaim_at = Some(Instant::now());
+                        provider_session_debug(
+                            "provider requested idle engine memory reclamation after the runtime floor activated",
+                        );
+                    }
+                    Ok(false) => {
+                        last_idle_memory_reclaim_at = Some(Instant::now());
+                    }
+                    Err(err) => {
+                        last_idle_memory_reclaim_at = Some(Instant::now());
+                        provider_session_debug(format!(
+                            "idle provider memory reclamation failed; continuing to refuse new sessions safely: {err:#}"
+                        ));
+                    }
+                }
             }
             let watchdog_action = if draining || engine_recovery.pending() {
                 ProviderEngineWatchdogAction::Healthy
