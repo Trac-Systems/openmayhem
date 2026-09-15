@@ -434,7 +434,7 @@ async function reportOperationalStatus(config) {
   }
 }
 
-async function runCommand(command, args, { api, work, timeoutMs = 1_200_000 } = {}) {
+async function runCommand(command, args, { timeoutMs = 1_200_000 } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(command, args, { cwd: repoRoot, env: process.env, stdio: ['ignore', 'pipe', 'pipe'] });
     let stdout = '';
@@ -443,11 +443,9 @@ async function runCommand(command, args, { api, work, timeoutMs = 1_200_000 } = 
     child.stdout.on('data', (chunk) => { stdout = append(stdout, chunk); });
     child.stderr.on('data', (chunk) => { stderr = append(stderr, chunk); });
     const timeout = setTimeout(() => child.kill('SIGTERM'), timeoutMs);
-    const renew = api && work ? setInterval(() => void api.renew(work).catch(() => undefined), 30_000) : null;
-    child.on('error', (error) => { clearTimeout(timeout); if (renew) clearInterval(renew); reject(error); });
+    child.on('error', (error) => { clearTimeout(timeout); reject(error); });
     child.on('close', (code, signal) => {
       clearTimeout(timeout);
-      if (renew) clearInterval(renew);
       if (code === 0) resolve({ stdout, stderr });
       else reject(new Error(`command exited ${code ?? signal ?? 'unknown'}`));
     });
@@ -858,6 +856,18 @@ async function processWork(config, work) {
   atomicJson(checkpointFile, checkpoint);
 }
 
+async function processWorkWithLease(config, work) {
+  const renew = setInterval(
+    () => void config.api.renew(work).catch(() => undefined),
+    30_000,
+  );
+  try {
+    await processWork(config, work);
+  } finally {
+    clearInterval(renew);
+  }
+}
+
 function reviveEvidence(value) {
   return {
     ...value,
@@ -948,7 +958,7 @@ async function main() {
         await sleep(config.intervalSeconds * 1_000);
         continue;
       }
-      await processWork(config, work);
+      await processWorkWithLease(config, work);
       console.log(JSON.stringify({ event: 'crypto_payment_credited', intent_id: work.intent.id, rail: work.intent.rail }));
     } catch (error) {
       if (work && error instanceof ReviewWork) {
