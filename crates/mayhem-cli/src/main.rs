@@ -80810,7 +80810,8 @@ async fn serve_provider_sessions(
                 }
                 runtime_floor_reject = next_runtime_floor_reject;
             }
-            if runtime_floor_reject.is_some()
+            if runtime_floor_monitor.memory_check().is_some()
+                && !engine_recovery.pending()
                 && sessions.is_empty()
                 && last_idle_memory_reclaim_at.is_none_or(|last| {
                     Instant::now().saturating_duration_since(last)
