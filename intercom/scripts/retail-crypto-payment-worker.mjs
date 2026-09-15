@@ -424,6 +424,15 @@ async function reportOperationalStatus(config) {
     try {
       await config.api.status(await collect(config));
     } catch (error) {
+      const detail = String(error?.message ?? error)
+        .replace(/https?:\/\/[^\s"']+/g, '<redacted-endpoint>')
+        .slice(0, 500);
+      console.error(JSON.stringify({
+        event: 'crypto_payment_status_unavailable',
+        rail,
+        code: error instanceof RetryWork ? error.code : 'status_unavailable',
+        detail,
+      }));
       const core = await coreWorkingFunds(config, rail).catch(() => ({ balanceAu: 0n, heldAu: 0n, signedLength: 0 }));
       await config.api.status({
         worker_id: config.workerId,
