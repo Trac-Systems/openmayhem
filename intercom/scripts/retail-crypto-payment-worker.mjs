@@ -162,14 +162,25 @@ class TapRpc {
 
   async call(method, params) {
     if (!this.selected) await this.select();
-    try {
-      return await this.callUrl(this.selected, method, params);
-    } catch {
-      this.selected = null;
-      this.selectedIndex = null;
-      await this.select();
-      return this.callUrl(this.selected, method, params);
+    const preferred = this.selectedIndex ?? 0;
+    const order = [preferred, ...this.urls.map((_url, index) => index).filter((index) => index !== preferred)];
+    let lastError = null;
+    for (const index of order) {
+      const candidate = this.urls[index];
+      try {
+        const chainId = parseHexInt(await this.callUrl(candidate, 'eth_chainId', []), 'Ethereum chain id');
+        if (chainId !== this.expectedChainId) continue;
+        const result = await this.callUrl(candidate, method, params);
+        this.selected = candidate;
+        this.selectedIndex = index;
+        return result;
+      } catch (error) {
+        lastError = error;
+      }
     }
+    this.selected = null;
+    this.selectedIndex = null;
+    throw lastError ?? new RetryWork('rpc_unavailable', 30);
   }
 
   async callUrl(url, method, params) {
@@ -343,20 +354,29 @@ async function tapOperationalStatus(config) {
 }
 
 async function tnkOperationalStatus(config) {
-  const msbConfig = createLocalConfig({
-    network: config.tnkNetwork,
-    stateDir: path.join(config.stateDir, 'tnk-health-reader'),
-    storeName: `${config.tnkReaderStore}-health`,
-    channel: process.env.MSB_CHANNEL || undefined,
-    bootstrap: process.env.MSB_BOOTSTRAP || undefined,
-    enableWallet: false,
-  });
-  const msb = new MainSettlementBus(msbConfig);
+  if (!config.tnkHealthMsb) {
+    const msbConfig = createLocalConfig({
+      network: config.tnkNetwork,
+      stateDir: path.join(config.stateDir, 'tnk-health-reader'),
+      storeName: `${config.tnkReaderStore}-health`,
+      channel: process.env.MSB_CHANNEL || undefined,
+      bootstrap: process.env.MSB_BOOTSTRAP || undefined,
+      enableWallet: false,
+    });
+    const candidate = new MainSettlementBus(msbConfig);
+    try {
+      await Promise.race([
+        candidate.ready(),
+        sleep(config.readerTimeoutSeconds * 1_000).then(() => { throw new RetryWork('reader_unavailable', 30); }),
+      ]);
+      config.tnkHealthMsb = candidate;
+    } catch (error) {
+      await closeMsb(candidate);
+      throw error;
+    }
+  }
+  const msb = config.tnkHealthMsb;
   try {
-    await Promise.race([
-      msb.ready(),
-      sleep(config.readerTimeoutSeconds * 1_000).then(() => { throw new RetryWork('reader_unavailable', 30); }),
-    ]);
     const [payments, rate, payout] = await Promise.all([
       readCore(config.coreRpc, 'payments/current'),
       readCore(config.coreRpc, 'rate/latest'),
@@ -414,8 +434,12 @@ async function tnkOperationalStatus(config) {
       last_error: null,
       checked_at: new Date().toISOString(),
     };
-  } finally {
-    await closeMsb(msb);
+  } catch (error) {
+    if (error instanceof RetryWork && error.code === 'reader_unavailable') {
+      config.tnkHealthMsb = null;
+      await closeMsb(msb);
+    }
+    throw error;
   }
 }
 
