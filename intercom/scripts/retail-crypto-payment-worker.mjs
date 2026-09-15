@@ -957,7 +957,16 @@ async function main() {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
+function isDirectExecution(argument) {
+  if (!argument) return false;
+  try {
+    return fs.realpathSync(argument) === fs.realpathSync(scriptPath);
+  } catch {
+    return path.resolve(argument) === scriptPath;
+  }
+}
+
+if (isDirectExecution(process.argv[1])) {
   main().catch((error) => {
     console.error(error?.message ?? String(error));
     process.exit(1);
