@@ -2140,7 +2140,7 @@ struct PayRailArgs {
 
 #[derive(Debug, Parser)]
 struct PayTnkArgs {
-    /// USD amount of Mayhem credit to target, with up to 18 fractional digits.
+    /// USD amount of Mayhem credit to target, for example 10 or 10.25.
     #[arg(long)]
     amount: String,
 
@@ -41220,7 +41220,7 @@ async fn pay_tnk(args: PayTnkArgs) -> Result<()> {
         wallet_password,
     )
     .await?;
-    let amount_au = parse_precise_usd_amount_to_au(&args.amount, "--amount")?;
+    let amount_au = parse_usd_amount_to_au(&args.amount)?;
     let rpc_url = resolve_cli_rpc_url(Some(&home), args.rpc_url.as_deref())?;
     if args.submit_intent || args.submit_transfer {
         require_secure_fund_rpc_url(&rpc_url)?;

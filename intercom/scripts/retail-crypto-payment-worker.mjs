@@ -655,10 +655,14 @@ async function verifyTnkCustomerTransfer(intent, config) {
 }
 
 function auToUsd(au) {
-  const micro = BigInt(au) / 1_000_000_000_000n;
-  const whole = micro / 1_000_000n;
-  const fraction = (micro % 1_000_000n).toString().padStart(6, '0').replace(/0+$/, '');
-  return fraction ? `${whole}.${fraction}` : whole.toString();
+  // Core's TNK deposit CLI accepts cents. Round the backing lot upward so
+  // every micro-valued retail credit is fully covered; the sub-cent remainder
+  // stays in the platform buyer's TNK balance for later purchases.
+  const centAu = 10_000_000_000_000_000n;
+  const cents = (BigInt(au) + centAu - 1n) / centAu;
+  const whole = cents / 100n;
+  const fraction = (cents % 100n).toString().padStart(2, '0');
+  return `${whole}.${fraction}`;
 }
 
 async function waitForCoreRecord(config, work, key, expectedAu, timeoutSeconds = 600) {
