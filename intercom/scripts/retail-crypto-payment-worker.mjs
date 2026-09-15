@@ -592,6 +592,7 @@ async function verifyTapCustomerTransfer(intent, rpc) {
 
 async function verifyTnkCustomerTransfer(intent, config) {
   const minimumSignedLength = await coreMsbSignedLength(config.coreRpc);
+  const hash = normalizeHex64(intent.transaction_hash, 'TNK transaction hash');
   const msbConfig = createLocalConfig({
     network: config.tnkNetwork,
     stateDir: path.join(config.stateDir, 'tnk-reader'),
@@ -614,8 +615,8 @@ async function verifyTnkCustomerTransfer(intent, config) {
       chunkSize: 500,
       timeoutSec: config.readerTimeoutSeconds,
       minimumSignedLength,
+      matchHash: hash,
     });
-    const hash = normalizeHex64(intent.transaction_hash, 'TNK transaction hash');
     const transfer = scan.transfers.find((candidate) => candidate.hash === hash);
     if (!transfer) throw new RetryWork('transfer_pending', 20);
     const confirmations = Math.max(0, scan.confirmedLength - Number(transfer.confirmed_length) + 1);

@@ -406,6 +406,7 @@ export async function scanMsbTransfers(msb, {
   chunkSize,
   timeoutSec,
   minimumSignedLength = fromSignedLength + 1,
+  matchHash = null,
   sleepImpl = sleep,
 }) {
   // ready() means the local Core opened; it does not mean a reused reader
@@ -426,6 +427,7 @@ export async function scanMsbTransfers(msb, {
     const end = Math.min(start + chunkSize, safeEnd);
     const { hashes } = await msb.getTxHashes(start, end);
     for (const hashEntry of hashes) {
+      if (matchHash && String(hashEntry.hash).toLowerCase() !== matchHash) continue;
       const details = await msb.getTxDetails(hashEntry.hash);
       const transfer = transferFromTxDetails(hashEntry, details);
       if (transfer) transfers.push(transfer);
