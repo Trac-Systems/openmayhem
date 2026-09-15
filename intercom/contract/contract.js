@@ -5473,9 +5473,39 @@ class MayhemContract extends Contract {
         current.paid_cum_au !== liability.paid_cum_au_before) {
       return new Error('Targeted payout preparation liability watermark mismatch.');
     }
+    const provider = await this.get(`prov/${liability.provider}`);
+    if (!provider ||
+        (provider.status !== 'active' && provider.status !== 'banned')) {
+      return new Error('Targeted payout preparation provider status is not payable.');
+    }
+    const params = await this.activeParamsAt(value.prepared_at, [
+      'holdback_epochs',
+      'challenge_epochs',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
+    ]);
+    if (params instanceof Error) return params;
+    const probeGate = await this.probeGateForEarning(
+      liability.provider,
+      current,
+      params
+    );
+    if (probeGate instanceof Error) return probeGate;
+    const lockedEpochs = this.providerLockedEarningEpochs(provider, params);
+    if (lockedEpochs instanceof Error) return lockedEpochs;
+    const disputeGate = await this.providerHasOpenDispute(liability.provider);
+    if (disputeGate instanceof Error) return disputeGate;
+    const refreshed = this.refreshEarningHoldback(
+      current,
+      value.epoch,
+      lockedEpochs,
+      probeGate,
+      disputeGate
+    );
+    if (refreshed instanceof Error) return refreshed;
     const payable = this.safeSubAu(
-      this.safeSubAu(current.total_au, current.held_au),
-      current.paid_cum_au
+      this.safeSubAu(refreshed.total_au, refreshed.held_au),
+      refreshed.paid_cum_au
     );
     if (payable instanceof Error) return payable;
     if (this.compareAu(liability.liability_au, payable) > 0) {
