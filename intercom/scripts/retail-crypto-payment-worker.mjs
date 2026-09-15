@@ -665,6 +665,14 @@ function auToUsd(au) {
   return `${whole}.${fraction}`;
 }
 
+function e18ToDecimal(amount) {
+  const value = BigInt(amount);
+  if (value <= 0n) throw new RetryWork('core_unavailable', 60, true);
+  const whole = value / TOKEN_SCALE;
+  const fraction = (value % TOKEN_SCALE).toString().padStart(18, '0').replace(/0+$/, '');
+  return fraction ? `${whole}.${fraction}` : whole.toString();
+}
+
 async function waitForCoreRecord(config, work, key, expectedAu, timeoutSeconds = 600) {
   const deadline = Date.now() + timeoutSeconds * 1_000;
   while (Date.now() <= deadline) {
@@ -695,17 +703,34 @@ async function bridgeTnk(config, work, checkpoint) {
   const creditedKey = `dep/tnk-credited/${memo}`;
   let credited = await readCore(config.coreRpc, creditedKey);
   if (!credited.value) {
-    const pending = await readCore(config.coreRpc, `dep/pending/${memo}`);
+    const pendingKey = `dep/pending/${memo}`;
+    let pending = await readCore(config.coreRpc, pendingKey);
     if (!pending.value) {
       await runCommand(config.mayhemBin, [...common.slice(0, -1), '--submit-intent', '--json'], { api: config.api, work });
+      const deadline = Date.now() + config.bridgeTimeoutSeconds * 1_000;
+      while (!pending.value && Date.now() <= deadline) {
+        await config.api.renew(work);
+        await sleep(5_000);
+        pending = await readCore(config.coreRpc, pendingKey);
+      }
     }
+    const locked = pending.value;
+    if (!locked || String(locked.user).toLowerCase() !== config.platformBuyer ||
+        String(locked.msb_network).toLowerCase() !== config.tnkNetwork ||
+        normalizeTnkAddress(locked.msb_from, config.tnkNetwork, 'TNK bridge sender') !== config.tnkCollection ||
+        normalizeTnkAddress(locked.treasury_address, config.tnkNetwork, 'TNK bridge treasury') !==
+          normalizeTnkAddress(dry.treasury_address, config.tnkNetwork, 'TNK bridge treasury') ||
+        BigInt(locked.quoted_au ?? 0) < BigInt(intent.expected_core_au)) {
+      throw new RetryWork('core_unavailable', 60, true);
+    }
+    const lockedTnkE18 = BigInt(locked.tnk_e18 ?? 0);
     const transferArgs = [
       path.join(repoRoot, 'crates/mayhem-cli/src/msb-transfer-helper.mjs'),
       'settlement-transfer', '--network', config.tnkNetwork,
       '--stores-directory', config.msbStoresDirectory, '--store-name', config.msbStoreName,
-      '--to', dry.treasury_address, '--amount', dry.tnk.amount,
-      '--operation-id', sha256(`openmayhem-retail-tnk-bridge-v1/${intent.id}`),
-      '--journal-file', path.join(config.stateDir, 'tnk-journals', `${intent.id}.json`),
+      '--to', locked.treasury_address, '--amount', e18ToDecimal(lockedTnkE18),
+      '--operation-id', sha256(`openmayhem-retail-tnk-bridge-v2/${intent.id}/${lockedTnkE18}`),
+      '--journal-file', path.join(config.stateDir, 'tnk-journals', `${intent.id}-${lockedTnkE18}.json`),
       '--wallet-password-file', config.walletPasswordFile,
       '--timeout-seconds', String(config.bridgeTimeoutSeconds),
     ];
