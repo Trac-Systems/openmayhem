@@ -17670,6 +17670,7 @@ fn seal_direct_session_request_body_with_workflow_output(
         "schema_version": 1,
         "endpoint_family": endpoint_family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
+        "endpoint_contract_canonical_fingerprint": mayhem_proto::endpoint_contract_canonical_fingerprint(contract),
         "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(&contract_request),
         "transport_request_fingerprint": transport_request_fingerprint,
     });
