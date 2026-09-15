@@ -1365,6 +1365,12 @@ and allocator memory when a provider's runtime floor activates. ComfyUI uses
 its supported unload and free-memory control path, restoring cohosted provider
 admission without interrupting an active workflow.
 
+The `0.2.222` source release adds a canonical endpoint-contract fingerprint to
+the existing request envelope. Updated providers prefer the canonical value,
+while the legacy fingerprint remains present for older peers. Equivalent
+contracts now survive JSON object reordering and JavaScript number round trips
+without disrupting mixed-version routes.
+
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
 local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON

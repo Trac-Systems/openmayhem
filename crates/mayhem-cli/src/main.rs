@@ -18833,6 +18833,7 @@ fn catalog_endpoint_calibration_seal(
         "schema_version": 1,
         "endpoint_family": contract.family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
+        "endpoint_contract_canonical_fingerprint": mayhem_proto::endpoint_contract_canonical_fingerprint(contract),
         "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(request),
         "transport_request_fingerprint": transport_fingerprint,
     });
@@ -91119,13 +91120,22 @@ fn provider_verify_endpoint_request<'a>(
         .iter()
         .find(|contract| contract.family == family)
         .with_context(|| format!("provider model does not expose endpoint family {family}"))?;
-    let declared_contract_fingerprint = provider_session_request_result(
+    let legacy_contract_fingerprint = provider_session_request_result(
         metadata
             .get("endpoint_contract_fingerprint")
             .and_then(Value::as_str)
             .context("provider request missing endpoint contract fingerprint"),
     )?;
-    if declared_contract_fingerprint != mayhem_proto::endpoint_contract_fingerprint(contract) {
+    let contract_fingerprint_matches = metadata
+        .get("endpoint_contract_canonical_fingerprint")
+        .and_then(Value::as_str)
+        .map(|fingerprint| {
+            fingerprint == mayhem_proto::endpoint_contract_canonical_fingerprint(contract)
+        })
+        .unwrap_or_else(|| {
+            legacy_contract_fingerprint == mayhem_proto::endpoint_contract_fingerprint(contract)
+        });
+    if !contract_fingerprint_matches {
         return Err(provider_session_request_error(
             "provider request endpoint contract fingerprint does not match the local signed catalog",
         ));
@@ -91330,6 +91340,7 @@ fn provider_seal_local_contract_request(
         "schema_version": 1,
         "endpoint_family": family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
+        "endpoint_contract_canonical_fingerprint": mayhem_proto::endpoint_contract_canonical_fingerprint(contract),
         "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(&request),
         "transport_request_fingerprint": transport_fingerprint,
     });
@@ -118128,6 +118139,34 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
         assert_eq!(sealed["kind"], json!("workflow_generation"));
         provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter).unwrap();
+        let mut legacy_order_drift = sealed.clone();
+        legacy_order_drift["mayhem_contract"]["endpoint_contract_fingerprint"] =
+            json!("ff".repeat(32));
+        provider_verify_endpoint_request(
+            &legacy_order_drift,
+            Some(&model.model_id),
+            &model.adapter,
+        )
+        .expect("the canonical fingerprint supersedes a representation-specific legacy hash");
+        legacy_order_drift["mayhem_contract"]
+            .as_object_mut()
+            .unwrap()
+            .remove("endpoint_contract_canonical_fingerprint");
+        assert!(provider_verify_endpoint_request(
+            &legacy_order_drift,
+            Some(&model.model_id),
+            &model.adapter,
+        )
+        .is_err());
+        let mut bad_canonical = sealed.clone();
+        bad_canonical["mayhem_contract"]["endpoint_contract_canonical_fingerprint"] =
+            json!("ee".repeat(32));
+        assert!(provider_verify_endpoint_request(
+            &bad_canonical,
+            Some(&model.model_id),
+            &model.adapter,
+        )
+        .is_err());
 
         model.model_class = MODEL_CLASS_WORKFLOW.to_owned();
         model.caps.output_modality = Some("image".to_owned());

@@ -4069,6 +4069,21 @@ pub fn endpoint_contract_fingerprint(contract: &EndpointFamilyContract) -> Strin
     blake3::hash(&encoded).to_hex().to_string()
 }
 
+/// Hashes an endpoint contract after canonicalizing nested JSON objects and
+/// JavaScript-roundtrippable numbers. The legacy contract fingerprint remains
+/// part of the wire envelope for compatibility with existing providers; peers
+/// that understand this fingerprint use it so Cargo feature unification,
+/// architecture-specific builds, and JavaScript relays cannot change the
+/// meaning of an otherwise identical signed contract.
+#[must_use]
+pub fn endpoint_contract_canonical_fingerprint(contract: &EndpointFamilyContract) -> String {
+    let value = serde_json::to_value(contract).expect("endpoint contracts are JSON serializable");
+    let canonical = javascript_roundtrip_stable_value(&value);
+    blake3::hash(canonical.to_string().as_bytes())
+        .to_hex()
+        .to_string()
+}
+
 /// Hashes the semantic JSON value while remaining stable across JavaScript relays.
 /// JavaScript serializes integral JSON numbers such as `1.0` as `1`; those values
 /// must compare equally without making changed integers or non-integral values equal.
@@ -5452,6 +5467,40 @@ mod tests {
         assert_ne!(
             endpoint_request_fingerprint(&json!({"cfg_scale": 1.5})),
             endpoint_request_fingerprint(&json!({"cfg_scale": 1.500_000_1}))
+        );
+    }
+
+    #[test]
+    fn canonical_contract_fingerprint_ignores_nested_object_order_and_js_numbers() {
+        let mut rust_contract =
+            endpoint_family_contract_template(ENDPOINT_MAYHEM_COMFY_WORKFLOWS).unwrap();
+        let mut relayed_contract = rust_contract.clone();
+        rust_contract
+            .request_attribute_specs
+            .get_mut("workflow")
+            .unwrap()
+            .calibration_values = vec![serde_json::from_str(
+            r#"{"1":{"strength":1.0},"10":{"shift":3.0},"2":{"seed":7}}"#,
+        )
+        .unwrap()];
+        relayed_contract
+            .request_attribute_specs
+            .get_mut("workflow")
+            .unwrap()
+            .calibration_values =
+            vec![
+                serde_json::from_str(r#"{"1":{"strength":1},"2":{"seed":7},"10":{"shift":3}}"#)
+                    .unwrap(),
+            ];
+
+        assert_ne!(
+            endpoint_contract_fingerprint(&rust_contract),
+            endpoint_contract_fingerprint(&relayed_contract),
+            "legacy fingerprints reproduce the order-sensitive production failure"
+        );
+        assert_eq!(
+            endpoint_contract_canonical_fingerprint(&rust_contract),
+            endpoint_contract_canonical_fingerprint(&relayed_contract)
         );
     }
 
