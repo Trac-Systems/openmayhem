@@ -785,12 +785,34 @@ async function bridgeTap(config, work, checkpoint, rpc) {
   const amountWei = ceilDiv(BigInt(intent.expected_core_au) * TOKEN_SCALE, rateAu) + tapDust(intent.id);
   checkpoint.tap_bridge_amount_wei = amountWei.toString();
   atomicJson(config.checkpointFile(intent.id), checkpoint);
-  const common = [
-    'pay', 'tap', '--amount-wei', amountWei.toString(), '--home', config.buyerHome,
-    '--peer-rpc-url', config.coreRpc, '--wallet-password-file', config.walletPasswordFile,
-    '--eth-rpc', rpc.selected, '--json',
-  ];
-  const dry = jsonOutput((await runCommand(config.mayhemBin, common, { api: config.api, work })).stdout);
+  const preferred = rpc.selectedIndex ?? 0;
+  const rpcOrder = [preferred, ...config.tapRpcUrls.map((_url, index) => index).filter((index) => index !== preferred)];
+  let common = null;
+  let dry = null;
+  let lastDryError = null;
+  for (const index of rpcOrder) {
+    const candidate = config.tapRpcUrls[index];
+    try {
+      const chainId = parseHexInt(await rpc.callUrl(candidate, 'eth_chainId', []), 'Ethereum chain id');
+      if (chainId !== BigInt(config.tapChainId)) continue;
+      const candidateArgs = [
+        'pay', 'tap', '--amount-wei', amountWei.toString(), '--home', config.buyerHome,
+        '--peer-rpc-url', config.coreRpc, '--wallet-password-file', config.walletPasswordFile,
+        '--eth-rpc', candidate, '--json',
+      ];
+      dry = jsonOutput((await runCommand(config.mayhemBin, candidateArgs, { api: config.api, work })).stdout);
+      common = candidateArgs;
+      rpc.selected = candidate;
+      rpc.selectedIndex = index;
+      break;
+    } catch (error) {
+      lastDryError = error;
+    }
+  }
+  if (!dry || !common) {
+    if (lastDryError instanceof ReviewWork || lastDryError instanceof RetryWork) throw lastDryError;
+    throw new RetryWork('rpc_unavailable', 30, true);
+  }
   let buyer;
   try {
     ({ ethereumAccount: buyer } = validateTapBridgePreflight(dry, {
