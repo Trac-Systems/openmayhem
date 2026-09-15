@@ -564,9 +564,18 @@ async function discoverTnkIncoming(config, intents) {
 
 async function discoverIncoming(config) {
   for (const rail of ['TAP', 'TNK']) {
-    const intents = (await config.api.discovery(rail))?.intents ?? [];
-    if (rail === 'TAP') await discoverTapIncoming(config, intents);
-    else await discoverTnkIncoming(config, intents);
+    try {
+      const intents = (await config.api.discovery(rail))?.intents ?? [];
+      if (rail === 'TAP') await discoverTapIncoming(config, intents);
+      else await discoverTnkIncoming(config, intents);
+    } catch (error) {
+      const detail = String(error?.message ?? error)
+        .replace(/https?:\/\/\S+/g, '<url>')
+        .slice(0, 300);
+      console.error(JSON.stringify({
+        event: 'crypto_payment_discovery_unavailable', rail, detail,
+      }));
+    }
   }
 }
 
