@@ -751,7 +751,10 @@ async function bridgeTnk(config, work, checkpoint) {
 }
 
 function tapDust(intentId) {
-  return BigInt(`0x${sha256(`openmayhem-retail-tap-dust-v1/${intentId}`).slice(0, 16)}`) + 1n;
+  // Keep deposits unique without materially changing what the platform funds.
+  // Ten hex digits provide about one trillion distinct wei values while the
+  // maximum surcharge stays below 0.0000011 TAP.
+  return BigInt(`0x${sha256(`openmayhem-retail-tap-dust-v1/${intentId}`).slice(0, 10)}`) + 1n;
 }
 
 async function findTapDeposit(rpc, pool, buyer, amountWei, lookbackBlocks) {
@@ -782,7 +785,12 @@ async function bridgeTap(config, work, checkpoint, rpc) {
       String(tap.token_address).toLowerCase() !== String(intent.token_contract).toLowerCase()) {
     throw new RetryWork('core_unavailable', 60, true);
   }
-  const amountWei = ceilDiv(BigInt(intent.expected_core_au) * TOKEN_SCALE, rateAu) + tapDust(intent.id);
+  const calculatedAmountWei = ceilDiv(BigInt(intent.expected_core_au) * TOKEN_SCALE, rateAu) + tapDust(intent.id);
+  // Once submission starts, its uniquely dusted amount is the recovery key.
+  // Before broadcast, refresh it from the current canonical rate.
+  const amountWei = checkpoint.tap_submission_started_at
+    ? BigInt(checkpoint.tap_bridge_amount_wei)
+    : calculatedAmountWei;
   checkpoint.tap_bridge_amount_wei = amountWei.toString();
   atomicJson(config.checkpointFile(intent.id), checkpoint);
   const preferred = rpc.selectedIndex ?? 0;
