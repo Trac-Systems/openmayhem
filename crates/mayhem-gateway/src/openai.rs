@@ -217,6 +217,7 @@ const MAX_ASYNC_ARTIFACT_ROUTE_WAIT_MS: u64 = 60 * 60 * 1000;
 const ROUTE_WAIT_POLL_MS: u64 = 1_000;
 const SESSION_OPEN_REPLAY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS: u64 = 1_024;
+const EMBEDDING_SPECIAL_TOKEN_ALLOWANCE_PER_INPUT: u64 = 16;
 const DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN: usize = 256;
 const DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN: usize =
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN as usize;
@@ -38255,7 +38256,18 @@ fn estimate_max_spend_au(
 }
 
 fn estimate_embedding_max_spend_au(price: &PriceRefAu, inputs: &[String]) -> MoneyAu {
-    let usage = ReceiptUsage::text(embedding_input_token_count(inputs), 0);
+    // Routing can use the cheap whitespace estimate, but the signed spend ceiling
+    // must cover the provider's exact tokenizer result. UTF-8 bytes bound the
+    // byte-fallback tokens, while the fixed allowance covers model-added special
+    // tokens even for a one-byte input.
+    let input_token_upper_bound = inputs.iter().fold(0_u64, |total, input| {
+        total.saturating_add(
+            u64::try_from(input.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(EMBEDDING_SPECIAL_TOKEN_ALLOWANCE_PER_INPUT),
+        )
+    });
+    let usage = ReceiptUsage::text(input_token_upper_bound, 0);
     calculate_au_owed(price, &usage).max(1_000)
 }
 
@@ -50000,6 +50012,47 @@ mod tests {
             let response = artifact_generation_response_value(&request, &run);
             assert_eq!(response["object"], json!(expected_object));
             assert_eq!(response["data"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn embedding_spend_ceiling_covers_special_and_subword_tokens() {
+        let price = PriceRefAu {
+            denom: "au_usd".to_owned(),
+            ver: 1,
+            rate_map: vec![RateMapEntry {
+                unit: USAGE_INPUT_TOKEN.to_owned(),
+                per_unit_au: 60_000_000_000_000,
+                granularity: 1_000,
+            }],
+            per_req_au: 0,
+            min_session_au: 0,
+            derivation: None,
+            history: Vec::new(),
+        };
+        let cases = [
+            (vec!["a".to_owned()], 2),
+            (
+                vec![
+                    "OpenMayhem embedding rollout smoke A".to_owned(),
+                    "OpenMayhem embedding rollout smoke B".to_owned(),
+                ],
+                16,
+            ),
+        ];
+
+        for (inputs, exact_provider_tokens) in cases {
+            let whitespace_ceiling = calculate_au_owed(
+                &price,
+                &ReceiptUsage::text(embedding_input_token_count(&inputs), 0),
+            );
+            let exact_provider_receipt =
+                calculate_au_owed(&price, &ReceiptUsage::text(exact_provider_tokens, 0));
+            assert!(exact_provider_receipt > whitespace_ceiling);
+            assert!(
+                exact_provider_receipt <= estimate_embedding_max_spend_au(&price, &inputs),
+                "exact provider token usage must fit the signed spend ceiling"
+            );
         }
     }
 
