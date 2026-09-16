@@ -53770,6 +53770,7 @@ async fn canonicalize_fiat_settlement_plan(
                                 "liability_au": money_au_json(output.liability_au),
                             }),
                             None,
+                            false,
                             max_attempts,
                             retry_ms,
                         )
@@ -53825,6 +53826,7 @@ async fn canonicalize_fiat_settlement_plan(
                             "liability_au": money_au_json(output.liability_au),
                         }),
                         None,
+                        false,
                         max_attempts,
                         retry_ms,
                     )
@@ -54541,6 +54543,7 @@ async fn stripe_create_fx_quote(
     lock_duration: &str,
     operation_identity: &Value,
     idempotency_key_override: Option<&str>,
+    allow_expired_valuation_quote: bool,
     max_attempts: u32,
     retry_ms: u64,
 ) -> Result<StripeFxQuote> {
@@ -54656,18 +54659,43 @@ async fn stripe_create_fx_quote(
                 "unlocked Stripe FX quote is not usable"
             );
         } else {
-            let now = unix_epoch_seconds()?;
-            ensure!(
-                quote.lock_status == "active"
-                    && quote
-                        .expires_at
-                        .is_some_and(|expires| expires > now.saturating_add(15)),
-                "Stripe FX quote is not active long enough to create a transfer"
-            );
+            validate_locked_stripe_fx_quote(
+                &quote,
+                lock_duration,
+                unix_epoch_seconds()?,
+                allow_expired_valuation_quote,
+            )?;
         }
         return Ok(quote);
     }
     unreachable!("positive max_attempts checked by caller")
+}
+
+fn validate_locked_stripe_fx_quote(
+    quote: &StripeFxQuote,
+    requested_lock_duration: &str,
+    now: u64,
+    allow_expired_valuation_quote: bool,
+) -> Result<()> {
+    let expires_at = quote
+        .expires_at
+        .context("locked Stripe FX quote is missing its expiry")?;
+    ensure!(
+        quote.lock_duration == requested_lock_duration && expires_at > quote.created,
+        "Stripe FX quote lock does not match its request"
+    );
+    if allow_expired_valuation_quote {
+        ensure!(
+            matches!(quote.lock_status.as_str(), "active" | "expired"),
+            "Stripe FX valuation quote has an invalid lock status"
+        );
+    } else {
+        ensure!(
+            quote.lock_status == "active" && expires_at > now.saturating_add(15),
+            "Stripe FX quote is not active long enough to create a transfer"
+        );
+    }
+    Ok(())
 }
 
 async fn stripe_retrieve_fx_quote(
@@ -55233,6 +55261,7 @@ async fn stripe_create_transfer_verified(
                         "operation": operation,
                     }),
                     Some(&journal.quote_idempotency_key),
+                    source_currency == destination_currency,
                     max_attempts,
                     retry_ms,
                 )
@@ -56700,6 +56729,7 @@ async fn create_targeted_fiat_quote(
             "attempt_no": attempt_no,
         }),
         Some(&idempotency_key),
+        source_currency == destination_currency,
         max_attempts,
         retry_ms,
     )
@@ -57105,6 +57135,7 @@ async fn stripe_operator_fee_evidence(
                 "liability_au": money_au_json(output.liability_au),
             }),
             None,
+            false,
             max_attempts,
             retry_ms,
         )
@@ -105178,6 +105209,28 @@ status: linked
             stripe_api_error_code(r#"{"error":{"code":"FX_QUOTE_EXPIRED"}}"#),
             None
         );
+    }
+
+    #[test]
+    fn expired_locked_quote_is_recoverable_only_as_valuation_evidence() {
+        let quote = StripeFxQuote {
+            id: "fxq_expired_valuation".to_owned(),
+            created: 100,
+            expires_at: Some(400),
+            lock_duration: "five_minutes".to_owned(),
+            lock_status: "expired".to_owned(),
+            to_currency: "eur".to_owned(),
+            usage_type: "transfer".to_owned(),
+            usage_destination: Some("acct_provider".to_owned()),
+            rates: BTreeMap::new(),
+        };
+
+        let transfer_error =
+            validate_locked_stripe_fx_quote(&quote, "five_minutes", 1_000, false).unwrap_err();
+        assert!(transfer_error
+            .to_string()
+            .contains("not active long enough"));
+        validate_locked_stripe_fx_quote(&quote, "five_minutes", 1_000, true).unwrap();
     }
 
     #[test]
