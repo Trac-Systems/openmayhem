@@ -15,6 +15,7 @@ import {
   RetryWork,
   ReviewWork,
   addressTopic,
+  isBridgeFundingShortfall,
   normalizeHex,
   normalizeHex64,
   normalizeTnkAddress,
@@ -512,7 +513,12 @@ async function runCommand(command, args, { timeoutMs = 1_200_000 } = {}) {
     child.on('close', (code, signal) => {
       clearTimeout(timeout);
       if (code === 0) resolve({ stdout, stderr });
-      else reject(new Error(`command exited ${code ?? signal ?? 'unknown'}`));
+      else {
+        const error = new Error(`command exited ${code ?? signal ?? 'unknown'}`);
+        error.stdout = stdout;
+        error.stderr = stderr;
+        reject(error);
+      }
     });
   });
 }
@@ -723,16 +729,30 @@ async function bridgeTnk(config, work, checkpoint) {
     '--home', config.buyerHome, '--rpc-url', config.coreRpc,
     '--wallet-password-file', config.walletPasswordFile, '--json',
   ];
-  const dry = jsonOutput((await runCommand(config.mayhemBin, common, { api: config.api, work })).stdout);
-  if (String(dry.who).toLowerCase() !== config.platformBuyer) throw new RetryWork('core_unavailable', 60, true);
-  const memo = normalizeHex64(dry.memo_hash, 'TNK bridge memo');
-  checkpoint.tnk_memo_hash = memo;
-  atomicJson(config.checkpointFile(intent.id), checkpoint);
-  const creditedKey = `dep/tnk-credited/${memo}`;
-  let credited = await readCore(config.coreRpc, creditedKey);
+  let memo = checkpoint.tnk_memo_hash
+    ? normalizeHex64(checkpoint.tnk_memo_hash, 'TNK bridge memo')
+    : null;
+  let dry = null;
+  let creditedKey = memo ? `dep/tnk-credited/${memo}` : null;
+  let pendingKey = memo ? `dep/pending/${memo}` : null;
+  let credited = creditedKey ? await readCore(config.coreRpc, creditedKey) : null;
+  let pending = !credited?.value && pendingKey ? await readCore(config.coreRpc, pendingKey) : null;
+  if (!memo || (!credited?.value && !pending?.value)) {
+    dry = jsonOutput((await runCommand(config.mayhemBin, common, { api: config.api, work })).stdout);
+    if (String(dry.who).toLowerCase() !== config.platformBuyer) {
+      throw new RetryWork('core_unavailable', 60, true);
+    }
+    const derivedMemo = normalizeHex64(dry.memo_hash, 'TNK bridge memo');
+    if (memo && derivedMemo !== memo) throw new RetryWork('core_unavailable', 60, true);
+    memo = derivedMemo;
+    checkpoint.tnk_memo_hash = memo;
+    atomicJson(config.checkpointFile(intent.id), checkpoint);
+    creditedKey = `dep/tnk-credited/${memo}`;
+    pendingKey = `dep/pending/${memo}`;
+    credited = await readCore(config.coreRpc, creditedKey);
+    pending = !credited.value ? await readCore(config.coreRpc, pendingKey) : null;
+  }
   if (!credited.value) {
-    const pendingKey = `dep/pending/${memo}`;
-    let pending = await readCore(config.coreRpc, pendingKey);
     if (!pending.value) {
       await runCommand(config.mayhemBin, [...common.slice(0, -1), '--submit-intent', '--json'], { api: config.api, work });
       const deadline = Date.now() + config.bridgeTimeoutSeconds * 1_000;
@@ -743,15 +763,27 @@ async function bridgeTnk(config, work, checkpoint) {
       }
     }
     const locked = pending.value;
+    const canonicalPayments = await readCore(config.coreRpc, 'payments/current');
+    const canonicalTreasury = canonicalPayments.value?.tnk?.treasury_address;
     if (!locked || String(locked.user).toLowerCase() !== config.platformBuyer ||
         String(locked.msb_network).toLowerCase() !== config.tnkNetwork ||
         normalizeTnkAddress(locked.msb_from, config.tnkNetwork, 'TNK bridge sender') !== config.tnkCollection ||
         normalizeTnkAddress(locked.treasury_address, config.tnkNetwork, 'TNK bridge treasury') !==
-          normalizeTnkAddress(dry.treasury_address, config.tnkNetwork, 'TNK bridge treasury') ||
+          normalizeTnkAddress(canonicalTreasury, config.tnkNetwork, 'TNK bridge treasury') ||
         BigInt(locked.quoted_au ?? 0) < BigInt(intent.expected_core_au)) {
       throw new RetryWork('core_unavailable', 60, true);
     }
     const lockedTnkE18 = BigInt(locked.tnk_e18 ?? 0);
+    if (checkpoint.tnk_bridge_amount_e18 &&
+        BigInt(checkpoint.tnk_bridge_amount_e18) !== lockedTnkE18) {
+      throw new RetryWork('core_unavailable', 60, true);
+    }
+    if (!checkpoint.tnk_bridge_amount_e18) {
+      checkpoint.tnk_bridge_amount_e18 = lockedTnkE18.toString();
+      checkpoint.tnk_bridge_rate_au = String(locked.rate_tnk_usd_au);
+      checkpoint.tnk_bridge_locked_at = new Date().toISOString();
+      atomicJson(config.checkpointFile(intent.id), checkpoint);
+    }
     const transferArgs = [
       path.join(repoRoot, 'crates/mayhem-cli/src/msb-transfer-helper.mjs'),
       'settlement-transfer', '--network', config.tnkNetwork,
@@ -762,7 +794,14 @@ async function bridgeTnk(config, work, checkpoint) {
       '--wallet-password-file', config.walletPasswordFile,
       '--timeout-seconds', String(config.bridgeTimeoutSeconds),
     ];
-    await runCommand(process.execPath, transferArgs, { api: config.api, work });
+    try {
+      await runCommand(process.execPath, transferArgs, { api: config.api, work });
+    } catch (error) {
+      if (isBridgeFundingShortfall(error, 'TNK')) {
+        throw new RetryWork('bridge_funding_shortfall', 30, true);
+      }
+      throw error;
+    }
     credited = await readCore(config.coreRpc, creditedKey);
   }
   const record = credited.value
@@ -813,14 +852,18 @@ async function bridgeTap(config, work, checkpoint, rpc) {
       String(tap.token_address).toLowerCase() !== String(intent.token_contract).toLowerCase()) {
     throw new RetryWork('core_unavailable', 60, true);
   }
-  const calculatedAmountWei = ceilDiv(BigInt(intent.expected_core_au) * TOKEN_SCALE, rateAu) + tapDust(intent.id);
-  // Once submission starts, its uniquely dusted amount is the recovery key.
-  // Before broadcast, refresh it from the current canonical rate.
-  const amountWei = checkpoint.tap_submission_started_at
+  // Freeze the Core-side obligation at the first verified bridge attempt. A
+  // retry must recover that exact deposit instead of repricing an already
+  // matched customer transfer whenever the oracle moves before broadcast.
+  const amountWei = checkpoint.tap_bridge_amount_wei
     ? BigInt(checkpoint.tap_bridge_amount_wei)
-    : calculatedAmountWei;
-  checkpoint.tap_bridge_amount_wei = amountWei.toString();
-  atomicJson(config.checkpointFile(intent.id), checkpoint);
+    : ceilDiv(BigInt(intent.expected_core_au) * TOKEN_SCALE, rateAu) + tapDust(intent.id);
+  if (!checkpoint.tap_bridge_amount_wei) {
+    checkpoint.tap_bridge_amount_wei = amountWei.toString();
+    checkpoint.tap_bridge_rate_au = rateAu.toString();
+    checkpoint.tap_bridge_locked_at = new Date().toISOString();
+    atomicJson(config.checkpointFile(intent.id), checkpoint);
+  }
   let common = null;
   let buyer = config.tapCollection;
   if (!checkpoint.tap_submission_started_at) {
@@ -844,6 +887,9 @@ async function bridgeTap(config, work, checkpoint, rpc) {
         rpc.selectedIndex = index;
         break;
       } catch (error) {
+        if (isBridgeFundingShortfall(error, 'TAP')) {
+          throw new RetryWork('bridge_funding_shortfall', 30, true);
+        }
         lastDryError = error;
       }
     }

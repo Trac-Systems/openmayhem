@@ -5,6 +5,7 @@ import {
   RetryWork,
   ReviewWork,
   addressTopic,
+  isBridgeFundingShortfall,
   normalizeTnkAddress,
   summarizePayoutLiabilities,
   uniqueIntentByAmount,
@@ -132,4 +133,16 @@ test('attributes a transfer only when its exact amount identifies one quote', ()
   assert.equal(uniqueIntentByAmount(intents, 1002n)?.id, 'two');
   assert.equal(uniqueIntentByAmount(intents, 999n), null);
   assert.equal(uniqueIntentByAmount([...intents, { id: 'duplicate', token_amount_base_units: '1002' }], 1002n), null);
+});
+
+test('distinguishes collection funding shortfalls from RPC failures', () => {
+  const tap = Object.assign(new Error('command exited 1'), {
+    stderr: 'not enough TAP - send 0.2 TAP to the collection wallet',
+  });
+  const tnk = Object.assign(new Error('command exited 1'), {
+    stdout: 'TNK balance is insufficient for the settlement transfer',
+  });
+  assert.equal(isBridgeFundingShortfall(tap, 'TAP'), true);
+  assert.equal(isBridgeFundingShortfall(tnk, 'TNK'), true);
+  assert.equal(isBridgeFundingShortfall(new Error('Ethereum RPC failed'), 'TAP'), false);
 });

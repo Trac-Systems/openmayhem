@@ -34,6 +34,15 @@ export class ReviewWork extends Error {
   }
 }
 
+export function isBridgeFundingShortfall(error, rail) {
+  const output = `${error?.stdout ?? ''}\n${error?.stderr ?? ''}`.toLowerCase();
+  const token = String(rail ?? '').toLowerCase();
+  if (!['tap', 'tnk'].includes(token)) return false;
+  return output.includes(`not enough ${token}`) ||
+    output.includes(`insufficient ${token}`) ||
+    output.includes(`${token} balance is insufficient`);
+}
+
 export function normalizeHex(value, bytes, label) {
   const text = String(value ?? '').trim().toLowerCase();
   if (!new RegExp(`^0x[0-9a-f]{${bytes * 2}}$`).test(text)) throw new Error(`${label} is invalid`);
