@@ -21,6 +21,7 @@ import { waitForMinimumSignedLength } from './msb-reader-catchup.mjs';
 
 const scriptPath = fileURLToPath(import.meta.url);
 const DEFAULT_CURSOR = path.resolve('.mayhem-local', 'tnk-deposit-watcher.json');
+const MSB_CLOSE_TIMEOUT_MS = 5_000;
 const MAX_UNMATCHED_TRANSFERS = 1000;
 
 const isHex64 = (value) => /^[0-9a-f]{64}$/i.test(String(value ?? ''));
@@ -109,6 +110,24 @@ function readJsonIfExists(filePath, fallback) {
 function writeJson(filePath, value) {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+async function closeMsbForExit(msb) {
+  let timer;
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => msb.close()),
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, MSB_CLOSE_TIMEOUT_MS);
+        timer.unref?.();
+      }),
+    ]);
+  } catch (_error) {
+    // Deposit evidence and the cursor are made durable before shutdown. A
+    // transport close failure must not suppress an already matched deposit.
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 function normalizeCursor(raw) {
@@ -519,24 +538,16 @@ async function main() {
   const msb = new MainSettlementBus(config);
   await msb.ready();
 
-  let scan;
-  let fromSignedLength;
-  try {
-    const confirmedLength = msb.state.getSignedLength();
-    fromSignedLength = args['from-signed-length'] !== undefined
-      ? parsePositiveInt(args['from-signed-length'], '--from-signed-length')
-      : cursor.next_signed_length ?? Math.max(0, confirmedLength - lookback);
-    scan = await scanMsbTransfers(msb, {
-      fromSignedLength,
-      finalitySignedLengths,
-      chunkSize,
-      timeoutSec,
-    });
-  } finally {
-    try {
-      await msb.close();
-    } catch (_error) {}
-  }
+  const confirmedLength = msb.state.getSignedLength();
+  const fromSignedLength = args['from-signed-length'] !== undefined
+    ? parsePositiveInt(args['from-signed-length'], '--from-signed-length')
+    : cursor.next_signed_length ?? Math.max(0, confirmedLength - lookback);
+  const scan = await scanMsbTransfers(msb, {
+    fromSignedLength,
+    finalitySignedLengths,
+    chunkSize,
+    timeoutSec,
+  });
 
   const pendingEntries = await readPendingIntents({
     peerRpc: adminRpcUrl,
@@ -690,12 +701,18 @@ async function main() {
     }
   }
 
+  // Do not close the reader until every matched deposit and the next cursor
+  // are durable. Some Hypercore transports can reject outstanding reads while
+  // closing; that must never prevent a confirmed deposit from being posted.
+  await closeMsbForExit(msb);
   if (!report.ok) process.exit(2);
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
-  main().catch((error) => {
-    console.error(error?.stack || error?.message || String(error));
-    process.exit(1);
-  });
+  main()
+    .then(() => process.exit(0))
+    .catch((error) => {
+      console.error(error?.stack || error?.message || String(error));
+      process.exit(1);
+    });
 }
