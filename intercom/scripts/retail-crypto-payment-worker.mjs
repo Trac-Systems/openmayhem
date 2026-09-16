@@ -19,6 +19,7 @@ import {
   normalizeTnkAddress,
   parseHexInt,
   summarizePayoutLiabilities,
+  tnkVerificationWindow,
   uniqueIntentByAmount,
   validateTapBridgePreflight,
   verifyTapTransferReceipt,
@@ -59,6 +60,55 @@ async function closeMsb(msb) {
     Promise.resolve().then(() => msb.close()).catch(() => undefined),
     sleep(10_000),
   ]);
+}
+
+async function openTnkReader(config) {
+  if (config.tnkMsb) return config.tnkMsb;
+  const msbConfig = createLocalConfig({
+    network: config.tnkNetwork,
+    stateDir: path.join(config.stateDir, 'tnk-health-reader'),
+    storeName: `${config.tnkReaderStore}-health`,
+    channel: process.env.MSB_CHANNEL || undefined,
+    bootstrap: process.env.MSB_BOOTSTRAP || undefined,
+    dhtBootstrap: process.env.MSB_DHT_BOOTSTRAP || undefined,
+    enableWallet: false,
+  });
+  const candidate = new MainSettlementBus(msbConfig);
+  try {
+    await Promise.race([
+      candidate.ready(),
+      sleep(config.readerTimeoutSeconds * 1_000).then(() => { throw new RetryWork('reader_unavailable', 30); }),
+    ]);
+    config.tnkMsb = candidate;
+    return candidate;
+  } catch (error) {
+    await closeMsb(candidate);
+    throw error;
+  }
+}
+
+async function withTnkReader(config, operation) {
+  const previous = config.tnkReaderQueue ?? Promise.resolve();
+  let release;
+  const turn = new Promise((resolve) => { release = resolve; });
+  config.tnkReaderQueue = previous.catch(() => undefined).then(() => turn);
+  await previous.catch(() => undefined);
+  try {
+    return await operation(await openTnkReader(config));
+  } finally {
+    release();
+  }
+}
+
+async function caughtUpTnkSignedLength(config, msb) {
+  const minimumSignedLength = await coreMsbSignedLength(config.coreRpc);
+  const signedLength = await waitForMinimumSignedLength(msb.state, {
+    minimumSignedLength,
+    timeoutSec: config.readerTimeoutSeconds,
+    sleepImpl: sleep,
+  });
+  if (signedLength < minimumSignedLength) throw new RetryWork('reader_unavailable', 30);
+  return signedLength;
 }
 
 function sha256(value) {
@@ -354,29 +404,8 @@ async function tapOperationalStatus(config) {
 }
 
 async function tnkOperationalStatus(config) {
-  if (!config.tnkHealthMsb) {
-    const msbConfig = createLocalConfig({
-      network: config.tnkNetwork,
-      stateDir: path.join(config.stateDir, 'tnk-health-reader'),
-      storeName: `${config.tnkReaderStore}-health`,
-      channel: process.env.MSB_CHANNEL || undefined,
-      bootstrap: process.env.MSB_BOOTSTRAP || undefined,
-      enableWallet: false,
-    });
-    const candidate = new MainSettlementBus(msbConfig);
-    try {
-      await Promise.race([
-        candidate.ready(),
-        sleep(config.readerTimeoutSeconds * 1_000).then(() => { throw new RetryWork('reader_unavailable', 30); }),
-      ]);
-      config.tnkHealthMsb = candidate;
-    } catch (error) {
-      await closeMsb(candidate);
-      throw error;
-    }
-  }
-  const msb = config.tnkHealthMsb;
-  try {
+  return withTnkReader(config, async (msb) => {
+    const signedLength = await caughtUpTnkSignedLength(config, msb);
     const [payments, rate, payout] = await Promise.all([
       readCore(config.coreRpc, 'payments/current'),
       readCore(config.coreRpc, 'rate/latest'),
@@ -411,8 +440,8 @@ async function tnkOperationalStatus(config) {
       rpc_mode: 'msb',
       collection_balance_base_units: String(balance.balance),
       gas_balance_base_units: null,
-      external_height: String(msb.state.getSignedLength()),
-      external_finalized_height: String(Math.max(0, msb.state.getSignedLength() - config.tnkFinality)),
+      external_height: String(signedLength),
+      external_finalized_height: String(Math.max(0, signedLength - config.tnkFinality)),
       core_balance_au: core.balanceAu.toString(),
       core_held_au: core.heldAu.toString(),
       core_signed_length: String(core.signedLength),
@@ -434,17 +463,12 @@ async function tnkOperationalStatus(config) {
       last_error: null,
       checked_at: new Date().toISOString(),
     };
-  } catch (error) {
-    if (error instanceof RetryWork && error.code === 'reader_unavailable') {
-      config.tnkHealthMsb = null;
-      await closeMsb(msb);
-    }
-    throw error;
-  }
+  });
 }
 
-async function reportOperationalStatus(config) {
+async function reportOperationalStatus(config, rails = ['TAP', 'TNK']) {
   for (const [rail, collect] of [['TAP', tapOperationalStatus], ['TNK', tnkOperationalStatus]]) {
+    if (!rails.includes(rail)) continue;
     try {
       await config.api.status(await collect(config));
     } catch (error) {
@@ -548,25 +572,10 @@ async function discoverTapIncoming(config, intents) {
 
 async function discoverTnkIncoming(config, intents) {
   if (intents.length === 0) return;
-  const minimumSignedLength = await coreMsbSignedLength(config.coreRpc);
-  const msbConfig = createLocalConfig({
-    network: config.tnkNetwork,
-    stateDir: path.join(config.stateDir, 'tnk-discovery-reader'),
-    storeName: config.tnkDiscoveryReaderStore,
-    channel: process.env.MSB_CHANNEL || undefined,
-    bootstrap: process.env.MSB_BOOTSTRAP || undefined,
-    dhtBootstrap: process.env.MSB_DHT_BOOTSTRAP || undefined,
-    enableWallet: false,
-  });
-  const msb = new MainSettlementBus(msbConfig);
-  try {
-    await Promise.race([
-      msb.ready(),
-      sleep(config.readerTimeoutSeconds * 1_000).then(() => { throw new RetryWork('reader_unavailable', 30); }),
-    ]);
+  await withTnkReader(config, async (msb) => {
+    const current = await caughtUpTnkSignedLength(config, msb);
     const checkpointFile = config.discoveryCheckpointFile('tnk');
     const checkpoint = readJson(checkpointFile, {});
-    const current = msb.state.getSignedLength();
     const stored = Number(checkpoint.next_signed_length);
     const start = Number.isSafeInteger(stored) && stored >= 0 && stored <= current
       ? Math.max(0, stored - Math.max(2, config.tnkFinality))
@@ -578,7 +587,7 @@ async function discoverTnkIncoming(config, intents) {
       finalitySignedLengths: 0,
       chunkSize: 500,
       timeoutSec: config.readerTimeoutSeconds,
-      minimumSignedLength,
+      minimumSignedLength: current,
     });
     const claimed = new Set();
     for (const transfer of scan.transfers) {
@@ -595,13 +604,11 @@ async function discoverTnkIncoming(config, intents) {
       next_signed_length: scan.confirmedLength,
       updated_at: new Date().toISOString(),
     });
-  } finally {
-    await closeMsb(msb);
-  }
+  });
 }
 
-async function discoverIncoming(config) {
-  for (const rail of ['TAP', 'TNK']) {
+async function discoverIncoming(config, rails = ['TAP', 'TNK']) {
+  for (const rail of rails) {
     try {
       const intents = (await config.api.discovery(rail))?.intents ?? [];
       if (rail === 'TAP') await discoverTapIncoming(config, intents);
@@ -631,30 +638,19 @@ async function verifyTapCustomerTransfer(intent, rpc) {
 }
 
 async function verifyTnkCustomerTransfer(intent, config) {
-  const minimumSignedLength = await coreMsbSignedLength(config.coreRpc);
   const hash = normalizeHex64(intent.transaction_hash, 'TNK transaction hash');
-  const msbConfig = createLocalConfig({
-    network: config.tnkNetwork,
-    stateDir: path.join(config.stateDir, 'tnk-reader'),
-    storeName: config.tnkReaderStore,
-    channel: process.env.MSB_CHANNEL || undefined,
-    bootstrap: process.env.MSB_BOOTSTRAP || undefined,
-    dhtBootstrap: process.env.MSB_DHT_BOOTSTRAP || undefined,
-    enableWallet: false,
-  });
-  const msb = new MainSettlementBus(msbConfig);
-  try {
-    await Promise.race([
-      msb.ready(),
-      sleep(config.readerTimeoutSeconds * 1_000).then(() => { throw new RetryWork('reader_unavailable', 30); }),
-    ]);
-    const confirmed = msb.state.getSignedLength();
+  return withTnkReader(config, async (msb) => {
+    // Compute the lookback only after the persistent reader reaches the Core
+    // frontier. Computing it from a stale startup position turns one lookup
+    // into an unbounded replay of the entire offline gap.
+    const confirmed = await caughtUpTnkSignedLength(config, msb);
+    const window = tnkVerificationWindow(confirmed, config.tnkLookback);
     const scan = await scanMsbTransfers(msb, {
-      fromSignedLength: Math.max(0, confirmed - config.tnkLookback),
+      fromSignedLength: window.fromSignedLength,
       finalitySignedLengths: config.tnkFinality,
       chunkSize: 500,
       timeoutSec: config.readerTimeoutSeconds,
-      minimumSignedLength,
+      minimumSignedLength: window.minimumSignedLength,
       matchHash: hash,
     });
     const transfer = scan.transfers.find((candidate) => candidate.hash === hash);
@@ -682,9 +678,7 @@ async function verifyTnkCustomerTransfer(intent, config) {
       throw new ReviewWork('amount_mismatch', evidence);
     }
     return evidence;
-  } finally {
-    await closeMsb(msb);
-  }
+  });
 }
 
 function auToUsd(au) {
@@ -1037,28 +1031,21 @@ function configuration(env = process.env) {
   };
 }
 
-async function main() {
-  const config = configuration();
-  fs.mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
-  let nextStatusAt = 0;
-  let statusRunning = false;
-  let nextDiscoveryAt = 0;
-  let discoveryRunning = false;
+async function runPeriodicLoop(intervalSeconds, task) {
+  while (true) {
+    try {
+      await task();
+    } catch {
+      console.error(JSON.stringify({ event: 'crypto_payment_periodic_task_unavailable' }));
+    }
+    await sleep(intervalSeconds * 1_000);
+  }
+}
+
+async function runWorkLoop(config) {
   while (true) {
     let work = null;
     try {
-      if (!statusRunning && Date.now() >= nextStatusAt) {
-        nextStatusAt = Date.now() + config.statusIntervalSeconds * 1_000;
-        statusRunning = true;
-        void reportOperationalStatus(config).finally(() => { statusRunning = false; });
-      }
-      if (!discoveryRunning && Date.now() >= nextDiscoveryAt) {
-        nextDiscoveryAt = Date.now() + config.discoveryIntervalSeconds * 1_000;
-        discoveryRunning = true;
-        void discoverIncoming(config)
-          .catch(() => console.error(JSON.stringify({ event: 'crypto_payment_discovery_unavailable' })))
-          .finally(() => { discoveryRunning = false; });
-      }
       work = (await config.api.pull())?.work ?? null;
       if (!work) {
         await sleep(config.intervalSeconds * 1_000);
@@ -1080,6 +1067,28 @@ async function main() {
       await sleep(config.intervalSeconds * 1_000);
     }
   }
+}
+
+async function main() {
+  const config = configuration();
+  fs.mkdirSync(config.stateDir, { recursive: true, mode: 0o700 });
+
+  const shutdown = async () => {
+    if (config.tnkMsb) await closeMsb(config.tnkMsb);
+    process.exit(0);
+  };
+  process.once('SIGINT', () => void shutdown());
+  process.once('SIGTERM', () => void shutdown());
+
+  // These loops must stay independent. A customer payment can spend minutes in
+  // a Core bridge without pausing either rail's discovery or health heartbeat.
+  await Promise.all([
+    runWorkLoop(config),
+    runPeriodicLoop(config.discoveryIntervalSeconds, () => discoverIncoming(config, ['TAP'])),
+    runPeriodicLoop(config.discoveryIntervalSeconds, () => discoverIncoming(config, ['TNK'])),
+    runPeriodicLoop(config.statusIntervalSeconds, () => reportOperationalStatus(config, ['TAP'])),
+    runPeriodicLoop(config.statusIntervalSeconds, () => reportOperationalStatus(config, ['TNK'])),
+  ]);
 }
 
 function isDirectExecution(argument) {

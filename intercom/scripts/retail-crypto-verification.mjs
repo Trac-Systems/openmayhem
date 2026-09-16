@@ -6,6 +6,17 @@ export function uniqueIntentByAmount(intents, amountBaseUnits) {
   return matches.length === 1 ? matches[0] : null;
 }
 
+export function tnkVerificationWindow(confirmedSignedLength, lookback) {
+  if (!Number.isSafeInteger(confirmedSignedLength) || confirmedSignedLength < 0 ||
+      !Number.isSafeInteger(lookback) || lookback <= 0) {
+    throw new Error('TNK verification window requires a non-negative frontier and positive lookback');
+  }
+  return {
+    fromSignedLength: Math.max(0, confirmedSignedLength - lookback),
+    minimumSignedLength: confirmedSignedLength,
+  };
+}
+
 export class RetryWork extends Error {
   constructor(code, delaySeconds, transferObserved = false) {
     super(code);
