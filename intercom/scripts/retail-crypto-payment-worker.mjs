@@ -9,6 +9,7 @@ import { MainSettlementBus } from 'trac-msb/src/index.js';
 
 import { TAP_DEPOSIT_EVENT_SIGNATURE, tapDepositKey } from '../../contracts/scripts/tap-deposit-watcher.mjs';
 import { createLocalConfig, sleep } from './msb-local-common.mjs';
+import { waitForMinimumSignedLength } from './msb-reader-catchup.mjs';
 import {
   ERC20_TRANSFER_TOPIC,
   RetryWork,
