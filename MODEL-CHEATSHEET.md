@@ -1008,6 +1008,64 @@ On a supported NVIDIA host, use
 `mayhem doctor --provider-backend needle-gpu` before the same managed start.
 Do not map MPS to `needle-gpu` or add a third canonical market.
 
+## Qwen3 Embedding 4B
+
+**Selector and source**
+
+- Model: `Qwen/Qwen3-Embedding-4B`
+- Backend/artifact: vLLM 0.24 pooling / BF16 safetensors
+- Admin mirror:
+  `TracNetwork/mayhem-catalog-Qwen-Qwen3-Embedding-4B-BF16@909825755dc39379f3eb31256602da9cafb29c95`
+- Upstream pin:
+  `Qwen/Qwen3-Embedding-4B@5cf2132abc99cad020ac570b19d031efec650f2b`
+- Primary artifact root:
+  `e228d4e36517c331c3ddf034753cf974a7f73d2ac3dd0be4ef145722eccdc26c`
+- Two weight shards total 8,043,548,672 bytes.
+- Canary:
+  [`canary-qwen3-embedding-4b-bf16-v1.json`](catalog/canaries/canary-qwen3-embedding-4b-bf16-v1.json)
+
+**Hard requirements and surface**
+
+- Linux NVIDIA with compute capability 12.1 is the only calibrated platform.
+  Windows and other backends remain unavailable until they receive separate
+  calibration proof.
+- 16 GiB full-offload target and 32,768 model tokens. The longest accepted
+  caller input is 32,767 tokens because the runtime adds one internal token.
+- Endpoints: OpenAI `/v1/embeddings` and Hugging Face feature extraction.
+  Both accept a string or an ordered array of up to 32 strings.
+- Native dimension is 2,560. Matryoshka output supports 32 through 2,560
+  dimensions, including exact 1,536-dimensional vectors. Truncation is followed
+  by L2 normalization.
+- Pooling uses the last non-padding token. Documents have no implicit prefix.
+  Retrieval queries should use
+  `Instruct: {task_description}\nQuery:{query}` with a task-specific instruction.
+- Float and base64 response encodings are supported. Billing counts exact input
+  tokens; embeddings have no output-token charge.
+
+**Measured guidance**
+
+- Cold load: 57.21 seconds.
+- Short-input throughput: 378.51 input tok/s at batch 1, 2,358.46 at batch 8,
+  and 2,432.98 at batch 32.
+- Four concurrent batches of eight reached 5,064.32 input tok/s; eight reached
+  5,920.53 input tok/s without sustained swap growth.
+- Sustained p50/p90/p99 latency was 38.4/39.5/41.6 ms at batch 1,
+  46.2/79.4/82.1 ms at batch 8, and 169.8/205.6/206.9 ms at batch 32.
+- Exact-runtime vectors matched the official Transformers reference with a
+  minimum cosine similarity of 0.999717 across native and 1,536-dimensional
+  query/document cases.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend vllm
+mayhem up --provider --provider-enclave Qwen/Qwen3-Embedding-4B --yes
+```
+
+The provider's local modality limits may advertise the calibrated batch and
+in-flight capacity. They must remain within the signed endpoint limit and the
+host's measured memory reserve.
+
 ## Verification and troubleshooting
 
 After startup, require all of the following rather than treating process

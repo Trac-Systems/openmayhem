@@ -71,10 +71,11 @@ use mayhem_enclave::{
 use mayhem_engine::ComfyUiBackend;
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, CancellationToken,
-    ComfyUiCustomNodePackage, ComfyUiModelFile, ComponentRecovery, ConcurrentGenerationBackend,
-    EngineBackend, EngineError, GenerateRequest, GenerateSpecialityParameter,
-    GenerateSpecialityTarget, GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest,
-    LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
+    ComfyUiCustomNodePackage, ComfyUiModelFile, ComponentRecovery, ConcurrentEmbeddingBackend,
+    ConcurrentGenerationBackend, EngineBackend, EngineError, GenerateRequest,
+    GenerateSpecialityParameter, GenerateSpecialityTarget, GrammarSpec,
+    ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
+    MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, WorkflowGenerationRequest,
     WorkflowInputFile, MTMD_MEDIA_MARKER,
 };
@@ -24962,6 +24963,14 @@ fn managed_python_backend_for_artifact(artifact: &catalog::CatalogArtifact) -> &
     }
 }
 
+fn bind_vllm_task_for_model(config: &mut LoadConfig, model: &catalog::CatalogModel) {
+    config.vllm_task = if model.model_class == MODEL_CLASS_EMBEDDING {
+        mayhem_engine::VllmTask::Embedding
+    } else {
+        mayhem_engine::VllmTask::Generate
+    };
+}
+
 fn needle_device_for_engine(engine: &str) -> Option<&'static str> {
     match engine {
         "needle-cpu" => Some("cpu"),
@@ -25288,6 +25297,7 @@ fn catalog_calibration_backend(
         };
     }
     if artifact.engine == "vllm" {
+        bind_vllm_task_for_model(&mut config, model);
         config.vllm_gpu_memory_utilization_pct = args.vllm_memory_utilization;
         config.vllm_gpu_memory_utilization_floor_pct = args.vllm_memory_utilization_floor;
         config.vllm_dtype = args.vllm_dtype.clone();
@@ -25882,11 +25892,19 @@ fn calibrate_embedding_cosine_prompt(
 ) -> Result<CanaryCalibrationPromptReport> {
     let input = canary_prompt_text(prompt)?;
     let input_bytes = u64::try_from(input.len()).unwrap_or(u64::MAX);
+    let mut request = mayhem_engine::EmbeddingRequest::new(input);
+    if let Some(dimensions) = prompt
+        .endpoint_attributes
+        .get("dimensions")
+        .and_then(Value::as_u64)
+    {
+        request.dimensions = Some(
+            usize::try_from(dimensions)
+                .context("embedding canary dimensions do not fit this platform")?,
+        );
+    }
     let output = backend
-        .embed(
-            mayhem_engine::EmbeddingRequest::new(input),
-            &CancellationToken::new(),
-        )
+        .embed(request, &CancellationToken::new())
         .with_context(|| format!("generating embedding canary prompt {}", prompt.id))?;
     let vector = output
         .embeddings
@@ -62222,6 +62240,9 @@ trait ProviderSessionResponder {
     fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
         None
     }
+    fn concurrent_embedding_backend(&self) -> Option<Arc<dyn ConcurrentEmbeddingBackend>> {
+        None
+    }
     fn respond(
         &mut self,
         terms: &ProviderSessionTerms,
@@ -62297,15 +62318,25 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
     }
 
     fn concurrent_session_capacity(&self) -> u32 {
-        self.backend
+        let generation = self
+            .backend
             .concurrent_generation_backend()
             .map(|backend| u32::try_from(backend.capacity()).unwrap_or(u32::MAX))
-            .unwrap_or(1)
-            .max(1)
+            .unwrap_or(1);
+        let embedding = self
+            .backend
+            .concurrent_embedding_backend()
+            .map(|backend| u32::try_from(backend.capacity()).unwrap_or(u32::MAX))
+            .unwrap_or(1);
+        generation.max(embedding).max(1)
     }
 
     fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
         self.backend.concurrent_generation_backend()
+    }
+
+    fn concurrent_embedding_backend(&self) -> Option<Arc<dyn ConcurrentEmbeddingBackend>> {
+        self.backend.concurrent_embedding_backend()
     }
 
     fn component_healthy(&mut self) -> bool {
@@ -62366,11 +62397,26 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
     }
 }
 
-struct ConcurrentGenerationEngineBackend {
-    backend: Arc<dyn ConcurrentGenerationBackend>,
+#[derive(Clone)]
+enum ProviderConcurrentEngine {
+    Generation(Arc<dyn ConcurrentGenerationBackend>),
+    Embedding(Arc<dyn ConcurrentEmbeddingBackend>),
 }
 
-impl EngineBackend for ConcurrentGenerationEngineBackend {
+impl ProviderConcurrentEngine {
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Generation(backend) => backend.capacity(),
+            Self::Embedding(backend) => backend.capacity(),
+        }
+    }
+}
+
+struct ConcurrentEngineBackend {
+    backend: ProviderConcurrentEngine,
+}
+
+impl EngineBackend for ConcurrentEngineBackend {
     fn backend_id(&self) -> &'static str {
         "vllm"
     }
@@ -62396,18 +62442,38 @@ impl EngineBackend for ConcurrentGenerationEngineBackend {
         sink: &mut dyn mayhem_engine::TokenSink,
         cancellation: &CancellationToken,
     ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
-        self.backend.generate(request, sink, cancellation)
+        match &self.backend {
+            ProviderConcurrentEngine::Generation(backend) => {
+                backend.generate(request, sink, cancellation)
+            }
+            ProviderConcurrentEngine::Embedding(_) => Err(EngineError::InvalidConfig(
+                "concurrent embedding handles cannot generate text".to_owned(),
+            )),
+        }
+    }
+
+    fn embed(
+        &mut self,
+        request: mayhem_engine::EmbeddingRequest,
+        cancellation: &CancellationToken,
+    ) -> mayhem_engine::Result<mayhem_engine::EmbeddingOutput> {
+        match &self.backend {
+            ProviderConcurrentEngine::Embedding(backend) => backend.embed(request, cancellation),
+            ProviderConcurrentEngine::Generation(_) => Err(EngineError::InvalidConfig(
+                "concurrent generation handles cannot create embeddings".to_owned(),
+            )),
+        }
     }
 }
 
 struct ConcurrentEngineProviderSessionResponder {
-    backend: ConcurrentGenerationEngineBackend,
+    backend: ConcurrentEngineBackend,
 }
 
 impl ConcurrentEngineProviderSessionResponder {
-    fn new(backend: Arc<dyn ConcurrentGenerationBackend>) -> Self {
+    fn new(backend: ProviderConcurrentEngine) -> Self {
         Self {
-            backend: ConcurrentGenerationEngineBackend { backend },
+            backend: ConcurrentEngineBackend { backend },
         }
     }
 }
@@ -80281,7 +80347,7 @@ struct ProviderConcurrentSessionTask {
     protection: Arc<Mutex<ProviderProtectionState>>,
     engine_recovery_initial: Duration,
     engine_recovery_max: Duration,
-    backend: Arc<dyn ConcurrentGenerationBackend>,
+    backend: ProviderConcurrentEngine,
     cancellation: CancellationToken,
 }
 
@@ -81098,8 +81164,16 @@ async fn serve_provider_sessions(
                             provider_session_allows_independent_dispatch(&terms, active)
                         })
                     {
+                        let concurrent_backend = responder
+                            .concurrent_generation_backend()
+                            .map(ProviderConcurrentEngine::Generation)
+                            .or_else(|| {
+                                responder
+                                    .concurrent_embedding_backend()
+                                    .map(ProviderConcurrentEngine::Embedding)
+                            });
                         if let (Some(backend), Some(active), Some(pending_request_deadline)) = (
-                            responder.concurrent_generation_backend(),
+                            concurrent_backend,
                             sessions.get(&event_session_id).cloned(),
                             pending_requests.get(&event_session_id).copied(),
                         ) {
@@ -86487,13 +86561,6 @@ fn provider_embedding_input_texts_from_value(value: &Value) -> Result<Vec<String
     }
 }
 
-fn provider_embedding_input_token_count(inputs: &[String]) -> u64 {
-    inputs
-        .iter()
-        .map(|input| rough_text_tokens(input))
-        .fold(0_u64, u64::saturating_add)
-}
-
 fn provider_session_attestation_policy_binding(
     frame: &Value,
     terms: &ProviderSessionTerms,
@@ -88264,6 +88331,7 @@ fn provider_engine_load_config(
         config.trt_require_engine_dir = true;
     }
     if selected.artifact.engine == "vllm" {
+        bind_vllm_task_for_model(&mut config, &selected.model);
         config.vllm_tensor_parallel = Some(enclave_tp_degree(&selected.enclave.caps)?);
         // CUDA reservations and a mapped checkpoint consume virtual addresses,
         // not the host's remaining resident-memory budget. Keep this finite
@@ -92154,7 +92222,6 @@ fn provider_engine_session_response_with_sampling_bounded(
         let inputs = provider_session_request_result(provider_embedding_input_texts_from_body(
             request_body,
         ))?;
-        let prompt_tokens = provider_embedding_input_token_count(&inputs);
         let dimensions = provider_session_request_result(
             request_body
                 .get("dimensions")
@@ -92168,6 +92235,11 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("generating provider session embeddings with mayhem-engine")?;
+        let prompt_tokens = u64::from(output.usage.prompt_tokens);
+        ensure!(
+            prompt_tokens > 0,
+            "embedding backend returned zero prompt tokens for a non-empty request"
+        );
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -118863,9 +118935,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(output.tools.is_empty());
         assert_eq!(output.embeddings, Some(vec![vec![0.1, 0.2, 0.3]]));
         assert_eq!(output.finish_reason, "stop");
-        assert_eq!(output.prompt_tokens, 4);
+        assert_eq!(output.prompt_tokens, 3);
         assert_eq!(output.completion_tokens, 0);
-        assert_eq!(output.usage.input_tokens(), 4);
+        assert_eq!(output.usage.input_tokens(), 3);
         assert_eq!(output.usage.output_tokens(), 0);
         let request = backend.last_embedding_request.expect("embedding request");
         assert_eq!(request.inputs, vec!["similar phrase", "similar sentence"]);
@@ -120957,6 +121029,20 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(config.vllm_linear_backend.as_deref(), Some("cutlass"));
         assert_eq!(config.vllm_moe_backend.as_deref(), Some("cutlass"));
         assert_eq!(config.vllm_mtp_num_speculative_tokens, None);
+        assert_eq!(config.vllm_task, mayhem_engine::VllmTask::Generate);
+        let mut embedding_selected = selected.clone();
+        embedding_selected.model.model_class = "embedding".to_owned();
+        let embedding_config = provider_engine_load_config(
+            &args,
+            &embedding_selected,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            embedding_config.vllm_task,
+            mayhem_engine::VllmTask::Embedding
+        );
         let mut legacy_selected = selected.clone();
         legacy_selected.vllm_execution_profile = None;
         let legacy_config = provider_engine_load_config(
@@ -128402,7 +128488,8 @@ State initialization...
     fn non_text_canary_calibration_helpers_emit_typed_values() {
         let embedding_prompt: CanaryPrompt = serde_json::from_value(json!({
             "id": "embed-p1",
-            "input": "embedding canary"
+            "input": "embedding canary",
+            "dimensions": 1536
         }))
         .unwrap();
         let mut embedding_backend = FakeEngineBackend::new("unused");
@@ -128412,6 +128499,13 @@ State initialization...
         assert_eq!(
             embedding.fingerprint,
             embedding_vector_fingerprint(&[0.1, 0.2, 0.3])
+        );
+        assert_eq!(
+            embedding_backend
+                .last_embedding_request
+                .as_ref()
+                .and_then(|request| request.dimensions),
+            Some(1536)
         );
 
         let wav = tiny_wav_bytes(16_000);

@@ -1032,9 +1032,12 @@ fn validate_generation_execution_profiles(catalog: &CatalogDocument, errors: &mu
         let bound_model = match primary_artifacts.get(artifact_root.as_str()) {
             Some(bindings) if bindings.len() == 1 => {
                 let (model, artifact) = bindings[0];
-                if model.model_class != DEFAULT_MODEL_CLASS {
+                if !matches!(
+                    model.model_class.as_str(),
+                    DEFAULT_MODEL_CLASS | MODEL_CLASS_EMBEDDING
+                ) {
                     errors.push(format!(
-                        "{label} is only valid for generation-capable text models"
+                        "{label} is only valid for generation-capable text or embedding models"
                     ));
                 }
                 if artifact.engine != profile.engine {
@@ -1117,6 +1120,8 @@ fn validate_generation_execution_profile_values(
         return;
     }
 
+    let embedding_dispatch =
+        bound_model.is_some_and(|model| model.model_class == MODEL_CLASS_EMBEDDING);
     let mut seen_sets = BTreeSet::new();
     for (set_index, modality_set) in profile.request_modalities.iter().enumerate() {
         let set_label = format!("{label}.request_modalities[{set_index}]");
@@ -1127,7 +1132,8 @@ fn validate_generation_execution_profile_values(
 
         let mut normalized = BTreeSet::new();
         for modality in modality_set {
-            if !valid_adapter_modality(modality) || modality == "embedding" {
+            if !valid_adapter_modality(modality) || (modality == "embedding" && !embedding_dispatch)
+            {
                 errors.push(format!(
                     "{set_label} contains unsupported generation modality {modality:?}"
                 ));
@@ -1142,7 +1148,13 @@ fn validate_generation_execution_profile_values(
             }
         }
         let normalized = normalized.into_iter().collect::<Vec<_>>();
-        if !normalized.iter().any(|modality| modality == "text") {
+        if embedding_dispatch {
+            if normalized.as_slice() != ["embedding"] {
+                errors.push(format!(
+                    "{set_label} must contain only embedding for embedding dispatch"
+                ));
+            }
+        } else if !normalized.iter().any(|modality| modality == "text") {
             errors.push(format!(
                 "{set_label} must include text for generation dispatch"
             ));
@@ -6459,6 +6471,32 @@ mod tests {
                 .request_modalities,
             vec![vec!["text".to_owned()]]
         );
+    }
+
+    #[test]
+    fn generation_execution_profile_accepts_embedding_dispatch_for_bound_embedding_model() {
+        let (mut catalog, artifact_root) = catalog_with_valid_generation_execution_profile();
+        let model = catalog
+            .models
+            .iter_mut()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == artifact_root)
+            })
+            .expect("bound model");
+        model.model_class = MODEL_CLASS_EMBEDDING.to_owned();
+        model.adapter.modality_set = vec!["embedding".to_owned()];
+        catalog
+            .generation_execution_profiles
+            .get_mut(&artifact_root)
+            .expect("profile")
+            .request_modalities = vec![vec!["embedding".to_owned()]];
+
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
     }
 
     #[test]

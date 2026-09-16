@@ -472,6 +472,14 @@ pub enum VllmGenerationTopology {
     IsolatedWorkers,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VllmTask {
+    #[default]
+    Generate,
+    Embedding,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LoadConfig {
     pub artifact: ModelArtifact,
@@ -503,6 +511,8 @@ pub struct LoadConfig {
     pub ubatch_size: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_max_num_seqs: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_default_vllm_task")]
+    pub vllm_task: VllmTask,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vllm_concurrent_generation_capacity: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -682,6 +692,7 @@ impl Default for LoadConfig {
             batch_size: DEFAULT_BATCH_SIZE,
             ubatch_size: DEFAULT_UBATCH_SIZE,
             vllm_max_num_seqs: None,
+            vllm_task: VllmTask::Generate,
             vllm_concurrent_generation_capacity: None,
             vllm_generation_topology: None,
             vllm_worker_address_space_limit_bytes: None,
@@ -1573,6 +1584,15 @@ pub trait ConcurrentGenerationBackend: Send + Sync {
     ) -> Result<GenerateOutput>;
 }
 
+pub trait ConcurrentEmbeddingBackend: Send + Sync {
+    fn capacity(&self) -> usize;
+    fn embed(
+        &self,
+        request: EmbeddingRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<EmbeddingOutput>;
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComponentRecovery {
     Unsupported,
@@ -1613,6 +1633,9 @@ pub trait EngineBackend {
         false
     }
     fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
+        None
+    }
+    fn concurrent_embedding_backend(&self) -> Option<Arc<dyn ConcurrentEmbeddingBackend>> {
         None
     }
     fn tokenize(&self, text: &str) -> Result<Tokenization>;
@@ -2247,6 +2270,11 @@ fn validate_load_config(config: &LoadConfig) -> Result<()> {
         ));
     }
     if config.vllm_generation_topology == Some(VllmGenerationTopology::IsolatedWorkers) {
+        if config.vllm_task != VllmTask::Generate {
+            return Err(EngineError::InvalidConfig(
+                "isolated vLLM workers currently require the generation task".to_owned(),
+            ));
+        }
         if !config
             .vllm_worker_address_space_limit_bytes
             .is_some_and(|bytes| bytes >= 1024 && bytes <= i64::MAX as u64)
@@ -2293,7 +2321,8 @@ fn validate_load_config(config: &LoadConfig) -> Result<()> {
                 .to_owned(),
         ));
     }
-    let has_vllm_execution_properties = config.vllm_generation_topology.is_some()
+    let has_vllm_execution_properties = config.vllm_task != VllmTask::Generate
+        || config.vllm_generation_topology.is_some()
         || config.vllm_worker_address_space_limit_bytes.is_some()
         || config.vllm_enforce_eager.is_some()
         || config.vllm_compilation_mode.is_some()
@@ -2813,6 +2842,10 @@ fn default_ubatch_size() -> u32 {
     DEFAULT_UBATCH_SIZE
 }
 
+fn is_default_vllm_task(task: &VllmTask) -> bool {
+    *task == VllmTask::Generate
+}
+
 fn effective_vllm_max_num_seqs(config: &LoadConfig) -> u32 {
     let default =
         if config.vllm_generation_topology == Some(VllmGenerationTopology::IsolatedWorkers) {
@@ -3169,7 +3202,7 @@ mod transformers_asr_backend {
                 self.call_existing("load", json!({ "path": model_path }), None)?;
             let loaded = LoadedModelInfo {
                 backend: self.backend_id().to_owned(),
-                artifact: config.artifact,
+                artifact: config.artifact.clone(),
                 ctx_size: config.ctx_size,
                 n_ctx_train: worker_info.n_ctx_train,
                 n_vocab: worker_info.n_vocab,
@@ -7746,7 +7779,7 @@ mod mlx_backend {
             )?;
             let loaded = LoadedModelInfo {
                 backend: self.backend_id().to_owned(),
-                artifact: config.artifact,
+                artifact: config.artifact.clone(),
                 ctx_size: config.ctx_size,
                 n_ctx_train: info.n_ctx_train,
                 n_vocab: info.n_vocab,
@@ -8255,9 +8288,10 @@ mod vllm_backend {
         select_runtime_compatible_cuda_home, validate_load_config,
         validate_vllm_compilation_config, validate_vllm_kernel_backend, verify_artifact,
         vllm_safetensors_payload_path, ArtifactFormat, CancellationToken, ComponentRecovery,
-        ConcurrentGenerationBackend, EngineBackend, EngineError, FinishReason, GenerateOutput,
-        GenerateRequest, LoadConfig, LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization,
-        UsageCounters, VllmGenerationTopology, WorkerContainment,
+        ConcurrentEmbeddingBackend, ConcurrentGenerationBackend, EmbeddingOutput, EmbeddingRequest,
+        EngineBackend, EngineError, FinishReason, GenerateOutput, GenerateRequest, LoadConfig,
+        LoadedModelInfo, Result, TokenChunk, TokenSink, Tokenization, UsageCounters,
+        VllmGenerationTopology, VllmTask, WorkerContainment,
     };
     use serde::de::DeserializeOwned;
     use serde::{Deserialize, Serialize};
@@ -8299,9 +8333,13 @@ mod vllm_backend {
         generation_gate: Arc<RwLock<()>>,
         generation_epoch: Arc<AtomicU64>,
         concurrent_generation: Option<Arc<VllmConcurrentGeneration>>,
+        concurrent_embedding: Option<Arc<VllmConcurrentEmbedding>>,
         concurrent_generation_enabled: bool,
+        concurrent_embedding_enabled: bool,
         loaded_batch_invariant: Option<bool>,
         loaded_generation_capacity: Option<usize>,
+        loaded_embedding_capacity: Option<usize>,
+        loaded_task: Option<VllmTask>,
         loaded_kv_cache_size_tokens: Option<u64>,
         loaded_kv_full_context_capacity: Option<usize>,
         loaded_execution: Option<WorkerExecutionInfo>,
@@ -8331,9 +8369,13 @@ mod vllm_backend {
                 generation_gate: Arc::new(RwLock::new(())),
                 generation_epoch: Arc::new(AtomicU64::new(0)),
                 concurrent_generation: None,
+                concurrent_embedding: None,
                 concurrent_generation_enabled: false,
+                concurrent_embedding_enabled: false,
                 loaded_batch_invariant: None,
                 loaded_generation_capacity: None,
+                loaded_embedding_capacity: None,
+                loaded_task: None,
                 loaded_kv_cache_size_tokens: None,
                 loaded_kv_full_context_capacity: None,
                 loaded_execution: None,
@@ -8669,6 +8711,82 @@ mod vllm_backend {
         }
     }
 
+    struct VllmConcurrentEmbedding {
+        worker: Arc<VllmWorker>,
+        next_id: Arc<AtomicU64>,
+        generation_gate: Arc<RwLock<()>>,
+        generation_epoch: Arc<AtomicU64>,
+        expected_epoch: u64,
+        limiter: Arc<GenerationLimiter>,
+    }
+
+    impl VllmConcurrentEmbedding {
+        fn next_request_id(&self) -> u64 {
+            loop {
+                let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+                if id != 0 {
+                    return id;
+                }
+            }
+        }
+    }
+
+    impl ConcurrentEmbeddingBackend for VllmConcurrentEmbedding {
+        fn capacity(&self) -> usize {
+            self.limiter.capacity()
+        }
+
+        fn embed(
+            &self,
+            request: EmbeddingRequest,
+            cancellation: &CancellationToken,
+        ) -> Result<EmbeddingOutput> {
+            cancellation.check()?;
+            if request.inputs.is_empty() {
+                return Err(EngineError::InvalidConfig(
+                    "embedding request must include at least one input".to_owned(),
+                ));
+            }
+            if request.dimensions == Some(0) {
+                return Err(EngineError::InvalidConfig(
+                    "embedding dimensions must be greater than zero".to_owned(),
+                ));
+            }
+            let _generation = self
+                .generation_gate
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.generation_epoch.load(Ordering::Acquire) != self.expected_epoch {
+                return Err(EngineError::NotLoaded);
+            }
+            let _permit = self.limiter.acquire(cancellation)?;
+            let expected_count = request.inputs.len();
+            let expected_dimensions = request.dimensions;
+            let route_capacity = expected_count.saturating_add(1);
+            let output: EmbeddingOutput = self.worker.call_streaming(
+                self.next_request_id(),
+                "embed",
+                serde_json::to_value(request)?,
+                &mut |_| Ok(()),
+                Some(cancellation),
+                false,
+                route_capacity,
+            )?;
+            if output.embeddings.len() != expected_count
+                || output.embeddings.iter().any(|row| {
+                    row.is_empty()
+                        || expected_dimensions.is_some_and(|dimensions| row.len() != dimensions)
+                        || row.iter().any(|value| !value.is_finite())
+                })
+            {
+                return Err(EngineError::Vllm(
+                    "vLLM worker returned an invalid embedding vector".to_owned(),
+                ));
+            }
+            Ok(output)
+        }
+    }
+
     struct IsolatedGenerationGuard {
         worker: Arc<VllmWorker>,
     }
@@ -8795,9 +8913,13 @@ mod vllm_backend {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             self.loaded = None;
             self.concurrent_generation = None;
+            self.concurrent_embedding = None;
             self.concurrent_generation_enabled = false;
+            self.concurrent_embedding_enabled = false;
             self.loaded_batch_invariant = None;
             self.loaded_generation_capacity = None;
+            self.loaded_embedding_capacity = None;
+            self.loaded_task = None;
             self.loaded_kv_cache_size_tokens = None;
             self.loaded_kv_full_context_capacity = None;
             self.loaded_execution = None;
@@ -8872,15 +8994,58 @@ mod vllm_backend {
                 EngineError::Vllm("vLLM load exhausted memory-utilization attempts".to_owned())
             })?;
             let has_explicit_execution_profile = has_explicit_vllm_execution_properties(&config);
-            if let Err(error) = validate_vllm_prefix_caching(&info)
-                .and_then(|()| validate_vllm_execution_report(&config, info.execution.as_ref()))
-            {
+            let validation = if info.task != config.vllm_task {
+                Err(EngineError::Vllm(format!(
+                    "vLLM worker loaded {:?}, expected {:?}",
+                    info.task, config.vllm_task
+                )))
+            } else {
+                validate_vllm_prefix_caching(&info)
+                    .and_then(|()| validate_vllm_execution_report(&config, info.execution.as_ref()))
+            };
+            if let Err(error) = validation {
                 self.reset_worker();
                 return Err(error);
             }
             let scheduler_capacity = usize::try_from(effective_vllm_max_num_seqs(&config))
                 .unwrap_or(usize::MAX)
                 .max(1);
+            let loaded = LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact.clone(),
+                ctx_size: config.ctx_size,
+                n_ctx_train: if info.n_ctx_train == 0 {
+                    config.ctx_size
+                } else {
+                    info.n_ctx_train
+                },
+                n_vocab: info.n_vocab,
+            };
+            let worker = self
+                .worker
+                .as_ref()
+                .ok_or_else(|| EngineError::Vllm("loaded vLLM worker is missing".to_owned()))?;
+            self.loaded_task = Some(config.vllm_task);
+            self.loaded_execution = has_explicit_execution_profile
+                .then_some(info.execution.clone())
+                .flatten();
+            self.loaded_batch_invariant = info.determinism.batch_invariant;
+
+            if config.vllm_task == VllmTask::Embedding {
+                self.concurrent_embedding = Some(Arc::new(VllmConcurrentEmbedding {
+                    worker: Arc::clone(worker),
+                    next_id: Arc::clone(&self.next_id),
+                    generation_gate: Arc::clone(&self.generation_gate),
+                    generation_epoch: Arc::clone(&self.generation_epoch),
+                    expected_epoch: generation_epoch,
+                    limiter: Arc::new(GenerationLimiter::new(scheduler_capacity)),
+                }));
+                self.concurrent_embedding_enabled = scheduler_capacity > 1;
+                self.loaded_embedding_capacity = Some(scheduler_capacity);
+                self.loaded = Some(loaded.clone());
+                return Ok(loaded);
+            }
+
             let requested_execution_capacity =
                 usize::try_from(config.vllm_concurrent_generation_capacity.unwrap_or(1))
                     .unwrap_or(usize::MAX)
@@ -8926,21 +9091,6 @@ mod vllm_backend {
                 })];
                 self.loaded_topology = config.vllm_generation_topology;
             }
-            let loaded = LoadedModelInfo {
-                backend: self.backend_id().to_owned(),
-                artifact: config.artifact,
-                ctx_size: config.ctx_size,
-                n_ctx_train: if info.n_ctx_train == 0 {
-                    config.ctx_size
-                } else {
-                    info.n_ctx_train
-                },
-                n_vocab: info.n_vocab,
-            };
-            let worker = self
-                .worker
-                .as_ref()
-                .ok_or_else(|| EngineError::Vllm("loaded vLLM worker is missing".to_owned()))?;
             self.concurrent_generation = Some(Arc::new(VllmConcurrentGeneration {
                 dispatch: VllmGenerationDispatch::Shared(Arc::clone(worker)),
                 next_id: Arc::clone(&self.next_id),
@@ -8950,13 +9100,9 @@ mod vllm_backend {
                 limiter: Arc::new(GenerationLimiter::new(execution_capacity)),
             }));
             self.concurrent_generation_enabled = execution_capacity > 1;
-            self.loaded_batch_invariant = info.determinism.batch_invariant;
             self.loaded_generation_capacity = Some(execution_capacity);
             self.loaded_kv_cache_size_tokens = info.kv_cache_size_tokens;
             self.loaded_kv_full_context_capacity = runtime_full_context_capacity;
-            self.loaded_execution = has_explicit_execution_profile
-                .then_some(info.execution)
-                .flatten();
             debug_assert!(scheduler_capacity >= execution_capacity);
             self.loaded = Some(loaded.clone());
             Ok(loaded)
@@ -9118,12 +9264,17 @@ mod vllm_backend {
         fn loaded_backend_evidence(&self) -> Option<Value> {
             self.loaded.as_ref()?;
             let mut evidence = json!({
+                "task": self.loaded_task,
                 "determinism": {
                     "batch_invariant": self.loaded_batch_invariant,
                 },
                 "generation": {
                     "capacity": self.loaded_generation_capacity.unwrap_or(1),
                     "concurrent": self.concurrent_generation_enabled,
+                },
+                "embedding": {
+                    "capacity": self.loaded_embedding_capacity,
+                    "concurrent": self.concurrent_embedding_enabled,
                 },
             });
             if let Some(tokens) = self.loaded_kv_cache_size_tokens {
@@ -9167,6 +9318,14 @@ mod vllm_backend {
             })?
         }
 
+        fn concurrent_embedding_backend(&self) -> Option<Arc<dyn ConcurrentEmbeddingBackend>> {
+            self.concurrent_embedding_enabled.then(|| {
+                self.concurrent_embedding
+                    .as_ref()
+                    .map(|backend| Arc::clone(backend) as Arc<dyn ConcurrentEmbeddingBackend>)
+            })?
+        }
+
         fn tokenize(&self, text: &str) -> Result<Tokenization> {
             self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
             let _exclusive = self
@@ -9188,10 +9347,29 @@ mod vllm_backend {
                 .ok_or(EngineError::NotLoaded)?;
             ConcurrentGenerationBackend::generate(backend.as_ref(), request, sink, cancellation)
         }
+
+        fn embed(
+            &mut self,
+            request: EmbeddingRequest,
+            cancellation: &CancellationToken,
+        ) -> Result<EmbeddingOutput> {
+            let backend = self.concurrent_embedding.as_ref().ok_or_else(|| {
+                if self.loaded.is_some() {
+                    EngineError::InvalidConfig(
+                        "loaded vLLM model is not an embedding runner".to_owned(),
+                    )
+                } else {
+                    EngineError::NotLoaded
+                }
+            })?;
+            ConcurrentEmbeddingBackend::embed(backend.as_ref(), request, cancellation)
+        }
     }
 
     #[derive(Debug, Deserialize)]
     struct WorkerLoadInfo {
+        #[serde(default)]
+        task: VllmTask,
         #[serde(default)]
         prefix_caching: bool,
         #[serde(default)]
@@ -10442,6 +10620,7 @@ exec "$@""#)
     fn vllm_load_payload(config: &LoadConfig, model_path: &Path) -> Value {
         let mut payload = json!({
             "path": model_path,
+            "task": config.vllm_task,
             "ctx_size": config.ctx_size,
             "max_batch_size": effective_vllm_max_num_seqs(config),
             "max_num_tokens": config.ubatch_size.max(1),
@@ -10988,6 +11167,7 @@ import ast
 import asyncio
 import copy
 import inspect
+import math
 import sys
 from enum import Enum
 from types import SimpleNamespace
@@ -10998,7 +11178,7 @@ nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.As
     and any(isinstance(target, ast.Name) and target.id.startswith("MAX_")
             for target in node.targets)
 )]
-namespace = {"asyncio": asyncio, "copy": copy, "inspect": inspect}
+namespace = {"asyncio": asyncio, "copy": copy, "inspect": inspect, "math": math}
 exec(compile(ast.Module(body=nodes, type_ignores=[]), "vllm_worker.py", "exec"), namespace)
 namespace["configure_deterministic_runtime"] = lambda path: None
 namespace["model_uses_nvfp4"] = lambda path: nvfp4
@@ -11051,11 +11231,15 @@ def initialize(args):
         },
         "scheduler_config": {"async_scheduling": args.async_scheduling},
         "cache_config": {"cache_dtype": getattr(args, "kv_cache_dtype", "auto"),
-                         "enable_prefix_caching": args.enable_prefix_caching,
+                         "enable_prefix_caching": getattr(args, "enable_prefix_caching", False),
                          "mamba_cache_mode": getattr(args, "mamba_cache_mode", None)},
         "speculative_config": getattr(args, "speculative_config", None),
         "compilation_config": getattr(args, "compilation_config", {}),
     }
+    config["model_config"].update(
+        runner_type=getattr(args, "runner", "generate"),
+        convert_type=getattr(args, "convert", "none"),
+    )
     mutate(config, args)
     return Engine(object_config(config) if use_objects else config)
 
@@ -11076,6 +11260,13 @@ profile = {
 }
 nvfp4 = False
 mutate = lambda config, args: None
+factory = Factory
+use_objects = True
+
+create_engine({"path": profile["path"], "task": "embedding"})
+assert received_kwargs[-1]["runner"] == "pooling"
+assert received_kwargs[-1]["convert"] == "embed"
+assert received_kwargs[-1]["enable_prefix_caching"] is True
 
 # Both construction APIs must read the post-init config, including enum values.
 for factory in (Factory, initialize):
@@ -11337,6 +11528,50 @@ for batches, expected_ids, expected_chunks in [
     streamed_text = "".join(chunk["text"] for chunk in chunks)
     assert streamed_text == result["text"], (streamed_text, result["text"])
     assert [chunk["text"] for chunk in chunks] == expected_chunks
+
+class PoolingParams:
+    def __init__(self, task, dimensions):
+        self.task = task
+        self.dimensions = dimensions
+    def clone(self):
+        return PoolingParams(self.task, self.dimensions)
+
+class PoolingEngine:
+    def __init__(self):
+        self.started = 0
+        self.gate = asyncio.Event()
+    async def encode(self, *, prompt, pooling_params, request_id):
+        assert pooling_params.task == "embed"
+        assert pooling_params.dimensions is None
+        index = int(request_id.rsplit("-", 1)[1])
+        self.started += 1
+        if self.started == 2:
+            self.gate.set()
+        await asyncio.wait_for(self.gate.wait(), 1)
+        yield SimpleNamespace(
+            outputs=SimpleNamespace(data=([3.0, 4.0, 12.0] if index == 0 else [0.0, 5.0, 12.0])),
+            prompt_token_ids=list(range(index + 2)),
+            finished=True,
+        )
+
+pooling_engine = PoolingEngine()
+namespace.update({
+    "engine": pooling_engine,
+    "worker_task": "embedding",
+    "embedding_engine_request_ids": {},
+    "engine_health_monitor": None,
+    "request_cancelled": lambda request_id: False,
+    "import_attr": lambda candidates: PoolingParams,
+})
+embedding = asyncio.run(namespace["async_handle_embed"](
+    77, {"inputs": ["first", "second"], "dimensions": 2}
+))
+assert pooling_engine.started == 2
+assert embedding["embeddings"] == [[0.6, 0.8], [0.0, 1.0]]
+assert embedding["usage"] == {
+    "prompt_tokens": 5, "completion_tokens": 0, "total_tokens": 5
+}
+assert namespace["embedding_engine_request_ids"] == {}
 print("ok")
 "#;
             let mut child = std::process::Command::new("python3")
@@ -11893,6 +12128,54 @@ printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"prefix_caching":tr
             let payload = vllm_load_payload(&config, Path::new("/tmp/checkpoint"));
             assert_eq!(payload["ctx_size"], json!(131_072));
             assert_eq!(payload["max_num_tokens"], json!(512));
+        }
+
+        #[test]
+        fn vllm_embedding_runner_loads_without_generation_kv_and_preserves_batch_order() {
+            let root = unique_test_root("vllm-embedding-runner");
+            let python = root.join("bin/python");
+            let model = root.join("checkpoint/model.safetensors");
+            fs::create_dir_all(python.parent().expect("python parent")).unwrap();
+            fs::create_dir_all(model.parent().expect("model parent")).unwrap();
+            let script = r#"#!/bin/sh
+IFS= read -r load_request
+printf '%s\n' '{"id":1,"type":"response","ok":true,"result":{"task":"embedding","prefix_caching":true,"n_ctx_train":32768,"n_vocab":151936,"determinism":{"batch_invariant":true}}}'
+IFS= read -r embed_request
+printf '%s\n' '{"id":2,"type":"response","ok":true,"result":{"embeddings":[[0.1,0.2,0.3],[0.4,0.5,0.6]],"usage":{"prompt_tokens":7,"completion_tokens":0,"total_tokens":7}}}'
+IFS= read -r shutdown_request
+"#;
+            write_fake_vllm_worker(&python, &model, script);
+
+            let mut backend = VllmBackend::with_python(&python).unwrap();
+            let mut config = LoadConfig::vllm_safetensors(&model);
+            config.vllm_task = VllmTask::Embedding;
+            config.ctx_size = 32_768;
+            config.vllm_max_num_seqs = Some(4);
+            config.backend_cache_dir = Some(root.join("cache"));
+            backend.load(config).expect("load embedding runner");
+
+            assert!(backend.prefix_caching_enabled());
+            assert_eq!(
+                backend
+                    .concurrent_embedding_backend()
+                    .expect("concurrent embedding handle")
+                    .capacity(),
+                4
+            );
+            let output = backend
+                .embed(
+                    EmbeddingRequest::many(["first", "second"]).with_dimensions(3),
+                    &CancellationToken::new(),
+                )
+                .expect("embedding result");
+            assert_eq!(
+                output.embeddings,
+                vec![vec![0.1, 0.2, 0.3], vec![0.4, 0.5, 0.6]]
+            );
+            assert_eq!(output.usage, UsageCounters::new(7, 0));
+
+            drop(backend);
+            let _ = fs::remove_dir_all(root);
         }
 
         #[test]
