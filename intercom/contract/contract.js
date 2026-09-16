@@ -5473,9 +5473,39 @@ class MayhemContract extends Contract {
         current.paid_cum_au !== liability.paid_cum_au_before) {
       return new Error('Targeted payout preparation liability watermark mismatch.');
     }
+    const provider = await this.get(`prov/${liability.provider}`);
+    if (!provider ||
+        (provider.status !== 'active' && provider.status !== 'banned')) {
+      return new Error('Targeted payout preparation provider status is not payable.');
+    }
+    const params = await this.activeParamsAt(value.prepared_at, [
+      'holdback_epochs',
+      'challenge_epochs',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
+    ]);
+    if (params instanceof Error) return params;
+    const probeGate = await this.probeGateForEarning(
+      liability.provider,
+      current,
+      params
+    );
+    if (probeGate instanceof Error) return probeGate;
+    const lockedEpochs = this.providerLockedEarningEpochs(provider, params);
+    if (lockedEpochs instanceof Error) return lockedEpochs;
+    const disputeGate = await this.providerHasOpenDispute(liability.provider);
+    if (disputeGate instanceof Error) return disputeGate;
+    const refreshed = this.refreshEarningHoldback(
+      current,
+      value.epoch,
+      lockedEpochs,
+      probeGate,
+      disputeGate
+    );
+    if (refreshed instanceof Error) return refreshed;
     const payable = this.safeSubAu(
-      this.safeSubAu(current.total_au, current.held_au),
-      current.paid_cum_au
+      this.safeSubAu(refreshed.total_au, refreshed.held_au),
+      refreshed.paid_cum_au
     );
     if (payable instanceof Error) return payable;
     if (this.compareAu(liability.liability_au, payable) > 0) {
@@ -7095,7 +7125,7 @@ class MayhemContract extends Contract {
       const fee = await this.feeCumRecord('tnk');
       if (fee instanceof Error) return fee;
       const payable = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
-      if (payable instanceof Error || payable !== planned.output.au) {
+      if (payable instanceof Error || this.compareAu(payable, planned.output.au) < 0) {
         return new Error('Targeted TNK fee output does not match canonical fee state.');
       }
       const swept = this.safeAddAu(fee.swept_cum_au, planned.output.au);
@@ -7230,7 +7260,8 @@ class MayhemContract extends Contract {
       const fee = await this.feeCumRecord('fiat');
       if (fee instanceof Error) return fee;
       const payable = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
-      if (payable instanceof Error || payable !== planned.output.liability_au ||
+      if (payable instanceof Error ||
+          this.compareAu(payable, planned.output.liability_au) < 0 ||
           planned.output.paid_au !== planned.output.liability_au) {
         return new Error('Targeted fiat fee output does not match canonical fee state.');
       }
@@ -14537,12 +14568,12 @@ class MayhemContract extends Contract {
     if (feeError) return feeError;
     const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
     if (payableFee instanceof Error) return payableFee;
-    if (this.compareAu(payableFee, value.operator_fee_au) !== 0) {
+    if (this.compareAu(payableFee, value.operator_fee_au) < 0) {
       return new Error('Targeted TNK operator fee does not match fee state.');
     }
     const operatorOutputs = outputs.filter((entry) => entry.role === 'operator_fee');
-    if ((this.isZeroAu(payableFee) && operatorOutputs.length !== 0) ||
-        (this.compareAu(payableFee, ZERO_AU) > 0 &&
+    if ((this.isZeroAu(value.operator_fee_au) && operatorOutputs.length !== 0) ||
+        (this.compareAu(value.operator_fee_au, ZERO_AU) > 0 &&
           (operatorOutputs.length !== 1 || operatorOutputs[0].to !== value.operator_to))) {
       return new Error('Targeted TNK operator output mismatch.');
     }
@@ -14745,7 +14776,7 @@ class MayhemContract extends Contract {
             !this.isZeroAu(value.operator_fee_retained_au))) ||
         (operatorOutputs.length === 1 &&
           (operatorOutputs[0].to !== value.operator_to ||
-            this.compareAu(operatorOutputs[0].liability_au, payableFee) !== 0 ||
+            this.compareAu(operatorOutputs[0].liability_au, payableFee) > 0 ||
             this.compareAu(operatorOutputs[0].paid_au, value.operator_fee_retained_au) !== 0))) {
       return new Error('Targeted fiat operator output mismatch.');
     }

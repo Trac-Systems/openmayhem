@@ -54,7 +54,7 @@ function takeOption(args, name) {
   return value;
 }
 
-function readWalletPasswordFile(file) {
+export function readWalletPasswordFile(file) {
   if (file === null) return null;
   let stat;
   try {
@@ -68,7 +68,10 @@ function readWalletPasswordFile(file) {
   if (!isWindows && (stat.mode & 0o077) !== 0) {
     fail('wallet password file must be owner-only (0600).');
   }
-  return fs.readFileSync(file, 'utf8');
+  // Password files created by standard shell tooling commonly end in one line
+  // break. Treat that delimiter as file formatting, while preserving every
+  // other byte so passwords containing spaces remain valid.
+  return fs.readFileSync(file, 'utf8').replace(/\r?\n$/, '');
 }
 
 function normalizeNetwork(value) {
