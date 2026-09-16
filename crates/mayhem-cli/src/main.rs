@@ -53059,6 +53059,7 @@ fn normalize_tnk_holdbacks(earning: &LedgerEarningRecord) -> Result<Vec<LedgerHo
 
 const STRIPE_FX_API_VERSION: &str = "2025-07-30.preview";
 const STRIPE_FX_QUOTE_LOCK_DURATION: &str = "five_minutes";
+const STRIPE_FX_QUOTE_RENEWAL_BUCKET_SECONDS: u64 = 4 * 60;
 const STRIPE_IDEMPOTENCY_RENEWAL_BOUND_SECONDS: u64 = 23 * 60 * 60;
 
 fn stripe_currency_minor_exponent(currency: &str) -> Result<u32> {
@@ -56714,7 +56715,8 @@ async fn create_targeted_fiat_quote(
         vec!["usd".to_owned(), source_currency.to_owned()]
     };
     from_currencies.retain(|currency| currency != destination_currency);
-    let idempotency_key = format!("mayhem:fiat:fx-quote:v1:{economic_op_id}:{attempt_no}");
+    let idempotency_key =
+        targeted_fiat_quote_idempotency_key(economic_op_id, attempt_no, unix_epoch_seconds()?);
     let quote = stripe_create_fx_quote(
         client,
         api_base_url,
@@ -56729,13 +56731,20 @@ async fn create_targeted_fiat_quote(
             "attempt_no": attempt_no,
         }),
         Some(&idempotency_key),
-        source_currency == destination_currency,
+        false,
         max_attempts,
         retry_ms,
     )
     .await?;
     ensure_canonical_fiat_quote_matches_output(output, Some(&quote))?;
     Ok(Some(quote))
+}
+
+fn targeted_fiat_quote_idempotency_key(economic_op_id: &str, attempt_no: u64, now: u64) -> String {
+    format!(
+        "mayhem:fiat:fx-quote:v2:{economic_op_id}:{attempt_no}:{}",
+        now / STRIPE_FX_QUOTE_RENEWAL_BUCKET_SECONDS
+    )
 }
 
 fn ensure_canonical_fiat_quote_matches_output(
@@ -105234,7 +105243,7 @@ status: linked
     }
 
     #[test]
-    fn same_currency_payout_uses_expired_quote_only_as_valuation_evidence() {
+    fn same_currency_payout_uses_fresh_quote_only_as_valuation_evidence() {
         let output = json!({
             "role": "provider",
             "provider": "aa".repeat(32),
@@ -105264,27 +105273,34 @@ status: linked
             },
         );
         let quote = StripeFxQuote {
-            id: "fxq_expired_valuation".to_owned(),
+            id: "fxq_fresh_valuation".to_owned(),
             created: 100,
-            expires_at: Some(400),
+            expires_at: Some(800),
             lock_duration: "five_minutes".to_owned(),
-            lock_status: "expired".to_owned(),
+            lock_status: "active".to_owned(),
             to_currency: "eur".to_owned(),
             usage_type: "transfer".to_owned(),
             usage_destination: Some("acct_provider".to_owned()),
             rates,
         };
 
-        assert!(validate_locked_stripe_fx_quote(&quote, "five_minutes", 500, false).is_err());
-        validate_locked_stripe_fx_quote(&quote, "five_minutes", 500, true).unwrap();
+        validate_locked_stripe_fx_quote(&quote, "five_minutes", 500, false).unwrap();
         let execution = ensure_canonical_fiat_quote_matches_output(&output, Some(&quote)).unwrap();
         assert_eq!(execution.source_amount_minor, 229);
         assert_eq!(execution.destination_currency, "eur");
         assert!(targeted_fiat_attempt_request(&output, 338, &"dd".repeat(32), None).is_err());
         let request =
             targeted_fiat_attempt_request(&output, 338, &"dd".repeat(32), Some(&quote)).unwrap();
-        assert_eq!(request["fx_quote_id"], "fxq_expired_valuation");
+        assert_eq!(request["fx_quote_id"], "fxq_fresh_valuation");
         assert!(request["fx_quote_hash"].as_str().is_some());
+        assert_eq!(
+            targeted_fiat_quote_idempotency_key(&"cc".repeat(32), 1, 239),
+            targeted_fiat_quote_idempotency_key(&"cc".repeat(32), 1, 100)
+        );
+        assert_ne!(
+            targeted_fiat_quote_idempotency_key(&"cc".repeat(32), 1, 240),
+            targeted_fiat_quote_idempotency_key(&"cc".repeat(32), 1, 239)
+        );
     }
 
     #[test]
