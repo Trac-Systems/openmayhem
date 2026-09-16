@@ -102,6 +102,21 @@ export async function resolveActiveBillingEpoch(explicitEpoch, rpcUrl, {
   return epoch;
 }
 
+export async function resolveMinimumMsbSignedLength(peerRpc, fallback, {
+  fetchImpl = globalThis.fetch,
+} = {}) {
+  if (!Number.isSafeInteger(fallback) || fallback < 1) {
+    throw new Error('MSB reader fallback length must be a positive safe integer');
+  }
+  if (!peerRpc) return fallback;
+  const status = await fetchJson(new URL('status', ensureRpcBase(peerRpc)), fetchImpl);
+  const advertised = Number(status?.msb?.signedLength);
+  if (!Number.isSafeInteger(advertised) || advertised < 1) {
+    throw new Error('Canonical peer did not report a valid MSB signed length');
+  }
+  return Math.max(fallback, advertised);
+}
+
 function readJsonIfExists(filePath, fallback) {
   if (!filePath || !fs.existsSync(filePath)) return fallback;
   return JSON.parse(fs.readFileSync(filePath, 'utf8'));
@@ -542,11 +557,16 @@ async function main() {
   const fromSignedLength = args['from-signed-length'] !== undefined
     ? parsePositiveInt(args['from-signed-length'], '--from-signed-length')
     : cursor.next_signed_length ?? Math.max(0, confirmedLength - lookback);
+  const minimumSignedLength = await resolveMinimumMsbSignedLength(
+    adminRpcUrl,
+    fromSignedLength + 1,
+  );
   const scan = await scanMsbTransfers(msb, {
     fromSignedLength,
     finalitySignedLengths,
     chunkSize,
     timeoutSec,
+    minimumSignedLength,
   });
 
   const pendingEntries = await readPendingIntents({
