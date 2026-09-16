@@ -3816,11 +3816,15 @@ async fn reconcile_pending_gateway_job_once(
     }
     let mut recovery = parse_gateway_job_receipt_recovery(&job)?;
     if !recovery.body.final_receipt {
-        if let (Some(feature), Some(publisher)) = (
-            recovery.reconciliation.settlement_feature.as_ref(),
-            state.receipt_settlement_publisher.as_ref().as_ref(),
-        ) {
-            publisher.queue(feature).map_err(GatewaySessionError::new)?;
+        if let Some(feature) = recovery
+            .reconciliation
+            .settlement_feature
+            .as_ref()
+            .filter(|feature| receipt_settlement_contract_version_is_supported(feature))
+        {
+            if let Some(publisher) = state.receipt_settlement_publisher.as_ref().as_ref() {
+                publisher.queue(feature).map_err(GatewaySessionError::new)?;
+            }
         }
         return failure_recovery::reconcile(state, &job).await;
     }
@@ -3842,11 +3846,7 @@ async fn reconcile_pending_gateway_job_once(
         &feature,
     )?;
     recovery = persist_gateway_job_recovery_feature(state, id, recovery, feature.clone()).await?;
-    if feature
-        .pointer("/value/contract_version")
-        .and_then(Value::as_u64)
-        .is_some_and(receipt_contract_version_is_supported)
-    {
+    if receipt_settlement_contract_version_is_supported(&feature) {
         let publisher = state
             .receipt_settlement_publisher
             .as_ref()
@@ -20952,16 +20952,19 @@ fn validate_receipt_settlement_feature_for_receipt(
     receipt_ack: &ReceiptAck,
     feature: &Value,
 ) -> Result<(), GatewaySessionError> {
-    if feature
-        .pointer("/value/contract_version")
-        .and_then(Value::as_u64)
-        != Some(u64::from(CONTRACT_VERSION))
-    {
+    if !receipt_settlement_contract_version_is_supported(feature) {
         return Err(GatewaySessionError::new(
             "receipt settlement feature has the wrong operation or contract version",
         ));
     }
     validate_stored_receipt_settlement_feature(provider_receipt, receipt_ack, feature)
+}
+
+fn receipt_settlement_contract_version_is_supported(feature: &Value) -> bool {
+    feature
+        .pointer("/value/contract_version")
+        .and_then(Value::as_u64)
+        .is_some_and(receipt_contract_version_is_supported)
 }
 
 fn validate_stored_receipt_settlement_feature(
@@ -49012,7 +49015,7 @@ mod tests {
                 &ack,
                 &feature
             )
-            .is_err());
+            .is_ok());
             invocation
                 .job
                 .as_ref()
@@ -49067,6 +49070,109 @@ mod tests {
             );
             assert_eq!(restarted.ledger_balance_au(), balance);
             assert_eq!(provider_receipt.body.usage, billed_usage);
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_recovery_requeues_only_contract_supported_features() {
+        for (contract_version, should_queue) in [
+            (22_u32, false),
+            (23_u32, true),
+            (24_u32, true),
+            (25_u32, true),
+        ] {
+            let publisher = Arc::new(RecordingReceiptSettlementPublisher::default());
+            let state =
+                GatewayState::fixture().with_receipt_settlement_publisher(publisher.clone());
+            let model = test_model();
+            let job = match prepare_gateway_job(
+                &state,
+                &HeaderMap::new(),
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                &model.id,
+                &json!({"model": model.id, "messages": []}),
+                &None,
+            )
+            .await
+            .unwrap()
+            {
+                PreparedGatewayJob::Started(job) => job,
+                _ => panic!("fresh job expected"),
+            };
+            let id = job.id.clone();
+            let mut invocation = test_invocation();
+            invocation.transport_peer = Some("ab".repeat(32));
+            invocation.job = Some(job.clone());
+            let output = test_chat_output();
+            let provider_receipt = test_provider_receipt_with_finality(
+                &model,
+                &test_chat_request(&model.id),
+                &output,
+                &invocation,
+                1,
+                false,
+            );
+            let ack = receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body)
+                .unwrap();
+            let mut feature = test_receipt_settlement_feature(&provider_receipt, &ack);
+            feature["value"]["contract_version"] = json!(contract_version);
+            let receipt =
+                parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
+            feature["key"] = json!(record_usage_receipt_feature_key_for_contract(
+                &receipt,
+                contract_version,
+            ));
+            feature["value"]["provider_sig"] = json!(sign_hex(
+                &test_provider_seed(),
+                &record_usage_receipt_signing_bytes(
+                    feature["key"].as_str().unwrap(),
+                    &feature["value"],
+                )
+                .unwrap(),
+            ));
+            job.persist_reconciliation_pending(
+                None,
+                Vec::new(),
+                Some(
+                    gateway_job_settled_receipt(
+                        &invocation,
+                        &provider_receipt,
+                        &ack,
+                        GatewayJobStatus::Cancelled,
+                        Some("stream interrupted before terminal receipt".to_owned()),
+                        Some("checkpoint".to_owned()),
+                    )
+                    .unwrap(),
+                ),
+                Some("checkpoint reconciliation is pending".to_owned()),
+            )
+            .await
+            .unwrap();
+            job.persist_reconciliation_settlement_feature(feature.clone())
+                .await
+                .unwrap();
+            let transport = RecordingReceiptAckRecoveryTransport {
+                expected_ack: ack,
+                feature: feature.clone(),
+                deliveries: Arc::new(Mutex::new(Vec::new())),
+            };
+
+            let error = reconcile_pending_gateway_job_once(&state, &id, &transport)
+                .await
+                .unwrap_err();
+            assert!(error.message.contains("canonical ledger access"));
+            assert_eq!(
+                publisher
+                    .features
+                    .lock_recover("test published features")
+                    .as_slice(),
+                if should_queue {
+                    std::slice::from_ref(&feature)
+                } else {
+                    &[]
+                },
+                "contract version {contract_version}",
+            );
         }
     }
 

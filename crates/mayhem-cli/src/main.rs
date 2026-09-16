@@ -61149,6 +61149,12 @@ fn receipt_settlement_feature_meta(feature: &Value) -> Result<ReceiptSettlementF
             .context("receipt settlement feature is missing receipt")?,
     )
     .map_err(anyhow::Error::msg)?;
+    receipt_settlement_receipt_meta(&receipt)
+}
+
+fn receipt_settlement_receipt_meta(
+    receipt: &SessionReceipt,
+) -> Result<ReceiptSettlementFeatureMeta> {
     let body = &receipt.body;
     let attempt_id = stable_value_hash(&json!({
         "domain": "mayhem-receipt-settlement-attempt-v1",
@@ -61250,15 +61256,38 @@ fn confirmed_receipt_settlement_record_matches(
     key: &str,
     entry: &ReceiptSettlementOutboxEntry,
 ) -> bool {
-    record.get("confirmed").and_then(Value::as_bool) == Some(true)
+    let confirmed_head = record.get("confirmed").and_then(Value::as_bool) == Some(true)
         && record.get("key").and_then(Value::as_str) == Some(key)
         && record.pointer("/value/type").and_then(Value::as_str) == Some("canonical_receipt_head")
         && record
             .pointer("/value/settlement_ready")
             .and_then(Value::as_bool)
-            == Some(true)
-        && record.pointer("/value/feature_key") == entry.feature.get("key")
+            == Some(true);
+    if !confirmed_head {
+        return false;
+    }
+    if record.pointer("/value/feature_key") == entry.feature.get("key")
         && record.pointer("/value/receipt") == entry.feature.pointer("/value/receipt")
+    {
+        return true;
+    }
+    if entry.final_receipt {
+        return false;
+    }
+    let Some(receipt) = record
+        .pointer("/value/receipt")
+        .and_then(|value| parse_record_usage_receipt_envelope(value).ok())
+    else {
+        return false;
+    };
+    let Ok(canonical) = receipt_settlement_receipt_meta(&receipt) else {
+        return false;
+    };
+    canonical.attempt_id == entry.attempt_id
+        && canonical.immutable_terms_hash == entry.immutable_terms_hash
+        && canonical.seq > entry.seq
+        && canonical.au_owed_cum >= entry.au_owed_cum
+        && canonical.usage.is_monotonic_from(&entry.usage)
 }
 
 async fn confirmed_receipt_settlement_entry(
@@ -112793,6 +112822,56 @@ esac
             entry.path.exists(),
             "a mismatch must leave durable evidence"
         );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_retires_checkpoint_proven_superseded_by_canonical_head() {
+        let root = test_temp_dir("mayhem-receipt-outbox-superseded-checkpoint");
+        let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
+        let entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test_at(
+                7, 69, false, 69,
+            ))
+            .unwrap();
+        let canonical = signed_receipt_settlement_feature_for_test_at(7, 70, true, 70);
+        let key = receipt_settlement_head_key(&entry).unwrap();
+        let record = json!({
+            "confirmed": true,
+            "key": key,
+            "value": {
+                "type": "canonical_receipt_head",
+                "settlement_ready": true,
+                "feature_key": canonical["key"],
+                "receipt": canonical["value"]["receipt"],
+            },
+        });
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record, &key, &entry
+        ));
+
+        let mut same_sequence = record.clone();
+        same_sequence["value"]["receipt"]["body"]["seq"] = json!(69);
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &same_sequence,
+            &key,
+            &entry,
+        ));
+        let mut changed_terms = record.clone();
+        changed_terms["value"]["receipt"]["body"]["payout_revision"] = json!("47".repeat(32));
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &changed_terms,
+            &key,
+            &entry,
+        ));
+        let mut regressed_usage = record;
+        regressed_usage["value"]["receipt"]["body"]["usage"]["output_tokens"] = json!(68);
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &regressed_usage,
+            &key,
+            &entry,
+        ));
+        assert!(entry.path.exists());
         let _ = fs::remove_dir_all(root);
     }
 
