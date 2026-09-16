@@ -7125,7 +7125,7 @@ class MayhemContract extends Contract {
       const fee = await this.feeCumRecord('tnk');
       if (fee instanceof Error) return fee;
       const payable = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
-      if (payable instanceof Error || payable !== planned.output.au) {
+      if (payable instanceof Error || this.compareAu(payable, planned.output.au) < 0) {
         return new Error('Targeted TNK fee output does not match canonical fee state.');
       }
       const swept = this.safeAddAu(fee.swept_cum_au, planned.output.au);
@@ -7260,7 +7260,8 @@ class MayhemContract extends Contract {
       const fee = await this.feeCumRecord('fiat');
       if (fee instanceof Error) return fee;
       const payable = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
-      if (payable instanceof Error || payable !== planned.output.liability_au ||
+      if (payable instanceof Error ||
+          this.compareAu(payable, planned.output.liability_au) < 0 ||
           planned.output.paid_au !== planned.output.liability_au) {
         return new Error('Targeted fiat fee output does not match canonical fee state.');
       }
@@ -14567,12 +14568,12 @@ class MayhemContract extends Contract {
     if (feeError) return feeError;
     const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
     if (payableFee instanceof Error) return payableFee;
-    if (this.compareAu(payableFee, value.operator_fee_au) !== 0) {
+    if (this.compareAu(payableFee, value.operator_fee_au) < 0) {
       return new Error('Targeted TNK operator fee does not match fee state.');
     }
     const operatorOutputs = outputs.filter((entry) => entry.role === 'operator_fee');
-    if ((this.isZeroAu(payableFee) && operatorOutputs.length !== 0) ||
-        (this.compareAu(payableFee, ZERO_AU) > 0 &&
+    if ((this.isZeroAu(value.operator_fee_au) && operatorOutputs.length !== 0) ||
+        (this.compareAu(value.operator_fee_au, ZERO_AU) > 0 &&
           (operatorOutputs.length !== 1 || operatorOutputs[0].to !== value.operator_to))) {
       return new Error('Targeted TNK operator output mismatch.');
     }
@@ -14775,7 +14776,7 @@ class MayhemContract extends Contract {
             !this.isZeroAu(value.operator_fee_retained_au))) ||
         (operatorOutputs.length === 1 &&
           (operatorOutputs[0].to !== value.operator_to ||
-            this.compareAu(operatorOutputs[0].liability_au, payableFee) !== 0 ||
+            this.compareAu(operatorOutputs[0].liability_au, payableFee) > 0 ||
             this.compareAu(operatorOutputs[0].paid_au, value.operator_fee_retained_au) !== 0))) {
       return new Error('Targeted fiat operator output mismatch.');
     }
