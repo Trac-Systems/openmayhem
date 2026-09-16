@@ -53770,6 +53770,7 @@ async fn canonicalize_fiat_settlement_plan(
                                 "liability_au": money_au_json(output.liability_au),
                             }),
                             None,
+                            false,
                             max_attempts,
                             retry_ms,
                         )
@@ -53825,6 +53826,7 @@ async fn canonicalize_fiat_settlement_plan(
                             "liability_au": money_au_json(output.liability_au),
                         }),
                         None,
+                        false,
                         max_attempts,
                         retry_ms,
                     )
@@ -54541,6 +54543,7 @@ async fn stripe_create_fx_quote(
     lock_duration: &str,
     operation_identity: &Value,
     idempotency_key_override: Option<&str>,
+    allow_expired_valuation_quote: bool,
     max_attempts: u32,
     retry_ms: u64,
 ) -> Result<StripeFxQuote> {
@@ -54656,18 +54659,43 @@ async fn stripe_create_fx_quote(
                 "unlocked Stripe FX quote is not usable"
             );
         } else {
-            let now = unix_epoch_seconds()?;
-            ensure!(
-                quote.lock_status == "active"
-                    && quote
-                        .expires_at
-                        .is_some_and(|expires| expires > now.saturating_add(15)),
-                "Stripe FX quote is not active long enough to create a transfer"
-            );
+            validate_locked_stripe_fx_quote(
+                &quote,
+                lock_duration,
+                unix_epoch_seconds()?,
+                allow_expired_valuation_quote,
+            )?;
         }
         return Ok(quote);
     }
     unreachable!("positive max_attempts checked by caller")
+}
+
+fn validate_locked_stripe_fx_quote(
+    quote: &StripeFxQuote,
+    requested_lock_duration: &str,
+    now: u64,
+    allow_expired_valuation_quote: bool,
+) -> Result<()> {
+    let expires_at = quote
+        .expires_at
+        .context("locked Stripe FX quote is missing its expiry")?;
+    ensure!(
+        quote.lock_duration == requested_lock_duration && expires_at > quote.created,
+        "Stripe FX quote lock does not match its request"
+    );
+    if allow_expired_valuation_quote {
+        ensure!(
+            matches!(quote.lock_status.as_str(), "active" | "expired"),
+            "Stripe FX valuation quote has an invalid lock status"
+        );
+    } else {
+        ensure!(
+            quote.lock_status == "active" && expires_at > now.saturating_add(15),
+            "Stripe FX quote is not active long enough to create a transfer"
+        );
+    }
+    Ok(())
 }
 
 async fn stripe_retrieve_fx_quote(
@@ -55233,6 +55261,7 @@ async fn stripe_create_transfer_verified(
                         "operation": operation,
                     }),
                     Some(&journal.quote_idempotency_key),
+                    source_currency == destination_currency,
                     max_attempts,
                     retry_ms,
                 )
@@ -56440,7 +56469,7 @@ fn targeted_fiat_attempt_request(
         .get("destination_currency")
         .and_then(Value::as_str)
         .context("canonical fiat provider output is missing destination_currency")?;
-    let requires_quote = source_currency != destination_currency;
+    let requires_quote = source_currency != "usd" || destination_currency != "usd";
     ensure!(
         requires_quote == quote.is_some(),
         "canonical fiat attempt quote does not match its currencies"
@@ -56668,8 +56697,7 @@ async fn create_targeted_fiat_quote(
         .get("destination_currency")
         .and_then(Value::as_str)
         .context("canonical fiat output is missing destination_currency")?;
-    if source_currency == destination_currency {
-        ensure_canonical_fiat_quote_matches_output(output, None)?;
+    if source_currency == "usd" && destination_currency == "usd" {
         return Ok(None);
     }
     let destination = output
@@ -56701,6 +56729,7 @@ async fn create_targeted_fiat_quote(
             "attempt_no": attempt_no,
         }),
         Some(&idempotency_key),
+        source_currency == destination_currency,
         max_attempts,
         retry_ms,
     )
@@ -56715,9 +56744,24 @@ fn ensure_canonical_fiat_quote_matches_output(
 ) -> Result<FiatFxPlan> {
     let planned = fiat_plan_output_fx(output)?;
     if planned.source_currency == planned.destination_currency {
+        if planned.source_currency == "usd" {
+            ensure!(
+                quote.is_none(),
+                "USD fiat execution must not carry an FX quote"
+            );
+            return Ok(planned);
+        }
+        let quote = quote.context("same-currency fiat execution is missing its valuation quote")?;
+        let destination = output
+            .get("to")
+            .and_then(Value::as_str)
+            .context("canonical fiat output is missing destination")?;
         ensure!(
-            quote.is_none(),
-            "same-currency fiat execution must not carry an FX quote"
+            quote.to_currency == planned.destination_currency
+                && quote.usage_type == "transfer"
+                && quote.usage_destination.as_deref() == Some(destination)
+                && quote.rates.contains_key("usd"),
+            "same-currency fiat valuation quote does not match the canonical output"
         );
         return Ok(planned);
     }
@@ -57113,6 +57157,7 @@ async fn stripe_operator_fee_evidence(
                 "liability_au": money_au_json(output.liability_au),
             }),
             None,
+            false,
             max_attempts,
             retry_ms,
         )
@@ -105189,7 +105234,7 @@ status: linked
     }
 
     #[test]
-    fn same_currency_payout_executes_the_canonical_amount_without_a_second_quote() {
+    fn same_currency_payout_uses_expired_quote_only_as_valuation_evidence() {
         let output = json!({
             "role": "provider",
             "provider": "aa".repeat(32),
@@ -105208,12 +105253,38 @@ status: linked
             "destination_amount_max_minor": "229",
         });
 
-        let execution = ensure_canonical_fiat_quote_matches_output(&output, None).unwrap();
+        let mut rates = BTreeMap::new();
+        rates.insert(
+            "usd".to_owned(),
+            StripeFxRate {
+                exchange_rate: "0.8".to_owned(),
+                exchange_ratio: parse_exact_decimal_ratio("0.8").unwrap(),
+                base_rate: "0.8".to_owned(),
+                base_ratio: parse_exact_decimal_ratio("0.8").unwrap(),
+            },
+        );
+        let quote = StripeFxQuote {
+            id: "fxq_expired_valuation".to_owned(),
+            created: 100,
+            expires_at: Some(400),
+            lock_duration: "five_minutes".to_owned(),
+            lock_status: "expired".to_owned(),
+            to_currency: "eur".to_owned(),
+            usage_type: "transfer".to_owned(),
+            usage_destination: Some("acct_provider".to_owned()),
+            rates,
+        };
+
+        assert!(validate_locked_stripe_fx_quote(&quote, "five_minutes", 500, false).is_err());
+        validate_locked_stripe_fx_quote(&quote, "five_minutes", 500, true).unwrap();
+        let execution = ensure_canonical_fiat_quote_matches_output(&output, Some(&quote)).unwrap();
         assert_eq!(execution.source_amount_minor, 229);
         assert_eq!(execution.destination_currency, "eur");
-        let request = targeted_fiat_attempt_request(&output, 338, &"dd".repeat(32), None).unwrap();
-        assert_eq!(request["fx_quote_id"], Value::Null);
-        assert_eq!(request["fx_quote_hash"], Value::Null);
+        assert!(targeted_fiat_attempt_request(&output, 338, &"dd".repeat(32), None).is_err());
+        let request =
+            targeted_fiat_attempt_request(&output, 338, &"dd".repeat(32), Some(&quote)).unwrap();
+        assert_eq!(request["fx_quote_id"], "fxq_expired_valuation");
+        assert!(request["fx_quote_hash"].as_str().is_some());
     }
 
     #[test]
