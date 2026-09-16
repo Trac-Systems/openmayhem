@@ -31,6 +31,26 @@ const JOURNAL_SCHEMA_VERSION = 1;
 const MAX_TRANSFER_AMOUNT = 0xffffffffffffffffffffffffffffffffn;
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const MSB_CLOSE_TIMEOUT_MS = 5_000;
+
+async function closeMsbBounded(msb, timeoutMs = MSB_CLOSE_TIMEOUT_MS) {
+  let timer;
+  try {
+    await Promise.race([
+      Promise.resolve().then(() => msb.close()),
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } catch (_error) {
+    // The operation result is already durable before shutdown begins. A
+    // transport close failure must not turn a confirmed transfer into a
+    // permanently running payment job.
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 function fail(message) {
   throw new Error(message);
@@ -655,9 +675,7 @@ export async function runSettlementTransferHelper(rawArgs, options = {}) {
     console.log = originalLog;
     console.info = originalInfo;
     if (!options.keepOpen && opened) {
-      try {
-        await msb.close();
-      } catch (_error) {}
+      await closeMsbBounded(msb);
     }
   }
 }
@@ -765,9 +783,7 @@ export async function runPreparedSettlementTransferHelper(command, rawArgs, opti
     console.log = originalLog;
     console.info = originalInfo;
     if (!options.keepOpen && opened) {
-      try {
-        await msb.close();
-      } catch (_error) {}
+      await closeMsbBounded(msb);
     }
   }
 }
@@ -922,9 +938,7 @@ export async function runTransferHelper(rawArgs, options = {}) {
     console.log = originalLog;
     console.info = originalInfo;
     if (!options.keepOpen && opened) {
-      try {
-        await msb.close();
-      } catch (_error) {}
+      await closeMsbBounded(msb);
     }
   }
 }
