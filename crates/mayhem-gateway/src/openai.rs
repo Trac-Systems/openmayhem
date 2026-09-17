@@ -56,11 +56,11 @@ use crate::{
         DEFAULT_IMAGE_FLOOR_IMAGES_PER_S, DEFAULT_LLM_GENERATION_FLOOR_TOK_S,
         DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
     },
-    verify_execution_mode_binding, verify_tier1_attestation, AttestationPolicyVerificationContext,
-    AttestationVerificationRequest, EnclaveContractRecord, HardwareQuoteVerifierCommand,
-    HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
-    ProviderHeartbeat, ProviderKey, ProviderProbation, ReputationEventKind, VerifiedAttestation,
-    GATEWAY_ATTESTATION_VERIFIER_VERSION,
+    structured_schema, verify_execution_mode_binding, verify_tier1_attestation,
+    AttestationPolicyVerificationContext, AttestationVerificationRequest, EnclaveContractRecord,
+    HardwareQuoteVerifierCommand, HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf,
+    HeartbeatQueue, HeartbeatSlots, ProviderHeartbeat, ProviderKey, ProviderProbation,
+    ReputationEventKind, VerifiedAttestation, GATEWAY_ATTESTATION_VERIFIER_VERSION,
 };
 use axum::{
     body::{Body, Bytes},
@@ -9673,6 +9673,9 @@ async fn create_chat_completion(
     };
     request.endpoint_family = Some(endpoint_family);
     request.endpoint_request = Some(normalized_request);
+    if let Err(err) = validate_requested_response_schema(request.response_format.as_ref()) {
+        return err.into_response();
+    }
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -9884,6 +9887,11 @@ async fn create_response(
         Ok(request) => request,
         Err(err) => return err.into_response(),
     };
+    if let Err(err) = validate_requested_response_schema(
+        request.text.as_ref().and_then(|text| text.get("format")),
+    ) {
+        return err.into_response();
+    }
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -24453,6 +24461,7 @@ async fn build_chat_completion(
 ) -> Result<ChatResponse, ApiError> {
     let model = require_model(&state, &request.model)?;
     let mut request = request;
+    validate_requested_response_schema(request.response_format.as_ref())?;
     apply_model_sampling_defaults(&model, &mut request)?;
     apply_model_speciality_defaults(&model, &mut request)?;
     synchronize_effective_chat_contract_request(&model, &mut request)?;
@@ -26150,6 +26159,7 @@ async fn run_live_direct_chat_sse_inner(
         finish_reason,
         usage,
     };
+    validate_structured_chat_output(&session.request, &output)?;
     let provider_receipt = final_provider_receipt.ok_or_else(|| {
         GatewaySessionError::new(format!(
             "provider session {} ended without a final receipt",
@@ -26644,6 +26654,15 @@ async fn run_chat_with_route_retry(
                         continue;
                     }
                 }
+                let metering_request = attempt_request.clone();
+                let metering_output = result.output.clone();
+                if !partials.is_empty() {
+                    stitch_partials_into_result(&mut result, &partials);
+                }
+                validate_structured_chat_output(request, &result.output).map_err(|error| {
+                    request_scoped_api_error(&error)
+                        .expect("structured output failure is request scoped")
+                })?;
                 record_route_observation(
                     state,
                     route,
@@ -26651,11 +26670,6 @@ async fn run_chat_with_route_retry(
                 );
                 if let Some(route) = route {
                     state.record_chat_affinity(model, request, route);
-                }
-                let metering_request = attempt_request.clone();
-                let metering_output = result.output.clone();
-                if !partials.is_empty() {
-                    stitch_partials_into_result(&mut result, &partials);
                 }
                 return Ok(GatewaySessionRun {
                     result,
@@ -37467,6 +37481,62 @@ fn wants_json(value: &Option<Value>) -> bool {
     )
 }
 
+fn validate_requested_response_schema(format: Option<&Value>) -> Result<(), ApiError> {
+    let Some(format) = format else {
+        return Ok(());
+    };
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return Ok(());
+    }
+    let schema = format
+        .get("json_schema")
+        .and_then(|wrapper| wrapper.get("schema"))
+        .or_else(|| format.get("schema"))
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "response_format.json_schema.schema is required",
+                Some("response_format"),
+            )
+            .with_public_error(
+                "unsupported_response_schema",
+                "request_validation",
+                false,
+            )
+        })?;
+    structured_schema::prepare(schema).map_err(|error| {
+        ApiError::bad_request(
+            format!("Unsupported response JSON schema: {error}"),
+            Some("response_format"),
+        )
+        .with_public_error("unsupported_response_schema", "request_validation", false)
+    })?;
+    Ok(())
+}
+
+fn validate_structured_chat_output(
+    request: &ChatCompletionRequest,
+    output: &ChatOutput,
+) -> Result<(), GatewaySessionError> {
+    if !output.tool_calls.is_empty() {
+        return Ok(());
+    }
+    let Some(format) = request.response_format.as_ref() else {
+        return Ok(());
+    };
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return Ok(());
+    }
+    let schema = format
+        .get("json_schema")
+        .and_then(|wrapper| wrapper.get("schema"))
+        .or_else(|| format.get("schema"))
+        .ok_or_else(|| GatewaySessionError::buyer_local("request_invalid: missing JSON schema"))?;
+    let content = output.content.as_deref().unwrap_or_default();
+    structured_schema::validate_output(schema, content).map_err(|error| {
+        GatewaySessionError::request_scoped(format!("model_output_invalid: {error}"))
+    })
+}
+
 fn last_tool_result(messages: &[ChatMessage]) -> Option<String> {
     messages
         .iter()
@@ -38568,6 +38638,129 @@ mod tests {
         attestation_signing_bytes, ctx_bracket_for_tokens, reassemble_json_payload,
         AttestationSigner, CTX_BRACKET_TABLE_VERSION,
     };
+
+    #[test]
+    fn schema_preflight_is_request_scoped_for_chat_and_responses() {
+        let valid = json!({"type":"json_schema","json_schema":{"schema":{
+            "type":"object","properties":{"items":{"type":"array","uniqueItems":true,
+                "items":{"type":"string"}}}
+        }}});
+        validate_requested_response_schema(Some(&valid)).unwrap();
+        let responses_format =
+            json!({"type":"json_schema","schema":valid["json_schema"]["schema"]});
+        validate_requested_response_schema(Some(&responses_format)).unwrap();
+
+        let unsupported = json!({"type":"json_schema","json_schema":{"schema":{
+            "type":"array","unknownConstraint":true
+        }}});
+        let error = validate_requested_response_schema(Some(&unsupported)).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(public_error_code(&error), "unsupported_response_schema");
+        assert!(!public_error_retryable(&error));
+    }
+
+    #[test]
+    fn buyer_checks_original_schema_before_accepting_model_output() {
+        let mut request = test_chat_request("test-model");
+        request.response_format = Some(json!({"type":"json_schema","json_schema":{"schema":{
+            "type":"object","required":["evidenceIds"],"properties":{
+                "evidenceIds":{"type":"array","uniqueItems":true,"minItems":2,
+                    "items":{"type":"string"}}
+            }
+        }}}));
+        let mut output = ChatOutput {
+            reasoning_content: String::new(),
+            content: Some(r#"{"evidenceIds":["E1","E1"]}"#.to_owned()),
+            tool_calls: Vec::new(),
+            artifacts: Vec::new(),
+            finish_reason: "stop".to_owned(),
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+        };
+        let error = validate_structured_chat_output(&request, &output).unwrap_err();
+        let api_error = request_scoped_api_error(&error).expect("request-scoped output error");
+        assert_eq!(api_error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            public_error_code(&api_error),
+            "provider_model_output_invalid"
+        );
+        output.content = Some(r#"{"evidenceIds":["E1","E2"]}"#.to_owned());
+        validate_structured_chat_output(&request, &output).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_schema_returns_400_without_starting_a_gateway_job() {
+        use tower::ServiceExt;
+
+        let mut model = GatewayState::fixture()
+            .models_snapshot()
+            .first()
+            .cloned()
+            .unwrap();
+        model.mayhem.adapter.endpoint_families.push(
+            mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+            )
+            .unwrap(),
+        );
+        let model_id = model.id.clone();
+        let state = GatewayState::from_models(vec![model]).with_dev_session_shim();
+        let app = openai_router(state);
+        for stream in [false, true] {
+            let schema = json!({"type":"array","unknownConstraint":true});
+            let cases = [
+                (
+                    "/v1/chat/completions",
+                    json!({
+                        "model":model_id,
+                        "messages":[{"role":"user","content":"Return JSON"}],
+                        "stream":stream,
+                        "response_format":{"type":"json_schema","json_schema":{"name":"bad","schema":schema}}
+                    }),
+                ),
+                (
+                    "/v1/responses",
+                    json!({
+                        "model":model_id,
+                        "input":"Return JSON",
+                        "stream":stream,
+                        "text":{"format":{"type":"json_schema","name":"bad","schema":schema}}
+                    }),
+                ),
+            ];
+            for (path, body) in cases {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{path} stream={stream}"
+                );
+                assert!(response.headers().get("x-mayhem-job-id").is_none());
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    body["error"]["code"], "unsupported_response_schema",
+                    "{path} stream={stream}: {body}"
+                );
+            }
+        }
+    }
 
     fn public_error_code(error: &ApiError) -> String {
         error

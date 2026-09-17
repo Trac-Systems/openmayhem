@@ -58,6 +58,10 @@ class PromptTooLong(ValueError):
 
 
 def request_error_fields(exc):
+    # Grammar compilation errors are deterministic request-schema failures,
+    # not a reason to cool an otherwise healthy serving route.
+    if str(exc).startswith("Grammar error:"):
+        return {"error_code": "invalid_response_schema"}
     # vLLM v0.24 validates again after multimodal expansion. Match only its
     # explicit decoder-context ValueError, never arbitrary engine/OOM failures.
     # https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/v1/engine/input_processor.py

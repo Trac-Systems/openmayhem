@@ -92456,6 +92456,11 @@ fn provider_engine_session_response_with_sampling_bounded(
         reasoning_output_mode,
         reasoning_delimiters,
     );
+    if tool_mode.is_none() && provider_wants_json(request_body) {
+        let schema = provider_response_json_schema(request_body);
+        mayhem_gateway::structured_schema::validate_output(&schema, &filtered_output.visible)
+            .map_err(|error| provider_session_output_error(error.to_string()))?;
+    }
     Ok(ProviderSessionOutput {
         usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
         content: streamed_content.unwrap_or_else(|| {
@@ -93458,8 +93463,11 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
             }
         }
     } else if provider_wants_json(body) {
+        let schema = provider_response_json_schema(body);
+        let generation_schema = mayhem_gateway::structured_schema::prepare(&schema)
+            .map_err(|error| provider_session_request_error(error.to_string()))?;
         request.grammar = Some(GrammarSpec::JsonSchema {
-            schema: provider_response_json_schema(body),
+            schema: generation_schema,
         });
     }
     Ok(request)
@@ -118649,6 +118657,64 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             panic!("expected json schema grammar");
         };
         assert_eq!(schema["required"][0], "ok");
+    }
+
+    #[test]
+    fn provider_projects_nested_unique_items_and_checks_original_output() {
+        let body = json!({
+            "messages": [{"role":"user","content":"Return evidence IDs"}],
+            "response_format": {"type":"json_schema","json_schema":{"name":"brief","schema":{
+                "type":"object","required":["evidenceIds"],"properties":{
+                    "evidenceIds":{"type":"array","minItems":2,"maxItems":4,
+                        "uniqueItems":true,"items":{"type":"string","pattern":"^E[1-9]$"}}
+                }
+            }}}
+        });
+        let mut valid = FakeEngineBackend::new(r#"{"evidenceIds":["E1","E2"]}"#);
+        let output = provider_engine_session_response(
+            &mut valid,
+            &catalog::CatalogAdapter::default(),
+            &body,
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.content, r#"{"evidenceIds":["E1","E2"]}"#);
+        let Some(GrammarSpec::JsonSchema { schema }) = valid.last_request.unwrap().grammar else {
+            panic!("expected projected JSON schema grammar");
+        };
+        assert!(schema["properties"]["evidenceIds"]
+            .get("uniqueItems")
+            .is_none());
+
+        let mut duplicate = FakeEngineBackend::new(r#"{"evidenceIds":["E1","E1"]}"#);
+        let error = provider_engine_session_response(
+            &mut duplicate,
+            &catalog::CatalogAdapter::default(),
+            &body,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(provider_response_error_code(&error), "model_output_invalid");
+    }
+
+    #[test]
+    fn provider_rejects_unsupported_schema_before_engine_dispatch() {
+        let body = json!({
+            "messages": [{"role":"user","content":"Return JSON"}],
+            "response_format": {"type":"json_schema","json_schema":{"name":"bad","schema":{
+                "type":"array","unknownConstraint":true
+            }}}
+        });
+        let mut backend = FakeEngineBackend::new("[]");
+        let error = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(provider_response_error_code(&error), "request_invalid");
+        assert!(backend.last_request.is_none());
     }
 
     #[test]

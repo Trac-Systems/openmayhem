@@ -32,6 +32,7 @@ getrandom = "0.3"
 hex = "0.4"
 image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
 jsonwebtoken = { version = "10.3", features = ["rust_crypto"] }
+jsonschema = { version = "0.53.0", default-features = false }
 mayhem-bridge = { path = "../mayhem-bridge" }
 mayhem-attestation = { path = "../mayhem-attestation" }
 mayhem-proto = { path = "../mayhem-proto" }

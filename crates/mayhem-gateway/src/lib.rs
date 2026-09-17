@@ -8,6 +8,7 @@ pub mod openai;
 pub mod pricing;
 pub mod provider_table;
 pub mod reputation;
+pub mod structured_schema;
 pub use attestation_policy::*;
 pub use audit::*;
 pub use failover::*;

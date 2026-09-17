@@ -9594,6 +9594,13 @@ mod vllm_backend {
     }
 
     fn worker_response_error(message: WorkerMessage) -> EngineError {
+        if message.error_code.as_deref() == Some("invalid_response_schema") {
+            return EngineError::InvalidRequest(
+                message
+                    .error
+                    .unwrap_or_else(|| "unsupported response JSON schema".to_owned()),
+            );
+        }
         if message.error_code.as_deref() == Some("context_length_exceeded") {
             if let (Some(prompt_tokens), Some(ctx_size)) = (message.prompt_tokens, message.ctx_size)
             {
@@ -10783,6 +10790,19 @@ exec "$@""#)
                     EngineError::Vllm(_)
                 ));
             }
+        }
+
+        #[test]
+        fn vllm_grammar_error_is_a_request_error_not_an_engine_failure() {
+            let message = serde_json::from_value(json!({
+                "id": 1, "ok": false, "error_code": "invalid_response_schema",
+                "error": "Grammar error: Unimplemented keys: [\"uniqueItems\"]",
+            }))
+            .unwrap();
+            assert!(matches!(
+                worker_response_error(message),
+                EngineError::InvalidRequest(_)
+            ));
         }
 
         #[test]
