@@ -21478,9 +21478,24 @@ fn authoritative_embedding_usage(
             inputs.len()
         )));
     }
-    let observed = embedding_usage_for_inputs(inputs);
-    ensure_reported_token_usage_matches(&output.usage, &observed, "embedding session")?;
-    Ok(ReceiptUsage::text(observed.prompt_tokens, 0))
+    // The gateway cannot reproduce every provider tokenizer. Accept its exact
+    // count within the same conservative envelope used for the signed voucher;
+    // receipt validation below still requires the signed usage to match it.
+    let reported = &output.usage;
+    let lower_bound = embedding_input_token_count(inputs);
+    let upper_bound = embedding_input_token_upper_bound(inputs);
+    if reported.prompt_tokens == 0
+        || reported.completion_tokens != 0
+        || reported.total_tokens != reported.prompt_tokens
+        || reported.prompt_tokens < lower_bound
+        || reported.prompt_tokens > upper_bound
+    {
+        return Err(GatewaySessionError::new(format!(
+            "embedding session reported invalid token usage: prompt={}, completion={}, total={}, expected positive prompt count in {lower_bound}..={upper_bound} and no completion tokens",
+            reported.prompt_tokens, reported.completion_tokens, reported.total_tokens,
+        )));
+    }
+    Ok(ReceiptUsage::text(reported.prompt_tokens, 0))
 }
 
 fn expected_embedding_provider_receipt<'a>(
@@ -38255,19 +38270,20 @@ fn estimate_max_spend_au(
     .max(1_000)
 }
 
-fn estimate_embedding_max_spend_au(price: &PriceRefAu, inputs: &[String]) -> MoneyAu {
-    // Routing can use the cheap whitespace estimate, but the signed spend ceiling
-    // must cover the provider's exact tokenizer result. UTF-8 bytes bound the
-    // byte-fallback tokens, while the fixed allowance covers model-added special
-    // tokens even for a one-byte input.
-    let input_token_upper_bound = inputs.iter().fold(0_u64, |total, input| {
+fn embedding_input_token_upper_bound(inputs: &[String]) -> u64 {
+    // UTF-8 bytes bound byte-fallback tokens; the allowance covers model-added
+    // special tokens. Share this bound between voucher and receipt validation.
+    inputs.iter().fold(0_u64, |total, input| {
         total.saturating_add(
             u64::try_from(input.len())
                 .unwrap_or(u64::MAX)
                 .saturating_add(EMBEDDING_SPECIAL_TOKEN_ALLOWANCE_PER_INPUT),
         )
-    });
-    let usage = ReceiptUsage::text(input_token_upper_bound, 0);
+    })
+}
+
+fn estimate_embedding_max_spend_au(price: &PriceRefAu, inputs: &[String]) -> MoneyAu {
+    let usage = ReceiptUsage::text(embedding_input_token_upper_bound(inputs), 0);
     calculate_au_owed(price, &usage).max(1_000)
 }
 
@@ -42929,16 +42945,89 @@ mod tests {
     }
 
     #[test]
-    fn embedding_provider_receipt_must_match_gateway_observed_usage() {
+    fn embedding_usage_accepts_exact_single_and_batch_token_counts() {
+        for (inputs, exact_tokens) in [
+            (vec!["a".to_owned()], 2),
+            // Public acceptance input: its provider tokenizer exceeds the five
+            // whitespace words; this exercises the previously rejected branch.
+            (
+                vec!["OpenMayhem embedding acceptance: single input".to_owned()],
+                9,
+            ),
+            (vec!["alpha".to_owned(), "beta gamma".to_owned()], 7),
+            (vec!["你好".to_owned()], 3),
+        ] {
+            let mut output = EmbeddingOutput {
+                embeddings: vec![vec![0.1]; inputs.len()],
+                usage: Usage {
+                    prompt_tokens: exact_tokens,
+                    completion_tokens: 0,
+                    total_tokens: exact_tokens,
+                },
+            };
+            assert_eq!(
+                authoritative_embedding_usage(&inputs, &output).unwrap(),
+                ReceiptUsage::text(exact_tokens, 0),
+            );
+            // Both inclusive boundaries use the same envelope as reservations.
+            for tokens in [
+                embedding_input_token_count(&inputs),
+                embedding_input_token_upper_bound(&inputs),
+            ] {
+                output.usage.prompt_tokens = tokens;
+                output.usage.total_tokens = tokens;
+                assert_eq!(
+                    authoritative_embedding_usage(&inputs, &output).unwrap(),
+                    ReceiptUsage::text(tokens, 0),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_usage_rejects_invalid_counts_and_output_cardinality() {
+        let inputs = vec!["alpha beta".to_owned(), "gamma".to_owned()];
+        let upper_bound = embedding_input_token_upper_bound(&inputs);
+        for (prompt_tokens, completion_tokens, total_tokens) in [
+            (0, 0, 0),
+            (2, 0, 2), // Below the conservative whitespace lower bound.
+            (upper_bound + 1, 0, upper_bound + 1),
+            (7, 1, 8),
+            (7, 0, 8),
+            (7, 0, 6),
+        ] {
+            let output = EmbeddingOutput {
+                embeddings: vec![vec![0.1]; inputs.len()],
+                usage: Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                },
+            };
+            assert!(authoritative_embedding_usage(&inputs, &output).is_err());
+        }
+        let output = EmbeddingOutput {
+            embeddings: vec![vec![0.1]],
+            usage: Usage {
+                prompt_tokens: 7,
+                completion_tokens: 0,
+                total_tokens: 7,
+            },
+        };
+        assert!(authoritative_embedding_usage(&inputs, &output).is_err());
+    }
+
+    #[test]
+    fn embedding_provider_receipt_must_match_bounded_reported_usage() {
         let state = GatewayState::fixture();
         let model = test_model();
         let inputs = vec!["alpha".to_owned(), "beta gamma".to_owned()];
         let output = EmbeddingOutput {
             embeddings: vec![vec![0.1, 0.2, 0.3], vec![0.2, 0.3, 0.4]],
             usage: Usage {
-                prompt_tokens: 3,
+                prompt_tokens: 7,
                 completion_tokens: 0,
-                total_tokens: 3,
+                total_tokens: 7,
             },
         };
         let invocation = test_invocation();
