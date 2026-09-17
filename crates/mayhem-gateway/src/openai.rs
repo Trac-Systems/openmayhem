@@ -19368,13 +19368,16 @@ async fn collect_direct_session_embedding_output(
             inputs.len()
         )));
     }
-    let observed_usage = embedding_usage_for_inputs(inputs);
-    if let Some(reported_usage) = usage.as_ref() {
-        ensure_reported_token_usage_matches(reported_usage, &observed_usage, "embedding session")?;
-    }
+    let provider_receipt = provider_receipt.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider embedding session {session_id} ended without a final receipt"
+        ))
+    })?;
+    let signed_usage =
+        verified_embedding_session_usage(inputs, usage.as_ref(), &provider_receipt.body.usage)?;
     let output = EmbeddingOutput {
         embeddings,
-        usage: observed_usage,
+        usage: signed_usage,
     };
     let quality = provider_quality.or_else(|| {
         watchdog
@@ -19388,11 +19391,6 @@ async fn collect_direct_session_embedding_output(
                 ),
             })
     });
-    let provider_receipt = provider_receipt.ok_or_else(|| {
-        GatewaySessionError::new(format!(
-            "provider embedding session {session_id} ended without a final receipt"
-        ))
-    })?;
     Ok(DirectEmbeddingSessionCollected {
         output,
         provider_receipt,
@@ -21478,10 +21476,16 @@ fn authoritative_embedding_usage(
             inputs.len()
         )));
     }
+    validate_embedding_usage_bounds(inputs, &output.usage)?;
+    Ok(ReceiptUsage::text(output.usage.prompt_tokens, 0))
+}
+
+fn validate_embedding_usage_bounds(
+    inputs: &[String],
+    reported: &Usage,
+) -> Result<(), GatewaySessionError> {
     // The gateway cannot reproduce every provider tokenizer. Accept its exact
-    // count within the same conservative envelope used for the signed voucher;
-    // receipt validation below still requires the signed usage to match it.
-    let reported = &output.usage;
+    // count within the same conservative envelope used for the signed voucher.
     let lower_bound = embedding_input_token_count(inputs);
     let upper_bound = embedding_input_token_upper_bound(inputs);
     if reported.prompt_tokens == 0
@@ -21495,7 +21499,20 @@ fn authoritative_embedding_usage(
             reported.prompt_tokens, reported.completion_tokens, reported.total_tokens,
         )));
     }
-    Ok(ReceiptUsage::text(reported.prompt_tokens, 0))
+    Ok(())
+}
+
+fn verified_embedding_session_usage(
+    inputs: &[String],
+    delta_usage: Option<&Usage>,
+    signed_usage: &ReceiptUsage,
+) -> Result<Usage, GatewaySessionError> {
+    let signed_usage = usage_from_receipt_usage(signed_usage);
+    validate_embedding_usage_bounds(inputs, &signed_usage)?;
+    if let Some(delta_usage) = delta_usage {
+        ensure_reported_token_usage_matches(delta_usage, &signed_usage, "embedding session")?;
+    }
+    Ok(signed_usage)
 }
 
 fn expected_embedding_provider_receipt<'a>(
@@ -42982,6 +42999,35 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn embedding_session_uses_signed_tokenizer_count_instead_of_whitespace_estimate() {
+        let inputs = vec!["OpenMayhem embedding acceptance: single input".to_owned()];
+        assert_eq!(embedding_input_token_count(&inputs), 5);
+        let exact = Usage {
+            prompt_tokens: 9,
+            completion_tokens: 0,
+            total_tokens: 9,
+        };
+        let signed = ReceiptUsage::text(9, 0);
+
+        assert_eq!(
+            verified_embedding_session_usage(&inputs, Some(&exact), &signed).unwrap(),
+            exact,
+        );
+        assert_eq!(
+            verified_embedding_session_usage(&inputs, None, &signed).unwrap(),
+            exact,
+        );
+
+        let stale_whitespace_usage = embedding_usage_for_inputs(&inputs);
+        let mismatch =
+            verified_embedding_session_usage(&inputs, Some(&stale_whitespace_usage), &signed)
+                .expect_err("delta usage must agree with the signed receipt");
+        assert!(mismatch
+            .message
+            .contains("provider-reported embedding session usage"));
     }
 
     #[test]
