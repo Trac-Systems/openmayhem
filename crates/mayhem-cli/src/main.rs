@@ -76,8 +76,8 @@ use mayhem_engine::{
     GenerateSpecialityParameter, GenerateSpecialityTarget, GrammarSpec,
     ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
     MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
-    SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, WorkflowGenerationRequest,
-    WorkflowInputFile, MTMD_MEDIA_MARKER,
+    SpeechReferenceAudio, SpeechRequest, TokenChunk, Tokenization, ToolSpec,
+    WorkflowGenerationRequest, WorkflowInputFile, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
     audio_fingerprint, cancellation_settlement_usage, embedding_vector_fingerprint,
@@ -123,18 +123,20 @@ use mayhem_proto::{
     AttestationRuntimeConfig, AttestationTrustDataRef, CatalogEnclaveIdentity, CheckpointPolicy,
     CtxBracketSchedule, HardwareQuote, HardwareQuoteKind, HardwareQuoteRoutePolicyBinding, MoneyAu,
     PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SessionReceipt, SpendVoucher, TpmActivateCredentialChallengeFrame,
-    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
-    TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall, WorkflowBinding,
-    WorkflowOutputBinding, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
-    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
-    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
-    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, RECOVERABLE_RECEIPT_CONTRACT_VERSION,
-    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
-    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
-    TRANSPORT_MAX_OUTPUT_DURATION_SECONDS, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
-    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
-    USAGE_STEP, USAGE_VIDEO_SECOND, VISIBLE_OUTPUT_BYTES_PER_UNIT,
+    ReceiptUsage, SessionReceipt, SpendVoucher, TokenizeRequestFrame, TokenizeResponseFrame,
+    TpmActivateCredentialChallengeFrame, TpmActivateCredentialResponseFrame, TranscriptionResult,
+    TranscriptionResultLimits, TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall,
+    WorkflowBinding, WorkflowOutputBinding, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
+    RECOVERABLE_RECEIPT_CONTRACT_VERSION, SESSION_RECEIPT_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION,
+    TOKENIZE_REQUEST_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
+    TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
+    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    VISIBLE_OUTPUT_BYTES_PER_UNIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -301,6 +303,8 @@ const MAX_TPM_ACTIVATION_COMMAND_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TPM_ACTIVATION_COMMAND_OUTPUT_BYTES: usize = 4 * 1024;
 const DEFAULT_TPM_ACTIVATIONS_PER_MINUTE: usize = 60;
 const DEFAULT_TPM_ACTIVATIONS_PER_PEER_PER_MINUTE: usize = 12;
+const DEFAULT_TOKENIZE_REQUESTS_PER_MINUTE: usize = 600;
+const DEFAULT_TOKENIZE_REQUESTS_PER_PEER_PER_MINUTE: usize = 120;
 const DEFAULT_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MILLIS: u64 = 300_000;
 const DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN: usize = 256;
 const DEFAULT_PROVIDER_SESSION_REQUEST_JSON_OVERHEAD_BYTES: usize = 1024 * 1024;
@@ -60597,6 +60601,53 @@ impl ProviderTpmActivationLimiter {
     }
 }
 
+#[derive(Debug)]
+struct ProviderTokenizeLimiter {
+    global_limit: usize,
+    per_peer_limit: usize,
+    accepted_at: VecDeque<Instant>,
+    accepted_by_peer: HashMap<String, VecDeque<Instant>>,
+}
+
+impl ProviderTokenizeLimiter {
+    fn from_environment() -> Result<Self> {
+        Ok(Self {
+            global_limit: configured_positive_count(
+                "MAYHEM_PROVIDER_TOKENIZE_REQUESTS_PER_MINUTE",
+                DEFAULT_TOKENIZE_REQUESTS_PER_MINUTE,
+                "provider tokenize global rate",
+            )?,
+            per_peer_limit: configured_positive_count(
+                "MAYHEM_PROVIDER_TOKENIZE_REQUESTS_PER_PEER_PER_MINUTE",
+                DEFAULT_TOKENIZE_REQUESTS_PER_PEER_PER_MINUTE,
+                "provider tokenize per-peer rate",
+            )?,
+            accepted_at: VecDeque::new(),
+            accepted_by_peer: HashMap::new(),
+        })
+    }
+
+    fn admit(&mut self, remote: &str, now: Instant) -> Result<()> {
+        ProviderTpmActivationLimiter::prune(&mut self.accepted_at, now);
+        self.accepted_by_peer.retain(|_, accepted| {
+            ProviderTpmActivationLimiter::prune(accepted, now);
+            !accepted.is_empty()
+        });
+        ensure!(
+            self.accepted_at.len() < self.global_limit,
+            "provider tokenize global rate limit reached"
+        );
+        let peer = self.accepted_by_peer.entry(remote.to_owned()).or_default();
+        ensure!(
+            peer.len() < self.per_peer_limit,
+            "provider tokenize per-peer rate limit reached"
+        );
+        self.accepted_at.push_back(now);
+        peer.push_back(now);
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ProviderRuntimeFloorRejection {
     code: &'static str,
@@ -62267,6 +62318,9 @@ trait ProviderSessionResponder {
     fn concurrent_embedding_backend(&self) -> Option<Arc<dyn ConcurrentEmbeddingBackend>> {
         None
     }
+    fn tokenize(&mut self, _terms: &ProviderSessionTerms, _body: &Value) -> Result<Tokenization> {
+        bail!("provider backend does not expose exact tokenization")
+    }
     fn respond(
         &mut self,
         terms: &ProviderSessionTerms,
@@ -62383,6 +62437,14 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         self.backend.requires_owner_restart()
     }
 
+    fn tokenize(&mut self, terms: &ProviderSessionTerms, body: &Value) -> Result<Tokenization> {
+        let prompt = provider_engine_tokenize_prompt(terms, body)?;
+        if let Some(backend) = self.backend.concurrent_generation_backend() {
+            return backend.tokenize(&prompt).map_err(Into::into);
+        }
+        self.backend.tokenize(&prompt).map_err(Into::into)
+    }
+
     fn respond(
         &mut self,
         terms: &ProviderSessionTerms,
@@ -62454,10 +62516,13 @@ impl EngineBackend for ConcurrentEngineBackend {
         ))
     }
 
-    fn tokenize(&self, _text: &str) -> mayhem_engine::Result<mayhem_engine::Tokenization> {
-        Err(EngineError::InvalidConfig(
-            "concurrent vLLM request handles cannot tokenize outside generation".to_owned(),
-        ))
+    fn tokenize(&self, text: &str) -> mayhem_engine::Result<mayhem_engine::Tokenization> {
+        match &self.backend {
+            ProviderConcurrentEngine::Generation(backend) => backend.tokenize(text),
+            ProviderConcurrentEngine::Embedding(_) => Err(EngineError::InvalidConfig(
+                "concurrent embedding handles do not expose text tokenization".to_owned(),
+            )),
+        }
     }
 
     fn generate(
@@ -62515,6 +62580,11 @@ impl ProviderSessionResponder for ConcurrentEngineProviderSessionResponder {
 
     fn supports_live_text_streaming(&self) -> bool {
         true
+    }
+
+    fn tokenize(&mut self, terms: &ProviderSessionTerms, body: &Value) -> Result<Tokenization> {
+        let prompt = provider_engine_tokenize_prompt(terms, body)?;
+        self.backend.tokenize(&prompt).map_err(Into::into)
     }
 
     fn respond(
@@ -80440,8 +80510,11 @@ async fn run_provider_concurrent_session_task(
         let mut engine_recovery =
             ProviderEngineRecovery::new(task.engine_recovery_initial, task.engine_recovery_max);
         let runtime = task.runtime.borrowed();
-        let result = match ProviderTpmActivationLimiter::from_environment() {
-            Ok(mut tpm_activation_limiter) => {
+        let result = match (
+            ProviderTpmActivationLimiter::from_environment(),
+            ProviderTokenizeLimiter::from_environment(),
+        ) {
+            (Ok(mut tpm_activation_limiter), Ok(mut tokenize_limiter)) => {
                 handle_provider_session_frame(
                     &mut bridge,
                     &mut sessions,
@@ -80451,6 +80524,7 @@ async fn run_provider_concurrent_session_task(
                     &task.heartbeat_load,
                     &task.protection,
                     &mut tpm_activation_limiter,
+                    &mut tokenize_limiter,
                     &task.terms,
                     &runtime,
                     &task.sc_bridge_url,
@@ -80468,7 +80542,7 @@ async fn run_provider_concurrent_session_task(
                 )
                 .await
             }
-            Err(error) => Err(error),
+            (Err(error), _) | (_, Err(error)) => Err(error),
         };
         (result, engine_recovery.reason().map(str::to_owned))
     }
@@ -80757,6 +80831,7 @@ async fn serve_provider_sessions(
     let owned_runtime = Arc::new(OwnedProviderSessionRuntime::from_borrowed(&runtime));
     let protection = Arc::new(Mutex::new(ProviderProtectionState::new(protection_config)));
     let mut tpm_activation_limiter = ProviderTpmActivationLimiter::from_environment()?;
+    let mut tokenize_limiter = ProviderTokenizeLimiter::from_environment()?;
     let mut draining = false;
     let mut local_drain_request = None::<ProviderDrainRequest>;
     let mut runtime_floor_reject: Option<ProviderRuntimeFloorRejection> = None;
@@ -81283,6 +81358,7 @@ async fn serve_provider_sessions(
                         &heartbeat_load,
                         &protection,
                         &mut tpm_activation_limiter,
+                        &mut tokenize_limiter,
                         &terms,
                         &runtime,
                         &sc_bridge_url,
@@ -83208,6 +83284,7 @@ async fn handle_provider_session_frame<R>(
     heartbeat_load: &ProviderHeartbeatLoad,
     protection: &Arc<Mutex<ProviderProtectionState>>,
     tpm_activation_limiter: &mut ProviderTpmActivationLimiter,
+    tokenize_limiter: &mut ProviderTokenizeLimiter,
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
     sc_bridge_url: &str,
@@ -83262,6 +83339,105 @@ where
         return Ok(());
     }
     match frame_type {
+        TOKENIZE_REQUEST_FRAME_TYPE => {
+            let request_frame: TokenizeRequestFrame = serde_json::from_value(frame.clone())
+                .context("tokenize request frame is invalid")?;
+            ensure!(
+                request_frame.frame_type == TOKENIZE_REQUEST_FRAME_TYPE
+                    && request_frame.version == TOKENIZE_FRAME_VERSION,
+                "tokenize request frame version is unsupported"
+            );
+            ensure!(
+                request_frame.session_id == session_id,
+                "tokenize request session binding mismatch"
+            );
+            ensure!(
+                request_frame.provider == terms.provider
+                    && request_frame.enclave_id == terms.enclave_id
+                    && terms.room_ids.contains(&request_frame.room_id)
+                    && request_frame.model == terms.model_id,
+                "tokenize request targets a different provider route"
+            );
+            let encoded_request =
+                stable_json_bytes(&request_frame.request).context("encoding tokenize request")?;
+            ensure!(
+                encoded_request.len() <= max_request_bytes,
+                "tokenize request exceeds provider request byte limit"
+            );
+            tokenize_limiter.admit(&remote, Instant::now())?;
+            open_provider_direct_session(bridge, &remote, &session_id)
+                .await
+                .context("opening provider side of tokenize session")?;
+            let response_frame = match responder.tokenize(terms, &request_frame.request) {
+                Ok(tokenization) if tokenization.token_ids.is_empty() => TokenizeResponseFrame {
+                    frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
+                    version: TOKENIZE_FRAME_VERSION,
+                    session_id: session_id.clone(),
+                    provider: terms.provider.clone(),
+                    enclave_id: terms.enclave_id.clone(),
+                    room_id: request_frame.room_id,
+                    model: terms.model_id.clone(),
+                    ok: false,
+                    count: None,
+                    tokens: None,
+                    error_code: Some("token_count_unsupported".to_owned()),
+                    error: Some(
+                        "Exact tokenization is unavailable for this provider runtime.".to_owned(),
+                    ),
+                },
+                Ok(tokenization) => TokenizeResponseFrame {
+                    frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
+                    version: TOKENIZE_FRAME_VERSION,
+                    session_id: session_id.clone(),
+                    provider: terms.provider.clone(),
+                    enclave_id: terms.enclave_id.clone(),
+                    room_id: request_frame.room_id,
+                    model: terms.model_id.clone(),
+                    ok: true,
+                    count: Some(u64::try_from(tokenization.token_ids.len()).unwrap_or(u64::MAX)),
+                    tokens: request_frame
+                        .return_tokens
+                        .then_some(tokenization.token_ids),
+                    error_code: None,
+                    error: None,
+                },
+                Err(error) => {
+                    let detail = error.to_string().to_ascii_lowercase();
+                    let unsupported = detail.contains("does not expose exact tokenization")
+                        || detail.contains("exact tokenization is unsupported")
+                        || detail.contains("tokenize outside generation");
+                    TokenizeResponseFrame {
+                        frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
+                        version: TOKENIZE_FRAME_VERSION,
+                        session_id: session_id.clone(),
+                        provider: terms.provider.clone(),
+                        enclave_id: terms.enclave_id.clone(),
+                        room_id: request_frame.room_id,
+                        model: terms.model_id.clone(),
+                        ok: false,
+                        count: None,
+                        tokens: None,
+                        error_code: Some(if unsupported {
+                            "token_count_unsupported".to_owned()
+                        } else {
+                            "token_count_failed".to_owned()
+                        }),
+                        error: Some(if unsupported {
+                            "Exact tokenization is unavailable for this provider runtime."
+                                .to_owned()
+                        } else {
+                            "The provider tokenizer could not complete this request.".to_owned()
+                        }),
+                    }
+                }
+            };
+            let send_result = bridge
+                .session_send(&remote, &session_id, response_frame)
+                .await
+                .context("sending tokenize response");
+            let _ = bridge.session_close(&remote, &session_id).await;
+            send_result?;
+        }
         TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE => {
             let challenge_frame: TpmActivateCredentialChallengeFrame =
                 serde_json::from_value(frame.clone())
@@ -84249,6 +84425,16 @@ fn provider_session_event_belongs_to_process(
     };
     match frame.get("t").and_then(Value::as_str) {
         Some("s.open") => provider_session_open_targets_enclave(frame, terms),
+        Some(TOKENIZE_REQUEST_FRAME_TYPE) => {
+            frame.get("provider").and_then(Value::as_str) == Some(terms.provider.as_str())
+                && frame.get("enclave_id").and_then(Value::as_str)
+                    == Some(terms.enclave_id.as_str())
+                && frame.get("model").and_then(Value::as_str) == Some(terms.model_id.as_str())
+                && frame
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|room_id| terms.room_ids.iter().any(|owned| owned == room_id))
+        }
         Some(TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE) => {
             frame.get("provider").and_then(Value::as_str) == Some(terms.provider.as_str())
                 && frame.get("enclave_id").and_then(Value::as_str)
@@ -91837,6 +92023,32 @@ fn provider_protocol_prompt_tokens(
         ));
     }
     Ok(Some(prompt_tokens))
+}
+
+fn provider_engine_tokenize_prompt(terms: &ProviderSessionTerms, body: &Value) -> Result<String> {
+    let verified = provider_verify_endpoint_request(body, Some(&terms.model_id), &terms.adapter)?;
+    ensure!(
+        matches!(
+            verified.family,
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+                | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+        ),
+        "exact tokenization is unsupported for endpoint family {}",
+        verified.family
+    );
+    let request = provider_engine_request_from_endpoint_body_with_sampling(
+        verified.family,
+        verified.request,
+        &terms.adapter,
+        &terms.sampling,
+    )?;
+    ensure!(
+        !request.prompt.is_empty(),
+        "provider tokenizer received an empty rendered prompt"
+    );
+    Ok(request.prompt)
 }
 
 fn provider_engine_session_response_with_sampling_bounded(
@@ -112523,6 +112735,34 @@ esac
             &terms
         ));
 
+        let tokenize_event = json!({
+            "type": "session_frame",
+            "session_id": "cc".repeat(32),
+            "remote": "22".repeat(32),
+            "frame": {
+                "t": TOKENIZE_REQUEST_FRAME_TYPE,
+                "v": TOKENIZE_FRAME_VERSION,
+                "session_id": "cc".repeat(32),
+                "provider": terms.provider,
+                "enclave_id": terms.enclave_id,
+                "room_id": terms.room_ids[0],
+                "model": terms.model_id,
+                "request": {},
+            },
+        });
+        assert!(provider_session_event_belongs_to_process(
+            &tokenize_event,
+            &sessions,
+            &terms
+        ));
+        let mut wrong_model_tokenize = tokenize_event;
+        wrong_model_tokenize["frame"]["model"] = json!("other/model");
+        assert!(!provider_session_event_belongs_to_process(
+            &wrong_model_tokenize,
+            &sessions,
+            &terms
+        ));
+
         for frame_type in [
             "s.accept",
             "s.reject",
@@ -112572,6 +112812,21 @@ esac
             &owned_sessions,
             &terms
         ));
+    }
+
+    #[test]
+    fn provider_tokenize_uses_the_signed_model_chat_template() {
+        let terms = test_provider_session_terms();
+        let body = json!({
+            "kind": "chat",
+            "messages": [{"role": "user", "content": "exact tokenizer marker"}],
+            "stream": false,
+        });
+        let sealed =
+            provider_seal_local_contract_request(&body, &terms.adapter, &terms.model_id).unwrap();
+        let prompt = provider_engine_tokenize_prompt(&terms, &sealed).unwrap();
+        assert!(prompt.contains("exact tokenizer marker"));
+        assert_ne!(prompt, "exact tokenizer marker");
     }
 
     #[test]

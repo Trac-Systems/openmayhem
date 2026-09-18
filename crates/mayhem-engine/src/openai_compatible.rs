@@ -527,6 +527,16 @@ impl ConcurrentGenerationBackend for OpenAiCompatibleConcurrent {
         self.loaded.gate.capacity
     }
 
+    fn tokenize(&self, text: &str) -> Result<Tokenization> {
+        let tokenization = tokenize(Arc::clone(&self.loaded), text)?;
+        if !text.is_empty() && tokenization.is_empty() {
+            return Err(backend_error(
+                "/v1/tokenize returned no tokens for non-empty input",
+            ));
+        }
+        Ok(tokenization)
+    }
+
     fn generate(
         &self,
         request: GenerateRequest,

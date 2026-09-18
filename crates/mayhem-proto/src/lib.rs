@@ -106,6 +106,9 @@ pub const TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION: u32 = 1;
 pub const TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION: u32 = 1;
 pub const TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE: &str = "tpm.activate.challenge";
 pub const TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE: &str = "tpm.activate.response";
+pub const TOKENIZE_REQUEST_FRAME_TYPE: &str = "tokenize.request";
+pub const TOKENIZE_RESPONSE_FRAME_TYPE: &str = "tokenize.response";
+pub const TOKENIZE_FRAME_VERSION: u32 = 1;
 pub const TPM_PCR_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const TPM_QUOTE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 11;
@@ -1380,6 +1383,46 @@ pub struct TpmActivateCredentialResponseFrame {
     pub enclave_id: String,
     pub room_id: String,
     pub response: TpmActivateCredentialResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenizeRequestFrame {
+    #[serde(rename = "t")]
+    pub frame_type: String,
+    #[serde(rename = "v")]
+    pub version: u32,
+    pub session_id: String,
+    pub provider: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub model: String,
+    pub request: Value,
+    #[serde(default)]
+    pub return_tokens: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenizeResponseFrame {
+    #[serde(rename = "t")]
+    pub frame_type: String,
+    #[serde(rename = "v")]
+    pub version: u32,
+    pub session_id: String,
+    pub provider: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub model: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Vec<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -5426,6 +5469,46 @@ mod tests {
             after_final.push(chunks[1].clone()).unwrap_err(),
             PayloadChunkError::ChunkAfterFinal { .. }
         ));
+    }
+
+    #[test]
+    fn tokenize_control_frames_round_trip_with_route_bindings() {
+        let request = TokenizeRequestFrame {
+            frame_type: TOKENIZE_REQUEST_FRAME_TYPE.to_owned(),
+            version: TOKENIZE_FRAME_VERSION,
+            session_id: "11".repeat(32),
+            provider: "22".repeat(32),
+            enclave_id: "33".repeat(32),
+            room_id: "room-1".to_owned(),
+            model: "qwen/example".to_owned(),
+            request: json!({"contract_request": {"messages": []}}),
+            return_tokens: true,
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TokenizeRequestFrame>(encoded).unwrap(),
+            request
+        );
+
+        let response = TokenizeResponseFrame {
+            frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
+            version: TOKENIZE_FRAME_VERSION,
+            session_id: request.session_id,
+            provider: request.provider,
+            enclave_id: request.enclave_id,
+            room_id: request.room_id,
+            model: request.model,
+            ok: true,
+            count: Some(3),
+            tokens: Some(vec![1, 2, 3]),
+            error_code: None,
+            error: None,
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TokenizeResponseFrame>(encoded).unwrap(),
+            response
+        );
     }
 }
 

@@ -1576,6 +1576,11 @@ impl ArtifactSink for NoopArtifactSink {
 
 pub trait ConcurrentGenerationBackend: Send + Sync {
     fn capacity(&self) -> usize;
+    fn tokenize(&self, _text: &str) -> Result<Tokenization> {
+        Err(EngineError::InvalidConfig(
+            "concurrent backend does not expose exact tokenization".to_owned(),
+        ))
+    }
     fn generate(
         &self,
         request: GenerateRequest,
@@ -8654,6 +8659,50 @@ mod vllm_backend {
     impl ConcurrentGenerationBackend for VllmConcurrentGeneration {
         fn capacity(&self) -> usize {
             self.limiter.capacity()
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Tokenization> {
+            let _generation = self
+                .generation_gate
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if self.generation_epoch.load(Ordering::Acquire) != self.expected_epoch {
+                return Err(EngineError::NotLoaded);
+            }
+            let (worker, _isolated_guard) = match &self.dispatch {
+                VllmGenerationDispatch::Shared(worker) => (Arc::clone(worker), None),
+                VllmGenerationDispatch::Isolated(workers) => {
+                    let workers = workers.read().unwrap_or_else(|p| p.into_inner());
+                    let worker = workers
+                        .iter()
+                        .find(|worker| worker.component_healthy())
+                        .cloned()
+                        .ok_or_else(|| {
+                            EngineError::Vllm(
+                                "isolated vLLM worker pool has no healthy tokenizer".to_owned(),
+                            )
+                        })?;
+                    let guard = IsolatedGenerationGuard {
+                        worker: Arc::clone(&worker),
+                    };
+                    (worker, Some(guard))
+                }
+            };
+            let tokenization: Tokenization = worker.call_streaming(
+                self.next_request_id(),
+                "tokenize",
+                json!({ "text": text }),
+                &mut |_| Ok(()),
+                None,
+                false,
+                1,
+            )?;
+            if !text.is_empty() && tokenization.is_empty() {
+                return Err(EngineError::InvalidConfig(
+                    "vLLM tokenizer returned no tokens for non-empty input".to_owned(),
+                ));
+            }
+            Ok(tokenization)
         }
 
         fn generate(

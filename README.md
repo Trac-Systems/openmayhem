@@ -872,6 +872,7 @@ behavior; parallel dispatch needs the selected mode's own approval. See
 | Class | Routes |
 |-------|--------|
 | Text generation | `/v1/chat/completions`, `/v1/completions`, `/v1/responses` — tools, JSON mode, streaming, vision input where the catalog says so |
+| Exact token counting | `/v1/tokenize`, `/v1/count_tokens` — accepts `messages` or a single `prompt`; set `return_tokens` to include token IDs |
 | Embedding | `/v1/embeddings` |
 | Image generation | `/v1/images/generations` |
 | Video generation | `/v1/videos` |

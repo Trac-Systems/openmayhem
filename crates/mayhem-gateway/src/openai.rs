@@ -106,14 +106,15 @@ use mayhem_proto::{
     HardwareQuoteKind, HardwareQuoteRouteAdvertisement, HardwareQuoteRoutePolicyBinding,
     ModelSpecialityDescriptor, MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest,
     ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody,
-    TpmActivateCredentialChallengeFrame, TpmActivateCredentialHello,
-    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
-    ValidatedAudioFormat, VisibleToolCall, WorkflowBinding, WorkflowOutputBinding, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    TokenizeRequestFrame, TokenizeResponseFrame, TpmActivateCredentialChallengeFrame,
+    TpmActivateCredentialHello, TpmActivateCredentialResponseFrame, TranscriptionResult,
+    TranscriptionResultLimits, ValidatedAudioFormat, VisibleToolCall, WorkflowBinding,
+    WorkflowOutputBinding, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
+    SESSION_RECEIPT_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION, TOKENIZE_REQUEST_FRAME_TYPE,
+    TOKENIZE_RESPONSE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
     TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
     TRANSPORT_MAX_OUTPUT_DURATION_SECONDS, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
     USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
@@ -2848,6 +2849,9 @@ pub type GatewayHedgeProbeFuture<'a> =
 pub type GatewayTpmActivationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ActivatedTpmIdentity, GatewaySessionError>> + Send + 'a>>;
 
+pub type GatewayTokenizeFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<GatewayTokenizeResult, GatewaySessionError>> + Send + 'a>>;
+
 pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
     fn bridge_stream_config(&self) -> Option<ScBridgeGatewaySessionConfig> {
@@ -2874,6 +2878,18 @@ pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
         Box::pin(async move {
             Err(GatewaySessionError::new(format!(
                 "{} backend does not support TPM activation",
+                self.name()
+            )))
+        })
+    }
+
+    fn run_tokenize<'a>(
+        &'a self,
+        _invocation: &'a GatewayTokenizeInvocation,
+    ) -> GatewayTokenizeFuture<'a> {
+        Box::pin(async move {
+            Err(GatewaySessionError::new(format!(
+                "{} backend does not support exact tokenization",
                 self.name()
             )))
         })
@@ -2966,6 +2982,13 @@ pub struct GatewaySessionResult {
     pub provider_receipt: Option<ProviderSignedReceipt>,
     pub token_ids: Vec<i32>,
     pub quality: Option<GatewaySessionQuality>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayTokenizeResult {
+    pub count: u64,
+    pub tokens: Option<Vec<i32>>,
+    pub provider: String,
 }
 
 #[derive(Clone, Debug)]
@@ -4165,6 +4188,18 @@ pub struct GatewayTpmActivationInvocation {
     pub enclave_id: String,
     pub room_id: String,
     pub hello: TpmActivateCredentialHello,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayTokenizeInvocation {
+    pub session_id: String,
+    pub provider_pubkey: String,
+    pub transport_peer: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub model: String,
+    pub request: Value,
+    pub return_tokens: bool,
 }
 
 impl GatewayHedgeProbeInvocation {
@@ -5755,6 +5790,8 @@ pub fn openai_router(state: GatewayState) -> Router {
     let state = Arc::new(state);
     let body_routes = Router::new()
         .route("/v1/chat/completions", post(create_chat_completion))
+        .route("/v1/tokenize", post(create_tokenize))
+        .route("/v1/count_tokens", post(create_tokenize))
         .route("/v1/completions", post(create_completion))
         .route("/v1/responses", post(create_response))
         .route("/v1/embeddings", post(create_embedding))
@@ -9739,6 +9776,168 @@ async fn create_chat_completion(
         Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
         Err(err) => err.into_response(),
     }
+}
+
+async fn create_tokenize(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(raw_request): Json<Value>,
+) -> Response {
+    match build_tokenize_response(&state, &headers, raw_request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn build_tokenize_response(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    mut raw_request: Value,
+) -> Result<Value, ApiError> {
+    let object = raw_request.as_object_mut().ok_or_else(|| {
+        ApiError::bad_request(
+            "tokenization request must be a JSON object",
+            Some("request"),
+        )
+    })?;
+    let return_tokens = object
+        .remove("return_tokens")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                ApiError::bad_request("return_tokens must be a boolean", Some("return_tokens"))
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if let Some(prompt) = object.remove("prompt") {
+        if object.contains_key("messages") {
+            return Err(ApiError::bad_request(
+                "provide either prompt or messages, not both",
+                Some("prompt"),
+            ));
+        }
+        let prompt = prompt
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ApiError::bad_request("prompt must be a non-empty string", Some("prompt"))
+            })?;
+        object.insert(
+            "messages".to_owned(),
+            json!([{ "role": "user", "content": prompt }]),
+        );
+    }
+    let model_id = endpoint_request_model(&raw_request)?;
+    let access_token = state.authorize_gateway_request(headers, Some(model_id))?;
+    let endpoint_family = chat_endpoint_family(state, model_id, &raw_request)?;
+    let (mut request, normalized_request) = parse_catalog_endpoint_request::<ChatCompletionRequest>(
+        state,
+        &raw_request,
+        &endpoint_family,
+    )?;
+    request.endpoint_family = Some(endpoint_family);
+    request.endpoint_request = Some(normalized_request);
+    let model = require_model(state, model_id)?;
+    apply_model_sampling_defaults(&model, &mut request)?;
+    apply_model_speciality_defaults(&model, &mut request)?;
+    synchronize_effective_chat_contract_request(&model, &mut request)?;
+    if request.messages.is_empty() {
+        return Err(ApiError::bad_request(
+            "messages must contain at least one item",
+            Some("messages"),
+        ));
+    }
+    validate_chat_modalities(&model, &request, &state.media_limits)?;
+    let mut options = state.request_options_from_headers(headers)?;
+    options.access_token = access_token;
+    state.refresh_provider_table_routes(&model);
+    let routes = order_strict_preferred_routes(
+        state,
+        &model,
+        &options,
+        eligible_route_candidates(
+            &model,
+            options.min_att_tier,
+            options.quant.as_deref(),
+            &state.receipt_config.rail,
+        ),
+    );
+    let route = routes
+        .into_iter()
+        .find(|route| route_has_live_control_transport(state, route));
+    let route = route.ok_or_else(|| {
+        ApiError::service_unavailable(
+            "no live provider can perform exact tokenization for this model",
+            Some("model"),
+        )
+        .with_public_error("token_count_unavailable", "provider_admission", true)
+    })?;
+    let transport_peer = state.transport_peer_for_route(Some(route)).ok_or_else(|| {
+        ApiError::service_unavailable(
+            "the selected tokenizer provider has no live transport",
+            Some("model"),
+        )
+        .with_public_error("token_count_unavailable", "provider_admission", true)
+    })?;
+    let transport_body = direct_session_request_body(&request);
+    let sealed_request = seal_direct_session_request_body(
+        &model,
+        direct_chat_endpoint_family(&request),
+        transport_body.clone(),
+        direct_chat_contract_request(&request, &transport_body),
+    )
+    .map_err(|error| ApiError::bad_request(error.message, Some("request")))?;
+    let mut entropy = [0_u8; 32];
+    getrandom::fill(&mut entropy).map_err(|error| {
+        ApiError::internal_message(format!(
+            "generating tokenization session identity failed: {error}"
+        ))
+    })?;
+    let invocation = GatewayTokenizeInvocation {
+        session_id: hex::encode(entropy),
+        provider_pubkey: route.provider.clone(),
+        transport_peer,
+        enclave_id: route.enclave_id.clone(),
+        room_id: route.room_id.clone(),
+        model: model.id.clone(),
+        request: sealed_request,
+        return_tokens,
+    };
+    let result = state
+        .session_backend
+        .run_tokenize(&invocation)
+        .await
+        .map_err(|error| {
+            if error.message.contains("Exact tokenization is unavailable")
+                || error
+                    .message
+                    .contains("does not support exact tokenization")
+            {
+                ApiError::bad_request(
+                    "exact tokenization is unavailable for this model runtime",
+                    Some("model"),
+                )
+                .with_public_error("token_count_unsupported", "capability", false)
+            } else {
+                ApiError::service_unavailable(
+                    "the tokenizer provider could not complete this request",
+                    Some("model"),
+                )
+                .with_public_error(
+                    "token_count_failed",
+                    "provider_execution",
+                    true,
+                )
+            }
+        })?;
+    Ok(json!({
+        "object": "tokenization",
+        "model": model.id,
+        "count": result.count,
+        "tokens": result.tokens,
+        "max_model_len": state.served_ctx_for_route(&model, Some(route)),
+        "provider": result.provider,
+    }))
 }
 
 fn chat_endpoint_family(
@@ -15656,6 +15855,13 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
         Box::pin(async move { self.activate_tpm_over_bridge(invocation).await })
     }
 
+    fn run_tokenize<'a>(
+        &'a self,
+        invocation: &'a GatewayTokenizeInvocation,
+    ) -> GatewayTokenizeFuture<'a> {
+        Box::pin(async move { self.run_tokenize_over_bridge(invocation).await })
+    }
+
     fn run_chat<'a>(
         &'a self,
         model: &'a GatewayModel,
@@ -15727,6 +15933,123 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
 }
 
 impl ScBridgeGatewaySessionBackend {
+    async fn run_tokenize_over_bridge(
+        &self,
+        invocation: &GatewayTokenizeInvocation,
+    ) -> Result<GatewayTokenizeResult, GatewaySessionError> {
+        let mut bridge = ScBridgeClient::connect(self.config.bridge_config()?).await?;
+        bridge
+            .session_subscribe([invocation.session_id.as_str()])
+            .await?;
+        bridge
+            .peer_connect(&invocation.transport_peer, self.config.open_timeout)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "connecting provider {} for tokenization failed: {err}",
+                    invocation.provider_pubkey
+                ))
+            })?;
+        let opened = bridge
+            .session_open(&invocation.transport_peer, &invocation.session_id)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "opening tokenization session {} to provider {} failed: {err}",
+                    invocation.session_id, invocation.provider_pubkey
+                ))
+            })?;
+        if !sc_bridge_session_transport_valid(&opened) {
+            return Err(GatewaySessionError::retryable(
+                "tokenization session did not open an authenticated direct-or-relayed channel",
+            ));
+        }
+        let request = TokenizeRequestFrame {
+            frame_type: TOKENIZE_REQUEST_FRAME_TYPE.to_owned(),
+            version: TOKENIZE_FRAME_VERSION,
+            session_id: invocation.session_id.clone(),
+            provider: invocation.provider_pubkey.clone(),
+            enclave_id: invocation.enclave_id.clone(),
+            room_id: invocation.room_id.clone(),
+            model: invocation.model.clone(),
+            request: invocation.request.clone(),
+            return_tokens: invocation.return_tokens,
+        };
+        bridge
+            .session_send(&invocation.transport_peer, &invocation.session_id, request)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending tokenization request to provider {} failed: {err}",
+                    invocation.provider_pubkey
+                ))
+            })?;
+        let event = bridge
+            .next_session_frame_for(&invocation.session_id, Some(Duration::from_secs(30)))
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "waiting for tokenization response from provider {} failed: {err}",
+                    invocation.provider_pubkey
+                ))
+            })?;
+        let remote = event
+            .get("remote")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let response: TokenizeResponseFrame = serde_json::from_value(
+            event
+                .get("frame")
+                .cloned()
+                .ok_or_else(|| GatewaySessionError::new("tokenization event has no frame"))?,
+        )
+        .map_err(|err| GatewaySessionError::new(format!("invalid tokenization response: {err}")))?;
+        let binding_matches = remote == invocation.transport_peer
+            && response.frame_type == TOKENIZE_RESPONSE_FRAME_TYPE
+            && response.version == TOKENIZE_FRAME_VERSION
+            && response.session_id == invocation.session_id
+            && response.provider == invocation.provider_pubkey
+            && response.enclave_id == invocation.enclave_id
+            && response.room_id == invocation.room_id
+            && response.model == invocation.model;
+        let _ = bridge
+            .session_close(&invocation.transport_peer, &invocation.session_id)
+            .await;
+        if !binding_matches {
+            return Err(GatewaySessionError::new(
+                "tokenization response does not match the authenticated route",
+            ));
+        }
+        if !response.ok {
+            let code = response
+                .error_code
+                .as_deref()
+                .unwrap_or("token_count_failed");
+            let message = response.error.unwrap_or_else(|| {
+                "The provider tokenizer could not complete this request.".to_owned()
+            });
+            return Err(GatewaySessionError::new(format!("{code}: {message}")));
+        }
+        let count = response
+            .count
+            .ok_or_else(|| GatewaySessionError::new("tokenization response is missing count"))?;
+        if invocation.return_tokens
+            && response
+                .tokens
+                .as_ref()
+                .is_none_or(|tokens| u64::try_from(tokens.len()).ok() != Some(count))
+        {
+            return Err(GatewaySessionError::new(
+                "tokenization response token list does not match count",
+            ));
+        }
+        Ok(GatewayTokenizeResult {
+            count,
+            tokens: response.tokens,
+            provider: response.provider,
+        })
+    }
+
     async fn activate_tpm_over_bridge(
         &self,
         invocation: &GatewayTpmActivationInvocation,
@@ -23558,25 +23881,23 @@ fn chat_context_capacity_error(
     request: &ChatCompletionRequest,
     options: &GatewayRequestOptions,
 ) -> Option<ApiError> {
-    if let Some(error) = preferred_provider_refusal_error(state, model, options) {
-        return Some(error);
-    }
     let required_ctx = effective_context_floor(
         options.min_ctx,
         chat_context_input_tokens(request),
         chat_output_headroom_tokens(request),
     );
-    let now_millis = now_millis_u64();
     state.refresh_provider_table_routes(model);
-    let candidates = eligible_route_candidates(
+    let candidates = order_strict_preferred_routes(
+        state,
         model,
-        options.min_att_tier,
-        options.quant.as_deref(),
-        &state.receipt_config.rail,
-    )
-    .into_iter()
-    .filter(|candidate| !state.route_provider_in_cooloff(candidate, now_millis))
-    .collect::<Vec<_>>();
+        options,
+        eligible_route_candidates(
+            model,
+            options.min_att_tier,
+            options.quant.as_deref(),
+            &state.receipt_config.rail,
+        ),
+    );
     (!candidates.is_empty()
         && candidates
             .iter()
@@ -24373,6 +24694,10 @@ fn synchronize_effective_chat_contract_request(
             "max_completion_tokens",
             request.max_completion_tokens.map(|value| json!(value)),
         ),
+        (
+            "max_output_tokens",
+            request.max_tokens.map(|value| json!(value)),
+        ),
     ];
     for (name, value) in values {
         if contract.request_attribute_specs.contains_key(name)
@@ -24575,6 +24900,7 @@ async fn build_chat_completion(
     validate_requested_response_schema(request.response_format.as_ref())?;
     apply_model_sampling_defaults(&model, &mut request)?;
     apply_model_speciality_defaults(&model, &mut request)?;
+    fit_chat_output_budget_to_context(&state, &model, &mut request, &options);
     synchronize_effective_chat_contract_request(&model, &mut request)?;
     if request.messages.is_empty() {
         return Err(ApiError::bad_request(
@@ -24751,6 +25077,11 @@ async fn prepare_live_direct_chat_session(
     );
     let eligible_route_refs =
         ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
+    if eligible_route_refs.is_empty() {
+        if let Some(error) = chat_context_capacity_error(&state, &model, &request, &options) {
+            return Err(error);
+        }
+    }
     let RouteWaitOutcome {
         routes: mut eligible_route_refs,
         waited,
@@ -24764,13 +25095,11 @@ async fn prepare_live_direct_chat_session(
         || ordered_route_candidates_for_request_with_options(&state, &model, &request, &options),
     )
     .await;
-    if eligible_route_refs.is_empty() {
-        if let Some(error) = preferred_provider_refusal_error(&state, &model, &options) {
-            return Err(error);
-        }
-    }
     if !model.mayhem.route_candidates.is_empty() && eligible_route_refs.is_empty() {
         if let Some(error) = chat_context_capacity_error(&state, &model, &request, &options) {
+            return Err(error);
+        }
+        if let Some(error) = preferred_provider_refusal_error(&state, &model, &options) {
             return Err(error);
         }
         if waited {
@@ -25561,6 +25890,12 @@ async fn recover_live_direct_chat_after_retryable(
     } else {
         redispatch_request_with_partials(&session.request, &partials)
     };
+    fit_chat_output_budget_to_context(
+        &session.state,
+        &session.model,
+        &mut retry_request,
+        &session.options,
+    );
     synchronize_effective_chat_contract_request(&session.model, &mut retry_request).map_err(
         |_| GatewaySessionError::new("effective redispatch request failed contract validation"),
     )?;
@@ -26599,6 +26934,11 @@ async fn run_chat_with_route_retry(
     );
     let eligible_routes =
         ordered_route_candidates_for_request_with_options(state, model, request, &options);
+    if eligible_routes.is_empty() {
+        if let Some(error) = chat_context_capacity_error(state, model, request, &options) {
+            return Err(error);
+        }
+    }
     let RouteWaitOutcome {
         routes: mut eligible_routes,
         waited,
@@ -26612,13 +26952,11 @@ async fn run_chat_with_route_retry(
         || ordered_route_candidates_for_request_with_options(state, model, request, &options),
     )
     .await;
-    if eligible_routes.is_empty() {
-        if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
-            return Err(error);
-        }
-    }
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
         if let Some(error) = chat_context_capacity_error(state, model, request, &options) {
+            return Err(error);
+        }
+        if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
             return Err(error);
         }
         if waited {
@@ -26836,6 +27174,12 @@ async fn run_chat_with_route_retry(
                 if let Some(partial) = err.partial {
                     partials.push(*partial);
                     attempt_request = redispatch_request_with_partials(request, &partials);
+                    fit_chat_output_budget_to_context(
+                        state,
+                        model,
+                        &mut attempt_request,
+                        &attempt_options,
+                    );
                     synchronize_effective_chat_contract_request(model, &mut attempt_request)?;
                     attempt_options.min_ctx = Some(exact_conversation_floor_after_partials(
                         &attempt_request,
@@ -28392,13 +28736,101 @@ fn chat_context_input_tokens(request: &ChatCompletionRequest) -> u64 {
     tokens
 }
 
+fn chat_requested_output_tokens(request: &ChatCompletionRequest) -> u32 {
+    request
+        .max_tokens
+        .or(request.max_completion_tokens)
+        .unwrap_or(DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS as u32)
+        .max(1)
+}
+
 fn chat_output_headroom_tokens(request: &ChatCompletionRequest) -> u64 {
-    u64::from(
-        request
-            .max_tokens
-            .unwrap_or(DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS as u32)
-            .max(1),
+    u64::from(chat_requested_output_tokens(request))
+}
+
+fn chat_context_ceiling(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+) -> u32 {
+    state.refresh_provider_table_routes(model);
+    order_strict_preferred_routes(
+        state,
+        model,
+        options,
+        eligible_route_candidates(
+            model,
+            options.min_att_tier,
+            options.quant.as_deref(),
+            &state.receipt_config.rail,
+        ),
     )
+    .into_iter()
+    .filter(|route| route_has_live_control_transport(state, route))
+    .map(|route| state.served_ctx_for_route(model, Some(route)))
+    .max()
+    .unwrap_or_else(|| model_served_ctx(model))
+    .max(1)
+}
+
+fn route_has_live_control_transport(state: &GatewayState, route: &GatewayRouteCandidate) -> bool {
+    let now_millis = now_millis_u64();
+    let key = route_key(route);
+    state
+        .provider_table
+        .lock_recover("provider table")
+        .entries(now_millis)
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .is_some_and(|entry| {
+            matches!(
+                baseline_route_state(&entry, &state.baseline_route_requirements(now_millis)),
+                BaselineRouteState::Live
+                    | BaselineRouteState::Saturated
+                    | BaselineRouteState::AtCapacity
+            ) && entry
+                .heartbeat
+                .as_ref()
+                .and_then(|heartbeat| heartbeat.transport_peer.as_deref())
+                .is_some_and(|peer| is_hex_len(peer, 64))
+        })
+}
+
+/// Treat the client's output limit as an upper bound. A large fixed limit must
+/// not make a growing conversation unroutable while its prompt still fits the
+/// signed context window.
+fn fit_chat_output_budget_to_context(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &mut ChatCompletionRequest,
+    options: &GatewayRequestOptions,
+) {
+    let input_tokens = chat_context_input_tokens(request);
+    let context_ceiling = u64::from(chat_context_ceiling(state, model, options));
+    let Some(remaining) = context_ceiling.checked_sub(input_tokens) else {
+        return;
+    };
+    if remaining == 0 {
+        return;
+    }
+    let requested = u64::from(chat_requested_output_tokens(request));
+    if requested <= remaining {
+        return;
+    }
+    let fitted = u32::try_from(remaining).unwrap_or(u32::MAX).max(1);
+    match (
+        request.max_tokens.is_some(),
+        request.max_completion_tokens.is_some(),
+    ) {
+        (true, true) => {
+            request.max_tokens = Some(request.max_tokens.unwrap_or(fitted).min(fitted));
+            request.max_completion_tokens =
+                Some(request.max_completion_tokens.unwrap_or(fitted).min(fitted));
+        }
+        (true, false) => request.max_tokens = Some(fitted),
+        (false, true) => request.max_completion_tokens = Some(fitted),
+        (false, false) => request.max_tokens = Some(fitted),
+    }
 }
 
 fn exact_conversation_floor_after_partials(
@@ -29293,17 +29725,17 @@ fn redispatch_request_with_partials(
             extra: BTreeMap::new(),
         });
     }
-    if let Some(max_tokens) = request.max_tokens {
-        let delivered = partials
-            .iter()
-            .map(|partial| partial.output.usage.completion_tokens)
-            .sum::<u64>();
-        request.max_tokens = Some(
-            max_tokens
-                .saturating_sub(u32::try_from(delivered).unwrap_or(u32::MAX))
-                .max(1),
-        );
-    }
+    let delivered = partials
+        .iter()
+        .map(|partial| partial.output.usage.completion_tokens)
+        .sum::<u64>();
+    let delivered = u32::try_from(delivered).unwrap_or(u32::MAX);
+    request.max_tokens = request
+        .max_tokens
+        .map(|max_tokens| max_tokens.saturating_sub(delivered).max(1));
+    request.max_completion_tokens = request
+        .max_completion_tokens
+        .map(|max_tokens| max_tokens.saturating_sub(delivered).max(1));
     request
 }
 
@@ -45875,6 +46307,61 @@ mod tests {
                 })
             })
         }
+
+        fn run_tokenize<'a>(
+            &'a self,
+            invocation: &'a GatewayTokenizeInvocation,
+        ) -> GatewayTokenizeFuture<'a> {
+            Box::pin(async move {
+                assert!(invocation.request.get("mayhem_contract").is_some());
+                assert!(invocation.request.get("contract_request").is_some());
+                Ok(GatewayTokenizeResult {
+                    count: 3,
+                    tokens: invocation.return_tokens.then_some(vec![11, 22, 33]),
+                    provider: invocation.provider_pubkey.clone(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tokenize_endpoint_uses_live_model_route_without_creating_inference_work() {
+        use tower::ServiceExt;
+
+        let model = test_routed_model(1);
+        let model_id = model.id.clone();
+        let backend = Arc::new(SuccessBackend {
+            providers: Arc::new(Mutex::new(Vec::new())),
+        });
+        let state = test_gateway_state_from_models(vec![model]).with_session_backend(backend);
+        let response = openai_router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokenize")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": model_id,
+                            "prompt": "count these exact model tokens",
+                            "return_tokens": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-mayhem-job-id").is_none());
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["object"], "tokenization");
+        assert_eq!(body["count"], 3);
+        assert_eq!(body["tokens"], json!([11, 22, 33]));
+        assert_eq!(body["model"], model_id);
     }
 
     #[test]
@@ -47061,6 +47548,123 @@ mod tests {
             model.mayhem.route_candidates[1].provider
         );
         assert_eq!(state.served_ctx_for_route(&model, Some(routes[0])), 262_144);
+    }
+
+    #[test]
+    fn growing_chat_fits_large_output_limit_to_remaining_context_for_streaming_and_json() {
+        let mut model = test_routed_model(2);
+        model.mayhem.caps.ctx = 262_144;
+        for route in &mut model.mayhem.route_candidates {
+            route.served_ctx = Some(262_144);
+        }
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let options = GatewayRequestOptions::default();
+
+        for stream in [false, true] {
+            let mut previous_limit = 226_921;
+            for bytes in [5_000, 60_000, 120_000, 150_000] {
+                let mut request = test_chat_request(&model.id);
+                request.stream = stream;
+                request.messages[0].content = json!("x".repeat(bytes));
+                request.max_tokens = Some(226_921);
+
+                let input_tokens = chat_context_input_tokens(&request);
+                fit_chat_output_budget_to_context(&state, &model, &mut request, &options);
+
+                let expected = 226_921_u64
+                    .min(262_144_u64.saturating_sub(input_tokens))
+                    .max(1) as u32;
+                assert_eq!(request.max_tokens, Some(expected));
+                assert!(expected <= previous_limit);
+                previous_limit = expected;
+                assert!(
+                    effective_context_floor(
+                        None,
+                        chat_context_input_tokens(&request),
+                        chat_output_headroom_tokens(&request),
+                    ) <= 262_144
+                );
+                assert_eq!(
+                    ordered_route_candidates_for_request_with_options(
+                        &state, &model, &request, &options,
+                    )
+                    .len(),
+                    2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn context_fit_honors_completion_and_responses_output_aliases() {
+        let mut model = test_routed_model(1);
+        model.mayhem.caps.ctx = 262_144;
+        model.mayhem.route_candidates[0].served_ctx = Some(262_144);
+        let responses_contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+        )
+        .expect("Responses contract");
+        model.mayhem.adapter.endpoint_families = vec![responses_contract.clone()];
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let options = GatewayRequestOptions::default();
+        let raw = json!({
+            "model": model.id,
+            "input": [{"role": "user", "content": "x".repeat(150_000)}],
+            "max_output_tokens": 226_921,
+            "stream": false
+        });
+        let normalized = normalize_endpoint_request_for_provider(&responses_contract, &raw)
+            .expect("Responses request normalizes");
+        let responses: ResponsesRequest =
+            serde_json::from_value(normalized.normalized_request.clone()).unwrap();
+        let mut request = responses_chat_request(responses, normalized.normalized_request).unwrap();
+
+        fit_chat_output_budget_to_context(&state, &model, &mut request, &options);
+        synchronize_effective_chat_contract_request(&model, &mut request).unwrap();
+
+        let fitted = request
+            .max_tokens
+            .expect("Responses output limit remains present");
+        assert!(fitted < 226_921);
+        assert_eq!(
+            request.endpoint_request.as_ref().unwrap()["max_output_tokens"],
+            json!(fitted)
+        );
+
+        request.max_tokens = None;
+        request.max_completion_tokens = Some(226_921);
+        request.endpoint_family = None;
+        request.endpoint_request = None;
+        assert_eq!(chat_output_headroom_tokens(&request), 226_921);
+        fit_chat_output_budget_to_context(&state, &model, &mut request, &options);
+        assert!(request.max_completion_tokens.unwrap() < 226_921);
+    }
+
+    #[tokio::test]
+    async fn preferred_provider_context_failure_is_immediate_and_not_masked_by_other_route() {
+        let mut model = test_routed_model(2);
+        model.mayhem.caps.ctx = 262_144;
+        model.mayhem.route_candidates[0].served_ctx = Some(8_192);
+        model.mayhem.route_candidates[1].served_ctx = Some(262_144);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let mut request = test_chat_request(&model.id);
+        request.messages[0].content = json!("word ".repeat(9_000));
+        request.max_tokens = Some(64);
+        let options = GatewayRequestOptions {
+            preferred_providers: Some(vec![model.mayhem.route_candidates[0].provider.clone()]),
+            max_wait_ms: 60_000,
+            ..GatewayRequestOptions::default()
+        };
+
+        let started = Instant::now();
+        let error = match run_chat_with_route_retry(&state, &model, &request, options).await {
+            Ok(_) => panic!("preferred 8k route cannot hold this prompt"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.public_code, "context_capacity_unavailable");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!error.message.contains("preferred provider"));
     }
 
     #[test]
