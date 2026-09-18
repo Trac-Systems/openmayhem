@@ -1000,7 +1000,11 @@ pub struct GatewayRouteCandidate {
     pub price_ref_au: Option<PriceRefAu>,
     #[serde(default, with = "mayhem_proto::decimal_u128")]
     pub min_ask_au: MoneyAu,
+    /// Effective routing/accountability tier. Verified provider identity raises
+    /// this to T4 without changing the enclave's execution attestation tier.
     pub att_tier: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclave_att_tier: Option<u8>,
     #[serde(default = "default_quant_bucket")]
     pub quant: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1029,6 +1033,10 @@ pub struct GatewayRouteCandidate {
     pub caps: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_run: Option<GatewayLocalRunBadge>,
+}
+
+fn route_enclave_attestation_tier(candidate: &GatewayRouteCandidate) -> u8 {
+    candidate.enclave_att_tier.unwrap_or(candidate.att_tier)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -6702,16 +6710,17 @@ fn gateway_route_attestation_readiness(
     candidate: &GatewayRouteCandidate,
     entries: &[ProviderTableEntry],
 ) -> RouteAttestationPolicyReadiness {
+    let enclave_att_tier = route_enclave_attestation_tier(candidate);
     dashboard_entry_for_route(entries, candidate)
         .map(|entry| entry.contract.attestation_policy.clone())
         .unwrap_or_else(|| {
-            if matches!(candidate.att_tier, 2 | 3) {
+            if matches!(enclave_att_tier, 2 | 3) {
                 RouteAttestationPolicyReadiness::unavailable(
-                    candidate.att_tier,
+                    enclave_att_tier,
                     "route has no local provider-table policy snapshot",
                 )
             } else {
-                RouteAttestationPolicyReadiness::not_required(candidate.att_tier)
+                RouteAttestationPolicyReadiness::not_required(enclave_att_tier)
             }
         })
 }
@@ -6763,8 +6772,8 @@ fn gateway_registered_route_value(
         "attestation_verification".to_owned(),
         serde_json::to_value(readiness).unwrap_or_else(|_| {
             json!({
-                "attestation_tier": candidate.att_tier,
-                "policy_required": matches!(candidate.att_tier, 2 | 3),
+                "attestation_tier": route_enclave_attestation_tier(candidate),
+                "policy_required": matches!(route_enclave_attestation_tier(candidate), 2 | 3),
                 "locally_ready": false,
                 "runtime_binary_hash_evidence_only": true,
                 "reason": "local attestation readiness could not be encoded",
@@ -7122,7 +7131,7 @@ fn gateway_route_belongs_to_market(
 ) -> bool {
     if candidate.enclave_id != market.enclave_id
         || !market.room_ids.contains(&candidate.room_id)
-        || candidate.att_tier != market.att_tier
+        || route_enclave_attestation_tier(candidate) != market.att_tier
         || !candidate.quant.eq_ignore_ascii_case(&market.quant)
         || !candidate
             .accepted_rails
@@ -14587,7 +14596,9 @@ fn contract_snapshot_for_route(
             resolved
                 .map(|resolved| resolved.readiness)
                 .unwrap_or_else(|| {
-                    RouteAttestationPolicyReadiness::not_required(candidate.att_tier)
+                    RouteAttestationPolicyReadiness::not_required(route_enclave_attestation_tier(
+                        candidate,
+                    ))
                 })
         },
     );
@@ -14724,12 +14735,13 @@ fn route_attestation_policy_resolution(
     verifier_command: Option<&HardwareQuoteVerifierCommand>,
     now_millis: u64,
 ) -> Result<Option<GatewayResolvedRouteAttestation>, RouteAttestationPolicyReadiness> {
-    if !matches!(candidate.att_tier, 2 | 3) {
+    let enclave_att_tier = route_enclave_attestation_tier(candidate);
+    if !matches!(enclave_att_tier, 2 | 3) {
         return Ok(None);
     }
 
     let mut status = RouteAttestationPolicyReadiness::unavailable(
-        candidate.att_tier,
+        enclave_att_tier,
         "authenticated attestation authority is not configured",
     );
     let Some(authority) = authority.cloned() else {
@@ -14744,12 +14756,12 @@ fn route_attestation_policy_resolution(
     };
     let advertisement = &live_advertisement.advertisement;
     status.quote_kind = Some(advertisement.kind);
-    if advertisement.kind.attestation_tier() != candidate.att_tier {
+    if advertisement.kind.attestation_tier() != enclave_att_tier {
         status.reason = Some(format!(
             "quote kind {} proves Tier {}, not route Tier {}",
             advertisement.kind.as_str(),
             advertisement.kind.attestation_tier(),
-            candidate.att_tier
+            enclave_att_tier
         ));
         return Err(status);
     }
@@ -15210,6 +15222,10 @@ fn canonical_route_candidate(candidate: &GatewayRouteCandidate) -> bool {
             .all(|root| is_hex_len(root, 64))
         && is_hex_len(&candidate.manifest_hash, 64)
         && is_hex_len(&candidate.binary_hash, 64)
+        && candidate
+            .enclave_att_tier
+            .is_none_or(|tier| (1..=3).contains(&tier))
+        && (candidate.att_tier != 4 || candidate.enclave_att_tier.is_some())
 }
 
 fn canonical_market_info(market: &GatewayMarketInfo) -> bool {
@@ -34294,7 +34310,7 @@ impl GatewayState {
                 format!(
                     "route {} cannot verify Tier {} locally: {}",
                     candidate.provider,
-                    candidate.att_tier,
+                    route_enclave_attestation_tier(candidate),
                     readiness
                         .reason
                         .as_deref()
@@ -34319,7 +34335,7 @@ impl GatewayState {
                 manifest_hash: candidate.manifest_hash.clone(),
                 binary_hash: candidate.binary_hash.clone(),
                 launch_measurements: candidate.launch_measurements.clone(),
-                att_tier: candidate.att_tier,
+                att_tier: route_enclave_attestation_tier(candidate),
                 caps: candidate.caps.clone(),
             },
             policy,
@@ -45773,6 +45789,7 @@ mod tests {
             price_ref_au: None,
             min_ask_au: 0,
             att_tier: 1,
+            enclave_att_tier: Some(1),
             quant: DEFAULT_QUANT_BUCKET.to_owned(),
             served_ctx: None,
             hardware_fingerprint: None,
@@ -47513,6 +47530,34 @@ mod tests {
         );
         assert_eq!(invocation.spend_voucher.body.locked_per_req_au, 123);
         assert_eq!(invocation.spend_voucher.body.locked_min_session_au, 456);
+    }
+
+    #[test]
+    fn t4_identity_preserves_underlying_execution_attestation() {
+        let mut tier1_model = test_routed_model(1);
+        tier1_model.mayhem.route_candidates[0].att_tier = 4;
+        tier1_model.mayhem.route_candidates[0].enclave_att_tier = Some(1);
+        assert!(canonical_route_candidate(
+            &tier1_model.mayhem.route_candidates[0]
+        ));
+        let tier1_state = test_gateway_state_from_models(vec![tier1_model.clone()]);
+        let tier1 = tier1_state
+            .session_attestation_for_route(&tier1_model, &tier1_model.mayhem.route_candidates[0])
+            .expect("T4 identity does not replace T1 execution attestation");
+        assert_eq!(tier1.contract.att_tier, 1);
+
+        let mut tier3_model = test_routed_model(1);
+        tier3_model.mayhem.route_candidates[0].att_tier = 4;
+        tier3_model.mayhem.route_candidates[0].enclave_att_tier = Some(3);
+        let tier3_state = test_gateway_state_from_models(vec![tier3_model.clone()]);
+        let error = tier3_state
+            .session_attestation_for_route(&tier3_model, &tier3_model.mayhem.route_candidates[0])
+            .expect_err("T4 identity must not bypass T3 policy verification");
+        assert!(error.message.contains("Tier 3"), "{}", error.message);
+
+        let mut unbound = tier1_model.mayhem.route_candidates[0].clone();
+        unbound.enclave_att_tier = None;
+        assert!(!canonical_route_candidate(&unbound));
     }
 
     #[test]

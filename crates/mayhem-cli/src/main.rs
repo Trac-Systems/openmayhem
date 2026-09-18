@@ -72700,6 +72700,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     )),
                     min_ask_au: 0,
                     att_tier: effective_att_tier,
+                    enclave_att_tier: Some(enclave.att_tier),
                     quant: normalize_ledger_quant(&enclave.quant),
                     served_ctx: Some(served_ctx),
                     hardware_fingerprint: active_serve
@@ -111625,6 +111626,10 @@ esac
         assert_eq!(models[0].mayhem.markets[0].availability, "routable");
         assert_eq!(models[0].mayhem.route_candidates.len(), 1);
         assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 1);
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].enclave_att_tier,
+            Some(1)
+        );
         assert_eq!(models[0].mayhem.route_candidates[0].kyb, None);
         assert_eq!(models[0].mayhem.route_candidates[0].reputation_bps, 10_000);
         assert_eq!(models[0].mayhem.route_candidates[0].probation, None);
@@ -112302,6 +112307,10 @@ esac
         let models = gateway_models_from_contract(&contract).unwrap();
         assert_eq!(models[0].mayhem.attestation_tiers["T4"], 1);
         assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 4);
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].enclave_att_tier,
+            Some(1)
+        );
         assert_eq!(models[0].mayhem.kyb_identities.len(), 1);
         assert_eq!(
             models[0].mayhem.kyb_identities[0].legal_name,
@@ -112320,6 +112329,10 @@ esac
         let models = gateway_models_from_contract(&contract).unwrap();
         assert_eq!(models[0].mayhem.attestation_tiers["T1"], 1);
         assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 1);
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].enclave_att_tier,
+            Some(1)
+        );
         assert!(models[0].mayhem.kyb_identities.is_empty());
         assert_eq!(models[0].mayhem.route_candidates[0].kyb, None);
     }

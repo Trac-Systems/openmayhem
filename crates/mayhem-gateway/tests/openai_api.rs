@@ -7479,6 +7479,7 @@ fn routed_test_candidate(provider: &str, idx: usize) -> GatewayRouteCandidate {
         price_ref_au: None,
         min_ask_au: 0,
         att_tier: 1,
+        enclave_att_tier: Some(1),
         quant: "int4".to_owned(),
         served_ctx: None,
         hardware_fingerprint: None,

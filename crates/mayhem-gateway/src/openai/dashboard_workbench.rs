@@ -1446,6 +1446,7 @@ fn fixture_candidate(
         price_ref_au: Some(model.mayhem.price_ref_au.clone()),
         min_ask_au: 0,
         att_tier: tier,
+        enclave_att_tier: Some(if tier == 4 { 1 } else { tier }),
         quant: if route_index % 2 == 0 { "int4" } else { "int8" }.to_owned(),
         served_ctx: Some(model.mayhem.caps.ctx),
         hardware_fingerprint: Some(hex_fill(0x90_u8.wrapping_add(seed))),
