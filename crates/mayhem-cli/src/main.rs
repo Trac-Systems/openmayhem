@@ -60110,11 +60110,13 @@ struct ProviderHeartbeatLoad {
     modality_active_items: Arc<BTreeMap<String, AtomicU64>>,
     modality_max_inflight_items: Arc<BTreeMap<String, u64>>,
     changes: tokio::sync::watch::Sender<u64>,
+    published_changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for ProviderHeartbeatLoad {
     fn default() -> Self {
         let (changes, _) = tokio::sync::watch::channel(0);
+        let (published_changes, _) = tokio::sync::watch::channel(0);
         Self {
             prefix_caching: Arc::new(AtomicBool::new(false)),
             active_slots: Arc::new(AtomicU64::new(0)),
@@ -60128,6 +60130,7 @@ impl Default for ProviderHeartbeatLoad {
             modality_active_items: Arc::new(BTreeMap::new()),
             modality_max_inflight_items: Arc::new(BTreeMap::new()),
             changes,
+            published_changes,
         }
     }
 }
@@ -60373,6 +60376,20 @@ impl ProviderHeartbeatLoad {
 
     fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
         self.changes.subscribe()
+    }
+
+    fn change_generation(&self) -> u64 {
+        *self.changes.borrow()
+    }
+
+    fn mark_published(&self, generation: u64) {
+        if *self.published_changes.borrow() < generation {
+            self.published_changes.send_replace(generation);
+        }
+    }
+
+    fn published_through(&self, generation: u64) -> bool {
+        *self.published_changes.borrow() >= generation
     }
 
     fn notify_change(&self) {
@@ -80269,7 +80286,7 @@ async fn run_provider_session_heartbeat_connection(
     let mut heartbeat_cache_updated_at = None::<Instant>;
     let mut load_changes = ctx.load.subscribe_changes();
     while !ctx.load.is_stopped() {
-        load_changes.borrow_and_update();
+        let load_generation = *load_changes.borrow_and_update();
         let round_started = Instant::now();
         let sent = timeout(
             ctx.bridge_operation_timeout,
@@ -80296,6 +80313,7 @@ async fn run_provider_session_heartbeat_connection(
         )
         .await
         .with_context(|| format!("timed out sending live provider heartbeat seq {seq}"))??;
+        ctx.load.mark_published(load_generation);
         let refresh_cache = heartbeat_cache_updated_at
             .map(|updated_at| updated_at.elapsed() >= ctx.heartbeat_ttl / 2)
             .unwrap_or(true);
@@ -80834,6 +80852,7 @@ async fn serve_provider_sessions(
     let mut tpm_activation_limiter = ProviderTpmActivationLimiter::from_environment()?;
     let mut tokenize_limiter = ProviderTokenizeLimiter::from_environment()?;
     let mut draining = false;
+    let mut drain_heartbeat_generation = None::<u64>;
     let mut local_drain_request = None::<ProviderDrainRequest>;
     let mut runtime_floor_reject: Option<ProviderRuntimeFloorRejection> = None;
     let mut last_idle_memory_reclaim_at = None::<Instant>;
@@ -80941,6 +80960,14 @@ async fn serve_provider_sessions(
                     heartbeat_task = Some(spawn_provider_session_heartbeat_task(config));
                     heartbeat_restart_at = None;
                 }
+            }
+            if draining
+                && sessions.is_empty()
+                && (!heartbeat_enabled
+                    || drain_heartbeat_generation
+                        .is_some_and(|generation| heartbeat_load.published_through(generation)))
+            {
+                break;
             }
             if !engine_recovery.pending() && !responder.component_healthy() {
                 heartbeat_load.set_accepting_new(false);
@@ -81148,11 +81175,10 @@ async fn serve_provider_sessions(
                             request.path.display()
                         ));
                         heartbeat_load.set_accepting_new(false);
+                        drain_heartbeat_generation = heartbeat_enabled
+                            .then(|| heartbeat_load.change_generation());
                         draining = true;
                         local_drain_request = Some(request);
-                        if sessions.is_empty() {
-                            break;
-                        }
                     }
                     Ok(None) => {}
                     Err(err) => provider_session_debug(format!(
@@ -81166,9 +81192,16 @@ async fn serve_provider_sessions(
                         "serve window elapsed; entering graceful drain and refusing new sessions",
                     );
                     heartbeat_load.set_accepting_new(false);
+                    drain_heartbeat_generation = heartbeat_enabled
+                        .then(|| heartbeat_load.change_generation());
                     draining = true;
                 }
-                if sessions.is_empty() {
+                if sessions.is_empty()
+                    && (!heartbeat_enabled
+                        || drain_heartbeat_generation.is_some_and(|generation| {
+                            heartbeat_load.published_through(generation)
+                        }))
+                {
                     break;
                 }
             }
@@ -81412,7 +81445,13 @@ async fn serve_provider_sessions(
                         &terms,
                     )
                     .await;
-                    if draining && sessions.is_empty() {
+                    if draining
+                        && sessions.is_empty()
+                        && (!heartbeat_enabled
+                            || drain_heartbeat_generation.is_some_and(|generation| {
+                                heartbeat_load.published_through(generation)
+                            }))
+                    {
                         break;
                     }
                 }
@@ -124203,6 +124242,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         load.set_accepting_new(false);
         assert!(changes.has_changed().unwrap());
         assert!(!load.snapshot(4).accepting_new);
+        let unavailable_generation = load.change_generation();
+        assert!(!load.published_through(unavailable_generation));
+        load.mark_published(unavailable_generation);
+        assert!(load.published_through(unavailable_generation));
         assert!(!load.is_stopped());
         load.stop();
         assert!(load.is_stopped());

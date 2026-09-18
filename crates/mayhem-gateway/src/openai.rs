@@ -254,6 +254,7 @@ const CONTEXT_NEEDLE_MAX_TOKENS: u32 = 16;
 const CONTEXT_NEEDLE_FILLER_WORDS_PER_LINE: usize = 32;
 const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
 const DEFAULT_THROUGHPUT_FLOOR_MIN_OUTPUT_TOKENS: u64 = 6;
+const DEFAULT_THROUGHPUT_FLOOR_FAST_SAMPLE_MIN_OUTPUT_TOKENS: u64 = 32;
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const DEFAULT_RESERVATION_MAX_LIFETIME_EPOCHS: u64 = 24;
 const DEFAULT_RESERVATION_RECEIPT_GRACE_EPOCHS: u64 = 6;
@@ -1219,6 +1220,23 @@ impl GatewayFailoverInvocation {
 
     fn stall_timeout(self) -> Option<Duration> {
         self.stall_timeout_ms.map(Duration::from_millis)
+    }
+
+    fn with_admission_attempt_budget(mut self, budget: Duration) -> Self {
+        // Admission has three independently blocking phases: peer connect,
+        // session open, and the signed provider accept. Divide the route's
+        // attempt budget across them so one silent route cannot consume the
+        // time reserved for another provider.
+        let phase_millis = u64::try_from(budget.as_millis() / 3)
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.open_timeout_ms = self.open_timeout_ms.min(phase_millis);
+        self.session_accept_timeout_ms = Some(
+            self.session_accept_timeout_ms
+                .unwrap_or(phase_millis)
+                .min(phase_millis),
+        );
+        self
     }
 }
 
@@ -15833,6 +15851,27 @@ fn sc_bridge_session_transport_valid(opened: &Value) -> bool {
     sc_bridge_session_transport(opened).is_ok()
 }
 
+async fn open_direct_session_with_timeout(
+    bridge: &mut ScBridgeClient,
+    provider: &str,
+    direct_peer: &str,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<Value, GatewaySessionError> {
+    tokio::time::timeout(timeout, bridge.session_open(direct_peer, session_id))
+        .await
+        .map_err(|_| {
+            GatewaySessionError::retryable(format!(
+                "opening direct session {session_id} to provider {provider} transport peer {direct_peer} timed out"
+            ))
+        })?
+        .map_err(|err| {
+            GatewaySessionError::retryable(format!(
+                "opening direct session {session_id} to provider {provider} transport peer {direct_peer} failed: {err}"
+            ))
+        })
+}
+
 impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
     fn name(&self) -> &str {
         "sc-bridge-direct-session"
@@ -16240,15 +16279,14 @@ impl ScBridgeGatewaySessionBackend {
                     provider, direct_peer, invocation.session_id
                 ))
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "hedge session open {} to provider {} via transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "hedge session {} did not open an authenticated direct-or-relayed transport",
@@ -16289,15 +16327,14 @@ impl ScBridgeGatewaySessionBackend {
                     provider, direct_peer, invocation.session_id
                 ))
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "session {} did not open an authenticated direct-or-relayed channel",
@@ -16503,15 +16540,14 @@ impl ScBridgeGatewaySessionBackend {
                     provider, direct_peer, invocation.session_id
                 ))
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct embedding session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "embedding session {} did not open an authenticated direct-or-relayed channel",
@@ -16670,15 +16706,14 @@ impl ScBridgeGatewaySessionBackend {
                     provider, direct_peer, invocation.session_id
                 ))
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct image session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "image session {} did not open an authenticated direct-or-relayed channel",
@@ -16837,15 +16872,14 @@ impl ScBridgeGatewaySessionBackend {
                     provider, direct_peer, invocation.session_id
                 ))
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct audio speech session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "audio speech session {} did not open an authenticated direct-or-relayed channel",
@@ -16994,15 +17028,14 @@ impl ScBridgeGatewaySessionBackend {
                     provider, direct_peer, invocation.session_id
                 ))
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct audio transcription session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "audio transcription session {} did not open an authenticated direct-or-relayed channel",
@@ -17151,15 +17184,14 @@ impl ScBridgeGatewaySessionBackend {
                     provider, direct_peer, request.output_modality, invocation.session_id
                 ))
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct {} generation session {} to provider {} transport peer {} failed: {err}",
-                    request.output_modality, invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "{} generation session {} did not open an authenticated direct-or-relayed channel",
@@ -18906,7 +18938,9 @@ fn generated_tokens_per_second(
     let elapsed_millis = completed_at_millis
         .saturating_sub(first_delta_at_millis)
         .max(1);
-    if elapsed_millis < DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS {
+    if elapsed_millis < DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS
+        && output_tokens < DEFAULT_THROUGHPUT_FLOOR_FAST_SAMPLE_MIN_OUTPUT_TOKENS
+    {
         return None;
     }
     let tok_s = token_intervals as f64 * 1000.0 / elapsed_millis as f64;
@@ -22831,14 +22865,18 @@ async fn run_embedding_with_route_retry(
                 continue;
             }
         };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_embedding_invocation_for_route(
+        let mut invocation = state.prepare_embedding_invocation_for_route(
             model,
             Some(request),
             inputs,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -23037,13 +23075,17 @@ async fn run_image_generation_with_route_retry(
                 continue;
             }
         };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_image_generation_invocation_for_route(
+        let mut invocation = state.prepare_image_generation_invocation_for_route(
             model,
             request,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -23241,13 +23283,17 @@ async fn run_audio_speech_with_route_retry(
                 continue;
             }
         };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_audio_speech_invocation_for_route(
+        let mut invocation = state.prepare_audio_speech_invocation_for_route(
             model,
             request,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -23449,13 +23495,17 @@ async fn run_audio_transcription_with_route_retry(
                 continue;
             }
         };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_audio_transcription_invocation_for_route(
+        let mut invocation = state.prepare_audio_transcription_invocation_for_route(
             model,
             request,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -23698,13 +23748,17 @@ async fn run_artifact_generation_with_route_retry(
                     continue;
                 }
             };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_artifact_generation_invocation_for_route(
+        let mut invocation = state.prepare_artifact_generation_invocation_for_route(
             model,
             &attempt_request,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -24289,6 +24343,16 @@ impl RouteAdmissionRecovery {
 
     fn can_attempt(&self) -> bool {
         self.attempts_made < self.total_attempt_limit
+    }
+
+    fn admission_attempt_budget(&self, candidate_count: usize) -> Duration {
+        let total = match self.deadline.remaining() {
+            remaining if remaining.is_zero() => Duration::from_millis(DEFAULT_ROUTE_MAX_WAIT_MS),
+            remaining => remaining,
+        };
+        let remaining_attempts = self.total_attempt_limit.saturating_sub(self.attempts_made);
+        let shares = candidate_count.max(1).min(remaining_attempts.max(1));
+        total / u32::try_from(shares).unwrap_or(u32::MAX).max(1)
     }
 
     fn begin_attempt(&mut self, route: Option<&GatewayRouteCandidate>) {
@@ -25364,13 +25428,17 @@ async fn prepare_live_direct_chat_session(
                     continue;
                 }
             };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route.as_ref());
-        let invocation = state.prepare_chat_invocation_for_route(
+        let mut invocation = state.prepare_chat_invocation_for_route(
             &model,
             &request,
             route.as_ref(),
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
         match open_live_direct_chat_session(&config, &model, &request, &invocation).await {
@@ -25499,15 +25567,14 @@ async fn open_live_direct_chat_session(
                 provider, direct_peer, invocation.session_id
             ))
         })?;
-    let opened = bridge
-        .session_open(direct_peer, &invocation.session_id)
-        .await
-        .map_err(|err| {
-            GatewaySessionError::retryable(format!(
-                "opening direct session {} to provider {} transport peer {} failed: {err}",
-                invocation.session_id, provider, direct_peer
-            ))
-        })?;
+    let opened = open_direct_session_with_timeout(
+        &mut bridge,
+        provider,
+        direct_peer,
+        &invocation.session_id,
+        invocation.failover.open_timeout(),
+    )
+    .await?;
     if !sc_bridge_session_transport_valid(&opened) {
         let _ = bridge
             .session_close(direct_peer, &invocation.session_id)
@@ -27239,13 +27306,17 @@ async fn run_chat_with_route_retry(
                 continue;
             }
         };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_chat_invocation_for_route(
+        let mut invocation = state.prepare_chat_invocation_for_route(
             model,
             &attempt_request,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
         match state
@@ -41083,11 +41154,27 @@ mod tests {
     }
 
     #[test]
-    fn generation_throughput_ignores_short_or_subsecond_turns() {
+    fn generation_throughput_uses_subsecond_samples_only_when_output_is_substantial() {
         assert_eq!(generated_tokens_per_second(1, 100, 10_000), None);
         assert_eq!(generated_tokens_per_second(5, 100, 10_000), None);
         assert_eq!(generated_tokens_per_second(6, 100, 1_099), None);
         assert_eq!(generated_tokens_per_second(6, 100, 1_100), Some(5.0));
+        assert_eq!(generated_tokens_per_second(32, 100, 600), Some(62.0));
+    }
+
+    #[test]
+    fn admission_attempt_budget_preserves_time_for_alternate_routes() {
+        let recovery = RouteAdmissionRecovery::new(RouteWaitDeadline::new(12_000), 4);
+        let budget = recovery.admission_attempt_budget(2);
+        assert!(budget <= Duration::from_secs(6));
+        assert!(budget > Duration::from_secs(5));
+
+        let failover = GatewayFailoverInvocation::default().with_admission_attempt_budget(budget);
+        assert!(failover.open_timeout() <= Duration::from_secs(2));
+        assert_eq!(
+            failover.session_accept_timeout(),
+            Some(failover.open_timeout())
+        );
     }
 
     #[test]
