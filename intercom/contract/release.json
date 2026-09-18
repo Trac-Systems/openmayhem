@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "release_version": "0.2.242",
-  "contract_version": 25,
-  "contract_code_sha256": "9b160277efc8dfe8f697f0ad3f148f4c9e1ac2e538f510cf227be6164c4a0a4f",
+  "release_version": "0.2.243",
+  "contract_version": 26,
+  "contract_code_sha256": "815b7cfb6d87f253120cece46d1738efa7b40596db8d0fcfb47550659b59f32b",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "3a836deefefdc0c5a62856e08598129f2a207c32491bdc8e09c58b228c5903ac"
+      "sha256": "6584ec2945d01cac7ab68b0f74171ce75116974dba1c403d898c5a166b488831"
     },
     {
       "path": "contract/history/v23.js",
@@ -15,6 +15,10 @@
     {
       "path": "contract/history/v24.js",
       "sha256": "695c8010aa8f61fcedeb277f4251f0c6bd670bdb1c2a133b2da175900f45dd08"
+    },
+    {
+      "path": "contract/history/v25.js",
+      "sha256": "31d570bd8ab6e89b469e67f1d035f1cb943ff99ded8ed7824b490841ed733a4a"
     },
     {
       "path": "contract/protocol.js",

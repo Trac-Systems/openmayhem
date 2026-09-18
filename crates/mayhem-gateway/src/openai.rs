@@ -50443,7 +50443,7 @@ mod tests {
 
     #[tokio::test]
     async fn contract_upgrade_resubmits_v191_context_receipts_without_rewriting() {
-        for recovery_version in [23, 24] {
+        for recovery_version in [23, 24, 25] {
             let root = tempfile::tempdir().unwrap();
             let jobs_dir = root.path().join("jobs");
             let seed = test_user_seed();

@@ -5,15 +5,14 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import { consumeCanonicalReplayContext } from 'trac-peer/src/base/canonical-replay.js';
 import PeerWallet from 'trac-wallet';
-import ContractV23 from './history/v23.js';
-import ContractV24 from './history/v24.js';
-import ContractV25 from './history/v25.js';
+import ContractV23 from './v23.js';
+import ContractV24 from './v24.js';
 
-export const CONTRACT_VERSION = 26;
+export const CONTRACT_VERSION = 25;
 // Recovery is limited to unchanged schema-11 receipt evidence already signed by
-// v23, v24, or v25 participants. New prior-version operations are not admitted;
+// v23 or v24 participants. New prior-version operations are not admitted;
 // separately authenticated canonical replay does not constitute new admission.
-const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25]);
+const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24]);
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -218,7 +217,7 @@ const PROBE_VERIFICATION_METHODS = new Set([
   'attestation_of_compute',
 ]);
 const AUDITOR_SLASH_REASONS = new Set(['collusion', 'false_report']);
-const BAN_TARGET_TYPES = new Set(['provider', 'device', 'fingerprint', 'committer', 'kyb']);
+const BAN_TARGET_TYPES = new Set(['provider', 'device', 'fingerprint', 'committer']);
 const FRAUD_PROOF_REASONS = new Set(['over_credit', 'price_derivation']);
 const DISPUTE_OUTCOMES = new Set(['provider_fault', 'opener_fault', 'no_fault']);
 const DISPUTE_DEPOSIT_ACTIONS = new Set(['refund', 'forfeit', 'partial_forfeit']);
@@ -901,19 +900,14 @@ class MayhemContract extends Contract {
       const versioned = versionedMayhemOperation(op);
       const canonicalReplay = consumeCanonicalReplayContext(consensusContext, op, storage);
       const historical = versioned.present && (
-        ([23, 24, 25].includes(versioned.version) && canonicalReplay) ||
-        ([24, 25].includes(versioned.version) &&
-          await this.isPreparedCheckpointReplay(op, storage))
+        ([23, 24].includes(versioned.version) && canonicalReplay) ||
+        (versioned.version === 24 && await this.isPreparedCheckpointReplay(op, storage))
       );
       if (historical) {
         // Replaying with today's pricing/receipt methods would produce a
         // different signed view. Retained implementations preserve the exact
         // historical transition, and never participate in new admission.
-        const Implementation = versioned.version === 23
-          ? ContractV23
-          : versioned.version === 24
-            ? ContractV24
-            : ContractV25;
+        const Implementation = versioned.version === 23 ? ContractV23 : ContractV24;
         this._historicalContracts ??= new Map();
         if (!this._historicalContracts.has(versioned.version)) {
           this._historicalContracts.set(versioned.version, new Implementation(this.protocol, this.config));
@@ -8322,48 +8316,6 @@ class MayhemContract extends Contract {
     if (!BAN_TARGET_TYPES.has(targetType)) return new Error('Unsupported ban target type.');
     if (!this.isHexBytes(this.value.target, 32)) return new Error('Invalid ban target.');
     if (!this.isHexBytes(this.value.reason_hash, 32)) return new Error('Invalid unban reason hash.');
-
-    if (targetType === 'kyb') {
-      const provider = await this.get(`prov/${this.value.target}`);
-      if (!provider) return new Error('Provider not found.');
-      const kyb = await this.get(`kyb/${this.value.target}`);
-      if (!kyb || kyb.status !== 'revoked') {
-        return new Error('Revoked provider KYB not found.');
-      }
-      const keys = await this.kybBanIndexKeys(kyb);
-      if (keys instanceof Error) return keys;
-      const records = [];
-      for (const key of keys) {
-        const current = await this.get(key);
-        if (!current || current.target_type !== 'kyb' || current.reversible !== true) {
-          return new Error('Reversible provider KYB ban index not found.');
-        }
-        if (!['banned', 'revoked', 'unbanned'].includes(current.status)) {
-          return new Error('Invalid provider KYB ban index status.');
-        }
-        if (!current.providers?.[this.value.target]) {
-          return new Error('Provider KYB ban index does not bind this provider.');
-        }
-        records.push([key, current]);
-      }
-      for (const [key, current] of records) {
-        await this.put(key, {
-          ...current,
-          status: 'unbanned',
-          unbanned_at: this.tx,
-          unbanned_by: this.address,
-          unbanned_by_role: 'admin',
-          unban_reason_hash: this.value.reason_hash,
-          reversible: true,
-        });
-      }
-      return {
-        ok: true,
-        op: 'unban',
-        target_type: targetType,
-        target: this.value.target,
-      };
-    }
 
     if (targetType === 'provider') {
       const provider = await this.get(`prov/${this.value.target}`);

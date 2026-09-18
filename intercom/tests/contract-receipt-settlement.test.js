@@ -1905,8 +1905,8 @@ test('canonical receipt metadata rejects count and revision overflow', async () 
 });
 
 
-test('v25 settles retained v23/v24 context receipts without rewriting signatures or billing', async () => {
-  for (const contractVersion of [23, 24, CONTRACT_VERSION]) {
+test('v26 settles retained v23/v24/v25 context receipts without rewriting signatures or billing', async () => {
+  for (const contractVersion of [23, 24, 25, CONTRACT_VERSION]) {
     const ctx = await setupContract();
     const reservation = await submitReservation(ctx);
     const value = receiptValue(ctx, reservation, {
@@ -1947,7 +1947,7 @@ test('v25 settles retained v23/v24 context receipts without rewriting signatures
   }
 });
 
-test('v24 context recovery bounds telemetry and admits no other legacy operations', async () => {
+test('prior-version context recovery bounds telemetry and admits no other legacy operations', async () => {
   const ctx = await setupContract();
   const reservation = await submitReservation(ctx);
   for (const count of [0, -1, 1.5, 8193, Number.MAX_SAFE_INTEGER + 1]) {
@@ -1974,7 +1974,7 @@ test('v24 context recovery bounds telemetry and admits no other legacy operation
   assert.match(rejected.message, /contract version/i);
 });
 
-test('v25 price fraud proof pins signed canonical work and survives later calibration changes', async () => {
+test('activity-price fraud proof pins signed canonical work and survives later calibration changes', async () => {
   const ctx = await setupContract();
   const reservation = await submitReservation(ctx);
   const receipt = await submitReceipt(ctx, receiptValue(ctx, reservation, { final: true }));

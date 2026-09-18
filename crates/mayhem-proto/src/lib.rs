@@ -87,9 +87,9 @@ pub fn openai_compatible_canary_units(reconstructed_output: &str) -> Vec<i32> {
         .map(|scalar| i32::try_from(u32::from(scalar)).expect("Unicode scalar fits i32"))
         .collect()
 }
-pub const CONTRACT_VERSION: u32 = 25;
-/// Retained schema-11 receipt settlement features accepted across the v25 upgrade.
-pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24];
+pub const CONTRACT_VERSION: u32 = 26;
+/// Retained schema-11 receipt settlement features accepted across the v26 upgrade.
+pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24, 25];
 /// Historical fixture version; use receipt_contract_version_is_supported for admission.
 pub const RECOVERABLE_RECEIPT_CONTRACT_VERSION: u32 = 23;
 pub fn receipt_contract_version_is_supported(version: u64) -> bool {
@@ -5527,11 +5527,11 @@ mod tests {
 #[cfg(test)]
 mod market_version_bridge_tests {
     #[test]
-    fn receipt_recovery_accepts_v23_v24_and_v25_only() {
-        for version in [23, 24, 25] {
+    fn receipt_recovery_accepts_v23_through_v26_only() {
+        for version in [23, 24, 25, 26] {
             assert!(super::receipt_contract_version_is_supported(version));
         }
-        for version in [0, 22, 26, u64::MAX] {
+        for version in [0, 22, 27, u64::MAX] {
             assert!(!super::receipt_contract_version_is_supported(version));
         }
     }

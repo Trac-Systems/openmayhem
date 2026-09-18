@@ -754,7 +754,7 @@ enum AdminCommands {
         #[command(subcommand)]
         command: AdminBanCommands,
     },
-    /// Reverse a provider, device, fingerprint, or committer ban going forward.
+    /// Reverse a provider, device, fingerprint, committer, or provider-KYB ban going forward.
     Unban(AdminUnbanArgs),
     /// Admin device-key operations.
     Device {
@@ -3769,6 +3769,7 @@ enum AdminBanTargetType {
     Device,
     Fingerprint,
     Committer,
+    Kyb,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
@@ -3793,6 +3794,7 @@ impl AdminBanTargetType {
             Self::Device => "device",
             Self::Fingerprint => "fingerprint",
             Self::Committer => "committer",
+            Self::Kyb => "kyb",
         }
     }
 }
@@ -5020,7 +5022,7 @@ struct AdminUnbanArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
 
-    /// Ban target to clear going forward.
+    /// Ban target to clear going forward. For --type kyb, use the provider public key.
     target: String,
 
     /// Ban record type.
@@ -33630,6 +33632,7 @@ async fn admin_ban_list(args: &AdminBanListArgs) -> Result<()> {
         ("device", "ban/device/"),
         ("fingerprint", "ban/fingerprint/"),
         ("committer", "committer/ban/"),
+        ("kyb", "ban/kyb/"),
     ];
     for (target_type, prefix) in prefixes {
         if wanted.is_some_and(|wanted| wanted != target_type) {
@@ -106140,7 +106143,7 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 25);
+        assert_eq!(CONTRACT_VERSION, 26);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 11);
     }
@@ -113358,8 +113361,8 @@ esac
     }
 
     #[test]
-    fn receipt_settlement_version_bridge_preserves_v23_v24_and_v25_signatures() {
-        for version in [23, 24, 25] {
+    fn receipt_settlement_version_bridge_preserves_v23_through_v26_signatures() {
+        for version in [23, 24, 25, 26] {
             let feature = signed_receipt_settlement_feature_for_test_version(
                 7,
                 1,
@@ -113373,7 +113376,7 @@ esac
                 "version {version}"
             );
         }
-        for version in [22, 26] {
+        for version in [22, 27] {
             let feature = signed_receipt_settlement_feature_for_test_version(
                 7,
                 1,
@@ -113842,7 +113845,7 @@ esac
         let expected_message = concat!(
             "mayhem-targeted-spend-reservation-v1",
             "{\"payout_revision\":\"9999999999999999999999999999999999999999999999999999999999999999\",",
-            "\"reservation\":{\"at\":25200,\"contract_version\":25,\"ctx_bracket\":\"le8k\",",
+            "\"reservation\":{\"at\":25200,\"contract_version\":26,\"ctx_bracket\":\"le8k\",",
             "\"ctx_bracket_table_ver\":1,",
             "\"enclave_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"enclave_pubkey\":\"5555555555555555555555555555555555555555555555555555555555555555\",",
