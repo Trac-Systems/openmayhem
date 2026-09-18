@@ -61716,19 +61716,14 @@ impl ReceiptSettlementOutbox {
             rpc.submit_feature(entry.feature.clone()),
         )
         .await;
-        if matches!(
-            &relay,
-            Ok(Ok(response)) if response.get("ok").and_then(Value::as_bool) == Some(true)
-        ) {
-            return self.remove(&entry);
-        }
-
         // A relay acknowledgement is transport evidence, not the source of
-        // truth.  The writer can commit the receipt and lose only its answer;
-        // retaining that already-canonical entry forever eventually blocks all
-        // new paid work.  Retire it only when the confirmed ledger head proves
-        // the exact signed feature landed.  Any missing or mismatched field
-        // fails closed and leaves the durable outbox entry untouched.
+        // truth. The writer may acknowledge an accepted append before that
+        // append is visible in canonical state. Removing the entry at that
+        // point also hides the pending final receipt from next-turn admission,
+        // so a newly freed provider can reject the next request while the
+        // previous hold is still closing. Retire only when the confirmed ledger
+        // head proves the exact signed feature landed. Any missing or
+        // mismatched field fails closed and leaves the durable entry visible.
         if confirmed_receipt_settlement_entry(rpc, &entry).await? {
             return self.remove(&entry);
         }
@@ -61739,7 +61734,7 @@ impl ReceiptSettlementOutbox {
                 Err(error).context("submitting receipt settlement through participant relay")
             }
             Ok(Ok(response)) => Err(anyhow!(
-                "receipt settlement relay did not confirm canonical evidence: {response}"
+                "receipt settlement relay accepted transport delivery but canonical evidence remains pending: {response}"
             )),
         }
     }
@@ -113183,13 +113178,15 @@ esac
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (seen_old, mut old_seen) = tokio::sync::mpsc::channel(1);
+        let (seen_fresh, mut fresh_seen) = tokio::sync::mpsc::channel(1);
         let release_old = Arc::new(tokio::sync::Notify::new());
         let server_release = release_old.clone();
         let server = tokio::spawn(async move {
             let mut requests = tokio::task::JoinSet::new();
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let seen_old = seen_old.clone();
+                let seen_fresh = seen_fresh.clone();
                 let release = server_release.clone();
                 requests.spawn(async move {
                     let mut bytes = Vec::new();
@@ -113200,11 +113197,14 @@ esac
                         bytes.extend_from_slice(&chunk[..n]);
                         if let Some(end) = bytes.windows(4).position(|x| x == b"\r\n\r\n") {
                             let headers = String::from_utf8_lossy(&bytes[..end]);
-                            let length = headers.lines().find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().unwrap())
-                            }).unwrap();
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
                             break (end + 4, length);
                         }
                     };
@@ -113214,12 +113214,29 @@ esac
                         assert!(n > 0);
                         bytes.extend_from_slice(&chunk[..n]);
                     }
-                    let feature: Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
-                    if feature["value"]["receipt"]["body"]["billing_id"] == "42".repeat(32) {
-                        seen_old.send(()).await.unwrap();
-                        release.notified().await;
-                    }
-                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").await.unwrap();
+                    let response = if length == 0 {
+                        r#"{"confirmed":false}"#
+                    } else {
+                        let feature: Value = serde_json::from_slice(
+                            &bytes[header_end..header_end + length],
+                        )
+                        .unwrap();
+                        if feature["value"]["receipt"]["body"]["billing_id"]
+                            == "42".repeat(32)
+                        {
+                            seen_old.send(()).await.unwrap();
+                            release.notified().await;
+                        } else {
+                            seen_fresh.send(()).await.unwrap();
+                        }
+                        r#"{"ok":true}"#
+                    };
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.len()
+                    );
+                    stream.write_all(headers.as_bytes()).await.unwrap();
+                    stream.write_all(response.as_bytes()).await.unwrap();
                 });
             }
             while let Some(result) = requests.join_next().await {
@@ -113234,26 +113251,22 @@ esac
             .unwrap()
             .unwrap();
         let fresh_entry = outbox.persist(&fresh).unwrap();
-        timeout(Duration::from_secs(3), async {
-            while fresh_entry.path.exists() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("fresh receipt must bypass the stalled disk retry pass");
+        timeout(Duration::from_secs(3), fresh_seen.recv())
+            .await
+            .expect("fresh receipt must bypass the stalled disk retry pass")
+            .expect("fresh receipt submission signal");
         assert!(
             old_entry.path.exists(),
             "older evidence must remain durable while its relay is stalled"
         );
+        assert!(
+            fresh_entry.path.exists(),
+            "relay acceptance must not hide a receipt before canonical confirmation"
+        );
         release_old.notify_one();
         server.await.unwrap();
-        timeout(Duration::from_secs(3), async {
-            while old_entry.path.exists() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(old_entry.path.exists());
+        assert!(fresh_entry.path.exists());
         let _ = fs::remove_dir_all(root);
     }
 

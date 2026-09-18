@@ -17195,6 +17195,32 @@ fn route_attempt_error_code(last_error: Option<&str>) -> (&'static str, &'static
     ("provider_attempts_failed", "provider_response", true)
 }
 
+fn route_attempt_error_priority(error: &str) -> u8 {
+    match route_attempt_error_code(Some(error)).0 {
+        "payment_reservation_failed"
+        | "provider_verification_failed"
+        | "request_exceeds_provider_capacity"
+        | "provider_price_floor"
+        | "execution_mode_unavailable" => 3,
+        "provider_admission_no_capacity"
+        | "provider_transport_closed"
+        | "provider_response_timeout" => 2,
+        _ => 1,
+    }
+}
+
+fn retain_most_specific_route_attempt_error(current: &mut Option<String>, candidate: String) {
+    let replace = match current.as_deref() {
+        None => true,
+        Some(existing) => {
+            route_attempt_error_priority(&candidate) >= route_attempt_error_priority(existing)
+        }
+    };
+    if replace {
+        *current = Some(candidate);
+    }
+}
+
 fn reservation_relay_phase(last_error: Option<&str>) -> Option<&'static str> {
     let message = last_error?;
     let marker = "[reservation_relay_phase=";
@@ -22343,13 +22369,30 @@ async fn run_embedding_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 if is_capacity {
                     recovery.record_capacity_refusal(state, route);
                 } else {
@@ -22535,13 +22578,30 @@ async fn run_image_generation_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 if is_capacity {
                     recovery.record_capacity_refusal(state, route);
                 } else {
@@ -22722,13 +22782,30 @@ async fn run_audio_speech_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 if is_capacity {
                     recovery.record_capacity_refusal(state, route);
                 } else {
@@ -22913,13 +22990,30 @@ async fn run_audio_transcription_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 if is_capacity {
                     recovery.record_capacity_refusal(state, route);
                 } else {
@@ -23144,13 +23238,30 @@ async fn run_artifact_generation_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 if is_capacity {
                     recovery.record_capacity_refusal(state, route);
                 } else {
@@ -24794,30 +24905,33 @@ async fn prepare_live_direct_chat_session(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(&state, route.as_ref(), attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
-                    if wait_for_pending_receipt_settlement(
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
                         state.receipt_settlement_publisher.as_ref().as_ref(),
                         &invocation.user_pubkey,
                         &invocation.rail,
                         deadline,
                     )
                     .await
-                    {
-                        // A clean refusal performed no inference and reserved no
-                        // canonical funds. Pending final receipts can release
-                        // the previous request's hold within the route deadline.
-                        recovery.total_attempt_limit =
-                            recovery.total_attempt_limit.saturating_add(1);
-                        billing = billing.after_attempt(None);
-                        attempt_options.billing = Some(billing.clone());
-                        continue;
-                    }
+                {
+                    // No inference or canonical spend occurred. A pending final
+                    // receipt can release the previous request's hold within
+                    // this request's route deadline.
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 if is_capacity {
                     recovery.record_capacity_refusal(&state, route.as_ref());
                 } else {
@@ -26686,7 +26800,24 @@ async fn run_chat_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 let billed_receipt = err
@@ -26714,7 +26845,7 @@ async fn run_chat_with_route_retry(
                 }
                 billing = billing.after_attempt(billed_receipt.as_ref());
                 attempt_options.billing = Some(billing.clone());
-                last_retryable_error = Some(err.message);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 if is_capacity {
                     recovery.record_capacity_refusal(state, route);
                 } else {
@@ -52733,6 +52864,23 @@ mod tests {
         assert!(err.retryable);
         assert!(!err.clean_refusal);
         assert_eq!(err.clean_refusal_code, None);
+    }
+
+    #[test]
+    fn route_attempt_summary_keeps_payment_failure_over_generic_failure() {
+        let mut error = None;
+        retain_most_specific_route_attempt_error(
+            &mut error,
+            "spend reservation did not complete before serving".to_owned(),
+        );
+        retain_most_specific_route_attempt_error(
+            &mut error,
+            "provider failed without a classified reason".to_owned(),
+        );
+        assert_eq!(
+            route_attempt_error_code(error.as_deref()).0,
+            "payment_reservation_failed"
+        );
     }
 
     #[test]
