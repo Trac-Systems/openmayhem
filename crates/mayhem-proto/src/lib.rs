@@ -107,7 +107,9 @@ pub const TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION: u32 = 1;
 pub const TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE: &str = "tpm.activate.challenge";
 pub const TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE: &str = "tpm.activate.response";
 pub const TOKENIZE_REQUEST_FRAME_TYPE: &str = "tokenize.request";
+pub const TOKENIZE_REQUEST_CHUNK_FRAME_TYPE: &str = "tokenize.request_chunk";
 pub const TOKENIZE_RESPONSE_FRAME_TYPE: &str = "tokenize.response";
+pub const TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE: &str = "tokenize.response_chunk";
 pub const TOKENIZE_FRAME_VERSION: u32 = 1;
 pub const TPM_PCR_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const TPM_QUOTE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
@@ -1397,7 +1399,12 @@ pub struct TokenizeRequestFrame {
     pub enclave_id: String,
     pub room_id: String,
     pub model: String,
-    pub request: Value,
+    #[serde(default, skip_serializing_if = "String::is_empty", rename = "rid")]
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_ref: Option<PayloadChunkManifest>,
     #[serde(default)]
     pub return_tokens: bool,
 }
@@ -1419,6 +1426,8 @@ pub struct TokenizeResponseFrame {
     pub count: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tokens: Option<Vec<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_ref: Option<PayloadChunkManifest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error_code: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -5481,7 +5490,9 @@ mod tests {
             enclave_id: "33".repeat(32),
             room_id: "room-1".to_owned(),
             model: "qwen/example".to_owned(),
-            request: json!({"contract_request": {"messages": []}}),
+            request_id: String::new(),
+            request: Some(json!({"contract_request": {"messages": []}})),
+            request_ref: None,
             return_tokens: true,
         };
         let encoded = serde_json::to_value(&request).unwrap();
@@ -5501,6 +5512,7 @@ mod tests {
             ok: true,
             count: Some(3),
             tokens: Some(vec![1, 2, 3]),
+            tokens_ref: None,
             error_code: None,
             error: None,
         };

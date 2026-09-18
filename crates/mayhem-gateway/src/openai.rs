@@ -113,12 +113,12 @@ use mayhem_proto::{
     DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION, TOKENIZE_REQUEST_FRAME_TYPE,
-    TOKENIZE_RESPONSE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
-    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
-    TRANSPORT_MAX_OUTPUT_DURATION_SECONDS, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
-    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
-    USAGE_STEP, USAGE_VIDEO_SECOND,
+    SESSION_RECEIPT_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION, TOKENIZE_REQUEST_CHUNK_FRAME_TYPE,
+    TOKENIZE_REQUEST_FRAME_TYPE, TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
+    TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
+    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 #[cfg(test)]
 use mayhem_proto::{
@@ -253,6 +253,7 @@ const CONTEXT_NEEDLE_MIN_CTX: u32 = 32_768;
 const CONTEXT_NEEDLE_MAX_TOKENS: u32 = 16;
 const CONTEXT_NEEDLE_FILLER_WORDS_PER_LINE: usize = 32;
 const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
+const DEFAULT_THROUGHPUT_FLOOR_MIN_OUTPUT_TOKENS: u64 = 6;
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const DEFAULT_RESERVATION_MAX_LIFETIME_EPOCHS: u64 = 24;
 const DEFAULT_RESERVATION_RECEIPT_GRACE_EPOCHS: u64 = 6;
@@ -4198,6 +4199,7 @@ pub struct GatewayTokenizeInvocation {
     pub enclave_id: String,
     pub room_id: String,
     pub model: String,
+    pub served_ctx: u32,
     pub request: Value,
     pub return_tokens: bool,
 }
@@ -9900,6 +9902,7 @@ async fn build_tokenize_response(
         enclave_id: route.enclave_id.clone(),
         room_id: route.room_id.clone(),
         model: model.id.clone(),
+        served_ctx: state.served_ctx_for_route(&model, Some(route)),
         request: sealed_request,
         return_tokens,
     };
@@ -15964,60 +15967,110 @@ impl ScBridgeGatewaySessionBackend {
                 "tokenization session did not open an authenticated direct-or-relayed channel",
             ));
         }
-        let request = TokenizeRequestFrame {
-            frame_type: TOKENIZE_REQUEST_FRAME_TYPE.to_owned(),
-            version: TOKENIZE_FRAME_VERSION,
-            session_id: invocation.session_id.clone(),
-            provider: invocation.provider_pubkey.clone(),
-            enclave_id: invocation.enclave_id.clone(),
-            room_id: invocation.room_id.clone(),
-            model: invocation.model.clone(),
-            request: invocation.request.clone(),
-            return_tokens: invocation.return_tokens,
-        };
-        bridge
-            .session_send(&invocation.transport_peer, &invocation.session_id, request)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "sending tokenization request to provider {} failed: {err}",
+        send_tokenize_request_frames(&mut bridge, invocation).await?;
+        let response_deadline = Instant::now() + Duration::from_secs(30);
+        let max_token_payload_bytes = usize::try_from(invocation.served_ctx)
+            .unwrap_or(usize::MAX / 16)
+            .saturating_mul(16)
+            .max(DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES);
+        let max_token_payload_chunks = max_token_payload_bytes
+            .div_ceil(1024)
+            .max(DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS);
+        let mut token_chunks =
+            PayloadChunkCollector::new(max_token_payload_bytes, max_token_payload_chunks);
+        let mut saw_token_chunk = false;
+        let mut response = loop {
+            let remaining = response_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(GatewaySessionError::retryable(format!(
+                    "waiting for tokenization response from provider {} timed out",
                     invocation.provider_pubkey
-                ))
-            })?;
-        let event = bridge
-            .next_session_frame_for(&invocation.session_id, Some(Duration::from_secs(30)))
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "waiting for tokenization response from provider {} failed: {err}",
-                    invocation.provider_pubkey
-                ))
-            })?;
-        let remote = event
-            .get("remote")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let response: TokenizeResponseFrame = serde_json::from_value(
-            event
+                )));
+            }
+            let event = bridge
+                .next_session_frame_for(&invocation.session_id, Some(remaining))
+                .await
+                .map_err(|err| {
+                    GatewaySessionError::retryable(format!(
+                        "waiting for tokenization response from provider {} failed: {err}",
+                        invocation.provider_pubkey
+                    ))
+                })?;
+            let remote = event
+                .get("remote")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let frame = event
                 .get("frame")
                 .cloned()
-                .ok_or_else(|| GatewaySessionError::new("tokenization event has no frame"))?,
-        )
-        .map_err(|err| GatewaySessionError::new(format!("invalid tokenization response: {err}")))?;
-        let binding_matches = remote == invocation.transport_peer
-            && response.frame_type == TOKENIZE_RESPONSE_FRAME_TYPE
-            && response.version == TOKENIZE_FRAME_VERSION
-            && response.session_id == invocation.session_id
-            && response.provider == invocation.provider_pubkey
-            && response.enclave_id == invocation.enclave_id
-            && response.room_id == invocation.room_id
-            && response.model == invocation.model;
+                .ok_or_else(|| GatewaySessionError::new("tokenization event has no frame"))?;
+            let frame_type = frame.get("t").and_then(Value::as_str).unwrap_or_default();
+            let binding_matches = remote == invocation.transport_peer
+                && frame.get("v").and_then(Value::as_u64)
+                    == Some(u64::from(TOKENIZE_FRAME_VERSION))
+                && frame.get("session_id").and_then(Value::as_str)
+                    == Some(invocation.session_id.as_str())
+                && frame.get("provider").and_then(Value::as_str)
+                    == Some(invocation.provider_pubkey.as_str())
+                && frame.get("enclave_id").and_then(Value::as_str)
+                    == Some(invocation.enclave_id.as_str())
+                && frame.get("room_id").and_then(Value::as_str)
+                    == Some(invocation.room_id.as_str())
+                && frame.get("model").and_then(Value::as_str) == Some(invocation.model.as_str());
+            if !binding_matches {
+                return Err(GatewaySessionError::new(
+                    "tokenization response does not match the authenticated route",
+                ));
+            }
+            if frame_type == TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE {
+                let chunk: PayloadChunk =
+                    serde_json::from_value(frame.get("chunk").cloned().ok_or_else(|| {
+                        GatewaySessionError::new("tokenization response chunk has no payload")
+                    })?)
+                    .map_err(|err| {
+                        GatewaySessionError::new(format!(
+                            "invalid tokenization response chunk: {err}"
+                        ))
+                    })?;
+                token_chunks.push(chunk).map_err(|err| {
+                    GatewaySessionError::new(format!(
+                        "collecting tokenization response chunk failed: {err}"
+                    ))
+                })?;
+                saw_token_chunk = true;
+                continue;
+            }
+            if frame_type != TOKENIZE_RESPONSE_FRAME_TYPE {
+                return Err(GatewaySessionError::new(
+                    "provider returned an unsupported tokenization response frame",
+                ));
+            }
+            break serde_json::from_value::<TokenizeResponseFrame>(frame).map_err(|err| {
+                GatewaySessionError::new(format!("invalid tokenization response: {err}"))
+            })?;
+        };
         let _ = bridge
             .session_close(&invocation.transport_peer, &invocation.session_id)
             .await;
-        if !binding_matches {
+        if let Some(manifest) = response.tokens_ref.take() {
+            if response.tokens.is_some() {
+                return Err(GatewaySessionError::new(
+                    "tokenization response contains both tokens and tokens_ref",
+                ));
+            }
+            let tokens_value = token_chunks.finish_json(&manifest).map_err(|err| {
+                GatewaySessionError::new(format!(
+                    "reassembling tokenization response tokens failed: {err}"
+                ))
+            })?;
+            response.tokens = Some(serde_json::from_value(tokens_value).map_err(|err| {
+                GatewaySessionError::new(format!(
+                    "tokenization response token payload is invalid: {err}"
+                ))
+            })?);
+        } else if saw_token_chunk {
             return Err(GatewaySessionError::new(
-                "tokenization response does not match the authenticated route",
+                "tokenization response chunks were not bound by a final manifest",
             ));
         }
         if !response.ok {
@@ -17233,6 +17286,125 @@ impl ScBridgeGatewaySessionBackend {
             quality: collected.quality,
         })
     }
+}
+
+async fn send_tokenize_request_frames(
+    bridge: &mut ScBridgeClient,
+    invocation: &GatewayTokenizeInvocation,
+) -> Result<(), GatewaySessionError> {
+    let max_frame_bytes = direct_session_max_frame_bytes();
+    let request_bytes = stable_json_bytes(&invocation.request).map_err(|err| {
+        GatewaySessionError::new(format!("serializing tokenization payload failed: {err}"))
+    })?;
+    let max_request_bytes = direct_session_request_byte_limit_for_len(
+        invocation.served_ctx,
+        request_bytes.len(),
+        configured_optional_positive_usize("MAYHEM_GATEWAY_SESSION_MAX_REQUEST_BYTES"),
+    );
+    for frame in tokenize_request_frames(invocation, max_frame_bytes, max_request_bytes)? {
+        bridge
+            .session_send(&invocation.transport_peer, &invocation.session_id, frame)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending tokenization request to provider {} failed: {err}",
+                    invocation.provider_pubkey
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+fn tokenize_request_frames(
+    invocation: &GatewayTokenizeInvocation,
+    max_frame_bytes: usize,
+    max_request_bytes: usize,
+) -> Result<Vec<Value>, GatewaySessionError> {
+    let inline = TokenizeRequestFrame {
+        frame_type: TOKENIZE_REQUEST_FRAME_TYPE.to_owned(),
+        version: TOKENIZE_FRAME_VERSION,
+        session_id: invocation.session_id.clone(),
+        provider: invocation.provider_pubkey.clone(),
+        enclave_id: invocation.enclave_id.clone(),
+        room_id: invocation.room_id.clone(),
+        model: invocation.model.clone(),
+        request_id: String::new(),
+        request: Some(invocation.request.clone()),
+        request_ref: None,
+        return_tokens: invocation.return_tokens,
+    };
+    let inline_value = serde_json::to_value(&inline).map_err(|err| {
+        GatewaySessionError::new(format!("serializing tokenization request failed: {err}"))
+    })?;
+    if session_frame_json_len(&inline_value)? <= max_frame_bytes {
+        return Ok(vec![inline_value]);
+    }
+
+    let bytes = stable_json_bytes(&invocation.request).map_err(|err| {
+        GatewaySessionError::new(format!("serializing tokenization payload failed: {err}"))
+    })?;
+    if bytes.len() > max_request_bytes {
+        return Err(GatewaySessionError::new(format!(
+            "tokenization request body {} bytes exceeds the {max_request_bytes}-byte selected-session budget",
+            bytes.len()
+        )));
+    }
+    let chunk_size = direct_session_payload_chunk_bytes(max_frame_bytes);
+    let manifest = payload_chunk_manifest(&bytes, chunk_size).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "planning tokenization request chunks failed: {err}"
+        ))
+    })?;
+    let request_id = request_id_for_body(&invocation.session_id, &invocation.request);
+    let mut frames = Vec::new();
+    for index in 0..manifest.chunk_count {
+        let chunk = payload_chunk_at(&bytes, chunk_size, index)
+            .map_err(|err| {
+                GatewaySessionError::new(format!(
+                    "building tokenization request chunk failed: {err}"
+                ))
+            })?
+            .ok_or_else(|| {
+                GatewaySessionError::new("planned tokenization request chunk was missing")
+            })?;
+        let frame = json!({
+            "t": TOKENIZE_REQUEST_CHUNK_FRAME_TYPE,
+            "v": TOKENIZE_FRAME_VERSION,
+            "session_id": invocation.session_id,
+            "provider": invocation.provider_pubkey,
+            "enclave_id": invocation.enclave_id,
+            "room_id": invocation.room_id,
+            "model": invocation.model,
+            "rid": request_id,
+            "payload_id": manifest.blake3,
+            "chunk": chunk,
+        });
+        let len = session_frame_json_len(&frame)?;
+        if len > max_frame_bytes {
+            return Err(GatewaySessionError::new(format!(
+                "chunked tokenization request frame {len} bytes exceeds session max {max_frame_bytes} bytes"
+            )));
+        }
+        frames.push(frame);
+    }
+    let final_frame = TokenizeRequestFrame {
+        request_id,
+        request: None,
+        request_ref: Some(manifest),
+        ..inline
+    };
+    let final_frame = serde_json::to_value(final_frame).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "serializing tokenization request manifest failed: {err}"
+        ))
+    })?;
+    if session_frame_json_len(&final_frame)? > max_frame_bytes {
+        return Err(GatewaySessionError::new(
+            "tokenization request manifest exceeds the session frame limit",
+        ));
+    }
+    frames.push(final_frame);
+    Ok(frames)
 }
 
 fn validate_direct_session_accept(
@@ -18727,13 +18899,16 @@ fn generated_tokens_per_second(
     first_delta_at_millis: u64,
     completed_at_millis: u64,
 ) -> Option<f64> {
-    let token_intervals = output_tokens.checked_sub(1)?;
-    if token_intervals == 0 {
+    if output_tokens < DEFAULT_THROUGHPUT_FLOOR_MIN_OUTPUT_TOKENS {
         return None;
     }
+    let token_intervals = output_tokens.checked_sub(1)?;
     let elapsed_millis = completed_at_millis
         .saturating_sub(first_delta_at_millis)
         .max(1);
+    if elapsed_millis < DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS {
+        return None;
+    }
     let tok_s = token_intervals as f64 * 1000.0 / elapsed_millis as f64;
     tok_s.is_finite().then_some(tok_s)
 }
@@ -40908,8 +41083,10 @@ mod tests {
     }
 
     #[test]
-    fn generation_throughput_uses_token_intervals_and_ignores_one_token_turns() {
+    fn generation_throughput_ignores_short_or_subsecond_turns() {
         assert_eq!(generated_tokens_per_second(1, 100, 10_000), None);
+        assert_eq!(generated_tokens_per_second(5, 100, 10_000), None);
+        assert_eq!(generated_tokens_per_second(6, 100, 1_099), None);
         assert_eq!(generated_tokens_per_second(6, 100, 1_100), Some(5.0));
     }
 
@@ -54329,6 +54506,51 @@ mod tests {
             .collect::<Vec<_>>();
         let restored = reassemble_json_payload(&manifest, &chunks).unwrap();
         assert_eq!(restored, body);
+    }
+
+    #[test]
+    fn tokenize_request_frames_chunk_large_context_under_transport_limit() {
+        let request = json!({
+            "contract_request": {
+                "messages": [{"role": "user", "content": "context ".repeat(40_000)}]
+            }
+        });
+        let invocation = GatewayTokenizeInvocation {
+            session_id: "11".repeat(32),
+            provider_pubkey: "22".repeat(32),
+            transport_peer: "33".repeat(32),
+            enclave_id: "44".repeat(32),
+            room_id: "55".repeat(16),
+            model: "qwen/example".to_owned(),
+            served_ctx: 262_144,
+            request: request.clone(),
+            return_tokens: false,
+        };
+        let frames = tokenize_request_frames(
+            &invocation,
+            DEFAULT_SESSION_MAX_FRAME_BYTES,
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+
+        assert!(frames.len() > 2);
+        assert!(frames.iter().all(|frame| {
+            session_frame_json_len(frame).expect("frame serializes")
+                <= DEFAULT_SESSION_MAX_FRAME_BYTES
+        }));
+        assert!(frames[..frames.len() - 1].iter().all(|frame| {
+            frame.get("t").and_then(Value::as_str) == Some(TOKENIZE_REQUEST_CHUNK_FRAME_TYPE)
+        }));
+        let final_frame: TokenizeRequestFrame =
+            serde_json::from_value(frames.last().unwrap().clone()).unwrap();
+        assert!(final_frame.request.is_none());
+        let manifest = final_frame.request_ref.unwrap();
+        let chunks = frames[..frames.len() - 1]
+            .iter()
+            .map(|frame| serde_json::from_value::<PayloadChunk>(frame["chunk"].clone()).unwrap())
+            .collect::<Vec<_>>();
+        let restored = reassemble_json_payload(&manifest, &chunks).unwrap();
+        assert_eq!(restored, request);
     }
 
     #[test]

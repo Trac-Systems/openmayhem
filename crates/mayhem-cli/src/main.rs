@@ -131,7 +131,8 @@ use mayhem_proto::{
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
     DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
     RECOVERABLE_RECEIPT_CONTRACT_VERSION, SESSION_RECEIPT_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION,
-    TOKENIZE_REQUEST_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
+    TOKENIZE_REQUEST_CHUNK_FRAME_TYPE, TOKENIZE_REQUEST_FRAME_TYPE,
+    TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
     TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
     TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
     USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
@@ -83339,6 +83340,33 @@ where
         return Ok(());
     }
     match frame_type {
+        TOKENIZE_REQUEST_CHUNK_FRAME_TYPE => {
+            ensure!(
+                frame.get("v").and_then(Value::as_u64) == Some(u64::from(TOKENIZE_FRAME_VERSION)),
+                "tokenize request chunk version is unsupported"
+            );
+            ensure!(
+                frame.get("session_id").and_then(Value::as_str) == Some(session_id.as_str()),
+                "tokenize request chunk session binding mismatch"
+            );
+            let first_chunk = !pending_payloads
+                .keys()
+                .any(|key| key.starts_with(&format!("{session_id}:")));
+            if first_chunk {
+                tokenize_limiter.admit(&remote, Instant::now())?;
+            }
+            if let Err(error) = provider_session_collect_request_chunk(
+                pending_payloads,
+                &session_id,
+                &frame,
+                max_request_bytes,
+                max_payload_chunks,
+            ) {
+                remove_provider_session_pending_payloads(pending_payloads, &session_id);
+                let _ = bridge.session_close(&remote, &session_id).await;
+                return Err(error).context("collecting tokenize request chunk");
+            }
+        }
         TOKENIZE_REQUEST_FRAME_TYPE => {
             let request_frame: TokenizeRequestFrame = serde_json::from_value(frame.clone())
                 .context("tokenize request frame is invalid")?;
@@ -83358,17 +83386,42 @@ where
                     && request_frame.model == terms.model_id,
                 "tokenize request targets a different provider route"
             );
+            ensure!(
+                request_frame.request.is_some() ^ request_frame.request_ref.is_some(),
+                "tokenize request must contain exactly one of request or request_ref"
+            );
+            let chunked = request_frame.request_ref.is_some();
+            let request = if let Some(request) = request_frame.request.clone() {
+                request
+            } else {
+                ensure!(
+                    !request_frame.request_id.is_empty(),
+                    "chunked tokenize request is missing rid"
+                );
+                provider_session_request_body_from_frame(
+                    pending_payloads,
+                    &session_id,
+                    &json!({
+                        "rid": request_frame.request_id,
+                        "body_ref": request_frame.request_ref,
+                    }),
+                    max_request_bytes,
+                )
+                .context("reassembling tokenize request")?
+            };
             let encoded_request =
-                stable_json_bytes(&request_frame.request).context("encoding tokenize request")?;
+                stable_json_bytes(&request).context("encoding tokenize request")?;
             ensure!(
                 encoded_request.len() <= max_request_bytes,
                 "tokenize request exceeds provider request byte limit"
             );
-            tokenize_limiter.admit(&remote, Instant::now())?;
+            if !chunked {
+                tokenize_limiter.admit(&remote, Instant::now())?;
+            }
             open_provider_direct_session(bridge, &remote, &session_id)
                 .await
                 .context("opening provider side of tokenize session")?;
-            let response_frame = match responder.tokenize(terms, &request_frame.request) {
+            let response_frame = match responder.tokenize(terms, &request) {
                 Ok(tokenization) if tokenization.token_ids.is_empty() => TokenizeResponseFrame {
                     frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
                     version: TOKENIZE_FRAME_VERSION,
@@ -83380,6 +83433,7 @@ where
                     ok: false,
                     count: None,
                     tokens: None,
+                    tokens_ref: None,
                     error_code: Some("token_count_unsupported".to_owned()),
                     error: Some(
                         "Exact tokenization is unavailable for this provider runtime.".to_owned(),
@@ -83398,6 +83452,7 @@ where
                     tokens: request_frame
                         .return_tokens
                         .then_some(tokenization.token_ids),
+                    tokens_ref: None,
                     error_code: None,
                     error: None,
                 },
@@ -83417,6 +83472,7 @@ where
                         ok: false,
                         count: None,
                         tokens: None,
+                        tokens_ref: None,
                         error_code: Some(if unsupported {
                             "token_count_unsupported".to_owned()
                         } else {
@@ -83431,10 +83487,8 @@ where
                     }
                 }
             };
-            let send_result = bridge
-                .session_send(&remote, &session_id, response_frame)
-                .await
-                .context("sending tokenize response");
+            let send_result =
+                send_provider_tokenize_response(bridge, &remote, &session_id, response_frame).await;
             let _ = bridge.session_close(&remote, &session_id).await;
             send_result?;
         }
@@ -84403,6 +84457,75 @@ where
     Ok(())
 }
 
+async fn send_provider_tokenize_response(
+    bridge: &mut ScBridgeClient,
+    remote: &str,
+    session_id: &str,
+    response: TokenizeResponseFrame,
+) -> Result<()> {
+    for frame in provider_tokenize_response_frames(response, provider_session_max_frame_bytes())? {
+        bridge
+            .session_send(remote, session_id, frame)
+            .await
+            .context("sending tokenize response")?;
+    }
+    Ok(())
+}
+
+fn provider_tokenize_response_frames(
+    mut response: TokenizeResponseFrame,
+    max_frame_bytes: usize,
+) -> Result<Vec<Value>> {
+    let inline = serde_json::to_value(&response).context("serializing tokenize response")?;
+    if provider_session_frame_json_len(&inline)? <= max_frame_bytes {
+        return Ok(vec![inline]);
+    }
+    let tokens = response
+        .tokens
+        .take()
+        .context("oversized tokenize response has no token payload to chunk")?;
+    let tokens_value =
+        serde_json::to_value(&tokens).context("serializing tokenize response tokens")?;
+    let bytes = stable_json_bytes(&tokens_value).context("serializing tokenize response tokens")?;
+    let chunk_size = provider_session_payload_chunk_bytes(max_frame_bytes);
+    let manifest = payload_chunk_manifest(&bytes, chunk_size)
+        .map_err(|error| anyhow!(error))
+        .context("planning tokenize response chunks")?;
+    let mut frames = Vec::new();
+    for index in 0..manifest.chunk_count {
+        let chunk = payload_chunk_at(&bytes, chunk_size, index)
+            .map_err(|error| anyhow!(error))
+            .context("building tokenize response chunk")?
+            .context("planned tokenize response chunk was missing")?;
+        let frame = json!({
+            "t": TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE,
+            "v": TOKENIZE_FRAME_VERSION,
+            "session_id": response.session_id,
+            "provider": response.provider,
+            "enclave_id": response.enclave_id,
+            "room_id": response.room_id,
+            "model": response.model,
+            "payload_id": manifest.blake3,
+            "chunk": chunk,
+        });
+        let len = provider_session_frame_json_len(&frame)?;
+        ensure!(
+            len <= max_frame_bytes,
+            "chunked tokenize response frame {len} bytes exceeds session max {max_frame_bytes} bytes"
+        );
+        frames.push(frame);
+    }
+    response.tokens_ref = Some(manifest);
+    let final_frame = serde_json::to_value(response).context("serializing tokenize response")?;
+    let final_len = provider_session_frame_json_len(&final_frame)?;
+    ensure!(
+        final_len <= max_frame_bytes,
+        "tokenize response manifest frame {final_len} bytes exceeds session max {max_frame_bytes} bytes"
+    );
+    frames.push(final_frame);
+    Ok(frames)
+}
+
 fn provider_session_event_belongs_to_process(
     event: &Value,
     sessions: &HashMap<String, ActiveProviderSession>,
@@ -84425,7 +84548,7 @@ fn provider_session_event_belongs_to_process(
     };
     match frame.get("t").and_then(Value::as_str) {
         Some("s.open") => provider_session_open_targets_enclave(frame, terms),
-        Some(TOKENIZE_REQUEST_FRAME_TYPE) => {
+        Some(TOKENIZE_REQUEST_FRAME_TYPE | TOKENIZE_REQUEST_CHUNK_FRAME_TYPE) => {
             frame.get("provider").and_then(Value::as_str) == Some(terms.provider.as_str())
                 && frame.get("enclave_id").and_then(Value::as_str)
                     == Some(terms.enclave_id.as_str())
@@ -123942,6 +124065,48 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 _ => unreachable!(),
             }
         }
+    }
+
+    #[test]
+    fn provider_tokenize_response_frames_chunk_large_token_lists() {
+        let tokens = (0..40_000).collect::<Vec<i32>>();
+        let response = TokenizeResponseFrame {
+            frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
+            version: TOKENIZE_FRAME_VERSION,
+            session_id: "11".repeat(32),
+            provider: "22".repeat(32),
+            enclave_id: "33".repeat(32),
+            room_id: "44".repeat(16),
+            model: "qwen/example".to_owned(),
+            ok: true,
+            count: Some(tokens.len() as u64),
+            tokens: Some(tokens.clone()),
+            tokens_ref: None,
+            error_code: None,
+            error: None,
+        };
+        let max_frame_bytes = 12 * 1024;
+
+        let frames = provider_tokenize_response_frames(response, max_frame_bytes).unwrap();
+
+        assert!(frames.len() > 2);
+        assert!(frames
+            .iter()
+            .all(|frame| provider_session_frame_json_len(frame).unwrap() <= max_frame_bytes));
+        assert!(frames[..frames.len() - 1].iter().all(|frame| {
+            frame.get("t").and_then(Value::as_str) == Some(TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE)
+        }));
+        let final_frame: TokenizeResponseFrame =
+            serde_json::from_value(frames.last().unwrap().clone()).unwrap();
+        assert!(final_frame.tokens.is_none());
+        let manifest = final_frame.tokens_ref.unwrap();
+        let chunks = frames[..frames.len() - 1]
+            .iter()
+            .map(|frame| serde_json::from_value::<PayloadChunk>(frame["chunk"].clone()).unwrap())
+            .collect::<Vec<_>>();
+        let restored: Vec<i32> =
+            serde_json::from_value(reassemble_json_payload(&manifest, &chunks).unwrap()).unwrap();
+        assert_eq!(restored, tokens);
     }
 
     #[test]
