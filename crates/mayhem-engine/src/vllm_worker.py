@@ -1812,6 +1812,14 @@ async def run_worker():
             request_id = int(request.get("id", 0))
             op = str(request.get("op", ""))
             request_op = "embed" if worker_task == "embedding" else "generate"
+            # Tokenization uses the already-loaded frontend tokenizer. It does
+            # not touch the generation engine or consume a generation slot, so
+            # it must remain available while generations are active. Draining
+            # here can hold a count request behind a minutes-long inference and
+            # makes the gateway's bounded control request time out.
+            if op == "tokenize":
+                await emit_control_response(request)
+                continue
             if op == request_op:
                 if generation_multiplexer is None:
                     await emit_control_response(request)
