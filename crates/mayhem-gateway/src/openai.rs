@@ -3152,6 +3152,17 @@ impl GatewayJobHandle {
             .is_active(&self.id)
     }
 
+    fn persisted_status(&self) -> Option<GatewayJobStatus> {
+        match self
+            .store
+            .lock_recover("gateway job vault")
+            .lookup_read_only(&self.id, now_secs())
+        {
+            Some(GatewayJobLookup::Terminal(job)) => Some(job.status),
+            Some(GatewayJobLookup::InProgress { .. }) | None => None,
+        }
+    }
+
     async fn persist_reconciliation_pending(
         &self,
         result: Option<Value>,
@@ -3475,6 +3486,42 @@ async fn finish_completed_invocation_job(
     Ok(())
 }
 
+async fn await_completed_invocation_reconciliation(
+    invocation: &GatewaySessionInvocation,
+    timeout: Duration,
+) -> bool {
+    let Some(job) = invocation.job.as_ref() else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match job.persisted_status() {
+            Some(GatewayJobStatus::Completed) => return true,
+            Some(GatewayJobStatus::Failed | GatewayJobStatus::Cancelled) => return false,
+            Some(GatewayJobStatus::ReconciliationPending) | None => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn finish_completed_invocation_after_handoff(
+    invocation: &GatewaySessionInvocation,
+    handoff: Result<(), GatewaySessionError>,
+    recovery_wait: Duration,
+) -> Result<(), GatewaySessionError> {
+    if let Err(error) = handoff {
+        if !error.retryable
+            || !await_completed_invocation_reconciliation(invocation, recovery_wait).await
+        {
+            return Err(error);
+        }
+    }
+    finish_completed_invocation_job(invocation).await
+}
+
 async fn stage_cancelled_invocation_job(
     invocation: &GatewaySessionInvocation,
     provider_receipt: &ProviderSignedReceipt,
@@ -3594,7 +3641,7 @@ async fn reconcile_and_persist_completed_invocation_job(
     stage_completed_invocation_job(invocation, result, artifacts, provider_receipt, receipt_ack)
         .await?;
     record_direct_session_receipt(invocation, provider_receipt, receipt_ack)?;
-    send_receipt_ack_and_queue_settlement(
+    let handoff = send_receipt_ack_and_queue_settlement(
         bridge,
         direct_peer,
         invocation,
@@ -3603,8 +3650,13 @@ async fn reconcile_and_persist_completed_invocation_job(
         None,
         ack_context,
     )
-    .await?;
-    finish_completed_invocation_job(invocation).await
+    .await;
+    let recovery_wait = invocation
+        .failover
+        .open_timeout()
+        .saturating_mul(2)
+        .clamp(Duration::from_secs(6), Duration::from_secs(30));
+    finish_completed_invocation_after_handoff(invocation, handoff, recovery_wait).await
 }
 
 type GatewayReceiptAckRecoveryFuture<'a> =
@@ -49773,6 +49825,77 @@ mod tests {
             .active_job_cancellations
             .lock_recover("active gateway job cancellations")
             .contains_key(&job.id));
+    }
+
+    #[tokio::test]
+    async fn transient_terminal_handoff_waits_for_durable_reconciliation() {
+        let mut state = GatewayState::fixture();
+        state.jobs = Arc::new(Mutex::new(GatewayJobStore::in_memory(
+            [29_u8; 32],
+            8,
+            64 * 1024 * 1024,
+            24 * 60 * 60,
+        )));
+        let job = match prepare_gateway_job(
+            &state,
+            &HeaderMap::new(),
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            "mayhem/test",
+            &json!({"model": "mayhem/test", "messages": [{"role": "user", "content": "recover"}]}),
+            &None,
+        )
+        .await
+        .unwrap()
+        {
+            PreparedGatewayJob::Started(job) => job,
+            _ => panic!("fresh request must start a job"),
+        };
+        let mut invocation = test_invocation();
+        invocation.transport_peer = Some("ab".repeat(32));
+        invocation.job = Some(job.clone());
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let output = test_chat_output();
+        let provider_receipt = test_provider_receipt(&model, &request, &output, &invocation);
+        let receipt_ack =
+            receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).unwrap();
+        stage_completed_invocation_job(
+            &invocation,
+            chat_job_result(&output),
+            &[],
+            &provider_receipt,
+            &receipt_ack,
+        )
+        .await
+        .unwrap();
+
+        let recovery_job = job.clone();
+        let recovery = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            recovery_job
+                .finish_reconciliation(GatewayJobStatus::Completed, None)
+                .await
+                .unwrap();
+        });
+        finish_completed_invocation_after_handoff(
+            &invocation,
+            Err(GatewaySessionError::retryable(
+                "receipt settlement transport timed out",
+            )),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("recovered terminal handoff must remain successful");
+        recovery.await.unwrap();
+
+        let completed = state
+            .jobs
+            .lock_recover("gateway job vault")
+            .get(&job.id, now_secs())
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, GatewayJobStatus::Completed);
+        assert_eq!(completed.result, Some(chat_job_result(&output)));
     }
 
     #[tokio::test]
