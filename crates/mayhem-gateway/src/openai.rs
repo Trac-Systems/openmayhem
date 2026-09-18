@@ -1230,7 +1230,10 @@ impl GatewayFailoverInvocation {
         self.stall_timeout_ms.map(Duration::from_millis)
     }
 
-    fn with_admission_attempt_budget(mut self, budget: Duration) -> Self {
+    fn with_admission_attempt_budget(mut self, budget: Option<Duration>) -> Self {
+        let Some(budget) = budget else {
+            return self;
+        };
         // Admission has three independently blocking phases: peer connect,
         // session open, and the signed provider accept. Divide the route's
         // attempt budget across them so one silent route cannot consume the
@@ -4385,6 +4388,9 @@ pub struct GatewaySessionError {
     pub message: String,
     pub failure_class: GatewaySessionFailureClass,
     pub retryable: bool,
+    /// The provider has not accepted any metered request frames, so retrying
+    /// the same route cannot duplicate inference or spend.
+    pub safe_same_route_retry: bool,
     pub before_first_output: bool,
     pub transport_closed: bool,
     pub wait_elapsed: bool,
@@ -15253,6 +15259,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: false,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
@@ -15268,6 +15275,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
@@ -15283,6 +15291,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: true,
             transport_closed: false,
             wait_elapsed: false,
@@ -15298,6 +15307,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: true,
             wait_elapsed: false,
@@ -15313,6 +15323,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: true,
@@ -15332,6 +15343,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
@@ -15347,6 +15359,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
@@ -15365,6 +15378,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
@@ -15395,6 +15409,11 @@ impl GatewaySessionError {
 
     pub fn into_retryable(mut self) -> Self {
         self.retryable = true;
+        self
+    }
+
+    fn into_safe_same_route_retry(mut self) -> Self {
+        self.safe_same_route_retry = self.retryable;
         self
     }
 
@@ -15932,11 +15951,13 @@ async fn open_direct_session_with_timeout(
             GatewaySessionError::retryable(format!(
                 "opening direct session {session_id} to provider {provider} transport peer {direct_peer} timed out"
             ))
+            .into_safe_same_route_retry()
         })?
         .map_err(|err| {
             GatewaySessionError::retryable(format!(
                 "opening direct session {session_id} to provider {provider} transport peer {direct_peer} failed: {err}"
             ))
+            .into_safe_same_route_retry()
         })
 }
 
@@ -16346,6 +16367,7 @@ impl ScBridgeGatewaySessionBackend {
                     "hedge peer connect to provider {} via transport peer {} for session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
         let opened = open_direct_session_with_timeout(
             &mut bridge,
@@ -16359,7 +16381,8 @@ impl ScBridgeGatewaySessionBackend {
             return Err(GatewaySessionError::retryable(format!(
                 "hedge session {} did not open an authenticated direct-or-relayed transport",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
         let _ = close_direct_session_channel(
             &mut bridge,
@@ -16394,6 +16417,7 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
         let opened = open_direct_session_with_timeout(
             &mut bridge,
@@ -16407,7 +16431,8 @@ impl ScBridgeGatewaySessionBackend {
             return Err(GatewaySessionError::retryable(format!(
                 "session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -16607,6 +16632,7 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for embedding session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
         let opened = open_direct_session_with_timeout(
             &mut bridge,
@@ -16620,7 +16646,8 @@ impl ScBridgeGatewaySessionBackend {
             return Err(GatewaySessionError::retryable(format!(
                 "embedding session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -16773,6 +16800,7 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for image session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
         let opened = open_direct_session_with_timeout(
             &mut bridge,
@@ -16786,7 +16814,8 @@ impl ScBridgeGatewaySessionBackend {
             return Err(GatewaySessionError::retryable(format!(
                 "image session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -16939,6 +16968,7 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for audio speech session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
         let opened = open_direct_session_with_timeout(
             &mut bridge,
@@ -16952,7 +16982,8 @@ impl ScBridgeGatewaySessionBackend {
             return Err(GatewaySessionError::retryable(format!(
                 "audio speech session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -17095,6 +17126,7 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for audio transcription session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
         let opened = open_direct_session_with_timeout(
             &mut bridge,
@@ -17108,7 +17140,8 @@ impl ScBridgeGatewaySessionBackend {
             return Err(GatewaySessionError::retryable(format!(
                 "audio transcription session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -17251,6 +17284,7 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for {} generation session {} failed: {err}",
                     provider, direct_peer, request.output_modality, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
         let opened = open_direct_session_with_timeout(
             &mut bridge,
@@ -17264,7 +17298,8 @@ impl ScBridgeGatewaySessionBackend {
             return Err(GatewaySessionError::retryable(format!(
                 "{} generation session {} did not open an authenticated direct-or-relayed channel",
                 request.output_modality, invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -22995,13 +23030,8 @@ async fn run_embedding_with_route_retry(
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
+                recovery.record_retryable_attempt(state, route, &err);
                 retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
                 pending_routes = ordered_route_candidates_for_embedding_with_options(
                     state,
                     model,
@@ -23208,13 +23238,8 @@ async fn run_image_generation_with_route_retry(
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
+                recovery.record_retryable_attempt(state, route, &err);
                 retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
                 pending_routes = ordered_route_candidates_for_image_generation_with_options(
                     state,
                     model,
@@ -23416,13 +23441,8 @@ async fn run_audio_speech_with_route_retry(
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
+                recovery.record_retryable_attempt(state, route, &err);
                 retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
                 pending_routes = ordered_route_candidates_for_audio_speech_with_options(
                     state,
                     model,
@@ -23628,13 +23648,8 @@ async fn run_audio_transcription_with_route_retry(
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
+                recovery.record_retryable_attempt(state, route, &err);
                 retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
                 pending_routes = ordered_route_candidates_for_audio_transcription_with_options(
                     state,
                     model,
@@ -23880,13 +23895,8 @@ async fn run_artifact_generation_with_route_retry(
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
+                recovery.record_retryable_attempt(state, route, &err);
                 retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
                 pending_routes = ordered_route_candidates_for_artifact_generation_with_options(
                     state,
                     model,
@@ -24271,6 +24281,10 @@ async fn wait_for_pending_receipt_settlement(
     !deadline.remaining().is_zero()
 }
 
+// One replay covers a cold or flapping admission path while keeping a silent
+// sole route from multiplying the configured transport timeout indefinitely.
+const MAX_PRE_SPEND_SAME_ROUTE_RETRIES: u8 = 1;
+
 #[derive(Debug)]
 struct RouteAdmissionRecovery {
     deadline: RouteWaitDeadline,
@@ -24279,6 +24293,7 @@ struct RouteAdmissionRecovery {
     attempted_providers: BTreeSet<String>,
     exhausted_route_keys: BTreeSet<ProviderKey>,
     capacity_refusal_generations: BTreeMap<ProviderKey, CapacityRefusalGeneration>,
+    safe_same_route_retry_counts: BTreeMap<ProviderKey, u8>,
     dev_route_attempted: bool,
     attempts_made: usize,
 }
@@ -24298,6 +24313,7 @@ impl RouteAdmissionRecovery {
             attempted_providers: BTreeSet::new(),
             exhausted_route_keys: BTreeSet::new(),
             capacity_refusal_generations: BTreeMap::new(),
+            safe_same_route_retry_counts: BTreeMap::new(),
             dev_route_attempted: false,
             attempts_made: 0,
         }
@@ -24413,14 +24429,20 @@ impl RouteAdmissionRecovery {
         self.attempts_made < self.total_attempt_limit
     }
 
-    fn admission_attempt_budget(&self, candidate_count: usize) -> Duration {
+    fn admission_attempt_budget(&self, candidate_count: usize) -> Option<Duration> {
+        // With no alternate route to protect, keep the configured transport
+        // timeout. A route-discovery wait budget is not a safe substitute for
+        // the time needed to establish a cold direct session.
+        if candidate_count <= 1 {
+            return None;
+        }
         let total = match self.deadline.remaining() {
             remaining if remaining.is_zero() => Duration::from_millis(DEFAULT_ROUTE_MAX_WAIT_MS),
             remaining => remaining,
         };
         let remaining_attempts = self.total_attempt_limit.saturating_sub(self.attempts_made);
         let shares = candidate_count.max(1).min(remaining_attempts.max(1));
-        total / u32::try_from(shares).unwrap_or(u32::MAX).max(1)
+        Some(total / u32::try_from(shares).unwrap_or(u32::MAX).max(1))
     }
 
     fn begin_attempt(&mut self, route: Option<&GatewayRouteCandidate>) {
@@ -24469,6 +24491,31 @@ impl RouteAdmissionRecovery {
             self.capacity_refusal_generations.remove(&key);
             self.exhausted_route_keys.insert(key);
         }
+    }
+
+    fn record_retryable_attempt(
+        &mut self,
+        state: &GatewayState,
+        route: Option<&GatewayRouteCandidate>,
+        error: &GatewaySessionError,
+    ) {
+        if capacity_refusal(error) {
+            self.record_capacity_refusal(state, route);
+            return;
+        }
+        if error.safe_same_route_retry {
+            if let Some(route) = route {
+                let retries = self
+                    .safe_same_route_retry_counts
+                    .entry(route_key(route))
+                    .or_default();
+                if *retries < MAX_PRE_SPEND_SAME_ROUTE_RETRIES {
+                    *retries += 1;
+                    return;
+                }
+            }
+        }
+        self.exhaust(route);
     }
 
     fn record_modality_admission_error(
@@ -25570,13 +25617,8 @@ async fn prepare_live_direct_chat_session(
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
+                recovery.record_retryable_attempt(&state, route.as_ref(), &err);
                 retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(&state, route.as_ref());
-                } else {
-                    recovery.exhaust(route.as_ref());
-                }
                 pending_routes = ordered_route_candidates_for_request_with_options(
                     &state,
                     &model,
@@ -25634,6 +25676,7 @@ async fn open_live_direct_chat_session(
                 "connecting provider {} transport peer {} for session {} failed: {err}",
                 provider, direct_peer, invocation.session_id
             ))
+            .into_safe_same_route_retry()
         })?;
     let opened = open_direct_session_with_timeout(
         &mut bridge,
@@ -25650,7 +25693,8 @@ async fn open_live_direct_chat_session(
         return Err(GatewaySessionError::retryable(format!(
             "session {} did not open an authenticated direct-or-relayed channel",
             invocation.session_id
-        )));
+        ))
+        .into_safe_same_route_retry());
     }
 
     let open_result = async {
@@ -25802,7 +25846,7 @@ async fn send_open_and_validate_session_accept(
         )
         .await;
     }
-    result
+    result.map_err(GatewaySessionError::into_safe_same_route_retry)
 }
 
 async fn send_open_and_await_session_accept(
@@ -27476,7 +27520,6 @@ async fn run_chat_with_route_retry(
                     .partial
                     .as_ref()
                     .map(|partial| partial.provider_receipt.body.clone());
-                let is_capacity = capacity_refusal(&err);
                 if let Some(partial) = err.partial.as_ref() {
                     state.record_partial_provider_receipt(
                         model,
@@ -27485,6 +27528,7 @@ async fn run_chat_with_route_retry(
                         partial,
                     )?;
                 }
+                recovery.record_retryable_attempt(state, route, &err);
                 if let Some(partial) = err.partial {
                     partials.push(*partial);
                     attempt_request = redispatch_request_with_partials(request, &partials);
@@ -27504,11 +27548,6 @@ async fn run_chat_with_route_retry(
                 billing = billing.after_attempt(billed_receipt.as_ref());
                 attempt_options.billing = Some(billing.clone());
                 retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
                 pending_routes = ordered_route_candidates_for_request_with_options(
                     state,
                     model,
@@ -29837,6 +29876,10 @@ fn record_route_attempt_error(
             .is_some_and(|code| code == "CAPACITY")
     {
         record_capacity_mismatch_if_advertised(state, route);
+    }
+    if err.safe_same_route_retry {
+        record_route_observation(state, route, observation_sample_from_error(elapsed));
+        return;
     }
     if !err.clean_refusal {
         record_route_failure_attempt(state, route, elapsed);
@@ -41233,16 +41276,33 @@ mod tests {
     #[test]
     fn admission_attempt_budget_preserves_time_for_alternate_routes() {
         let recovery = RouteAdmissionRecovery::new(RouteWaitDeadline::new(12_000), 4);
-        let budget = recovery.admission_attempt_budget(2);
+        let budget = recovery
+            .admission_attempt_budget(2)
+            .expect("alternate routes require a bounded admission attempt");
         assert!(budget <= Duration::from_secs(6));
         assert!(budget > Duration::from_secs(5));
 
-        let failover = GatewayFailoverInvocation::default().with_admission_attempt_budget(budget);
+        let failover =
+            GatewayFailoverInvocation::default().with_admission_attempt_budget(Some(budget));
         assert!(failover.open_timeout() <= Duration::from_secs(2));
         assert_eq!(
             failover.session_accept_timeout(),
             Some(failover.open_timeout())
         );
+    }
+
+    #[test]
+    fn sole_route_keeps_its_configured_admission_timeouts() {
+        let recovery = RouteAdmissionRecovery::new(RouteWaitDeadline::new(10_000), 4);
+        let budget = recovery.admission_attempt_budget(1);
+        assert_eq!(budget, None);
+
+        let failover = GatewayFailoverInvocation::default().with_admission_attempt_budget(budget);
+        assert_eq!(
+            failover.open_timeout(),
+            Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS)
+        );
+        assert_eq!(failover.session_accept_timeout(), None);
     }
 
     #[test]
@@ -46159,6 +46219,66 @@ mod tests {
                     direct_session: true,
                     provider_receipt: None,
                     token_ids: vec![2],
+                    quality: Some(GatewaySessionQuality {
+                        ttft_ms: 10,
+                        tok_s: Some(40.0),
+                    }),
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
+    struct PreSpendAdmissionThenSuccessBackend {
+        providers: Arc<Mutex<Vec<String>>>,
+        billing_attempts: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl GatewaySessionBackend for PreSpendAdmissionThenSuccessBackend {
+        fn name(&self) -> &str {
+            "test-pre-spend-admission-then-success"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                self.billing_attempts
+                    .lock()
+                    .expect("billing attempts lock")
+                    .push(invocation.spend_voucher.body.billing_attempt);
+                let attempt = {
+                    let mut providers = self.providers.lock().expect("providers lock");
+                    providers.push(invocation.provider_pubkey.clone().unwrap_or_default());
+                    providers.len()
+                };
+                if attempt == 1 {
+                    return Err(GatewaySessionError::retryable(
+                        "simulated direct-session admission timeout before request frames",
+                    )
+                    .into_safe_same_route_retry());
+                }
+                let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+                Ok(GatewaySessionResult {
+                    output: ChatOutput {
+                        reasoning_content: String::new(),
+                        content: Some("recovered before spend".to_owned()),
+                        tool_calls: Vec::new(),
+                        artifacts: Vec::new(),
+                        finish_reason: "stop".to_owned(),
+                        usage: Usage {
+                            prompt_tokens,
+                            completion_tokens: 3,
+                            total_tokens: prompt_tokens + 3,
+                        },
+                    },
+                    backend: self.name().to_owned(),
+                    direct_session: true,
+                    provider_receipt: None,
+                    token_ids: vec![1, 2, 3],
                     quality: Some(GatewaySessionQuality {
                         ttft_ms: 10,
                         tok_s: Some(40.0),
@@ -53332,6 +53452,43 @@ mod tests {
         assert!(!post_failure_order
             .iter()
             .any(|candidate| candidate.provider == providers[0]));
+    }
+
+    #[tokio::test]
+    async fn sole_route_retries_pre_spend_admission_failure_without_cooling_provider() {
+        let model = test_routed_model(1);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let billing_attempts = Arc::new(Mutex::new(Vec::new()));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(PreSpendAdmissionThenSuccessBackend {
+                providers: providers.clone(),
+                billing_attempts: billing_attempts.clone(),
+            }),
+        );
+        let request = test_chat_request(&model.id);
+
+        let run =
+            run_chat_with_route_retry(&state, &model, &request, GatewayRequestOptions::default())
+                .await
+                .expect("a sole healthy route should recover from cold-session admission failure");
+
+        assert_eq!(
+            run.result.output.content.as_deref(),
+            Some("recovered before spend")
+        );
+        let providers = providers.lock().expect("providers lock").clone();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0], providers[1]);
+        assert_eq!(
+            billing_attempts
+                .lock()
+                .expect("billing attempts lock")
+                .as_slice(),
+            &[0, 0]
+        );
+        assert!(
+            !state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64())
+        );
     }
 
     #[test]
