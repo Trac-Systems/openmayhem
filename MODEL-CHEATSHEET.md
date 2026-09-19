@@ -1032,7 +1032,8 @@ Do not map MPS to `needle-gpu` or add a third canonical market.
 - 16 GiB full-offload target and 32,768 model tokens. The longest accepted
   caller input is 32,767 tokens because the runtime adds one internal token.
 - Endpoints: OpenAI `/v1/embeddings` and Hugging Face feature extraction.
-  Both accept a string or an ordered array of up to 32 strings.
+  Both accept a string or an ordered array of up to 128 strings. The signed
+  aggregate limit is 256 in-flight items, so two full batches can overlap.
 - Native dimension is 2,560. Matryoshka output supports 32 through 2,560
   dimensions, including exact 1,536-dimensional vectors. Truncation is followed
   by L2 normalization.
@@ -1049,6 +1050,10 @@ Do not map MPS to `needle-gpu` or add a third canonical market.
   and 2,432.98 at batch 32.
 - Four concurrent batches of eight reached 5,064.32 input tok/s; eight reached
   5,920.53 input tok/s without sustained swap growth.
+- Large-batch proof reached 200.25 items/s at batch 128 and 196.45 items/s for
+  two overlapping batches of 128. Two overlapping batches of 256 also passed
+  as unpublished headroom at 189.68 items/s. Process-tree RSS remained about
+  3.49 GB with about 84.2 GB of system memory available.
 - Sustained p50/p90/p99 latency was 38.4/39.5/41.6 ms at batch 1,
   46.2/79.4/82.1 ms at batch 8, and 169.8/205.6/206.9 ms at batch 32.
 - Exact-runtime vectors matched the official Transformers reference with a

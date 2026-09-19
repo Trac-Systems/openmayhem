@@ -38142,7 +38142,7 @@
                 ],
                 "min_length": 1,
                 "min_items": 1,
-                "max_items": 32
+                "max_items": 128
               },
               "encoding_format": {
                 "value_types": [
@@ -38261,7 +38261,7 @@
                 ],
                 "min_length": 1,
                 "min_items": 1,
-                "max_items": 32
+                "max_items": 128
               },
               "dimensions": {
                 "value_types": [
@@ -38332,8 +38332,8 @@
               "calibration_baseline_memory_bytes": 3581898752,
               "calibration_peak_memory_bytes": 3584724992,
               "calibration_f13_budget_bytes": 96129949696,
-              "default_max_inflight_items": 1,
-              "default_max_items_per_request": 1
+              "default_max_inflight_items": 256,
+              "default_max_items_per_request": 128
             }
           }
         }
@@ -48243,7 +48243,7 @@
         ]
       ],
       "topology": "shared_worker",
-      "proof_sha256": "7467392b2766a7cd4a831cfe32e3246de9e4b66afa86694ee3eb7af1c492842a"
+      "proof_sha256": "bd4bee976e32756304ef73d293eaea734aea789a2065975717ca86cb20918e10"
     }
   },
   "vllm_execution_modes": {

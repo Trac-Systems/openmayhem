@@ -18,8 +18,10 @@
   },
   "proven_capacity": {
     "concurrent_requests": 8,
-    "items_per_concurrent_request": 8,
-    "max_items_per_request": 32,
+    "items_per_concurrent_request": 32,
+    "max_inflight_items": 256,
+    "max_items_per_request": 128,
+    "max_sized_concurrent_requests": 2,
     "max_input_tokens_including_internal_token": 32768
   },
   "evidence": {
@@ -34,6 +36,10 @@
     "reference_equivalence": {
       "path": "qwen3-embedding-4b-reference-compare.json",
       "sha256": "1eef40cec37ba00eae1db319bc93b0a33fa1b8278719fe8d98cc2c10fafac691"
+    },
+    "large_batch_benchmark": {
+      "path": "qwen3-embedding-4b-large-batch-benchmark.json",
+      "sha256": "db4d1ae1bda0aaf9650d7e5fe595b141f7d842021b8b5475f5fe2a03de015e8d"
     }
   }
 }
