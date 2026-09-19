@@ -74786,11 +74786,19 @@ fn provider_vllm_generation_execution_capacity(
         "generation execution profile does not authorize independent dispatch"
     );
 
-    let provider_capacity = args
-        .max_sessions
-        .unwrap_or(verdict.max_sessions)
-        .min(verdict.max_sessions)
-        .max(1);
+    let shared_embedding_scheduler = profile.topology
+        != Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
+        && generation_execution_profile_allows_modalities(Some(profile), &["embedding".to_owned()]);
+    let configured_capacity = args.max_sessions.unwrap_or(verdict.max_sessions).max(1);
+    // A shared embedding scheduler batches requests inside one loaded model.
+    // The hardware verdict's max_sessions describes independently resident
+    // model sessions and must not reduce that scheduler to one. The signed
+    // max_batch_size and the operator's explicit max_sessions remain hard caps.
+    let provider_capacity = if shared_embedding_scheduler {
+        configured_capacity
+    } else {
+        configured_capacity.min(verdict.max_sessions).max(1)
+    };
     if artifact.engine == "openai-compatible" {
         ensure!(
             profile.topology.is_none(),
@@ -109492,6 +109500,62 @@ status: linked
                 floor_pct: 35,
                 max_pct: 85,
             }
+        );
+    }
+
+    #[test]
+    fn shared_vllm_embedding_capacity_uses_scheduler_instead_of_replica_count() {
+        let mut selected =
+            test_auto_fit_candidate('e', "test/vllm-embedding", "embedding", 4, 96, 1, 6.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.artifact.engine = "vllm".to_owned();
+        selected.enclave.caps = json!({"max_batch_size": 8});
+        selected.verdict.backend = "vllm".to_owned();
+        selected.verdict.max_sessions = 1;
+        selected.feasibility.memory_budget.total_bytes = 96 * GIB_BYTES;
+        selected.feasibility.memory_budget.budget_bytes = 72 * GIB_BYTES;
+        selected.feasibility.estimated_required_bytes = 10 * GIB_BYTES;
+        selected.feasibility.estimated_kv_bytes = 0;
+
+        let profile = catalog::CatalogGenerationExecutionProfile {
+            schema_version: 1,
+            engine: "vllm".to_owned(),
+            topology: Some(mayhem_proto::GenerationExecutionTopology::SharedWorker),
+            independent_dispatch: true,
+            max_concurrent: None,
+            request_modalities: vec![vec!["embedding".to_owned()]],
+            proof_sha256: "ab".repeat(32),
+        };
+        let mut args = test_provider_start_args();
+        args.max_sessions = Some(8);
+        args.vllm_memory_utilization = Some(13);
+
+        assert_eq!(
+            provider_vllm_generation_execution_capacity(
+                &selected.artifact,
+                Some(&profile),
+                &selected.enclave.caps,
+                &selected.verdict,
+                &args,
+                &selected.feasibility,
+            )
+            .unwrap(),
+            8
+        );
+
+        args.max_sessions = Some(16);
+        assert_eq!(
+            provider_vllm_generation_execution_capacity(
+                &selected.artifact,
+                Some(&profile),
+                &selected.enclave.caps,
+                &selected.verdict,
+                &args,
+                &selected.feasibility,
+            )
+            .unwrap(),
+            8,
+            "signed scheduler capacity remains the hard ceiling"
         );
     }
 
