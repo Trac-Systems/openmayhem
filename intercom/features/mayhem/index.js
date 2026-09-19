@@ -369,12 +369,13 @@ const serviceParticipantFor = (service, value) => {
   return null;
 };
 
-const relayError = (message, requestId = null) => ({
+const relayError = (message, requestId = null, phase = null) => ({
   ok: false,
   accepted: false,
   status: 'rejected',
   relayed: true,
   request_id: requestId,
+  ...(phase ? { phase } : {}),
   message,
 });
 
@@ -735,12 +736,18 @@ class MayhemFeature extends Feature {
 
     let connected = false;
     let sent = false;
+    let connectFailurePhase = 'transport_unavailable';
     let attemptInFlight = false;
     const attempt = async () => {
       if (attemptInFlight || !pending.has(requestId)) return;
       attemptInFlight = true;
       try {
-        if (!(await this._connectAdminTransport(admin, sidechannel))) return;
+        if (!(await this._connectAdminTransport(admin, sidechannel))) {
+          connectFailurePhase = sidechannel
+            .directConnectFailure?.(admin, this.channel)
+            ?.phase ?? connectFailurePhase;
+          return;
+        }
         connected = true;
         if (sidechannel.broadcast(this.channel, message)) sent = true;
       } catch (_error) {
@@ -776,7 +783,12 @@ class MayhemFeature extends Feature {
             : !sent
               ? unsentMessage
               : timeoutMessage;
-          current.resolve(relayError(messageText, requestId));
+          const phase = !connected
+            ? connectFailurePhase
+            : !sent
+              ? 'request_send'
+              : 'admin_ack';
+          current.resolve(relayError(messageText, requestId, phase));
         }, this.timeoutMs)
       : null;
     void attempt();

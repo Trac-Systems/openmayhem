@@ -113,8 +113,7 @@ pub(crate) struct CatalogDocument {
     #[serde(default)]
     pub(crate) vllm_execution_profiles: BTreeMap<String, CatalogVllmExecutionProfile>,
     #[serde(default)]
-    pub(crate) vllm_execution_modes:
-        BTreeMap<String, BTreeMap<String, CatalogVllmExecutionMode>>,
+    pub(crate) vllm_execution_modes: BTreeMap<String, BTreeMap<String, CatalogVllmExecutionMode>>,
     pub(crate) models: Vec<CatalogModel>,
 }
 
@@ -148,6 +147,8 @@ pub(crate) struct CatalogGenerationExecutionProfile {
     pub(crate) schema_version: u32,
     pub(crate) engine: String,
     pub(crate) independent_dispatch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_concurrent: Option<u32>,
     pub(crate) request_modalities: Vec<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) topology: Option<mayhem_proto::GenerationExecutionTopology>,
@@ -213,7 +214,9 @@ pub(crate) fn execution_mode_model(
     artifact_name: &str,
     mode: &CatalogVllmExecutionMode,
 ) -> Result<CatalogModel> {
-    let artifact = model.artifacts.get(artifact_name)
+    let artifact = model
+        .artifacts
+        .get(artifact_name)
         .with_context(|| format!("unknown execution mode artifact {artifact_name}"))?;
     if artifact.engine != "vllm" || mode.schema_version != 1 {
         bail!("execution mode requires a vllm artifact and schema version 1");
@@ -251,33 +254,42 @@ pub(crate) fn execution_mode_model(
 
     let mut effective = model.clone();
     effective.artifacts.retain(|name, _| name == artifact_name);
-    effective.adapter.endpoint_families.retain(|contract| mode.requests.endpoint_families
-        .iter().any(|policy| policy.family == contract.family));
+    effective.adapter.endpoint_families.retain(|contract| {
+        mode.requests
+            .endpoint_families
+            .iter()
+            .any(|policy| policy.family == contract.family)
+    });
     for contract in &mut effective.adapter.endpoint_families {
-        let restrictions = mode.requests.endpoint_families.iter()
-            .find(|policy| policy.family == contract.family).expect("retained mode family");
+        let restrictions = mode
+            .requests
+            .endpoint_families
+            .iter()
+            .find(|policy| policy.family == contract.family)
+            .expect("retained mode family");
         for (path, restriction) in &restrictions.request_attribute_specs {
             let mut spec = restriction.clone();
             let original = &contract.request_attribute_specs[path];
             if let Some(default) = &original.default {
                 mayhem_proto::validate_endpoint_attribute_value(&spec, default)
                     .map_err(anyhow::Error::msg)
-                    .with_context(|| format!("execution mode cannot serve inherited default for {path}"))?;
+                    .with_context(|| {
+                        format!("execution mode cannot serve inherited default for {path}")
+                    })?;
                 spec.default = Some(default.clone());
             }
             contract.request_attribute_specs.insert(path.clone(), spec);
         }
     }
     effective.canary = mode.canary.clone();
-    effective.modality_assessment.calibrated_fingerprints = BTreeMap::from([
-        (artifact_name.to_owned(), mode.modality_fingerprints.clone()),
-    ]);
-    effective.modality_assessment.resource_profiles = BTreeMap::from([
-        (artifact_name.to_owned(), mode.resource_profiles.clone()),
-    ]);
-    effective.speciality_assessment.calibrated = BTreeMap::from([
-        (artifact_name.to_owned(), mode.speciality_calibrations.clone()),
-    ]);
+    effective.modality_assessment.calibrated_fingerprints =
+        BTreeMap::from([(artifact_name.to_owned(), mode.modality_fingerprints.clone())]);
+    effective.modality_assessment.resource_profiles =
+        BTreeMap::from([(artifact_name.to_owned(), mode.resource_profiles.clone())]);
+    effective.speciality_assessment.calibrated = BTreeMap::from([(
+        artifact_name.to_owned(),
+        mode.speciality_calibrations.clone(),
+    )]);
     Ok(effective)
 }
 
@@ -453,6 +465,8 @@ pub(crate) struct ConversionRef {
 #[serde(deny_unknown_fields)]
 pub(crate) struct CatalogArtifact {
     pub(crate) engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) openai_compatible: Option<mayhem_engine::OpenAiCompatibleRuntimeBinding>,
     #[serde(default)]
     pub(crate) stable_diffusion_cpp: Option<mayhem_engine::StableDiffusionCppConfig>,
     #[serde(default)]
@@ -1018,9 +1032,12 @@ fn validate_generation_execution_profiles(catalog: &CatalogDocument, errors: &mu
         let bound_model = match primary_artifacts.get(artifact_root.as_str()) {
             Some(bindings) if bindings.len() == 1 => {
                 let (model, artifact) = bindings[0];
-                if model.model_class != DEFAULT_MODEL_CLASS {
+                if !matches!(
+                    model.model_class.as_str(),
+                    DEFAULT_MODEL_CLASS | MODEL_CLASS_EMBEDDING
+                ) {
                     errors.push(format!(
-                        "{label} is only valid for generation-capable text models"
+                        "{label} is only valid for generation-capable text or embedding models"
                     ));
                 }
                 if artifact.engine != profile.engine {
@@ -1028,6 +1045,14 @@ fn validate_generation_execution_profiles(catalog: &CatalogDocument, errors: &mu
                         "{label}.engine {} does not match bound artifact engine {}",
                         profile.engine, artifact.engine
                     ));
+                }
+                if let Some(binding) = artifact.openai_compatible.as_ref() {
+                    if profile.max_concurrent != Some(binding.max_concurrent) {
+                        errors.push(format!(
+                            "{label}.max_concurrent {:?} must equal the signed openai_compatible runtime capacity {}",
+                            profile.max_concurrent, binding.max_concurrent
+                        ));
+                    }
                 }
                 Some(model)
             }
@@ -1064,11 +1089,24 @@ fn validate_generation_execution_profile_values(
     if profile.schema_version != 1 {
         errors.push(format!("{label}.schema_version must be 1"));
     }
-    if profile.engine != "vllm" {
-        errors.push(format!("{label}.engine must be vllm"));
+    if !matches!(profile.engine.as_str(), "vllm" | "openai-compatible") {
+        errors.push(format!("{label}.engine must be vllm or openai-compatible"));
     }
     if !profile.independent_dispatch {
         errors.push(format!("{label}.independent_dispatch must be true"));
+    }
+    if profile
+        .max_concurrent
+        .is_some_and(|capacity| !(1..=64).contains(&capacity))
+    {
+        errors.push(format!(
+            "{label}.max_concurrent must be between 1 and 64 when present"
+        ));
+    }
+    if profile.engine == "openai-compatible" && profile.max_concurrent.is_none() {
+        errors.push(format!(
+            "{label}.max_concurrent is required for openai-compatible"
+        ));
     }
     if !is_lower_hex_len(&profile.proof_sha256, 64) {
         errors.push(format!(
@@ -1082,6 +1120,8 @@ fn validate_generation_execution_profile_values(
         return;
     }
 
+    let embedding_dispatch =
+        bound_model.is_some_and(|model| model.model_class == MODEL_CLASS_EMBEDDING);
     let mut seen_sets = BTreeSet::new();
     for (set_index, modality_set) in profile.request_modalities.iter().enumerate() {
         let set_label = format!("{label}.request_modalities[{set_index}]");
@@ -1092,7 +1132,8 @@ fn validate_generation_execution_profile_values(
 
         let mut normalized = BTreeSet::new();
         for modality in modality_set {
-            if !valid_adapter_modality(modality) || modality == "embedding" {
+            if !valid_adapter_modality(modality) || (modality == "embedding" && !embedding_dispatch)
+            {
                 errors.push(format!(
                     "{set_label} contains unsupported generation modality {modality:?}"
                 ));
@@ -1107,9 +1148,15 @@ fn validate_generation_execution_profile_values(
             }
         }
         let normalized = normalized.into_iter().collect::<Vec<_>>();
-        if !normalized.iter().any(|modality| modality == "text") {
+        if embedding_dispatch {
+            if normalized.as_slice() != ["embedding"] {
+                errors.push(format!(
+                    "{set_label} must contain only embedding for embedding dispatch"
+                ));
+            }
+        } else if !normalized.iter().any(|modality| modality == "text") {
             errors.push(format!(
-                "{set_label} must include text for vLLM generation dispatch"
+                "{set_label} must include text for generation dispatch"
             ));
         }
         if &normalized != modality_set {
@@ -1720,6 +1767,27 @@ fn validate_model(model: &CatalogModel, errors: &mut Vec<String>) {
             !future_model,
             errors,
         );
+        if let Some(binding) = artifact.openai_compatible.as_ref() {
+            if u64::from(binding.native_context) != model.caps.ctx_max {
+                errors.push(format!(
+                    "{}/{} openai_compatible.native_context {} must equal caps.ctx_max {}",
+                    model.model_id, name, binding.native_context, model.caps.ctx_max
+                ));
+            }
+            for (capability, advertised) in [
+                ("tools", model.caps.tools),
+                ("json", model.caps.json),
+                ("image", model.caps.vision || model.caps.image),
+                ("video", model_has_input_modality(model, "video")),
+            ] {
+                if advertised != binding.capabilities.contains(capability) {
+                    errors.push(format!(
+                        "{}/{} openai_compatible capability {capability} must match model caps",
+                        model.model_id, name
+                    ));
+                }
+            }
+        }
     }
     if model.caps.ctx_max == 0 {
         errors.push(format!("{} caps.ctx_max must be positive", model.model_id));
@@ -4601,6 +4669,19 @@ fn adapter_modality_allowed(model: &CatalogModel, modality: &str) -> bool {
         .any(|detected| detected == modality)
 }
 
+fn model_has_input_modality(model: &CatalogModel, modality: &str) -> bool {
+    model
+        .adapter
+        .modality_set
+        .iter()
+        .any(|entry| entry == modality)
+        && model
+            .modality_assessment
+            .detected
+            .iter()
+            .any(|entry| entry == modality)
+}
+
 fn validate_artifact(
     model_id: &str,
     tier: &str,
@@ -4636,12 +4717,58 @@ fn validate_artifact_with_engine_policy(
                 | "transformers-asr"
                 | "whisper.cpp"
                 | "piper"
+                | "openai-compatible"
         )
     {
         errors.push(format!(
             "{model_id}/{name} has unsupported engine {}",
             artifact.engine
         ));
+    }
+    match (&*artifact.engine, artifact.openai_compatible.as_ref()) {
+        ("openai-compatible", Some(binding)) => {
+            if let Err(error) = binding.validate() {
+                errors.push(format!(
+                    "{model_id}/{name} invalid openai_compatible runtime binding: {error}"
+                ));
+            }
+            match artifact.sidecars.get(&binding.runtime_recipe_sidecar) {
+                Some(recipe) if recipe.source_sha256 == binding.runtime_recipe_sha256 => {}
+                Some(_) => errors.push(format!(
+                    "{model_id}/{name} runtime recipe sidecar hash does not match openai_compatible.runtime_recipe_sha256"
+                )),
+                None => errors.push(format!(
+                    "{model_id}/{name} is missing openai_compatible runtime recipe sidecar {}",
+                    binding.runtime_recipe_sidecar
+                )),
+            }
+            match artifact.sidecars.get(&binding.snapshot_manifest_sidecar) {
+                Some(manifest) if manifest.source_sha256 == binding.snapshot_manifest_sha256 => {
+                    if artifact.path != manifest.path
+                        || artifact.source_sha256.as_deref()
+                            != Some(manifest.source_sha256.as_str())
+                    {
+                        errors.push(format!(
+                            "{model_id}/{name} primary path/hash must bind the same snapshot manifest object as openai_compatible.snapshot_manifest_sidecar"
+                        ));
+                    }
+                }
+                Some(_) => errors.push(format!(
+                    "{model_id}/{name} snapshot manifest sidecar hash does not match openai_compatible.snapshot_manifest_sha256"
+                )),
+                None => errors.push(format!(
+                    "{model_id}/{name} is missing openai_compatible snapshot manifest sidecar {}",
+                    binding.snapshot_manifest_sidecar
+                )),
+            }
+        }
+        ("openai-compatible", None) => errors.push(format!(
+            "{model_id}/{name} openai-compatible engine requires a signed openai_compatible runtime binding"
+        )),
+        (_, Some(_)) => errors.push(format!(
+            "{model_id}/{name} openai_compatible runtime binding requires engine openai-compatible"
+        )),
+        _ => {}
     }
     validate_source(
         model_id,
@@ -4708,7 +4835,10 @@ fn validate_artifact_with_engine_policy(
             ));
         }
     }
-    if matches!(artifact.engine.as_str(), "trt-llm" | "vllm") && artifact.min_compute_cap.is_none()
+    if matches!(
+        artifact.engine.as_str(),
+        "trt-llm" | "vllm" | "openai-compatible"
+    ) && artifact.min_compute_cap.is_none()
     {
         errors.push(format!(
             "{model_id}/{name} {} artifact needs min_compute_cap",
@@ -4986,6 +5116,41 @@ fn validate_artifact_with_engine_policy(
                 if profile.quantized_start_tokens != 0 {
                     errors.push(format!(
                         "{model_id}/{name} vLLM KV-cache quantized_start_tokens must be 0"
+                    ));
+                }
+            }
+            "openai-compatible" => {
+                let signed_dtype = artifact
+                    .openai_compatible
+                    .as_ref()
+                    .and_then(|binding| binding.server_info_checks.get("/kv_cache_dtype"))
+                    .and_then(Value::as_str);
+                if signed_dtype != Some(profile.dtype.as_str()) {
+                    errors.push(format!(
+                        "{model_id}/{name} OpenAI-compatible KV-cache dtype {} must match the signed /server_info /kv_cache_dtype check",
+                        profile.dtype
+                    ));
+                }
+                let expected_bits = vllm_kv_cache_expected_bits(&profile.dtype);
+                match expected_bits {
+                    Some(bits) if bits == profile.bits => {}
+                    Some(bits) => errors.push(format!(
+                        "{model_id}/{name} OpenAI-compatible KV-cache dtype {} requires bits={bits}, got {}",
+                        profile.dtype, profile.bits
+                    )),
+                    None => errors.push(format!(
+                        "{model_id}/{name} has unsupported OpenAI-compatible KV-cache dtype {}",
+                        profile.dtype
+                    )),
+                }
+                if profile.group_size != 1 {
+                    errors.push(format!(
+                        "{model_id}/{name} OpenAI-compatible KV-cache group_size must be 1"
+                    ));
+                }
+                if profile.quantized_start_tokens != 0 {
+                    errors.push(format!(
+                        "{model_id}/{name} OpenAI-compatible KV-cache quantized_start_tokens must be 0"
                     ));
                 }
             }
@@ -6159,6 +6324,7 @@ mod tests {
                 schema_version: 1,
                 engine: "vllm".to_owned(),
                 independent_dispatch: true,
+                max_concurrent: None,
                 request_modalities: vec![vec!["text".to_owned()]],
                 topology: None,
                 proof_sha256: "a".repeat(64),
@@ -6308,6 +6474,32 @@ mod tests {
     }
 
     #[test]
+    fn generation_execution_profile_accepts_embedding_dispatch_for_bound_embedding_model() {
+        let (mut catalog, artifact_root) = catalog_with_valid_generation_execution_profile();
+        let model = catalog
+            .models
+            .iter_mut()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == artifact_root)
+            })
+            .expect("bound model");
+        model.model_class = MODEL_CLASS_EMBEDDING.to_owned();
+        model.adapter.modality_set = vec!["embedding".to_owned()];
+        catalog
+            .generation_execution_profiles
+            .get_mut(&artifact_root)
+            .expect("profile")
+            .request_modalities = vec![vec!["embedding".to_owned()]];
+
+        let mut errors = Vec::new();
+        validate_catalog(&catalog, &mut errors);
+        assert!(errors.is_empty(), "{errors:#?}");
+    }
+
+    #[test]
     fn generation_execution_profile_absent_topology_preserves_serialized_bytes() {
         let legacy = format!(
             r#"{{"schema_version":1,"engine":"vllm","independent_dispatch":true,"request_modalities":[["text"]],"proof_sha256":"{}"}}"#,
@@ -6348,8 +6540,8 @@ mod tests {
     #[test]
     fn generation_execution_profile_topology_rejects_unknown_values_in_root_and_mode() {
         let (catalog, root, _) = catalog_with_optional_vllm_mode();
-        let mode =
-            serde_json::to_value(catalog.vllm_execution_mode(&root, "throughput").unwrap()).unwrap();
+        let mode = serde_json::to_value(catalog.vllm_execution_mode(&root, "throughput").unwrap())
+            .unwrap();
         for value in [
             serde_json::json!("unknown"),
             serde_json::json!("IsolatedWorkers"),
@@ -6630,6 +6822,7 @@ mod tests {
                 schema_version: 1,
                 engine: "vllm".to_owned(),
                 independent_dispatch: true,
+                max_concurrent: None,
                 request_modalities: vec![vec!["text".to_owned()]],
                 topology: None,
                 proof_sha256: "e".repeat(64),
@@ -6886,7 +7079,10 @@ mod tests {
         let effective = execution_mode_model(model, &artifact_name, &mode).unwrap();
 
         assert_eq!(effective.adapter.endpoint_families.len(), 1);
-        assert_eq!(effective.adapter.endpoint_families[0].family, expected_family);
+        assert_eq!(
+            effective.adapter.endpoint_families[0].family,
+            expected_family
+        );
     }
 
     #[test]
@@ -7063,9 +7259,16 @@ mod tests {
         let mode = missing.vllm_execution_mode(&root, "throughput").unwrap();
         assert!(mode.profile.speculative_decoding.is_some());
         assert!(mode.generation_execution_profile.is_none());
-        let model = missing.models.iter().find(|model| {
-            model.artifacts.values().any(|artifact| artifact.artifact_root == root)
-        }).unwrap();
+        let model = missing
+            .models
+            .iter()
+            .find(|model| {
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == root)
+            })
+            .unwrap();
         execution_mode_model(model, &artifact_name, mode).unwrap();
 
         let mut invalid = catalog.clone();
@@ -7130,7 +7333,10 @@ mod tests {
             .models
             .iter()
             .find(|model| {
-                model.artifacts.values().any(|artifact| artifact.artifact_root == root)
+                model
+                    .artifacts
+                    .values()
+                    .any(|artifact| artifact.artifact_root == root)
             })
             .unwrap();
         let effective = execution_mode_model(model, &artifact_name, mode).unwrap();
@@ -7176,10 +7382,9 @@ mod tests {
         }
 
         let mut invalid_root = catalog.clone();
-        invalid_root.generation_execution_profiles.insert(
-            root,
-            mode.generation_execution_profile.clone().unwrap(),
-        );
+        invalid_root
+            .generation_execution_profiles
+            .insert(root, mode.generation_execution_profile.clone().unwrap());
         validate_catalog(&invalid_root, &mut errors);
         assert_eq!(errors.len(), 1, "{errors:#?}");
         assert!(errors[0].contains("isolated_workers requires an authenticated execution mode"));
@@ -7291,7 +7496,10 @@ mod tests {
                     .models
                     .iter()
                     .find(|model| {
-                        model.artifacts.values().any(|artifact| artifact.artifact_root == root)
+                        model
+                            .artifacts
+                            .values()
+                            .any(|artifact| artifact.artifact_root == root)
                     })
                     .unwrap();
                 assert!(execution_mode_model(
@@ -7344,10 +7552,12 @@ mod tests {
         );
         assert_ne!(mode.binding(&root, "different").unwrap(), binding);
         let mut changed_runtime = mode.clone();
-        changed_runtime.profile.runtime = Some(
-            crate::python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1,
+        changed_runtime.profile.runtime =
+            Some(crate::python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1);
+        assert_ne!(
+            changed_runtime.binding(&root, "throughput").unwrap(),
+            binding
         );
-        assert_ne!(changed_runtime.binding(&root, "throughput").unwrap(), binding);
         let mut changed = mode.clone();
         changed
             .profile
@@ -7487,14 +7697,21 @@ mod tests {
         assert_eq!(serde_json::to_value(restored).unwrap(), legacy);
 
         for mode in 0..=3 {
-            for graph in ["NONE", "FULL_DECODE_ONLY", "FULL", "PIECEWISE", "FULL_AND_PIECEWISE"] {
+            for graph in [
+                "NONE",
+                "FULL_DECODE_ONLY",
+                "FULL",
+                "PIECEWISE",
+                "FULL_AND_PIECEWISE",
+            ] {
                 let profile = catalog.vllm_execution_profiles.get_mut(&root).unwrap();
                 profile.compilation_mode = Some(mode);
                 profile.cudagraph_mode = Some(graph.to_owned());
                 let encoded = serde_json::to_value(&*profile).unwrap();
                 assert_eq!(encoded["compilation_mode"], serde_json::json!(mode));
                 assert_eq!(encoded["cudagraph_mode"], serde_json::json!(graph));
-                let restored: CatalogVllmExecutionProfile = serde_json::from_value(encoded).unwrap();
+                let restored: CatalogVllmExecutionProfile =
+                    serde_json::from_value(encoded).unwrap();
                 assert_eq!(*profile, restored);
                 let mut errors = Vec::new();
                 validate_vllm_execution_profiles(&catalog, &mut errors);
@@ -7804,18 +8021,24 @@ mod tests {
 
         let mut explicit_default = source.clone();
         explicit_default["runtime"] = serde_json::Value::Null;
-        let default: CatalogVllmExecutionProfile = serde_json::from_value(explicit_default).unwrap();
+        let default: CatalogVllmExecutionProfile =
+            serde_json::from_value(explicit_default).unwrap();
         assert_eq!(default, legacy);
         assert_eq!(serde_json::to_value(default).unwrap(), source);
 
         let mut selected_source = source;
         selected_source["runtime"] = serde_json::json!("flashinfer_speculative_metadata_v1");
-        let selected: CatalogVllmExecutionProfile = serde_json::from_value(selected_source.clone()).unwrap();
-        assert_eq!(selected.runtime, Some(crate::python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1));
+        let selected: CatalogVllmExecutionProfile =
+            serde_json::from_value(selected_source.clone()).unwrap();
+        assert_eq!(
+            selected.runtime,
+            Some(crate::python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1)
+        );
         assert_eq!(serde_json::to_value(selected).unwrap(), selected_source);
 
         selected_source["runtime"] = serde_json::json!("unknown_runtime");
-        let error = serde_json::from_value::<CatalogVllmExecutionProfile>(selected_source).unwrap_err();
+        let error =
+            serde_json::from_value::<CatalogVllmExecutionProfile>(selected_source).unwrap_err();
         assert!(error.to_string().contains("unknown variant"), "{error}");
     }
 
@@ -9103,6 +9326,7 @@ mod tests {
         };
         let mut artifact = CatalogArtifact {
             engine: "llama.cpp".to_owned(),
+            openai_compatible: None,
             stable_diffusion_cpp: None,
             mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
             kv_cache: None,
@@ -9392,6 +9616,7 @@ mod tests {
     fn artifact_kv_cache_profile_is_validated_as_signed_runtime_data() {
         let mut artifact = CatalogArtifact {
             engine: "llama.cpp".to_owned(),
+            openai_compatible: None,
             stable_diffusion_cpp: None,
             mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
             kv_cache: Some(CatalogKvCacheProfile {
@@ -10567,6 +10792,7 @@ mod tests {
                 "fixture".to_owned(),
                 CatalogArtifact {
                     engine: engine.to_owned(),
+                    openai_compatible: None,
                     stable_diffusion_cpp: (engine == "stable-diffusion.cpp")
                         .then_some(mayhem_engine::StableDiffusionCppConfig::default()),
                     mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
@@ -10659,6 +10885,83 @@ mod tests {
                 rate_map: Vec::new(),
             },
         }
+    }
+
+    #[test]
+    fn openai_compatible_kv_metadata_and_video_input_validate() {
+        let draft_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../catalog/drafts/qwen3.8-flash-next-nvfp4/artifact-binding.values.json");
+        let draft: Value = serde_json::from_slice(
+            &fs::read(&draft_path)
+                .unwrap_or_else(|error| panic!("reading {}: {error}", draft_path.display())),
+        )
+        .expect("artifact binding draft JSON");
+        let artifact: CatalogArtifact = serde_json::from_value(draft["artifact"].clone())
+            .expect("OpenAI-compatible artifact binding");
+
+        let mut artifact_errors = Vec::new();
+        validate_artifact(
+            "Qwen/Qwen3.8-Flash-Next",
+            "launch",
+            "nvfp4",
+            &artifact,
+            &mut artifact_errors,
+        );
+        assert!(artifact_errors.is_empty(), "{artifact_errors:#?}");
+
+        let mut drifted = artifact.clone();
+        drifted
+            .openai_compatible
+            .as_mut()
+            .unwrap()
+            .server_info_checks
+            .insert(
+                "/kv_cache_dtype".to_owned(),
+                Value::String("bfloat16".to_owned()),
+            );
+        artifact_errors.clear();
+        validate_artifact(
+            "Qwen/Qwen3.8-Flash-Next",
+            "launch",
+            "nvfp4",
+            &drifted,
+            &mut artifact_errors,
+        );
+        assert!(artifact_errors.iter().any(|error| error.contains(
+            "KV-cache dtype fp8_e4m3 must match the signed /server_info /kv_cache_dtype check"
+        )));
+
+        let catalog = repository_catalog();
+        let mut model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "Qwen/Qwen3.8-27B")
+            .expect("Qwen3.8 multimodal fixture")
+            .clone();
+        model.model_id = "Qwen/Qwen3.8-Flash-Next".to_owned();
+        model.caps.video = false;
+        assert!(model_has_input_modality(&model, "video"));
+        model.artifacts = BTreeMap::from([("nvfp4".to_owned(), artifact)]);
+        let mut model_errors = Vec::new();
+        validate_model(&model, &mut model_errors);
+        assert!(
+            !model_errors.iter().any(|error| {
+                error.contains("openai_compatible capability video must match model caps")
+                    || error.contains("caps.video output")
+                    || error.contains("declares a KV-cache profile for unsupported engine")
+            }),
+            "{model_errors:#?}"
+        );
+
+        model
+            .adapter
+            .modality_set
+            .retain(|modality| modality != "video");
+        model_errors.clear();
+        validate_model(&model, &mut model_errors);
+        assert!(model_errors.iter().any(|error| {
+            error.contains("openai_compatible capability video must match model caps")
+        }));
     }
 
     fn hex_string(bytes: &[u8]) -> String {

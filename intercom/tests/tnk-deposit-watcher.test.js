@@ -8,6 +8,7 @@ import {
   pendingEntriesFromState,
   pubKeyHexToMsbAddress,
   resolveActiveBillingEpoch,
+  resolveMinimumMsbSignedLength,
   transferFromTxDetails,
   waitForDepositState,
 } from '../scripts/tnk-deposit-watcher.mjs';
@@ -30,6 +31,18 @@ test('tnk deposit watcher derives the active billing epoch from ledger apply sta
     resolveActiveBillingEpoch(undefined, null),
     /Missing --epoch or --peer-rpc/,
   );
+});
+
+test('tnk deposit watcher waits for the canonical peer MSB height', async () => {
+  const statusFetch = async () => ({
+    ok: true,
+    json: async () => ({ msb: { signedLength: 356_400 } }),
+  });
+  assert.equal(
+    await resolveMinimumMsbSignedLength('http://peer/v1', 339_540, { fetchImpl: statusFetch }),
+    356_400,
+  );
+  assert.equal(await resolveMinimumMsbSignedLength(null, 339_540), 339_540);
 });
 
 test('tnk deposit watcher matches quoted pending intents by user-derived MSB sender, treasury, and amount', () => {

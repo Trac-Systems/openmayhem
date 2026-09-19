@@ -8,6 +8,7 @@ cursor="${MAYHEM_TNK_DEPOSIT_CURSOR:-/opt/mayhem/.mayhem-local/watchers/tnk-depo
 state_dir="${MAYHEM_TNK_DEPOSIT_STATE_DIR:-/opt/mayhem/.mayhem-local/tnk-deposit-msb}"
 store_name="${MAYHEM_TNK_DEPOSIT_STORE_NAME:-mayhem-mainnet-deposit-watcher}"
 interval="${MAYHEM_TNK_DEPOSIT_INTERVAL_SECONDS:-30}"
+reader_timeout="${MAYHEM_TNK_DEPOSIT_READER_TIMEOUT_SECONDS:-300}"
 
 mkdir -p "$(dirname "$cursor")" "$state_dir"
 
@@ -18,6 +19,7 @@ while true; do
     --store-name "$store_name" \
     --peer-rpc "$peer_rpc" \
     --cursor "$cursor" \
+    --timeout "$reader_timeout" \
     --admin-home "$home" \
     --mayhem-bin "$repo/target/release/mayhem" \
     --submit \

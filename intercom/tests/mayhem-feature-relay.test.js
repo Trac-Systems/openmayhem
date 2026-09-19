@@ -969,6 +969,7 @@ test('participant does not broadcast when the canonical admin channel is unavail
   participant.peer.sidechannel = {
     started: true,
     connectDirectPeer: async () => false,
+    directConnectFailure: () => ({ phase: 'protocol_incompatible' }),
     broadcast() {
       broadcasts += 1;
       return true;
@@ -984,6 +985,7 @@ test('participant does not broadcast when the canonical admin channel is unavail
 
   assert.equal(result.ok, false);
   assert.match(result.message, /direct channel to the canonical admin/);
+  assert.equal(result.phase, 'protocol_incompatible');
   assert.equal(broadcasts, 0);
 });
 

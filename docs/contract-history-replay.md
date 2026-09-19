@@ -17,7 +17,7 @@ must contain the same envelope. The signed canonical read view must contain eith
 
 A dispatch field or RPC caller cannot provide this capability. Unaccepted, altered,
 optimistic, forged, reused and cross-batch evidence cannot enable compatibility.
-Only v23 and v24 are eligible. Fresh operations continue through current admission;
+Only v23, v24 and v25 are eligible. Fresh operations continue through current admission;
 the existing evidence-bound prepared checkpoint path remains separate.
 
 Accepted historical calls execute serially with retained source implementations:
@@ -26,12 +26,13 @@ Accepted historical calls execute serially with retained source implementations:
 |---|---|---|
 | 23 | v0.2.191 (identical in v0.2.183–v0.2.191) | `365330d5a94be2c8a3afdbeb2766e052c1ab3324f39880d7940d0a9a91b9a0bc` |
 | 24 | v0.2.193 (identical in v0.2.192–v0.2.193) | `695c8010aa8f61fcedeb277f4251f0c6bd670bdb1c2a133b2da175900f45dd08` |
+| 25 | v0.2.242 | `31d570bd8ab6e89b469e67f1d035f1cb943ff99ded8ed7824b490841ed733a4a` |
 
 These sources use no mutable protocol business helpers. Their only protocol access
 is wallet signature verification and immutable subnet/MSB network identity for
 admin signing contexts. The wallet implementation is unchanged across these source
 releases. Each retained contract supplies its own version, signing domains, schemas
-and economic methods. The current release identity includes both retained files and
+and economic methods. The current release identity includes all retained files and
 the replay admission/consensus transport sources.
 
 Regression fixtures use real Autobase/Corestore history, close and reopen persisted

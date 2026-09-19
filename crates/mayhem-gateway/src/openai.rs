@@ -56,11 +56,11 @@ use crate::{
         DEFAULT_IMAGE_FLOOR_IMAGES_PER_S, DEFAULT_LLM_GENERATION_FLOOR_TOK_S,
         DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
     },
-    verify_execution_mode_binding, verify_tier1_attestation, AttestationPolicyVerificationContext,
-    AttestationVerificationRequest, EnclaveContractRecord, HardwareQuoteVerifierCommand,
-    HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf, HeartbeatQueue, HeartbeatSlots,
-    ProviderHeartbeat, ProviderKey, ProviderProbation, ReputationEventKind, VerifiedAttestation,
-    GATEWAY_ATTESTATION_VERIFIER_VERSION,
+    structured_schema, verify_execution_mode_binding, verify_tier1_attestation,
+    AttestationPolicyVerificationContext, AttestationVerificationRequest, EnclaveContractRecord,
+    HardwareQuoteVerifierCommand, HeartbeatAttestation, HeartbeatCaps, HeartbeatPerf,
+    HeartbeatQueue, HeartbeatSlots, ProviderHeartbeat, ProviderKey, ProviderProbation,
+    ReputationEventKind, VerifiedAttestation, GATEWAY_ATTESTATION_VERIFIER_VERSION,
 };
 use axum::{
     body::{Body, Bytes},
@@ -91,14 +91,12 @@ use mayhem_attestation::{
 use mayhem_bridge::{
     sc_bridge_session_transport, BridgeError, PeerRpcClient, ScBridgeClient, ScBridgeConfig,
 };
-#[cfg(test)]
-use mayhem_proto::{record_usage_receipt_envelope, record_usage_receipt_feature_key};
 use mayhem_proto::{
     artifact_generation_inline_audio_load, ctx_bracket_for_tokens_in_schedule,
     default_ctx_bracket_schedule, default_model_class, metered_output_units,
     parse_record_usage_receipt_envelope, payload_chunk_at, payload_chunk_manifest,
-    receipt_signing_bytes, record_usage_receipt_feature_key_for_contract,
-    record_usage_receipt_signing_bytes, RECOVERABLE_RECEIPT_CONTRACT_VERSION, receipt_contract_version_is_supported,
+    receipt_contract_version_is_supported, receipt_signing_bytes,
+    record_usage_receipt_feature_key_for_contract, record_usage_receipt_signing_bytes,
     session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
     stable_json_bytes, tools_only_model_input_prompt_units, validate_transcription_result,
     validated_audio_metadata, validated_wav_audio_metadata, vllm_execution_mode_binding,
@@ -108,21 +106,26 @@ use mayhem_proto::{
     HardwareQuoteKind, HardwareQuoteRouteAdvertisement, HardwareQuoteRoutePolicyBinding,
     ModelSpecialityDescriptor, MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest,
     ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody,
-    TpmActivateCredentialChallengeFrame, TpmActivateCredentialHello,
-    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
-    ValidatedAudioFormat, VisibleToolCall, WorkflowBinding, WorkflowOutputBinding, ATTESTATION_ALG,
-    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    TokenizeRequestFrame, TokenizeResponseFrame, TpmActivateCredentialChallengeFrame,
+    TpmActivateCredentialHello, TpmActivateCredentialResponseFrame, TranscriptionResult,
+    TranscriptionResultLimits, ValidatedAudioFormat, VisibleToolCall, WorkflowBinding,
+    WorkflowOutputBinding, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
+    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
-    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
-    TRANSPORT_MAX_OUTPUT_DURATION_SECONDS, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
-    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
-    USAGE_STEP, USAGE_VIDEO_SECOND,
+    SESSION_RECEIPT_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION, TOKENIZE_REQUEST_CHUNK_FRAME_TYPE,
+    TOKENIZE_REQUEST_FRAME_TYPE, TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
+    TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
+    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
 };
 #[cfg(test)]
-use mayhem_proto::{chunk_json_payload, visible_output_units};
+use mayhem_proto::{
+    chunk_json_payload, visible_output_units, RECOVERABLE_RECEIPT_CONTRACT_VERSION,
+};
+#[cfg(test)]
+use mayhem_proto::{record_usage_receipt_envelope, record_usage_receipt_feature_key};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest as _, Sha256};
@@ -133,9 +136,9 @@ type SharedState = Arc<GatewayState>;
 
 #[cfg(test)]
 mod durable_streaming_tests;
-mod response_stream;
-mod incremental_output;
 mod failure_recovery;
+mod incremental_output;
+mod response_stream;
 
 mod github_update;
 use github_update::{
@@ -215,6 +218,7 @@ const MAX_ASYNC_ARTIFACT_ROUTE_WAIT_MS: u64 = 60 * 60 * 1000;
 const ROUTE_WAIT_POLL_MS: u64 = 1_000;
 const SESSION_OPEN_REPLAY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS: u64 = 1_024;
+const EMBEDDING_SPECIAL_TOKEN_ALLOWANCE_PER_INPUT: u64 = 16;
 const DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN: usize = 256;
 const DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN: usize =
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN as usize;
@@ -249,6 +253,8 @@ const CONTEXT_NEEDLE_MIN_CTX: u32 = 32_768;
 const CONTEXT_NEEDLE_MAX_TOKENS: u32 = 16;
 const CONTEXT_NEEDLE_FILLER_WORDS_PER_LINE: usize = 32;
 const DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS: u64 = 1_000;
+const DEFAULT_THROUGHPUT_FLOOR_MIN_OUTPUT_TOKENS: u64 = 6;
+const DEFAULT_THROUGHPUT_FLOOR_FAST_SAMPLE_MIN_OUTPUT_TOKENS: u64 = 32;
 const DEFAULT_EPOCH_SECONDS: u64 = 3_600;
 const DEFAULT_RESERVATION_MAX_LIFETIME_EPOCHS: u64 = 24;
 const DEFAULT_RESERVATION_RECEIPT_GRACE_EPOCHS: u64 = 6;
@@ -994,7 +1000,11 @@ pub struct GatewayRouteCandidate {
     pub price_ref_au: Option<PriceRefAu>,
     #[serde(default, with = "mayhem_proto::decimal_u128")]
     pub min_ask_au: MoneyAu,
+    /// Effective routing/accountability tier. Verified provider identity raises
+    /// this to T4 without changing the enclave's execution attestation tier.
     pub att_tier: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enclave_att_tier: Option<u8>,
     #[serde(default = "default_quant_bucket")]
     pub quant: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1023,6 +1033,10 @@ pub struct GatewayRouteCandidate {
     pub caps: Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_run: Option<GatewayLocalRunBadge>,
+}
+
+fn route_enclave_attestation_tier(candidate: &GatewayRouteCandidate) -> u8 {
+    candidate.enclave_att_tier.unwrap_or(candidate.att_tier)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -1214,6 +1228,26 @@ impl GatewayFailoverInvocation {
 
     fn stall_timeout(self) -> Option<Duration> {
         self.stall_timeout_ms.map(Duration::from_millis)
+    }
+
+    fn with_admission_attempt_budget(mut self, budget: Option<Duration>) -> Self {
+        let Some(budget) = budget else {
+            return self;
+        };
+        // Admission has three independently blocking phases: peer connect,
+        // session open, and the signed provider accept. Divide the route's
+        // attempt budget across them so one silent route cannot consume the
+        // time reserved for another provider.
+        let phase_millis = u64::try_from(budget.as_millis() / 3)
+            .unwrap_or(u64::MAX)
+            .max(1);
+        self.open_timeout_ms = self.open_timeout_ms.min(phase_millis);
+        self.session_accept_timeout_ms = Some(
+            self.session_accept_timeout_ms
+                .unwrap_or(phase_millis)
+                .min(phase_millis),
+        );
+        self
     }
 }
 
@@ -1902,6 +1936,7 @@ pub struct GatewayCanaryModelConfig {
     pub prompts: Vec<GatewayCanaryPrompt>,
     pub fingerprints_by_artifact_root: BTreeMap<String, String>,
     pub token_prefixes_by_artifact_root: BTreeMap<String, BTreeMap<String, Vec<i32>>>,
+    pub openai_compatible_artifact_roots: BTreeSet<String>,
     pub perceptual_hashes_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
     pub embedding_vectors_by_artifact_root: BTreeMap<String, BTreeMap<String, Vec<f32>>>,
     pub transcripts_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
@@ -2735,12 +2770,15 @@ fn normalize_chat_client_metadata<'a>(
     request: &'a Value,
 ) -> Result<std::borrow::Cow<'a, Value>, String> {
     if contract.family != mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
-        || (request.get("store").is_none() && request.get("prompt_cache_key").is_none()) {
+        || (request.get("store").is_none() && request.get("prompt_cache_key").is_none())
+    {
         return Ok(std::borrow::Cow::Borrowed(request));
     }
     if let Some(value) = request.get("store") {
         if !value.is_null() && value != &Value::Bool(false) {
-            return Err("store: stored completions are not supported; use false or omit it".to_owned());
+            return Err(
+                "store: stored completions are not supported; use false or omit it".to_owned(),
+            );
         }
     }
     if let Some(value) = request.get("prompt_cache_key") {
@@ -2841,6 +2879,9 @@ pub type GatewayHedgeProbeFuture<'a> =
 pub type GatewayTpmActivationFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ActivatedTpmIdentity, GatewaySessionError>> + Send + 'a>>;
 
+pub type GatewayTokenizeFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<GatewayTokenizeResult, GatewaySessionError>> + Send + 'a>>;
+
 pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
     fn name(&self) -> &str;
     fn bridge_stream_config(&self) -> Option<ScBridgeGatewaySessionConfig> {
@@ -2867,6 +2908,18 @@ pub trait GatewaySessionBackend: Send + Sync + std::fmt::Debug {
         Box::pin(async move {
             Err(GatewaySessionError::new(format!(
                 "{} backend does not support TPM activation",
+                self.name()
+            )))
+        })
+    }
+
+    fn run_tokenize<'a>(
+        &'a self,
+        _invocation: &'a GatewayTokenizeInvocation,
+    ) -> GatewayTokenizeFuture<'a> {
+        Box::pin(async move {
+            Err(GatewaySessionError::new(format!(
+                "{} backend does not support exact tokenization",
                 self.name()
             )))
         })
@@ -2959,6 +3012,13 @@ pub struct GatewaySessionResult {
     pub provider_receipt: Option<ProviderSignedReceipt>,
     pub token_ids: Vec<i32>,
     pub quality: Option<GatewaySessionQuality>,
+}
+
+#[derive(Clone, Debug)]
+pub struct GatewayTokenizeResult {
+    pub count: u64,
+    pub tokens: Option<Vec<i32>>,
+    pub provider: String,
 }
 
 #[derive(Clone, Debug)]
@@ -3103,6 +3163,17 @@ impl GatewayJobHandle {
             .is_active(&self.id)
     }
 
+    fn persisted_status(&self) -> Option<GatewayJobStatus> {
+        match self
+            .store
+            .lock_recover("gateway job vault")
+            .lookup_read_only(&self.id, now_secs())
+        {
+            Some(GatewayJobLookup::Terminal(job)) => Some(job.status),
+            Some(GatewayJobLookup::InProgress { .. }) | None => None,
+        }
+    }
+
     async fn persist_reconciliation_pending(
         &self,
         result: Option<Value>,
@@ -3216,6 +3287,12 @@ impl GatewayJobHandle {
             code: error.public_code.to_owned(),
             category: error.category.to_owned(),
             retryable: error.retryable,
+            phase: error
+                .safe_detail
+                .as_ref()
+                .and_then(|detail| detail.get("reservation_relay_phase"))
+                .and_then(Value::as_str)
+                .map(str::to_owned),
         };
         let message = error.message.clone();
         let persisted = tokio::task::spawn_blocking(move || {
@@ -3420,6 +3497,45 @@ async fn finish_completed_invocation_job(
     Ok(())
 }
 
+async fn await_completed_invocation_reconciliation(
+    invocation: &GatewaySessionInvocation,
+    timeout: Duration,
+) -> bool {
+    let Some(job) = invocation.job.as_ref() else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match job.persisted_status() {
+            Some(GatewayJobStatus::Completed) => return true,
+            Some(GatewayJobStatus::Failed | GatewayJobStatus::Cancelled) => return false,
+            Some(GatewayJobStatus::ReconciliationPending) | None => {}
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn finish_completed_invocation_after_handoff(
+    invocation: &GatewaySessionInvocation,
+    handoff: Result<(), GatewaySessionError>,
+    recovery_wait: Duration,
+) -> Result<(), GatewaySessionError> {
+    if let Err(error) = handoff {
+        // The durable job is the terminal source of truth. A settlement
+        // publisher can report a non-retryable local enqueue error while its
+        // durable recovery worker completes the exact staged receipt. Do not
+        // turn that already-completed inference into a provider failure merely
+        // because the original handoff classified its local error differently.
+        if !await_completed_invocation_reconciliation(invocation, recovery_wait).await {
+            return Err(error);
+        }
+    }
+    finish_completed_invocation_job(invocation).await
+}
+
 async fn stage_cancelled_invocation_job(
     invocation: &GatewaySessionInvocation,
     provider_receipt: &ProviderSignedReceipt,
@@ -3539,7 +3655,7 @@ async fn reconcile_and_persist_completed_invocation_job(
     stage_completed_invocation_job(invocation, result, artifacts, provider_receipt, receipt_ack)
         .await?;
     record_direct_session_receipt(invocation, provider_receipt, receipt_ack)?;
-    send_receipt_ack_and_queue_settlement(
+    let handoff = send_receipt_ack_and_queue_settlement(
         bridge,
         direct_peer,
         invocation,
@@ -3548,8 +3664,13 @@ async fn reconcile_and_persist_completed_invocation_job(
         None,
         ack_context,
     )
-    .await?;
-    finish_completed_invocation_job(invocation).await
+    .await;
+    let recovery_wait = invocation
+        .failover
+        .open_timeout()
+        .saturating_mul(2)
+        .clamp(Duration::from_secs(6), Duration::from_secs(30));
+    finish_completed_invocation_after_handoff(invocation, handoff, recovery_wait).await
 }
 
 type GatewayReceiptAckRecoveryFuture<'a> =
@@ -3796,15 +3917,23 @@ async fn reconcile_pending_gateway_job_once(
     if job.status != GatewayJobStatus::ReconciliationPending {
         return Ok(());
     }
-    if job.receipt.as_ref().is_some_and(|raw| (raw.get("body").is_none() && raw.get("reservation").is_some()) || raw.get("canonical_settlement").is_some()) {
+    if job.receipt.as_ref().is_some_and(|raw| {
+        (raw.get("body").is_none() && raw.get("reservation").is_some())
+            || raw.get("canonical_settlement").is_some()
+    }) {
         return failure_recovery::reconcile(state, &job).await;
     }
     let mut recovery = parse_gateway_job_receipt_recovery(&job)?;
     if !recovery.body.final_receipt {
-        if let (Some(feature), Some(publisher)) = (
-            recovery.reconciliation.settlement_feature.as_ref(), state.receipt_settlement_publisher.as_ref().as_ref(),
-        ) {
-            publisher.queue(feature).map_err(GatewaySessionError::new)?;
+        if let Some(feature) = recovery
+            .reconciliation
+            .settlement_feature
+            .as_ref()
+            .filter(|feature| receipt_settlement_contract_version_is_supported(feature))
+        {
+            if let Some(publisher) = state.receipt_settlement_publisher.as_ref().as_ref() {
+                publisher.queue(feature).map_err(GatewaySessionError::new)?;
+            }
         }
         return failure_recovery::reconcile(state, &job).await;
     }
@@ -3813,7 +3942,9 @@ async fn reconcile_pending_gateway_job_once(
         None => match transport.deliver(&recovery).await {
             Ok(feature) => feature,
             Err(error) => {
-                if failure_recovery::reconcile(state, &job).await.is_ok() { return Ok(()); }
+                if failure_recovery::reconcile(state, &job).await.is_ok() {
+                    return Ok(());
+                }
                 return Err(error);
             }
         },
@@ -3824,9 +3955,7 @@ async fn reconcile_pending_gateway_job_once(
         &feature,
     )?;
     recovery = persist_gateway_job_recovery_feature(state, id, recovery, feature.clone()).await?;
-    if feature.pointer("/value/contract_version").and_then(Value::as_u64)
-        .is_some_and(receipt_contract_version_is_supported)
-    {
+    if receipt_settlement_contract_version_is_supported(&feature) {
         let publisher = state
             .receipt_settlement_publisher
             .as_ref()
@@ -3840,10 +3969,19 @@ async fn reconcile_pending_gateway_job_once(
     } else {
         // Historical signed bytes must never be rewritten or resubmitted under
         // the new revision. Retire local recovery only with exact ledger proof.
-        let rpc = state.canary_probe_contract_rpc.as_ref().as_ref().ok_or_else(|| {
-            GatewaySessionError::retryable("historical receipt recovery requires canonical ledger access")
-        })?;
-        let key = format!("receipt/head/{}/{}", recovery.body.billing_id, recovery.body.billing_attempt);
+        let rpc = state
+            .canary_probe_contract_rpc
+            .as_ref()
+            .as_ref()
+            .ok_or_else(|| {
+                GatewaySessionError::retryable(
+                    "historical receipt recovery requires canonical ledger access",
+                )
+            })?;
+        let key = format!(
+            "receipt/head/{}/{}",
+            recovery.body.billing_id, recovery.body.billing_attempt
+        );
         let record = rpc.state(Some(&key), Some(true)).await.map_err(|err| {
             GatewaySessionError::retryable(format!("historical receipt confirmation failed: {err}"))
         })?;
@@ -3875,7 +4013,10 @@ fn confirmed_receipt_recovery_matches(record: &Value, key: &str, feature: &Value
     record.get("confirmed").and_then(Value::as_bool) == Some(true)
         && record.get("key").and_then(Value::as_str) == Some(key)
         && record.pointer("/value/type").and_then(Value::as_str) == Some("canonical_receipt_head")
-        && record.pointer("/value/settlement_ready").and_then(Value::as_bool) == Some(true)
+        && record
+            .pointer("/value/settlement_ready")
+            .and_then(Value::as_bool)
+            == Some(true)
         && record.pointer("/value/feature_key") == feature.get("key")
         && record.pointer("/value/receipt") == feature.pointer("/value/receipt")
 }
@@ -3920,8 +4061,12 @@ fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), 
         .jobs
         .lock_recover("gateway job vault")
         .pending_reconciliations(now_secs())?;
-    if pending.is_empty() && (state.session_backend.bridge_stream_config().is_none()
-        || state.receipt_settlement_publisher.as_ref().is_none()) { return Ok(()); }
+    if pending.is_empty()
+        && (state.session_backend.bridge_stream_config().is_none()
+            || state.receipt_settlement_publisher.as_ref().is_none())
+    {
+        return Ok(());
+    }
     let config = state
         .session_backend
         .bridge_stream_config()
@@ -3936,7 +4081,10 @@ fn spawn_pending_gateway_job_reconciliation(state: &GatewayState) -> Result<(), 
     }
     for job in &pending {
         if let Err(err) = parse_gateway_job_receipt_recovery(job) {
-            eprintln!("Gateway receipt recovery for {} remains pending: {}", job.id, err.message);
+            eprintln!(
+                "Gateway receipt recovery for {} remains pending: {}",
+                job.id, err.message
+            );
         }
     }
     let transport: Arc<dyn GatewayReceiptAckRecoveryTransport> =
@@ -4127,6 +4275,19 @@ pub struct GatewayTpmActivationInvocation {
     pub hello: TpmActivateCredentialHello,
 }
 
+#[derive(Clone, Debug)]
+pub struct GatewayTokenizeInvocation {
+    pub session_id: String,
+    pub provider_pubkey: String,
+    pub transport_peer: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub model: String,
+    pub served_ctx: u32,
+    pub request: Value,
+    pub return_tokens: bool,
+}
+
 impl GatewayHedgeProbeInvocation {
     fn provider_pubkey_required(&self) -> Result<&str, GatewaySessionError> {
         self.provider_pubkey
@@ -4230,6 +4391,9 @@ pub struct GatewaySessionError {
     pub message: String,
     pub failure_class: GatewaySessionFailureClass,
     pub retryable: bool,
+    /// The provider has not accepted any metered request frames, so retrying
+    /// the same route cannot duplicate inference or spend.
+    pub safe_same_route_retry: bool,
     pub before_first_output: bool,
     pub transport_closed: bool,
     pub wait_elapsed: bool,
@@ -5443,6 +5607,11 @@ impl GatewayState {
         Ok(())
     }
 
+    #[cfg(any(test, feature = "dashboard-workbench"))]
+    fn record_workbench_probe(&self, probe: StoredProbeEvent) {
+        self.probes.lock_recover("probe store").push(probe);
+    }
+
     fn paused_session_count(&self) -> usize {
         self.paused_sessions
             .lock_recover("paused session store")
@@ -5710,6 +5879,8 @@ pub fn openai_router(state: GatewayState) -> Router {
     let state = Arc::new(state);
     let body_routes = Router::new()
         .route("/v1/chat/completions", post(create_chat_completion))
+        .route("/v1/tokenize", post(create_tokenize))
+        .route("/v1/count_tokens", post(create_tokenize))
         .route("/v1/completions", post(create_completion))
         .route("/v1/responses", post(create_response))
         .route("/v1/embeddings", post(create_embedding))
@@ -5850,6 +6021,7 @@ pub async fn serve(bind: SocketAddr, mut state: GatewayState) -> std::io::Result
     let listener = TcpListener::bind(bind).await?;
     spawn_pending_gateway_job_reconciliation(&state)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    failure_recovery::spawn_ledger_reservation_sweep(&state);
     axum::serve(listener, openai_router(state)).await
 }
 
@@ -6547,16 +6719,17 @@ fn gateway_route_attestation_readiness(
     candidate: &GatewayRouteCandidate,
     entries: &[ProviderTableEntry],
 ) -> RouteAttestationPolicyReadiness {
+    let enclave_att_tier = route_enclave_attestation_tier(candidate);
     dashboard_entry_for_route(entries, candidate)
         .map(|entry| entry.contract.attestation_policy.clone())
         .unwrap_or_else(|| {
-            if matches!(candidate.att_tier, 2 | 3) {
+            if matches!(enclave_att_tier, 2 | 3) {
                 RouteAttestationPolicyReadiness::unavailable(
-                    candidate.att_tier,
+                    enclave_att_tier,
                     "route has no local provider-table policy snapshot",
                 )
             } else {
-                RouteAttestationPolicyReadiness::not_required(candidate.att_tier)
+                RouteAttestationPolicyReadiness::not_required(enclave_att_tier)
             }
         })
 }
@@ -6576,8 +6749,8 @@ fn gateway_registered_route_value(
     let readiness = gateway_route_attestation_readiness(candidate, entries);
     object.insert("dispatch_eligible".to_owned(), json!(dispatch_eligible));
     let entry = dashboard_entry_for_route(entries, candidate);
-    let fresh = entry
-        .is_some_and(|entry| entry.has_fresh_heartbeat(state.provider_heartbeat_ttl_millis));
+    let fresh =
+        entry.is_some_and(|entry| entry.has_fresh_heartbeat(state.provider_heartbeat_ttl_millis));
     let presence = if fresh {
         "online"
     } else if entry.is_some() {
@@ -6608,8 +6781,8 @@ fn gateway_registered_route_value(
         "attestation_verification".to_owned(),
         serde_json::to_value(readiness).unwrap_or_else(|_| {
             json!({
-                "attestation_tier": candidate.att_tier,
-                "policy_required": matches!(candidate.att_tier, 2 | 3),
+                "attestation_tier": route_enclave_attestation_tier(candidate),
+                "policy_required": matches!(route_enclave_attestation_tier(candidate), 2 | 3),
                 "locally_ready": false,
                 "runtime_binary_hash_evidence_only": true,
                 "reason": "local attestation readiness could not be encoded",
@@ -6618,10 +6791,7 @@ fn gateway_registered_route_value(
     );
     if fresh {
         if let Some(entry) = entry {
-            gateway_apply_heartbeat_route_caps(
-                &mut value,
-                GatewayLiveRoute { candidate, entry },
-            );
+            gateway_apply_heartbeat_route_caps(&mut value, GatewayLiveRoute { candidate, entry });
         }
     }
     value
@@ -6970,7 +7140,7 @@ fn gateway_route_belongs_to_market(
 ) -> bool {
     if candidate.enclave_id != market.enclave_id
         || !market.room_ids.contains(&candidate.room_id)
-        || candidate.att_tier != market.att_tier
+        || route_enclave_attestation_tier(candidate) != market.att_tier
         || !candidate.quant.eq_ignore_ascii_case(&market.quant)
         || !candidate
             .accepted_rails
@@ -7061,14 +7231,7 @@ fn gateway_model_info_value(
     let live_route_values = live_routes
         .iter()
         .map(|route| {
-            gateway_registered_route_value(
-                state,
-                model,
-                route.candidate,
-                entries,
-                true,
-                now_millis,
-            )
+            gateway_registered_route_value(state, model, route.candidate, entries, true, now_millis)
         })
         .collect::<Vec<_>>();
     let registered_route_values = model
@@ -9637,6 +9800,9 @@ async fn create_chat_completion(
     };
     request.endpoint_family = Some(endpoint_family);
     request.endpoint_request = Some(normalized_request);
+    if let Err(err) = validate_requested_response_schema(request.response_format.as_ref()) {
+        return err.into_response();
+    }
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -9700,6 +9866,169 @@ async fn create_chat_completion(
         Ok(ChatResponse::SseStream(events)) => sse_stream_response(events),
         Err(err) => err.into_response(),
     }
+}
+
+async fn create_tokenize(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(raw_request): Json<Value>,
+) -> Response {
+    match build_tokenize_response(&state, &headers, raw_request).await {
+        Ok(response) => Json(response).into_response(),
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn build_tokenize_response(
+    state: &GatewayState,
+    headers: &HeaderMap,
+    mut raw_request: Value,
+) -> Result<Value, ApiError> {
+    let object = raw_request.as_object_mut().ok_or_else(|| {
+        ApiError::bad_request(
+            "tokenization request must be a JSON object",
+            Some("request"),
+        )
+    })?;
+    let return_tokens = object
+        .remove("return_tokens")
+        .map(|value| {
+            value.as_bool().ok_or_else(|| {
+                ApiError::bad_request("return_tokens must be a boolean", Some("return_tokens"))
+            })
+        })
+        .transpose()?
+        .unwrap_or(false);
+    if let Some(prompt) = object.remove("prompt") {
+        if object.contains_key("messages") {
+            return Err(ApiError::bad_request(
+                "provide either prompt or messages, not both",
+                Some("prompt"),
+            ));
+        }
+        let prompt = prompt
+            .as_str()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                ApiError::bad_request("prompt must be a non-empty string", Some("prompt"))
+            })?;
+        object.insert(
+            "messages".to_owned(),
+            json!([{ "role": "user", "content": prompt }]),
+        );
+    }
+    let model_id = endpoint_request_model(&raw_request)?;
+    let access_token = state.authorize_gateway_request(headers, Some(model_id))?;
+    let endpoint_family = chat_endpoint_family(state, model_id, &raw_request)?;
+    let (mut request, normalized_request) = parse_catalog_endpoint_request::<ChatCompletionRequest>(
+        state,
+        &raw_request,
+        &endpoint_family,
+    )?;
+    request.endpoint_family = Some(endpoint_family);
+    request.endpoint_request = Some(normalized_request);
+    let model = require_model(state, model_id)?;
+    apply_model_sampling_defaults(&model, &mut request)?;
+    apply_model_speciality_defaults(&model, &mut request)?;
+    synchronize_effective_chat_contract_request(&model, &mut request)?;
+    if request.messages.is_empty() {
+        return Err(ApiError::bad_request(
+            "messages must contain at least one item",
+            Some("messages"),
+        ));
+    }
+    validate_chat_modalities(&model, &request, &state.media_limits)?;
+    let mut options = state.request_options_from_headers(headers)?;
+    options.access_token = access_token;
+    state.refresh_provider_table_routes(&model);
+    let routes = order_strict_preferred_routes(
+        state,
+        &model,
+        &options,
+        eligible_route_candidates(
+            &model,
+            options.min_att_tier,
+            options.quant.as_deref(),
+            &state.receipt_config.rail,
+        ),
+    );
+    let route = routes
+        .into_iter()
+        .find(|route| route_has_live_control_transport(state, route));
+    let route = route.ok_or_else(|| {
+        ApiError::service_unavailable(
+            "no live provider can perform exact tokenization for this model",
+            Some("model"),
+        )
+        .with_public_error("token_count_unavailable", "provider_admission", true)
+    })?;
+    let transport_peer = state.transport_peer_for_route(Some(route)).ok_or_else(|| {
+        ApiError::service_unavailable(
+            "the selected tokenizer provider has no live transport",
+            Some("model"),
+        )
+        .with_public_error("token_count_unavailable", "provider_admission", true)
+    })?;
+    let transport_body = direct_session_request_body(&request);
+    let sealed_request = seal_direct_session_request_body(
+        &model,
+        direct_chat_endpoint_family(&request),
+        transport_body.clone(),
+        direct_chat_contract_request(&request, &transport_body),
+    )
+    .map_err(|error| ApiError::bad_request(error.message, Some("request")))?;
+    let mut entropy = [0_u8; 32];
+    getrandom::fill(&mut entropy).map_err(|error| {
+        ApiError::internal_message(format!(
+            "generating tokenization session identity failed: {error}"
+        ))
+    })?;
+    let invocation = GatewayTokenizeInvocation {
+        session_id: hex::encode(entropy),
+        provider_pubkey: route.provider.clone(),
+        transport_peer,
+        enclave_id: route.enclave_id.clone(),
+        room_id: route.room_id.clone(),
+        model: model.id.clone(),
+        served_ctx: state.served_ctx_for_route(&model, Some(route)),
+        request: sealed_request,
+        return_tokens,
+    };
+    let result = state
+        .session_backend
+        .run_tokenize(&invocation)
+        .await
+        .map_err(|error| {
+            if error.message.contains("Exact tokenization is unavailable")
+                || error
+                    .message
+                    .contains("does not support exact tokenization")
+            {
+                ApiError::bad_request(
+                    "exact tokenization is unavailable for this model runtime",
+                    Some("model"),
+                )
+                .with_public_error("token_count_unsupported", "capability", false)
+            } else {
+                ApiError::service_unavailable(
+                    "the tokenizer provider could not complete this request",
+                    Some("model"),
+                )
+                .with_public_error(
+                    "token_count_failed",
+                    "provider_execution",
+                    true,
+                )
+            }
+        })?;
+    Ok(json!({
+        "object": "tokenization",
+        "model": model.id,
+        "count": result.count,
+        "tokens": result.tokens,
+        "max_model_len": state.served_ctx_for_route(&model, Some(route)),
+        "provider": result.provider,
+    }))
 }
 
 fn chat_endpoint_family(
@@ -9848,6 +10177,11 @@ async fn create_response(
         Ok(request) => request,
         Err(err) => return err.into_response(),
     };
+    if let Err(err) = validate_requested_response_schema(
+        request.text.as_ref().and_then(|text| text.get("format")),
+    ) {
+        return err.into_response();
+    }
     let mut options = match state.request_options_from_headers(&headers) {
         Ok(options) => options,
         Err(err) => return err.into_response(),
@@ -13729,6 +14063,7 @@ fn canary_registry_from_catalog_root(
         }
         let mut fingerprints_by_artifact_root = BTreeMap::new();
         let mut token_prefixes_by_artifact_root = BTreeMap::new();
+        let mut openai_compatible_artifact_roots = BTreeSet::new();
         let mut perceptual_hashes_by_artifact_root = BTreeMap::new();
         let mut embedding_vectors_by_artifact_root = BTreeMap::new();
         let mut transcripts_by_artifact_root = BTreeMap::new();
@@ -13739,6 +14074,9 @@ fn canary_registry_from_catalog_root(
         if let Some(artifacts) = model.get("artifacts").and_then(Value::as_object) {
             for (artifact_name, artifact) in artifacts {
                 if let Some(artifact_root) = artifact.get("artifact_root").and_then(Value::as_str) {
+                    if artifact.get("engine").and_then(Value::as_str) == Some("openai-compatible") {
+                        openai_compatible_artifact_roots.insert(artifact_root.to_owned());
+                    }
                     if let Some(calibrations) = speciality_calibrations.get(artifact_name) {
                         speciality_calibrations_by_artifact_root
                             .insert(artifact_root.to_owned(), calibrations.clone());
@@ -13796,6 +14134,7 @@ fn canary_registry_from_catalog_root(
                 prompts,
                 fingerprints_by_artifact_root,
                 token_prefixes_by_artifact_root,
+                openai_compatible_artifact_roots,
                 perceptual_hashes_by_artifact_root,
                 embedding_vectors_by_artifact_root,
                 transcripts_by_artifact_root,
@@ -14266,7 +14605,9 @@ fn contract_snapshot_for_route(
             resolved
                 .map(|resolved| resolved.readiness)
                 .unwrap_or_else(|| {
-                    RouteAttestationPolicyReadiness::not_required(candidate.att_tier)
+                    RouteAttestationPolicyReadiness::not_required(route_enclave_attestation_tier(
+                        candidate,
+                    ))
                 })
         },
     );
@@ -14403,12 +14744,13 @@ fn route_attestation_policy_resolution(
     verifier_command: Option<&HardwareQuoteVerifierCommand>,
     now_millis: u64,
 ) -> Result<Option<GatewayResolvedRouteAttestation>, RouteAttestationPolicyReadiness> {
-    if !matches!(candidate.att_tier, 2 | 3) {
+    let enclave_att_tier = route_enclave_attestation_tier(candidate);
+    if !matches!(enclave_att_tier, 2 | 3) {
         return Ok(None);
     }
 
     let mut status = RouteAttestationPolicyReadiness::unavailable(
-        candidate.att_tier,
+        enclave_att_tier,
         "authenticated attestation authority is not configured",
     );
     let Some(authority) = authority.cloned() else {
@@ -14423,12 +14765,12 @@ fn route_attestation_policy_resolution(
     };
     let advertisement = &live_advertisement.advertisement;
     status.quote_kind = Some(advertisement.kind);
-    if advertisement.kind.attestation_tier() != candidate.att_tier {
+    if advertisement.kind.attestation_tier() != enclave_att_tier {
         status.reason = Some(format!(
             "quote kind {} proves Tier {}, not route Tier {}",
             advertisement.kind.as_str(),
             advertisement.kind.attestation_tier(),
-            candidate.att_tier
+            enclave_att_tier
         ));
         return Err(status);
     }
@@ -14889,6 +15231,10 @@ fn canonical_route_candidate(candidate: &GatewayRouteCandidate) -> bool {
             .all(|root| is_hex_len(root, 64))
         && is_hex_len(&candidate.manifest_hash, 64)
         && is_hex_len(&candidate.binary_hash, 64)
+        && candidate
+            .enclave_att_tier
+            .is_none_or(|tier| (1..=3).contains(&tier))
+        && (candidate.att_tier != 4 || candidate.enclave_att_tier.is_some())
 }
 
 fn canonical_market_info(market: &GatewayMarketInfo) -> bool {
@@ -14916,6 +15262,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: false,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
@@ -14931,6 +15278,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
@@ -14946,6 +15294,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: true,
             transport_closed: false,
             wait_elapsed: false,
@@ -14961,6 +15310,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: true,
             wait_elapsed: false,
@@ -14976,6 +15326,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: true,
@@ -14995,6 +15346,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
@@ -15010,6 +15362,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
@@ -15028,6 +15381,7 @@ impl GatewaySessionError {
             message: message.into(),
             failure_class: GatewaySessionFailureClass::ProviderFault,
             retryable: true,
+            safe_same_route_retry: false,
             before_first_output: false,
             transport_closed: false,
             wait_elapsed: false,
@@ -15061,6 +15415,11 @@ impl GatewaySessionError {
         self
     }
 
+    fn into_safe_same_route_retry(mut self) -> Self {
+        self.safe_same_route_retry = self.retryable;
+        self
+    }
+
     fn into_retryable_before_output(mut self) -> Self {
         self.retryable = true;
         self.before_first_output = true;
@@ -15078,6 +15437,7 @@ fn provider_reported_session_error(
     frame: &Value,
     session_context: &str,
     retryable: bool,
+    execution_evidence_observed: bool,
 ) -> GatewaySessionError {
     let code = frame
         .get("code")
@@ -15088,10 +15448,21 @@ fn provider_reported_session_error(
         .and_then(Value::as_str)
         .unwrap_or("provider returned s.error");
     let message = format!("provider returned {code} on {session_context}: {message}");
+    let execution_evidence_observed = execution_evidence_observed || frame.get("receipt").is_some();
     match code {
-        "context_length_exceeded" | "request_invalid" | "request_chunk_failed" | "request_reassembly_failed" => {
-            GatewaySessionError::buyer_local(message)
+        // Some provider workers report an atomic admission race as a lowercase
+        // s.error instead of the uppercase s.reject code. It is a clean
+        // pre-spend refusal only while the collector has seen no evidence that
+        // execution began. Once output or a receipt exists, fail closed so a
+        // retry cannot duplicate inference or spend.
+        "capacity" if !execution_evidence_observed => {
+            GatewaySessionError::clean_refusal_with_code(message, Some("CAPACITY"))
         }
+        "capacity" => GatewaySessionError::new(message),
+        "context_length_exceeded"
+        | "request_invalid"
+        | "request_chunk_failed"
+        | "request_reassembly_failed" => GatewaySessionError::buyer_local(message),
         "model_output_invalid" => GatewaySessionError::request_scoped(message),
         _ if retryable => GatewaySessionError::retryable(message),
         _ => GatewaySessionError::new(message),
@@ -15581,6 +15952,29 @@ fn sc_bridge_session_transport_valid(opened: &Value) -> bool {
     sc_bridge_session_transport(opened).is_ok()
 }
 
+async fn open_direct_session_with_timeout(
+    bridge: &mut ScBridgeClient,
+    provider: &str,
+    direct_peer: &str,
+    session_id: &str,
+    timeout: Duration,
+) -> Result<Value, GatewaySessionError> {
+    tokio::time::timeout(timeout, bridge.session_open(direct_peer, session_id))
+        .await
+        .map_err(|_| {
+            GatewaySessionError::retryable(format!(
+                "opening direct session {session_id} to provider {provider} transport peer {direct_peer} timed out"
+            ))
+            .into_safe_same_route_retry()
+        })?
+        .map_err(|err| {
+            GatewaySessionError::retryable(format!(
+                "opening direct session {session_id} to provider {provider} transport peer {direct_peer} failed: {err}"
+            ))
+            .into_safe_same_route_retry()
+        })
+}
+
 impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
     fn name(&self) -> &str {
         "sc-bridge-direct-session"
@@ -15604,6 +15998,13 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
         invocation: &'a GatewayTpmActivationInvocation,
     ) -> GatewayTpmActivationFuture<'a> {
         Box::pin(async move { self.activate_tpm_over_bridge(invocation).await })
+    }
+
+    fn run_tokenize<'a>(
+        &'a self,
+        invocation: &'a GatewayTokenizeInvocation,
+    ) -> GatewayTokenizeFuture<'a> {
+        Box::pin(async move { self.run_tokenize_over_bridge(invocation).await })
     }
 
     fn run_chat<'a>(
@@ -15677,6 +16078,173 @@ impl GatewaySessionBackend for ScBridgeGatewaySessionBackend {
 }
 
 impl ScBridgeGatewaySessionBackend {
+    async fn run_tokenize_over_bridge(
+        &self,
+        invocation: &GatewayTokenizeInvocation,
+    ) -> Result<GatewayTokenizeResult, GatewaySessionError> {
+        let mut bridge = ScBridgeClient::connect(self.config.bridge_config()?).await?;
+        bridge
+            .session_subscribe([invocation.session_id.as_str()])
+            .await?;
+        bridge
+            .peer_connect(&invocation.transport_peer, self.config.open_timeout)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "connecting provider {} for tokenization failed: {err}",
+                    invocation.provider_pubkey
+                ))
+            })?;
+        let opened = bridge
+            .session_open(&invocation.transport_peer, &invocation.session_id)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "opening tokenization session {} to provider {} failed: {err}",
+                    invocation.session_id, invocation.provider_pubkey
+                ))
+            })?;
+        if !sc_bridge_session_transport_valid(&opened) {
+            return Err(GatewaySessionError::retryable(
+                "tokenization session did not open an authenticated direct-or-relayed channel",
+            ));
+        }
+        send_tokenize_request_frames(&mut bridge, invocation).await?;
+        let response_deadline = Instant::now() + Duration::from_secs(30);
+        let max_token_payload_bytes = usize::try_from(invocation.served_ctx)
+            .unwrap_or(usize::MAX / 16)
+            .saturating_mul(16)
+            .max(DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES);
+        let max_token_payload_chunks = max_token_payload_bytes
+            .div_ceil(1024)
+            .max(DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS);
+        let mut token_chunks =
+            PayloadChunkCollector::new(max_token_payload_bytes, max_token_payload_chunks);
+        let mut saw_token_chunk = false;
+        let mut response = loop {
+            let remaining = response_deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(GatewaySessionError::retryable(format!(
+                    "waiting for tokenization response from provider {} timed out",
+                    invocation.provider_pubkey
+                )));
+            }
+            let event = bridge
+                .next_session_frame_for(&invocation.session_id, Some(remaining))
+                .await
+                .map_err(|err| {
+                    GatewaySessionError::retryable(format!(
+                        "waiting for tokenization response from provider {} failed: {err}",
+                        invocation.provider_pubkey
+                    ))
+                })?;
+            let remote = event
+                .get("remote")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let frame = event
+                .get("frame")
+                .cloned()
+                .ok_or_else(|| GatewaySessionError::new("tokenization event has no frame"))?;
+            let frame_type = frame.get("t").and_then(Value::as_str).unwrap_or_default();
+            let binding_matches = remote == invocation.transport_peer
+                && frame.get("v").and_then(Value::as_u64)
+                    == Some(u64::from(TOKENIZE_FRAME_VERSION))
+                && frame.get("session_id").and_then(Value::as_str)
+                    == Some(invocation.session_id.as_str())
+                && frame.get("provider").and_then(Value::as_str)
+                    == Some(invocation.provider_pubkey.as_str())
+                && frame.get("enclave_id").and_then(Value::as_str)
+                    == Some(invocation.enclave_id.as_str())
+                && frame.get("room_id").and_then(Value::as_str)
+                    == Some(invocation.room_id.as_str())
+                && frame.get("model").and_then(Value::as_str) == Some(invocation.model.as_str());
+            if !binding_matches {
+                return Err(GatewaySessionError::new(
+                    "tokenization response does not match the authenticated route",
+                ));
+            }
+            if frame_type == TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE {
+                let chunk: PayloadChunk =
+                    serde_json::from_value(frame.get("chunk").cloned().ok_or_else(|| {
+                        GatewaySessionError::new("tokenization response chunk has no payload")
+                    })?)
+                    .map_err(|err| {
+                        GatewaySessionError::new(format!(
+                            "invalid tokenization response chunk: {err}"
+                        ))
+                    })?;
+                token_chunks.push(chunk).map_err(|err| {
+                    GatewaySessionError::new(format!(
+                        "collecting tokenization response chunk failed: {err}"
+                    ))
+                })?;
+                saw_token_chunk = true;
+                continue;
+            }
+            if frame_type != TOKENIZE_RESPONSE_FRAME_TYPE {
+                return Err(GatewaySessionError::new(
+                    "provider returned an unsupported tokenization response frame",
+                ));
+            }
+            break serde_json::from_value::<TokenizeResponseFrame>(frame).map_err(|err| {
+                GatewaySessionError::new(format!("invalid tokenization response: {err}"))
+            })?;
+        };
+        let _ = bridge
+            .session_close(&invocation.transport_peer, &invocation.session_id)
+            .await;
+        if let Some(manifest) = response.tokens_ref.take() {
+            if response.tokens.is_some() {
+                return Err(GatewaySessionError::new(
+                    "tokenization response contains both tokens and tokens_ref",
+                ));
+            }
+            let tokens_value = token_chunks.finish_json(&manifest).map_err(|err| {
+                GatewaySessionError::new(format!(
+                    "reassembling tokenization response tokens failed: {err}"
+                ))
+            })?;
+            response.tokens = Some(serde_json::from_value(tokens_value).map_err(|err| {
+                GatewaySessionError::new(format!(
+                    "tokenization response token payload is invalid: {err}"
+                ))
+            })?);
+        } else if saw_token_chunk {
+            return Err(GatewaySessionError::new(
+                "tokenization response chunks were not bound by a final manifest",
+            ));
+        }
+        if !response.ok {
+            let code = response
+                .error_code
+                .as_deref()
+                .unwrap_or("token_count_failed");
+            let message = response.error.unwrap_or_else(|| {
+                "The provider tokenizer could not complete this request.".to_owned()
+            });
+            return Err(GatewaySessionError::new(format!("{code}: {message}")));
+        }
+        let count = response
+            .count
+            .ok_or_else(|| GatewaySessionError::new("tokenization response is missing count"))?;
+        if invocation.return_tokens
+            && response
+                .tokens
+                .as_ref()
+                .is_none_or(|tokens| u64::try_from(tokens.len()).ok() != Some(count))
+        {
+            return Err(GatewaySessionError::new(
+                "tokenization response token list does not match count",
+            ));
+        }
+        Ok(GatewayTokenizeResult {
+            count,
+            tokens: response.tokens,
+            provider: response.provider,
+        })
+    }
+
     async fn activate_tpm_over_bridge(
         &self,
         invocation: &GatewayTpmActivationInvocation,
@@ -15813,21 +16381,22 @@ impl ScBridgeGatewaySessionBackend {
                     "hedge peer connect to provider {} via transport peer {} for session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "hedge session open {} to provider {} via transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "hedge session {} did not open an authenticated direct-or-relayed transport",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
         let _ = close_direct_session_channel(
             &mut bridge,
@@ -15862,21 +16431,22 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -15988,7 +16558,9 @@ impl ScBridgeGatewaySessionBackend {
             Err(err) => {
                 if err.failure_class.is_request_scoped()
                     || invocation.job.as_ref().is_some_and(|job| !job.is_active())
-                { return Err(err); }
+                {
+                    return Err(err);
+                }
                 if let Some(partial) = err.partial.as_ref() {
                     let receipt_ack = direct_session_partial_receipt_ack(
                         request, invocation, partial, provider, model,
@@ -16074,21 +16646,22 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for embedding session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct embedding session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "embedding session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -16165,7 +16738,8 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             &inputs,
             &accept_info.enclave_pubkey,
-            invocation, model,
+            invocation,
+            model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16240,21 +16814,22 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for image session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct image session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "image session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -16331,7 +16906,8 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
-            invocation, model,
+            invocation,
+            model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16406,21 +16982,22 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for audio speech session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct audio speech session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "audio speech session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -16487,7 +17064,8 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
-            invocation, model,
+            invocation,
+            model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16562,21 +17140,22 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for audio transcription session {} failed: {err}",
                     provider, direct_peer, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct audio transcription session {} to provider {} transport peer {} failed: {err}",
-                    invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "audio transcription session {} did not open an authenticated direct-or-relayed channel",
                 invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -16643,7 +17222,8 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
-            invocation, model,
+            invocation,
+            model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16718,21 +17298,22 @@ impl ScBridgeGatewaySessionBackend {
                     "connecting provider {} transport peer {} for {} generation session {} failed: {err}",
                     provider, direct_peer, request.output_modality, invocation.session_id
                 ))
+                .into_safe_same_route_retry()
             })?;
-        let opened = bridge
-            .session_open(direct_peer, &invocation.session_id)
-            .await
-            .map_err(|err| {
-                GatewaySessionError::retryable(format!(
-                    "opening direct {} generation session {} to provider {} transport peer {} failed: {err}",
-                    request.output_modality, invocation.session_id, provider, direct_peer
-                ))
-            })?;
+        let opened = open_direct_session_with_timeout(
+            &mut bridge,
+            provider,
+            direct_peer,
+            &invocation.session_id,
+            invocation.failover.open_timeout(),
+        )
+        .await?;
         if !sc_bridge_session_transport_valid(&opened) {
             return Err(GatewaySessionError::retryable(format!(
                 "{} generation session {} did not open an authenticated direct-or-relayed channel",
                 request.output_modality, invocation.session_id
-            )));
+            ))
+            .into_safe_same_route_retry());
         }
 
         let now = now_millis_u64();
@@ -16799,7 +17380,8 @@ impl ScBridgeGatewaySessionBackend {
             invocation.failover,
             request,
             &accept_info.enclave_pubkey,
-            invocation, model,
+            invocation,
+            model,
             invocation.client_cancellation.as_ref(),
         )
         .await
@@ -16853,6 +17435,125 @@ impl ScBridgeGatewaySessionBackend {
             quality: collected.quality,
         })
     }
+}
+
+async fn send_tokenize_request_frames(
+    bridge: &mut ScBridgeClient,
+    invocation: &GatewayTokenizeInvocation,
+) -> Result<(), GatewaySessionError> {
+    let max_frame_bytes = direct_session_max_frame_bytes();
+    let request_bytes = stable_json_bytes(&invocation.request).map_err(|err| {
+        GatewaySessionError::new(format!("serializing tokenization payload failed: {err}"))
+    })?;
+    let max_request_bytes = direct_session_request_byte_limit_for_len(
+        invocation.served_ctx,
+        request_bytes.len(),
+        configured_optional_positive_usize("MAYHEM_GATEWAY_SESSION_MAX_REQUEST_BYTES"),
+    );
+    for frame in tokenize_request_frames(invocation, max_frame_bytes, max_request_bytes)? {
+        bridge
+            .session_send(&invocation.transport_peer, &invocation.session_id, frame)
+            .await
+            .map_err(|err| {
+                GatewaySessionError::retryable(format!(
+                    "sending tokenization request to provider {} failed: {err}",
+                    invocation.provider_pubkey
+                ))
+            })?;
+    }
+    Ok(())
+}
+
+fn tokenize_request_frames(
+    invocation: &GatewayTokenizeInvocation,
+    max_frame_bytes: usize,
+    max_request_bytes: usize,
+) -> Result<Vec<Value>, GatewaySessionError> {
+    let inline = TokenizeRequestFrame {
+        frame_type: TOKENIZE_REQUEST_FRAME_TYPE.to_owned(),
+        version: TOKENIZE_FRAME_VERSION,
+        session_id: invocation.session_id.clone(),
+        provider: invocation.provider_pubkey.clone(),
+        enclave_id: invocation.enclave_id.clone(),
+        room_id: invocation.room_id.clone(),
+        model: invocation.model.clone(),
+        request_id: String::new(),
+        request: Some(invocation.request.clone()),
+        request_ref: None,
+        return_tokens: invocation.return_tokens,
+    };
+    let inline_value = serde_json::to_value(&inline).map_err(|err| {
+        GatewaySessionError::new(format!("serializing tokenization request failed: {err}"))
+    })?;
+    if session_frame_json_len(&inline_value)? <= max_frame_bytes {
+        return Ok(vec![inline_value]);
+    }
+
+    let bytes = stable_json_bytes(&invocation.request).map_err(|err| {
+        GatewaySessionError::new(format!("serializing tokenization payload failed: {err}"))
+    })?;
+    if bytes.len() > max_request_bytes {
+        return Err(GatewaySessionError::new(format!(
+            "tokenization request body {} bytes exceeds the {max_request_bytes}-byte selected-session budget",
+            bytes.len()
+        )));
+    }
+    let chunk_size = direct_session_payload_chunk_bytes(max_frame_bytes);
+    let manifest = payload_chunk_manifest(&bytes, chunk_size).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "planning tokenization request chunks failed: {err}"
+        ))
+    })?;
+    let request_id = request_id_for_body(&invocation.session_id, &invocation.request);
+    let mut frames = Vec::new();
+    for index in 0..manifest.chunk_count {
+        let chunk = payload_chunk_at(&bytes, chunk_size, index)
+            .map_err(|err| {
+                GatewaySessionError::new(format!(
+                    "building tokenization request chunk failed: {err}"
+                ))
+            })?
+            .ok_or_else(|| {
+                GatewaySessionError::new("planned tokenization request chunk was missing")
+            })?;
+        let frame = json!({
+            "t": TOKENIZE_REQUEST_CHUNK_FRAME_TYPE,
+            "v": TOKENIZE_FRAME_VERSION,
+            "session_id": invocation.session_id,
+            "provider": invocation.provider_pubkey,
+            "enclave_id": invocation.enclave_id,
+            "room_id": invocation.room_id,
+            "model": invocation.model,
+            "rid": request_id,
+            "payload_id": manifest.blake3,
+            "chunk": chunk,
+        });
+        let len = session_frame_json_len(&frame)?;
+        if len > max_frame_bytes {
+            return Err(GatewaySessionError::new(format!(
+                "chunked tokenization request frame {len} bytes exceeds session max {max_frame_bytes} bytes"
+            )));
+        }
+        frames.push(frame);
+    }
+    let final_frame = TokenizeRequestFrame {
+        request_id,
+        request: None,
+        request_ref: Some(manifest),
+        ..inline
+    };
+    let final_frame = serde_json::to_value(final_frame).map_err(|err| {
+        GatewaySessionError::new(format!(
+            "serializing tokenization request manifest failed: {err}"
+        ))
+    })?;
+    if session_frame_json_len(&final_frame)? > max_frame_bytes {
+        return Err(GatewaySessionError::new(
+            "tokenization request manifest exceeds the session frame limit",
+        ));
+    }
+    frames.push(final_frame);
+    Ok(frames)
 }
 
 fn validate_direct_session_accept(
@@ -17138,12 +17839,57 @@ fn route_attempt_error_code(last_error: Option<&str>) -> (&'static str, &'static
     ("provider_attempts_failed", "provider_response", true)
 }
 
+fn route_attempt_error_priority(error: &str) -> u8 {
+    match route_attempt_error_code(Some(error)).0 {
+        "payment_reservation_failed"
+        | "provider_verification_failed"
+        | "request_exceeds_provider_capacity"
+        | "provider_price_floor"
+        | "execution_mode_unavailable" => 3,
+        "provider_admission_no_capacity"
+        | "provider_transport_closed"
+        | "provider_response_timeout" => 2,
+        _ => 1,
+    }
+}
+
+fn retain_most_specific_route_attempt_error(current: &mut Option<String>, candidate: String) {
+    let replace = match current.as_deref() {
+        None => true,
+        Some(existing) => {
+            route_attempt_error_priority(&candidate) >= route_attempt_error_priority(existing)
+        }
+    };
+    if replace {
+        *current = Some(candidate);
+    }
+}
+
+fn reservation_relay_phase(last_error: Option<&str>) -> Option<&'static str> {
+    let message = last_error?;
+    let marker = "[reservation_relay_phase=";
+    let start = message.find(marker)? + marker.len();
+    let phase = message.get(start..)?.split_once(']')?.0;
+    match phase {
+        "transport_unavailable" => Some("transport_unavailable"),
+        "health_proof_unavailable" => Some("health_proof_unavailable"),
+        "protocol_incompatible" => Some("protocol_incompatible"),
+        "transport_changed" => Some("transport_changed"),
+        "transport_rejoin_failed" => Some("transport_rejoin_failed"),
+        "transport_recovering" => Some("transport_recovering"),
+        "request_send" => Some("request_send"),
+        "admin_ack" => Some("admin_ack"),
+        _ => None,
+    }
+}
+
 fn route_attempts_failed_error(
     attempts_made: usize,
     last_error: Option<String>,
     phase: &'static str,
 ) -> ApiError {
     let (code, category, retryable) = route_attempt_error_code(last_error.as_deref());
+    let reservation_relay_phase = reservation_relay_phase(last_error.as_deref());
     let message = match code {
         "request_exceeds_provider_capacity" => {
             "The request exceeds the signed capacity envelope of every otherwise eligible provider."
@@ -17182,12 +17928,15 @@ fn route_attempts_failed_error(
         "provider_verification_failed" => StatusCode::BAD_GATEWAY,
         _ => StatusCode::BAD_GATEWAY,
     };
-    ApiError::new(status, message, Some("model"), code, category, retryable).with_safe_detail(
-        json!({
-            "attempts": attempts_made,
-            "phase": phase,
-        }),
-    )
+    let mut safe_detail = json!({
+        "attempts": attempts_made,
+        "phase": phase,
+    });
+    if let Some(reservation_relay_phase) = reservation_relay_phase {
+        safe_detail["reservation_relay_phase"] = json!(reservation_relay_phase);
+    }
+    ApiError::new(status, message, Some("model"), code, category, retryable)
+        .with_safe_detail(safe_detail)
 }
 
 fn verify_provider_receipt_signature(
@@ -17600,12 +18349,17 @@ fn seal_direct_session_request_body_with_workflow_output(
         "schema_version": 1,
         "endpoint_family": endpoint_family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
+        "endpoint_contract_canonical_fingerprint": mayhem_proto::endpoint_contract_canonical_fingerprint(contract),
         "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(&contract_request),
         "transport_request_fingerprint": transport_request_fingerprint,
     });
-    if matches!(endpoint_family,
-        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
-        | mayhem_proto::ENDPOINT_OPENAI_RESPONSES | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT) {
+    if matches!(
+        endpoint_family,
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+            | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+            | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+            | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+    ) {
         // Opt in without changing model-visible input or signed billing units.
         // Older providers ignore this; new providers emit only to opted-in gateways.
         sealed["mayhem_contract"]["context_usage"] = json!(1);
@@ -17668,8 +18422,16 @@ fn direct_session_image_generation_request_body(request: &ImageGenerationRequest
             .expect("validated image request has an admin-signed response format"),
         "endpoint_family": image_generation_endpoint_family(request),
     });
-    set_optional_json(&mut body, "input_reference", request.input_reference.as_ref().map(|value| json!(value)));
-    set_optional_json(&mut body, "strength", request.strength.map(|value| json!(value)));
+    set_optional_json(
+        &mut body,
+        "input_reference",
+        request.input_reference.as_ref().map(|value| json!(value)),
+    );
+    set_optional_json(
+        &mut body,
+        "strength",
+        request.strength.map(|value| json!(value)),
+    );
     set_optional_json(
         &mut body,
         "background",
@@ -18286,13 +19048,18 @@ fn generated_tokens_per_second(
     first_delta_at_millis: u64,
     completed_at_millis: u64,
 ) -> Option<f64> {
-    let token_intervals = output_tokens.checked_sub(1)?;
-    if token_intervals == 0 {
+    if output_tokens < DEFAULT_THROUGHPUT_FLOOR_MIN_OUTPUT_TOKENS {
         return None;
     }
+    let token_intervals = output_tokens.checked_sub(1)?;
     let elapsed_millis = completed_at_millis
         .saturating_sub(first_delta_at_millis)
         .max(1);
+    if elapsed_millis < DEFAULT_THROUGHPUT_FLOOR_SAMPLE_MILLIS
+        && output_tokens < DEFAULT_THROUGHPUT_FLOOR_FAST_SAMPLE_MIN_OUTPUT_TOKENS
+    {
+        return None;
+    }
     let tok_s = token_intervals as f64 * 1000.0 / elapsed_millis as f64;
     tok_s.is_finite().then_some(tok_s)
 }
@@ -18952,13 +19719,24 @@ async fn collect_direct_session_output(
                     &frame,
                     &format!("session {session_id}"),
                     false,
+                    delta_sequence.next_index > 0
+                        || latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
                 );
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
                     latest_checkpoint_receipt.as_ref(),
                     blake3_hex(chat_prompt_text(request).as_bytes()),
-                ).await?;
-                if frame.get("receipt").is_some() { return Err(error); }
+                )
+                .await?;
+                if frame.get("receipt").is_some() {
+                    return Err(error);
+                }
                 if error.failure_class.is_request_scoped() {
                     return Err(error);
                 }
@@ -19236,13 +20014,20 @@ async fn collect_direct_session_embedding_output(
             }
             Some("s.error") => {
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
+                    None,
                     blake3_hex(embedding_prompt_text(inputs).as_bytes()),
-                ).await?;
+                )
+                .await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("embedding session {session_id}"),
                     true,
+                    delta_sequence.next_index > 0 || provider_receipt.is_some(),
                 ));
             }
             Some("s.close") => {
@@ -19271,13 +20056,16 @@ async fn collect_direct_session_embedding_output(
             inputs.len()
         )));
     }
-    let observed_usage = embedding_usage_for_inputs(inputs);
-    if let Some(reported_usage) = usage.as_ref() {
-        ensure_reported_token_usage_matches(reported_usage, &observed_usage, "embedding session")?;
-    }
+    let provider_receipt = provider_receipt.ok_or_else(|| {
+        GatewaySessionError::new(format!(
+            "provider embedding session {session_id} ended without a final receipt"
+        ))
+    })?;
+    let signed_usage =
+        verified_embedding_session_usage(inputs, usage.as_ref(), &provider_receipt.body.usage)?;
     let output = EmbeddingOutput {
         embeddings,
-        usage: observed_usage,
+        usage: signed_usage,
     };
     let quality = provider_quality.or_else(|| {
         watchdog
@@ -19291,11 +20079,6 @@ async fn collect_direct_session_embedding_output(
                 ),
             })
     });
-    let provider_receipt = provider_receipt.ok_or_else(|| {
-        GatewaySessionError::new(format!(
-            "provider embedding session {session_id} ended without a final receipt"
-        ))
-    })?;
     Ok(DirectEmbeddingSessionCollected {
         output,
         provider_receipt,
@@ -19375,13 +20158,20 @@ async fn collect_direct_session_image_generation_output(
             }
             Some("s.error") => {
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
+                    None,
                     image_generation_prompt_hash(request),
-                ).await?;
+                )
+                .await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("image session {session_id}"),
                     true,
+                    delta_sequence.next_index > 0 || provider_receipt.is_some(),
                 ));
             }
             Some("s.close") => {
@@ -19516,13 +20306,20 @@ async fn collect_direct_session_audio_speech_output(
             }
             Some("s.error") => {
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
+                    None,
                     audio_speech_prompt_hash(request),
-                ).await?;
+                )
+                .await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("audio speech session {session_id}"),
                     true,
+                    delta_sequence.next_index > 0 || provider_receipt.is_some(),
                 ));
             }
             Some("s.close") => {
@@ -19648,9 +20445,15 @@ async fn collect_direct_session_artifact_generation_output(
             }
             Some("s.error") => {
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
+                    None,
                     artifact_generation_prompt_hash(request),
-                ).await?;
+                )
+                .await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!(
@@ -19658,6 +20461,7 @@ async fn collect_direct_session_artifact_generation_output(
                         request.output_modality
                     ),
                     true,
+                    delta_sequence.next_index > 0 || provider_receipt.is_some(),
                 ));
             }
             Some("s.close") => {
@@ -19837,13 +20641,20 @@ async fn collect_direct_session_audio_transcription_output(
             }
             Some("s.error") => {
                 settle_failed_direct_session_frame(
-                    bridge, invocation, model, enclave_pubkey, &frame, None,
+                    bridge,
+                    invocation,
+                    model,
+                    enclave_pubkey,
+                    &frame,
+                    None,
                     audio_transcription_prompt_hash(request),
-                ).await?;
+                )
+                .await?;
                 return Err(provider_reported_session_error(
                     &frame,
                     &format!("audio transcription session {session_id}"),
                     true,
+                    delta_sequence.next_index > 0 || provider_receipt.is_some(),
                 ));
             }
             Some("s.close") => {
@@ -20832,14 +21643,19 @@ fn validate_receipt_settlement_feature_for_receipt(
     receipt_ack: &ReceiptAck,
     feature: &Value,
 ) -> Result<(), GatewaySessionError> {
-    if feature.pointer("/value/contract_version").and_then(Value::as_u64)
-        != Some(u64::from(CONTRACT_VERSION))
-    {
+    if !receipt_settlement_contract_version_is_supported(feature) {
         return Err(GatewaySessionError::new(
             "receipt settlement feature has the wrong operation or contract version",
         ));
     }
     validate_stored_receipt_settlement_feature(provider_receipt, receipt_ack, feature)
+}
+
+fn receipt_settlement_contract_version_is_supported(feature: &Value) -> bool {
+    feature
+        .pointer("/value/contract_version")
+        .and_then(Value::as_u64)
+        .is_some_and(receipt_contract_version_is_supported)
 }
 
 fn validate_stored_receipt_settlement_feature(
@@ -20861,7 +21677,9 @@ fn validate_stored_receipt_settlement_feature(
         .filter(|value| value.is_object())
         .ok_or_else(|| GatewaySessionError::new("receipt settlement feature is missing value"))?;
     if value.get("op").and_then(Value::as_str) != Some("record_usage_receipt")
-        || !value.get("contract_version").and_then(Value::as_u64)
+        || !value
+            .get("contract_version")
+            .and_then(Value::as_u64)
             .is_some_and(|version| version > 0 && version <= u64::from(CONTRACT_VERSION))
     {
         return Err(GatewaySessionError::new(
@@ -20894,7 +21712,9 @@ fn validate_stored_receipt_settlement_feature(
     }
     // A durable receipt's original version participates in its signed feature
     // key. Historical evidence is never silently re-keyed to this release.
-    let contract_version = value["contract_version"].as_u64().expect("validated contract version") as u32;
+    let contract_version = value["contract_version"]
+        .as_u64()
+        .expect("validated contract version") as u32;
     if key != record_usage_receipt_feature_key_for_contract(&expected_receipt, contract_version) {
         return Err(GatewaySessionError::new(
             "receipt settlement feature key is not canonical",
@@ -21003,14 +21823,25 @@ fn failed_direct_session_receipt_ack(
     prompt_hash: String,
 ) -> Result<ReceiptAck, GatewaySessionError> {
     if !invocation.receipt_cosign_enabled {
-        return Err(GatewaySessionError::new("failed session receipt co-signing is disabled"));
+        return Err(GatewaySessionError::new(
+            "failed session receipt co-signing is disabled",
+        ));
     }
-    let (usage, attribution, seq) = checkpoint.map(|checkpoint| (
-        checkpoint.body.usage.clone(), checkpoint.body.usage_attribution.clone(),
-        checkpoint.body.seq.saturating_add(1),
-    )).unwrap_or_else(|| (
-        invocation.spend_voucher.body.billing_prior_usage.clone(), BTreeMap::new(), 1,
-    ));
+    let (usage, attribution, seq) = checkpoint
+        .map(|checkpoint| {
+            (
+                checkpoint.body.usage.clone(),
+                checkpoint.body.usage_attribution.clone(),
+                checkpoint.body.seq.saturating_add(1),
+            )
+        })
+        .unwrap_or_else(|| {
+            (
+                invocation.spend_voucher.body.billing_prior_usage.clone(),
+                BTreeMap::new(),
+                1,
+            )
+        });
     let amount = calculate_locked_au_owed(invocation, &usage);
     if amount <= invocation.spend_voucher.body.billing_prior_au_owed_cum
         || receipt.body.usage_attribution != attribution
@@ -21020,12 +21851,22 @@ fn failed_direct_session_receipt_ack(
         ));
     }
     ensure_final_receipt_within_voucher(invocation, amount)?;
-    validate_provider_receipt(model, invocation, receipt, ExpectedProviderReceipt {
-        provider: invocation.provider_pubkey_required()?, seq, final_receipt: true,
-        au_owed_cum: amount, usage, prompt_hash,
-    })?;
-    receipt_ack_for_body(&invocation.receipt_user_seed, &receipt.body)
-        .map_err(|error| GatewaySessionError::new(format!("signing failed session receipt: {error}")))
+    validate_provider_receipt(
+        model,
+        invocation,
+        receipt,
+        ExpectedProviderReceipt {
+            provider: invocation.provider_pubkey_required()?,
+            seq,
+            final_receipt: true,
+            au_owed_cum: amount,
+            usage,
+            prompt_hash,
+        },
+    )?;
+    receipt_ack_for_body(&invocation.receipt_user_seed, &receipt.body).map_err(|error| {
+        GatewaySessionError::new(format!("signing failed session receipt: {error}"))
+    })
 }
 
 async fn settle_failed_direct_session_frame(
@@ -21037,44 +21878,75 @@ async fn settle_failed_direct_session_frame(
     checkpoint: Option<&ProviderSignedReceipt>,
     prompt_hash: String,
 ) -> Result<(), GatewaySessionError> {
-    if frame.get("receipt").is_none() { return Ok(()); }
-    let receipt = provider_signed_receipt_from_frame(
-        frame, &invocation.session_id, enclave_pubkey,
-    )?;
-    let ack = failed_direct_session_receipt_ack(model, invocation, &receipt, checkpoint, prompt_hash)?;
-    let failure = provider_reported_session_error(frame, "failed generation", false);
+    if frame.get("receipt").is_none() {
+        return Ok(());
+    }
+    let receipt =
+        provider_signed_receipt_from_frame(frame, &invocation.session_id, enclave_pubkey)?;
+    let ack =
+        failed_direct_session_receipt_ack(model, invocation, &receipt, checkpoint, prompt_hash)?;
+    let failure = provider_reported_session_error(frame, "failed generation", false, true);
     let public_error = provider_session_api_error(&failure);
     if let Some(job) = invocation.job.as_ref() {
         job.mark_settlement_reconciliation_started();
         let recovery = gateway_job_settled_receipt(
-            invocation, &receipt, &ack, GatewayJobStatus::Failed,
-            Some(public_error.message.clone()), Some("provider_failure".to_owned()),
+            invocation,
+            &receipt,
+            &ack,
+            GatewayJobStatus::Failed,
+            Some(public_error.message.clone()),
+            Some("provider_failure".to_owned()),
         )?;
         let store = job.store.clone();
         let id = job.id.clone();
         let message = public_error.message.clone();
         let info = GatewayJobErrorInfo {
             code: public_error.public_code.to_owned(),
-            category: public_error.category.to_owned(), retryable: false,
+            category: public_error.category.to_owned(),
+            retryable: false,
+            phase: None,
         };
-        tokio::task::spawn_blocking(move || store.lock_recover("gateway job vault")
-            .complete_with_error_info(&id, GatewayJobStatus::ReconciliationPending,
-                None, Vec::new(), Some(recovery), Some(message), Some(info), now_secs()))
-            .await.map_err(|error| GatewaySessionError::new(error.to_string()))?
-            .map_err(GatewaySessionError::new)?;
+        tokio::task::spawn_blocking(move || {
+            store
+                .lock_recover("gateway job vault")
+                .complete_with_error_info(
+                    &id,
+                    GatewayJobStatus::ReconciliationPending,
+                    None,
+                    Vec::new(),
+                    Some(recovery),
+                    Some(message),
+                    Some(info),
+                    now_secs(),
+                )
+        })
+        .await
+        .map_err(|error| GatewaySessionError::new(error.to_string()))?
+        .map_err(GatewaySessionError::new)?;
     }
     record_direct_session_receipt(invocation, &receipt, &ack)?;
     send_receipt_ack_and_queue_settlement(
-        bridge, invocation.direct_peer()?, invocation, &receipt, &ack,
-        Some("provider_failure"), "acknowledging failed generation accounting",
-    ).await.map_err(|error| {
+        bridge,
+        invocation.direct_peer()?,
+        invocation,
+        &receipt,
+        &ack,
+        Some("provider_failure"),
+        "acknowledging failed generation accounting",
+    )
+    .await
+    .map_err(|error| {
         // Accounting recovery already owns the signed evidence. Keep the
         // generation failure visible instead of encouraging a paid retry.
-        eprintln!("Failed generation accounting handoff remains pending: {}", error.message);
+        eprintln!(
+            "Failed generation accounting handoff remains pending: {}",
+            error.message
+        );
         failure.clone()
     })?;
     if let Some(job) = invocation.job.as_ref() {
-        job.finish_reconciliation(GatewayJobStatus::Failed, Some(public_error.message)).await?;
+        job.finish_reconciliation(GatewayJobStatus::Failed, Some(public_error.message))
+            .await?;
     }
     Ok(())
 }
@@ -21187,7 +22059,9 @@ async fn cancel_and_settle_direct_session(
                 // was not acknowledged by the interrupted collector, so do not
                 // advance settlement to it. The provider cancels at its previous
                 // signed high water after its bounded ACK drain.
-                if !receipt.body.final_receipt { continue; }
+                if !receipt.body.final_receipt {
+                    continue;
+                }
                 let receipt_ack = record_cancelled_direct_session_receipt(
                     model,
                     invocation,
@@ -21294,9 +22168,43 @@ fn authoritative_embedding_usage(
             inputs.len()
         )));
     }
-    let observed = embedding_usage_for_inputs(inputs);
-    ensure_reported_token_usage_matches(&output.usage, &observed, "embedding session")?;
-    Ok(ReceiptUsage::text(observed.prompt_tokens, 0))
+    validate_embedding_usage_bounds(inputs, &output.usage)?;
+    Ok(ReceiptUsage::text(output.usage.prompt_tokens, 0))
+}
+
+fn validate_embedding_usage_bounds(
+    inputs: &[String],
+    reported: &Usage,
+) -> Result<(), GatewaySessionError> {
+    // The gateway cannot reproduce every provider tokenizer. Accept its exact
+    // count within the same conservative envelope used for the signed voucher.
+    let lower_bound = embedding_input_token_count(inputs);
+    let upper_bound = embedding_input_token_upper_bound(inputs);
+    if reported.prompt_tokens == 0
+        || reported.completion_tokens != 0
+        || reported.total_tokens != reported.prompt_tokens
+        || reported.prompt_tokens < lower_bound
+        || reported.prompt_tokens > upper_bound
+    {
+        return Err(GatewaySessionError::new(format!(
+            "embedding session reported invalid token usage: prompt={}, completion={}, total={}, expected positive prompt count in {lower_bound}..={upper_bound} and no completion tokens",
+            reported.prompt_tokens, reported.completion_tokens, reported.total_tokens,
+        )));
+    }
+    Ok(())
+}
+
+fn verified_embedding_session_usage(
+    inputs: &[String],
+    delta_usage: Option<&Usage>,
+    signed_usage: &ReceiptUsage,
+) -> Result<Usage, GatewaySessionError> {
+    let signed_usage = usage_from_receipt_usage(signed_usage);
+    validate_embedding_usage_bounds(inputs, &signed_usage)?;
+    if let Some(delta_usage) = delta_usage {
+        ensure_reported_token_usage_matches(delta_usage, &signed_usage, "embedding session")?;
+    }
+    Ok(signed_usage)
 }
 
 fn expected_embedding_provider_receipt<'a>(
@@ -21632,7 +22540,9 @@ fn validate_provider_receipt(
     validate_usage_attribution(&body.usage, &body.usage_attribution)?;
     if let Some(tokens) = body.usage_attribution.get("context_input_tokens") {
         if *tokens == 0 || *tokens > u64::from(invocation.served_ctx) {
-            return Err(GatewaySessionError::new("provider context input tokens exceed served context"));
+            return Err(GatewaySessionError::new(
+                "provider context input tokens exceed served context",
+            ));
         }
     }
     let checks = [
@@ -21882,7 +22792,10 @@ fn validate_usage_attribution(
     for axis in attribution.keys() {
         if !matches!(
             axis.as_str(),
-            "reasoning_output_tokens" | "vision_input_tokens" | "audio_input_tokens" | "context_input_tokens"
+            "reasoning_output_tokens"
+                | "vision_input_tokens"
+                | "audio_input_tokens"
+                | "context_input_tokens"
         ) {
             return Err(GatewaySessionError::new(format!(
                 "unsupported provider usage attribution {axis}"
@@ -22078,14 +22991,18 @@ async fn run_embedding_with_route_retry(
                 continue;
             }
         };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_embedding_invocation_for_route(
+        let mut invocation = state.prepare_embedding_invocation_for_route(
             model,
             Some(request),
             inputs,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -22114,18 +23031,30 @@ async fn run_embedding_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
+                recovery.record_retryable_attempt(state, route, &err);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 pending_routes = ordered_route_candidates_for_embedding_with_options(
                     state,
                     model,
@@ -22267,13 +23196,17 @@ async fn run_image_generation_with_route_retry(
                 continue;
             }
         };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_image_generation_invocation_for_route(
+        let mut invocation = state.prepare_image_generation_invocation_for_route(
             model,
             request,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -22306,18 +23239,30 @@ async fn run_image_generation_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
+                recovery.record_retryable_attempt(state, route, &err);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 pending_routes = ordered_route_candidates_for_image_generation_with_options(
                     state,
                     model,
@@ -22454,13 +23399,17 @@ async fn run_audio_speech_with_route_retry(
                 continue;
             }
         };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_audio_speech_invocation_for_route(
+        let mut invocation = state.prepare_audio_speech_invocation_for_route(
             model,
             request,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -22493,18 +23442,30 @@ async fn run_audio_speech_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
+                recovery.record_retryable_attempt(state, route, &err);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 pending_routes = ordered_route_candidates_for_audio_speech_with_options(
                     state,
                     model,
@@ -22645,13 +23606,17 @@ async fn run_audio_transcription_with_route_retry(
                 continue;
             }
         };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_audio_transcription_invocation_for_route(
+        let mut invocation = state.prepare_audio_transcription_invocation_for_route(
             model,
             request,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -22684,18 +23649,30 @@ async fn run_audio_transcription_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
+                recovery.record_retryable_attempt(state, route, &err);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 pending_routes = ordered_route_candidates_for_audio_transcription_with_options(
                     state,
                     model,
@@ -22877,13 +23854,17 @@ async fn run_artifact_generation_with_route_retry(
                     continue;
                 }
             };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_artifact_generation_invocation_for_route(
+        let mut invocation = state.prepare_artifact_generation_invocation_for_route(
             model,
             &attempt_request,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let attempt_started = Instant::now();
         match state
             .session_backend
@@ -22915,18 +23896,30 @@ async fn run_artifact_generation_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
+                recovery.record_retryable_attempt(state, route, &err);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 pending_routes = ordered_route_candidates_for_artifact_generation_with_options(
                     state,
                     model,
@@ -23218,25 +24211,23 @@ fn chat_context_capacity_error(
     request: &ChatCompletionRequest,
     options: &GatewayRequestOptions,
 ) -> Option<ApiError> {
-    if let Some(error) = preferred_provider_refusal_error(state, model, options) {
-        return Some(error);
-    }
     let required_ctx = effective_context_floor(
         options.min_ctx,
         chat_context_input_tokens(request),
         chat_output_headroom_tokens(request),
     );
-    let now_millis = now_millis_u64();
     state.refresh_provider_table_routes(model);
-    let candidates = eligible_route_candidates(
+    let candidates = order_strict_preferred_routes(
+        state,
         model,
-        options.min_att_tier,
-        options.quant.as_deref(),
-        &state.receipt_config.rail,
-    )
-    .into_iter()
-    .filter(|candidate| !state.route_provider_in_cooloff(candidate, now_millis))
-    .collect::<Vec<_>>();
+        options,
+        eligible_route_candidates(
+            model,
+            options.min_att_tier,
+            options.quant.as_deref(),
+            &state.receipt_config.rail,
+        ),
+    );
     (!candidates.is_empty()
         && candidates
             .iter()
@@ -23304,15 +24295,18 @@ async fn wait_for_pending_receipt_settlement(
     deadline: RouteWaitDeadline,
 ) -> bool {
     if deadline.remaining().is_zero()
-        || !publisher.is_some_and(|publisher| {
-            publisher.has_pending_final_receipts(user, rail) == Ok(true)
-        })
+        || !publisher
+            .is_some_and(|publisher| publisher.has_pending_final_receipts(user, rail) == Ok(true))
     {
         return false;
     }
     tokio::time::sleep(Duration::from_secs(1).min(deadline.remaining())).await;
     !deadline.remaining().is_zero()
 }
+
+// One replay covers a cold or flapping admission path while keeping a silent
+// sole route from multiplying the configured transport timeout indefinitely.
+const MAX_PRE_SPEND_SAME_ROUTE_RETRIES: u8 = 1;
 
 #[derive(Debug)]
 struct RouteAdmissionRecovery {
@@ -23322,6 +24316,7 @@ struct RouteAdmissionRecovery {
     attempted_providers: BTreeSet<String>,
     exhausted_route_keys: BTreeSet<ProviderKey>,
     capacity_refusal_generations: BTreeMap<ProviderKey, CapacityRefusalGeneration>,
+    safe_same_route_retry_counts: BTreeMap<ProviderKey, u8>,
     dev_route_attempted: bool,
     attempts_made: usize,
 }
@@ -23341,6 +24336,7 @@ impl RouteAdmissionRecovery {
             attempted_providers: BTreeSet::new(),
             exhausted_route_keys: BTreeSet::new(),
             capacity_refusal_generations: BTreeMap::new(),
+            safe_same_route_retry_counts: BTreeMap::new(),
             dev_route_attempted: false,
             attempts_made: 0,
         }
@@ -23456,6 +24452,22 @@ impl RouteAdmissionRecovery {
         self.attempts_made < self.total_attempt_limit
     }
 
+    fn admission_attempt_budget(&self, candidate_count: usize) -> Option<Duration> {
+        // With no alternate route to protect, keep the configured transport
+        // timeout. A route-discovery wait budget is not a safe substitute for
+        // the time needed to establish a cold direct session.
+        if candidate_count <= 1 {
+            return None;
+        }
+        let total = match self.deadline.remaining() {
+            remaining if remaining.is_zero() => Duration::from_millis(DEFAULT_ROUTE_MAX_WAIT_MS),
+            remaining => remaining,
+        };
+        let remaining_attempts = self.total_attempt_limit.saturating_sub(self.attempts_made);
+        let shares = candidate_count.max(1).min(remaining_attempts.max(1));
+        Some(total / u32::try_from(shares).unwrap_or(u32::MAX).max(1))
+    }
+
     fn begin_attempt(&mut self, route: Option<&GatewayRouteCandidate>) {
         self.attempts_made = self.attempts_made.saturating_add(1);
         let Some(route) = route else {
@@ -23502,6 +24514,31 @@ impl RouteAdmissionRecovery {
             self.capacity_refusal_generations.remove(&key);
             self.exhausted_route_keys.insert(key);
         }
+    }
+
+    fn record_retryable_attempt(
+        &mut self,
+        state: &GatewayState,
+        route: Option<&GatewayRouteCandidate>,
+        error: &GatewaySessionError,
+    ) {
+        if capacity_refusal(error) {
+            self.record_capacity_refusal(state, route);
+            return;
+        }
+        if error.safe_same_route_retry {
+            if let Some(route) = route {
+                let retries = self
+                    .safe_same_route_retry_counts
+                    .entry(route_key(route))
+                    .or_default();
+                if *retries < MAX_PRE_SPEND_SAME_ROUTE_RETRIES {
+                    *retries += 1;
+                    return;
+                }
+            }
+        }
+        self.exhaust(route);
     }
 
     fn record_modality_admission_error(
@@ -24034,6 +25071,10 @@ fn synchronize_effective_chat_contract_request(
             "max_completion_tokens",
             request.max_completion_tokens.map(|value| json!(value)),
         ),
+        (
+            "max_output_tokens",
+            request.max_tokens.map(|value| json!(value)),
+        ),
     ];
     for (name, value) in values {
         if contract.request_attribute_specs.contains_key(name)
@@ -24233,8 +25274,10 @@ async fn build_chat_completion(
 ) -> Result<ChatResponse, ApiError> {
     let model = require_model(&state, &request.model)?;
     let mut request = request;
+    validate_requested_response_schema(request.response_format.as_ref())?;
     apply_model_sampling_defaults(&model, &mut request)?;
     apply_model_speciality_defaults(&model, &mut request)?;
+    fit_chat_output_budget_to_context(&state, &model, &mut request, &options);
     synchronize_effective_chat_contract_request(&model, &mut request)?;
     if request.messages.is_empty() {
         return Err(ApiError::bad_request(
@@ -24411,6 +25454,11 @@ async fn prepare_live_direct_chat_session(
     );
     let eligible_route_refs =
         ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
+    if eligible_route_refs.is_empty() {
+        if let Some(error) = chat_context_capacity_error(&state, &model, &request, &options) {
+            return Err(error);
+        }
+    }
     let RouteWaitOutcome {
         routes: mut eligible_route_refs,
         waited,
@@ -24424,13 +25472,11 @@ async fn prepare_live_direct_chat_session(
         || ordered_route_candidates_for_request_with_options(&state, &model, &request, &options),
     )
     .await;
-    if eligible_route_refs.is_empty() {
-        if let Some(error) = preferred_provider_refusal_error(&state, &model, &options) {
-            return Err(error);
-        }
-    }
     if !model.mayhem.route_candidates.is_empty() && eligible_route_refs.is_empty() {
         if let Some(error) = chat_context_capacity_error(&state, &model, &request, &options) {
+            return Err(error);
+        }
+        if let Some(error) = preferred_provider_refusal_error(&state, &model, &options) {
             return Err(error);
         }
         if waited {
@@ -24520,13 +25566,17 @@ async fn prepare_live_direct_chat_session(
                     continue;
                 }
             };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route.as_ref());
-        let invocation = state.prepare_chat_invocation_for_route(
+        let mut invocation = state.prepare_chat_invocation_for_route(
             &model,
             &request,
             route.as_ref(),
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
         match open_live_direct_chat_session(&config, &model, &request, &invocation).await {
@@ -24565,35 +25615,33 @@ async fn prepare_live_direct_chat_session(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(&state, route.as_ref(), attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
-                    if wait_for_pending_receipt_settlement(
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
                         state.receipt_settlement_publisher.as_ref().as_ref(),
                         &invocation.user_pubkey,
                         &invocation.rail,
                         deadline,
                     )
                     .await
-                    {
-                        // A clean refusal performed no inference and reserved no
-                        // canonical funds. Pending final receipts can release
-                        // the previous request's hold within the route deadline.
-                        recovery.total_attempt_limit =
-                            recovery.total_attempt_limit.saturating_add(1);
-                        billing = billing.after_attempt(None);
-                        attempt_options.billing = Some(billing.clone());
-                        continue;
-                    }
+                {
+                    // No inference or canonical spend occurred. A pending final
+                    // receipt can release the previous request's hold within
+                    // this request's route deadline.
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
-                let is_capacity = capacity_refusal(&err);
-                last_retryable_error = Some(err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(&state, route.as_ref());
-                } else {
-                    recovery.exhaust(route.as_ref());
-                }
+                recovery.record_retryable_attempt(&state, route.as_ref(), &err);
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 pending_routes = ordered_route_candidates_for_request_with_options(
                     &state,
                     &model,
@@ -24651,16 +25699,16 @@ async fn open_live_direct_chat_session(
                 "connecting provider {} transport peer {} for session {} failed: {err}",
                 provider, direct_peer, invocation.session_id
             ))
+            .into_safe_same_route_retry()
         })?;
-    let opened = bridge
-        .session_open(direct_peer, &invocation.session_id)
-        .await
-        .map_err(|err| {
-            GatewaySessionError::retryable(format!(
-                "opening direct session {} to provider {} transport peer {} failed: {err}",
-                invocation.session_id, provider, direct_peer
-            ))
-        })?;
+    let opened = open_direct_session_with_timeout(
+        &mut bridge,
+        provider,
+        direct_peer,
+        &invocation.session_id,
+        invocation.failover.open_timeout(),
+    )
+    .await?;
     if !sc_bridge_session_transport_valid(&opened) {
         let _ = bridge
             .session_close(direct_peer, &invocation.session_id)
@@ -24668,7 +25716,8 @@ async fn open_live_direct_chat_session(
         return Err(GatewaySessionError::retryable(format!(
             "session {} did not open an authenticated direct-or-relayed channel",
             invocation.session_id
-        )));
+        ))
+        .into_safe_same_route_retry());
     }
 
     let open_result = async {
@@ -24820,7 +25869,7 @@ async fn send_open_and_validate_session_accept(
         )
         .await;
     }
-    result
+    result.map_err(GatewaySessionError::into_safe_same_route_retry)
 }
 
 async fn send_open_and_await_session_accept(
@@ -25133,14 +26182,28 @@ async fn finish_live_direct_chat_after_client_disconnect(
 ) -> Result<(), GatewaySessionError> {
     // Stop generation but keep the direct channel alive until a final signed
     // receipt closes the voucher. Only acknowledged checkpoints are chargeable.
-    let (usage, seq) = err.partial.as_ref().map(|partial|
-        (partial.provider_receipt.body.usage.clone(), partial.provider_receipt.body.seq.saturating_add(1)))
+    let (usage, seq) = err
+        .partial
+        .as_ref()
+        .map(|partial| {
+            (
+                partial.provider_receipt.body.usage.clone(),
+                partial.provider_receipt.body.seq.saturating_add(1),
+            )
+        })
         .unwrap_or_else(|| (ReceiptUsage::default(), 1));
     cancel_and_settle_direct_session(
-        &mut session.bridge, &session.invocation, &session.transport_peer,
-        &session.provider, &session.model, &session.enclave_pubkey,
-        blake3_hex(chat_prompt_text(&session.request).as_bytes()), usage, seq,
-    ).await
+        &mut session.bridge,
+        &session.invocation,
+        &session.transport_peer,
+        &session.provider,
+        &session.model,
+        &session.enclave_pubkey,
+        blake3_hex(chat_prompt_text(&session.request).as_bytes()),
+        usage,
+        seq,
+    )
+    .await
 }
 
 async fn recover_live_direct_chat_after_retryable(
@@ -25204,6 +26267,12 @@ async fn recover_live_direct_chat_after_retryable(
     } else {
         redispatch_request_with_partials(&session.request, &partials)
     };
+    fit_chat_output_budget_to_context(
+        &session.state,
+        &session.model,
+        &mut retry_request,
+        &session.options,
+    );
     synchronize_effective_chat_contract_request(&session.model, &mut retry_request).map_err(
         |_| GatewaySessionError::new("effective redispatch request failed contract validation"),
     )?;
@@ -25551,16 +26620,43 @@ async fn run_live_direct_chat_sse_inner(
                         ));
                     }
                 }
-                let reasoning_delta = reasoning_stream.push(session_delta_reasoning_evidence(&frame)?);
+                let reasoning_delta =
+                    reasoning_stream.push(session_delta_reasoning_evidence(&frame)?);
                 let tool_deltas = tool_stream.push(&frame, &session.request, max_text_bytes)?;
                 let mut public_delta = json!({});
-                if !reasoning_delta.is_empty() { public_delta["reasoning_content"] = json!(reasoning_delta); }
-                if !tool_deltas.is_empty() { public_delta["tool_calls"] = json!(tool_deltas); }
-                if public_delta.as_object().is_some_and(|delta| !delta.is_empty()) && !send_live_sse_value(session.options.continue_after_stream_disconnect, tx,
-                    chat_chunk(&session.id, session.created, &session.model.id, public_delta, None, None)).await {
-                    return Err(client_disconnect_direct_session_error(&session.request, &content,
-                        &reasoning_evidence, tool_calls.clone(), latest_checkpoint_receipt.as_ref(),
-                        &token_ids, &watchdog, now));
+                if !reasoning_delta.is_empty() {
+                    public_delta["reasoning_content"] = json!(reasoning_delta);
+                }
+                if !tool_deltas.is_empty() {
+                    public_delta["tool_calls"] = json!(tool_deltas);
+                }
+                if public_delta
+                    .as_object()
+                    .is_some_and(|delta| !delta.is_empty())
+                    && !send_live_sse_value(
+                        session.options.continue_after_stream_disconnect,
+                        tx,
+                        chat_chunk(
+                            &session.id,
+                            session.created,
+                            &session.model.id,
+                            public_delta,
+                            None,
+                            None,
+                        ),
+                    )
+                    .await
+                {
+                    return Err(client_disconnect_direct_session_error(
+                        &session.request,
+                        &content,
+                        &reasoning_evidence,
+                        tool_calls.clone(),
+                        latest_checkpoint_receipt.as_ref(),
+                        &token_ids,
+                        &watchdog,
+                        now,
+                    ));
                 }
                 if let Some(receipt) = pending_checkpoint_receipt.take() {
                     if let Some(ack_frame) = maybe_ack_direct_session_checkpoint_receipt(
@@ -25620,13 +26716,35 @@ async fn run_live_direct_chat_sse_inner(
                 }
                 collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
                 if let Some(fin) = frame.get("fin").and_then(Value::as_str) {
-                    if tool_calls.is_empty() { tool_stream.finish(&[])?; }
+                    if tool_calls.is_empty() {
+                        tool_stream.finish(&[])?;
+                    }
                     let tail = reasoning_stream.finish();
-                    if !tail.is_empty() && !send_live_sse_value(session.options.continue_after_stream_disconnect, tx, chat_chunk(&session.id, session.created,
-                        &session.model.id, json!({"reasoning_content":tail}), None, None)).await {
-                        return Err(client_disconnect_direct_session_error(&session.request, &content,
-                            &reasoning_evidence, tool_calls.clone(), latest_checkpoint_receipt.as_ref(),
-                            &token_ids, &watchdog, now));
+                    if !tail.is_empty()
+                        && !send_live_sse_value(
+                            session.options.continue_after_stream_disconnect,
+                            tx,
+                            chat_chunk(
+                                &session.id,
+                                session.created,
+                                &session.model.id,
+                                json!({"reasoning_content":tail}),
+                                None,
+                                None,
+                            ),
+                        )
+                        .await
+                    {
+                        return Err(client_disconnect_direct_session_error(
+                            &session.request,
+                            &content,
+                            &reasoning_evidence,
+                            tool_calls.clone(),
+                            latest_checkpoint_receipt.as_ref(),
+                            &token_ids,
+                            &watchdog,
+                            now,
+                        ));
                     }
                     finish_reason = Some(fin.to_owned());
                     claimed_usage = usage_from_session_delta(&frame);
@@ -25710,13 +26828,24 @@ async fn run_live_direct_chat_sse_inner(
                     &frame,
                     &format!("session {}", session.invocation.session_id),
                     false,
+                    delta_sequence.next_index > 0
+                        || latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
                 );
                 settle_failed_direct_session_frame(
-                    &mut session.bridge, &session.invocation, &session.model,
-                    &session.enclave_pubkey, &frame, latest_checkpoint_receipt.as_ref(),
+                    &mut session.bridge,
+                    &session.invocation,
+                    &session.model,
+                    &session.enclave_pubkey,
+                    &frame,
+                    latest_checkpoint_receipt.as_ref(),
                     blake3_hex(chat_prompt_text(&session.request).as_bytes()),
-                ).await?;
-                if frame.get("receipt").is_some() { return Err(error); }
+                )
+                .await?;
+                if frame.get("receipt").is_some() {
+                    return Err(error);
+                }
                 if error.failure_class.is_request_scoped() {
                     return Err(error);
                 }
@@ -25860,6 +26989,7 @@ async fn run_live_direct_chat_sse_inner(
         finish_reason,
         usage,
     };
+    validate_structured_chat_output(&session.request, &output)?;
     let provider_receipt = final_provider_receipt.ok_or_else(|| {
         GatewaySessionError::new(format!(
             "provider session {} ended without a final receipt",
@@ -26185,6 +27315,11 @@ async fn run_chat_with_route_retry(
     );
     let eligible_routes =
         ordered_route_candidates_for_request_with_options(state, model, request, &options);
+    if eligible_routes.is_empty() {
+        if let Some(error) = chat_context_capacity_error(state, model, request, &options) {
+            return Err(error);
+        }
+    }
     let RouteWaitOutcome {
         routes: mut eligible_routes,
         waited,
@@ -26198,13 +27333,11 @@ async fn run_chat_with_route_retry(
         || ordered_route_candidates_for_request_with_options(state, model, request, &options),
     )
     .await;
-    if eligible_routes.is_empty() {
-        if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
-            return Err(error);
-        }
-    }
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
         if let Some(error) = chat_context_capacity_error(state, model, request, &options) {
+            return Err(error);
+        }
+        if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
             return Err(error);
         }
         if waited {
@@ -26312,13 +27445,17 @@ async fn run_chat_with_route_retry(
                 continue;
             }
         };
+        let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
-        let invocation = state.prepare_chat_invocation_for_route(
+        let mut invocation = state.prepare_chat_invocation_for_route(
             model,
             &attempt_request,
             route,
             &attempt_options,
         )?;
+        invocation.failover = invocation
+            .failover
+            .with_admission_attempt_budget(admission_attempt_budget);
         let invocation = invocation.with_hedge_probe_outcome(&hedge_probe);
         let attempt_started = Instant::now();
         match state
@@ -26354,6 +27491,15 @@ async fn run_chat_with_route_retry(
                         continue;
                     }
                 }
+                let metering_request = attempt_request.clone();
+                let metering_output = result.output.clone();
+                if !partials.is_empty() {
+                    stitch_partials_into_result(&mut result, &partials);
+                }
+                validate_structured_chat_output(request, &result.output).map_err(|error| {
+                    request_scoped_api_error(&error)
+                        .expect("structured output failure is request scoped")
+                })?;
                 record_route_observation(
                     state,
                     route,
@@ -26361,11 +27507,6 @@ async fn run_chat_with_route_retry(
                 );
                 if let Some(route) = route {
                     state.record_chat_affinity(model, request, route);
-                }
-                let metering_request = attempt_request.clone();
-                let metering_output = result.output.clone();
-                if !partials.is_empty() {
-                    stitch_partials_into_result(&mut result, &partials);
                 }
                 return Ok(GatewaySessionRun {
                     result,
@@ -26382,14 +27523,30 @@ async fn run_chat_with_route_retry(
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
-                if let Some(refusal) = terminal_balance_refusal(&err) {
+                let balance_refusal = terminal_balance_refusal(&err);
+                let payment_pending =
+                    route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if (balance_refusal.is_some() || payment_pending)
+                    && wait_for_pending_receipt_settlement(
+                        state.receipt_settlement_publisher.as_ref().as_ref(),
+                        &invocation.user_pubkey,
+                        &invocation.rail,
+                        deadline,
+                    )
+                    .await
+                {
+                    recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
+                    billing = billing.after_attempt(None);
+                    attempt_options.billing = Some(billing.clone());
+                    continue;
+                }
+                if let Some(refusal) = balance_refusal {
                     return Err(refusal);
                 }
                 let billed_receipt = err
                     .partial
                     .as_ref()
                     .map(|partial| partial.provider_receipt.body.clone());
-                let is_capacity = capacity_refusal(&err);
                 if let Some(partial) = err.partial.as_ref() {
                     state.record_partial_provider_receipt(
                         model,
@@ -26398,9 +27555,16 @@ async fn run_chat_with_route_retry(
                         partial,
                     )?;
                 }
+                recovery.record_retryable_attempt(state, route, &err);
                 if let Some(partial) = err.partial {
                     partials.push(*partial);
                     attempt_request = redispatch_request_with_partials(request, &partials);
+                    fit_chat_output_budget_to_context(
+                        state,
+                        model,
+                        &mut attempt_request,
+                        &attempt_options,
+                    );
                     synchronize_effective_chat_contract_request(model, &mut attempt_request)?;
                     attempt_options.min_ctx = Some(exact_conversation_floor_after_partials(
                         &attempt_request,
@@ -26410,12 +27574,7 @@ async fn run_chat_with_route_retry(
                 }
                 billing = billing.after_attempt(billed_receipt.as_ref());
                 attempt_options.billing = Some(billing.clone());
-                last_retryable_error = Some(err.message);
-                if is_capacity {
-                    recovery.record_capacity_refusal(state, route);
-                } else {
-                    recovery.exhaust(route);
-                }
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
                 pending_routes = ordered_route_candidates_for_request_with_options(
                     state,
                     model,
@@ -27521,9 +28680,14 @@ impl GatewayState {
                 .get(&(provider.clone(), modality.clone()))
                 .copied()
                 .unwrap_or_default();
+            // `active_items` is an advisory heartbeat snapshot and may already
+            // include this gateway's live reservations. Adding both counters
+            // double-counts overlapping work, so reserve against the more
+            // conservative observation. The provider remains the atomic
+            // admission authority and can still reject a race with CAPACITY.
             if capacity
                 .active_items
-                .saturating_add(locally_active)
+                .max(locally_active)
                 .saturating_add(load.item_count)
                 > capacity.max_inflight_items
             {
@@ -27802,7 +28966,11 @@ fn request_requirements_for_chat(
             request.endpoint_request.as_ref(),
         )),
         modality_load,
-        min_ctx: effective_context_floor(explicit_min_ctx, chat_context_input_tokens(request), output_tokens),
+        min_ctx: effective_context_floor(
+            explicit_min_ctx,
+            chat_context_input_tokens(request),
+            output_tokens,
+        ),
         input_tokens,
         output_tokens,
         usage,
@@ -27953,13 +29121,101 @@ fn chat_context_input_tokens(request: &ChatCompletionRequest) -> u64 {
     tokens
 }
 
+fn chat_requested_output_tokens(request: &ChatCompletionRequest) -> u32 {
+    request
+        .max_tokens
+        .or(request.max_completion_tokens)
+        .unwrap_or(DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS as u32)
+        .max(1)
+}
+
 fn chat_output_headroom_tokens(request: &ChatCompletionRequest) -> u64 {
-    u64::from(
-        request
-            .max_tokens
-            .unwrap_or(DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS as u32)
-            .max(1),
+    u64::from(chat_requested_output_tokens(request))
+}
+
+fn chat_context_ceiling(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+) -> u32 {
+    state.refresh_provider_table_routes(model);
+    order_strict_preferred_routes(
+        state,
+        model,
+        options,
+        eligible_route_candidates(
+            model,
+            options.min_att_tier,
+            options.quant.as_deref(),
+            &state.receipt_config.rail,
+        ),
     )
+    .into_iter()
+    .filter(|route| route_has_live_control_transport(state, route))
+    .map(|route| state.served_ctx_for_route(model, Some(route)))
+    .max()
+    .unwrap_or_else(|| model_served_ctx(model))
+    .max(1)
+}
+
+fn route_has_live_control_transport(state: &GatewayState, route: &GatewayRouteCandidate) -> bool {
+    let now_millis = now_millis_u64();
+    let key = route_key(route);
+    state
+        .provider_table
+        .lock_recover("provider table")
+        .entries(now_millis)
+        .into_iter()
+        .find(|entry| entry.key == key)
+        .is_some_and(|entry| {
+            matches!(
+                baseline_route_state(&entry, &state.baseline_route_requirements(now_millis)),
+                BaselineRouteState::Live
+                    | BaselineRouteState::Saturated
+                    | BaselineRouteState::AtCapacity
+            ) && entry
+                .heartbeat
+                .as_ref()
+                .and_then(|heartbeat| heartbeat.transport_peer.as_deref())
+                .is_some_and(|peer| is_hex_len(peer, 64))
+        })
+}
+
+/// Treat the client's output limit as an upper bound. A large fixed limit must
+/// not make a growing conversation unroutable while its prompt still fits the
+/// signed context window.
+fn fit_chat_output_budget_to_context(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &mut ChatCompletionRequest,
+    options: &GatewayRequestOptions,
+) {
+    let input_tokens = chat_context_input_tokens(request);
+    let context_ceiling = u64::from(chat_context_ceiling(state, model, options));
+    let Some(remaining) = context_ceiling.checked_sub(input_tokens) else {
+        return;
+    };
+    if remaining == 0 {
+        return;
+    }
+    let requested = u64::from(chat_requested_output_tokens(request));
+    if requested <= remaining {
+        return;
+    }
+    let fitted = u32::try_from(remaining).unwrap_or(u32::MAX).max(1);
+    match (
+        request.max_tokens.is_some(),
+        request.max_completion_tokens.is_some(),
+    ) {
+        (true, true) => {
+            request.max_tokens = Some(request.max_tokens.unwrap_or(fitted).min(fitted));
+            request.max_completion_tokens =
+                Some(request.max_completion_tokens.unwrap_or(fitted).min(fitted));
+        }
+        (true, false) => request.max_tokens = Some(fitted),
+        (false, true) => request.max_completion_tokens = Some(fitted),
+        (false, false) => request.max_tokens = Some(fitted),
+    }
 }
 
 fn exact_conversation_floor_after_partials(
@@ -28057,8 +29313,11 @@ fn request_requirements_for_image_generation(
     let (width, height) = parse_image_generation_size(request)
         .expect("validated image request has admin-signed dimensions");
     let image_count = image_generation_count(request);
-    let reference = request.input_reference.as_deref()
-        .map(mayhem_proto::image_reference_metadata).transpose()
+    let reference = request
+        .input_reference
+        .as_deref()
+        .map(mayhem_proto::image_reference_metadata)
+        .transpose()
         .expect("validated image reference has bounded content");
     RequestRequirements {
         current_rules_ver: state.receipt_config.rules_ver,
@@ -28076,7 +29335,8 @@ fn request_requirements_for_image_generation(
             ModalityRequestLoad {
                 item_count: image_count,
                 max_item_bytes: reference.map_or(1, |image| image.bytes),
-                max_item_units: u64::from(width).saturating_mul(u64::from(height))
+                max_item_units: u64::from(width)
+                    .saturating_mul(u64::from(height))
                     .max(reference.map_or(0, |image| image.pixels)),
             },
         )]),
@@ -28649,6 +29909,10 @@ fn record_route_attempt_error(
     {
         record_capacity_mismatch_if_advertised(state, route);
     }
+    if err.safe_same_route_retry {
+        record_route_observation(state, route, observation_sample_from_error(elapsed));
+        return;
+    }
     if !err.clean_refusal {
         record_route_failure_attempt(state, route, elapsed);
     }
@@ -28850,17 +30114,17 @@ fn redispatch_request_with_partials(
             extra: BTreeMap::new(),
         });
     }
-    if let Some(max_tokens) = request.max_tokens {
-        let delivered = partials
-            .iter()
-            .map(|partial| partial.output.usage.completion_tokens)
-            .sum::<u64>();
-        request.max_tokens = Some(
-            max_tokens
-                .saturating_sub(u32::try_from(delivered).unwrap_or(u32::MAX))
-                .max(1),
-        );
-    }
+    let delivered = partials
+        .iter()
+        .map(|partial| partial.output.usage.completion_tokens)
+        .sum::<u64>();
+    let delivered = u32::try_from(delivered).unwrap_or(u32::MAX);
+    request.max_tokens = request
+        .max_tokens
+        .map(|max_tokens| max_tokens.saturating_sub(delivered).max(1));
+    request.max_completion_tokens = request
+        .max_completion_tokens
+        .map(|max_tokens| max_tokens.saturating_sub(delivered).max(1));
     request
 }
 
@@ -28964,12 +30228,7 @@ fn selector_route_exclusion_reason(
     requirements: &RequestRequirements,
     now_millis: u64,
 ) -> Option<&'static str> {
-    if !route_matches_selector_filters(
-        candidate,
-        min_att_tier,
-        quant,
-        &state.receipt_config.rail,
-    ) {
+    if !route_matches_selector_filters(candidate, min_att_tier, quant, &state.receipt_config.rail) {
         return Some("selector_filter");
     }
     if state.route_provider_in_cooloff(candidate, now_millis) {
@@ -29278,9 +30537,15 @@ fn responses_value_from_chat(response: Value) -> Result<Value, ApiError> {
         .ok_or_else(|| ApiError::bad_gateway("chat provider returned no choices", Some("model")))?;
     let message = choice.get("message").cloned().unwrap_or_else(|| json!({}));
     let mut output = Vec::new();
-    if let Some(text) = message.get("reasoning_content").and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        output.push(json!({"id":make_id("rs"),"type":"reasoning","status":"completed",
-            "summary":[],"content":[{"type":"reasoning_text","text":text}]}));
+    if let Some(text) = message
+        .get("reasoning_content")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        output.push(
+            json!({"id":make_id("rs"),"type":"reasoning","status":"completed",
+            "summary":[],"content":[{"type":"reasoning_text","text":text}]}),
+        );
     }
 
     if let Some(text) = message.get("content").and_then(Value::as_str) {
@@ -31723,8 +32988,13 @@ impl GatewayState {
                 .run_chat(model, &request, &invocation)
                 .await
                 .map_err(|err| provider_session_api_error(&err))?;
-            let token_fingerprint = token_fingerprint(result.token_ids.iter().copied()).digest;
-            observed_tokens.insert(prompt.id.clone(), result.token_ids.clone());
+            let token_ids = catalog_canary_result_units(
+                config,
+                route.as_ref().map(|route| route.artifact_root.as_str()),
+                &result,
+            );
+            let token_fingerprint = token_fingerprint(token_ids.iter().copied()).digest;
+            observed_tokens.insert(prompt.id.clone(), token_ids.clone());
             let receipt = self.meter_chat_session(
                 model,
                 &request,
@@ -31738,8 +33008,8 @@ impl GatewayState {
             prompt_reports.push(json!({
                 "prompt_id": prompt.id,
                 "request": request,
-                "token_count": result.token_ids.len(),
-                "token_ids": result.token_ids,
+                "token_count": token_ids.len(),
+                "token_ids": token_ids,
                 "token_fingerprint": token_fingerprint,
                 "session_id": invocation.session_id,
                 "receipt_hash": receipt_hash,
@@ -32017,8 +33287,12 @@ impl GatewayState {
                             Some("model"),
                         )
                     })?;
-                    let observed_prefix = result
-                        .token_ids
+                    let token_ids = catalog_canary_result_units(
+                        config,
+                        Some(route.artifact_root.as_str()),
+                        &result,
+                    );
+                    let observed_prefix = token_ids
                         .iter()
                         .copied()
                         .take(expected_prefix.len())
@@ -32026,7 +33300,7 @@ impl GatewayState {
                     let observed_prompt_fingerprint =
                         token_fingerprint(observed_prefix.iter().copied()).digest;
                     let full_output_fingerprint =
-                        token_fingerprint(result.token_ids.iter().copied()).digest;
+                        token_fingerprint(token_ids.iter().copied()).digest;
                     observed_prefixes.insert(prompt.id.clone(), observed_prefix);
                     let receipt = self.meter_chat_session(
                         model,
@@ -32052,8 +33326,8 @@ impl GatewayState {
                         "prompt_id": prompt.id,
                         "request": request,
                         "selected_specialities": invocation.spend_voucher.body.required_specialities,
-                        "token_count": result.token_ids.len(),
-                        "token_ids": result.token_ids,
+                        "token_count": token_ids.len(),
+                        "token_ids": token_ids,
                         "stable_prefix_fingerprint": observed_prompt_fingerprint,
                         "full_output_fingerprint": full_output_fingerprint,
                         "session_id": invocation.session_id,
@@ -33111,7 +34385,7 @@ impl GatewayState {
                 format!(
                     "route {} cannot verify Tier {} locally: {}",
                     candidate.provider,
-                    candidate.att_tier,
+                    route_enclave_attestation_tier(candidate),
                     readiness
                         .reason
                         .as_deref()
@@ -33136,7 +34410,7 @@ impl GatewayState {
                 manifest_hash: candidate.manifest_hash.clone(),
                 binary_hash: candidate.binary_hash.clone(),
                 launch_measurements: candidate.launch_measurements.clone(),
-                att_tier: candidate.att_tier,
+                att_tier: route_enclave_attestation_tier(candidate),
                 caps: candidate.caps.clone(),
             },
             policy,
@@ -33224,7 +34498,8 @@ impl GatewayState {
         options: &GatewayRequestOptions,
     ) -> Result<GatewaySessionInvocation, ApiError> {
         let prompt_text = chat_prompt_text(request);
-        let failover = self.failover_thresholds_for_model(model, options, chat_context_input_tokens(request));
+        let failover =
+            self.failover_thresholds_for_model(model, options, chat_context_input_tokens(request));
         let session_id = session_id_for(&model.id, &prompt_text);
         let billing = options
             .billing
@@ -34825,6 +36100,22 @@ fn canary_served_route(
         .cloned()
 }
 
+fn catalog_canary_result_units(
+    config: &GatewayCanaryModelConfig,
+    artifact_root: Option<&str>,
+    result: &GatewaySessionResult,
+) -> Vec<i32> {
+    if artifact_root.is_some_and(|root| config.openai_compatible_artifact_roots.contains(root)) {
+        let reconstructed = mayhem_proto::openai_compatible_canary_output(
+            &result.output.reasoning_content,
+            result.output.content.as_deref().unwrap_or_default(),
+        );
+        mayhem_proto::openai_compatible_canary_units(&reconstructed)
+    } else {
+        result.token_ids.clone()
+    }
+}
+
 fn canary_request_options(invocation: &GatewaySessionInvocation) -> GatewayRequestOptions {
     GatewayRequestOptions {
         execution_mode_expectation: Some(match invocation.expected_execution_mode.as_ref() {
@@ -35959,7 +37250,9 @@ fn chat_response_value(
             "content": output.content.clone().unwrap_or_default(),
         })
     };
-    if !output.reasoning_content.is_empty() { message["reasoning_content"] = json!(output.reasoning_content); }
+    if !output.reasoning_content.is_empty() {
+        message["reasoning_content"] = json!(output.reasoning_content);
+    }
     json!({
         "id": id,
         "object": "chat.completion",
@@ -36009,7 +37302,16 @@ fn chat_stream_chunks(
         None,
     )];
     for part in stream_parts(&output.reasoning_content) {
-        if !part.is_empty() { chunks.push(chat_chunk(id, created, model, json!({"reasoning_content":part}), None, None)); }
+        if !part.is_empty() {
+            chunks.push(chat_chunk(
+                id,
+                created,
+                model,
+                json!({"reasoning_content":part}),
+                None,
+                None,
+            ));
+        }
     }
     if !output.tool_calls.is_empty() {
         chunks.push(chat_chunk(
@@ -37131,6 +38433,62 @@ fn wants_json(value: &Option<Value>) -> bool {
     )
 }
 
+fn validate_requested_response_schema(format: Option<&Value>) -> Result<(), ApiError> {
+    let Some(format) = format else {
+        return Ok(());
+    };
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return Ok(());
+    }
+    let schema = format
+        .get("json_schema")
+        .and_then(|wrapper| wrapper.get("schema"))
+        .or_else(|| format.get("schema"))
+        .ok_or_else(|| {
+            ApiError::bad_request(
+                "response_format.json_schema.schema is required",
+                Some("response_format"),
+            )
+            .with_public_error(
+                "unsupported_response_schema",
+                "request_validation",
+                false,
+            )
+        })?;
+    structured_schema::prepare(schema).map_err(|error| {
+        ApiError::bad_request(
+            format!("Unsupported response JSON schema: {error}"),
+            Some("response_format"),
+        )
+        .with_public_error("unsupported_response_schema", "request_validation", false)
+    })?;
+    Ok(())
+}
+
+fn validate_structured_chat_output(
+    request: &ChatCompletionRequest,
+    output: &ChatOutput,
+) -> Result<(), GatewaySessionError> {
+    if !output.tool_calls.is_empty() {
+        return Ok(());
+    }
+    let Some(format) = request.response_format.as_ref() else {
+        return Ok(());
+    };
+    if format.get("type").and_then(Value::as_str) != Some("json_schema") {
+        return Ok(());
+    }
+    let schema = format
+        .get("json_schema")
+        .and_then(|wrapper| wrapper.get("schema"))
+        .or_else(|| format.get("schema"))
+        .ok_or_else(|| GatewaySessionError::buyer_local("request_invalid: missing JSON schema"))?;
+    let content = output.content.as_deref().unwrap_or_default();
+    structured_schema::validate_output(schema, content).map_err(|error| {
+        GatewaySessionError::request_scoped(format!("model_output_invalid: {error}"))
+    })
+}
+
 fn last_tool_result(messages: &[ChatMessage]) -> Option<String> {
     messages
         .iter()
@@ -37261,11 +38619,20 @@ fn validate_image_generation_request(
         mayhem_proto::image_reference_metadata(reference)
             .map_err(|message| ApiError::bad_request(message, Some("input_reference")))?;
         if request.strength.is_none() {
-            return Err(ApiError::bad_request("input_reference requires strength", Some("strength")));
+            return Err(ApiError::bad_request(
+                "input_reference requires strength",
+                Some("strength"),
+            ));
         }
     }
-    if request.strength.is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value)) {
-        return Err(ApiError::bad_request("strength must be between 0 and 1", Some("strength")));
+    if request
+        .strength
+        .is_some_and(|value| !value.is_finite() || !(0.0..=1.0).contains(&value))
+    {
+        return Err(ApiError::bad_request(
+            "strength must be between 0 and 1",
+            Some("strength"),
+        ));
     }
     if request.prompt.trim().is_empty() {
         return Err(ApiError::bad_request(
@@ -37942,8 +39309,20 @@ fn estimate_max_spend_au(
     .max(1_000)
 }
 
+fn embedding_input_token_upper_bound(inputs: &[String]) -> u64 {
+    // UTF-8 bytes bound byte-fallback tokens; the allowance covers model-added
+    // special tokens. Share this bound between voucher and receipt validation.
+    inputs.iter().fold(0_u64, |total, input| {
+        total.saturating_add(
+            u64::try_from(input.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(EMBEDDING_SPECIAL_TOKEN_ALLOWANCE_PER_INPUT),
+        )
+    })
+}
+
 fn estimate_embedding_max_spend_au(price: &PriceRefAu, inputs: &[String]) -> MoneyAu {
-    let usage = ReceiptUsage::text(embedding_input_token_count(inputs), 0);
+    let usage = ReceiptUsage::text(embedding_input_token_upper_bound(inputs), 0);
     calculate_au_owed(price, &usage).max(1_000)
 }
 
@@ -38212,6 +39591,129 @@ mod tests {
         AttestationSigner, CTX_BRACKET_TABLE_VERSION,
     };
 
+    #[test]
+    fn schema_preflight_is_request_scoped_for_chat_and_responses() {
+        let valid = json!({"type":"json_schema","json_schema":{"schema":{
+            "type":"object","properties":{"items":{"type":"array","uniqueItems":true,
+                "items":{"type":"string"}}}
+        }}});
+        validate_requested_response_schema(Some(&valid)).unwrap();
+        let responses_format =
+            json!({"type":"json_schema","schema":valid["json_schema"]["schema"]});
+        validate_requested_response_schema(Some(&responses_format)).unwrap();
+
+        let unsupported = json!({"type":"json_schema","json_schema":{"schema":{
+            "type":"array","unknownConstraint":true
+        }}});
+        let error = validate_requested_response_schema(Some(&unsupported)).unwrap_err();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(public_error_code(&error), "unsupported_response_schema");
+        assert!(!public_error_retryable(&error));
+    }
+
+    #[test]
+    fn buyer_checks_original_schema_before_accepting_model_output() {
+        let mut request = test_chat_request("test-model");
+        request.response_format = Some(json!({"type":"json_schema","json_schema":{"schema":{
+            "type":"object","required":["evidenceIds"],"properties":{
+                "evidenceIds":{"type":"array","uniqueItems":true,"minItems":2,
+                    "items":{"type":"string"}}
+            }
+        }}}));
+        let mut output = ChatOutput {
+            reasoning_content: String::new(),
+            content: Some(r#"{"evidenceIds":["E1","E1"]}"#.to_owned()),
+            tool_calls: Vec::new(),
+            artifacts: Vec::new(),
+            finish_reason: "stop".to_owned(),
+            usage: Usage {
+                prompt_tokens: 1,
+                completion_tokens: 1,
+                total_tokens: 2,
+            },
+        };
+        let error = validate_structured_chat_output(&request, &output).unwrap_err();
+        let api_error = request_scoped_api_error(&error).expect("request-scoped output error");
+        assert_eq!(api_error.status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            public_error_code(&api_error),
+            "provider_model_output_invalid"
+        );
+        output.content = Some(r#"{"evidenceIds":["E1","E2"]}"#.to_owned());
+        validate_structured_chat_output(&request, &output).unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_schema_returns_400_without_starting_a_gateway_job() {
+        use tower::ServiceExt;
+
+        let mut model = GatewayState::fixture()
+            .models_snapshot()
+            .first()
+            .cloned()
+            .unwrap();
+        model.mayhem.adapter.endpoint_families.push(
+            mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+            )
+            .unwrap(),
+        );
+        let model_id = model.id.clone();
+        let state = GatewayState::from_models(vec![model]).with_dev_session_shim();
+        let app = openai_router(state);
+        for stream in [false, true] {
+            let schema = json!({"type":"array","unknownConstraint":true});
+            let cases = [
+                (
+                    "/v1/chat/completions",
+                    json!({
+                        "model":model_id,
+                        "messages":[{"role":"user","content":"Return JSON"}],
+                        "stream":stream,
+                        "response_format":{"type":"json_schema","json_schema":{"name":"bad","schema":schema}}
+                    }),
+                ),
+                (
+                    "/v1/responses",
+                    json!({
+                        "model":model_id,
+                        "input":"Return JSON",
+                        "stream":stream,
+                        "text":{"format":{"type":"json_schema","name":"bad","schema":schema}}
+                    }),
+                ),
+            ];
+            for (path, body) in cases {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        axum::http::Request::builder()
+                            .method("POST")
+                            .uri(path)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(Body::from(body.to_string()))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "{path} stream={stream}"
+                );
+                assert!(response.headers().get("x-mayhem-job-id").is_none());
+                let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+                    .await
+                    .unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                assert_eq!(
+                    body["error"]["code"], "unsupported_response_schema",
+                    "{path} stream={stream}: {body}"
+                );
+            }
+        }
+    }
+
     fn public_error_code(error: &ApiError) -> String {
         error
             .public_error_value()
@@ -38362,8 +39864,7 @@ mod tests {
         let error = route_attempts_failed_error(
             1,
             Some(
-                "provider rejected session abc123 with BALANCE: spend reservation did not complete"
-                    .to_owned(),
+                "provider rejected session abc123 [reservation_relay_phase=admin_ack] with BALANCE: spend reservation did not complete".to_owned(),
             ),
             "pre_spend",
         );
@@ -38376,6 +39877,10 @@ mod tests {
         assert!(!message.contains("provider rejected"));
         assert_eq!(value["error"]["safe_detail"]["attempts"], 1);
         assert_eq!(value["error"]["safe_detail"]["phase"], "pre_spend");
+        assert_eq!(
+            value["error"]["safe_detail"]["reservation_relay_phase"],
+            "admin_ack"
+        );
     }
 
     #[test]
@@ -39349,17 +40854,25 @@ mod tests {
     fn opencode_cache_hints_preserve_inference_contract_and_reject_storage() {
         let contract = mayhem_proto::endpoint_family_contract_template(
             mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
-        ).unwrap();
+        )
+        .unwrap();
         let raw = json!({"model":"test/model", "messages":[{"role":"user","content":"hello"}]});
         let expected = normalize_endpoint_request_for_provider(&contract, &raw).unwrap();
         for cache_key in [json!("session-a"), json!("session-b"), Value::Null] {
             let mut with_hints = raw.clone();
             with_hints["store"] = json!(false);
             with_hints["prompt_cache_key"] = cache_key;
-            assert_eq!(normalize_endpoint_request_for_provider(&contract, &with_hints).unwrap(), expected);
+            assert_eq!(
+                normalize_endpoint_request_for_provider(&contract, &with_hints).unwrap(),
+                expected
+            );
         }
-        for (key, value) in [("store",json!(true)), ("store",json!("false")),
-            ("prompt_cache_key",json!({"arbitrary":"object"})), ("unknown_unsigned_field",json!(true))] {
+        for (key, value) in [
+            ("store", json!(true)),
+            ("store", json!("false")),
+            ("prompt_cache_key", json!({"arbitrary":"object"})),
+            ("unknown_unsigned_field", json!(true)),
+        ] {
             let mut invalid = raw.clone();
             invalid[key] = value;
             assert!(normalize_endpoint_request_for_provider(&contract, &invalid).is_err());
@@ -39784,9 +41297,44 @@ mod tests {
     }
 
     #[test]
-    fn generation_throughput_uses_token_intervals_and_ignores_one_token_turns() {
+    fn generation_throughput_uses_subsecond_samples_only_when_output_is_substantial() {
         assert_eq!(generated_tokens_per_second(1, 100, 10_000), None);
+        assert_eq!(generated_tokens_per_second(5, 100, 10_000), None);
+        assert_eq!(generated_tokens_per_second(6, 100, 1_099), None);
         assert_eq!(generated_tokens_per_second(6, 100, 1_100), Some(5.0));
+        assert_eq!(generated_tokens_per_second(32, 100, 600), Some(62.0));
+    }
+
+    #[test]
+    fn admission_attempt_budget_preserves_time_for_alternate_routes() {
+        let recovery = RouteAdmissionRecovery::new(RouteWaitDeadline::new(12_000), 4);
+        let budget = recovery
+            .admission_attempt_budget(2)
+            .expect("alternate routes require a bounded admission attempt");
+        assert!(budget <= Duration::from_secs(6));
+        assert!(budget > Duration::from_secs(5));
+
+        let failover =
+            GatewayFailoverInvocation::default().with_admission_attempt_budget(Some(budget));
+        assert!(failover.open_timeout() <= Duration::from_secs(2));
+        assert_eq!(
+            failover.session_accept_timeout(),
+            Some(failover.open_timeout())
+        );
+    }
+
+    #[test]
+    fn sole_route_keeps_its_configured_admission_timeouts() {
+        let recovery = RouteAdmissionRecovery::new(RouteWaitDeadline::new(10_000), 4);
+        let budget = recovery.admission_attempt_budget(1);
+        assert_eq!(budget, None);
+
+        let failover = GatewayFailoverInvocation::default().with_admission_attempt_budget(budget);
+        assert_eq!(
+            failover.open_timeout(),
+            Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS)
+        );
+        assert_eq!(failover.session_accept_timeout(), None);
     }
 
     #[test]
@@ -41967,13 +43515,23 @@ mod tests {
         let model = test_model();
         let request = test_chat_request(&model.id);
         let invocation = test_invocation();
-        let receipt = test_provider_receipt_with_finality(&model, &request, &test_chat_output(), &invocation, 18, false);
+        let receipt = test_provider_receipt_with_finality(
+            &model,
+            &request,
+            &test_chat_output(),
+            &invocation,
+            18,
+            false,
+        );
         let ack = receipt_ack_for_body(&invocation.receipt_user_seed, &receipt.body).unwrap();
         let binding = json!(receipt.body);
         let proof = failure_recovery::test_closed_proof(&receipt, &ack);
-        assert!(failure_recovery::verify_closed(&binding, &proof).unwrap().is_some());
+        assert!(failure_recovery::verify_closed(&binding, &proof)
+            .unwrap()
+            .is_some());
         for (pointer, wrong) in [
-            ("/close/confirmed", json!(false)), ("/head/confirmed", json!(false)),
+            ("/close/confirmed", json!(false)),
+            ("/head/confirmed", json!(false)),
             ("/reservation/value/status", json!("active")),
             ("/close/value/session_id", json!("ef".repeat(32))),
             ("/close/value/retained_au", json!("0")),
@@ -41983,8 +43541,110 @@ mod tests {
         ] {
             let mut invalid = proof.clone();
             *invalid.pointer_mut(pointer).unwrap() = wrong;
-            assert!(failure_recovery::verify_closed(&binding, &invalid).is_err(), "accepted {pointer}");
+            assert!(
+                failure_recovery::verify_closed(&binding, &invalid).is_err(),
+                "accepted {pointer}"
+            );
         }
+    }
+
+    #[tokio::test]
+    async fn canonical_reservation_sweep_expires_orphaned_hold_without_local_job() {
+        let seed = test_user_seed();
+        let state = GatewayState::fixture().with_receipt_user_seed(seed);
+        let invocation = test_invocation();
+        let mut session = serde_json::to_value(&invocation.spend_voucher.body).unwrap();
+        session["type"] = json!("targeted_spend_session");
+        let user = verifying_key_hex(&seed);
+        let rail = invocation.spend_voucher.body.rail.clone();
+        let reservation_id = invocation.spend_voucher.body.reservation_id.clone();
+        let billing_id = invocation.spend_voucher.body.billing_id.clone();
+        let billing_attempt = invocation.spend_voucher.body.billing_attempt;
+        let prefix = format!("hold/targeted-session/{rail}/{user}/");
+        let session_key = format!("{prefix}{}", invocation.session_id);
+        let mut reservation = session.clone();
+        reservation["status"] = json!("active");
+        let submitted = Arc::new(Mutex::new(Vec::<Value>::new()));
+        let submitted_handler = submitted.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/state",
+                axum::routing::get(
+                    move |axum::extract::Query(query): axum::extract::Query<
+                        BTreeMap<String, String>,
+                    >| {
+                        let session = session.clone();
+                        let reservation = reservation.clone();
+                        let prefix = prefix.clone();
+                        let session_key = session_key.clone();
+                        let reservation_id = reservation_id.clone();
+                        let billing_id = billing_id.clone();
+                        async move {
+                            assert_eq!(query.get("confirmed").map(String::as_str), Some("true"));
+                            let response = if query.get("key").map(String::as_str)
+                                == Some("epoch/apply/state")
+                            {
+                                json!({"key": "epoch/apply/state", "confirmed": true,
+                                    "signed_length": 123, "value": {"updated_epoch": 37}})
+                            } else if query.get("prefix").map(String::as_str)
+                                == Some(prefix.as_str())
+                            {
+                                assert_eq!(query.get("signed_length").map(String::as_str), Some("123"));
+                                json!({"prefix": prefix, "confirmed": true, "signed_length": 123,
+                                    "values": [{"key": session_key, "value": session}],
+                                    "truncated": false})
+                            } else if query.get("key").map(String::as_str)
+                                == Some(format!("receipt/reservation/{reservation_id}").as_str())
+                            {
+                                json!({"key": format!("receipt/reservation/{reservation_id}"),
+                                    "confirmed": true, "signed_length": 123, "value": reservation})
+                            } else if query.get("key").map(String::as_str)
+                                == Some(format!("receipt/head/{billing_id}/{billing_attempt}").as_str())
+                            {
+                                json!({"key": format!("receipt/head/{billing_id}/{billing_attempt}"),
+                                    "confirmed": true, "signed_length": 123, "value": null})
+                            } else {
+                                panic!("unexpected canonical state query: {query:?}");
+                            };
+                            axum::Json(response)
+                        }
+                    },
+                ),
+            )
+            .route(
+                "/v1/contract/feature",
+                axum::routing::post(move |axum::Json(body): axum::Json<Value>| {
+                    let submitted = submitted_handler.clone();
+                    async move {
+                        submitted
+                            .lock_recover("submitted reservation expiries")
+                            .push(body);
+                        axum::Json(json!({"ok": true}))
+                    }
+                }),
+            );
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let rpc = PeerRpcClient::new(format!("http://{address}/v1")).unwrap();
+
+        let pass = failure_recovery::sweep_ledger_reservations_once(&state, &rpc, 32)
+            .await
+            .unwrap();
+        assert_eq!(pass.discovered, 1);
+        assert_eq!(pass.eligible, 1);
+        assert_eq!(pass.submitted, 1);
+        let submitted = submitted.lock_recover("submitted reservation expiries");
+        assert_eq!(submitted.len(), 1);
+        assert_eq!(submitted[0]["value"]["op"], "expire_usage_reservation");
+        assert_eq!(submitted[0]["value"]["reason"], "gateway_ledger_sweep");
+        assert_eq!(submitted[0]["value"]["actor"], user);
+        assert_eq!(submitted[0]["value"]["actor_role"], "user");
+        assert_eq!(
+            submitted[0]["value"]["actor_sig"].as_str().map(str::len),
+            Some(128)
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -41995,12 +43655,22 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let dir = root.path().join("jobs");
             let seed = test_user_seed();
-            let state = GatewayState::fixture().with_receipt_user_seed(seed)
-                .with_job_store_dir(dir.clone()).unwrap();
+            let state = GatewayState::fixture()
+                .with_receipt_user_seed(seed)
+                .with_job_store_dir(dir.clone())
+                .unwrap();
             let model = test_model();
-            let job = match prepare_gateway_job(&state, &HeaderMap::new(),
-                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS, &model.id,
-                &json!({"model": model.id, "messages": []}), &None).await.unwrap() {
+            let job = match prepare_gateway_job(
+                &state,
+                &HeaderMap::new(),
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                &model.id,
+                &json!({"model": model.id, "messages": []}),
+                &None,
+            )
+            .await
+            .unwrap()
+            {
                 PreparedGatewayJob::Started(job) => job,
                 _ => panic!("fresh job expected"),
             };
@@ -42012,8 +43682,22 @@ mod tests {
             invocation.receipt_recorder.settlement_publisher = Arc::new(Some(publisher.clone()));
             let request = test_chat_request(&model.id);
             let output = test_chat_output();
-            let checkpoint = test_provider_receipt_with_finality(&model, &request, &output, &invocation, 18, false);
-            let terminal = test_provider_receipt_with_finality(&model, &request, &output, &invocation, 19, true);
+            let checkpoint = test_provider_receipt_with_finality(
+                &model,
+                &request,
+                &output,
+                &invocation,
+                18,
+                false,
+            );
+            let terminal = test_provider_receipt_with_finality(
+                &model,
+                &request,
+                &output,
+                &invocation,
+                19,
+                true,
+            );
             let ack = receipt_ack_for_body(&seed, &terminal.body).unwrap();
             let feature = test_receipt_settlement_feature(&terminal, &ack);
             let mut wire = json!(terminal.body);
@@ -42029,40 +43713,123 @@ mod tests {
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                let auth: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
-                socket.send(Message::Text(json!({"id": auth["id"], "type": "auth_ok"}).to_string().into())).await.unwrap();
-                let sent: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                let auth: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                socket
+                    .send(Message::Text(
+                        json!({"id": auth["id"], "type": "auth_ok"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let sent: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
                 assert_eq!(sent["type"], "session_send");
                 assert_eq!(sent["frame"]["t"], "s.receipt_ack");
                 assert_eq!(sent["frame"]["user_sig"], expected_ack.user_sig);
                 assert_eq!(sent["frame"]["seq"], 19);
-                socket.send(Message::Text(json!({"id": sent["id"], "type": "session_sent"}).to_string().into())).await.unwrap();
-                let frame = if lost_handoff { json!({"t": "s.close", "session_id": session}) }
-                    else { json!({"t": "s.receipt_settlement", "session_id": session, "seq": 19, "feature": sent_feature}) };
-                socket.send(Message::Text(json!({"type": "session_frame", "remote": remote,
-                    "session_id": session, "frame": frame}).to_string().into())).await.unwrap();
+                socket
+                    .send(Message::Text(
+                        json!({"id": sent["id"], "type": "session_sent"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let frame = if lost_handoff {
+                    json!({"t": "s.close", "session_id": session})
+                } else {
+                    json!({"t": "s.receipt_settlement", "session_id": session, "seq": 19, "feature": sent_feature})
+                };
+                socket
+                    .send(Message::Text(
+                        json!({"type": "session_frame", "remote": remote,
+                    "session_id": session, "frame": frame})
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
             });
-            let mut bridge = ScBridgeClient::connect(ScBridgeConfig::new(format!("ws://{address}"), "test-token").unwrap()).await.unwrap();
-            let result = settle_failed_direct_session_frame(&mut bridge, &invocation, &model,
-                &terminal.enclave_pubkey, &failure, Some(&checkpoint), blake3_hex(chat_prompt_text(&request).as_bytes())).await;
+            let mut bridge = ScBridgeClient::connect(
+                ScBridgeConfig::new(format!("ws://{address}"), "test-token").unwrap(),
+            )
+            .await
+            .unwrap();
+            let result = settle_failed_direct_session_frame(
+                &mut bridge,
+                &invocation,
+                &model,
+                &terminal.enclave_pubkey,
+                &failure,
+                Some(&checkpoint),
+                blake3_hex(chat_prompt_text(&request).as_bytes()),
+            )
+            .await;
             server.await.unwrap();
             if lost_handoff {
                 let error = result.unwrap_err();
                 assert!(!error.retryable);
-                assert_eq!(provider_session_api_error(&error).public_code, "provider_model_output_invalid");
-            } else { result.unwrap(); }
-            let stored = state.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
-            assert_eq!(stored.status, if lost_handoff { GatewayJobStatus::ReconciliationPending } else { GatewayJobStatus::Failed });
-            assert_eq!(stored.error_info.as_ref().unwrap().code, "provider_model_output_invalid");
-            assert_eq!(stored.receipt.as_ref().unwrap()["body"]["usage"], json!(checkpoint.body.usage));
-            drop(invocation); drop(state);
-            let restarted = GatewayState::fixture().with_receipt_user_seed(seed)
-                .with_job_store_dir(dir).unwrap().with_receipt_settlement_publisher(publisher.clone());
-            let transport = RecordingReceiptAckRecoveryTransport { expected_ack: ack, feature,
-                deliveries: Arc::new(Mutex::new(Vec::new())) };
-            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-            assert_eq!(restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().status, GatewayJobStatus::Failed);
+                assert_eq!(
+                    provider_session_api_error(&error).public_code,
+                    "provider_model_output_invalid"
+                );
+            } else {
+                result.unwrap();
+            }
+            let stored = state
+                .jobs
+                .lock_recover("test jobs")
+                .get(&id, now_secs())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                stored.status,
+                if lost_handoff {
+                    GatewayJobStatus::ReconciliationPending
+                } else {
+                    GatewayJobStatus::Failed
+                }
+            );
+            assert_eq!(
+                stored.error_info.as_ref().unwrap().code,
+                "provider_model_output_invalid"
+            );
+            assert_eq!(
+                stored.receipt.as_ref().unwrap()["body"]["usage"],
+                json!(checkpoint.body.usage)
+            );
+            drop(invocation);
+            drop(state);
+            let restarted = GatewayState::fixture()
+                .with_receipt_user_seed(seed)
+                .with_job_store_dir(dir)
+                .unwrap()
+                .with_receipt_settlement_publisher(publisher.clone());
+            let transport = RecordingReceiptAckRecoveryTransport {
+                expected_ack: ack,
+                feature,
+                deliveries: Arc::new(Mutex::new(Vec::new())),
+            };
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                .await
+                .unwrap();
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                .await
+                .unwrap();
+            assert_eq!(
+                restarted
+                    .jobs
+                    .lock_recover("test jobs")
+                    .get(&id, now_secs())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                GatewayJobStatus::Failed
+            );
             assert_eq!(publisher.features.lock_recover("test publisher").len(), 1);
         }
     }
@@ -42073,36 +43840,64 @@ mod tests {
         let request = test_chat_request(&model.id);
         let invocation = test_invocation();
         let output = test_chat_output();
-        let checkpoint = test_provider_receipt_with_finality(
-            &model, &request, &output, &invocation, 18, false,
-        );
-        let terminal = test_provider_receipt_with_finality(
-            &model, &request, &output, &invocation, 19, true,
-        );
+        let checkpoint =
+            test_provider_receipt_with_finality(&model, &request, &output, &invocation, 18, false);
+        let terminal =
+            test_provider_receipt_with_finality(&model, &request, &output, &invocation, 19, true);
         let prompt_hash = blake3_hex(chat_prompt_text(&request).as_bytes());
         let ack = failed_direct_session_receipt_ack(
-            &model, &invocation, &terminal, Some(&checkpoint), prompt_hash.clone(),
-        ).unwrap();
+            &model,
+            &invocation,
+            &terminal,
+            Some(&checkpoint),
+            prompt_hash.clone(),
+        )
+        .unwrap();
         assert_eq!(ack.seq, 19);
-        for mutation in ["usage", "amount", "sequence", "finality", "attribution", "session"] {
+        for mutation in [
+            "usage",
+            "amount",
+            "sequence",
+            "finality",
+            "attribution",
+            "session",
+        ] {
             let mut invalid = terminal.clone();
             match mutation {
                 "usage" => invalid.body.usage = ReceiptUsage::text(1, 99),
                 "amount" => invalid.body.au_owed_cum += 1,
                 "sequence" => invalid.body.seq += 1,
                 "finality" => invalid.body.final_receipt = false,
-                "attribution" => { invalid.body.usage_attribution.insert("reasoning_output_tokens".into(), 1); },
+                "attribution" => {
+                    invalid
+                        .body
+                        .usage_attribution
+                        .insert("reasoning_output_tokens".into(), 1);
+                }
                 "session" => invalid.body.session_id = "ef".repeat(32),
                 _ => unreachable!(),
             }
-            invalid.enclave_sig = sign_hex(&test_enclave_seed(), &receipt_signing_bytes(&invalid.body).unwrap());
-            assert!(failed_direct_session_receipt_ack(
-                &model, &invocation, &invalid, Some(&checkpoint), prompt_hash.clone(),
-            ).is_err(), "accepted {mutation}");
+            invalid.enclave_sig = sign_hex(
+                &test_enclave_seed(),
+                &receipt_signing_bytes(&invalid.body).unwrap(),
+            );
+            assert!(
+                failed_direct_session_receipt_ack(
+                    &model,
+                    &invocation,
+                    &invalid,
+                    Some(&checkpoint),
+                    prompt_hash.clone(),
+                )
+                .is_err(),
+                "accepted {mutation}"
+            );
         }
-        assert!(failed_direct_session_receipt_ack(
-            &model, &invocation, &terminal, None, prompt_hash,
-        ).is_err(), "unacknowledged output must not become a charge");
+        assert!(
+            failed_direct_session_receipt_ack(&model, &invocation, &terminal, None, prompt_hash,)
+                .is_err(),
+            "unacknowledged output must not become a charge"
+        );
     }
 
     #[test]
@@ -42347,16 +44142,118 @@ mod tests {
     }
 
     #[test]
-    fn embedding_provider_receipt_must_match_gateway_observed_usage() {
+    fn embedding_usage_accepts_exact_single_and_batch_token_counts() {
+        for (inputs, exact_tokens) in [
+            (vec!["a".to_owned()], 2),
+            // Public acceptance input: its provider tokenizer exceeds the five
+            // whitespace words; this exercises the previously rejected branch.
+            (
+                vec!["OpenMayhem embedding acceptance: single input".to_owned()],
+                9,
+            ),
+            (vec!["alpha".to_owned(), "beta gamma".to_owned()], 7),
+            (vec!["你好".to_owned()], 3),
+        ] {
+            let mut output = EmbeddingOutput {
+                embeddings: vec![vec![0.1]; inputs.len()],
+                usage: Usage {
+                    prompt_tokens: exact_tokens,
+                    completion_tokens: 0,
+                    total_tokens: exact_tokens,
+                },
+            };
+            assert_eq!(
+                authoritative_embedding_usage(&inputs, &output).unwrap(),
+                ReceiptUsage::text(exact_tokens, 0),
+            );
+            // Both inclusive boundaries use the same envelope as reservations.
+            for tokens in [
+                embedding_input_token_count(&inputs),
+                embedding_input_token_upper_bound(&inputs),
+            ] {
+                output.usage.prompt_tokens = tokens;
+                output.usage.total_tokens = tokens;
+                assert_eq!(
+                    authoritative_embedding_usage(&inputs, &output).unwrap(),
+                    ReceiptUsage::text(tokens, 0),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_session_uses_signed_tokenizer_count_instead_of_whitespace_estimate() {
+        let inputs = vec!["OpenMayhem embedding acceptance: single input".to_owned()];
+        assert_eq!(embedding_input_token_count(&inputs), 5);
+        let exact = Usage {
+            prompt_tokens: 9,
+            completion_tokens: 0,
+            total_tokens: 9,
+        };
+        let signed = ReceiptUsage::text(9, 0);
+
+        assert_eq!(
+            verified_embedding_session_usage(&inputs, Some(&exact), &signed).unwrap(),
+            exact,
+        );
+        assert_eq!(
+            verified_embedding_session_usage(&inputs, None, &signed).unwrap(),
+            exact,
+        );
+
+        let stale_whitespace_usage = embedding_usage_for_inputs(&inputs);
+        let mismatch =
+            verified_embedding_session_usage(&inputs, Some(&stale_whitespace_usage), &signed)
+                .expect_err("delta usage must agree with the signed receipt");
+        assert!(mismatch
+            .message
+            .contains("provider-reported embedding session usage"));
+    }
+
+    #[test]
+    fn embedding_usage_rejects_invalid_counts_and_output_cardinality() {
+        let inputs = vec!["alpha beta".to_owned(), "gamma".to_owned()];
+        let upper_bound = embedding_input_token_upper_bound(&inputs);
+        for (prompt_tokens, completion_tokens, total_tokens) in [
+            (0, 0, 0),
+            (2, 0, 2), // Below the conservative whitespace lower bound.
+            (upper_bound + 1, 0, upper_bound + 1),
+            (7, 1, 8),
+            (7, 0, 8),
+            (7, 0, 6),
+        ] {
+            let output = EmbeddingOutput {
+                embeddings: vec![vec![0.1]; inputs.len()],
+                usage: Usage {
+                    prompt_tokens,
+                    completion_tokens,
+                    total_tokens,
+                },
+            };
+            assert!(authoritative_embedding_usage(&inputs, &output).is_err());
+        }
+        let output = EmbeddingOutput {
+            embeddings: vec![vec![0.1]],
+            usage: Usage {
+                prompt_tokens: 7,
+                completion_tokens: 0,
+                total_tokens: 7,
+            },
+        };
+        assert!(authoritative_embedding_usage(&inputs, &output).is_err());
+    }
+
+    #[test]
+    fn embedding_provider_receipt_must_match_bounded_reported_usage() {
         let state = GatewayState::fixture();
         let model = test_model();
         let inputs = vec!["alpha".to_owned(), "beta gamma".to_owned()];
         let output = EmbeddingOutput {
             embeddings: vec![vec![0.1, 0.2, 0.3], vec![0.2, 0.3, 0.4]],
             usage: Usage {
-                prompt_tokens: 3,
+                prompt_tokens: 7,
                 completion_tokens: 0,
-                total_tokens: 3,
+                total_tokens: 7,
             },
         };
         let invocation = test_invocation();
@@ -43365,6 +45262,7 @@ mod tests {
             prompts: Vec::new(),
             fingerprints_by_artifact_root: BTreeMap::new(),
             token_prefixes_by_artifact_root: BTreeMap::new(),
+            openai_compatible_artifact_roots: BTreeSet::new(),
             perceptual_hashes_by_artifact_root: BTreeMap::new(),
             embedding_vectors_by_artifact_root: BTreeMap::new(),
             transcripts_by_artifact_root: BTreeMap::new(),
@@ -43787,15 +45685,21 @@ mod tests {
             "model": model.id, "prompt": "A blue sculpture", "width": 64, "height": 64,
             "n": 1, "steps": 9, "cfg_scale": 0.0, "response_format": "b64_json",
             "input_reference": reference, "strength": 0.5,
-        })).unwrap();
+        }))
+        .unwrap();
         validate_image_generation_request(&model, &request).unwrap();
         let transport = direct_session_image_generation_request_body(&request);
         assert_eq!(transport["input_reference"], reference);
         assert_eq!(transport["strength"], 0.5);
-        let load = request_requirements_for_image_generation(&state, &model, &request, 0, None, None);
+        let load =
+            request_requirements_for_image_generation(&state, &model, &request, 0, None, None);
         assert_eq!(load.modality_load["image"].max_item_units, 96 * 80);
-        assert_eq!(load.modality_load["image"].max_item_bytes,
-            mayhem_proto::image_reference_metadata(&reference).unwrap().bytes);
+        assert_eq!(
+            load.modality_load["image"].max_item_bytes,
+            mayhem_proto::image_reference_metadata(&reference)
+                .unwrap()
+                .bytes
+        );
         let hash = image_generation_prompt_hash(&request);
         let mut changed = request.clone();
         changed.input_reference = Some(test_png_data_url_with_size(80, 96));
@@ -43977,6 +45881,7 @@ mod tests {
             price_ref_au: None,
             min_ask_au: 0,
             att_tier: 1,
+            enclave_att_tier: Some(1),
             quant: DEFAULT_QUANT_BUCKET.to_owned(),
             served_ctx: None,
             hardware_fingerprint: None,
@@ -44356,6 +46261,66 @@ mod tests {
     }
 
     #[derive(Debug)]
+    struct PreSpendAdmissionThenSuccessBackend {
+        providers: Arc<Mutex<Vec<String>>>,
+        billing_attempts: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl GatewaySessionBackend for PreSpendAdmissionThenSuccessBackend {
+        fn name(&self) -> &str {
+            "test-pre-spend-admission-then-success"
+        }
+
+        fn run_chat<'a>(
+            &'a self,
+            _model: &'a GatewayModel,
+            request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                self.billing_attempts
+                    .lock()
+                    .expect("billing attempts lock")
+                    .push(invocation.spend_voucher.body.billing_attempt);
+                let attempt = {
+                    let mut providers = self.providers.lock().expect("providers lock");
+                    providers.push(invocation.provider_pubkey.clone().unwrap_or_default());
+                    providers.len()
+                };
+                if attempt == 1 {
+                    return Err(GatewaySessionError::retryable(
+                        "simulated direct-session admission timeout before request frames",
+                    )
+                    .into_safe_same_route_retry());
+                }
+                let prompt_tokens = rough_tokens(&chat_prompt_text(request));
+                Ok(GatewaySessionResult {
+                    output: ChatOutput {
+                        reasoning_content: String::new(),
+                        content: Some("recovered before spend".to_owned()),
+                        tool_calls: Vec::new(),
+                        artifacts: Vec::new(),
+                        finish_reason: "stop".to_owned(),
+                        usage: Usage {
+                            prompt_tokens,
+                            completion_tokens: 3,
+                            total_tokens: prompt_tokens + 3,
+                        },
+                    },
+                    backend: self.name().to_owned(),
+                    direct_session: true,
+                    provider_receipt: None,
+                    token_ids: vec![1, 2, 3],
+                    quality: Some(GatewaySessionQuality {
+                        ttft_ms: 10,
+                        tok_s: Some(40.0),
+                    }),
+                })
+            })
+        }
+    }
+
+    #[derive(Debug)]
     struct AcceptThenCloseThenSuccessBackend {
         providers: Arc<Mutex<Vec<String>>>,
     }
@@ -44391,6 +46356,7 @@ mod tests {
                 }),
                 context,
                 retryable,
+                false,
             )
         }
     }
@@ -44827,6 +46793,61 @@ mod tests {
                 })
             })
         }
+
+        fn run_tokenize<'a>(
+            &'a self,
+            invocation: &'a GatewayTokenizeInvocation,
+        ) -> GatewayTokenizeFuture<'a> {
+            Box::pin(async move {
+                assert!(invocation.request.get("mayhem_contract").is_some());
+                assert!(invocation.request.get("contract_request").is_some());
+                Ok(GatewayTokenizeResult {
+                    count: 3,
+                    tokens: invocation.return_tokens.then_some(vec![11, 22, 33]),
+                    provider: invocation.provider_pubkey.clone(),
+                })
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn tokenize_endpoint_uses_live_model_route_without_creating_inference_work() {
+        use tower::ServiceExt;
+
+        let model = test_routed_model(1);
+        let model_id = model.id.clone();
+        let backend = Arc::new(SuccessBackend {
+            providers: Arc::new(Mutex::new(Vec::new())),
+        });
+        let state = test_gateway_state_from_models(vec![model]).with_session_backend(backend);
+        let response = openai_router(state)
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/tokenize")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({
+                            "model": model_id,
+                            "prompt": "count these exact model tokens",
+                            "return_tokens": true
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(response.headers().get("x-mayhem-job-id").is_none());
+        let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let body: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(body["object"], "tokenization");
+        assert_eq!(body["count"], 3);
+        assert_eq!(body["tokens"], json!([11, 22, 33]));
+        assert_eq!(body["model"], model_id);
     }
 
     #[test]
@@ -45665,6 +47686,34 @@ mod tests {
     }
 
     #[test]
+    fn t4_identity_preserves_underlying_execution_attestation() {
+        let mut tier1_model = test_routed_model(1);
+        tier1_model.mayhem.route_candidates[0].att_tier = 4;
+        tier1_model.mayhem.route_candidates[0].enclave_att_tier = Some(1);
+        assert!(canonical_route_candidate(
+            &tier1_model.mayhem.route_candidates[0]
+        ));
+        let tier1_state = test_gateway_state_from_models(vec![tier1_model.clone()]);
+        let tier1 = tier1_state
+            .session_attestation_for_route(&tier1_model, &tier1_model.mayhem.route_candidates[0])
+            .expect("T4 identity does not replace T1 execution attestation");
+        assert_eq!(tier1.contract.att_tier, 1);
+
+        let mut tier3_model = test_routed_model(1);
+        tier3_model.mayhem.route_candidates[0].att_tier = 4;
+        tier3_model.mayhem.route_candidates[0].enclave_att_tier = Some(3);
+        let tier3_state = test_gateway_state_from_models(vec![tier3_model.clone()]);
+        let error = tier3_state
+            .session_attestation_for_route(&tier3_model, &tier3_model.mayhem.route_candidates[0])
+            .expect_err("T4 identity must not bypass T3 policy verification");
+        assert!(error.message.contains("Tier 3"), "{}", error.message);
+
+        let mut unbound = tier1_model.mayhem.route_candidates[0].clone();
+        unbound.enclave_att_tier = None;
+        assert!(!canonical_route_candidate(&unbound));
+    }
+
+    #[test]
     fn chat_invocation_uses_signed_heartbeat_transport_peer() {
         let model = test_routed_model(1);
         let route = &model.mayhem.route_candidates[0];
@@ -46016,6 +48065,123 @@ mod tests {
     }
 
     #[test]
+    fn growing_chat_fits_large_output_limit_to_remaining_context_for_streaming_and_json() {
+        let mut model = test_routed_model(2);
+        model.mayhem.caps.ctx = 262_144;
+        for route in &mut model.mayhem.route_candidates {
+            route.served_ctx = Some(262_144);
+        }
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let options = GatewayRequestOptions::default();
+
+        for stream in [false, true] {
+            let mut previous_limit = 226_921;
+            for bytes in [5_000, 60_000, 120_000, 150_000] {
+                let mut request = test_chat_request(&model.id);
+                request.stream = stream;
+                request.messages[0].content = json!("x".repeat(bytes));
+                request.max_tokens = Some(226_921);
+
+                let input_tokens = chat_context_input_tokens(&request);
+                fit_chat_output_budget_to_context(&state, &model, &mut request, &options);
+
+                let expected = 226_921_u64
+                    .min(262_144_u64.saturating_sub(input_tokens))
+                    .max(1) as u32;
+                assert_eq!(request.max_tokens, Some(expected));
+                assert!(expected <= previous_limit);
+                previous_limit = expected;
+                assert!(
+                    effective_context_floor(
+                        None,
+                        chat_context_input_tokens(&request),
+                        chat_output_headroom_tokens(&request),
+                    ) <= 262_144
+                );
+                assert_eq!(
+                    ordered_route_candidates_for_request_with_options(
+                        &state, &model, &request, &options,
+                    )
+                    .len(),
+                    2
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn context_fit_honors_completion_and_responses_output_aliases() {
+        let mut model = test_routed_model(1);
+        model.mayhem.caps.ctx = 262_144;
+        model.mayhem.route_candidates[0].served_ctx = Some(262_144);
+        let responses_contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+        )
+        .expect("Responses contract");
+        model.mayhem.adapter.endpoint_families = vec![responses_contract.clone()];
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let options = GatewayRequestOptions::default();
+        let raw = json!({
+            "model": model.id,
+            "input": [{"role": "user", "content": "x".repeat(150_000)}],
+            "max_output_tokens": 226_921,
+            "stream": false
+        });
+        let normalized = normalize_endpoint_request_for_provider(&responses_contract, &raw)
+            .expect("Responses request normalizes");
+        let responses: ResponsesRequest =
+            serde_json::from_value(normalized.normalized_request.clone()).unwrap();
+        let mut request = responses_chat_request(responses, normalized.normalized_request).unwrap();
+
+        fit_chat_output_budget_to_context(&state, &model, &mut request, &options);
+        synchronize_effective_chat_contract_request(&model, &mut request).unwrap();
+
+        let fitted = request
+            .max_tokens
+            .expect("Responses output limit remains present");
+        assert!(fitted < 226_921);
+        assert_eq!(
+            request.endpoint_request.as_ref().unwrap()["max_output_tokens"],
+            json!(fitted)
+        );
+
+        request.max_tokens = None;
+        request.max_completion_tokens = Some(226_921);
+        request.endpoint_family = None;
+        request.endpoint_request = None;
+        assert_eq!(chat_output_headroom_tokens(&request), 226_921);
+        fit_chat_output_budget_to_context(&state, &model, &mut request, &options);
+        assert!(request.max_completion_tokens.unwrap() < 226_921);
+    }
+
+    #[tokio::test]
+    async fn preferred_provider_context_failure_is_immediate_and_not_masked_by_other_route() {
+        let mut model = test_routed_model(2);
+        model.mayhem.caps.ctx = 262_144;
+        model.mayhem.route_candidates[0].served_ctx = Some(8_192);
+        model.mayhem.route_candidates[1].served_ctx = Some(262_144);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let mut request = test_chat_request(&model.id);
+        request.messages[0].content = json!("word ".repeat(9_000));
+        request.max_tokens = Some(64);
+        let options = GatewayRequestOptions {
+            preferred_providers: Some(vec![model.mayhem.route_candidates[0].provider.clone()]),
+            max_wait_ms: 60_000,
+            ..GatewayRequestOptions::default()
+        };
+
+        let started = Instant::now();
+        let error = match run_chat_with_route_retry(&state, &model, &request, options).await {
+            Ok(_) => panic!("preferred 8k route cannot hold this prompt"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.public_code, "context_capacity_unavailable");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(!error.message.contains("preferred provider"));
+    }
+
+    #[test]
     fn context_estimate_includes_compact_text_tools_history_and_reasoning() {
         let mut request = test_chat_request("test/model");
         request.messages[0].content = json!("a".repeat(4000));
@@ -46157,12 +48323,12 @@ mod tests {
     async fn context_exhaustion_is_terminal_and_does_not_penalize_provider() {
         let model = test_routed_model(3);
         let attempts = Arc::new(Mutex::new(0));
-        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(Arc::new(
-            ProviderReportedFailureBackend {
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(ProviderReportedFailureBackend {
                 code: "context_length_exceeded",
                 attempts: Arc::clone(&attempts),
-            },
-        ));
+            }),
+        );
         let error = focused_route_runner_error(
             run_chat_with_route_retry(
                 &state,
@@ -46181,7 +48347,9 @@ mod tests {
         assert_eq!(error.public_code, "context_length_exceeded");
         assert!(!error.retryable);
         assert!(error.message.contains("Compact"));
-        assert!(!state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64()));
+        assert!(
+            !state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64())
+        );
         assert!(state.reputation_events().is_empty());
     }
 
@@ -46771,6 +48939,107 @@ mod tests {
             panic!("capability loss must be a permanent admission failure");
         };
         assert!(err.contains("Capabilities"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn modality_admission_deduplicates_heartbeat_and_local_activity() {
+        let mut model = test_routed_model(1);
+        model.mayhem.caps.vision = true;
+        model.mayhem.adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
+        model.mayhem.route_candidates[0].served_modalities =
+            vec!["text".to_owned(), "image".to_owned()];
+        let route = &model.mayhem.route_candidates[0];
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let now = now_millis_u64();
+        let mut heartbeat = heartbeat_for_route(&model, route, now);
+        heartbeat.caps.modality_capacity.insert(
+            "image".to_owned(),
+            HeartbeatModalityCapacity {
+                unit: "pixel".to_owned(),
+                max_inflight_items: 256,
+                active_items: 128,
+                max_items_per_request: 128,
+                max_item_bytes: 1024 * 1024,
+                max_item_units: 1024 * 1024,
+                working_set_bytes_per_item: 1024,
+            },
+        );
+        heartbeat.sig = "aa".repeat(64);
+        state.ingest_provider_heartbeat(heartbeat.clone(), now);
+
+        let mut request = test_chat_request(&model.id);
+        request.messages[0].content = json!([
+            { "type": "text", "text": "describe" },
+            { "type": "image_url", "image_url": { "url": test_png_data_url() } }
+        ]);
+        let mut requirements =
+            request_requirements_for_chat(&state, &model, &request, now, None, None, None);
+        requirements
+            .modality_load
+            .get_mut("image")
+            .expect("image load")
+            .item_count = 128;
+
+        let first = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("remote 128 plus request 128 fits")
+            .expect("first admission guard");
+        let second = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("overlapping remote 128 and local 128 plus request 128 fits")
+            .expect("second admission guard");
+        drop(first);
+        drop(second);
+
+        heartbeat
+            .caps
+            .modality_capacity
+            .get_mut("image")
+            .expect("image capacity")
+            .active_items = 256;
+        state.ingest_provider_heartbeat(heartbeat.clone(), now.saturating_add(1));
+        assert!(matches!(
+            state.try_acquire_modality_admission(Some(route), &requirements),
+            Err(ModalityAdmissionError::RemoteCapacity(_))
+        ));
+
+        heartbeat
+            .caps
+            .modality_capacity
+            .get_mut("image")
+            .expect("image capacity")
+            .active_items = 128;
+        state.ingest_provider_heartbeat(heartbeat.clone(), now.saturating_add(2));
+        let refreshed = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("heartbeat refresh restores remote capacity")
+            .expect("refreshed admission guard");
+        drop(refreshed);
+
+        heartbeat
+            .caps
+            .modality_capacity
+            .get_mut("image")
+            .expect("image capacity")
+            .active_items = 0;
+        state.ingest_provider_heartbeat(heartbeat, now.saturating_add(3));
+        let local_first = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("first local admission")
+            .expect("first local guard");
+        let local_second = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("second local admission")
+            .expect("second local guard");
+        assert!(matches!(
+            state.try_acquire_modality_admission(Some(route), &requirements),
+            Err(ModalityAdmissionError::LocalCapacity { .. })
+        ));
+        drop(local_first);
+        assert!(state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .is_ok());
+        drop(local_second);
     }
 
     #[tokio::test]
@@ -47858,6 +50127,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn terminal_handoff_error_defers_to_durable_reconciliation() {
+        let mut state = GatewayState::fixture();
+        state.jobs = Arc::new(Mutex::new(GatewayJobStore::in_memory(
+            [29_u8; 32],
+            8,
+            64 * 1024 * 1024,
+            24 * 60 * 60,
+        )));
+        let job = match prepare_gateway_job(
+            &state,
+            &HeaderMap::new(),
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            "mayhem/test",
+            &json!({"model": "mayhem/test", "messages": [{"role": "user", "content": "recover"}]}),
+            &None,
+        )
+        .await
+        .unwrap()
+        {
+            PreparedGatewayJob::Started(job) => job,
+            _ => panic!("fresh request must start a job"),
+        };
+        let mut invocation = test_invocation();
+        invocation.transport_peer = Some("ab".repeat(32));
+        invocation.job = Some(job.clone());
+        let model = test_model();
+        let request = test_chat_request(&model.id);
+        let output = test_chat_output();
+        let provider_receipt = test_provider_receipt(&model, &request, &output, &invocation);
+        let receipt_ack =
+            receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body).unwrap();
+        stage_completed_invocation_job(
+            &invocation,
+            chat_job_result(&output),
+            &[],
+            &provider_receipt,
+            &receipt_ack,
+        )
+        .await
+        .unwrap();
+
+        let recovery_job = job.clone();
+        let recovery = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            recovery_job
+                .finish_reconciliation(GatewayJobStatus::Completed, None)
+                .await
+                .unwrap();
+        });
+        finish_completed_invocation_after_handoff(
+            &invocation,
+            Err(GatewaySessionError::new(
+                "receipt settlement publisher rejected the local enqueue",
+            )),
+            Duration::from_secs(2),
+        )
+        .await
+        .expect("recovered terminal handoff must remain successful");
+        recovery.await.unwrap();
+
+        let completed = state
+            .jobs
+            .lock_recover("gateway job vault")
+            .get(&job.id, now_secs())
+            .unwrap()
+            .unwrap();
+        assert_eq!(completed.status, GatewayJobStatus::Completed);
+        assert_eq!(completed.result, Some(chat_job_result(&output)));
+    }
+
+    #[tokio::test]
     async fn ack_delivery_failure_preserves_artifact_and_retry_cannot_double_bill() {
         use tower::ServiceExt;
 
@@ -48142,45 +50482,90 @@ mod tests {
         invocation.transport_peer = Some("ab".repeat(32));
         invocation.job = Some(job);
         let output = test_chat_output();
-        let provider_receipt = test_provider_receipt(
-            &model, &test_chat_request(&model.id), &output, &invocation,
-        );
+        let provider_receipt =
+            test_provider_receipt(&model, &test_chat_request(&model.id), &output, &invocation);
         let ack = receipt_ack_for_body(&seed, &provider_receipt.body).unwrap();
         let result = chat_job_result(&output);
         stage_completed_invocation_job(
-            &invocation, result.clone(), &output.artifacts, &provider_receipt, &ack,
+            &invocation,
+            result.clone(),
+            &output.artifacts,
+            &provider_receipt,
+            &ack,
         )
         .await
         .unwrap();
         let mut feature = test_receipt_settlement_feature(&provider_receipt, &ack);
         feature["value"]["contract_version"] = json!(RECOVERABLE_RECEIPT_CONTRACT_VERSION - 1);
-        assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_err());
-        let historical_receipt = parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
+        assert!(
+            validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_err()
+        );
+        let historical_receipt =
+            parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
         feature["key"] = json!(record_usage_receipt_feature_key_for_contract(
-            &historical_receipt, RECOVERABLE_RECEIPT_CONTRACT_VERSION - 1,
+            &historical_receipt,
+            RECOVERABLE_RECEIPT_CONTRACT_VERSION - 1,
         ));
         feature["value"]["provider_sig"] = json!(sign_hex(
             &test_provider_seed(),
-            &record_usage_receipt_signing_bytes(feature["key"].as_str().unwrap(), &feature["value"]).unwrap(),
+            &record_usage_receipt_signing_bytes(
+                feature["key"].as_str().unwrap(),
+                &feature["value"]
+            )
+            .unwrap(),
         ));
-        assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_ok());
-        assert!(validate_receipt_settlement_feature_for_receipt(&provider_receipt, &ack, &feature).is_err());
-        invocation.job.as_ref().unwrap()
-            .persist_reconciliation_settlement_feature(feature.clone()).await.unwrap();
+        assert!(
+            validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_ok()
+        );
+        assert!(
+            validate_receipt_settlement_feature_for_receipt(&provider_receipt, &ack, &feature)
+                .is_err()
+        );
+        invocation
+            .job
+            .as_ref()
+            .unwrap()
+            .persist_reconciliation_settlement_feature(feature.clone())
+            .await
+            .unwrap();
         // An incompatible durable job cannot take down otherwise healthy admission.
-        let startup = state.clone()
-            .with_receipt_settlement_publisher(Arc::new(RecordingReceiptSettlementPublisher::default()))
+        let startup = state
+            .clone()
+            .with_receipt_settlement_publisher(Arc::new(
+                RecordingReceiptSettlementPublisher::default(),
+            ))
             .with_session_backend(Arc::new(ScBridgeGatewaySessionBackend::new(
                 ScBridgeGatewaySessionConfig::new("ws://127.0.0.1:1", "test-token"),
             )));
-        let stored = startup.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
+        let stored = startup
+            .jobs
+            .lock_recover("test jobs")
+            .get(&id, now_secs())
+            .unwrap()
+            .unwrap();
         let mut malformed = stored.receipt.unwrap();
-        malformed["reconciliation"]["settlement_feature"]["value"]["contract_version"] = json!(CONTRACT_VERSION + 1);
-        startup.jobs.lock_recover("test jobs").update_reconciliation_receipt(&id, malformed, now_secs()).unwrap();
+        malformed["reconciliation"]["settlement_feature"]["value"]["contract_version"] =
+            json!(CONTRACT_VERSION + 1);
+        startup
+            .jobs
+            .lock_recover("test jobs")
+            .update_reconciliation_receipt(&id, malformed, now_secs())
+            .unwrap();
         assert!(spawn_pending_gateway_job_reconciliation(&startup).is_ok());
-        let mut restored = startup.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().receipt.unwrap();
+        let mut restored = startup
+            .jobs
+            .lock_recover("test jobs")
+            .get(&id, now_secs())
+            .unwrap()
+            .unwrap()
+            .receipt
+            .unwrap();
         restored["reconciliation"]["settlement_feature"] = feature.clone();
-        startup.jobs.lock_recover("test jobs").update_reconciliation_receipt(&id, restored, now_secs()).unwrap();
+        startup
+            .jobs
+            .lock_recover("test jobs")
+            .update_reconciliation_receipt(&id, restored, now_secs())
+            .unwrap();
         drop(startup);
         drop(invocation);
         drop(state);
@@ -48193,10 +50578,19 @@ mod tests {
             .with_receipt_settlement_publisher(publisher.clone());
         let deliveries = Arc::new(Mutex::new(Vec::new()));
         let transport = RecordingReceiptAckRecoveryTransport {
-            expected_ack: ack, feature: feature.clone(), deliveries: deliveries.clone(),
+            expected_ack: ack,
+            feature: feature.clone(),
+            deliveries: deliveries.clone(),
         };
-        assert!(reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.is_err());
-        let key = format!("receipt/head/{}/{}", provider_receipt.body.billing_id, provider_receipt.body.billing_attempt);
+        assert!(
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                .await
+                .is_err()
+        );
+        let key = format!(
+            "receipt/head/{}/{}",
+            provider_receipt.body.billing_id, provider_receipt.body.billing_attempt
+        );
         let confirmed = json!({
             "key": key, "confirmed": true, "signed_length": 123,
             "value": {
@@ -48206,17 +50600,26 @@ mod tests {
         });
         let response = Arc::new(Mutex::new(confirmed.clone()));
         let handler_response = response.clone();
-        let app = axum::Router::new().route("/v1/state", axum::routing::get(move |axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>| {
-            let response = handler_response.clone();
-            async move {
-                assert_eq!(query.get("confirmed").map(String::as_str), Some("true"));
-                axum::Json(response.lock_recover("test canonical response").clone())
-            }
-        }));
+        let app = axum::Router::new().route(
+            "/v1/state",
+            axum::routing::get(
+                move |axum::extract::Query(query): axum::extract::Query<
+                    BTreeMap<String, String>,
+                >| {
+                    let response = handler_response.clone();
+                    async move {
+                        assert_eq!(query.get("confirmed").map(String::as_str), Some("true"));
+                        axum::Json(response.lock_recover("test canonical response").clone())
+                    }
+                },
+            ),
+        );
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let restarted = restarted.with_canary_probe_contract_rpc(PeerRpcClient::new(format!("http://{address}/v1")).unwrap());
+        let restarted = restarted.with_canary_probe_contract_rpc(
+            PeerRpcClient::new(format!("http://{address}/v1")).unwrap(),
+        );
         let balance = restarted.ledger_balance_au();
         for (pointer, wrong) in [
             ("/confirmed", json!(false)),
@@ -48229,28 +50632,72 @@ mod tests {
             let mut invalid = confirmed.clone();
             *invalid.pointer_mut(pointer).unwrap() = wrong;
             *response.lock_recover("test canonical response") = invalid;
-            assert!(reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.is_err());
-            assert_eq!(restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().status, GatewayJobStatus::ReconciliationPending);
+            assert!(
+                reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                restarted
+                    .jobs
+                    .lock_recover("test jobs")
+                    .get(&id, now_secs())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                GatewayJobStatus::ReconciliationPending
+            );
         }
         *response.lock_recover("test canonical response") = confirmed;
-        reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-        reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-        let completed = restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
+        reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+            .await
+            .unwrap();
+        reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+            .await
+            .unwrap();
+        let completed = restarted
+            .jobs
+            .lock_recover("test jobs")
+            .get(&id, now_secs())
+            .unwrap()
+            .unwrap();
         assert_eq!(completed.status, GatewayJobStatus::Completed);
         assert_eq!(completed.result, Some(result));
-        assert_eq!(completed.receipt.as_ref().unwrap().pointer("/reconciliation/settlement_feature"), Some(&feature));
-        assert!(publisher.features.lock_recover("test published features").is_empty());
+        assert_eq!(
+            completed
+                .receipt
+                .as_ref()
+                .unwrap()
+                .pointer("/reconciliation/settlement_feature"),
+            Some(&feature)
+        );
+        assert!(publisher
+            .features
+            .lock_recover("test published features")
+            .is_empty());
         assert!(deliveries.lock_recover("test deliveries").is_empty());
         assert_eq!(restarted.ledger_balance_au(), balance);
         drop(restarted);
-        let reopened = GatewayState::fixture().with_receipt_user_seed(seed).with_job_store_dir(jobs_dir).unwrap();
-        assert_eq!(reopened.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap().status, GatewayJobStatus::Completed);
+        let reopened = GatewayState::fixture()
+            .with_receipt_user_seed(seed)
+            .with_job_store_dir(jobs_dir)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .jobs
+                .lock_recover("test jobs")
+                .get(&id, now_secs())
+                .unwrap()
+                .unwrap()
+                .status,
+            GatewayJobStatus::Completed
+        );
         server.abort();
     }
 
     #[tokio::test]
     async fn contract_upgrade_resubmits_v191_context_receipts_without_rewriting() {
-        for recovery_version in [23, 24] {
+        for recovery_version in [23, 24, 25] {
             let root = tempfile::tempdir().unwrap();
             let jobs_dir = root.path().join("jobs");
             let seed = test_user_seed();
@@ -48278,58 +50725,215 @@ mod tests {
             invocation.transport_peer = Some("ab".repeat(32));
             invocation.job = Some(job);
             let output = test_chat_output();
-            let mut provider_receipt = test_provider_receipt(
-                &model, &test_chat_request(&model.id), &output, &invocation,
-            );
+            let mut provider_receipt =
+                test_provider_receipt(&model, &test_chat_request(&model.id), &output, &invocation);
             let billed_usage = provider_receipt.body.usage.clone();
-            provider_receipt.body.usage_attribution.insert("context_input_tokens".into(), 1200);
+            provider_receipt
+                .body
+                .usage_attribution
+                .insert("context_input_tokens".into(), 1200);
             provider_receipt.enclave_sig = sign_hex(
-                &test_enclave_seed(), &receipt_signing_bytes(&provider_receipt.body).unwrap(),
+                &test_enclave_seed(),
+                &receipt_signing_bytes(&provider_receipt.body).unwrap(),
             );
             let ack = receipt_ack_for_body(&seed, &provider_receipt.body).unwrap();
             let result = chat_job_result(&output);
             stage_completed_invocation_job(
-                &invocation, result.clone(), &output.artifacts, &provider_receipt, &ack,
+                &invocation,
+                result.clone(),
+                &output.artifacts,
+                &provider_receipt,
+                &ack,
             )
             .await
             .unwrap();
             let mut feature = test_receipt_settlement_feature(&provider_receipt, &ack);
             feature["value"]["contract_version"] = json!(recovery_version);
-            assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_err());
-            let historical_receipt = parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
+            assert!(
+                validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature)
+                    .is_err()
+            );
+            let historical_receipt =
+                parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
             feature["key"] = json!(record_usage_receipt_feature_key_for_contract(
-                &historical_receipt, recovery_version,
+                &historical_receipt,
+                recovery_version,
             ));
             feature["value"]["provider_sig"] = json!(sign_hex(
                 &test_provider_seed(),
-                &record_usage_receipt_signing_bytes(feature["key"].as_str().unwrap(), &feature["value"]).unwrap(),
+                &record_usage_receipt_signing_bytes(
+                    feature["key"].as_str().unwrap(),
+                    &feature["value"]
+                )
+                .unwrap(),
             ));
-            assert!(validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).is_ok());
-            assert!(validate_receipt_settlement_feature_for_receipt(&provider_receipt, &ack, &feature).is_err());
-            invocation.job.as_ref().unwrap()
-                .persist_reconciliation_settlement_feature(feature.clone()).await.unwrap();
+            assert!(
+                validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature)
+                    .is_ok()
+            );
+            assert!(validate_receipt_settlement_feature_for_receipt(
+                &provider_receipt,
+                &ack,
+                &feature
+            )
+            .is_ok());
+            invocation
+                .job
+                .as_ref()
+                .unwrap()
+                .persist_reconciliation_settlement_feature(feature.clone())
+                .await
+                .unwrap();
             drop(invocation);
             drop(state);
             let publisher = Arc::new(RecordingReceiptSettlementPublisher::default());
             let restarted = GatewayState::fixture()
                 .with_receipt_user_seed(seed)
-                .with_job_store_dir(jobs_dir.clone()).unwrap()
+                .with_job_store_dir(jobs_dir.clone())
+                .unwrap()
                 .with_receipt_settlement_publisher(publisher.clone());
             let deliveries = Arc::new(Mutex::new(Vec::new()));
             let transport = RecordingReceiptAckRecoveryTransport {
-                expected_ack: ack, feature: feature.clone(), deliveries: deliveries.clone(),
+                expected_ack: ack,
+                feature: feature.clone(),
+                deliveries: deliveries.clone(),
             };
             let balance = restarted.ledger_balance_au();
-            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-            reconcile_pending_gateway_job_once(&restarted, &id, &transport).await.unwrap();
-            let completed = restarted.jobs.lock_recover("test jobs").get(&id, now_secs()).unwrap().unwrap();
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                .await
+                .unwrap();
+            reconcile_pending_gateway_job_once(&restarted, &id, &transport)
+                .await
+                .unwrap();
+            let completed = restarted
+                .jobs
+                .lock_recover("test jobs")
+                .get(&id, now_secs())
+                .unwrap()
+                .unwrap();
             assert_eq!(completed.status, GatewayJobStatus::Completed);
             assert_eq!(completed.result, Some(result));
-            assert_eq!(completed.receipt.as_ref().unwrap().pointer("/reconciliation/settlement_feature"), Some(&feature));
-            assert_eq!(*publisher.features.lock_recover("test published features"), vec![feature]);
-            assert!(deliveries.lock_recover("test deliveries").is_empty(), "no model or ACK redispatch");
+            assert_eq!(
+                completed
+                    .receipt
+                    .as_ref()
+                    .unwrap()
+                    .pointer("/reconciliation/settlement_feature"),
+                Some(&feature)
+            );
+            assert_eq!(
+                *publisher.features.lock_recover("test published features"),
+                vec![feature]
+            );
+            assert!(
+                deliveries.lock_recover("test deliveries").is_empty(),
+                "no model or ACK redispatch"
+            );
             assert_eq!(restarted.ledger_balance_au(), balance);
             assert_eq!(provider_receipt.body.usage, billed_usage);
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_recovery_requeues_only_contract_supported_features() {
+        for (contract_version, should_queue) in [
+            (22_u32, false),
+            (23_u32, true),
+            (24_u32, true),
+            (25_u32, true),
+        ] {
+            let publisher = Arc::new(RecordingReceiptSettlementPublisher::default());
+            let state =
+                GatewayState::fixture().with_receipt_settlement_publisher(publisher.clone());
+            let model = test_model();
+            let job = match prepare_gateway_job(
+                &state,
+                &HeaderMap::new(),
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                &model.id,
+                &json!({"model": model.id, "messages": []}),
+                &None,
+            )
+            .await
+            .unwrap()
+            {
+                PreparedGatewayJob::Started(job) => job,
+                _ => panic!("fresh job expected"),
+            };
+            let id = job.id.clone();
+            let mut invocation = test_invocation();
+            invocation.transport_peer = Some("ab".repeat(32));
+            invocation.job = Some(job.clone());
+            let output = test_chat_output();
+            let provider_receipt = test_provider_receipt_with_finality(
+                &model,
+                &test_chat_request(&model.id),
+                &output,
+                &invocation,
+                1,
+                false,
+            );
+            let ack = receipt_ack_for_body(&invocation.receipt_user_seed, &provider_receipt.body)
+                .unwrap();
+            let mut feature = test_receipt_settlement_feature(&provider_receipt, &ack);
+            feature["value"]["contract_version"] = json!(contract_version);
+            let receipt =
+                parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
+            feature["key"] = json!(record_usage_receipt_feature_key_for_contract(
+                &receipt,
+                contract_version,
+            ));
+            feature["value"]["provider_sig"] = json!(sign_hex(
+                &test_provider_seed(),
+                &record_usage_receipt_signing_bytes(
+                    feature["key"].as_str().unwrap(),
+                    &feature["value"],
+                )
+                .unwrap(),
+            ));
+            job.persist_reconciliation_pending(
+                None,
+                Vec::new(),
+                Some(
+                    gateway_job_settled_receipt(
+                        &invocation,
+                        &provider_receipt,
+                        &ack,
+                        GatewayJobStatus::Cancelled,
+                        Some("stream interrupted before terminal receipt".to_owned()),
+                        Some("checkpoint".to_owned()),
+                    )
+                    .unwrap(),
+                ),
+                Some("checkpoint reconciliation is pending".to_owned()),
+            )
+            .await
+            .unwrap();
+            job.persist_reconciliation_settlement_feature(feature.clone())
+                .await
+                .unwrap();
+            let transport = RecordingReceiptAckRecoveryTransport {
+                expected_ack: ack,
+                feature: feature.clone(),
+                deliveries: Arc::new(Mutex::new(Vec::new())),
+            };
+
+            let error = reconcile_pending_gateway_job_once(&state, &id, &transport)
+                .await
+                .unwrap_err();
+            assert!(error.message.contains("canonical ledger access"));
+            assert_eq!(
+                publisher
+                    .features
+                    .lock_recover("test published features")
+                    .as_slice(),
+                if should_queue {
+                    std::slice::from_ref(&feature)
+                } else {
+                    &[]
+                },
+                "contract version {contract_version}",
+            );
         }
     }
 
@@ -48388,9 +50992,10 @@ mod tests {
             .with_receipt_settlement_publisher(publisher.clone());
         let transport = RecordingAnyReceiptAckRecoveryTransport::default();
 
-        let first = reconcile_pending_gateway_jobs_pass(&restarted, &transport, 1, &mut String::new())
-            .await
-            .unwrap();
+        let first =
+            reconcile_pending_gateway_jobs_pass(&restarted, &transport, 1, &mut String::new())
+                .await
+                .unwrap();
         assert_eq!(
             first,
             GatewayReceiptAckRecoveryPass {
@@ -48424,9 +51029,10 @@ mod tests {
             1
         );
 
-        let second = reconcile_pending_gateway_jobs_pass(&restarted, &transport, 8, &mut String::new())
-            .await
-            .unwrap();
+        let second =
+            reconcile_pending_gateway_jobs_pass(&restarted, &transport, 8, &mut String::new())
+                .await
+                .unwrap();
         assert_eq!(second.pending, 2);
         assert_eq!(second.attempted, 2);
         assert_eq!(second.completed, 2);
@@ -49155,6 +51761,47 @@ mod tests {
             let response = artifact_generation_response_value(&request, &run);
             assert_eq!(response["object"], json!(expected_object));
             assert_eq!(response["data"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
+    fn embedding_spend_ceiling_covers_special_and_subword_tokens() {
+        let price = PriceRefAu {
+            denom: "au_usd".to_owned(),
+            ver: 1,
+            rate_map: vec![RateMapEntry {
+                unit: USAGE_INPUT_TOKEN.to_owned(),
+                per_unit_au: 60_000_000_000_000,
+                granularity: 1_000,
+            }],
+            per_req_au: 0,
+            min_session_au: 0,
+            derivation: None,
+            history: Vec::new(),
+        };
+        let cases = [
+            (vec!["a".to_owned()], 2),
+            (
+                vec![
+                    "OpenMayhem embedding rollout smoke A".to_owned(),
+                    "OpenMayhem embedding rollout smoke B".to_owned(),
+                ],
+                16,
+            ),
+        ];
+
+        for (inputs, exact_provider_tokens) in cases {
+            let whitespace_ceiling = calculate_au_owed(
+                &price,
+                &ReceiptUsage::text(embedding_input_token_count(&inputs), 0),
+            );
+            let exact_provider_receipt =
+                calculate_au_owed(&price, &ReceiptUsage::text(exact_provider_tokens, 0));
+            assert!(exact_provider_receipt > whitespace_ceiling);
+            assert!(
+                exact_provider_receipt <= estimate_embedding_max_spend_au(&price, &inputs),
+                "exact provider token usage must fit the signed spend ceiling"
+            );
         }
     }
 
@@ -50523,6 +53170,7 @@ mod tests {
             }],
             fingerprints_by_artifact_root: BTreeMap::new(),
             token_prefixes_by_artifact_root: BTreeMap::new(),
+            openai_compatible_artifact_roots: BTreeSet::new(),
             perceptual_hashes_by_artifact_root: BTreeMap::from([(
                 "ab".repeat(32),
                 BTreeMap::from([("fixed-workflow-image".to_owned(), expected_hash)]),
@@ -50940,6 +53588,43 @@ mod tests {
             .any(|candidate| candidate.provider == providers[0]));
     }
 
+    #[tokio::test]
+    async fn sole_route_retries_pre_spend_admission_failure_without_cooling_provider() {
+        let model = test_routed_model(1);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let billing_attempts = Arc::new(Mutex::new(Vec::new()));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(PreSpendAdmissionThenSuccessBackend {
+                providers: providers.clone(),
+                billing_attempts: billing_attempts.clone(),
+            }),
+        );
+        let request = test_chat_request(&model.id);
+
+        let run =
+            run_chat_with_route_retry(&state, &model, &request, GatewayRequestOptions::default())
+                .await
+                .expect("a sole healthy route should recover from cold-session admission failure");
+
+        assert_eq!(
+            run.result.output.content.as_deref(),
+            Some("recovered before spend")
+        );
+        let providers = providers.lock().expect("providers lock").clone();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0], providers[1]);
+        assert_eq!(
+            billing_attempts
+                .lock()
+                .expect("billing attempts lock")
+                .as_slice(),
+            &[0, 0]
+        );
+        assert!(
+            !state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64())
+        );
+    }
+
     #[test]
     fn buyer_local_direct_session_limits_are_modality_neutral_and_unpenalized() {
         let receive_rate = direct_session_transport_closed_error(
@@ -51088,7 +53773,10 @@ mod tests {
 
             for (code, expected_class) in [
                 ("request_invalid", GatewaySessionFailureClass::BuyerLocal),
-                ("context_length_exceeded", GatewaySessionFailureClass::BuyerLocal),
+                (
+                    "context_length_exceeded",
+                    GatewaySessionFailureClass::BuyerLocal,
+                ),
                 (
                     "request_chunk_failed",
                     GatewaySessionFailureClass::BuyerLocal,
@@ -51110,6 +53798,7 @@ mod tests {
                     }),
                     &format!("{collector} {endpoint_family} session"),
                     collector_retryable,
+                    false,
                 );
                 assert_eq!(error.failure_class, expected_class, "{collector}");
                 assert!(!error.retryable, "{collector}");
@@ -51119,9 +53808,15 @@ mod tests {
                     "{collector} cooled the route for {code}"
                 );
                 let api_error = request_scoped_api_error(&error).expect("request-scoped API error");
-                assert_eq!(api_error.status,
-                    if code == "model_output_invalid" { StatusCode::BAD_GATEWAY } else { StatusCode::BAD_REQUEST },
-                    "{collector}");
+                assert_eq!(
+                    api_error.status,
+                    if code == "model_output_invalid" {
+                        StatusCode::BAD_GATEWAY
+                    } else {
+                        StatusCode::BAD_REQUEST
+                    },
+                    "{collector}"
+                );
             }
 
             let entry = state
@@ -51142,6 +53837,7 @@ mod tests {
                 }),
                 &format!("{collector} {endpoint_family} session"),
                 collector_retryable,
+                false,
             );
             assert_eq!(
                 provider_fault.failure_class,
@@ -51167,6 +53863,60 @@ mod tests {
                 .expect("route remains in provider table");
             assert_eq!(entry.observed.samples, 1, "{collector}");
             assert_eq!(entry.observed.consecutive_failures, 1, "{collector}");
+        }
+    }
+
+    #[test]
+    fn lowercase_capacity_error_is_clean_only_before_execution_evidence() {
+        let collectors = [
+            ("chat and multimodal chat", false),
+            ("embedding", true),
+            ("image", true),
+            ("speech", true),
+            ("transcription", true),
+            ("artifact and workflow", true),
+            ("video", true),
+        ];
+        let frame = json!({
+            "t": "s.error",
+            "code": "capacity",
+            "message": "provider lane filled before atomic admission"
+        });
+
+        for (collector, normally_retryable) in collectors {
+            let clean = provider_reported_session_error(
+                &frame,
+                &format!("{collector} session"),
+                normally_retryable,
+                false,
+            );
+            assert!(clean.clean_refusal, "{collector}");
+            assert_eq!(clean.clean_refusal_code.as_deref(), Some("CAPACITY"));
+            assert!(clean.retryable, "{collector}");
+            assert!(!clean.safe_same_route_retry, "{collector}");
+
+            let after_output = provider_reported_session_error(
+                &frame,
+                &format!("{collector} session"),
+                normally_retryable,
+                true,
+            );
+            assert!(!after_output.clean_refusal, "{collector}");
+            assert!(!after_output.retryable, "{collector}");
+            assert!(!after_output.before_first_output, "{collector}");
+            assert!(!after_output.safe_same_route_retry, "{collector}");
+
+            let mut with_receipt = frame.clone();
+            with_receipt["receipt"] = json!({"execution": "observed"});
+            let after_receipt = provider_reported_session_error(
+                &with_receipt,
+                &format!("{collector} session"),
+                normally_retryable,
+                false,
+            );
+            assert!(!after_receipt.clean_refusal, "{collector}");
+            assert!(!after_receipt.retryable, "{collector}");
+            assert!(!after_receipt.safe_same_route_retry, "{collector}");
         }
     }
 
@@ -51247,8 +53997,12 @@ mod tests {
         code: &'static str,
     ) -> (GatewayState, GatewayModel, ApiError) {
         let model = focused_route_runner_model(runner);
-        let state = test_gateway_state_from_models(vec![model.clone()])
-            .with_session_backend(Arc::new(ProviderReportedFailureBackend { code, attempts: Arc::default() }));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(ProviderReportedFailureBackend {
+                code,
+                attempts: Arc::default(),
+            }),
+        );
         let options = GatewayRequestOptions {
             max_wait_ms: 0,
             ..GatewayRequestOptions::default()
@@ -51493,6 +54247,23 @@ mod tests {
         assert!(err.retryable);
         assert!(!err.clean_refusal);
         assert_eq!(err.clean_refusal_code, None);
+    }
+
+    #[test]
+    fn route_attempt_summary_keeps_payment_failure_over_generic_failure() {
+        let mut error = None;
+        retain_most_specific_route_attempt_error(
+            &mut error,
+            "spend reservation did not complete before serving".to_owned(),
+        );
+        retain_most_specific_route_attempt_error(
+            &mut error,
+            "provider failed without a classified reason".to_owned(),
+        );
+        assert_eq!(
+            route_attempt_error_code(error.as_deref()).0,
+            "payment_reservation_failed"
+        );
     }
 
     #[test]
@@ -51854,23 +54625,47 @@ mod tests {
         for pending in [Ok(false), Err("unreadable durable evidence".to_owned())] {
             let publisher: Arc<dyn GatewayReceiptSettlementPublisher> =
                 Arc::new(PendingPublisher(pending));
-            assert!(!wait_for_pending_receipt_settlement(
-                Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(5000),
-            ).await);
+            assert!(
+                !wait_for_pending_receipt_settlement(
+                    Some(&publisher),
+                    "buyer",
+                    "fiat",
+                    RouteWaitDeadline::new(5000),
+                )
+                .await
+            );
         }
         let publisher: Arc<dyn GatewayReceiptSettlementPublisher> =
             Arc::new(PendingPublisher(Ok(true)));
-        assert!(!wait_for_pending_receipt_settlement(
-            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(0),
-        ).await);
+        assert!(
+            !wait_for_pending_receipt_settlement(
+                Some(&publisher),
+                "buyer",
+                "fiat",
+                RouteWaitDeadline::new(0),
+            )
+            .await
+        );
         let started = Instant::now();
-        assert!(wait_for_pending_receipt_settlement(
-            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(5000),
-        ).await);
+        assert!(
+            wait_for_pending_receipt_settlement(
+                Some(&publisher),
+                "buyer",
+                "fiat",
+                RouteWaitDeadline::new(5000),
+            )
+            .await
+        );
         assert!(started.elapsed() >= Duration::from_secs(1));
-        assert!(!wait_for_pending_receipt_settlement(
-            Some(&publisher), "buyer", "fiat", RouteWaitDeadline::new(20),
-        ).await);
+        assert!(
+            !wait_for_pending_receipt_settlement(
+                Some(&publisher),
+                "buyer",
+                "fiat",
+                RouteWaitDeadline::new(20),
+            )
+            .await
+        );
     }
 
     #[test]
@@ -51910,43 +54705,45 @@ mod tests {
     #[tokio::test]
     async fn capacity_and_balance_semantics_cover_every_non_streaming_endpoint_runner() {
         for runner in FocusedRouteRunner::ALL {
-            let (state, model, capacity_error) =
-                run_focused_route_runner_failure(runner, "CAPACITY").await;
-            assert_eq!(
-                capacity_error.status,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{runner:?}"
-            );
-            assert_eq!(
-                public_error_code(&capacity_error),
-                "provider_admission_no_capacity",
-                "{runner:?}"
-            );
-            assert_eq!(
-                public_error_category(&capacity_error),
-                "provider_admission",
-                "{runner:?}"
-            );
-            assert!(public_error_retryable(&capacity_error), "{runner:?}");
-            let route = &model.mayhem.route_candidates[0];
-            assert!(
-                !state.route_provider_in_cooloff(route, now_millis_u64()),
-                "{runner:?} cooled an honest capacity refusal"
-            );
-            let entry = state
-                .provider_table
-                .lock_recover("provider table")
-                .entries(now_millis_u64())
-                .into_iter()
-                .find(|entry| entry.key == route_key(route))
-                .expect("route remains in provider table");
-            assert_eq!(entry.observed.samples, 0, "{runner:?}");
-            assert_eq!(entry.observed.consecutive_failures, 0, "{runner:?}");
-            assert!(state
-                .wallet_spend
-                .lock_recover("gateway wallet spend state")
-                .reservations
-                .is_empty());
+            for code in ["CAPACITY", "capacity"] {
+                let (state, model, capacity_error) =
+                    run_focused_route_runner_failure(runner, code).await;
+                assert_eq!(
+                    capacity_error.status,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{runner:?} {code}"
+                );
+                assert_eq!(
+                    public_error_code(&capacity_error),
+                    "provider_admission_no_capacity",
+                    "{runner:?} {code}"
+                );
+                assert_eq!(
+                    public_error_category(&capacity_error),
+                    "provider_admission",
+                    "{runner:?} {code}"
+                );
+                assert!(public_error_retryable(&capacity_error), "{runner:?} {code}");
+                let route = &model.mayhem.route_candidates[0];
+                assert!(
+                    !state.route_provider_in_cooloff(route, now_millis_u64()),
+                    "{runner:?} cooled an honest {code} refusal"
+                );
+                let entry = state
+                    .provider_table
+                    .lock_recover("provider table")
+                    .entries(now_millis_u64())
+                    .into_iter()
+                    .find(|entry| entry.key == route_key(route))
+                    .expect("route remains in provider table");
+                assert_eq!(entry.observed.samples, 0, "{runner:?} {code}");
+                assert_eq!(entry.observed.consecutive_failures, 0, "{runner:?} {code}");
+                assert!(state
+                    .wallet_spend
+                    .lock_recover("gateway wallet spend state")
+                    .reservations
+                    .is_empty());
+            }
 
             let (_, _, balance_error) = run_focused_route_runner_failure(runner, "BALANCE").await;
             assert_eq!(
@@ -52313,6 +55110,51 @@ mod tests {
             .collect::<Vec<_>>();
         let restored = reassemble_json_payload(&manifest, &chunks).unwrap();
         assert_eq!(restored, body);
+    }
+
+    #[test]
+    fn tokenize_request_frames_chunk_large_context_under_transport_limit() {
+        let request = json!({
+            "contract_request": {
+                "messages": [{"role": "user", "content": "context ".repeat(40_000)}]
+            }
+        });
+        let invocation = GatewayTokenizeInvocation {
+            session_id: "11".repeat(32),
+            provider_pubkey: "22".repeat(32),
+            transport_peer: "33".repeat(32),
+            enclave_id: "44".repeat(32),
+            room_id: "55".repeat(16),
+            model: "qwen/example".to_owned(),
+            served_ctx: 262_144,
+            request: request.clone(),
+            return_tokens: false,
+        };
+        let frames = tokenize_request_frames(
+            &invocation,
+            DEFAULT_SESSION_MAX_FRAME_BYTES,
+            4 * 1024 * 1024,
+        )
+        .unwrap();
+
+        assert!(frames.len() > 2);
+        assert!(frames.iter().all(|frame| {
+            session_frame_json_len(frame).expect("frame serializes")
+                <= DEFAULT_SESSION_MAX_FRAME_BYTES
+        }));
+        assert!(frames[..frames.len() - 1].iter().all(|frame| {
+            frame.get("t").and_then(Value::as_str) == Some(TOKENIZE_REQUEST_CHUNK_FRAME_TYPE)
+        }));
+        let final_frame: TokenizeRequestFrame =
+            serde_json::from_value(frames.last().unwrap().clone()).unwrap();
+        assert!(final_frame.request.is_none());
+        let manifest = final_frame.request_ref.unwrap();
+        let chunks = frames[..frames.len() - 1]
+            .iter()
+            .map(|frame| serde_json::from_value::<PayloadChunk>(frame["chunk"].clone()).unwrap())
+            .collect::<Vec<_>>();
+        let restored = reassemble_json_payload(&manifest, &chunks).unwrap();
+        assert_eq!(restored, request);
     }
 
     #[test]

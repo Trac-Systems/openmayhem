@@ -19,7 +19,8 @@ pub use validated_image::{image_reference_metadata, ImageReferenceMetadata};
 mod reservation_close;
 pub use reservation_close::{
     canonical_usage_receipt_hash, reservation_binding_matches, usage_reservation_close_feature,
-    usage_reservation_close_signing_bytes, usage_reservation_close_value, RESERVATION_BINDING_FIELDS,
+    usage_reservation_close_signing_bytes, usage_reservation_close_value,
+    RESERVATION_BINDING_FIELDS,
 };
 
 pub use comfy_workflow::{
@@ -41,7 +42,8 @@ pub use comfy_workflow_media::{
 pub use endpoint_contract::{
     artifact_generation_inline_audio_load, artifact_generation_input_characters,
     canonicalize_endpoint_request_aliases, endpoint_attribute_value_matches,
-    endpoint_contract_fingerprint, endpoint_family_contract_template, endpoint_request_fingerprint,
+    endpoint_contract_canonical_fingerprint, endpoint_contract_fingerprint,
+    endpoint_family_contract_template, endpoint_request_fingerprint,
     generate_endpoint_calibration_cases, materialize_endpoint_calibration_request,
     materialize_endpoint_request_defaults, openai_responses_input_to_chat_messages,
     validate_endpoint_attribute_value, validate_endpoint_request, validate_endpoint_response,
@@ -63,9 +65,31 @@ pub use validated_audio::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
-pub const CONTRACT_VERSION: u32 = 25;
-/// Retained schema-11 receipt settlement features accepted across the v25 upgrade.
-pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24];
+
+/// Reconstruct the text used by OpenAI-compatible canary evidence without
+/// retaining transport-specific SSE delta boundaries.
+pub fn openai_compatible_canary_output(reasoning: &str, content: &str) -> String {
+    let mut output = String::new();
+    if !reasoning.is_empty() {
+        output.push_str("<think>");
+        output.push_str(reasoning);
+        output.push_str("</think>");
+    }
+    output.push_str(content);
+    output
+}
+
+/// Return Unicode scalar values for the reconstructed OpenAI-compatible
+/// canary output. These units are evidence-only and do not affect metering.
+pub fn openai_compatible_canary_units(reconstructed_output: &str) -> Vec<i32> {
+    reconstructed_output
+        .chars()
+        .map(|scalar| i32::try_from(u32::from(scalar)).expect("Unicode scalar fits i32"))
+        .collect()
+}
+pub const CONTRACT_VERSION: u32 = 26;
+/// Retained schema-11 receipt settlement features accepted across the v26 upgrade.
+pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24, 25];
 /// Historical fixture version; use receipt_contract_version_is_supported for admission.
 pub const RECOVERABLE_RECEIPT_CONTRACT_VERSION: u32 = 23;
 pub fn receipt_contract_version_is_supported(version: u64) -> bool {
@@ -82,6 +106,11 @@ pub const TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION: u32 = 1;
 pub const TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION: u32 = 1;
 pub const TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE: &str = "tpm.activate.challenge";
 pub const TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE: &str = "tpm.activate.response";
+pub const TOKENIZE_REQUEST_FRAME_TYPE: &str = "tokenize.request";
+pub const TOKENIZE_REQUEST_CHUNK_FRAME_TYPE: &str = "tokenize.request_chunk";
+pub const TOKENIZE_RESPONSE_FRAME_TYPE: &str = "tokenize.response";
+pub const TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE: &str = "tokenize.response_chunk";
+pub const TOKENIZE_FRAME_VERSION: u32 = 1;
 pub const TPM_PCR_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const TPM_QUOTE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 11;
@@ -1356,6 +1385,53 @@ pub struct TpmActivateCredentialResponseFrame {
     pub enclave_id: String,
     pub room_id: String,
     pub response: TpmActivateCredentialResponse,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenizeRequestFrame {
+    #[serde(rename = "t")]
+    pub frame_type: String,
+    #[serde(rename = "v")]
+    pub version: u32,
+    pub session_id: String,
+    pub provider: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty", rename = "rid")]
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_ref: Option<PayloadChunkManifest>,
+    #[serde(default)]
+    pub return_tokens: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenizeResponseFrame {
+    #[serde(rename = "t")]
+    pub frame_type: String,
+    #[serde(rename = "v")]
+    pub version: u32,
+    pub session_id: String,
+    pub provider: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub model: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Vec<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_ref: Option<PayloadChunkManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -3454,10 +3530,9 @@ mod tests {
             "request_modalities": [["text"]],
             "proof_sha256": "33".repeat(32),
         });
-        let profile: SerializedGenerationExecutionProfile = serde_json::from_value(
-            serialized_mode["generation_execution_profile"].clone(),
-        )
-        .unwrap();
+        let profile: SerializedGenerationExecutionProfile =
+            serde_json::from_value(serialized_mode["generation_execution_profile"].clone())
+                .unwrap();
         let legacy_profile_bytes = br#"{"schema_version":1,"engine":"vllm","independent_dispatch":true,"request_modalities":[["text"]]}"#;
         assert_eq!(profile.topology, None);
         assert_eq!(serde_json::to_vec(&profile).unwrap(), legacy_profile_bytes);
@@ -3513,12 +3588,10 @@ mod tests {
         let mut hashes = BTreeSet::from([legacy.policy_hash]);
         for topology in ["shared_worker", "isolated_workers"] {
             mode["generation_execution_profile"]["topology"] = json!(topology);
-            let binding =
-                vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
+            let binding = vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
             assert!(hashes.insert(binding.policy_hash.clone()));
             let mut changed_proof = mode.clone();
-            changed_proof["generation_execution_profile"]["proof_sha256"] =
-                json!("44".repeat(32));
+            changed_proof["generation_execution_profile"]["proof_sha256"] = json!("44".repeat(32));
             assert_eq!(
                 vllm_execution_mode_binding(&artifact_root, "throughput", &changed_proof).unwrap(),
                 binding
@@ -3616,7 +3689,10 @@ mod tests {
         let profile: SerializedVllmExecutionProfile =
             serde_json::from_value(mode["profile"].clone()).unwrap();
         assert_eq!(profile.runtime, None);
-        assert!(serde_json::to_value(profile).unwrap().get("runtime").is_none());
+        assert!(serde_json::to_value(profile)
+            .unwrap()
+            .get("runtime")
+            .is_none());
 
         mode["profile"]["runtime"] = Value::Null;
         assert_eq!(
@@ -3626,15 +3702,24 @@ mod tests {
         let profile: SerializedVllmExecutionProfile =
             serde_json::from_value(mode["profile"].clone()).unwrap();
         assert_eq!(profile.runtime, None);
-        assert!(serde_json::to_value(profile).unwrap().get("runtime").is_none());
+        assert!(serde_json::to_value(profile)
+            .unwrap()
+            .get("runtime")
+            .is_none());
 
         let runtime = VllmRuntime::FlashinferSpeculativeMetadataV1;
-        assert_eq!(serde_json::to_value(runtime).unwrap(), json!("flashinfer_speculative_metadata_v1"));
+        assert_eq!(
+            serde_json::to_value(runtime).unwrap(),
+            json!("flashinfer_speculative_metadata_v1")
+        );
         mode["profile"]["runtime"] = serde_json::to_value(runtime).unwrap();
         let profile: SerializedVllmExecutionProfile =
             serde_json::from_value(mode["profile"].clone()).unwrap();
         assert_eq!(profile.runtime, Some(runtime));
-        assert_eq!(serde_json::to_value(profile).unwrap()["runtime"], mode["profile"]["runtime"]);
+        assert_eq!(
+            serde_json::to_value(profile).unwrap()["runtime"],
+            mode["profile"]["runtime"]
+        );
         let selected = vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
         assert_ne!(selected, baseline);
         mode["profile"]["proof_sha256"] = json!("ff".repeat(32));
@@ -3643,7 +3728,11 @@ mod tests {
             selected
         );
 
-        for invalid in [json!("unknown_runtime"), json!(1), json!({"runtime": "flashinfer_speculative_metadata_v1"})] {
+        for invalid in [
+            json!("unknown_runtime"),
+            json!(1),
+            json!({"runtime": "flashinfer_speculative_metadata_v1"}),
+        ] {
             mode["profile"]["runtime"] = invalid;
             assert!(vllm_execution_mode_binding(&artifact_root, "throughput", &mode).is_err());
         }
@@ -5390,16 +5479,59 @@ mod tests {
             PayloadChunkError::ChunkAfterFinal { .. }
         ));
     }
+
+    #[test]
+    fn tokenize_control_frames_round_trip_with_route_bindings() {
+        let request = TokenizeRequestFrame {
+            frame_type: TOKENIZE_REQUEST_FRAME_TYPE.to_owned(),
+            version: TOKENIZE_FRAME_VERSION,
+            session_id: "11".repeat(32),
+            provider: "22".repeat(32),
+            enclave_id: "33".repeat(32),
+            room_id: "room-1".to_owned(),
+            model: "qwen/example".to_owned(),
+            request_id: String::new(),
+            request: Some(json!({"contract_request": {"messages": []}})),
+            request_ref: None,
+            return_tokens: true,
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TokenizeRequestFrame>(encoded).unwrap(),
+            request
+        );
+
+        let response = TokenizeResponseFrame {
+            frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
+            version: TOKENIZE_FRAME_VERSION,
+            session_id: request.session_id,
+            provider: request.provider,
+            enclave_id: request.enclave_id,
+            room_id: request.room_id,
+            model: request.model,
+            ok: true,
+            count: Some(3),
+            tokens: Some(vec![1, 2, 3]),
+            tokens_ref: None,
+            error_code: None,
+            error: None,
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TokenizeResponseFrame>(encoded).unwrap(),
+            response
+        );
+    }
 }
 
 #[cfg(test)]
 mod market_version_bridge_tests {
     #[test]
-    fn receipt_recovery_accepts_v23_v24_and_v25_only() {
-        for version in [23, 24, 25] {
+    fn receipt_recovery_accepts_v23_through_v26_only() {
+        for version in [23, 24, 25, 26] {
             assert!(super::receipt_contract_version_is_supported(version));
         }
-        for version in [0, 22, 26, u64::MAX] {
+        for version in [0, 22, 27, u64::MAX] {
             assert!(!super::receipt_contract_version_is_supported(version));
         }
     }

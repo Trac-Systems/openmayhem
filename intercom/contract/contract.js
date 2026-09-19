@@ -7,12 +7,13 @@ import { consumeCanonicalReplayContext } from 'trac-peer/src/base/canonical-repl
 import PeerWallet from 'trac-wallet';
 import ContractV23 from './history/v23.js';
 import ContractV24 from './history/v24.js';
+import ContractV25 from './history/v25.js';
 
-export const CONTRACT_VERSION = 25;
+export const CONTRACT_VERSION = 26;
 // Recovery is limited to unchanged schema-11 receipt evidence already signed by
-// v23 or v24 participants. New prior-version operations are not admitted;
+// v23, v24, or v25 participants. New prior-version operations are not admitted;
 // separately authenticated canonical replay does not constitute new admission.
-const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24]);
+const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25]);
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -217,7 +218,7 @@ const PROBE_VERIFICATION_METHODS = new Set([
   'attestation_of_compute',
 ]);
 const AUDITOR_SLASH_REASONS = new Set(['collusion', 'false_report']);
-const BAN_TARGET_TYPES = new Set(['provider', 'device', 'fingerprint', 'committer']);
+const BAN_TARGET_TYPES = new Set(['provider', 'device', 'fingerprint', 'committer', 'kyb']);
 const FRAUD_PROOF_REASONS = new Set(['over_credit', 'price_derivation']);
 const DISPUTE_OUTCOMES = new Set(['provider_fault', 'opener_fault', 'no_fault']);
 const DISPUTE_DEPOSIT_ACTIONS = new Set(['refund', 'forfeit', 'partial_forfeit']);
@@ -900,14 +901,19 @@ class MayhemContract extends Contract {
       const versioned = versionedMayhemOperation(op);
       const canonicalReplay = consumeCanonicalReplayContext(consensusContext, op, storage);
       const historical = versioned.present && (
-        ([23, 24].includes(versioned.version) && canonicalReplay) ||
-        (versioned.version === 24 && await this.isPreparedCheckpointReplay(op, storage))
+        ([23, 24, 25].includes(versioned.version) && canonicalReplay) ||
+        ([24, 25].includes(versioned.version) &&
+          await this.isPreparedCheckpointReplay(op, storage))
       );
       if (historical) {
         // Replaying with today's pricing/receipt methods would produce a
         // different signed view. Retained implementations preserve the exact
         // historical transition, and never participate in new admission.
-        const Implementation = versioned.version === 23 ? ContractV23 : ContractV24;
+        const Implementation = versioned.version === 23
+          ? ContractV23
+          : versioned.version === 24
+            ? ContractV24
+            : ContractV25;
         this._historicalContracts ??= new Map();
         if (!this._historicalContracts.has(versioned.version)) {
           this._historicalContracts.set(versioned.version, new Implementation(this.protocol, this.config));
@@ -5473,9 +5479,39 @@ class MayhemContract extends Contract {
         current.paid_cum_au !== liability.paid_cum_au_before) {
       return new Error('Targeted payout preparation liability watermark mismatch.');
     }
+    const provider = await this.get(`prov/${liability.provider}`);
+    if (!provider ||
+        (provider.status !== 'active' && provider.status !== 'banned')) {
+      return new Error('Targeted payout preparation provider status is not payable.');
+    }
+    const params = await this.activeParamsAt(value.prepared_at, [
+      'holdback_epochs',
+      'challenge_epochs',
+      'canary_probe_holdback_bps',
+      'canary_probe_release_min_passes',
+    ]);
+    if (params instanceof Error) return params;
+    const probeGate = await this.probeGateForEarning(
+      liability.provider,
+      current,
+      params
+    );
+    if (probeGate instanceof Error) return probeGate;
+    const lockedEpochs = this.providerLockedEarningEpochs(provider, params);
+    if (lockedEpochs instanceof Error) return lockedEpochs;
+    const disputeGate = await this.providerHasOpenDispute(liability.provider);
+    if (disputeGate instanceof Error) return disputeGate;
+    const refreshed = this.refreshEarningHoldback(
+      current,
+      value.epoch,
+      lockedEpochs,
+      probeGate,
+      disputeGate
+    );
+    if (refreshed instanceof Error) return refreshed;
     const payable = this.safeSubAu(
-      this.safeSubAu(current.total_au, current.held_au),
-      current.paid_cum_au
+      this.safeSubAu(refreshed.total_au, refreshed.held_au),
+      refreshed.paid_cum_au
     );
     if (payable instanceof Error) return payable;
     if (this.compareAu(liability.liability_au, payable) > 0) {
@@ -7095,7 +7131,7 @@ class MayhemContract extends Contract {
       const fee = await this.feeCumRecord('tnk');
       if (fee instanceof Error) return fee;
       const payable = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
-      if (payable instanceof Error || payable !== planned.output.au) {
+      if (payable instanceof Error || this.compareAu(payable, planned.output.au) < 0) {
         return new Error('Targeted TNK fee output does not match canonical fee state.');
       }
       const swept = this.safeAddAu(fee.swept_cum_au, planned.output.au);
@@ -7230,7 +7266,8 @@ class MayhemContract extends Contract {
       const fee = await this.feeCumRecord('fiat');
       if (fee instanceof Error) return fee;
       const payable = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
-      if (payable instanceof Error || payable !== planned.output.liability_au ||
+      if (payable instanceof Error ||
+          this.compareAu(payable, planned.output.liability_au) < 0 ||
           planned.output.paid_au !== planned.output.liability_au) {
         return new Error('Targeted fiat fee output does not match canonical fee state.');
       }
@@ -8285,6 +8322,48 @@ class MayhemContract extends Contract {
     if (!BAN_TARGET_TYPES.has(targetType)) return new Error('Unsupported ban target type.');
     if (!this.isHexBytes(this.value.target, 32)) return new Error('Invalid ban target.');
     if (!this.isHexBytes(this.value.reason_hash, 32)) return new Error('Invalid unban reason hash.');
+
+    if (targetType === 'kyb') {
+      const provider = await this.get(`prov/${this.value.target}`);
+      if (!provider) return new Error('Provider not found.');
+      const kyb = await this.get(`kyb/${this.value.target}`);
+      if (!kyb || kyb.status !== 'revoked') {
+        return new Error('Revoked provider KYB not found.');
+      }
+      const keys = await this.kybBanIndexKeys(kyb);
+      if (keys instanceof Error) return keys;
+      const records = [];
+      for (const key of keys) {
+        const current = await this.get(key);
+        if (!current || current.target_type !== 'kyb' || current.reversible !== true) {
+          return new Error('Reversible provider KYB ban index not found.');
+        }
+        if (!['banned', 'revoked', 'unbanned'].includes(current.status)) {
+          return new Error('Invalid provider KYB ban index status.');
+        }
+        if (!current.providers?.[this.value.target]) {
+          return new Error('Provider KYB ban index does not bind this provider.');
+        }
+        records.push([key, current]);
+      }
+      for (const [key, current] of records) {
+        await this.put(key, {
+          ...current,
+          status: 'unbanned',
+          unbanned_at: this.tx,
+          unbanned_by: this.address,
+          unbanned_by_role: 'admin',
+          unban_reason_hash: this.value.reason_hash,
+          reversible: true,
+        });
+      }
+      return {
+        ok: true,
+        op: 'unban',
+        target_type: targetType,
+        target: this.value.target,
+      };
+    }
 
     if (targetType === 'provider') {
       const provider = await this.get(`prov/${this.value.target}`);
@@ -14537,12 +14616,12 @@ class MayhemContract extends Contract {
     if (feeError) return feeError;
     const payableFee = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
     if (payableFee instanceof Error) return payableFee;
-    if (this.compareAu(payableFee, value.operator_fee_au) !== 0) {
+    if (this.compareAu(payableFee, value.operator_fee_au) < 0) {
       return new Error('Targeted TNK operator fee does not match fee state.');
     }
     const operatorOutputs = outputs.filter((entry) => entry.role === 'operator_fee');
-    if ((this.isZeroAu(payableFee) && operatorOutputs.length !== 0) ||
-        (this.compareAu(payableFee, ZERO_AU) > 0 &&
+    if ((this.isZeroAu(value.operator_fee_au) && operatorOutputs.length !== 0) ||
+        (this.compareAu(value.operator_fee_au, ZERO_AU) > 0 &&
           (operatorOutputs.length !== 1 || operatorOutputs[0].to !== value.operator_to))) {
       return new Error('Targeted TNK operator output mismatch.');
     }
@@ -14745,7 +14824,7 @@ class MayhemContract extends Contract {
             !this.isZeroAu(value.operator_fee_retained_au))) ||
         (operatorOutputs.length === 1 &&
           (operatorOutputs[0].to !== value.operator_to ||
-            this.compareAu(operatorOutputs[0].liability_au, payableFee) !== 0 ||
+            this.compareAu(operatorOutputs[0].liability_au, payableFee) > 0 ||
             this.compareAu(operatorOutputs[0].paid_au, value.operator_fee_retained_au) !== 0))) {
       return new Error('Targeted fiat operator output mismatch.');
     }

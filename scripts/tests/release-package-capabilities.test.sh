@@ -177,6 +177,9 @@ if (manifest.dependencies?.['trac-wallet'] !== '1.0.1' ||
     Object.prototype.hasOwnProperty.call(manifest.overrides ?? {}, 'trac-wallet')) {
   throw new Error('Intercom root must pin trac-wallet 1.0.1 without overriding pinned MSB/peer wallets');
 }
+if (manifest.dependencies?.hyperdht !== '6.29.6') {
+  throw new Error('Intercom root must pin hyperdht 6.29.6');
+}
 for (const [name, source] of [
   ['trac-msb', 'trac/msb'],
   ['trac-peer', 'trac/trac-peer'],
@@ -205,6 +208,14 @@ const expectedWallets = new Map([
 if (wallets.length !== expectedWallets.size ||
     wallets.some(([entry, locked]) => locked.version !== expectedWallets.get(entry))) {
   throw new Error('root lock does not contain the three pinned trac-wallet installs');
+}
+const hyperdhts = Object.entries(lock.packages)
+  .filter(([entry]) => entry === 'node_modules/hyperdht' ||
+    entry.endsWith('/node_modules/hyperdht'));
+if (hyperdhts.length !== 1 ||
+    hyperdhts[0][0] !== 'node_modules/hyperdht' ||
+    hyperdhts[0][1].version !== '6.29.6') {
+  throw new Error('root lock must contain exactly one hyperdht 6.29.6');
 }
 NODE
 
@@ -238,6 +249,7 @@ mkdir -p \
   "$topology/trac/msb" \
   "$topology/trac/trac-peer" \
   "$topology/scripts" \
+  "$topology/node_modules/hyperdht" \
   "$topology/node_modules/trac-msb" \
   "$topology/node_modules/trac-peer" \
   "$topology/node_modules/trac-wallet" \
@@ -251,6 +263,7 @@ cat >"$topology/package.json" <<'JSON'
   "name": "topology-root",
   "version": "1.0.0",
   "dependencies": {
+    "hyperdht": "6.29.6",
     "trac-msb": "file:trac/msb",
     "trac-peer": "file:trac/trac-peer",
     "trac-wallet": "1.0.1"
@@ -265,12 +278,26 @@ cat >"$topology/package-lock.json" <<'JSON'
   "packages": {
     "": {
       "name": "topology-root",
-      "version": "1.0.0"
+      "version": "1.0.0",
+      "dependencies": {
+        "hyperdht": "6.29.6",
+        "trac-msb": "file:trac/msb",
+        "trac-peer": "file:trac/trac-peer",
+        "trac-wallet": "1.0.1"
+      }
+    },
+    "node_modules/hyperdht": {
+      "name": "hyperdht",
+      "version": "6.29.6"
     },
     "node_modules/trac-msb": {
       "name": "trac-msb",
       "version": "0.2.9",
-      "resolved": "file:trac/msb"
+      "resolved": "file:trac/msb",
+      "dependencies": {
+        "hyperdht": "6.29.6",
+        "trac-wallet": "2.1.0"
+      }
     },
     "node_modules/trac-msb/node_modules/trac-wallet": {
       "name": "trac-wallet",
@@ -279,7 +306,12 @@ cat >"$topology/package-lock.json" <<'JSON'
     "node_modules/trac-peer": {
       "name": "trac-peer",
       "version": "0.4.0",
-      "resolved": "file:trac/trac-peer"
+      "resolved": "file:trac/trac-peer",
+      "dependencies": {
+        "hyperdht": "6.29.6",
+        "trac-msb": "file:../msb",
+        "trac-wallet": "1.0.4"
+      }
     },
     "node_modules/trac-peer/node_modules/trac-wallet": {
       "name": "trac-wallet",
@@ -297,13 +329,22 @@ cat >"$topology/package-lock.json" <<'JSON'
 }
 JSON
 cat >"$topology/trac/msb/package.json" <<'JSON'
-{"name":"trac-msb","version":"0.2.9","dependencies":{"trac-wallet":"2.1.0"}}
+{"name":"trac-msb","version":"0.2.9","dependencies":{"hyperdht":"6.29.6","trac-wallet":"2.1.0"}}
 JSON
 cat >"$topology/trac/trac-peer/package.json" <<'JSON'
-{"name":"trac-peer","version":"0.4.0","dependencies":{"trac-wallet":"1.0.4"}}
+{"name":"trac-peer","version":"0.4.0","dependencies":{"hyperdht":"6.29.6","trac-msb":"file:../msb","trac-wallet":"1.0.4"}}
+JSON
+cat >"$topology/trac/msb/package-lock.json" <<'JSON'
+{"name":"trac-msb","version":"0.2.9","lockfileVersion":3,"packages":{"":{"name":"trac-msb","version":"0.2.9","dependencies":{"hyperdht":"6.29.6"}},"node_modules/hyperdht":{"name":"hyperdht","version":"6.29.6"}}}
+JSON
+cat >"$topology/trac/trac-peer/package-lock.json" <<'JSON'
+{"name":"trac-peer","version":"0.4.0","lockfileVersion":3,"packages":{"":{"name":"trac-peer","version":"0.4.0","dependencies":{"hyperdht":"6.29.6","trac-msb":"file:../msb"}},"node_modules/hyperdht":{"name":"hyperdht","version":"6.29.6"},"node_modules/trac-msb":{"name":"trac-msb","version":"0.2.9","resolved":"file:../msb"}}}
 JSON
 cp "$topology/trac/msb/package.json" "$topology/node_modules/trac-msb/package.json"
 cp "$topology/trac/trac-peer/package.json" "$topology/node_modules/trac-peer/package.json"
+cat >"$topology/node_modules/hyperdht/package.json" <<'JSON'
+{"name":"hyperdht","version":"6.29.6"}
+JSON
 mkdir -p \
   "$topology/node_modules/trac-msb/node_modules/trac-wallet" \
   "$topology/node_modules/trac-peer/node_modules/trac-wallet"
@@ -358,6 +399,14 @@ expect_failure "topology verifier accepted a wallet missing encodeBech32mSafe" \
 printf 'module.exports = class PeerWallet { static encodeBech32mSafe() {} };\n' \
   >"$topology/node_modules/trac-wallet/index.js"
 node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology" >/dev/null
+
+mkdir -p "$topology/node_modules/trac-peer/node_modules/hyperdht"
+cat >"$topology/node_modules/trac-peer/node_modules/hyperdht/package.json" <<'JSON'
+{"name":"hyperdht","version":"6.27.0"}
+JSON
+expect_failure "topology verifier accepted a nested stale hyperdht" \
+  node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$topology"
+rm -rf "$topology/node_modules/trac-peer/node_modules/hyperdht"
 
 rm "$topology/node_modules/trac-msb/migration/initial_balances.csv"
 expect_failure "topology verifier accepted an npm-omitted pinned MSB runtime file" \

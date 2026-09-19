@@ -1,0 +1,215 @@
+{
+  "artifact_root": "e228d4e36517c331c3ddf034753cf974a7f73d2ac3dd0be4ef145722eccdc26c",
+  "baseline_memory": {
+    "process_tree_rss_bytes": 896282624,
+    "swap_used_bytes": 137527296,
+    "system_available_bytes": 103230713856,
+    "system_used_bytes": 25289302016
+  },
+  "engine": {
+    "dtype": "bfloat16",
+    "max_model_len": 32768,
+    "max_num_batched_tokens": 32768,
+    "max_num_seqs": 8,
+    "memory_utilization": 0.13,
+    "runner": "pooling"
+  },
+  "error": null,
+  "final_memory": {
+    "process_tree_rss_bytes": 1282727936,
+    "swap_used_bytes": 137527296,
+    "system_available_bytes": 102961094656,
+    "system_used_bytes": 25558921216
+  },
+  "load_seconds": 54.16936773201451,
+  "model_id": "Qwen/Qwen3-Embedding-4B",
+  "results": [
+    {
+      "characters_per_item": 256,
+      "elapsed_seconds": 0.21863502683117986,
+      "items": 32,
+      "items_per_second": 146.36264126474558,
+      "label": "batch-32-short",
+      "memory": {
+        "process_tree_rss_bytes": 3488243712,
+        "swap_used_bytes": 137527296,
+        "system_available_bytes": 84238307328,
+        "system_used_bytes": 44281708544
+      },
+      "native_dimensions": 2560,
+      "prefix_norm_max": 0.7856993008427331,
+      "prefix_norm_min": 0.7792221555829805,
+      "tokens": 1910
+    },
+    {
+      "characters_per_item": 256,
+      "elapsed_seconds": 0.3710502199828625,
+      "items": 64,
+      "items_per_second": 172.48339053122226,
+      "label": "batch-64-short",
+      "memory": {
+        "process_tree_rss_bytes": 3488673792,
+        "swap_used_bytes": 137527296,
+        "system_available_bytes": 84237283328,
+        "system_used_bytes": 44282732544
+      },
+      "native_dimensions": 2560,
+      "prefix_norm_max": 0.7843741288268352,
+      "prefix_norm_min": 0.7788104116055219,
+      "tokens": 3830
+    },
+    {
+      "characters_per_item": 256,
+      "elapsed_seconds": 0.6391891683451831,
+      "items": 128,
+      "items_per_second": 200.25370631887148,
+      "label": "batch-128-short",
+      "memory": {
+        "process_tree_rss_bytes": 3489374208,
+        "swap_used_bytes": 137527296,
+        "system_available_bytes": 84234555392,
+        "system_used_bytes": 44285460480
+      },
+      "native_dimensions": 2560,
+      "prefix_norm_max": 0.7847229961029868,
+      "prefix_norm_min": 0.7682898861122237,
+      "tokens": 8594
+    },
+    {
+      "characters_per_item": 256,
+      "elapsed_seconds": 1.221637852024287,
+      "items": 256,
+      "items_per_second": 209.55473799031446,
+      "label": "batch-256-short",
+      "memory": {
+        "process_tree_rss_bytes": 3490811904,
+        "swap_used_bytes": 137527296,
+        "system_available_bytes": 84229816320,
+        "system_used_bytes": 44290199552
+      },
+      "native_dimensions": 2560,
+      "prefix_norm_max": 0.784149551808552,
+      "prefix_norm_min": 0.7739120455896952,
+      "tokens": 17298
+    },
+    {
+      "characters_per_item": 1024,
+      "elapsed_seconds": 0.7169509520754218,
+      "items": 128,
+      "items_per_second": 178.5338308422173,
+      "label": "batch-128-medium",
+      "memory": {
+        "process_tree_rss_bytes": 3491168256,
+        "swap_used_bytes": 137527296,
+        "system_available_bytes": 84231159808,
+        "system_used_bytes": 44288856064
+      },
+      "native_dimensions": 2560,
+      "prefix_norm_max": 0.7786052924707149,
+      "prefix_norm_min": 0.7705326067971371,
+      "tokens": 30226
+    },
+    {
+      "children": [
+        {
+          "characters_per_item": 256,
+          "elapsed_seconds": 0.675924182869494,
+          "items": 128,
+          "items_per_second": 189.37035135598038,
+          "label": "concurrent-2x128-short-request-0",
+          "memory": {
+            "process_tree_rss_bytes": 3491291136,
+            "swap_used_bytes": 137527296,
+            "system_available_bytes": 84229103616,
+            "system_used_bytes": 44290912256
+          },
+          "native_dimensions": 2560,
+          "prefix_norm_max": 0.7813606755954394,
+          "prefix_norm_min": 0.7727673270565892,
+          "tokens": 8978
+        },
+        {
+          "characters_per_item": 256,
+          "elapsed_seconds": 1.297165031079203,
+          "items": 128,
+          "items_per_second": 98.6767272730963,
+          "label": "concurrent-2x128-short-request-1",
+          "memory": {
+            "process_tree_rss_bytes": 3491291136,
+            "swap_used_bytes": 137527296,
+            "system_available_bytes": 84231680000,
+            "system_used_bytes": 44288335872
+          },
+          "native_dimensions": 2560,
+          "prefix_norm_max": 0.7816625150801263,
+          "prefix_norm_min": 0.7767387438664163,
+          "tokens": 8978
+        }
+      ],
+      "elapsed_seconds": 1.3031410882249475,
+      "items_per_request": 128,
+      "items_per_second": 196.4484139999808,
+      "label": "concurrent-2x128-short",
+      "memory": {
+        "process_tree_rss_bytes": 3491291136,
+        "swap_used_bytes": 137527296,
+        "system_available_bytes": 84231680000,
+        "system_used_bytes": 44288335872
+      },
+      "requests": 2,
+      "total_items": 256
+    },
+    {
+      "children": [
+        {
+          "characters_per_item": 256,
+          "elapsed_seconds": 1.3670537709258497,
+          "items": 256,
+          "items_per_second": 187.26403119214663,
+          "label": "headroom-2x256-short-request-0",
+          "memory": {
+            "process_tree_rss_bytes": 3493797888,
+            "swap_used_bytes": 137527296,
+            "system_available_bytes": 84228239360,
+            "system_used_bytes": 44291776512
+          },
+          "native_dimensions": 2560,
+          "prefix_norm_max": 0.7929500773948939,
+          "prefix_norm_min": 0.7867744059672586,
+          "tokens": 19858
+        },
+        {
+          "characters_per_item": 256,
+          "elapsed_seconds": 2.6903738491237164,
+          "items": 256,
+          "items_per_second": 95.15406198412981,
+          "label": "headroom-2x256-short-request-1",
+          "memory": {
+            "process_tree_rss_bytes": 3493797888,
+            "swap_used_bytes": 137527296,
+            "system_available_bytes": 84222025728,
+            "system_used_bytes": 44297990144
+          },
+          "native_dimensions": 2560,
+          "prefix_norm_max": 0.7911254723700878,
+          "prefix_norm_min": 0.7859656944333793,
+          "tokens": 19858
+        }
+      ],
+      "elapsed_seconds": 2.699317823164165,
+      "items_per_request": 256,
+      "items_per_second": 189.677553197433,
+      "label": "headroom-2x256-short",
+      "memory": {
+        "process_tree_rss_bytes": 3493797888,
+        "swap_used_bytes": 137527296,
+        "system_available_bytes": 84222025728,
+        "system_used_bytes": 44297990144
+      },
+      "requests": 2,
+      "total_items": 512
+    }
+  ],
+  "runtime": "vllm-0.24.0",
+  "schema_version": 1
+}
