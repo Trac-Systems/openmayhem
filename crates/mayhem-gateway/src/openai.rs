@@ -15437,6 +15437,7 @@ fn provider_reported_session_error(
     frame: &Value,
     session_context: &str,
     retryable: bool,
+    execution_evidence_observed: bool,
 ) -> GatewaySessionError {
     let code = frame
         .get("code")
@@ -15447,7 +15448,17 @@ fn provider_reported_session_error(
         .and_then(Value::as_str)
         .unwrap_or("provider returned s.error");
     let message = format!("provider returned {code} on {session_context}: {message}");
+    let execution_evidence_observed = execution_evidence_observed || frame.get("receipt").is_some();
     match code {
+        // Some provider workers report an atomic admission race as a lowercase
+        // s.error instead of the uppercase s.reject code. It is a clean
+        // pre-spend refusal only while the collector has seen no evidence that
+        // execution began. Once output or a receipt exists, fail closed so a
+        // retry cannot duplicate inference or spend.
+        "capacity" if !execution_evidence_observed => {
+            GatewaySessionError::clean_refusal_with_code(message, Some("CAPACITY"))
+        }
+        "capacity" => GatewaySessionError::new(message),
         "context_length_exceeded"
         | "request_invalid"
         | "request_chunk_failed"
@@ -19708,6 +19719,10 @@ async fn collect_direct_session_output(
                     &frame,
                     &format!("session {session_id}"),
                     false,
+                    delta_sequence.next_index > 0
+                        || latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
                 );
                 settle_failed_direct_session_frame(
                     bridge,
@@ -20012,6 +20027,7 @@ async fn collect_direct_session_embedding_output(
                     &frame,
                     &format!("embedding session {session_id}"),
                     true,
+                    delta_sequence.next_index > 0 || provider_receipt.is_some(),
                 ));
             }
             Some("s.close") => {
@@ -20155,6 +20171,7 @@ async fn collect_direct_session_image_generation_output(
                     &frame,
                     &format!("image session {session_id}"),
                     true,
+                    delta_sequence.next_index > 0 || provider_receipt.is_some(),
                 ));
             }
             Some("s.close") => {
@@ -20302,6 +20319,7 @@ async fn collect_direct_session_audio_speech_output(
                     &frame,
                     &format!("audio speech session {session_id}"),
                     true,
+                    delta_sequence.next_index > 0 || provider_receipt.is_some(),
                 ));
             }
             Some("s.close") => {
@@ -20443,6 +20461,7 @@ async fn collect_direct_session_artifact_generation_output(
                         request.output_modality
                     ),
                     true,
+                    delta_sequence.next_index > 0 || provider_receipt.is_some(),
                 ));
             }
             Some("s.close") => {
@@ -20635,6 +20654,7 @@ async fn collect_direct_session_audio_transcription_output(
                     &frame,
                     &format!("audio transcription session {session_id}"),
                     true,
+                    delta_sequence.next_index > 0 || provider_receipt.is_some(),
                 ));
             }
             Some("s.close") => {
@@ -21865,7 +21885,7 @@ async fn settle_failed_direct_session_frame(
         provider_signed_receipt_from_frame(frame, &invocation.session_id, enclave_pubkey)?;
     let ack =
         failed_direct_session_receipt_ack(model, invocation, &receipt, checkpoint, prompt_hash)?;
-    let failure = provider_reported_session_error(frame, "failed generation", false);
+    let failure = provider_reported_session_error(frame, "failed generation", false, true);
     let public_error = provider_session_api_error(&failure);
     if let Some(job) = invocation.job.as_ref() {
         job.mark_settlement_reconciliation_started();
@@ -26808,6 +26828,10 @@ async fn run_live_direct_chat_sse_inner(
                     &frame,
                     &format!("session {}", session.invocation.session_id),
                     false,
+                    delta_sequence.next_index > 0
+                        || latest_checkpoint_receipt.is_some()
+                        || pending_checkpoint_receipt.is_some()
+                        || final_provider_receipt.is_some(),
                 );
                 settle_failed_direct_session_frame(
                     &mut session.bridge,
@@ -28656,9 +28680,14 @@ impl GatewayState {
                 .get(&(provider.clone(), modality.clone()))
                 .copied()
                 .unwrap_or_default();
+            // `active_items` is an advisory heartbeat snapshot and may already
+            // include this gateway's live reservations. Adding both counters
+            // double-counts overlapping work, so reserve against the more
+            // conservative observation. The provider remains the atomic
+            // admission authority and can still reject a race with CAPACITY.
             if capacity
                 .active_items
-                .saturating_add(locally_active)
+                .max(locally_active)
                 .saturating_add(load.item_count)
                 > capacity.max_inflight_items
             {
@@ -46327,6 +46356,7 @@ mod tests {
                 }),
                 context,
                 retryable,
+                false,
             )
         }
     }
@@ -48909,6 +48939,107 @@ mod tests {
             panic!("capability loss must be a permanent admission failure");
         };
         assert!(err.contains("Capabilities"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn modality_admission_deduplicates_heartbeat_and_local_activity() {
+        let mut model = test_routed_model(1);
+        model.mayhem.caps.vision = true;
+        model.mayhem.adapter.modality_set = vec!["text".to_owned(), "image".to_owned()];
+        model.mayhem.route_candidates[0].served_modalities =
+            vec!["text".to_owned(), "image".to_owned()];
+        let route = &model.mayhem.route_candidates[0];
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let now = now_millis_u64();
+        let mut heartbeat = heartbeat_for_route(&model, route, now);
+        heartbeat.caps.modality_capacity.insert(
+            "image".to_owned(),
+            HeartbeatModalityCapacity {
+                unit: "pixel".to_owned(),
+                max_inflight_items: 256,
+                active_items: 128,
+                max_items_per_request: 128,
+                max_item_bytes: 1024 * 1024,
+                max_item_units: 1024 * 1024,
+                working_set_bytes_per_item: 1024,
+            },
+        );
+        heartbeat.sig = "aa".repeat(64);
+        state.ingest_provider_heartbeat(heartbeat.clone(), now);
+
+        let mut request = test_chat_request(&model.id);
+        request.messages[0].content = json!([
+            { "type": "text", "text": "describe" },
+            { "type": "image_url", "image_url": { "url": test_png_data_url() } }
+        ]);
+        let mut requirements =
+            request_requirements_for_chat(&state, &model, &request, now, None, None, None);
+        requirements
+            .modality_load
+            .get_mut("image")
+            .expect("image load")
+            .item_count = 128;
+
+        let first = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("remote 128 plus request 128 fits")
+            .expect("first admission guard");
+        let second = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("overlapping remote 128 and local 128 plus request 128 fits")
+            .expect("second admission guard");
+        drop(first);
+        drop(second);
+
+        heartbeat
+            .caps
+            .modality_capacity
+            .get_mut("image")
+            .expect("image capacity")
+            .active_items = 256;
+        state.ingest_provider_heartbeat(heartbeat.clone(), now.saturating_add(1));
+        assert!(matches!(
+            state.try_acquire_modality_admission(Some(route), &requirements),
+            Err(ModalityAdmissionError::RemoteCapacity(_))
+        ));
+
+        heartbeat
+            .caps
+            .modality_capacity
+            .get_mut("image")
+            .expect("image capacity")
+            .active_items = 128;
+        state.ingest_provider_heartbeat(heartbeat.clone(), now.saturating_add(2));
+        let refreshed = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("heartbeat refresh restores remote capacity")
+            .expect("refreshed admission guard");
+        drop(refreshed);
+
+        heartbeat
+            .caps
+            .modality_capacity
+            .get_mut("image")
+            .expect("image capacity")
+            .active_items = 0;
+        state.ingest_provider_heartbeat(heartbeat, now.saturating_add(3));
+        let local_first = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("first local admission")
+            .expect("first local guard");
+        let local_second = state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .expect("second local admission")
+            .expect("second local guard");
+        assert!(matches!(
+            state.try_acquire_modality_admission(Some(route), &requirements),
+            Err(ModalityAdmissionError::LocalCapacity { .. })
+        ));
+        drop(local_first);
+        assert!(state
+            .try_acquire_modality_admission(Some(route), &requirements)
+            .is_ok());
+        drop(local_second);
     }
 
     #[tokio::test]
@@ -53667,6 +53798,7 @@ mod tests {
                     }),
                     &format!("{collector} {endpoint_family} session"),
                     collector_retryable,
+                    false,
                 );
                 assert_eq!(error.failure_class, expected_class, "{collector}");
                 assert!(!error.retryable, "{collector}");
@@ -53705,6 +53837,7 @@ mod tests {
                 }),
                 &format!("{collector} {endpoint_family} session"),
                 collector_retryable,
+                false,
             );
             assert_eq!(
                 provider_fault.failure_class,
@@ -53730,6 +53863,60 @@ mod tests {
                 .expect("route remains in provider table");
             assert_eq!(entry.observed.samples, 1, "{collector}");
             assert_eq!(entry.observed.consecutive_failures, 1, "{collector}");
+        }
+    }
+
+    #[test]
+    fn lowercase_capacity_error_is_clean_only_before_execution_evidence() {
+        let collectors = [
+            ("chat and multimodal chat", false),
+            ("embedding", true),
+            ("image", true),
+            ("speech", true),
+            ("transcription", true),
+            ("artifact and workflow", true),
+            ("video", true),
+        ];
+        let frame = json!({
+            "t": "s.error",
+            "code": "capacity",
+            "message": "provider lane filled before atomic admission"
+        });
+
+        for (collector, normally_retryable) in collectors {
+            let clean = provider_reported_session_error(
+                &frame,
+                &format!("{collector} session"),
+                normally_retryable,
+                false,
+            );
+            assert!(clean.clean_refusal, "{collector}");
+            assert_eq!(clean.clean_refusal_code.as_deref(), Some("CAPACITY"));
+            assert!(clean.retryable, "{collector}");
+            assert!(!clean.safe_same_route_retry, "{collector}");
+
+            let after_output = provider_reported_session_error(
+                &frame,
+                &format!("{collector} session"),
+                normally_retryable,
+                true,
+            );
+            assert!(!after_output.clean_refusal, "{collector}");
+            assert!(!after_output.retryable, "{collector}");
+            assert!(!after_output.before_first_output, "{collector}");
+            assert!(!after_output.safe_same_route_retry, "{collector}");
+
+            let mut with_receipt = frame.clone();
+            with_receipt["receipt"] = json!({"execution": "observed"});
+            let after_receipt = provider_reported_session_error(
+                &with_receipt,
+                &format!("{collector} session"),
+                normally_retryable,
+                false,
+            );
+            assert!(!after_receipt.clean_refusal, "{collector}");
+            assert!(!after_receipt.retryable, "{collector}");
+            assert!(!after_receipt.safe_same_route_retry, "{collector}");
         }
     }
 
@@ -54518,43 +54705,45 @@ mod tests {
     #[tokio::test]
     async fn capacity_and_balance_semantics_cover_every_non_streaming_endpoint_runner() {
         for runner in FocusedRouteRunner::ALL {
-            let (state, model, capacity_error) =
-                run_focused_route_runner_failure(runner, "CAPACITY").await;
-            assert_eq!(
-                capacity_error.status,
-                StatusCode::SERVICE_UNAVAILABLE,
-                "{runner:?}"
-            );
-            assert_eq!(
-                public_error_code(&capacity_error),
-                "provider_admission_no_capacity",
-                "{runner:?}"
-            );
-            assert_eq!(
-                public_error_category(&capacity_error),
-                "provider_admission",
-                "{runner:?}"
-            );
-            assert!(public_error_retryable(&capacity_error), "{runner:?}");
-            let route = &model.mayhem.route_candidates[0];
-            assert!(
-                !state.route_provider_in_cooloff(route, now_millis_u64()),
-                "{runner:?} cooled an honest capacity refusal"
-            );
-            let entry = state
-                .provider_table
-                .lock_recover("provider table")
-                .entries(now_millis_u64())
-                .into_iter()
-                .find(|entry| entry.key == route_key(route))
-                .expect("route remains in provider table");
-            assert_eq!(entry.observed.samples, 0, "{runner:?}");
-            assert_eq!(entry.observed.consecutive_failures, 0, "{runner:?}");
-            assert!(state
-                .wallet_spend
-                .lock_recover("gateway wallet spend state")
-                .reservations
-                .is_empty());
+            for code in ["CAPACITY", "capacity"] {
+                let (state, model, capacity_error) =
+                    run_focused_route_runner_failure(runner, code).await;
+                assert_eq!(
+                    capacity_error.status,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "{runner:?} {code}"
+                );
+                assert_eq!(
+                    public_error_code(&capacity_error),
+                    "provider_admission_no_capacity",
+                    "{runner:?} {code}"
+                );
+                assert_eq!(
+                    public_error_category(&capacity_error),
+                    "provider_admission",
+                    "{runner:?} {code}"
+                );
+                assert!(public_error_retryable(&capacity_error), "{runner:?} {code}");
+                let route = &model.mayhem.route_candidates[0];
+                assert!(
+                    !state.route_provider_in_cooloff(route, now_millis_u64()),
+                    "{runner:?} cooled an honest {code} refusal"
+                );
+                let entry = state
+                    .provider_table
+                    .lock_recover("provider table")
+                    .entries(now_millis_u64())
+                    .into_iter()
+                    .find(|entry| entry.key == route_key(route))
+                    .expect("route remains in provider table");
+                assert_eq!(entry.observed.samples, 0, "{runner:?} {code}");
+                assert_eq!(entry.observed.consecutive_failures, 0, "{runner:?} {code}");
+                assert!(state
+                    .wallet_spend
+                    .lock_recover("gateway wallet spend state")
+                    .reservations
+                    .is_empty());
+            }
 
             let (_, _, balance_error) = run_focused_route_runner_failure(runner, "BALANCE").await;
             assert_eq!(
