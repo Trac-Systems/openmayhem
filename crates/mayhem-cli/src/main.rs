@@ -80168,6 +80168,15 @@ fn provider_session_output_error(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(ProviderSessionOutputError(message.into()))
 }
 
+fn validate_streamed_tool_call_count(emitted: usize, validated: usize) -> Result<()> {
+    if emitted > validated {
+        return Err(provider_session_output_error(
+            "provider streamed a tool call that failed final validation",
+        ));
+    }
+    Ok(())
+}
+
 fn provider_response_error_code(error: &anyhow::Error) -> &'static str {
     if error.chain().any(|cause| {
         cause.is::<ProviderSessionRequestError>()
@@ -92777,10 +92786,7 @@ fn provider_engine_session_response_with_sampling_bounded(
     let streamed_content = if let (Some(stream), Some(filter)) =
         (live_stream.as_deref_mut(), tool_stream_filter.as_mut())
     {
-        ensure!(
-            filter.emitted_count() <= tools.len(),
-            "provider streamed a tool call that failed final validation"
-        );
+        validate_streamed_tool_call_count(filter.emitted_count(), tools.len())?;
         for (index, call) in tools.iter_mut().enumerate().take(filter.emitted_count()) {
             call["id"] = json!(stream.tool_stream_id(index));
         }
@@ -119203,6 +119209,19 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider_response_error_code(&engine_error),
             "provider_response_failed"
         );
+
+        let streamed_tool_error = validate_streamed_tool_call_count(1, 0)
+            .expect_err("a provisional tool call must match a validated final call");
+        assert_eq!(
+            provider_response_error_code(&streamed_tool_error),
+            "model_output_invalid"
+        );
+        assert_eq!(
+            provider_response_error_message(&streamed_tool_error),
+            "provider streamed a tool call that failed final validation"
+        );
+        validate_streamed_tool_call_count(1, 1)
+            .expect("a validated streamed tool call must remain accepted");
     }
 
     #[test]
