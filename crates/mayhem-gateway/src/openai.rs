@@ -3524,9 +3524,12 @@ async fn finish_completed_invocation_after_handoff(
     recovery_wait: Duration,
 ) -> Result<(), GatewaySessionError> {
     if let Err(error) = handoff {
-        if !error.retryable
-            || !await_completed_invocation_reconciliation(invocation, recovery_wait).await
-        {
+        // The durable job is the terminal source of truth. A settlement
+        // publisher can report a non-retryable local enqueue error while its
+        // durable recovery worker completes the exact staged receipt. Do not
+        // turn that already-completed inference into a provider failure merely
+        // because the original handoff classified its local error differently.
+        if !await_completed_invocation_reconciliation(invocation, recovery_wait).await {
             return Err(error);
         }
     }
@@ -49993,7 +49996,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_terminal_handoff_waits_for_durable_reconciliation() {
+    async fn terminal_handoff_error_defers_to_durable_reconciliation() {
         let mut state = GatewayState::fixture();
         state.jobs = Arc::new(Mutex::new(GatewayJobStore::in_memory(
             [29_u8; 32],
@@ -50044,8 +50047,8 @@ mod tests {
         });
         finish_completed_invocation_after_handoff(
             &invocation,
-            Err(GatewaySessionError::retryable(
-                "receipt settlement transport timed out",
+            Err(GatewaySessionError::new(
+                "receipt settlement publisher rejected the local enqueue",
             )),
             Duration::from_secs(2),
         )
