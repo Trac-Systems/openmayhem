@@ -74786,9 +74786,8 @@ fn provider_vllm_generation_execution_capacity(
         "generation execution profile does not authorize independent dispatch"
     );
 
-    let shared_embedding_scheduler = profile.topology
-        != Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
-        && generation_execution_profile_allows_modalities(Some(profile), &["embedding".to_owned()]);
+    let shared_embedding_scheduler =
+        generation_execution_uses_shared_embedding_scheduler(Some(profile));
     let configured_capacity = args.max_sessions.unwrap_or(verdict.max_sessions).max(1);
     // A shared embedding scheduler batches requests inside one loaded model.
     // The hardware verdict's max_sessions describes independently resident
@@ -74821,6 +74820,14 @@ fn provider_vllm_generation_execution_capacity(
     let scheduler_capacity = enclave_max_batch_size(caps)?
         .unwrap_or(provider_capacity)
         .max(1);
+    if shared_embedding_scheduler {
+        // Embedding requests are multiplexed inside one loaded vLLM model and
+        // do not reserve one full decoder KV cache per provider session. The
+        // signed scheduler ceiling and the operator limit are the relevant
+        // capacity bounds; applying the text-generation KV formula here would
+        // collapse a proven batched embedding runtime back to one session.
+        return Ok(provider_capacity.min(scheduler_capacity).max(1));
+    }
     let utilization = provider_vllm_memory_utilization_for_feasibility(
         caps,
         feasibility,
@@ -74872,6 +74879,18 @@ fn generation_execution_uses_isolated_workers(
 ) -> bool {
     profile.is_some_and(|profile| {
         profile.topology == Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
+    })
+}
+
+fn generation_execution_uses_shared_embedding_scheduler(
+    profile: Option<&catalog::CatalogGenerationExecutionProfile>,
+) -> bool {
+    profile.is_some_and(|profile| {
+        profile.topology != Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
+            && !profile.request_modalities.is_empty()
+            && profile.request_modalities.iter().all(|modalities| {
+                modalities.len() == 1 && modalities.first().is_some_and(|item| item == "embedding")
+            })
     })
 }
 
@@ -76457,26 +76476,32 @@ fn build_provider_candidates(
                 continue;
             }
         };
-        let reserve_result =
-            if generation_execution_uses_isolated_workers(generation_execution_profile.as_ref()) {
-                provider_vllm_memory_utilization_for_feasibility(
-                    &enclave.caps,
-                    &feasibility,
-                    args.vllm_memory_utilization,
-                )
-                .and_then(|utilization| {
-                    reserve_provider_vllm_replica_memory(
-                        &mut feasibility,
-                        generation_execution_capacity,
-                        utilization,
-                    )
-                })
-            } else {
-                reserve_provider_generation_execution_memory(
+        let reserve_result = if generation_execution_uses_shared_embedding_scheduler(
+            generation_execution_profile.as_ref(),
+        ) {
+            // One shared vLLM embedding scheduler owns the admitted allocation;
+            // concurrent requests do not each require a decoder KV reservation.
+            Ok(())
+        } else if generation_execution_uses_isolated_workers(generation_execution_profile.as_ref())
+        {
+            provider_vllm_memory_utilization_for_feasibility(
+                &enclave.caps,
+                &feasibility,
+                args.vllm_memory_utilization,
+            )
+            .and_then(|utilization| {
+                reserve_provider_vllm_replica_memory(
                     &mut feasibility,
                     generation_execution_capacity,
+                    utilization,
                 )
-            };
+            })
+        } else {
+            reserve_provider_generation_execution_memory(
+                &mut feasibility,
+                generation_execution_capacity,
+            )
+        };
         if let Err(err) = reserve_result {
             rejections.push(provider_rejection(
                 enclave,
@@ -109513,9 +109538,13 @@ status: linked
         selected.verdict.backend = "vllm".to_owned();
         selected.verdict.max_sessions = 1;
         selected.feasibility.memory_budget.total_bytes = 96 * GIB_BYTES;
-        selected.feasibility.memory_budget.budget_bytes = 72 * GIB_BYTES;
-        selected.feasibility.estimated_required_bytes = 10 * GIB_BYTES;
-        selected.feasibility.estimated_kv_bytes = 0;
+        // Mirror the live failure shape: the admitted allocation has room for
+        // one full-context decoder KV estimate, but not eight. Embeddings use a
+        // shared scheduler and must not be reduced by that generation-only
+        // estimate.
+        selected.feasibility.memory_budget.budget_bytes = 13 * GIB_BYTES;
+        selected.feasibility.estimated_required_bytes = 12 * GIB_BYTES;
+        selected.feasibility.estimated_kv_bytes = 2 * GIB_BYTES;
 
         let profile = catalog::CatalogGenerationExecutionProfile {
             schema_version: 1,
