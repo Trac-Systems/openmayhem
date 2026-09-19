@@ -62274,6 +62274,10 @@ struct ProviderSessionTerms {
     model_id: String,
     adapter: catalog::CatalogAdapter,
     generation_execution_profile: Option<catalog::CatalogGenerationExecutionProfile>,
+    /// Request modality sets that the loaded runtime can dispatch independently
+    /// without a catalog generation profile. This is populated only from a
+    /// live concurrent backend, never from advertised provider capacity.
+    runtime_independent_dispatch_modalities: Vec<Vec<String>>,
     sampling: catalog::CatalogSamplingProfile,
     workflow_policy: Option<mayhem_proto::ComfyWorkflowCatalogPolicy>,
     output_modalities: Vec<String>,
@@ -80625,10 +80629,47 @@ fn provider_session_allows_independent_dispatch(
     terms: &ProviderSessionTerms,
     active: &ActiveProviderSession,
 ) -> bool {
-    generation_execution_profile_allows_modalities(
+    provider_request_modalities_allow_independent_dispatch(terms, &active.required_modalities)
+}
+
+fn provider_request_modalities_allow_independent_dispatch(
+    terms: &ProviderSessionTerms,
+    requested: &[String],
+) -> bool {
+    if generation_execution_profile_allows_modalities(
         terms.generation_execution_profile.as_ref(),
-        &active.required_modalities,
-    )
+        requested,
+    ) {
+        return true;
+    }
+    let requested = requested.iter().cloned().collect::<BTreeSet<_>>();
+    terms
+        .runtime_independent_dispatch_modalities
+        .iter()
+        .any(|allowed| allowed.iter().cloned().collect::<BTreeSet<_>>() == requested)
+}
+
+fn provider_runtime_independent_dispatch_modalities(
+    responder: &dyn ProviderSessionResponder,
+) -> Vec<Vec<String>> {
+    if responder.concurrent_embedding_backend().is_some() {
+        vec![vec!["embedding".to_owned()]]
+    } else {
+        Vec::new()
+    }
+}
+
+fn provider_execution_capacity_for_terms(
+    terms: &ProviderSessionTerms,
+    responder: &dyn ProviderSessionResponder,
+) -> u32 {
+    if terms.generation_execution_profile.is_some()
+        || !terms.runtime_independent_dispatch_modalities.is_empty()
+    {
+        responder.concurrent_session_capacity()
+    } else {
+        1
+    }
 }
 
 fn provider_session_open_required_modalities(frame: &Value) -> Option<Vec<String>> {
@@ -80648,10 +80689,8 @@ fn provider_local_session_acceptance_decision(
             reason: "signed spend voucher is missing normalized required_modalities".to_owned(),
         };
     };
-    let requested_is_independent = generation_execution_profile_allows_modalities(
-        terms.generation_execution_profile.as_ref(),
-        &requested_modalities,
-    );
+    let requested_is_independent =
+        provider_request_modalities_allow_independent_dispatch(terms, &requested_modalities);
     let active_are_independent = sessions
         .values()
         .all(|active| provider_session_allows_independent_dispatch(terms, active));
@@ -80703,14 +80742,12 @@ async fn serve_provider_sessions(
     runtime: ProviderSessionRuntime<'_>,
     mut responder: Box<dyn ProviderSessionResponder>,
 ) -> Result<()> {
-    let terms = provider_session_terms(&ctx, runtime.min_ask.current())?;
+    let mut terms = provider_session_terms(&ctx, runtime.min_ask.current())?;
     let configured_protection =
         ProviderProtectionConfig::from_provider_args(ctx.args, ctx.selected)?;
-    let execution_capacity = if terms.generation_execution_profile.is_some() {
-        responder.concurrent_session_capacity()
-    } else {
-        1
-    };
+    terms.runtime_independent_dispatch_modalities =
+        provider_runtime_independent_dispatch_modalities(responder.as_ref());
+    let execution_capacity = provider_execution_capacity_for_terms(&terms, responder.as_ref());
     let protection_config = configured_protection.limit_to_execution_capacity(execution_capacity);
     let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
         ctx.args.home.as_ref(),
@@ -90172,6 +90209,7 @@ fn provider_session_terms(
             .unwrap_or(&ctx.selected.model.adapter)
             .clone(),
         generation_execution_profile: ctx.selected.generation_execution_profile.clone(),
+        runtime_independent_dispatch_modalities: Vec::new(),
         sampling: ctx.selected.model.sampling.clone(),
         workflow_policy: ctx.selected.model.workflow.clone(),
         output_modalities: if ctx.selected.model.caps.output_modalities.is_empty() {
@@ -124577,6 +124615,98 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(recovered.accepting_new);
     }
 
+    struct TestConcurrentEmbeddingBackend {
+        capacity: usize,
+    }
+
+    impl ConcurrentEmbeddingBackend for TestConcurrentEmbeddingBackend {
+        fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        fn embed(
+            &self,
+            _request: mayhem_engine::EmbeddingRequest,
+            _cancellation: &CancellationToken,
+        ) -> mayhem_engine::Result<mayhem_engine::EmbeddingOutput> {
+            unreachable!("embedding admission test does not execute inference")
+        }
+    }
+
+    struct ConcurrentEmbeddingResponder {
+        backend: Arc<TestConcurrentEmbeddingBackend>,
+    }
+
+    impl ProviderSessionResponder for ConcurrentEmbeddingResponder {
+        fn mode(&self) -> &'static str {
+            "test-concurrent-embedding"
+        }
+
+        fn concurrent_session_capacity(&self) -> u32 {
+            u32::try_from(self.backend.capacity()).unwrap_or(u32::MAX)
+        }
+
+        fn concurrent_embedding_backend(&self) -> Option<Arc<dyn ConcurrentEmbeddingBackend>> {
+            Some(Arc::clone(&self.backend) as Arc<dyn ConcurrentEmbeddingBackend>)
+        }
+
+        fn respond(
+            &mut self,
+            _terms: &ProviderSessionTerms,
+            _body: &Value,
+            _cancellation: &CancellationToken,
+        ) -> Result<ProviderSessionOutput> {
+            unreachable!("embedding admission test does not execute inference")
+        }
+    }
+
+    #[test]
+    fn concurrent_embedding_backend_admits_independent_embedding_sessions_only() {
+        let responder = ConcurrentEmbeddingResponder {
+            backend: Arc::new(TestConcurrentEmbeddingBackend { capacity: 8 }),
+        };
+        let mut terms = test_provider_session_terms();
+        terms.runtime_independent_dispatch_modalities =
+            provider_runtime_independent_dispatch_modalities(&responder);
+        assert_eq!(provider_execution_capacity_for_terms(&terms, &responder), 8);
+        assert!(provider_request_modalities_allow_independent_dispatch(
+            &terms,
+            &["embedding".to_owned()]
+        ));
+        assert!(!provider_request_modalities_allow_independent_dispatch(
+            &terms,
+            &["text".to_owned()]
+        ));
+
+        let active = test_active_provider_session(&terms, vec!["embedding".to_owned()]);
+        let sessions = HashMap::from([(active.session_id.clone(), active)]);
+        let protection = Arc::new(Mutex::new(ProviderProtectionState::new(
+            ProviderProtectionConfig::unlimited_for_tests(8),
+        )));
+        let mut frame = test_session_open_frame(&terms);
+        frame["voucher"]["required_modalities"] = json!(["embedding"]);
+        assert_eq!(
+            provider_local_session_acceptance_decision(&protection, &sessions, &terms, &frame,),
+            ProviderSessionDecision::Accept
+        );
+
+        frame["voucher"]["required_modalities"] = json!(["text"]);
+        assert!(matches!(
+            provider_local_session_acceptance_decision(&protection, &sessions, &terms, &frame,),
+            ProviderSessionDecision::Reject {
+                code: "CAPACITY",
+                ..
+            }
+        ));
+
+        let load = ProviderHeartbeatLoad::default();
+        load.set_active_sessions(&sessions, &terms);
+        let snapshot = load.snapshot(8);
+        assert_eq!(snapshot.active_slots, 1);
+        assert_eq!(snapshot.free_slots, 7);
+        assert!(snapshot.accepting_new);
+    }
+
     #[test]
     fn provider_protection_rejects_capacity_rate_and_quota_cleanly() {
         let mut capacity =
@@ -135462,6 +135592,7 @@ State initialization...
             model_id: "test/model@4bit".to_owned(),
             adapter: catalog::CatalogAdapter::default(),
             generation_execution_profile: None,
+            runtime_independent_dispatch_modalities: Vec::new(),
             sampling: catalog::CatalogSamplingProfile::default(),
             workflow_policy: None,
             output_modalities: vec!["text".to_owned()],
