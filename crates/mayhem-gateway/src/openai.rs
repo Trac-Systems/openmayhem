@@ -15459,7 +15459,8 @@ fn provider_reported_session_error(
         .and_then(Value::as_str)
         .unwrap_or("provider returned s.error");
     let message = format!("provider returned {code} on {session_context}: {message}");
-    let execution_evidence_observed = execution_evidence_observed || frame.get("receipt").is_some();
+    let failure_receipt_observed = frame.get("receipt").is_some();
+    let execution_evidence_observed = execution_evidence_observed || failure_receipt_observed;
     match code {
         // Some provider workers report an atomic admission race as a lowercase
         // s.error instead of the uppercase s.reject code. It is a clean
@@ -15475,7 +15476,11 @@ fn provider_reported_session_error(
         | "request_chunk_failed"
         | "request_reassembly_failed" => GatewaySessionError::buyer_local(message),
         "model_output_invalid" => GatewaySessionError::request_scoped(message),
-        _ if retryable => GatewaySessionError::retryable(message),
+        // A signed failure receipt settles the attempt before this error is
+        // returned. Never redispatch a generic provider fault after that paid
+        // terminal outcome. Request-scoped codes above retain their precise
+        // public classification even when the frame includes a receipt.
+        _ if retryable && !failure_receipt_observed => GatewaySessionError::retryable(message),
         _ => GatewaySessionError::new(message),
     }
 }
@@ -46408,6 +46413,7 @@ mod tests {
     struct ProviderReportedFailureBackend {
         code: &'static str,
         attempts: Arc<Mutex<usize>>,
+        failure_receipt: bool,
     }
 
     impl ProviderReportedFailureBackend {
@@ -46424,16 +46430,15 @@ mod tests {
                     Some(self.code),
                 );
             }
-            provider_reported_session_error(
-                &json!({
-                    "t": "s.error",
-                    "code": self.code,
-                    "message": "focused route-runner failure"
-                }),
-                context,
-                retryable,
-                false,
-            )
+            let mut frame = json!({
+                "t": "s.error",
+                "code": self.code,
+                "message": "focused route-runner failure"
+            });
+            if self.failure_receipt {
+                frame["receipt"] = json!({"settled": true});
+            }
+            provider_reported_session_error(&frame, context, retryable, false)
         }
     }
 
@@ -48403,6 +48408,7 @@ mod tests {
             Arc::new(ProviderReportedFailureBackend {
                 code: "context_length_exceeded",
                 attempts: Arc::clone(&attempts),
+                failure_receipt: false,
             }),
         );
         let error = focused_route_runner_error(
@@ -53915,7 +53921,8 @@ mod tests {
                     &json!({
                         "t": "s.error",
                         "code": code,
-                        "message": "request-specific failure"
+                        "message": "request-specific failure",
+                        "receipt": {"settled": true}
                     }),
                     &format!("{collector} {endpoint_family} session"),
                     collector_retryable,
@@ -54050,10 +54057,11 @@ mod tests {
         Transcription,
         AudioArtifact,
         VideoArtifact,
+        WorkflowArtifact,
     }
 
     impl FocusedRouteRunner {
-        const ALL: [Self; 7] = [
+        const ALL: [Self; 8] = [
             Self::Chat,
             Self::Embedding,
             Self::Image,
@@ -54061,6 +54069,7 @@ mod tests {
             Self::Transcription,
             Self::AudioArtifact,
             Self::VideoArtifact,
+            Self::WorkflowArtifact,
         ];
 
         fn modalities(self) -> &'static [&'static str] {
@@ -54072,12 +54081,13 @@ mod tests {
                 Self::Transcription => &["audio", "text"],
                 Self::AudioArtifact => &["audio"],
                 Self::VideoArtifact => &["video"],
+                Self::WorkflowArtifact => &["image"],
             }
         }
     }
 
-    fn focused_route_runner_model(runner: FocusedRouteRunner) -> GatewayModel {
-        let mut model = test_routed_model(1);
+    fn focused_route_runner_model(runner: FocusedRouteRunner, provider_count: u8) -> GatewayModel {
+        let mut model = test_routed_model(provider_count);
         let modalities = runner
             .modalities()
             .iter()
@@ -54095,6 +54105,7 @@ mod tests {
                 FocusedRouteRunner::Speech | FocusedRouteRunner::Transcription => "audio",
                 FocusedRouteRunner::AudioArtifact => "audio",
                 FocusedRouteRunner::VideoArtifact => "video",
+                FocusedRouteRunner::WorkflowArtifact => "image",
                 FocusedRouteRunner::Chat => "text",
             }
             .to_owned(),
@@ -54117,11 +54128,24 @@ mod tests {
         runner: FocusedRouteRunner,
         code: &'static str,
     ) -> (GatewayState, GatewayModel, ApiError) {
-        let model = focused_route_runner_model(runner);
+        let (state, model, error, _) =
+            run_focused_route_runner_failure_with_options(runner, code, false, 1).await;
+        (state, model, error)
+    }
+
+    async fn run_focused_route_runner_failure_with_options(
+        runner: FocusedRouteRunner,
+        code: &'static str,
+        failure_receipt: bool,
+        provider_count: u8,
+    ) -> (GatewayState, GatewayModel, ApiError, usize) {
+        let model = focused_route_runner_model(runner, provider_count);
+        let attempts = Arc::new(Mutex::new(0));
         let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
             Arc::new(ProviderReportedFailureBackend {
                 code,
-                attempts: Arc::default(),
+                attempts: Arc::clone(&attempts),
+                failure_receipt,
             }),
         );
         let options = GatewayRequestOptions {
@@ -54227,30 +54251,53 @@ mod tests {
                         .await,
                 )
             }
-            FocusedRouteRunner::AudioArtifact | FocusedRouteRunner::VideoArtifact => {
+            FocusedRouteRunner::AudioArtifact
+            | FocusedRouteRunner::VideoArtifact
+            | FocusedRouteRunner::WorkflowArtifact => {
                 let is_video = matches!(runner, FocusedRouteRunner::VideoArtifact);
+                let is_workflow = matches!(runner, FocusedRouteRunner::WorkflowArtifact);
                 let request = ArtifactGenerationRequest {
                     model: model.id.clone(),
                     prompt: if is_video {
                         "a precise test video"
+                    } else if is_workflow {
+                        "a precise test workflow artifact"
                     } else {
                         "a precise test audio artifact"
                     }
                     .to_owned(),
                     endpoint_family: if is_video {
                         mayhem_proto::ENDPOINT_OPENAI_VIDEOS
+                    } else if is_workflow {
+                        mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
                     } else {
                         mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
                     }
                     .to_owned(),
                     contract_request: json!({}),
                     workflow: None,
-                    workflow_output: None,
+                    workflow_output: is_workflow.then(|| WorkflowOutputBinding {
+                        output_modalities: vec!["image".to_owned()],
+                        metrics: BTreeMap::from([
+                            ("artifact_count".to_owned(), 1),
+                            ("width".to_owned(), 64),
+                            ("height".to_owned(), 64),
+                        ]),
+                    }),
                     workflow_input_files: WorkflowInputFileStats::default(),
                     effective_specialities: BTreeMap::new(),
-                    output_modality: if is_video { "video" } else { "audio" }.to_owned(),
+                    output_modality: if is_video {
+                        "video"
+                    } else if is_workflow {
+                        "image"
+                    } else {
+                        "audio"
+                    }
+                    .to_owned(),
                     transport_kind: if is_video {
                         "video_generation"
+                    } else if is_workflow {
+                        "workflow_generation"
                     } else {
                         "audio_generation"
                     }
@@ -54269,7 +54316,7 @@ mod tests {
                     input_audio_count: 0,
                     input_audio_max_bytes: 0,
                     input_audio_max_seconds: 0,
-                    response_format: "mp4".to_owned(),
+                    response_format: if is_workflow { "artifact" } else { "mp4" }.to_owned(),
                 };
                 focused_route_runner_error(
                     run_artifact_generation_with_route_retry(&state, &model, &request, options)
@@ -54277,7 +54324,8 @@ mod tests {
                 )
             }
         };
-        (state, model, error)
+        let attempt_count = *attempts.lock().unwrap();
+        (state, model, error, attempt_count)
     }
 
     #[tokio::test]
@@ -54366,6 +54414,99 @@ mod tests {
                 .expect("route remains in provider table");
             assert_eq!(entry.observed.samples, 1, "{runner:?}");
             assert_eq!(entry.observed.consecutive_failures, 1, "{runner:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn settled_failure_receipt_is_terminal_for_every_route_runner() {
+        for runner in FocusedRouteRunner::ALL {
+            let (state, model, error, attempts) = run_focused_route_runner_failure_with_options(
+                runner,
+                "provider_response_failed",
+                true,
+                2,
+            )
+            .await;
+            assert_eq!(attempts, 1, "{runner:?} retried a settled failure");
+            assert_eq!(error.status, StatusCode::BAD_GATEWAY, "{runner:?}");
+            assert_eq!(public_error_code(&error), "provider_error", "{runner:?}");
+            assert_eq!(
+                public_error_category(&error),
+                "provider_response",
+                "{runner:?}"
+            );
+            assert!(!public_error_retryable(&error), "{runner:?}");
+            let entries = state
+                .provider_table
+                .lock_recover("provider table")
+                .entries(now_millis_u64());
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|entry| {
+                        model
+                            .mayhem
+                            .route_candidates
+                            .iter()
+                            .any(|route| entry.key == route_key(route))
+                    })
+                    .map(|entry| entry.observed.consecutive_failures)
+                    .sum::<u32>(),
+                1,
+                "{runner:?} must penalize exactly the provider that returned the failure receipt"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn settled_failure_receipt_preserves_request_scoped_codes_for_every_route_runner() {
+        for (code, expected_public_code, expected_status) in [
+            (
+                "request_invalid",
+                "request_rejected_by_provider_contract",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "context_length_exceeded",
+                "context_length_exceeded",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "request_chunk_failed",
+                "request_media_reassembly_failed",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "request_reassembly_failed",
+                "request_media_reassembly_failed",
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "model_output_invalid",
+                "provider_model_output_invalid",
+                StatusCode::BAD_GATEWAY,
+            ),
+        ] {
+            for runner in FocusedRouteRunner::ALL {
+                let (state, model, error, attempts) =
+                    run_focused_route_runner_failure_with_options(runner, code, true, 2).await;
+                assert_eq!(attempts, 1, "{runner:?} retried {code}");
+                assert_eq!(error.status, expected_status, "{runner:?} {code}");
+                assert_eq!(
+                    public_error_code(&error),
+                    expected_public_code,
+                    "{runner:?} {code}"
+                );
+                assert!(!public_error_retryable(&error), "{runner:?} {code}");
+                assert!(
+                    model
+                        .mayhem
+                        .route_candidates
+                        .iter()
+                        .all(|route| { !state.route_provider_in_cooloff(route, now_millis_u64()) }),
+                    "{runner:?} cooled a route for {code}"
+                );
+            }
         }
     }
 
