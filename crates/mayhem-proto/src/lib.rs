@@ -87,9 +87,9 @@ pub fn openai_compatible_canary_units(reconstructed_output: &str) -> Vec<i32> {
         .map(|scalar| i32::try_from(u32::from(scalar)).expect("Unicode scalar fits i32"))
         .collect()
 }
-pub const CONTRACT_VERSION: u32 = 26;
-/// Retained schema-11 receipt settlement features accepted across the v26 upgrade.
-pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24, 25];
+pub const CONTRACT_VERSION: u32 = 27;
+/// Retained schema-11 receipt settlement features accepted across the v27 upgrade.
+pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24, 25, 26];
 /// Historical fixture version; use receipt_contract_version_is_supported for admission.
 pub const RECOVERABLE_RECEIPT_CONTRACT_VERSION: u32 = 23;
 pub fn receipt_contract_version_is_supported(version: u64) -> bool {
@@ -113,7 +113,8 @@ pub const TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE: &str = "tokenize.response_chunk";
 pub const TOKENIZE_FRAME_VERSION: u32 = 1;
 pub const TPM_PCR_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const TPM_QUOTE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
-pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 11;
+pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 12;
+pub const SPEND_VOUCHER_SCHEMA_VERSION: u32 = 11;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const CTX_BRACKET_TABLE_VERSION: u32 = 1;
 pub const CTX_BRACKETS: &[(u32, &str)] = &[
@@ -1849,6 +1850,8 @@ pub struct ReceiptBody {
     #[serde(with = "decimal_u128")]
     pub locked_min_session_au: MoneyAu,
     pub served_ctx: u32,
+    pub compute_ms: u64,
+    pub capacity_slots: u32,
     #[serde(default)]
     pub ctx_bracket: Option<String>,
     #[serde(default)]
@@ -4519,7 +4522,7 @@ mod tests {
     #[test]
     fn voucher_and_receipt_signing_payloads_are_bound_to_terms() {
         let voucher = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: "sess".to_owned(),
             billing_id: "11".repeat(32),
             billing_attempt: 0,
@@ -4608,6 +4611,8 @@ mod tests {
             locked_per_req_au: 7,
             locked_min_session_au: 11,
             served_ctx: voucher.served_ctx,
+            compute_ms: 1,
+            capacity_slots: 1,
             ctx_bracket: voucher.ctx_bracket.clone(),
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
@@ -4720,7 +4725,7 @@ mod tests {
     #[test]
     fn signing_payloads_use_current_version_only() {
         let voucher = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: "sess".to_owned(),
             billing_id: "11".repeat(32),
             billing_attempt: 0,
@@ -4782,6 +4787,8 @@ mod tests {
             locked_per_req_au: 7,
             locked_min_session_au: 11,
             served_ctx: voucher.served_ctx,
+            compute_ms: 1,
+            capacity_slots: 1,
             ctx_bracket: voucher.ctx_bracket.clone(),
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
@@ -4814,7 +4821,7 @@ mod tests {
             },
         ];
         let voucher = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: "sess-au-roundtrip".to_owned(),
             billing_id: "44".repeat(32),
             billing_attempt: 0,
@@ -4899,6 +4906,8 @@ mod tests {
             locked_per_req_au: voucher.locked_per_req_au,
             locked_min_session_au: voucher.locked_min_session_au,
             served_ctx: voucher.served_ctx,
+            compute_ms: 1,
+            capacity_slots: 1,
             ctx_bracket: voucher.ctx_bracket,
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 7,
@@ -4912,7 +4921,7 @@ mod tests {
         };
         let expected_receipt = concat!(
             "{\"domain\":\"mayhem-session-receipt\",\"signing_version\":2,\"body\":{",
-            "\"schema_version\":11,\"session_id\":\"sess-au-roundtrip\",",
+            "\"schema_version\":12,\"session_id\":\"sess-au-roundtrip\",",
             "\"billing_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"billing_attempt\":0,\"billing_prior_usage\":{},\"billing_prior_au_owed_cum\":\"0\",",
             "\"billing_epoch\":12,",
@@ -4927,7 +4936,8 @@ mod tests {
             "{\"unit\":\"input_token\",\"per_unit_au\":\"10000000\",\"granularity\":1},",
             "{\"unit\":\"output_token\",\"per_unit_au\":\"2500000000000000\",\"granularity\":1000}",
             "],\"locked_per_req_au\":\"1\",\"locked_min_session_au\":\"2000000000000000000000000\",",
-            "\"served_ctx\":131072,\"ctx_bracket\":\"le128k\",\"ctx_bracket_table_ver\":1,",
+            "\"served_ctx\":131072,\"compute_ms\":1,\"capacity_slots\":1,",
+            "\"ctx_bracket\":\"le128k\",\"ctx_bracket_table_ver\":1,",
             "\"rules_ver\":7,\"usage\":{\"input_token\":3,\"output_token\":5},",
             "\"au_owed_cum\":\"2000000000000000000000001\",",
             "\"prompt_hash\":\"3333333333333333333333333333333333333333333333333333333333333333\",",
@@ -5527,11 +5537,11 @@ mod tests {
 #[cfg(test)]
 mod market_version_bridge_tests {
     #[test]
-    fn receipt_recovery_accepts_v23_through_v26_only() {
-        for version in [23, 24, 25, 26] {
+    fn receipt_recovery_accepts_v23_through_current_only() {
+        for version in [23, 24, 25, 26, 27] {
             assert!(super::receipt_contract_version_is_supported(version));
         }
-        for version in [0, 22, 27, u64::MAX] {
+        for version in [0, 22, 28, u64::MAX] {
             assert!(!super::receipt_contract_version_is_supported(version));
         }
     }

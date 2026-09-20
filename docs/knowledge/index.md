@@ -26,7 +26,7 @@ custody model, and every credential.
 * [OKF maintenance rules](/okf-maintenance.md) - how to keep this bundle compliant with Google OKF v0.2 and avoid local wiki drift.
 
 ## Market and money
-* [Market and pricing](/market/index.md) - the activity-momentum clearing price, reservation bands, epochs and provenance.
+* [Market and pricing](/market/index.md) - the utilization-indexed clearing price, reservation bands, epochs and provenance.
 * [Payments, rails, and settlement](/payments/index.md) - the three rails, payouts, epoch settlement, and fraud proofs.
 
 ## How it works

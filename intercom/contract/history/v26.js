@@ -5,16 +5,15 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import { consumeCanonicalReplayContext } from 'trac-peer/src/base/canonical-replay.js';
 import PeerWallet from 'trac-wallet';
-import ContractV23 from './history/v23.js';
-import ContractV24 from './history/v24.js';
-import ContractV25 from './history/v25.js';
-import ContractV26 from './history/v26.js';
+import ContractV23 from './v23.js';
+import ContractV24 from './v24.js';
+import ContractV25 from './v25.js';
 
-export const CONTRACT_VERSION = 27;
-// Recovery is limited to receipt evidence already signed by v23-v26
-// participants. New prior-version operations are not admitted;
+export const CONTRACT_VERSION = 26;
+// Recovery is limited to unchanged schema-11 receipt evidence already signed by
+// v23, v24, or v25 participants. New prior-version operations are not admitted;
 // separately authenticated canonical replay does not constitute new admission.
-const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25, 26]);
+const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25]);
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -53,9 +52,6 @@ const DEFAULT_MARKET_PRICE_TARGET_UTILIZATION_BPS = 8_500;
 const DEFAULT_MARKET_PRICE_EMA_ALPHA_BPS = 2_500;
 const DEFAULT_MARKET_PRICE_GAIN_BPS = 5_000;
 const DEFAULT_MARKET_PRICE_MAX_STEP_BPS = 1_000;
-const MARKET_UTILIZATION_LOW_BPS = 2_000;
-const MARKET_UTILIZATION_HIGH_BPS = 8_000;
-const MARKET_UTILIZATION_STEP_BPS = 1_000;
 const DEFAULT_MARKET_PRICE_COLD_START_MIN_PROVIDERS = 2;
 const ZERO_AU = '0';
 const ONE_USD_AU = '1000000000000000000';
@@ -84,7 +80,7 @@ const TAP_OPERATOR_BPS = 1_500;
 const TAP_BURN_BPS = 1_000;
 const DISPUTE_EVIDENCE_MAX_BYTES = 4_096;
 const FRAUD_PROOF_MAX_BYTES = 4_096;
-export const SESSION_RECEIPT_SCHEMA_VERSION = 12;
+export const SESSION_RECEIPT_SCHEMA_VERSION = 11;
 export const SPEND_VOUCHER_SCHEMA_VERSION = 11;
 const RECEIPT_EPOCH_INDEX_PAGE_SIZE = 128;
 const CTX_BRACKET_TABLE_VERSION = 1;
@@ -136,9 +132,9 @@ const PARAM_DEFINITIONS = Object.freeze({
   price_max_bps: { default: 40_000, min: 2_500, max: 40_000 },
   price_rate_limit_seconds: { default: DEFAULT_PRICE_RATE_LIMIT_SECONDS, min: 0, max: 365 * DAY_SECONDS },
   market_target_utilization_bps: { default: DEFAULT_MARKET_PRICE_TARGET_UTILIZATION_BPS, min: 1, max: 9_999, deprecated: true },
-  market_ema_alpha_bps: { default: DEFAULT_MARKET_PRICE_EMA_ALPHA_BPS, min: 1, max: 10_000, deprecated: true },
-  market_gain_bps: { default: DEFAULT_MARKET_PRICE_GAIN_BPS, min: 1, max: 10_000, deprecated: true },
-  market_max_step_bps: { default: DEFAULT_MARKET_PRICE_MAX_STEP_BPS, min: 1, max: 10_000, deprecated: true },
+  market_ema_alpha_bps: { default: DEFAULT_MARKET_PRICE_EMA_ALPHA_BPS, min: 1, max: 10_000 },
+  market_gain_bps: { default: DEFAULT_MARKET_PRICE_GAIN_BPS, min: 1, max: 10_000 },
+  market_max_step_bps: { default: DEFAULT_MARKET_PRICE_MAX_STEP_BPS, min: 1, max: 10_000 },
   market_cold_start_min_providers: { default: DEFAULT_MARKET_PRICE_COLD_START_MIN_PROVIDERS, min: 0, max: 1_000_000, deprecated: true },
   market_provider_epoch_target_au: { default: DEFAULT_MARKET_PRICE_PROVIDER_EPOCH_TARGET_AU, min: '1', money: true, deprecated: true },
   market_max_utilization_bps: { default: DEFAULT_MARKET_PRICE_MAX_UTILIZATION_BPS, min: 1, max: 1_000_000, deprecated: true },
@@ -184,6 +180,9 @@ const EPOCH_ADMIN_PARAM_KEYS = Object.freeze([
   'price_min_bps',
   'price_max_bps',
   'price_rate_limit_seconds',
+  'market_ema_alpha_bps',
+  'market_gain_bps',
+  'market_max_step_bps',
   'epoch_seconds',
   'reservation_max_lifetime_epochs',
   'reservation_receipt_grace_epochs',
@@ -527,8 +526,6 @@ const canonicalReceiptBody = (body) => {
     locked_min_session_au: body.locked_min_session_au,
     served_ctx: body.served_ctx,
   };
-  if (hasOwn(body, 'compute_ms')) canonical.compute_ms = body.compute_ms;
-  if (hasOwn(body, 'capacity_slots')) canonical.capacity_slots = body.capacity_slots;
   if (hasOwn(body, 'ctx_bracket')) canonical.ctx_bracket = body.ctx_bracket;
   if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
   canonical.rules_ver = body.rules_ver;
@@ -904,8 +901,8 @@ class MayhemContract extends Contract {
       const versioned = versionedMayhemOperation(op);
       const canonicalReplay = consumeCanonicalReplayContext(consensusContext, op, storage);
       const historical = versioned.present && (
-        ([23, 24, 25, 26].includes(versioned.version) && canonicalReplay) ||
-        ([24, 25, 26].includes(versioned.version) &&
+        ([23, 24, 25].includes(versioned.version) && canonicalReplay) ||
+        ([24, 25].includes(versioned.version) &&
           await this.isPreparedCheckpointReplay(op, storage))
       );
       if (historical) {
@@ -916,9 +913,7 @@ class MayhemContract extends Contract {
           ? ContractV23
           : versioned.version === 24
             ? ContractV24
-            : versioned.version === 25
-              ? ContractV25
-              : ContractV26;
+            : ContractV25;
         this._historicalContracts ??= new Map();
         if (!this._historicalContracts.has(versioned.version)) {
           this._historicalContracts.set(versioned.version, new Implementation(this.protocol, this.config));
@@ -3254,7 +3249,6 @@ class MayhemContract extends Contract {
       locked_per_req_au: body.locked_per_req_au,
       locked_min_session_au: body.locked_min_session_au,
       served_ctx: body.served_ctx,
-      capacity_slots: body.capacity_slots,
       ctx_bracket: body.ctx_bracket,
       ctx_bracket_table_ver: body.ctx_bracket_table_ver,
       rules_ver: body.rules_ver,
@@ -3307,11 +3301,8 @@ class MayhemContract extends Contract {
       'record usage receipt envelope'
     );
     if (receiptShapeError) return receiptShapeError;
-    const targetSchemaVersion = value.contract_version === CONTRACT_VERSION
-      ? SESSION_RECEIPT_SCHEMA_VERSION
-      : 11;
     const receipt = await this.normalizeReceiptEnvelope(value.receipt, {
-      targetSchemaVersion,
+      targetSchemaVersion: SESSION_RECEIPT_SCHEMA_VERSION,
     });
     if (receipt instanceof Error) return receipt;
     const canonicalReceipt = {
@@ -4329,8 +4320,7 @@ class MayhemContract extends Contract {
         return new Error('Higher receipt sequence changed immutable attempt terms.');
       }
       if (!this.receiptUsageIsMonotonic(existingHead.receipt.body.usage, body.usage) ||
-          this.compareAu(body.au_owed_cum, existingHead.receipt.body.au_owed_cum) < 0 ||
-          body.compute_ms < existingHead.receipt.body.compute_ms) {
+          this.compareAu(body.au_owed_cum, existingHead.receipt.body.au_owed_cum) < 0) {
         return new Error('Higher receipt sequence is not monotonic.');
       }
     }
@@ -10241,8 +10231,9 @@ class MayhemContract extends Contract {
           ctx_bracket_table_ver: update.ctx_bracket_table_ver,
         } : {}),
         ver: update.ver,
-        utilization_bps: update.utilization_bps,
-        multiplier_bps: update.multiplier_bps,
+        momentum_bps: update.momentum_bps,
+        activity_rate: update.activity_rate,
+        ema_activity_rate: update.ema_activity_rate,
         active_supply: update.active_supply,
         active_demand_au: update.active_demand_au,
         frozen: update.frozen,
@@ -10371,21 +10362,6 @@ class MayhemContract extends Contract {
         const providers = Array.isArray(usage?.providers)
           ? usage.providers.slice().sort(compareCodepoint)
           : [];
-        const computeMs = this.normalizeAu(
-          usage?.compute_ms,
-          'bounded receipt canonical market compute duration'
-        );
-        const providerCapacities = Array.isArray(usage?.provider_capacities)
-          ? usage.provider_capacities.slice()
-          : [];
-        const capacityProviders = providerCapacities.map((entry) => entry?.provider);
-        const legacyReceiptCount = usage?.legacy_receipt_count;
-        const capacitySlotCount = providerCapacities.reduce(
-          (sum, entry) => Number.isSafeInteger(entry?.capacity_slots)
-            ? sum + entry.capacity_slots
-            : Number.MAX_SAFE_INTEGER,
-          0
-        );
         if (!usage ||
             !this.isSafeKeyPart(usage.enclave_id) ||
             (ctxBracket !== null && !this.isSafeKeyPart(ctxBracket)) ||
@@ -10395,26 +10371,10 @@ class MayhemContract extends Contract {
             demandAu instanceof Error ||
             !Number.isSafeInteger(usage.session_count) ||
             usage.session_count < 1 ||
-            !Number.isSafeInteger(legacyReceiptCount) ||
-            legacyReceiptCount < 0 ||
-            legacyReceiptCount > usage.session_count ||
-            computeMs instanceof Error ||
             providers.length < 1 ||
             providers.some((provider) => !this.isSafeKeyPart(provider)) ||
             new Set(providers).size !== providers.length ||
             stableJson(providers) !== stableJson(usage.providers) ||
-            providerCapacities.length > providers.length ||
-            new Set(capacityProviders).size !== capacityProviders.length ||
-            stableJson(capacityProviders.slice().sort(compareCodepoint)) !==
-              stableJson(capacityProviders) ||
-            capacityProviders.some((provider) => !providers.includes(provider)) ||
-            providerCapacities.some((entry) =>
-              !entry || !Number.isSafeInteger(entry.capacity_slots) ||
-              entry.capacity_slots < 1 || entry.capacity_slots > 1_000_000) ||
-            !Number.isSafeInteger(capacitySlotCount) || capacitySlotCount < 0 ||
-            (legacyReceiptCount === 0 &&
-              (this.isZeroAu(computeMs) || capacitySlotCount < 1 ||
-                providerCapacities.length !== providers.length)) ||
             canonicalPageMarketUsageMap.has(marketKey)) {
           return new Error('Bounded receipt canonical market usage is invalid.');
         }
@@ -10436,12 +10396,8 @@ class MayhemContract extends Contract {
           } : {}),
           demand_au: demandAu,
           settled_usage: usage.settled_usage,
-          compute_ms: computeMs,
-          legacy_receipt_count: legacyReceiptCount,
-          capacity_slot_count: capacitySlotCount,
           session_count: usage.session_count,
           providers,
-          provider_capacities: providerCapacities,
         });
       }
       if (this.compareAu(canonicalPageDemandAu, grossTotal) !== 0 ||
@@ -10822,11 +10778,8 @@ class MayhemContract extends Contract {
             } : {}),
             demand_au: ZERO_AU,
             settled_usage: {},
-            compute_ms: ZERO_AU,
-            legacy_receipt_count: 0,
             session_count: 0,
             provider_count: 0,
-            capacity_slot_count: 0,
             first_page: page,
             last_page: page - 1,
             updated_at: null,
@@ -10845,34 +10798,17 @@ class MayhemContract extends Contract {
           !Number.isSafeInteger(marker.session_count) ||
           marker.session_count < 1 ||
           !Number.isSafeInteger(marker.provider_count) ||
-          marker.provider_count < 1 ||
-          !/^(0|[1-9][0-9]*)$/.test(marker.compute_ms ?? '') ||
-          !Number.isSafeInteger(marker.legacy_receipt_count) ||
-          marker.legacy_receipt_count < 0 ||
-          !Number.isSafeInteger(marker.capacity_slot_count) ||
-          marker.capacity_slot_count < 0
+          marker.provider_count < 1
         ) {
           return new Error('Bounded receipt market usage marker is inconsistent.');
         }
         let newProviderCount = 0;
-        let capacitySlotDelta = 0;
         for (const provider of usage.providers) {
-          const capacitySlots = usage.provider_capacities
-            .find((entry) => entry.provider === provider)?.capacity_slots ?? 0;
-          if (!Number.isSafeInteger(capacitySlots) || capacitySlots < 0) {
-            return new Error('Bounded receipt market provider capacity is invalid.');
-          }
           const providerKey =
             `epoch/market-provider/${value.epoch}/${usage.enclave_id}/${ctxKey}/${provider}`;
           const providerMarker = await this.get(providerKey);
           if (providerMarker === null) {
             newProviderCount += 1;
-            capacitySlotDelta = this.safeAddCount(
-              capacitySlotDelta,
-              capacitySlots,
-              'bounded receipt market capacity slots'
-            );
-            if (capacitySlotDelta instanceof Error) return capacitySlotDelta;
             epochMarketProviderUpdates.push({
               key: providerKey,
               value: {
@@ -10881,7 +10817,6 @@ class MayhemContract extends Contract {
                 enclave_id: usage.enclave_id,
                 ...(usage.ctx_bracket ? { ctx_bracket: usage.ctx_bracket } : {}),
                 provider,
-                capacity_slots: capacitySlots,
                 first_page: page,
                 updated_at: this.tx,
               },
@@ -10892,28 +10827,11 @@ class MayhemContract extends Contract {
             providerMarker.enclave_id !== usage.enclave_id ||
             (providerMarker.ctx_bracket ?? null) !== (usage.ctx_bracket ?? null) ||
             providerMarker.provider !== provider ||
-            !Number.isSafeInteger(providerMarker.capacity_slots) ||
-            providerMarker.capacity_slots < 0 ||
             !Number.isSafeInteger(providerMarker.first_page) ||
             providerMarker.first_page < 0 ||
             providerMarker.first_page >= page
           ) {
             return new Error('Bounded receipt market provider marker is inconsistent.');
-          } else if (capacitySlots > providerMarker.capacity_slots) {
-            capacitySlotDelta = this.safeAddCount(
-              capacitySlotDelta,
-              capacitySlots - providerMarker.capacity_slots,
-              'bounded receipt market capacity slots'
-            );
-            if (capacitySlotDelta instanceof Error) return capacitySlotDelta;
-            epochMarketProviderUpdates.push({
-              key: providerKey,
-              value: {
-                ...providerMarker,
-                capacity_slots: capacitySlots,
-                updated_at: this.tx,
-              },
-            });
           }
         }
         const demandAu = this.safeAddAu(marker.demand_au, usage.demand_au);
@@ -10927,21 +10845,8 @@ class MayhemContract extends Contract {
           newProviderCount,
           'bounded receipt market providers'
         );
-        const computeMs = this.safeAddAu(marker.compute_ms, usage.compute_ms);
-        const legacyReceiptCount = this.safeAddCount(
-          marker.legacy_receipt_count,
-          usage.legacy_receipt_count,
-          'bounded receipt legacy receipt count'
-        );
-        const capacitySlotCount = this.safeAddCount(
-          marker.capacity_slot_count,
-          capacitySlotDelta,
-          'bounded receipt market capacity slots'
-        );
         if (demandAu instanceof Error || sessionCount instanceof Error ||
-            providerCount instanceof Error || computeMs instanceof Error ||
-            legacyReceiptCount instanceof Error ||
-            capacitySlotCount instanceof Error) {
+            providerCount instanceof Error) {
           return new Error('Bounded receipt market usage marker overflow.');
         }
         const settledUsage = this.addSettledUsage(marker.settled_usage, usage.settled_usage);
@@ -10950,11 +10855,8 @@ class MayhemContract extends Contract {
           ...marker,
           settled_usage: settledUsage,
           demand_au: demandAu,
-          compute_ms: computeMs,
-          legacy_receipt_count: legacyReceiptCount,
           session_count: sessionCount,
           provider_count: providerCount,
-          capacity_slot_count: capacitySlotCount,
           last_page: page,
           updated_at: this.tx,
         };
@@ -11005,9 +10907,6 @@ class MayhemContract extends Contract {
             demand_au: marker.demand_au,
             session_count: marker.session_count,
             provider_count: marker.provider_count,
-            compute_ms: marker.compute_ms,
-            legacy_receipt_count: marker.legacy_receipt_count,
-            capacity_slot_count: marker.capacity_slot_count,
           }) !== stableJson(usage)) {
             return new Error('Final market usage does not match canonical receipt settlement state.');
           }
@@ -11358,8 +11257,9 @@ class MayhemContract extends Contract {
           ctx_bracket_table_ver: update.ctx_bracket_table_ver,
         } : {}),
         ver: update.ver,
-        utilization_bps: update.utilization_bps,
-        multiplier_bps: update.multiplier_bps,
+        momentum_bps: update.momentum_bps,
+        activity_rate: update.activity_rate,
+        ema_activity_rate: update.ema_activity_rate,
         active_supply: update.active_supply,
         active_demand_au: update.active_demand_au,
         frozen: update.frozen,
@@ -17478,13 +17378,10 @@ class MayhemContract extends Contract {
         ...(receiptBody.ctx_bracket_table_ver ? {
           ctx_bracket_table_ver: receiptBody.ctx_bracket_table_ver,
         } : {}),
-          demand_au: ZERO_AU,
-          settled_usage: {},
-          compute_ms: ZERO_AU,
-          legacy_receipt_count: 0,
-          session_count: 0,
-          providers: new Set(),
-          provider_capacities: new Map(),
+        demand_au: ZERO_AU,
+        settled_usage: {},
+        session_count: 0,
+        providers: new Set(),
       };
       if ((currentMarket.ctx_bracket_table_ver ?? null) !==
           (receiptBody.ctx_bracket_table_ver ?? currentMarket.ctx_bracket_table_ver ?? null)) {
@@ -17504,31 +17401,6 @@ class MayhemContract extends Contract {
       const settledUsage = this.addSettledUsage(currentMarket.settled_usage, increment);
       if (settledUsage instanceof Error) return settledUsage;
       currentMarket.settled_usage = settledUsage;
-      if (receiptBody.schema_version === SESSION_RECEIPT_SCHEMA_VERSION) {
-        const computeMs = this.safeAddAu(
-          currentMarket.compute_ms,
-          String(receiptBody.compute_ms)
-        );
-        if (computeMs instanceof Error) {
-          return new Error('Canonical receipt market compute duration overflow.');
-        }
-        currentMarket.compute_ms = computeMs;
-        currentMarket.provider_capacities.set(
-          allocation.provider,
-          Math.max(
-            currentMarket.provider_capacities.get(allocation.provider) ?? 0,
-            receiptBody.capacity_slots
-          )
-        );
-      } else {
-        const legacyReceiptCount = this.safeAddCount(
-          currentMarket.legacy_receipt_count,
-          1,
-          'canonical legacy receipt count'
-        );
-        if (legacyReceiptCount instanceof Error) return legacyReceiptCount;
-        currentMarket.legacy_receipt_count = legacyReceiptCount;
-      }
       currentMarket.demand_au = marketDemandAu;
       currentMarket.session_count = marketSessionCount;
       currentMarket.providers.add(allocation.provider);
@@ -17676,13 +17548,8 @@ class MayhemContract extends Contract {
           } : {}),
           demand_au: entry.demand_au,
           settled_usage: entry.settled_usage,
-          compute_ms: entry.compute_ms,
-          legacy_receipt_count: entry.legacy_receipt_count,
           session_count: entry.session_count,
           providers: Array.from(entry.providers).sort(compareCodepoint),
-          provider_capacities: Array.from(entry.provider_capacities.entries())
-            .sort(([left], [right]) => compareCodepoint(left, right))
-            .map(([provider, capacity_slots]) => ({ provider, capacity_slots })),
         })),
     };
   }
@@ -18808,7 +18675,7 @@ class MayhemContract extends Contract {
         !Array.isArray(this.value.markets) || this.value.markets.length > 128) {
       return new Error('Migration requires a timestamp and at most 128 active market rows.');
     }
-    const key = 'market/activity/migration-v3';
+    const key = 'market/activity/migration-v2';
     const existing = await this.get(key);
     const state = await this.epochApplyStateRecord();
     if (state.pending_epoch !== null && state.pending_epoch !== undefined) {
@@ -18860,11 +18727,8 @@ class MayhemContract extends Contract {
     for (const repair of repairs) await this.put(`params/${repair.key}`, repair.after);
     await this.put('market/activity/index', nextIndex);
     await this.put(key, {
-      schema_version: 3, contract_version: CONTRACT_VERSION,
+      schema_version: 2, contract_version: CONTRACT_VERSION,
       hard_min_bps: 2_500, hard_max_bps: 40_000,
-      low_utilization_bps: MARKET_UTILIZATION_LOW_BPS,
-      high_utilization_bps: MARKET_UTILIZATION_HIGH_BPS,
-      price_step_bps: MARKET_UTILIZATION_STEP_BPS,
       previous_applied_epoch: state.updated_epoch ?? 0,
       repairs: [...(existing?.repairs ?? []), ...repairs], market_count: index.size,
       migrated_at: existing?.migrated_at ?? this.tx, updated_at: this.tx, migrated_by: this.address,
@@ -18963,6 +18827,43 @@ class MayhemContract extends Contract {
     return work.toString(); // picoseconds of calibrated reference work.
   }
 
+  marketActivityMomentum(currentRate, previousRate, constants) {
+    const current = BigInt(currentRate);
+    const previous = BigInt(previousRate);
+    const raw = previous > 0n ? current * 10_000n / previous
+      : (current > 0n ? BigInt(constants.max_momentum_bps) : 0n);
+    return Number(raw > BigInt(constants.max_momentum_bps)
+      ? BigInt(constants.max_momentum_bps) : raw);
+  }
+
+  marketActivityEma(previousRate, currentRate, constants) {
+    return ((BigInt(previousRate) * BigInt(10_000 - constants.ema_alpha_bps) +
+      BigInt(currentRate) * BigInt(constants.ema_alpha_bps)) / 10_000n).toString();
+  }
+
+  marketActivityVector(usage, epochSeconds) {
+    return Object.fromEntries(Object.entries(usage).map(([unit, count]) => [
+      unit, (BigInt(count) * 1_000_000_000_000n / BigInt(epochSeconds)).toString(),
+    ]));
+  }
+
+  marketVectorMomentum(current, previous, constants) {
+    const units = [...new Set([...Object.keys(current), ...Object.keys(previous)])]
+      .filter((unit) => BigInt(current[unit] ?? '0') > 0n || BigInt(previous[unit] ?? '0') > 0n)
+      .sort(compareCodepoint);
+    if (!units.length) return 0;
+    let sum = 0n;
+    for (const unit of units) sum += BigInt(this.marketActivityMomentum(
+      current[unit] ?? '0', previous[unit] ?? '0', constants));
+    return Number(sum / BigInt(units.length));
+  }
+
+  marketVectorEma(previous, current, constants) {
+    return Object.fromEntries([...new Set([...Object.keys(current), ...Object.keys(previous)])]
+      .sort(compareCodepoint).map((unit) => [unit, this.marketActivityEma(
+        previous[unit] ?? '0', current[unit] ?? '0', constants)]));
+  }
+
   async activityMarketEntries(usageMap, includeDormant) {
     const entries = this.mapMarketUsageEntriesForHash(usageMap);
     const known = await this.get('market/activity/index') ?? [];
@@ -18972,16 +18873,7 @@ class MayhemContract extends Contract {
     const keys = new Set(entries.map((row) => this.priceMarketKey(row.enclave_id, row.ctx_bracket ?? null)));
     for (const row of known) {
       const key = this.priceMarketKey(row.enclave_id, row.ctx_bracket ?? null);
-      if (includeDormant && !keys.has(key)) entries.push({
-        ...row,
-        demand_au: '0',
-        session_count: 0,
-        provider_count: 0,
-        compute_ms: '0',
-        capacity_slot_count: 0,
-        legacy_receipt_count: 0,
-        _activity_dormant: true,
-      });
+      if (includeDormant && !keys.has(key)) entries.push({ ...row, demand_au: '0', session_count: 0, provider_count: 0, _activity_dormant: true });
     }
     if (new Set([...keys, ...known.map((row) => this.priceMarketKey(row.enclave_id, row.ctx_bracket ?? null))]).size > DEFAULT_MAX_MARKET_USAGE_ENTRIES) {
       return new Error('Market activity index capacity exceeded.');
@@ -19009,43 +18901,18 @@ class MayhemContract extends Contract {
   }
 
   marketPriceParamKeys() {
-    return ['price_min_bps', 'price_max_bps'];
+    return ['price_min_bps', 'price_max_bps', 'market_ema_alpha_bps',
+      'market_gain_bps', 'market_max_step_bps'];
   }
 
-  marketPriceConstants() {
+  marketPriceConstants(params) {
     return {
-      schema_version: 3,
-      low_utilization_bps: MARKET_UTILIZATION_LOW_BPS,
-      high_utilization_bps: MARKET_UTILIZATION_HIGH_BPS,
-      price_step_bps: MARKET_UTILIZATION_STEP_BPS,
+      schema_version: 2,
+      ema_alpha_bps: params.market_ema_alpha_bps,
+      gain_bps: params.market_gain_bps,
+      max_step_bps: params.market_max_step_bps,
+      max_momentum_bps: 50_000,
     };
-  }
-
-  marketUtilizationBps(computeMs, capacitySlotCount, epochSeconds) {
-    const busy = this.parseAu(computeMs, 'market compute duration');
-    if (busy instanceof Error || !Number.isSafeInteger(capacitySlotCount) ||
-        capacitySlotCount < 0 || !Number.isSafeInteger(epochSeconds) || epochSeconds < 1) {
-      return new Error('Invalid market utilization evidence.');
-    }
-    if (capacitySlotCount === 0) {
-      return busy === 0n ? 0 : new Error('Market compute duration requires execution capacity.');
-    }
-    const available = BigInt(capacitySlotCount) * BigInt(epochSeconds) * 1_000n;
-    const utilization = busy * 10_000n / available;
-    return Number(utilization > 10_000n ? 10_000n : utilization);
-  }
-
-  marketUtilizationMultiplier(utilizationBps) {
-    if (!Number.isSafeInteger(utilizationBps) || utilizationBps < 0 || utilizationBps > 10_000) {
-      return new Error('Invalid market utilization.');
-    }
-    if (utilizationBps >= MARKET_UTILIZATION_HIGH_BPS) {
-      return 10_000 + MARKET_UTILIZATION_STEP_BPS;
-    }
-    if (utilizationBps <= MARKET_UTILIZATION_LOW_BPS) {
-      return 10_000 - MARKET_UTILIZATION_STEP_BPS;
-    }
-    return 10_000;
   }
 
   scalePriceTerm(term, multiplierBps) {
@@ -19058,6 +18925,25 @@ class MayhemContract extends Contract {
     return this.canonicalAu(scaled > 0n ? scaled : 1n);
   }
 
+  stepPriceTerm(current, desired, constants) {
+    const currentAu = this.parseAu(current, 'current price term');
+    const desiredAu = this.parseAu(desired, 'desired price term');
+    if (currentAu instanceof Error || desiredAu instanceof Error) return new Error('Invalid price term.');
+    if (currentAu === desiredAu) return this.canonicalAu(currentAu);
+    if (currentAu === 0n) return this.canonicalAu(desiredAu);
+    const delta = currentAu > desiredAu ? currentAu - desiredAu : desiredAu - currentAu;
+    const gainedRaw = (delta * BigInt(constants.gain_bps)) / 10_000n;
+    const maxStepRaw = (currentAu * BigInt(constants.max_step_bps)) / 10_000n;
+    const gained = gainedRaw > 0n ? gainedRaw : 1n;
+    const maxStep = maxStepRaw > 0n ? maxStepRaw : 1n;
+    const step = gained < maxStep ? gained : maxStep;
+    return this.canonicalAu(
+      desiredAu > currentAu
+        ? currentAu + step
+        : (step > currentAu ? 0n : currentAu - step)
+    );
+  }
+
   scaleRateMap(rateMap, multiplierBps) {
     const scaled = [];
     for (const entry of rateMap) {
@@ -19066,6 +18952,21 @@ class MayhemContract extends Contract {
       scaled.push({ ...entry, per_unit_au: perUnitAu });
     }
     return this.normalizeRateMap(scaled);
+  }
+
+  stepRateMap(currentRateMap, desiredRateMap, constants) {
+    const desiredByUnit = this.rateMapByUnit(desiredRateMap);
+    const stepped = [];
+    for (const entry of currentRateMap) {
+      const desired = desiredByUnit.get(entry.unit);
+      if (!desired || desired.granularity !== entry.granularity) {
+        return new Error('Market price rate_map shape changed.');
+      }
+      const perUnitAu = this.stepPriceTerm(entry.per_unit_au, desired.per_unit_au, constants);
+      if (perUnitAu instanceof Error) return perUnitAu;
+      stepped.push({ ...entry, per_unit_au: perUnitAu });
+    }
+    return this.normalizeRateMap(stepped);
   }
 
   clampRateMapBounds(priceRateMap, referenceRateMap, params) {
@@ -19151,49 +19052,60 @@ class MayhemContract extends Contract {
       const modelRef = await this.get(`modelref/${enclave.model_id}`);
       if (!modelRef) return new Error('Market price model reference not found.');
       const previousMarket = current.market ?? {};
-      if (Number.isSafeInteger(previousMarket.epoch) && previousMarket.epoch >= epoch) {
+      if (previousMarket.schema_version === 2 && previousMarket.epoch >= epoch) {
         return new Error('Market activity epoch must increase exactly once per settled epoch.');
       }
       const canonical = context.canonicalActivity?.get(marketKey) ??
-        (context.includeDormant && usage.session_count === 0
-          ? { settled_usage: {}, compute_ms: '0', capacity_slot_count: 0,
-            legacy_receipt_count: 0 }
-          : usage);
-      const settledUsage = canonical?.settled_usage ?? {};
-      const computeMs = canonical?.compute_ms ?? usage.compute_ms;
-      const capacitySlotCount = canonical?.capacity_slot_count ?? usage.capacity_slot_count;
-      const legacyReceiptCount = canonical?.legacy_receipt_count ??
-        usage.legacy_receipt_count;
+        (context.includeDormant && usage.session_count === 0 ? { settled_usage: {} } : null);
+      const settledUsage = canonical?.settled_usage ?? null;
+      const calibration = modelRef.activity_calibration ?? null;
+      const calibrationError = calibration && this.validateActivityCalibration(calibration, modelRef.model_class, modelRef.rate_map);
+      if (calibrationError) return calibrationError;
+      const calibrationHash = calibration
+        ? await this.opaqueHash('mayhem-market-activity-calibration-v1', calibration) : null;
+      const work = calibration && settledUsage !== null
+        ? this.calibratedActivityWork(settledUsage, calibration) : null;
+      if (work instanceof Error) return work;
+      const activityRate = work === null ? null : (BigInt(work) / BigInt(epochSeconds)).toString();
+      const vector = settledUsage === null ? null : this.marketActivityVector(settledUsage, epochSeconds);
+      // With no machine-readable calibration, compare each signed dimension only
+      // against its own history. No synthetic GPU capacity or monetary weights.
+      const activityBasis = work === null ? 'relative_dimension_vector_v1' : 'calibrated_work_v1';
+      const initialized = previousMarket.schema_version === 2 &&
+        previousMarket.activity_initialized === true &&
+        previousMarket.calibration_hash === calibrationHash &&
+        previousMarket.activity_basis === activityBasis &&
+        previousMarket.epoch === epoch - 1;
+      const previousEma = initialized ? previousMarket.ema_activity_rate : activityRate;
+      const activeSupply = usage.provider_count;
       if (canonical && canonical.session_count !== undefined &&
           (canonical.session_count !== usage.session_count ||
             canonical.demand_au !== usage.demand_au ||
-            canonical.compute_ms !== usage.compute_ms ||
-            canonical.capacity_slot_count !== usage.capacity_slot_count ||
-            (canonical.legacy_receipt_count ?? 0) !== usage.legacy_receipt_count ||
             (canonical.provider_count ?? canonical.providers?.length) !== usage.provider_count)) {
         return new Error('Market activity totals do not match canonical receipt evidence.');
       }
-      if (computeMs === undefined || capacitySlotCount === undefined ||
-          !Number.isSafeInteger(legacyReceiptCount) || legacyReceiptCount < 0) {
-        return new Error('Market utilization requires canonical signed compute evidence.');
-      }
-      const legacyHold = legacyReceiptCount > 0;
-      const utilizationBps = legacyHold ? null : this.marketUtilizationBps(
-        computeMs, capacitySlotCount, epochSeconds);
-      if (utilizationBps instanceof Error) return utilizationBps;
-      const multiplierBps = legacyHold ? 10_000 :
-        this.marketUtilizationMultiplier(utilizationBps);
-      if (multiplierBps instanceof Error) return multiplierBps;
-      const activeSupply = usage.provider_count;
-      // Apply the fixed utilization step directly. No previous-hour activity,
-      // revenue target, EMA, or demand AU enters the direction decision.
+      // Nonzero direction follows the previous epoch; empty epochs keep decaying.
+      // EMA is telemetry only; the bootstrap still holds for one epoch.
+      const rawMomentum = initialized && vector !== null
+        ? activityBasis === 'calibrated_work_v1'
+          ? this.marketActivityMomentum(activityRate, previousMarket.activity_rate, constants)
+          : this.marketVectorMomentum(vector, previousMarket.activity_vector, constants)
+        : 10_000;
+      const frozenReason = settledUsage === null ? 'missing_canonical_activity'
+        : !initialized ? 'activity_baseline_bootstrap' : null;
+      const frozen = frozenReason !== null;
+      const multiplierBps = frozen ? 10_000 : rawMomentum;
+      const activityInitialized = vector !== null;
+      const emaActivityRate = activityRate === null ? null : initialized
+        ? this.marketActivityEma(previousEma, activityRate, constants) : activityRate;
+      // Momentum moves the current price. The admin seed is provenance, not a dollar target.
       const desiredRateMap = this.scaleRateMap(current.rate_map, multiplierBps);
       const desiredPerReqAu = this.scalePriceTerm(current.per_req_au, multiplierBps);
       const desiredMinSessionAu = this.scalePriceTerm(current.min_session_au, multiplierBps);
       const nextTerms = {
-        rate_map: desiredRateMap,
-        per_req_au: desiredPerReqAu,
-        min_session_au: desiredMinSessionAu,
+        rate_map: this.stepRateMap(current.rate_map, desiredRateMap, constants),
+        per_req_au: this.stepPriceTerm(current.per_req_au, desiredPerReqAu, constants),
+        min_session_au: this.stepPriceTerm(current.min_session_au, desiredMinSessionAu, constants),
       };
       for (const term of Object.values(nextTerms)) if (term instanceof Error) return term;
       for (const field of ['per_req_au', 'min_session_au']) {
@@ -19211,25 +19123,24 @@ class MayhemContract extends Contract {
         set_by: seed.set_by, set_by_role: 'admin',
         ...(ctxMeta ? { ctx_bracket: ctxMeta.ctx_bracket,
           ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver } : {}),
-        price_source: 'market_utilization', seed,
+        price_source: frozen ? 'market_activity_hold' : 'market_activity_momentum', seed,
         market: {
-          schema_version: 3,
-          source: legacyHold ? 'canonical_legacy_receipt_hold' :
-            'canonical_signed_slot_time',
-          epoch,
-          epoch_seconds: epochSeconds,
+          schema_version: 2, source: 'canonical_settled_work', epoch, epoch_seconds: epochSeconds,
           active_supply: activeSupply,
-          capacity_slot_count: capacitySlotCount,
-          compute_ms: computeMs,
-          legacy_receipt_count: legacyReceiptCount,
-          utilization_bps: utilizationBps,
-          // Gross AU and metered units remain accounting evidence only.
+          // Gross AU remains accounting evidence only; it never enters the controller.
           active_demand_au: usage.demand_au, session_count: usage.session_count,
-          settled_usage: settledUsage,
-          activity_basis: legacyHold ? 'legacy_receipt_hold_v1' :
-            'signed_slot_time_v1',
-          modelref_ver: modelRef.ver ?? null,
-          activity_initialized: true, multiplier_bps: multiplierBps, constants,
+          settled_usage: settledUsage, calibration_hash: calibrationHash,
+          activity_basis: activityBasis, activity_vector: vector,
+          previous_activity_vector: initialized ? previousMarket.activity_vector : vector,
+          previous_activity_rate: initialized ? previousMarket.activity_rate : activityRate,
+          previous_ema_activity_vector: initialized ? previousMarket.ema_activity_vector : vector,
+          ema_activity_vector: vector === null ? null : initialized
+            ? this.marketVectorEma(previousMarket.ema_activity_vector, vector, constants) : vector,
+          calibration: cloneValue(calibration), modelref_ver: modelRef.ver ?? null,
+          calibrated_work_ps: work, activity_rate: activityRate,
+          previous_ema_activity_rate: previousEma, ema_activity_rate: emaActivityRate,
+          activity_initialized: activityInitialized, momentum_bps: rawMomentum,
+          multiplier_bps: multiplierBps, frozen, frozen_reason: frozenReason, constants,
           desired_rate_map: desiredRateMap, desired_per_req_au: desiredPerReqAu,
           desired_min_session_au: desiredMinSessionAu,
           previous_price_ver: current.ver, previous_rate_map: cloneValue(current.rate_map),
@@ -19242,10 +19153,8 @@ class MayhemContract extends Contract {
         ...(ctxMeta ? { ctx_bracket: ctxMeta.ctx_bracket,
           ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver } : {}),
         market_key: marketKey, ver: record.ver, rate_map: record.rate_map,
-        utilization_bps: utilizationBps, multiplier_bps: multiplierBps,
-        active_supply: activeSupply, capacity_slot_count: capacitySlotCount,
-        compute_ms: computeMs, legacy_receipt_count: legacyReceiptCount,
-        active_demand_au: usage.demand_au, frozen: false,
+        momentum_bps: rawMomentum, activity_rate: activityRate, ema_activity_rate: emaActivityRate,
+        active_supply: activeSupply, active_demand_au: usage.demand_au, frozen,
         schedule_key: scheduleKey, schedule: { ...schedule, current: record },
         record_key: this.priceRecordKey(usage.enclave_id, record.ver, ctxMeta?.ctx_bracket ?? null), record,
       });
@@ -22865,10 +22774,6 @@ class MayhemContract extends Contract {
       prompt_hash: bodySource.prompt_hash,
       ts: bodySource.ts,
     };
-    if (targetSchemaVersion >= 12) {
-      body.compute_ms = bodySource.compute_ms;
-      body.capacity_slots = bodySource.capacity_slots;
-    }
     if (hasOwn(bodySource, 'usage_attribution')) {
       body.usage_attribution = cloneValue(bodySource.usage_attribution);
     }
@@ -22982,15 +22887,6 @@ class MayhemContract extends Contract {
     }
     if (!Number.isSafeInteger(body.served_ctx) || body.served_ctx < 0) {
       return new Error('Invalid receipt served context.');
-    }
-    if (expectedSchemaVersion >= 12) {
-      if (!Number.isSafeInteger(body.compute_ms) || body.compute_ms < 1) {
-        return new Error('Invalid receipt compute duration.');
-      }
-      if (!Number.isSafeInteger(body.capacity_slots) || body.capacity_slots < 1 ||
-          body.capacity_slots > 1_000_000) {
-        return new Error('Invalid receipt execution capacity.');
-      }
     }
     const table = body.ctx_bracket_table_ver === null || body.ctx_bracket_table_ver === undefined
       ? null
@@ -23178,7 +23074,7 @@ class MayhemContract extends Contract {
     }
     return {
       type: 'price_derivation',
-      schema_version: 3,
+      schema_version: 2,
       epoch,
       at,
       epoch_seconds: epochSeconds,
@@ -23194,9 +23090,7 @@ class MayhemContract extends Contract {
       usage: {
         usage_root: usageRoot,
         settled_usage: cloneValue(market.settled_usage),
-        compute_ms: market.compute_ms,
-        capacity_slot_count: market.capacity_slot_count,
-        legacy_receipt_count: market.legacy_receipt_count,
+        calibrated_work_ps: market.calibrated_work_ps,
         active_demand_au: market.active_demand_au,
         session_count: market.session_count,
         ...(record.ctx_bracket ? {
@@ -23208,10 +23102,22 @@ class MayhemContract extends Contract {
         source: market.source,
         active_supply: market.active_supply,
         activity_basis: market.activity_basis,
-        utilization_bps: market.utilization_bps,
+        activity_vector: cloneValue(market.activity_vector),
+        previous_activity_vector: cloneValue(market.previous_activity_vector),
+        previous_activity_rate: market.previous_activity_rate,
+        previous_ema_activity_vector: cloneValue(market.previous_ema_activity_vector),
+        ema_activity_vector: cloneValue(market.ema_activity_vector),
+        momentum_bps: market.momentum_bps,
+        activity_rate: market.activity_rate,
+        previous_ema_activity_rate: market.previous_ema_activity_rate,
+        ema_activity_rate: market.ema_activity_rate,
         activity_initialized: market.activity_initialized,
+        calibration_hash: market.calibration_hash,
+        calibration: cloneValue(market.calibration),
         modelref_ver: market.modelref_ver,
         multiplier_bps: market.multiplier_bps,
+        frozen: market.frozen,
+        frozen_reason: market.frozen_reason,
         constants: cloneValue(market.constants),
       },
       seed_price: this.priceTermsSnapshot(record.seed),
@@ -23325,31 +23231,15 @@ class MayhemContract extends Contract {
           ...(body.ctx_bracket ? { ctx_bracket: body.ctx_bracket,
             ctx_bracket_table_ver: body.ctx_bracket_table_ver } : {}),
           demand_au: '0', session_count: 0, providers: new Set(), settled_usage: {},
-          compute_ms: '0', legacy_receipt_count: 0, provider_capacities: new Map(),
         };
         const increment = this.incrementalSettledUsage(body);
         if (increment instanceof Error) return increment;
         row.settled_usage = this.addSettledUsage(row.settled_usage, increment);
         row.demand_au = this.safeAddAu(row.demand_au, head.incremental_au);
-        if (body.schema_version === SESSION_RECEIPT_SCHEMA_VERSION) {
-          row.compute_ms = this.safeAddAu(row.compute_ms, String(body.compute_ms));
-          row.provider_capacities.set(
-            head.provider,
-            Math.max(row.provider_capacities.get(head.provider) ?? 0, body.capacity_slots)
-          );
-        } else {
-          row.legacy_receipt_count = this.safeAddCount(
-            row.legacy_receipt_count,
-            1,
-            'activity commitment legacy receipt count'
-          );
-        }
-        if (row.settled_usage instanceof Error || row.demand_au instanceof Error ||
-            row.compute_ms instanceof Error || row.legacy_receipt_count instanceof Error) {
+        if (row.settled_usage instanceof Error || row.demand_au instanceof Error) {
           return new Error('Activity commitment work overflow.');
         }
-        row.session_count++;
-        row.providers.add(head.provider);
+        row.session_count++; row.providers.add(head.provider);
         markets.set(marketKey, row);
         leaves.push(await this.usageLeafHash(head.receipt));
       }
@@ -23362,10 +23252,8 @@ class MayhemContract extends Contract {
     }
     const canonical = new Map(); const usage = new Map();
     for (const [key, row] of markets) {
-      const { providers, provider_capacities: providerCapacities, settled_usage, ...publicRow } = row;
+      const { providers, settled_usage, ...publicRow } = row;
       publicRow.provider_count = providers.size;
-      publicRow.capacity_slot_count = Array.from(providerCapacities.values())
-        .reduce((sum, slots) => sum + slots, 0);
       if (publicRow.demand_au !== totals.use_au) return new Error('Activity commitment gross total mismatch.');
       usage.set(key, publicRow);
       canonical.set(key, { ...publicRow, settled_usage });
@@ -23690,22 +23578,12 @@ class MayhemContract extends Contract {
         'demand_au',
         'session_count',
         'provider_count',
-        'compute_ms',
-        'capacity_slot_count',
-        'legacy_receipt_count',
       ]);
       const unknown = Object.keys(entry).filter((key) => !allowed.has(key)).sort();
       if (unknown.length > 0) {
         return new Error(`market usage entry does not accept fields: ${unknown.join(', ')}.`);
       }
-      for (const key of [
-        'enclave_id',
-        'demand_au',
-        'session_count',
-        'provider_count',
-        'compute_ms',
-        'capacity_slot_count',
-      ]) {
+      for (const key of ['enclave_id', 'demand_au', 'session_count', 'provider_count']) {
         if (!hasOwn(entry, key)) return new Error(`market usage entry is missing ${key}.`);
       }
       const enclaveId = entry.enclave_id;
@@ -23730,21 +23608,6 @@ class MayhemContract extends Contract {
       if (!Number.isSafeInteger(entry.provider_count) || entry.provider_count <= 0) {
         return new Error('Invalid market usage provider_count.');
       }
-      const legacyReceiptCount = entry.legacy_receipt_count ?? 0;
-      if (!Number.isSafeInteger(legacyReceiptCount) || legacyReceiptCount < 0 ||
-          legacyReceiptCount > entry.session_count) {
-        return new Error('Invalid market usage legacy_receipt_count.');
-      }
-      const computeMs = this.normalizeAu(entry.compute_ms, 'market usage compute duration');
-      if (computeMs instanceof Error ||
-          (legacyReceiptCount === 0 && this.isZeroAu(computeMs))) {
-        return new Error('Invalid market usage compute duration.');
-      }
-      if (!Number.isSafeInteger(entry.capacity_slot_count) ||
-          entry.capacity_slot_count < 0 ||
-          (legacyReceiptCount === 0 && entry.capacity_slot_count === 0)) {
-        return new Error('Invalid market usage capacity_slot_count.');
-      }
       const key = this.priceMarketKey(enclaveId, ctxBracket);
       const current = out.get(key) ?? {
         enclave_id: enclaveId,
@@ -23753,9 +23616,6 @@ class MayhemContract extends Contract {
         demand_au: ZERO_AU,
         session_count: 0,
         provider_count: 0,
-        compute_ms: ZERO_AU,
-        capacity_slot_count: 0,
-        legacy_receipt_count: 0,
       };
       if ((current.ctx_bracket_table_ver ?? null) !== (entry.ctx_bracket_table_ver ?? current.ctx_bracket_table_ver ?? null)) {
         return new Error('Market usage context bracket table version mismatch.');
@@ -23766,23 +23626,6 @@ class MayhemContract extends Contract {
       if (sessionCount instanceof Error) return sessionCount;
       const providerCount = this.safeAddCount(current.provider_count, entry.provider_count, 'market usage provider_count');
       if (providerCount instanceof Error) return providerCount;
-      const totalComputeMs = this.safeAddAu(current.compute_ms, computeMs);
-      if (totalComputeMs instanceof Error) return totalComputeMs;
-      const capacitySlotCount = this.safeAddCount(
-        current.capacity_slot_count,
-        entry.capacity_slot_count,
-        'market usage capacity slot count'
-      );
-      if (capacitySlotCount instanceof Error) return capacitySlotCount;
-      const totalLegacyReceiptCount = this.safeAddCount(
-        current.legacy_receipt_count,
-        legacyReceiptCount,
-        'market usage legacy receipt count'
-      );
-      if (totalLegacyReceiptCount instanceof Error ||
-          totalLegacyReceiptCount > sessionCount) {
-        return new Error('Invalid market usage legacy receipt total.');
-      }
       out.set(key, {
         enclave_id: enclaveId,
         ...(ctxBracket ? { ctx_bracket: ctxBracket } : {}),
@@ -23790,9 +23633,6 @@ class MayhemContract extends Contract {
         demand_au: demandAu,
         session_count: sessionCount,
         provider_count: providerCount,
-        compute_ms: totalComputeMs,
-        capacity_slot_count: capacitySlotCount,
-        legacy_receipt_count: totalLegacyReceiptCount,
       });
     }
     return out;
@@ -24082,9 +23922,6 @@ class MayhemContract extends Contract {
         demand_au: entry.demand_au,
         session_count: entry.session_count,
         provider_count: entry.provider_count,
-        compute_ms: entry.compute_ms,
-        capacity_slot_count: entry.capacity_slot_count,
-        legacy_receipt_count: entry.legacy_receipt_count ?? 0,
       }));
   }
 

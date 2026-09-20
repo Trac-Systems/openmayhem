@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {runMarketSimulation,validateMarketSimulation,formatMarketSimulationMarkdown,marketConstants} from '../scripts/market-sim.mjs';
 
-test('market simulation uses live activity constants and respects step/hard bands',()=>{
+test('market simulation uses live utilization constants and respects step/hard bands',()=>{
   const report=runMarketSimulation();assert.deepEqual(report.constants,marketConstants());
   const result=validateMarketSimulation(report);assert.equal(result.ok,true,result.failures.join('\n'));
 });
@@ -17,8 +17,8 @@ test('spend and phantom-provider changes do not alter market activity',()=>{
   const r=runMarketSimulation();
   for(const name of ['spend_spike','phantom_supply']) assert.ok(r.scenarios[name].rows.every(row=>row.price_au===r.seed_price_au));
 });
-test('simulation describes activity without a dollar utilization target',()=>{
+test('simulation describes utilization without a dollar target or previous-hour comparison',()=>{
   const markdown=formatMarketSimulationMarkdown(runMarketSimulation());
-  assert.match(markdown,/Settled activity momentum/);assert.match(markdown,/max_step_bps/);assert.match(markdown,/Validation: PASS/);
+  assert.match(markdown,/Signed slot utilization/);assert.match(markdown,/price_step_bps/);assert.match(markdown,/Validation: PASS/);
   assert.doesNotMatch(markdown,/target_utilization_bps|provider_epoch_target_au/);
 });

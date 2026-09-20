@@ -1517,19 +1517,22 @@ fn fixture_price(base: &PriceRefAu, model_index: usize) -> PriceRefAu {
                 .collect::<Vec<_>>();
             json!({
                 "epoch": epoch,
-                "price_source": "market_activity_momentum",
+                "price_source": "market_utilization",
                 "ctx_bracket": if epoch % 4 == 0 { "32k" } else { "base" },
                 "usage": {
                     "active_demand_au": (650_000_000_000_000_000_u128 + u128::from(epoch - 40) * 95_000_000_000_000_000).to_string(),
                     "settled_usage": { "input_token": (4_000 + (epoch - 40) * 700).to_string() },
+                    "compute_ms": (1_800_000 + (epoch - 40) * 120_000).to_string(),
+                    "capacity_slot_count": 1,
+                    "legacy_receipt_count": 0,
                     "session_count": 7 + epoch - 40,
                 },
                 "controller": {
-                    "source": "canonical_settled_work",
+                    "source": "canonical_signed_slot_time",
                     "active_supply": 3 + model_index,
-                    "momentum_bps": 9_500 + (epoch - 40) * 155,
-                    "activity_basis": "relative_dimension_vector_v1",
-                    "frozen": false,
+                    "utilization_bps": 5_000 + (epoch - 40) * 250,
+                    "multiplier_bps": if epoch >= 52 { 11_000 } else { 10_000 },
+                    "activity_basis": "signed_slot_time_v1",
                 },
                 "seed_price": {"ver": 1, "rate_map": historical_rates},
                 "result_price": {"ver": epoch, "rate_map": historical_rates},
@@ -1629,7 +1632,7 @@ fn fixture_receipt(
     let usage = ReceiptUsage::text(640 + index as u64 * 175, 210 + index as u64 * 95);
     let cost = 120_000_000_000_000_000_u128.saturating_add(index as u128 * 47_000_000_000_000_000);
     let voucher_body = SpendVoucherBody {
-        schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+        schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
         session_id: session_id.clone(),
         billing_id: session_id.clone(),
         billing_attempt: 0,
@@ -1686,6 +1689,8 @@ fn fixture_receipt(
         locked_per_req_au: model.mayhem.price_ref_au.per_req_au,
         locked_min_session_au: model.mayhem.price_ref_au.min_session_au,
         served_ctx: model.mayhem.caps.ctx,
+        compute_ms: 1,
+        capacity_slots: 1,
         ctx_bracket: Some("base".to_owned()),
         ctx_bracket_table_ver: Some(1),
         rules_ver: 1,

@@ -131,8 +131,9 @@ use mayhem_proto::{
     DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
     DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, RECOVERABLE_RECEIPT_CONTRACT_VERSION,
-    SESSION_RECEIPT_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION, TOKENIZE_REQUEST_CHUNK_FRAME_TYPE,
-    TOKENIZE_REQUEST_FRAME_TYPE, TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
+    SESSION_RECEIPT_SCHEMA_VERSION, SPEND_VOUCHER_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION,
+    TOKENIZE_REQUEST_CHUNK_FRAME_TYPE, TOKENIZE_REQUEST_FRAME_TYPE,
+    TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
     TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
     TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
     USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
@@ -50717,9 +50718,6 @@ fn price_derivation_summary(derivation: &Value) -> String {
         .or_else(|| derivation_u64(derivation, &["price_ver"]))
         .map(|value| format!("v{value}"))
         .unwrap_or_else(|| "price".to_owned());
-    let momentum = derivation_u64(derivation, &["controller", "momentum_bps"])
-        .map(format_bps)
-        .unwrap_or_else(|| "?".to_owned());
     let basis = derivation_str(derivation, &["controller", "activity_basis"])
         .unwrap_or("historical pricing");
     let sessions = derivation_u64(derivation, &["usage", "session_count"])
@@ -50737,9 +50735,31 @@ fn price_derivation_summary(derivation: &Value) -> String {
     let leaf = derivation_str(derivation, &["derivation_hash"])
         .map(|value| format!(" leaf={}", short_hash(value)))
         .unwrap_or_default();
-    format!(
-        "price {result_ver}; activity momentum {momentum}; {basis}; epoch {epoch}; {sessions} settled sessions; {supply} providers; seed {seed_ver}; {source}{root}{leaf}"
-    )
+    if derivation.get("controller").is_some_and(|controller| {
+        controller.get("activity_basis").is_some_and(|value| {
+            matches!(
+                value.as_str(),
+                Some("signed_slot_time_v1" | "legacy_receipt_hold_v1")
+            )
+        })
+    }) {
+        let utilization = derivation_u64(derivation, &["controller", "utilization_bps"])
+            .map(format_bps)
+            .unwrap_or_else(|| "held for retained receipt recovery".to_owned());
+        let multiplier = derivation_u64(derivation, &["controller", "multiplier_bps"])
+            .map(format_bps)
+            .unwrap_or_else(|| "?".to_owned());
+        format!(
+            "price {result_ver}; utilization {utilization}; price multiplier {multiplier}; {basis}; epoch {epoch}; {sessions} settled sessions; {supply} providers; seed {seed_ver}; {source}{root}{leaf}"
+        )
+    } else {
+        let momentum = derivation_u64(derivation, &["controller", "momentum_bps"])
+            .map(format_bps)
+            .unwrap_or_else(|| "?".to_owned());
+        format!(
+            "price {result_ver}; activity momentum {momentum}; {basis}; epoch {epoch}; {sessions} settled sessions; {supply} providers; seed {seed_ver}; {source}{root}{leaf}"
+        )
+    }
 }
 
 fn derivation_u64(value: &Value, path: &[&str]) -> Option<u64> {
@@ -61104,6 +61124,14 @@ fn provider_session_quality_value(
     })
 }
 
+fn provider_session_quality_compute_ms(quality: &Value) -> u64 {
+    quality
+        .get("compute_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1)
+}
+
 struct ProviderRequestLoadGuard {
     load: ProviderHeartbeatLoad,
     modality_items: BTreeMap<String, u32>,
@@ -62307,6 +62335,7 @@ struct ProviderSessionTerms {
     min_session_au: MoneyAu,
     min_ask_au: MoneyAu,
     rules_ver: u64,
+    capacity_slots: u32,
     ctx: u64,
     ctx_bracket: Option<String>,
     ctx_bracket_table_ver: Option<u32>,
@@ -80797,6 +80826,7 @@ async fn serve_provider_sessions(
     terms.runtime_independent_dispatch_modalities =
         provider_runtime_independent_dispatch_modalities(responder.as_ref());
     let execution_capacity = provider_execution_capacity_for_terms(&terms, responder.as_ref());
+    terms.capacity_slots = execution_capacity.max(1);
     let protection_config = configured_protection.limit_to_execution_capacity(execution_capacity);
     let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
         ctx.args.home.as_ref(),
@@ -84371,6 +84401,7 @@ where
                             usage,
                             usage_attribution,
                             receipt_seq,
+                            duration_millis_u64(request_started.elapsed()).max(1),
                             runtime.runtime_keypair,
                         )
                         .await
@@ -84424,6 +84455,7 @@ where
                         usage,
                         attribution,
                         receipt_seq,
+                        duration_millis_u64(request_started.elapsed()).max(1),
                         runtime.runtime_keypair,
                     )?;
                     send_provider_session_failure(
@@ -84760,6 +84792,7 @@ struct ProviderSessionLiveStreamState {
     delivered_metered_units: u64,
     reasoning_units: u64,
     prompt_tokens: u64,
+    compute_ms: u64,
 }
 
 struct ProviderSessionLiveStream<'a> {
@@ -85102,6 +85135,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
                 usage_attribution,
                 self.receipt_seq,
                 false,
+                duration_millis_u64(self.request_started.elapsed()).max(1),
                 self.runtime_keypair,
             )
             .context("building live provider session checkpoint receipt")?;
@@ -85349,6 +85383,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
                     usage,
                     attribution,
                     seq,
+                    duration_millis_u64(self.request_started.elapsed()).max(1),
                     self.runtime_keypair,
                 )
                 .await
@@ -85366,6 +85401,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             delivered_metered_units: self.delivered_metered_units,
             reasoning_units: metered_output_units("", &self.hidden_reasoning, &[]),
             prompt_tokens: self.prompt_tokens,
+            compute_ms: duration_millis_u64(self.request_started.elapsed()).max(1),
         })
     }
 }
@@ -85377,6 +85413,7 @@ fn provider_failed_session_receipt(
     usage: ReceiptUsage,
     attribution: BTreeMap<String, u64>,
     seq: u64,
+    compute_ms: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<Option<ProviderSignedSessionReceipt>> {
     // A provider failure never invents the minimum work quantum used for a
@@ -85390,6 +85427,7 @@ fn provider_failed_session_receipt(
         attribution,
         seq,
         true,
+        compute_ms,
         runtime_keypair,
     )?;
     Ok((receipt.body.au_owed_cum > active.billing_prior_au_owed_cum).then_some(receipt))
@@ -85429,6 +85467,7 @@ async fn settle_cancelled_provider_session(
     usage: ReceiptUsage,
     usage_attribution: BTreeMap<String, u64>,
     receipt_seq: u64,
+    compute_ms: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
     let receipt = provider_cancelled_session_receipt(
@@ -85438,6 +85477,7 @@ async fn settle_cancelled_provider_session(
         usage,
         usage_attribution,
         receipt_seq,
+        compute_ms,
         runtime_keypair,
     )
     .context("building cancelled provider session receipt")?;
@@ -85470,6 +85510,7 @@ fn provider_cancelled_session_receipt(
     metered_usage: ReceiptUsage,
     usage_attribution: BTreeMap<String, u64>,
     receipt_seq: u64,
+    compute_ms: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
     let usage = cancellation_settlement_usage(
@@ -85489,6 +85530,7 @@ fn provider_cancelled_session_receipt(
         usage_attribution,
         receipt_seq,
         true,
+        compute_ms,
         runtime_keypair,
     )
 }
@@ -85602,6 +85644,7 @@ async fn send_provider_session_output(
                     usage_attribution,
                     receipt_seq,
                     false,
+                    provider_session_quality_compute_ms(&provider_quality),
                     runtime_keypair,
                 )
                 .context("building provider session checkpoint receipt")?;
@@ -85673,6 +85716,7 @@ async fn send_provider_session_output(
         output.usage_attribution.clone(),
         receipt_seq,
         true,
+        provider_session_quality_compute_ms(&provider_quality),
         runtime_keypair,
     )
     .context("building provider session receipt")?;
@@ -85714,6 +85758,7 @@ async fn send_provider_client_disconnect_receipt_if_requested(
         usage,
         attribution,
         state.receipt_seq,
+        state.compute_ms,
         runtime_keypair,
     )
     .await?;
@@ -86722,6 +86767,7 @@ fn provider_session_receipt(
         output.usage_attribution.clone(),
         1,
         true,
+        1,
         runtime_keypair,
     )
 }
@@ -86733,6 +86779,7 @@ fn provider_session_receipt_for_usage(
     usage: ReceiptUsage,
     seq: u64,
     final_receipt: bool,
+    compute_ms: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
     provider_session_receipt_for_usage_attribution(
@@ -86743,6 +86790,7 @@ fn provider_session_receipt_for_usage(
         BTreeMap::new(),
         seq,
         final_receipt,
+        compute_ms,
         runtime_keypair,
     )
 }
@@ -86755,6 +86803,7 @@ fn provider_session_receipt_for_usage_attribution(
     usage_attribution: BTreeMap<String, u64>,
     seq: u64,
     final_receipt: bool,
+    compute_ms: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
     let usage = provider_session_logical_usage(active, &usage);
@@ -86799,6 +86848,8 @@ fn provider_session_receipt_for_usage_attribution(
         locked_per_req_au: active.locked_per_req_au,
         locked_min_session_au: active.locked_min_session_au,
         served_ctx: active.served_ctx,
+        compute_ms: compute_ms.max(1),
+        capacity_slots: terms.capacity_slots.max(1),
         ctx_bracket: active.ctx_bracket.clone(),
         ctx_bracket_table_ver: active.ctx_bracket_table_ver,
         rules_ver: terms.rules_ver,
@@ -90295,6 +90346,7 @@ fn provider_session_terms(
         min_session_au: price.min_session_au,
         min_ask_au,
         rules_ver: ctx.rules.ver,
+        capacity_slots: 1,
         ctx: ctx.selected.served_ctx,
         ctx_bracket,
         ctx_bracket_table_ver,
@@ -91441,8 +91493,8 @@ fn contract_upgrade_required_reason(expected: u32, actual: Option<u32>) -> Strin
 
 fn verify_provider_session_spend_voucher(voucher: &SpendVoucher, user_pubkey: &str) -> Result<()> {
     ensure!(
-        voucher.body.schema_version == SESSION_RECEIPT_SCHEMA_VERSION,
-        "spend voucher schema_version must be {SESSION_RECEIPT_SCHEMA_VERSION}"
+        voucher.body.schema_version == SPEND_VOUCHER_SCHEMA_VERSION,
+        "spend voucher schema_version must be {SPEND_VOUCHER_SCHEMA_VERSION}"
     );
     let key_bytes = hex_decode_array::<32>(user_pubkey, "spend voucher user pubkey")?;
     let sig_bytes = hex_decode_array::<64>(&voucher.user_sig, "spend voucher user signature")?;
@@ -106385,9 +106437,10 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 26);
+        assert_eq!(CONTRACT_VERSION, 27);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
-        assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 11);
+        assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 12);
+        assert_eq!(SPEND_VOUCHER_SCHEMA_VERSION, 11);
     }
 
     #[test]
@@ -111846,16 +111899,17 @@ esac
             "usage": {
                 "usage_root": "66".repeat(32),
                 "active_demand_au": "12345",
+                "compute_ms": "1800000",
+                "capacity_slot_count": 1u64,
+                "legacy_receipt_count": 0u64,
                 "session_count": 2u64
             },
             "controller": {
-                "source": "canonical_settled_work",
+                "source": "canonical_signed_slot_time",
                 "active_supply": 1u64,
-                "momentum_bps": 10_000u64,
-                "activity_basis": "relative_dimension_vector_v1",
+                "utilization_bps": 5_000u64,
+                "activity_basis": "signed_slot_time_v1",
                 "multiplier_bps": 10_000u64,
-                "frozen": true,
-                "frozen_reason": "activity_baseline_bootstrap"
             },
             "seed_price": {
                 "ver": 1u64,
@@ -113481,6 +113535,8 @@ esac
             locked_per_req_au: 0,
             locked_min_session_au: 0,
             served_ctx: 1024,
+            compute_ms: 1,
+            capacity_slots: 1,
             ctx_bracket: Some("le32k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             rules_ver: 1,
@@ -114167,7 +114223,7 @@ esac
     #[test]
     fn js_contract_targeted_spend_reservation_fixture_matches_rust() {
         let voucher = json!({
-            "schema_version": SESSION_RECEIPT_SCHEMA_VERSION,
+            "schema_version": SPEND_VOUCHER_SCHEMA_VERSION,
             "session_id": "11".repeat(32),
             "billing_id": "12".repeat(32),
             "billing_attempt": 0,
@@ -114969,6 +115025,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ReceiptUsage::text(1, 1),
             1,
             true,
+            1,
             &runtime_keypair,
         )
         .unwrap();
@@ -115020,6 +115077,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 }),
                 ReceiptUsage::default(),
                 BTreeMap::new(),
+                1,
                 1,
                 &RuntimeKeypair::from_seed([9; 32]),
             )
@@ -115290,6 +115348,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             attribution.clone(),
             18,
             false,
+            1,
             &keypair,
         )
         .unwrap();
@@ -115300,6 +115359,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             usage,
             attribution,
             19,
+            1,
             &keypair,
         )
         .unwrap()
@@ -115328,6 +115388,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ReceiptUsage::default(),
             BTreeMap::new(),
             1,
+            1,
             &RuntimeKeypair::from_seed([9; 32]),
         )
         .unwrap()
@@ -115351,6 +115412,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }),
             ReceiptUsage::default(),
             BTreeMap::new(),
+            1,
             1,
             &RuntimeKeypair::from_seed([9; 32]),
         )
@@ -115392,6 +115454,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }),
             ReceiptUsage::default(),
             BTreeMap::new(),
+            1,
             1,
             &RuntimeKeypair::from_seed([9; 32]),
         )
@@ -115493,6 +115556,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             usage.clone(),
             7,
             false,
+            1,
             &runtime_keypair,
         )
         .unwrap();
@@ -115550,6 +115614,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ReceiptUsage::text(99, 3),
             1,
             true,
+            1,
             &RuntimeKeypair::from_seed([19; 32]),
         )
         .expect("redispatch receipt should charge only the new visible output");
@@ -115568,6 +115633,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ReceiptUsage::text(99, 3),
             1,
             true,
+            1,
             &RuntimeKeypair::from_seed([19; 32]),
         )
         .unwrap_err()
@@ -115726,6 +115792,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ReceiptUsage::text(1, 1),
             1,
             true,
+            1,
             &RuntimeKeypair::from_seed([9; 32]),
         )
         .unwrap();
@@ -135946,6 +136013,7 @@ State initialization...
             min_session_au: 0,
             min_ask_au: 0,
             rules_ver: 3,
+            capacity_slots: 1,
             ctx: 8192,
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
@@ -136178,7 +136246,7 @@ State initialization...
         let user_key = SigningKey::from_bytes(&[6_u8; 32]);
         let user = hex_encode(&user_key.verifying_key().to_bytes());
         let voucher_body = mayhem_proto::SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: "bb".repeat(32),
             billing_attempt: 0,

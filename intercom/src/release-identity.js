@@ -9,6 +9,7 @@ export const CONTRACT_CODE_PATHS = Object.freeze([
   'contract/history/v23.js',
   'contract/history/v24.js',
   'contract/history/v25.js',
+  'contract/history/v26.js',
   'contract/protocol.js',
   'features/mayhem/index.js',
   'trac/trac-peer/src/artifacts/contract.js',

@@ -113,8 +113,9 @@ use mayhem_proto::{
     DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION, TOKENIZE_REQUEST_CHUNK_FRAME_TYPE,
-    TOKENIZE_REQUEST_FRAME_TYPE, TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
+    SESSION_RECEIPT_SCHEMA_VERSION, SPEND_VOUCHER_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION,
+    TOKENIZE_REQUEST_CHUNK_FRAME_TYPE, TOKENIZE_REQUEST_FRAME_TYPE,
+    TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
     TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
     TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
     USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
@@ -22546,9 +22547,9 @@ fn validate_provider_receipt(
     provider_receipt: &ProviderSignedReceipt,
     expected: ExpectedProviderReceipt<'_>,
 ) -> Result<(), GatewaySessionError> {
-    if invocation.spend_voucher.body.schema_version != SESSION_RECEIPT_SCHEMA_VERSION {
+    if invocation.spend_voucher.body.schema_version != SPEND_VOUCHER_SCHEMA_VERSION {
         return Err(GatewaySessionError::new(format!(
-            "spend voucher schema_version must be {SESSION_RECEIPT_SCHEMA_VERSION}"
+            "spend voucher schema_version must be {SPEND_VOUCHER_SCHEMA_VERSION}"
         )));
     }
     if provider_receipt.body.schema_version != SESSION_RECEIPT_SCHEMA_VERSION {
@@ -25845,15 +25846,15 @@ async fn send_open_and_validate_session_accept(
     open_head: &str,
     att_nonce: &str,
 ) -> Result<ValidatedDirectSessionAccept, GatewaySessionError> {
-    if invocation.spend_voucher.body.schema_version != SESSION_RECEIPT_SCHEMA_VERSION
+    if invocation.spend_voucher.body.schema_version != SPEND_VOUCHER_SCHEMA_VERSION
         || open_frame
             .get("voucher")
             .and_then(|voucher| voucher.get("schema_version"))
             .and_then(Value::as_u64)
-            != Some(u64::from(SESSION_RECEIPT_SCHEMA_VERSION))
+            != Some(u64::from(SPEND_VOUCHER_SCHEMA_VERSION))
     {
         return Err(GatewaySessionError::new(format!(
-            "spend voucher schema_version must be {SESSION_RECEIPT_SCHEMA_VERSION}"
+            "spend voucher schema_version must be {SPEND_VOUCHER_SCHEMA_VERSION}"
         )));
     }
     let result = async {
@@ -34575,7 +34576,7 @@ impl GatewayState {
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let checkpoint_every = self.receipt_checkpoint_every_for_request(request);
         let voucher_body = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
@@ -34714,7 +34715,7 @@ impl GatewayState {
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
@@ -34825,7 +34826,7 @@ impl GatewayState {
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
@@ -34936,7 +34937,7 @@ impl GatewayState {
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
@@ -35047,7 +35048,7 @@ impl GatewayState {
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
@@ -35162,7 +35163,7 @@ impl GatewayState {
         let (ctx_bracket, ctx_bracket_table_ver) =
             self.ctx_bracket_terms_for_model_served_ctx(model, served_ctx, opened_at)?;
         let voucher_body = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: billing.billing_id,
             billing_attempt: billing.billing_attempt,
@@ -35374,6 +35375,8 @@ impl GatewayState {
                 locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
                 locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
+                compute_ms: 1,
+                capacity_slots: 1,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
@@ -35489,6 +35492,8 @@ impl GatewayState {
                 locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
                 locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
+                compute_ms: 1,
+                capacity_slots: 1,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
@@ -35604,6 +35609,8 @@ impl GatewayState {
                 locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
                 locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
+                compute_ms: 1,
+                capacity_slots: 1,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
@@ -35726,6 +35733,8 @@ impl GatewayState {
                 locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
                 locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
+                compute_ms: 1,
+                capacity_slots: 1,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
@@ -35909,6 +35918,8 @@ impl GatewayState {
                 locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
                 locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
+                compute_ms: 1,
+                capacity_slots: 1,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
@@ -36024,6 +36035,8 @@ impl GatewayState {
                 locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
                 locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
+                compute_ms: 1,
+                capacity_slots: 1,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
@@ -44091,6 +44104,8 @@ mod tests {
                 locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
                 locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
                 served_ctx: invocation.served_ctx,
+                compute_ms: 1,
+                capacity_slots: 1,
                 ctx_bracket: invocation.ctx_bracket.clone(),
                 ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
                 rules_ver: invocation.rules_ver,
@@ -44518,7 +44533,7 @@ mod tests {
             caps: json!({}),
         };
         let voucher_body = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: session_id.clone(),
             billing_attempt: 0,
@@ -55736,6 +55751,8 @@ mod tests {
             locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
             locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
             served_ctx: invocation.served_ctx,
+            compute_ms: 1,
+            capacity_slots: 1,
             ctx_bracket: invocation.ctx_bracket.clone(),
             ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
             rules_ver: invocation.rules_ver,
@@ -55790,6 +55807,8 @@ mod tests {
             locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
             locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
             served_ctx: invocation.served_ctx,
+            compute_ms: 1,
+            capacity_slots: 1,
             ctx_bracket: invocation.ctx_bracket.clone(),
             ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
             rules_ver: invocation.rules_ver,
@@ -55860,6 +55879,8 @@ mod tests {
             locked_per_req_au: invocation.spend_voucher.body.locked_per_req_au,
             locked_min_session_au: invocation.spend_voucher.body.locked_min_session_au,
             served_ctx: invocation.served_ctx,
+            compute_ms: 1,
+            capacity_slots: 1,
             ctx_bracket: invocation.ctx_bracket.clone(),
             ctx_bracket_table_ver: invocation.ctx_bracket_table_ver,
             rules_ver: invocation.rules_ver,
