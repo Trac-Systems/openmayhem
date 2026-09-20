@@ -62198,10 +62198,26 @@ fn provider_session_reject_replay_decision(
     Ok(
         if replay.remote != remote || replay.open_head != replay_head {
             ProviderSessionReplayDecision::Conflict
+        } else if replay.reject_frame.get("code").and_then(Value::as_str)
+            == Some("RESERVATION_PENDING")
+        {
+            ProviderSessionReplayDecision::Pending
         } else {
             ProviderSessionReplayDecision::Cached(replay.reject_frame.clone())
         },
     )
+}
+
+fn provider_session_reservation_timeout_decision(
+    admission_timeout: Duration,
+) -> ProviderSessionDecision {
+    ProviderSessionDecision::Reject {
+        code: "RESERVATION_PENDING",
+        reason: format!(
+            "the signed spend reservation did not reach a canonical result within the {} ms provider admission budget; the exact reservation is retained for recovery",
+            admission_timeout.as_millis()
+        ),
+    }
 }
 
 fn prune_provider_session_reject_replays(
@@ -83671,8 +83687,12 @@ where
         }
         "s.open" => {
             prune_provider_session_reject_replays(rejected_sessions, Instant::now());
-            if let Some(replay) = rejected_sessions.get(&session_id) {
-                match provider_session_reject_replay_decision(replay, &remote, &frame)? {
+            let rejected_replay_decision = rejected_sessions
+                .get(&session_id)
+                .map(|replay| provider_session_reject_replay_decision(replay, &remote, &frame))
+                .transpose()?;
+            if let Some(replay_decision) = rejected_replay_decision {
+                match replay_decision {
                     ProviderSessionReplayDecision::Cached(reject_frame) => {
                         provider_session_debug(format!(
                             "replaying cached s.reject for terminal session {session_id} after transport reconnect"
@@ -83686,16 +83706,26 @@ where
                             .context("replaying cached s.reject");
                         let _ = bridge.session_close(&remote, &session_id).await;
                         send_result?;
+                        return Ok(());
                     }
-                    ProviderSessionReplayDecision::Conflict
-                    | ProviderSessionReplayDecision::Pending => {
+                    ProviderSessionReplayDecision::Conflict => {
                         provider_session_debug(format!(
                             "refusing changed s.open replay for terminal session {session_id} from {remote}"
                         ));
                         let _ = bridge.session_close(&remote, &session_id).await;
+                        return Ok(());
+                    }
+                    ProviderSessionReplayDecision::Pending => {
+                        // A pending reservation is not a terminal rejection. The
+                        // durable recovery binding below guarantees that this
+                        // identical replay re-submits the same signed reservation
+                        // identity instead of creating another reservation.
+                        rejected_sessions.remove(&session_id);
+                        provider_session_debug(format!(
+                            "resuming identical s.open for pending reservation session {session_id}"
+                        ));
                     }
                 }
-                return Ok(());
             }
             if let Some(existing) = sessions.get(&session_id) {
                 if existing.remote != remote {
@@ -83846,13 +83876,9 @@ where
                                             decision
                                         }
                                         Ok(Err(error)) => return Err(error),
-                                        Err(_) => ProviderSessionDecision::Reject {
-                                        code: "BALANCE",
-                                        reason: format!(
-                                            "spend reservation did not complete within the {} ms provider admission budget; no work was served",
-                                            admission_timeout.as_millis()
+                                        Err(_) => provider_session_reservation_timeout_decision(
+                                            admission_timeout,
                                         ),
-                                    },
                                     };
                                     reservation_decision
                                 }
@@ -113117,6 +113143,60 @@ esac
 
         prune_provider_session_reject_replays(&mut rejected, now + Duration::from_secs(31));
         assert!(rejected.is_empty());
+    }
+
+    #[test]
+    fn provider_session_resumes_only_the_identical_pending_reservation() {
+        let terms = test_provider_session_terms();
+        let open_frame = test_session_open_frame(&terms);
+        let session_id = open_frame["session_id"].as_str().unwrap().to_owned();
+        let remote = "22".repeat(32);
+        let reject_frame = json!({
+            "t": "s.reject",
+            "session_id": session_id,
+            "code": "RESERVATION_PENDING",
+        });
+        let mut rejected = HashMap::new();
+        cache_provider_session_reject(
+            &mut rejected,
+            session_id.clone(),
+            remote.clone(),
+            &open_frame,
+            reject_frame,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider_session_reject_replay_decision(
+                rejected.get(&session_id).unwrap(),
+                &remote,
+                &open_frame,
+            )
+            .unwrap(),
+            ProviderSessionReplayDecision::Pending
+        );
+
+        let mut changed = open_frame.clone();
+        changed["nonce"] = json!("changed");
+        assert_eq!(
+            provider_session_reject_replay_decision(
+                rejected.get(&session_id).unwrap(),
+                &remote,
+                &changed,
+            )
+            .unwrap(),
+            ProviderSessionReplayDecision::Conflict
+        );
+
+        match provider_session_reservation_timeout_decision(Duration::from_secs(90)) {
+            ProviderSessionDecision::Reject { code, reason } => {
+                assert_eq!(code, "RESERVATION_PENDING");
+                assert!(reason.contains("90000 ms"));
+                assert!(reason.contains("retained for recovery"));
+            }
+            other => panic!("reservation timeout must remain retryable: {other:?}"),
+        }
     }
 
     #[test]
