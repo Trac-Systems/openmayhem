@@ -44634,6 +44634,7 @@ fn spawn_gateway_catalog_watcher(state: GatewayState, config: GatewayCatalogWatc
                     eprintln!("Gateway catalog watcher component panicked; restarting: {err}");
                 }
             }
+            state.failed_catalog_refresh();
             sleep(Duration::from_secs(1)).await;
         }
     });
@@ -44652,7 +44653,10 @@ async fn run_gateway_catalog_watcher(
     let mut applied_snapshot = String::new();
     let mut last_error = None;
     loop {
-        sleep(config.refresh_interval).await;
+        tokio::select! {
+            _ = sleep(config.refresh_interval) => {},
+            _ = state.wait_for_catalog_refresh_request() => {},
+        }
         let refresh = async {
             let contract = read_contract_catalog(&rpc).await?;
             let contract_models = gateway_models_from_contract(&contract)?;
@@ -44788,8 +44792,10 @@ async fn run_gateway_catalog_watcher(
                         "Gateway authenticated catalog refreshed from contract: {model_count} model(s)"
                     );
                 }
+                state.complete_catalog_refresh();
             }
             Err(err) => {
+                state.failed_catalog_refresh();
                 let message = format!("{err:#}");
                 if last_error.as_deref() != Some(message.as_str()) {
                     eprintln!("Gateway catalog watcher retrying: {message}");
@@ -61229,6 +61235,7 @@ struct ReceiptSettlementOutboxEntry {
     final_receipt: bool,
     usage: ReceiptUsage,
     au_owed_cum: MoneyAu,
+    compute_ms: u64,
     immutable_terms_hash: String,
 }
 
@@ -61239,6 +61246,7 @@ struct ReceiptSettlementFeatureMeta {
     final_receipt: bool,
     usage: ReceiptUsage,
     au_owed_cum: MoneyAu,
+    compute_ms: u64,
     immutable_terms_hash: String,
 }
 
@@ -61279,6 +61287,11 @@ fn receipt_settlement_receipt_meta(
         "usage",
         "usage_attribution",
         "au_owed_cum",
+        // Schema v12 measures cumulative compute at each checkpoint. It is
+        // signed evidence, but advances with usage and is not an admission
+        // term. Treating it as immutable makes checkpoint #2 conflict with
+        // checkpoint #1 and aborts every sufficiently long streamed request.
+        "compute_ms",
         "ts",
     ] {
         terms.remove(field);
@@ -61289,6 +61302,7 @@ fn receipt_settlement_receipt_meta(
         final_receipt: body.final_receipt,
         usage: body.usage.clone(),
         au_owed_cum: body.au_owed_cum,
+        compute_ms: body.compute_ms,
         immutable_terms_hash: stable_value_hash(&immutable_terms),
     })
 }
@@ -61314,29 +61328,22 @@ fn receipt_settlement_entry_supersedes(
         ensure!(
             incoming.seq <= current.seq
                 && current.au_owed_cum >= incoming.au_owed_cum
-                && current.usage.is_monotonic_from(&incoming.usage),
+                && current.usage.is_monotonic_from(&incoming.usage)
+                && current.compute_ms >= incoming.compute_ms,
             "receipt settlement attempt cannot advance or conflict with a durable final receipt"
         );
         return Ok(false);
     }
     ensure!(
-        incoming.seq >= current.seq,
-        "receipt settlement attempt cannot downgrade its canonical sequence"
+        incoming.seq > current.seq,
+        "receipt settlement attempt must advance its canonical sequence"
     );
-    if incoming.seq == current.seq {
-        ensure!(
-            incoming.final_receipt
-                && incoming.au_owed_cum >= current.au_owed_cum
-                && incoming.usage.is_monotonic_from(&current.usage),
-            "receipt settlement attempt has conflicting evidence at the same sequence"
-        );
-    } else {
-        ensure!(
-            incoming.au_owed_cum >= current.au_owed_cum
-                && incoming.usage.is_monotonic_from(&current.usage),
-            "receipt settlement attempt high-water evidence is not monotonic"
-        );
-    }
+    ensure!(
+        incoming.au_owed_cum >= current.au_owed_cum
+            && incoming.usage.is_monotonic_from(&current.usage)
+            && incoming.compute_ms >= current.compute_ms,
+        "receipt settlement attempt high-water evidence is not monotonic"
+    );
     Ok(true)
 }
 
@@ -61363,12 +61370,16 @@ fn confirmed_receipt_settlement_record_matches(
 ) -> bool {
     let confirmed_head = record.get("confirmed").and_then(Value::as_bool) == Some(true)
         && record.get("key").and_then(Value::as_str) == Some(key)
-        && record.pointer("/value/type").and_then(Value::as_str) == Some("canonical_receipt_head")
-        && record
-            .pointer("/value/settlement_ready")
-            .and_then(Value::as_bool)
-            == Some(true);
-    if !confirmed_head {
+        && record.pointer("/value/type").and_then(Value::as_str) == Some("canonical_receipt_head");
+    // A confirmed checkpoint has been delivered even though the session has
+    // not settled. Requiring settlement here deadlocks failed-session recovery:
+    // recovery waits for signed evidence delivery before closing the hold.
+    // Finals still gate subsequent admission until settlement is ready.
+    let settlement_ready = record
+        .pointer("/value/settlement_ready")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if !confirmed_head || (entry.final_receipt && !settlement_ready) {
         return false;
     }
     if record.pointer("/value/feature_key") == entry.feature.get("key")
@@ -61393,6 +61404,7 @@ fn confirmed_receipt_settlement_record_matches(
         && canonical.seq > entry.seq
         && canonical.au_owed_cum >= entry.au_owed_cum
         && canonical.usage.is_monotonic_from(&entry.usage)
+        && canonical.compute_ms >= entry.compute_ms
 }
 
 async fn confirmed_receipt_settlement_entry(
@@ -61515,6 +61527,7 @@ impl ReceiptSettlementOutbox {
             final_receipt: meta.final_receipt,
             usage: meta.usage,
             au_owed_cum: meta.au_owed_cum,
+            compute_ms: meta.compute_ms,
             immutable_terms_hash: meta.immutable_terms_hash,
         })
     }
@@ -61619,8 +61632,14 @@ impl ReceiptSettlementOutbox {
     }
 
     fn load_entries(&self) -> Result<Vec<ReceiptSettlementOutboxEntry>> {
+        Self::select_attempt_heads(self.load_physical_entries()?)
+    }
+
+    fn select_attempt_heads(
+        entries: Vec<ReceiptSettlementOutboxEntry>,
+    ) -> Result<Vec<ReceiptSettlementOutboxEntry>> {
         let mut attempts = BTreeMap::<String, ReceiptSettlementOutboxEntry>::new();
-        for entry in self.load_physical_entries()? {
+        for entry in entries {
             match attempts.get(&entry.attempt_id) {
                 None => {
                     attempts.insert(entry.attempt_id.clone(), entry);
@@ -61632,6 +61651,7 @@ impl ReceiptSettlementOutbox {
                         final_receipt: entry.final_receipt,
                         usage: entry.usage.clone(),
                         au_owed_cum: entry.au_owed_cum,
+                        compute_ms: entry.compute_ms,
                         immutable_terms_hash: entry.immutable_terms_hash.clone(),
                     };
                     if receipt_settlement_entry_supersedes(current, &meta, &entry.feature)? {
@@ -61646,6 +61666,89 @@ impl ReceiptSettlementOutbox {
             RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES
         );
         Ok(attempts.into_values().collect())
+    }
+
+    // Called under the cross-process outbox lock. Enumerate current filenames
+    // for capacity, but only read/verify signed documents for this attempt.
+    // Startup, admission and retry still perform complete validation; no cache
+    // or layout change can hide another process's durable evidence.
+    fn load_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<(usize, Option<ReceiptSettlementOutboxEntry>)> {
+        let mut attempts = BTreeSet::new();
+        let mut paths = Vec::new();
+        let mut physical_count = 0_usize;
+        for item in fs::read_dir(&self.directory)? {
+            let item = item?;
+            let path = item.path();
+            if path.extension() != Some(OsStr::new("json")) {
+                continue;
+            }
+            physical_count += 1;
+            ensure!(
+                physical_count <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES.saturating_mul(2),
+                "receipt settlement outbox exceeded its bounded recovery file count"
+            );
+            let filename = item.file_name();
+            let parts = filename
+                .to_str()
+                .context("invalid receipt filename")?
+                .split('.')
+                .collect::<Vec<_>>();
+            let lower_hex = |s: &str| {
+                s.len() == 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            };
+            ensure!(
+                parts.len() == 5
+                    && lower_hex(parts[0])
+                    && parts[1].len() == 20
+                    && parts[1].bytes().all(|b| b.is_ascii_digit())
+                    && parts[1].parse::<u64>().is_ok()
+                    && matches!(parts[2], "0" | "1")
+                    && lower_hex(parts[3])
+                    && parts[4] == "json",
+                "receipt settlement outbox entry has a non-canonical filename"
+            );
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                // Full background validation can quarantine an obsolete entry
+                // between directory enumeration and this metadata check.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            ensure!(
+                metadata.file_type().is_file(),
+                "receipt settlement outbox entry must be a regular file"
+            );
+            ensure!(
+                metadata.len() <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRY_BYTES,
+                "receipt settlement outbox entry exceeds its byte bound"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                ensure!(
+                    metadata.permissions().mode() & 0o077 == 0,
+                    "receipt settlement outbox entry must not be group/world accessible"
+                );
+            }
+            attempts.insert(parts[0].to_owned());
+            if parts[0] == attempt_id {
+                paths.push(path);
+            }
+        }
+        ensure!(
+            attempts.len() <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES,
+            "receipt settlement outbox reached its attempt bound"
+        );
+        paths.sort();
+        let current = Self::select_attempt_heads(self.load_physical_entries_at_paths(paths)?)?
+            .into_iter()
+            .next();
+        Ok((attempts.len(), current))
     }
 
     fn lock_file(&self) -> Result<fs::File> {
@@ -61693,19 +61796,7 @@ impl ReceiptSettlementOutbox {
         let lock = self.lock_file()?;
         let meta = receipt_settlement_feature_meta(feature)?;
         let path = self.entry_path(feature)?;
-        if path.exists() {
-            let existing = self.load_entry(&path)?;
-            ensure!(
-                existing.feature == *feature,
-                "receipt settlement outbox key already contains different signed evidence"
-            );
-            fs2::FileExt::unlock(&lock).context("unlocking receipt settlement outbox")?;
-            return Ok(existing);
-        }
-        let current = self
-            .load_entries()?
-            .into_iter()
-            .find(|entry| entry.attempt_id == meta.attempt_id);
+        let (attempt_count, current) = self.load_attempt(&meta.attempt_id)?;
         if let Some(current) = current.as_ref() {
             if !receipt_settlement_entry_supersedes(current, &meta, feature)? {
                 fs2::FileExt::unlock(&lock).context("unlocking receipt settlement outbox")?;
@@ -61713,7 +61804,7 @@ impl ReceiptSettlementOutbox {
             }
         }
         ensure!(
-            self.load_entries()?.len() < RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES,
+            current.is_some() || attempt_count < RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES,
             "receipt settlement outbox reached its {} attempt bound",
             RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES
         );
@@ -61785,10 +61876,7 @@ impl ReceiptSettlementOutbox {
 
     fn remove(&self, entry: &ReceiptSettlementOutboxEntry) -> Result<()> {
         let lock = self.lock_file()?;
-        let current = self
-            .load_entries()?
-            .into_iter()
-            .find(|current| current.attempt_id == entry.attempt_id);
+        let (_, current) = self.load_attempt(&entry.attempt_id)?;
         if current
             .as_ref()
             .is_some_and(|current| current.feature != entry.feature)
@@ -80257,6 +80345,10 @@ fn provider_session_output_error(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(ProviderSessionOutputError(message.into()))
 }
 
+fn provider_session_output_result<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| provider_session_output_error(format!("{error:#}")))
+}
+
 fn validate_streamed_tool_call_count(emitted: usize, validated: usize) -> Result<()> {
     if emitted > validated {
         return Err(provider_session_output_error(
@@ -84310,11 +84402,19 @@ where
                         live_stream.as_mut(),
                         &cancellation,
                     )?;
-                    normalize_provider_visible_output_usage(&body, &mut output)?;
+                    provider_session_output_result(normalize_provider_visible_output_usage(
+                        &body,
+                        &mut output,
+                    ))?;
                     cancellation
                         .check()
                         .context("provider request cancelled before response publication")?;
-                    validate_provider_session_output(terms, &body, &output)?;
+                    provider_session_output_result(validate_provider_session_output(
+                        terms, &body, &output,
+                    ))?;
+                    if let Some(stream) = live_stream.as_mut() {
+                        stream.finish()?;
+                    }
                     Ok(output)
                 })
             });
@@ -84335,49 +84435,6 @@ where
                             .as_ref()
                             .and_then(ProviderSessionLiveStream::measured_generation_tok_s),
                     );
-                    if let Some(stream) = live_stream.as_mut() {
-                        if let Err(err) = stream.finish() {
-                            let err_text = format!("{err:#}");
-                            if err_text.contains(PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT) {
-                                request_load.finish();
-                                provider_session_debug(format!(
-                                    "client disconnected during live flush after partial receipt for session {session_id} request {request_id}"
-                                ));
-                                sessions.remove(&session_id);
-                                pending_requests.remove(&session_id);
-                                remove_provider_session_pending_payloads(
-                                    pending_payloads,
-                                    &session_id,
-                                );
-                                heartbeat_load.set_active_sessions(sessions, terms);
-                                return Ok(());
-                            }
-                            provider_session_debug(format!(
-                                "flushing live response failed for session {session_id}: {err_text}"
-                            ));
-                            send_provider_session_error(
-                                bridge,
-                                &active.remote,
-                                &active.session_id,
-                                request_id,
-                                "provider_response_failed",
-                                &err.to_string(),
-                            )
-                            .await?;
-                            send_provider_session_close(
-                                bridge,
-                                &active.remote,
-                                &active.session_id,
-                                "err:provider_response_failed",
-                            )
-                            .await?;
-                            sessions.remove(&session_id);
-                            pending_requests.remove(&session_id);
-                            remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                            heartbeat_load.set_active_sessions(sessions, terms);
-                            return Ok(());
-                        }
-                    }
                     (output, measured_throughput)
                 }
                 Err(err) => {
@@ -85155,7 +85212,24 @@ impl<'a> ProviderSessionLiveStream<'a> {
                         &receipt,
                         "checkpoint",
                     )
-                    .await?;
+                    .await
+                    .context("sending live checkpoint receipt")
+                })
+            })?;
+            // A successfully transmitted sequence is consumed even when its
+            // ACK is lost. A terminal recovery receipt must use a fresh
+            // sequence because the buyer may already have durably signed and
+            // queued this checkpoint before the transport failed.
+            self.receipt_seq = self.receipt_seq.saturating_add(1);
+            // Retain the transmitted high-water usage for the same reason.
+            // If the ACK is lost after the buyer persisted this checkpoint,
+            // terminal recovery at the fresh sequence must not regress usage
+            // or reasoning attribution below the durable checkpoint.
+            self.last_checkpoint_metered_units = self.delivered_metered_units;
+            self.last_checkpoint_reasoning_units =
+                metered_output_units("", &self.hidden_reasoning, &[]);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
                     wait_for_provider_receipt_ack(
                         self.bridge,
                         self.active,
@@ -85167,10 +85241,6 @@ impl<'a> ProviderSessionLiveStream<'a> {
                     .context("waiting for live checkpoint receipt ack")
                 })
             })?;
-            self.last_checkpoint_metered_units = self.delivered_metered_units;
-            self.last_checkpoint_reasoning_units =
-                metered_output_units("", &self.hidden_reasoning, &[]);
-            self.receipt_seq = self.receipt_seq.saturating_add(1);
         }
         self.poll_client_disconnect()?;
         Ok(())
@@ -85663,6 +85733,7 @@ async fn send_provider_session_output(
                     "checkpoint",
                 )
                 .await?;
+                receipt_seq = receipt_seq.saturating_add(1);
                 wait_for_provider_receipt_ack(
                     bridge,
                     active,
@@ -85673,7 +85744,6 @@ async fn send_provider_session_output(
                 .await
                 .context("waiting for checkpoint receipt ack")?;
                 last_checkpoint_metered_units = delivered_metered_units;
-                receipt_seq = receipt_seq.saturating_add(1);
             }
         }
     }
@@ -91566,17 +91636,17 @@ impl ProviderSessionArtifactCollector {
     fn push(&mut self, chunk: ArtifactChunk) -> mayhem_engine::Result<()> {
         let artifact_id = chunk.artifact_id.trim();
         if artifact_id.is_empty() {
-            return Err(EngineError::InvalidConfig(
+            return Err(EngineError::InvalidOutput(
                 "provider engine emitted artifact chunk with empty id".to_owned(),
             ));
         }
         if chunk.content_type.trim().is_empty() {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine emitted artifact {artifact_id} with empty content type"
             )));
         }
         if !self.artifacts.contains_key(artifact_id) && self.artifacts.len() >= self.max_artifacts {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine emitted more than {} session artifacts",
                 self.max_artifacts
             )));
@@ -91585,12 +91655,12 @@ impl ProviderSessionArtifactCollector {
             .total_bytes
             .checked_add(chunk.bytes.len())
             .ok_or_else(|| {
-                EngineError::InvalidConfig(
+                EngineError::InvalidOutput(
                     "provider engine artifact byte count overflow".to_owned(),
                 )
             })?;
         if next_total > self.max_bytes {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifacts exceed the session byte budget of {} bytes",
                 self.max_bytes
             )));
@@ -91606,24 +91676,24 @@ impl ProviderSessionArtifactCollector {
                 final_seen: false,
             });
         if builder.final_seen {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} emitted data after its final chunk"
             )));
         }
         if builder.content_type != chunk.content_type {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} changed content type mid-stream"
             )));
         }
         if builder.next_index != chunk.index {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} chunk index gap: expected {}, got {}",
                 builder.next_index, chunk.index
             )));
         }
         builder.bytes.extend_from_slice(&chunk.bytes);
         builder.next_index = builder.next_index.checked_add(1).ok_or_else(|| {
-            EngineError::InvalidConfig(format!(
+            EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} chunk index overflow"
             ))
         })?;
@@ -91691,15 +91761,12 @@ fn provider_visible_tool_calls(tools: &[Value]) -> Result<Vec<VisibleToolCall>> 
         .collect()
 }
 
-fn normalize_provider_visible_output_usage(
-    body: &Value,
-    output: &mut ProviderSessionOutput,
-) -> Result<()> {
+fn provider_session_is_text_generation(body: &Value) -> bool {
     let endpoint_family = body
         .get("mayhem_contract")
         .and_then(|value| value.get("endpoint_family"))
         .and_then(Value::as_str);
-    let is_text_generation = body.get("kind").is_none()
+    body.get("kind").is_none()
         || matches!(
             endpoint_family,
             Some(
@@ -91708,8 +91775,14 @@ fn normalize_provider_visible_output_usage(
                     | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
                     | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
             )
-        );
-    if !is_text_generation {
+        )
+}
+
+fn normalize_provider_visible_output_usage(
+    body: &Value,
+    output: &mut ProviderSessionOutput,
+) -> Result<()> {
+    if !provider_session_is_text_generation(body) {
         return Ok(());
     }
     let tools = provider_visible_tool_calls(&output.tools)?;
@@ -91753,7 +91826,7 @@ fn validate_provider_session_output(
         "MAYHEM_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES",
         DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
     );
-    if body.get("kind").and_then(Value::as_str).is_none() {
+    if provider_session_is_text_generation(body) {
         let available_tokens = terms.ctx.saturating_sub(output.prompt_tokens);
         let max_output_tokens = provider_requested_max_output_tokens(body)
             .unwrap_or(available_tokens)
@@ -91768,6 +91841,14 @@ fn validate_provider_session_output(
             u64::try_from(output.token_ids.len()).unwrap_or(u64::MAX) <= max_output_tokens,
             "provider token ids exceeded the selected session token budget"
         );
+        if output.finish_reason == "stop" {
+            ensure!(
+                !output.content.trim().is_empty()
+                    || !output.tools.is_empty()
+                    || !output.artifacts.is_empty(),
+                "provider text generation stopped without a visible answer"
+            );
+        }
     } else {
         ensure!(
             output.content.len() <= payload_limit,
@@ -92609,10 +92690,14 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("synthesizing provider session speech with mayhem-engine")?;
-        let artifacts = artifact_chunks.finish()?;
-        if artifacts.is_empty() {
-            bail!("provider speech engine produced no audio artifact");
-        }
+        let artifacts = provider_session_output_result(artifact_chunks.finish())?;
+        provider_session_output_result((|| {
+            ensure!(
+                !artifacts.is_empty(),
+                "provider speech engine produced no audio artifact"
+            );
+            Ok(())
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92648,21 +92733,24 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("generating provider session image artifact with mayhem-engine")?;
-        ensure!(
-            output.image_count == image_count && u64::from(output.steps) == steps,
-            "provider image engine changed the requested image count or step count"
-        );
-        let artifacts = artifact_chunks.finish()?;
-        if artifacts.is_empty() {
-            bail!("provider image generation engine produced no image artifacts");
-        }
-        let usage = provider_image_generation_usage(artifacts.len() as u64, steps, width, height);
-        if artifacts.len() as u32 != image_count {
-            bail!(
+        let artifacts = provider_session_output_result((|| {
+            ensure!(
+                output.image_count == image_count && u64::from(output.steps) == steps,
+                "provider image engine changed the requested image count or step count"
+            );
+            let artifacts = artifact_chunks.finish()?;
+            ensure!(
+                !artifacts.is_empty(),
+                "provider image generation engine produced no image artifacts"
+            );
+            ensure!(
+                artifacts.len() as u32 == image_count,
                 "provider image generation engine produced {} artifact(s), expected {image_count}",
                 artifacts.len()
             );
-        }
+            Ok(artifacts)
+        })())?;
+        let usage = provider_image_generation_usage(artifacts.len() as u64, steps, width, height);
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92686,14 +92774,15 @@ fn provider_engine_session_response_with_sampling_bounded(
         let mut request = provider_session_request_result(
             provider_media_generation_request_from_body(endpoint_family, request_body),
         )?;
-        let (expected_duration, expected_frames) =
-            provider_video_output_expectation(verified.contract, &request)?;
+        let (expected_duration, expected_frames) = provider_session_request_result(
+            provider_video_output_expectation(verified.contract, &request),
+        )?;
         request.frame_count = Some(expected_frames);
-        provider_canonicalize_video_engine_request(
+        provider_session_request_result(provider_canonicalize_video_engine_request(
             verified.contract,
             &mut request,
             expected_frames,
-        )?;
+        ))?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = backend
             .generate_video(
@@ -92702,28 +92791,31 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("generating provider session video artifact with mayhem-engine")?;
-        ensure!(
-            output.duration_seconds > 0 && output.frame_count > 0,
-            "provider video engine returned zero duration or frames"
-        );
-        ensure!(
-            output.duration_seconds == expected_duration,
-            "provider video engine returned {} seconds, expected {expected_duration}",
-            output.duration_seconds
-        );
-        ensure!(
-            output.frame_count == expected_frames,
-            "provider video engine returned {} frames, expected {expected_frames}",
-            output.frame_count
-        );
-        let artifacts = artifact_chunks.finish()?;
-        ensure!(
-            !artifacts.is_empty()
-                && artifacts
-                    .iter()
-                    .all(|artifact| artifact.content_type.starts_with("video/")),
-            "provider video generation engine produced no valid video artifact"
-        );
+        let artifacts = provider_session_output_result((|| {
+            ensure!(
+                output.duration_seconds > 0 && output.frame_count > 0,
+                "provider video engine returned zero duration or frames"
+            );
+            ensure!(
+                output.duration_seconds == expected_duration,
+                "provider video engine returned {} seconds, expected {expected_duration}",
+                output.duration_seconds
+            );
+            ensure!(
+                output.frame_count == expected_frames,
+                "provider video engine returned {} frames, expected {expected_frames}",
+                output.frame_count
+            );
+            let artifacts = artifact_chunks.finish()?;
+            ensure!(
+                !artifacts.is_empty()
+                    && artifacts
+                        .iter()
+                        .all(|artifact| artifact.content_type.starts_with("video/")),
+                "provider video generation engine produced no valid video artifact"
+            );
+            Ok(artifacts)
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92741,10 +92833,12 @@ fn provider_engine_session_response_with_sampling_bounded(
     }
 
     if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
-        let workflow_graph = request_body
-            .get("workflow")
-            .cloned()
-            .context("workflow request is missing workflow")?;
+        let workflow_graph = provider_session_request_result(
+            request_body
+                .get("workflow")
+                .cloned()
+                .context("workflow request is missing workflow"),
+        )?;
         let workflow = provider_session_request_result(provider_comfy_workflow_binding(
             request_body,
             workflow_policy,
@@ -92773,17 +92867,20 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("running provider Comfy workflow with mayhem-engine")?;
-        let artifacts = artifact_chunks.finish()?;
-        ensure!(
-            !artifacts.is_empty(),
-            "provider workflow engine produced no artifacts"
-        );
-        ensure!(
-            u64::from(output.artifact_count) == expected_artifacts
-                && u64::try_from(artifacts.len()).unwrap_or(u64::MAX) == expected_artifacts,
-            "provider workflow engine produced {} artifact(s), expected {expected_artifacts}",
-            artifacts.len()
-        );
+        let artifacts = provider_session_output_result((|| {
+            let artifacts = artifact_chunks.finish()?;
+            ensure!(
+                !artifacts.is_empty(),
+                "provider workflow engine produced no artifacts"
+            );
+            ensure!(
+                u64::from(output.artifact_count) == expected_artifacts
+                    && u64::try_from(artifacts.len()).unwrap_or(u64::MAX) == expected_artifacts,
+                "provider workflow engine produced {} artifact(s), expected {expected_artifacts}",
+                artifacts.len()
+            );
+            Ok(artifacts)
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92813,8 +92910,9 @@ fn provider_engine_session_response_with_sampling_bounded(
         let automatic_duration_cap = provider_session_request_result(
             provider_automatic_audio_duration_cap(verified.contract, requested_duration, body),
         )?;
-        let input_characters =
-            provider_media_generation_input_characters(endpoint_family, &request.request)?;
+        let input_characters = provider_session_request_result(
+            provider_media_generation_input_characters(endpoint_family, &request.request),
+        )?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
             backend
@@ -92833,78 +92931,84 @@ fn provider_engine_session_response_with_sampling_bounded(
                 )
                 .context("generating provider session audio artifact with mayhem-engine")?
         };
-        ensure!(
-            output.duration_seconds > 0,
-            "provider audio engine returned zero duration"
-        );
-        if let Some(expected) = requested_duration {
+        let (artifacts, measured_audio_seconds) = provider_session_output_result((|| {
             ensure!(
-                output.duration_seconds.abs_diff(expected) <= 1,
-                "provider audio engine returned {} seconds, expected approximately {expected}",
-                output.duration_seconds
-            );
-        } else if let Some(cap) = automatic_duration_cap {
-            ensure!(
-                output.duration_seconds <= cap,
-                "provider audio engine returned {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
-                output.duration_seconds
-            );
-        }
-        let artifacts = artifact_chunks.finish()?;
-        ensure!(
-            !artifacts.is_empty()
-                && artifacts
-                    .iter()
-                    .all(|artifact| artifact.content_type.starts_with("audio/")),
-            "provider audio generation engine produced no valid audio artifact"
-        );
-        let mut measured_audio_seconds = 0_u64;
-        for artifact in &artifacts {
-            let metadata = validated_audio_metadata(&artifact.bytes).with_context(|| {
-                format!(
-                    "provider audio engine returned invalid {} bytes",
-                    artifact.content_type
-                )
-            })?;
-            ensure!(
-                provider_audio_content_type_matches_format(&artifact.content_type, metadata.format),
-                "provider audio engine content type {} does not match the encoded audio format",
-                artifact.content_type
-            );
-            ensure!(
-                output
-                    .duration_seconds
-                    .abs_diff(metadata.duration_seconds_ceil)
-                    <= 1,
-                "provider audio engine reported {} seconds but encoded artifact measures {} seconds",
-                output.duration_seconds,
-                metadata.duration_seconds_ceil
+                output.duration_seconds > 0,
+                "provider audio engine returned zero duration"
             );
             if let Some(expected) = requested_duration {
                 ensure!(
-                    expected.abs_diff(metadata.duration_seconds_ceil) <= 1,
-                    "provider audio artifact measures {} seconds, expected {expected}",
-                    metadata.duration_seconds_ceil
+                    output.duration_seconds.abs_diff(expected) <= 1,
+                    "provider audio engine returned {} seconds, expected approximately {expected}",
+                    output.duration_seconds
                 );
             } else if let Some(cap) = automatic_duration_cap {
                 ensure!(
-                    metadata.duration_seconds_ceil <= cap,
-                    "provider audio artifact measures {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
-                    metadata.duration_seconds_ceil
+                    output.duration_seconds <= cap,
+                    "provider audio engine returned {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
+                    output.duration_seconds
                 );
             }
-            measured_audio_seconds =
-                measured_audio_seconds.saturating_add(metadata.duration_seconds_ceil);
-        }
-        if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO {
+            let artifacts = artifact_chunks.finish()?;
             ensure!(
-                artifacts.iter().all(|artifact| {
-                    artifact.content_type == "audio/wav"
-                        && wav_sample_rate(&artifact.bytes).is_some()
-                }),
-                "HF text-to-audio requires a valid WAV artifact with a declared sample rate"
+                !artifacts.is_empty()
+                    && artifacts
+                        .iter()
+                        .all(|artifact| artifact.content_type.starts_with("audio/")),
+                "provider audio generation engine produced no valid audio artifact"
             );
-        }
+            let mut measured_audio_seconds = 0_u64;
+            for artifact in &artifacts {
+                let metadata = validated_audio_metadata(&artifact.bytes).with_context(|| {
+                    format!(
+                        "provider audio engine returned invalid {} bytes",
+                        artifact.content_type
+                    )
+                })?;
+                ensure!(
+                    provider_audio_content_type_matches_format(
+                        &artifact.content_type,
+                        metadata.format
+                    ),
+                    "provider audio engine content type {} does not match the encoded audio format",
+                    artifact.content_type
+                );
+                ensure!(
+                    output
+                        .duration_seconds
+                        .abs_diff(metadata.duration_seconds_ceil)
+                        <= 1,
+                    "provider audio engine reported {} seconds but encoded artifact measures {} seconds",
+                    output.duration_seconds,
+                    metadata.duration_seconds_ceil
+                );
+                if let Some(expected) = requested_duration {
+                    ensure!(
+                        expected.abs_diff(metadata.duration_seconds_ceil) <= 1,
+                        "provider audio artifact measures {} seconds, expected {expected}",
+                        metadata.duration_seconds_ceil
+                    );
+                } else if let Some(cap) = automatic_duration_cap {
+                    ensure!(
+                        metadata.duration_seconds_ceil <= cap,
+                        "provider audio artifact measures {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
+                        metadata.duration_seconds_ceil
+                    );
+                }
+                measured_audio_seconds =
+                    measured_audio_seconds.saturating_add(metadata.duration_seconds_ceil);
+            }
+            if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO {
+                ensure!(
+                    artifacts.iter().all(|artifact| {
+                        artifact.content_type == "audio/wav"
+                            && wav_sample_rate(&artifact.bytes).is_some()
+                    }),
+                    "HF text-to-audio requires a valid WAV artifact with a declared sample rate"
+                );
+            }
+            Ok((artifacts, measured_audio_seconds))
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92942,10 +93046,13 @@ fn provider_engine_session_response_with_sampling_bounded(
             )
             .context("generating provider session embeddings with mayhem-engine")?;
         let prompt_tokens = u64::from(output.usage.prompt_tokens);
-        ensure!(
-            prompt_tokens > 0,
-            "embedding backend returned zero prompt tokens for a non-empty request"
-        );
+        provider_session_output_result((|| {
+            ensure!(
+                prompt_tokens > 0,
+                "embedding backend returned zero prompt tokens for a non-empty request"
+            );
+            Ok(())
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92962,24 +93069,29 @@ fn provider_engine_session_response_with_sampling_bounded(
         });
     }
 
-    ensure!(
-        matches!(
-            endpoint_family,
-            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
-                | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
-                | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
-                | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
-        ),
-        "provider endpoint family {endpoint_family} has no engine execution path"
-    );
+    provider_session_request_result((|| {
+        ensure!(
+            matches!(
+                endpoint_family,
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+                    | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+            ),
+            "provider endpoint family {endpoint_family} has no engine execution path"
+        );
+        Ok(())
+    })())?;
 
-    let tool_mode = provider_engine_tool_request(request_body, adapter)?;
-    let mut request = provider_engine_request_from_endpoint_body_with_sampling(
-        endpoint_family,
-        request_body,
-        adapter,
-        sampling,
-    )?;
+    let tool_mode =
+        provider_session_request_result(provider_engine_tool_request(request_body, adapter))?;
+    let mut request =
+        provider_session_request_result(provider_engine_request_from_endpoint_body_with_sampling(
+            endpoint_family,
+            request_body,
+            adapter,
+            sampling,
+        ))?;
     if let Some(cap) = output_token_cap {
         request.max_new_tokens = request.max_new_tokens.min(cap.max(1));
     }
@@ -92999,43 +93111,44 @@ fn provider_engine_session_response_with_sampling_bounded(
         .map(|mode| provider_output_stream::OutputStream::new(mode.strategy, mode.tools.clone()));
     let mut token_ids = Vec::new();
     let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
+    let mut live_stream_error = None;
     // Existing text models keep the established request-text estimate. A signed
     // tools-only endpoint is metered from the model-visible query and selected
     // tools so buyer and provider agree without charging transport metadata.
     let estimated_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body, adapter));
-    let output = backend
-        .generate_with_artifacts(
-            request,
-            &mut |chunk: mayhem_engine::TokenChunk| {
-                if let Some(stream) = live_stream.as_deref_mut() {
-                    let filtered = reasoning_stream_filter.push_split(&chunk.text);
-                    let mut visible_chunk = chunk.clone();
-                    visible_chunk.text = if let Some(filter) = tool_stream_filter.as_mut() {
-                        let delta = filter.push(&filtered.visible);
-                        stream.append_tool_deltas(delta.tools);
-                        delta.text
-                    } else {
-                        filtered.visible
-                    };
-                    stream
-                        .on_token(
-                            visible_chunk,
-                            &filtered.hidden,
-                            protocol_prompt_tokens.unwrap_or(estimated_prompt_tokens),
-                        )
-                        .map_err(|err| {
-                            mayhem_engine::EngineError::InvalidConfig(format!(
-                                "provider live stream failed: {err:#}"
-                            ))
-                        })?;
+    let generated = backend.generate_with_artifacts(
+        request,
+        &mut |chunk: mayhem_engine::TokenChunk| {
+            if let Some(stream) = live_stream.as_deref_mut() {
+                let filtered = reasoning_stream_filter.push_split(&chunk.text);
+                let mut visible_chunk = chunk.clone();
+                visible_chunk.text = if let Some(filter) = tool_stream_filter.as_mut() {
+                    let delta = filter.push(&filtered.visible);
+                    stream.append_tool_deltas(delta.tools);
+                    delta.text
+                } else {
+                    filtered.visible
+                };
+                if let Err(error) = stream.on_token(
+                    visible_chunk,
+                    &filtered.hidden,
+                    protocol_prompt_tokens.unwrap_or(estimated_prompt_tokens),
+                ) {
+                    let message = format!("provider live stream failed: {error:#}");
+                    live_stream_error = Some(error);
+                    return Err(mayhem_engine::EngineError::InvalidConfig(message));
                 }
-                token_ids.push(chunk.token_id);
-                Ok(())
-            },
-            &mut |chunk: ArtifactChunk| artifact_chunks.push(chunk),
-            cancellation,
-        )
-        .context("generating provider session response with mayhem-engine")?;
+            }
+            token_ids.push(chunk.token_id);
+            Ok(())
+        },
+        &mut |chunk: ArtifactChunk| artifact_chunks.push(chunk),
+        cancellation,
+    );
+    if let Some(error) = live_stream_error {
+        return Err(error.context("streaming provider session response"));
+    }
+    let output = generated.context("generating provider session response with mayhem-engine")?;
     if let Some(stream) = live_stream.as_deref_mut() {
         let mut trailing = reasoning_stream_filter.finish_split();
         if let Some(filter) = tool_stream_filter.as_mut() {
@@ -93045,7 +93158,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         stream.append_filtered_text(trailing);
     }
-    let artifacts = artifact_chunks.finish()?;
+    let artifacts = provider_session_output_result(artifact_chunks.finish())?;
     let mut tools = tool_mode
         .as_ref()
         .and_then(|mode| {
@@ -113511,6 +113624,26 @@ esac
         contract_version: u32,
         context_input_tokens: Option<u64>,
     ) -> Value {
+        signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            epoch,
+            seq,
+            final_receipt,
+            output_tokens,
+            contract_version,
+            context_input_tokens,
+            1,
+        )
+    }
+
+    fn signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+        epoch: u64,
+        seq: u64,
+        final_receipt: bool,
+        output_tokens: u64,
+        contract_version: u32,
+        context_input_tokens: Option<u64>,
+        compute_ms: u64,
+    ) -> Value {
         let provider_key = SigningKey::from_bytes(&[31_u8; 32]);
         let enclave_key = SigningKey::from_bytes(&[32_u8; 32]);
         let user_key = SigningKey::from_bytes(&[33_u8; 32]);
@@ -113542,7 +113675,7 @@ esac
             locked_per_req_au: 0,
             locked_min_session_au: 0,
             served_ctx: 1024,
-            compute_ms: 1,
+            compute_ms,
             capacity_slots: 1,
             ctx_bracket: Some("le32k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
@@ -113664,6 +113797,159 @@ esac
     }
 
     #[test]
+    fn receipt_outbox_confirmed_partial_can_retire_without_settlement() {
+        let root = test_temp_dir("mayhem-partial-delivery-before-close");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let partial = outbox
+            .persist(&signed_receipt_settlement_feature_for_test_at(
+                7, 1, false, 2,
+            ))
+            .unwrap();
+        let key = receipt_settlement_head_key(&partial).unwrap();
+        let mut record = json!({"confirmed": true, "key": key, "value": {
+            "type": "canonical_receipt_head", "settlement_ready": false,
+            "feature_key": partial.feature["key"], "receipt": partial.feature["value"]["receipt"]
+        }});
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        record["confirmed"] = json!(false);
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        record["confirmed"] = json!(true);
+        record["key"] = json!("another/head");
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        let final_entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        record["key"] = json!(key);
+        record["value"]["feature_key"] = final_entry.feature["key"].clone();
+        record["value"]["receipt"] = final_entry.feature["value"]["receipt"].clone();
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &record,
+            &key,
+            &final_entry
+        ));
+        record["value"]["settlement_ready"] = json!(true);
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record,
+            &key,
+            &final_entry
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_outbox_checkpoint_hot_path_does_not_parse_unrelated_backlog() {
+        let root = test_temp_dir("mayhem-receipt-backlog-hot-path");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let other_process = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let first = outbox
+            .persist(&signed_receipt_settlement_feature_for_test_at(
+                7, 1, false, 1,
+            ))
+            .unwrap();
+        // These deliberately unreadable documents prove persist/remove do not
+        // parse unrelated attempts. Full admission/retry validation must still
+        // reject them; the optimization must not change that behavior.
+        for n in 0..RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES - 1 {
+            let path =
+                outbox
+                    .directory
+                    .join(format!("{n:064x}.{:020}.0.{}.json", 1, "ab".repeat(32)));
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"invalid JSON probe").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        let next = other_process
+            .persist(&signed_receipt_settlement_feature_for_test_at(
+                7, 2, false, 2,
+            ))
+            .unwrap();
+        outbox.remove(&first).unwrap();
+        assert!(
+            next.path.exists(),
+            "stale removal must not erase another process's checkpoint"
+        );
+        let final_entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        other_process.remove(&next).unwrap();
+        assert!(final_entry.path.exists());
+        assert!(
+            outbox.load_entries().is_err(),
+            "full scans must still validate every document"
+        );
+        other_process.remove(&final_entry).unwrap();
+        assert!(!final_entry.path.exists());
+        assert_eq!(
+            fs::read_dir(&outbox.directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|item| item.path().extension() == Some(OsStr::new("json")))
+                .count(),
+            RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES - 1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_outbox_attempt_scan_checks_names_and_crash_survivors() {
+        let root = test_temp_dir("mayhem-receipt-attempt-crash");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let first_feature = signed_receipt_settlement_feature_for_test_at(7, 1, false, 1);
+        let first = outbox.persist(&first_feature).unwrap();
+        let saved = fs::read(&first.path).unwrap();
+        let final_entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        // Simulate power loss after the new link landed but before old unlink.
+        fs::write(&first.path, saved).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&first.path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(outbox.persist(&first_feature).unwrap(), final_entry);
+        outbox.remove(&first).unwrap();
+        assert!(final_entry.path.exists());
+        let (count, current) = outbox.load_attempt(&first.attempt_id).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(current.unwrap(), final_entry);
+        let malformed = outbox.directory.join("not-an-attempt.json");
+        fs::write(&malformed, b"{}").unwrap();
+        assert!(outbox.load_attempt(&first.attempt_id).is_err());
+        fs::remove_file(malformed).unwrap();
+        #[cfg(unix)]
+        {
+            let link = outbox.directory.join(format!(
+                "{}.00000000000000000001.0.{}.json", "00".repeat(32), "ab".repeat(32)
+            ));
+            std::os::unix::fs::symlink(&final_entry.path, &link).unwrap();
+            assert!(outbox.load_attempt(&first.attempt_id).is_err());
+            fs::remove_file(link).unwrap();
+        }
+        let restarted = ReceiptSettlementOutbox::new(outbox.directory.clone()).unwrap();
+        assert_eq!(restarted.load_entries().unwrap(), vec![final_entry]);
+        assert!(!first.path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn receipt_outbox_retires_only_exact_confirmed_canonical_evidence() {
         let root = test_temp_dir("mayhem-receipt-outbox-canonical-proof");
         let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
@@ -113701,11 +113987,27 @@ esac
         let root = test_temp_dir("mayhem-receipt-outbox-superseded-checkpoint");
         let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
         let entry = outbox
-            .persist(&signed_receipt_settlement_feature_for_test_at(
-                7, 69, false, 69,
-            ))
+            .persist(
+                &signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+                    7,
+                    69,
+                    false,
+                    69,
+                    CONTRACT_VERSION,
+                    None,
+                    100,
+                ),
+            )
             .unwrap();
-        let canonical = signed_receipt_settlement_feature_for_test_at(7, 70, true, 70);
+        let canonical = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            70,
+            true,
+            70,
+            CONTRACT_VERSION,
+            None,
+            200,
+        );
         let key = receipt_settlement_head_key(&entry).unwrap();
         let record = json!({
             "confirmed": true,
@@ -113732,6 +114034,13 @@ esac
         changed_terms["value"]["receipt"]["body"]["payout_revision"] = json!("47".repeat(32));
         assert!(!confirmed_receipt_settlement_record_matches(
             &changed_terms,
+            &key,
+            &entry,
+        ));
+        let mut regressed_compute = record.clone();
+        regressed_compute["value"]["receipt"]["body"]["compute_ms"] = json!(99);
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &regressed_compute,
             &key,
             &entry,
         ));
@@ -113792,6 +114101,115 @@ esac
             .unwrap());
         outbox.remove(&final_receipt).unwrap();
         assert!(!outbox.has_pending_final_receipts(user, "tnk").unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_accepts_advancing_compute_across_receipt_series() {
+        let root = test_temp_dir("mayhem-receipt-outbox-compute-checkpoints");
+        for (delivery, checkpoints) in [
+            (
+                "streaming",
+                vec![(1, false, 8, 100), (2, false, 16, 225), (3, true, 21, 310)],
+            ),
+            ("single-final", vec![(1, true, 41, 525)]),
+        ] {
+            let outbox = ReceiptSettlementOutbox::new(root.join(delivery)).unwrap();
+            for (seq, final_receipt, output_tokens, compute_ms) in checkpoints {
+                let feature = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+                    7,
+                    seq,
+                    final_receipt,
+                    output_tokens,
+                    CONTRACT_VERSION,
+                    None,
+                    compute_ms,
+                );
+                outbox
+                    .persist(&feature)
+                    .expect("cumulative compute must advance with checkpoint usage");
+                let entries = outbox.load_entries().unwrap();
+                assert_eq!(entries.len(), 1, "{delivery}");
+                assert_eq!(entries[0].seq, seq, "{delivery}");
+                assert_eq!(entries[0].final_receipt, final_receipt, "{delivery}");
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_rejects_regressing_compute_across_checkpoints() {
+        let root = test_temp_dir("mayhem-receipt-outbox-compute-regression");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let first = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            1,
+            false,
+            8,
+            CONTRACT_VERSION,
+            None,
+            100,
+        );
+        outbox.persist(&first).unwrap();
+        let regressed = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            2,
+            false,
+            16,
+            CONTRACT_VERSION,
+            None,
+            99,
+        );
+        let error = outbox
+            .persist(&regressed)
+            .expect_err("higher sequence must not regress cumulative compute");
+        assert!(error.to_string().contains("high-water evidence"));
+        let entries = outbox.load_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[0].compute_ms, 100);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_requires_fresh_sequence_for_terminal_recovery() {
+        let root = test_temp_dir("mayhem-receipt-outbox-terminal-sequence");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let checkpoint = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            3,
+            false,
+            16,
+            CONTRACT_VERSION,
+            None,
+            225,
+        );
+        outbox.persist(&checkpoint).unwrap();
+        let same_sequence_final = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            3,
+            true,
+            16,
+            CONTRACT_VERSION,
+            None,
+            310,
+        );
+        let error = outbox
+            .persist(&same_sequence_final)
+            .expect_err("a terminal receipt must not reuse a transmitted checkpoint sequence");
+        assert!(error.to_string().contains("must advance"));
+        let final_receipt = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            4,
+            true,
+            16,
+            CONTRACT_VERSION,
+            None,
+            310,
+        );
+        let entry = outbox.persist(&final_receipt).unwrap();
+        assert!(entry.final_receipt);
+        assert_eq!(entry.seq, 4);
         let _ = fs::remove_dir_all(root);
     }
 
@@ -113941,6 +114359,17 @@ esac
         let mut feature = signed_receipt_settlement_feature_for_test(7);
         feature["value"]["receipt"]["body"]["schema_version"] =
             json!(SESSION_RECEIPT_SCHEMA_VERSION.saturating_sub(1));
+        // Keep the synthetic stale envelope valid for schema 11 so recovery
+        // reaches the intended obsolete-schema quarantine path. Schema 11
+        // predates the cumulative utilization fields introduced in schema 12.
+        feature["value"]["receipt"]["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("compute_ms");
+        feature["value"]["receipt"]["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("capacity_slots");
         let stale_path = directory.join("obsolete-receipt-schema-entry.json");
         fs::write(
             &stale_path,
@@ -113977,11 +114406,11 @@ esac
             outbox.persist(&feature).unwrap();
             assert_eq!(outbox.load_entries().unwrap().len(), 1);
         }
-        let final_feature = signed_receipt_settlement_feature_for_test_at(7, 200, true, 200);
+        let final_feature = signed_receipt_settlement_feature_for_test_at(7, 201, true, 200);
         outbox.persist(&final_feature).unwrap();
         let entries = outbox.load_entries().unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].seq, 200);
+        assert_eq!(entries[0].seq, 201);
         assert!(entries[0].final_receipt);
         assert_eq!(
             fs::read_dir(root.join("provider"))
@@ -113994,10 +114423,10 @@ esac
         let stale = signed_receipt_settlement_feature_for_test_at(7, 199, false, 199);
         let retained = outbox.persist(&stale).unwrap();
         assert_eq!(retained.feature, final_feature);
-        let conflicting_final = signed_receipt_settlement_feature_for_test_at(7, 200, true, 201);
+        let conflicting_final = signed_receipt_settlement_feature_for_test_at(7, 201, true, 201);
         assert!(outbox.persist(&conflicting_final).is_err());
         let post_final_checkpoint =
-            signed_receipt_settlement_feature_for_test_at(7, 201, false, 201);
+            signed_receipt_settlement_feature_for_test_at(7, 202, false, 201);
         assert!(outbox.persist(&post_final_checkpoint).is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -115168,141 +115597,191 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[tokio::test]
     async fn provider_failure_close_retries_exact_submission_until_confirmed() {
-        let root = test_temp_dir("provider-failure-close");
-        let outbox = Arc::new(ReceiptSettlementOutbox::new(root.join("provider")).unwrap());
-        let terms = test_provider_session_terms();
-        let mut active = test_active_provider_session(&terms, vec!["text".into()]);
-        let settlement = Arc::new(ProviderReceiptSettlement {
-            outbox,
-            keypair_path: root.join("unused-key"),
-            password: String::new(),
-            enclave_pubkey: "aa".repeat(32),
-        });
-        active.receipt_settlement = Some(settlement.clone());
-        let guard = provider_failure_recovery::begin(&active, &terms).unwrap();
-        let path = root
-            .join("provider/reservation-recovery")
-            .join(format!("{}.json", active.reservation_id));
-        let binding = read_private_json_optional(&path).unwrap().unwrap()["binding"].clone();
-        let mut value = mayhem_proto::usage_reservation_close_value(
-            &binding,
-            None,
-            false,
-            1234,
-            "provider_session_ended",
-        )
-        .unwrap();
-        value["actor_sig"] = json!("aa".repeat(64));
-        let feature = mayhem_proto::usage_reservation_close_feature(value).unwrap();
-        write_private_json_once(&path.with_extension("close"), &feature).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let expected_feature = feature.clone();
-        let server = thread::spawn(move || {
-            let mut posts = 0;
-            for _ in 0..8 {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut buffer = [0u8; 8192];
-                    let n = stream.read(&mut buffer).unwrap();
-                    assert!(n > 0);
-                    request.extend_from_slice(&buffer[..n]);
-                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&request[..end]);
-                        let size = headers
-                            .lines()
-                            .find_map(|line| {
-                                line.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .and_then(|s| s.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= end + 4 + size {
-                            break;
+        for with_partial in [false, true] {
+            let root = test_temp_dir("provider-failure-close");
+            let outbox = Arc::new(ReceiptSettlementOutbox::new(root.join("provider")).unwrap());
+            let terms = test_provider_session_terms();
+            let mut active = test_active_provider_session(&terms, vec!["text".into()]);
+            let settlement = Arc::new(ProviderReceiptSettlement {
+                outbox: outbox.clone(),
+                keypair_path: root.join("unused-key"),
+                password: String::new(),
+                enclave_pubkey: "aa".repeat(32),
+            });
+            active.receipt_settlement = Some(settlement.clone());
+            let partial = with_partial.then(|| {
+                outbox
+                    .persist(&signed_receipt_settlement_feature_for_test_at(
+                        7, 1, false, 2,
+                    ))
+                    .unwrap()
+            });
+            let guard = if let Some(partial) = &partial {
+                Some(
+                    provider_failure_recovery::begin_binding(
+                        &settlement,
+                        &partial.feature["value"]["receipt"]["body"],
+                    )
+                    .unwrap(),
+                )
+            } else {
+                provider_failure_recovery::begin(&active, &terms).unwrap()
+            };
+            let reservation_id = partial
+                .as_ref()
+                .map(|entry| {
+                    entry.feature["value"]["receipt"]["body"]["reservation_id"]
+                        .as_str()
+                        .unwrap()
+                })
+                .unwrap_or(&active.reservation_id);
+            let path = root
+                .join("provider/reservation-recovery")
+                .join(format!("{reservation_id}.json"));
+            let binding = read_private_json_optional(&path).unwrap().unwrap()["binding"].clone();
+            let provider = binding["provider"].as_str().unwrap().to_owned();
+            let head = partial.as_ref().map(|entry| {
+                json!({"type": "canonical_receipt_head", "settlement_ready": false,
+            "feature_key": entry.feature["key"], "receipt": entry.feature["value"]["receipt"]})
+            });
+            let mut value = mayhem_proto::usage_reservation_close_value(
+                &binding,
+                head.as_ref(),
+                false,
+                1234,
+                "provider_session_ended",
+            )
+            .unwrap();
+            value["actor_sig"] = json!("aa".repeat(64));
+            let feature = mayhem_proto::usage_reservation_close_feature(value).unwrap();
+            write_private_json_once(&path.with_extension("close"), &feature).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected_feature = feature.clone();
+            let server = thread::spawn(move || {
+                let mut posts = 0;
+                for _ in 0..if with_partial { 9 } else { 8 } {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0u8; 8192];
+                        let n = stream.read(&mut buffer).unwrap();
+                        assert!(n > 0);
+                        request.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let size = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|s| s.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + size {
+                                break;
+                            }
                         }
                     }
-                }
-                let end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-                let headers = String::from_utf8_lossy(&request[..end]);
-                let (status, body) = if headers.starts_with("POST ") {
-                    assert_eq!(
-                        serde_json::from_slice::<Value>(&request[end + 4..]).unwrap(),
-                        expected_feature
-                    );
-                    posts += 1;
-                    (
-                        if posts == 1 {
-                            "503 Service Unavailable"
-                        } else {
-                            "200 OK"
-                        },
-                        json!({"ok": posts > 1}),
-                    )
-                } else {
-                    let target = headers.split_whitespace().nth(1).unwrap();
-                    let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
-                    let key = url
-                        .query_pairs()
-                        .find(|(k, _)| k == "key")
-                        .unwrap()
-                        .1
-                        .into_owned();
-                    let mut value = binding.clone();
-                    if key.starts_with("receipt/head/") {
-                        value = Value::Null;
-                    } else if key.starts_with("receipt/reservation-close/") {
-                        value["type"] = json!("targeted_reservation_close");
+                    let end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let (status, body) = if headers.starts_with("POST ") {
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&request[end + 4..]).unwrap(),
+                            expected_feature
+                        );
+                        posts += 1;
+                        (
+                            if posts == 1 {
+                                "503 Service Unavailable"
+                            } else {
+                                "200 OK"
+                            },
+                            json!({"ok": posts > 1}),
+                        )
                     } else {
-                        value["type"] = json!("receipt_reservation_identity");
-                        value["status"] = json!(if posts > 1 { "closed" } else { "active" });
-                    }
-                    (
-                        "200 OK",
-                        json!({"key": key, "confirmed": true, "value": value}),
-                    )
-                };
-                let body = body.to_string();
-                write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
-                stream.flush().unwrap();
+                        let target = headers.split_whitespace().nth(1).unwrap();
+                        let url =
+                            reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+                        let key = url
+                            .query_pairs()
+                            .find(|(k, _)| k == "key")
+                            .unwrap()
+                            .1
+                            .into_owned();
+                        let mut value = binding.clone();
+                        if key.starts_with("receipt/head/") {
+                            value = head.clone().unwrap_or(Value::Null);
+                        } else if key.starts_with("receipt/reservation-close/") {
+                            value["type"] = json!("targeted_reservation_close");
+                        } else {
+                            value["type"] = json!("receipt_reservation_identity");
+                            value["status"] = json!(if posts > 1 { "closed" } else { "active" });
+                        }
+                        (
+                            "200 OK",
+                            json!({"key": key, "confirmed": true, "value": value}),
+                        )
+                    };
+                    let body = body.to_string();
+                    write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    stream.flush().unwrap();
+                }
+                assert_eq!(posts, 2);
+            });
+            let rpc = PeerRpcClient::new(format!("http://{address}")).unwrap();
+            assert!(
+                !provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .unwrap()
+            );
+            drop(guard);
+            if let Some(partial) = partial {
+                assert!(
+                    !provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                        .await
+                        .unwrap(),
+                    "unconfirmed signed evidence must block closing the reservation"
+                );
+                let key = receipt_settlement_head_key(&partial).unwrap();
+                let confirmed = json!({"confirmed": true, "key": key, "value": {
+                    "type": "canonical_receipt_head", "settlement_ready": false,
+                    "feature_key": partial.feature["key"], "receipt": partial.feature["value"]["receipt"]
+                }});
+                assert!(confirmed_receipt_settlement_record_matches(
+                    &confirmed, &key, &partial
+                ));
+                outbox.remove(&partial).unwrap();
             }
-            assert_eq!(posts, 2);
-        });
-        let rpc = PeerRpcClient::new(format!("http://{address}")).unwrap();
-        assert!(
-            !provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path)
-                .await
-                .unwrap()
-        );
-        drop(guard);
-        assert!(
-            provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path)
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            read_private_json_optional(&path.with_extension("close"))
-                .unwrap()
-                .unwrap(),
-            feature
-        );
-        assert!(
-            !provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path)
-                .await
-                .unwrap()
-        );
-        assert!(path.exists(), "a submission response is not confirmation");
-        assert!(
-            provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path)
-                .await
-                .unwrap()
-        );
-        assert!(!path.exists());
-        server.join().unwrap();
-        fs::remove_dir_all(root).unwrap();
+            assert!(
+                provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                read_private_json_optional(&path.with_extension("close"))
+                    .unwrap()
+                    .unwrap(),
+                feature
+            );
+            assert!(
+                !provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .unwrap()
+            );
+            assert!(path.exists(), "a submission response is not confirmation");
+            assert!(
+                provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .unwrap()
+            );
+            assert!(!path.exists());
+            server.join().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -119632,6 +120111,79 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         .unwrap_err();
         assert_eq!(provider_response_error_code(&error), "request_invalid");
         assert!(backend.last_request.is_none());
+    }
+
+    #[test]
+    fn qwen_system_message_order_is_request_invalid_before_engine_dispatch() {
+        let adapter = catalog::CatalogAdapter {
+            chat_template_id: "qwen3.5-instruct".to_owned(),
+            tool_call_strategy: "none".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "system", "content": "too late"}
+            ]
+        });
+        let mut backend = FakeEngineBackend::new("must not run");
+
+        let error = provider_engine_session_response(&mut backend, &adapter, &body, None)
+            .expect_err("Qwen must reject a late system message before engine dispatch");
+
+        assert_eq!(provider_response_error_code(&error), "request_invalid");
+        assert_eq!(
+            provider_response_error_message(&error),
+            "qwen system message must be first"
+        );
+        assert!(backend.last_request.is_none());
+    }
+
+    #[test]
+    fn reasoning_only_stop_is_model_output_invalid() {
+        let adapter = catalog::CatalogAdapter {
+            chat_template_id: "qwen3.5-instruct".to_owned(),
+            tool_call_strategy: "none".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{"role": "user", "content": "give a visible answer"}],
+            "max_tokens": 32
+        });
+        let sealed = provider_test_seal_contract_request(&body, &adapter).unwrap();
+        let mut backend = FakeEngineBackend::new("<think>private reasoning only</think>");
+        let mut output = provider_engine_session_response_with_sampling(
+            &mut backend,
+            None,
+            &adapter,
+            &catalog::CatalogSamplingProfile::default(),
+            None,
+            &sealed,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(output.content.trim().is_empty());
+        assert!(!output.reasoning_evidence.trim().is_empty());
+        assert_eq!(output.finish_reason, "stop");
+
+        provider_session_output_result(normalize_provider_visible_output_usage(
+            &sealed,
+            &mut output,
+        ))
+        .unwrap();
+        let error = provider_session_output_result(validate_provider_session_output(
+            &test_provider_session_terms(),
+            &sealed,
+            &output,
+        ))
+        .expect_err("reasoning-only stop must not publish an HTTP-200 response");
+
+        assert_eq!(provider_response_error_code(&error), "model_output_invalid");
+        assert_eq!(
+            provider_response_error_message(&error),
+            "provider text generation stopped without a visible answer"
+        );
     }
 
     #[test]

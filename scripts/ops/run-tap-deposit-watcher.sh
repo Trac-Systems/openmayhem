@@ -6,7 +6,12 @@ home="${MAYHEM_HOME:-/opt/mayhem/.mayhem-local/live-home}"
 peer_rpc="${MAYHEM_PEER_RPC:-http://127.0.0.1:49223/v1}"
 cursor="${MAYHEM_TAP_DEPOSIT_CURSOR:-/opt/mayhem/.mayhem-local/watchers/tap-deposit.json}"
 interval="${MAYHEM_TAP_DEPOSIT_INTERVAL_SECONDS:-30}"
-mayhem_bin="$repo/target/release/mayhem"
+mayhem_bin="${MAYHEM_BIN:-$repo/target/release/mayhem}"
+
+if [[ ! -x "$mayhem_bin" ]]; then
+  echo "Deposit watcher requires an executable MAYHEM_BIN: $mayhem_bin" >&2
+  exit 1
+fi
 
 mkdir -p "$(dirname "$cursor")"
 
