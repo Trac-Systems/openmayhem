@@ -1234,19 +1234,19 @@ impl GatewayFailoverInvocation {
         let Some(budget) = budget else {
             return self;
         };
-        // Admission has three independently blocking phases: peer connect,
-        // session open, and the signed provider accept. Divide the route's
-        // attempt budget across them so one silent route cannot consume the
-        // time reserved for another provider.
-        let phase_millis = u64::try_from(budget.as_millis() / 3)
+        // The route wait budget protects the two transport phases: peer
+        // connect and session open. A signed provider accept also waits for a
+        // canonical spend reservation, so it must retain the configured
+        // admission window instead of inheriting a small fraction of route
+        // discovery time.
+        let accept_timeout_ms = self
+            .session_accept_timeout_ms
+            .unwrap_or(self.open_timeout_ms);
+        let phase_millis = u64::try_from(budget.as_millis() / 2)
             .unwrap_or(u64::MAX)
             .max(1);
         self.open_timeout_ms = self.open_timeout_ms.min(phase_millis);
-        self.session_accept_timeout_ms = Some(
-            self.session_accept_timeout_ms
-                .unwrap_or(phase_millis)
-                .min(phase_millis),
-        );
+        self.session_accept_timeout_ms = Some(accept_timeout_ms);
         self
     }
 }
@@ -15420,6 +15420,12 @@ impl GatewaySessionError {
         self
     }
 
+    fn into_non_retryable_admission_outcome(mut self) -> Self {
+        self.retryable = false;
+        self.safe_same_route_retry = false;
+        self
+    }
+
     fn into_retryable_before_output(mut self) -> Self {
         self.retryable = true;
         self.before_first_output = true;
@@ -17699,11 +17705,25 @@ fn provider_reject_session_error(frame: &Value, session_id: &str) -> GatewaySess
         .and_then(Value::as_str)
         .unwrap_or("no reason provided");
     let message = format!("provider rejected session {session_id} with {code}: {reason}");
+    if code == "RESERVATION_PENDING"
+        || (code == "BALANCE" && reservation_admission_outcome_ambiguous(reason))
+    {
+        return GatewaySessionError::new(message);
+    }
     if clean_provider_reject_code(code) {
         GatewaySessionError::clean_refusal_with_code(message, Some(code))
     } else {
         GatewaySessionError::retryable(message)
     }
+}
+
+fn reservation_admission_outcome_ambiguous(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    reason.contains("reservation_pending")
+        || reason.contains("reservation_relay_phase=admin_ack")
+        || (reason.contains("accepted the append") && reason.contains("canonical result"))
+        || (reason.contains("spend reservation did not complete within")
+            && reason.contains("provider admission budget"))
 }
 
 fn clean_provider_reject_code(code: &str) -> bool {
@@ -25869,7 +25889,18 @@ async fn send_open_and_validate_session_accept(
         )
         .await;
     }
-    result.map_err(GatewaySessionError::into_safe_same_route_retry)
+    result.map_err(|error| {
+        if error.clean_refusal {
+            // Explicit pre-spend refusals (capacity, policy, or a canonical
+            // balance rejection) did not start provider work and are safe to
+            // route elsewhere. Transport loss, timeout, and malformed accepts
+            // after s.open are outcome-ambiguous because the reservation may
+            // already exist even if its acknowledgement did not arrive.
+            error.into_safe_same_route_retry()
+        } else {
+            error.into_non_retryable_admission_outcome()
+        }
+    })
 }
 
 async fn send_open_and_await_session_accept(
@@ -25889,20 +25920,22 @@ async fn send_open_and_await_session_accept(
             ))
         })?;
     let explicit_accept_timeout = invocation.failover.session_accept_timeout();
-    let accept_wait = explicit_accept_timeout
-        .unwrap_or_else(|| Duration::from_millis(SESSION_OPEN_REPLAY_INTERVAL_MS));
+    let accept_budget =
+        explicit_accept_timeout.unwrap_or_else(|| invocation.failover.open_timeout());
+    let replay_interval = Duration::from_millis(SESSION_OPEN_REPLAY_INTERVAL_MS);
     // Total budget for the provider to answer s.open. Without it a silent
     // provider (or a flapping transport) keeps this loop replaying forever,
     // even after the end user is long gone.
-    let accept_deadline = Instant::now()
-        + explicit_accept_timeout.unwrap_or_else(|| invocation.failover.open_timeout());
+    let accept_deadline = Instant::now() + accept_budget;
     loop {
-        if Instant::now() >= accept_deadline {
+        let remaining = accept_deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(GatewaySessionError::retryable(format!(
                 "provider {} did not answer s.open for session {} within the accept budget",
                 provider, invocation.session_id
             )));
         }
+        let accept_wait = replay_interval.min(remaining);
         match next_session_frame_with_optional_wait(
             bridge,
             &invocation.session_id,
@@ -25924,7 +25957,13 @@ async fn send_open_and_await_session_accept(
                 )
                 .await?;
             }
-            Err(err) if err.wait_elapsed && explicit_accept_timeout.is_none() => {
+            Err(err) if err.wait_elapsed => {
+                if Instant::now() >= accept_deadline {
+                    return Err(GatewaySessionError::retryable(format!(
+                        "provider {} did not answer s.open for session {} within the accept budget",
+                        provider, invocation.session_id
+                    )));
+                }
                 if bridge
                     .session_send(direct_peer, &invocation.session_id, open_frame)
                     .await
@@ -41316,11 +41355,12 @@ mod tests {
 
         let failover =
             GatewayFailoverInvocation::default().with_admission_attempt_budget(Some(budget));
-        assert!(failover.open_timeout() <= Duration::from_secs(2));
+        assert!(failover.open_timeout() <= Duration::from_secs(3));
         assert_eq!(
             failover.session_accept_timeout(),
-            Some(failover.open_timeout())
+            Some(Duration::from_millis(DEFAULT_OPEN_TIMEOUT_MILLIS))
         );
+        assert!(failover.session_accept_timeout().unwrap() > budget);
     }
 
     #[test]
@@ -54297,7 +54337,6 @@ mod tests {
         for reason in [
             "spend reservation did not complete within the 90000 ms provider admission budget; no work was served",
             "contract spend reservation rejected before serving: Mayhem feature relay accepted the append but no canonical result appeared before the relay result budget.",
-            "provider has no active verified fiat payout binding: missing payout binding",
         ] {
             let err = provider_reject_session_error(
                 &json!({
@@ -54309,9 +54348,33 @@ mod tests {
             );
             assert!(
                 terminal_balance_refusal(&err).is_none(),
-                "{reason} must stay route-retryable"
+                "{reason} is not an insufficient-credit rejection"
             );
+            assert!(!err.retryable, "{reason} must not create reservation #2");
+            assert!(!err.clean_refusal, "{reason} is outcome-ambiguous");
         }
+
+        let payout = provider_reject_session_error(
+            &json!({
+                "t": "s.reject",
+                "code": "BALANCE",
+                "reason": "provider has no active verified fiat payout binding: missing payout binding",
+            }),
+            "session-a",
+        );
+        assert!(payout.retryable);
+        assert!(payout.clean_refusal);
+
+        let pending = provider_reject_session_error(
+            &json!({
+                "t": "s.reject",
+                "code": "RESERVATION_PENDING",
+                "reason": "exact reservation is pending",
+            }),
+            "session-a",
+        );
+        assert!(!pending.retryable);
+        assert!(!pending.clean_refusal);
     }
 
     #[test]

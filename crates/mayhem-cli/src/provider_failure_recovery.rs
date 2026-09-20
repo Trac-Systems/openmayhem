@@ -9,6 +9,7 @@ use mayhem_proto::{
 #[derive(Debug)]
 pub(super) struct AttemptGuard {
     _lock: fs::File,
+    path: PathBuf,
 }
 
 fn directory(settlement: &ProviderReceiptSettlement) -> PathBuf {
@@ -55,13 +56,41 @@ pub(super) fn begin(
     let Some(settlement) = active.receipt_settlement.as_ref() else {
         return Ok(None);
     };
+    let binding = json!({
+        "billing_epoch": active.billing_epoch, "reservation_id": active.reservation_id,
+        "reservation_expires_after_epoch": active.reservation_expires_after_epoch,
+        "reservation_receipt_grace_epochs": active.reservation_receipt_grace_epochs,
+        "billing_id": active.billing_id, "billing_attempt": active.billing_attempt,
+        "session_id": active.session_id, "user": active.user_pubkey, "rail": active.rail,
+        "provider": terms.provider, "payout_revision": active.payout_revision,
+        "model_id": terms.model_id, "enclave_id": terms.enclave_id,
+    });
+    begin_binding(settlement, &binding).map(Some)
+}
+
+pub(super) fn begin_binding(
+    settlement: &ProviderReceiptSettlement,
+    binding: &Value,
+) -> Result<AttemptGuard> {
     let root = directory(settlement);
     ensure_private_directory(&root, "provider reservation recovery")?;
+    let reservation_id = binding["reservation_id"]
+        .as_str()
+        .context("reservation recovery binding has no identity")?;
     ensure!(
-        is_hex_len(&active.reservation_id, 64),
+        is_hex_len(reservation_id, 64) && reservation_binding_matches(binding, binding),
         "invalid reservation identity"
     );
-    let path = root.join(format!("{}.json", active.reservation_id));
+    ensure!(
+        binding["model_id"]
+            .as_str()
+            .is_some_and(|model| !model.is_empty())
+            && binding["enclave_id"]
+                .as_str()
+                .is_some_and(|enclave| is_hex_len(enclave, 64)),
+        "reservation recovery binding is missing model evidence"
+    );
+    let path = root.join(format!("{reservation_id}.json"));
     ensure!(
         path.exists() || journal_paths(&root)?.len() < RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES,
         "provider reservation recovery is full; refusing new compute until recovery progresses"
@@ -70,21 +99,24 @@ pub(super) fn begin(
     fs2::FileExt::try_lock_exclusive(&held)
         .context("reservation is already executing or recovering")?;
     // No prompts, credential material, or card/account funding data.
-    write_private_json_once(
-        &path,
-        &json!({
-            "schema_version": 1, "binding": {
-                "billing_epoch": active.billing_epoch, "reservation_id": active.reservation_id,
-                "reservation_expires_after_epoch": active.reservation_expires_after_epoch,
-                "reservation_receipt_grace_epochs": active.reservation_receipt_grace_epochs,
-                "billing_id": active.billing_id, "billing_attempt": active.billing_attempt,
-                "session_id": active.session_id, "user": active.user_pubkey, "rail": active.rail,
-                "provider": terms.provider, "payout_revision": active.payout_revision,
-                "model_id": terms.model_id, "enclave_id": terms.enclave_id,
-            },
-        }),
-    )?;
-    Ok(Some(AttemptGuard { _lock: held }))
+    write_private_json_once(&path, &json!({"schema_version": 1, "binding": binding}))?;
+    Ok(AttemptGuard { _lock: held, path })
+}
+
+pub(super) fn discard(guard: AttemptGuard) -> Result<()> {
+    let path = guard.path.clone();
+    if path.exists() {
+        fs::remove_file(&path)?;
+        sync_receipt_settlement_directory(path.parent().context("recovery parent missing")?)?;
+    }
+    let lock_path = path.with_extension("lock");
+    drop(guard);
+    match fs::remove_file(lock_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 async fn confirmed(rpc: &PeerRpcClient, key: &str) -> Result<Value> {
@@ -126,6 +158,29 @@ pub(super) async fn recover_one(
         "reservation journal filename mismatch"
     );
     let reservation = confirmed(rpc, &format!("receipt/reservation/{id}")).await?;
+    if reservation.is_null() {
+        // The provider can observe the confirmed envelope before this key is
+        // visible in its local canonical view. That is pending propagation,
+        // not evidence that a different reservation owns this identity.
+        let state = confirmed(rpc, "epoch/apply/state").await?;
+        let updated_epoch = state["updated_epoch"]
+            .as_u64()
+            .context("reservation recovery epoch state is invalid")?;
+        let abandon_after = binding["reservation_expires_after_epoch"]
+            .as_u64()
+            .context("reservation recovery expiry is invalid")?
+            .saturating_add(
+                binding["reservation_receipt_grace_epochs"]
+                    .as_u64()
+                    .context("reservation recovery grace is invalid")?,
+            );
+        if updated_epoch > abandon_after {
+            fs::remove_file(path)?;
+            sync_receipt_settlement_directory(path.parent().context("recovery parent missing")?)?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
     ensure!(
         reservation["type"] == "receipt_reservation_identity"
             && reservation_binding_matches(binding, &reservation),

@@ -117,22 +117,22 @@ use mayhem_proto::{
     payload_chunk_manifest, reassemble_json_payload, receipt_contract_version_is_supported,
     receipt_signing_bytes, record_usage_receipt_envelope, record_usage_receipt_feature_key,
     record_usage_receipt_feature_key_for_contract, record_usage_receipt_signing_bytes,
-    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    stable_json_bytes, tools_only_model_input_prompt_units, validate_ctx_bracket_schedule,
-    validated_audio_metadata, validated_wav_audio_metadata, AdminAttestationPolicy,
-    AttestationRuntimeConfig, AttestationTrustDataRef, CatalogEnclaveIdentity, CheckpointPolicy,
-    CtxBracketSchedule, HardwareQuote, HardwareQuoteKind, HardwareQuoteRoutePolicyBinding, MoneyAu,
-    PayloadChunk, PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody,
-    ReceiptUsage, SessionReceipt, SpendVoucher, TokenizeRequestFrame, TokenizeResponseFrame,
-    TpmActivateCredentialChallengeFrame, TpmActivateCredentialResponseFrame, TranscriptionResult,
-    TranscriptionResultLimits, TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall,
-    WorkflowBinding, WorkflowOutputBinding, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
-    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
-    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
-    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    RECOVERABLE_RECEIPT_CONTRACT_VERSION, SESSION_RECEIPT_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION,
-    TOKENIZE_REQUEST_CHUNK_FRAME_TYPE, TOKENIZE_REQUEST_FRAME_TYPE,
-    TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
+    reservation_binding_matches, session_accept_signing_bytes, session_frame_head,
+    spend_voucher_signing_bytes, stable_json_bytes, tools_only_model_input_prompt_units,
+    validate_ctx_bracket_schedule, validated_audio_metadata, validated_wav_audio_metadata,
+    AdminAttestationPolicy, AttestationRuntimeConfig, AttestationTrustDataRef,
+    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
+    HardwareQuoteRoutePolicyBinding, MoneyAu, PayloadChunk, PayloadChunkCollector,
+    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
+    TokenizeRequestFrame, TokenizeResponseFrame, TpmActivateCredentialChallengeFrame,
+    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
+    TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall, WorkflowBinding,
+    WorkflowOutputBinding, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
+    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
+    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
+    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, RECOVERABLE_RECEIPT_CONTRACT_VERSION,
+    SESSION_RECEIPT_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION, TOKENIZE_REQUEST_CHUNK_FRAME_TYPE,
+    TOKENIZE_REQUEST_FRAME_TYPE, TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
     TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
     TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
     USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
@@ -83776,6 +83776,7 @@ where
                 },
                 reject => reject,
             };
+            let mut accepted_reservation_recovery = None;
             let decision = match static_decision {
                 ProviderSessionDecision::Accept => {
                     let protection_decision = if let Some(reject) = runtime_floor_reject {
@@ -83829,6 +83830,7 @@ where
                                         admission_timeout,
                                         provider_session_spend_reservation_decision(
                                             runtime.rpc,
+                                            &runtime.receipt_settlement,
                                             runtime.keypair_path,
                                             runtime.password,
                                             &runtime.runtime_keypair.public_key_hex(),
@@ -83839,7 +83841,10 @@ where
                                     )
                                     .await;
                                     let reservation_decision = match reservation {
-                                        Ok(Ok(decision)) => decision,
+                                        Ok(Ok((decision, recovery))) => {
+                                            accepted_reservation_recovery = recovery;
+                                            decision
+                                        }
                                         Ok(Err(error)) => return Err(error),
                                         Err(_) => ProviderSessionDecision::Reject {
                                         code: "BALANCE",
@@ -83908,10 +83913,8 @@ where
                         max_spend_au: spend_voucher.body.max_spend_au,
                         receipt_settlement: Some(runtime.receipt_settlement.clone()),
                         accept_replay: None,
-                        reservation_recovery: None,
+                        reservation_recovery: accepted_reservation_recovery.map(Arc::new),
                     };
-                    active.reservation_recovery =
-                        provider_failure_recovery::begin(&active, terms)?.map(Arc::new);
                     let ts = unix_epoch_millis()?;
                     let open_head =
                         session_frame_head(&frame).context("hashing s.open frame for s.accept")?;
@@ -90471,17 +90474,22 @@ fn provider_session_contract_decision(
 
 async fn provider_session_spend_reservation_decision(
     rpc: &PeerRpcClient,
+    settlement: &ProviderReceiptSettlement,
     keypair_path: &Path,
     password: &str,
     enclave_pubkey: &str,
     terms: &ProviderSessionTerms,
     frame: &Value,
     rail: &str,
-) -> Result<ProviderSessionDecision> {
+) -> Result<(
+    ProviderSessionDecision,
+    Option<provider_failure_recovery::AttemptGuard>,
+)> {
     let reject = |reason: String| ProviderSessionDecision::Reject {
         code: "BALANCE",
         reason,
     };
+    let rejected = |reason: String| Ok((reject(reason), None));
     let voucher: SpendVoucher = match frame
         .get("voucher")
         .cloned()
@@ -90489,31 +90497,31 @@ async fn provider_session_spend_reservation_decision(
         .and_then(|value| serde_json::from_value(value).context("invalid spend voucher"))
     {
         Ok(voucher) => voucher,
-        Err(err) => return Ok(reject(format!("invalid spend reservation: {err:#}"))),
+        Err(err) => return rejected(format!("invalid spend reservation: {err:#}")),
     };
     let active_epoch = active_billing_epoch(rpc).await?;
     if let Err(error) = validate_provider_session_voucher_epoch(&voucher, active_epoch) {
-        return Ok(reject(error.to_string()));
+        return rejected(error.to_string());
     }
     let epoch = voucher.body.billing_epoch;
     let at = match provider_session_open_at(frame) {
         Ok(at) => at,
-        Err(err) => return Ok(reject(format!("invalid spend reservation: {err:#}"))),
+        Err(err) => return rejected(format!("invalid spend reservation: {err:#}")),
     };
     let payout_revision =
         match active_provider_payout_revision(rpc, &terms.provider, rail, epoch).await {
             Ok(revision) => revision,
             Err(err) => {
-                return Ok(reject(format!(
+                return rejected(format!(
                     "provider has no active verified {rail} payout binding: {err:#}"
-                )))
+                ))
             }
         };
     if payout_revision != voucher.body.payout_revision {
-        return Ok(reject(
+        return rejected(
             "signed payout revision does not match the canonical active provider binding"
                 .to_owned(),
-        ));
+        );
     }
     let mut value = match provider_session_spend_reservation_value(
         terms,
@@ -90525,7 +90533,7 @@ async fn provider_session_spend_reservation_decision(
         enclave_pubkey,
     ) {
         Ok(value) => value,
-        Err(err) => return Ok(reject(format!("invalid spend reservation: {err:#}"))),
+        Err(err) => return rejected(format!("invalid spend reservation: {err:#}")),
     };
     let message = targeted_spend_reservation_message(&value);
     let provider_sig = sign_message(keypair_path, password, &message)
@@ -90533,11 +90541,10 @@ async fn provider_session_spend_reservation_decision(
         .context("signing provider spend reservation")?;
     value["provider_sig"] = json!(provider_sig);
     let key = targeted_spend_reservation_feature_key(&value)?;
-    // The local relay comes up shortly after the peer process; an admission that
-    // races that window should wait it out (bounded) instead of rejecting the
-    // session outright (observed live 2026-07-12: s.reject BALANCE on a relay that
-    // became ready seconds later). Only relay-readiness errors retry; every other
-    // failure rejects immediately as before.
+    // The local relay comes up shortly after the peer process, and a lost RPC
+    // response cannot prove whether the writer accepted the reservation. Retry
+    // the same signed feature and reservation identity within a bounded window;
+    // never construct a second reservation for this billing attempt.
     let retry_window = configured_nonnegative_millis(
         "MAYHEM_PROVIDER_ADMISSION_RELAY_RETRY_WINDOW_MS",
         DEFAULT_PROVIDER_ADMISSION_RELAY_RETRY_WINDOW_MILLIS,
@@ -90549,34 +90556,85 @@ async fn provider_session_spend_reservation_decision(
         "provider admission relay retry interval",
     )?);
     let retry_deadline = Instant::now() + Duration::from_millis(retry_window);
-    let submitted = loop {
-        match rpc
-            .submit_feature(json!({
-                "feature": "mayhem",
-                "key": key.clone(),
-                "value": value.clone(),
-            }))
-            .await
-        {
+    let feature = json!({
+        "feature": "mayhem",
+        "key": key.clone(),
+        "value": value.clone(),
+    });
+    let mut recovery_guard = Some(provider_failure_recovery::begin_binding(
+        settlement,
+        &spend_reservation_binding(&value)?,
+    )?);
+    let mut submitted = loop {
+        match rpc.submit_feature(feature.clone()).await {
             Ok(submitted) => break submitted,
             Err(err) => {
                 let message = format!("{err:#}");
-                let relay_not_ready = message.contains("relay is not ready");
-                if relay_not_ready && Instant::now() < retry_deadline {
+                if Instant::now() < retry_deadline {
                     provider_session_debug(format!(
-                        "spend reservation waiting for local relay readiness; retrying: {message}"
+                        "exact spend reservation did not receive a relay response; retrying: {message}"
                     ));
                     tokio::time::sleep(retry_interval).await;
                     continue;
                 }
-                return Ok(reject(format!(
-                    "could not reserve user balance on contract before serving: {err}"
-                )));
+                return Ok((
+                    ProviderSessionDecision::Reject {
+                        code: "RESERVATION_PENDING",
+                        reason: format!(
+                            "the signed spend reservation outcome is unknown after relay failure: {err}"
+                        ),
+                    },
+                    None,
+                ));
             }
         }
     };
-    if submitted.get("ok").and_then(Value::as_bool) == Some(true) {
-        return Ok(ProviderSessionDecision::Accept);
+    loop {
+        if submitted.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok((ProviderSessionDecision::Accept, recovery_guard));
+        }
+        if confirmed_spend_reservation_matches(rpc, &value).await? {
+            return Ok((ProviderSessionDecision::Accept, recovery_guard));
+        }
+        if !spend_reservation_submission_pending(&submitted) {
+            break;
+        }
+        if Instant::now() >= retry_deadline {
+            return Ok((
+                ProviderSessionDecision::Reject {
+                    code: "RESERVATION_PENDING",
+                    reason: "the signed spend reservation may have been accepted but its canonical result is still pending; the exact reservation is retained for recovery".to_owned(),
+                },
+                None,
+            ));
+        }
+        provider_session_debug(format!(
+            "spend reservation append is awaiting canonical confirmation; retrying the exact signed reservation"
+        ));
+        tokio::time::sleep(
+            retry_interval.min(retry_deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
+        submitted = match rpc.submit_feature(feature.clone()).await {
+            Ok(response) => response,
+            Err(error) if Instant::now() < retry_deadline => {
+                provider_session_debug(format!(
+                    "exact spend reservation retry did not receive a relay response: {error:#}"
+                ));
+                continue;
+            }
+            Err(error) => {
+                return Ok((
+                    ProviderSessionDecision::Reject {
+                        code: "RESERVATION_PENDING",
+                        reason: format!(
+                            "the signed spend reservation outcome remains unknown after relay failure: {error:#}"
+                        ),
+                    },
+                    None,
+                ))
+            }
+        };
     }
     let relay_phase = submitted
         .get("phase")
@@ -90609,9 +90667,88 @@ async fn provider_session_spend_reservation_decision(
     let phase_marker = relay_phase
         .map(|phase| format!(" [reservation_relay_phase={phase}]"))
         .unwrap_or_default();
-    Ok(reject(format!(
-        "contract spend reservation rejected before serving{phase_marker}: {reason}"
-    )))
+    if let Some(guard) = recovery_guard.take() {
+        provider_failure_recovery::discard(guard)?;
+    }
+    Ok((
+        reject(format!(
+            "contract spend reservation rejected before serving{phase_marker}: {reason}"
+        )),
+        None,
+    ))
+}
+
+fn spend_reservation_binding(value: &Value) -> Result<Value> {
+    let voucher: SpendVoucher = serde_json::from_value(
+        value
+            .get("voucher")
+            .cloned()
+            .context("spend reservation is missing its voucher")?,
+    )
+    .context("spend reservation voucher is invalid")?;
+    Ok(json!({
+        "billing_epoch": voucher.body.billing_epoch,
+        "reservation_id": voucher.body.reservation_id,
+        "reservation_expires_after_epoch": voucher.body.reservation_expires_after_epoch,
+        "reservation_receipt_grace_epochs": voucher.body.reservation_receipt_grace_epochs,
+        "billing_id": voucher.body.billing_id,
+        "billing_attempt": voucher.body.billing_attempt,
+        "session_id": voucher.body.session_id,
+        "user": voucher.body.user,
+        "rail": voucher.body.rail,
+        "provider": voucher.body.provider,
+        "payout_revision": voucher.body.payout_revision,
+    }))
+}
+
+async fn confirmed_spend_reservation_matches(rpc: &PeerRpcClient, value: &Value) -> Result<bool> {
+    let binding = spend_reservation_binding(value)?;
+    let reservation_id = binding["reservation_id"]
+        .as_str()
+        .context("spend reservation binding has no identity")?;
+    let key = format!("receipt/reservation/{reservation_id}");
+    let record = rpc.state(Some(&key), Some(true)).await?;
+    ensure!(
+        record["confirmed"] == true && record["key"] == key,
+        "spend reservation confirmation requires exact canonical state"
+    );
+    let reservation = &record["value"];
+    if reservation.is_null() {
+        return Ok(false);
+    }
+    ensure!(
+        reservation["type"] == "receipt_reservation_identity"
+            && reservation["status"] == "active"
+            && reservation_binding_matches(&binding, reservation),
+        "canonical spend reservation does not match the exact signed binding"
+    );
+    Ok(true)
+}
+
+fn spend_reservation_submission_pending(response: &Value) -> bool {
+    response.get("status").and_then(Value::as_str) == Some("pending")
+        || response
+            .get("phase")
+            .and_then(Value::as_str)
+            .is_some_and(|phase| {
+                matches!(
+                    phase,
+                    "transport_unavailable"
+                        | "health_proof_unavailable"
+                        | "protocol_incompatible"
+                        | "transport_changed"
+                        | "transport_rejoin_failed"
+                        | "transport_recovering"
+                        | "request_send"
+                        | "admin_ack"
+                )
+            })
+        || response
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.contains("accepted the append") && message.contains("canonical result")
+            })
 }
 
 fn validate_provider_session_voucher_epoch(
@@ -113915,6 +114052,32 @@ esac
             key,
             "provider signature is not part of the reservation feature key"
         );
+
+        let binding = spend_reservation_binding(&signed).unwrap();
+        assert!(reservation_binding_matches(&binding, &binding));
+        assert_eq!(binding["reservation_id"], signed["reservation_id"]);
+        assert_eq!(binding["billing_id"], signed["voucher"]["billing_id"]);
+        assert_eq!(
+            binding["billing_attempt"],
+            signed["voucher"]["billing_attempt"]
+        );
+    }
+
+    #[test]
+    fn provider_reservation_pending_detection_preserves_ambiguous_append_outcomes() {
+        for response in [
+            json!({"ok": false, "accepted": true, "status": "pending"}),
+            json!({"ok": false, "accepted": false, "status": "rejected", "phase": "admin_ack"}),
+            json!({"ok": false, "message": "Mayhem feature relay accepted the append but no canonical result appeared before the relay result budget."}),
+        ] {
+            assert!(spend_reservation_submission_pending(&response));
+        }
+        assert!(!spend_reservation_submission_pending(&json!({
+            "ok": false,
+            "accepted": true,
+            "status": "rejected",
+            "message": "Insufficient unreserved credit balance.",
+        })));
     }
 
     #[test]

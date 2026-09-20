@@ -1869,13 +1869,28 @@ class MayhemFeature extends Feature {
       );
     }
     if (this.stopped && response?.status === 'pending') {
-      return relayError('Mayhem feature relay stopped before the canonical result appeared.', requestId);
+      return {
+        ...response,
+        ok: false,
+        accepted: true,
+        status: 'pending',
+        relayed: true,
+        request_id: requestId,
+        phase: 'admin_ack',
+        message: 'Mayhem feature relay stopped after accepting the append but before the canonical result appeared.',
+      };
     }
     if (response?.status === 'pending') {
-      return relayError(
-        'Mayhem feature relay accepted the append but no canonical result appeared before the relay result budget.',
-        requestId
-      );
+      return {
+        ...response,
+        ok: false,
+        accepted: true,
+        status: 'pending',
+        relayed: true,
+        request_id: requestId,
+        phase: 'admin_ack',
+        message: 'Mayhem feature relay accepted the append but no canonical result appeared before the relay result budget.',
+      };
     }
     return response;
   }

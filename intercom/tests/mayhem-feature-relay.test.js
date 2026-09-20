@@ -908,6 +908,9 @@ test('admin writer returns a bounded relay error when an accepted feature never 
   );
 
   assert.equal(result.ok, false);
+  assert.equal(result.accepted, true);
+  assert.equal(result.status, 'pending');
+  assert.equal(result.phase, 'admin_ack');
   assert.equal(result.relayed, true);
   assert.match(result.message, /no canonical result appeared before the relay result budget/);
   assert.equal(writer.appended.length, 1);
