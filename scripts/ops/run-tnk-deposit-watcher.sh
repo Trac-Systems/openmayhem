@@ -9,6 +9,12 @@ state_dir="${MAYHEM_TNK_DEPOSIT_STATE_DIR:-/opt/mayhem/.mayhem-local/tnk-deposit
 store_name="${MAYHEM_TNK_DEPOSIT_STORE_NAME:-mayhem-mainnet-deposit-watcher}"
 interval="${MAYHEM_TNK_DEPOSIT_INTERVAL_SECONDS:-30}"
 reader_timeout="${MAYHEM_TNK_DEPOSIT_READER_TIMEOUT_SECONDS:-300}"
+mayhem_bin="${MAYHEM_BIN:-$repo/target/release/mayhem}"
+
+if [[ ! -x "$mayhem_bin" ]]; then
+  echo "Deposit watcher requires an executable MAYHEM_BIN: $mayhem_bin" >&2
+  exit 1
+fi
 
 mkdir -p "$(dirname "$cursor")" "$state_dir"
 
@@ -21,7 +27,7 @@ while true; do
     --cursor "$cursor" \
     --timeout "$reader_timeout" \
     --admin-home "$home" \
-    --mayhem-bin "$repo/target/release/mayhem" \
+    --mayhem-bin "$mayhem_bin" \
     --submit \
     --json; then
     echo "TNK deposit watcher tick failed; retrying after ${interval}s" >&2

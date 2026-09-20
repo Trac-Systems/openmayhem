@@ -13864,6 +13864,7 @@ struct DirectArtifactGenerationSessionCollected {
 }
 
 struct GatewaySessionRun {
+    model: GatewayModel,
     result: GatewaySessionResult,
     invocation: GatewaySessionInvocation,
     metering_request: ChatCompletionRequest,
@@ -13871,6 +13872,7 @@ struct GatewaySessionRun {
 }
 
 struct GatewayEmbeddingRun {
+    model: GatewayModel,
     result: GatewayEmbeddingResult,
     invocation: GatewaySessionInvocation,
     metering_inputs: Vec<String>,
@@ -13878,6 +13880,7 @@ struct GatewayEmbeddingRun {
 }
 
 struct GatewayImageGenerationRun {
+    model: GatewayModel,
     result: GatewayImageGenerationResult,
     invocation: GatewaySessionInvocation,
     metering_request: ImageGenerationRequest,
@@ -13885,6 +13888,7 @@ struct GatewayImageGenerationRun {
 }
 
 struct GatewayAudioSpeechRun {
+    model: GatewayModel,
     result: GatewayAudioSpeechResult,
     invocation: GatewaySessionInvocation,
     metering_request: AudioSpeechRequest,
@@ -13892,6 +13896,7 @@ struct GatewayAudioSpeechRun {
 }
 
 struct GatewayAudioTranscriptionRun {
+    model: GatewayModel,
     result: GatewayAudioTranscriptionResult,
     invocation: GatewaySessionInvocation,
     metering_request: AudioTranscriptionRequest,
@@ -13899,6 +13904,7 @@ struct GatewayAudioTranscriptionRun {
 }
 
 struct GatewayArtifactGenerationRun {
+    model: GatewayModel,
     result: GatewayArtifactGenerationResult,
     invocation: GatewaySessionInvocation,
     metering_request: ArtifactGenerationRequest,
@@ -23125,6 +23131,7 @@ async fn run_embedding_with_route_retry(
                 );
                 let metering_output = result.output.clone();
                 return Ok(GatewayEmbeddingRun {
+                    model: model.clone(),
                     result,
                     invocation,
                     metering_inputs: inputs.to_vec(),
@@ -23368,6 +23375,7 @@ async fn run_image_generation_with_route_retry(
                 let metering_request = request.clone();
                 let metering_output = result.output.clone();
                 return Ok(GatewayImageGenerationRun {
+                    model: model.clone(),
                     result,
                     invocation,
                     metering_request,
@@ -23605,6 +23613,7 @@ async fn run_audio_speech_with_route_retry(
                 let metering_request = request.clone();
                 let metering_output = result.output.clone();
                 return Ok(GatewayAudioSpeechRun {
+                    model: model.clone(),
                     result,
                     invocation,
                     metering_request,
@@ -23846,6 +23855,7 @@ async fn run_audio_transcription_with_route_retry(
                 let metering_request = request.clone();
                 let metering_output = result.output.clone();
                 return Ok(GatewayAudioTranscriptionRun {
+                    model: model.clone(),
                     result,
                     invocation,
                     metering_request,
@@ -24130,6 +24140,7 @@ async fn run_artifact_generation_with_route_retry(
                     ),
                 );
                 return Ok(GatewayArtifactGenerationRun {
+                    model: model.clone(),
                     metering_request: attempt_request,
                     metering_output: result.output.clone(),
                     result,
@@ -25681,6 +25692,7 @@ async fn build_chat_completion(
         }
     }
     let GatewaySessionRun {
+        model,
         result:
             GatewaySessionResult {
                 output,
@@ -26684,6 +26696,7 @@ async fn recover_live_direct_chat_after_retryable(
         ));
     }
     let GatewaySessionRun {
+        model,
         result,
         invocation,
         metering_request,
@@ -26696,6 +26709,7 @@ async fn recover_live_direct_chat_after_retryable(
     )
     .await
     .map_err(|err| GatewaySessionError::new(err.message))?;
+    session.model = model;
     let receipt = session
         .state
         .meter_chat_session(
@@ -27919,6 +27933,7 @@ async fn run_chat_with_route_retry(
                     state.record_chat_affinity(model, request, route);
                 }
                 return Ok(GatewaySessionRun {
+                    model: model.clone(),
                     result,
                     invocation,
                     metering_request,
@@ -31086,6 +31101,7 @@ async fn build_embedding(
     let id = make_id("embd");
     let created = now_secs();
     let GatewayEmbeddingRun {
+        model,
         result:
             GatewayEmbeddingResult {
                 output,
@@ -31169,6 +31185,7 @@ async fn build_image_generation(
     let id = make_id("img");
     let created = now_secs();
     let GatewayImageGenerationRun {
+        model,
         result:
             GatewayImageGenerationResult {
                 output,
@@ -31263,6 +31280,7 @@ async fn build_artifact_generation(
         ));
     }
     let GatewayArtifactGenerationRun {
+        model,
         result:
             GatewayArtifactGenerationResult {
                 output,
@@ -31398,6 +31416,7 @@ async fn build_audio_speech(
     }
     validate_audio_speech_request(&request)?;
     let GatewayAudioSpeechRun {
+        model,
         result:
             GatewayAudioSpeechResult {
                 output,
@@ -31658,6 +31677,7 @@ async fn build_audio_transcription(
     }
     validate_audio_transcription_response_request(&request)?;
     let GatewayAudioTranscriptionRun {
+        model,
         result:
             GatewayAudioTranscriptionResult {
                 output,
@@ -54546,7 +54566,11 @@ mod tests {
         match runner {
             FocusedRouteRunner::Chat => discard_route_result(
                 run_chat_with_route_retry(state, model, &test_chat_request(&model.id), options)
-                    .await,
+                    .await.map(|run| {
+                        assert_eq!(run.model.mayhem.price_ref_au.ver, run.invocation.price_ver,
+                            "post-session metering/probes must retain the accepted catalog snapshot");
+                        run
+                    }),
             ),
             FocusedRouteRunner::Embedding => {
                 let inputs = vec!["embed this".to_owned()];
@@ -54560,7 +54584,11 @@ mod tests {
                     endpoint_request: None,
                 };
                 discard_route_result(
-                    run_embedding_with_route_retry(state, model, &request, &inputs, options).await,
+                    run_embedding_with_route_retry(state, model, &request, &inputs, options).await.map(|run| {
+                        assert_eq!(run.model.mayhem.price_ref_au.ver, run.invocation.price_ver,
+                            "post-session metering/probes must retain the accepted catalog snapshot");
+                        run
+                    }),
                 )
             }
             FocusedRouteRunner::Image => {
@@ -54593,7 +54621,11 @@ mod tests {
                     endpoint_request: None,
                 };
                 discard_route_result(
-                    run_image_generation_with_route_retry(state, model, &request, options).await,
+                    run_image_generation_with_route_retry(state, model, &request, options).await.map(|run| {
+                        assert_eq!(run.model.mayhem.price_ref_au.ver, run.invocation.price_ver,
+                            "post-session metering/probes must retain the accepted catalog snapshot");
+                        run
+                    }),
                 )
             }
             FocusedRouteRunner::Speech => {
@@ -54617,7 +54649,11 @@ mod tests {
                     endpoint_request: None,
                 };
                 discard_route_result(
-                    run_audio_speech_with_route_retry(state, model, &request, options).await,
+                    run_audio_speech_with_route_retry(state, model, &request, options).await.map(|run| {
+                        assert_eq!(run.model.mayhem.price_ref_au.ver, run.invocation.price_ver,
+                            "post-session metering/probes must retain the accepted catalog snapshot");
+                        run
+                    }),
                 )
             }
             FocusedRouteRunner::Transcription => {
@@ -54637,7 +54673,11 @@ mod tests {
                     contract_request: json!({}),
                 };
                 discard_route_result(
-                    run_audio_transcription_with_route_retry(state, model, &request, options).await,
+                    run_audio_transcription_with_route_retry(state, model, &request, options).await.map(|run| {
+                        assert_eq!(run.model.mayhem.price_ref_au.ver, run.invocation.price_ver,
+                            "post-session metering/probes must retain the accepted catalog snapshot");
+                        run
+                    }),
                 )
             }
             FocusedRouteRunner::AudioArtifact
@@ -54708,7 +54748,11 @@ mod tests {
                     response_format: if is_workflow { "artifact" } else { "mp4" }.to_owned(),
                 };
                 discard_route_result(
-                    run_artifact_generation_with_route_retry(state, model, &request, options).await,
+                    run_artifact_generation_with_route_retry(state, model, &request, options).await.map(|run| {
+                        assert_eq!(run.model.mayhem.price_ref_au.ver, run.invocation.price_ver,
+                            "post-session metering/probes must retain the accepted catalog snapshot");
+                        run
+                    }),
                 )
             }
         }
