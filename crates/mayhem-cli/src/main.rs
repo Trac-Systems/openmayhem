@@ -80257,6 +80257,10 @@ fn provider_session_output_error(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(ProviderSessionOutputError(message.into()))
 }
 
+fn provider_session_output_result<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| provider_session_output_error(format!("{error:#}")))
+}
+
 fn validate_streamed_tool_call_count(emitted: usize, validated: usize) -> Result<()> {
     if emitted > validated {
         return Err(provider_session_output_error(
@@ -84310,11 +84314,16 @@ where
                         live_stream.as_mut(),
                         &cancellation,
                     )?;
-                    normalize_provider_visible_output_usage(&body, &mut output)?;
+                    provider_session_output_result(normalize_provider_visible_output_usage(
+                        &body,
+                        &mut output,
+                    ))?;
                     cancellation
                         .check()
                         .context("provider request cancelled before response publication")?;
-                    validate_provider_session_output(terms, &body, &output)?;
+                    provider_session_output_result(validate_provider_session_output(
+                        terms, &body, &output,
+                    ))?;
                     Ok(output)
                 })
             });
@@ -91566,17 +91575,17 @@ impl ProviderSessionArtifactCollector {
     fn push(&mut self, chunk: ArtifactChunk) -> mayhem_engine::Result<()> {
         let artifact_id = chunk.artifact_id.trim();
         if artifact_id.is_empty() {
-            return Err(EngineError::InvalidConfig(
+            return Err(EngineError::InvalidOutput(
                 "provider engine emitted artifact chunk with empty id".to_owned(),
             ));
         }
         if chunk.content_type.trim().is_empty() {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine emitted artifact {artifact_id} with empty content type"
             )));
         }
         if !self.artifacts.contains_key(artifact_id) && self.artifacts.len() >= self.max_artifacts {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine emitted more than {} session artifacts",
                 self.max_artifacts
             )));
@@ -91585,12 +91594,12 @@ impl ProviderSessionArtifactCollector {
             .total_bytes
             .checked_add(chunk.bytes.len())
             .ok_or_else(|| {
-                EngineError::InvalidConfig(
+                EngineError::InvalidOutput(
                     "provider engine artifact byte count overflow".to_owned(),
                 )
             })?;
         if next_total > self.max_bytes {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifacts exceed the session byte budget of {} bytes",
                 self.max_bytes
             )));
@@ -91606,24 +91615,24 @@ impl ProviderSessionArtifactCollector {
                 final_seen: false,
             });
         if builder.final_seen {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} emitted data after its final chunk"
             )));
         }
         if builder.content_type != chunk.content_type {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} changed content type mid-stream"
             )));
         }
         if builder.next_index != chunk.index {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} chunk index gap: expected {}, got {}",
                 builder.next_index, chunk.index
             )));
         }
         builder.bytes.extend_from_slice(&chunk.bytes);
         builder.next_index = builder.next_index.checked_add(1).ok_or_else(|| {
-            EngineError::InvalidConfig(format!(
+            EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} chunk index overflow"
             ))
         })?;
@@ -91691,15 +91700,12 @@ fn provider_visible_tool_calls(tools: &[Value]) -> Result<Vec<VisibleToolCall>> 
         .collect()
 }
 
-fn normalize_provider_visible_output_usage(
-    body: &Value,
-    output: &mut ProviderSessionOutput,
-) -> Result<()> {
+fn provider_session_is_text_generation(body: &Value) -> bool {
     let endpoint_family = body
         .get("mayhem_contract")
         .and_then(|value| value.get("endpoint_family"))
         .and_then(Value::as_str);
-    let is_text_generation = body.get("kind").is_none()
+    body.get("kind").is_none()
         || matches!(
             endpoint_family,
             Some(
@@ -91708,8 +91714,14 @@ fn normalize_provider_visible_output_usage(
                     | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
                     | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
             )
-        );
-    if !is_text_generation {
+        )
+}
+
+fn normalize_provider_visible_output_usage(
+    body: &Value,
+    output: &mut ProviderSessionOutput,
+) -> Result<()> {
+    if !provider_session_is_text_generation(body) {
         return Ok(());
     }
     let tools = provider_visible_tool_calls(&output.tools)?;
@@ -91753,7 +91765,7 @@ fn validate_provider_session_output(
         "MAYHEM_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES",
         DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
     );
-    if body.get("kind").and_then(Value::as_str).is_none() {
+    if provider_session_is_text_generation(body) {
         let available_tokens = terms.ctx.saturating_sub(output.prompt_tokens);
         let max_output_tokens = provider_requested_max_output_tokens(body)
             .unwrap_or(available_tokens)
@@ -91768,6 +91780,14 @@ fn validate_provider_session_output(
             u64::try_from(output.token_ids.len()).unwrap_or(u64::MAX) <= max_output_tokens,
             "provider token ids exceeded the selected session token budget"
         );
+        if output.finish_reason == "stop" {
+            ensure!(
+                !output.content.trim().is_empty()
+                    || !output.tools.is_empty()
+                    || !output.artifacts.is_empty(),
+                "provider text generation stopped without a visible answer"
+            );
+        }
     } else {
         ensure!(
             output.content.len() <= payload_limit,
@@ -92609,10 +92629,14 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("synthesizing provider session speech with mayhem-engine")?;
-        let artifacts = artifact_chunks.finish()?;
-        if artifacts.is_empty() {
-            bail!("provider speech engine produced no audio artifact");
-        }
+        let artifacts = provider_session_output_result(artifact_chunks.finish())?;
+        provider_session_output_result((|| {
+            ensure!(
+                !artifacts.is_empty(),
+                "provider speech engine produced no audio artifact"
+            );
+            Ok(())
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92648,21 +92672,24 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("generating provider session image artifact with mayhem-engine")?;
-        ensure!(
-            output.image_count == image_count && u64::from(output.steps) == steps,
-            "provider image engine changed the requested image count or step count"
-        );
-        let artifacts = artifact_chunks.finish()?;
-        if artifacts.is_empty() {
-            bail!("provider image generation engine produced no image artifacts");
-        }
-        let usage = provider_image_generation_usage(artifacts.len() as u64, steps, width, height);
-        if artifacts.len() as u32 != image_count {
-            bail!(
+        let artifacts = provider_session_output_result((|| {
+            ensure!(
+                output.image_count == image_count && u64::from(output.steps) == steps,
+                "provider image engine changed the requested image count or step count"
+            );
+            let artifacts = artifact_chunks.finish()?;
+            ensure!(
+                !artifacts.is_empty(),
+                "provider image generation engine produced no image artifacts"
+            );
+            ensure!(
+                artifacts.len() as u32 == image_count,
                 "provider image generation engine produced {} artifact(s), expected {image_count}",
                 artifacts.len()
             );
-        }
+            Ok(artifacts)
+        })())?;
+        let usage = provider_image_generation_usage(artifacts.len() as u64, steps, width, height);
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92686,14 +92713,15 @@ fn provider_engine_session_response_with_sampling_bounded(
         let mut request = provider_session_request_result(
             provider_media_generation_request_from_body(endpoint_family, request_body),
         )?;
-        let (expected_duration, expected_frames) =
-            provider_video_output_expectation(verified.contract, &request)?;
+        let (expected_duration, expected_frames) = provider_session_request_result(
+            provider_video_output_expectation(verified.contract, &request),
+        )?;
         request.frame_count = Some(expected_frames);
-        provider_canonicalize_video_engine_request(
+        provider_session_request_result(provider_canonicalize_video_engine_request(
             verified.contract,
             &mut request,
             expected_frames,
-        )?;
+        ))?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = backend
             .generate_video(
@@ -92702,28 +92730,31 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("generating provider session video artifact with mayhem-engine")?;
-        ensure!(
-            output.duration_seconds > 0 && output.frame_count > 0,
-            "provider video engine returned zero duration or frames"
-        );
-        ensure!(
-            output.duration_seconds == expected_duration,
-            "provider video engine returned {} seconds, expected {expected_duration}",
-            output.duration_seconds
-        );
-        ensure!(
-            output.frame_count == expected_frames,
-            "provider video engine returned {} frames, expected {expected_frames}",
-            output.frame_count
-        );
-        let artifacts = artifact_chunks.finish()?;
-        ensure!(
-            !artifacts.is_empty()
-                && artifacts
-                    .iter()
-                    .all(|artifact| artifact.content_type.starts_with("video/")),
-            "provider video generation engine produced no valid video artifact"
-        );
+        let artifacts = provider_session_output_result((|| {
+            ensure!(
+                output.duration_seconds > 0 && output.frame_count > 0,
+                "provider video engine returned zero duration or frames"
+            );
+            ensure!(
+                output.duration_seconds == expected_duration,
+                "provider video engine returned {} seconds, expected {expected_duration}",
+                output.duration_seconds
+            );
+            ensure!(
+                output.frame_count == expected_frames,
+                "provider video engine returned {} frames, expected {expected_frames}",
+                output.frame_count
+            );
+            let artifacts = artifact_chunks.finish()?;
+            ensure!(
+                !artifacts.is_empty()
+                    && artifacts
+                        .iter()
+                        .all(|artifact| artifact.content_type.starts_with("video/")),
+                "provider video generation engine produced no valid video artifact"
+            );
+            Ok(artifacts)
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92741,10 +92772,12 @@ fn provider_engine_session_response_with_sampling_bounded(
     }
 
     if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
-        let workflow_graph = request_body
-            .get("workflow")
-            .cloned()
-            .context("workflow request is missing workflow")?;
+        let workflow_graph = provider_session_request_result(
+            request_body
+                .get("workflow")
+                .cloned()
+                .context("workflow request is missing workflow"),
+        )?;
         let workflow = provider_session_request_result(provider_comfy_workflow_binding(
             request_body,
             workflow_policy,
@@ -92773,17 +92806,20 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("running provider Comfy workflow with mayhem-engine")?;
-        let artifacts = artifact_chunks.finish()?;
-        ensure!(
-            !artifacts.is_empty(),
-            "provider workflow engine produced no artifacts"
-        );
-        ensure!(
-            u64::from(output.artifact_count) == expected_artifacts
-                && u64::try_from(artifacts.len()).unwrap_or(u64::MAX) == expected_artifacts,
-            "provider workflow engine produced {} artifact(s), expected {expected_artifacts}",
-            artifacts.len()
-        );
+        let artifacts = provider_session_output_result((|| {
+            let artifacts = artifact_chunks.finish()?;
+            ensure!(
+                !artifacts.is_empty(),
+                "provider workflow engine produced no artifacts"
+            );
+            ensure!(
+                u64::from(output.artifact_count) == expected_artifacts
+                    && u64::try_from(artifacts.len()).unwrap_or(u64::MAX) == expected_artifacts,
+                "provider workflow engine produced {} artifact(s), expected {expected_artifacts}",
+                artifacts.len()
+            );
+            Ok(artifacts)
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92813,8 +92849,9 @@ fn provider_engine_session_response_with_sampling_bounded(
         let automatic_duration_cap = provider_session_request_result(
             provider_automatic_audio_duration_cap(verified.contract, requested_duration, body),
         )?;
-        let input_characters =
-            provider_media_generation_input_characters(endpoint_family, &request.request)?;
+        let input_characters = provider_session_request_result(
+            provider_media_generation_input_characters(endpoint_family, &request.request),
+        )?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
             backend
@@ -92833,78 +92870,84 @@ fn provider_engine_session_response_with_sampling_bounded(
                 )
                 .context("generating provider session audio artifact with mayhem-engine")?
         };
-        ensure!(
-            output.duration_seconds > 0,
-            "provider audio engine returned zero duration"
-        );
-        if let Some(expected) = requested_duration {
+        let (artifacts, measured_audio_seconds) = provider_session_output_result((|| {
             ensure!(
-                output.duration_seconds.abs_diff(expected) <= 1,
-                "provider audio engine returned {} seconds, expected approximately {expected}",
-                output.duration_seconds
-            );
-        } else if let Some(cap) = automatic_duration_cap {
-            ensure!(
-                output.duration_seconds <= cap,
-                "provider audio engine returned {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
-                output.duration_seconds
-            );
-        }
-        let artifacts = artifact_chunks.finish()?;
-        ensure!(
-            !artifacts.is_empty()
-                && artifacts
-                    .iter()
-                    .all(|artifact| artifact.content_type.starts_with("audio/")),
-            "provider audio generation engine produced no valid audio artifact"
-        );
-        let mut measured_audio_seconds = 0_u64;
-        for artifact in &artifacts {
-            let metadata = validated_audio_metadata(&artifact.bytes).with_context(|| {
-                format!(
-                    "provider audio engine returned invalid {} bytes",
-                    artifact.content_type
-                )
-            })?;
-            ensure!(
-                provider_audio_content_type_matches_format(&artifact.content_type, metadata.format),
-                "provider audio engine content type {} does not match the encoded audio format",
-                artifact.content_type
-            );
-            ensure!(
-                output
-                    .duration_seconds
-                    .abs_diff(metadata.duration_seconds_ceil)
-                    <= 1,
-                "provider audio engine reported {} seconds but encoded artifact measures {} seconds",
-                output.duration_seconds,
-                metadata.duration_seconds_ceil
+                output.duration_seconds > 0,
+                "provider audio engine returned zero duration"
             );
             if let Some(expected) = requested_duration {
                 ensure!(
-                    expected.abs_diff(metadata.duration_seconds_ceil) <= 1,
-                    "provider audio artifact measures {} seconds, expected {expected}",
-                    metadata.duration_seconds_ceil
+                    output.duration_seconds.abs_diff(expected) <= 1,
+                    "provider audio engine returned {} seconds, expected approximately {expected}",
+                    output.duration_seconds
                 );
             } else if let Some(cap) = automatic_duration_cap {
                 ensure!(
-                    metadata.duration_seconds_ceil <= cap,
-                    "provider audio artifact measures {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
-                    metadata.duration_seconds_ceil
+                    output.duration_seconds <= cap,
+                    "provider audio engine returned {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
+                    output.duration_seconds
                 );
             }
-            measured_audio_seconds =
-                measured_audio_seconds.saturating_add(metadata.duration_seconds_ceil);
-        }
-        if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO {
+            let artifacts = artifact_chunks.finish()?;
             ensure!(
-                artifacts.iter().all(|artifact| {
-                    artifact.content_type == "audio/wav"
-                        && wav_sample_rate(&artifact.bytes).is_some()
-                }),
-                "HF text-to-audio requires a valid WAV artifact with a declared sample rate"
+                !artifacts.is_empty()
+                    && artifacts
+                        .iter()
+                        .all(|artifact| artifact.content_type.starts_with("audio/")),
+                "provider audio generation engine produced no valid audio artifact"
             );
-        }
+            let mut measured_audio_seconds = 0_u64;
+            for artifact in &artifacts {
+                let metadata = validated_audio_metadata(&artifact.bytes).with_context(|| {
+                    format!(
+                        "provider audio engine returned invalid {} bytes",
+                        artifact.content_type
+                    )
+                })?;
+                ensure!(
+                    provider_audio_content_type_matches_format(
+                        &artifact.content_type,
+                        metadata.format
+                    ),
+                    "provider audio engine content type {} does not match the encoded audio format",
+                    artifact.content_type
+                );
+                ensure!(
+                    output
+                        .duration_seconds
+                        .abs_diff(metadata.duration_seconds_ceil)
+                        <= 1,
+                    "provider audio engine reported {} seconds but encoded artifact measures {} seconds",
+                    output.duration_seconds,
+                    metadata.duration_seconds_ceil
+                );
+                if let Some(expected) = requested_duration {
+                    ensure!(
+                        expected.abs_diff(metadata.duration_seconds_ceil) <= 1,
+                        "provider audio artifact measures {} seconds, expected {expected}",
+                        metadata.duration_seconds_ceil
+                    );
+                } else if let Some(cap) = automatic_duration_cap {
+                    ensure!(
+                        metadata.duration_seconds_ceil <= cap,
+                        "provider audio artifact measures {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
+                        metadata.duration_seconds_ceil
+                    );
+                }
+                measured_audio_seconds =
+                    measured_audio_seconds.saturating_add(metadata.duration_seconds_ceil);
+            }
+            if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO {
+                ensure!(
+                    artifacts.iter().all(|artifact| {
+                        artifact.content_type == "audio/wav"
+                            && wav_sample_rate(&artifact.bytes).is_some()
+                    }),
+                    "HF text-to-audio requires a valid WAV artifact with a declared sample rate"
+                );
+            }
+            Ok((artifacts, measured_audio_seconds))
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92942,10 +92985,13 @@ fn provider_engine_session_response_with_sampling_bounded(
             )
             .context("generating provider session embeddings with mayhem-engine")?;
         let prompt_tokens = u64::from(output.usage.prompt_tokens);
-        ensure!(
-            prompt_tokens > 0,
-            "embedding backend returned zero prompt tokens for a non-empty request"
-        );
+        provider_session_output_result((|| {
+            ensure!(
+                prompt_tokens > 0,
+                "embedding backend returned zero prompt tokens for a non-empty request"
+            );
+            Ok(())
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -92962,24 +93008,29 @@ fn provider_engine_session_response_with_sampling_bounded(
         });
     }
 
-    ensure!(
-        matches!(
-            endpoint_family,
-            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
-                | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
-                | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
-                | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
-        ),
-        "provider endpoint family {endpoint_family} has no engine execution path"
-    );
+    provider_session_request_result((|| {
+        ensure!(
+            matches!(
+                endpoint_family,
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+                    | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+            ),
+            "provider endpoint family {endpoint_family} has no engine execution path"
+        );
+        Ok(())
+    })())?;
 
-    let tool_mode = provider_engine_tool_request(request_body, adapter)?;
-    let mut request = provider_engine_request_from_endpoint_body_with_sampling(
-        endpoint_family,
-        request_body,
-        adapter,
-        sampling,
-    )?;
+    let tool_mode =
+        provider_session_request_result(provider_engine_tool_request(request_body, adapter))?;
+    let mut request =
+        provider_session_request_result(provider_engine_request_from_endpoint_body_with_sampling(
+            endpoint_family,
+            request_body,
+            adapter,
+            sampling,
+        ))?;
     if let Some(cap) = output_token_cap {
         request.max_new_tokens = request.max_new_tokens.min(cap.max(1));
     }
@@ -93045,7 +93096,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         stream.append_filtered_text(trailing);
     }
-    let artifacts = artifact_chunks.finish()?;
+    let artifacts = provider_session_output_result(artifact_chunks.finish())?;
     let mut tools = tool_mode
         .as_ref()
         .and_then(|mode| {
@@ -119632,6 +119683,79 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         .unwrap_err();
         assert_eq!(provider_response_error_code(&error), "request_invalid");
         assert!(backend.last_request.is_none());
+    }
+
+    #[test]
+    fn qwen_system_message_order_is_request_invalid_before_engine_dispatch() {
+        let adapter = catalog::CatalogAdapter {
+            chat_template_id: "qwen3.5-instruct".to_owned(),
+            tool_call_strategy: "none".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "system", "content": "too late"}
+            ]
+        });
+        let mut backend = FakeEngineBackend::new("must not run");
+
+        let error = provider_engine_session_response(&mut backend, &adapter, &body, None)
+            .expect_err("Qwen must reject a late system message before engine dispatch");
+
+        assert_eq!(provider_response_error_code(&error), "request_invalid");
+        assert_eq!(
+            provider_response_error_message(&error),
+            "qwen system message must be first"
+        );
+        assert!(backend.last_request.is_none());
+    }
+
+    #[test]
+    fn reasoning_only_stop_is_model_output_invalid() {
+        let adapter = catalog::CatalogAdapter {
+            chat_template_id: "qwen3.5-instruct".to_owned(),
+            tool_call_strategy: "none".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{"role": "user", "content": "give a visible answer"}],
+            "max_tokens": 32
+        });
+        let sealed = provider_test_seal_contract_request(&body, &adapter).unwrap();
+        let mut backend = FakeEngineBackend::new("<think>private reasoning only</think>");
+        let mut output = provider_engine_session_response_with_sampling(
+            &mut backend,
+            None,
+            &adapter,
+            &catalog::CatalogSamplingProfile::default(),
+            None,
+            &sealed,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(output.content.trim().is_empty());
+        assert!(!output.reasoning_evidence.trim().is_empty());
+        assert_eq!(output.finish_reason, "stop");
+
+        provider_session_output_result(normalize_provider_visible_output_usage(
+            &sealed,
+            &mut output,
+        ))
+        .unwrap();
+        let error = provider_session_output_result(validate_provider_session_output(
+            &test_provider_session_terms(),
+            &sealed,
+            &output,
+        ))
+        .expect_err("reasoning-only stop must not publish an HTTP-200 response");
+
+        assert_eq!(provider_response_error_code(&error), "model_output_invalid");
+        assert_eq!(
+            provider_response_error_message(&error),
+            "provider text generation stopped without a visible answer"
+        );
     }
 
     #[test]

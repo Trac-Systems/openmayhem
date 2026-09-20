@@ -53880,6 +53880,11 @@ mod tests {
                 mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO,
                 true,
             ),
+            (
+                "workflow",
+                mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+                true,
+            ),
         ];
 
         for (collector, endpoint_family, collector_retryable) in collectors {
@@ -54300,6 +54305,43 @@ mod tests {
                     .lock_recover("gateway wallet spend state")
                     .reservations
                     .is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn request_and_model_output_failures_do_not_penalize_any_route_runner() {
+        for (code, status, public_code) in [
+            (
+                "request_invalid",
+                StatusCode::BAD_REQUEST,
+                "request_rejected_by_provider_contract",
+            ),
+            (
+                "model_output_invalid",
+                StatusCode::BAD_GATEWAY,
+                "provider_model_output_invalid",
+            ),
+        ] {
+            for runner in FocusedRouteRunner::ALL {
+                let (state, model, error) = run_focused_route_runner_failure(runner, code).await;
+                assert_eq!(error.status, status, "{runner:?} {code}");
+                assert_eq!(public_error_code(&error), public_code, "{runner:?} {code}");
+                let route = &model.mayhem.route_candidates[0];
+                assert!(
+                    !state.route_provider_in_cooloff(route, now_millis_u64()),
+                    "{runner:?} cooled the route for {code}"
+                );
+                let entry = state
+                    .provider_table
+                    .lock_recover("provider table")
+                    .entries(now_millis_u64())
+                    .into_iter()
+                    .find(|entry| entry.key == route_key(route))
+                    .expect("route remains in provider table");
+                assert_eq!(entry.observed.samples, 0, "{runner:?} {code}");
+                assert_eq!(entry.observed.consecutive_failures, 0, "{runner:?} {code}");
+                assert!(state.reputation_events().is_empty(), "{runner:?} {code}");
             }
         }
     }
