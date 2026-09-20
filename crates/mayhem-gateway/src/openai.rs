@@ -95,22 +95,23 @@ use mayhem_proto::{
     artifact_generation_inline_audio_load, ctx_bracket_for_tokens_in_schedule,
     default_ctx_bracket_schedule, default_model_class, metered_output_units,
     parse_record_usage_receipt_envelope, payload_chunk_at, payload_chunk_manifest,
-    receipt_contract_version_is_supported, receipt_signing_bytes,
-    record_usage_receipt_feature_key_for_contract, record_usage_receipt_signing_bytes,
-    session_accept_signing_bytes, session_frame_head, spend_voucher_signing_bytes,
-    stable_json_bytes, tools_only_model_input_prompt_units, validate_transcription_result,
-    validated_audio_metadata, validated_wav_audio_metadata, vllm_execution_mode_binding,
-    AdminAttestationPolicy, AdminEnclaveAttestationBinding, AttestationReport,
-    AttestationTrustDataRef, AttestationVerifierProfile, CheckpointPolicy, CtxBracketSchedule,
-    EndpointFamilyContract, EndpointValueType, ExecutionModeBinding, ExecutionModeRequestPolicy,
-    HardwareQuoteKind, HardwareQuoteRouteAdvertisement, HardwareQuoteRoutePolicyBinding,
-    ModelSpecialityDescriptor, MoneyAu, PayloadChunk, PayloadChunkCollector, PayloadChunkManifest,
-    ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher, SpendVoucherBody,
-    TokenizeRequestFrame, TokenizeResponseFrame, TpmActivateCredentialChallengeFrame,
-    TpmActivateCredentialHello, TpmActivateCredentialResponseFrame, TranscriptionResult,
-    TranscriptionResultLimits, ValidatedAudioFormat, VisibleToolCall, WorkflowBinding,
-    WorkflowOutputBinding, ATTESTATION_ALG, ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION,
-    DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    receipt_contract_version_is_supported, receipt_schema_version_is_supported_for_contract,
+    receipt_signing_bytes, record_usage_receipt_feature_key_from_envelope_for_contract,
+    record_usage_receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
+    spend_voucher_signing_bytes, stable_json_bytes, tools_only_model_input_prompt_units,
+    validate_transcription_result, validated_audio_metadata, validated_wav_audio_metadata,
+    vllm_execution_mode_binding, AdminAttestationPolicy, AdminEnclaveAttestationBinding,
+    AttestationReport, AttestationTrustDataRef, AttestationVerifierProfile, CheckpointPolicy,
+    CtxBracketSchedule, EndpointFamilyContract, EndpointValueType, ExecutionModeBinding,
+    ExecutionModeRequestPolicy, HardwareQuoteKind, HardwareQuoteRouteAdvertisement,
+    HardwareQuoteRoutePolicyBinding, ModelSpecialityDescriptor, MoneyAu, PayloadChunk,
+    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SessionReceipt, SpendVoucher, SpendVoucherBody, TokenizeRequestFrame, TokenizeResponseFrame,
+    TpmActivateCredentialChallengeFrame, TpmActivateCredentialHello,
+    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
+    ValidatedAudioFormat, VisibleToolCall, WorkflowBinding, WorkflowOutputBinding, ATTESTATION_ALG,
+    ATTESTATION_SCHEMA_VERSION, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
     SESSION_RECEIPT_SCHEMA_VERSION, SPEND_VOUCHER_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION,
@@ -126,7 +127,10 @@ use mayhem_proto::{
     chunk_json_payload, visible_output_units, RECOVERABLE_RECEIPT_CONTRACT_VERSION,
 };
 #[cfg(test)]
-use mayhem_proto::{record_usage_receipt_envelope, record_usage_receipt_feature_key};
+use mayhem_proto::{
+    record_usage_receipt_envelope, record_usage_receipt_feature_key,
+    record_usage_receipt_feature_key_for_contract,
+};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest as _, Sha256};
@@ -21669,6 +21673,17 @@ fn validate_receipt_settlement_feature_for_receipt(
             "receipt settlement feature has the wrong operation or contract version",
         ));
     }
+    let contract_version = feature["value"]["contract_version"]
+        .as_u64()
+        .expect("validated receipt settlement contract version");
+    if !receipt_schema_version_is_supported_for_contract(
+        u64::from(provider_receipt.body.schema_version),
+        contract_version,
+    ) {
+        return Err(GatewaySessionError::new(
+            "receipt settlement feature has an unsupported receipt schema",
+        ));
+    }
     validate_stored_receipt_settlement_feature(provider_receipt, receipt_ack, feature)
 }
 
@@ -21713,11 +21728,11 @@ fn validate_stored_receipt_settlement_feature(
         enclave_pubkey: provider_receipt.enclave_pubkey.clone(),
         user_sig: receipt_ack.user_sig.clone(),
     };
+    let receipt_envelope = value
+        .get("receipt")
+        .ok_or_else(|| GatewaySessionError::new("receipt settlement feature is missing receipt"))?;
     let actual_receipt =
-        parse_record_usage_receipt_envelope(value.get("receipt").ok_or_else(|| {
-            GatewaySessionError::new("receipt settlement feature is missing receipt")
-        })?)
-        .map_err(GatewaySessionError::new)?;
+        parse_record_usage_receipt_envelope(receipt_envelope).map_err(GatewaySessionError::new)?;
     if actual_receipt != expected_receipt {
         return Err(GatewaySessionError::new(
             "receipt settlement feature does not contain the exact co-signed receipt",
@@ -21736,7 +21751,13 @@ fn validate_stored_receipt_settlement_feature(
     let contract_version = value["contract_version"]
         .as_u64()
         .expect("validated contract version") as u32;
-    if key != record_usage_receipt_feature_key_for_contract(&expected_receipt, contract_version) {
+    if key
+        != record_usage_receipt_feature_key_from_envelope_for_contract(
+            receipt_envelope,
+            contract_version,
+        )
+        .map_err(GatewaySessionError::new)?
+    {
         return Err(GatewaySessionError::new(
             "receipt settlement feature key is not canonical",
         ));
@@ -50748,6 +50769,46 @@ mod tests {
             GatewayJobStatus::Completed
         );
         server.abort();
+    }
+
+    #[test]
+    fn retained_contract_26_schema_11_receipt_keeps_exact_signed_envelope() {
+        let model = test_model();
+        let invocation = test_invocation();
+        let output = test_chat_output();
+        let mut provider_receipt =
+            test_provider_receipt(&model, &test_chat_request(&model.id), &output, &invocation);
+        provider_receipt.body.schema_version =
+            mayhem_proto::RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION;
+        provider_receipt.body.compute_ms = 0;
+        provider_receipt.body.capacity_slots = 0;
+        provider_receipt.enclave_sig = sign_hex(
+            &test_enclave_seed(),
+            &receipt_signing_bytes(&provider_receipt.body).unwrap(),
+        );
+        let ack = receipt_ack_for_body(&test_user_seed(), &provider_receipt.body).unwrap();
+        let mut feature = test_receipt_settlement_feature(&provider_receipt, &ack);
+        feature["value"]["contract_version"] = json!(CONTRACT_VERSION - 1);
+        let envelope = feature["value"]["receipt"].clone();
+        feature["key"] = json!(record_usage_receipt_feature_key_from_envelope_for_contract(
+            &envelope,
+            CONTRACT_VERSION - 1,
+        )
+        .unwrap());
+        feature["value"]["provider_sig"] = json!(sign_hex(
+            &test_provider_seed(),
+            &record_usage_receipt_signing_bytes(
+                feature["key"].as_str().unwrap(),
+                &feature["value"],
+            )
+            .unwrap(),
+        ));
+
+        validate_stored_receipt_settlement_feature(&provider_receipt, &ack, &feature).unwrap();
+        validate_receipt_settlement_feature_for_receipt(&provider_receipt, &ack, &feature).unwrap();
+        assert_eq!(feature["value"]["receipt"], envelope);
+        assert!(envelope["body"].get("compute_ms").is_none());
+        assert!(envelope["body"].get("capacity_slots").is_none());
     }
 
     #[tokio::test]

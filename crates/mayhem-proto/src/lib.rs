@@ -98,6 +98,19 @@ pub fn receipt_contract_version_is_supported(version: u64) -> bool {
             .iter()
             .any(|prior| version == u64::from(*prior))
 }
+
+pub fn receipt_schema_version_is_supported_for_contract(
+    schema_version: u64,
+    contract_version: u64,
+) -> bool {
+    if contract_version == u64::from(CONTRACT_VERSION) {
+        return schema_version == u64::from(SESSION_RECEIPT_SCHEMA_VERSION);
+    }
+    RECOVERABLE_RECEIPT_CONTRACT_VERSIONS
+        .iter()
+        .any(|prior| contract_version == u64::from(*prior))
+        && schema_version == u64::from(RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION)
+}
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
 pub const ATTESTATION_ALG: &str = "ed25519";
 pub const ATTESTATION_POLICY_SCHEMA_VERSION: u32 = 1;
@@ -114,6 +127,9 @@ pub const TOKENIZE_FRAME_VERSION: u32 = 1;
 pub const TPM_PCR_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const TPM_QUOTE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
 pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 12;
+/// Receipt schema emitted before signed utilization evidence was added.
+/// It remains readable only so already-signed settlement evidence can drain.
+pub const RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 11;
 pub const SPEND_VOUCHER_SCHEMA_VERSION: u32 = 11;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const CTX_BRACKET_TABLE_VERSION: u32 = 1;
@@ -1821,6 +1837,14 @@ pub fn canonical_usage_unit(unit: &str) -> Option<&'static str> {
     }
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReceiptBody {
     pub schema_version: u32,
@@ -1850,7 +1874,9 @@ pub struct ReceiptBody {
     #[serde(with = "decimal_u128")]
     pub locked_min_session_au: MoneyAu,
     pub served_ctx: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
     pub compute_ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
     pub capacity_slots: u32,
     #[serde(default)]
     pub ctx_bracket: Option<String>,
@@ -1900,6 +1926,27 @@ pub fn record_usage_receipt_envelope(receipt: &SessionReceipt) -> serde_json::Va
 pub fn parse_record_usage_receipt_envelope(
     value: &serde_json::Value,
 ) -> Result<SessionReceipt, String> {
+    let schema_version = value
+        .pointer("/body/schema_version")
+        .and_then(Value::as_u64);
+    let has_compute_ms = value.pointer("/body/compute_ms").is_some();
+    let has_capacity_slots = value.pointer("/body/capacity_slots").is_some();
+    if schema_version == Some(u64::from(RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION))
+        && (has_compute_ms || has_capacity_slots)
+    {
+        return Err(
+            "invalid record usage receipt envelope: schema-11 receipt contains utilization fields"
+                .to_owned(),
+        );
+    }
+    if schema_version == Some(u64::from(SESSION_RECEIPT_SCHEMA_VERSION))
+        && !(has_compute_ms && has_capacity_slots)
+    {
+        return Err(
+            "invalid record usage receipt envelope: schema-12 receipt is missing utilization fields"
+                .to_owned(),
+        );
+    }
     let envelope: RecordUsageReceiptEnvelope = serde_json::from_value(value.clone())
         .map_err(|error| format!("invalid record usage receipt envelope: {error}"))?;
     let receipt = SessionReceipt {
@@ -1931,11 +1978,25 @@ pub fn record_usage_receipt_feature_key_for_contract(
     receipt: &SessionReceipt,
     contract_version: u32,
 ) -> String {
+    record_usage_receipt_feature_key_from_envelope_for_contract(
+        &record_usage_receipt_envelope(receipt),
+        contract_version,
+    )
+    .expect("serializing a receipt feature key cannot fail")
+}
+
+/// Reconstruct a receipt key from the exact signed envelope. This preserves
+/// retained schema-11 evidence rather than adding schema-12 fields to it.
+pub fn record_usage_receipt_feature_key_from_envelope_for_contract(
+    envelope: &serde_json::Value,
+    contract_version: u32,
+) -> Result<String, String> {
+    let receipt = parse_record_usage_receipt_envelope(envelope)?;
     let evidence = serde_json::json!({
         "contract_version": contract_version,
         "epoch": receipt.body.billing_epoch,
         "payout_revision": receipt.body.payout_revision,
-        "receipt": record_usage_receipt_envelope(receipt),
+        "receipt": envelope,
     });
     let key_material = serde_json::json!({
         "domain": "mayhem-record-usage-receipt-feature-v1",
@@ -1943,15 +2004,15 @@ pub fn record_usage_receipt_feature_key_for_contract(
     });
     let digest = stable_json_bytes(&key_material)
         .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-        .expect("serializing a receipt feature key cannot fail");
-    format!(
+        .map_err(|error| format!("serializing receipt feature key: {error}"))?;
+    Ok(format!(
         "receipt/submit/{}/{}/{}/{}/{}",
         receipt.body.billing_epoch,
         receipt.body.billing_id,
         receipt.body.billing_attempt,
         receipt.body.seq,
         digest
-    )
+    ))
 }
 
 pub fn record_usage_receipt_signing_bytes(
@@ -4685,6 +4746,36 @@ mod tests {
             receipt_signing_bytes(&workflow_receipt).unwrap(),
             receipt_signing_bytes(&changed).unwrap()
         );
+
+        let current = SessionReceipt {
+            body: receipt.clone(),
+            enclave_sig: "enclave-signature".to_owned(),
+            enclave_pubkey: "enclave-key".to_owned(),
+            user_sig: "user-signature".to_owned(),
+        };
+        let mut incomplete_current = record_usage_receipt_envelope(&current);
+        incomplete_current["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("compute_ms");
+        assert!(parse_record_usage_receipt_envelope(&incomplete_current).is_err());
+
+        let mut legacy = current;
+        legacy.body.schema_version = RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION;
+        legacy.body.compute_ms = 0;
+        legacy.body.capacity_slots = 0;
+        let legacy_envelope = record_usage_receipt_envelope(&legacy);
+        assert!(legacy_envelope["body"].get("compute_ms").is_none());
+        assert!(legacy_envelope["body"].get("capacity_slots").is_none());
+        assert_eq!(
+            parse_record_usage_receipt_envelope(&legacy_envelope).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            record_usage_receipt_feature_key_for_contract(&legacy, 26),
+            record_usage_receipt_feature_key_from_envelope_for_contract(&legacy_envelope, 26)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -5544,5 +5635,19 @@ mod market_version_bridge_tests {
         for version in [0, 22, 28, u64::MAX] {
             assert!(!super::receipt_contract_version_is_supported(version));
         }
+        for version in [23, 24, 25, 26] {
+            assert!(super::receipt_schema_version_is_supported_for_contract(
+                11, version
+            ));
+            assert!(!super::receipt_schema_version_is_supported_for_contract(
+                12, version
+            ));
+        }
+        assert!(super::receipt_schema_version_is_supported_for_contract(
+            12, 27
+        ));
+        assert!(!super::receipt_schema_version_is_supported_for_contract(
+            11, 27
+        ));
     }
 }

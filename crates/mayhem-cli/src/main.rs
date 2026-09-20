@@ -115,25 +115,26 @@ use mayhem_proto::{
     ctx_bracket_for_tokens_in_schedule, ctx_bracket_table_at, default_ctx_bracket_schedule,
     metered_output_units, parse_record_usage_receipt_envelope, payload_chunk_at,
     payload_chunk_manifest, reassemble_json_payload, receipt_contract_version_is_supported,
-    receipt_signing_bytes, record_usage_receipt_envelope, record_usage_receipt_feature_key,
-    record_usage_receipt_feature_key_for_contract, record_usage_receipt_signing_bytes,
-    reservation_binding_matches, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, stable_json_bytes, tools_only_model_input_prompt_units,
-    validate_ctx_bracket_schedule, validated_audio_metadata, validated_wav_audio_metadata,
-    AdminAttestationPolicy, AttestationRuntimeConfig, AttestationTrustDataRef,
-    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
-    HardwareQuoteRoutePolicyBinding, MoneyAu, PayloadChunk, PayloadChunkCollector,
-    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
-    TokenizeRequestFrame, TokenizeResponseFrame, TpmActivateCredentialChallengeFrame,
-    TpmActivateCredentialResponseFrame, TranscriptionResult, TranscriptionResultLimits,
-    TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall, WorkflowBinding,
-    WorkflowOutputBinding, CONTRACT_VERSION, DEFAULT_MODEL_CLASS, DEFAULT_SESSION_MAX_FRAME_BYTES,
-    DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS, DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
-    DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES, DEFAULT_VIDEO_GENERATION_FPS,
-    MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN, RECOVERABLE_RECEIPT_CONTRACT_VERSION,
-    SESSION_RECEIPT_SCHEMA_VERSION, SPEND_VOUCHER_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION,
-    TOKENIZE_REQUEST_CHUNK_FRAME_TYPE, TOKENIZE_REQUEST_FRAME_TYPE,
-    TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
+    receipt_schema_version_is_supported_for_contract, receipt_signing_bytes,
+    record_usage_receipt_envelope, record_usage_receipt_feature_key,
+    record_usage_receipt_feature_key_from_envelope_for_contract,
+    record_usage_receipt_signing_bytes, reservation_binding_matches, session_accept_signing_bytes,
+    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes,
+    tools_only_model_input_prompt_units, validate_ctx_bracket_schedule, validated_audio_metadata,
+    validated_wav_audio_metadata, AdminAttestationPolicy, AttestationRuntimeConfig,
+    AttestationTrustDataRef, CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule,
+    HardwareQuote, HardwareQuoteKind, HardwareQuoteRoutePolicyBinding, MoneyAu, PayloadChunk,
+    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SessionReceipt, SpendVoucher, TokenizeRequestFrame, TokenizeResponseFrame,
+    TpmActivateCredentialChallengeFrame, TpmActivateCredentialResponseFrame, TranscriptionResult,
+    TranscriptionResultLimits, TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall,
+    WorkflowBinding, WorkflowOutputBinding, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
+    DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
+    DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
+    DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
+    RECOVERABLE_RECEIPT_CONTRACT_VERSION, SESSION_RECEIPT_SCHEMA_VERSION,
+    SPEND_VOUCHER_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION, TOKENIZE_REQUEST_CHUNK_FRAME_TYPE,
+    TOKENIZE_REQUEST_FRAME_TYPE, TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
     TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
     TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
     USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
@@ -61243,17 +61244,16 @@ struct ReceiptSettlementFeatureMeta {
 
 fn receipt_settlement_feature_meta(feature: &Value) -> Result<ReceiptSettlementFeatureMeta> {
     validate_receipt_settlement_feature(feature)?;
-    let receipt = parse_record_usage_receipt_envelope(
-        feature
-            .pointer("/value/receipt")
-            .context("receipt settlement feature is missing receipt")?,
-    )
-    .map_err(anyhow::Error::msg)?;
-    receipt_settlement_receipt_meta(&receipt)
+    let envelope = feature
+        .pointer("/value/receipt")
+        .context("receipt settlement feature is missing receipt")?;
+    let receipt = parse_record_usage_receipt_envelope(envelope).map_err(anyhow::Error::msg)?;
+    receipt_settlement_receipt_meta(&receipt, Some(envelope))
 }
 
 fn receipt_settlement_receipt_meta(
     receipt: &SessionReceipt,
+    original_envelope: Option<&Value>,
 ) -> Result<ReceiptSettlementFeatureMeta> {
     let body = &receipt.body;
     let attempt_id = stable_value_hash(&json!({
@@ -61263,8 +61263,13 @@ fn receipt_settlement_receipt_meta(
         "reservation_id": body.reservation_id,
         "provider": body.provider,
     }));
-    let mut immutable_terms =
-        serde_json::to_value(body).context("serializing receipt immutable terms")?;
+    let mut immutable_terms = match original_envelope {
+        Some(envelope) => envelope
+            .get("body")
+            .cloned()
+            .context("receipt envelope is missing its body")?,
+        None => serde_json::to_value(body).context("serializing receipt immutable terms")?,
+    };
     let terms = immutable_terms
         .as_object_mut()
         .context("receipt body did not serialize as an object")?;
@@ -61374,13 +61379,13 @@ fn confirmed_receipt_settlement_record_matches(
     if entry.final_receipt {
         return false;
     }
-    let Some(receipt) = record
-        .pointer("/value/receipt")
-        .and_then(|value| parse_record_usage_receipt_envelope(value).ok())
-    else {
+    let Some(envelope) = record.pointer("/value/receipt") else {
         return false;
     };
-    let Ok(canonical) = receipt_settlement_receipt_meta(&receipt) else {
+    let Some(receipt) = parse_record_usage_receipt_envelope(envelope).ok() else {
+        return false;
+    };
+    let Ok(canonical) = receipt_settlement_receipt_meta(&receipt, Some(envelope)) else {
         return false;
     };
     canonical.attempt_id == entry.attempt_id
@@ -62031,24 +62036,26 @@ fn validate_receipt_settlement_feature(feature: &Value) -> Result<String> {
                 if receipt_contract_version_is_supported(version)),
         "receipt settlement feature has the wrong operation or contract version"
     );
-    let receipt = parse_record_usage_receipt_envelope(
-        value
-            .get("receipt")
-            .context("receipt settlement feature is missing receipt")?,
-    )
-    .map_err(anyhow::Error::msg)?;
+    let receipt_envelope = value
+        .get("receipt")
+        .context("receipt settlement feature is missing receipt")?;
+    let receipt =
+        parse_record_usage_receipt_envelope(receipt_envelope).map_err(anyhow::Error::msg)?;
     ensure!(
-        receipt.body.schema_version == SESSION_RECEIPT_SCHEMA_VERSION
-            && value.get("epoch").and_then(Value::as_u64) == Some(receipt.body.billing_epoch)
+        receipt_schema_version_is_supported_for_contract(
+            u64::from(receipt.body.schema_version),
+            contract_version.expect("validated receipt contract version")
+        ) && value.get("epoch").and_then(Value::as_u64) == Some(receipt.body.billing_epoch)
             && value.get("payout_revision").and_then(Value::as_str)
                 == Some(receipt.body.payout_revision.as_str()),
         "receipt settlement outer binding does not match its signed receipt"
     );
     ensure!(
-        key == record_usage_receipt_feature_key_for_contract(
-            &receipt,
-            contract_version.expect("validated receipt contract version") as u32
-        ),
+        key == record_usage_receipt_feature_key_from_envelope_for_contract(
+            receipt_envelope,
+            contract_version.expect("validated receipt contract version") as u32,
+        )
+        .map_err(anyhow::Error::msg)?,
         "receipt settlement feature key is not canonical"
     );
     let provider_signature = value
@@ -113557,8 +113564,24 @@ esac
             enclave_pubkey: hex_encode(&enclave_key.verifying_key().to_bytes()),
             user_sig: hex_encode(&user_key.sign(&receipt_payload).to_bytes()),
         };
-        let key = record_usage_receipt_feature_key_for_contract(&receipt, contract_version);
-        let receipt_envelope = record_usage_receipt_envelope(&receipt);
+        let mut receipt_envelope = record_usage_receipt_envelope(&receipt);
+        if contract_version != CONTRACT_VERSION {
+            receipt_envelope["body"]["schema_version"] =
+                json!(mayhem_proto::RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION);
+            receipt_envelope["body"]
+                .as_object_mut()
+                .unwrap()
+                .remove("compute_ms");
+            receipt_envelope["body"]
+                .as_object_mut()
+                .unwrap()
+                .remove("capacity_slots");
+        }
+        let key = record_usage_receipt_feature_key_from_envelope_for_contract(
+            &receipt_envelope,
+            contract_version,
+        )
+        .unwrap();
         let mut value = json!({
             "op": "record_usage_receipt",
             "contract_version": contract_version,
@@ -113788,7 +113811,7 @@ esac
                 "version {version}"
             );
         }
-        for version in [22, 27] {
+        for version in [22, CONTRACT_VERSION + 1] {
             let feature = signed_receipt_settlement_feature_for_test_version(
                 7,
                 1,
@@ -113871,10 +113894,7 @@ esac
         let mut rewritten = feature.clone();
         rewritten["value"]["contract_version"] = json!(CONTRACT_VERSION);
         rewritten["key"] = json!(record_usage_receipt_feature_key(&receipt));
-        assert!(validate_receipt_settlement_feature(&rewritten)
-            .unwrap_err()
-            .to_string()
-            .contains("provider signature failed"));
+        assert!(validate_receipt_settlement_feature(&rewritten).is_err());
         let mut unsupported = feature;
         unsupported["value"]["contract_version"] = json!(22);
         assert!(validate_receipt_settlement_feature(&unsupported).is_err());
