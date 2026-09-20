@@ -90698,6 +90698,8 @@ fn spend_reservation_binding(value: &Value) -> Result<Value> {
         "rail": voucher.body.rail,
         "provider": voucher.body.provider,
         "payout_revision": voucher.body.payout_revision,
+        "model_id": value.get("model_id").cloned().unwrap_or(Value::Null),
+        "enclave_id": value.get("enclave_id").cloned().unwrap_or(Value::Null),
     }))
 }
 
@@ -114057,6 +114059,8 @@ esac
         assert!(reservation_binding_matches(&binding, &binding));
         assert_eq!(binding["reservation_id"], signed["reservation_id"]);
         assert_eq!(binding["billing_id"], signed["voucher"]["billing_id"]);
+        assert_eq!(binding["model_id"], signed["model_id"]);
+        assert_eq!(binding["enclave_id"], signed["enclave_id"]);
         assert_eq!(
             binding["billing_attempt"],
             signed["voucher"]["billing_attempt"]

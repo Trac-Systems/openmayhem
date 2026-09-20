@@ -1,4 +1,4 @@
-# OpenMayhem Core 0.2.251
+# OpenMayhem Core 0.2.252
 
 Provider admission now keeps canonical spend-reservation confirmation separate
 from route-discovery timing. Pending reservations retain their exact signed
