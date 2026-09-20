@@ -61229,6 +61229,7 @@ struct ReceiptSettlementOutboxEntry {
     final_receipt: bool,
     usage: ReceiptUsage,
     au_owed_cum: MoneyAu,
+    compute_ms: u64,
     immutable_terms_hash: String,
 }
 
@@ -61239,6 +61240,7 @@ struct ReceiptSettlementFeatureMeta {
     final_receipt: bool,
     usage: ReceiptUsage,
     au_owed_cum: MoneyAu,
+    compute_ms: u64,
     immutable_terms_hash: String,
 }
 
@@ -61279,6 +61281,11 @@ fn receipt_settlement_receipt_meta(
         "usage",
         "usage_attribution",
         "au_owed_cum",
+        // Schema v12 measures cumulative compute at each checkpoint. It is
+        // signed evidence, but advances with usage and is not an admission
+        // term. Treating it as immutable makes checkpoint #2 conflict with
+        // checkpoint #1 and aborts every sufficiently long streamed request.
+        "compute_ms",
         "ts",
     ] {
         terms.remove(field);
@@ -61289,6 +61296,7 @@ fn receipt_settlement_receipt_meta(
         final_receipt: body.final_receipt,
         usage: body.usage.clone(),
         au_owed_cum: body.au_owed_cum,
+        compute_ms: body.compute_ms,
         immutable_terms_hash: stable_value_hash(&immutable_terms),
     })
 }
@@ -61314,7 +61322,8 @@ fn receipt_settlement_entry_supersedes(
         ensure!(
             incoming.seq <= current.seq
                 && current.au_owed_cum >= incoming.au_owed_cum
-                && current.usage.is_monotonic_from(&incoming.usage),
+                && current.usage.is_monotonic_from(&incoming.usage)
+                && current.compute_ms >= incoming.compute_ms,
             "receipt settlement attempt cannot advance or conflict with a durable final receipt"
         );
         return Ok(false);
@@ -61327,13 +61336,15 @@ fn receipt_settlement_entry_supersedes(
         ensure!(
             incoming.final_receipt
                 && incoming.au_owed_cum >= current.au_owed_cum
-                && incoming.usage.is_monotonic_from(&current.usage),
+                && incoming.usage.is_monotonic_from(&current.usage)
+                && incoming.compute_ms >= current.compute_ms,
             "receipt settlement attempt has conflicting evidence at the same sequence"
         );
     } else {
         ensure!(
             incoming.au_owed_cum >= current.au_owed_cum
-                && incoming.usage.is_monotonic_from(&current.usage),
+                && incoming.usage.is_monotonic_from(&current.usage)
+                && incoming.compute_ms >= current.compute_ms,
             "receipt settlement attempt high-water evidence is not monotonic"
         );
     }
@@ -61393,6 +61404,7 @@ fn confirmed_receipt_settlement_record_matches(
         && canonical.seq > entry.seq
         && canonical.au_owed_cum >= entry.au_owed_cum
         && canonical.usage.is_monotonic_from(&entry.usage)
+        && canonical.compute_ms >= entry.compute_ms
 }
 
 async fn confirmed_receipt_settlement_entry(
@@ -61515,6 +61527,7 @@ impl ReceiptSettlementOutbox {
             final_receipt: meta.final_receipt,
             usage: meta.usage,
             au_owed_cum: meta.au_owed_cum,
+            compute_ms: meta.compute_ms,
             immutable_terms_hash: meta.immutable_terms_hash,
         })
     }
@@ -61632,6 +61645,7 @@ impl ReceiptSettlementOutbox {
                         final_receipt: entry.final_receipt,
                         usage: entry.usage.clone(),
                         au_owed_cum: entry.au_owed_cum,
+                        compute_ms: entry.compute_ms,
                         immutable_terms_hash: entry.immutable_terms_hash.clone(),
                     };
                     if receipt_settlement_entry_supersedes(current, &meta, &entry.feature)? {
@@ -84324,6 +84338,9 @@ where
                     provider_session_output_result(validate_provider_session_output(
                         terms, &body, &output,
                     ))?;
+                    if let Some(stream) = live_stream.as_mut() {
+                        stream.finish()?;
+                    }
                     Ok(output)
                 })
             });
@@ -84344,49 +84361,6 @@ where
                             .as_ref()
                             .and_then(ProviderSessionLiveStream::measured_generation_tok_s),
                     );
-                    if let Some(stream) = live_stream.as_mut() {
-                        if let Err(err) = stream.finish() {
-                            let err_text = format!("{err:#}");
-                            if err_text.contains(PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT) {
-                                request_load.finish();
-                                provider_session_debug(format!(
-                                    "client disconnected during live flush after partial receipt for session {session_id} request {request_id}"
-                                ));
-                                sessions.remove(&session_id);
-                                pending_requests.remove(&session_id);
-                                remove_provider_session_pending_payloads(
-                                    pending_payloads,
-                                    &session_id,
-                                );
-                                heartbeat_load.set_active_sessions(sessions, terms);
-                                return Ok(());
-                            }
-                            provider_session_debug(format!(
-                                "flushing live response failed for session {session_id}: {err_text}"
-                            ));
-                            send_provider_session_error(
-                                bridge,
-                                &active.remote,
-                                &active.session_id,
-                                request_id,
-                                "provider_response_failed",
-                                &err.to_string(),
-                            )
-                            .await?;
-                            send_provider_session_close(
-                                bridge,
-                                &active.remote,
-                                &active.session_id,
-                                "err:provider_response_failed",
-                            )
-                            .await?;
-                            sessions.remove(&session_id);
-                            pending_requests.remove(&session_id);
-                            remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                            heartbeat_load.set_active_sessions(sessions, terms);
-                            return Ok(());
-                        }
-                    }
                     (output, measured_throughput)
                 }
                 Err(err) => {
@@ -93050,43 +93024,44 @@ fn provider_engine_session_response_with_sampling_bounded(
         .map(|mode| provider_output_stream::OutputStream::new(mode.strategy, mode.tools.clone()));
     let mut token_ids = Vec::new();
     let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
+    let mut live_stream_error = None;
     // Existing text models keep the established request-text estimate. A signed
     // tools-only endpoint is metered from the model-visible query and selected
     // tools so buyer and provider agree without charging transport metadata.
     let estimated_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body, adapter));
-    let output = backend
-        .generate_with_artifacts(
-            request,
-            &mut |chunk: mayhem_engine::TokenChunk| {
-                if let Some(stream) = live_stream.as_deref_mut() {
-                    let filtered = reasoning_stream_filter.push_split(&chunk.text);
-                    let mut visible_chunk = chunk.clone();
-                    visible_chunk.text = if let Some(filter) = tool_stream_filter.as_mut() {
-                        let delta = filter.push(&filtered.visible);
-                        stream.append_tool_deltas(delta.tools);
-                        delta.text
-                    } else {
-                        filtered.visible
-                    };
-                    stream
-                        .on_token(
-                            visible_chunk,
-                            &filtered.hidden,
-                            protocol_prompt_tokens.unwrap_or(estimated_prompt_tokens),
-                        )
-                        .map_err(|err| {
-                            mayhem_engine::EngineError::InvalidConfig(format!(
-                                "provider live stream failed: {err:#}"
-                            ))
-                        })?;
+    let generated = backend.generate_with_artifacts(
+        request,
+        &mut |chunk: mayhem_engine::TokenChunk| {
+            if let Some(stream) = live_stream.as_deref_mut() {
+                let filtered = reasoning_stream_filter.push_split(&chunk.text);
+                let mut visible_chunk = chunk.clone();
+                visible_chunk.text = if let Some(filter) = tool_stream_filter.as_mut() {
+                    let delta = filter.push(&filtered.visible);
+                    stream.append_tool_deltas(delta.tools);
+                    delta.text
+                } else {
+                    filtered.visible
+                };
+                if let Err(error) = stream.on_token(
+                    visible_chunk,
+                    &filtered.hidden,
+                    protocol_prompt_tokens.unwrap_or(estimated_prompt_tokens),
+                ) {
+                    let message = format!("provider live stream failed: {error:#}");
+                    live_stream_error = Some(error);
+                    return Err(mayhem_engine::EngineError::InvalidConfig(message));
                 }
-                token_ids.push(chunk.token_id);
-                Ok(())
-            },
-            &mut |chunk: ArtifactChunk| artifact_chunks.push(chunk),
-            cancellation,
-        )
-        .context("generating provider session response with mayhem-engine")?;
+            }
+            token_ids.push(chunk.token_id);
+            Ok(())
+        },
+        &mut |chunk: ArtifactChunk| artifact_chunks.push(chunk),
+        cancellation,
+    );
+    if let Some(error) = live_stream_error {
+        return Err(error.context("streaming provider session response"));
+    }
+    let output = generated.context("generating provider session response with mayhem-engine")?;
     if let Some(stream) = live_stream.as_deref_mut() {
         let mut trailing = reasoning_stream_filter.finish_split();
         if let Some(filter) = tool_stream_filter.as_mut() {
@@ -113562,6 +113537,26 @@ esac
         contract_version: u32,
         context_input_tokens: Option<u64>,
     ) -> Value {
+        signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            epoch,
+            seq,
+            final_receipt,
+            output_tokens,
+            contract_version,
+            context_input_tokens,
+            1,
+        )
+    }
+
+    fn signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+        epoch: u64,
+        seq: u64,
+        final_receipt: bool,
+        output_tokens: u64,
+        contract_version: u32,
+        context_input_tokens: Option<u64>,
+        compute_ms: u64,
+    ) -> Value {
         let provider_key = SigningKey::from_bytes(&[31_u8; 32]);
         let enclave_key = SigningKey::from_bytes(&[32_u8; 32]);
         let user_key = SigningKey::from_bytes(&[33_u8; 32]);
@@ -113593,7 +113588,7 @@ esac
             locked_per_req_au: 0,
             locked_min_session_au: 0,
             served_ctx: 1024,
-            compute_ms: 1,
+            compute_ms,
             capacity_slots: 1,
             ctx_bracket: Some("le32k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
@@ -113752,11 +113747,27 @@ esac
         let root = test_temp_dir("mayhem-receipt-outbox-superseded-checkpoint");
         let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
         let entry = outbox
-            .persist(&signed_receipt_settlement_feature_for_test_at(
-                7, 69, false, 69,
-            ))
+            .persist(
+                &signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+                    7,
+                    69,
+                    false,
+                    69,
+                    CONTRACT_VERSION,
+                    None,
+                    100,
+                ),
+            )
             .unwrap();
-        let canonical = signed_receipt_settlement_feature_for_test_at(7, 70, true, 70);
+        let canonical = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            70,
+            true,
+            70,
+            CONTRACT_VERSION,
+            None,
+            200,
+        );
         let key = receipt_settlement_head_key(&entry).unwrap();
         let record = json!({
             "confirmed": true,
@@ -113783,6 +113794,13 @@ esac
         changed_terms["value"]["receipt"]["body"]["payout_revision"] = json!("47".repeat(32));
         assert!(!confirmed_receipt_settlement_record_matches(
             &changed_terms,
+            &key,
+            &entry,
+        ));
+        let mut regressed_compute = record.clone();
+        regressed_compute["value"]["receipt"]["body"]["compute_ms"] = json!(99);
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &regressed_compute,
             &key,
             &entry,
         ));
@@ -113843,6 +113861,73 @@ esac
             .unwrap());
         outbox.remove(&final_receipt).unwrap();
         assert!(!outbox.has_pending_final_receipts(user, "tnk").unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_accepts_advancing_compute_across_receipt_series() {
+        let root = test_temp_dir("mayhem-receipt-outbox-compute-checkpoints");
+        for (delivery, checkpoints) in [
+            (
+                "streaming",
+                vec![(1, false, 8, 100), (2, false, 16, 225), (3, true, 21, 310)],
+            ),
+            ("single-final", vec![(1, true, 41, 525)]),
+        ] {
+            let outbox = ReceiptSettlementOutbox::new(root.join(delivery)).unwrap();
+            for (seq, final_receipt, output_tokens, compute_ms) in checkpoints {
+                let feature = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+                    7,
+                    seq,
+                    final_receipt,
+                    output_tokens,
+                    CONTRACT_VERSION,
+                    None,
+                    compute_ms,
+                );
+                outbox
+                    .persist(&feature)
+                    .expect("cumulative compute must advance with checkpoint usage");
+                let entries = outbox.load_entries().unwrap();
+                assert_eq!(entries.len(), 1, "{delivery}");
+                assert_eq!(entries[0].seq, seq, "{delivery}");
+                assert_eq!(entries[0].final_receipt, final_receipt, "{delivery}");
+            }
+        }
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_rejects_regressing_compute_across_checkpoints() {
+        let root = test_temp_dir("mayhem-receipt-outbox-compute-regression");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let first = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            1,
+            false,
+            8,
+            CONTRACT_VERSION,
+            None,
+            100,
+        );
+        outbox.persist(&first).unwrap();
+        let regressed = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            2,
+            false,
+            16,
+            CONTRACT_VERSION,
+            None,
+            99,
+        );
+        let error = outbox
+            .persist(&regressed)
+            .expect_err("higher sequence must not regress cumulative compute");
+        assert!(error.to_string().contains("high-water evidence"));
+        let entries = outbox.load_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[0].compute_ms, 100);
         let _ = fs::remove_dir_all(root);
     }
 
