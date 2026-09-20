@@ -61364,12 +61364,16 @@ fn confirmed_receipt_settlement_record_matches(
 ) -> bool {
     let confirmed_head = record.get("confirmed").and_then(Value::as_bool) == Some(true)
         && record.get("key").and_then(Value::as_str) == Some(key)
-        && record.pointer("/value/type").and_then(Value::as_str) == Some("canonical_receipt_head")
-        && record
-            .pointer("/value/settlement_ready")
-            .and_then(Value::as_bool)
-            == Some(true);
-    if !confirmed_head {
+        && record.pointer("/value/type").and_then(Value::as_str) == Some("canonical_receipt_head");
+    // A confirmed checkpoint has been delivered even though the session has
+    // not settled. Requiring settlement here deadlocks failed-session recovery:
+    // recovery waits for signed evidence delivery before closing the hold.
+    // Finals still gate subsequent admission until settlement is ready.
+    let settlement_ready = record
+        .pointer("/value/settlement_ready")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if !confirmed_head || (entry.final_receipt && !settlement_ready) {
         return false;
     }
     if record.pointer("/value/feature_key") == entry.feature.get("key")
@@ -61622,8 +61626,14 @@ impl ReceiptSettlementOutbox {
     }
 
     fn load_entries(&self) -> Result<Vec<ReceiptSettlementOutboxEntry>> {
+        Self::select_attempt_heads(self.load_physical_entries()?)
+    }
+
+    fn select_attempt_heads(
+        entries: Vec<ReceiptSettlementOutboxEntry>,
+    ) -> Result<Vec<ReceiptSettlementOutboxEntry>> {
         let mut attempts = BTreeMap::<String, ReceiptSettlementOutboxEntry>::new();
-        for entry in self.load_physical_entries()? {
+        for entry in entries {
             match attempts.get(&entry.attempt_id) {
                 None => {
                     attempts.insert(entry.attempt_id.clone(), entry);
@@ -61650,6 +61660,89 @@ impl ReceiptSettlementOutbox {
             RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES
         );
         Ok(attempts.into_values().collect())
+    }
+
+    // Called under the cross-process outbox lock. Enumerate current filenames
+    // for capacity, but only read/verify signed documents for this attempt.
+    // Startup, admission and retry still perform complete validation; no cache
+    // or layout change can hide another process's durable evidence.
+    fn load_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<(usize, Option<ReceiptSettlementOutboxEntry>)> {
+        let mut attempts = BTreeSet::new();
+        let mut paths = Vec::new();
+        let mut physical_count = 0_usize;
+        for item in fs::read_dir(&self.directory)? {
+            let item = item?;
+            let path = item.path();
+            if path.extension() != Some(OsStr::new("json")) {
+                continue;
+            }
+            physical_count += 1;
+            ensure!(
+                physical_count <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES.saturating_mul(2),
+                "receipt settlement outbox exceeded its bounded recovery file count"
+            );
+            let filename = item.file_name();
+            let parts = filename
+                .to_str()
+                .context("invalid receipt filename")?
+                .split('.')
+                .collect::<Vec<_>>();
+            let lower_hex = |s: &str| {
+                s.len() == 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            };
+            ensure!(
+                parts.len() == 5
+                    && lower_hex(parts[0])
+                    && parts[1].len() == 20
+                    && parts[1].bytes().all(|b| b.is_ascii_digit())
+                    && parts[1].parse::<u64>().is_ok()
+                    && matches!(parts[2], "0" | "1")
+                    && lower_hex(parts[3])
+                    && parts[4] == "json",
+                "receipt settlement outbox entry has a non-canonical filename"
+            );
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                // Full background validation can quarantine an obsolete entry
+                // between directory enumeration and this metadata check.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            ensure!(
+                metadata.file_type().is_file(),
+                "receipt settlement outbox entry must be a regular file"
+            );
+            ensure!(
+                metadata.len() <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRY_BYTES,
+                "receipt settlement outbox entry exceeds its byte bound"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                ensure!(
+                    metadata.permissions().mode() & 0o077 == 0,
+                    "receipt settlement outbox entry must not be group/world accessible"
+                );
+            }
+            attempts.insert(parts[0].to_owned());
+            if parts[0] == attempt_id {
+                paths.push(path);
+            }
+        }
+        ensure!(
+            attempts.len() <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES,
+            "receipt settlement outbox reached its attempt bound"
+        );
+        paths.sort();
+        let current = Self::select_attempt_heads(self.load_physical_entries_at_paths(paths)?)?
+            .into_iter()
+            .next();
+        Ok((attempts.len(), current))
     }
 
     fn lock_file(&self) -> Result<fs::File> {
@@ -61697,19 +61790,7 @@ impl ReceiptSettlementOutbox {
         let lock = self.lock_file()?;
         let meta = receipt_settlement_feature_meta(feature)?;
         let path = self.entry_path(feature)?;
-        if path.exists() {
-            let existing = self.load_entry(&path)?;
-            ensure!(
-                existing.feature == *feature,
-                "receipt settlement outbox key already contains different signed evidence"
-            );
-            fs2::FileExt::unlock(&lock).context("unlocking receipt settlement outbox")?;
-            return Ok(existing);
-        }
-        let current = self
-            .load_entries()?
-            .into_iter()
-            .find(|entry| entry.attempt_id == meta.attempt_id);
+        let (attempt_count, current) = self.load_attempt(&meta.attempt_id)?;
         if let Some(current) = current.as_ref() {
             if !receipt_settlement_entry_supersedes(current, &meta, feature)? {
                 fs2::FileExt::unlock(&lock).context("unlocking receipt settlement outbox")?;
@@ -61717,7 +61798,7 @@ impl ReceiptSettlementOutbox {
             }
         }
         ensure!(
-            self.load_entries()?.len() < RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES,
+            current.is_some() || attempt_count < RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES,
             "receipt settlement outbox reached its {} attempt bound",
             RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES
         );
@@ -61789,10 +61870,7 @@ impl ReceiptSettlementOutbox {
 
     fn remove(&self, entry: &ReceiptSettlementOutboxEntry) -> Result<()> {
         let lock = self.lock_file()?;
-        let current = self
-            .load_entries()?
-            .into_iter()
-            .find(|current| current.attempt_id == entry.attempt_id);
+        let (_, current) = self.load_attempt(&entry.attempt_id)?;
         if current
             .as_ref()
             .is_some_and(|current| current.feature != entry.feature)
@@ -113713,6 +113791,159 @@ esac
     }
 
     #[test]
+    fn receipt_outbox_confirmed_partial_can_retire_without_settlement() {
+        let root = test_temp_dir("mayhem-partial-delivery-before-close");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let partial = outbox
+            .persist(&signed_receipt_settlement_feature_for_test_at(
+                7, 1, false, 2,
+            ))
+            .unwrap();
+        let key = receipt_settlement_head_key(&partial).unwrap();
+        let mut record = json!({"confirmed": true, "key": key, "value": {
+            "type": "canonical_receipt_head", "settlement_ready": false,
+            "feature_key": partial.feature["key"], "receipt": partial.feature["value"]["receipt"]
+        }});
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        record["confirmed"] = json!(false);
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        record["confirmed"] = json!(true);
+        record["key"] = json!("another/head");
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        let final_entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        record["key"] = json!(key);
+        record["value"]["feature_key"] = final_entry.feature["key"].clone();
+        record["value"]["receipt"] = final_entry.feature["value"]["receipt"].clone();
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &record,
+            &key,
+            &final_entry
+        ));
+        record["value"]["settlement_ready"] = json!(true);
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record,
+            &key,
+            &final_entry
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_outbox_checkpoint_hot_path_does_not_parse_unrelated_backlog() {
+        let root = test_temp_dir("mayhem-receipt-backlog-hot-path");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let other_process = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let first = outbox
+            .persist(&signed_receipt_settlement_feature_for_test_at(
+                7, 1, false, 1,
+            ))
+            .unwrap();
+        // These deliberately unreadable documents prove persist/remove do not
+        // parse unrelated attempts. Full admission/retry validation must still
+        // reject them; the optimization must not change that behavior.
+        for n in 0..RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES - 1 {
+            let path =
+                outbox
+                    .directory
+                    .join(format!("{n:064x}.{:020}.0.{}.json", 1, "ab".repeat(32)));
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"invalid JSON probe").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        let next = other_process
+            .persist(&signed_receipt_settlement_feature_for_test_at(
+                7, 2, false, 2,
+            ))
+            .unwrap();
+        outbox.remove(&first).unwrap();
+        assert!(
+            next.path.exists(),
+            "stale removal must not erase another process's checkpoint"
+        );
+        let final_entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        other_process.remove(&next).unwrap();
+        assert!(final_entry.path.exists());
+        assert!(
+            outbox.load_entries().is_err(),
+            "full scans must still validate every document"
+        );
+        other_process.remove(&final_entry).unwrap();
+        assert!(!final_entry.path.exists());
+        assert_eq!(
+            fs::read_dir(&outbox.directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|item| item.path().extension() == Some(OsStr::new("json")))
+                .count(),
+            RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES - 1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_outbox_attempt_scan_checks_names_and_crash_survivors() {
+        let root = test_temp_dir("mayhem-receipt-attempt-crash");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let first_feature = signed_receipt_settlement_feature_for_test_at(7, 1, false, 1);
+        let first = outbox.persist(&first_feature).unwrap();
+        let saved = fs::read(&first.path).unwrap();
+        let final_entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        // Simulate power loss after the new link landed but before old unlink.
+        fs::write(&first.path, saved).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&first.path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(outbox.persist(&first_feature).unwrap(), final_entry);
+        outbox.remove(&first).unwrap();
+        assert!(final_entry.path.exists());
+        let (count, current) = outbox.load_attempt(&first.attempt_id).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(current.unwrap(), final_entry);
+        let malformed = outbox.directory.join("not-an-attempt.json");
+        fs::write(&malformed, b"{}").unwrap();
+        assert!(outbox.load_attempt(&first.attempt_id).is_err());
+        fs::remove_file(malformed).unwrap();
+        #[cfg(unix)]
+        {
+            let link = outbox.directory.join(format!(
+                "{}.00000000000000000001.0.{}.json", "00".repeat(32), "ab".repeat(32)
+            ));
+            std::os::unix::fs::symlink(&final_entry.path, &link).unwrap();
+            assert!(outbox.load_attempt(&first.attempt_id).is_err());
+            fs::remove_file(link).unwrap();
+        }
+        let restarted = ReceiptSettlementOutbox::new(outbox.directory.clone()).unwrap();
+        assert_eq!(restarted.load_entries().unwrap(), vec![final_entry]);
+        assert!(!first.path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn receipt_outbox_retires_only_exact_confirmed_canonical_evidence() {
         let root = test_temp_dir("mayhem-receipt-outbox-canonical-proof");
         let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
@@ -115360,141 +115591,191 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[tokio::test]
     async fn provider_failure_close_retries_exact_submission_until_confirmed() {
-        let root = test_temp_dir("provider-failure-close");
-        let outbox = Arc::new(ReceiptSettlementOutbox::new(root.join("provider")).unwrap());
-        let terms = test_provider_session_terms();
-        let mut active = test_active_provider_session(&terms, vec!["text".into()]);
-        let settlement = Arc::new(ProviderReceiptSettlement {
-            outbox,
-            keypair_path: root.join("unused-key"),
-            password: String::new(),
-            enclave_pubkey: "aa".repeat(32),
-        });
-        active.receipt_settlement = Some(settlement.clone());
-        let guard = provider_failure_recovery::begin(&active, &terms).unwrap();
-        let path = root
-            .join("provider/reservation-recovery")
-            .join(format!("{}.json", active.reservation_id));
-        let binding = read_private_json_optional(&path).unwrap().unwrap()["binding"].clone();
-        let mut value = mayhem_proto::usage_reservation_close_value(
-            &binding,
-            None,
-            false,
-            1234,
-            "provider_session_ended",
-        )
-        .unwrap();
-        value["actor_sig"] = json!("aa".repeat(64));
-        let feature = mayhem_proto::usage_reservation_close_feature(value).unwrap();
-        write_private_json_once(&path.with_extension("close"), &feature).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let expected_feature = feature.clone();
-        let server = thread::spawn(move || {
-            let mut posts = 0;
-            for _ in 0..8 {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut buffer = [0u8; 8192];
-                    let n = stream.read(&mut buffer).unwrap();
-                    assert!(n > 0);
-                    request.extend_from_slice(&buffer[..n]);
-                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&request[..end]);
-                        let size = headers
-                            .lines()
-                            .find_map(|line| {
-                                line.to_ascii_lowercase()
-                                    .strip_prefix("content-length:")
-                                    .and_then(|s| s.trim().parse::<usize>().ok())
-                            })
-                            .unwrap_or(0);
-                        if request.len() >= end + 4 + size {
-                            break;
+        for with_partial in [false, true] {
+            let root = test_temp_dir("provider-failure-close");
+            let outbox = Arc::new(ReceiptSettlementOutbox::new(root.join("provider")).unwrap());
+            let terms = test_provider_session_terms();
+            let mut active = test_active_provider_session(&terms, vec!["text".into()]);
+            let settlement = Arc::new(ProviderReceiptSettlement {
+                outbox: outbox.clone(),
+                keypair_path: root.join("unused-key"),
+                password: String::new(),
+                enclave_pubkey: "aa".repeat(32),
+            });
+            active.receipt_settlement = Some(settlement.clone());
+            let partial = with_partial.then(|| {
+                outbox
+                    .persist(&signed_receipt_settlement_feature_for_test_at(
+                        7, 1, false, 2,
+                    ))
+                    .unwrap()
+            });
+            let guard = if let Some(partial) = &partial {
+                Some(
+                    provider_failure_recovery::begin_binding(
+                        &settlement,
+                        &partial.feature["value"]["receipt"]["body"],
+                    )
+                    .unwrap(),
+                )
+            } else {
+                provider_failure_recovery::begin(&active, &terms).unwrap()
+            };
+            let reservation_id = partial
+                .as_ref()
+                .map(|entry| {
+                    entry.feature["value"]["receipt"]["body"]["reservation_id"]
+                        .as_str()
+                        .unwrap()
+                })
+                .unwrap_or(&active.reservation_id);
+            let path = root
+                .join("provider/reservation-recovery")
+                .join(format!("{reservation_id}.json"));
+            let binding = read_private_json_optional(&path).unwrap().unwrap()["binding"].clone();
+            let provider = binding["provider"].as_str().unwrap().to_owned();
+            let head = partial.as_ref().map(|entry| {
+                json!({"type": "canonical_receipt_head", "settlement_ready": false,
+            "feature_key": entry.feature["key"], "receipt": entry.feature["value"]["receipt"]})
+            });
+            let mut value = mayhem_proto::usage_reservation_close_value(
+                &binding,
+                head.as_ref(),
+                false,
+                1234,
+                "provider_session_ended",
+            )
+            .unwrap();
+            value["actor_sig"] = json!("aa".repeat(64));
+            let feature = mayhem_proto::usage_reservation_close_feature(value).unwrap();
+            write_private_json_once(&path.with_extension("close"), &feature).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected_feature = feature.clone();
+            let server = thread::spawn(move || {
+                let mut posts = 0;
+                for _ in 0..if with_partial { 9 } else { 8 } {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0u8; 8192];
+                        let n = stream.read(&mut buffer).unwrap();
+                        assert!(n > 0);
+                        request.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let size = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|s| s.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + size {
+                                break;
+                            }
                         }
                     }
-                }
-                let end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-                let headers = String::from_utf8_lossy(&request[..end]);
-                let (status, body) = if headers.starts_with("POST ") {
-                    assert_eq!(
-                        serde_json::from_slice::<Value>(&request[end + 4..]).unwrap(),
-                        expected_feature
-                    );
-                    posts += 1;
-                    (
-                        if posts == 1 {
-                            "503 Service Unavailable"
-                        } else {
-                            "200 OK"
-                        },
-                        json!({"ok": posts > 1}),
-                    )
-                } else {
-                    let target = headers.split_whitespace().nth(1).unwrap();
-                    let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
-                    let key = url
-                        .query_pairs()
-                        .find(|(k, _)| k == "key")
-                        .unwrap()
-                        .1
-                        .into_owned();
-                    let mut value = binding.clone();
-                    if key.starts_with("receipt/head/") {
-                        value = Value::Null;
-                    } else if key.starts_with("receipt/reservation-close/") {
-                        value["type"] = json!("targeted_reservation_close");
+                    let end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let (status, body) = if headers.starts_with("POST ") {
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&request[end + 4..]).unwrap(),
+                            expected_feature
+                        );
+                        posts += 1;
+                        (
+                            if posts == 1 {
+                                "503 Service Unavailable"
+                            } else {
+                                "200 OK"
+                            },
+                            json!({"ok": posts > 1}),
+                        )
                     } else {
-                        value["type"] = json!("receipt_reservation_identity");
-                        value["status"] = json!(if posts > 1 { "closed" } else { "active" });
-                    }
-                    (
-                        "200 OK",
-                        json!({"key": key, "confirmed": true, "value": value}),
-                    )
-                };
-                let body = body.to_string();
-                write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
-                stream.flush().unwrap();
+                        let target = headers.split_whitespace().nth(1).unwrap();
+                        let url =
+                            reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+                        let key = url
+                            .query_pairs()
+                            .find(|(k, _)| k == "key")
+                            .unwrap()
+                            .1
+                            .into_owned();
+                        let mut value = binding.clone();
+                        if key.starts_with("receipt/head/") {
+                            value = head.clone().unwrap_or(Value::Null);
+                        } else if key.starts_with("receipt/reservation-close/") {
+                            value["type"] = json!("targeted_reservation_close");
+                        } else {
+                            value["type"] = json!("receipt_reservation_identity");
+                            value["status"] = json!(if posts > 1 { "closed" } else { "active" });
+                        }
+                        (
+                            "200 OK",
+                            json!({"key": key, "confirmed": true, "value": value}),
+                        )
+                    };
+                    let body = body.to_string();
+                    write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    stream.flush().unwrap();
+                }
+                assert_eq!(posts, 2);
+            });
+            let rpc = PeerRpcClient::new(format!("http://{address}")).unwrap();
+            assert!(
+                !provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .unwrap()
+            );
+            drop(guard);
+            if let Some(partial) = partial {
+                assert!(
+                    !provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                        .await
+                        .unwrap(),
+                    "unconfirmed signed evidence must block closing the reservation"
+                );
+                let key = receipt_settlement_head_key(&partial).unwrap();
+                let confirmed = json!({"confirmed": true, "key": key, "value": {
+                    "type": "canonical_receipt_head", "settlement_ready": false,
+                    "feature_key": partial.feature["key"], "receipt": partial.feature["value"]["receipt"]
+                }});
+                assert!(confirmed_receipt_settlement_record_matches(
+                    &confirmed, &key, &partial
+                ));
+                outbox.remove(&partial).unwrap();
             }
-            assert_eq!(posts, 2);
-        });
-        let rpc = PeerRpcClient::new(format!("http://{address}")).unwrap();
-        assert!(
-            !provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path)
-                .await
-                .unwrap()
-        );
-        drop(guard);
-        assert!(
-            provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path)
-                .await
-                .is_err()
-        );
-        assert_eq!(
-            read_private_json_optional(&path.with_extension("close"))
-                .unwrap()
-                .unwrap(),
-            feature
-        );
-        assert!(
-            !provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path)
-                .await
-                .unwrap()
-        );
-        assert!(path.exists(), "a submission response is not confirmation");
-        assert!(
-            provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path)
-                .await
-                .unwrap()
-        );
-        assert!(!path.exists());
-        server.join().unwrap();
-        fs::remove_dir_all(root).unwrap();
+            assert!(
+                provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                read_private_json_optional(&path.with_extension("close"))
+                    .unwrap()
+                    .unwrap(),
+                feature
+            );
+            assert!(
+                !provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .unwrap()
+            );
+            assert!(path.exists(), "a submission response is not confirmation");
+            assert!(
+                provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .unwrap()
+            );
+            assert!(!path.exists());
+            server.join().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
