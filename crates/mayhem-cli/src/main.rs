@@ -44634,6 +44634,7 @@ fn spawn_gateway_catalog_watcher(state: GatewayState, config: GatewayCatalogWatc
                     eprintln!("Gateway catalog watcher component panicked; restarting: {err}");
                 }
             }
+            state.failed_catalog_refresh();
             sleep(Duration::from_secs(1)).await;
         }
     });
@@ -44652,7 +44653,10 @@ async fn run_gateway_catalog_watcher(
     let mut applied_snapshot = String::new();
     let mut last_error = None;
     loop {
-        sleep(config.refresh_interval).await;
+        tokio::select! {
+            _ = sleep(config.refresh_interval) => {},
+            _ = state.wait_for_catalog_refresh_request() => {},
+        }
         let refresh = async {
             let contract = read_contract_catalog(&rpc).await?;
             let contract_models = gateway_models_from_contract(&contract)?;
@@ -44788,8 +44792,10 @@ async fn run_gateway_catalog_watcher(
                         "Gateway authenticated catalog refreshed from contract: {model_count} model(s)"
                     );
                 }
+                state.complete_catalog_refresh();
             }
             Err(err) => {
+                state.failed_catalog_refresh();
                 let message = format!("{err:#}");
                 if last_error.as_deref() != Some(message.as_str()) {
                     eprintln!("Gateway catalog watcher retrying: {message}");

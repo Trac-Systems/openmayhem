@@ -280,6 +280,9 @@ const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0
 #[derive(Clone, Debug)]
 pub struct GatewayState {
     catalog_runtime: Arc<Mutex<GatewayCatalogRuntime>>,
+    catalog_refresh: Arc<Mutex<GatewayCatalogRefresh>>,
+    catalog_refresh_request: Arc<Notify>,
+    catalog_refresh_complete: Arc<Notify>,
     receipts: Arc<Mutex<Vec<StoredReceipt>>>,
     dashboard_history_path: Arc<Option<PathBuf>>,
     dashboard_history_write: Arc<Mutex<()>>,
@@ -331,6 +334,12 @@ pub struct GatewayState {
     default_min_ctx: Option<u32>,
     dev_session_shim: bool,
     media_limits: Arc<GatewayMediaLimits>,
+}
+
+#[derive(Debug, Default)]
+struct GatewayCatalogRefresh {
+    generation: u64,
+    requested: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -4757,6 +4766,9 @@ impl GatewayState {
                 execution_modes: Arc::new(GatewayExecutionModeRegistry::default()),
                 attestation_authority: None,
             })),
+            catalog_refresh: Arc::new(Mutex::new(GatewayCatalogRefresh::default())),
+            catalog_refresh_request: Arc::new(Notify::new()),
+            catalog_refresh_complete: Arc::new(Notify::new()),
             receipts: Arc::new(Mutex::new(Vec::new())),
             dashboard_history_path: Arc::new(None),
             dashboard_history_write: Arc::new(Mutex::new(())),
@@ -5023,6 +5035,36 @@ impl GatewayState {
             .lock_recover("gateway catalog runtime")
             .models
             .clone()
+    }
+
+    /// Wake the existing authenticated catalog watcher; concurrent refusals share
+    /// one refresh. Provider-supplied prices are never accepted as authority.
+    fn request_catalog_refresh(&self) -> u64 {
+        let mut refresh = self.catalog_refresh.lock_recover("catalog refresh");
+        if !refresh.requested {
+            refresh.requested = true;
+            self.catalog_refresh_request.notify_one();
+        }
+        refresh.generation
+    }
+
+    pub async fn wait_for_catalog_refresh_request(&self) {
+        self.catalog_refresh_request.notified().await;
+    }
+
+    /// Called only after a successful read/validation, even if the catalog did
+    /// not change (the rejecting provider may be behind this gateway).
+    pub fn complete_catalog_refresh(&self) {
+        let mut refresh = self.catalog_refresh.lock_recover("catalog refresh");
+        refresh.generation = refresh.generation.wrapping_add(1);
+        refresh.requested = false;
+        self.catalog_refresh_complete.notify_waiters();
+    }
+
+    pub fn failed_catalog_refresh(&self) {
+        self.catalog_refresh
+            .lock_recover("catalog refresh")
+            .requested = false;
     }
 
     /// Swap the model catalog at runtime (contract catalog refresh). Keeps
@@ -17744,6 +17786,7 @@ fn clean_provider_reject_code(code: &str) -> bool {
             | "RATE"
             | "QUOTA"
             | "PRICE_FLOOR"
+            | "PRICE_VER"
             | "DRAINING"
             | "BALANCE"
             | "EXECUTION_MODE"
@@ -17772,6 +17815,9 @@ fn terminal_balance_refusal(err: &GatewaySessionError) -> Option<ApiError> {
 fn provider_session_api_error(err: &GatewaySessionError) -> ApiError {
     if let Some(error) = request_scoped_api_error(err) {
         return error;
+    }
+    if is_price_version_refusal(err) {
+        return catalog_price_refresh_error();
     }
     let lower = err.message.to_ascii_lowercase();
     if err.transport_closed {
@@ -17850,6 +17896,9 @@ fn route_attempt_error_code(last_error: Option<&str>) -> (&'static str, &'static
         || lower.contains("contract spend reservation")
     {
         return ("payment_reservation_failed", "payment", true);
+    }
+    if lower.contains("price_ver") {
+        return ("catalog_price_refresh_pending", "route_selection", true);
     }
     if lower.contains("price_floor") || lower.contains("price floor") {
         return ("provider_price_floor", "route_selection", false);
@@ -17933,6 +17982,9 @@ fn route_attempts_failed_error(
         "provider_price_floor" => {
             "Every otherwise eligible provider refused the request at the offered price."
         }
+        "catalog_price_refresh_pending" => {
+            "The current model price is still being synchronized. Please retry shortly."
+        }
         "execution_mode_unavailable" => {
             "No currently available execution mode supports this request."
         }
@@ -17949,7 +18001,7 @@ fn route_attempts_failed_error(
     };
     let status = match code {
         "request_exceeds_provider_capacity" => StatusCode::BAD_REQUEST,
-        "provider_admission_no_capacity" | "provider_response_timeout" => {
+        "provider_admission_no_capacity" | "provider_response_timeout" | "catalog_price_refresh_pending" => {
             StatusCode::SERVICE_UNAVAILABLE
         }
         "execution_mode_unavailable" => StatusCode::SERVICE_UNAVAILABLE,
@@ -22982,7 +23034,8 @@ async fn run_embedding_with_route_retry(
         deadline,
         route_retry_total_attempt_limit(state, model, &options),
     );
-    let mut pending_routes = eligible_routes;
+    let mut current_model = model.clone();
+    let mut pending_routes = eligible_routes.into_iter().cloned().collect::<Vec<_>>();
     let mut attempt_options = options.clone();
     let mut billing = options.billing.clone().unwrap_or_else(|| {
         GatewayBillingContext::initial(logical_billing_id_for(
@@ -22993,14 +23046,15 @@ async fn run_embedding_with_route_retry(
     attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     loop {
+        let model = &current_model;
         if !recovery.can_attempt()
             || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
         {
             break;
         }
-        pending_routes = recovery.filter_routes(state, pending_routes);
+        pending_routes = recovery.filter_owned_routes(state, pending_routes);
         if pending_routes.is_empty() && recovery.has_capacity_waiters() {
-            pending_routes = wait_for_capacity_recovery(
+            pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
                 || {
@@ -23011,12 +23065,16 @@ async fn run_embedding_with_route_retry(
                         inputs,
                         &attempt_options,
                     )
+                    .into_iter()
+                    .cloned()
+                    .collect()
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
             .await;
         }
-        let route = pending_routes.first().copied();
+        let owned_route = pending_routes.first().cloned();
+        let route = owned_route.as_ref();
         if route.is_none()
             && ((!model.mayhem.route_candidates.is_empty() || !state.dev_session_shim)
                 || recovery.dev_route_attempted)
@@ -23034,7 +23092,10 @@ async fn run_embedding_with_route_retry(
                     Some(request),
                     inputs,
                     &attempt_options,
-                );
+                )
+                .into_iter()
+                .cloned()
+                .collect();
                 continue;
             }
         };
@@ -23076,6 +23137,29 @@ async fn run_embedding_with_route_retry(
             Err(err) if err.failure_class.is_request_scoped() => {
                 return Err(request_scoped_api_error(&err).expect("request-scoped error"));
             }
+            Err(err) if is_price_version_refusal(&err) => {
+                // PRICE_VER is rejected before reservation/compute. Do not
+                // penalize or exhaust the provider, or discard prior partials.
+                drop(_modality_admission);
+                current_model = refresh_model_after_price_refusal(
+                    state, model, &invocation, deadline,
+                ).await?;
+                let model = &current_model;
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
+                pending_routes = ordered_route_candidates_for_embedding_with_options(
+                    state,
+                    model,
+                    Some(request),
+                    inputs,
+                    &attempt_options,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+                continue;
+            }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 let balance_refusal = terminal_balance_refusal(&err);
@@ -23108,7 +23192,10 @@ async fn run_embedding_with_route_retry(
                     Some(request),
                     inputs,
                     &attempt_options,
-                );
+                )
+                .into_iter()
+                .cloned()
+                .collect();
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -23189,7 +23276,8 @@ async fn run_image_generation_with_route_retry(
         deadline,
         route_retry_total_attempt_limit(state, model, &options),
     );
-    let mut pending_routes = eligible_routes;
+    let mut current_model = model.clone();
+    let mut pending_routes = eligible_routes.into_iter().cloned().collect::<Vec<_>>();
     let mut attempt_options = options.clone();
     let mut billing = options.billing.clone().unwrap_or_else(|| {
         GatewayBillingContext::initial(logical_billing_id_for(
@@ -23200,14 +23288,15 @@ async fn run_image_generation_with_route_retry(
     attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     loop {
+        let model = &current_model;
         if !recovery.can_attempt()
             || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
         {
             break;
         }
-        pending_routes = recovery.filter_routes(state, pending_routes);
+        pending_routes = recovery.filter_owned_routes(state, pending_routes);
         if pending_routes.is_empty() && recovery.has_capacity_waiters() {
-            pending_routes = wait_for_capacity_recovery(
+            pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
                 || {
@@ -23217,12 +23306,16 @@ async fn run_image_generation_with_route_retry(
                         request,
                         &attempt_options,
                     )
+                    .into_iter()
+                    .cloned()
+                    .collect()
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
             .await;
         }
-        let route = pending_routes.first().copied();
+        let owned_route = pending_routes.first().cloned();
+        let route = owned_route.as_ref();
         if route.is_none()
             && ((!model.mayhem.route_candidates.is_empty() || !state.dev_session_shim)
                 || recovery.dev_route_attempted)
@@ -23239,7 +23332,10 @@ async fn run_image_generation_with_route_retry(
                     model,
                     request,
                     &attempt_options,
-                );
+                )
+                .into_iter()
+                .cloned()
+                .collect();
                 continue;
             }
         };
@@ -23284,6 +23380,28 @@ async fn run_image_generation_with_route_retry(
             Err(err) if err.failure_class.is_request_scoped() => {
                 return Err(request_scoped_api_error(&err).expect("request-scoped error"));
             }
+            Err(err) if is_price_version_refusal(&err) => {
+                // PRICE_VER is rejected before reservation/compute. Do not
+                // penalize or exhaust the provider, or discard prior partials.
+                drop(_modality_admission);
+                current_model = refresh_model_after_price_refusal(
+                    state, model, &invocation, deadline,
+                ).await?;
+                let model = &current_model;
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
+                pending_routes = ordered_route_candidates_for_image_generation_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+                continue;
+            }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 let balance_refusal = terminal_balance_refusal(&err);
@@ -23315,7 +23433,10 @@ async fn run_image_generation_with_route_retry(
                     model,
                     request,
                     &attempt_options,
-                );
+                )
+                .into_iter()
+                .cloned()
+                .collect();
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -23392,7 +23513,8 @@ async fn run_audio_speech_with_route_retry(
         deadline,
         route_retry_total_attempt_limit(state, model, &options),
     );
-    let mut pending_routes = eligible_routes;
+    let mut current_model = model.clone();
+    let mut pending_routes = eligible_routes.into_iter().cloned().collect::<Vec<_>>();
     let mut attempt_options = options.clone();
     let mut billing = options.billing.clone().unwrap_or_else(|| {
         GatewayBillingContext::initial(logical_billing_id_for(
@@ -23403,14 +23525,15 @@ async fn run_audio_speech_with_route_retry(
     attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     loop {
+        let model = &current_model;
         if !recovery.can_attempt()
             || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
         {
             break;
         }
-        pending_routes = recovery.filter_routes(state, pending_routes);
+        pending_routes = recovery.filter_owned_routes(state, pending_routes);
         if pending_routes.is_empty() && recovery.has_capacity_waiters() {
-            pending_routes = wait_for_capacity_recovery(
+            pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
                 || {
@@ -23420,12 +23543,16 @@ async fn run_audio_speech_with_route_retry(
                         request,
                         &attempt_options,
                     )
+                    .into_iter()
+                    .cloned()
+                    .collect()
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
             .await;
         }
-        let route = pending_routes.first().copied();
+        let owned_route = pending_routes.first().cloned();
+        let route = owned_route.as_ref();
         if route.is_none()
             && ((!model.mayhem.route_candidates.is_empty() || !state.dev_session_shim)
                 || recovery.dev_route_attempted)
@@ -23442,7 +23569,10 @@ async fn run_audio_speech_with_route_retry(
                     model,
                     request,
                     &attempt_options,
-                );
+                )
+                .into_iter()
+                .cloned()
+                .collect();
                 continue;
             }
         };
@@ -23487,6 +23617,28 @@ async fn run_audio_speech_with_route_retry(
             Err(err) if err.failure_class.is_request_scoped() => {
                 return Err(request_scoped_api_error(&err).expect("request-scoped error"));
             }
+            Err(err) if is_price_version_refusal(&err) => {
+                // PRICE_VER is rejected before reservation/compute. Do not
+                // penalize or exhaust the provider, or discard prior partials.
+                drop(_modality_admission);
+                current_model = refresh_model_after_price_refusal(
+                    state, model, &invocation, deadline,
+                ).await?;
+                let model = &current_model;
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
+                pending_routes = ordered_route_candidates_for_audio_speech_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+                continue;
+            }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 let balance_refusal = terminal_balance_refusal(&err);
@@ -23518,7 +23670,10 @@ async fn run_audio_speech_with_route_retry(
                     model,
                     request,
                     &attempt_options,
-                );
+                )
+                .into_iter()
+                .cloned()
+                .collect();
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -23599,7 +23754,8 @@ async fn run_audio_transcription_with_route_retry(
         deadline,
         route_retry_total_attempt_limit(state, model, &options),
     );
-    let mut pending_routes = eligible_routes;
+    let mut current_model = model.clone();
+    let mut pending_routes = eligible_routes.into_iter().cloned().collect::<Vec<_>>();
     let mut attempt_options = options.clone();
     let mut billing = options.billing.clone().unwrap_or_else(|| {
         GatewayBillingContext::initial(logical_billing_id_for(
@@ -23610,14 +23766,15 @@ async fn run_audio_transcription_with_route_retry(
     attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     loop {
+        let model = &current_model;
         if !recovery.can_attempt()
             || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
         {
             break;
         }
-        pending_routes = recovery.filter_routes(state, pending_routes);
+        pending_routes = recovery.filter_owned_routes(state, pending_routes);
         if pending_routes.is_empty() && recovery.has_capacity_waiters() {
-            pending_routes = wait_for_capacity_recovery(
+            pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
                 || {
@@ -23627,12 +23784,16 @@ async fn run_audio_transcription_with_route_retry(
                         request,
                         &attempt_options,
                     )
+                    .into_iter()
+                    .cloned()
+                    .collect()
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
             .await;
         }
-        let route = pending_routes.first().copied();
+        let owned_route = pending_routes.first().cloned();
+        let route = owned_route.as_ref();
         if route.is_none()
             && ((!model.mayhem.route_candidates.is_empty() || !state.dev_session_shim)
                 || recovery.dev_route_attempted)
@@ -23649,7 +23810,10 @@ async fn run_audio_transcription_with_route_retry(
                     model,
                     request,
                     &attempt_options,
-                );
+                )
+                .into_iter()
+                .cloned()
+                .collect();
                 continue;
             }
         };
@@ -23694,6 +23858,28 @@ async fn run_audio_transcription_with_route_retry(
             Err(err) if err.failure_class.is_request_scoped() => {
                 return Err(request_scoped_api_error(&err).expect("request-scoped error"));
             }
+            Err(err) if is_price_version_refusal(&err) => {
+                // PRICE_VER is rejected before reservation/compute. Do not
+                // penalize or exhaust the provider, or discard prior partials.
+                drop(_modality_admission);
+                current_model = refresh_model_after_price_refusal(
+                    state, model, &invocation, deadline,
+                ).await?;
+                let model = &current_model;
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
+                pending_routes = ordered_route_candidates_for_audio_transcription_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+                continue;
+            }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 let balance_refusal = terminal_balance_refusal(&err);
@@ -23725,7 +23911,10 @@ async fn run_audio_transcription_with_route_retry(
                     model,
                     request,
                     &attempt_options,
-                );
+                )
+                .into_iter()
+                .cloned()
+                .collect();
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -23815,7 +24004,8 @@ async fn run_artifact_generation_with_route_retry(
         deadline,
         route_retry_total_attempt_limit(state, model, &options),
     );
-    let mut pending_routes = eligible_routes;
+    let mut current_model = model.clone();
+    let mut pending_routes = eligible_routes.into_iter().cloned().collect::<Vec<_>>();
     let mut attempt_options = options.clone();
     let mut billing = options.billing.clone().unwrap_or_else(|| {
         GatewayBillingContext::initial(logical_billing_id_for(
@@ -23826,14 +24016,15 @@ async fn run_artifact_generation_with_route_retry(
     attempt_options.billing = Some(billing.clone());
     let mut last_retryable_error = None;
     loop {
+        let model = &current_model;
         if !recovery.can_attempt()
             || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
         {
             break;
         }
-        pending_routes = recovery.filter_routes(state, pending_routes);
+        pending_routes = recovery.filter_owned_routes(state, pending_routes);
         if pending_routes.is_empty() && recovery.has_capacity_waiters() {
-            pending_routes = wait_for_capacity_recovery(
+            pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
                 || {
@@ -23843,12 +24034,16 @@ async fn run_artifact_generation_with_route_retry(
                         request,
                         &attempt_options,
                     )
+                    .into_iter()
+                    .cloned()
+                    .collect()
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
             .await;
         }
-        let route = pending_routes.first().copied();
+        let owned_route = pending_routes.first().cloned();
+        let route = owned_route.as_ref();
         if route.is_none()
             && ((!model.mayhem.route_candidates.is_empty() || !state.dev_session_shim)
                 || recovery.dev_route_attempted)
@@ -23866,7 +24061,10 @@ async fn run_artifact_generation_with_route_retry(
                         model,
                         request,
                         &attempt_options,
-                    );
+                    )
+                    .into_iter()
+                    .cloned()
+                    .collect();
                     continue;
                 }
             };
@@ -23897,7 +24095,10 @@ async fn run_artifact_generation_with_route_retry(
                         model,
                         request,
                         &attempt_options,
-                    );
+                    )
+                    .into_iter()
+                    .cloned()
+                    .collect();
                     continue;
                 }
             };
@@ -23941,6 +24142,28 @@ async fn run_artifact_generation_with_route_retry(
             Err(err) if err.failure_class.is_request_scoped() => {
                 return Err(request_scoped_api_error(&err).expect("request-scoped error"));
             }
+            Err(err) if is_price_version_refusal(&err) => {
+                // PRICE_VER is rejected before reservation/compute. Do not
+                // penalize or exhaust the provider, or discard prior partials.
+                drop(_modality_admission);
+                current_model = refresh_model_after_price_refusal(
+                    state, model, &invocation, deadline,
+                ).await?;
+                let model = &current_model;
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
+                pending_routes = ordered_route_candidates_for_artifact_generation_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+                continue;
+            }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
                 let balance_refusal = terminal_balance_refusal(&err);
@@ -23972,7 +24195,10 @@ async fn run_artifact_generation_with_route_retry(
                     model,
                     request,
                     &attempt_options,
-                );
+                )
+                .into_iter()
+                .cloned()
+                .collect();
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -24335,6 +24561,91 @@ impl RouteWaitDeadline {
     }
 }
 
+fn is_price_version_refusal(err: &GatewaySessionError) -> bool {
+    err.clean_refusal
+        && err.clean_refusal_code.as_deref() == Some("PRICE_VER")
+        // Set by the s.open admission path, not by an in-flight s.error.
+        && err.safe_same_route_retry
+        && err.partial.is_none()
+        && err.interrupted.is_none()
+}
+
+fn catalog_price_refresh_error() -> ApiError {
+    ApiError::service_unavailable(
+        "The current model price is still being synchronized. Please retry shortly.",
+        Some("model"),
+    )
+    .with_public_error("catalog_price_refresh_pending", "route_selection", true)
+}
+
+async fn refresh_model_after_price_refusal(
+    state: &GatewayState,
+    model: &GatewayModel,
+    invocation: &GatewaySessionInvocation,
+    deadline: RouteWaitDeadline,
+) -> Result<GatewayModel, ApiError> {
+    if invocation
+        .client_cancellation
+        .as_ref()
+        .is_some_and(|c| c.is_cancelled())
+    {
+        return Err(ApiError::client_closed_request("request cancelled"));
+    }
+    // A concurrent request or the periodic watcher may already have obtained
+    // newer authenticated terms while this request was awaiting s.reject.
+    if let Some(current) = state.models_snapshot().iter().find(|current| current.id == model.id) {
+        let route = current.mayhem.route_candidates.iter().find(|route| {
+            invocation.selected_route_key.as_ref() == Some(&route_key(route))
+        });
+        if route_price_ref_au(current, route).ver != invocation.price_ver {
+            return Ok(current.clone());
+        }
+    }
+    let generation = state.request_catalog_refresh();
+    loop {
+        // Register before checking generation, so completion cannot be lost
+        // between the check and awaiting notification.
+        let completed = state.catalog_refresh_complete.notified();
+        tokio::pin!(completed);
+        completed.as_mut().enable();
+        if invocation
+            .client_cancellation
+            .as_ref()
+            .is_some_and(|c| c.is_cancelled())
+        {
+            return Err(ApiError::client_closed_request("request cancelled"));
+        }
+        if state
+            .catalog_refresh
+            .lock_recover("catalog refresh")
+            .generation
+            != generation
+        {
+            return state
+                .models_snapshot()
+                .iter()
+                .find(|current| current.id == model.id)
+                .cloned()
+                .ok_or_else(catalog_price_refresh_error);
+        }
+        if deadline.remaining().is_zero() {
+            return Err(catalog_price_refresh_error());
+        }
+        tokio::select! {
+            _ = &mut completed => {},
+            _ = tokio::time::sleep(deadline.remaining()) => {
+                return Err(catalog_price_refresh_error());
+            },
+            _ = async {
+                match invocation.client_cancellation.as_ref() {
+                    Some(cancellation) => cancellation.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => return Err(ApiError::client_closed_request("request cancelled")),
+        }
+    }
+}
+
 async fn wait_for_pending_receipt_settlement(
     publisher: Option<&Arc<dyn GatewayReceiptSettlementPublisher>>,
     user: &str,
@@ -24389,6 +24700,7 @@ impl RouteAdmissionRecovery {
         }
     }
 
+    #[cfg(test)]
     fn filter_routes<'a>(
         &self,
         state: &GatewayState,
@@ -24725,6 +25037,7 @@ where
     RouteWaitOutcome { routes, waited }
 }
 
+#[cfg(test)]
 async fn wait_for_capacity_recovery<'a, F>(
     state: &GatewayState,
     recovery: &RouteAdmissionRecovery,
@@ -25482,7 +25795,7 @@ async fn build_live_chat_completion(
 
 async fn prepare_live_direct_chat_session(
     state: SharedState,
-    model: GatewayModel,
+    mut model: GatewayModel,
     request: ChatCompletionRequest,
     options: GatewayRequestOptions,
     id: String,
@@ -25659,6 +25972,25 @@ async fn prepare_live_direct_chat_session(
                     backend: "sc-bridge-direct-session".to_owned(),
                     _modality_admission: modality_admission,
                 });
+            }
+            Err(err) if is_price_version_refusal(&err) => {
+                drop(modality_admission);
+                model = refresh_model_after_price_refusal(
+                    &state, &model, &invocation, deadline,
+                ).await?;
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
+                pending_routes = ordered_route_candidates_for_request_with_options(
+                    &state,
+                    &model,
+                    &request,
+                    &attempt_options,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+                continue;
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(&state, route.as_ref(), attempt_started.elapsed(), &err);
@@ -27444,19 +27776,21 @@ async fn run_chat_with_route_retry(
         deadline,
         route_retry_total_attempt_limit(state, model, &options),
     );
-    let mut pending_routes = eligible_routes;
+    let mut current_model = model.clone();
+    let mut pending_routes = eligible_routes.into_iter().cloned().collect::<Vec<_>>();
     let mut last_retryable_error = None;
     let mut partials = Vec::new();
 
     loop {
+        let model = &current_model;
         if !recovery.can_attempt()
             || (recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero())
         {
             break;
         }
-        pending_routes = recovery.filter_routes(state, pending_routes);
+        pending_routes = recovery.filter_owned_routes(state, pending_routes);
         if pending_routes.is_empty() && recovery.has_capacity_waiters() {
-            pending_routes = wait_for_capacity_recovery(
+            pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
                 || {
@@ -27466,12 +27800,16 @@ async fn run_chat_with_route_retry(
                         &attempt_request,
                         &attempt_options,
                     )
+                    .into_iter()
+                    .cloned()
+                    .collect()
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
             .await;
         }
-        let route = pending_routes.first().copied();
+        let owned_route = pending_routes.first().cloned();
+        let route = owned_route.as_ref();
         if route.is_none() {
             if recovery.has_capacity_waiters() && recovery.deadline.remaining().is_zero() {
                 break;
@@ -27507,7 +27845,10 @@ async fn run_chat_with_route_retry(
                     model,
                     &attempt_request,
                     &attempt_options,
-                );
+                )
+                .into_iter()
+                .cloned()
+                .collect();
                 continue;
             }
         };
@@ -27553,7 +27894,10 @@ async fn run_chat_with_route_retry(
                             model,
                             &attempt_request,
                             &attempt_options,
-                        );
+                        )
+                        .into_iter()
+                        .cloned()
+                        .collect();
                         continue;
                     }
                 }
@@ -27586,6 +27930,28 @@ async fn run_chat_with_route_retry(
             }
             Err(err) if err.failure_class.is_request_scoped() => {
                 return Err(request_scoped_api_error(&err).expect("request-scoped error"));
+            }
+            Err(err) if is_price_version_refusal(&err) => {
+                // PRICE_VER is rejected before reservation/compute. Do not
+                // penalize or exhaust the provider, or discard prior partials.
+                drop(_modality_admission);
+                current_model = refresh_model_after_price_refusal(
+                    state, model, &invocation, deadline,
+                ).await?;
+                let model = &current_model;
+                billing = billing.after_attempt(None);
+                attempt_options.billing = Some(billing.clone());
+                retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
+                pending_routes = ordered_route_candidates_for_request_with_options(
+                    state,
+                    model,
+                    &attempt_request,
+                    &attempt_options,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+                continue;
             }
             Err(err) if err.retryable => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -27646,7 +28012,10 @@ async fn run_chat_with_route_retry(
                     model,
                     &attempt_request,
                     &attempt_options,
-                );
+                )
+                .into_iter()
+                .cloned()
+                .collect();
             }
             Err(err) => {
                 record_route_attempt_error(state, route, attempt_started.elapsed(), &err);
@@ -50819,7 +51188,7 @@ mod tests {
 
     #[tokio::test]
     async fn contract_upgrade_resubmits_v191_context_receipts_without_rewriting() {
-        for recovery_version in [23, 24, 25] {
+        for recovery_version in [23, 24, 25, 26] {
             let root = tempfile::tempdir().unwrap();
             let jobs_dir = root.path().join("jobs");
             let seed = test_user_seed();
@@ -50849,6 +51218,11 @@ mod tests {
             let output = test_chat_output();
             let mut provider_receipt =
                 test_provider_receipt(&model, &test_chat_request(&model.id), &output, &invocation);
+            // These contracts predate utilization fields and emitted schema 11.
+            provider_receipt.body.schema_version =
+                mayhem_proto::RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION;
+            provider_receipt.body.compute_ms = 0;
+            provider_receipt.body.capacity_slots = 0;
             let billed_usage = provider_receipt.body.usage.clone();
             provider_receipt
                 .body
@@ -54152,9 +54526,26 @@ mod tests {
             max_wait_ms: 0,
             ..GatewayRequestOptions::default()
         };
-        let error = match runner {
-            FocusedRouteRunner::Chat => focused_route_runner_error(
-                run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options)
+        let error = focused_route_runner_error(
+            run_focused_route_runner(runner, &state, &model, options).await,
+        );
+        let attempt_count = *attempts.lock().unwrap();
+        (state, model, error, attempt_count)
+    }
+
+    fn discard_route_result<T>(result: Result<T, ApiError>) -> Result<(), ApiError> {
+        result.map(|_| ())
+    }
+
+    async fn run_focused_route_runner(
+        runner: FocusedRouteRunner,
+        state: &GatewayState,
+        model: &GatewayModel,
+        options: GatewayRequestOptions,
+    ) -> Result<(), ApiError> {
+        match runner {
+            FocusedRouteRunner::Chat => discard_route_result(
+                run_chat_with_route_retry(state, model, &test_chat_request(&model.id), options)
                     .await,
             ),
             FocusedRouteRunner::Embedding => {
@@ -54168,9 +54559,8 @@ mod tests {
                     endpoint_family: None,
                     endpoint_request: None,
                 };
-                focused_route_runner_error(
-                    run_embedding_with_route_retry(&state, &model, &request, &inputs, options)
-                        .await,
+                discard_route_result(
+                    run_embedding_with_route_retry(state, model, &request, &inputs, options).await,
                 )
             }
             FocusedRouteRunner::Image => {
@@ -54202,8 +54592,8 @@ mod tests {
                     endpoint_family: None,
                     endpoint_request: None,
                 };
-                focused_route_runner_error(
-                    run_image_generation_with_route_retry(&state, &model, &request, options).await,
+                discard_route_result(
+                    run_image_generation_with_route_retry(state, model, &request, options).await,
                 )
             }
             FocusedRouteRunner::Speech => {
@@ -54226,8 +54616,8 @@ mod tests {
                     endpoint_family: None,
                     endpoint_request: None,
                 };
-                focused_route_runner_error(
-                    run_audio_speech_with_route_retry(&state, &model, &request, options).await,
+                discard_route_result(
+                    run_audio_speech_with_route_retry(state, model, &request, options).await,
                 )
             }
             FocusedRouteRunner::Transcription => {
@@ -54246,9 +54636,8 @@ mod tests {
                     endpoint_family: mayhem_proto::ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS.to_owned(),
                     contract_request: json!({}),
                 };
-                focused_route_runner_error(
-                    run_audio_transcription_with_route_retry(&state, &model, &request, options)
-                        .await,
+                discard_route_result(
+                    run_audio_transcription_with_route_retry(state, model, &request, options).await,
                 )
             }
             FocusedRouteRunner::AudioArtifact
@@ -54318,14 +54707,451 @@ mod tests {
                     input_audio_max_seconds: 0,
                     response_format: if is_workflow { "artifact" } else { "mp4" }.to_owned(),
                 };
-                focused_route_runner_error(
-                    run_artifact_generation_with_route_retry(&state, &model, &request, options)
-                        .await,
+                discard_route_result(
+                    run_artifact_generation_with_route_retry(state, model, &request, options).await,
                 )
             }
+        }
+    }
+
+    #[derive(Debug)]
+    struct PriceAttempt {
+        session_id: String,
+        provider_pubkey: Option<String>,
+        price_ver: u64,
+        spend_voucher: SpendVoucher,
+    }
+
+    #[derive(Debug)]
+    struct PriceTransitionBackend {
+        expected_price_ver: u64,
+        partial_first: bool,
+        attempts: Arc<Mutex<Vec<PriceAttempt>>>,
+        chat: Arc<dyn GatewaySessionBackend>,
+    }
+
+    impl PriceTransitionBackend {
+        fn admit(&self, invocation: &GatewaySessionInvocation) -> Result<(), GatewaySessionError> {
+            self.attempts.lock().unwrap().push(PriceAttempt {
+                session_id: invocation.session_id.clone(),
+                provider_pubkey: invocation.provider_pubkey.clone(),
+                price_ver: invocation.price_ver,
+                spend_voucher: invocation.spend_voucher.clone(),
+            });
+            if invocation.price_ver != self.expected_price_ver
+                && !(self.partial_first && self.attempts.lock().unwrap().len() == 1)
+            {
+                return Err(provider_reject_session_error(&json!({
+                    "t": "s.reject", "code": "PRICE_VER", "reason": "price version mismatch"
+                }), &invocation.session_id).into_safe_same_route_retry());
+            }
+            Ok(())
+        }
+    }
+
+    impl GatewaySessionBackend for PriceTransitionBackend {
+        fn name(&self) -> &str { "price-transition" }
+        fn run_chat<'a>(&'a self, model: &'a GatewayModel, request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                self.admit(invocation)?;
+                self.chat.run_chat(model, request, invocation).await
+            })
+        }
+        fn run_embedding<'a>(&'a self, _model: &'a GatewayModel, request: &'a EmbeddingRequest,
+            invocation: &'a GatewaySessionInvocation) -> GatewayEmbeddingFuture<'a> {
+            Box::pin(async move {
+                self.admit(invocation)?;
+                let inputs = embedding_input_texts(request).unwrap();
+                let count = rough_tokens(&embedding_prompt_text(&inputs));
+                Ok(GatewayEmbeddingResult {
+                    output: EmbeddingOutput { embeddings: inputs.iter().map(|_| vec![1.0, 0.0]).collect(),
+                        usage: Usage { prompt_tokens: count, completion_tokens: 0, total_tokens: count } },
+                    backend: self.name().to_owned(), direct_session: true, provider_receipt: None, quality: None,
+                })
+            })
+        }
+        fn run_image_generation<'a>(&'a self, model: &'a GatewayModel, request: &'a ImageGenerationRequest,
+            invocation: &'a GatewaySessionInvocation) -> GatewayImageGenerationFuture<'a> {
+            Box::pin(async move {
+                self.admit(invocation)?;
+                ArtifactGenerationSuccessBackend
+                    .run_image_generation(model, request, invocation)
+                    .await
+            })
+        }
+        fn run_audio_speech<'a>(&'a self, _model: &'a GatewayModel, _request: &'a AudioSpeechRequest,
+            invocation: &'a GatewaySessionInvocation) -> GatewayAudioSpeechFuture<'a> {
+            Box::pin(async move {
+                self.admit(invocation)?;
+                let bytes = test_wav_with_samples(8_000);
+                Ok(GatewayAudioSpeechResult {
+                    output: AudioSpeechOutput { artifacts: vec![GatewayArtifactOutput {
+                        id: "speech".to_owned(), content_type: "audio/wav".to_owned(),
+                        blake3: blake3_hex(&bytes), bytes,
+                    }], usage: ReceiptUsage::from_units([(USAGE_AUDIO_SECOND, 1)]) },
+                    backend: self.name().to_owned(), direct_session: true, provider_receipt: None, quality: None,
+                })
+            })
+        }
+        fn run_audio_transcription<'a>(&'a self, _model: &'a GatewayModel, request: &'a AudioTranscriptionRequest,
+            invocation: &'a GatewaySessionInvocation) -> GatewayAudioTranscriptionFuture<'a> {
+            Box::pin(async move {
+                self.admit(invocation)?;
+                Ok(GatewayAudioTranscriptionResult {
+                    output: AudioTranscriptionOutput { transcription: TranscriptionResult::text("test audio"),
+                        usage: audio_transcription_usage_for_request(request) },
+                    backend: self.name().to_owned(), direct_session: true, provider_receipt: None, quality: None,
+                })
+            })
+        }
+        fn run_artifact_generation<'a>(&'a self, model: &'a GatewayModel, request: &'a ArtifactGenerationRequest,
+            invocation: &'a GatewaySessionInvocation) -> GatewayArtifactGenerationFuture<'a> {
+            Box::pin(async move {
+                self.admit(invocation)?;
+                ArtifactGenerationSuccessBackend
+                    .run_artifact_generation(model, request, invocation)
+                    .await
+            })
+        }
+    }
+
+    fn price_transition_backend(price_ver: u64) -> Arc<PriceTransitionBackend> {
+        Arc::new(PriceTransitionBackend {
+            expected_price_ver: price_ver,
+            partial_first: false,
+            attempts: Arc::new(Mutex::new(Vec::new())),
+            chat: Arc::new(SuccessBackend { providers: Arc::new(Mutex::new(Vec::new())) }),
+        })
+    }
+
+    fn refreshed_price_model(model: &GatewayModel, multiplier: u128) -> GatewayModel {
+        let mut model = model.clone();
+        model.mayhem.price_ref_au.ver += 1;
+        for rate in &mut model.mayhem.price_ref_au.rate_map {
+            rate.per_unit_au *= multiplier;
+        }
+        for route in &mut model.mayhem.route_candidates {
+            route.price_ver = model.mayhem.price_ref_au.ver;
+            route.price_ref_au = None;
+        }
+        model
+    }
+
+    fn serve_one_catalog_refresh(state: GatewayState, model: GatewayModel) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            tokio::time::timeout(Duration::from_secs(5), state.wait_for_catalog_refresh_request()).await.expect("route must request catalog refresh");
+            state.replace_model_catalog(vec![model.clone()]);
+            state.complete_catalog_refresh();
+        })
+    }
+
+    #[tokio::test]
+    async fn price_transition_recovers_all_route_runners_and_preserves_billing() {
+        for runner in FocusedRouteRunner::ALL {
+            for provider_count in [1, 2] {
+              for rail in ["fiat", "tnk", "tap"] {
+                let model = focused_route_runner_model(runner, provider_count);
+                let refreshed = refreshed_price_model(&model, 1);
+                let backend = price_transition_backend(refreshed.mayhem.price_ref_au.ver);
+                let state = test_gateway_state_from_models(vec![model.clone()])
+                    .with_session_backend(backend.clone()).with_receipt_rail(rail);
+                let refresh = serve_one_catalog_refresh(state.clone(), refreshed);
+                let result = run_focused_route_runner(runner, &state, &model, GatewayRequestOptions::default()).await;
+                assert!(result.is_ok(), "{runner:?}, {provider_count}: {:?}", result.err());
+                refresh.await.unwrap();
+                let attempts = backend.attempts.lock().unwrap();
+                assert_eq!(attempts.len(), 2, "{runner:?}");
+                assert_ne!(attempts[0].session_id, attempts[1].session_id);
+                assert_eq!(attempts[0].price_ver + 1, attempts[1].price_ver);
+                assert_eq!(attempts[0].spend_voucher.body.billing_id, attempts[1].spend_voucher.body.billing_id);
+                assert_eq!(attempts[0].spend_voucher.body.billing_attempt, attempts[1].spend_voucher.body.billing_attempt);
+                assert_eq!(attempts[0].spend_voucher.body.locked_rate_map, attempts[1].spend_voucher.body.locked_rate_map);
+                if provider_count == 2 {
+                    assert_ne!(attempts[0].provider_pubkey, attempts[1].provider_pubkey,
+                        "{runner:?}: untried provider must remain available after refresh");
+                }
+                assert_eq!(attempts[1].spend_voucher.body.rail, rail);
+                assert!(state.wallet_spend.lock().unwrap().reservations.is_empty());
+                assert!(state.receipts().is_empty());
+                assert!(state.reputation_events().is_empty());
+                for route in &model.mayhem.route_candidates {
+                    assert!(!state.route_provider_in_cooloff(route, now_millis_u64()), "{runner:?}");
+                }
+              }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn price_transition_does_not_bypass_explicit_price_ceiling() {
+        let model = test_routed_model(1);
+        let refreshed = refreshed_price_model(&model, 100);
+        let backend = price_transition_backend(refreshed.mayhem.price_ref_au.ver);
+        let state = test_gateway_state_from_models(vec![model.clone()])
+            .with_session_backend(backend.clone());
+        let refresh = serve_one_catalog_refresh(state.clone(), refreshed);
+        let request = test_chat_request(&model.id);
+        let options = GatewayRequestOptions {
+            max_price_au: Some(rate_gate_basis_au(&model.mayhem.price_ref_au.rate_map, model.mayhem.price_ref_au.per_req_au, model.mayhem.price_ref_au.min_session_au)),
+            ..GatewayRequestOptions::default()
         };
-        let attempt_count = *attempts.lock().unwrap();
-        (state, model, error, attempt_count)
+        let result = run_chat_with_route_retry(&state, &model, &request, options).await;
+        assert!(result.is_err());
+        refresh.await.unwrap();
+        assert_eq!(
+            backend.attempts.lock().unwrap().len(),
+            1,
+            "must not sign a voucher beyond caller's ceiling"
+        );
+        assert!(state.receipts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn price_transition_refresh_coalesces_waiters_and_honors_cancellation() {
+        let model = test_model();
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let cancellation = GatewayRequestCancellation::new();
+        let mut invocation = test_invocation();
+        invocation.client_cancellation = Some(cancellation.clone());
+        let deadline = RouteWaitDeadline::new(5_000);
+        let refresh = refresh_model_after_price_refusal(&state, &model, &invocation, deadline);
+        let drive = async {
+            state.wait_for_catalog_refresh_request().await;
+            let generation = state.request_catalog_refresh();
+            assert_eq!(generation, state.request_catalog_refresh());
+            assert!(tokio::time::timeout(
+                Duration::from_millis(10),
+                state.wait_for_catalog_refresh_request()
+            )
+            .await
+            .is_err());
+            cancellation.cancel();
+        };
+        let (result, _) = tokio::join!(refresh, drive);
+        assert_eq!(
+            result.unwrap_err().status,
+            StatusCode::from_u16(499).unwrap()
+        );
+        state.complete_catalog_refresh();
+        assert!(state.request_catalog_refresh() > 0);
+        tokio::time::timeout(Duration::from_millis(50), state.wait_for_catalog_refresh_request()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn price_transition_preserves_receipted_partial_and_only_reprices_new_usage() {
+        let model = test_routed_model(2);
+        let refreshed = refreshed_price_model(&model, 2);
+        let backend = Arc::new(PriceTransitionBackend {
+            expected_price_ver: refreshed.mayhem.price_ref_au.ver,
+            partial_first: true,
+            attempts: Arc::new(Mutex::new(Vec::new())),
+            chat: Arc::new(PartialThenSuccessBackend {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                providers: Arc::new(Mutex::new(Vec::new())),
+            }),
+        });
+        let state = test_gateway_state_from_models(vec![model.clone()])
+            .with_session_backend(backend.clone());
+        let refresh = serve_one_catalog_refresh(state.clone(), refreshed);
+        let mut request = test_chat_request(&model.id);
+        request.max_tokens = Some(8);
+        let run =
+            run_chat_with_route_retry(&state, &model, &request, GatewayRequestOptions::default())
+                .await
+                .unwrap();
+        refresh.await.unwrap();
+        assert_eq!(run.result.output.content.as_deref(), Some("hello world"));
+        let attempts = backend.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 3);
+        let refused = &attempts[1].spend_voucher.body;
+        let resumed = &attempts[2].spend_voucher.body;
+        assert!(resumed.billing_prior_au_owed_cum > 0);
+        assert_eq!(refused.billing_prior_usage, resumed.billing_prior_usage);
+        assert_eq!(
+            refused.billing_prior_au_owed_cum,
+            resumed.billing_prior_au_owed_cum
+        );
+        assert_eq!(refused.billing_attempt, resumed.billing_attempt);
+        assert_eq!(resumed.billing_attempt, 1);
+        let receipt = run.result.provider_receipt.as_ref().unwrap();
+        let increment =
+            ReceiptUsage::saturating_delta(&resumed.billing_prior_usage, &receipt.body.usage);
+        assert_eq!(
+            receipt.body.au_owed_cum,
+            resumed.billing_prior_au_owed_cum
+                + crate::pricing::usage_map_au(&resumed.locked_rate_map, &increment)
+        );
+        assert_eq!(
+            state.receipts().len(),
+            1,
+            "only the completed partial is recorded so far"
+        );
+    }
+
+    #[tokio::test]
+    async fn price_transition_streaming_admission_reopens_with_refreshed_signed_voucher() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let mut model = test_model();
+        let contract = test_invocation().attestation.unwrap().contract;
+        let mut route = test_route_candidate(0);
+        route.provider = verifying_key_hex(&test_provider_seed());
+        route.enclave_id = contract.enclave_id;
+        route.admin_pubkey = contract.admin_pubkey;
+        route.artifact_root = contract.artifact_root;
+        route.artifact_sidecar_roots = contract.artifact_sidecar_roots;
+        route.manifest_hash = contract.manifest_hash;
+        route.binary_hash = contract.binary_hash;
+        model.mayhem.route_candidates = vec![route];
+        let refreshed = refreshed_price_model(&model, 1);
+        let new_version = refreshed.mayhem.price_ref_au.ver;
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let refresh = serve_one_catalog_refresh(state.clone(), refreshed.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_state = state.clone();
+        let request = test_chat_request(&model.id);
+        let server_request = request.clone();
+        let server = tokio::spawn(async move {
+            let mut opens = Vec::new();
+            for attempt in 0..2 {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                while let Some(Ok(message)) = socket.next().await {
+                    let Ok(text) = message.to_text() else {
+                        continue;
+                    };
+                    let wire: Value = serde_json::from_str(text).unwrap();
+                    let response_type = match wire["type"].as_str().unwrap() {
+                        "auth" => "auth_ok",
+                        "session_subscribe" => "session_subscribed",
+                        "peer_connect" => "peer_connected",
+                        "session_open" => "session_opened",
+                        "session_send" => "session_sent",
+                        "session_close" => "session_closed",
+                        other => panic!("unexpected bridge operation {other}"),
+                    };
+                    socket.send(Message::Text(json!({"id":wire["id"], "type":response_type,
+                        "direct":true, "relayed":false}).to_string().into())).await.unwrap();
+                    if wire["type"] != "session_send" { continue; }
+                    match wire["frame"]["t"].as_str().unwrap() {
+                        "s.open" => {
+                            let open = &wire["frame"];
+                            opens.push(open.clone());
+                            let frame = if attempt == 0 {
+                                assert_ne!(open["price_ver"], new_version);
+                                json!({"t":"s.reject", "session_id":open["session_id"],
+                                    "code":"PRICE_VER", "reason":"price version mismatch"})
+                            } else {
+                                assert_eq!(open["price_ver"], new_version);
+                                let mut invocation = server_state
+                                    .prepare_chat_invocation_for_route(
+                                        &refreshed,
+                                        &server_request,
+                                        Some(&refreshed.mayhem.route_candidates[0]),
+                                        &GatewayRequestOptions::default(),
+                                    )
+                                    .unwrap();
+                                invocation.session_id =
+                                    open["session_id"].as_str().unwrap().to_owned();
+                                let nonce = open["att_nonce"].as_str().unwrap().to_owned();
+                                let report = test_attestation_report_with_mutation(&invocation, nonce.clone(), |report| {
+                                    report.report_ts = now_secs();
+                                });
+                                let mut accept = json!({"t":"s.accept", "v":1,
+                                    "contract_version":invocation.contract_version,
+                                    "session_id":invocation.session_id,
+                                    "open_head":session_frame_head(open).unwrap(), "att_nonce":nonce,
+                                    "att_report":report, "ts":now_secs(), "nonce":"ab".repeat(32)});
+                                sign_accept_frame(&mut accept);
+                                validate_direct_session_accept(&accept, &invocation,
+                                    &session_frame_head(open).unwrap(), open["att_nonce"].as_str().unwrap(), now_secs()).unwrap();
+                                accept
+                            };
+                            socket.send(Message::Text(json!({"type":"session_frame", "remote":wire["remote"],
+                                "session_id":wire["session_id"], "frame":frame}).to_string().into())).await.unwrap();
+                        }
+                        "s.req" => {
+                            assert_eq!(
+                                attempt, 1,
+                                "never send inference work after the price refusal"
+                            );
+                            return opens;
+                        }
+                        "s.close" => {},
+                        other => panic!("unexpected session frame {other}"),
+                    }
+                }
+            }
+            panic!("fresh price admission never dispatched work");
+        });
+        let session = tokio::time::timeout(Duration::from_secs(10), prepare_live_direct_chat_session(
+            Arc::new(state.clone()), model.clone(), request, GatewayRequestOptions::default(),
+            "stream-price-transition".to_owned(), now_secs(),
+            ScBridgeGatewaySessionConfig::new(format!("ws://{address}"), "test-token"),
+        )).await.unwrap().unwrap();
+        assert_eq!(session.invocation.price_ver, new_version);
+        let opens = server.await.unwrap();
+        refresh.await.unwrap();
+        assert_eq!(opens.len(), 2);
+        assert_ne!(opens[0]["session_id"], opens[1]["session_id"]);
+        assert!(opens[0]["voucher"]["billing_id"].is_string());
+        assert_eq!(
+            opens[0]["voucher"]["billing_id"],
+            opens[1]["voucher"]["billing_id"]
+        );
+        assert_eq!(
+            opens[0]["voucher"]["billing_attempt"],
+            opens[1]["voucher"]["billing_attempt"]
+        );
+        assert!(
+            !state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64())
+        );
+    }
+
+    #[tokio::test]
+    async fn price_transition_unchanged_catalog_is_bounded_and_keeps_provider_healthy() {
+        let model = test_routed_model(1);
+        let backend = price_transition_backend(model.mayhem.price_ref_au.ver + 1);
+        let state = test_gateway_state_from_models(vec![model.clone()])
+            .with_session_backend(backend.clone());
+        let watcher_state = state.clone();
+        let watcher = tokio::spawn(async move {
+            loop {
+                watcher_state.wait_for_catalog_refresh_request().await;
+                watcher_state.complete_catalog_refresh();
+            }
+        });
+        let error = focused_route_runner_error(run_chat_with_route_retry(
+            &state, &model, &test_chat_request(&model.id), GatewayRequestOptions::default(),
+        ).await);
+        watcher.abort();
+        assert_eq!(public_error_code(&error), "catalog_price_refresh_pending");
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            backend.attempts.lock().unwrap().len(),
+            usize::from(DEFAULT_MAX_OPEN_ATTEMPTS)
+        );
+        assert!(state.wallet_spend.lock().unwrap().reservations.is_empty());
+        assert!(
+            !state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64())
+        );
+    }
+
+    #[tokio::test]
+    async fn price_transition_missing_refresh_expires_without_provider_penalty() {
+        let model = test_routed_model(1);
+        let backend = price_transition_backend(model.mayhem.price_ref_au.ver + 1);
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(backend.clone());
+        let options = GatewayRequestOptions { max_wait_ms: 10, ..GatewayRequestOptions::default() };
+        let error = focused_route_runner_error(run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id), options).await);
+        assert_eq!(public_error_code(&error), "catalog_price_refresh_pending");
+        assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(backend.attempts.lock().unwrap().len(), 1);
+        assert!(
+            !state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64())
+        );
     }
 
     #[tokio::test]
@@ -54518,6 +55344,7 @@ mod tests {
             "RATE",
             "QUOTA",
             "PRICE_FLOOR",
+            "PRICE_VER",
             "DRAINING",
             "BALANCE",
             "EXECUTION_MODE",
