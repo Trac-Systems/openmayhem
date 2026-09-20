@@ -61329,25 +61329,15 @@ fn receipt_settlement_entry_supersedes(
         return Ok(false);
     }
     ensure!(
-        incoming.seq >= current.seq,
-        "receipt settlement attempt cannot downgrade its canonical sequence"
+        incoming.seq > current.seq,
+        "receipt settlement attempt must advance its canonical sequence"
     );
-    if incoming.seq == current.seq {
-        ensure!(
-            incoming.final_receipt
-                && incoming.au_owed_cum >= current.au_owed_cum
-                && incoming.usage.is_monotonic_from(&current.usage)
-                && incoming.compute_ms >= current.compute_ms,
-            "receipt settlement attempt has conflicting evidence at the same sequence"
-        );
-    } else {
-        ensure!(
-            incoming.au_owed_cum >= current.au_owed_cum
-                && incoming.usage.is_monotonic_from(&current.usage)
-                && incoming.compute_ms >= current.compute_ms,
-            "receipt settlement attempt high-water evidence is not monotonic"
-        );
-    }
+    ensure!(
+        incoming.au_owed_cum >= current.au_owed_cum
+            && incoming.usage.is_monotonic_from(&current.usage)
+            && incoming.compute_ms >= current.compute_ms,
+        "receipt settlement attempt high-water evidence is not monotonic"
+    );
     Ok(true)
 }
 
@@ -85138,7 +85128,24 @@ impl<'a> ProviderSessionLiveStream<'a> {
                         &receipt,
                         "checkpoint",
                     )
-                    .await?;
+                    .await
+                    .context("sending live checkpoint receipt")
+                })
+            })?;
+            // A successfully transmitted sequence is consumed even when its
+            // ACK is lost. A terminal recovery receipt must use a fresh
+            // sequence because the buyer may already have durably signed and
+            // queued this checkpoint before the transport failed.
+            self.receipt_seq = self.receipt_seq.saturating_add(1);
+            // Retain the transmitted high-water usage for the same reason.
+            // If the ACK is lost after the buyer persisted this checkpoint,
+            // terminal recovery at the fresh sequence must not regress usage
+            // or reasoning attribution below the durable checkpoint.
+            self.last_checkpoint_metered_units = self.delivered_metered_units;
+            self.last_checkpoint_reasoning_units =
+                metered_output_units("", &self.hidden_reasoning, &[]);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
                     wait_for_provider_receipt_ack(
                         self.bridge,
                         self.active,
@@ -85150,10 +85157,6 @@ impl<'a> ProviderSessionLiveStream<'a> {
                     .context("waiting for live checkpoint receipt ack")
                 })
             })?;
-            self.last_checkpoint_metered_units = self.delivered_metered_units;
-            self.last_checkpoint_reasoning_units =
-                metered_output_units("", &self.hidden_reasoning, &[]);
-            self.receipt_seq = self.receipt_seq.saturating_add(1);
         }
         self.poll_client_disconnect()?;
         Ok(())
@@ -85646,6 +85649,7 @@ async fn send_provider_session_output(
                     "checkpoint",
                 )
                 .await?;
+                receipt_seq = receipt_seq.saturating_add(1);
                 wait_for_provider_receipt_ack(
                     bridge,
                     active,
@@ -85656,7 +85660,6 @@ async fn send_provider_session_output(
                 .await
                 .context("waiting for checkpoint receipt ack")?;
                 last_checkpoint_metered_units = delivered_metered_units;
-                receipt_seq = receipt_seq.saturating_add(1);
             }
         }
     }
@@ -113932,6 +113935,48 @@ esac
     }
 
     #[test]
+    fn receipt_outbox_requires_fresh_sequence_for_terminal_recovery() {
+        let root = test_temp_dir("mayhem-receipt-outbox-terminal-sequence");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let checkpoint = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            3,
+            false,
+            16,
+            CONTRACT_VERSION,
+            None,
+            225,
+        );
+        outbox.persist(&checkpoint).unwrap();
+        let same_sequence_final = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            3,
+            true,
+            16,
+            CONTRACT_VERSION,
+            None,
+            310,
+        );
+        let error = outbox
+            .persist(&same_sequence_final)
+            .expect_err("a terminal receipt must not reuse a transmitted checkpoint sequence");
+        assert!(error.to_string().contains("must advance"));
+        let final_receipt = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            4,
+            true,
+            16,
+            CONTRACT_VERSION,
+            None,
+            310,
+        );
+        let entry = outbox.persist(&final_receipt).unwrap();
+        assert!(entry.final_receipt);
+        assert_eq!(entry.seq, 4);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn receipt_settlement_version_bridge_preserves_v23_through_v26_signatures() {
         for version in [23, 24, 25, 26] {
             let feature = signed_receipt_settlement_feature_for_test_version(
@@ -114077,6 +114122,17 @@ esac
         let mut feature = signed_receipt_settlement_feature_for_test(7);
         feature["value"]["receipt"]["body"]["schema_version"] =
             json!(SESSION_RECEIPT_SCHEMA_VERSION.saturating_sub(1));
+        // Keep the synthetic stale envelope valid for schema 11 so recovery
+        // reaches the intended obsolete-schema quarantine path. Schema 11
+        // predates the cumulative utilization fields introduced in schema 12.
+        feature["value"]["receipt"]["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("compute_ms");
+        feature["value"]["receipt"]["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("capacity_slots");
         let stale_path = directory.join("obsolete-receipt-schema-entry.json");
         fs::write(
             &stale_path,
@@ -114113,11 +114169,11 @@ esac
             outbox.persist(&feature).unwrap();
             assert_eq!(outbox.load_entries().unwrap().len(), 1);
         }
-        let final_feature = signed_receipt_settlement_feature_for_test_at(7, 200, true, 200);
+        let final_feature = signed_receipt_settlement_feature_for_test_at(7, 201, true, 200);
         outbox.persist(&final_feature).unwrap();
         let entries = outbox.load_entries().unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].seq, 200);
+        assert_eq!(entries[0].seq, 201);
         assert!(entries[0].final_receipt);
         assert_eq!(
             fs::read_dir(root.join("provider"))
@@ -114130,10 +114186,10 @@ esac
         let stale = signed_receipt_settlement_feature_for_test_at(7, 199, false, 199);
         let retained = outbox.persist(&stale).unwrap();
         assert_eq!(retained.feature, final_feature);
-        let conflicting_final = signed_receipt_settlement_feature_for_test_at(7, 200, true, 201);
+        let conflicting_final = signed_receipt_settlement_feature_for_test_at(7, 201, true, 201);
         assert!(outbox.persist(&conflicting_final).is_err());
         let post_final_checkpoint =
-            signed_receipt_settlement_feature_for_test_at(7, 201, false, 201);
+            signed_receipt_settlement_feature_for_test_at(7, 202, false, 201);
         assert!(outbox.persist(&post_final_checkpoint).is_err());
         let _ = fs::remove_dir_all(root);
     }
