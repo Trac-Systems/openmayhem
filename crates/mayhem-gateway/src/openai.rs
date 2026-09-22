@@ -226,6 +226,12 @@ const ROUTE_WAIT_POLL_MS: u64 = 1_000;
 const SESSION_OPEN_REPLAY_INTERVAL_MS: u64 = 5_000;
 const DEFAULT_CHAT_OUTPUT_HEADROOM_TOKENS: u64 = 1_024;
 const EMBEDDING_SPECIAL_TOKEN_ALLOWANCE_PER_INPUT: u64 = 16;
+const DECISION_MAX_QUESTIONS: u64 = 64;
+const DECISION_MAX_SEQUENCE_TOKENS: u64 = 1_024;
+const DECISION_MAX_SHORTLIST_OPTIONS: u64 = 256;
+const DECISION_DEFAULT_SHORTLIST_K: u64 = 20;
+const DECISION_OUTPUT_FIXED_ALLOWANCE_BYTES: usize = 256 * 1024;
+const DECISION_OUTPUT_REQUEST_SIZE_MULTIPLIER: usize = 16;
 const DEFAULT_SESSION_REQUEST_BYTES_PER_CONTEXT_TOKEN: usize = 256;
 const DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN: usize =
     MAX_VISIBLE_OUTPUT_BYTES_PER_REQUEST_TOKEN as usize;
@@ -19430,10 +19436,134 @@ fn configured_optional_positive_usize(name: &str) -> Option<usize> {
         .filter(|value| *value > 0)
 }
 
+fn is_decision_chat_request(request: &ChatCompletionRequest) -> bool {
+    direct_chat_endpoint_family(request) == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS
+}
+
+fn decision_contract_request(request: &ChatCompletionRequest) -> Option<&Value> {
+    is_decision_chat_request(request)
+        .then_some(request.endpoint_request.as_ref())
+        .flatten()
+}
+
+fn decision_question_count(request: &ChatCompletionRequest) -> u64 {
+    decision_contract_request(request)
+        .and_then(|body| body.get("questions"))
+        .and_then(Value::as_object)
+        .map(|questions| u64::try_from(questions.len()).unwrap_or(u64::MAX))
+        .filter(|count| *count > 0)
+        .unwrap_or(DECISION_MAX_QUESTIONS)
+        .min(DECISION_MAX_QUESTIONS)
+}
+
+fn decision_sequence_token_limit(request: &ChatCompletionRequest) -> u64 {
+    decision_contract_request(request)
+        .and_then(|body| body.get("limits"))
+        .and_then(Value::as_object)
+        .and_then(|limits| limits.get("max_len"))
+        .and_then(Value::as_u64)
+        .filter(|value| (128..=DECISION_MAX_SEQUENCE_TOKENS).contains(value))
+        .unwrap_or(DECISION_MAX_SEQUENCE_TOKENS)
+}
+
+fn decision_input_token_bounds(request: &ChatCompletionRequest) -> (u64, u64) {
+    let question_count = decision_question_count(request);
+    let mut upper = question_count.saturating_mul(decision_sequence_token_limit(request));
+    let Some(body) = decision_contract_request(request) else {
+        let shortlist = DECISION_MAX_QUESTIONS
+            .saturating_mul(DECISION_MAX_SHORTLIST_OPTIONS.saturating_add(1))
+            .saturating_mul(DECISION_MAX_SEQUENCE_TOKENS);
+        return (1, upper.saturating_add(shortlist));
+    };
+    let Some(shortlist) = body.get("shortlist").and_then(Value::as_object) else {
+        return (question_count.max(1), upper.max(question_count.max(1)));
+    };
+    if shortlist.get("vectors").is_some() {
+        return (question_count.max(1), upper.max(question_count.max(1)));
+    }
+    let k = shortlist
+        .get("k")
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=DECISION_DEFAULT_SHORTLIST_K).contains(value))
+        .unwrap_or(DECISION_DEFAULT_SHORTLIST_K);
+    let max_length = shortlist
+        .get("max_length")
+        .and_then(Value::as_u64)
+        .filter(|value| (1..=DECISION_MAX_SEQUENCE_TOKENS).contains(value))
+        .unwrap_or(DECISION_MAX_SEQUENCE_TOKENS);
+    if let Some(questions) = body.get("questions").and_then(Value::as_object) {
+        for question in questions.values().filter_map(Value::as_object) {
+            if question.get("type").and_then(Value::as_str) != Some("choice") {
+                continue;
+            }
+            let criteria_count = match question.get("criteria") {
+                Some(Value::Object(criteria)) => u64::try_from(criteria.len()).unwrap_or(u64::MAX),
+                Some(Value::Array(criteria)) => u64::try_from(criteria.len()).unwrap_or(u64::MAX),
+                _ => DECISION_MAX_SHORTLIST_OPTIONS,
+            }
+            .min(DECISION_MAX_SHORTLIST_OPTIONS);
+            if criteria_count > k {
+                upper = upper
+                    .saturating_add(criteria_count.saturating_add(1).saturating_mul(max_length));
+            }
+        }
+    } else {
+        upper = upper.saturating_add(
+            DECISION_MAX_QUESTIONS
+                .saturating_mul(DECISION_MAX_SHORTLIST_OPTIONS.saturating_add(1))
+                .saturating_mul(max_length),
+        );
+    }
+    (question_count.max(1), upper.max(question_count.max(1)))
+}
+
+fn decision_output_byte_upper_bound(request: &ChatCompletionRequest) -> usize {
+    let request_bytes = decision_contract_request(request)
+        .and_then(|body| serde_json::to_vec(body).ok())
+        .map(|bytes| bytes.len())
+        .unwrap_or(256 * 1024);
+    request_bytes
+        .saturating_mul(DECISION_OUTPUT_REQUEST_SIZE_MULTIPLIER)
+        .saturating_add(DECISION_OUTPUT_FIXED_ALLOWANCE_BYTES)
+        .min(DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES)
+        .max(DECISION_OUTPUT_FIXED_ALLOWANCE_BYTES)
+}
+
+fn decision_output_unit_upper_bound(request: &ChatCompletionRequest) -> u64 {
+    u64::try_from(decision_output_byte_upper_bound(request))
+        .unwrap_or(u64::MAX)
+        .div_ceil(mayhem_proto::VISIBLE_OUTPUT_BYTES_PER_UNIT)
+}
+
+fn validate_decision_input_usage(
+    request: &ChatCompletionRequest,
+    usage: &ReceiptUsage,
+) -> Result<(), GatewaySessionError> {
+    let (lower_bound, upper_bound) = decision_input_token_bounds(request);
+    let input_tokens = usage.input_tokens();
+    let has_unsupported_units = usage.units().iter().any(|(unit, count)| {
+        *count > 0 && !matches!(unit.as_str(), USAGE_INPUT_TOKEN | USAGE_OUTPUT_TOKEN)
+    });
+    if input_tokens < lower_bound
+        || input_tokens > upper_bound
+        || usage.cached_input_tokens() != 0
+        || has_unsupported_units
+    {
+        return Err(GatewaySessionError::new(format!(
+            "decision session reported invalid input usage: input={input_tokens}, expected {lower_bound}..={upper_bound} with only input_token and output_token units",
+        )));
+    }
+    Ok(())
+}
+
 fn direct_session_chat_output_byte_limit(
     request: &ChatCompletionRequest,
     invocation: &GatewaySessionInvocation,
 ) -> usize {
+    if is_decision_chat_request(request) {
+        return configured_optional_positive_usize("MAYHEM_SESSION_MAX_TEXT_OUTPUT_BYTES")
+            .unwrap_or_else(|| decision_output_byte_upper_bound(request));
+    }
     let prompt_tokens = rough_tokens(&chat_prompt_text(request));
     let available_tokens = u64::from(invocation.served_ctx)
         .saturating_sub(prompt_tokens)
@@ -20217,7 +20347,10 @@ fn reconcile_final_chat_prompt_usage(
     vision_tokens: u64,
     audio_tokens: u64,
 ) -> Result<(), GatewaySessionError> {
-    if let Some(expected_prompt_tokens) =
+    if is_decision_chat_request(request) {
+        validate_decision_input_usage(request, provider_usage)?;
+        usage.prompt_tokens = provider_usage.input_tokens();
+    } else if let Some(expected_prompt_tokens) =
         tools_only_prompt_token_units(model, request, invocation.served_ctx)?
     {
         usage.prompt_tokens =
@@ -22769,6 +22902,24 @@ fn expected_chat_usage_for_provider(
     locked_rate_map: &[RateMapEntry],
     protocol_prompt_tokens: Option<u64>,
 ) -> Result<ReceiptUsage, GatewaySessionError> {
+    if is_decision_chat_request(request) {
+        let usage = provider_usage.cloned().unwrap_or_else(|| {
+            ReceiptUsage::text(observed_prompt_tokens, observed_completion_tokens)
+        });
+        if provider_usage.is_some() {
+            validate_decision_input_usage(request, &usage)?;
+            if usage.output_tokens() != observed_completion_tokens {
+                return Err(GatewaySessionError::new(format!(
+                    "decision session reported {} output units, expected {observed_completion_tokens}",
+                    usage.output_tokens()
+                )));
+            }
+        }
+        return Ok(ReceiptUsage::text(
+            usage.input_tokens(),
+            observed_completion_tokens,
+        ));
+    }
     let text = expected_text_usage_for_provider(
         provider_usage,
         observed_prompt_tokens,
@@ -29609,6 +29760,32 @@ fn request_requirements_for_chat(
     explicit_min_ctx: Option<u32>,
     min_throughput: Option<f64>,
 ) -> RequestRequirements {
+    if is_decision_chat_request(request) {
+        let (_, input_tokens) = decision_input_token_bounds(request);
+        let output_tokens = decision_output_unit_upper_bound(request);
+        let min_ctx = explicit_min_ctx
+            .unwrap_or(0)
+            .max(u32::try_from(decision_sequence_token_limit(request)).unwrap_or(u32::MAX));
+        return RequestRequirements {
+            current_rules_ver: state.receipt_config.rules_ver,
+            requires_transport_peer: !state.dev_session_shim,
+            requires_prefix_caching: false,
+            requires_json: true,
+            compatible_execution_modes: Some(state.compatible_execution_modes(
+                direct_chat_endpoint_family(request),
+                request.endpoint_request.as_ref(),
+            )),
+            min_ctx,
+            input_tokens,
+            output_tokens,
+            usage: ReceiptUsage::text(input_tokens, output_tokens),
+            min_throughput,
+            now_millis,
+            max_price_au,
+            heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
+            ..RequestRequirements::default()
+        };
+    }
     let prompt_text = chat_prompt_text(request);
     let input_tokens = rough_tokens(&prompt_text);
     let output_tokens = chat_output_headroom_tokens(request);
@@ -40307,6 +40484,31 @@ fn estimate_max_spend_au(
     billing: &GatewayBillingContext,
     protocol_prompt_tokens: Option<u64>,
 ) -> MoneyAu {
+    if is_decision_chat_request(request) {
+        let (_, max_input_tokens) = decision_input_token_bounds(request);
+        let max_output_tokens = decision_output_unit_upper_bound(request);
+        let usage = if billing.prior_au_owed_cum == 0 {
+            ReceiptUsage::text(max_input_tokens, max_output_tokens)
+        } else {
+            billing
+                .prior_usage
+                .saturating_add(&ReceiptUsage::from_units([(
+                    USAGE_OUTPUT_TOKEN,
+                    max_output_tokens,
+                )]))
+        };
+        return logical_cumulative_priced_usage_au(
+            &price.rate_map,
+            price.per_req_au,
+            price.min_session_au,
+            &billing.prior_usage,
+            billing.prior_au_owed_cum,
+            &usage,
+        )
+        .and_then(|cumulative| cumulative.checked_sub(billing.prior_au_owed_cum))
+        .unwrap_or(MoneyAu::MAX)
+        .max(1_000);
+    }
     let served_ctx = u64::from(served_ctx).max(1);
     let max_input_tokens = protocol_prompt_tokens.unwrap_or(served_ctx).min(served_ctx);
     let max_output_tokens = request
@@ -49057,6 +49259,139 @@ mod tests {
             gateway_model_live_route_keys(&state, &model, &entries, now),
             BTreeSet::from([route_key(route)])
         );
+    }
+
+    #[test]
+    fn decision_transport_uses_bounded_structured_output_and_exact_provider_usage() {
+        let mut criteria = serde_json::Map::new();
+        for index in 0..25 {
+            criteria.insert(
+                format!("option-{index}"),
+                json!(format!("criterion {index}")),
+            );
+        }
+        let body = json!({
+            "model": "convaiinnovations/laya",
+            "state": {"body": "A customer cannot sign in."},
+            "questions": {
+                "intent": {
+                    "type": "choice",
+                    "instructions": "Choose the closest category.",
+                    "criteria": Value::Object(criteria),
+                },
+                "urgent": {
+                    "type": "noul",
+                    "instructions": "Is it urgent?"
+                }
+            },
+            "checkpoint": "english",
+            "shortlist": {"k": 20, "max_length": 512, "batch_size": 16},
+            "limits": {"max_len": 512, "head_max_len": 192}
+        });
+        let mut request = test_chat_request("convaiinnovations/laya");
+        request.endpoint_family = Some(mayhem_proto::ENDPOINT_MAYHEM_DECISIONS.to_owned());
+        request.endpoint_request = Some(body.clone());
+        request.messages[0].content = json!(stable_json_value(&body).to_string());
+        request.max_tokens = Some(1);
+
+        let (lower, upper) = decision_input_token_bounds(&request);
+        assert_eq!(lower, 2);
+        assert_eq!(upper, 2 * 512 + 26 * 512);
+
+        let invocation = test_invocation();
+        let output_limit = direct_session_chat_output_byte_limit(&request, &invocation);
+        assert!(output_limit > DEFAULT_SESSION_OUTPUT_BYTES_PER_REQUEST_TOKEN);
+        assert_eq!(output_limit, decision_output_byte_upper_bound(&request));
+
+        let state = GatewayState::fixture();
+        let model = test_model();
+        let requirements = request_requirements_for_chat(
+            &state,
+            &model,
+            &request,
+            now_millis_u64(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(requirements.min_ctx, 512);
+        assert_eq!(requirements.input_tokens, upper);
+        assert_eq!(
+            requirements.output_tokens,
+            decision_output_unit_upper_bound(&request)
+        );
+
+        let exact = ReceiptUsage::text(463, 382);
+        let verified = expected_chat_usage_for_provider(
+            &request,
+            Some(&exact),
+            1,
+            382,
+            &text_generation_rate_map(20, 60),
+            None,
+        )
+        .expect("exact Laya tokenizer usage inside the signed envelope is accepted");
+        assert_eq!(verified, exact);
+
+        let wrong_output = ReceiptUsage::text(463, 383);
+        let error = expected_chat_usage_for_provider(
+            &request,
+            Some(&wrong_output),
+            1,
+            382,
+            &text_generation_rate_map(20, 60),
+            None,
+        )
+        .expect_err("decision output units remain buyer-verifiable");
+        assert!(error.message.contains("output units"));
+
+        let excessive_input = ReceiptUsage::text(upper.saturating_add(1), 382);
+        let error = expected_chat_usage_for_provider(
+            &request,
+            Some(&excessive_input),
+            1,
+            382,
+            &text_generation_rate_map(20, 60),
+            None,
+        )
+        .expect_err("provider input usage above the model-derived envelope is rejected");
+        assert!(error.message.contains("invalid input usage"));
+
+        let billing = GatewayBillingContext::initial("decision-test".to_owned());
+        let max_spend =
+            estimate_max_spend_au(&model.mayhem.price_ref_au, &request, 512, &billing, None);
+        let exact_spend = calculate_au_owed(&model.mayhem.price_ref_au, &exact);
+        assert!(max_spend >= exact_spend);
+
+        let mut invocation = invocation;
+        invocation.spend_voucher.body.max_spend_au = MoneyAu::MAX;
+        let output = ChatOutput {
+            reasoning_content: String::new(),
+            content: Some("x".repeat(382 * mayhem_proto::VISIBLE_OUTPUT_BYTES_PER_UNIT as usize)),
+            tool_calls: Vec::new(),
+            artifacts: Vec::new(),
+            finish_reason: "stop".to_owned(),
+            usage: Usage {
+                prompt_tokens: 463,
+                completion_tokens: 382,
+                total_tokens: 845,
+            },
+        };
+        let mut receipt = test_provider_receipt(&model, &request, &output, &invocation);
+        receipt.body.prompt_hash = direct_chat_prompt_hash(&request);
+        receipt.enclave_sig = sign_hex(
+            &test_enclave_seed(),
+            &receipt_signing_bytes(&receipt.body).unwrap(),
+        );
+        direct_session_receipt_ack(
+            &request,
+            &output,
+            &invocation,
+            &receipt,
+            invocation.provider_pubkey.as_deref().unwrap(),
+            &model,
+        )
+        .expect("valid decision receipt fits the signed voucher and receives an ack");
     }
 
     #[test]
