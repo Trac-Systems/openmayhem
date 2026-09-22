@@ -18381,12 +18381,18 @@ async fn next_session_frame_with_optional_wait(
 }
 
 fn direct_session_request_body(request: &ChatCompletionRequest) -> Value {
+    let endpoint_family = direct_chat_endpoint_family(request);
+    let transport_kind = if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS {
+        "decision"
+    } else {
+        "chat"
+    };
     let mut body = json!({
-        "kind": "chat",
+        "kind": transport_kind,
         "model": &request.model,
         "messages": &request.messages,
         "stream": request.stream,
-        "endpoint_family": mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        "endpoint_family": endpoint_family,
     });
     set_optional_json(
         &mut body,
@@ -49033,6 +49039,12 @@ mod tests {
         request.endpoint_family = Some(mayhem_proto::ENDPOINT_MAYHEM_DECISIONS.to_owned());
         request.endpoint_request = Some(json!({"state": "hello", "questions": {}}));
         request.max_tokens = Some(1);
+        let transport = direct_session_request_body(&request);
+        assert_eq!(transport["kind"], "decision");
+        assert_eq!(
+            transport["endpoint_family"],
+            mayhem_proto::ENDPOINT_MAYHEM_DECISIONS
+        );
         let request_requirements =
             request_requirements_for_chat(&state, &model, &request, now, None, None, None);
         assert!(!request_requirements.requires_prefix_caching);
