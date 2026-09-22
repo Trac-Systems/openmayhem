@@ -48790,17 +48790,17 @@
       },
       "price_ref_au": {
         "denom": "au_usd",
-        "in_per_1k": "10000000000000",
-        "out_per_1k": "10000000000000",
+        "in_per_1k": "100000000000",
+        "out_per_1k": "100000000000",
         "rate_map": [
           {
             "unit": "input_token",
-            "per_unit_au": "10000000000",
+            "per_unit_au": "100000000",
             "granularity": 1
           },
           {
             "unit": "output_token",
-            "per_unit_au": "10000000000",
+            "per_unit_au": "100000000",
             "granularity": 1
           }
         ],

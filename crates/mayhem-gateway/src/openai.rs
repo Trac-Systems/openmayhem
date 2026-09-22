@@ -6602,7 +6602,7 @@ fn gateway_reporting_requirements_for_route(
             RequestRequirements {
                 current_rules_ver: state.receipt_config.rules_ver,
                 requires_transport_peer: !state.dev_session_shim,
-                requires_prefix_caching: is_text_generation,
+                requires_prefix_caching: is_text_generation && !is_needle_cache_exception(model),
                 workflow: gateway_reporting_workflow_requirements(model, &modalities),
                 required_modalities: modalities,
                 modality_load,
@@ -6630,6 +6630,10 @@ fn endpoint_family_requires_prefix_caching(family: &str) -> bool {
             | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
             | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
     )
+}
+
+fn is_needle_cache_exception(model: &GatewayModel) -> bool {
+    model.id == "Cactus-Compute/needle" && model.mayhem.model_class == "text-generation"
 }
 
 fn gateway_reporting_text_output_tokens(model: &GatewayModel) -> u64 {
@@ -29753,7 +29757,7 @@ fn chat_affinity_key(
 
 fn request_requirements_for_chat(
     state: &GatewayState,
-    _model: &GatewayModel,
+    model: &GatewayModel,
     request: &ChatCompletionRequest,
     now_millis: u64,
     max_price_au: Option<MoneyAu>,
@@ -29797,7 +29801,7 @@ fn request_requirements_for_chat(
         requires_transport_peer: !state.dev_session_shim,
         requires_prefix_caching: endpoint_family_requires_prefix_caching(
             direct_chat_endpoint_family(request),
-        ),
+        ) && !is_needle_cache_exception(model),
         requires_tools: request
             .tools
             .as_ref()
@@ -49259,6 +49263,40 @@ mod tests {
             gateway_model_live_route_keys(&state, &model, &entries, now),
             BTreeSet::from([route_key(route)])
         );
+    }
+
+    #[test]
+    fn needle_routes_without_prefix_cache_but_other_chat_routes_still_require_it() {
+        let mut needle = test_routed_model(1);
+        needle.id = "Cactus-Compute/needle".to_owned();
+        let route = &needle.mayhem.route_candidates[0];
+        let now = now_millis_u64();
+        let mut heartbeat = heartbeat_for_route(&needle, route, now);
+        heartbeat.prefix_caching = Some(false);
+        heartbeat.sig = "aa".repeat(64);
+        let state = GatewayState::from_models(vec![needle.clone()])
+            .with_provider_heartbeats(vec![heartbeat]);
+
+        let reporting = gateway_reporting_requirements_for_route(&state, &needle, route, now);
+        assert_eq!(reporting.len(), 1);
+        assert!(!reporting[0].requires_prefix_caching);
+        let request = test_chat_request(&needle.id);
+        let requirements =
+            request_requirements_for_chat(&state, &needle, &request, now, None, None, None);
+        assert!(!requirements.requires_prefix_caching);
+        let entries = state
+            .provider_table
+            .lock_recover("provider table")
+            .entries(now);
+        assert_eq!(
+            gateway_model_live_route_keys(&state, &needle, &entries, now),
+            BTreeSet::from([route_key(route)])
+        );
+
+        let other = test_routed_model(1);
+        let other_requirements =
+            request_requirements_for_chat(&state, &other, &request, now, None, None, None);
+        assert!(other_requirements.requires_prefix_caching);
     }
 
     #[test]

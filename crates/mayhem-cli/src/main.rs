@@ -88189,7 +88189,11 @@ fn provider_session_responder_with_modality_health(
     // The start-up self-test admits no sessions, so no price floor applies to its terms.
     let terms = provider_session_terms(ctx, 0)?;
     let mut responder = provider_session_responder(ctx)?;
-    if ctx.selected.model.model_class == DEFAULT_MODEL_CLASS {
+    if provider_requires_prefix_caching(
+        &ctx.selected.model.model_id,
+        &ctx.selected.artifact.engine,
+        &ctx.selected.model.model_class,
+    ) {
         ensure!(responder.prefix_caching_enabled(),
             "LLM provider admission requires initialized prefix caching; upgrade to a cache-capable runtime");
     }
@@ -88205,6 +88209,38 @@ fn provider_session_responder_with_modality_health(
     let cases = provider_modality_self_test_plan(ctx, &terms.adapter, ctx.canaries_dir)?;
     let health = provider_modality_self_test(ctx, &terms, responder.as_mut(), cases)?;
     Ok((responder, health))
+}
+
+fn provider_requires_prefix_caching(model_id: &str, engine: &str, model_class: &str) -> bool {
+    model_class == DEFAULT_MODEL_CLASS
+        && !(model_id == NEEDLE_MODEL_REPO && matches!(engine, "needle-cpu" | "needle-gpu"))
+}
+
+#[cfg(test)]
+#[test]
+fn needle_cache_exception_is_limited_to_its_two_runtimes() {
+    for engine in ["needle-cpu", "needle-gpu"] {
+        assert!(!provider_requires_prefix_caching(
+            NEEDLE_MODEL_REPO,
+            engine,
+            DEFAULT_MODEL_CLASS
+        ));
+        assert!(provider_requires_prefix_caching(
+            "another/chat-model",
+            engine,
+            DEFAULT_MODEL_CLASS
+        ));
+    }
+    assert!(provider_requires_prefix_caching(
+        NEEDLE_MODEL_REPO,
+        "llama.cpp",
+        DEFAULT_MODEL_CLASS
+    ));
+    assert!(!provider_requires_prefix_caching(
+        "another/embedding-model",
+        "needle-cpu",
+        "embedding"
+    ));
 }
 
 fn provider_workflow_admission_modality_health(
