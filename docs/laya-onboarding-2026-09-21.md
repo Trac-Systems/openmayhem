@@ -1,6 +1,6 @@
 # Laya onboarding and calibration
 
-Status: implementation in progress. This plan is subordinate to `docs/CALIBRATION.md` v10.
+Status: implementation and two-host calibration complete; production micro-canary and rollout remain. This plan is subordinate to `docs/CALIBRATION.md` v10.
 
 ## Scope
 
@@ -66,6 +66,35 @@ The reference price is below the upstream managed-API comparison of $0.042 per
 million tokens while preserving room for every downward market step. Tier 2
 uses the same calibration evidence and receives its required higher seed when
 the enclaves are registered.
+
+## Final two-host calibration evidence
+
+The final catalog fingerprints were produced from Core commit `f72df193` with
+the release-mode executable whose SHA-256 is
+`845be261b273eb564fc37a22edd9f28344a612390026bc45974df689fa24f862`.
+Both selected CUDA hosts independently ran all eight decision canaries and the
+complete 64-case `mayhem_decisions` endpoint matrix with `--require-match`.
+Both runs passed with zero endpoint failures and reported:
+
+- catalog fingerprint: `f0e70feb5f9da6ad5e273a109c7131c54c01414e96c9a404dffb225054af98c1`
+- text-modality fingerprint: `1977665478c278ee738983b310f7fdec25a43d5db6f415732340a5053c2a4ab1`
+- endpoint-matrix fingerprint: `327ab16b78ac6c24314d73ee0b47cb31945b5cfcc2a8885b5136c197eacce76f`
+- eight matching prompt fingerprints and 64 passing endpoint cases per host
+
+The retained reports are
+`.local-mayhem/laya-onboarding-20260921/reports/f72df193/spark41/report.json`
+and
+`.local-mayhem/laya-onboarding-20260921/reports/f72df193/spark42/report.json`.
+Their SHA-256 values are respectively
+`5e524549bd3f158cd54172e6b4272cd90729b292d2f51ca8eec6379f18931f28`
+and
+`1d909312822a90bc0e84425100d81f6cad7b3b1113ea7a289477e5d0b9e8c0fb`.
+
+The upstream checkpoint contains a `choice:11+` temperature of `0.1006`,
+outside Laya's supported `[0.5, 5]` range. The pinned upstream runtime clamps
+that value and warns that confidence for the affected bucket is uncalibrated.
+Mayhem preserves that upstream behavior and does not silently reinterpret the
+confidence value.
 
 ## Implementation order
 
