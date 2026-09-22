@@ -119,6 +119,7 @@ def per_request_system_one(agent, state, questions, temperatures, limits):
 
     ids = list(questions.keys())
     items = []
+    temperatures = temperatures or {}
     limits = limits or {}
     config = getattr(agent, "cfg", None) or {}
     max_len = int(limits.get("max_len", config.get("max_len", 512)))
