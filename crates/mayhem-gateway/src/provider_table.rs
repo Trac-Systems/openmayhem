@@ -191,6 +191,11 @@ impl ProviderTableEntry {
 pub struct BaselineRouteRequirements {
     pub current_rules_ver: u64,
     pub requires_transport_peer: bool,
+    /// Autoregressive generation routes must prove that their runtime prefix
+    /// cache is enabled. Other endpoints may still bill output tokens without
+    /// owning a reusable KV cache (for example typed decision classifiers).
+    #[serde(default)]
+    pub requires_prefix_caching: bool,
     pub now_millis: u64,
     pub max_attestation_head_age_millis: u64,
     pub heartbeat_ttl_millis: u64,
@@ -219,6 +224,8 @@ pub struct RequestRequirements {
     pub current_rules_ver: u64,
     pub min_reputation: f64,
     pub requires_transport_peer: bool,
+    #[serde(default)]
+    pub requires_prefix_caching: bool,
     pub requires_tools: bool,
     pub requires_json: bool,
     pub requires_vision: bool,
@@ -424,6 +431,7 @@ impl Default for BaselineRouteRequirements {
         Self {
             current_rules_ver: 1,
             requires_transport_peer: false,
+            requires_prefix_caching: false,
             now_millis: 0,
             max_attestation_head_age_millis: DEFAULT_ATTESTATION_HEAD_MAX_AGE_MILLIS,
             heartbeat_ttl_millis: DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
@@ -483,6 +491,7 @@ impl From<&RequestRequirements> for BaselineRouteRequirements {
         Self {
             current_rules_ver: request.current_rules_ver,
             requires_transport_peer: request.requires_transport_peer,
+            requires_prefix_caching: request.requires_prefix_caching,
             now_millis: request.now_millis,
             max_attestation_head_age_millis: request.max_attestation_head_age_millis,
             heartbeat_ttl_millis: request.heartbeat_ttl_millis,
@@ -520,6 +529,7 @@ impl Default for RequestRequirements {
             current_rules_ver: 1,
             min_reputation: 0.0,
             requires_transport_peer: false,
+            requires_prefix_caching: false,
             requires_tools: false,
             requires_json: false,
             requires_vision: false,
@@ -913,14 +923,17 @@ pub fn baseline_route_state(
     {
         return BaselineRouteState::HeartbeatStale;
     }
-    // The signed catalog's output-token pricing identifies generation routes.
-    // Use contract data so a heartbeat cannot evade this by hiding text capability.
-    if entry
-        .contract
-        .ref_rate_map
-        .iter()
-        .chain(&entry.contract.rate_map)
-        .any(|rate| rate.unit == mayhem_proto::USAGE_OUTPUT_TOKEN)
+    // The endpoint contract identifies autoregressive generation. Its signed
+    // output-token tariff then prevents a heartbeat from evading this check by
+    // hiding text capability. Output-token billing alone is insufficient:
+    // typed decision endpoints are not KV-cache generation runtimes.
+    if requirements.requires_prefix_caching
+        && entry
+            .contract
+            .ref_rate_map
+            .iter()
+            .chain(&entry.contract.rate_map)
+            .any(|rate| rate.unit == mayhem_proto::USAGE_OUTPUT_TOKEN)
         && heartbeat.prefix_caching != Some(true)
     {
         return BaselineRouteState::PrefixCachingRequired;
@@ -1726,6 +1739,7 @@ mod tests {
         RequestRequirements {
             current_rules_ver: 3,
             min_reputation: 0.5,
+            requires_prefix_caching: true,
             requires_tools: true,
             requires_json: true,
             min_ctx: 4096,
@@ -2578,6 +2592,14 @@ mod tests {
                 BaselineRouteState::PrefixCachingRequired
             );
         }
+        let decision_request = RequestRequirements {
+            requires_prefix_caching: false,
+            ..request.clone()
+        };
+        assert_eq!(
+            baseline_route_state(&entry, &BaselineRouteRequirements::from(&decision_request)),
+            BaselineRouteState::Live
+        );
         entry.heartbeat.as_mut().unwrap().prefix_caching = Some(true);
         assert_eq!(
             baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),

@@ -18019,9 +18019,7 @@ fn catalog_endpoint_calibration_materialize_request_with_tool_budget(
             request["email"] = json!({"clean": true, "max_chars": 3000});
         }
         if request.get("email").is_some()
-            && !request
-                .pointer("/state/body")
-                .is_some_and(Value::is_string)
+            && !request.pointer("/state/body").is_some_and(Value::is_string)
         {
             request["state"] = json!({
                 "body": "Mayhem calibration email body",
@@ -87496,14 +87494,8 @@ fn provider_decision_request_from_body(body: &Value) -> Result<EngineDecisionReq
             .get("checkpoint")
             .and_then(Value::as_str)
             .map(str::to_owned),
-        task: body
-            .get("task")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
-        lang: body
-            .get("lang")
-            .and_then(Value::as_str)
-            .map(str::to_owned),
+        task: body.get("task").and_then(Value::as_str).map(str::to_owned),
+        lang: body.get("lang").and_then(Value::as_str).map(str::to_owned),
         auto_task_detection: body
             .get("auto_task_detection")
             .and_then(Value::as_bool)
@@ -118694,8 +118686,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         catalog_endpoint_calibration_preflight(model, &prompts).unwrap();
         assert!(prompts.iter().all(|prompt| {
-            provider_canary_prompt_modalities(model, prompt)
-                == BTreeSet::from(["text".to_owned()])
+            provider_canary_prompt_modalities(model, prompt) == BTreeSet::from(["text".to_owned()])
         }));
 
         let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, &prompts);
@@ -118717,9 +118708,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             )
             .unwrap();
             if request.get("email").is_some() {
-                assert!(request
-                    .pointer("/state/body")
-                    .is_some_and(Value::is_string));
+                assert!(request.pointer("/state/body").is_some_and(Value::is_string));
             }
             if case
                 .expected_response_attributes
