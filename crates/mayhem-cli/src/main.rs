@@ -17997,6 +17997,39 @@ fn catalog_endpoint_calibration_materialize_request_with_tool_budget(
     if contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
         return catalog_endpoint_calibration_materialize_workflow_request(case, request, fixtures);
     }
+    if contract.family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS && case.expect_accept {
+        if case
+            .expected_response_attributes
+            .iter()
+            .any(|path| path == "shortlist")
+            && request.get("shortlist").is_none()
+        {
+            request["shortlist"] = json!({
+                "k": 20,
+                "max_length": 512,
+                "batch_size": 32,
+            });
+        }
+        if case
+            .expected_response_attributes
+            .iter()
+            .any(|path| path == "preprocessing")
+            && request.get("email").is_none()
+        {
+            request["email"] = json!({"clean": true, "max_chars": 3000});
+        }
+        if request.get("email").is_some()
+            && !request
+                .pointer("/state/body")
+                .is_some_and(Value::is_string)
+        {
+            request["state"] = json!({
+                "body": "Mayhem calibration email body",
+                "subject": "Calibration",
+            });
+        }
+        return Ok(request);
+    }
     if contract.family != mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
         return Ok(request);
     }
@@ -19291,7 +19324,7 @@ fn catalog_endpoint_calibration_response(
         mayhem_proto::ENDPOINT_MAYHEM_DECISIONS => {
             let result: Value = serde_json::from_str(&output.content)
                 .context("decision backend produced invalid JSON")?;
-            Ok(json!({
+            let mut response = json!({
                 "id": "decision-calibration",
                 "object": "decision.result",
                 "created": 1,
@@ -19300,7 +19333,13 @@ fn catalog_endpoint_calibration_response(
                 "routing": result.get("routing").cloned().context("decision result is missing routing")?,
                 "usage": usage,
                 "mayhem": mayhem,
-            }))
+            });
+            for optional in ["shortlist", "preprocessing"] {
+                if let Some(value) = result.get(optional) {
+                    response[optional] = value.clone();
+                }
+            }
+            Ok(response)
         }
         mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS => Ok(json!({
             "id": "img-calibration",
@@ -118572,6 +118611,45 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider_canary_prompt_modalities(model, prompt)
                 == BTreeSet::from(["text".to_owned()])
         }));
+
+        let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, &prompts);
+        let contract = model
+            .adapter
+            .endpoint_families
+            .iter()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS)
+            .unwrap();
+        for case in mayhem_proto::generate_endpoint_calibration_cases(contract).unwrap() {
+            if !case.expect_accept {
+                continue;
+            }
+            let request =
+                mayhem_proto::materialize_endpoint_calibration_request(&case, &substitutions)
+                    .unwrap();
+            let request = catalog_endpoint_calibration_materialize_request(
+                contract, &case, request, &fixtures,
+            )
+            .unwrap();
+            if request.get("email").is_some() {
+                assert!(request
+                    .pointer("/state/body")
+                    .is_some_and(Value::is_string));
+            }
+            if case
+                .expected_response_attributes
+                .iter()
+                .any(|path| path == "shortlist")
+            {
+                assert!(request.get("shortlist").is_some_and(Value::is_object));
+            }
+            if case
+                .expected_response_attributes
+                .iter()
+                .any(|path| path == "preprocessing")
+            {
+                assert!(request.get("email").is_some_and(Value::is_object));
+            }
+        }
     }
 
     #[test]

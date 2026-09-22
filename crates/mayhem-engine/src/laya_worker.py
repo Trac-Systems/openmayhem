@@ -120,9 +120,10 @@ def per_request_system_one(agent, state, questions, temperatures, limits):
     ids = list(questions.keys())
     items = []
     limits = limits or {}
-    max_len = int(limits.get("max_len", agent.cfg.get("max_len", 512)))
+    config = getattr(agent, "cfg", None) or {}
+    max_len = int(limits.get("max_len", config.get("max_len", 512)))
     head_max_len = int(
-        limits.get("head_max_len", agent.cfg.get("head_max_len", 192))
+        limits.get("head_max_len", config.get("head_max_len", 192))
     )
     for qid in ids:
         question = agent._to_internal(questions[qid])
