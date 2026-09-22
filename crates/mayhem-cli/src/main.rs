@@ -18884,6 +18884,9 @@ fn catalog_endpoint_calibration_translation(
                 .context("embedding dimensions overflowed usize")?;
             serde_json::to_value(mayhem_engine::EmbeddingRequest { inputs, dimensions })?
         }
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS => {
+            serde_json::to_value(provider_decision_request_from_body(request)?)?
+        }
         mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => serde_json::to_value(
             provider_image_generation_request_from_body(&contract.family, request)?,
@@ -87440,6 +87443,39 @@ fn provider_embedding_input_texts_from_body(body: &Value) -> Result<Vec<String>>
     provider_embedding_input_texts_from_value(input)
 }
 
+fn provider_decision_request_from_body(body: &Value) -> Result<EngineDecisionRequest> {
+    Ok(EngineDecisionRequest {
+        state: body
+            .get("state")
+            .cloned()
+            .context("decision request is missing state")?,
+        questions: body
+            .get("questions")
+            .cloned()
+            .context("decision request is missing questions")?,
+        checkpoint: body
+            .get("checkpoint")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        task: body
+            .get("task")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        lang: body
+            .get("lang")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        auto_task_detection: body
+            .get("auto_task_detection")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        email: body.get("email").cloned(),
+        shortlist: body.get("shortlist").cloned(),
+        temperature: body.get("temperature").cloned(),
+        limits: body.get("limits").cloned(),
+    })
+}
+
 fn provider_embedding_input_texts_from_value(value: &Value) -> Result<Vec<String>> {
     match value {
         Value::String(text) => {
@@ -93569,46 +93605,10 @@ fn provider_engine_session_response_with_sampling_bounded(
     }
 
     if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS {
-        let state = provider_session_request_result(
-            request_body
-                .get("state")
-                .cloned()
-                .context("decision request is missing state"),
-        )?;
-        let questions = provider_session_request_result(
-            request_body
-                .get("questions")
-                .cloned()
-                .context("decision request is missing questions"),
-        )?;
+        let request =
+            provider_session_request_result(provider_decision_request_from_body(request_body))?;
         let output = backend
-            .decide(
-                EngineDecisionRequest {
-                    state,
-                    questions,
-                    checkpoint: request_body
-                        .get("checkpoint")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    task: request_body
-                        .get("task")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    lang: request_body
-                        .get("lang")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
-                    auto_task_detection: request_body
-                        .get("auto_task_detection")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                    email: request_body.get("email").cloned(),
-                    shortlist: request_body.get("shortlist").cloned(),
-                    temperature: request_body.get("temperature").cloned(),
-                    limits: request_body.get("limits").cloned(),
-                },
-                cancellation,
-            )
+            .decide(request, cancellation)
             .context("running provider typed decision with mayhem-engine")?;
         let content = provider_session_output_result(
             serde_json::to_string(&output.result).context("serializing provider decision result"),
@@ -118544,6 +118544,23 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .iter()
             .find(|model| model.model_id == "Qwen/Qwen3.8-27B")
             .expect("Qwen 3.8 catalog model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+
+        catalog_endpoint_calibration_preflight(model, &prompts).unwrap();
+    }
+
+    #[test]
+    fn laya_endpoint_calibration_preflight_is_complete() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "convaiinnovations/laya")
+            .expect("Laya catalog model");
         let canaries_dir = repo_path("catalog/canaries").unwrap();
         let prompts =
             load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
