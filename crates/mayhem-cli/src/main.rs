@@ -25885,7 +25885,7 @@ fn calibrate_decision_fingerprint_prompt(
                     .unwrap_or(false),
                 email: prompt.endpoint_attributes.get("email").cloned(),
                 shortlist: prompt.endpoint_attributes.get("shortlist").cloned(),
-                temperature: prompt.endpoint_attributes.get("temperature").cloned(),
+                temperature: prompt.decision_temperature.clone(),
                 limits: prompt.endpoint_attributes.get("limits").cloned(),
             },
             &CancellationToken::new(),
@@ -47824,6 +47824,8 @@ struct CanaryPrompt {
     specialities: BTreeMap<String, String>,
     #[serde(default)]
     temperature: Option<f64>,
+    #[serde(default)]
+    decision_temperature: Option<Value>,
     #[serde(default)]
     top_p: Option<f64>,
     #[serde(default)]
@@ -129334,6 +129336,7 @@ State initialization...
             })]),
             specialities: BTreeMap::from([("thinking_mode".to_owned(), "disabled".to_owned())]),
             temperature: Some(0.2),
+            decision_temperature: None,
             top_p: Some(0.9),
             top_k: Some(20),
             min_p: Some(0.05),

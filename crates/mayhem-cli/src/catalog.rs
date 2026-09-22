@@ -717,6 +717,8 @@ struct CanarySetPrompt {
     #[serde(default)]
     temperature: Option<f64>,
     #[serde(default)]
+    decision_temperature: Option<Value>,
+    #[serde(default)]
     top_p: Option<f64>,
     #[serde(default)]
     top_k: Option<i32>,
@@ -10165,6 +10167,7 @@ mod tests {
             input: None,
             audio_b64: None,
             temperature: Some(0.0),
+            decision_temperature: None,
             top_p: None,
             top_k: None,
             min_p: None,
@@ -10253,6 +10256,7 @@ mod tests {
         let prompt: CanarySetPrompt = serde_json::from_value(serde_json::json!({
             "id": "decision",
             "state": {"message": "Please refund the duplicate charge."},
+            "decision_temperature": {"choice": 1.0, "noul": 1.5},
             "questions": {
                 "refund_requested": {
                     "type": "noul",
@@ -10261,6 +10265,8 @@ mod tests {
             }
         }))
         .expect("parse decision prompt");
+
+        assert!(prompt.decision_temperature.is_some());
 
         assert_eq!(
             canary_prompt_modalities(&model, &prompt),
