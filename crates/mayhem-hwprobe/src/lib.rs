@@ -20,6 +20,8 @@ const ACE_STEP_CUDA_FULL_OFFLOAD_FLOOR: u64 = 20 * GIB;
 const ACE_STEP_APPLE_UNIFIED_MEMORY_FLOOR: u64 = 16 * GIB;
 const CHATTERBOX_RAM_FLOOR: u64 = 8 * GIB;
 const CHATTERBOX_ACCELERATOR_MEMORY_FLOOR: u64 = 6 * GIB;
+const LAYA_RAM_FLOOR: u64 = 8 * GIB;
+const LAYA_CUDA_MEMORY_FLOOR: u64 = 8 * GIB;
 const NEEDLE_RAM_FLOOR: u64 = GIB;
 const NEEDLE_GPU_MEMORY_FLOOR: u64 = 512 * MIB;
 const COMFYUI_RAM_FLOOR: u64 = 4 * GIB;
@@ -346,6 +348,7 @@ fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
         ace_step_verdict(profile),
         chatterbox_verdict(profile),
         transformers_asr_verdict(profile),
+        laya_verdict(profile),
         whisper_cpp_verdict(profile),
         piper_verdict(profile),
         needle_cpu_verdict(profile),
@@ -1383,6 +1386,80 @@ fn transformers_asr_verdict(profile: &HardwareProfile) -> BackendVerdict {
             .available_bytes
             .unwrap_or(profile.memory.total_bytes)
             / 8,
+    }
+}
+
+fn laya_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    if profile.host.os != "linux" {
+        return insufficient(
+            "laya",
+            "Laya's calibrated production runtime requires Linux CUDA",
+        );
+    }
+    if profile.memory.total_bytes < LAYA_RAM_FLOOR {
+        return insufficient("laya", "less than 8 GiB host RAM detected");
+    }
+
+    let compatible = profile
+        .gpus
+        .iter()
+        .filter(|gpu| {
+            gpu.vendor == GpuVendor::Nvidia
+                && gpu.backend == GpuBackend::Nvml
+                && gpu
+                    .compute_capability
+                    .as_deref()
+                    .and_then(parse_compute_capability)
+                    .is_some_and(|capability| capability >= (7, 5))
+        })
+        .collect::<Vec<_>>();
+    if compatible.is_empty() {
+        return insufficient(
+            "laya",
+            "no compatible NVIDIA GPU with compute capability >= 7.5 detected",
+        );
+    }
+
+    // A Laya worker preloads all three checkpoints on one CUDA device. Do not
+    // add memory across devices: split capacity cannot satisfy that residency
+    // requirement.
+    let usable_memory = compatible
+        .iter()
+        .map(|gpu| {
+            if nvidia_gpu_uses_host_unified_memory(profile, gpu) {
+                gpu.memory_bytes.unwrap_or_else(|| {
+                    profile
+                        .memory
+                        .available_bytes
+                        .unwrap_or(profile.memory.total_bytes)
+                })
+            } else {
+                gpu.dedicated_memory_bytes.or(gpu.memory_bytes).unwrap_or(0)
+            }
+        })
+        .max()
+        .unwrap_or(0);
+    if usable_memory < LAYA_CUDA_MEMORY_FLOOR {
+        return insufficient(
+            "laya",
+            &format!(
+                "Laya requires at least 8 GiB usable memory on one compatible NVIDIA GPU; {} detected",
+                format_bytes(usable_memory)
+            ),
+        );
+    }
+
+    BackendVerdict {
+        backend: "laya".to_owned(),
+        status: VerdictStatus::FullOffload,
+        reason: Some(
+            "one compatible NVIDIA CUDA GPU can keep the complete English, multilingual, and typed-decisions checkpoint family resident"
+                .to_owned(),
+        ),
+        est_tok_s: None,
+        n_layers_gpu: None,
+        max_sessions: 1,
+        kv_cache_bytes_budget: 0,
     }
 }
 
@@ -3470,6 +3547,56 @@ mod tests {
         assert_eq!(verdict.status, VerdictStatus::CpuOnly);
         assert_eq!(verdict.n_layers_gpu, Some(0));
         assert!(verdict.reason.unwrap_or_default().contains("below 4 GiB"));
+    }
+
+    #[test]
+    fn laya_requires_one_linux_cuda_device_with_the_full_memory_floor() {
+        for fixture in [
+            FixtureProfile::LinuxNvidia,
+            FixtureProfile::LinuxNvidiaArm64,
+        ] {
+            let profile = fixture_profile(fixture, Path::new("."));
+            let verdict = laya_verdict(&profile);
+            assert_eq!(verdict.status, VerdictStatus::FullOffload);
+            assert_eq!(verdict.max_sessions, 1);
+            assert_eq!(verdict.kv_cache_bytes_budget, 0);
+        }
+
+        let mut split = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
+        for gpu in &mut split.gpus {
+            gpu.memory_bytes = Some(6 * GIB);
+            gpu.dedicated_memory_bytes = Some(6 * GIB);
+        }
+        let split = laya_verdict(&split);
+        assert_eq!(split.status, VerdictStatus::Insufficient);
+        assert!(split
+            .reason
+            .unwrap_or_default()
+            .contains("on one compatible NVIDIA GPU"));
+    }
+
+    #[test]
+    fn laya_rejects_uncalibrated_platforms_and_cuda_capabilities() {
+        for fixture in [
+            FixtureProfile::AppleSilicon,
+            FixtureProfile::WindowsNvidia,
+            FixtureProfile::CpuOnly,
+        ] {
+            assert_eq!(
+                laya_verdict(&fixture_profile(fixture, Path::new("."))).status,
+                VerdictStatus::Insufficient,
+                "{}",
+                fixture.as_str()
+            );
+        }
+
+        let mut old_cuda = fixture_profile(FixtureProfile::LinuxNvidia, Path::new("."));
+        for gpu in &mut old_cuda.gpus {
+            gpu.compute_capability = Some("7.0".to_owned());
+        }
+        let old_cuda = laya_verdict(&old_cuda);
+        assert_eq!(old_cuda.status, VerdictStatus::Insufficient);
+        assert!(old_cuda.reason.unwrap_or_default().contains(">= 7.5"));
     }
 
     #[test]
