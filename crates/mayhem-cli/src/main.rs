@@ -82671,7 +82671,7 @@ fn provider_session_request_modalities(
             modality_load.contains_key("image"),
         ),
         "workflow_generation" => modality_load.keys().cloned().collect::<Vec<_>>(),
-        "chat" => vec!["text".to_owned()],
+        "chat" | "decision" => vec!["text".to_owned()],
         other => bail!("unsupported provider request kind {other}"),
     };
     if provider_endpoint_transport_kind(family)? == "chat" {
@@ -83483,6 +83483,7 @@ fn provider_session_modality_load(
             }
             Ok(load)
         }
+        "decision" => Ok(BTreeMap::new()),
         "embedding" => {
             let inputs =
                 provider_session_request_result(provider_embedding_input_texts_from_body(body))?;
@@ -118122,6 +118123,26 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)
                 .unwrap();
         assert_eq!(verified.family, mayhem_proto::ENDPOINT_MAYHEM_DECISIONS);
+        let load = provider_session_modality_load(
+            verified.contract,
+            verified.family,
+            verified.request,
+            &sealed,
+            None,
+            &["text".to_owned()],
+        )
+        .unwrap();
+        assert!(load.is_empty());
+        assert_eq!(
+            provider_session_request_modalities(
+                verified.family,
+                verified.request,
+                &["text".to_owned()],
+                &load,
+            )
+            .unwrap(),
+            vec!["text".to_owned()]
+        );
         let request = provider_decision_request_from_body(verified.request).unwrap();
         assert_eq!(request.checkpoint.as_deref(), Some("english"));
 
