@@ -5,17 +5,16 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import { consumeCanonicalReplayContext } from 'trac-peer/src/base/canonical-replay.js';
 import PeerWallet from 'trac-wallet';
-import ContractV23 from './history/v23.js';
-import ContractV24 from './history/v24.js';
-import ContractV25 from './history/v25.js';
-import ContractV26 from './history/v26.js';
-import ContractV27 from './history/v27.js';
+import ContractV23 from './v23.js';
+import ContractV24 from './v24.js';
+import ContractV25 from './v25.js';
+import ContractV26 from './v26.js';
 
-export const CONTRACT_VERSION = 28;
-// Recovery is limited to receipt evidence already signed by v23-v27
+export const CONTRACT_VERSION = 27;
+// Recovery is limited to receipt evidence already signed by v23-v26
 // participants. New prior-version operations are not admitted;
 // separately authenticated canonical replay does not constitute new admission.
-const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25, 26, 27]);
+const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25, 26]);
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -293,7 +292,6 @@ const MODEL_CLASSES = new Set([
   'audio-generation',
   'music-generation',
   'workflow',
-  'decision',
 ]);
 const RATE_MAP_MAX_ENTRIES = 16;
 const MODEL_CLASS_RATE_UNITS = Object.freeze({
@@ -309,7 +307,6 @@ const MODEL_CLASS_RATE_UNITS = Object.freeze({
   stt: new Set(['audio_second']),
   'audio-generation': new Set(['input_character', 'audio_second']),
   'music-generation': new Set(['input_character', 'audio_second']),
-  decision: new Set(['input_token', 'output_token']),
   workflow: new Set([
     'megapixel_step',
     'megapixel',
@@ -337,7 +334,6 @@ const MODEL_CLASS_OUTPUT_MODALITIES = Object.freeze({
   stt: new Set(['text']),
   'audio-generation': new Set(['audio']),
   'music-generation': new Set(['audio']),
-  decision: new Set(['text']),
   workflow: new Set(['image', 'video', 'audio']),
 });
 const ENCLAVE_ARTIFACT_ROOT_KIND = 'blake3_merkle_v1';
@@ -908,8 +904,8 @@ class MayhemContract extends Contract {
       const versioned = versionedMayhemOperation(op);
       const canonicalReplay = consumeCanonicalReplayContext(consensusContext, op, storage);
       const historical = versioned.present && (
-        ([23, 24, 25, 26, 27].includes(versioned.version) && canonicalReplay) ||
-        ([24, 25, 26, 27].includes(versioned.version) &&
+        ([23, 24, 25, 26].includes(versioned.version) && canonicalReplay) ||
+        ([24, 25, 26].includes(versioned.version) &&
           await this.isPreparedCheckpointReplay(op, storage))
       );
       if (historical) {
@@ -922,9 +918,7 @@ class MayhemContract extends Contract {
             ? ContractV24
             : versioned.version === 25
               ? ContractV25
-              : versioned.version === 26
-                ? ContractV26
-                : ContractV27;
+              : ContractV26;
         this._historicalContracts ??= new Map();
         if (!this._historicalContracts.has(versioned.version)) {
           this._historicalContracts.set(versioned.version, new Implementation(this.protocol, this.config));
@@ -3313,7 +3307,7 @@ class MayhemContract extends Contract {
       'record usage receipt envelope'
     );
     if (receiptShapeError) return receiptShapeError;
-    const targetSchemaVersion = value.contract_version === CONTRACT_VERSION || value.contract_version === 27
+    const targetSchemaVersion = value.contract_version === CONTRACT_VERSION
       ? SESSION_RECEIPT_SCHEMA_VERSION
       : 11;
     const receipt = await this.normalizeReceiptEnvelope(value.receipt, {
@@ -18299,7 +18293,6 @@ class MayhemContract extends Contract {
   coreModalitiesForModelClass(modelClass) {
     switch (modelClass) {
       case DEFAULT_MODEL_CLASS:
-      case 'decision':
         return new Set(['text']);
       case 'embedding':
         return new Set(['embedding']);
@@ -19343,7 +19336,7 @@ class MayhemContract extends Contract {
     if (modalityError) return modalityError;
     const modelClass = this.modelClassFor(enclave);
     const required = new Set();
-    if (modelClass === DEFAULT_MODEL_CLASS || modelClass === 'decision') {
+    if (modelClass === DEFAULT_MODEL_CLASS) {
       required.add('input_token');
       required.add('output_token');
     } else if (modelClass === 'embedding') {

@@ -26,6 +26,7 @@ const VERIFICATION_EMBEDDING_COSINE: &str = "embedding_cosine";
 const VERIFICATION_TRANSCRIPT_MATCH: &str = "transcript_match";
 const VERIFICATION_AUDIO_FINGERPRINT: &str = "audio_fingerprint";
 const VERIFICATION_VIDEO_AV_FINGERPRINT: &str = "video_av_fingerprint";
+const VERIFICATION_DECISION_FINGERPRINT: &str = "decision_fingerprint";
 const VERIFICATION_ATTESTATION_OF_COMPUTE: &str = "attestation_of_compute";
 const MODEL_CLASS_EMBEDDING: &str = "embedding";
 const MODEL_CLASS_IMAGE_GENERATION: &str = "image-generation";
@@ -35,6 +36,7 @@ const MODEL_CLASS_STT: &str = "stt";
 const MODEL_CLASS_AUDIO_GENERATION: &str = "audio-generation";
 const MODEL_CLASS_MUSIC_GENERATION: &str = "music-generation";
 const MODEL_CLASS_WORKFLOW: &str = "workflow";
+const MODEL_CLASS_DECISION: &str = "decision";
 const MAX_CATALOG_MODALITY_INFLIGHT_ITEMS: u32 = 1_024;
 const MAX_CATALOG_MODALITY_ITEMS_PER_REQUEST: u32 = 1_024;
 const MAX_VLLM_SPECULATIVE_TOKENS: u32 = 32;
@@ -647,6 +649,8 @@ pub(crate) struct CanaryRef {
     pub(crate) audio_fingerprints: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
     pub(crate) video_fingerprints: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) decision_fingerprints: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -658,6 +662,10 @@ pub(crate) struct PriceRef {
     pub(crate) out_per_1k: MoneyAu,
     #[serde(default)]
     pub(crate) rate_map: Vec<CatalogRateMapEntry>,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    pub(crate) per_req_au: MoneyAu,
+    #[serde(default, with = "mayhem_proto::decimal_u128")]
+    pub(crate) min_session_au: MoneyAu,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -2422,6 +2430,26 @@ fn validate_model_modality_assessment(model: &CatalogModel, errors: &mut Vec<Str
 }
 
 fn validate_price_ref(model: &CatalogModel, errors: &mut Vec<String>) {
+    if model.model_class == MODEL_CLASS_DECISION {
+        if model.price_ref_au.rate_map.is_empty() {
+            if model.price_ref_au.in_per_1k == 0 || model.price_ref_au.out_per_1k == 0 {
+                errors.push(format!(
+                    "{} decision pricing requires positive input and output token rates",
+                    model.model_id
+                ));
+            }
+        } else {
+            validate_price_rate_map(model, errors);
+            validate_required_modality_price_units(model, errors);
+        }
+        if model.price_ref_au.per_req_au != 0 || model.price_ref_au.min_session_au != 0 {
+            errors.push(format!(
+                "{} decision pricing must use token rates without a fixed or minimum fee",
+                model.model_id
+            ));
+        }
+        return;
+    }
     if !model.price_ref_au.rate_map.is_empty() {
         validate_price_rate_map(model, errors);
         validate_required_modality_price_units(model, errors);
@@ -2444,7 +2472,7 @@ fn validate_price_ref(model: &CatalogModel, errors: &mut Vec<String>) {
 fn validate_required_modality_price_units(model: &CatalogModel, errors: &mut Vec<String>) {
     let mut required = BTreeSet::new();
     match model.model_class.as_str() {
-        DEFAULT_MODEL_CLASS => {
+        DEFAULT_MODEL_CLASS | MODEL_CLASS_DECISION => {
             required.insert("input_token");
             required.insert("output_token");
         }
@@ -2514,6 +2542,7 @@ fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
             USAGE_STEP,
             USAGE_VIDEO_SECOND,
         ],
+        MODEL_CLASS_DECISION => &["input_token", "output_token"],
         _ => &["input_token", "cached_input_token", "output_token"],
     };
     for entry in &model.price_ref_au.rate_map {
@@ -2564,6 +2593,7 @@ fn validate_price_rate_map(model: &CatalogModel, errors: &mut Vec<String>) {
             .and_then(|policy| policy.pricing_unit.as_deref())
             .into_iter()
             .collect(),
+        MODEL_CLASS_DECISION => vec![USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN],
         _ => vec![USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN],
     };
     for unit in required_units {
@@ -2616,6 +2646,7 @@ fn validate_canary_verification(model: &CatalogModel, errors: &mut Vec<String>) 
         VERIFICATION_TRANSCRIPT_MATCH => validate_transcript_match_canary(model, errors),
         VERIFICATION_AUDIO_FINGERPRINT => validate_audio_fingerprint_canary(model, errors),
         VERIFICATION_VIDEO_AV_FINGERPRINT => validate_video_av_fingerprint_canary(model, errors),
+        VERIFICATION_DECISION_FINGERPRINT => validate_decision_fingerprint_canary(model, errors),
         VERIFICATION_ATTESTATION_OF_COMPUTE => {
             validate_attestation_of_compute_canary(model, errors)
         }
@@ -2819,6 +2850,7 @@ fn valid_canary_verification_method(method: &str) -> bool {
             | VERIFICATION_TRANSCRIPT_MATCH
             | VERIFICATION_AUDIO_FINGERPRINT
             | VERIFICATION_VIDEO_AV_FINGERPRINT
+            | VERIFICATION_DECISION_FINGERPRINT
             | VERIFICATION_ATTESTATION_OF_COMPUTE
     )
 }
@@ -2847,6 +2879,7 @@ fn canary_verification_method_allowed_for_class(model_class: &str, method: &str)
                     | VERIFICATION_AUDIO_FINGERPRINT
                     | VERIFICATION_VIDEO_AV_FINGERPRINT
             )
+            | (MODEL_CLASS_DECISION, VERIFICATION_DECISION_FINGERPRINT)
             | (_, VERIFICATION_ATTESTATION_OF_COMPUTE)
     )
 }
@@ -2861,8 +2894,44 @@ fn required_launch_output_canary_method(model_class: &str) -> Option<&'static st
         MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
             Some(VERIFICATION_AUDIO_FINGERPRINT)
         }
+        MODEL_CLASS_DECISION => Some(VERIFICATION_DECISION_FINGERPRINT),
         _ => None,
     }
+}
+
+fn validate_decision_fingerprint_canary(model: &CatalogModel, errors: &mut Vec<String>) {
+    if model.canary.verification_tolerance_bps.is_some() {
+        errors.push(format!(
+            "{} decision_fingerprint canary must not set verification_tolerance_bps",
+            model.model_id
+        ));
+    }
+    if !model.canary.fingerprints.is_empty()
+        || !model.canary.token_prefixes.is_empty()
+        || !model.canary.perceptual_hashes.is_empty()
+        || !model.canary.embedding_vectors.is_empty()
+        || !model.canary.transcripts.is_empty()
+        || !model.canary.audio_fingerprints.is_empty()
+        || !model.canary.video_fingerprints.is_empty()
+    {
+        errors.push(format!(
+            "{} decision_fingerprint canary must use decision_fingerprints only",
+            model.model_id
+        ));
+    }
+    validate_prompt_map_complete(
+        model,
+        "decision_fingerprints",
+        &model.canary.decision_fingerprints,
+        errors,
+        |model_id, artifact, prompt_id, fingerprint, errors| {
+            if prompt_id.trim().is_empty() || !is_lower_hex_len(fingerprint, 64) {
+                errors.push(format!(
+                    "{model_id} canary decision_fingerprints for {artifact} prompt {prompt_id} must be exact lowercase 32-byte hex"
+                ));
+            }
+        },
+    );
 }
 
 fn validate_token_fingerprint_canary(model: &CatalogModel, errors: &mut Vec<String>) {
@@ -3257,6 +3326,7 @@ fn valid_model_class(model_class: &str) -> bool {
             | MODEL_CLASS_AUDIO_GENERATION
             | MODEL_CLASS_MUSIC_GENERATION
             | MODEL_CLASS_WORKFLOW
+            | MODEL_CLASS_DECISION
     )
 }
 
@@ -3277,6 +3347,7 @@ fn output_modality_allowed_for_class(model_class: &str, modality: &str) -> bool 
             )
             | (MODEL_CLASS_STT, "text")
             | (MODEL_CLASS_WORKFLOW, "image" | "video" | "audio")
+            | (MODEL_CLASS_DECISION, "text")
     )
 }
 
@@ -4514,6 +4585,7 @@ fn valid_endpoint_family(family: &str) -> bool {
             | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
             | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
             | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+            | mayhem_proto::ENDPOINT_MAYHEM_DECISIONS
     )
 }
 
@@ -4587,6 +4659,7 @@ fn required_endpoint_family_names(
             mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO,
         ]),
         MODEL_CLASS_WORKFLOW => BTreeSet::from([mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS]),
+        MODEL_CLASS_DECISION => BTreeSet::from([mayhem_proto::ENDPOINT_MAYHEM_DECISIONS]),
         _ => BTreeSet::new(),
     };
     if model_class == DEFAULT_MODEL_CLASS
@@ -4653,6 +4726,7 @@ fn endpoint_family_allowed_for_model(model: &CatalogModel, family: &str) -> bool
                 | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
         ),
         MODEL_CLASS_WORKFLOW => family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        MODEL_CLASS_DECISION => family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
         _ => false,
     }
 }
@@ -5896,6 +5970,12 @@ fn canary_prompt_modalities<'a>(
             )) {
                 modalities.insert("image");
             }
+        }
+        VERIFICATION_DECISION_FINGERPRINT
+            if prompt.endpoint_attributes.contains_key("state")
+                && prompt.endpoint_attributes.contains_key("questions") =>
+        {
+            modalities.insert("text");
         }
         VERIFICATION_SEED_PERCEPTUAL_HASH
             if model.model_class == MODEL_CLASS_WORKFLOW
@@ -8152,6 +8232,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
 
@@ -8355,6 +8436,7 @@ mod tests {
                     )]),
                 )]),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let artifact = model.artifacts.get_mut("fixture").unwrap();
@@ -8439,6 +8521,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         {
@@ -8582,6 +8665,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let artifact = {
@@ -8793,6 +8877,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let artifact = model.artifacts.get_mut("fixture").unwrap();
@@ -8940,6 +9025,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         model.min_app_version = Some("0.1.0".to_owned());
@@ -8982,6 +9068,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -9035,6 +9122,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let descriptor = ModelSpecialityDescriptor {
@@ -9316,11 +9404,14 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
             price_ref_au: PriceRef {
                 denom: "au_usd".to_owned(),
                 in_per_1k: 1,
                 out_per_1k: 1,
+                per_req_au: 0,
+                min_session_au: 0,
                 rate_map: Vec::new(),
             },
         };
@@ -9392,6 +9483,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -9417,6 +9509,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -9466,6 +9559,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -9504,6 +9598,7 @@ mod tests {
                 )]),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -9532,6 +9627,7 @@ mod tests {
                     )]),
                 )]),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -9588,6 +9684,7 @@ mod tests {
                     "fixture".to_owned(),
                     BTreeMap::from([("fixed-video".to_owned(), test_video_av_fingerprint())]),
                 )]),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let mut errors = Vec::new();
@@ -9874,6 +9971,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         model.adapter.tool_call_strategy = "openai_tool_calls".to_owned();
@@ -10000,6 +10098,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         model.adapter.endpoint_families.retain(|contract| {
@@ -10050,6 +10149,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let prompt = CanarySetPrompt {
@@ -10100,6 +10200,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let text_to_video: CanarySetPrompt = serde_json::from_value(serde_json::json!({
@@ -10129,6 +10230,45 @@ mod tests {
     }
 
     #[test]
+    fn decision_canary_counts_structured_state_and_questions_as_text() {
+        let model = verification_test_model(
+            "admin/decision@fixture",
+            MODEL_CLASS_DECISION,
+            "laya",
+            CanaryRef {
+                set_id: "canary-decision-v1".to_owned(),
+                match_min: 1.0,
+                verification_method: VERIFICATION_DECISION_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
+            },
+        );
+        let prompt: CanarySetPrompt = serde_json::from_value(serde_json::json!({
+            "id": "decision",
+            "state": {"message": "Please refund the duplicate charge."},
+            "questions": {
+                "refund_requested": {
+                    "type": "noul",
+                    "instructions": "Was a refund requested?"
+                }
+            }
+        }))
+        .expect("parse decision prompt");
+
+        assert_eq!(
+            canary_prompt_modalities(&model, &prompt),
+            BTreeSet::from(["text"])
+        );
+    }
+
+    #[test]
     fn embedding_adapter_and_input_only_pricing_validate() {
         let mut model = verification_test_model(
             "admin/embed@q8",
@@ -10149,6 +10289,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         model.price_ref_au.out_per_1k = 0;
@@ -10184,6 +10325,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         text_with_zero_output.price_ref_au.out_per_1k = 0;
@@ -10214,6 +10356,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         model.adapter.tool_call_strategy = "none".to_owned();
@@ -10317,6 +10460,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         text_with_image_shape.adapter.endpoint_families =
@@ -10352,6 +10496,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         model.family = "comfy-workflow".to_owned();
@@ -10427,6 +10572,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         model.family = "comfy-workflow".to_owned();
@@ -10484,6 +10630,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         let rate = |unit: &str, per_unit_au, granularity| CatalogRateMapEntry {
@@ -10577,6 +10724,7 @@ mod tests {
                     "fixture".to_owned(),
                     BTreeMap::from([("fixed-video".to_owned(), test_video_av_fingerprint())]),
                 )]),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         model.price_ref_au.in_per_1k = 0;
@@ -10638,6 +10786,7 @@ mod tests {
                 transcripts: BTreeMap::new(),
                 audio_fingerprints: BTreeMap::new(),
                 video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
             },
         );
         model.adapter.modality_set = vec!["audio".to_owned()];
@@ -10882,6 +11031,8 @@ mod tests {
                 denom: "au_usd".to_owned(),
                 in_per_1k: 1,
                 out_per_1k: 1,
+                per_req_au: 0,
+                min_session_au: 0,
                 rate_map: Vec::new(),
             },
         }

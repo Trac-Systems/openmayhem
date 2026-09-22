@@ -104,8 +104,8 @@ const clone = (value) => JSON.parse(JSON.stringify(value));
 test('checked-in Intercom release identity verifies exact sorted contract code bytes', () => {
   const identity = verifyReleaseIdentity({ rootDir: INTERCOM_ROOT });
 
-  assert.equal(identity.releaseVersion, '0.2.260');
-  assert.equal(identity.contractVersion, 27);
+  assert.equal(identity.releaseVersion, '0.2.261');
+  assert.equal(identity.contractVersion, 28);
   assert.match(identity.contractCodeSha256, /^[0-9a-f]{64}$/);
   assert.deepEqual(
     identity.files.map((file) => file.path),
@@ -317,7 +317,7 @@ test('health exposes only a verified Intercom contract identity', async (t) => {
   assert.equal(response.status, 200);
   assert.deepEqual(await response.json(), {
     ok: true,
-    contract_version: 27,
+    contract_version: 28,
     contract_code_sha256: releaseIdentity.contractCodeSha256,
   });
 });
@@ -335,7 +335,7 @@ test('health has no compatibility fallback when release identity is unavailable'
 });
 
 test('release identity binds retained implementations and replay admission code', (t) => {
-  for (const name of ['contract/history/v23.js', 'contract/history/v24.js', 'contract/history/v25.js', 'trac/trac-peer/src/base/canonical-replay.js']) {
+  for (const name of ['contract/history/v23.js', 'contract/history/v24.js', 'contract/history/v25.js', 'contract/history/v26.js', 'contract/history/v27.js', 'trac/trac-peer/src/base/canonical-replay.js']) {
     const rootDir = fixtureRoot(t);
     fs.appendFileSync(path.join(rootDir, name), '\n// changed replay semantics\n');
     assert.throws(() => verifyReleaseIdentity({ rootDir }), /mismatch/);

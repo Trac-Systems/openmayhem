@@ -48100,6 +48100,713 @@
         "in_per_1k": "60000000000000",
         "out_per_1k": "0"
       }
+    },
+    {
+      "model_id": "convaiinnovations/laya",
+      "min_app_version": "0.2.261",
+      "model_class": "decision",
+      "family": "laya",
+      "params_b": 1.164,
+      "tier": "launch",
+      "provenance": {
+        "source": {
+          "kind": "huggingface",
+          "publisher_key": "huggingface-repo",
+          "repo": "convaiinnovations/laya",
+          "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+        },
+        "conversion": [
+          {
+            "tool": "huggingface_hub",
+            "method": "immutable-byte-mirror:pinned-full-three-checkpoint-snapshot",
+            "input_sha256": "1213bb35234c9375176bc9f65f93096f23043fd28738dafd7e47414eb59ef7ea",
+            "output_sha256": "1213bb35234c9375176bc9f65f93096f23043fd28738dafd7e47414eb59ef7ea"
+          }
+        ],
+        "license": "apache-2.0",
+        "license_sha256": "a6cba85bc92e0cff7a450b1d873c0eaa2e9fc96bf472df0247a26bec77bf3ff9"
+      },
+      "artifacts": {
+        "safetensors-bf16": {
+          "engine": "laya",
+          "source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+            "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+          },
+          "upstream_source": {
+            "kind": "huggingface",
+            "publisher_key": "huggingface-repo",
+            "repo": "convaiinnovations/laya",
+            "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+          },
+          "path": "model.safetensors",
+          "artifact_root": "51ad4528dc734e31e1feb8ad4652e81fe70554e9c628f9aca1cd7518ec1885a3",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 842609210,
+          "source_sha256": "891102d372688fc2a094dac56a384bc537b87c63f21f9f3dac0be2b7cbc8d86c",
+          "tokenizer_sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30",
+          "min_compute_cap": "7.5",
+          "download_check": true,
+          "notes": "Pinned complete Laya snapshot with English, multilingual, and typed-decisions checkpoints; all three checkpoints are preloaded and must remain CUDA-resident.",
+          "sidecars": {
+            "laya_encoder_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "encoder/config.json",
+              "artifact_root": "2ef876e3157c4a4963350ebd5fbd391c576b8bfe5f9f96cdfc25f8a30612e29e",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 2083,
+              "source_sha256": "bf3ab80598fdccf414855a2ce80f22859e4492d06ca8a62ddd1cfb63972f8979"
+            },
+            "laya_agent_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "rl_agent_config.json",
+              "artifact_root": "fd54d74f48524982fc923ec83407cc30746b2591aed0a411688211a2cddb5e09",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 745,
+              "source_sha256": "ae287b56bbcf5f8c4f4541ae9dfd00c914c4c48b940b8398c3058af37ba92bbd"
+            },
+            "laya_tokenizer": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "tokenizer/tokenizer.json",
+              "artifact_root": "0dffd509e083200fff68397489a923cfdcb55217aec5f6622d6b2b7f51cbbd30",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 3583228,
+              "source_sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30"
+            },
+            "laya_tokenizer_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "tokenizer/tokenizer_config.json",
+              "artifact_root": "1813f2e15a19bc82ff3fdb0fab1cf5f1dcb7b5f04d1f7bfb982f343ffece06b1",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 308,
+              "source_sha256": "50044de60daaa73df97d262e15a40d4faf0160e7d742df64b377877a1320dd12"
+            },
+            "laya_multilingual_model": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "multilingual/model.safetensors",
+              "artifact_root": "f6a38ff4955ce85f245e453b57eab5169028eef15de0c59f2e7a46b13360e456",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 643835514,
+              "source_sha256": "9d628fd971b700382ac6f65920a86f149777b2e748e0c955fb3b19695aa8f204"
+            },
+            "laya_multilingual_encoder_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "multilingual/encoder/config.json",
+              "artifact_root": "43273722f230d62c88f498b6ae64a438ea2e95b446939ebfdbbb5be4650680e6",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 1938,
+              "source_sha256": "83f6916d13ef0f556ac461f28308dc2bffa7ebeadee8ec9e2db5812020ea5bb4"
+            },
+            "laya_multilingual_agent_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "multilingual/rl_agent_config.json",
+              "artifact_root": "301155769ef0d3caa5e2fa2494e6296668af5a032a7174df18e0687a22b47c09",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 472,
+              "source_sha256": "25061739243b617ad88d1219ba6f8a9c86c5881ca28df024fa2d9b3b2fcc30c6"
+            },
+            "laya_multilingual_tokenizer": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "multilingual/tokenizer/tokenizer.json",
+              "artifact_root": "1d254e265e07518a8bbede19dd84b8574c97edfb5f97df332241989543d26dee",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 34363188,
+              "source_sha256": "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f"
+            },
+            "laya_multilingual_tokenizer_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "multilingual/tokenizer/tokenizer_config.json",
+              "artifact_root": "0081bcd5b6692a64aea3f32bcf56b90cef0fdb638c4160db870317ddbf5a54e4",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 524,
+              "source_sha256": "6c6b2d8e3c84ce0e671c129cd6b374b235d6f9863042a5836358d00a89bbb5a1"
+            },
+            "laya_typed_decisions_model": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "typed-decisions/model.safetensors",
+              "artifact_root": "da57720e920005372bbd1d6f6fbb9b0d37d74f0d7bc0a1181bf832fb0f2690a7",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 842609220,
+              "source_sha256": "4fa56de72383a9d3efa9cfa78955733c81b9fc8067a587ca4beb82c78107a24e"
+            },
+            "laya_typed_decisions_encoder_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "typed-decisions/encoder/config.json",
+              "artifact_root": "c13e935799e247d15acc9bc039aff4ad0e812587d4cdaee0c3aa5419ae126f33",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 2084,
+              "source_sha256": "5268d24ad3b77c8151de5dcb0762ba4391619aad9ab0bda33e36fb083cfeae6d"
+            },
+            "laya_typed_decisions_agent_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "typed-decisions/rl_agent_config.json",
+              "artifact_root": "0db65108ff10bd1737f4d2087696e7dbff00c57a33cf2d5d6ebd8360e9d3a778",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 847,
+              "source_sha256": "ebf0cd524d92342a6be5e48e9fca3d7c2babfb5a56ccd79d2171ef5d8c7f7be8"
+            },
+            "laya_typed_decisions_tokenizer": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "typed-decisions/tokenizer/tokenizer.json",
+              "artifact_root": "0dffd509e083200fff68397489a923cfdcb55217aec5f6622d6b2b7f51cbbd30",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 3583228,
+              "source_sha256": "6c8aaa9a542084f2457eab775d4eeb51f92a70c0fd9de28d5edb0ddec3c08d30"
+            },
+            "laya_typed_decisions_tokenizer_config": {
+              "source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "TracNetwork/mayhem-catalog-convaiinnovations-laya",
+                "revision": "d288cbfe560a0ff904401f57e28820aa140c11e7"
+              },
+              "upstream_source": {
+                "kind": "huggingface",
+                "publisher_key": "huggingface-repo",
+                "repo": "convaiinnovations/laya",
+                "revision": "1c5edc17a7acd8701df6fc341c0d179f1c62c982"
+              },
+              "path": "typed-decisions/tokenizer/tokenizer_config.json",
+              "artifact_root": "6476314c3aaac80b46446340e97b6a7cde12320997b8c5621d5ad6ab8cae3643",
+              "artifact_root_kind": "blake3_merkle_v1",
+              "weights_bytes": 337,
+              "source_sha256": "08d4cf3ac4dca381759441b85b91a6d40e688471dcd33d15d6649eb0a9a854d1"
+            }
+          }
+        }
+      },
+      "caps": {
+        "tools": false,
+        "json": true,
+        "ctx_max": 1024,
+        "vision": false,
+        "image": false,
+        "video": false,
+        "audio": false,
+        "output_modality": "text",
+        "output_modalities": [
+          "text"
+        ]
+      },
+      "requirements": {
+        "min_ram_gb": 8,
+        "min_vram_gb_full_offload": 8,
+        "cpu_flags": [
+          "neon"
+        ],
+        "backends": [
+          "laya"
+        ]
+      },
+      "adapter": {
+        "endpoint_families": [
+          {
+            "family": "mayhem_decisions",
+            "request_attributes": [
+              "model",
+              "state",
+              "questions",
+              "checkpoint",
+              "task",
+              "lang",
+              "auto_task_detection",
+              "email",
+              "shortlist",
+              "temperature",
+              "limits",
+              "user"
+            ],
+            "required_request_attributes": [
+              "model",
+              "state",
+              "questions"
+            ],
+            "response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "answers",
+              "routing",
+              "shortlist",
+              "preprocessing",
+              "usage",
+              "mayhem"
+            ],
+            "required_response_attributes": [
+              "id",
+              "object",
+              "created",
+              "model",
+              "answers",
+              "routing",
+              "usage",
+              "mayhem"
+            ],
+            "request_attribute_specs": {
+              "auto_task_detection": {
+                "value_types": [
+                  "boolean"
+                ],
+                "default": false,
+                "calibration_values": [
+                  false,
+                  true
+                ]
+              },
+              "checkpoint": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "english",
+                  "multilingual",
+                  "typed-decisions"
+                ],
+                "calibration_values": [
+                  "english",
+                  "multilingual",
+                  "typed-decisions"
+                ]
+              },
+              "email": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "clean": true,
+                    "max_chars": 3000
+                  }
+                ]
+              },
+              "lang": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 128,
+                "calibration_values": [
+                  "en"
+                ]
+              },
+              "limits": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "max_len": 1024,
+                    "head_max_len": 256
+                  }
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "calibration_values": [
+                  "$MODEL"
+                ]
+              },
+              "questions": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "intent": {
+                      "type": "choice",
+                      "instructions": "What is the request about?",
+                      "criteria": {
+                        "support": "support request",
+                        "other": "another topic"
+                      }
+                    },
+                    "urgent": {
+                      "type": "noul",
+                      "instructions": "Is the request urgent?"
+                    }
+                  }
+                ]
+              },
+              "shortlist": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "k": 20,
+                    "max_length": 512,
+                    "batch_size": 32
+                  }
+                ]
+              },
+              "state": {
+                "value_types": [
+                  "string",
+                  "object",
+                  "array"
+                ],
+                "calibration_values": [
+                  "Mayhem calibration state",
+                  {
+                    "message": "Mayhem calibration state"
+                  },
+                  [
+                    {
+                      "role": "user",
+                      "content": "Mayhem calibration state"
+                    }
+                  ]
+                ]
+              },
+              "task": {
+                "value_types": [
+                  "string"
+                ],
+                "enum_values": [
+                  "typed_decisions"
+                ],
+                "calibration_values": [
+                  "typed_decisions"
+                ]
+              },
+              "temperature": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {
+                    "choice": 1.0,
+                    "score": 1.0,
+                    "noul": 1.0
+                  }
+                ]
+              },
+              "user": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 1,
+                "max_length": 512,
+                "calibration_values": [
+                  "mayhem-calibration-user"
+                ]
+              }
+            },
+            "response_attribute_specs": {
+              "answers": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "created": {
+                "value_types": [
+                  "integer"
+                ],
+                "minimum": 0,
+                "maximum": 18446744073709552000,
+                "calibration_values": [
+                  1
+                ]
+              },
+              "id": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "mayhem": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "model": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "object": {
+                "value_types": [
+                  "string"
+                ],
+                "min_length": 0,
+                "max_length": 536870912,
+                "calibration_values": [
+                  "$RESPONSE_VALUE"
+                ]
+              },
+              "preprocessing": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "routing": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "shortlist": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              },
+              "usage": {
+                "value_types": [
+                  "object"
+                ],
+                "calibration_values": [
+                  {}
+                ]
+              }
+            },
+            "interaction_groups": []
+          }
+        ],
+      "chat_template_id": "generic_chatml",
+        "tool_call_strategy": "none",
+        "reasoning_passthrough": "strip",
+        "modality_set": [
+          "text"
+        ],
+        "specialities": []
+      },
+      "modality_assessment": {
+        "detected": [
+          "text"
+        ],
+        "evidence": [
+          "Pinned upstream model snapshot, SDK, and README define structured text-state decision inference across English, multilingual, and typed-decision checkpoints."
+        ],
+        "calibrated_fingerprints": {
+          "safetensors-bf16": {
+            "text": "b564d8beb4c8513fd08cdd780645f26d2d2bf1f92bd51e5a5fd2c916811a879e"
+          }
+        },
+        "resource_profiles": {}
+      },
+    "speciality_assessment": {
+      "detected": [],
+      "evidence": [
+        "Pinned upstream card, configuration files, SDK implementation, and checkpoint inventory were reviewed; Laya exposes checkpoint and decision-question selection through its signed decision endpoint rather than text-generation speciality controls."
+      ],
+        "unsupported": {},
+        "calibrated": {}
+      },
+      "sampling": {},
+      "canary": {
+      "set_id": "canary-laya-decision-v1",
+      "match_min": 1,
+      "verification_method": "decision_fingerprint",
+      "fingerprints": {},
+        "token_prefixes": {},
+        "perceptual_hashes": {},
+        "embedding_vectors": {},
+        "transcripts": {},
+        "audio_fingerprints": {},
+        "video_fingerprints": {},
+        "decision_fingerprints": {
+          "safetensors-bf16": {
+            "english-choice-noul": "818b8e4a60d19e9247c3b2a432e44ea4b280cfc0db191f953ba6be65d433cd6d",
+            "multilingual-choice-score": "3219c4dafe34116d5ad09603779c77f44cc37027b1b07647ba9f4e12db8c4e6a",
+            "typed-all-question-types": "fa45b50c6d7b40c8e4de11f4cad3b98757c2ee13d25e5321dc9112f415441932",
+            "automatic-non-latin-routing": "ca591297f756ec8d724c52704201aee94c40dedfd6c29861d8c4a32a33d690f4",
+            "automatic-typed-workflow-routing": "35e1ce961ff340e1a83b9da038addb4b7404740fd3f8992a521682c5ce005167",
+            "email-temperature-limits": "5205d2d9257715c0625b769a3681fcaaf27e075ed53e9e83c9cd84dac8251c5c",
+            "high-cardinality-shortlist": "1f188bc03310ee4d3da3b6c43a0e79cc3dd7a9b4aa59921e4247fcce0cbf4e75",
+            "supplied-vector-shortlist": "56e4e19e84191640ae5382efc6b109fcd69376d8a9b8e9dfa5daea4255771543"
+          }
+        }
+      },
+      "price_ref_au": {
+        "denom": "au_usd",
+        "in_per_1k": "10000000000000",
+        "out_per_1k": "10000000000000",
+        "rate_map": [
+          {
+            "unit": "input_token",
+            "per_unit_au": "10000000000",
+            "granularity": 1
+          },
+          {
+            "unit": "output_token",
+            "per_unit_au": "10000000000",
+            "granularity": 1
+          }
+        ],
+        "per_req_au": "0",
+        "min_session_au": "0"
+      }
     }
   ],
   "schema_version": 1,

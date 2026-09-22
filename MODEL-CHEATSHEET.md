@@ -1071,6 +1071,63 @@ The provider's local modality limits may advertise the calibrated batch and
 in-flight capacity. They must remain within the signed endpoint limit and the
 host's measured memory reserve.
 
+## Laya typed decisions
+
+**Selector and source**
+
+- Model: `convaiinnovations/laya`
+- Backend/artifact: native Laya 0.3.5 / BF16 safetensors
+- Admin mirror:
+  `TracNetwork/mayhem-catalog-convaiinnovations-laya@d288cbfe560a0ff904401f57e28820aa140c11e7`
+- Upstream pin:
+  `convaiinnovations/laya@1c5edc17a7acd8701df6fc341c0d179f1c62c982`
+- Runtime requirements SHA-256:
+  `b146de268c7caf04ee58e7c70bde58e7876ee9b280a8de63cf79c68fd06bab14`
+- Canary:
+  [`canary-laya-decision-v1.json`](catalog/canaries/canary-laya-decision-v1.json)
+
+**Hard requirements and surface**
+
+- CUDA is mandatory. The backend fails load if it observes a CPU fallback or
+  does not preload exactly `english`, `multilingual`, and `typed-decisions`.
+- Native ceiling is 1,024 input tokens. The English checkpoint internally uses
+  its shorter documented default where applicable; caller controls remain
+  bounded by the signed `limits` object.
+- Endpoint: Mayhem `POST /v1/decisions`. This model is a structured decision
+  model and is not exposed as chat completion or media generation.
+- `state` accepts a string, JSON object, or conversation array. `questions`
+  accepts ordered `choice`, `score`, and `noul` decisions. Explicit checkpoint,
+  language hint, typed-task routing, opt-in automatic routing, email cleaning,
+  temperature buckets, length controls, and shortlist controls are supported.
+- Choice questions accept at most 20 options normally. Larger signed requests
+  can use shortlist mode, including caller-supplied vectors, within the endpoint
+  bounds.
+- Billing uses exact processed input tokens and one result unit per four bytes
+  of canonical visible decision JSON. The reference is $0.01 per million input
+  or result units, with no fixed request or minimum-session charge. The hard
+  market band remains positive at $0.0025-$0.04 per million units.
+
+**Measured guidance**
+
+- Exact three-checkpoint CUDA load: about 13.5-13.7 seconds.
+- Peak worker GPU allocation: 5,671 MiB.
+- Five-request warm probes on two independent calibration hosts measured
+  20.889 ms and 20.444 ms p95. The fuller mixed probes measured 84.531 ms and
+  84.237 ms p95.
+- One provider process owns one session slot. The launch uses two independent
+  providers for two aggregate slots and failover without sharing mutable router
+  state between requests.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend laya
+mayhem up --provider --provider-enclave convaiinnovations/laya --yes
+```
+
+The managed provider discovers the signed mirror and builds the pinned Python
+runtime. No request may download weights or lazily load a checkpoint.
+
 ## Verification and troubleshooting
 
 After startup, require all of the following rather than treating process

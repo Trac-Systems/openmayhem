@@ -8,7 +8,7 @@ use crate::{
     ValidatedAudioFormat, ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION, ENDPOINT_HF_FEATURE_EXTRACTION,
     ENDPOINT_HF_MULTIMODAL_CHAT, ENDPOINT_HF_TEXT_TO_AUDIO, ENDPOINT_HF_TEXT_TO_IMAGE,
     ENDPOINT_HF_TEXT_TO_SPEECH, ENDPOINT_HF_TEXT_TO_VIDEO, ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
-    ENDPOINT_MAYHEM_COMFY_WORKFLOWS, ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
+    ENDPOINT_MAYHEM_COMFY_WORKFLOWS, ENDPOINT_MAYHEM_DECISIONS, ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
     ENDPOINT_OPENAI_AUDIO_SPEECH, ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
     ENDPOINT_OPENAI_CHAT_COMPLETIONS, ENDPOINT_OPENAI_COMPLETIONS, ENDPOINT_OPENAI_EMBEDDINGS,
     ENDPOINT_OPENAI_IMAGE_GENERATIONS, ENDPOINT_OPENAI_RESPONSES, ENDPOINT_OPENAI_VIDEOS,
@@ -778,6 +778,35 @@ pub fn endpoint_family_contract_template(family: &str) -> Option<EndpointFamilyC
                 "mayhem",
             ],
         ),
+        ENDPOINT_MAYHEM_DECISIONS => (
+            &[
+                "model",
+                "state",
+                "questions",
+                "checkpoint",
+                "task",
+                "lang",
+                "auto_task_detection",
+                "email",
+                "shortlist",
+                "temperature",
+                "limits",
+                "user",
+            ],
+            &["model", "state", "questions"],
+            &[
+                "id",
+                "object",
+                "created",
+                "model",
+                "answers",
+                "routing",
+                "shortlist",
+                "preprocessing",
+                "usage",
+                "mayhem",
+            ],
+        ),
         _ => return None,
     };
 
@@ -844,6 +873,7 @@ fn endpoint_response_attribute_optional(family: &str, path: &str) -> bool {
             ENDPOINT_OPENAI_AUDIO_TRANSCRIPTIONS,
             "task" | "language" | "duration" | "words" | "segments"
         ) | (ENDPOINT_HF_AUTOMATIC_SPEECH_RECOGNITION, "chunks")
+            | (ENDPOINT_MAYHEM_DECISIONS, "shortlist" | "preprocessing")
     )
 }
 
@@ -1123,6 +1153,60 @@ fn request_attribute_spec(family: &str, path: &str) -> Option<EndpointAttributeS
         "response_format" if family == ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {
             enum_spec(Some(json!("artifact")), &[json!("artifact"), json!("json")])
         }
+        "state" if family == ENDPOINT_MAYHEM_DECISIONS => union_spec(
+            &[
+                EndpointValueType::String,
+                EndpointValueType::Object,
+                EndpointValueType::Array,
+            ],
+            &[
+                json!("Mayhem calibration state"),
+                json!({"message":"Mayhem calibration state"}),
+                json!([{"role":"user","content":"Mayhem calibration state"}]),
+            ],
+        ),
+        "questions" if family == ENDPOINT_MAYHEM_DECISIONS => object_spec(json!({
+            "intent": {
+                "type": "choice",
+                "instructions": "What is the request about?",
+                "criteria": {"support":"support request", "other":"another topic"}
+            },
+            "urgent": {
+                "type": "noul",
+                "instructions": "Is the request urgent?"
+            }
+        })),
+        "checkpoint" if family == ENDPOINT_MAYHEM_DECISIONS => enum_spec(
+            None,
+            &[
+                json!("english"),
+                json!("multilingual"),
+                json!("typed-decisions"),
+            ],
+        ),
+        "task" if family == ENDPOINT_MAYHEM_DECISIONS => {
+            enum_spec(None, &[json!("typed_decisions")])
+        }
+        "lang" if family == ENDPOINT_MAYHEM_DECISIONS => string_spec(1, 128, json!("en")),
+        "auto_task_detection" if family == ENDPOINT_MAYHEM_DECISIONS => boolean_spec(Some(false)),
+        "email" if family == ENDPOINT_MAYHEM_DECISIONS => object_spec(json!({
+            "clean": true,
+            "max_chars": 3000
+        })),
+        "shortlist" if family == ENDPOINT_MAYHEM_DECISIONS => object_spec(json!({
+            "k": 20,
+            "max_length": 512,
+            "batch_size": 32
+        })),
+        "temperature" if family == ENDPOINT_MAYHEM_DECISIONS => object_spec(json!({
+            "choice": 1.0,
+            "score": 1.0,
+            "noul": 1.0
+        })),
+        "limits" if family == ENDPOINT_MAYHEM_DECISIONS => object_spec(json!({
+            "max_len": 1024,
+            "head_max_len": 256
+        })),
         "text" | "reasoning" | "response_format"
             if matches!(
                 family,
@@ -1893,7 +1977,9 @@ fn response_attribute_spec(path: &str) -> Option<EndpointAttributeSpec> {
         }
         "choices" | "data" | "output" | "embeddings" | "chunks" | "words" | "segments"
         | "artifacts" => array_spec(0, 1_000_000, json!([])),
-        "usage" | "mayhem" => object_spec(json!({})),
+        "usage" | "mayhem" | "answers" | "routing" | "shortlist" | "preprocessing" => {
+            object_spec(json!({}))
+        }
         "error" => union_spec(
             &[EndpointValueType::Object, EndpointValueType::Null],
             &[json!({}), Value::Null],
@@ -1906,7 +1992,12 @@ fn response_attribute_spec(path: &str) -> Option<EndpointAttributeSpec> {
 fn boolean_leaf(leaf: &str) -> bool {
     matches!(
         leaf,
-        "normalize" | "truncate" | "return_timestamps" | "do_sample" | "use_cache"
+        "normalize"
+            | "truncate"
+            | "return_timestamps"
+            | "do_sample"
+            | "use_cache"
+            | "auto_task_detection"
     )
 }
 
@@ -5524,6 +5615,7 @@ mod tests {
             ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
             ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
             ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+            ENDPOINT_MAYHEM_DECISIONS,
             ENDPOINT_HF_TEXT_TO_AUDIO,
         ] {
             let contract = endpoint_family_contract_template(family)

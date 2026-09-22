@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Offline only: read a canonical state export and emit unsigned v27 migration commands.
+// Offline only: read a canonical state export and emit unsigned v28 migration commands.
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -78,7 +78,7 @@ export function prepareMarketActivityUpgrade(snapshot) {
   }
   return {
     schema_version: 2,
-    contract_version: 27,
+    contract_version: 28,
     snapshot_sha256: crypto.createHash('sha256')
       .update(JSON.stringify(snapshot)).digest('hex'),
     active_market_count: markets.length,

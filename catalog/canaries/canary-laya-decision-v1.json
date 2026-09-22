@@ -1,0 +1,272 @@
+{
+  "set_id": "canary-laya-decision-v1",
+  "description": "Pinned Laya decision canaries covering every bundled checkpoint, all question types, multilingual routing, and explicit typed-workflow routing.",
+  "prompts": [
+    {
+      "id": "english-choice-noul",
+      "state": {
+        "subject": "Duplicate invoice charge",
+        "body": "We were billed twice. Please refund the duplicate today or we will cancel."
+      },
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which department should handle this request?",
+          "criteria": {
+            "billing": "invoices, payments, refunds",
+            "technical": "bugs, outages, system errors",
+            "sales": "pricing and new contracts",
+            "other": "everything else"
+          }
+        },
+        "refund_requested": {
+          "type": "noul",
+          "instructions": "Does the user explicitly request a refund?"
+        }
+      },
+      "checkpoint": "english"
+    },
+    {
+      "id": "multilingual-choice-score",
+      "state": {
+        "body": "Der Kunde wurde zweimal belastet und benötigt heute eine Rückerstattung."
+      },
+      "questions": {
+        "department": {
+          "type": "choice",
+          "instructions": "Which department should handle this request?",
+          "criteria": {
+            "billing": "invoices, payments, refunds",
+            "technical": "bugs, outages, system errors",
+            "sales": "pricing and new contracts"
+          }
+        },
+        "urgency": {
+          "type": "score",
+          "instructions": "How urgent is this request?",
+          "criteria": ["not urgent", "soon", "critical deadline or blocking issue"]
+        }
+      },
+      "checkpoint": "multilingual",
+      "lang": "de"
+    },
+    {
+      "id": "typed-all-question-types",
+      "state": {
+        "body": "The invoice total differs from the purchase order and payment is due tomorrow."
+      },
+      "questions": {
+        "disposition": {
+          "type": "choice",
+          "instructions": "Choose the processing disposition.",
+          "criteria": {
+            "approve": "approve without intervention",
+            "review": "send for human review",
+            "reject": "reject the invoice"
+          }
+        },
+        "urgency": {
+          "type": "score",
+          "instructions": "Score the urgency.",
+          "criteria": ["low", "medium", "high"]
+        },
+        "matches_order": {
+          "type": "noul",
+          "instructions": "Does the invoice match the purchase order?"
+        }
+      },
+      "checkpoint": "typed-decisions"
+    },
+    {
+      "id": "automatic-non-latin-routing",
+      "state": {
+        "body": "मुझसे दो बार शुल्क लिया गया, कृपया पैसे वापस करें।"
+      },
+      "questions": {
+        "refund_requested": {
+          "type": "noul",
+          "instructions": "Does the user request a refund?"
+        }
+      }
+    },
+    {
+      "id": "automatic-typed-workflow-routing",
+      "state": {
+        "body": "The invoice total differs from the order and requires review before tomorrow."
+      },
+      "questions": {
+        "discrepancy_severity": {
+          "type": "score",
+          "instructions": "Score the discrepancy severity.",
+          "criteria": ["none", "minor", "major"]
+        },
+        "disposition": {
+          "type": "choice",
+          "instructions": "Choose the processing disposition.",
+          "criteria": {
+            "approve": "approve without intervention",
+            "review": "send for human review",
+            "reject": "reject the invoice"
+          }
+        },
+        "duplicate": {
+          "type": "noul",
+          "instructions": "Is this invoice a duplicate?"
+        },
+        "matches_order": {
+          "type": "noul",
+          "instructions": "Does the invoice match the purchase order?"
+        },
+        "urgency": {
+          "type": "score",
+          "instructions": "Score the urgency.",
+          "criteria": ["low", "medium", "high"]
+        }
+      },
+      "auto_task_detection": true
+    },
+    {
+      "id": "email-temperature-limits",
+      "state": {
+        "body": "From: customer@example.com\nSent: Monday\n> Previous reply\nPlease cancel the duplicate invoice and refund it today.\n-- \nLong signature block",
+        "subject": "Duplicate invoice"
+      },
+      "questions": {
+        "refund_requested": {
+          "type": "noul",
+          "instructions": "Does the current email request a refund?"
+        },
+        "urgency": {
+          "type": "score",
+          "instructions": "Score the urgency.",
+          "criteria": ["low", "medium", "high"]
+        }
+      },
+      "checkpoint": "english",
+      "email": {
+        "clean": true,
+        "max_chars": 3000
+      },
+      "temperature": {
+        "noul:2": 1.5,
+        "score:3-5": 1.25
+      },
+      "limits": {
+        "max_len": 512,
+        "head_max_len": 192
+      }
+    },
+    {
+      "id": "high-cardinality-shortlist",
+      "state": {
+        "body": "I cannot sign in because the password reset link has expired."
+      },
+      "questions": {
+        "intent": {
+          "type": "choice",
+          "instructions": "Choose the closest support category.",
+          "criteria": {
+            "account_access": "login, password, or authentication problem",
+            "billing_duplicate": "duplicate invoice or charge",
+            "billing_refund": "refund request",
+            "billing_tax": "tax or VAT question",
+            "cancel_subscription": "cancel a subscription",
+            "change_plan": "change a subscription plan",
+            "data_export": "export account data",
+            "data_import": "import account data",
+            "delete_account": "delete an account",
+            "email_delivery": "email was not delivered",
+            "feature_request": "request a new feature",
+            "integration_api": "API integration question",
+            "integration_webhook": "webhook integration question",
+            "mobile_app": "mobile application problem",
+            "performance": "slow application performance",
+            "privacy": "privacy question",
+            "security": "security concern",
+            "service_outage": "service is unavailable",
+            "shipping": "physical shipment question",
+            "team_members": "manage team members",
+            "two_factor": "two-factor authentication problem",
+            "usage_limits": "usage quota or limit",
+            "verification": "identity or email verification",
+            "website_bug": "website error",
+            "other": "none of the listed categories"
+          }
+        }
+      },
+      "checkpoint": "english",
+      "shortlist": {
+        "k": 20,
+        "max_length": 512,
+        "batch_size": 16
+      }
+    },
+    {
+      "id": "supplied-vector-shortlist",
+      "state": {
+        "body": "The password reset link expired and I cannot sign in."
+      },
+      "questions": {
+        "intent": {
+          "type": "choice",
+          "instructions": "Choose the closest support category.",
+          "criteria": {
+            "account_access": "login, password, or authentication problem",
+            "billing_duplicate": "duplicate invoice or charge",
+            "billing_refund": "refund request",
+            "billing_tax": "tax or VAT question",
+            "cancel_subscription": "cancel a subscription",
+            "change_plan": "change a subscription plan",
+            "data_export": "export account data",
+            "data_import": "import account data",
+            "delete_account": "delete an account",
+            "email_delivery": "email was not delivered",
+            "feature_request": "request a new feature",
+            "integration_api": "API integration question",
+            "integration_webhook": "webhook integration question",
+            "mobile_app": "mobile application problem",
+            "performance": "slow application performance",
+            "privacy": "privacy question",
+            "security": "security concern",
+            "service_outage": "service is unavailable",
+            "team_members": "manage team members",
+            "two_factor": "two-factor authentication problem",
+            "other": "none of the listed categories"
+          }
+        }
+      },
+      "checkpoint": "english",
+      "shortlist": {
+        "k": 20,
+        "vectors": {
+          "intent": {
+            "query": [1, 0],
+            "options": {
+              "account_access": [1, 0],
+              "billing_duplicate": [0, 1],
+              "billing_refund": [0, 1],
+              "billing_tax": [0, 1],
+              "cancel_subscription": [0, 1],
+              "change_plan": [0, 1],
+              "data_export": [0, 1],
+              "data_import": [0, 1],
+              "delete_account": [0, 1],
+              "email_delivery": [0, 1],
+              "feature_request": [0, 1],
+              "integration_api": [0, 1],
+              "integration_webhook": [0, 1],
+              "mobile_app": [0, 1],
+              "performance": [0, 1],
+              "privacy": [0, 1],
+              "security": [0, 1],
+              "service_outage": [0, 1],
+              "team_members": [0, 1],
+              "two_factor": [0, 1],
+              "other": [0, 1]
+            }
+          }
+        }
+      }
+    }
+  ]
+}

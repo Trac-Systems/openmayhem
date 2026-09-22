@@ -87,9 +87,9 @@ pub fn openai_compatible_canary_units(reconstructed_output: &str) -> Vec<i32> {
         .map(|scalar| i32::try_from(u32::from(scalar)).expect("Unicode scalar fits i32"))
         .collect()
 }
-pub const CONTRACT_VERSION: u32 = 27;
-/// Retained schema-11 receipt settlement features accepted across the v27 upgrade.
-pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24, 25, 26];
+pub const CONTRACT_VERSION: u32 = 28;
+/// Retained receipt settlement features accepted across the v28 upgrade.
+pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24, 25, 26, 27];
 /// Historical fixture version; use receipt_contract_version_is_supported for admission.
 pub const RECOVERABLE_RECEIPT_CONTRACT_VERSION: u32 = 23;
 pub fn receipt_contract_version_is_supported(version: u64) -> bool {
@@ -103,7 +103,7 @@ pub fn receipt_schema_version_is_supported_for_contract(
     schema_version: u64,
     contract_version: u64,
 ) -> bool {
-    if contract_version == u64::from(CONTRACT_VERSION) {
+    if contract_version == u64::from(CONTRACT_VERSION) || contract_version == 27 {
         return schema_version == u64::from(SESSION_RECEIPT_SCHEMA_VERSION);
     }
     RECOVERABLE_RECEIPT_CONTRACT_VERSIONS
@@ -399,6 +399,7 @@ pub const ENDPOINT_HF_TEXT_TO_VIDEO: &str = "hf_text_to_video";
 pub const ENDPOINT_MAYHEM_AUDIO_GENERATIONS: &str = "mayhem_audio_generations";
 pub const ENDPOINT_MAYHEM_MUSIC_GENERATIONS: &str = "mayhem_music_generations";
 pub const ENDPOINT_MAYHEM_COMFY_WORKFLOWS: &str = "mayhem_comfy_workflows";
+pub const ENDPOINT_MAYHEM_DECISIONS: &str = "mayhem_decisions";
 pub const ENDPOINT_HF_TEXT_TO_AUDIO: &str = "hf_text_to_audio";
 pub const DEFAULT_SESSION_MAX_FRAME_BYTES: usize = 256 * 1024;
 pub const DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES: usize = 16 * 1024;
@@ -5629,10 +5630,10 @@ mod tests {
 mod market_version_bridge_tests {
     #[test]
     fn receipt_recovery_accepts_v23_through_current_only() {
-        for version in [23, 24, 25, 26, 27] {
+        for version in [23, 24, 25, 26, 27, 28] {
             assert!(super::receipt_contract_version_is_supported(version));
         }
-        for version in [0, 22, 28, u64::MAX] {
+        for version in [0, 22, 29, u64::MAX] {
             assert!(!super::receipt_contract_version_is_supported(version));
         }
         for version in [23, 24, 25, 26] {
@@ -5645,6 +5646,9 @@ mod market_version_bridge_tests {
         }
         assert!(super::receipt_schema_version_is_supported_for_contract(
             12, 27
+        ));
+        assert!(super::receipt_schema_version_is_supported_for_contract(
+            12, 28
         ));
         assert!(!super::receipt_schema_version_is_supported_for_contract(
             11, 27

@@ -38,7 +38,8 @@ const VLLM_MAX_MTP_SPECULATIVE_TOKENS: u32 = 32;
     feature = "mlx",
     feature = "vllm",
     feature = "trt-llm",
-    feature = "transformers-asr"
+    feature = "transformers-asr",
+    feature = "laya"
 ))]
 const WORKER_STDOUT_QUEUE_CAPACITY: usize = 64;
 
@@ -80,6 +81,8 @@ pub enum EngineError {
     Vllm(String),
     #[error("Transformers ASR backend error: {0}")]
     TransformersAsr(String),
+    #[error("Laya backend error: {0}")]
+    Laya(String),
     #[error("ACE-Step backend error: {0}")]
     AceStep(String),
     #[error("Chatterbox backend error: {0}")]
@@ -232,6 +235,7 @@ pub enum ArtifactFormat {
     VllmSafetensors,
     OpenAiCompatibleModel,
     TransformersSafetensors,
+    LayaSafetensors,
     AceStepSafetensors,
     ChatterboxSafetensors,
     ComfyUiRuntime,
@@ -250,6 +254,7 @@ impl ArtifactFormat {
             Self::VllmSafetensors => b"",
             Self::OpenAiCompatibleModel => b"",
             Self::TransformersSafetensors => b"",
+            Self::LayaSafetensors => b"",
             Self::AceStepSafetensors => b"",
             Self::ChatterboxSafetensors => b"",
             Self::ComfyUiRuntime => b"",
@@ -268,6 +273,7 @@ impl ArtifactFormat {
             Self::VllmSafetensors => "vLLM safetensors",
             Self::OpenAiCompatibleModel => "OpenAI-compatible model artifact",
             Self::TransformersSafetensors => "Transformers safetensors",
+            Self::LayaSafetensors => "Laya safetensors bundle",
             Self::AceStepSafetensors => "ACE-Step safetensors",
             Self::ChatterboxSafetensors => "Chatterbox safetensors",
             Self::ComfyUiRuntime => "ComfyUI runtime",
@@ -383,6 +389,15 @@ impl ModelArtifact {
         Self {
             path: path.into(),
             format: ArtifactFormat::TransformersSafetensors,
+            sha256: None,
+            sha256_path: None,
+        }
+    }
+
+    pub fn laya_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            format: ArtifactFormat::LayaSafetensors,
             sha256: None,
             sha256_path: None,
         }
@@ -631,6 +646,13 @@ impl LoadConfig {
         }
     }
 
+    pub fn laya_safetensors(path: impl Into<PathBuf>) -> Self {
+        Self {
+            artifact: ModelArtifact::laya_safetensors(path),
+            ..Self::default()
+        }
+    }
+
     pub fn ace_step_safetensors(path: impl Into<PathBuf>) -> Self {
         Self {
             artifact: ModelArtifact::ace_step_safetensors(path),
@@ -816,6 +838,28 @@ pub struct EmbeddingRequest {
     pub inputs: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dimensions: Option<usize>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionRequest {
+    pub state: Value,
+    pub questions: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub auto_task_detection: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shortlist: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limits: Option<Value>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1166,6 +1210,12 @@ pub struct GenerateOutput {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct EmbeddingOutput {
     pub embeddings: Vec<Vec<f32>>,
+    pub usage: UsageCounters,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct DecisionOutput {
+    pub result: Value,
     pub usage: UsageCounters,
 }
 
@@ -1611,6 +1661,16 @@ pub trait EngineBackend {
     /// True only after the backend has initialized required prefix reuse.
     fn prefix_caching_enabled(&self) -> bool {
         false
+    }
+    fn decide(
+        &mut self,
+        _request: DecisionRequest,
+        _cancellation: &CancellationToken,
+    ) -> Result<DecisionOutput> {
+        Err(EngineError::InvalidConfig(format!(
+            "{} backend does not support typed decisions",
+            self.backend_id()
+        )))
     }
     fn loaded_backend_evidence(&self) -> Option<Value> {
         None
@@ -2105,6 +2165,23 @@ pub fn verify_artifact(artifact: &ModelArtifact) -> Result<()> {
             let payload = transformers_safetensors_payload_path(&artifact.path)?;
             verify_safetensors_header_as(&payload, artifact.format.label())?;
             payload
+        }
+        ArtifactFormat::LayaSafetensors => {
+            let root_payload = laya_safetensors_payload_path(&artifact.path)?;
+            verify_safetensors_header_as(&root_payload, artifact.format.label())?;
+            let root = root_payload.parent().ok_or_else(|| {
+                EngineError::InvalidConfig(format!(
+                    "Laya weights path {} has no parent",
+                    root_payload.display()
+                ))
+            })?;
+            for relative in [
+                "multilingual/model.safetensors",
+                "typed-decisions/model.safetensors",
+            ] {
+                verify_safetensors_header_as(&root.join(relative), artifact.format.label())?;
+            }
+            root_payload
         }
         ArtifactFormat::AceStepSafetensors => {
             if !artifact.path.is_file() {
@@ -2612,6 +2689,29 @@ fn transformers_safetensors_payload_path(path: &Path) -> Result<PathBuf> {
     })
 }
 
+fn laya_safetensors_payload_path(path: &Path) -> Result<PathBuf> {
+    let model_dir = if path.is_file() {
+        path.parent().ok_or_else(|| {
+            EngineError::InvalidConfig(format!(
+                "Laya weights path {} has no parent",
+                path.display()
+            ))
+        })?
+    } else if path.is_dir() {
+        path
+    } else {
+        return Err(EngineError::ModelPathMissing(path.to_path_buf()));
+    };
+    let payload = model_dir.join("model.safetensors");
+    if !payload.is_file() {
+        return Err(EngineError::InvalidConfig(format!(
+            "Laya artifact {} is missing model.safetensors",
+            model_dir.display()
+        )));
+    }
+    Ok(payload)
+}
+
 fn chatterbox_safetensors_payload_path(path: &Path) -> Result<PathBuf> {
     let model_root = if path.is_file() {
         path.parent().ok_or_else(|| {
@@ -2914,6 +3014,9 @@ pub use vllm_backend::VllmBackend;
 
 #[cfg(feature = "transformers-asr")]
 pub use transformers_asr_backend::TransformersAsrBackend;
+
+#[cfg(feature = "laya")]
+pub use laya_backend::LayaBackend;
 
 #[cfg(feature = "ace-step")]
 mod ace_step_backend;
@@ -3510,6 +3613,1107 @@ mod transformers_asr_backend {
                 Err(error) => {
                     let _ = sender.send(WorkerRead::Error(format!(
                         "reading ASR worker stdout failed: {error}"
+                    )));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(feature = "laya")]
+mod laya_backend {
+    use super::{
+        attach_worker_containment, engine_worker_command, laya_safetensors_payload_path,
+        validate_load_config, verify_artifact, ArtifactFormat, CancellationToken, DecisionOutput,
+        DecisionRequest, EngineBackend, EngineError, GenerateOutput, GenerateRequest, LoadConfig,
+        LoadedModelInfo, Result, TokenSink, Tokenization, UsageCounters, WorkerContainment,
+    };
+    use serde::de::DeserializeOwned;
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+    use std::env;
+    use std::fs;
+    use std::io::{BufRead, BufReader, Write};
+    use std::path::{Path, PathBuf};
+    use std::process::{Child, ChildStdin, ChildStdout, Stdio};
+    use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+
+    const WORKER: &str = include_str!("laya_worker.py");
+    const PYTHON_ENV: &str = "MAYHEM_LAYA_PYTHON";
+    const MAX_QUESTIONS: usize = 64;
+    const MAX_CHOICE_OPTIONS: usize = 20;
+    const MAX_SHORTLIST_CHOICE_OPTIONS: usize = 256;
+    const MAX_REQUEST_JSON_BYTES: usize = 256 * 1024;
+    const REQUIRED_CHECKPOINTS: [&str; 3] = ["english", "multilingual", "typed-decisions"];
+
+    pub struct LayaBackend {
+        python: PathBuf,
+        worker: Option<LayaWorker>,
+        loaded: Option<LoadedModelInfo>,
+        config: Option<LoadConfig>,
+        next_id: u64,
+        evidence: Option<Value>,
+    }
+
+    impl LayaBackend {
+        pub fn new() -> Result<Self> {
+            let python = env::var_os(PYTHON_ENV)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("python3"));
+            Self::with_python(python)
+        }
+
+        pub fn with_python(python: impl Into<PathBuf>) -> Result<Self> {
+            Ok(Self {
+                python: python.into(),
+                worker: None,
+                loaded: None,
+                config: None,
+                next_id: 1,
+                evidence: None,
+            })
+        }
+
+        fn ensure_worker_loaded(&mut self) -> Result<()> {
+            if self.worker.is_some() {
+                return Ok(());
+            }
+            let config = self.config.clone().ok_or(EngineError::NotLoaded)?;
+            self.worker = Some(LayaWorker::spawn(
+                &self.python,
+                config.memory_limit_bytes,
+                config.backend_cache_dir.as_deref(),
+            )?);
+            let root = laya_snapshot_dir(&config.artifact.path)?;
+            let worker_info: WorkerLoadInfo =
+                self.call_existing("load", json!({ "path": root }), None)?;
+            validate_worker_load_info(&worker_info)?;
+            self.evidence = Some(worker_info.evidence());
+            Ok(())
+        }
+
+        fn call<T>(
+            &mut self,
+            operation: &str,
+            payload: Value,
+            cancellation: Option<&CancellationToken>,
+        ) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            self.ensure_worker_loaded()?;
+            self.call_existing(operation, payload, cancellation)
+        }
+
+        fn call_existing<T>(
+            &mut self,
+            operation: &str,
+            payload: Value,
+            cancellation: Option<&CancellationToken>,
+        ) -> Result<T>
+        where
+            T: DeserializeOwned,
+        {
+            let id = self.next_id;
+            self.next_id = self.next_id.saturating_add(1);
+            self.worker_mut()?.send(id, operation, payload)?;
+            loop {
+                if cancellation.is_some_and(CancellationToken::is_cancelled) {
+                    self.stop_worker();
+                    return Err(EngineError::Cancelled);
+                }
+                let message = match self.worker_mut()?.read_message(Duration::from_millis(25)) {
+                    Ok(Some(message)) => message,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        self.stop_worker();
+                        return Err(error);
+                    }
+                };
+                if message.id != id {
+                    self.stop_worker();
+                    return Err(EngineError::Laya(format!(
+                        "worker response id {} did not match request id {id}",
+                        message.id
+                    )));
+                }
+                if message.ok {
+                    return Ok(serde_json::from_value(
+                        message.result.unwrap_or(Value::Null),
+                    )?);
+                }
+                return Err(EngineError::Laya(
+                    message
+                        .error
+                        .unwrap_or_else(|| "worker returned an unknown error".to_owned()),
+                ));
+            }
+        }
+
+        fn worker_mut(&mut self) -> Result<&mut LayaWorker> {
+            self.worker
+                .as_mut()
+                .ok_or_else(|| EngineError::Laya("Laya worker is not running".to_owned()))
+        }
+
+        fn stop_worker(&mut self) {
+            if let Some(mut worker) = self.worker.take() {
+                worker.stop();
+            }
+        }
+    }
+
+    impl EngineBackend for LayaBackend {
+        fn backend_id(&self) -> &'static str {
+            "laya"
+        }
+
+        fn load(&mut self, config: LoadConfig) -> Result<LoadedModelInfo> {
+            validate_load_config(&config)?;
+            if config.artifact.format != ArtifactFormat::LayaSafetensors {
+                return Err(EngineError::InvalidConfig(format!(
+                    "Laya requires a Transformers safetensors snapshot, got {:?}",
+                    config.artifact.format
+                )));
+            }
+            verify_artifact(&config.artifact)?;
+            self.stop_worker();
+            self.config = Some(config.clone());
+            self.worker = Some(LayaWorker::spawn(
+                &self.python,
+                config.memory_limit_bytes,
+                config.backend_cache_dir.as_deref(),
+            )?);
+            let root = laya_snapshot_dir(&config.artifact.path)?;
+            let worker_info: WorkerLoadInfo =
+                self.call_existing("load", json!({ "path": root }), None)?;
+            if let Err(error) = validate_worker_load_info(&worker_info) {
+                self.stop_worker();
+                return Err(error);
+            }
+            self.evidence = Some(worker_info.evidence());
+            let loaded = LoadedModelInfo {
+                backend: self.backend_id().to_owned(),
+                artifact: config.artifact.clone(),
+                ctx_size: config.ctx_size,
+                n_ctx_train: worker_info.n_ctx_train,
+                n_vocab: worker_info.n_vocab,
+            };
+            self.loaded = Some(loaded.clone());
+            Ok(loaded)
+        }
+
+        fn loaded_backend_evidence(&self) -> Option<Value> {
+            self.evidence.clone()
+        }
+
+        fn component_healthy(&mut self) -> bool {
+            match self.worker.as_mut() {
+                Some(worker) => matches!(worker.child.try_wait(), Ok(None)),
+                None => self.loaded.is_none(),
+            }
+        }
+
+        fn process_ids(&self) -> Vec<u32> {
+            self.worker
+                .as_ref()
+                .map(|worker| vec![worker.child.id()])
+                .unwrap_or_default()
+        }
+
+        fn tokenize(&self, text: &str) -> Result<Tokenization> {
+            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+            let _ = text;
+            Err(EngineError::InvalidConfig(
+                "exact standalone tokenization is unavailable for typed decisions".to_owned(),
+            ))
+        }
+
+        fn generate(
+            &mut self,
+            _request: GenerateRequest,
+            _sink: &mut dyn TokenSink,
+            _cancellation: &CancellationToken,
+        ) -> Result<GenerateOutput> {
+            Err(EngineError::InvalidConfig(
+                "Laya produces typed decisions; use decide".to_owned(),
+            ))
+        }
+
+        fn decide(
+            &mut self,
+            request: DecisionRequest,
+            cancellation: &CancellationToken,
+        ) -> Result<DecisionOutput> {
+            cancellation.check()?;
+            self.loaded.as_ref().ok_or(EngineError::NotLoaded)?;
+            validate_decision_request(&request)?;
+            let result: Value = self.call(
+                "decide",
+                serde_json::to_value(&request)?,
+                Some(cancellation),
+            )?;
+            let input_tokens = result
+                .get("usage")
+                .and_then(|usage| usage.get("input_tokens"))
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    EngineError::InvalidOutput(
+                        "Laya result is missing integer usage.input_tokens".to_owned(),
+                    )
+                })?;
+            let input_tokens = u32::try_from(input_tokens).map_err(|_| {
+                EngineError::InvalidOutput(
+                    "Laya usage.input_tokens exceeds the supported u32 range".to_owned(),
+                )
+            })?;
+            validate_decision_result(&request.questions, &result)?;
+            Ok(DecisionOutput {
+                result,
+                usage: UsageCounters::new(input_tokens, 0),
+            })
+        }
+    }
+
+    impl Drop for LayaBackend {
+        fn drop(&mut self) {
+            self.stop_worker();
+        }
+    }
+
+    fn validate_decision_request(request: &DecisionRequest) -> Result<()> {
+        let bytes = serde_json::to_vec(request)?;
+        if bytes.len() > MAX_REQUEST_JSON_BYTES {
+            return Err(EngineError::InvalidRequest(format!(
+                "Laya request exceeds {MAX_REQUEST_JSON_BYTES} bytes"
+            )));
+        }
+        if !(request.state.is_string() || request.state.is_object() || request.state.is_array()) {
+            return Err(EngineError::InvalidRequest(
+                "Laya state must be a string, object, or array".to_owned(),
+            ));
+        }
+        let questions = request.questions.as_object().ok_or_else(|| {
+            EngineError::InvalidRequest("Laya questions must be an object".to_owned())
+        })?;
+        if questions.is_empty() || questions.len() > MAX_QUESTIONS {
+            return Err(EngineError::InvalidRequest(format!(
+                "Laya questions must contain 1 to {MAX_QUESTIONS} entries"
+            )));
+        }
+        validate_decision_email(request)?;
+        let shortlist_k = validate_decision_shortlist(request)?;
+        validate_decision_temperatures(request)?;
+        validate_decision_limits(request)?;
+        for (id, raw) in questions {
+            if id.is_empty() || id.len() > 128 {
+                return Err(EngineError::InvalidRequest(
+                    "Laya question ids must contain 1 to 128 bytes".to_owned(),
+                ));
+            }
+            let question = raw.as_object().ok_or_else(|| {
+                EngineError::InvalidRequest(format!("Laya question {id} must be an object"))
+            })?;
+            let kind = question
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    EngineError::InvalidRequest(format!("Laya question {id} is missing type"))
+                })?;
+            if !matches!(kind, "choice" | "score" | "noul") {
+                return Err(EngineError::InvalidRequest(format!(
+                    "Laya question {id} has unsupported type {kind}"
+                )));
+            }
+            if !question.contains_key("instructions") {
+                return Err(EngineError::InvalidRequest(format!(
+                    "Laya question {id} is missing instructions"
+                )));
+            }
+            match kind {
+                "choice" => {
+                    let count = match question.get("criteria") {
+                        Some(Value::Object(values)) => values.len(),
+                        Some(Value::Array(values)) => values.len(),
+                        _ => 0,
+                    };
+                    let maximum = if shortlist_k.is_some() {
+                        MAX_SHORTLIST_CHOICE_OPTIONS
+                    } else {
+                        MAX_CHOICE_OPTIONS
+                    };
+                    if !(2..=maximum).contains(&count) {
+                        return Err(EngineError::InvalidRequest(format!(
+                            "Laya choice question {id} must contain 2 to {maximum} criteria"
+                        )));
+                    }
+                }
+                "score" => {
+                    let count = question
+                        .get("criteria")
+                        .and_then(Value::as_array)
+                        .map(Vec::len)
+                        .unwrap_or(0);
+                    if !(2..=MAX_CHOICE_OPTIONS).contains(&count) {
+                        return Err(EngineError::InvalidRequest(format!(
+                            "Laya score question {id} must contain 2 to {MAX_CHOICE_OPTIONS} criteria"
+                        )));
+                    }
+                }
+                _ => {}
+            }
+        }
+        if request
+            .checkpoint
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "english" | "multilingual" | "typed-decisions"))
+        {
+            return Err(EngineError::InvalidRequest(
+                "Laya checkpoint must be english, multilingual, or typed-decisions".to_owned(),
+            ));
+        }
+        if request
+            .task
+            .as_deref()
+            .is_some_and(|value| value != "typed_decisions")
+        {
+            return Err(EngineError::InvalidRequest(
+                "Laya task must be typed_decisions".to_owned(),
+            ));
+        }
+        if request
+            .lang
+            .as_deref()
+            .is_some_and(|value| value.is_empty() || value.len() > 128)
+        {
+            return Err(EngineError::InvalidRequest(
+                "Laya lang must contain 1 to 128 bytes".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_decision_email(request: &DecisionRequest) -> Result<()> {
+        let Some(raw) = request.email.as_ref() else {
+            return Ok(());
+        };
+        let email = raw.as_object().ok_or_else(|| {
+            EngineError::InvalidRequest("Laya email must be an object".to_owned())
+        })?;
+        for key in email.keys() {
+            if !matches!(key.as_str(), "clean" | "max_chars") {
+                return Err(EngineError::InvalidRequest(format!(
+                    "Laya email contains unsupported field {key}"
+                )));
+            }
+        }
+        if email.get("clean").is_some_and(|value| !value.is_boolean()) {
+            return Err(EngineError::InvalidRequest(
+                "Laya email.clean must be a boolean".to_owned(),
+            ));
+        }
+        optional_bounded_u64(email.get("max_chars"), 1, 10_000, "email.max_chars")?;
+        if !request
+            .state
+            .as_object()
+            .and_then(|state| state.get("body"))
+            .is_some_and(Value::is_string)
+        {
+            return Err(EngineError::InvalidRequest(
+                "Laya email preprocessing requires state.body to be a string".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_decision_shortlist(request: &DecisionRequest) -> Result<Option<u64>> {
+        let Some(raw) = request.shortlist.as_ref() else {
+            return Ok(None);
+        };
+        let shortlist = raw.as_object().ok_or_else(|| {
+            EngineError::InvalidRequest("Laya shortlist must be an object".to_owned())
+        })?;
+        for key in shortlist.keys() {
+            if !matches!(key.as_str(), "k" | "max_length" | "batch_size" | "vectors") {
+                return Err(EngineError::InvalidRequest(format!(
+                    "Laya shortlist contains unsupported field {key}"
+                )));
+            }
+        }
+        let k = optional_bounded_u64(shortlist.get("k"), 1, 20, "shortlist.k")?.unwrap_or(20);
+        optional_bounded_u64(
+            shortlist.get("max_length"),
+            1,
+            1_024,
+            "shortlist.max_length",
+        )?;
+        optional_bounded_u64(shortlist.get("batch_size"), 1, 64, "shortlist.batch_size")?;
+        if let Some(raw_vectors) = shortlist.get("vectors") {
+            if shortlist.contains_key("max_length") || shortlist.contains_key("batch_size") {
+                return Err(EngineError::InvalidRequest(
+                    "Laya shortlist supplied vectors cannot be combined with encoder controls"
+                        .to_owned(),
+                ));
+            }
+            validate_supplied_shortlist_vectors(request, raw_vectors, k as usize)?;
+        }
+        Ok(Some(k))
+    }
+
+    fn validate_supplied_shortlist_vectors(
+        request: &DecisionRequest,
+        raw_vectors: &Value,
+        k: usize,
+    ) -> Result<()> {
+        const MAX_VECTOR_DIMENSIONS: usize = 4_096;
+        let vectors = raw_vectors.as_object().ok_or_else(|| {
+            EngineError::InvalidRequest("Laya shortlist.vectors must be an object".to_owned())
+        })?;
+        let questions = request.questions.as_object().ok_or_else(|| {
+            EngineError::InvalidRequest("Laya questions must be an object".to_owned())
+        })?;
+        let expected = questions
+            .iter()
+            .filter_map(|(id, question)| {
+                let question = question.as_object()?;
+                if question.get("type").and_then(Value::as_str) != Some("choice") {
+                    return None;
+                }
+                let count = match question.get("criteria") {
+                    Some(Value::Object(values)) => values.len(),
+                    Some(Value::Array(values)) => values.len(),
+                    _ => 0,
+                };
+                (count > k).then_some(id.as_str())
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let supplied = vectors
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        if supplied != expected {
+            return Err(EngineError::InvalidRequest(
+                "Laya shortlist.vectors must cover exactly the choice questions reduced by k"
+                    .to_owned(),
+            ));
+        }
+        for id in expected {
+            let entry = vectors[id].as_object().ok_or_else(|| {
+                EngineError::InvalidRequest(format!(
+                    "Laya shortlist.vectors.{id} must be an object"
+                ))
+            })?;
+            if entry
+                .keys()
+                .any(|key| !matches!(key.as_str(), "query" | "options"))
+                || !entry.contains_key("query")
+                || !entry.contains_key("options")
+            {
+                return Err(EngineError::InvalidRequest(format!(
+                    "Laya shortlist.vectors.{id} must contain only query and options"
+                )));
+            }
+            let dimensions = validate_decision_vector(
+                entry.get("query").expect("checked query"),
+                MAX_VECTOR_DIMENSIONS,
+                &format!("shortlist.vectors.{id}.query"),
+            )?;
+            let criteria = questions[id]
+                .get("criteria")
+                .expect("validated choice criteria");
+            match (criteria, entry.get("options").expect("checked options")) {
+                (Value::Object(criteria), Value::Object(options)) => {
+                    if criteria.len() != options.len()
+                        || criteria.keys().any(|label| !options.contains_key(label))
+                    {
+                        return Err(EngineError::InvalidRequest(format!(
+                            "Laya shortlist.vectors.{id}.options must match every criteria label"
+                        )));
+                    }
+                    for (label, vector) in options {
+                        if !criteria.contains_key(label)
+                            || validate_decision_vector(
+                                vector,
+                                MAX_VECTOR_DIMENSIONS,
+                                &format!("shortlist.vectors.{id}.options.{label}"),
+                            )? != dimensions
+                        {
+                            return Err(EngineError::InvalidRequest(format!(
+                                "Laya shortlist.vectors.{id}.options vectors must match query dimensions"
+                            )));
+                        }
+                    }
+                }
+                (Value::Array(criteria), Value::Array(options)) => {
+                    if criteria.len() != options.len() {
+                        return Err(EngineError::InvalidRequest(format!(
+                            "Laya shortlist.vectors.{id}.options must match every criteria entry"
+                        )));
+                    }
+                    for vector in options {
+                        if validate_decision_vector(
+                            vector,
+                            MAX_VECTOR_DIMENSIONS,
+                            &format!("shortlist.vectors.{id}.options"),
+                        )? != dimensions
+                        {
+                            return Err(EngineError::InvalidRequest(format!(
+                                "Laya shortlist.vectors.{id}.options vectors must match query dimensions"
+                            )));
+                        }
+                    }
+                }
+                _ => {
+                    return Err(EngineError::InvalidRequest(format!(
+                        "Laya shortlist.vectors.{id}.options shape must match criteria"
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_decision_vector(value: &Value, maximum: usize, field: &str) -> Result<usize> {
+        let values = value.as_array().ok_or_else(|| {
+            EngineError::InvalidRequest(format!("Laya {field} must be a numeric array"))
+        })?;
+        if values.is_empty() || values.len() > maximum {
+            return Err(EngineError::InvalidRequest(format!(
+                "Laya {field} must contain 1 to {maximum} dimensions"
+            )));
+        }
+        if values
+            .iter()
+            .any(|value| !value.as_f64().is_some_and(f64::is_finite))
+        {
+            return Err(EngineError::InvalidRequest(format!(
+                "Laya {field} must contain only finite numbers"
+            )));
+        }
+        Ok(values.len())
+    }
+
+    fn validate_decision_temperatures(request: &DecisionRequest) -> Result<()> {
+        let Some(raw) = request.temperature.as_ref() else {
+            return Ok(());
+        };
+        let temperatures = raw.as_object().ok_or_else(|| {
+            EngineError::InvalidRequest("Laya temperature must be an object".to_owned())
+        })?;
+        for (key, value) in temperatures {
+            if !matches!(
+                key.as_str(),
+                "choice"
+                    | "score"
+                    | "noul"
+                    | "choice:2"
+                    | "choice:3-5"
+                    | "choice:6-10"
+                    | "choice:11+"
+                    | "score:2"
+                    | "score:3-5"
+                    | "score:6-10"
+                    | "score:11+"
+                    | "noul:2"
+            ) {
+                return Err(EngineError::InvalidRequest(format!(
+                    "Laya temperature contains unsupported field {key}"
+                )));
+            }
+            let number = value.as_f64().ok_or_else(|| {
+                EngineError::InvalidRequest(format!("Laya temperature.{key} must be a number"))
+            })?;
+            if !number.is_finite() || !(0.5..=5.0).contains(&number) {
+                return Err(EngineError::InvalidRequest(format!(
+                    "Laya temperature.{key} must be between 0.5 and 5.0"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_decision_limits(request: &DecisionRequest) -> Result<()> {
+        let Some(raw) = request.limits.as_ref() else {
+            return Ok(());
+        };
+        let limits = raw.as_object().ok_or_else(|| {
+            EngineError::InvalidRequest("Laya limits must be an object".to_owned())
+        })?;
+        for key in limits.keys() {
+            if !matches!(key.as_str(), "max_len" | "head_max_len") {
+                return Err(EngineError::InvalidRequest(format!(
+                    "Laya limits contains unsupported field {key}"
+                )));
+            }
+        }
+        let max_len = optional_bounded_u64(limits.get("max_len"), 128, 1_024, "limits.max_len")?;
+        let head_max_len =
+            optional_bounded_u64(limits.get("head_max_len"), 32, 512, "limits.head_max_len")?;
+        if matches!((max_len, head_max_len), (Some(max_len), Some(head_max_len)) if head_max_len >= max_len)
+        {
+            return Err(EngineError::InvalidRequest(
+                "Laya limits.head_max_len must be smaller than limits.max_len".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn optional_bounded_u64(
+        value: Option<&Value>,
+        minimum: u64,
+        maximum: u64,
+        field: &str,
+    ) -> Result<Option<u64>> {
+        let Some(value) = value else {
+            return Ok(None);
+        };
+        let number = value.as_u64().ok_or_else(|| {
+            EngineError::InvalidRequest(format!("Laya {field} must be an integer"))
+        })?;
+        if !(minimum..=maximum).contains(&number) {
+            return Err(EngineError::InvalidRequest(format!(
+                "Laya {field} must be between {minimum} and {maximum}"
+            )));
+        }
+        Ok(Some(number))
+    }
+
+    fn validate_decision_result(questions: &Value, result: &Value) -> Result<()> {
+        let object = result.as_object().ok_or_else(|| {
+            EngineError::InvalidOutput("Laya result must be an object".to_owned())
+        })?;
+        let expected_questions = questions.as_object().ok_or_else(|| {
+            EngineError::InvalidOutput("Laya request questions were not an object".to_owned())
+        })?;
+        let answers = object
+            .get("answers")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                EngineError::InvalidOutput("Laya result is missing an answers object".to_owned())
+            })?;
+        if answers.len() != expected_questions.len()
+            || expected_questions
+                .keys()
+                .any(|id| !answers.contains_key(id))
+        {
+            return Err(EngineError::InvalidOutput(
+                "Laya result answer ids do not match the request".to_owned(),
+            ));
+        }
+        for (id, answer) in answers {
+            let answer = answer.as_object().ok_or_else(|| {
+                EngineError::InvalidOutput(format!("Laya answer {id} must be an object"))
+            })?;
+            let expected_type = expected_questions[id]
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if answer.get("type").and_then(Value::as_str) != Some(expected_type) {
+                return Err(EngineError::InvalidOutput(format!(
+                    "Laya answer {id} type does not match the request"
+                )));
+            }
+        }
+        let routing = object
+            .get("routing")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                EngineError::InvalidOutput("Laya result is missing a routing object".to_owned())
+            })?;
+        for key in routing.keys() {
+            if !matches!(key.as_str(), "model" | "reason" | "detection" | "workflow") {
+                return Err(EngineError::InvalidOutput(format!(
+                    "Laya routing contains unsupported field {key}"
+                )));
+            }
+        }
+        if !routing
+            .get("model")
+            .and_then(Value::as_str)
+            .is_some_and(|value| matches!(value, "english" | "multilingual" | "typed-decisions"))
+        {
+            return Err(EngineError::InvalidOutput(
+                "Laya routing.model is invalid".to_owned(),
+            ));
+        }
+        if !routing
+            .get("reason")
+            .and_then(Value::as_str)
+            .is_some_and(|value| !value.is_empty() && value.len() <= 1_024)
+        {
+            return Err(EngineError::InvalidOutput(
+                "Laya routing.reason is invalid".to_owned(),
+            ));
+        }
+        let usage = object
+            .get("usage")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                EngineError::InvalidOutput("Laya result is missing a usage object".to_owned())
+            })?;
+        if !usage
+            .get("input_tokens")
+            .and_then(Value::as_u64)
+            .is_some_and(|value| value > 0)
+            || usage.get("output_tokens").and_then(Value::as_u64) != Some(0)
+        {
+            return Err(EngineError::InvalidOutput(
+                "Laya result usage is invalid".to_owned(),
+            ));
+        }
+        let encoded = serde_json::to_vec(result)?;
+        if encoded.len() > MAX_REQUEST_JSON_BYTES {
+            return Err(EngineError::InvalidOutput(
+                "Laya result exceeds the bounded response size".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WorkerLoadInfo {
+        device: String,
+        n_ctx_train: u32,
+        n_vocab: i32,
+        loaded: Vec<String>,
+    }
+
+    fn validate_worker_load_info(info: &WorkerLoadInfo) -> Result<()> {
+        if info.device != "cuda" {
+            return Err(EngineError::Laya(
+                "Laya production worker did not load on CUDA".to_owned(),
+            ));
+        }
+        let mut loaded = info.loaded.iter().map(String::as_str).collect::<Vec<_>>();
+        loaded.sort_unstable();
+        let mut required = REQUIRED_CHECKPOINTS.to_vec();
+        required.sort_unstable();
+        if loaded != required {
+            return Err(EngineError::Laya(format!(
+                "Laya production worker must preload exactly {}; loaded {}",
+                REQUIRED_CHECKPOINTS.join(", "),
+                info.loaded.join(", ")
+            )));
+        }
+        if info.n_ctx_train != 1_024 || info.n_vocab <= 0 {
+            return Err(EngineError::Laya(
+                "Laya production worker reported invalid model dimensions".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    impl WorkerLoadInfo {
+        fn evidence(&self) -> Value {
+            json!({
+                "device": self.device,
+                "preloaded_checkpoints": self.loaded,
+                "offline": true,
+            })
+        }
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct WorkerMessage {
+        id: u64,
+        #[serde(default)]
+        ok: bool,
+        #[serde(default)]
+        result: Option<Value>,
+        #[serde(default)]
+        error: Option<String>,
+    }
+
+    struct LayaWorker {
+        child: Child,
+        _containment: WorkerContainment,
+        stdin: ChildStdin,
+        stdout_rx: Option<Receiver<WorkerRead>>,
+        reader: Option<JoinHandle<()>>,
+    }
+
+    impl LayaWorker {
+        fn spawn(
+            python: &Path,
+            memory_limit_bytes: Option<u64>,
+            cache_root: Option<&Path>,
+        ) -> Result<Self> {
+            let mut command = engine_worker_command(python, memory_limit_bytes);
+            configure_worker_environment(&mut command, python, cache_root)?;
+            command
+                .arg("-u")
+                .arg("-c")
+                .arg(WORKER)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::inherit());
+            let mut child = command.spawn().map_err(|error| {
+                EngineError::Laya(format!(
+                    "spawning Laya worker with {} failed: {error}",
+                    python.display()
+                ))
+            })?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| EngineError::Laya("opening Laya worker stdin failed".to_owned()))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| EngineError::Laya("opening Laya worker stdout failed".to_owned()))?;
+            let containment =
+                attach_worker_containment(&child, memory_limit_bytes).map_err(|error| {
+                    EngineError::Laya(format!("applying Laya worker containment failed: {error}"))
+                })?;
+            let (stdout_tx, stdout_rx) = mpsc::sync_channel(super::WORKER_STDOUT_QUEUE_CAPACITY);
+            let reader = thread::spawn(move || read_worker_stdout(stdout, stdout_tx));
+            Ok(Self {
+                child,
+                _containment: containment,
+                stdin,
+                stdout_rx: Some(stdout_rx),
+                reader: Some(reader),
+            })
+        }
+
+        fn send(&mut self, id: u64, operation: &str, payload: Value) -> Result<()> {
+            serde_json::to_writer(
+                &mut self.stdin,
+                &json!({ "id": id, "op": operation, "payload": payload }),
+            )?;
+            self.stdin.write_all(b"\n")?;
+            self.stdin.flush()?;
+            Ok(())
+        }
+
+        fn read_message(&mut self, wait: Duration) -> Result<Option<WorkerMessage>> {
+            let read = match self
+                .stdout_rx
+                .as_ref()
+                .ok_or_else(|| EngineError::Laya("Laya worker stdout is closed".to_owned()))?
+                .recv_timeout(wait)
+            {
+                Ok(read) => read,
+                Err(RecvTimeoutError::Timeout) => return Ok(None),
+                Err(RecvTimeoutError::Disconnected) => {
+                    return Err(EngineError::Laya(
+                        "Laya worker stdout reader stopped".to_owned(),
+                    ))
+                }
+            };
+            let line = match read {
+                WorkerRead::Line(line) => line,
+                WorkerRead::Eof => {
+                    return Err(EngineError::Laya(
+                        "Laya worker exited before replying".to_owned(),
+                    ))
+                }
+                WorkerRead::Error(error) => return Err(EngineError::Laya(error)),
+            };
+            serde_json::from_str(line.trim_end())
+                .map(Some)
+                .map_err(Into::into)
+        }
+
+        fn stop(&mut self) {
+            let _ = self.send(0, "shutdown", Value::Null);
+            self.stdout_rx.take();
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            if let Some(reader) = self.reader.take() {
+                let _ = reader.join();
+            }
+        }
+    }
+
+    fn configure_worker_environment(
+        command: &mut std::process::Command,
+        python: &Path,
+        cache_root: Option<&Path>,
+    ) -> Result<()> {
+        let cache_root = cache_root
+            .map(Path::to_path_buf)
+            .or_else(|| {
+                env::var_os("MAYHEM_HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join("cache/laya"))
+            })
+            .or_else(|| {
+                env::var_os("HOME")
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".mayhem/cache/laya"))
+            })
+            .unwrap_or_else(|| env::temp_dir().join("mayhem-laya-cache"));
+        for (name, default_path) in [
+            ("XDG_CACHE_HOME", cache_root.join("xdg")),
+            ("HF_HOME", cache_root.join("huggingface")),
+            ("HF_HUB_CACHE", cache_root.join("huggingface/hub")),
+            ("TRANSFORMERS_CACHE", cache_root.join("transformers")),
+        ] {
+            let path = env::var_os(name).map(PathBuf::from).unwrap_or(default_path);
+            fs::create_dir_all(&path).map_err(|error| {
+                EngineError::Laya(format!(
+                    "creating Laya cache directory {} failed: {error}",
+                    path.display()
+                ))
+            })?;
+            command.env(name, path);
+        }
+        command
+            .env("HF_HUB_OFFLINE", "1")
+            .env("HF_DATASETS_OFFLINE", "1")
+            .env("TRANSFORMERS_OFFLINE", "1")
+            .env("HF_HUB_DISABLE_TELEMETRY", "1")
+            .env("TOKENIZERS_PARALLELISM", "false");
+        if let Some(python_bin) = python.parent() {
+            let mut paths = vec![python_bin.to_path_buf()];
+            if let Some(current) = env::var_os("PATH") {
+                paths.extend(env::split_paths(&current));
+            }
+            if let Ok(path) = env::join_paths(paths) {
+                command.env("PATH", path);
+            }
+        }
+        Ok(())
+    }
+
+    fn laya_snapshot_dir(path: &Path) -> Result<PathBuf> {
+        let payload = laya_safetensors_payload_path(path)?;
+        payload.parent().map(Path::to_path_buf).ok_or_else(|| {
+            EngineError::InvalidConfig(format!(
+                "Laya weights path {} has no parent",
+                payload.display()
+            ))
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn choice_request(option_count: usize) -> DecisionRequest {
+            let criteria = (0..option_count)
+                .map(|index| (format!("option-{index}"), json!(format!("Option {index}"))))
+                .collect::<serde_json::Map<String, Value>>();
+            DecisionRequest {
+                state: json!({"body": "Please reset my password"}),
+                questions: json!({
+                    "intent": {
+                        "type": "choice",
+                        "instructions": "Choose an intent",
+                        "criteria": criteria,
+                    }
+                }),
+                checkpoint: Some("english".to_owned()),
+                task: None,
+                lang: None,
+                auto_task_detection: false,
+                email: None,
+                shortlist: None,
+                temperature: None,
+                limits: None,
+            }
+        }
+
+        #[test]
+        fn high_cardinality_choices_require_bounded_shortlisting() {
+            let mut request = choice_request(25);
+            assert!(validate_decision_request(&request).is_err());
+            request.shortlist = Some(json!({"k": 20, "max_length": 512, "batch_size": 32}));
+            validate_decision_request(&request).expect("bounded shortlist request");
+            request.shortlist = Some(json!({"k": 21}));
+            assert!(validate_decision_request(&request).is_err());
+        }
+
+        #[test]
+        fn request_local_decision_controls_are_strictly_validated() {
+            let mut request = choice_request(4);
+            request.email = Some(json!({"clean": true, "max_chars": 3000}));
+            request.temperature = Some(json!({"choice:3-5": 1.25}));
+            request.limits = Some(json!({"max_len": 512, "head_max_len": 192}));
+            validate_decision_request(&request).expect("valid local controls");
+
+            request.temperature = Some(json!({"choice:3-5": 0.1}));
+            assert!(validate_decision_request(&request).is_err());
+            request.temperature = Some(json!({"choice:3-5": 1.25}));
+            request.limits = Some(json!({"max_len": 256, "head_max_len": 256}));
+            assert!(validate_decision_request(&request).is_err());
+            request.limits = Some(json!({"max_len": 512, "head_max_len": 192}));
+            request.email = Some(json!({"clean": "yes"}));
+            assert!(validate_decision_request(&request).is_err());
+        }
+
+        #[test]
+        fn supplied_shortlist_vectors_are_data_only_and_shape_checked() {
+            let mut request = choice_request(25);
+            let options = (0..25)
+                .map(|index| (format!("option-{index}"), json!([index as f64, 1.0])))
+                .collect::<serde_json::Map<String, Value>>();
+            request.shortlist = Some(json!({
+                "k": 20,
+                "vectors": {
+                    "intent": {
+                        "query": [0.0, 1.0],
+                        "options": options,
+                    }
+                }
+            }));
+            validate_decision_request(&request).expect("valid supplied shortlist vectors");
+
+            request.shortlist.as_mut().unwrap()["vectors"]["intent"]["options"]["option-0"] =
+                json!([1.0]);
+            assert!(validate_decision_request(&request).is_err());
+        }
+
+        #[test]
+        fn production_load_requires_the_complete_cuda_checkpoint_family() {
+            let complete = WorkerLoadInfo {
+                device: "cuda".to_owned(),
+                n_ctx_train: 1_024,
+                n_vocab: 32_000,
+                loaded: vec![
+                    "typed-decisions".to_owned(),
+                    "english".to_owned(),
+                    "multilingual".to_owned(),
+                ],
+            };
+            validate_worker_load_info(&complete).expect("complete CUDA checkpoint family");
+
+            let mut missing = complete;
+            missing.loaded.pop();
+            assert!(validate_worker_load_info(&missing).is_err());
+            missing.loaded.push("multilingual".to_owned());
+            missing.device = "cpu".to_owned();
+            assert!(validate_worker_load_info(&missing).is_err());
+        }
+    }
+
+    enum WorkerRead {
+        Line(String),
+        Eof,
+        Error(String),
+    }
+
+    fn read_worker_stdout(stdout: ChildStdout, sender: mpsc::SyncSender<WorkerRead>) {
+        let mut stdout = BufReader::new(stdout);
+        loop {
+            let mut line = String::new();
+            match stdout.read_line(&mut line) {
+                Ok(0) => {
+                    let _ = sender.send(WorkerRead::Eof);
+                    return;
+                }
+                Ok(_) => {
+                    if sender.send(WorkerRead::Line(line)).is_err() {
+                        return;
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(WorkerRead::Error(format!(
+                        "reading Laya worker stdout failed: {error}"
                     )));
                     return;
                 }

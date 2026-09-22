@@ -30,7 +30,7 @@ const versioningLockedRateMap = [
 const versioningBillingId = 'bb'.repeat(32);
 
 test('launch version gates cover A16/A17/D6/D7/M5/M6/M8 deterministic changes', () => {
-  assert.equal(CONTRACT_VERSION, 27);
+  assert.equal(CONTRACT_VERSION, 28);
   assert.deepEqual(signingMessageVersions(), [2]);
   assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 12);
   assert.equal(SPEND_VOUCHER_SCHEMA_VERSION, 11);
@@ -87,6 +87,25 @@ test('contract keeps descriptive backends extensible while routing semantics sta
     modality_set: ['text', 'video', 'audio'],
     speciality_levels: {},
   }, 'video-generation'), null);
+  assert.equal(contract.validateEnclaveCaps({
+    chat: false,
+    tools: false,
+    json: true,
+    vision: false,
+    image: false,
+    video: false,
+    audio: false,
+    ctx: 1024,
+    ctx_max: 1024,
+    output_modality: 'text',
+    output_modalities: ['text'],
+    modality_set: ['text'],
+    speciality_levels: {},
+  }, 'decision'), null);
+  assert.equal(contract.validateEnclaveModalityRateMap({
+    model_class: 'decision',
+    caps: { modality_set: ['text'] },
+  }, versioningLockedRateMap), null);
 });
 
 test('contract accepts only the current consent signing version', async () => {

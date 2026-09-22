@@ -11,7 +11,7 @@ test('offline upgrade generator includes every active base and context price, ne
    prices:[{current:{enclave_id:'a',model_id:'media',set_by_role:'admin'}},{current:{enclave_id:'b',model_id:'text',set_by_role:'admin',ctx_bracket:'le8k',ctx_bracket_table_ver:1}},{current:{enclave_id:'c',model_id:'media',set_by_role:'admin'}}]};
  const before=JSON.stringify(snapshot);const plan=prepareMarketActivityUpgrade(snapshot);
  assert.equal(plan.active_market_count,2);assert.equal(plan.commands[0].markets.length,2);
- assert.equal(plan.contract_version,27);assert.equal(plan.schema_version,2);
+ assert.equal(plan.contract_version,28);assert.equal(plan.schema_version,2);
  assert.ok(plan.modelref_inventory.every(r=>r.activity_basis==='signed_slot_time_v1'));
  assert.deepEqual([plan.low_utilization_bps,plan.high_utilization_bps,plan.price_step_bps],[2000,8000,1000]);
  assert.equal(JSON.stringify(snapshot),before);

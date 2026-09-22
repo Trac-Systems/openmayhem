@@ -20,16 +20,18 @@ use crate::{
     audit::{
         aggregate_canary_fingerprints, audio_fingerprint, embedding_vector_fingerprint,
         evaluate_catalog_canary_audio_fingerprint_probe,
+        evaluate_catalog_canary_decision_fingerprint_probe,
         evaluate_catalog_canary_embedding_cosine_probe,
         evaluate_catalog_canary_perceptual_hash_probe, evaluate_catalog_canary_token_prefix_probe,
         evaluate_catalog_canary_transcript_match_probe,
         evaluate_catalog_canary_video_av_fingerprint_probe, image_average_hash_hex,
         supported_canary_verification_method, token_fingerprint, video_av_fingerprint,
         CanaryProbeEvaluation, CanaryProbeSpec, CANARY_VERIFICATION_AUDIO_FINGERPRINT,
-        CANARY_VERIFICATION_CONTEXT_NEEDLE, CANARY_VERIFICATION_EMBEDDING_COSINE,
-        CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH, CANARY_VERIFICATION_TOKEN_FINGERPRINT,
-        CANARY_VERIFICATION_TRANSCRIPT_MATCH, CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT,
-        DEFAULT_CANARY_MATCH_MIN_BPS, MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS,
+        CANARY_VERIFICATION_CONTEXT_NEEDLE, CANARY_VERIFICATION_DECISION_FINGERPRINT,
+        CANARY_VERIFICATION_EMBEDDING_COSINE, CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH,
+        CANARY_VERIFICATION_TOKEN_FINGERPRINT, CANARY_VERIFICATION_TRANSCRIPT_MATCH,
+        CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT, DEFAULT_CANARY_MATCH_MIN_BPS,
+        MIN_LAUNCH_CANARY_STABLE_PREFIX_TOKENS,
     },
     failover::{
         effective_context_floor, midstream_stalled_after, x_mayhem_hedge_requested, FailoverPolicy,
@@ -1956,6 +1958,7 @@ pub struct GatewayCanaryModelConfig {
     pub transcripts_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
     pub audio_fingerprints_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
     pub video_fingerprints_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
+    pub decision_fingerprints_by_artifact_root: BTreeMap<String, BTreeMap<String, String>>,
     pub speciality_calibrations_by_artifact_root:
         BTreeMap<String, BTreeMap<String, BTreeMap<String, GatewaySpecialityCalibration>>>,
     pub default_fingerprint: Option<String>,
@@ -1965,6 +1968,7 @@ pub struct GatewayCanaryModelConfig {
     pub default_transcripts: Option<BTreeMap<String, String>>,
     pub default_audio_fingerprints: Option<BTreeMap<String, String>>,
     pub default_video_fingerprints: Option<BTreeMap<String, String>>,
+    pub default_decision_fingerprints: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -2433,6 +2437,34 @@ pub struct EmbeddingRequest {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct DecisionRequest {
+    pub model: String,
+    pub state: Value,
+    pub questions: Value,
+    #[serde(default)]
+    pub checkpoint: Option<String>,
+    #[serde(default)]
+    pub task: Option<String>,
+    #[serde(default)]
+    pub lang: Option<String>,
+    #[serde(default)]
+    pub auto_task_detection: bool,
+    #[serde(default)]
+    pub email: Option<Value>,
+    #[serde(default)]
+    pub shortlist: Option<Value>,
+    #[serde(default)]
+    pub temperature: Option<Value>,
+    #[serde(default)]
+    pub limits: Option<Value>,
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(skip)]
+    pub endpoint_request: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ImageGenerationRequest {
     pub model: String,
     pub prompt: String,
@@ -2736,7 +2768,8 @@ pub fn normalize_endpoint_request_for_provider(
         | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
         | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
-        | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS => {}
+        | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+        | mayhem_proto::ENDPOINT_MAYHEM_DECISIONS => {}
         other => {
             return Err(format!(
                 "endpoint family {other} has no gateway normalization path"
@@ -4162,6 +4195,22 @@ fn chat_job_result(output: &ChatOutput) -> Value {
         "finish_reason": output.finish_reason,
         "usage": output.usage,
         "artifacts": artifact_summaries(&output.artifacts),
+    })
+}
+
+fn chat_job_result_for_request(request: &ChatCompletionRequest, output: &ChatOutput) -> Value {
+    if direct_chat_endpoint_family(request) != mayhem_proto::ENDPOINT_MAYHEM_DECISIONS {
+        return chat_job_result(output);
+    }
+    let result = output
+        .content
+        .as_deref()
+        .and_then(|content| serde_json::from_str::<Value>(content).ok())
+        .unwrap_or(Value::Null);
+    json!({
+        "kind": "decision",
+        "result": result,
+        "usage": output.usage,
     })
 }
 
@@ -5931,6 +5980,7 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/v1/completions", post(create_completion))
         .route("/v1/responses", post(create_response))
         .route("/v1/embeddings", post(create_embedding))
+        .route("/v1/decisions", post(create_decision))
         .route("/v1/images/generations", post(create_image_generation))
         .route("/v1/videos", post(create_video_generation))
         .route("/v1/audio/speech", post(create_audio_speech))
@@ -10287,6 +10337,83 @@ async fn create_response(
     }
 }
 
+async fn create_decision(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(raw_request): Json<Value>,
+) -> Response {
+    let model_id = match endpoint_request_model(&raw_request) {
+        Ok(model) => model,
+        Err(err) => return err.into_response(),
+    };
+    let access_token = match state.authorize_gateway_request(&headers, Some(model_id)) {
+        Ok(access_token) => access_token,
+        Err(err) => return err.into_response(),
+    };
+    let (mut request, normalized_request) = match parse_catalog_endpoint_request::<DecisionRequest>(
+        &state,
+        &raw_request,
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
+    ) {
+        Ok(request) => request,
+        Err(err) => return err.into_response(),
+    };
+    request.endpoint_request = Some(normalized_request);
+    let mut options = match state.request_options_from_headers(&headers) {
+        Ok(options) => options,
+        Err(err) => return err.into_response(),
+    };
+    options.access_token = access_token;
+    let job = match prepare_gateway_job(
+        &state,
+        &headers,
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
+        &request.model,
+        request
+            .endpoint_request
+            .as_ref()
+            .expect("normalized decision request is present"),
+        &options.access_token,
+    )
+    .await
+    {
+        Ok(PreparedGatewayJob::Started(job)) => job,
+        Ok(PreparedGatewayJob::InProgress(id)) => return gateway_job_pending_response(&id),
+        Ok(PreparedGatewayJob::Existing(job)) => return gateway_existing_job_response(job),
+        Err(err) => return err.into_response(),
+    };
+    options.job = Some(job.clone());
+    let cancellation = job.cancellation();
+    options.client_cancellation = Some(cancellation.clone());
+    if gateway_prefers_async_response(&headers) {
+        let job_id = job.id.clone();
+        let request_state = state.clone();
+        spawn_gateway_job_request(job, async move {
+            build_decision(&request_state, request, options).await
+        });
+        return gateway_job_pending_response(&job_id);
+    }
+    let request_state = state.clone();
+    let result = run_detached_gateway_job_request(cancellation, job.clone(), async move {
+        build_decision(&request_state, request, options).await
+    })
+    .await;
+    match result {
+        Ok(value) => {
+            if let Err(err) = job
+                .persist_completed_if_active(value.clone(), Vec::new(), None)
+                .await
+            {
+                return err.into_response();
+            }
+            let mut response = Json(value).into_response();
+            attach_gateway_job_headers(&mut response, &job.id);
+            response
+        }
+        Err(err) => err.into_response(),
+    }
+}
+
 async fn create_embedding(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -14114,6 +14241,12 @@ fn canary_registry_from_catalog_root(
         {
             continue;
         }
+        let decision_fingerprints = canary_decision_fingerprints_by_artifact(canary);
+        if verification_method == CANARY_VERIFICATION_DECISION_FINGERPRINT
+            && decision_fingerprints.is_empty()
+        {
+            continue;
+        }
         let mut fingerprints_by_artifact_root = BTreeMap::new();
         let mut token_prefixes_by_artifact_root = BTreeMap::new();
         let mut openai_compatible_artifact_roots = BTreeSet::new();
@@ -14122,6 +14255,7 @@ fn canary_registry_from_catalog_root(
         let mut transcripts_by_artifact_root = BTreeMap::new();
         let mut audio_fingerprints_by_artifact_root = BTreeMap::new();
         let mut video_fingerprints_by_artifact_root = BTreeMap::new();
+        let mut decision_fingerprints_by_artifact_root = BTreeMap::new();
         let speciality_calibrations = speciality_calibrations_from_catalog_value(model);
         let mut speciality_calibrations_by_artifact_root = BTreeMap::new();
         if let Some(artifacts) = model.get("artifacts").and_then(Value::as_object) {
@@ -14165,6 +14299,10 @@ fn canary_registry_from_catalog_root(
                     } else if let Some(expected) = video_fingerprints.get(artifact_name.as_str()) {
                         video_fingerprints_by_artifact_root
                             .insert(artifact_root.to_owned(), expected.clone());
+                    } else if let Some(expected) = decision_fingerprints.get(artifact_name.as_str())
+                    {
+                        decision_fingerprints_by_artifact_root
+                            .insert(artifact_root.to_owned(), expected.clone());
                     }
                 }
             }
@@ -14176,6 +14314,7 @@ fn canary_registry_from_catalog_root(
         let default_transcripts = transcripts.values().next().cloned();
         let default_audio_fingerprints = audio_fingerprints.values().next().cloned();
         let default_video_fingerprints = video_fingerprints.values().next().cloned();
+        let default_decision_fingerprints = decision_fingerprints.values().next().cloned();
         models.insert(
             model_id.to_owned(),
             GatewayCanaryModelConfig {
@@ -14193,6 +14332,7 @@ fn canary_registry_from_catalog_root(
                 transcripts_by_artifact_root,
                 audio_fingerprints_by_artifact_root,
                 video_fingerprints_by_artifact_root,
+                decision_fingerprints_by_artifact_root,
                 speciality_calibrations_by_artifact_root,
                 default_fingerprint,
                 default_token_prefixes,
@@ -14201,6 +14341,7 @@ fn canary_registry_from_catalog_root(
                 default_transcripts,
                 default_audio_fingerprints,
                 default_video_fingerprints,
+                default_decision_fingerprints,
             },
         );
     }
@@ -14360,6 +14501,9 @@ fn mode_canary_has_exact_evidence(canary: &GatewayCanaryModelConfig, artifact_ro
         CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT => canary
             .video_fingerprints_by_artifact_root
             .contains_key(artifact_root),
+        CANARY_VERIFICATION_DECISION_FINGERPRINT => canary
+            .decision_fingerprints_by_artifact_root
+            .contains_key(artifact_root),
         _ => false,
     }
 }
@@ -14508,6 +14652,35 @@ fn canary_video_fingerprints_by_artifact(
                     fingerprint
                         .as_str()
                         .filter(|fingerprint| crate::valid_video_av_fingerprint(fingerprint))
+                        .map(|fingerprint| (prompt_id.clone(), fingerprint.to_owned()))
+                })
+                .collect::<BTreeMap<_, _>>();
+            (!prompts.is_empty()).then(|| (artifact_name.clone(), prompts))
+        })
+        .collect()
+}
+
+fn canary_decision_fingerprints_by_artifact(
+    canary: &Value,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    canary
+        .get("decision_fingerprints")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(|object| object.iter())
+        .filter_map(|(artifact_name, value)| {
+            let prompts = value.as_object()?;
+            let prompts = prompts
+                .iter()
+                .filter_map(|(prompt_id, fingerprint)| {
+                    fingerprint
+                        .as_str()
+                        .filter(|fingerprint| {
+                            fingerprint.len() == 64
+                                && fingerprint.bytes().all(|byte| {
+                                    byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()
+                                })
+                        })
                         .map(|fingerprint| (prompt_id.clone(), fingerprint.to_owned()))
                 })
                 .collect::<BTreeMap<_, _>>();
@@ -16612,7 +16785,7 @@ impl ScBridgeGatewaySessionBackend {
                     provider,
                     model,
                     &accept_info.enclave_pubkey,
-                    blake3_hex(chat_prompt_text(request).as_bytes()),
+                    direct_chat_prompt_hash(request),
                     expected_usage,
                     expected_seq,
                 )
@@ -16667,7 +16840,7 @@ impl ScBridgeGatewaySessionBackend {
             &mut bridge,
             direct_peer,
             invocation,
-            chat_job_result(&collected.output),
+            chat_job_result_for_request(request, &collected.output),
             &collected.output.artifacts,
             &collected.provider_receipt,
             &receipt_ack,
@@ -18272,6 +18445,15 @@ fn direct_chat_endpoint_family(request: &ChatCompletionRequest) -> &str {
         .unwrap_or(mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS)
 }
 
+fn direct_chat_prompt_hash(request: &ChatCompletionRequest) -> String {
+    if direct_chat_endpoint_family(request) == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS {
+        return mayhem_proto::endpoint_request_fingerprint(
+            request.endpoint_request.as_ref().unwrap_or(&Value::Null),
+        );
+    }
+    blake3_hex(chat_prompt_text(request).as_bytes())
+}
+
 fn direct_chat_contract_request(request: &ChatCompletionRequest, transport_body: &Value) -> Value {
     request
         .endpoint_request
@@ -19819,7 +20001,7 @@ async fn collect_direct_session_output(
                     enclave_pubkey,
                     &frame,
                     latest_checkpoint_receipt.as_ref(),
-                    blake3_hex(chat_prompt_text(request).as_bytes()),
+                    direct_chat_prompt_hash(request),
                 )
                 .await?;
                 if frame.get("receipt").is_some() {
@@ -21504,7 +21686,7 @@ fn direct_session_receipt_ack(
         seq: provider_receipt.body.seq,
         final_receipt: true,
         au_owed_cum: calculate_locked_au_owed(invocation, &usage),
-        prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
+        prompt_hash: direct_chat_prompt_hash(request),
         usage,
     };
     if locked_increment_exceeds_voucher(invocation, expected.au_owed_cum) {
@@ -22252,7 +22434,7 @@ fn direct_session_partial_receipt_ack(
             final_receipt: false,
             au_owed_cum,
             usage,
-            prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
+            prompt_hash: direct_chat_prompt_hash(request),
         },
     )?;
     receipt_ack_for_body(&invocation.receipt_user_seed, body).map_err(|err| {
@@ -25730,7 +25912,7 @@ async fn build_chat_completion(
     };
     if let Some(job) = invocation.job.as_ref() {
         job.persist_completed_if_active(
-            chat_job_result(&output),
+            chat_job_result_for_request(&request, &output),
             gateway_job_artifacts(&output.artifacts),
             receipt.as_ref().map(|receipt| {
                 if request.stream {
@@ -26609,7 +26791,7 @@ async fn finish_live_direct_chat_after_client_disconnect(
         &session.provider,
         &session.model,
         &session.enclave_pubkey,
-        blake3_hex(chat_prompt_text(&session.request).as_bytes()),
+        direct_chat_prompt_hash(&session.request),
         usage,
         seq,
     )
@@ -27252,7 +27434,7 @@ async fn run_live_direct_chat_sse_inner(
                     &session.enclave_pubkey,
                     &frame,
                     latest_checkpoint_receipt.as_ref(),
-                    blake3_hex(chat_prompt_text(&session.request).as_bytes()),
+                    direct_chat_prompt_hash(&session.request),
                 )
                 .await?;
                 if frame.get("receipt").is_some() {
@@ -27420,7 +27602,7 @@ async fn run_live_direct_chat_sse_inner(
         &mut session.bridge,
         &session.transport_peer,
         &session.invocation,
-        chat_job_result(&output),
+        chat_job_result_for_request(&session.request, &output),
         &output.artifacts,
         &provider_receipt,
         &receipt_ack,
@@ -31084,6 +31266,167 @@ fn responses_value_from_chat(response: Value) -> Result<Value, ApiError> {
         "mayhem": response.get("mayhem").cloned().unwrap_or_else(|| json!({})),
     }))
 }
+fn decision_chat_request(request: &DecisionRequest) -> Result<ChatCompletionRequest, ApiError> {
+    let contract_request = request
+        .endpoint_request
+        .clone()
+        .ok_or_else(|| ApiError::internal_message("normalized decision request is missing"))?;
+    let prompt = stable_json_value(&contract_request).to_string();
+    Ok(ChatCompletionRequest {
+        model: request.model.clone(),
+        messages: vec![ChatMessage {
+            role: "user".to_owned(),
+            content: json!(prompt),
+            name: None,
+            extra: BTreeMap::new(),
+        }],
+        user: request.user.clone(),
+        metadata: BTreeMap::new(),
+        stream: false,
+        stream_options: None,
+        tools: None,
+        tool_choice: None,
+        parallel_tool_calls: None,
+        response_format: None,
+        temperature: None,
+        top_p: None,
+        top_k: None,
+        min_p: None,
+        repeat_penalty: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        seed: None,
+        stop: None,
+        max_tokens: Some(1),
+        max_completion_tokens: None,
+        reasoning_effort: None,
+        speciality_values: BTreeMap::new(),
+        effective_specialities: BTreeMap::new(),
+        preserve_reasoning_content: false,
+        endpoint_family: Some(mayhem_proto::ENDPOINT_MAYHEM_DECISIONS.to_owned()),
+        endpoint_request: Some(contract_request),
+    })
+}
+
+fn validated_decision_result(output: &ChatOutput) -> Result<Value, ApiError> {
+    let content = output
+        .content
+        .as_deref()
+        .filter(|content| !content.trim().is_empty())
+        .ok_or_else(|| {
+            ApiError::bad_gateway("decision provider returned no result", Some("model"))
+        })?;
+    let result: Value = serde_json::from_str(content).map_err(|err| {
+        ApiError::bad_gateway(
+            format!("decision provider returned invalid JSON: {err}"),
+            Some("model"),
+        )
+    })?;
+    if !result.get("answers").is_some_and(Value::is_object) {
+        return Err(ApiError::bad_gateway(
+            "decision provider result is missing an answers object",
+            Some("model"),
+        ));
+    }
+    if !result.get("routing").is_some_and(Value::is_object) {
+        return Err(ApiError::bad_gateway(
+            "decision provider result is missing a routing object",
+            Some("model"),
+        ));
+    }
+    Ok(result)
+}
+
+async fn build_decision(
+    state: &GatewayState,
+    request: DecisionRequest,
+    options: GatewayRequestOptions,
+) -> Result<Value, ApiError> {
+    let model = require_model(state, &request.model)?;
+    if model.mayhem.model_class != "decision"
+        || !model
+            .mayhem
+            .adapter
+            .endpoint_families
+            .iter()
+            .any(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS)
+    {
+        return Err(ApiError::bad_request(
+            "model does not support typed decisions",
+            Some("model"),
+        ));
+    }
+    let chat_request = decision_chat_request(&request)?;
+    let id = make_id("decision");
+    let created = now_secs();
+    let GatewaySessionRun {
+        model,
+        result:
+            GatewaySessionResult {
+                output,
+                backend,
+                direct_session,
+                provider_receipt,
+                token_ids: _,
+                quality,
+            },
+        invocation,
+        metering_request,
+        metering_output,
+    } = run_chat_with_route_retry(state, &model, &chat_request, options).await?;
+    let result = validated_decision_result(&output)?;
+    let receipt = if state.dev_session_shim {
+        None
+    } else {
+        let receipt = state.meter_chat_session(
+            &model,
+            &metering_request,
+            &metering_output,
+            &invocation,
+            provider_receipt.as_ref(),
+        )?;
+        state
+            .maybe_run_canary_probe_after_session(&model, &invocation)
+            .await;
+        Some(receipt_summary(&receipt))
+    };
+    if let Some(job) = invocation.job.as_ref() {
+        job.persist_completed_if_active(
+            chat_job_result_for_request(&chat_request, &output),
+            Vec::new(),
+            receipt.clone(),
+        )
+        .await?;
+    }
+    let mut response = json!({
+        "id": id,
+        "object": "decision",
+        "created": created,
+        "model": model.id,
+        "answers": result.get("answers").cloned().unwrap_or_else(|| json!({})),
+        "routing": result.get("routing").cloned().unwrap_or_else(|| json!({})),
+        "usage": output.usage,
+        "mayhem": {
+            "backend": backend,
+            "direct_session": direct_session,
+            "billable": !state.dev_session_shim,
+            "dev_session": state.dev_session_shim,
+            "quality": quality.map(|quality| json!({
+                "ttft_ms": quality.ttft_ms,
+                "tok_s": quality.tok_s,
+            })),
+            "receipt": receipt,
+        },
+    });
+    if let Some(shortlist) = result.get("shortlist") {
+        response["shortlist"] = shortlist.clone();
+    }
+    if let Some(preprocessing) = result.get("preprocessing") {
+        response["preprocessing"] = preprocessing.clone();
+    }
+    Ok(response)
+}
+
 async fn build_embedding(
     state: &GatewayState,
     request: EmbeddingRequest,
@@ -33064,6 +33407,18 @@ impl GatewayState {
                     return;
                 }
             }
+            CANARY_VERIFICATION_DECISION_FINGERPRINT => {
+                if model.mayhem.model_class != "decision"
+                    || !model
+                        .mayhem
+                        .adapter
+                        .endpoint_families
+                        .iter()
+                        .any(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS)
+                {
+                    return;
+                }
+            }
             _ => return,
         }
         let route_key = canary_route_key(model, invocation);
@@ -33097,6 +33452,10 @@ impl GatewayState {
                 .map(|probe| vec![probe]),
             CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT => self
                 .run_video_av_fingerprint_probe_for_route(model, invocation, &config)
+                .await
+                .map(|probe| vec![probe]),
+            CANARY_VERIFICATION_DECISION_FINGERPRINT => self
+                .run_decision_fingerprint_probe_for_route(model, invocation, &config)
                 .await
                 .map(|probe| vec![probe]),
             _ => return,
@@ -34726,6 +35085,111 @@ impl GatewayState {
         ))
     }
 
+    async fn run_decision_fingerprint_probe_for_route(
+        &self,
+        model: &GatewayModel,
+        served_invocation: &GatewaySessionInvocation,
+        config: &GatewayCanaryModelConfig,
+    ) -> Result<StoredProbeEvent, ApiError> {
+        let expected_fingerprints =
+            canary_expected_decision_fingerprints(config, served_invocation).ok_or_else(|| {
+                ApiError::bad_gateway(
+                    "no catalog canary decision fingerprints for served artifact",
+                    Some("model"),
+                )
+            })?;
+        let route = canary_served_route(model, served_invocation);
+        let mut prompt_reports = Vec::with_capacity(expected_fingerprints.len());
+        let mut receipt_hashes = Vec::with_capacity(expected_fingerprints.len());
+        let mut stored_receipts = Vec::with_capacity(expected_fingerprints.len());
+        let mut observed_fingerprints = BTreeMap::new();
+
+        for prompt in &config.prompts {
+            if !expected_fingerprints.contains_key(&prompt.id) {
+                continue;
+            }
+            let request = canary_decision_request(model, prompt)?;
+            let chat_request = decision_chat_request(&request)?;
+            let invocation = self.prepare_chat_invocation_for_route(
+                model,
+                &chat_request,
+                route.as_ref(),
+                &canary_request_options(served_invocation),
+            )?;
+            let result = self
+                .session_backend
+                .run_chat(model, &chat_request, &invocation)
+                .await
+                .map_err(|err| provider_session_api_error(&err))?;
+            let decision = validated_decision_result(&result.output)?;
+            let fingerprint = stable_value_hash(&stable_json_value(&decision));
+            observed_fingerprints.insert(prompt.id.clone(), fingerprint.clone());
+            let receipt = self.meter_chat_session(
+                model,
+                &chat_request,
+                &result.output,
+                &invocation,
+                result.provider_receipt.as_ref(),
+            )?;
+            let receipt_hash = stable_value_hash(&json!(receipt));
+            receipt_hashes.push(receipt_hash.clone());
+            stored_receipts.push(receipt);
+            prompt_reports.push(json!({
+                "prompt_id": prompt.id,
+                "request": request.endpoint_request,
+                "decision": decision,
+                "decision_fingerprint": fingerprint,
+                "session_id": invocation.session_id,
+                "receipt_hash": receipt_hash,
+            }));
+        }
+
+        if observed_fingerprints.is_empty() {
+            return Err(ApiError::bad_gateway(
+                "no canary decision prompts matched expected fingerprints",
+                Some("model"),
+            ));
+        }
+        let spec = CanaryProbeSpec {
+            model: model.id.clone(),
+            canary_set: config.canary_set.clone(),
+            prompt_id: format!("aggregate:{}", expected_fingerprints.len()),
+            prompt: config
+                .prompts
+                .iter()
+                .filter(|prompt| expected_fingerprints.contains_key(&prompt.id))
+                .map(|prompt| prompt.id.as_str())
+                .collect::<Vec<_>>()
+                .join(","),
+            seed: self.canary_policy.seed,
+            max_tokens: 1,
+            sampling: Default::default(),
+        };
+        let evaluation = evaluate_catalog_canary_decision_fingerprint_probe(
+            &spec,
+            &expected_fingerprints,
+            &observed_fingerprints,
+        );
+        let evidence = json!({
+            "schema_version": 1,
+            "kind": "mayhem-automatic-decision-canary-probe-evidence",
+            "catalog_expected_decision_fingerprints": expected_fingerprints,
+            "observed_decision_fingerprints": observed_fingerprints,
+            "evaluation": evaluation,
+            "prompts": prompt_reports,
+            "receipt_hashes": receipt_hashes,
+        });
+        Ok(self.content_canary_probe_event(
+            model,
+            served_invocation,
+            config,
+            evaluation,
+            evidence,
+            receipt_hashes,
+            stored_receipts,
+        ))
+    }
+
     fn content_canary_probe_event(
         &self,
         model: &GatewayModel,
@@ -35665,6 +36129,14 @@ impl GatewayState {
         model: &GatewayModel,
         options: &GatewayRequestOptions,
     ) -> Option<f64> {
+        if model.mayhem.model_class != DEFAULT_MODEL_CLASS {
+            return options
+                .failover_overrides
+                .min_tok_s
+                .or(model.mayhem.failover.min_tok_s)
+                .or(self.failover_policy.min_tok_s)
+                .filter(|value| value.is_finite() && *value > 0.0);
+        }
         self.throughput_floor_for_model(model, options, DEFAULT_LLM_GENERATION_FLOOR_TOK_S)
     }
 
@@ -35694,7 +36166,6 @@ impl GatewayState {
         invocation: &GatewaySessionInvocation,
         provider_receipt: Option<&ProviderSignedReceipt>,
     ) -> Result<StoredReceipt, ApiError> {
-        let prompt_text = chat_prompt_text(request);
         if !self.receipt_config.cosign_enabled {
             self.pause_session(PausedSession {
                 session_id: invocation.session_id.clone(),
@@ -35739,7 +36210,7 @@ impl GatewayState {
                     final_receipt: true,
                     usage: usage.clone(),
                     au_owed_cum,
-                    prompt_hash: blake3_hex(prompt_text.as_bytes()),
+                    prompt_hash: direct_chat_prompt_hash(request),
                 },
             )?
         } else {
@@ -35800,7 +36271,7 @@ impl GatewayState {
                 usage,
                 usage_attribution: BTreeMap::new(),
                 au_owed_cum,
-                prompt_hash: blake3_hex(prompt_text.as_bytes()),
+                prompt_hash: direct_chat_prompt_hash(request),
                 ts: now_millis_u64(),
             };
             let receipt_payload = receipt_signing_bytes(&body).map_err(ApiError::internal)?;
@@ -36235,7 +36706,7 @@ impl GatewayState {
                 final_receipt: false,
                 au_owed_cum,
                 usage,
-                prompt_hash: blake3_hex(chat_prompt_text(request).as_bytes()),
+                prompt_hash: direct_chat_prompt_hash(request),
             },
         )?;
         let receipt_ack = ReceiptAck {
@@ -36763,6 +37234,28 @@ fn canary_expected_video_fingerprints(
         })
 }
 
+fn canary_expected_decision_fingerprints(
+    config: &GatewayCanaryModelConfig,
+    invocation: &GatewaySessionInvocation,
+) -> Option<BTreeMap<String, String>> {
+    invocation
+        .attestation
+        .as_ref()
+        .and_then(|attestation| {
+            config
+                .decision_fingerprints_by_artifact_root
+                .get(&attestation.contract.artifact_root)
+                .cloned()
+        })
+        .or_else(|| {
+            invocation
+                .expected_execution_mode
+                .is_none()
+                .then(|| config.default_decision_fingerprints.clone())
+                .flatten()
+        })
+}
+
 #[derive(Clone, Debug)]
 struct ContextNeedleSpec {
     answer: String,
@@ -37082,6 +37575,41 @@ fn canary_embedding_request(
         )
     })?;
     request.endpoint_family = Some(family.to_owned());
+    request.endpoint_request = Some(normalized.normalized_request);
+    Ok(request)
+}
+
+fn canary_decision_request(
+    model: &GatewayModel,
+    prompt: &GatewayCanaryPrompt,
+) -> Result<DecisionRequest, ApiError> {
+    let mut raw = Map::from_iter(prompt.endpoint_attributes.clone());
+    raw.insert("model".to_owned(), json!(model.id));
+    let raw = Value::Object(raw);
+    let contract = model
+        .mayhem
+        .adapter
+        .endpoint_families
+        .iter()
+        .find(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS)
+        .ok_or_else(|| {
+            ApiError::bad_gateway("Canary endpoint contract is unavailable.", Some("model"))
+        })?;
+    let normalized = normalize_endpoint_request_for_provider(contract, &raw).map_err(|_| {
+        ApiError::bad_gateway(
+            "Canary request does not satisfy its signed endpoint contract.",
+            Some("model"),
+        )
+    })?;
+    let mut request = serde_json::from_value::<DecisionRequest>(
+        normalized.normalized_request.clone(),
+    )
+    .map_err(|error| {
+        ApiError::bad_gateway(
+            format!("signed decision canary request cannot be decoded: {error}"),
+            Some("model"),
+        )
+    })?;
     request.endpoint_request = Some(normalized.normalized_request);
     Ok(request)
 }
@@ -45738,6 +46266,7 @@ mod tests {
             transcripts_by_artifact_root: BTreeMap::new(),
             audio_fingerprints_by_artifact_root: BTreeMap::new(),
             video_fingerprints_by_artifact_root: BTreeMap::new(),
+            decision_fingerprints_by_artifact_root: BTreeMap::new(),
             speciality_calibrations_by_artifact_root: BTreeMap::new(),
             default_fingerprint: Some("baseline-only".to_owned()),
             default_token_prefixes: None,
@@ -45746,6 +46275,7 @@ mod tests {
             default_transcripts: None,
             default_audio_fingerprints: None,
             default_video_fingerprints: None,
+            default_decision_fingerprints: None,
         }
     }
 
@@ -53695,6 +54225,7 @@ mod tests {
             transcripts_by_artifact_root: BTreeMap::new(),
             audio_fingerprints_by_artifact_root: BTreeMap::new(),
             video_fingerprints_by_artifact_root: BTreeMap::new(),
+            decision_fingerprints_by_artifact_root: BTreeMap::new(),
             speciality_calibrations_by_artifact_root: BTreeMap::new(),
             default_fingerprint: None,
             default_token_prefixes: None,
@@ -53703,6 +54234,7 @@ mod tests {
             default_transcripts: None,
             default_audio_fingerprints: None,
             default_video_fingerprints: None,
+            default_decision_fingerprints: None,
         };
         let served_request = artifact_generation_request_with_workflow_policy(
             &model.id,

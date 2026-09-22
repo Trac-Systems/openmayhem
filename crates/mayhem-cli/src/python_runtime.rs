@@ -26,6 +26,7 @@ const MLX_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/mlx.txt");
 const LLAMA_MEDIA_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/llama-media.txt");
 const TRANSFORMERS_ASR_REQUIREMENTS: &[u8] =
     include_bytes!("../resources/python/transformers-asr.txt");
+const LAYA_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/laya.txt");
 const CHATTERBOX_CPU_PROJECT: &[u8] =
     include_bytes!("../resources/python/chatterbox-runtime-cpu/pyproject.toml");
 const CHATTERBOX_CPU_LOCK: &[u8] =
@@ -3309,6 +3310,26 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             requirements: TRANSFORMERS_ASR_REQUIREMENTS,
             requirements_sha256: "293ff8c2998e0fe7962e561e53b7f379b295460f294a407eabc2cacd5464827c",
             extra_index_urls: &[],
+            min_free_bytes: 8 * GIB,
+            embedded_module: None,
+        }),
+        "laya" => Some(PythonRuntimeSpec {
+            backend: "laya",
+            override_env: "MAYHEM_LAYA_PYTHON",
+            distribution: "laya",
+            required_imports: &[
+                "laya",
+                "transformers",
+                "torch",
+                "tokenizers",
+                "safetensors",
+                "huggingface_hub",
+                "numpy",
+            ],
+            version: "0.3.5",
+            requirements: LAYA_REQUIREMENTS,
+            requirements_sha256: "b146de268c7caf04ee58e7c70bde58e7876ee9b280a8de63cf79c68fd06bab14",
+            extra_index_urls: &["https://download.pytorch.org/whl/cu130"],
             min_free_bytes: 8 * GIB,
             embedded_module: None,
         }),

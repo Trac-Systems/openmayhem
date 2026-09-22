@@ -227,6 +227,73 @@ impl GatewaySessionBackend for EmbeddingDirectSessionBackend {
 }
 
 #[derive(Debug)]
+struct DecisionDirectSessionBackend;
+
+impl GatewaySessionBackend for DecisionDirectSessionBackend {
+    fn name(&self) -> &str {
+        "test-decision-direct-session"
+    }
+
+    fn run_chat<'a>(
+        &'a self,
+        _model: &'a GatewayModel,
+        request: &'a ChatCompletionRequest,
+        _invocation: &'a GatewaySessionInvocation,
+    ) -> GatewaySessionFuture<'a> {
+        Box::pin(async move {
+            assert_eq!(
+                request.endpoint_family.as_deref(),
+                Some(mayhem_proto::ENDPOINT_MAYHEM_DECISIONS)
+            );
+            assert_eq!(
+                request
+                    .endpoint_request
+                    .as_ref()
+                    .and_then(|body| body.get("checkpoint"))
+                    .and_then(Value::as_str),
+                Some("english")
+            );
+            let content = json!({
+                "model": "laya-rl-agent",
+                "answers": {
+                    "intent": {
+                        "type": "choice",
+                        "choice": "support",
+                        "probabilities": {"support": 0.9, "other": 0.1},
+                        "confidence": 0.9,
+                        "action": {"act_probability": 0.2}
+                    }
+                },
+                "routing": {"checkpoint": "english", "reason": "explicit"},
+                "shortlist": {"intent": ["support", "other"]},
+                "preprocessing": {"email_cleaned": false},
+                "usage": {"input_tokens": 7, "output_tokens": 0}
+            })
+            .to_string();
+            Ok(GatewaySessionResult {
+                output: ChatOutput {
+                    reasoning_content: String::new(),
+                    content: Some(content),
+                    tool_calls: Vec::new(),
+                    artifacts: Vec::new(),
+                    finish_reason: "stop".to_owned(),
+                    usage: Usage {
+                        prompt_tokens: 7,
+                        completion_tokens: 9,
+                        total_tokens: 16,
+                    },
+                },
+                backend: self.name().to_owned(),
+                direct_session: true,
+                provider_receipt: None,
+                token_ids: Vec::new(),
+                quality: None,
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
 struct ImageGenerationDirectSessionBackend;
 
 impl GatewaySessionBackend for ImageGenerationDirectSessionBackend {
@@ -3177,6 +3244,84 @@ async fn embeddings_endpoint_rejects_non_embedding_model() {
 }
 
 #[tokio::test]
+async fn decisions_endpoint_uses_signed_route_and_records_typed_usage() {
+    let state = test_gateway_state_from_models(vec![routed_decision_test_model()])
+        .with_session_backend(Arc::new(DecisionDirectSessionBackend));
+    let app = openai_router(state.clone());
+    let request = json!({
+        "model": "convaiinnovations/laya",
+        "state": {"body": "Please help with my account."},
+        "questions": {
+            "intent": {
+                "type": "choice",
+                "instructions": "Choose the intent.",
+                "criteria": {
+                    "support": "support request",
+                    "other": "another topic"
+                }
+            }
+        },
+        "checkpoint": "english"
+    });
+
+    let (status, body) = json_request(app, Method::POST, "/v1/decisions", request).await;
+
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["object"], "decision");
+    assert_eq!(body["model"], "convaiinnovations/laya");
+    assert_eq!(body["answers"]["intent"]["choice"], "support");
+    assert_eq!(body["routing"]["checkpoint"], "english");
+    assert_eq!(body["shortlist"]["intent"][0], "support");
+    assert_eq!(body["preprocessing"]["email_cleaned"], false);
+    assert_eq!(body["usage"]["prompt_tokens"], 7);
+    assert_eq!(body["usage"]["completion_tokens"], 9);
+    assert_eq!(body["mayhem"]["backend"], "test-decision-direct-session");
+    assert_eq!(body["mayhem"]["direct_session"], true);
+    assert_eq!(body["mayhem"]["receipt"]["rail"], "fiat");
+
+    let receipts = state.receipts();
+    assert_eq!(receipts.len(), 1);
+    assert_eq!(receipts[0].receipt.body.model_id, "convaiinnovations/laya");
+    assert_eq!(receipts[0].receipt.body.usage.input_tokens(), 7);
+    assert_eq!(receipts[0].receipt.body.usage.output_tokens(), 9);
+}
+
+#[tokio::test]
+async fn decisions_endpoint_rejects_unknown_or_inapplicable_models_before_dispatch() {
+    let state =
+        test_gateway_state_from_models(vec![routed_decision_test_model(), routed_test_model()])
+            .with_session_backend(Arc::new(DecisionDirectSessionBackend));
+    let app = openai_router(state);
+
+    let (status, body) = json_request(
+        app.clone(),
+        Method::POST,
+        "/v1/decisions",
+        json!({
+            "model": "convaiinnovations/laya",
+            "state": "hello",
+            "questions": {"urgent": {"type": "noul", "instructions": "Urgent?"}},
+            "server_path": "/tmp/escape"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+
+    let (status, body) = json_request(
+        app,
+        Method::POST,
+        "/v1/decisions",
+        json!({
+            "model": "mayhem/routed-test",
+            "state": "hello",
+            "questions": {"urgent": {"type": "noul", "instructions": "Urgent?"}}
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+}
+
+#[tokio::test]
 async fn image_generation_endpoint_uses_routed_engine_and_records_receipt() {
     let state = test_gateway_state_from_models(vec![routed_image_generation_test_model()])
         .with_session_backend(Arc::new(ImageGenerationDirectSessionBackend));
@@ -6101,6 +6246,51 @@ fn routed_embedding_test_model() -> GatewayModel {
     model
 }
 
+fn routed_decision_test_model() -> GatewayModel {
+    let mut model = routed_test_model_with_providers(&["55".repeat(32)]);
+    model.id = "convaiinnovations/laya".to_owned();
+    model.mayhem.model_class = "decision".to_owned();
+    model.mayhem.price_ref_au = PriceRefAu {
+        denom: "au_usd".to_owned(),
+        ver: 8,
+        rate_map: text_generation_rate_map(10, 10),
+        per_req_au: 0,
+        min_session_au: 0,
+        derivation: None,
+        history: Vec::new(),
+    };
+    model.mayhem.caps = ModelCaps {
+        tools: false,
+        json: true,
+        ctx: 1024,
+        vision: false,
+        image: false,
+        video: false,
+        audio: false,
+        max_image_width: None,
+        max_image_height: None,
+        max_image_steps: None,
+        output_modality: Some("text".to_owned()),
+        output_modalities: vec!["text".to_owned()],
+    };
+    model.mayhem.adapter.modality_set = vec!["text".to_owned()];
+    model.mayhem.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
+    )
+    .unwrap()];
+    for candidate in &mut model.mayhem.route_candidates {
+        candidate.served_modalities = vec!["text".to_owned()];
+        candidate.price_ver = 8;
+        candidate.caps = serde_json::json!({
+            "ctx_max": 1024,
+            "json": true,
+            "output_modality": "text",
+            "output_modalities": ["text"]
+        });
+    }
+    model
+}
+
 fn routed_image_generation_test_model() -> GatewayModel {
     let mut model = routed_test_model_with_providers(&["55".repeat(32)]);
     model.id = "admin/image-fixture".to_owned();
@@ -6904,6 +7094,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                 transcripts_by_artifact_root: BTreeMap::new(),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
                 video_fingerprints_by_artifact_root: BTreeMap::new(),
+                decision_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -6912,6 +7103,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                 default_transcripts: None,
                 default_audio_fingerprints: None,
                 default_video_fingerprints: None,
+                default_decision_fingerprints: None,
             },
         )]),
         prompt_ids_by_set: BTreeMap::from([(
@@ -6973,6 +7165,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                 transcripts_by_artifact_root: BTreeMap::new(),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
                 video_fingerprints_by_artifact_root: BTreeMap::new(),
+                decision_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -6981,6 +7174,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                 default_transcripts: None,
                 default_audio_fingerprints: None,
                 default_video_fingerprints: None,
+                default_decision_fingerprints: None,
             },
         )]),
         prompt_ids_by_set: BTreeMap::from([(
@@ -7042,6 +7236,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                 transcripts_by_artifact_root: BTreeMap::new(),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
                 video_fingerprints_by_artifact_root: BTreeMap::new(),
+                decision_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -7050,6 +7245,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                 default_transcripts: None,
                 default_audio_fingerprints: None,
                 default_video_fingerprints: None,
+                default_decision_fingerprints: None,
             },
         )]),
         prompt_ids_by_set: BTreeMap::from([(
@@ -7121,6 +7317,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                 )]),
                 audio_fingerprints_by_artifact_root: BTreeMap::new(),
                 video_fingerprints_by_artifact_root: BTreeMap::new(),
+                decision_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -7129,6 +7326,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                 default_transcripts: None,
                 default_audio_fingerprints: None,
                 default_video_fingerprints: None,
+                default_decision_fingerprints: None,
             },
         )]),
         prompt_ids_by_set: BTreeMap::from([(
@@ -7190,6 +7388,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                     BTreeMap::from([("fixed-tts".to_owned(), expected_fingerprint)]),
                 )]),
                 video_fingerprints_by_artifact_root: BTreeMap::new(),
+                decision_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -7198,6 +7397,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                 default_transcripts: None,
                 default_audio_fingerprints: None,
                 default_video_fingerprints: None,
+                default_decision_fingerprints: None,
             },
         )]),
         prompt_ids_by_set: BTreeMap::from([(
@@ -7275,6 +7475,7 @@ fn test_music_audio_fingerprint_canary_registry(
                     BTreeMap::from([("fixed-music".to_owned(), expected_fingerprint)]),
                 )]),
                 video_fingerprints_by_artifact_root: BTreeMap::new(),
+                decision_fingerprints_by_artifact_root: BTreeMap::new(),
                 speciality_calibrations_by_artifact_root: BTreeMap::new(),
                 default_fingerprint: None,
                 default_token_prefixes: None,
@@ -7283,6 +7484,7 @@ fn test_music_audio_fingerprint_canary_registry(
                 default_transcripts: None,
                 default_audio_fingerprints: None,
                 default_video_fingerprints: None,
+                default_decision_fingerprints: None,
             },
         )]),
         prompt_ids_by_set: BTreeMap::from([(

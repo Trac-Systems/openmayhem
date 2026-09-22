@@ -72,9 +72,9 @@ use mayhem_engine::ComfyUiBackend;
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, CancellationToken,
     ComfyUiCustomNodePackage, ComfyUiModelFile, ComponentRecovery, ConcurrentEmbeddingBackend,
-    ConcurrentGenerationBackend, EngineBackend, EngineError, GenerateRequest,
-    GenerateSpecialityParameter, GenerateSpecialityTarget, GrammarSpec,
-    ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
+    ConcurrentGenerationBackend, DecisionRequest as EngineDecisionRequest, EngineBackend,
+    EngineError, GenerateRequest, GenerateSpecialityParameter, GenerateSpecialityTarget,
+    GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
     MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
     SpeechReferenceAudio, SpeechRequest, TokenChunk, Tokenization, ToolSpec,
     WorkflowGenerationRequest, WorkflowInputFile, MTMD_MEDIA_MARKER,
@@ -357,6 +357,7 @@ const PROVIDER_ACCEPTED_RAIL_ORDER: [&str; 3] = ["fiat", "tap", "tnk"];
 const CANARY_VERIFICATION_TOKEN_FINGERPRINT: &str = "token_fingerprint";
 const CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";
 const CANARY_VERIFICATION_EMBEDDING_COSINE: &str = "embedding_cosine";
+const CANARY_VERIFICATION_DECISION_FINGERPRINT: &str = "decision_fingerprint";
 const CANARY_VERIFICATION_TRANSCRIPT_MATCH: &str = "transcript_match";
 const CANARY_VERIFICATION_AUDIO_FINGERPRINT: &str = "audio_fingerprint";
 const CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT: &str = "video_av_fingerprint";
@@ -369,6 +370,7 @@ const MODEL_CLASS_STT: &str = "stt";
 const MODEL_CLASS_AUDIO_GENERATION: &str = "audio-generation";
 const MODEL_CLASS_MUSIC_GENERATION: &str = "music-generation";
 const MODEL_CLASS_WORKFLOW: &str = "workflow";
+const MODEL_CLASS_DECISION: &str = "decision";
 const DEFAULT_COMFY_OUTCOME_GRID_PATH: &str = "catalog/comfy/outcome-classes-v1.json";
 
 #[derive(Debug, Parser)]
@@ -7932,6 +7934,7 @@ fn resolve_doctor_provider_backend(requested: &str, report: &HardwareReport) -> 
                 | "needle-gpu"
                 | "sulphur"
                 | "transformers-asr"
+                | "laya"
                 | "whisper.cpp"
                 | "piper"
         ),
@@ -8975,6 +8978,9 @@ fn backend_requirement_hint(backend: &str) -> &'static str {
         }
         "transformers-asr" => {
             "Transformers ASR requires at least 8 GiB RAM and supports CUDA, Metal/MPS, or CPU execution"
+        }
+        "laya" => {
+            "Laya requires a CUDA host, its pinned offline Python runtime, and enough memory to preload all three checkpoints"
         }
         "whisper.cpp" => "whisper.cpp requires enough local RAM and CPU SIMD support",
         "piper" => "Piper requires enough local RAM for the voice artifact",
@@ -19054,6 +19060,7 @@ fn calibration_endpoint_attribute_is_handled(
         mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS => {
             matches!(path, "model" | "input" | "encoding_format" | "dimensions")
         }
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS => true,
         mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION => {
             matches!(path, "inputs" | "dimensions")
         }
@@ -19278,6 +19285,20 @@ fn catalog_endpoint_calibration_response(
             "usage": usage,
             "mayhem": mayhem,
         })),
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS => {
+            let result: Value = serde_json::from_str(&output.content)
+                .context("decision backend produced invalid JSON")?;
+            Ok(json!({
+                "id": "decision-calibration",
+                "object": "decision.result",
+                "created": 1,
+                "model": model,
+                "answers": result.get("answers").cloned().context("decision result is missing answers")?,
+                "routing": result.get("routing").cloned().context("decision result is missing routing")?,
+                "usage": usage,
+                "mayhem": mayhem,
+            }))
+        }
         mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS => Ok(json!({
             "id": "img-calibration",
             "object": "images.response",
@@ -19702,6 +19723,22 @@ fn verify_calibration_sidecars_match_catalog(
             ensure!(
                 paths.contains_key(*required),
                 "Transformers ASR calibration requires --artifact-sidecar {required}=PATH"
+            );
+        }
+    }
+    if artifact.engine == "laya" {
+        for (required, filename) in LAYA_REQUIRED_SIDECARS {
+            let sidecar = artifact.sidecars.get(*required).with_context(|| {
+                format!("Laya calibration requires admin catalog sidecar {required}")
+            })?;
+            ensure!(
+                sidecar.path == *filename,
+                "Laya sidecar {required} must use path {filename}, got {}",
+                sidecar.path
+            );
+            ensure!(
+                paths.contains_key(*required),
+                "Laya calibration requires --artifact-sidecar {required}=PATH"
             );
         }
     }
@@ -20990,6 +21027,7 @@ fn required_launch_output_canary_method(model: &catalog::CatalogModel) -> Option
         MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
             Some(CANARY_VERIFICATION_AUDIO_FINGERPRINT)
         }
+        MODEL_CLASS_DECISION => Some(CANARY_VERIFICATION_DECISION_FINGERPRINT),
         _ => None,
     }
 }
@@ -21891,6 +21929,11 @@ fn catalog_canary_evidence_report(
                 model.canary.audio_fingerprints.get(artifact_name).cloned();
             let expected_video_fingerprints =
                 model.canary.video_fingerprints.get(artifact_name).cloned();
+            let expected_decision_fingerprints = model
+                .canary
+                .decision_fingerprints
+                .get(artifact_name)
+                .cloned();
             if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
                 && model.canary.verification_method == "token_fingerprint"
             {
@@ -21913,6 +21956,7 @@ fn catalog_canary_evidence_report(
                     expected_transcripts.as_ref(),
                     expected_audio_fingerprints.as_ref(),
                     expected_video_fingerprints.as_ref(),
+                    expected_decision_fingerprints.as_ref(),
                     &mut entry_errors,
                 );
             }
@@ -21943,6 +21987,7 @@ fn catalog_canary_evidence_report(
                 expected_transcripts,
                 expected_audio_fingerprints,
                 expected_video_fingerprints,
+                expected_decision_fingerprints,
                 expected_artifact_binding: catalog_canary_artifact_binding(artifact),
                 report_path: None,
                 report_fingerprint: None,
@@ -21955,6 +22000,7 @@ fn catalog_canary_evidence_report(
                 report_transcripts: None,
                 report_audio_fingerprints: None,
                 report_video_fingerprints: None,
+                report_decision_fingerprints: None,
                 report_canary_set_sha256: None,
                 report_artifact_binding: None,
                 matches_catalog: None,
@@ -22188,6 +22234,11 @@ fn catalog_canary_evidence_report(
                     .map(|value| (prompt.prompt_id.clone(), value))
             })
             .collect::<BTreeMap<_, _>>();
+        let report_decision_fingerprints = calibration
+            .prompts
+            .iter()
+            .map(|prompt| (prompt.prompt_id.clone(), prompt.fingerprint.clone()))
+            .collect::<BTreeMap<_, _>>();
         if calibration.verification_method == "token_fingerprint" {
             entry.report_token_prefixes = Some(report_token_prefixes.clone());
         }
@@ -22205,6 +22256,9 @@ fn catalog_canary_evidence_report(
         }
         if calibration.verification_method == CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT {
             entry.report_video_fingerprints = Some(report_video_fingerprints.clone());
+        }
+        if calibration.verification_method == CANARY_VERIFICATION_DECISION_FINGERPRINT {
+            entry.report_decision_fingerprints = Some(report_decision_fingerprints.clone());
         }
         entry.report_canary_set_sha256 = Some(calibration.canary_set_sha256.clone());
         entry.report_artifact_binding = Some(calibration.artifact_binding.clone());
@@ -22244,17 +22298,21 @@ fn catalog_canary_evidence_report(
             entry.expected_transcripts.as_ref(),
             entry.expected_audio_fingerprints.as_ref(),
             entry.expected_video_fingerprints.as_ref(),
+            entry.expected_decision_fingerprints.as_ref(),
             &report_perceptual_hashes,
             &report_embedding_vectors,
             &report_transcripts,
             &report_audio_fingerprints,
             &report_video_fingerprints,
+            &report_decision_fingerprints,
             canary_min_match_bps,
         );
         entry.method_values_match_catalog = method_values_match_catalog;
         let matches_catalog = if matches!(
             entry.verification_method.as_str(),
-            CANARY_VERIFICATION_AUDIO_FINGERPRINT | CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT
+            CANARY_VERIFICATION_AUDIO_FINGERPRINT
+                | CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT
+                | CANARY_VERIFICATION_DECISION_FINGERPRINT
         ) {
             method_values_match_catalog
         } else {
@@ -22657,6 +22715,11 @@ fn catalog_execution_mode_evidence_entry(
     let expected_transcripts = model.canary.transcripts.get(artifact_name).cloned();
     let expected_audio_fingerprints = model.canary.audio_fingerprints.get(artifact_name).cloned();
     let expected_video_fingerprints = model.canary.video_fingerprints.get(artifact_name).cloned();
+    let expected_decision_fingerprints = model
+        .canary
+        .decision_fingerprints
+        .get(artifact_name)
+        .cloned();
     if report_mode == CatalogCanaryReportMode::VerifyMatchesCatalog {
         match expected_fingerprint.as_deref() {
             Some(value) if is_hex_len(value, 64) => {}
@@ -22703,6 +22766,7 @@ fn catalog_execution_mode_evidence_entry(
             expected_transcripts.as_ref(),
             expected_audio_fingerprints.as_ref(),
             expected_video_fingerprints.as_ref(),
+            expected_decision_fingerprints.as_ref(),
             &mut errors,
         );
     }
@@ -22729,6 +22793,7 @@ fn catalog_execution_mode_evidence_entry(
         expected_transcripts,
         expected_audio_fingerprints,
         expected_video_fingerprints,
+        expected_decision_fingerprints,
         expected_artifact_binding: catalog_canary_artifact_binding(artifact),
         report_path: None,
         report_fingerprint: None,
@@ -22741,6 +22806,7 @@ fn catalog_execution_mode_evidence_entry(
         report_transcripts: None,
         report_audio_fingerprints: None,
         report_video_fingerprints: None,
+        report_decision_fingerprints: None,
         report_canary_set_sha256: None,
         report_artifact_binding: None,
         matches_catalog: None,
@@ -22762,6 +22828,7 @@ fn validate_expected_canary_method_values(
     transcripts: Option<&BTreeMap<String, String>>,
     audio_fingerprints: Option<&BTreeMap<String, String>>,
     video_fingerprints: Option<&BTreeMap<String, String>>,
+    decision_fingerprints: Option<&BTreeMap<String, String>>,
     errors: &mut Vec<String>,
 ) {
     match method {
@@ -22810,6 +22877,22 @@ fn validate_expected_canary_method_values(
             )),
             None => errors.push(format!(
                 "canary video_fingerprints missing artifact {artifact}"
+            )),
+        },
+        CANARY_VERIFICATION_DECISION_FINGERPRINT => match decision_fingerprints {
+            Some(values)
+                if !values.is_empty()
+                    && values.values().all(|fingerprint| {
+                        is_hex_len(fingerprint, 64)
+                            && fingerprint
+                                .bytes()
+                                .all(|byte| !byte.is_ascii_uppercase())
+                    }) => {}
+            Some(_) => errors.push(format!(
+                "canary decision_fingerprints for {artifact} must contain lowercase 32-byte hex fingerprints"
+            )),
+            None => errors.push(format!(
+                "canary decision_fingerprints missing artifact {artifact}"
             )),
         },
         _ => {}
@@ -23241,11 +23324,13 @@ fn method_values_match_catalog(
     expected_transcripts: Option<&BTreeMap<String, String>>,
     expected_audio_fingerprints: Option<&BTreeMap<String, String>>,
     expected_video_fingerprints: Option<&BTreeMap<String, String>>,
+    expected_decision_fingerprints: Option<&BTreeMap<String, String>>,
     report_perceptual_hashes: &BTreeMap<String, String>,
     report_embedding_vectors: &BTreeMap<String, Vec<f32>>,
     report_transcripts: &BTreeMap<String, String>,
     report_audio_fingerprints: &BTreeMap<String, String>,
     report_video_fingerprints: &BTreeMap<String, String>,
+    report_decision_fingerprints: &BTreeMap<String, String>,
     min_match_bps: u32,
 ) -> Option<bool> {
     match method {
@@ -23281,6 +23366,9 @@ fn method_values_match_catalog(
                         .is_some_and(|similarity| similarity >= min_match_bps)
                 })
         }),
+        CANARY_VERIFICATION_DECISION_FINGERPRINT => {
+            expected_decision_fingerprints.map(|expected| expected == report_decision_fingerprints)
+        }
         _ => None,
     }
 }
@@ -23602,6 +23690,15 @@ fn apply_canary_report_fingerprints(
                     entry.report_video_fingerprints.as_ref(),
                 )?;
             }
+            CANARY_VERIFICATION_DECISION_FINGERPRINT => {
+                insert_canary_method_map(
+                    canary,
+                    &entry.model_id,
+                    "decision_fingerprints",
+                    &entry.artifact,
+                    entry.report_decision_fingerprints.as_ref(),
+                )?;
+            }
             other => bail!("cannot apply unsupported canary verification_method {other}"),
         }
         let modality_fingerprints =
@@ -23777,6 +23874,13 @@ fn apply_execution_mode_canary_report(
             &entry.artifact,
             entry.report_video_fingerprints.as_ref(),
         )?,
+        CANARY_VERIFICATION_DECISION_FINGERPRINT => insert_canary_method_map(
+            canary,
+            &entry.model_id,
+            "decision_fingerprints",
+            &entry.artifact,
+            entry.report_decision_fingerprints.as_ref(),
+        )?,
         other => bail!("cannot apply unsupported canary verification_method {other}"),
     }
     mode.insert(
@@ -23930,6 +24034,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
                 | "needle-gpu"
                 | "sulphur"
                 | "transformers-asr"
+                | "laya"
                 | "whisper.cpp"
                 | "piper" => "ready",
                 "trt-llm" => "requires-prebuilt-trt-engine",
@@ -24326,6 +24431,7 @@ fn catalog_canary_matrix_report(
             let mut transcript_count = None;
             let mut audio_fingerprint_count = None;
             let mut video_fingerprint_count = None;
+            let mut decision_fingerprint_count = None;
             let modality_fingerprints = model
                 .modality_assessment
                 .calibrated_fingerprints
@@ -24530,6 +24636,37 @@ fn catalog_canary_matrix_report(
                     }
                     "video-av-fingerprint-calibrated"
                 }
+                CANARY_VERIFICATION_DECISION_FINGERPRINT => {
+                    match model.canary.decision_fingerprints.get(artifact_name) {
+                        Some(fingerprints) => {
+                            decision_fingerprint_count = Some(fingerprints.len());
+                            if fingerprints.is_empty() {
+                                entry_errors.push(format!(
+                                    "canary decision_fingerprints for {artifact_name} must not be empty"
+                                ));
+                            }
+                            for prompt_id in prompt_ids {
+                                match fingerprints.get(prompt_id) {
+                                    Some(fingerprint)
+                                        if is_hex_len(fingerprint, 64)
+                                            && fingerprint
+                                                .bytes()
+                                                .all(|byte| !byte.is_ascii_uppercase()) => {}
+                                    Some(_) => entry_errors.push(format!(
+                                        "canary decision_fingerprints for {artifact_name} prompt {prompt_id} must be lowercase 32-byte hex"
+                                    )),
+                                    None => entry_errors.push(format!(
+                                        "canary decision_fingerprints missing prompt {prompt_id} for artifact {artifact_name}"
+                                    )),
+                                }
+                            }
+                        }
+                        None => entry_errors.push(format!(
+                            "canary decision_fingerprints missing artifact {artifact_name}"
+                        )),
+                    }
+                    "decision-fingerprint-calibrated"
+                }
                 CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE => {
                     if fingerprint.is_some()
                         || model.canary.token_prefixes.contains_key(artifact_name)
@@ -24538,6 +24675,10 @@ fn catalog_canary_matrix_report(
                         || model.canary.transcripts.contains_key(artifact_name)
                         || model.canary.audio_fingerprints.contains_key(artifact_name)
                         || model.canary.video_fingerprints.contains_key(artifact_name)
+                        || model
+                            .canary
+                            .decision_fingerprints
+                            .contains_key(artifact_name)
                     {
                         entry_errors.push(format!(
                             "attestation_of_compute canary for {artifact_name} must not carry output calibration blobs"
@@ -24567,6 +24708,7 @@ fn catalog_canary_matrix_report(
                 transcript_count,
                 audio_fingerprint_count,
                 video_fingerprint_count,
+                decision_fingerprint_count,
                 modality_fingerprint_count: modality_fingerprints.map(BTreeMap::len),
                 modality_resource_profile_count: modality_resource_profiles.map(BTreeMap::len),
                 speciality_calibration_level_count: speciality_calibrations
@@ -25028,6 +25170,7 @@ fn preflight_catalog_calibration_managed_runtime(
             | "needle-gpu"
             | "sulphur"
             | "transformers-asr"
+            | "laya"
             | "trt-llm"
             | "vllm"
     ) {
@@ -25133,6 +25276,7 @@ fn catalog_calibration_backend(
             | "needle-gpu"
             | "sulphur"
             | "transformers-asr"
+            | "laya"
             | "trt-llm"
             | "vllm"
     ) {
@@ -25198,6 +25342,18 @@ fn catalog_calibration_backend(
         materialized_artifact_path = materialize_transformers_asr_layout(
             &format!("{}/{}", artifact.source.repo, artifact.path),
             &artifact.artifact_root,
+            artifact,
+            &paths,
+        )?;
+        materialized_artifact_path.as_path()
+    } else if artifact.engine == "laya" {
+        let paths = ProviderArtifactPaths {
+            primary: artifact_path.to_path_buf(),
+            sidecars: sidecar_paths.clone(),
+        };
+        materialized_artifact_path = materialize_laya_layout(
+            &format!("{}/{}", artifact.source.repo, artifact.path),
+            &artifact.path,
             artifact,
             &paths,
         )?;
@@ -25281,6 +25437,7 @@ fn catalog_calibration_backend(
         "needle-cpu" | "needle-gpu" => LoadConfig::transformers_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?,
         "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
+        "laya" => LoadConfig::laya_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
         "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported canary calibration engine {other}"),
@@ -25621,6 +25778,19 @@ fn catalog_calibration_backend(
                 .context("loading Transformers ASR canary calibration artifact")?;
             Ok(Box::new(backend))
         }
+        "laya" => {
+            let python = &managed_runtime
+                .as_ref()
+                .context("Laya calibration runtime was not resolved")?
+                .0
+                .python;
+            let mut backend = mayhem_engine::LayaBackend::with_python(python)
+                .context("initializing Laya backend")?;
+            backend
+                .load(config)
+                .context("loading Laya canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
         "whisper.cpp" => {
             let mut backend = mayhem_engine::WhisperCppBackend::new()
                 .context("initializing whisper.cpp backend")?;
@@ -25657,6 +25827,9 @@ fn calibrate_canary_prompt(
             calibrate_image_perceptual_hash_prompt(backend, prompt, seed, include_output)
         }
         "embedding_cosine" => calibrate_embedding_cosine_prompt(backend, prompt),
+        CANARY_VERIFICATION_DECISION_FINGERPRINT => {
+            calibrate_decision_fingerprint_prompt(backend, prompt, include_output)
+        }
         "transcript_match" => calibrate_transcript_match_prompt(backend, prompt, include_output),
         "audio_fingerprint" => {
             calibrate_audio_fingerprint_prompt(backend, model, prompt, artifact_output_dir)
@@ -25668,6 +25841,99 @@ fn calibrate_canary_prompt(
             "catalog calibrate-canary does not support verification_method {other}; attestation-only descriptors do not produce output fingerprints"
         ),
     }
+}
+
+fn calibrate_decision_fingerprint_prompt(
+    backend: &mut dyn EngineBackend,
+    prompt: &CanaryPrompt,
+    include_output: bool,
+) -> Result<CanaryCalibrationPromptReport> {
+    let state = prompt
+        .endpoint_attributes
+        .get("state")
+        .cloned()
+        .with_context(|| format!("decision canary prompt {} is missing state", prompt.id))?;
+    let questions = prompt
+        .endpoint_attributes
+        .get("questions")
+        .cloned()
+        .with_context(|| format!("decision canary prompt {} is missing questions", prompt.id))?;
+    let output = backend
+        .decide(
+            EngineDecisionRequest {
+                state,
+                questions,
+                checkpoint: prompt
+                    .endpoint_attributes
+                    .get("checkpoint")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                task: prompt
+                    .endpoint_attributes
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                lang: prompt
+                    .endpoint_attributes
+                    .get("lang")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                auto_task_detection: prompt
+                    .endpoint_attributes
+                    .get("auto_task_detection")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                email: prompt.endpoint_attributes.get("email").cloned(),
+                shortlist: prompt.endpoint_attributes.get("shortlist").cloned(),
+                temperature: prompt.endpoint_attributes.get("temperature").cloned(),
+                limits: prompt.endpoint_attributes.get("limits").cloned(),
+            },
+            &CancellationToken::new(),
+        )
+        .with_context(|| format!("generating decision canary prompt {}", prompt.id))?;
+    ensure!(
+        output.result.get("answers").is_some_and(Value::is_object),
+        "decision canary prompt {} returned no answers object",
+        prompt.id
+    );
+    ensure!(
+        output.result.get("routing").is_some_and(Value::is_object),
+        "decision canary prompt {} returned no routing object",
+        prompt.id
+    );
+    let stable_output = stable_json_value(&output.result);
+    let output_text = stable_output.to_string();
+    let fingerprint = stable_value_hash(&stable_output);
+    let completion_tokens =
+        metered_output_units(&output_text, "", &[]).min(u64::from(u32::MAX)) as u32;
+    Ok(CanaryCalibrationPromptReport {
+        prompt_id: prompt.id.clone(),
+        max_tokens: 1,
+        prompt_tokens: output.usage.prompt_tokens,
+        completion_tokens,
+        reasoning_tokens: 0,
+        token_count: 0,
+        token_ids: Vec::new(),
+        token_prefix: Vec::new(),
+        reproducibility_runs: 1,
+        fingerprint,
+        perceptual_hash: None,
+        embedding_vector: None,
+        transcript: None,
+        detected_language: None,
+        transcription_duration_seconds: None,
+        word_timestamps: Vec::new(),
+        segment_timestamps: Vec::new(),
+        audio_fingerprint: None,
+        video_fingerprint: None,
+        retained_artifacts: Vec::new(),
+        resource_items: BTreeMap::new(),
+        calibration_baseline_memory_bytes: 0,
+        calibration_peak_memory_bytes: 0,
+        output_text: include_output.then_some(output_text),
+        behavioral_output_fingerprint: None,
+        behavioral_witness: None,
+    })
 }
 
 fn calibrate_token_canary_prompt(
@@ -27318,6 +27584,17 @@ fn existing_catalog_canary_fingerprint(
                     .map(|(id, vector)| (id.as_str(), embedding_vector_fingerprint(vector))),
             )
         }),
+        CANARY_VERIFICATION_DECISION_FINGERPRINT => model
+            .canary
+            .decision_fingerprints
+            .get(artifact)
+            .map(|values| {
+                aggregate_prompt_fingerprint_map(
+                    values
+                        .iter()
+                        .map(|(id, fingerprint)| (id.as_str(), fingerprint.clone())),
+                )
+            }),
         "transcript_match" => model.canary.transcripts.get(artifact).map(|values| {
             aggregate_prompt_fingerprint_map(values.iter().map(|(id, transcript)| {
                 (
@@ -35820,7 +36097,14 @@ fn enforce_backend_caps(backend: &str, caps: &mut Value) -> Result<()> {
 fn backend_supports_tool_calls(backend: &str) -> bool {
     !matches!(
         backend,
-        "mlx" | "comfyui" | "ace-step" | "chatterbox" | "sulphur" | "transformers-asr" | "trt-llm"
+        "mlx"
+            | "comfyui"
+            | "ace-step"
+            | "chatterbox"
+            | "sulphur"
+            | "transformers-asr"
+            | "laya"
+            | "trt-llm"
     )
 }
 
@@ -47846,6 +48130,7 @@ struct CatalogCanaryMatrixEntry {
     transcript_count: Option<usize>,
     audio_fingerprint_count: Option<usize>,
     video_fingerprint_count: Option<usize>,
+    decision_fingerprint_count: Option<usize>,
     modality_fingerprint_count: Option<usize>,
     modality_resource_profile_count: Option<usize>,
     speciality_calibration_level_count: Option<usize>,
@@ -47934,6 +48219,7 @@ struct CatalogCanaryEvidenceEntry {
     expected_transcripts: Option<BTreeMap<String, String>>,
     expected_audio_fingerprints: Option<BTreeMap<String, String>>,
     expected_video_fingerprints: Option<BTreeMap<String, String>>,
+    expected_decision_fingerprints: Option<BTreeMap<String, String>>,
     expected_artifact_binding: CatalogCanaryArtifactBinding,
     report_path: Option<PathBuf>,
     report_fingerprint: Option<String>,
@@ -47947,6 +48233,7 @@ struct CatalogCanaryEvidenceEntry {
     report_transcripts: Option<BTreeMap<String, String>>,
     report_audio_fingerprints: Option<BTreeMap<String, String>>,
     report_video_fingerprints: Option<BTreeMap<String, String>>,
+    report_decision_fingerprints: Option<BTreeMap<String, String>>,
     report_canary_set_sha256: Option<String>,
     report_artifact_binding: Option<CatalogCanaryArtifactBinding>,
     matches_catalog: Option<bool>,
@@ -63887,6 +64174,7 @@ fn provider_backend_runtime_child_env(
         "transformers-asr" => {
             insert_path("MAYHEM_TRANSFORMERS_ASR_PYTHON", runtime.python.as_deref());
         }
+        "laya" => insert_path("MAYHEM_LAYA_PYTHON", runtime.python.as_deref()),
         "stable-diffusion.cpp" => {
             insert_path(
                 "MAYHEM_STABLE_DIFFUSION_CPP_BIN",
@@ -64287,7 +64575,7 @@ fn provider_backend_runtime_preflight_for_backend(
     let mut runtime = ProviderBackendRuntime::default();
     match backend {
         "vllm" | "trt-llm" | "mlx" | "ace-step" | "chatterbox" | "needle-cpu" | "needle-gpu"
-        | "sulphur" | "transformers-asr" => {
+        | "sulphur" | "transformers-asr" | "laya" => {
             let chatterbox_device = if backend == "chatterbox" {
                 let device = chatterbox_managed_device(hardware).context(
                     "hardware probe did not select a supported Chatterbox managed device",
@@ -77534,6 +77822,7 @@ fn backend_rank(backend: &str) -> u8 {
         "needle-gpu" => 2,
         "sulphur" => 2,
         "transformers-asr" => 2,
+        "laya" => 2,
         "llama.cpp" => 1,
         "stable-diffusion.cpp" | "whisper.cpp" | "piper" => 0,
         _ => 0,
@@ -87033,6 +87322,7 @@ fn provider_receipt_binds_contract_request(endpoint_family: &str) -> bool {
             | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
             | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
             | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+            | mayhem_proto::ENDPOINT_MAYHEM_DECISIONS
             | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
     )
 }
@@ -87070,6 +87360,7 @@ fn provider_session_prompt_text(body: &Value, adapter: &catalog::CatalogAdapter)
                 | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
                 | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
                 | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+                | mayhem_proto::ENDPOINT_MAYHEM_DECISIONS
                 | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
         )
     ) {
@@ -87301,6 +87592,23 @@ fn provider_session_responder(
                 backend
                     .load(load_config)
                     .context("loading llama.cpp provider session engine")
+            })?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
+        "laya" => {
+            let python = ctx
+                .backend_runtime
+                .python
+                .as_ref()
+                .context("Laya runtime preflight did not resolve Python")?;
+            let mut backend = mayhem_engine::LayaBackend::with_python(python)
+                .context("initializing Laya provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "Laya engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading Laya provider session engine")
             })?;
             Ok(Box::new(EngineProviderSessionResponder {
                 backend: Box::new(backend),
@@ -88790,6 +89098,8 @@ fn provider_engine_load_config(
         artifact_path_buf = materialize_needle_artifacts(selected, artifact_paths, cache_dir)?;
     } else if selected.artifact.engine == "transformers-asr" {
         artifact_path_buf = materialize_transformers_asr_artifacts(selected, artifact_paths)?;
+    } else if selected.artifact.engine == "laya" {
+        artifact_path_buf = materialize_laya_artifacts(selected, artifact_paths)?;
     }
     let artifact_path = artifact_path_buf.as_path();
     let mut artifact = match selected.artifact.engine.as_str() {
@@ -88805,6 +89115,7 @@ fn provider_engine_load_config(
         "needle-cpu" | "needle-gpu" => ModelArtifact::transformers_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?.artifact,
         "transformers-asr" => ModelArtifact::transformers_safetensors(artifact_path),
+        "laya" => ModelArtifact::laya_safetensors(artifact_path),
         "whisper.cpp" => ModelArtifact::whisper_ggml(artifact_path),
         "piper" => ModelArtifact::piper_voice(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
@@ -88837,6 +89148,7 @@ fn provider_engine_load_config(
         "needle-cpu" | "needle-gpu" => LoadConfig::transformers_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?,
         "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
+        "laya" => LoadConfig::laya_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
         "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
@@ -89033,6 +89345,50 @@ const TRANSFORMERS_ASR_REQUIRED_SIDECARS: &[(&str, &str)] = &[
     ("transformers_processor_config", "processor_config.json"),
     ("transformers_tokenizer_json", "tokenizer.json"),
     ("transformers_tokenizer_config", "tokenizer_config.json"),
+];
+
+const LAYA_REQUIRED_SIDECARS: &[(&str, &str)] = &[
+    ("laya_encoder_config", "encoder/config.json"),
+    ("laya_agent_config", "rl_agent_config.json"),
+    ("laya_tokenizer", "tokenizer/tokenizer.json"),
+    ("laya_tokenizer_config", "tokenizer/tokenizer_config.json"),
+    ("laya_multilingual_model", "multilingual/model.safetensors"),
+    (
+        "laya_multilingual_encoder_config",
+        "multilingual/encoder/config.json",
+    ),
+    (
+        "laya_multilingual_agent_config",
+        "multilingual/rl_agent_config.json",
+    ),
+    (
+        "laya_multilingual_tokenizer",
+        "multilingual/tokenizer/tokenizer.json",
+    ),
+    (
+        "laya_multilingual_tokenizer_config",
+        "multilingual/tokenizer/tokenizer_config.json",
+    ),
+    (
+        "laya_typed_decisions_model",
+        "typed-decisions/model.safetensors",
+    ),
+    (
+        "laya_typed_decisions_encoder_config",
+        "typed-decisions/encoder/config.json",
+    ),
+    (
+        "laya_typed_decisions_agent_config",
+        "typed-decisions/rl_agent_config.json",
+    ),
+    (
+        "laya_typed_decisions_tokenizer",
+        "typed-decisions/tokenizer/tokenizer.json",
+    ),
+    (
+        "laya_typed_decisions_tokenizer_config",
+        "typed-decisions/tokenizer/tokenizer_config.json",
+    ),
 ];
 
 const NEEDLE_MODEL_REPO: &str = "Cactus-Compute/needle";
@@ -89432,6 +89788,74 @@ fn materialize_transformers_asr_layout(
         })?;
     }
     Ok(model_dir)
+}
+
+fn materialize_laya_artifacts(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    materialize_laya_layout(
+        &format!("{}/{}", selected.model.model_id, selected.artifact_name),
+        &selected.artifact_name,
+        &selected.artifact,
+        artifact_paths,
+    )
+}
+
+fn materialize_laya_layout(
+    label: &str,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    let model_dir = laya_checkpoint_cache_dir(&artifact_paths.primary, artifact_name, artifact);
+    fs::create_dir_all(&model_dir)
+        .with_context(|| format!("creating Laya model layout {}", model_dir.display()))?;
+    let primary_relative = validate_catalog_artifact_relative_path(&artifact.path)?;
+    let primary = model_dir.join(&primary_relative);
+    link_or_copy_file(&artifact_paths.primary, &primary).with_context(|| {
+        format!(
+            "materializing Laya primary artifact {label} at {}",
+            primary.display()
+        )
+    })?;
+
+    for (sidecar_name, filename) in LAYA_REQUIRED_SIDECARS {
+        let sidecar = artifact.sidecars.get(*sidecar_name).with_context(|| {
+            format!("Laya artifact {label} requires admin catalog sidecar {sidecar_name}")
+        })?;
+        ensure!(
+            sidecar.path == *filename,
+            "Laya artifact {label} sidecar {sidecar_name} must use path {filename}, got {}",
+            sidecar.path
+        );
+    }
+
+    let mut occupied_paths = BTreeSet::from([primary_relative]);
+    for (sidecar_name, sidecar) in &artifact.sidecars {
+        let relative = validate_catalog_artifact_relative_path(&sidecar.path)?;
+        ensure!(
+            occupied_paths.insert(relative.clone()),
+            "Laya artifact {label} declares duplicate path {}",
+            sidecar.path
+        );
+        let source = artifact_paths.sidecars.get(sidecar_name).with_context(|| {
+            format!("downloaded Laya artifact {label} is missing admin sidecar {sidecar_name}")
+        })?;
+        let destination = model_dir.join(relative);
+        let materialize = if sidecar.path.ends_with("tokenizer/tokenizer_config.json") {
+            copy_file_replace(source, &destination)
+        } else {
+            link_or_copy_file(source, &destination)
+        };
+        materialize.with_context(|| {
+            format!(
+                "materializing Laya sidecar {sidecar_name} at {}",
+                destination.display()
+            )
+        })?;
+    }
+    Ok(primary)
 }
 
 fn materialize_needle_artifacts(
@@ -90105,6 +90529,22 @@ fn link_or_copy_file(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_file_replace(source: &Path, destination: &Path) -> Result<()> {
+    if !source.is_file() {
+        bail!("{} is not a file", source.display());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if destination.exists() {
+        fs::remove_file(destination)
+            .with_context(|| format!("removing stale {}", destination.display()))?;
+    }
+    fs::copy(source, destination)
+        .with_context(|| format!("copying {} to {}", source.display(), destination.display()))?;
+    Ok(())
+}
+
 fn same_canonical_path(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
@@ -90227,6 +90667,32 @@ fn transformers_asr_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &s
     };
     base.join(".transformers-asr-models")
         .join(safe_path_component(artifact_name))
+}
+
+fn laya_checkpoint_cache_dir(
+    artifact_path: &Path,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+) -> PathBuf {
+    let base = if artifact_path.is_dir() {
+        artifact_path.to_path_buf()
+    } else {
+        artifact_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"mayhem/laya/materialized-layout/v1\0");
+    identity.update(artifact.artifact_root.as_bytes());
+    for (name, sidecar) in &artifact.sidecars {
+        identity.update(name.as_bytes());
+        identity.update(sidecar.artifact_root.as_bytes());
+        identity.update(sidecar.path.as_bytes());
+    }
+    base.join(".laya-models")
+        .join(safe_path_component(artifact_name))
+        .join(identity.finalize().to_hex().as_str())
 }
 
 fn needle_checkpoint_cache_dir(
@@ -91854,6 +92320,35 @@ fn validate_provider_session_output(
             output.content.len() <= payload_limit,
             "provider modality text output exceeds the session payload budget"
         );
+        let endpoint_family = body
+            .get("mayhem_contract")
+            .and_then(|value| value.get("endpoint_family"))
+            .and_then(Value::as_str);
+        if endpoint_family == Some(mayhem_proto::ENDPOINT_MAYHEM_DECISIONS) {
+            let result: Value = serde_json::from_str(&output.content)
+                .context("decision backend returned invalid JSON")?;
+            ensure!(
+                result.get("answers").is_some_and(Value::is_object),
+                "decision backend result is missing an answers object"
+            );
+            ensure!(
+                result.get("routing").is_some_and(Value::is_object),
+                "decision backend result is missing a routing object"
+            );
+            ensure!(
+                output.embeddings.is_none(),
+                "decision output included embeddings"
+            );
+            ensure!(
+                output.transcription.is_none(),
+                "decision output included transcription"
+            );
+            ensure!(
+                output.artifacts.is_empty(),
+                "decision output included artifacts"
+            );
+            ensure!(output.tools.is_empty(), "decision output included tools");
+        }
     }
     if !output.tools.is_empty() {
         ensure!(
@@ -92132,6 +92627,7 @@ fn provider_endpoint_transport_kind(family: &str) -> Result<&'static str> {
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => Ok("audio_generation"),
         mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => Ok("music_generation"),
         mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS => Ok("workflow_generation"),
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS => Ok("decision"),
         _ => bail!("unsupported provider endpoint family {family}"),
     }
 }
@@ -92248,6 +92744,7 @@ fn provider_local_endpoint_family(kind: &str) -> &'static str {
         "audio_generation" => mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
         "music_generation" => mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
         "workflow_generation" => mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        "decision" => mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
         _ => mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
     }
 }
@@ -93065,6 +93562,69 @@ fn provider_engine_session_response_with_sampling_bounded(
             completion_tokens: 0,
             token_ids: Vec::new(),
             usage: ReceiptUsage::text(prompt_tokens, 0),
+            usage_attribution: BTreeMap::new(),
+        });
+    }
+
+    if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS {
+        let state = provider_session_request_result(
+            request_body
+                .get("state")
+                .cloned()
+                .context("decision request is missing state"),
+        )?;
+        let questions = provider_session_request_result(
+            request_body
+                .get("questions")
+                .cloned()
+                .context("decision request is missing questions"),
+        )?;
+        let output = backend
+            .decide(
+                EngineDecisionRequest {
+                    state,
+                    questions,
+                    checkpoint: request_body
+                        .get("checkpoint")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    task: request_body
+                        .get("task")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    lang: request_body
+                        .get("lang")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned),
+                    auto_task_detection: request_body
+                        .get("auto_task_detection")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                    email: request_body.get("email").cloned(),
+                    shortlist: request_body.get("shortlist").cloned(),
+                    temperature: request_body.get("temperature").cloned(),
+                    limits: request_body.get("limits").cloned(),
+                },
+                cancellation,
+            )
+            .context("running provider typed decision with mayhem-engine")?;
+        let content = provider_session_output_result(
+            serde_json::to_string(&output.result).context("serializing provider decision result"),
+        )?;
+        let prompt_tokens = u64::from(output.usage.prompt_tokens);
+        let completion_tokens = metered_output_units(&content, "", &[]);
+        return Ok(ProviderSessionOutput {
+            content,
+            reasoning_evidence: String::new(),
+            tools: Vec::new(),
+            embeddings: None,
+            transcription: None,
+            artifacts: Vec::new(),
+            finish_reason: "stop".to_owned(),
+            prompt_tokens,
+            completion_tokens,
+            token_ids: Vec::new(),
+            usage: ReceiptUsage::text(prompt_tokens, completion_tokens),
             usage_attribution: BTreeMap::new(),
         });
     }
@@ -106557,7 +107117,7 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 27);
+        assert_eq!(CONTRACT_VERSION, 28);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 12);
         assert_eq!(SPEND_VOUCHER_SCHEMA_VERSION, 11);
@@ -113937,7 +114497,9 @@ esac
         #[cfg(unix)]
         {
             let link = outbox.directory.join(format!(
-                "{}.00000000000000000001.0.{}.json", "00".repeat(32), "ab".repeat(32)
+                "{}.00000000000000000001.0.{}.json",
+                "00".repeat(32),
+                "ab".repeat(32)
             ));
             std::os::unix::fs::symlink(&final_entry.path, &link).unwrap();
             assert!(outbox.load_attempt(&first.attempt_id).is_err());
@@ -114214,8 +114776,8 @@ esac
     }
 
     #[test]
-    fn receipt_settlement_version_bridge_preserves_v23_through_v26_signatures() {
-        for version in [23, 24, 25, 26] {
+    fn receipt_settlement_version_bridge_preserves_v23_through_v27_signatures() {
+        for version in [23, 24, 25, 26, 27] {
             let feature = signed_receipt_settlement_feature_for_test_version(
                 7,
                 1,
@@ -131476,10 +132038,12 @@ State initialization...
                 None,
                 Some(&expected),
                 None,
+                None,
                 &empty_hashes,
                 &empty_vectors,
                 &empty_hashes,
                 observed,
+                &empty_hashes,
                 &empty_hashes,
                 9_000,
             )
@@ -139199,11 +139763,14 @@ State initialization...
                     transcripts: BTreeMap::new(),
                     audio_fingerprints: BTreeMap::new(),
                     video_fingerprints: BTreeMap::new(),
+                    decision_fingerprints: BTreeMap::new(),
                 },
                 price_ref_au: catalog::PriceRef {
                     denom: "au_usd".to_owned(),
                     in_per_1k: 1,
                     out_per_1k: 2,
+                    per_req_au: 0,
+                    min_session_au: 0,
                     rate_map: Vec::new(),
                 },
             }],
