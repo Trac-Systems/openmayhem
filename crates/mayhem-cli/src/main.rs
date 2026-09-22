@@ -72637,6 +72637,100 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
     })
 }
 
+// A provider admission only needs the canonical records for its own market and
+// startup rooms. The general catalog reader above enumerates historical price
+// versions for every market, which grows without bound as prices move. Keep
+// all admission reads on one confirmed ledger snapshot instead.
+async fn read_provider_session_contract_catalog(
+    rpc: &PeerRpcClient,
+    terms: &ProviderSessionTerms,
+) -> Result<ContractCatalog> {
+    let signed_length = confirmed_snapshot_signed_length(rpc, "rules/current").await?;
+    let enclave_key = format!("enclave/{}", terms.enclave_id);
+    let provider_key = format!("prov/{}", terms.provider);
+    let serve_key = format!("serve/{}/{}", terms.provider, terms.enclave_id);
+    let (enclaves, providers, serves, schedule_value, rules_value) = tokio::try_join!(
+        read_provider_session_record_at::<LedgerEnclave>(rpc, &enclave_key, signed_length),
+        read_provider_session_record_at::<LedgerProvider>(rpc, &provider_key, signed_length),
+        read_provider_session_record_at::<LedgerServe>(rpc, &serve_key, signed_length),
+        read_state_value_at(rpc, "ctx_brackets", signed_length),
+        read_state_value_at(rpc, "rules/current", signed_length),
+    )?;
+    let ctx_bracket_schedule = match schedule_value {
+        Some(value) => serde_json::from_value(value)
+            .context("parsing confirmed contract ctx_brackets schedule")?,
+        None => default_ctx_bracket_schedule(),
+    };
+    validate_ctx_bracket_schedule(&ctx_bracket_schedule)
+        .map_err(|err| anyhow::anyhow!("invalid confirmed ctx_brackets schedule: {err}"))?;
+    let rules = rules_value
+        .map(serde_json::from_value)
+        .transpose()
+        .context("parsing confirmed rules/current")?;
+    let ctx_bracket = match enclaves.first() {
+        Some(enclave) if enclave.model_class == DEFAULT_MODEL_CLASS => {
+            ctx_bracket_for_tokens_in_schedule(
+                u32::try_from(terms.ctx).unwrap_or(u32::MAX),
+                &ctx_bracket_schedule,
+                unix_epoch_seconds()?,
+            )
+            .map(|(bracket, _)| bracket)
+        }
+        _ => None,
+    };
+    let price_key = format!(
+        "price/{}",
+        ledger_price_market_key(&terms.enclave_id, ctx_bracket.as_deref())
+    );
+    let prices =
+        read_provider_session_record_at::<LedgerPriceSchedule>(rpc, &price_key, signed_length)
+            .await?;
+    let mut rooms = Vec::with_capacity(terms.room_ids.len());
+    let mut roomserve = Vec::with_capacity(terms.room_ids.len());
+    for room_id in &terms.room_ids {
+        let room_key = format!("room/{room_id}");
+        let roomserve_key = format!(
+            "roomserve/{room_id}/{}/{}",
+            terms.provider, terms.enclave_id
+        );
+        let (mut live_rooms, mut live_roomserve) = tokio::try_join!(
+            read_provider_session_record_at::<LedgerRoom>(rpc, &room_key, signed_length),
+            read_provider_session_record_at::<LedgerRoomServe>(rpc, &roomserve_key, signed_length,),
+        )?;
+        rooms.append(&mut live_rooms);
+        roomserve.append(&mut live_roomserve);
+    }
+    Ok(ContractCatalog {
+        enclaves,
+        rooms,
+        roomserve,
+        serves,
+        providers,
+        reputations: Vec::new(),
+        kyb: Vec::new(),
+        prices,
+        price_derivations: Vec::new(),
+        tier3_measurements: Vec::new(),
+        ctx_bracket_schedule,
+        rules,
+        active_billing_epoch: 0,
+        active_payout_revisions: BTreeMap::new(),
+    })
+}
+
+async fn read_provider_session_record_at<T: DeserializeOwned>(
+    rpc: &PeerRpcClient,
+    key: &str,
+    signed_length: u64,
+) -> Result<Vec<T>> {
+    match read_state_value_at(rpc, key, signed_length).await? {
+        Some(value) => Ok(vec![serde_json::from_value(value).with_context(|| {
+            format!("parsing confirmed provider admission record {key}")
+        })?]),
+        None => Ok(Vec::new()),
+    }
+}
+
 async fn read_active_provider_payout_revisions(
     rpc: &PeerRpcClient,
     active_epoch: u64,
@@ -84243,7 +84337,7 @@ where
             }
             provider_session_debug(format!("provider side session {session_id} opened"));
             let session_rail = provider_session_frame_rail(&frame).unwrap_or_default();
-            let contract = read_contract_catalog(runtime.rpc).await?;
+            let contract = read_provider_session_contract_catalog(runtime.rpc, terms).await?;
             let mut admission_terms = terms.clone();
             let price_decision = refresh_provider_session_price_terms(
                 &contract,
@@ -115571,6 +115665,125 @@ esac
         assert_eq!(terms.ctx_bracket, None);
         assert_eq!(terms.ctx_bracket_table_ver, None);
         assert_eq!(terms.rate_map[0].unit, "image");
+    }
+
+    #[tokio::test]
+    async fn provider_session_catalog_reads_only_its_confirmed_market_and_room() {
+        let terms = test_provider_session_terms();
+        let source = test_contract(&"aa".repeat(32));
+        let price_key = format!(
+            "price/{}",
+            ledger_price_market_key(&terms.enclave_id, terms.ctx_bracket.as_deref())
+        );
+        let room_id = &terms.room_ids[0];
+        let records = Arc::new(BTreeMap::from([
+            (
+                format!("enclave/{}", terms.enclave_id),
+                serde_json::to_value(&source.enclaves[0]).unwrap(),
+            ),
+            (
+                format!("prov/{}", terms.provider),
+                serde_json::to_value(&source.providers[0]).unwrap(),
+            ),
+            (
+                format!("serve/{}/{}", terms.provider, terms.enclave_id),
+                serde_json::to_value(&source.serves[0]).unwrap(),
+            ),
+            (
+                format!("room/{room_id}"),
+                serde_json::to_value(&source.rooms[0]).unwrap(),
+            ),
+            (
+                format!(
+                    "roomserve/{room_id}/{}/{}",
+                    terms.provider, terms.enclave_id
+                ),
+                serde_json::to_value(&source.roomserve[0]).unwrap(),
+            ),
+            (
+                price_key.clone(),
+                serde_json::to_value(&source.prices[0]).unwrap(),
+            ),
+            (
+                "ctx_brackets".to_owned(),
+                serde_json::to_value(&source.ctx_bracket_schedule).unwrap(),
+            ),
+            (
+                "rules/current".to_owned(),
+                serde_json::to_value(source.rules.as_ref().unwrap()).unwrap(),
+            ),
+        ]));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_records = Arc::clone(&records);
+        let server_seen = Arc::clone(&seen);
+        let server = thread::spawn(move || {
+            // One snapshot query, five independent state reads, one price, and
+            // the selected room plus its provider binding.
+            for _ in 0..9 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 4096];
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request_line = String::from_utf8_lossy(&request);
+                let path = request_line.split_whitespace().nth(1).unwrap();
+                let url = reqwest::Url::parse(&format!("http://{address}{path}")).unwrap();
+                let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+                assert_eq!(query.get("confirmed").map(|v| v.as_ref()), Some("true"));
+                let body = if let Some(prefix) = query.get("prefix") {
+                    assert_eq!(prefix.as_ref(), "rules/current");
+                    assert_eq!(query.get("limit").map(|v| v.as_ref()), Some("1"));
+                    server_seen.lock().unwrap().push("snapshot".to_owned());
+                    json!({
+                        "prefix": "rules/current", "confirmed": true, "signed_length": 42,
+                        "truncated": false, "next_cursor": null,
+                        "values": [{"key": "rules/current", "value": server_records["rules/current"]}]
+                    })
+                } else {
+                    let key = query.get("key").unwrap().to_string();
+                    assert_eq!(query.get("signed_length").map(|v| v.as_ref()), Some("42"));
+                    server_seen.lock().unwrap().push(key.clone());
+                    json!({
+                        "key": key, "confirmed": true, "signed_length": 42,
+                        "value": server_records.get(&key)
+                    })
+                }
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let rpc = PeerRpcClient::new(format!("http://{address}/v1")).unwrap();
+        let contract = read_provider_session_contract_catalog(&rpc, &terms)
+            .await
+            .unwrap();
+        server.join().unwrap();
+        let mut refreshed = terms.clone();
+        assert_eq!(
+            refresh_provider_session_price_terms(&contract, &mut refreshed, 200),
+            ProviderSessionDecision::Accept
+        );
+        assert_eq!(
+            provider_session_contract_decision(&contract, &refreshed, &source.rooms[..1], "fiat"),
+            ProviderSessionDecision::Accept
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 9);
+        assert!(seen.contains(&price_key));
+        assert!(!seen.iter().any(|key| key == "price/" || key == "ev/price/"));
     }
 
     #[test]
