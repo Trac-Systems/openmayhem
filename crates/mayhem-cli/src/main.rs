@@ -88296,6 +88296,21 @@ fn provider_canary_self_test_body(
             "kind": "embedding",
             "input": canary_prompt_text(prompt)?,
         })),
+        MODEL_CLASS_DECISION => {
+            let mut body = Value::Object(prompt.endpoint_attributes.clone().into_iter().collect());
+            let object = body
+                .as_object_mut()
+                .expect("decision canary body is an object");
+            object.insert("kind".to_owned(), json!("decision"));
+            object.insert(
+                "endpoint_family".to_owned(),
+                json!(mayhem_proto::ENDPOINT_MAYHEM_DECISIONS),
+            );
+            if let Some(temperature) = &prompt.decision_temperature {
+                object.insert("temperature".to_owned(), temperature.clone());
+            }
+            Ok(body)
+        }
         "image-generation" => {
             if let Some(body) = provider_comfy_workflow_canary_self_test_body(model, prompt)? {
                 return Ok(body);
@@ -89041,6 +89056,22 @@ fn validate_provider_canary_self_test_output(
                     && embeddings.iter().all(|row| !row.is_empty())),
             "embedding modality canary produced no embedding vectors"
         ),
+        MODEL_CLASS_DECISION => {
+            let result: Value = serde_json::from_str(&output.content)
+                .context("decision modality canary produced invalid JSON")?;
+            ensure!(
+                result.get("answers").is_some_and(Value::is_object),
+                "decision modality canary produced no answers object"
+            );
+            ensure!(
+                result.get("routing").is_some_and(Value::is_object),
+                "decision modality canary produced no routing object"
+            );
+            ensure!(
+                output.prompt_tokens > 0 && output.completion_tokens > 0,
+                "decision modality canary produced no metered usage"
+            );
+        }
         "image-generation" => ensure!(
             output
                 .artifacts
@@ -118061,6 +118092,61 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         }
 
         assert_eq!(covered, served);
+    }
+
+    #[test]
+    fn laya_provider_modality_canary_is_transportable_and_validated() {
+        let catalog = catalog::load_document(&repo_path("catalog/models.json").unwrap()).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "convaiinnovations/laya")
+            .expect("live Laya model");
+        let prompts = load_canary_prompts_checked(
+            Some(&repo_path("catalog/canaries").unwrap()),
+            &model.canary.set_id,
+            None,
+            false,
+        )
+        .unwrap();
+        let prompt = prompts
+            .iter()
+            .find(|prompt| prompt.id == "english-choice-noul")
+            .expect("Laya decision canary");
+
+        assert_eq!(
+            provider_canary_prompt_modalities(model, prompt),
+            BTreeSet::from(["text".to_owned()])
+        );
+        let body = provider_canary_self_test_body(model, prompt).unwrap();
+        assert_eq!(body["kind"], "decision");
+        assert_eq!(
+            body["endpoint_family"],
+            mayhem_proto::ENDPOINT_MAYHEM_DECISIONS
+        );
+        let sealed =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+        let verified =
+            provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)
+                .unwrap();
+        assert_eq!(verified.family, mayhem_proto::ENDPOINT_MAYHEM_DECISIONS);
+        let request = provider_decision_request_from_body(verified.request).unwrap();
+        assert_eq!(request.checkpoint.as_deref(), Some("english"));
+
+        let mut output = test_provider_output_with_artifacts(Vec::new());
+        output.content = json!({
+            "answers": {"department": {"type": "choice", "choice": "billing"}},
+            "routing": {"checkpoint": "english", "reason": "explicit"},
+            "usage": {"input_tokens": 12}
+        })
+        .to_string();
+        output.prompt_tokens = 12;
+        output.completion_tokens = 24;
+        output.usage = ReceiptUsage::text(12, 24);
+        validate_provider_canary_self_test_output(model, &output).unwrap();
+
+        output.content = json!({"routing": {"checkpoint": "english"}}).to_string();
+        assert!(validate_provider_canary_self_test_output(model, &output).is_err());
     }
 
     #[test]
