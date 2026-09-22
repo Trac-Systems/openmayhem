@@ -126907,6 +126907,33 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_tool_parser_executes_recovered_structured_call_after_private_reasoning() {
+        let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
+        let recovered = serde_json::to_string(&json!({"tool_calls":[{
+            "id":"call_recovered",
+            "type":"function",
+            "function":{"name":"write","arguments":"{\"path\":\"README.md\"}"}
+        }]}))
+        .unwrap();
+        let output = format!(
+            "<think>Attempted <tool_call><function=write></function></tool_call></think>{recovered}"
+        );
+        let calls = provider_engine_tool_call_outputs_after_reasoning(
+            &output,
+            ProviderReasoningOutputMode::StripPrefilled,
+            Some(true),
+            PROVIDER_QWEN_REASONING_DELIMITERS,
+            ProviderEngineToolStrategy::OpenAiToolCalls,
+            &tools,
+            false,
+        )
+        .expect("recovered structured call after private reasoning");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "write");
+        assert_eq!(calls[0]["arguments"], r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
     fn provider_tool_parser_rejects_reasoning_text_even_with_json_grammar() {
         let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
         for text in [

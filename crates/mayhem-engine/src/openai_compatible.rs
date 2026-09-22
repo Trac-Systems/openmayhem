@@ -998,6 +998,11 @@ fn generate(
     cancellation.check()?;
     let _permit = loaded.gate.acquire(cancellation)?;
     let body = chat_request_body(&loaded.runtime.served_model, request)?;
+    let non_reasoning_kwargs = loaded
+        .runtime
+        .preflight
+        .non_reasoning_chat_template_kwargs
+        .clone();
     let url = endpoint_url(&loaded.base_url, "v1/chat/completions")?;
     // Unbounded delivery keeps cancellation from deadlocking behind a full
     // producer queue while the caller is unwinding after a disconnect.
@@ -1013,6 +1018,7 @@ fn generate(
                 client,
                 url,
                 body,
+                non_reasoning_kwargs,
                 network_cancellation,
                 worker_cancellation,
                 events_tx,
@@ -1102,15 +1108,127 @@ async fn stream_completion(
     client: Client,
     url: Url,
     body: Value,
+    non_reasoning_kwargs: BTreeMap<String, Value>,
     cancellation: CancellationToken,
     internal_cancellation: CancellationToken,
     events: mpsc::Sender<StreamEvent>,
 ) -> Result<()> {
+    let first = stream_completion_attempt(
+        &client,
+        &url,
+        &body,
+        &cancellation,
+        &internal_cancellation,
+        &events,
+    )
+    .await?;
+    let output = if first.unexecuted_reasoning_tool_call
+        && first.advertised_reasoning_tool_call
+        && first.output.finish_reason == FinishReason::Stop
+        && non_reasoning_kwargs.get("enable_thinking") == Some(&Value::Bool(false))
+        && body
+            .get("chat_template_kwargs")
+            .and_then(|kwargs| kwargs.get("enable_thinking"))
+            != Some(&Value::Bool(false))
+        && body.get("tool_choice") != Some(&Value::String("none".to_owned()))
+        && body.get("response_format").is_none()
+    {
+        // A complete tool instruction in unfinished reasoning is not an
+        // executable call. Retry this one turn with the runtime's already
+        // proven non-reasoning profile; never promote private thought to a tool.
+        let mut retry_body = body.clone();
+        let retry = retry_body
+            .as_object_mut()
+            .ok_or_else(|| backend_error("chat request body is not an object"))?;
+        let original_limit = retry
+            .get("max_tokens")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| backend_error("chat request has no output token limit"))?;
+        let used = u64::from(first.output.usage.completion_tokens);
+        if used == 0 || original_limit.saturating_sub(used) < 32 {
+            return Err(backend_error(
+                "unexecuted reasoning tool call left no verifiable recovery budget",
+            ));
+        }
+        retry.insert("max_tokens".to_owned(), json!(original_limit - used));
+        let template = retry
+            .entry("chat_template_kwargs")
+            .or_insert_with(|| json!({}))
+            .as_object_mut()
+            .ok_or_else(|| backend_error("chat template kwargs are not an object"))?;
+        template.extend(non_reasoning_kwargs);
+        let second = stream_completion_attempt(
+            &client,
+            &url,
+            &retry_body,
+            &cancellation,
+            &internal_cancellation,
+            &events,
+        )
+        .await?;
+        if second.unexecuted_reasoning_tool_call
+            || (!second.has_tool_calls && !second.has_visible_content)
+        {
+            return Err(backend_error(
+                "tool-call recovery returned neither a structured call nor an answer",
+            ));
+        }
+        if u64::from(second.output.usage.completion_tokens) > original_limit - used {
+            return Err(backend_error(
+                "tool-call recovery exceeded the original output token limit",
+            ));
+        }
+        combine_recovered_output(first.output, second.output)
+    } else if first.unexecuted_reasoning_tool_call {
+        return Err(backend_error(
+            "runtime returned an unexecuted tool call inside reasoning",
+        ));
+    } else {
+        first.output
+    };
+    let _ = events.send(StreamEvent::Complete(output));
+    Ok(())
+}
+
+struct StreamAttempt {
+    output: GenerateOutput,
+    has_tool_calls: bool,
+    has_visible_content: bool,
+    unexecuted_reasoning_tool_call: bool,
+    advertised_reasoning_tool_call: bool,
+}
+
+fn combine_recovered_output(mut first: GenerateOutput, second: GenerateOutput) -> GenerateOutput {
+    first.text.push_str(&second.text);
+    first.usage.completion_tokens = first
+        .usage
+        .completion_tokens
+        .saturating_add(second.usage.completion_tokens);
+    first.usage.reasoning_tokens = first
+        .usage
+        .reasoning_tokens
+        .saturating_add(second.usage.reasoning_tokens);
+    first.usage.total_tokens = first
+        .usage
+        .prompt_tokens
+        .saturating_add(first.usage.completion_tokens);
+    first.finish_reason = second.finish_reason;
+    first
+}
+
+async fn stream_completion_attempt(
+    client: &Client,
+    url: &Url,
+    body: &Value,
+    cancellation: &CancellationToken,
+    internal_cancellation: &CancellationToken,
+    events: &mpsc::Sender<StreamEvent>,
+) -> Result<StreamAttempt> {
     let response = tokio::select! {
         () = wait_cancelled(&cancellation, &internal_cancellation) => {
             return Err(EngineError::Cancelled);
         }
-        response = client.post(url).json(&body).send() => response.map_err(map_http_error)?,
+        response = client.post(url.clone()).json(body).send() => response.map_err(map_http_error)?,
     };
     if !response.status().is_success() {
         let status = response.status();
@@ -1144,9 +1262,20 @@ async fn stream_completion(
             if let Some(data) = line.strip_prefix("data:") {
                 let data = data.trim();
                 if data == "[DONE]" {
+                    let unexecuted_reasoning_tool_call =
+                        collector.unexecuted_reasoning_tool_call(body);
+                    let advertised_reasoning_tool_call =
+                        collector.advertised_reasoning_tool_call(body);
+                    let has_tool_calls = !collector.tool_calls.is_empty();
+                    let has_visible_content = !collector.text.trim().is_empty();
                     let output = collector.finish(&events)?;
-                    let _ = events.send(StreamEvent::Complete(output));
-                    return Ok(());
+                    return Ok(StreamAttempt {
+                        output,
+                        has_tool_calls,
+                        has_visible_content,
+                        unexecuted_reasoning_tool_call,
+                        advertised_reasoning_tool_call,
+                    });
                 }
                 if !data.is_empty() {
                     let value: Value = serde_json::from_str(data).map_err(|error| {
@@ -1179,6 +1308,43 @@ struct ToolCallAccumulator {
 }
 
 impl StreamCollector {
+    fn unexecuted_reasoning_tool_call(&self, body: &Value) -> bool {
+        if !self.tool_calls.is_empty()
+            || !self.text.trim().is_empty()
+            || self.finish_reason.is_none()
+            || body.get("tools").and_then(Value::as_array).is_none()
+        {
+            return false;
+        }
+        let reasoning = self.reasoning.trim_end();
+        (reasoning.contains("<tool_calls>") && reasoning.ends_with("</tool_calls>"))
+            || (reasoning.contains("<tool_call>") && reasoning.ends_with("</tool_call>"))
+    }
+
+    fn advertised_reasoning_tool_call(&self, body: &Value) -> bool {
+        let names = self
+            .reasoning
+            .split("<function=")
+            .skip(1)
+            .filter_map(|rest| rest.split_once('>').map(|(name, _)| name.trim()))
+            .collect::<Vec<_>>();
+        if names.is_empty() {
+            return false;
+        }
+        body.get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| {
+                names.iter().all(|name| {
+                    tools.iter().any(|tool| {
+                        tool.get("function")
+                            .and_then(|function| function.get("name"))
+                            .and_then(Value::as_str)
+                            == Some(*name)
+                    })
+                })
+            })
+    }
+
     fn push(&mut self, value: Value, events: &mpsc::Sender<StreamEvent>) -> Result<()> {
         if let Some(usage) = value.get("usage") {
             self.usage = parse_usage(usage);
@@ -2030,6 +2196,71 @@ mod tests {
         format!("http://{address}/")
     }
 
+    fn spawn_tool_recovery_server() -> (String, mpsc::Receiver<Value>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let (requests, observed) = mpsc::channel();
+        thread::spawn(move || {
+            let responses = [
+                vec![
+                    json!({"choices":[{"delta":{"reasoning_content":"I will call the tool.\n<tool_call><function=command><parameter=command>date</parameter></function></tool_call>"}}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"stop"}]}),
+                    json!({"usage":{"prompt_tokens":100,"completion_tokens":24,"total_tokens":124,"reasoning_tokens":24}}),
+                ],
+                vec![
+                    json!({"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_recovered","function":{"name":"command","arguments":"{\"command\":\"date\"}"}}]}}]}),
+                    json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+                    json!({"usage":{"prompt_tokens":100,"completion_tokens":8,"total_tokens":108,"reasoning_tokens":0}}),
+                ],
+            ];
+            for response in responses {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                let mut buffer = [0u8; 4096];
+                let header_end = loop {
+                    let read = socket.read(&mut buffer).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(end) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                        break end + 4;
+                    }
+                };
+                let headers = std::str::from_utf8(&request[..header_end]).unwrap();
+                let length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length: ")
+                            .and_then(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                while request.len() < header_end + length {
+                    let read = socket.read(&mut buffer).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                requests
+                    .send(
+                        serde_json::from_slice(&request[header_end..header_end + length]).unwrap(),
+                    )
+                    .unwrap();
+                let mut payload = response
+                    .into_iter()
+                    .map(|chunk| format!("data: {chunk}\n\n"))
+                    .collect::<String>();
+                payload.push_str("data: [DONE]\n\n");
+                write!(
+                    socket,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    payload.len()
+                )
+                .unwrap();
+                socket.write_all(payload.as_bytes()).unwrap();
+            }
+        });
+        (format!("http://{address}/"), observed)
+    }
+
     fn spawn_identity_server(responses: Vec<(&'static str, Value)>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -2126,6 +2357,7 @@ mod tests {
                 client,
                 url,
                 json!({}),
+                BTreeMap::new(),
                 CancellationToken::new(),
                 CancellationToken::new(),
                 tx,
@@ -2144,6 +2376,85 @@ mod tests {
         }
         assert_eq!(text, "Grüße");
         assert_eq!(complete.unwrap().text, "Grüße");
+    }
+
+    #[test]
+    fn complete_tool_markup_in_reasoning_retries_as_structured_call() {
+        let (base, requests) = spawn_tool_recovery_server();
+        let client = Client::builder().build().unwrap();
+        let url = Url::parse(&format!("{base}v1/chat/completions")).unwrap();
+        let (tx, rx) = mpsc::channel();
+        run_async(move || async move {
+            stream_completion(
+                client,
+                url,
+                json!({
+                    "model":"org/model",
+                    "max_tokens":256,
+                    "tools":[{"type":"function","function":{"name":"command","parameters":{"type":"object"}}}],
+                    "tool_choice":"auto",
+                    "chat_template_kwargs":{"enable_thinking":true}
+                }),
+                BTreeMap::from([("enable_thinking".to_owned(), json!(false))]),
+                CancellationToken::new(),
+                CancellationToken::new(),
+                tx,
+            )
+            .await
+        })
+        .unwrap();
+        let original = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        let retry = requests.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(original["chat_template_kwargs"]["enable_thinking"], true);
+        assert_eq!(original["tool_choice"], "auto");
+        assert_eq!(retry["chat_template_kwargs"]["enable_thinking"], false);
+        assert_eq!(retry["tool_choice"], "auto");
+        assert_eq!(retry["max_tokens"], 232);
+        assert_eq!(retry["tools"], original["tools"]);
+        let mut streamed = String::new();
+        let mut complete = None;
+        for event in rx {
+            match event {
+                StreamEvent::Text { text, .. } => streamed.push_str(&text),
+                StreamEvent::Complete(output) => complete = Some(output),
+                StreamEvent::Error(error) => panic!("unexpected stream error: {error}"),
+            }
+        }
+        let complete = complete.unwrap();
+        assert_eq!(streamed, complete.text);
+        assert!(complete.text.contains("\"name\":\"command\""));
+        assert_eq!(complete.usage.prompt_tokens, 100);
+        assert_eq!(complete.usage.completion_tokens, 32);
+    }
+
+    #[test]
+    fn reasoning_examples_and_real_tool_calls_do_not_trigger_recovery() {
+        let body = json!({
+            "tools":[{"type":"function","function":{"name":"command"}}],
+            "tool_choice":"auto"
+        });
+        let mut collector = StreamCollector {
+            reasoning: "An example is <tool_calls><function=command></function></tool_calls>."
+                .to_owned(),
+            text: "Here is the answer.".to_owned(),
+            finish_reason: Some(FinishReason::Stop),
+            ..Default::default()
+        };
+        assert!(!collector.unexecuted_reasoning_tool_call(&body));
+        collector.text.clear();
+        collector
+            .tool_calls
+            .insert(0, ToolCallAccumulator::default());
+        assert!(!collector.unexecuted_reasoning_tool_call(&body));
+        collector.tool_calls.clear();
+        collector.finish_reason = Some(FinishReason::Length);
+        assert!(!collector.unexecuted_reasoning_tool_call(&body));
+        collector.finish_reason = Some(FinishReason::Stop);
+        collector.reasoning = "<tool_call><function=unknown></function></tool_call>".to_owned();
+        assert!(collector.unexecuted_reasoning_tool_call(&body));
+        assert!(!collector.advertised_reasoning_tool_call(&body));
+        collector.finish_reason = Some(FinishReason::Length);
+        assert!(collector.unexecuted_reasoning_tool_call(&body));
     }
 
     #[test]
