@@ -88133,6 +88133,7 @@ fn provider_canary_prompt_modalities(
             modalities
         }
         "embedding" => BTreeSet::from(["embedding".to_owned()]),
+        MODEL_CLASS_DECISION => BTreeSet::from(["text".to_owned()]),
         "image-generation" => BTreeSet::from(["image".to_owned()]),
         "video-generation" => {
             let mut modalities = BTreeSet::from(["audio".to_owned(), "video".to_owned()]);
@@ -118567,6 +118568,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 .unwrap();
 
         catalog_endpoint_calibration_preflight(model, &prompts).unwrap();
+        assert!(prompts.iter().all(|prompt| {
+            provider_canary_prompt_modalities(model, prompt)
+                == BTreeSet::from(["text".to_owned()])
+        }));
     }
 
     #[test]
