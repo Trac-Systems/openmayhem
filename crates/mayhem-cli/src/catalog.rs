@@ -4787,6 +4787,7 @@ fn validate_artifact_with_engine_policy(
                 | "comfyui"
                 | "ace-step"
                 | "chatterbox"
+                | "laya"
                 | "needle-cpu"
                 | "needle-gpu"
                 | "sulphur"
@@ -9097,6 +9098,37 @@ mod tests {
                 .iter()
                 .any(|error| error.contains("path is required")),
             "future models must still receive generic structural validation: {errors:?}"
+        );
+    }
+
+    #[test]
+    fn laya_is_a_supported_catalog_engine() {
+        let model = verification_test_model(
+            "admin/decision@fixture",
+            MODEL_CLASS_DECISION,
+            "laya",
+            CanaryRef {
+                set_id: "canary-decision-v1".to_owned(),
+                match_min: 1.0,
+                verification_method: VERIFICATION_DECISION_FINGERPRINT.to_owned(),
+                verification_tolerance_bps: None,
+                fingerprints: BTreeMap::new(),
+                token_prefixes: BTreeMap::new(),
+                perceptual_hashes: BTreeMap::new(),
+                embedding_vectors: BTreeMap::new(),
+                transcripts: BTreeMap::new(),
+                audio_fingerprints: BTreeMap::new(),
+                video_fingerprints: BTreeMap::new(),
+                decision_fingerprints: BTreeMap::new(),
+            },
+        );
+        let mut errors = Vec::new();
+        validate_model(&model, &mut errors);
+        assert!(
+            !errors
+                .iter()
+                .any(|error| error.contains("unsupported engine laya")),
+            "{errors:?}"
         );
     }
 
