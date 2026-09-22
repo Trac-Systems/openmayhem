@@ -908,6 +908,9 @@ test('admin writer returns a bounded relay error when an accepted feature never 
   );
 
   assert.equal(result.ok, false);
+  assert.equal(result.accepted, true);
+  assert.equal(result.status, 'pending');
+  assert.equal(result.phase, 'admin_ack');
   assert.equal(result.relayed, true);
   assert.match(result.message, /no canonical result appeared before the relay result budget/);
   assert.equal(writer.appended.length, 1);
@@ -969,6 +972,7 @@ test('participant does not broadcast when the canonical admin channel is unavail
   participant.peer.sidechannel = {
     started: true,
     connectDirectPeer: async () => false,
+    directConnectFailure: () => ({ phase: 'protocol_incompatible' }),
     broadcast() {
       broadcasts += 1;
       return true;
@@ -984,6 +988,7 @@ test('participant does not broadcast when the canonical admin channel is unavail
 
   assert.equal(result.ok, false);
   assert.match(result.message, /direct channel to the canonical admin/);
+  assert.equal(result.phase, 'protocol_incompatible');
   assert.equal(broadcasts, 0);
 });
 

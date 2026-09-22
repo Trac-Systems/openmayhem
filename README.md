@@ -872,6 +872,7 @@ behavior; parallel dispatch needs the selected mode's own approval. See
 | Class | Routes |
 |-------|--------|
 | Text generation | `/v1/chat/completions`, `/v1/completions`, `/v1/responses` — tools, JSON mode, streaming, vision input where the catalog says so |
+| Exact token counting | `/v1/tokenize`, `/v1/count_tokens` — accepts `messages` or a single `prompt`; set `return_tokens` to include token IDs |
 | Embedding | `/v1/embeddings` |
 | Image generation | `/v1/images/generations` |
 | Video generation | `/v1/videos` |
@@ -1339,6 +1340,37 @@ providers with a persisted signed admission proof now advertise admission-backed
 modality health immediately instead of rerunning an expensive functional canary
 before their first room heartbeat. The Comfy runtime default device is `auto`;
 explicit `MAYHEM_COMFYUI_DEVICE=cpu` still forces CPU for hosts that need it.
+
+The `0.2.217` source release adds an optional
+`MAYHEM_COMFYUI_RESERVE_VRAM_GB` provider setting. It passes a bounded VRAM
+reserve to ComfyUI so a workflow provider can offload more model state to system
+memory while leaving measured GPU headroom for another local workload. Leave it
+unset unless the host has a calibrated coexistence profile.
+
+The `0.2.218` source release preserves assistant commentary before native
+OpenAI-compatible tool calls while streaming the calls as structured deltas;
+partial tool envelopes now fail closed instead of appearing as chat text. It
+also keeps ComfyUI request journals deletable inside the Windows sandbox.
+
+The `0.2.219` source release admits signed workflow inventory against the
+maximum parts one request can select. Providers still verify every advertised
+part, while optional model-part catalogs no longer consume memory admission as
+if every choice were loaded together.
+
+The `0.2.220` source release recovers expired inference reservations from the
+canonical ledger even when a gateway's local job record is unavailable. Any
+confirmed partial receipt is retained when the expired reservation closes.
+
+The `0.2.221` source release lets idle workflow engines release retained model
+and allocator memory when a provider's runtime floor activates. ComfyUI uses
+its supported unload and free-memory control path, restoring cohosted provider
+admission without interrupting an active workflow.
+
+The `0.2.222` source release adds a canonical endpoint-contract fingerprint to
+the existing request envelope. Updated providers prefer the canonical value,
+while the legacy fingerprint remains present for older peers. Equivalent
+contracts now survive JSON object reordering and JavaScript number round trips
+without disrupting mixed-version routes.
 
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the

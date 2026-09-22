@@ -26,6 +26,7 @@ const MLX_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/mlx.txt");
 const LLAMA_MEDIA_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/llama-media.txt");
 const TRANSFORMERS_ASR_REQUIREMENTS: &[u8] =
     include_bytes!("../resources/python/transformers-asr.txt");
+const LAYA_REQUIREMENTS: &[u8] = include_bytes!("../resources/python/laya.txt");
 const CHATTERBOX_CPU_PROJECT: &[u8] =
     include_bytes!("../resources/python/chatterbox-runtime-cpu/pyproject.toml");
 const CHATTERBOX_CPU_LOCK: &[u8] =
@@ -165,16 +166,26 @@ pub(crate) fn ensure_vllm_python(
     }?;
     let backup = home.join("runtime-patches").join("vllm-prefix-v1");
     fs::create_dir_all(&backup)?;
-    let lock = OpenOptions::new().create(true).truncate(false).write(true)
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
         .open(backup.join("install.lock"))?;
     lock.lock_exclusive()?;
     let output = Command::new(&runtime.python)
-        .arg("-B").arg("-c")
+        .arg("-B")
+        .arg("-c")
         .arg(include_str!("../../../scripts/vllm-prefix-runtime.py"))
-        .arg("--backup").arg(&backup).arg("--apply")
-        .output().context("applying mandatory vLLM prefix runtime correction")?;
-    ensure!(output.status.success(), "vLLM prefix runtime correction failed: {}",
-        String::from_utf8_lossy(&output.stderr));
+        .arg("--backup")
+        .arg(&backup)
+        .arg("--apply")
+        .output()
+        .context("applying mandatory vLLM prefix runtime correction")?;
+    ensure!(
+        output.status.success(),
+        "vLLM prefix runtime correction failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     Ok(runtime)
 }
 
@@ -378,7 +389,9 @@ pub(crate) fn ensure_backend_python(home: &Path, backend: &str) -> Result<Python
         fs::create_dir_all(&uv_cache)
             .with_context(|| format!("creating uv cache directory {}", uv_cache.display()))?;
         let mut create_command = Command::new(&uv);
-        create_command.args(managed_venv_args(runtime_wheel.is_some())).arg(&venv);
+        create_command
+            .args(managed_venv_args(runtime_wheel.is_some()))
+            .arg(&venv);
         let create = create_command
             .env("UV_PYTHON_INSTALL_DIR", &python_install_dir)
             .env("UV_CACHE_DIR", &uv_cache)
@@ -3300,6 +3313,26 @@ fn python_runtime_spec(backend: &str) -> Option<PythonRuntimeSpec> {
             min_free_bytes: 8 * GIB,
             embedded_module: None,
         }),
+        "laya" => Some(PythonRuntimeSpec {
+            backend: "laya",
+            override_env: "MAYHEM_LAYA_PYTHON",
+            distribution: "laya",
+            required_imports: &[
+                "laya",
+                "transformers",
+                "torch",
+                "tokenizers",
+                "safetensors",
+                "huggingface_hub",
+                "numpy",
+            ],
+            version: "0.3.5",
+            requirements: LAYA_REQUIREMENTS,
+            requirements_sha256: "b146de268c7caf04ee58e7c70bde58e7876ee9b280a8de63cf79c68fd06bab14",
+            extra_index_urls: &["https://download.pytorch.org/whl/cu130"],
+            min_free_bytes: 8 * GIB,
+            embedded_module: None,
+        }),
         "sulphur" => Some(PythonRuntimeSpec {
             backend: "sulphur",
             override_env: "MAYHEM_SULPHUR_PYTHON",
@@ -4789,8 +4822,20 @@ mod tests {
 
     #[test]
     fn version_bound_runtime_requires_managed_python_without_changing_baseline() {
-        assert_eq!(managed_venv_args(false), vec!["venv", "--python", MANAGED_PYTHON_VERSION, "--seed"]);
-        assert_eq!(managed_venv_args(true), vec!["venv", "--python", MANAGED_PYTHON_VERSION, "--seed", "--managed-python"]);
+        assert_eq!(
+            managed_venv_args(false),
+            vec!["venv", "--python", MANAGED_PYTHON_VERSION, "--seed"]
+        );
+        assert_eq!(
+            managed_venv_args(true),
+            vec![
+                "venv",
+                "--python",
+                MANAGED_PYTHON_VERSION,
+                "--seed",
+                "--managed-python"
+            ]
+        );
     }
 
     #[test]
@@ -4820,7 +4865,8 @@ mod tests {
             .output()
             .unwrap();
         assert!(!result.status.success());
-        assert!(String::from_utf8_lossy(&result.stderr).contains("requires CPython development headers"));
+        assert!(String::from_utf8_lossy(&result.stderr)
+            .contains("requires CPython development headers"));
 
         let base = python_runtime_spec("vllm").unwrap();
         let script = python_validation_script(&base).unwrap();

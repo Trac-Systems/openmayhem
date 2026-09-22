@@ -145,7 +145,7 @@ const paidOperation = (paid, proof = { signed_length: 100, validator: 'ab'.repea
     ipk: paid.surrogate.address, wp: proof.validator, msbsl: proof.signed_length },
 });
 
-test('v24 durable checkpoint survives v25 restart and exact paid replay only once', async () => {
+test('v24 durable checkpoint survives v26 restart and exact paid replay only once', async () => {
   const ctx = await harness();
   const paid = await historicalPreparation(ctx);
   await assert.rejects(ctx.transport.broadcast(paid), /response lost/);
@@ -173,9 +173,9 @@ test('v24 durable checkpoint survives v25 restart and exact paid replay only onc
 test('fresh v24 dispatch cannot fabricate historical preparation', async () => {
   const ctx = await harness();
   const paid = await historicalPreparation(ctx);
-  assert.throws(() => validateMayhemOperationContractVersion(paidOperation(paid)), /expected CONTRACT_VERSION 25, got 24/);
+  assert.throws(() => validateMayhemOperationContractVersion(paidOperation(paid)), /expected CONTRACT_VERSION 26, got 24/);
   await ctx.storage.del('checkpoint/prepared/100');
-  await assert.rejects(ctx.contract.execute(paidOperation(paid), ctx.storage), /expected CONTRACT_VERSION 25, got 24/);
+  await assert.rejects(ctx.contract.execute(paidOperation(paid), ctx.storage), /expected CONTRACT_VERSION 26, got 24/);
   await assert.rejects(ctx.transport.broadcast(paid), /no matching historical canonical preparation/);
   assert.equal(ctx.broadcasts, 0);
 });
@@ -192,7 +192,7 @@ test('historical checkpoint recovery rejects tampered evidence and unrelated old
     const snapshot = (await ctx.storage.get('checkpoint/prepared/100')).value;
     mutate(snapshot);
     await ctx.storage.put('checkpoint/prepared/100', snapshot);
-    await assert.rejects(ctx.contract.execute(paidOperation(paid), ctx.storage), /expected CONTRACT_VERSION 25, got 24/);
+    await assert.rejects(ctx.contract.execute(paidOperation(paid), ctx.storage), /expected CONTRACT_VERSION 26, got 24/);
     await assert.rejects(ctx.transport.broadcast(paid), /no matching historical canonical preparation/);
   }
   const ctx = await harness();
@@ -200,7 +200,7 @@ test('historical checkpoint recovery rejects tampered evidence and unrelated old
   const unrelated = paidOperation(paid);
   unrelated.value.dispatch = { type: 'setRules', value: { op: 'set_rules', ver: 1,
     hash: 'aa'.repeat(32), contract_version: 24 } };
-  await assert.rejects(ctx.contract.execute(unrelated, ctx.storage), /expected CONTRACT_VERSION 25, got 24/);
+  await assert.rejects(ctx.contract.execute(unrelated, ctx.storage), /expected CONTRACT_VERSION 26, got 24/);
   const mutated = structuredClone(paid);
   mutated.dispatch.value.snapshot_hash = '99'.repeat(32);
   await assert.rejects(ctx.transport.broadcast(mutated), /bytes or signature changed/);

@@ -13,7 +13,7 @@ An epoch is the settlement window, `epoch_seconds` default **3600s (1 hour)**, a
 60–86400. It is the unit of: evidence root computation, market-price recomputation, reputation
 folds, and holdback maturation. At the end of each epoch all signed receipts settle, and that
 settlement doubles as the signed workload input for the next epoch's price. See
-[The Activity Momentum Pricing Controller](/market/pricing-controller.md) and [Epoch Settlement and Fraud Proofs](/payments/settlement-and-fraud-proofs.md).
+[The Utilization-Indexed Pricing Controller](/market/pricing-controller.md) and [Epoch Settlement and Fraud Proofs](/payments/settlement-and-fraud-proofs.md).
 
 ## Per-session price lock (I3-F3)
 This is the load-bearing fix that makes a floating price safe. At session open, the actual resolved
@@ -27,10 +27,10 @@ price. Without the lock the float would invalidate in-flight sessions; without t
 would freeze the market — they exist as a pair (CONCEPTS.md §2).
 
 ## Price provenance (I3-F8) — every price is recomputable
-Each completed bounded epoch hashes consensus-derived price updates into its market price evidence root. Derivations bind settled workload dimensions, calibration or dimension-vector basis, previous actual activity, telemetry EMA, epoch duration, constants, seed, previous terms and result. The ordinary roller commits an empty external price root; the contract computes the actual market-price evidence after validating all canonical receipt pages. Empty seals also bind their zero-activity price evidence.
+Each completed bounded epoch hashes consensus-derived price updates into its market price evidence root. Derivations bind signed compute time, execution-slot capacity, utilization, epoch duration, thresholds, multiplier, seed, previous terms and result. The ordinary roller commits an empty external price root; the contract computes the actual market-price evidence after validating all canonical receipt pages. Empty seals also bind their zero-utilization price evidence.
 
 ## Price fraud proof
-Explicit nonempty price commitments require one market and at most 128 canonical final receipt heads. At commit time the contract verifies the frozen signed usage root and pins its expected activity derivation. A challenger can prove a contradictory price root within the challenge window without relying on later mutable price/calibration state. Larger epochs use bounded consensus computation. Historical monetary-price commitments must be resolved before upgrading to v25; see [the rollout procedure](../../market-activity-pricing-v25.md).
+Explicit nonempty price commitments require one market and at most 128 canonical final receipt heads. At commit time the contract verifies the frozen signed usage root and pins its expected utilization derivation. A challenger can prove a contradictory price root within the challenge window without relying on later mutable price state. Larger epochs use bounded consensus computation. Historical monetary-price commitments must be resolved before upgrading; see [the v27 rollout procedure](../../market-utilization-pricing-v27.md).
 
 ## Where the money math lives
 Settlement itself (`epochApply`) runs the fee (15%), the TAP burn (10%), per-rail conservation

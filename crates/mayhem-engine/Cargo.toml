@@ -24,6 +24,7 @@ mlx = []
 needle = ["dep:mayhem-enclave"]
 trt-llm = []
 transformers-asr = []
+laya = []
 vllm = []
 
 [dependencies]
@@ -32,15 +33,18 @@ blake3 = "1"
 encoding_rs = { version = "0.8", optional = true }
 flate2 = { version = "1", optional = true }
 jsonschema = { version = "0.53.0", default-features = false }
+futures-util = "0.3"
 llama-cpp-2 = { version = "0.1.150", optional = true, default-features = false, features = ["common", "sampler"] }
 mayhem-enclave = { path = "../mayhem-enclave", optional = true }
 mayhem-proto = { path = "../mayhem-proto" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream"] }
 tar = { version = "0.4", optional = true }
 tempfile = "3.27"
 thiserror = "2"
+tokio = { version = "1", features = ["macros", "net", "rt", "sync", "time"] }
 wait-timeout = { version = "0.2", optional = true }
 
 [target.'cfg(windows)'.dependencies]

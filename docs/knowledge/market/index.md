@@ -1,10 +1,10 @@
 # Market and Pricing
 
-How OpenMayhem sets prices: one automated, activity-momentum clearing price per market per epoch,
+How OpenMayhem sets prices: one automated, utilization-indexed clearing price per market per epoch,
 seeded once by the admin and then floated by the contract on verified settled work. Nobody types
 the running price.
 
-* [Pricing controller](/market/pricing-controller.md) - the activity-momentum controller: calibrated work, the previous-epoch baseline, the per-epoch step, and hard reference bounds.
+* [Pricing controller](/market/pricing-controller.md) - the utilization controller: signed compute time, execution-slot capacity, fixed per-epoch steps, and hard reference bounds.
 * [Reservation bands: min-ask and max-bid](/market/bands-min-ask-max-bid.md) - how providers and users gate participation without naming a price.
 * [Epochs, settlement, and price provenance](/market/epochs-and-settlement.md) - the hourly epoch, the price lock, and how every published price carries a recomputable derivation.
 

@@ -22,9 +22,10 @@ function writeExecutable(target, source) {
 async function receiptHead(ordinal, {
   settlementEpoch = 1,
   billingEpoch = settlementEpoch,
+  schemaVersion = 11,
 } = {}) {
   const body = {
-    schema_version: 11,
+    schema_version: schemaVersion,
     session_id: hex(1_000 + ordinal),
     billing_id: hex(ordinal),
     billing_attempt: 0,
@@ -45,6 +46,7 @@ async function receiptHead(ordinal, {
     locked_per_req_au: '0',
     locked_min_session_au: '0',
     served_ctx: 1_024,
+    ...(schemaVersion === 12 ? { compute_ms: 1_000, capacity_slots: 1 } : {}),
     ctx_bracket: 'le32k',
     ctx_bracket_table_ver: 1,
     rules_ver: 1,
@@ -79,6 +81,7 @@ async function harness({
   staleSnapshotAndCommit = false,
   settlementEpoch = 1,
   billingEpoch = settlementEpoch,
+  schemaVersion = 11,
 } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-finalizer-'));
   const bin = path.join(root, 'bin');
@@ -94,9 +97,9 @@ async function harness({
   fs.symlinkSync(process.execPath, path.join(bin, 'node'));
 
   const heads = [
-    await receiptHead(3, { settlementEpoch, billingEpoch }),
-    await receiptHead(1, { settlementEpoch, billingEpoch }),
-    await receiptHead(2, { settlementEpoch, billingEpoch }),
+    await receiptHead(3, { settlementEpoch, billingEpoch, schemaVersion }),
+    await receiptHead(1, { settlementEpoch, billingEpoch, schemaVersion }),
+    await receiptHead(2, { settlementEpoch, billingEpoch, schemaVersion }),
   ];
   const index = {
     type: 'canonical_receipt_epoch_index',
@@ -501,6 +504,21 @@ test('finalizer settles a late billing receipt from the current receipt index', 
   ));
   assert.equal(snapshot.settlement_epoch, 2);
   assert.equal(Object.hasOwn(snapshot, 'epoch'), false);
+});
+
+test('finalizer accepts current schema-12 utilization receipts', async (t) => {
+  const ctx = await harness({ schemaVersion: 12 });
+  t.after(() => ctx.close());
+  const result = ctx.run();
+  assert.equal(result.status, 0, `${result.stdout}\n${result.stderr}`);
+  const state = ctx.state();
+  assert.equal(state.apply.updated_epoch, 1);
+  assert.equal(
+    state.features.every((feature) =>
+      feature.value.allocations.every((allocation) => allocation.billing_epoch === 1)
+    ),
+    true,
+  );
 });
 
 test('mid-page failure resumes the exact page and completed retry is idempotent', async (t) => {

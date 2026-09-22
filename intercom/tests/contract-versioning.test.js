@@ -30,9 +30,9 @@ const versioningLockedRateMap = [
 const versioningBillingId = 'bb'.repeat(32);
 
 test('launch version gates cover A16/A17/D6/D7/M5/M6/M8 deterministic changes', () => {
-  assert.equal(CONTRACT_VERSION, 25);
+  assert.equal(CONTRACT_VERSION, 28);
   assert.deepEqual(signingMessageVersions(), [2]);
-  assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 11);
+  assert.equal(SESSION_RECEIPT_SCHEMA_VERSION, 12);
   assert.equal(SPEND_VOUCHER_SCHEMA_VERSION, 11);
 });
 
@@ -87,6 +87,25 @@ test('contract keeps descriptive backends extensible while routing semantics sta
     modality_set: ['text', 'video', 'audio'],
     speciality_levels: {},
   }, 'video-generation'), null);
+  assert.equal(contract.validateEnclaveCaps({
+    chat: false,
+    tools: false,
+    json: true,
+    vision: false,
+    image: false,
+    video: false,
+    audio: false,
+    ctx: 1024,
+    ctx_max: 1024,
+    output_modality: 'text',
+    output_modalities: ['text'],
+    modality_set: ['text'],
+    speciality_levels: {},
+  }, 'decision'), null);
+  assert.equal(contract.validateEnclaveModalityRateMap({
+    model_class: 'decision',
+    caps: { modality_set: ['text'] },
+  }, versioningLockedRateMap), null);
 });
 
 test('contract accepts only the current consent signing version', async () => {
@@ -192,6 +211,8 @@ test('receipt verifier accepts only the current signing payload', async () => {
     locked_per_req_au: '0',
     locked_min_session_au: '0',
     served_ctx: 8192,
+    compute_ms: 1_000,
+    capacity_slots: 1,
     ctx_bracket: 'le8k',
     ctx_bracket_table_ver: 1,
     rules_ver: 1,
@@ -220,7 +241,7 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
     { unit: 'output_token', per_unit_au: '2500000000000000', granularity: 1000 },
   ];
   const voucher = {
-    schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+    schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
     session_id: 'sess-au-roundtrip',
     billing_id: '44'.repeat(32),
     billing_attempt: 0,
@@ -300,6 +321,8 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
     locked_per_req_au: '1',
     locked_min_session_au: '2000000000000000000000000',
     served_ctx: 131072,
+    compute_ms: 1_000,
+    capacity_slots: 1,
     ctx_bracket: 'le128k',
     ctx_bracket_table_ver: 1,
     rules_ver: 7,
@@ -310,7 +333,7 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
   };
   const expectedReceipt = [
     '{"domain":"mayhem-session-receipt","signing_version":2,"body":{',
-    '"schema_version":11,"session_id":"sess-au-roundtrip","billing_id":"',
+    '"schema_version":12,"session_id":"sess-au-roundtrip","billing_id":"',
     '44'.repeat(32),
     '","billing_attempt":0,"billing_prior_usage":{},"billing_prior_au_owed_cum":"0",',
     '"billing_epoch":7,"reservation_id":"',
@@ -328,7 +351,7 @@ test('Rust atto money signing fixture matches JS canonical messages', () => {
     '{"unit":"input_token","per_unit_au":"10000000","granularity":1},',
     '{"unit":"output_token","per_unit_au":"2500000000000000","granularity":1000}',
     '],"locked_per_req_au":"1","locked_min_session_au":"2000000000000000000000000",',
-    '"served_ctx":131072,"ctx_bracket":"le128k","ctx_bracket_table_ver":1,',
+    '"served_ctx":131072,"compute_ms":1000,"capacity_slots":1,"ctx_bracket":"le128k","ctx_bracket_table_ver":1,',
     '"rules_ver":7,"usage":{"input_token":3,"output_token":5},',
     '"au_owed_cum":"2000000000000000000000001","prompt_hash":"',
     '33'.repeat(32),
@@ -417,6 +440,8 @@ test('workflow voucher and receipt terms are canonical signed evidence', async (
     locked_per_req_au: '0',
     locked_min_session_au: '0',
     served_ctx: 0,
+    compute_ms: 1_000,
+    capacity_slots: 1,
     ctx_bracket: null,
     ctx_bracket_table_ver: null,
     rules_ver: voucher.rules_ver,
@@ -498,6 +523,8 @@ test('receipt normalization rejects old schemas and non-canonical usage', async 
     locked_per_req_au: '0',
     locked_min_session_au: '0',
     served_ctx: 8192,
+    compute_ms: 1_000,
+    capacity_slots: 1,
     ctx_bracket: 'le8k',
     ctx_bracket_table_ver: 1,
     rules_ver: 1,

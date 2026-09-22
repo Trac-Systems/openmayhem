@@ -3,9 +3,9 @@ import base64
 import contextlib
 import errno
 import json
+import math
 import os
 import sys
-import tempfile
 import time
 import traceback
 import uuid
@@ -228,7 +228,11 @@ def input_transfer_lock():
 @contextlib.contextmanager
 def materialized_input_files(payload):
     with input_transfer_lock():
-        with staged_input_files(payload):
+        if payload.get("input_files"):
+            with staged_input_files(payload):
+                yield
+        else:
+            recover_input_transfers()
             yield
 
 
@@ -237,7 +241,17 @@ def staged_input_files(payload):
     # Cancellation can terminate this worker, bypassing finally. Recover its
     # journals before another graph can read any input left by that request.
     recover_input_transfers()
-    backup_root = Path(tempfile.mkdtemp(prefix="request-", dir=input_transfer_root()))
+    # tempfile.mkdtemp uses mode 0o700. Python 3.12 maps that mode to a
+    # restrictive Windows DACL, so an AppContainer worker can create the
+    # journal and then lose DELETE access to it. A normal mkdir inherits the
+    # writable-tree ACL installed by the sandbox.
+    while True:
+        backup_root = input_transfer_root() / f"request-{uuid.uuid4().hex}"
+        try:
+            backup_root.mkdir()
+            break
+        except FileExistsError:
+            continue
     written = []
     seen = set()
     try:
@@ -397,6 +411,19 @@ def load(payload):
     base_dir = Path(comfy_path(Path(payload["base_dir"]).resolve()))
     socket_path = Path(comfy_path(Path(payload["socket_path"]).resolve()))
     device = payload.get("device", "auto")
+    vram_reserve_gb = payload.get("vram_reserve_gb")
+    if vram_reserve_gb is not None:
+        if isinstance(vram_reserve_gb, bool) or not isinstance(
+            vram_reserve_gb, (int, float)
+        ):
+            raise ValueError(
+                "ComfyUI vram_reserve_gb must be a finite number between 0 and 1024"
+            )
+        vram_reserve_gb = float(vram_reserve_gb)
+        if not math.isfinite(vram_reserve_gb) or not 0 <= vram_reserve_gb <= 1024:
+            raise ValueError(
+                "ComfyUI vram_reserve_gb must be a finite number between 0 and 1024"
+            )
     custom_node_whitelist = payload.get("custom_node_whitelist", [])
     aliases = payload.get("model_path_aliases", {})
     if not isinstance(aliases, dict) or any(
@@ -426,6 +453,8 @@ def load(payload):
         argv.extend(str(name) for name in custom_node_whitelist)
     if device == "cpu":
         argv.append("--cpu")
+    if vram_reserve_gb is not None:
+        argv.extend(("--reserve-vram", format(vram_reserve_gb, "g")))
     sys.argv = argv
     os.chdir(comfy_path(runtime_root))
 
@@ -590,6 +619,17 @@ async def shutdown():
         await runner.cleanup()
 
 
+async def reclaim_memory():
+    if prompt_server is None:
+        return {"requested": False}
+    # This is the same supported path as ComfyUI's /free endpoint. The prompt
+    # worker owns its executor caches, so flags let it reset those caches and
+    # unload model weights on the correct thread after the queue is idle.
+    prompt_server.prompt_queue.set_flag("unload_models", True)
+    prompt_server.prompt_queue.set_flag("free_memory", True)
+    return {"requested": True}
+
+
 def dispatch(message):
     op = message.get("op")
     payload = message.get("payload")
@@ -597,6 +637,8 @@ def dispatch(message):
         return load(payload)
     if op == "run_workflow":
         return loop.run_until_complete(run_workflow(payload))
+    if op == "reclaim_memory":
+        return loop.run_until_complete(reclaim_memory())
     if op == "shutdown":
         loop.run_until_complete(shutdown())
         return {"shutdown": True}

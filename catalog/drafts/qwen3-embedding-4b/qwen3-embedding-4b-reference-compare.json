@@ -1,0 +1,40 @@
+{
+  "schema_version": 1,
+  "model_path": "hf://TracNetwork/mayhem-catalog-Qwen-Qwen3-Embedding-4B-BF16@909825755dc39379f3eb31256602da9cafb29c95",
+  "reference_runtime": "transformers-official-last-token-pooling",
+  "dtype": "bfloat16",
+  "attention": "sdpa",
+  "load_seconds": 46.523810502141714,
+  "inference_seconds": 0.7429673876613379,
+  "cases": [
+    {
+      "id": "qwen3-embed-query-native",
+      "dimensions": 2560,
+      "cosine": 0.9997303381428202,
+      "reference_norm": 1.0019597312973452,
+      "vllm_norm": 0.9999999713036141
+    },
+    {
+      "id": "qwen3-embed-query-1536",
+      "dimensions": 1536,
+      "cosine": 0.9997171903088767,
+      "reference_norm": 1.0,
+      "vllm_norm": 0.9999999971255501
+    },
+    {
+      "id": "qwen3-embed-document-native",
+      "dimensions": 2560,
+      "cosine": 0.9997516154802264,
+      "reference_norm": 1.0009139912045055,
+      "vllm_norm": 1.0000000445473054
+    },
+    {
+      "id": "qwen3-embed-document-1536",
+      "dimensions": 1536,
+      "cosine": 0.9997535800177928,
+      "reference_norm": 1.0,
+      "vllm_norm": 0.9999999985817098
+    }
+  ],
+  "minimum_cosine": 0.9997171903088767
+}

@@ -191,23 +191,46 @@ test('TAP roller reconstructs Rust receipt wire order from sorted retained value
   assert.doesNotThrow(() => verifyReceiptEnvelope(signed.receipt));
 });
 
-test('TAP roller accepts current schema 11 while rejecting unknown receipt schemas', () => {
+test('TAP roller accepts current schema 12 while rejecting unknown receipt schemas', () => {
   const current = receipt({
     session: 'tap-current-schema',
     au: '123',
     epoch: 17,
-    extraBody: { schema_version: 11 },
+    extraBody: { schema_version: 12, compute_ms: 1_000, capacity_slots: 1 },
   });
   assert.doesNotThrow(() => verifyReceiptEnvelope(current.receipt));
 
-  for (const schemaVersion of [9, 12]) {
+  for (const schemaVersion of [9, 13]) {
     const unsupported = structuredClone(current.receipt);
     unsupported.body.schema_version = schemaVersion;
     assert.throws(
       () => verifyReceiptEnvelope(unsupported),
-      /receipt schema_version must be one of 10, 11/
+      /receipt schema_version must be one of 10, 11, 12/
     );
   }
+});
+
+test('TAP roller enforces schema-specific utilization fields', () => {
+  const current = receipt({
+    session: 'tap-schema-utilization',
+    au: '123',
+    epoch: 17,
+    extraBody: { schema_version: 12, compute_ms: 1_000, capacity_slots: 2 },
+  });
+  assert.doesNotThrow(() => verifyReceiptEnvelope(current.receipt));
+
+  for (const field of ['compute_ms', 'capacity_slots']) {
+    const missing = structuredClone(current.receipt);
+    delete missing.body[field];
+    assert.throws(() => verifyReceiptEnvelope(missing), /schema-12 receipt/);
+  }
+
+  const legacy = structuredClone(current.receipt);
+  legacy.body.schema_version = 11;
+  assert.throws(
+    () => verifyReceiptEnvelope(legacy),
+    /legacy receipt schemas cannot contain utilization fields/
+  );
 });
 
 test('TAP roller locks payout minimum from confirmed historical parameter evidence', async () => {

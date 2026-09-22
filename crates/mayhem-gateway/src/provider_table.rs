@@ -24,6 +24,10 @@ pub const DEFAULT_UNDERDELIVERY_EVENT_STREAK: u32 = 2;
 pub const DEFAULT_THROUGHPUT_FACTOR_FLOOR: f64 = 0.1;
 pub const DEFAULT_TRANSIENT_THROUGHPUT_FACTOR_FLOOR: f64 = 0.5;
 pub const DEFAULT_LLM_GENERATION_FLOOR_TOK_S: f64 = 5.0;
+/// A measured throughput sample is an admission hint, not a permanent route
+/// verdict. Providers keep publishing fresh heartbeat performance, so a stale
+/// gateway-local sample must eventually yield to that live signal.
+pub const DEFAULT_THROUGHPUT_OBSERVATION_TTL_MILLIS: u64 = 60_000;
 pub const DEFAULT_LLM_PREFILL_FLOOR_TOK_S: f64 = 100.0;
 pub const DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S: f64 = 10.0;
 pub const DEFAULT_IMAGE_FLOOR_IMAGES_PER_S: f64 = 1.0 / 300.0;
@@ -114,6 +118,8 @@ pub struct ProviderObservation {
     pub ewma_ttft_ms: Option<f64>,
     pub ewma_tok_s: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub throughput_observed_at_millis: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ewma_throughput_ratio: Option<f64>,
     pub ewma_error_rate: f64,
     #[serde(default)]
@@ -185,6 +191,11 @@ impl ProviderTableEntry {
 pub struct BaselineRouteRequirements {
     pub current_rules_ver: u64,
     pub requires_transport_peer: bool,
+    /// Autoregressive generation routes must prove that their runtime prefix
+    /// cache is enabled. Other endpoints may still bill output tokens without
+    /// owning a reusable KV cache (for example typed decision classifiers).
+    #[serde(default)]
+    pub requires_prefix_caching: bool,
     pub now_millis: u64,
     pub max_attestation_head_age_millis: u64,
     pub heartbeat_ttl_millis: u64,
@@ -213,6 +224,8 @@ pub struct RequestRequirements {
     pub current_rules_ver: u64,
     pub min_reputation: f64,
     pub requires_transport_peer: bool,
+    #[serde(default)]
+    pub requires_prefix_caching: bool,
     pub requires_tools: bool,
     pub requires_json: bool,
     pub requires_vision: bool,
@@ -418,6 +431,7 @@ impl Default for BaselineRouteRequirements {
         Self {
             current_rules_ver: 1,
             requires_transport_peer: false,
+            requires_prefix_caching: false,
             now_millis: 0,
             max_attestation_head_age_millis: DEFAULT_ATTESTATION_HEAD_MAX_AGE_MILLIS,
             heartbeat_ttl_millis: DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
@@ -477,6 +491,7 @@ impl From<&RequestRequirements> for BaselineRouteRequirements {
         Self {
             current_rules_ver: request.current_rules_ver,
             requires_transport_peer: request.requires_transport_peer,
+            requires_prefix_caching: request.requires_prefix_caching,
             now_millis: request.now_millis,
             max_attestation_head_age_millis: request.max_attestation_head_age_millis,
             heartbeat_ttl_millis: request.heartbeat_ttl_millis,
@@ -514,6 +529,7 @@ impl Default for RequestRequirements {
             current_rules_ver: 1,
             min_reputation: 0.0,
             requires_transport_peer: false,
+            requires_prefix_caching: false,
             requires_tools: false,
             requires_json: false,
             requires_vision: false,
@@ -696,6 +712,7 @@ impl ProviderTable {
             .filter(|value| value.is_finite() && *value >= 0.0)
         {
             observed.ewma_tok_s = Some(update_ewma(observed.ewma_tok_s, tok_s, alpha));
+            observed.throughput_observed_at_millis = Some(now_millis);
             if let Some(advertised_tok_s) = advertised_tok_s {
                 let ratio = (tok_s / advertised_tok_s).clamp(0.0, 10.0);
                 observed.ewma_throughput_ratio =
@@ -906,10 +923,17 @@ pub fn baseline_route_state(
     {
         return BaselineRouteState::HeartbeatStale;
     }
-    // The signed catalog's output-token pricing identifies generation routes.
-    // Use contract data so a heartbeat cannot evade this by hiding text capability.
-    if entry.contract.ref_rate_map.iter().chain(&entry.contract.rate_map)
-        .any(|rate| rate.unit == mayhem_proto::USAGE_OUTPUT_TOKEN)
+    // The endpoint contract identifies autoregressive generation. Its signed
+    // output-token tariff then prevents a heartbeat from evading this check by
+    // hiding text capability. Output-token billing alone is insufficient:
+    // typed decision endpoints are not KV-cache generation runtimes.
+    if requirements.requires_prefix_caching
+        && entry
+            .contract
+            .ref_rate_map
+            .iter()
+            .chain(&entry.contract.rate_map)
+            .any(|rate| rate.unit == mayhem_proto::USAGE_OUTPUT_TOKEN)
         && heartbeat.prefix_caching != Some(true)
     {
         return BaselineRouteState::PrefixCachingRequired;
@@ -1065,7 +1089,9 @@ pub fn evaluate_eligibility(
         .min_throughput
         .filter(|value| value.is_finite() && *value > 0.0)
     {
-        if effective_throughput(entry).is_some_and(|throughput| throughput < floor) {
+        if effective_throughput(entry, request.now_millis)
+            .is_some_and(|throughput| throughput < floor)
+        {
             return Err(IneligibilityReason::ThroughputFloor);
         }
     }
@@ -1275,10 +1301,19 @@ fn effective_ttft_ms(entry: &ProviderTableEntry) -> f64 {
         .unwrap_or(1.0)
 }
 
-fn effective_throughput(entry: &ProviderTableEntry) -> Option<f64> {
+fn effective_throughput(entry: &ProviderTableEntry, now_millis: u64) -> Option<f64> {
     entry
         .observed
         .ewma_tok_s
+        .filter(|_| {
+            entry
+                .observed
+                .throughput_observed_at_millis
+                .is_none_or(|observed_at| {
+                    now_millis.saturating_sub(observed_at)
+                        <= DEFAULT_THROUGHPUT_OBSERVATION_TTL_MILLIS
+                })
+        })
         .or_else(|| {
             entry
                 .heartbeat
@@ -1704,6 +1739,7 @@ mod tests {
         RequestRequirements {
             current_rules_ver: 3,
             min_reputation: 0.5,
+            requires_prefix_caching: true,
             requires_tools: true,
             requires_json: true,
             min_ctx: 4096,
@@ -2358,6 +2394,7 @@ mod tests {
         assert_eq!(entry.observed.samples, 2);
         assert_eq!(entry.observed.ewma_ttft_ms, Some(180.0));
         assert_eq!(entry.observed.ewma_tok_s, Some(48.0));
+        assert_eq!(entry.observed.throughput_observed_at_millis, Some(0));
         assert!((entry.observed.ewma_throughput_ratio.unwrap() - 1.0).abs() < 1e-12);
         assert_eq!(entry.observed.underdelivery_streak, 0);
         assert!((entry.observed.ewma_error_rate - 0.2).abs() < f64::EPSILON);
@@ -2538,20 +2575,50 @@ mod tests {
         assert!(evaluate_eligibility(&entry, &request).is_ok());
         for evidence in [None, Some(false)] {
             entry.heartbeat.as_mut().unwrap().prefix_caching = evidence;
-            assert_eq!(evaluate_eligibility(&entry, &request),
-                Err(IneligibilityReason::PrefixCachingRequired));
+            assert_eq!(
+                evaluate_eligibility(&entry, &request),
+                Err(IneligibilityReason::PrefixCachingRequired)
+            );
             // Withholding text in a heartbeat does not bypass the signed catalog.
-            entry.heartbeat.as_mut().unwrap().caps.served_modalities.clear();
-            assert_eq!(baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),
-                BaselineRouteState::PrefixCachingRequired);
+            entry
+                .heartbeat
+                .as_mut()
+                .unwrap()
+                .caps
+                .served_modalities
+                .clear();
+            assert_eq!(
+                baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),
+                BaselineRouteState::PrefixCachingRequired
+            );
         }
+        let decision_request = RequestRequirements {
+            requires_prefix_caching: false,
+            ..request.clone()
+        };
+        assert_eq!(
+            baseline_route_state(&entry, &BaselineRouteRequirements::from(&decision_request)),
+            BaselineRouteState::Live
+        );
         entry.heartbeat.as_mut().unwrap().prefix_caching = Some(true);
-        assert_eq!(baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)), BaselineRouteState::Live);
+        assert_eq!(
+            baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),
+            BaselineRouteState::Live
+        );
         // Media and embedding routes do not have an output-token tariff.
         entry.heartbeat.as_mut().unwrap().prefix_caching = None;
-        entry.contract.rate_map.retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
-        entry.contract.ref_rate_map.retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
-        assert_eq!(baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)), BaselineRouteState::Live);
+        entry
+            .contract
+            .rate_map
+            .retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
+        entry
+            .contract
+            .ref_rate_map
+            .retain(|rate| rate.unit != mayhem_proto::USAGE_OUTPUT_TOKEN);
+        assert_eq!(
+            baseline_route_state(&entry, &BaselineRouteRequirements::from(&request)),
+            BaselineRouteState::Live
+        );
     }
 
     #[test]
@@ -2915,6 +2982,20 @@ mod tests {
         );
         throughput_limited.min_throughput = Some(50.0);
         assert_eq!(evaluate_eligibility(&good, &throughput_limited), Ok(80));
+        let mut temporarily_slow = good.clone();
+        temporarily_slow.observed.ewma_tok_s = Some(2.0);
+        temporarily_slow.observed.throughput_observed_at_millis = Some(now);
+        throughput_limited.min_throughput = Some(5.0);
+        assert_eq!(
+            evaluate_eligibility(&temporarily_slow, &throughput_limited),
+            Err(IneligibilityReason::ThroughputFloor)
+        );
+        throughput_limited.now_millis = now + DEFAULT_THROUGHPUT_OBSERVATION_TTL_MILLIS + 1;
+        assert_eq!(
+            evaluate_eligibility(&temporarily_slow, &throughput_limited),
+            Ok(80),
+            "a stale local throughput sample must yield to the fresh heartbeat"
+        );
         let mut cold_start = good.clone();
         cold_start.heartbeat.as_mut().expect("heartbeat").perf.tok_s = None;
         cold_start.observed.ewma_tok_s = None;
