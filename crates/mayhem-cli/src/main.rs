@@ -56524,6 +56524,24 @@ fn stripe_fx_quote_hash(quote: &StripeFxQuote) -> Result<String> {
     })))
 }
 
+fn ensure_canonical_fiat_quote_hash(quote: &StripeFxQuote, expected: &str) -> Result<()> {
+    if stripe_fx_quote_hash(quote)? == expected {
+        return Ok(());
+    }
+    // Stripe changes lock_status on the same quote after its lock expires.
+    // Compare the immutable fields against the prepared active quote, while
+    // retaining the prepared hash for canonical settlement evidence.
+    if quote.lock_status == "expired" && quote.lock_duration != "none" && quote.expires_at.is_some()
+    {
+        let mut active = quote.clone();
+        active.lock_status = "active".to_owned();
+        if stripe_fx_quote_hash(&active)? == expected {
+            return Ok(());
+        }
+    }
+    bail!("canonical fiat attempt FX quote hash mismatch")
+}
+
 fn fiat_fx_plan_report(plan: &FiatFxPlan) -> Value {
     json!({
         "liability_au": money_au_json(plan.liability_au),
@@ -57255,11 +57273,11 @@ async fn execute_canonical_stripe_attempt(
                 retry_ms,
             )
             .await?;
-            ensure!(
-                request.get("fx_quote_hash").and_then(Value::as_str)
-                    == Some(stripe_fx_quote_hash(&quote)?.as_str()),
-                "canonical fiat attempt FX quote hash mismatch"
-            );
+            let expected_hash = request
+                .get("fx_quote_hash")
+                .and_then(Value::as_str)
+                .context("canonical fiat attempt is missing its FX quote hash")?;
+            ensure_canonical_fiat_quote_hash(&quote, expected_hash)?;
             Some(quote)
         }
         None => None,
@@ -57402,7 +57420,7 @@ async fn execute_canonical_stripe_attempt(
                     return Ok(CanonicalFiatAttemptExecution::ExpiredPreEffect {
                         evidence: stable_json_value(&json!({
                             "fx_quote_id": quote.id,
-                            "fx_quote_hash": stripe_fx_quote_hash(quote)?,
+                            "fx_quote_hash": request.get("fx_quote_hash"),
                             "quote_expires_at": quote_expires_at,
                             "error_code": "fx_quote_expired",
                             "external_effect_absent": true,
@@ -57480,7 +57498,7 @@ async fn execute_canonical_stripe_attempt(
             && destination_payment.captured,
         "Stripe destination payment did not match the canonical attempt"
     );
-    let quote_hash = quote.as_ref().map(stripe_fx_quote_hash).transpose()?;
+    let quote_hash = request.get("fx_quote_hash");
     let evidence = stable_json_value(&json!({
         "schema_version": 2,
         "kind": "stripe_transfer",
@@ -106415,6 +106433,33 @@ status: linked
             })
         );
         assert_eq!(payload["fiat"].as_object().unwrap().len(), 5);
+    }
+
+    #[test]
+    fn expired_stripe_quote_retains_its_prepared_identity() {
+        let quote = StripeFxQuote {
+            id: "fxq_test_prepared".to_owned(),
+            created: 1,
+            expires_at: Some(301),
+            lock_duration: "five_minutes".to_owned(),
+            lock_status: "active".to_owned(),
+            to_currency: "eur".to_owned(),
+            usage_type: "transfer".to_owned(),
+            usage_destination: Some("acct_provider".to_owned()),
+            rates: BTreeMap::new(),
+        };
+        let prepared_hash = stripe_fx_quote_hash(&quote).unwrap();
+        ensure_canonical_fiat_quote_hash(&quote, &prepared_hash).unwrap();
+
+        let mut expired = quote.clone();
+        expired.lock_status = "expired".to_owned();
+        ensure_canonical_fiat_quote_hash(&expired, &prepared_hash).unwrap();
+
+        expired.usage_destination = Some("acct_other".to_owned());
+        assert!(ensure_canonical_fiat_quote_hash(&expired, &prepared_hash).is_err());
+        expired.usage_destination = quote.usage_destination.clone();
+        expired.expires_at = Some(302);
+        assert!(ensure_canonical_fiat_quote_hash(&expired, &prepared_hash).is_err());
     }
 
     #[test]
