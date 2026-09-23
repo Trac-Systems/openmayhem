@@ -80856,6 +80856,97 @@ fn provider_response_error_message(error: &anyhow::Error) -> String {
         .unwrap_or_else(|| error.to_string())
 }
 
+// Opt-in, bounded diagnostics for provider output-contract failures. The full
+// error may contain tool arguments or model output, so never write it here.
+const PROVIDER_OUTPUT_DIAGNOSTIC_LIMIT: u64 = 64;
+static PROVIDER_OUTPUT_DIAGNOSTIC_EMITTED: AtomicU64 = AtomicU64::new(0);
+
+fn provider_output_diagnostic_reason(error: &anyhow::Error) -> &'static str {
+    let message = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<ProviderSessionOutputError>()
+            .map(|error| error.0.as_str())
+    });
+    match message {
+        Some(message) if message.contains("unadvertised tool call") => "unadvertised_tool",
+        Some(message) if message.contains("malformed arguments for tool") => {
+            "malformed_tool_arguments"
+        }
+        Some(message) if message.contains("non-object arguments for tool") => {
+            "non_object_tool_arguments"
+        }
+        Some(message) if message.contains("arguments that do not satisfy the schema") => {
+            "tool_schema_mismatch"
+        }
+        Some(message) if message.contains("tool call without a name") => "tool_name_missing",
+        Some(message) if message.contains("parallel_tool_calls=false") => {
+            "parallel_tool_calls_disabled"
+        }
+        Some(message) if message.contains("did not return a valid required tool call") => {
+            "required_tool_missing"
+        }
+        Some(message) if message.contains("streamed a tool call that failed final validation") => {
+            "streamed_tool_validation_mismatch"
+        }
+        Some(message) if message.contains("stopped without a visible answer") => {
+            "empty_visible_answer"
+        }
+        Some(message) if message.contains("selected session token budget") => {
+            "output_token_budget_exceeded"
+        }
+        Some(message) if message.contains("selected session byte-derived unit budget") => {
+            "output_unit_budget_exceeded"
+        }
+        Some(_) => "other_output_contract_failure",
+        None if error.chain().any(|cause| {
+            matches!(
+                cause.downcast_ref::<EngineError>(),
+                Some(EngineError::InvalidOutput(_))
+            )
+        }) =>
+        {
+            "engine_invalid_output"
+        }
+        None => "other_model_output_invalid",
+    }
+}
+
+fn take_provider_output_diagnostic_slot(counter: &AtomicU64) -> bool {
+    counter
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < PROVIDER_OUTPUT_DIAGNOSTIC_LIMIT).then_some(count + 1)
+        })
+        .is_ok()
+}
+
+fn log_provider_output_diagnostic(error: &anyhow::Error, request_id: &str) {
+    // An optional file switch lets operators turn diagnostics off immediately
+    // by removing the file, without restarting an active provider session.
+    let enabled = env::var_os("MAYHEM_PROVIDER_OUTPUT_DIAGNOSTICS").as_deref()
+        == Some(OsStr::new("1"))
+        || env::var_os("MAYHEM_PROVIDER_OUTPUT_DIAGNOSTICS_FILE")
+            .is_some_and(|path| Path::new(&path).is_file());
+    if !enabled || !take_provider_output_diagnostic_slot(&PROVIDER_OUTPUT_DIAGNOSTIC_EMITTED) {
+        return;
+    }
+    let safe_request_id = if request_id.len() <= 96
+        && request_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        request_id.to_owned()
+    } else {
+        format!(
+            "hash:{}",
+            &blake3::hash(request_id.as_bytes()).to_hex()[..16]
+        )
+    };
+    eprintln!(
+        "[provider-output] code=model_output_invalid reason={} request_id={safe_request_id}",
+        provider_output_diagnostic_reason(error),
+    );
+}
+
 async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> Result<()> {
     let mut retry_delay = ctx.heartbeat_reconnect_initial;
     while !ctx.load.is_stopped() {
@@ -81187,6 +81278,9 @@ async fn run_provider_concurrent_session_task(
     .await;
     if let Err(error) = &result {
         let error_code = provider_response_error_code(error);
+        if error_code == "model_output_invalid" {
+            log_provider_output_diagnostic(error, &request_id);
+        }
         let error_message = provider_response_error_message(error);
         let _ = send_provider_session_error(
             &mut bridge,
@@ -84933,6 +85027,9 @@ where
                         "response failed for session {session_id}: {err_text}"
                     ));
                     let error_code = provider_response_error_code_for_request(&err, &body);
+                    if error_code == "model_output_invalid" {
+                        log_provider_output_diagnostic(&err, request_id);
+                    }
                     let error_message = provider_response_error_message(&err);
                     let (usage, attribution, receipt_seq) = live_stream
                         .as_ref()
@@ -121248,6 +121345,44 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         );
         validate_streamed_tool_call_count(1, 1)
             .expect("a validated streamed tool call must remain accepted");
+    }
+
+    #[test]
+    fn provider_output_diagnostics_classify_without_exposing_model_output() {
+        let error = provider_session_output_error(
+            "provider engine did not return a valid required tool call: private model output",
+        );
+        assert_eq!(
+            provider_output_diagnostic_reason(&error),
+            "required_tool_missing"
+        );
+        let malformed = provider_session_output_error(
+            "provider engine returned malformed arguments for tool private_tool_name",
+        );
+        assert_eq!(
+            provider_output_diagnostic_reason(&malformed),
+            "malformed_tool_arguments"
+        );
+        let engine_error = anyhow::Error::new(EngineError::InvalidOutput(
+            "private argument value".to_owned(),
+        ));
+        assert_eq!(
+            provider_output_diagnostic_reason(&engine_error),
+            "engine_invalid_output"
+        );
+    }
+
+    #[test]
+    fn provider_output_diagnostics_have_a_hard_per_process_limit() {
+        let counter = AtomicU64::new(0);
+        for _ in 0..PROVIDER_OUTPUT_DIAGNOSTIC_LIMIT {
+            assert!(take_provider_output_diagnostic_slot(&counter));
+        }
+        assert!(!take_provider_output_diagnostic_slot(&counter));
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            PROVIDER_OUTPUT_DIAGNOSTIC_LIMIT
+        );
     }
 
     #[test]
