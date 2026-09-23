@@ -93955,8 +93955,19 @@ fn provider_engine_session_response_with_sampling_bounded(
         request.grammar.as_ref(),
         Some(GrammarSpec::ToolCall { .. } | GrammarSpec::JsonSchema { .. })
     );
-    let reasoning_output_mode =
-        provider_constrained_reasoning_output_mode(reasoning_output_mode, json_grammar_enforced);
+    let reasoning_output_mode = provider_constrained_reasoning_output_mode(
+        if backend.backend_id() == "openai-compatible"
+            && reasoning_output_mode == ProviderReasoningOutputMode::StripPrefilled
+        {
+            // This bridge emits <think> only when native reasoning_content is
+            // present. A content-only native reply has no prefilled thinking
+            // span; suppressing until </think> would erase its entire answer.
+            ProviderReasoningOutputMode::StripTagged
+        } else {
+            reasoning_output_mode
+        },
+        json_grammar_enforced,
+    );
     let mut reasoning_stream_filter =
         ProviderReasoningOutputFilter::with_delimiters(reasoning_output_mode, reasoning_delimiters);
     let mut tool_stream_filter = tool_mode
@@ -121640,6 +121651,47 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ),
             ProviderReasoningOutputMode::StripPrefilled
         );
+    }
+
+    #[test]
+    fn openai_compatible_reasoning_mode_preserves_content_only_answer() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "hauhaucs/qwen3.6-35b-a3b-uncensored")
+            .expect("reasoning-enabled model");
+        let body = json!({
+            "model": model.model_id,
+            "messages": [{"role": "user", "content": "answer the question"}]
+        });
+        let sealed =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+        for (native_output, expected_answer, expected_hidden) in [
+            ("public answer", "public answer", ""),
+            (
+                "<think>private</think>public answer",
+                "public answer",
+                "<think>private</think>",
+            ),
+        ] {
+            let mut backend =
+                FakeEngineBackend::new(native_output).with_backend_id("openai-compatible");
+            let output = provider_engine_session_response_with_sampling(
+                &mut backend,
+                Some(&model.model_id),
+                &model.adapter,
+                &model.sampling,
+                model.workflow.as_ref(),
+                &sealed,
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(output.content, expected_answer);
+            assert_eq!(output.reasoning_evidence, expected_hidden);
+        }
     }
 
     #[test]

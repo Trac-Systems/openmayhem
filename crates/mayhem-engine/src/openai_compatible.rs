@@ -1,5 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::net::IpAddr;
+use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -18,6 +21,59 @@ use crate::{
 
 const BACKEND_ID: &str = "openai-compatible";
 const REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const OUTPUT_SHAPE_DIAGNOSTIC_LIMIT: u64 = 64;
+static OUTPUT_SHAPE_DIAGNOSTIC_EMITTED: AtomicU64 = AtomicU64::new(0);
+
+fn output_shape_diagnostics_enabled() -> bool {
+    std::env::var_os("MAYHEM_PROVIDER_OUTPUT_DIAGNOSTICS").as_deref() == Some(OsStr::new("1"))
+        || std::env::var_os("MAYHEM_PROVIDER_OUTPUT_DIAGNOSTICS_FILE")
+            .is_some_and(|path| Path::new(&path).is_file())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct NativeResponseShape {
+    finish_reason: &'static str,
+    content_bytes: usize,
+    reasoning_bytes: usize,
+    tool_calls: usize,
+    // SSE arguments are fragments. Validate only the complete string after
+    // joining the native fragments for each tool-call index.
+    fragment_bytes_match: bool,
+    native_arguments_valid_json: bool,
+    envelope_arguments_valid_json: bool,
+}
+
+impl NativeResponseShape {
+    fn anomalous(self) -> bool {
+        !self.native_arguments_valid_json
+            || !self.envelope_arguments_valid_json
+            || (self.content_bytes == 0 && self.tool_calls == 0)
+    }
+}
+
+fn log_native_response_shape(shape: NativeResponseShape) {
+    if !shape.anomalous() || !output_shape_diagnostics_enabled() {
+        return;
+    }
+    if OUTPUT_SHAPE_DIAGNOSTIC_EMITTED
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+            (count < OUTPUT_SHAPE_DIAGNOSTIC_LIMIT).then_some(count + 1)
+        })
+        .is_err()
+    {
+        return;
+    }
+    eprintln!(
+        "[provider-output-shape] finish_reason={} content_bytes={} reasoning_bytes={} tool_calls={} fragment_bytes_match={} native_arguments_valid_json={} envelope_arguments_valid_json={}",
+        shape.finish_reason,
+        shape.content_bytes,
+        shape.reasoning_bytes,
+        shape.tool_calls,
+        shape.fragment_bytes_match,
+        shape.native_arguments_valid_json,
+        shape.envelope_arguments_valid_json,
+    );
+}
 const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(45);
 const ALLOWED_CAPABILITIES: &[&str] = &[
     "cancellation",
@@ -1262,6 +1318,12 @@ async fn stream_completion_attempt(
             if let Some(data) = line.strip_prefix("data:") {
                 let data = data.trim();
                 if data == "[DONE]" {
+                    if output_shape_diagnostics_enabled()
+                        && OUTPUT_SHAPE_DIAGNOSTIC_EMITTED.load(Ordering::Relaxed)
+                            < OUTPUT_SHAPE_DIAGNOSTIC_LIMIT
+                    {
+                        log_native_response_shape(collector.response_shape());
+                    }
                     let unexecuted_reasoning_tool_call =
                         collector.unexecuted_reasoning_tool_call(body);
                     let advertised_reasoning_tool_call =
@@ -1298,6 +1360,7 @@ struct StreamCollector {
     tool_calls: BTreeMap<usize, ToolCallAccumulator>,
     usage: UsageCounters,
     finish_reason: Option<FinishReason>,
+    native_finish_reason: Option<&'static str>,
 }
 
 #[derive(Default)]
@@ -1305,9 +1368,47 @@ struct ToolCallAccumulator {
     id: String,
     name: String,
     arguments: String,
+    argument_fragment_bytes: usize,
 }
 
 impl StreamCollector {
+    fn response_shape(&self) -> NativeResponseShape {
+        let native_arguments_valid_json = self.tool_calls.values().all(|call| {
+            serde_json::from_str::<Value>(&call.arguments)
+                .is_ok_and(|arguments| arguments.is_object())
+        });
+        // Check the escaped envelope delivered to Core separately from the
+        // native SSE argument string. The fragment byte count proves that the
+        // stream join did not drop bytes; neither check retains argument text.
+        let envelope_arguments_valid_json = self.tool_calls.values().all(|call| {
+            serde_json::to_string(&json!({
+                "tool_calls": [{"function": {"arguments": call.arguments}}]
+            }))
+            .ok()
+            .and_then(|envelope| serde_json::from_str::<Value>(&envelope).ok())
+            .and_then(|parsed| {
+                parsed["tool_calls"][0]["function"]["arguments"]
+                    .as_str()
+                    .map(str::to_owned)
+            })
+            .is_some_and(|arguments| {
+                serde_json::from_str::<Value>(&arguments).is_ok_and(|value| value.is_object())
+            })
+        });
+        NativeResponseShape {
+            finish_reason: self.native_finish_reason.unwrap_or("missing"),
+            content_bytes: self.text.len(),
+            reasoning_bytes: self.reasoning.len(),
+            tool_calls: self.tool_calls.len(),
+            fragment_bytes_match: self
+                .tool_calls
+                .values()
+                .all(|call| call.argument_fragment_bytes == call.arguments.len()),
+            native_arguments_valid_json,
+            envelope_arguments_valid_json,
+        }
+    }
+
     fn unexecuted_reasoning_tool_call(&self, body: &Value) -> bool {
         if !self.tool_calls.is_empty()
             || !self.text.trim().is_empty()
@@ -1356,6 +1457,13 @@ impl StreamCollector {
             .flatten()
         {
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
+                self.native_finish_reason = Some(match reason {
+                    "stop" => "stop",
+                    "length" => "length",
+                    "tool_calls" => "tool_calls",
+                    "content_filter" => "content_filter",
+                    _ => "other",
+                });
                 self.finish_reason = Some(if reason == "length" {
                     FinishReason::Length
                 } else {
@@ -1415,6 +1523,9 @@ impl StreamCollector {
                         target.name.push_str(name);
                     }
                     if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                        target.argument_fragment_bytes = target
+                            .argument_fragment_bytes
+                            .saturating_add(arguments.len());
                         target.arguments.push_str(arguments);
                     }
                 }
@@ -2455,6 +2566,49 @@ mod tests {
         assert!(!collector.advertised_reasoning_tool_call(&body));
         collector.finish_reason = Some(FinishReason::Length);
         assert!(collector.unexecuted_reasoning_tool_call(&body));
+    }
+
+    #[test]
+    fn native_response_shape_checks_completed_sse_arguments_without_content() {
+        let (events, _receiver) = mpsc::channel();
+        let mut collector = StreamCollector::default();
+        for delta in [
+            json!({"choices":[{"delta":{"reasoning_content":"thinking"}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"probe","arguments":"{\"value\":"}}]}}]}),
+            json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}),
+            json!({"choices":[{"delta":{},"finish_reason":"tool_calls"}]}),
+        ] {
+            collector.push(delta, &events).unwrap();
+        }
+        assert_eq!(
+            collector.response_shape(),
+            NativeResponseShape {
+                finish_reason: "tool_calls",
+                content_bytes: 0,
+                reasoning_bytes: 8,
+                tool_calls: 1,
+                fragment_bytes_match: true,
+                native_arguments_valid_json: true,
+                envelope_arguments_valid_json: true,
+            }
+        );
+        collector.tool_calls.get_mut(&0).unwrap().arguments.pop();
+        let invalid = collector.response_shape();
+        assert!(!invalid.fragment_bytes_match);
+        assert!(!invalid.native_arguments_valid_json);
+        assert!(!invalid.envelope_arguments_valid_json);
+        assert!(invalid.anomalous());
+
+        let mut native_incomplete = StreamCollector::default();
+        native_incomplete
+            .push(
+                json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"probe","arguments":"{\"value\":1"}}]}}]}),
+                &events,
+            )
+            .unwrap();
+        let malformed_from_sse = native_incomplete.response_shape();
+        assert!(malformed_from_sse.fragment_bytes_match);
+        assert!(!malformed_from_sse.native_arguments_valid_json);
     }
 
     #[test]
