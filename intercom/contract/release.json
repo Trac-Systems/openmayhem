@@ -1,12 +1,12 @@
 {
   "schema": 1,
-  "release_version": "0.2.197",
-  "contract_version": 25,
-  "contract_code_sha256": "cf2d19a4a4d36d7f08af86ee01fbbf90ad3734ef5b9ab7075445768f557d599c",
+  "release_version": "0.2.263",
+  "contract_version": 28,
+  "contract_code_sha256": "15bdb5d131993e499fdab5c601245237a32c5eadacc6a52d010be5ecca45eb98",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "70f956c9163f6cfaea90a31197204785e74f54562b16cca816ee9faacbd2a087"
+      "sha256": "61615e2185e1ab7468991e455576cb4afd4b65828124feb5b8b606fede174981"
     },
     {
       "path": "contract/history/v23.js",
@@ -17,12 +17,24 @@
       "sha256": "695c8010aa8f61fcedeb277f4251f0c6bd670bdb1c2a133b2da175900f45dd08"
     },
     {
+      "path": "contract/history/v25.js",
+      "sha256": "31d570bd8ab6e89b469e67f1d035f1cb943ff99ded8ed7824b490841ed733a4a"
+    },
+    {
+      "path": "contract/history/v26.js",
+      "sha256": "ebf21e882b387d83b8dd85011b3800eecea2b4c22e418ad4bef1fc9a6157b33c"
+    },
+    {
+      "path": "contract/history/v27.js",
+      "sha256": "72435496d4b37ebde029349369ac15d3072defb0d35348f5d91006e810e63d2f"
+    },
+    {
       "path": "contract/protocol.js",
       "sha256": "2ea38037623ddb799222f6958835fcd2c5a45de6ef1dcbac3dfe3c6e2449906b"
     },
     {
       "path": "features/mayhem/index.js",
-      "sha256": "89fe96672e71e9df3c4cfcf275addd0f69b75a8518e6cef51c2941fc4028db9f"
+      "sha256": "10f189b71763014d77bd100506b3596c8aad1b49a01d160d32ab60f9b0af53af"
     },
     {
       "path": "trac/trac-peer/src/artifacts/contract.js",

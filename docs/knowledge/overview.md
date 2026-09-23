@@ -18,8 +18,8 @@ OpenMayhem is a peer-to-peer AI inference marketplace on Trac Network. Users poi
 OpenAI-compatible client at a local gateway (`127.0.0.1:11435`) and buy inference directly from
 provider machines over encrypted P2P; an admin-only replicated contract on an Intercom subnet holds
 the catalog, prices, balances, and settlement. Everything is priced in dollars (`au_usd`, atto-USD).
-Nobody sets the running price — the admin seeds each per-enclave market once, then a
-activity-momentum controller floats it. Four attestation tiers (software, TPM device identity,
+Nobody sets the running price — the admin seeds each per-enclave market once, then an
+absolute-utilization controller floats it. Four attestation tiers (software, TPM device identity,
 confidential compute, KYB business), each its own priced market, back trust with evidence: signed
 receipts, canary probes, holdbacks, and permissionless fraud proofs. Three isolated payment rails
 (Stripe, Ethereum/TAP, Trac/TNK) carry value but never mix; providers keep 85% on fiat/TNK and

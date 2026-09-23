@@ -95,15 +95,21 @@ const makePrice = (overrides = {}) => ({
   ...overrides,
 });
 
-const makeMarketUsage = (demandAu, sessionCount, overrides = {}) => ({
-  enclave_id: enclaveId,
-  ctx_bracket: priceCtxBracket,
-  ctx_bracket_table_ver: priceCtxBracketTableVer,
-  demand_au: auString(demandAu),
-  session_count: sessionCount,
-  provider_count: 1,
-  ...overrides,
-});
+const makeMarketUsage = (demandAu, sessionCount, overrides = {}) => {
+  const providerCount = overrides.provider_count ?? 1;
+  return {
+    enclave_id: enclaveId,
+    ctx_bracket: priceCtxBracket,
+    ctx_bracket_table_ver: priceCtxBracketTableVer,
+    demand_au: auString(demandAu),
+    session_count: sessionCount,
+    provider_count: providerCount,
+    compute_ms: auString(1_800_000 * providerCount),
+    capacity_slot_count: providerCount,
+    legacy_receipt_count: 0,
+    ...overrides,
+  };
+};
 
 async function setupRegisteredEnclave() {
   const provider = await makeIdentity();
@@ -117,18 +123,6 @@ async function setupRegisteredEnclave() {
     model_class: 'text-generation',
     rate_map: textRateMap(20, 60),
   });
-  await storage.put('params/market_provider_epoch_target_au', {
-    key: 'market_provider_epoch_target_au',
-    current: {
-      value: '1000000',
-      ver: 1,
-      submitted_at: 0,
-      effective_at: 0,
-      set_at: null,
-    },
-    pending: null,
-  });
-
   for (const op of [
     {
       type: 'setRules',
@@ -380,7 +374,7 @@ test('MayhemContract bills multimodal LLM input through token rates only', async
   assert.match(doubleBill.message, /unit image is not allowed for model_class text-generation/i);
 });
 
-test('MayhemContract epochApply keeps cold-start markets pinned to the admin seed', async () => {
+test('MayhemContract epochApply keeps mid-utilization markets at the current price', async () => {
   const { contract, storage, provider, admin } = await setupRegisteredEnclave();
   const user = await makeIdentity();
 
@@ -421,12 +415,11 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
       ctx_bracket: priceCtxBracket,
       ctx_bracket_table_ver: priceCtxBracketTableVer,
       ver: 2,
-      momentum_bps: 10_000,
-      activity_rate: null,
-      ema_activity_rate: null,
+      utilization_bps: 5_000,
+      multiplier_bps: 10_000,
       active_supply: 1,
       active_demand_au: '10000000',
-      frozen: true,
+      frozen: false,
       derivation_hash: '<hash>',
     }
   );
@@ -435,17 +428,18 @@ test('MayhemContract epochApply keeps cold-start markets pinned to the admin see
 
   const schedule = await storage.get(priceKey);
   assert.equal(schedule.value.current.ver, 2);
-  assert.equal(schedule.value.current.price_source, 'market_activity_hold');
+  assert.equal(schedule.value.current.price_source, 'market_utilization');
   assert.deepEqual(schedule.value.current.rate_map, textRateMap(18, 55));
   const priceRoot = (await storage.get('ev/price/1')).value;
   assert.equal(priceRoot.merkle_root, applied.price_root);
   assert.equal(priceRoot.price_count, 1);
   const derivation = (await storage.get(priceEvidenceKey)).value;
   assert.equal(derivation.price_root, applied.price_root);
-  assert.equal(derivation.controller.frozen, true);
+  assert.equal(derivation.controller.utilization_bps, 5_000);
+  assert.equal(derivation.controller.multiplier_bps, 10_000);
 });
 
-test('MayhemContract epochApply counts settled-work supply, not idle joined wallets', async () => {
+test('MayhemContract epochApply uses signed execution capacity, not idle joined wallets', async () => {
   const { contract, storage, provider, admin } = await setupRegisteredEnclave();
   const user = await makeIdentity();
   const idleProvider = await makeIdentity();
@@ -481,26 +475,14 @@ test('MayhemContract epochApply counts settled-work supply, not idle joined wall
   );
   assert.equal(applied.ok, true, applied.message);
   assert.equal(applied.market_prices[0].active_supply, 1);
-  assert.equal(applied.market_prices[0].frozen, true);
+  assert.equal(applied.market_prices[0].utilization_bps, 5_000);
+  assert.equal(applied.market_prices[0].frozen, false);
 
   const derivation = (await storage.get(priceEvidenceKey)).value;
   assert.equal(derivation.controller.active_supply, 1);
-  assert.equal(derivation.controller.frozen, true);
-});
-
-
-
-test('MayhemContract market price math supports sub-micro atto price steps', async () => {
-  const { contract } = await setupRegisteredEnclave();
-  const qwenEmbeddingPerTokenAu = '10000000';
-  const next = contract.stepPriceTerm(qwenEmbeddingPerTokenAu, '10001000', {
-    gain_bps: 5_000,
-    max_step_bps: 1,
-  });
-
-  assert.equal(next, '10000500');
-  assert.ok(BigInt(next) > BigInt(qwenEmbeddingPerTokenAu));
-  assert.ok(BigInt(next) - BigInt(qwenEmbeddingPerTokenAu) < BigInt(qwenEmbeddingPerTokenAu) / 10_000n);
+  assert.equal(derivation.usage.capacity_slot_count, 1);
+  assert.equal(derivation.usage.compute_ms, '1800000');
+  assert.equal(derivation.controller.utilization_bps, 5_000);
 });
 
 test('MayhemContract keeps context brackets as independent price markets', async () => {
@@ -580,13 +562,8 @@ test('MayhemContract keeps context brackets as independent price markets', async
   assert.equal(shortDerivation.price_root, longDerivation.price_root);
 });
 
-test('MayhemContract market price derivation uses active admin-tuned epoch params', async () => {
-  const { contract, storage, provider, admin } = await setupRegisteredEnclave();
-  const user = await makeIdentity();
-  const providerTwo = await makeIdentity();
-
-  const seeded = await execute(contract, storage, 'setPrice', makePrice(), admin.publicKey, 5);
-  assert.equal(seeded.ok, true, seeded.message);
+test('MayhemContract rejects retired momentum controller parameters', async () => {
+  const { contract, storage, admin } = await setupRegisteredEnclave();
   const tuned = await execute(
     contract,
     storage,
@@ -601,50 +578,9 @@ test('MayhemContract market price derivation uses active admin-tuned epoch param
       },
     },
     admin.publicKey,
-    6
+    5
   );
-  assert.equal(tuned.ok, true, tuned.message);
-  const joined = await execute(
-    contract,
-    storage,
-    'joinEnclave',
-    providerJoin,
-    provider.publicKey,
-    7
-  );
-  assert.equal(joined.ok, true, joined.message);
-  await registerAndJoinExtraProvider(contract, storage, admin, providerTwo, 8);
-  await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000_000));
-
-  const applyValue = {
-    op: 'epoch_apply',
-    epoch: 1,
-    at: DAY_SECONDS + 1,
-    debits: [{ rail: 'fiat', user: user.publicKey, au: '2000000' }],
-    earnings: [
-      { rail: 'fiat', provider: provider.publicKey, gross_au: '1000000' },
-      { rail: 'fiat', provider: providerTwo.publicKey, gross_au: '1000000' },
-    ],
-    market_usage: [makeMarketUsage(2_000_000, 4, { provider_count: 2 })],
-  };
-  await seedSpendHoldsForApply(storage, applyValue);
-  const applied = await executeEpochApplyFeature(
-    contract,
-    storage,
-    applyValue,
-    admin.publicKey
-  );
-  assert.equal(applied.ok, true, applied.message);
-  const derivation = (await storage.get(priceEvidenceKey)).value;
-  assert.deepEqual(derivation.controller.constants, {
-    schema_version: 2,
-    ema_alpha_bps: 2_500,
-    gain_bps: 10_000,
-    max_step_bps: 10_000,
-    max_momentum_bps: 50_000,
-  });
-  assert.equal(derivation.controller.momentum_bps, 10_000);
-  assert.equal(derivation.controller.frozen_reason, 'missing_canonical_activity');
+  assert.match(tuned.message, /market_gain_bps is deprecated and read-only/i);
 });
 
 
@@ -737,12 +673,11 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
       ctx_bracket: priceCtxBracket,
       ctx_bracket_table_ver: priceCtxBracketTableVer,
       ver: 2,
-      momentum_bps: 10_000,
-      activity_rate: null,
-      ema_activity_rate: null,
+      utilization_bps: 5_000,
+      multiplier_bps: 10_000,
       active_supply: 2,
       active_demand_au: '1000000',
-      frozen: true,
+      frozen: false,
       derivation_hash: applied.market_prices[0].derivation_hash,
     },
   ]);
@@ -750,7 +685,7 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
 
   const schedule = await storage.get(priceKey);
   assert.equal(schedule.value.current.ver, 2);
-  assert.equal(schedule.value.current.price_source, 'market_activity_hold');
+  assert.equal(schedule.value.current.price_source, 'market_utilization');
   assert.equal(await storage.get(`price/${enclaveId}/fiat`), null);
   assert.equal(await storage.get(`price/${enclaveId}/tap`), null);
   assert.equal(await storage.get(`price/${enclaveId}`), null);

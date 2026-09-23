@@ -2333,6 +2333,65 @@ test('MayhemContract admin verifies and revokes provider KYB without raw documen
   );
   assert.match(regrantRevokedIdentity.message, /kyb identity is banned or revoked/i);
   assert.equal(await storage.get(`kyb/${replacement.publicKey}`), null);
+
+  const nonAdminKybUnban = await execute(
+    contract,
+    storage,
+    'unban',
+    {
+      op: 'unban',
+      target_type: 'kyb',
+      target: provider.publicKey,
+      reason_hash: 'c'.repeat(64),
+    },
+    provider.publicKey,
+    13
+  );
+  assert.match(nonAdminKybUnban.message, /admin required/i);
+
+  const restoredKybIdentity = await execute(
+    contract,
+    storage,
+    'unban',
+    {
+      op: 'unban',
+      target_type: 'kyb',
+      target: provider.publicKey,
+      reason_hash: 'c'.repeat(64),
+    },
+    admin.publicKey,
+    14
+  );
+  assert.deepEqual(restoredKybIdentity, {
+    ok: true,
+    op: 'unban',
+    target_type: 'kyb',
+    target: provider.publicKey,
+  });
+  const kybBanKeys = await contract.kybBanIndexKeys(revokedKyb.value);
+  assert.equal(kybBanKeys.length, 3);
+  for (const key of kybBanKeys) {
+    const record = await storage.get(key);
+    assert.equal(record.value.status, 'unbanned');
+    assert.equal(record.value.unbanned_by, admin.publicKey);
+    assert.equal(record.value.unban_reason_hash, 'c'.repeat(64));
+  }
+
+  const reverified = await execute(
+    contract,
+    storage,
+    'setProviderKyb',
+    signedKyb,
+    admin.publicKey,
+    15
+  );
+  assert.deepEqual(reverified, {
+    ok: true,
+    op: 'setProviderKyb',
+    provider: provider.publicKey,
+    att_tier: 4,
+  });
+  assert.equal((await storage.get(`kyb/${provider.publicKey}`)).value.status, 'verified');
 });
 
 test('MayhemContract lets providers narrow but never invent admin speciality levels', async () => {

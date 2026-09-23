@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "model_id": "Qwen/Qwen3-Embedding-4B",
+  "artifact_root": "e228d4e36517c331c3ddf034753cf974a7f73d2ac3dd0be4ef145722eccdc26c",
+  "runtime": "vllm-0.24.0",
+  "platform": "linux-nvidia-gb10",
+  "task": "embedding",
+  "independent_dispatch": true,
+  "request_modalities": [
+    [
+      "embedding"
+    ]
+  ],
+  "scheduler": {
+    "max_num_seqs": 8,
+    "max_num_batched_tokens": 32768,
+    "memory_utilization": 0.13
+  },
+  "proven_capacity": {
+    "concurrent_requests": 8,
+    "items_per_concurrent_request": 32,
+    "max_inflight_items": 256,
+    "max_items_per_request": 128,
+    "max_sized_concurrent_requests": 2,
+    "max_input_tokens_including_internal_token": 32768
+  },
+  "evidence": {
+    "performance_benchmark": {
+      "path": "qwen3-embedding-4b-vllm-benchmark.json",
+      "sha256": "1c271e018273a46549ca9b5f35d9d26b8ffb293b4661cfa8da11744731068d4b"
+    },
+    "cancellation_recovery": {
+      "path": "qwen3-embedding-4b-cancellation.json",
+      "sha256": "928a4aeb7f1412e302b34c26d0ee30cc359a3ac260d5653a2dfc264c729099ea"
+    },
+    "reference_equivalence": {
+      "path": "qwen3-embedding-4b-reference-compare.json",
+      "sha256": "1eef40cec37ba00eae1db319bc93b0a33fa1b8278719fe8d98cc2c10fafac691"
+    },
+    "large_batch_benchmark": {
+      "path": "qwen3-embedding-4b-large-batch-benchmark.json",
+      "sha256": "db4d1ae1bda0aaf9650d7e5fe595b141f7d842021b8b5475f5fe2a03de015e8d"
+    }
+  }
+}

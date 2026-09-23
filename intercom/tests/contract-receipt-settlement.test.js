@@ -360,6 +360,7 @@ async function moveReservationsToLegacyHold(ctx, reservations, { txNo = 60 } = {
 }
 
 function receiptValue(ctx, reservation, {
+  schemaVersion = SESSION_RECEIPT_SCHEMA_VERSION,
   seq = 1,
   final = false,
   usage = { input_token: 10 },
@@ -371,7 +372,7 @@ function receiptValue(ctx, reservation, {
 } = {}) {
   const voucher = reservation.value.voucher;
   const body = {
-    schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+    schema_version: schemaVersion,
     session_id: voucher.session_id,
     billing_id: voucher.billing_id,
     billing_attempt: voucher.billing_attempt,
@@ -394,6 +395,7 @@ function receiptValue(ctx, reservation, {
     locked_per_req_au: voucher.locked_per_req_au,
     locked_min_session_au: voucher.locked_min_session_au,
     served_ctx: voucher.served_ctx,
+    ...(schemaVersion >= 12 ? { compute_ms: 1_000, capacity_slots: 1 } : {}),
     ctx_bracket: voucher.ctx_bracket,
     ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
     rules_ver: voucher.rules_ver,
@@ -906,10 +908,33 @@ test('non-final receipt heads stay unindexed until the final head becomes settle
     /sequence conflicts/i
   );
 
+  const computeRegression = receiptValue(ctx, reservation, {
+    seq: 2,
+    usage: { input_token: 15 },
+    auOwedCum: '150',
+    bodyOverrides: { compute_ms: 999 },
+  });
+  assert.match(
+    (await submitReceipt(ctx, computeRegression)).result.message,
+    /not monotonic/i
+  );
+
+  const capacityChange = receiptValue(ctx, reservation, {
+    seq: 2,
+    usage: { input_token: 15 },
+    auOwedCum: '150',
+    bodyOverrides: { compute_ms: 2_000, capacity_slots: 2 },
+  });
+  assert.match(
+    (await submitReceipt(ctx, capacityChange)).result.message,
+    /immutable attempt terms/i
+  );
+
   const advanced = receiptValue(ctx, reservation, {
     seq: 2,
     usage: { input_token: 15 },
     auOwedCum: '150',
+    bodyOverrides: { compute_ms: 2_000 },
   });
   const second = await submitReceipt(ctx, advanced);
   assert.equal(second.result.ok, true, second.result.message);
@@ -924,6 +949,7 @@ test('non-final receipt heads stay unindexed until the final head becomes settle
     final: true,
     usage: { input_token: 20 },
     auOwedCum: '200',
+    bodyOverrides: { compute_ms: 3_000 },
   });
   const finalized = await submitReceipt(ctx, final);
   assert.equal(finalized.result.ok, true, finalized.result.message);
@@ -1625,6 +1651,8 @@ test('atomic commit plus page zero safely replaces an unapplied stale commit', a
     demand_au: '20',
     session_count: 2,
     provider_count: 1,
+    compute_ms: '2000',
+    capacity_slot_count: 1,
   }];
   const falseMarketPage = structuredClone(page1);
   falseMarketPage.market_usage[0].session_count = 1;
@@ -1667,7 +1695,7 @@ test('atomic commit plus page zero safely replaces an unapplied stale commit', a
   }, ctx.admin.publicKey, 301);
   assert.equal(empty.ok, true, empty.message);
   const dormant = (await ctx.storage.get(`price/${ENCLAVE_ID}/le8k`)).value.current;
-  assert.equal(dormant.rate_map[0].per_unit_au, '9');
+  assert.equal(dormant.rate_map[0].per_unit_au, '8');
   assert.deepEqual(dormant.market.settled_usage, {});
 });
 
@@ -1905,11 +1933,13 @@ test('canonical receipt metadata rejects count and revision overflow', async () 
 });
 
 
-test('v25 settles retained v23/v24 context receipts without rewriting signatures or billing', async () => {
-  for (const contractVersion of [23, 24, CONTRACT_VERSION]) {
+test('v27 settles retained v23-v26 schema-11 receipts without rewriting signatures or billing', async () => {
+  for (const contractVersion of [23, 24, 25, 26, CONTRACT_VERSION]) {
     const ctx = await setupContract();
     const reservation = await submitReservation(ctx);
     const value = receiptValue(ctx, reservation, {
+      schemaVersion: contractVersion === CONTRACT_VERSION ?
+        SESSION_RECEIPT_SCHEMA_VERSION : 11,
       final: true,
       bodyOverrides: { usage_attribution: { context_input_tokens: 1200 } },
       outerOverrides: { contract_version: contractVersion },
@@ -1942,16 +1972,17 @@ test('v25 settles retained v23/v24 context receipts without rewriting signatures
       const rewritten = { ...recovered, contract_version: CONTRACT_VERSION };
       const rejected = await submitReceipt(ctx, rewritten);
       assert.notEqual(rejected.result.ok, true);
-      assert.match(rejected.result.message, /signature/i);
+      assert.match(rejected.result.message, /schema|signature/i);
     }
   }
 });
 
-test('v24 context recovery bounds telemetry and admits no other legacy operations', async () => {
+test('prior-version context recovery bounds telemetry and admits no other legacy operations', async () => {
   const ctx = await setupContract();
   const reservation = await submitReservation(ctx);
   for (const count of [0, -1, 1.5, 8193, Number.MAX_SAFE_INTEGER + 1]) {
     const invalid = receiptValue(ctx, reservation, {
+      schemaVersion: 11,
       final: true,
       bodyOverrides: { usage_attribution: { context_input_tokens: count } },
       outerOverrides: { contract_version: 23 },
@@ -1974,7 +2005,7 @@ test('v24 context recovery bounds telemetry and admits no other legacy operation
   assert.match(rejected.message, /contract version/i);
 });
 
-test('v25 price fraud proof pins signed canonical work and survives later calibration changes', async () => {
+test('activity-price fraud proof pins signed canonical work and survives later calibration changes', async () => {
   const ctx = await setupContract();
   const reservation = await submitReservation(ctx);
   const receipt = await submitReceipt(ctx, receiptValue(ctx, reservation, { final: true }));

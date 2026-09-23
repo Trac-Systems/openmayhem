@@ -30,6 +30,7 @@ const lock = readJson(lockfilePath);
 const npmrc = fs.readFileSync(npmrcPath, 'utf8');
 const materializerPath = path.join(root, 'scripts', 'materialize-local-dependencies.mjs');
 const { verifyLocalDependencies } = await import(pathToFileURL(materializerPath).href);
+const requiredHyperdhtVersion = '6.29.6';
 
 if (!/^\s*install-links\s*=\s*true\s*(?:[#;].*)?$/m.test(npmrc)) {
   fail(`${npmrcPath} must set install-links=true`);
@@ -42,6 +43,56 @@ if (Object.prototype.hasOwnProperty.call(manifest.overrides ?? {}, 'trac-wallet'
 }
 if (lock.lockfileVersion !== 3 || typeof lock.packages !== 'object') {
   fail('root package-lock.json must use lockfileVersion 3');
+}
+if (manifest.dependencies?.hyperdht !== requiredHyperdhtVersion) {
+  fail(`root dependencies must pin hyperdht to ${requiredHyperdhtVersion}`);
+}
+
+const msbSourceManifest = readJson(path.join(root, 'trac', 'msb', 'package.json'));
+const msbSourceLock = readJson(path.join(root, 'trac', 'msb', 'package-lock.json'));
+const peerSourceManifest = readJson(path.join(root, 'trac', 'trac-peer', 'package.json'));
+const peerSourceLock = readJson(path.join(root, 'trac', 'trac-peer', 'package-lock.json'));
+if (msbSourceManifest.dependencies?.hyperdht !== requiredHyperdhtVersion) {
+  fail(`pinned trac-msb source must pin hyperdht to ${requiredHyperdhtVersion}`);
+}
+if (peerSourceManifest.dependencies?.hyperdht !== requiredHyperdhtVersion) {
+  fail(`pinned trac-peer source must pin hyperdht to ${requiredHyperdhtVersion}`);
+}
+if (peerSourceManifest.dependencies?.['trac-msb'] !== 'file:../msb') {
+  fail('pinned trac-peer source must follow the sibling pinned trac-msb source');
+}
+
+const assertSingleLockedHyperdht = (candidate, label) => {
+  if (candidate.lockfileVersion !== 3 || typeof candidate.packages !== 'object') {
+    fail(`${label} must use lockfileVersion 3`);
+  }
+  const paths = Object.keys(candidate.packages).filter(
+    (entry) => entry === 'node_modules/hyperdht' || entry.endsWith('/node_modules/hyperdht'),
+  );
+  if (paths.length !== 1 || paths[0] !== 'node_modules/hyperdht') {
+    fail(`${label} must resolve exactly one root hyperdht, found: ${paths.join(', ')}`);
+  }
+  if (candidate.packages[paths[0]]?.version !== requiredHyperdhtVersion) {
+    fail(`${label} must resolve hyperdht ${requiredHyperdhtVersion}`);
+  }
+};
+
+assertSingleLockedHyperdht(lock, 'root package-lock.json');
+assertSingleLockedHyperdht(msbSourceLock, 'pinned trac-msb package-lock.json');
+assertSingleLockedHyperdht(peerSourceLock, 'pinned trac-peer package-lock.json');
+
+const lockedBuses = Object.keys(lock.packages).filter(
+  (entry) => entry === 'node_modules/trac-msb' || entry.endsWith('/node_modules/trac-msb'),
+);
+if (lockedBuses.length !== 1 || lockedBuses[0] !== 'node_modules/trac-msb') {
+  fail(`root lock must resolve exactly one trac-msb, found: ${lockedBuses.join(', ')}`);
+}
+if (lock.packages['node_modules/trac-msb']?.dependencies?.hyperdht !== requiredHyperdhtVersion) {
+  fail(`installed trac-msb metadata must pin hyperdht ${requiredHyperdhtVersion}`);
+}
+if (lock.packages['node_modules/trac-peer']?.dependencies?.hyperdht !== requiredHyperdhtVersion ||
+    lock.packages['node_modules/trac-peer']?.dependencies?.['trac-msb'] !== 'file:../msb') {
+  fail('installed trac-peer metadata must follow the pinned hyperdht and sibling trac-msb sources');
 }
 
 const localPackages = [
@@ -140,6 +191,20 @@ const visitNodeModules = (directory) => {
 };
 
 visitNodeModules(path.join(root, 'node_modules'));
+
+const hyperdhtPackages = installedPackages.filter(
+  ({ manifest: packageManifest }) => packageManifest.name === 'hyperdht',
+);
+const expectedHyperdhtRoot = path.join(root, 'node_modules', 'hyperdht');
+if (hyperdhtPackages.length !== 1 || hyperdhtPackages[0].root !== expectedHyperdhtRoot) {
+  fail(
+    `runtime must contain exactly one root hyperdht, found: ` +
+    hyperdhtPackages.map(({ root: packageRoot }) => packageRoot).join(', '),
+  );
+}
+if (hyperdhtPackages[0].manifest.version !== requiredHyperdhtVersion) {
+  fail(`runtime hyperdht must be ${requiredHyperdhtVersion}`);
+}
 
 const walletRoot = path.join(root, 'node_modules', 'trac-wallet');
 const walletRoots = new Map([

@@ -26,7 +26,7 @@ async function canonicalBundle(count, {
   for (const ordinal of order) {
     const billingId = hex(ordinal);
     const body = {
-      schema_version: 11,
+      schema_version: 12,
       session_id: hex(10_000 + ordinal),
       billing_id: billingId,
       billing_attempt: 0,
@@ -47,6 +47,8 @@ async function canonicalBundle(count, {
       locked_per_req_au: '0',
       locked_min_session_au: '0',
       served_ctx: 1024,
+      compute_ms: 1_800_000,
+      capacity_slots: 1,
       ctx_bracket: 'le32k',
       ctx_bracket_table_ver: 1,
       rules_ver: 1,
@@ -148,6 +150,22 @@ test('v17 recompute preserves insertion-order snapshots and emits targeted field
       'user',
     ]);
   }
+});
+
+test('v27 recompute preserves a legacy receipt and marks utilization incomplete', async () => {
+  const bundle = await canonicalBundle(1, {
+    mutateBody: (body) => {
+      body.schema_version = 11;
+      delete body.compute_ms;
+      delete body.capacity_slots;
+    },
+  });
+  const result = await recomputeEpoch(bundle);
+  const usage = result.apply_pages.at(-1).market_usage[0];
+  assert.equal(usage.session_count, 1);
+  assert.equal(usage.legacy_receipt_count, 1);
+  assert.equal(usage.compute_ms, '0');
+  assert.equal(usage.capacity_slot_count, 0);
 });
 
 test('v17 recompute pages more than 1000 exact receipt heads without peers', async () => {

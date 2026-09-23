@@ -22,8 +22,8 @@ export const BPS = 10_000n;
 export const PROVIDER_BPS = 7_500n;
 export const OPERATOR_BPS = 1_500n;
 const PROVIDER_CAP_TOLERANCE_WEI = 0n;
-const SESSION_RECEIPT_SCHEMA_VERSION = 11;
-const SETTLEMENT_RECEIPT_SCHEMA_VERSIONS = new Set([10, SESSION_RECEIPT_SCHEMA_VERSION]);
+const SESSION_RECEIPT_SCHEMA_VERSION = 12;
+const SETTLEMENT_RECEIPT_SCHEMA_VERSIONS = new Set([10, 11, SESSION_RECEIPT_SCHEMA_VERSION]);
 const SIGNING_MESSAGE_VERSION = 2;
 const DEFAULT_TAP_CHALLENGE_EPOCHS = 6;
 const CONTRACT_VERSION = 19;
@@ -313,6 +313,8 @@ export function canonicalReceiptBody(body) {
     locked_min_session_au: body.locked_min_session_au,
     served_ctx: body.served_ctx,
   };
+  if (hasOwn(body, 'compute_ms')) canonical.compute_ms = body.compute_ms;
+  if (hasOwn(body, 'capacity_slots')) canonical.capacity_slots = body.capacity_slots;
   if (hasOwn(body, 'ctx_bracket')) canonical.ctx_bracket = body.ctx_bracket;
   if (hasOwn(body, 'ctx_bracket_table_ver')) canonical.ctx_bracket_table_ver = body.ctx_bracket_table_ver;
   canonical.rules_ver = body.rules_ver;
@@ -355,6 +357,17 @@ export function verifyReceiptEnvelope(envelope) {
     throw new Error(
       `receipt schema_version must be one of ${Array.from(SETTLEMENT_RECEIPT_SCHEMA_VERSIONS).join(', ')}`
     );
+  }
+  if (body.schema_version === SESSION_RECEIPT_SCHEMA_VERSION) {
+    if (!Number.isSafeInteger(body.compute_ms) || body.compute_ms < 1) {
+      throw new Error('schema-12 receipt compute_ms must be a positive safe integer');
+    }
+    if (!Number.isSafeInteger(body.capacity_slots) || body.capacity_slots < 1 ||
+        body.capacity_slots > 1_000_000) {
+      throw new Error('schema-12 receipt capacity_slots must be an integer from 1 to 1000000');
+    }
+  } else if (hasOwn(body, 'compute_ms') || hasOwn(body, 'capacity_slots')) {
+    throw new Error('legacy receipt schemas cannot contain utilization fields');
   }
   if (body.rail !== 'tap') throw new Error('TAP settlement receipt rail must be tap');
   for (const field of ['session_id', 'model_id', 'prompt_hash']) {

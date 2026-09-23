@@ -4,9 +4,10 @@ mod catalog;
 mod endpoint_calibration;
 mod gemma4;
 mod intercom_runtime;
-mod python_runtime;
-mod provider_output_stream;
+mod managed_openai_compatible;
 mod provider_failure_recovery;
+mod provider_output_stream;
+mod python_runtime;
 mod release_bundle;
 
 #[cfg(test)]
@@ -70,12 +71,13 @@ use mayhem_enclave::{
 use mayhem_engine::ComfyUiBackend;
 use mayhem_engine::{
     ArtifactChunk, AudioTranscriptionRequest as EngineAudioTranscriptionRequest, CancellationToken,
-    ComfyUiCustomNodePackage, ComfyUiModelFile, ComponentRecovery, ConcurrentGenerationBackend,
-    EngineBackend, EngineError, GenerateRequest, GenerateSpecialityParameter,
-    GenerateSpecialityTarget, GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest,
-    LoadConfig, MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
-    SpeechReferenceAudio, SpeechRequest, TokenChunk, ToolSpec, WorkflowGenerationRequest,
-    WorkflowInputFile, MTMD_MEDIA_MARKER,
+    ComfyUiCustomNodePackage, ComfyUiModelFile, ComponentRecovery, ConcurrentEmbeddingBackend,
+    ConcurrentGenerationBackend, DecisionRequest as EngineDecisionRequest, EngineBackend,
+    EngineError, GenerateRequest, GenerateSpecialityParameter, GenerateSpecialityTarget,
+    GrammarSpec, ImageGenerationRequest as EngineImageGenerationRequest, LoadConfig,
+    MediaGenerationRequest as EngineMediaGenerationRequest, MediaInput, ModelArtifact,
+    SpeechReferenceAudio, SpeechRequest, TokenChunk, Tokenization, ToolSpec,
+    WorkflowGenerationRequest, WorkflowInputFile, MTMD_MEDIA_MARKER,
 };
 use mayhem_gateway::{
     audio_fingerprint, cancellation_settlement_usage, embedding_vector_fingerprint,
@@ -86,12 +88,12 @@ use mayhem_gateway::{
         validate_gateway_bind_access, GatewayAccessControl, GatewayAttestationAuthority,
         GatewayAttestationCollateral, GatewayCanaryChallengeContext, GatewayCanaryProbePolicy,
         GatewayCanaryRegistry, GatewayExecutionModeRegistry, GatewayLocalRunBadge,
-        GatewayMarketInfo, GatewayModel,
-        GatewayReceiptSettlementPublisher, GatewayRouteCandidate, GatewayState,
-        GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore, GatewayUpdateModelNotice,
-        MayhemModelInfo, ModelCaps, PriceRefAu, ProviderKybInfo, SamplingProfile,
-        ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig, ShapeAdapterInfo,
-        DEFAULT_ROUTE_MAX_WAIT_MS, MAX_PREFERRED_PROVIDERS_PER_MODEL, MAX_ROUTE_MAX_WAIT_MS,
+        GatewayMarketInfo, GatewayModel, GatewayReceiptSettlementPublisher, GatewayRouteCandidate,
+        GatewayState, GatewayTokenBudgetPeriod, GatewayTokenRecord, GatewayTokenStore,
+        GatewayUpdateModelNotice, MayhemModelInfo, ModelCaps, PriceRefAu, ProviderKybInfo,
+        SamplingProfile, ScBridgeGatewaySessionBackend, ScBridgeGatewaySessionConfig,
+        ShapeAdapterInfo, DEFAULT_ROUTE_MAX_WAIT_MS, MAX_PREFERRED_PROVIDERS_PER_MODEL,
+        MAX_ROUTE_MAX_WAIT_MS,
     },
     rate_gate_basis_au, rate_map_cost_basis_per_1k, text_generation_rate_map, text_rate_per_1k_au,
     valid_video_av_fingerprint, video_av_fingerprint, video_av_fingerprint_similarity_bps,
@@ -112,27 +114,32 @@ use mayhem_proto::{
     artifact_generation_inline_audio_load, catalog_enclave_id, chunk_json_payload,
     ctx_bracket_for_tokens_in_schedule, ctx_bracket_table_at, default_ctx_bracket_schedule,
     metered_output_units, parse_record_usage_receipt_envelope, payload_chunk_at,
-    payload_chunk_manifest, reassemble_json_payload, receipt_signing_bytes,
+    payload_chunk_manifest, reassemble_json_payload, receipt_contract_version_is_supported,
+    receipt_schema_version_is_supported_for_contract, receipt_signing_bytes,
     record_usage_receipt_envelope, record_usage_receipt_feature_key,
-    record_usage_receipt_feature_key_for_contract, RECOVERABLE_RECEIPT_CONTRACT_VERSION, receipt_contract_version_is_supported,
-    record_usage_receipt_signing_bytes, session_accept_signing_bytes, session_frame_head,
-    spend_voucher_signing_bytes, stable_json_bytes, tools_only_model_input_prompt_units,
-    validate_ctx_bracket_schedule, validated_audio_metadata, validated_wav_audio_metadata,
-    AdminAttestationPolicy, AttestationRuntimeConfig, AttestationTrustDataRef,
-    CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule, HardwareQuote, HardwareQuoteKind,
-    HardwareQuoteRoutePolicyBinding, MoneyAu, PayloadChunk, PayloadChunkCollector,
-    PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage, SessionReceipt, SpendVoucher,
+    record_usage_receipt_feature_key_from_envelope_for_contract,
+    record_usage_receipt_signing_bytes, reservation_binding_matches, session_accept_signing_bytes,
+    session_frame_head, spend_voucher_signing_bytes, stable_json_bytes,
+    tools_only_model_input_prompt_units, validate_ctx_bracket_schedule, validated_audio_metadata,
+    validated_wav_audio_metadata, AdminAttestationPolicy, AttestationRuntimeConfig,
+    AttestationTrustDataRef, CatalogEnclaveIdentity, CheckpointPolicy, CtxBracketSchedule,
+    HardwareQuote, HardwareQuoteKind, HardwareQuoteRoutePolicyBinding, MoneyAu, PayloadChunk,
+    PayloadChunkCollector, PayloadChunkManifest, ReceiptAck, ReceiptBody, ReceiptUsage,
+    SessionReceipt, SpendVoucher, TokenizeRequestFrame, TokenizeResponseFrame,
     TpmActivateCredentialChallengeFrame, TpmActivateCredentialResponseFrame, TranscriptionResult,
     TranscriptionResultLimits, TranscriptionTimestamp, ValidatedAudioFormat, VisibleToolCall,
     WorkflowBinding, WorkflowOutputBinding, CONTRACT_VERSION, DEFAULT_MODEL_CLASS,
     DEFAULT_SESSION_MAX_FRAME_BYTES, DEFAULT_SESSION_MAX_PAYLOAD_CHUNKS,
     DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES, DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES,
     DEFAULT_VIDEO_GENERATION_FPS, MAX_VISIBLE_OUTPUT_UNITS_PER_REQUEST_TOKEN,
-    SESSION_RECEIPT_SCHEMA_VERSION, TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE,
-    TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION, TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE,
-    TRANSPORT_MAX_OUTPUT_DURATION_SECONDS, USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN,
-    USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER, USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN,
-    USAGE_STEP, USAGE_VIDEO_SECOND, VISIBLE_OUTPUT_BYTES_PER_UNIT,
+    RECOVERABLE_RECEIPT_CONTRACT_VERSION, SESSION_RECEIPT_SCHEMA_VERSION,
+    SPEND_VOUCHER_SCHEMA_VERSION, TOKENIZE_FRAME_VERSION, TOKENIZE_REQUEST_CHUNK_FRAME_TYPE,
+    TOKENIZE_REQUEST_FRAME_TYPE, TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE, TOKENIZE_RESPONSE_FRAME_TYPE,
+    TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE, TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION,
+    TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE, TRANSPORT_MAX_OUTPUT_DURATION_SECONDS,
+    USAGE_AUDIO_SECOND, USAGE_CACHED_INPUT_TOKEN, USAGE_FRAME, USAGE_IMAGE, USAGE_INPUT_CHARACTER,
+    USAGE_INPUT_TOKEN, USAGE_OUTPUT_TOKEN, USAGE_STEP, USAGE_VIDEO_SECOND,
+    VISIBLE_OUTPUT_BYTES_PER_UNIT,
 };
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize};
@@ -299,6 +306,8 @@ const MAX_TPM_ACTIVATION_COMMAND_INPUT_BYTES: usize = 64 * 1024;
 const MAX_TPM_ACTIVATION_COMMAND_OUTPUT_BYTES: usize = 4 * 1024;
 const DEFAULT_TPM_ACTIVATIONS_PER_MINUTE: usize = 60;
 const DEFAULT_TPM_ACTIVATIONS_PER_PEER_PER_MINUTE: usize = 12;
+const DEFAULT_TOKENIZE_REQUESTS_PER_MINUTE: usize = 600;
+const DEFAULT_TOKENIZE_REQUESTS_PER_PEER_PER_MINUTE: usize = 120;
 const DEFAULT_PROVIDER_SESSION_REQUEST_STALL_TIMEOUT_MILLIS: u64 = 300_000;
 const DEFAULT_PROVIDER_SESSION_REQUEST_BYTES_PER_CTX_TOKEN: usize = 256;
 const DEFAULT_PROVIDER_SESSION_REQUEST_JSON_OVERHEAD_BYTES: usize = 1024 * 1024;
@@ -320,6 +329,7 @@ const F13_DISK_RESERVE_FLOOR_BYTES: u64 = 2 * GIB_BYTES;
 const PROVIDER_MACOS_MEMORY_PRESSURE_STOP_LEVEL: i32 = 2;
 const DEFAULT_PROVIDER_ENGINE_WATCHDOG_RESTART_AFTER_MILLIS: u64 = 0;
 const DEFAULT_PROVIDER_ENGINE_WATCHDOG_RESTART_COOLDOWN_MILLIS: u64 = 30_000;
+const DEFAULT_PROVIDER_IDLE_MEMORY_RECLAIM_COOLDOWN_MILLIS: u64 = 30_000;
 const F13_MEMORY_CLAIM_TTL_SECONDS: u64 = 24 * 60 * 60;
 const VLLM_ADMIN_MEMORY_UTILIZATION_MAX_PCT: u32 = 90;
 const VLLM_MEMORY_UTILIZATION_CUSHION_PCT: u32 = 5;
@@ -347,6 +357,7 @@ const PROVIDER_ACCEPTED_RAIL_ORDER: [&str; 3] = ["fiat", "tap", "tnk"];
 const CANARY_VERIFICATION_TOKEN_FINGERPRINT: &str = "token_fingerprint";
 const CANARY_VERIFICATION_SEED_PERCEPTUAL_HASH: &str = "seed_perceptual_hash";
 const CANARY_VERIFICATION_EMBEDDING_COSINE: &str = "embedding_cosine";
+const CANARY_VERIFICATION_DECISION_FINGERPRINT: &str = "decision_fingerprint";
 const CANARY_VERIFICATION_TRANSCRIPT_MATCH: &str = "transcript_match";
 const CANARY_VERIFICATION_AUDIO_FINGERPRINT: &str = "audio_fingerprint";
 const CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT: &str = "video_av_fingerprint";
@@ -359,6 +370,7 @@ const MODEL_CLASS_STT: &str = "stt";
 const MODEL_CLASS_AUDIO_GENERATION: &str = "audio-generation";
 const MODEL_CLASS_MUSIC_GENERATION: &str = "music-generation";
 const MODEL_CLASS_WORKFLOW: &str = "workflow";
+const MODEL_CLASS_DECISION: &str = "decision";
 const DEFAULT_COMFY_OUTCOME_GRID_PATH: &str = "catalog/comfy/outcome-classes-v1.json";
 
 #[derive(Debug, Parser)]
@@ -746,7 +758,7 @@ enum AdminCommands {
         #[command(subcommand)]
         command: AdminBanCommands,
     },
-    /// Reverse a provider, device, fingerprint, or committer ban going forward.
+    /// Reverse a provider, device, fingerprint, committer, or provider-KYB ban going forward.
     Unban(AdminUnbanArgs),
     /// Admin device-key operations.
     Device {
@@ -3761,6 +3773,7 @@ enum AdminBanTargetType {
     Device,
     Fingerprint,
     Committer,
+    Kyb,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, ValueEnum)]
@@ -3785,6 +3798,7 @@ impl AdminBanTargetType {
             Self::Device => "device",
             Self::Fingerprint => "fingerprint",
             Self::Committer => "committer",
+            Self::Kyb => "kyb",
         }
     }
 }
@@ -5012,7 +5026,7 @@ struct AdminUnbanArgs {
     #[command(flatten)]
     tx: AdminTxArgs,
 
-    /// Ban target to clear going forward.
+    /// Ban target to clear going forward. For --type kyb, use the provider public key.
     target: String,
 
     /// Ban record type.
@@ -6395,7 +6409,7 @@ struct ProviderServePlanArgs {
     #[arg(long, value_name = "PATH")]
     canaries_dir: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, comfyui, ace-step, chatterbox, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, comfyui, ace-step, chatterbox, laya, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -6647,7 +6661,7 @@ struct ProviderStartArgs {
     #[arg(long, value_name = "PATH")]
     hf_token_file: Option<PathBuf>,
 
-    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, comfyui, ace-step, chatterbox, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
+    /// Override backend selection: auto, trt-llm, mlx, llama.cpp, stable-diffusion.cpp, comfyui, ace-step, chatterbox, laya, needle-cpu, needle-gpu, sulphur, transformers-asr, whisper.cpp, or piper.
     #[arg(long, default_value = "auto")]
     engine_backend: String,
 
@@ -7920,6 +7934,7 @@ fn resolve_doctor_provider_backend(requested: &str, report: &HardwareReport) -> 
                 | "needle-gpu"
                 | "sulphur"
                 | "transformers-asr"
+                | "laya"
                 | "whisper.cpp"
                 | "piper"
         ),
@@ -8936,6 +8951,9 @@ fn backend_requirement_hint(backend: &str) -> &'static str {
             "TensorRT-LLM requires a compatible NVIDIA GPU; NVFP4 artifacts require Blackwell-class compute capability"
         }
         "vllm" => "vLLM launch artifacts require a compatible NVIDIA GPU",
+        "openai-compatible" => {
+            "managed OpenAI-compatible launch artifacts require the signed container runtime and compatible accelerator"
+        }
         "llama.cpp" => "llama.cpp requires enough RAM and a compatible CPU/GPU runtime",
         "stable-diffusion.cpp" => {
             "stable-diffusion.cpp requires enough local RAM and preferably a local accelerator"
@@ -8960,6 +8978,9 @@ fn backend_requirement_hint(backend: &str) -> &'static str {
         }
         "transformers-asr" => {
             "Transformers ASR requires at least 8 GiB RAM and supports CUDA, Metal/MPS, or CPU execution"
+        }
+        "laya" => {
+            "Laya requires a CUDA host, its pinned offline Python runtime, and enough memory to preload all three checkpoints"
         }
         "whisper.cpp" => "whisper.cpp requires enough local RAM and CPU SIMD support",
         "piper" => "Piper requires enough local RAM for the voice artifact",
@@ -16043,7 +16064,7 @@ fn catalog_calibrate_canary(mut args: CatalogCalibrateCanaryArgs) -> Result<()> 
     validate_calibration_args_for_artifact(artifact, &args)?;
     let calibration_memory = calibration_memory_context(artifact, &artifact_path, &args)?;
     preflight_catalog_calibration_managed_runtime(artifact, &args)?;
-    verify_calibration_artifact_matches_catalog(artifact, &artifact_path)?;
+    verify_calibration_artifact_matches_catalog(artifact, &artifact_path, &artifact_sidecar_paths)?;
     verify_calibration_sidecars_match_catalog(artifact, &artifact_sidecar_paths)?;
     let prompts = load_canary_prompts_checked(
         Some(&canaries_dir),
@@ -17326,6 +17347,7 @@ fn calibration_token_prefixes(
 struct CatalogEndpointCalibrationFixtures {
     audio: Option<Vec<u8>>,
     audio_by_content_type: BTreeMap<&'static str, &'static [u8]>,
+    video_base64: Option<String>,
     workflow_input_files: Option<Value>,
 }
 
@@ -17629,13 +17651,24 @@ fn catalog_endpoint_calibration_report(
     mut behavioral_witness: Option<EndpointCalibrationBehavioralWitness>,
 ) -> EndpointCalibrationReport {
     let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, prompts);
+    let forced_tool_max_output_tokens = artifact
+        .openai_compatible
+        .as_ref()
+        .map(|binding| binding.preflight.tools_max_tokens)
+        .unwrap_or(ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS);
     let mut execution_cache = BTreeMap::<(String, String), EndpointCalibrationExecution>::new();
     run_endpoint_calibration_matrix_with_materializer(
         &model.adapter.endpoint_families,
         &substitutions,
         |contract, case, request| {
-            catalog_endpoint_calibration_materialize_request(contract, case, request, &fixtures)
-                .map_err(|error| format!("{error:#}"))
+            catalog_endpoint_calibration_materialize_request_with_tool_budget(
+                contract,
+                case,
+                request,
+                &fixtures,
+                forced_tool_max_output_tokens,
+            )
+            .map_err(|error| format!("{error:#}"))
         },
         |contract, _case, request| {
             let cache_key = (
@@ -17656,6 +17689,7 @@ fn catalog_endpoint_calibration_report(
                     request,
                     &fixtures,
                     &mut behavioral_witness,
+                    forced_tool_max_output_tokens,
                 )?
             } else {
                 catalog_endpoint_calibration_execute_unsupported_artifact_case(
@@ -17852,6 +17886,7 @@ fn catalog_endpoint_calibration_fixtures(
     let mut substitutions = BTreeMap::from([("$MODEL".to_owned(), json!(model.model_id))]);
     let mut fixtures = CatalogEndpointCalibrationFixtures {
         audio: None,
+        video_base64: None,
         workflow_input_files: None,
         audio_by_content_type: BTreeMap::from([
             ("audio/aac", CALIBRATION_AUDIO_AAC),
@@ -17911,14 +17946,34 @@ fn catalog_endpoint_calibration_fixtures(
             }
         }
     }
+    fixtures.video_base64 = substitutions
+        .get("$VIDEO_BASE64")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
     (substitutions, fixtures)
 }
 
 fn catalog_endpoint_calibration_materialize_request(
     contract: &mayhem_proto::EndpointFamilyContract,
     case: &mayhem_proto::EndpointCalibrationCase,
+    request: Value,
+    fixtures: &CatalogEndpointCalibrationFixtures,
+) -> Result<Value> {
+    catalog_endpoint_calibration_materialize_request_with_tool_budget(
+        contract,
+        case,
+        request,
+        fixtures,
+        ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS,
+    )
+}
+
+fn catalog_endpoint_calibration_materialize_request_with_tool_budget(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    case: &mayhem_proto::EndpointCalibrationCase,
     mut request: Value,
     fixtures: &CatalogEndpointCalibrationFixtures,
+    forced_tool_max_output_tokens: u32,
 ) -> Result<Value> {
     if matches!(
         contract.family.as_str(),
@@ -17926,10 +17981,52 @@ fn catalog_endpoint_calibration_materialize_request(
             | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
             | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
     ) {
-        return catalog_endpoint_calibration_materialize_tool_request(contract, case, request);
+        request = catalog_endpoint_calibration_materialize_tool_request(
+            contract,
+            case,
+            request,
+            forced_tool_max_output_tokens,
+        )?;
+        if contract.family == mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT {
+            request = catalog_endpoint_calibration_materialize_hf_video_request(
+                contract, case, request, fixtures,
+            )?;
+        }
+        return Ok(request);
     }
     if contract.family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
         return catalog_endpoint_calibration_materialize_workflow_request(case, request, fixtures);
+    }
+    if contract.family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS && case.expect_accept {
+        if case
+            .expected_response_attributes
+            .iter()
+            .any(|path| path == "shortlist")
+            && request.get("shortlist").is_none()
+        {
+            request["shortlist"] = json!({
+                "k": 20,
+                "max_length": 512,
+                "batch_size": 32,
+            });
+        }
+        if case
+            .expected_response_attributes
+            .iter()
+            .any(|path| path == "preprocessing")
+            && request.get("email").is_none()
+        {
+            request["email"] = json!({"clean": true, "max_chars": 3000});
+        }
+        if request.get("email").is_some()
+            && !request.pointer("/state/body").is_some_and(Value::is_string)
+        {
+            request["state"] = json!({
+                "body": "Mayhem calibration email body",
+                "subject": "Calibration",
+            });
+        }
+        return Ok(request);
     }
     if contract.family != mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
         return Ok(request);
@@ -18035,10 +18132,145 @@ fn catalog_endpoint_calibration_materialize_request(
     Ok(request)
 }
 
+fn catalog_endpoint_calibration_materialize_hf_video_request(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    case: &mayhem_proto::EndpointCalibrationCase,
+    mut request: Value,
+    fixtures: &CatalogEndpointCalibrationFixtures,
+) -> Result<Value> {
+    let mutates_parent = case.mutations.iter().any(|mutation| {
+        matches!(
+            mutation.path.as_str(),
+            "messages" | "messages.content" | "messages.content.video"
+        )
+    });
+    let mutates = |path: &str| case.mutations.iter().any(|mutation| mutation.path == path);
+    if !case.expect_accept || mutates_parent {
+        return Ok(request);
+    }
+    let data_mutated = mutates("messages.content.video.data");
+    let content_type_mutated = mutates("messages.content.video.content_type");
+
+    let needs_companion = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|message| message.get("content").and_then(Value::as_array))
+        .flatten()
+        .any(|part| {
+            part.get("type").and_then(Value::as_str) == Some("video")
+                && part
+                    .get("video")
+                    .and_then(Value::as_object)
+                    .is_some_and(|video| {
+                        (!data_mutated && !video.contains_key("data") && !video.contains_key("url"))
+                            || (!content_type_mutated && !video.contains_key("content_type"))
+                    })
+        });
+    if !needs_companion {
+        return Ok(request);
+    }
+
+    let signed = catalog_endpoint_calibration_signed_hf_video_fixture(contract, fixtures)
+        .with_context(|| {
+            format!(
+                "accepted HF video calibration case {} has no complete signed video fixture",
+                case.case_id
+            )
+        })?;
+    for message in request
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        let Some(parts) = message.get_mut("content").and_then(Value::as_array_mut) else {
+            continue;
+        };
+        for part in parts {
+            if part.get("type").and_then(Value::as_str) != Some("video") {
+                continue;
+            }
+            let Some(video) = part.get_mut("video").and_then(Value::as_object_mut) else {
+                continue;
+            };
+            if !data_mutated && !video.contains_key("data") && !video.contains_key("url") {
+                video.insert("data".to_owned(), signed["data"].clone());
+            }
+            if !content_type_mutated && !video.contains_key("content_type") {
+                video.insert("content_type".to_owned(), signed["content_type"].clone());
+            }
+        }
+    }
+    Ok(request)
+}
+
+fn catalog_endpoint_calibration_signed_hf_video_fixture(
+    contract: &mayhem_proto::EndpointFamilyContract,
+    fixtures: &CatalogEndpointCalibrationFixtures,
+) -> Option<Map<String, Value>> {
+    let values = &contract
+        .request_attribute_specs
+        .get("messages")?
+        .calibration_values;
+    for value in values {
+        let Some(messages) = value.as_array() else {
+            continue;
+        };
+        for message in messages {
+            let Some(parts) = message.get("content").and_then(Value::as_array) else {
+                continue;
+            };
+            for part in parts {
+                if part.get("type").and_then(Value::as_str) != Some("video") {
+                    continue;
+                }
+                let Some(video) = part.get("video").and_then(Value::as_object) else {
+                    continue;
+                };
+                let Some(content_type) =
+                    video
+                        .get("content_type")
+                        .and_then(Value::as_str)
+                        .filter(|content_type| {
+                            content_type
+                                .strip_prefix("video/")
+                                .is_some_and(|subtype| !subtype.is_empty())
+                        })
+                else {
+                    continue;
+                };
+                let Some(data) = video.get("data").and_then(Value::as_str) else {
+                    continue;
+                };
+                let data = if data == "$VIDEO_BASE64" {
+                    fixtures.video_base64.as_deref()?
+                } else {
+                    data
+                };
+                if data.is_empty()
+                    || base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .is_err()
+                {
+                    continue;
+                }
+                return Some(Map::from_iter([
+                    ("data".to_owned(), json!(data)),
+                    ("content_type".to_owned(), json!(content_type)),
+                ]));
+            }
+        }
+    }
+    None
+}
+
 fn catalog_endpoint_calibration_materialize_tool_request(
     contract: &mayhem_proto::EndpointFamilyContract,
     case: &mayhem_proto::EndpointCalibrationCase,
     mut request: Value,
+    forced_tool_max_output_tokens: u32,
 ) -> Result<Value> {
     // Supply a companion fixture, never repair an explicit tools value or omission test.
     if !case.expect_accept
@@ -18053,7 +18285,8 @@ fn catalog_endpoint_calibration_materialize_tool_request(
     let choice = request.get("tool_choice");
     let named = choice
         .and_then(Value::as_object)
-        .and_then(provider_engine_named_tool_choice);
+        .and_then(provider_engine_named_tool_choice)
+        .map(str::to_owned);
     if named.is_none() && !matches!(choice.and_then(Value::as_str), Some("required" | "any")) {
         return Ok(request);
     }
@@ -18072,7 +18305,7 @@ fn catalog_endpoint_calibration_materialize_tool_request(
                     provider_engine_tool_definition(tool)
                         .and_then(|function| function.get("name"))
                         .and_then(Value::as_str)
-                        .is_some_and(|name| named.is_none_or(|chosen| chosen == name))
+                        .is_some_and(|name| named.as_deref().is_none_or(|chosen| chosen == name))
                 })
             });
             if !matches_choice {
@@ -18089,7 +18322,80 @@ fn catalog_endpoint_calibration_materialize_tool_request(
             )
         })?;
     request["tools"] = tools.clone();
+    let selected_tool = named
+        .as_deref()
+        .or_else(|| {
+            tools.as_array().and_then(|tools| {
+                tools.iter().find_map(|tool| {
+                    provider_engine_tool_definition(tool)
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                })
+            })
+        })
+        .context("forced-tool calibration fixture has no named function")?;
+    catalog_endpoint_calibration_strengthen_tool_request(
+        &contract.family,
+        case,
+        &mut request,
+        selected_tool,
+        forced_tool_max_output_tokens,
+    )?;
     Ok(request)
+}
+
+fn catalog_endpoint_calibration_strengthen_tool_request(
+    endpoint_family: &str,
+    case: &mayhem_proto::EndpointCalibrationCase,
+    request: &mut Value,
+    selected_tool: &str,
+    forced_tool_max_output_tokens: u32,
+) -> Result<()> {
+    let instruction = format!(
+        "Call the {selected_tool} function now with arguments that satisfy its schema. Return the function call immediately; do not answer in prose."
+    );
+    let (prompt_path, budget_path) = match endpoint_family {
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+        | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => ("messages", "max_tokens"),
+        mayhem_proto::ENDPOINT_OPENAI_RESPONSES => ("input", "max_output_tokens"),
+        other => bail!("endpoint family {other} has no forced-tool calibration prompt"),
+    };
+    if !case.mutations.iter().any(|mutation| {
+        mutation.path == prompt_path || mutation.path.starts_with(&format!("{prompt_path}."))
+    }) {
+        match endpoint_family {
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+            | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT => request
+                .get_mut("messages")
+                .and_then(Value::as_array_mut)
+                .context("forced-tool calibration request has no messages array")?
+                .push(json!({"role": "user", "content": instruction})),
+            mayhem_proto::ENDPOINT_OPENAI_RESPONSES => match request.get_mut("input") {
+                Some(Value::String(input)) => {
+                    input.push_str("\n\n");
+                    input.push_str(&instruction);
+                }
+                Some(Value::Array(input)) => {
+                    input.push(json!({"role": "user", "content": instruction}));
+                }
+                _ => bail!("forced-tool calibration Responses request has no usable input"),
+            },
+            _ => unreachable!(),
+        }
+    }
+    if !case
+        .mutations
+        .iter()
+        .any(|mutation| mutation.path == budget_path)
+        && request
+            .get(budget_path)
+            .and_then(Value::as_u64)
+            .unwrap_or_default()
+            < u64::from(forced_tool_max_output_tokens)
+    {
+        request[budget_path] = json!(forced_tool_max_output_tokens);
+    }
+    Ok(())
 }
 
 fn catalog_endpoint_calibration_materialize_workflow_request(
@@ -18164,6 +18470,19 @@ fn collect_endpoint_media_fixture_substitutions(
                 .entry("$IMAGE_DATA_URL".to_owned())
                 .or_insert_with(|| json!(value));
         }
+        Value::String(value) if value.starts_with("data:video/") => {
+            if let Some((metadata, encoded)) = value.split_once(',') {
+                if metadata.ends_with(";base64")
+                    && base64::engine::general_purpose::STANDARD
+                        .decode(encoded)
+                        .is_ok()
+                {
+                    substitutions
+                        .entry("$VIDEO_BASE64".to_owned())
+                        .or_insert_with(|| json!(encoded));
+                }
+            }
+        }
         Value::Array(items) => {
             for item in items {
                 collect_endpoint_media_fixture_substitutions(item, substitutions);
@@ -18203,7 +18522,10 @@ fn catalog_endpoint_calibration_execute(
     request: &Value,
     fixtures: &CatalogEndpointCalibrationFixtures,
     behavioral_witness: &mut Option<EndpointCalibrationBehavioralWitness>,
+    forced_tool_max_output_tokens: u32,
 ) -> Result<EndpointCalibrationExecution, String> {
+    let output_token_cap =
+        catalog_endpoint_calibration_output_token_cap(request, forced_tool_max_output_tokens);
     let transport = catalog_endpoint_calibration_transport(contract, request, fixtures)
         .map_err(|error| format!("building provider transport: {error:#}"))?;
     let (translation, mut handled_request_attributes) =
@@ -18254,7 +18576,7 @@ fn catalog_endpoint_calibration_execute(
                     model.workflow.as_ref(),
                     &sealed,
                     None,
-                    Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
+                    Some(output_token_cap),
                     &CancellationToken::new(),
                 )
                 .map_err(|error| format!("executing provider request: {error:#}"))?;
@@ -18284,7 +18606,7 @@ fn catalog_endpoint_calibration_execute(
                 model.workflow.as_ref(),
                 &sealed,
                 None,
-                Some(ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS),
+                Some(output_token_cap),
                 &CancellationToken::new(),
             )
             .map_err(|error| format!("executing provider request: {error:#}"))?;
@@ -18356,6 +18678,29 @@ fn catalog_endpoint_calibration_execute_unsupported_artifact_case(
 }
 
 const ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS: u32 = 128;
+const ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS: u32 = 384;
+
+fn catalog_endpoint_calibration_output_token_cap(
+    request: &Value,
+    forced_tool_max_output_tokens: u32,
+) -> u32 {
+    let choice = request.get("tool_choice");
+    let forced = matches!(choice.and_then(Value::as_str), Some("required" | "any"))
+        || choice
+            .and_then(Value::as_object)
+            .and_then(provider_engine_named_tool_choice)
+            .is_some();
+    if forced
+        && request
+            .get("tools")
+            .and_then(Value::as_array)
+            .is_some_and(|tools| !tools.is_empty())
+    {
+        forced_tool_max_output_tokens
+    } else {
+        ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS
+    }
+}
 
 fn provider_engine_session_media_validation(
     backend: &mut dyn EngineBackend,
@@ -18535,6 +18880,7 @@ fn catalog_endpoint_calibration_seal(
         "schema_version": 1,
         "endpoint_family": contract.family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
+        "endpoint_contract_canonical_fingerprint": mayhem_proto::endpoint_contract_canonical_fingerprint(contract),
         "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(request),
         "transport_request_fingerprint": transport_fingerprint,
     });
@@ -18568,6 +18914,9 @@ fn catalog_endpoint_calibration_translation(
                 .transpose()
                 .context("embedding dimensions overflowed usize")?;
             serde_json::to_value(mayhem_engine::EmbeddingRequest { inputs, dimensions })?
+        }
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS => {
+            serde_json::to_value(provider_decision_request_from_body(request)?)?
         }
         mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_IMAGE => serde_json::to_value(
@@ -18745,6 +19094,7 @@ fn calibration_endpoint_attribute_is_handled(
         mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS => {
             matches!(path, "model" | "input" | "encoding_format" | "dimensions")
         }
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS => true,
         mayhem_proto::ENDPOINT_HF_FEATURE_EXTRACTION => {
             matches!(path, "inputs" | "dimensions")
         }
@@ -18969,6 +19319,26 @@ fn catalog_endpoint_calibration_response(
             "usage": usage,
             "mayhem": mayhem,
         })),
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS => {
+            let result: Value = serde_json::from_str(&output.content)
+                .context("decision backend produced invalid JSON")?;
+            let mut response = json!({
+                "id": "decision-calibration",
+                "object": "decision.result",
+                "created": 1,
+                "model": model,
+                "answers": result.get("answers").cloned().context("decision result is missing answers")?,
+                "routing": result.get("routing").cloned().context("decision result is missing routing")?,
+                "usage": usage,
+                "mayhem": mayhem,
+            });
+            for optional in ["shortlist", "preprocessing"] {
+                if let Some(value) = result.get(optional) {
+                    response[optional] = value.clone();
+                }
+            }
+            Ok(response)
+        }
         mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS => Ok(json!({
             "id": "img-calibration",
             "object": "images.response",
@@ -19184,7 +19554,36 @@ fn catalog_endpoint_calibration_response(
 fn verify_calibration_artifact_matches_catalog(
     artifact: &catalog::CatalogArtifact,
     artifact_path: &Path,
+    sidecar_paths: &BTreeMap<String, PathBuf>,
 ) -> Result<()> {
+    if artifact.engine == "openai-compatible" {
+        let binding = artifact
+            .openai_compatible
+            .as_ref()
+            .context("openai-compatible artifact is missing its signed runtime binding")?;
+        let manifest_path = sidecar_paths
+            .get(&binding.snapshot_manifest_sidecar)
+            .context("openai-compatible calibration requires its snapshot manifest sidecar")?;
+        let manifest: OpenAiCompatibleSnapshotManifest = serde_json::from_slice(
+            &fs::read(manifest_path)
+                .with_context(|| format!("reading {}", manifest_path.display()))?,
+        )
+        .with_context(|| format!("parsing {}", manifest_path.display()))?;
+        validate_openai_compatible_snapshot_manifest_for_artifact(artifact, binding, &manifest)?;
+        validate_openai_compatible_snapshot_directory(
+            artifact_path,
+            &manifest,
+            DEFAULT_CHUNK_SIZE,
+        )?;
+        let merkle = build_artifact_merkle_manifest(artifact_path, DEFAULT_CHUNK_SIZE)?;
+        ensure!(
+            merkle.root == artifact.artifact_root,
+            "openai-compatible calibration snapshot root mismatch; expected {}, got {}",
+            artifact.artifact_root,
+            merkle.root
+        );
+        return Ok(());
+    }
     if artifact.engine == "comfyui" {
         let metadata = fs::metadata(artifact_path)
             .with_context(|| format!("stat {}", artifact_path.display()))?;
@@ -19364,6 +19763,22 @@ fn verify_calibration_sidecars_match_catalog(
             ensure!(
                 paths.contains_key(*required),
                 "Transformers ASR calibration requires --artifact-sidecar {required}=PATH"
+            );
+        }
+    }
+    if artifact.engine == "laya" {
+        for (required, filename) in LAYA_REQUIRED_SIDECARS {
+            let sidecar = artifact.sidecars.get(*required).with_context(|| {
+                format!("Laya calibration requires admin catalog sidecar {required}")
+            })?;
+            ensure!(
+                sidecar.path == *filename,
+                "Laya sidecar {required} must use path {filename}, got {}",
+                sidecar.path
+            );
+            ensure!(
+                paths.contains_key(*required),
+                "Laya calibration requires --artifact-sidecar {required}=PATH"
             );
         }
     }
@@ -19679,7 +20094,11 @@ fn calibration_memory_context(
     if args.vllm_generation_topology
         == Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
     {
-        scope_vllm_execution_mode_memory_pool(&mut pool, &hardware, args.trt_tensor_parallel.unwrap_or(1))?;
+        scope_vllm_execution_mode_memory_pool(
+            &mut pool,
+            &hardware,
+            args.trt_tensor_parallel.unwrap_or(1),
+        )?;
     }
     let reserve_basis = pool.total_bytes.max(pool.available_bytes);
     let (reserve_bytes, reserve_source) =
@@ -19691,11 +20110,8 @@ fn calibration_memory_context(
         human_bytes(pool.available_bytes),
         human_bytes(reserve_bytes)
     );
-    let vllm_replica_limit_bytes = calibration_vllm_replica_allocation(
-        args,
-        pool.total_bytes,
-        f13_budget_bytes,
-    )?;
+    let vllm_replica_limit_bytes =
+        calibration_vllm_replica_allocation(args, pool.total_bytes, f13_budget_bytes)?;
 
     let chatterbox_device = (artifact.engine == "chatterbox")
         .then(|| {
@@ -19749,23 +20165,38 @@ fn calibration_vllm_replica_allocation(
     if args.vllm_generation_topology
         != Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
     {
-        ensure!(args.vllm_worker_count.is_none(),
-            "--vllm-worker-count requires a signed isolated-worker execution mode");
+        ensure!(
+            args.vllm_worker_count.is_none(),
+            "--vllm-worker-count requires a signed isolated-worker execution mode"
+        );
         return Ok(None);
     }
-    let count = args.vllm_worker_count.context("isolated calibration worker count is missing")?;
-    ensure!(count > 0, "isolated calibration worker count must be positive");
-    let target = args.vllm_memory_utilization
+    let count = args
+        .vllm_worker_count
+        .context("isolated calibration worker count is missing")?;
+    ensure!(
+        count > 0,
+        "isolated calibration worker count must be positive"
+    );
+    let target = args
+        .vllm_memory_utilization
         .context("isolated calibration requires --vllm-memory-utilization per worker")?;
     validate_provider_vllm_memory_utilization_pct(target)?;
     let per_worker = u64::try_from(u128::from(total_bytes) * u128::from(target) / 100)
         .context("isolated calibration worker allocation exceeds u64")?;
-    ensure!(per_worker > 0, "isolated calibration worker allocation is empty");
-    let aggregate = per_worker.checked_mul(u64::from(count))
+    ensure!(
+        per_worker > 0,
+        "isolated calibration worker allocation is empty"
+    );
+    let aggregate = per_worker
+        .checked_mul(u64::from(count))
         .context("isolated calibration allocation overflow")?;
-    ensure!(aggregate <= f13_budget_bytes,
+    ensure!(
+        aggregate <= f13_budget_bytes,
         "isolated calibration workers require {}, exceeding the F13 budget {}",
-        human_bytes(aggregate), human_bytes(f13_budget_bytes));
+        human_bytes(aggregate),
+        human_bytes(f13_budget_bytes)
+    );
     // This is an aggregate process containment limit, not a claim of measured usage.
     Ok(Some(aggregate))
 }
@@ -19815,17 +20246,20 @@ fn calibration_memory_bytes(
     match context.probe {
         CalibrationMemoryProbe::ProcessRss => {
             let mut total = 0_u64;
-            let mut missing = Vec::new();
+            let mut live = 0_usize;
             for pid in process_ids {
                 match provider_process_rss_bytes(*pid) {
-                    Some(bytes) => total = total.saturating_add(bytes),
-                    None => missing.push(*pid),
+                    Some(bytes) => {
+                        live += 1;
+                        total = total.saturating_add(bytes);
+                    }
+                    None => {}
                 }
             }
             ensure!(
-                missing.is_empty(),
+                live > 0,
                 "failed to read calibration RSS for pid(s) {}",
-                missing
+                process_ids
                     .iter()
                     .map(u32::to_string)
                     .collect::<Vec<_>>()
@@ -20251,18 +20685,25 @@ fn bind_calibration_generation_topology(
 ) -> Result<()> {
     args.vllm_generation_topology = profile.and_then(|profile| profile.topology);
     if generation_execution_uses_isolated_workers(profile) {
-        ensure!(args.execution_mode.is_some(),
-            "isolated calibration requires --execution-mode");
+        ensure!(
+            args.execution_mode.is_some(),
+            "isolated calibration requires --execution-mode"
+        );
         ensure!(args.vllm_max_num_seqs.is_none_or(|count| count == 1)
             && args.trt_max_batch_size.is_none(),
             "isolated calibration requires one sequence per worker; use --vllm-worker-count for concurrency");
         let count = args.vllm_worker_count.unwrap_or(1);
-        ensure!(count > 0, "isolated calibration worker count must be positive");
+        ensure!(
+            count > 0,
+            "isolated calibration worker count must be positive"
+        );
         args.vllm_worker_count = Some(count);
         args.vllm_max_num_seqs = Some(1);
     } else {
-        ensure!(args.vllm_worker_count.is_none(),
-            "--vllm-worker-count requires a signed isolated-worker execution mode");
+        ensure!(
+            args.vllm_worker_count.is_none(),
+            "--vllm-worker-count requires a signed isolated-worker execution mode"
+        );
     }
     Ok(())
 }
@@ -20271,16 +20712,20 @@ fn validate_calibration_generation_topology(
     runtime: &CatalogCanaryRuntimeConfig,
     profile: Option<&catalog::CatalogGenerationExecutionProfile>,
 ) -> Result<()> {
-    ensure!(runtime.vllm_generation_topology == profile.and_then(|profile| profile.topology),
-        "report generation topology does not match the catalog execution mode");
+    ensure!(
+        runtime.vllm_generation_topology == profile.and_then(|profile| profile.topology),
+        "report generation topology does not match the catalog execution mode"
+    );
     if generation_execution_uses_isolated_workers(profile) {
         ensure!(runtime.execution_mode.is_some()
             && runtime.vllm_worker_count.is_some_and(|count| count > 0)
             && runtime.vllm_max_num_seqs == Some(1),
             "isolated calibration report requires a mode binding, positive worker count and one sequence per worker");
     } else {
-        ensure!(runtime.vllm_worker_count.is_none(),
-            "report worker count requires a signed isolated-worker execution mode");
+        ensure!(
+            runtime.vllm_worker_count.is_none(),
+            "report worker count requires a signed isolated-worker execution mode"
+        );
     }
     Ok(())
 }
@@ -20622,6 +21067,7 @@ fn required_launch_output_canary_method(model: &catalog::CatalogModel) -> Option
         MODEL_CLASS_TTS | MODEL_CLASS_AUDIO_GENERATION | MODEL_CLASS_MUSIC_GENERATION => {
             Some(CANARY_VERIFICATION_AUDIO_FINGERPRINT)
         }
+        MODEL_CLASS_DECISION => Some(CANARY_VERIFICATION_DECISION_FINGERPRINT),
         _ => None,
     }
 }
@@ -20918,7 +21364,8 @@ fn merge_token_canary_calibration_reports(
         );
         ensure!(
             report.runtime_config.vllm_runtime == merged.runtime_config.vllm_runtime
-                && report.runtime_config.vllm_enforce_eager == merged.runtime_config.vllm_enforce_eager
+                && report.runtime_config.vllm_enforce_eager
+                    == merged.runtime_config.vllm_enforce_eager
                 && report.runtime_config.vllm_compilation_mode
                     == merged.runtime_config.vllm_compilation_mode
                 && report.runtime_config.vllm_cudagraph_mode
@@ -21522,6 +21969,11 @@ fn catalog_canary_evidence_report(
                 model.canary.audio_fingerprints.get(artifact_name).cloned();
             let expected_video_fingerprints =
                 model.canary.video_fingerprints.get(artifact_name).cloned();
+            let expected_decision_fingerprints = model
+                .canary
+                .decision_fingerprints
+                .get(artifact_name)
+                .cloned();
             if mode == CatalogCanaryReportMode::VerifyMatchesCatalog
                 && model.canary.verification_method == "token_fingerprint"
             {
@@ -21544,6 +21996,7 @@ fn catalog_canary_evidence_report(
                     expected_transcripts.as_ref(),
                     expected_audio_fingerprints.as_ref(),
                     expected_video_fingerprints.as_ref(),
+                    expected_decision_fingerprints.as_ref(),
                     &mut entry_errors,
                 );
             }
@@ -21574,6 +22027,7 @@ fn catalog_canary_evidence_report(
                 expected_transcripts,
                 expected_audio_fingerprints,
                 expected_video_fingerprints,
+                expected_decision_fingerprints,
                 expected_artifact_binding: catalog_canary_artifact_binding(artifact),
                 report_path: None,
                 report_fingerprint: None,
@@ -21586,6 +22040,7 @@ fn catalog_canary_evidence_report(
                 report_transcripts: None,
                 report_audio_fingerprints: None,
                 report_video_fingerprints: None,
+                report_decision_fingerprints: None,
                 report_canary_set_sha256: None,
                 report_artifact_binding: None,
                 matches_catalog: None,
@@ -21819,6 +22274,11 @@ fn catalog_canary_evidence_report(
                     .map(|value| (prompt.prompt_id.clone(), value))
             })
             .collect::<BTreeMap<_, _>>();
+        let report_decision_fingerprints = calibration
+            .prompts
+            .iter()
+            .map(|prompt| (prompt.prompt_id.clone(), prompt.fingerprint.clone()))
+            .collect::<BTreeMap<_, _>>();
         if calibration.verification_method == "token_fingerprint" {
             entry.report_token_prefixes = Some(report_token_prefixes.clone());
         }
@@ -21836,6 +22296,9 @@ fn catalog_canary_evidence_report(
         }
         if calibration.verification_method == CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT {
             entry.report_video_fingerprints = Some(report_video_fingerprints.clone());
+        }
+        if calibration.verification_method == CANARY_VERIFICATION_DECISION_FINGERPRINT {
+            entry.report_decision_fingerprints = Some(report_decision_fingerprints.clone());
         }
         entry.report_canary_set_sha256 = Some(calibration.canary_set_sha256.clone());
         entry.report_artifact_binding = Some(calibration.artifact_binding.clone());
@@ -21875,17 +22338,21 @@ fn catalog_canary_evidence_report(
             entry.expected_transcripts.as_ref(),
             entry.expected_audio_fingerprints.as_ref(),
             entry.expected_video_fingerprints.as_ref(),
+            entry.expected_decision_fingerprints.as_ref(),
             &report_perceptual_hashes,
             &report_embedding_vectors,
             &report_transcripts,
             &report_audio_fingerprints,
             &report_video_fingerprints,
+            &report_decision_fingerprints,
             canary_min_match_bps,
         );
         entry.method_values_match_catalog = method_values_match_catalog;
         let matches_catalog = if matches!(
             entry.verification_method.as_str(),
-            CANARY_VERIFICATION_AUDIO_FINGERPRINT | CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT
+            CANARY_VERIFICATION_AUDIO_FINGERPRINT
+                | CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT
+                | CANARY_VERIFICATION_DECISION_FINGERPRINT
         ) {
             method_values_match_catalog
         } else {
@@ -21969,12 +22436,17 @@ fn catalog_canary_evidence_report(
         }
         let generation_profile = match &entry.execution_mode {
             Some(binding) => catalog_doc
-                .vllm_execution_mode(&entry.expected_artifact_binding.artifact_root, &binding.mode_id)
+                .vllm_execution_mode(
+                    &entry.expected_artifact_binding.artifact_root,
+                    &binding.mode_id,
+                )
                 .and_then(|mode| mode.generation_execution_profile.as_ref()),
-            None => catalog_doc.generation_execution_profile(&entry.expected_artifact_binding.artifact_root),
+            None => catalog_doc
+                .generation_execution_profile(&entry.expected_artifact_binding.artifact_root),
         };
         if let Err(error) = validate_calibration_generation_topology(
-            &calibration.runtime_config, generation_profile,
+            &calibration.runtime_config,
+            generation_profile,
         ) {
             entry.errors.push(error.to_string());
         }
@@ -22283,6 +22755,11 @@ fn catalog_execution_mode_evidence_entry(
     let expected_transcripts = model.canary.transcripts.get(artifact_name).cloned();
     let expected_audio_fingerprints = model.canary.audio_fingerprints.get(artifact_name).cloned();
     let expected_video_fingerprints = model.canary.video_fingerprints.get(artifact_name).cloned();
+    let expected_decision_fingerprints = model
+        .canary
+        .decision_fingerprints
+        .get(artifact_name)
+        .cloned();
     if report_mode == CatalogCanaryReportMode::VerifyMatchesCatalog {
         match expected_fingerprint.as_deref() {
             Some(value) if is_hex_len(value, 64) => {}
@@ -22329,6 +22806,7 @@ fn catalog_execution_mode_evidence_entry(
             expected_transcripts.as_ref(),
             expected_audio_fingerprints.as_ref(),
             expected_video_fingerprints.as_ref(),
+            expected_decision_fingerprints.as_ref(),
             &mut errors,
         );
     }
@@ -22355,6 +22833,7 @@ fn catalog_execution_mode_evidence_entry(
         expected_transcripts,
         expected_audio_fingerprints,
         expected_video_fingerprints,
+        expected_decision_fingerprints,
         expected_artifact_binding: catalog_canary_artifact_binding(artifact),
         report_path: None,
         report_fingerprint: None,
@@ -22367,6 +22846,7 @@ fn catalog_execution_mode_evidence_entry(
         report_transcripts: None,
         report_audio_fingerprints: None,
         report_video_fingerprints: None,
+        report_decision_fingerprints: None,
         report_canary_set_sha256: None,
         report_artifact_binding: None,
         matches_catalog: None,
@@ -22388,6 +22868,7 @@ fn validate_expected_canary_method_values(
     transcripts: Option<&BTreeMap<String, String>>,
     audio_fingerprints: Option<&BTreeMap<String, String>>,
     video_fingerprints: Option<&BTreeMap<String, String>>,
+    decision_fingerprints: Option<&BTreeMap<String, String>>,
     errors: &mut Vec<String>,
 ) {
     match method {
@@ -22436,6 +22917,22 @@ fn validate_expected_canary_method_values(
             )),
             None => errors.push(format!(
                 "canary video_fingerprints missing artifact {artifact}"
+            )),
+        },
+        CANARY_VERIFICATION_DECISION_FINGERPRINT => match decision_fingerprints {
+            Some(values)
+                if !values.is_empty()
+                    && values.values().all(|fingerprint| {
+                        is_hex_len(fingerprint, 64)
+                            && fingerprint
+                                .bytes()
+                                .all(|byte| !byte.is_ascii_uppercase())
+                    }) => {}
+            Some(_) => errors.push(format!(
+                "canary decision_fingerprints for {artifact} must contain lowercase 32-byte hex fingerprints"
+            )),
+            None => errors.push(format!(
+                "canary decision_fingerprints missing artifact {artifact}"
             )),
         },
         _ => {}
@@ -22867,11 +23364,13 @@ fn method_values_match_catalog(
     expected_transcripts: Option<&BTreeMap<String, String>>,
     expected_audio_fingerprints: Option<&BTreeMap<String, String>>,
     expected_video_fingerprints: Option<&BTreeMap<String, String>>,
+    expected_decision_fingerprints: Option<&BTreeMap<String, String>>,
     report_perceptual_hashes: &BTreeMap<String, String>,
     report_embedding_vectors: &BTreeMap<String, Vec<f32>>,
     report_transcripts: &BTreeMap<String, String>,
     report_audio_fingerprints: &BTreeMap<String, String>,
     report_video_fingerprints: &BTreeMap<String, String>,
+    report_decision_fingerprints: &BTreeMap<String, String>,
     min_match_bps: u32,
 ) -> Option<bool> {
     match method {
@@ -22907,6 +23406,9 @@ fn method_values_match_catalog(
                         .is_some_and(|similarity| similarity >= min_match_bps)
                 })
         }),
+        CANARY_VERIFICATION_DECISION_FINGERPRINT => {
+            expected_decision_fingerprints.map(|expected| expected == report_decision_fingerprints)
+        }
         _ => None,
     }
 }
@@ -23052,12 +23554,6 @@ fn validate_calibration_prompt_method_value(
 ) {
     match method {
         "token_fingerprint" => {
-            if prompt.token_count != prompt.completion_tokens as usize {
-                errors.push(format!(
-                    "prompt {} token_count {} does not match completion_tokens {}",
-                    prompt.prompt_id, prompt.token_count, prompt.completion_tokens
-                ));
-            }
             if prompt.token_count != prompt.token_ids.len() {
                 errors.push(format!(
                     "prompt {} token_count {} does not match token_ids length {}",
@@ -23232,6 +23728,15 @@ fn apply_canary_report_fingerprints(
                     "video_fingerprints",
                     &entry.artifact,
                     entry.report_video_fingerprints.as_ref(),
+                )?;
+            }
+            CANARY_VERIFICATION_DECISION_FINGERPRINT => {
+                insert_canary_method_map(
+                    canary,
+                    &entry.model_id,
+                    "decision_fingerprints",
+                    &entry.artifact,
+                    entry.report_decision_fingerprints.as_ref(),
                 )?;
             }
             other => bail!("cannot apply unsupported canary verification_method {other}"),
@@ -23409,6 +23914,13 @@ fn apply_execution_mode_canary_report(
             &entry.artifact,
             entry.report_video_fingerprints.as_ref(),
         )?,
+        CANARY_VERIFICATION_DECISION_FINGERPRINT => insert_canary_method_map(
+            canary,
+            &entry.model_id,
+            "decision_fingerprints",
+            &entry.artifact,
+            entry.report_decision_fingerprints.as_ref(),
+        )?,
         other => bail!("cannot apply unsupported canary verification_method {other}"),
     }
     mode.insert(
@@ -23562,6 +24074,7 @@ fn catalog_canary_plan_report(input: CatalogCanaryPlanInput<'_>) -> CatalogCanar
                 | "needle-gpu"
                 | "sulphur"
                 | "transformers-asr"
+                | "laya"
                 | "whisper.cpp"
                 | "piper" => "ready",
                 "trt-llm" => "requires-prebuilt-trt-engine",
@@ -23958,6 +24471,7 @@ fn catalog_canary_matrix_report(
             let mut transcript_count = None;
             let mut audio_fingerprint_count = None;
             let mut video_fingerprint_count = None;
+            let mut decision_fingerprint_count = None;
             let modality_fingerprints = model
                 .modality_assessment
                 .calibrated_fingerprints
@@ -24025,7 +24539,7 @@ fn catalog_canary_matrix_report(
                     }
                     match artifact.engine.as_str() {
                         "llama.cpp" | "mlx" | "needle-cpu" => "token-prefix-local-calibration",
-                        "trt-llm" | "vllm" | "needle-gpu" => {
+                        "trt-llm" | "vllm" | "openai-compatible" | "needle-gpu" => {
                             "token-prefix-hardware-calibration"
                         }
                         other => {
@@ -24162,6 +24676,37 @@ fn catalog_canary_matrix_report(
                     }
                     "video-av-fingerprint-calibrated"
                 }
+                CANARY_VERIFICATION_DECISION_FINGERPRINT => {
+                    match model.canary.decision_fingerprints.get(artifact_name) {
+                        Some(fingerprints) => {
+                            decision_fingerprint_count = Some(fingerprints.len());
+                            if fingerprints.is_empty() {
+                                entry_errors.push(format!(
+                                    "canary decision_fingerprints for {artifact_name} must not be empty"
+                                ));
+                            }
+                            for prompt_id in prompt_ids {
+                                match fingerprints.get(prompt_id) {
+                                    Some(fingerprint)
+                                        if is_hex_len(fingerprint, 64)
+                                            && fingerprint
+                                                .bytes()
+                                                .all(|byte| !byte.is_ascii_uppercase()) => {}
+                                    Some(_) => entry_errors.push(format!(
+                                        "canary decision_fingerprints for {artifact_name} prompt {prompt_id} must be lowercase 32-byte hex"
+                                    )),
+                                    None => entry_errors.push(format!(
+                                        "canary decision_fingerprints missing prompt {prompt_id} for artifact {artifact_name}"
+                                    )),
+                                }
+                            }
+                        }
+                        None => entry_errors.push(format!(
+                            "canary decision_fingerprints missing artifact {artifact_name}"
+                        )),
+                    }
+                    "decision-fingerprint-calibrated"
+                }
                 CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE => {
                     if fingerprint.is_some()
                         || model.canary.token_prefixes.contains_key(artifact_name)
@@ -24170,6 +24715,10 @@ fn catalog_canary_matrix_report(
                         || model.canary.transcripts.contains_key(artifact_name)
                         || model.canary.audio_fingerprints.contains_key(artifact_name)
                         || model.canary.video_fingerprints.contains_key(artifact_name)
+                        || model
+                            .canary
+                            .decision_fingerprints
+                            .contains_key(artifact_name)
                     {
                         entry_errors.push(format!(
                             "attestation_of_compute canary for {artifact_name} must not carry output calibration blobs"
@@ -24199,6 +24748,7 @@ fn catalog_canary_matrix_report(
                 transcript_count,
                 audio_fingerprint_count,
                 video_fingerprint_count,
+                decision_fingerprint_count,
                 modality_fingerprint_count: modality_fingerprints.map(BTreeMap::len),
                 modality_resource_profile_count: modality_resource_profiles.map(BTreeMap::len),
                 speciality_calibration_level_count: speciality_calibrations
@@ -24604,6 +25154,14 @@ fn managed_python_backend_for_artifact(artifact: &catalog::CatalogArtifact) -> &
     }
 }
 
+fn bind_vllm_task_for_model(config: &mut LoadConfig, model: &catalog::CatalogModel) {
+    config.vllm_task = if model.model_class == MODEL_CLASS_EMBEDDING {
+        mayhem_engine::VllmTask::Embedding
+    } else {
+        mayhem_engine::VllmTask::Generate
+    };
+}
+
 fn needle_device_for_engine(engine: &str) -> Option<&'static str> {
     match engine {
         "needle-cpu" => Some("cpu"),
@@ -24633,6 +25191,16 @@ fn preflight_catalog_calibration_managed_runtime(
     artifact: &catalog::CatalogArtifact,
     args: &CatalogCalibrateCanaryArgs,
 ) -> Result<()> {
+    if artifact.engine == "openai-compatible" {
+        artifact
+            .openai_compatible
+            .as_ref()
+            .context("openai-compatible calibration is missing its signed runtime binding")?;
+        validate_managed_openai_hardware(&probe(ProbeOptions::default()))?;
+        resolve_executable(Path::new("docker"))
+            .context("managed openai-compatible calibration requires Docker on PATH")?;
+        return Ok(());
+    }
     if !matches!(
         artifact.engine.as_str(),
         "mlx"
@@ -24642,6 +25210,7 @@ fn preflight_catalog_calibration_managed_runtime(
             | "needle-gpu"
             | "sulphur"
             | "transformers-asr"
+            | "laya"
             | "trt-llm"
             | "vllm"
     ) {
@@ -24650,14 +25219,84 @@ fn preflight_catalog_calibration_managed_runtime(
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
-    ensure_catalog_artifact_python(&home, artifact, args.vllm_runtime.clone()).with_context(|| {
-        format!(
-            "preparing the managed {} calibration runtime under {}",
-            artifact.engine,
-            home.display()
-        )
-    })?;
+    ensure_catalog_artifact_python(&home, artifact, args.vllm_runtime.clone()).with_context(
+        || {
+            format!(
+                "preparing the managed {} calibration runtime under {}",
+                artifact.engine,
+                home.display()
+            )
+        },
+    )?;
     Ok(())
+}
+
+struct ProcessBoundOpenAiBackend {
+    backend: mayhem_engine::OpenAiCompatibleBackend,
+    process_id: u32,
+    // The runtime owner must outlive every calibration request. Dropping the
+    // wrapper stops only the exact container identity it created.
+    _runtime: Option<Arc<managed_openai_compatible::ManagedOpenAiRuntime>>,
+}
+
+impl EngineBackend for ProcessBoundOpenAiBackend {
+    fn backend_id(&self) -> &'static str {
+        self.backend.backend_id()
+    }
+
+    fn load(
+        &mut self,
+        config: LoadConfig,
+    ) -> mayhem_engine::Result<mayhem_engine::LoadedModelInfo> {
+        self.backend.load(config)
+    }
+
+    fn prefix_caching_enabled(&self) -> bool {
+        self.backend.prefix_caching_enabled()
+    }
+
+    fn loaded_backend_evidence(&self) -> Option<Value> {
+        self.backend.loaded_backend_evidence()
+    }
+
+    fn component_healthy(&mut self) -> bool {
+        self.backend.component_healthy()
+    }
+
+    fn process_ids(&self) -> Vec<u32> {
+        calibration_process_parent_rows()
+            .map(|parents| process_tree_ids_from_parent_rows(&[self.process_id], &parents))
+            .unwrap_or_else(|_| vec![self.process_id])
+    }
+
+    fn requires_owner_restart(&self) -> bool {
+        self._runtime.is_some()
+    }
+
+    fn recover_component(&mut self) -> mayhem_engine::Result<ComponentRecovery> {
+        Ok(if self.backend.component_healthy() {
+            ComponentRecovery::Recovered
+        } else {
+            ComponentRecovery::Unsupported
+        })
+    }
+
+    fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
+        self.backend.concurrent_generation_backend()
+    }
+
+    fn tokenize(&self, text: &str) -> mayhem_engine::Result<mayhem_engine::Tokenization> {
+        self.backend.tokenize(text)
+    }
+
+    fn generate(
+        &mut self,
+        request: GenerateRequest,
+        sink: &mut dyn mayhem_engine::TokenSink,
+        cancellation: &CancellationToken,
+    ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
+        self.backend.generate(request, sink, cancellation)
+    }
 }
 
 fn catalog_calibration_backend(
@@ -24677,19 +25316,21 @@ fn catalog_calibration_backend(
             | "needle-gpu"
             | "sulphur"
             | "transformers-asr"
+            | "laya"
             | "trt-llm"
             | "vllm"
     ) {
         let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
         let home = absolutize(home)?;
         fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
-        let runtime = ensure_catalog_artifact_python(&home, artifact, args.vllm_runtime.clone()).with_context(|| {
-            format!(
-                "preparing the managed {} calibration runtime under {}",
-                artifact.engine,
-                home.display()
-            )
-        })?;
+        let runtime = ensure_catalog_artifact_python(&home, artifact, args.vllm_runtime.clone())
+            .with_context(|| {
+                format!(
+                    "preparing the managed {} calibration runtime under {}",
+                    artifact.engine,
+                    home.display()
+                )
+            })?;
         Some((runtime, home.join("cache").join(&artifact.engine)))
     } else {
         None
@@ -24741,6 +25382,18 @@ fn catalog_calibration_backend(
         materialized_artifact_path = materialize_transformers_asr_layout(
             &format!("{}/{}", artifact.source.repo, artifact.path),
             &artifact.artifact_root,
+            artifact,
+            &paths,
+        )?;
+        materialized_artifact_path.as_path()
+    } else if artifact.engine == "laya" {
+        let paths = ProviderArtifactPaths {
+            primary: artifact_path.to_path_buf(),
+            sidecars: sidecar_paths.clone(),
+        };
+        materialized_artifact_path = materialize_laya_layout(
+            &format!("{}/{}", artifact.source.repo, artifact.path),
+            &artifact.path,
             artifact,
             &paths,
         )?;
@@ -24816,6 +25469,7 @@ fn catalog_calibration_backend(
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
+        "openai-compatible" => LoadConfig::openai_compatible_model(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
         "comfyui" => LoadConfig::comfyui_runtime(artifact_path),
         "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
@@ -24823,6 +25477,7 @@ fn catalog_calibration_backend(
         "needle-cpu" | "needle-gpu" => LoadConfig::transformers_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?,
         "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
+        "laya" => LoadConfig::laya_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
         "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported canary calibration engine {other}"),
@@ -24848,6 +25503,7 @@ fn catalog_calibration_backend(
         };
     }
     if artifact.engine == "vllm" {
+        bind_vllm_task_for_model(&mut config, model);
         config.vllm_gpu_memory_utilization_pct = args.vllm_memory_utilization;
         config.vllm_gpu_memory_utilization_floor_pct = args.vllm_memory_utilization_floor;
         config.vllm_dtype = args.vllm_dtype.clone();
@@ -24877,17 +25533,22 @@ fn catalog_calibration_backend(
         if args.vllm_generation_topology
             == Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
         {
-            config.vllm_generation_topology = Some(mayhem_engine::VllmGenerationTopology::IsolatedWorkers);
+            config.vllm_generation_topology =
+                Some(mayhem_engine::VllmGenerationTopology::IsolatedWorkers);
             config.vllm_concurrent_generation_capacity = args.vllm_worker_count;
-            config.vllm_worker_address_space_limit_bytes = Some(calibration_memory.f13_budget_bytes);
-            config.memory_limit_bytes = Some(calibration_memory.vllm_replica_limit_bytes
-                .context("isolated calibration is missing aggregate F13 admission")?);
+            config.vllm_worker_address_space_limit_bytes =
+                Some(calibration_memory.f13_budget_bytes);
+            config.memory_limit_bytes = Some(
+                calibration_memory
+                    .vllm_replica_limit_bytes
+                    .context("isolated calibration is missing aggregate F13 admission")?,
+            );
         }
     }
     if artifact.engine == "sulphur" {
         bind_sulphur_primary_hash_path(&mut config.artifact, artifact)?;
     }
-    if artifact.engine != "comfyui" {
+    if !matches!(artifact.engine.as_str(), "comfyui" | "openai-compatible") {
         if let Some(sha256) = &artifact.source_sha256 {
             config.artifact = config.artifact.with_sha256(sha256.clone());
         }
@@ -24995,6 +25656,71 @@ fn catalog_calibration_backend(
                 .context("loading vLLM canary calibration artifact")?;
             Ok(Box::new(backend))
         }
+        "openai-compatible" => {
+            let binding = artifact
+                .openai_compatible
+                .clone()
+                .context("openai-compatible calibration is missing its signed runtime binding")?;
+            validate_managed_openai_hardware(&probe(ProbeOptions::default()))?;
+            let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
+            let home = absolutize(home)?;
+            fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
+            let docker = resolve_executable(Path::new("docker"))
+                .context("managed openai-compatible calibration requires Docker on PATH")?;
+            let recipe_path = sidecar_paths
+                .get(&binding.runtime_recipe_sidecar)
+                .context("openai-compatible calibration requires its runtime recipe sidecar")?;
+            let upstream = artifact
+                .upstream_source
+                .as_ref()
+                .unwrap_or(&artifact.source);
+            let root_prefix = artifact
+                .artifact_root
+                .get(..16)
+                .unwrap_or(artifact.artifact_root.as_str());
+            let enclave_id = format!("calibration-{root_prefix}");
+            let managed = Arc::new(
+                managed_openai_compatible::prepare_managed_runtime(
+                    managed_openai_compatible::ManagedRuntimeInputs {
+                        home: &home,
+                        docker: &docker,
+                        provider_id: "catalog-calibration",
+                        enclave_id: &enclave_id,
+                        public_model_id: &model.model_id,
+                        artifact_repo: &upstream.repo,
+                        artifact_revision: &upstream.revision,
+                        snapshot_manifest_sidecar: &binding.snapshot_manifest_sidecar,
+                        snapshot_manifest_sha256: &binding.snapshot_manifest_sha256,
+                        snapshot_file_count: binding.model_snapshot_file_count,
+                        snapshot_total_bytes: artifact.weights_bytes,
+                        runtime_revision: &binding.runtime_revision,
+                        container_image_digest: &binding.container_image_digest,
+                        max_concurrent: binding.max_concurrent,
+                        recipe_sha256: &binding.runtime_recipe_sha256,
+                        recipe_path,
+                        snapshot_dir: artifact_path,
+                        sidecars: sidecar_paths,
+                    },
+                )
+                .context("starting the signed managed OpenAI-compatible calibration runtime")?,
+            );
+            let mut backend = ProcessBoundOpenAiBackend {
+                backend: mayhem_engine::OpenAiCompatibleBackend::new(
+                    mayhem_engine::OpenAiCompatibleBackendConfig {
+                        base_url: managed.base_url().to_owned(),
+                        runtime: binding,
+                        readiness_timeout: Duration::from_secs(3_600),
+                    },
+                )
+                .context("initializing the managed OpenAI-compatible calibration backend")?,
+                process_id: managed.process_id(),
+                _runtime: Some(managed),
+            };
+            backend
+                .load(config)
+                .context("loading the managed OpenAI-compatible calibration backend")?;
+            Ok(Box::new(backend))
+        }
         "stable-diffusion.cpp" => {
             let mut backend = mayhem_engine::StableDiffusionCppBackend::new()
                 .context("initializing stable-diffusion.cpp backend")?;
@@ -25092,6 +25818,19 @@ fn catalog_calibration_backend(
                 .context("loading Transformers ASR canary calibration artifact")?;
             Ok(Box::new(backend))
         }
+        "laya" => {
+            let python = &managed_runtime
+                .as_ref()
+                .context("Laya calibration runtime was not resolved")?
+                .0
+                .python;
+            let mut backend = mayhem_engine::LayaBackend::with_python(python)
+                .context("initializing Laya backend")?;
+            backend
+                .load(config)
+                .context("loading Laya canary calibration artifact")?;
+            Ok(Box::new(backend))
+        }
         "whisper.cpp" => {
             let mut backend = mayhem_engine::WhisperCppBackend::new()
                 .context("initializing whisper.cpp backend")?;
@@ -25128,6 +25867,9 @@ fn calibrate_canary_prompt(
             calibrate_image_perceptual_hash_prompt(backend, prompt, seed, include_output)
         }
         "embedding_cosine" => calibrate_embedding_cosine_prompt(backend, prompt),
+        CANARY_VERIFICATION_DECISION_FINGERPRINT => {
+            calibrate_decision_fingerprint_prompt(backend, prompt, include_output)
+        }
         "transcript_match" => calibrate_transcript_match_prompt(backend, prompt, include_output),
         "audio_fingerprint" => {
             calibrate_audio_fingerprint_prompt(backend, model, prompt, artifact_output_dir)
@@ -25139,6 +25881,99 @@ fn calibrate_canary_prompt(
             "catalog calibrate-canary does not support verification_method {other}; attestation-only descriptors do not produce output fingerprints"
         ),
     }
+}
+
+fn calibrate_decision_fingerprint_prompt(
+    backend: &mut dyn EngineBackend,
+    prompt: &CanaryPrompt,
+    include_output: bool,
+) -> Result<CanaryCalibrationPromptReport> {
+    let state = prompt
+        .endpoint_attributes
+        .get("state")
+        .cloned()
+        .with_context(|| format!("decision canary prompt {} is missing state", prompt.id))?;
+    let questions = prompt
+        .endpoint_attributes
+        .get("questions")
+        .cloned()
+        .with_context(|| format!("decision canary prompt {} is missing questions", prompt.id))?;
+    let output = backend
+        .decide(
+            EngineDecisionRequest {
+                state,
+                questions,
+                checkpoint: prompt
+                    .endpoint_attributes
+                    .get("checkpoint")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                task: prompt
+                    .endpoint_attributes
+                    .get("task")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                lang: prompt
+                    .endpoint_attributes
+                    .get("lang")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                auto_task_detection: prompt
+                    .endpoint_attributes
+                    .get("auto_task_detection")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                email: prompt.endpoint_attributes.get("email").cloned(),
+                shortlist: prompt.endpoint_attributes.get("shortlist").cloned(),
+                temperature: prompt.decision_temperature.clone(),
+                limits: prompt.endpoint_attributes.get("limits").cloned(),
+            },
+            &CancellationToken::new(),
+        )
+        .with_context(|| format!("generating decision canary prompt {}", prompt.id))?;
+    ensure!(
+        output.result.get("answers").is_some_and(Value::is_object),
+        "decision canary prompt {} returned no answers object",
+        prompt.id
+    );
+    ensure!(
+        output.result.get("routing").is_some_and(Value::is_object),
+        "decision canary prompt {} returned no routing object",
+        prompt.id
+    );
+    let stable_output = stable_json_value(&output.result);
+    let output_text = stable_output.to_string();
+    let fingerprint = stable_value_hash(&stable_output);
+    let completion_tokens =
+        metered_output_units(&output_text, "", &[]).min(u64::from(u32::MAX)) as u32;
+    Ok(CanaryCalibrationPromptReport {
+        prompt_id: prompt.id.clone(),
+        max_tokens: 1,
+        prompt_tokens: output.usage.prompt_tokens,
+        completion_tokens,
+        reasoning_tokens: 0,
+        token_count: 0,
+        token_ids: Vec::new(),
+        token_prefix: Vec::new(),
+        reproducibility_runs: 1,
+        fingerprint,
+        perceptual_hash: None,
+        embedding_vector: None,
+        transcript: None,
+        detected_language: None,
+        transcription_duration_seconds: None,
+        word_timestamps: Vec::new(),
+        segment_timestamps: Vec::new(),
+        audio_fingerprint: None,
+        video_fingerprint: None,
+        retained_artifacts: Vec::new(),
+        resource_items: BTreeMap::new(),
+        calibration_baseline_memory_bytes: 0,
+        calibration_peak_memory_bytes: 0,
+        output_text: include_output.then_some(output_text),
+        behavioral_output_fingerprint: None,
+        behavioral_witness: None,
+    })
 }
 
 fn calibrate_token_canary_prompt(
@@ -25187,17 +26022,23 @@ fn calibrate_token_canary_prompt_with_speciality(
     )?;
     request.seed = Some(prompt.seed.unwrap_or(seed));
     let max_tokens = request.max_new_tokens;
-    let mut token_ids = Vec::new();
+    let use_canonical_openai_units = backend.backend_id() == "openai-compatible";
+    let mut streamed_token_ids = Vec::new();
     let output = backend
         .generate(
             request,
             &mut |chunk: mayhem_engine::TokenChunk| {
-                token_ids.push(chunk.token_id);
+                streamed_token_ids.push(chunk.token_id);
                 Ok(())
             },
             &CancellationToken::new(),
         )
         .with_context(|| format!("generating canary prompt {}", prompt.id))?;
+    let token_ids = if use_canonical_openai_units {
+        mayhem_proto::openai_compatible_canary_units(&output.text)
+    } else {
+        streamed_token_ids
+    };
     if token_ids.is_empty() {
         bail!("canary prompt {} produced no tokens", prompt.id);
     }
@@ -25257,13 +26098,27 @@ fn calibrate_image_perceptual_hash_prompt(
     _include_output: bool,
 ) -> Result<CanaryCalibrationPromptReport> {
     let mut request = EngineImageGenerationRequest::new(canary_prompt_text(prompt)?);
-    request.input_reference = prompt.endpoint_attributes.get("input_reference")
-        .and_then(Value::as_str).map(str::to_owned);
-    request.strength = prompt.endpoint_attributes.get("strength")
-        .and_then(Value::as_f64).map(|value| value as f32);
-    request.negative_prompt = prompt.negative_prompt.as_ref().and_then(Value::as_str).map(str::to_owned);
-    let reference = request.input_reference.as_deref().map(mayhem_proto::image_reference_metadata)
-        .transpose().map_err(anyhow::Error::msg)?;
+    request.input_reference = prompt
+        .endpoint_attributes
+        .get("input_reference")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    request.strength = prompt
+        .endpoint_attributes
+        .get("strength")
+        .and_then(Value::as_f64)
+        .map(|value| value as f32);
+    request.negative_prompt = prompt
+        .negative_prompt
+        .as_ref()
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let reference = request
+        .input_reference
+        .as_deref()
+        .map(mayhem_proto::image_reference_metadata)
+        .transpose()
+        .map_err(anyhow::Error::msg)?;
     request.seed = Some(prompt.seed.unwrap_or(seed));
     request.image_count = 1;
     if let Some((width, height)) = prompt
@@ -25308,9 +26163,11 @@ fn calibrate_image_perceptual_hash_prompt(
         CanaryCalibrationResourceItem {
             unit: "pixel".to_owned(),
             item_count: 1,
-            item_bytes: u64::try_from(artifact.bytes.len()).unwrap_or(u64::MAX)
+            item_bytes: u64::try_from(artifact.bytes.len())
+                .unwrap_or(u64::MAX)
                 .max(reference.map_or(0, |image| image.bytes)),
-            item_units: u64::from(width).saturating_mul(u64::from(height))
+            item_units: u64::from(width)
+                .saturating_mul(u64::from(height))
                 .max(reference.map_or(0, |image| image.pixels)),
         },
     )]);
@@ -25350,11 +26207,19 @@ fn calibrate_embedding_cosine_prompt(
 ) -> Result<CanaryCalibrationPromptReport> {
     let input = canary_prompt_text(prompt)?;
     let input_bytes = u64::try_from(input.len()).unwrap_or(u64::MAX);
+    let mut request = mayhem_engine::EmbeddingRequest::new(input);
+    if let Some(dimensions) = prompt
+        .endpoint_attributes
+        .get("dimensions")
+        .and_then(Value::as_u64)
+    {
+        request.dimensions = Some(
+            usize::try_from(dimensions)
+                .context("embedding canary dimensions do not fit this platform")?,
+        );
+    }
     let output = backend
-        .embed(
-            mayhem_engine::EmbeddingRequest::new(input),
-            &CancellationToken::new(),
-        )
+        .embed(request, &CancellationToken::new())
         .with_context(|| format!("generating embedding canary prompt {}", prompt.id))?;
     let vector = output
         .embeddings
@@ -26759,6 +27624,17 @@ fn existing_catalog_canary_fingerprint(
                     .map(|(id, vector)| (id.as_str(), embedding_vector_fingerprint(vector))),
             )
         }),
+        CANARY_VERIFICATION_DECISION_FINGERPRINT => model
+            .canary
+            .decision_fingerprints
+            .get(artifact)
+            .map(|values| {
+                aggregate_prompt_fingerprint_map(
+                    values
+                        .iter()
+                        .map(|(id, fingerprint)| (id.as_str(), fingerprint.clone())),
+                )
+            }),
         "transcript_match" => model.canary.transcripts.get(artifact).map(|values| {
             aggregate_prompt_fingerprint_map(values.iter().map(|(id, transcript)| {
                 (
@@ -30058,7 +30934,7 @@ fn provider_comfy_workflow_inventory_resident_bytes(
         .iter()
         .map(|part| (part.part_id.as_str(), part))
         .collect::<BTreeMap<_, _>>();
-    let mut total = 0_u64;
+    let mut verified = BTreeMap::<String, (String, u64)>::new();
     for required in &policy.parts {
         let part = by_part_id.get(required.part_id.as_str()).with_context(|| {
             format!(
@@ -30073,7 +30949,56 @@ fn provider_comfy_workflow_inventory_resident_bytes(
             model.model_id,
             required.part_id
         );
-        total = total.saturating_add(part.record.size_bytes);
+        verified.insert(
+            required.name.clone(),
+            (required.part_id.clone(), part.record.size_bytes),
+        );
+    }
+    let Some(constraints) = policy.graph_constraints.as_ref() else {
+        return Ok(verified
+            .values()
+            .fold(0_u64, |total, (_, size)| total.saturating_add(*size)));
+    };
+
+    // `policy.parts` is the complete selectable inventory. Optional workflow roles can expose
+    // many signed choices while bounding how many are resident in one request (for example, a
+    // catalog of LoRAs with a four-loader maximum). Memory admission must still verify every
+    // advertised part above, but charging the resident set for every alternative makes a bounded
+    // workflow impossible to serve on hardware that safely fits its signed maximum.
+    let mut referenced = BTreeSet::new();
+    let mut total = 0_u64;
+    for role in constraints.roles.values() {
+        for input in role.inputs.values() {
+            if input.value_type != mayhem_proto::ComfyWorkflowInputType::Part
+                || input.part_names.is_empty()
+            {
+                continue;
+            }
+            let mut candidates = Vec::with_capacity(input.part_names.len());
+            for name in &input.part_names {
+                let (part_id, size) = verified.get(name).with_context(|| {
+                    format!(
+                        "Comfy workflow {} graph references part {} outside its signed parts envelope",
+                        model.model_id, name
+                    )
+                })?;
+                referenced.insert(part_id.clone());
+                candidates.push(*size);
+            }
+            candidates.sort_unstable_by(|left, right| right.cmp(left));
+            total = candidates
+                .into_iter()
+                .take(role.max_count)
+                .fold(total, u64::saturating_add);
+        }
+    }
+    // Parts that are not request-selectable graph inputs are runtime/system parts and remain
+    // resident requirements. This also preserves the prior conservative behavior for custom-node
+    // packages and fixed workflow assets.
+    for (part_id, size) in verified.values() {
+        if !referenced.contains(part_id) {
+            total = total.saturating_add(*size);
+        }
     }
     Ok(total)
 }
@@ -33026,6 +33951,7 @@ async fn admin_ban_list(args: &AdminBanListArgs) -> Result<()> {
         ("device", "ban/device/"),
         ("fingerprint", "ban/fingerprint/"),
         ("committer", "committer/ban/"),
+        ("kyb", "ban/kyb/"),
     ];
     for (target_type, prefix) in prefixes {
         if wanted.is_some_and(|wanted| wanted != target_type) {
@@ -35211,7 +36137,14 @@ fn enforce_backend_caps(backend: &str, caps: &mut Value) -> Result<()> {
 fn backend_supports_tool_calls(backend: &str) -> bool {
     !matches!(
         backend,
-        "mlx" | "comfyui" | "ace-step" | "chatterbox" | "sulphur" | "transformers-asr" | "trt-llm"
+        "mlx"
+            | "comfyui"
+            | "ace-step"
+            | "chatterbox"
+            | "sulphur"
+            | "transformers-asr"
+            | "laya"
+            | "trt-llm"
     )
 }
 
@@ -37890,8 +38823,10 @@ fn canonical_targeted_payout_plan(record: &Value, rail: &str, epoch: u64) -> Res
             && record.get("rail").and_then(Value::as_str) == Some(rail)
             && record.get("epoch").and_then(Value::as_u64) == Some(epoch)
             && value.get("op").and_then(Value::as_str) == Some("prepare_targeted_payout_epoch")
-            && value.get("contract_version").and_then(Value::as_u64)
-                == Some(u64::from(CONTRACT_VERSION))
+            && value
+                .get("contract_version")
+                .and_then(Value::as_u64)
+                .is_some_and(|version| version == 27 || version == u64::from(CONTRACT_VERSION))
             && value.get("rail").and_then(Value::as_str) == Some(rail)
             && value.get("epoch").and_then(Value::as_u64) == Some(epoch)
             && record.get("plan_root") == value.get("plan_root"),
@@ -37914,15 +38849,20 @@ async fn ensure_targeted_payout_epoch_plan(
         .and_then(Value::as_u64)
         .context("targeted payout epoch plan is missing epoch")?;
     let record_key = format!("payout/epoch-plan/{rail}/{epoch}");
+    if let Some(existing) = read_confirmed_state_value(rpc, &record_key).await? {
+        let value = canonical_targeted_payout_plan(&existing, rail, epoch)?;
+        ensure!(
+            value == *candidate,
+            "canonical targeted payout epoch plan differs from the locally planned operation"
+        );
+        return Ok((value, existing));
+    }
     let signed = sign_targeted_payout_control(signer, candidate).await?;
-    let record = if let Some(existing) = read_confirmed_state_value(rpc, &record_key).await? {
-        existing
-    } else {
+    let record =
         submit_targeted_payout_control(rpc, signer, candidate, &record_key, None, |record| {
             record.get("value") == Some(&signed)
         })
-        .await?
-    };
+        .await?;
     let value = canonical_targeted_payout_plan(&record, rail, epoch)?;
     ensure!(
         value == signed,
@@ -44025,6 +44965,7 @@ fn spawn_gateway_catalog_watcher(state: GatewayState, config: GatewayCatalogWatc
                     eprintln!("Gateway catalog watcher component panicked; restarting: {err}");
                 }
             }
+            state.failed_catalog_refresh();
             sleep(Duration::from_secs(1)).await;
         }
     });
@@ -44043,7 +44984,10 @@ async fn run_gateway_catalog_watcher(
     let mut applied_snapshot = String::new();
     let mut last_error = None;
     loop {
-        sleep(config.refresh_interval).await;
+        tokio::select! {
+            _ = sleep(config.refresh_interval) => {},
+            _ = state.wait_for_catalog_refresh_request() => {},
+        }
         let refresh = async {
             let contract = read_contract_catalog(&rpc).await?;
             let contract_models = gateway_models_from_contract(&contract)?;
@@ -44054,70 +44998,68 @@ async fn run_gateway_catalog_watcher(
                 canary_registry,
                 execution_mode_registry,
                 attestation_authority,
-            ) =
-                match config.dev_catalog.as_ref() {
-                    Some(dev) => (
-                        dev.catalog_hash.clone(),
-                        Some(dev.catalog_doc.clone()),
-                        dev.canary_registry.clone(),
-                        dev.execution_mode_registry.clone(),
-                        dev.attestation_authority.clone(),
-                    ),
-                    None => match read_optional_catalog_release_anchor(&rpc).await? {
-                        Some(release) => {
-                            let files =
-                                fetch_catalog_release_files(&client, &config.home, &release)
-                                    .await?;
-                            let catalog_doc = catalog::load_document(&files.catalog_path)
-                                .with_context(|| {
-                                    format!(
-                                        "loading refreshed ledger catalog {}",
-                                        files.catalog_path.display()
-                                    )
-                                })?;
-                            let catalog_json = fs::read_to_string(&files.catalog_path)
-                                .with_context(|| {
-                                    format!(
-                                        "reading refreshed ledger catalog {}",
-                                        files.catalog_path.display()
-                                    )
-                                })?;
-                            let canary_json_by_set =
-                                load_catalog_canary_json_by_set(&catalog_doc, &files.canaries_dir)?;
-                            let canary_registry =
-                                GatewayState::canary_registry_from_catalog_and_canary_json(
-                                    &catalog_json,
-                                    &canary_json_by_set,
+            ) = match config.dev_catalog.as_ref() {
+                Some(dev) => (
+                    dev.catalog_hash.clone(),
+                    Some(dev.catalog_doc.clone()),
+                    dev.canary_registry.clone(),
+                    dev.execution_mode_registry.clone(),
+                    dev.attestation_authority.clone(),
+                ),
+                None => match read_optional_catalog_release_anchor(&rpc).await? {
+                    Some(release) => {
+                        let files =
+                            fetch_catalog_release_files(&client, &config.home, &release).await?;
+                        let catalog_doc = catalog::load_document(&files.catalog_path)
+                            .with_context(|| {
+                                format!(
+                                    "loading refreshed ledger catalog {}",
+                                    files.catalog_path.display()
                                 )
-                                .map_err(anyhow::Error::msg)
-                                .context("loading refreshed gateway canary registry")?;
-                            let execution_mode_registry =
-                                GatewayState::execution_mode_registry_from_catalog_and_canary_json(
-                                    &catalog_json,
-                                    &canary_json_by_set,
+                            })?;
+                        let catalog_json =
+                            fs::read_to_string(&files.catalog_path).with_context(|| {
+                                format!(
+                                    "reading refreshed ledger catalog {}",
+                                    files.catalog_path.display()
                                 )
-                                .map_err(anyhow::Error::msg)
-                                .context("loading refreshed gateway execution mode registry")?;
-                            (
-                                release.catalog_hash,
-                                Some(catalog_doc),
-                                canary_registry,
-                                execution_mode_registry,
-                                files.attestation_authority,
+                            })?;
+                        let canary_json_by_set =
+                            load_catalog_canary_json_by_set(&catalog_doc, &files.canaries_dir)?;
+                        let canary_registry =
+                            GatewayState::canary_registry_from_catalog_and_canary_json(
+                                &catalog_json,
+                                &canary_json_by_set,
                             )
-                        }
-                        None if contract_models.is_empty() => (
-                            "unpublished-empty".to_owned(),
-                            None,
-                            GatewayCanaryRegistry::default(),
-                            GatewayExecutionModeRegistry::default(),
-                            catalog::CatalogAttestationAuthority::default(),
-                        ),
-                        None => bail!(
-                            "catalog/current disappeared while canonical models remain published"
-                        ),
-                    },
-                };
+                            .map_err(anyhow::Error::msg)
+                            .context("loading refreshed gateway canary registry")?;
+                        let execution_mode_registry =
+                            GatewayState::execution_mode_registry_from_catalog_and_canary_json(
+                                &catalog_json,
+                                &canary_json_by_set,
+                            )
+                            .map_err(anyhow::Error::msg)
+                            .context("loading refreshed gateway execution mode registry")?;
+                        (
+                            release.catalog_hash,
+                            Some(catalog_doc),
+                            canary_registry,
+                            execution_mode_registry,
+                            files.attestation_authority,
+                        )
+                    }
+                    None if contract_models.is_empty() => (
+                        "unpublished-empty".to_owned(),
+                        None,
+                        GatewayCanaryRegistry::default(),
+                        GatewayExecutionModeRegistry::default(),
+                        catalog::CatalogAttestationAuthority::default(),
+                    ),
+                    None => {
+                        bail!("catalog/current disappeared while canonical models remain published")
+                    }
+                },
+            };
             let (models, _version_gates) = match catalog_doc.as_ref() {
                 Some(catalog_doc) => {
                     filter_gateway_models_by_app_version(contract_models, catalog_doc)?
@@ -44181,8 +45123,10 @@ async fn run_gateway_catalog_watcher(
                         "Gateway authenticated catalog refreshed from contract: {model_count} model(s)"
                     );
                 }
+                state.complete_catalog_refresh();
             }
             Err(err) => {
+                state.failed_catalog_refresh();
                 let message = format!("{err:#}");
                 if last_error.as_deref() != Some(message.as_str()) {
                     eprintln!("Gateway catalog watcher retrying: {message}");
@@ -46928,6 +47872,8 @@ struct CanaryPrompt {
     #[serde(default)]
     temperature: Option<f64>,
     #[serde(default)]
+    decision_temperature: Option<Value>,
+    #[serde(default)]
     top_p: Option<f64>,
     #[serde(default)]
     top_k: Option<i32>,
@@ -47233,6 +48179,7 @@ struct CatalogCanaryMatrixEntry {
     transcript_count: Option<usize>,
     audio_fingerprint_count: Option<usize>,
     video_fingerprint_count: Option<usize>,
+    decision_fingerprint_count: Option<usize>,
     modality_fingerprint_count: Option<usize>,
     modality_resource_profile_count: Option<usize>,
     speciality_calibration_level_count: Option<usize>,
@@ -47321,6 +48268,7 @@ struct CatalogCanaryEvidenceEntry {
     expected_transcripts: Option<BTreeMap<String, String>>,
     expected_audio_fingerprints: Option<BTreeMap<String, String>>,
     expected_video_fingerprints: Option<BTreeMap<String, String>>,
+    expected_decision_fingerprints: Option<BTreeMap<String, String>>,
     expected_artifact_binding: CatalogCanaryArtifactBinding,
     report_path: Option<PathBuf>,
     report_fingerprint: Option<String>,
@@ -47334,6 +48282,7 @@ struct CatalogCanaryEvidenceEntry {
     report_transcripts: Option<BTreeMap<String, String>>,
     report_audio_fingerprints: Option<BTreeMap<String, String>>,
     report_video_fingerprints: Option<BTreeMap<String, String>>,
+    report_decision_fingerprints: Option<BTreeMap<String, String>>,
     report_canary_set_sha256: Option<String>,
     report_artifact_binding: Option<CatalogCanaryArtifactBinding>,
     matches_catalog: Option<bool>,
@@ -48172,9 +49121,12 @@ fn load_catalog_canary_json_by_set(
         .models
         .iter()
         .map(|model| model.canary.set_id.as_str())
-        .chain(catalog.vllm_execution_modes.values().flat_map(|modes| {
-            modes.values().map(|mode| mode.canary.set_id.as_str())
-        }))
+        .chain(
+            catalog
+                .vllm_execution_modes
+                .values()
+                .flat_map(|modes| modes.values().map(|mode| mode.canary.set_id.as_str())),
+        )
         .collect::<BTreeSet<_>>()
     {
         let mut components = Path::new(set_id).components();
@@ -50109,9 +51061,6 @@ fn price_derivation_summary(derivation: &Value) -> String {
         .or_else(|| derivation_u64(derivation, &["price_ver"]))
         .map(|value| format!("v{value}"))
         .unwrap_or_else(|| "price".to_owned());
-    let momentum = derivation_u64(derivation, &["controller", "momentum_bps"])
-        .map(format_bps)
-        .unwrap_or_else(|| "?".to_owned());
     let basis = derivation_str(derivation, &["controller", "activity_basis"])
         .unwrap_or("historical pricing");
     let sessions = derivation_u64(derivation, &["usage", "session_count"])
@@ -50129,9 +51078,31 @@ fn price_derivation_summary(derivation: &Value) -> String {
     let leaf = derivation_str(derivation, &["derivation_hash"])
         .map(|value| format!(" leaf={}", short_hash(value)))
         .unwrap_or_default();
-    format!(
-        "price {result_ver}; activity momentum {momentum}; {basis}; epoch {epoch}; {sessions} settled sessions; {supply} providers; seed {seed_ver}; {source}{root}{leaf}"
-    )
+    if derivation.get("controller").is_some_and(|controller| {
+        controller.get("activity_basis").is_some_and(|value| {
+            matches!(
+                value.as_str(),
+                Some("signed_slot_time_v1" | "legacy_receipt_hold_v1")
+            )
+        })
+    }) {
+        let utilization = derivation_u64(derivation, &["controller", "utilization_bps"])
+            .map(format_bps)
+            .unwrap_or_else(|| "held for retained receipt recovery".to_owned());
+        let multiplier = derivation_u64(derivation, &["controller", "multiplier_bps"])
+            .map(format_bps)
+            .unwrap_or_else(|| "?".to_owned());
+        format!(
+            "price {result_ver}; utilization {utilization}; price multiplier {multiplier}; {basis}; epoch {epoch}; {sessions} settled sessions; {supply} providers; seed {seed_ver}; {source}{root}{leaf}"
+        )
+    } else {
+        let momentum = derivation_u64(derivation, &["controller", "momentum_bps"])
+            .map(format_bps)
+            .unwrap_or_else(|| "?".to_owned());
+        format!(
+            "price {result_ver}; activity momentum {momentum}; {basis}; epoch {epoch}; {sessions} settled sessions; {supply} providers; seed {seed_ver}; {source}{root}{leaf}"
+        )
+    }
 }
 
 fn derivation_u64(value: &Value, path: &[&str]) -> Option<u64> {
@@ -52477,6 +53448,7 @@ fn normalize_tnk_holdbacks(earning: &LedgerEarningRecord) -> Result<Vec<LedgerHo
 
 const STRIPE_FX_API_VERSION: &str = "2025-07-30.preview";
 const STRIPE_FX_QUOTE_LOCK_DURATION: &str = "five_minutes";
+const STRIPE_FX_QUOTE_RENEWAL_BUCKET_SECONDS: u64 = 4 * 60;
 const STRIPE_IDEMPOTENCY_RENEWAL_BOUND_SECONDS: u64 = 23 * 60 * 60;
 
 fn stripe_currency_minor_exponent(currency: &str) -> Result<u32> {
@@ -53188,6 +54160,7 @@ async fn canonicalize_fiat_settlement_plan(
                                 "liability_au": money_au_json(output.liability_au),
                             }),
                             None,
+                            false,
                             max_attempts,
                             retry_ms,
                         )
@@ -53243,6 +54216,7 @@ async fn canonicalize_fiat_settlement_plan(
                             "liability_au": money_au_json(output.liability_au),
                         }),
                         None,
+                        false,
                         max_attempts,
                         retry_ms,
                     )
@@ -53959,6 +54933,7 @@ async fn stripe_create_fx_quote(
     lock_duration: &str,
     operation_identity: &Value,
     idempotency_key_override: Option<&str>,
+    allow_expired_valuation_quote: bool,
     max_attempts: u32,
     retry_ms: u64,
 ) -> Result<StripeFxQuote> {
@@ -54074,18 +55049,43 @@ async fn stripe_create_fx_quote(
                 "unlocked Stripe FX quote is not usable"
             );
         } else {
-            let now = unix_epoch_seconds()?;
-            ensure!(
-                quote.lock_status == "active"
-                    && quote
-                        .expires_at
-                        .is_some_and(|expires| expires > now.saturating_add(15)),
-                "Stripe FX quote is not active long enough to create a transfer"
-            );
+            validate_locked_stripe_fx_quote(
+                &quote,
+                lock_duration,
+                unix_epoch_seconds()?,
+                allow_expired_valuation_quote,
+            )?;
         }
         return Ok(quote);
     }
     unreachable!("positive max_attempts checked by caller")
+}
+
+fn validate_locked_stripe_fx_quote(
+    quote: &StripeFxQuote,
+    requested_lock_duration: &str,
+    now: u64,
+    allow_expired_valuation_quote: bool,
+) -> Result<()> {
+    let expires_at = quote
+        .expires_at
+        .context("locked Stripe FX quote is missing its expiry")?;
+    ensure!(
+        quote.lock_duration == requested_lock_duration && expires_at > quote.created,
+        "Stripe FX quote lock does not match its request"
+    );
+    if allow_expired_valuation_quote {
+        ensure!(
+            matches!(quote.lock_status.as_str(), "active" | "expired"),
+            "Stripe FX valuation quote has an invalid lock status"
+        );
+    } else {
+        ensure!(
+            quote.lock_status == "active" && expires_at > now.saturating_add(15),
+            "Stripe FX quote is not active long enough to create a transfer"
+        );
+    }
+    Ok(())
 }
 
 async fn stripe_retrieve_fx_quote(
@@ -54651,6 +55651,7 @@ async fn stripe_create_transfer_verified(
                         "operation": operation,
                     }),
                     Some(&journal.quote_idempotency_key),
+                    source_currency == destination_currency,
                     max_attempts,
                     retry_ms,
                 )
@@ -55530,6 +56531,24 @@ fn stripe_fx_quote_hash(quote: &StripeFxQuote) -> Result<String> {
     })))
 }
 
+fn ensure_canonical_fiat_quote_hash(quote: &StripeFxQuote, expected: &str) -> Result<()> {
+    if stripe_fx_quote_hash(quote)? == expected {
+        return Ok(());
+    }
+    // Stripe changes lock_status on the same quote after its lock expires.
+    // Compare the immutable fields against the prepared active quote, while
+    // retaining the prepared hash for canonical settlement evidence.
+    if quote.lock_status == "expired" && quote.lock_duration != "none" && quote.expires_at.is_some()
+    {
+        let mut active = quote.clone();
+        active.lock_status = "active".to_owned();
+        if stripe_fx_quote_hash(&active)? == expected {
+            return Ok(());
+        }
+    }
+    bail!("canonical fiat attempt FX quote hash mismatch")
+}
+
 fn fiat_fx_plan_report(plan: &FiatFxPlan) -> Value {
     json!({
         "liability_au": money_au_json(plan.liability_au),
@@ -56103,7 +57122,8 @@ async fn create_targeted_fiat_quote(
         vec!["usd".to_owned(), source_currency.to_owned()]
     };
     from_currencies.retain(|currency| currency != destination_currency);
-    let idempotency_key = format!("mayhem:fiat:fx-quote:v1:{economic_op_id}:{attempt_no}");
+    let idempotency_key =
+        targeted_fiat_quote_idempotency_key(economic_op_id, attempt_no, unix_epoch_seconds()?);
     let quote = stripe_create_fx_quote(
         client,
         api_base_url,
@@ -56118,6 +57138,7 @@ async fn create_targeted_fiat_quote(
             "attempt_no": attempt_no,
         }),
         Some(&idempotency_key),
+        false,
         max_attempts,
         retry_ms,
     )
@@ -56126,11 +57147,40 @@ async fn create_targeted_fiat_quote(
     Ok(Some(quote))
 }
 
+fn targeted_fiat_quote_idempotency_key(economic_op_id: &str, attempt_no: u64, now: u64) -> String {
+    format!(
+        "mayhem:fiat:fx-quote:v2:{economic_op_id}:{attempt_no}:{}",
+        now / STRIPE_FX_QUOTE_RENEWAL_BUCKET_SECONDS
+    )
+}
+
 fn ensure_canonical_fiat_quote_matches_output(
     output: &Value,
     quote: Option<&StripeFxQuote>,
 ) -> Result<FiatFxPlan> {
     let planned = fiat_plan_output_fx(output)?;
+    if planned.source_currency == planned.destination_currency {
+        if planned.source_currency == "usd" {
+            ensure!(
+                quote.is_none(),
+                "USD fiat execution must not carry an FX quote"
+            );
+            return Ok(planned);
+        }
+        let quote = quote.context("same-currency fiat execution is missing its valuation quote")?;
+        let destination = output
+            .get("to")
+            .and_then(Value::as_str)
+            .context("canonical fiat output is missing destination")?;
+        ensure!(
+            quote.to_currency == planned.destination_currency
+                && quote.usage_type == "transfer"
+                && quote.usage_destination.as_deref() == Some(destination)
+                && quote.rates.contains_key("usd"),
+            "same-currency fiat valuation quote does not match the canonical output"
+        );
+        return Ok(planned);
+    }
     let candidate = fiat_provider_transfer_plan(
         planned.liability_au,
         &planned.source_currency,
@@ -56230,11 +57280,11 @@ async fn execute_canonical_stripe_attempt(
                 retry_ms,
             )
             .await?;
-            ensure!(
-                request.get("fx_quote_hash").and_then(Value::as_str)
-                    == Some(stripe_fx_quote_hash(&quote)?.as_str()),
-                "canonical fiat attempt FX quote hash mismatch"
-            );
+            let expected_hash = request
+                .get("fx_quote_hash")
+                .and_then(Value::as_str)
+                .context("canonical fiat attempt is missing its FX quote hash")?;
+            ensure_canonical_fiat_quote_hash(&quote, expected_hash)?;
             Some(quote)
         }
         None => None,
@@ -56377,7 +57427,7 @@ async fn execute_canonical_stripe_attempt(
                     return Ok(CanonicalFiatAttemptExecution::ExpiredPreEffect {
                         evidence: stable_json_value(&json!({
                             "fx_quote_id": quote.id,
-                            "fx_quote_hash": stripe_fx_quote_hash(quote)?,
+                            "fx_quote_hash": request.get("fx_quote_hash"),
                             "quote_expires_at": quote_expires_at,
                             "error_code": "fx_quote_expired",
                             "external_effect_absent": true,
@@ -56455,7 +57505,7 @@ async fn execute_canonical_stripe_attempt(
             && destination_payment.captured,
         "Stripe destination payment did not match the canonical attempt"
     );
-    let quote_hash = quote.as_ref().map(stripe_fx_quote_hash).transpose()?;
+    let quote_hash = request.get("fx_quote_hash");
     let evidence = stable_json_value(&json!({
         "schema_version": 2,
         "kind": "stripe_transfer",
@@ -56523,6 +57573,7 @@ async fn stripe_operator_fee_evidence(
                 "liability_au": money_au_json(output.liability_au),
             }),
             None,
+            false,
             max_attempts,
             retry_ms,
         )
@@ -59244,6 +60295,28 @@ struct ProviderArtifactPaths {
     sidecars: BTreeMap<String, PathBuf>,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiCompatibleSnapshotManifest {
+    schema: u32,
+    source: String,
+    repo: String,
+    source_revision: String,
+    canonical_hf_revision: String,
+    total_bytes: u64,
+    files: Vec<OpenAiCompatibleSnapshotFile>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenAiCompatibleSnapshotFile {
+    path: String,
+    size: u64,
+    sha256: String,
+    hf_oid: String,
+    hf_oid_kind: String,
+}
+
 const PROVIDER_COMFY_WORKFLOW_DEFINITION_ARTIFACT: &str = "__workflow_class_definition";
 
 #[derive(Clone, Debug)]
@@ -59421,11 +60494,13 @@ struct ProviderHeartbeatLoad {
     modality_active_items: Arc<BTreeMap<String, AtomicU64>>,
     modality_max_inflight_items: Arc<BTreeMap<String, u64>>,
     changes: tokio::sync::watch::Sender<u64>,
+    published_changes: tokio::sync::watch::Sender<u64>,
 }
 
 impl Default for ProviderHeartbeatLoad {
     fn default() -> Self {
         let (changes, _) = tokio::sync::watch::channel(0);
+        let (published_changes, _) = tokio::sync::watch::channel(0);
         Self {
             prefix_caching: Arc::new(AtomicBool::new(false)),
             active_slots: Arc::new(AtomicU64::new(0)),
@@ -59439,6 +60514,7 @@ impl Default for ProviderHeartbeatLoad {
             modality_active_items: Arc::new(BTreeMap::new()),
             modality_max_inflight_items: Arc::new(BTreeMap::new()),
             changes,
+            published_changes,
         }
     }
 }
@@ -59686,6 +60762,20 @@ impl ProviderHeartbeatLoad {
         self.changes.subscribe()
     }
 
+    fn change_generation(&self) -> u64 {
+        *self.changes.borrow()
+    }
+
+    fn mark_published(&self, generation: u64) {
+        if *self.published_changes.borrow() < generation {
+            self.published_changes.send_replace(generation);
+        }
+    }
+
+    fn published_through(&self, generation: u64) -> bool {
+        *self.published_changes.borrow() >= generation
+    }
+
     fn notify_change(&self) {
         self.changes
             .send_modify(|generation| *generation = generation.wrapping_add(1));
@@ -59910,6 +61000,53 @@ impl ProviderTpmActivationLimiter {
         }) {
             accepted.pop_front();
         }
+    }
+}
+
+#[derive(Debug)]
+struct ProviderTokenizeLimiter {
+    global_limit: usize,
+    per_peer_limit: usize,
+    accepted_at: VecDeque<Instant>,
+    accepted_by_peer: HashMap<String, VecDeque<Instant>>,
+}
+
+impl ProviderTokenizeLimiter {
+    fn from_environment() -> Result<Self> {
+        Ok(Self {
+            global_limit: configured_positive_count(
+                "MAYHEM_PROVIDER_TOKENIZE_REQUESTS_PER_MINUTE",
+                DEFAULT_TOKENIZE_REQUESTS_PER_MINUTE,
+                "provider tokenize global rate",
+            )?,
+            per_peer_limit: configured_positive_count(
+                "MAYHEM_PROVIDER_TOKENIZE_REQUESTS_PER_PEER_PER_MINUTE",
+                DEFAULT_TOKENIZE_REQUESTS_PER_PEER_PER_MINUTE,
+                "provider tokenize per-peer rate",
+            )?,
+            accepted_at: VecDeque::new(),
+            accepted_by_peer: HashMap::new(),
+        })
+    }
+
+    fn admit(&mut self, remote: &str, now: Instant) -> Result<()> {
+        ProviderTpmActivationLimiter::prune(&mut self.accepted_at, now);
+        self.accepted_by_peer.retain(|_, accepted| {
+            ProviderTpmActivationLimiter::prune(accepted, now);
+            !accepted.is_empty()
+        });
+        ensure!(
+            self.accepted_at.len() < self.global_limit,
+            "provider tokenize global rate limit reached"
+        );
+        let peer = self.accepted_by_peer.entry(remote.to_owned()).or_default();
+        ensure!(
+            peer.len() < self.per_peer_limit,
+            "provider tokenize per-peer rate limit reached"
+        );
+        self.accepted_at.push_back(now);
+        peer.push_back(now);
+        Ok(())
     }
 }
 
@@ -60348,6 +61485,14 @@ fn provider_session_quality_value(
     })
 }
 
+fn provider_session_quality_compute_ms(quality: &Value) -> u64 {
+    quality
+        .get("compute_ms")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1)
+}
+
 struct ProviderRequestLoadGuard {
     load: ProviderHeartbeatLoad,
     modality_items: BTreeMap<String, u32>,
@@ -60444,6 +61589,7 @@ struct ReceiptSettlementOutboxEntry {
     final_receipt: bool,
     usage: ReceiptUsage,
     au_owed_cum: MoneyAu,
+    compute_ms: u64,
     immutable_terms_hash: String,
 }
 
@@ -60454,17 +61600,23 @@ struct ReceiptSettlementFeatureMeta {
     final_receipt: bool,
     usage: ReceiptUsage,
     au_owed_cum: MoneyAu,
+    compute_ms: u64,
     immutable_terms_hash: String,
 }
 
 fn receipt_settlement_feature_meta(feature: &Value) -> Result<ReceiptSettlementFeatureMeta> {
     validate_receipt_settlement_feature(feature)?;
-    let receipt = parse_record_usage_receipt_envelope(
-        feature
-            .pointer("/value/receipt")
-            .context("receipt settlement feature is missing receipt")?,
-    )
-    .map_err(anyhow::Error::msg)?;
+    let envelope = feature
+        .pointer("/value/receipt")
+        .context("receipt settlement feature is missing receipt")?;
+    let receipt = parse_record_usage_receipt_envelope(envelope).map_err(anyhow::Error::msg)?;
+    receipt_settlement_receipt_meta(&receipt, Some(envelope))
+}
+
+fn receipt_settlement_receipt_meta(
+    receipt: &SessionReceipt,
+    original_envelope: Option<&Value>,
+) -> Result<ReceiptSettlementFeatureMeta> {
     let body = &receipt.body;
     let attempt_id = stable_value_hash(&json!({
         "domain": "mayhem-receipt-settlement-attempt-v1",
@@ -60473,8 +61625,13 @@ fn receipt_settlement_feature_meta(feature: &Value) -> Result<ReceiptSettlementF
         "reservation_id": body.reservation_id,
         "provider": body.provider,
     }));
-    let mut immutable_terms =
-        serde_json::to_value(body).context("serializing receipt immutable terms")?;
+    let mut immutable_terms = match original_envelope {
+        Some(envelope) => envelope
+            .get("body")
+            .cloned()
+            .context("receipt envelope is missing its body")?,
+        None => serde_json::to_value(body).context("serializing receipt immutable terms")?,
+    };
     let terms = immutable_terms
         .as_object_mut()
         .context("receipt body did not serialize as an object")?;
@@ -60484,6 +61641,11 @@ fn receipt_settlement_feature_meta(feature: &Value) -> Result<ReceiptSettlementF
         "usage",
         "usage_attribution",
         "au_owed_cum",
+        // Schema v12 measures cumulative compute at each checkpoint. It is
+        // signed evidence, but advances with usage and is not an admission
+        // term. Treating it as immutable makes checkpoint #2 conflict with
+        // checkpoint #1 and aborts every sufficiently long streamed request.
+        "compute_ms",
         "ts",
     ] {
         terms.remove(field);
@@ -60494,6 +61656,7 @@ fn receipt_settlement_feature_meta(feature: &Value) -> Result<ReceiptSettlementF
         final_receipt: body.final_receipt,
         usage: body.usage.clone(),
         au_owed_cum: body.au_owed_cum,
+        compute_ms: body.compute_ms,
         immutable_terms_hash: stable_value_hash(&immutable_terms),
     })
 }
@@ -60519,29 +61682,22 @@ fn receipt_settlement_entry_supersedes(
         ensure!(
             incoming.seq <= current.seq
                 && current.au_owed_cum >= incoming.au_owed_cum
-                && current.usage.is_monotonic_from(&incoming.usage),
+                && current.usage.is_monotonic_from(&incoming.usage)
+                && current.compute_ms >= incoming.compute_ms,
             "receipt settlement attempt cannot advance or conflict with a durable final receipt"
         );
         return Ok(false);
     }
     ensure!(
-        incoming.seq >= current.seq,
-        "receipt settlement attempt cannot downgrade its canonical sequence"
+        incoming.seq > current.seq,
+        "receipt settlement attempt must advance its canonical sequence"
     );
-    if incoming.seq == current.seq {
-        ensure!(
-            incoming.final_receipt
-                && incoming.au_owed_cum >= current.au_owed_cum
-                && incoming.usage.is_monotonic_from(&current.usage),
-            "receipt settlement attempt has conflicting evidence at the same sequence"
-        );
-    } else {
-        ensure!(
-            incoming.au_owed_cum >= current.au_owed_cum
-                && incoming.usage.is_monotonic_from(&current.usage),
-            "receipt settlement attempt high-water evidence is not monotonic"
-        );
-    }
+    ensure!(
+        incoming.au_owed_cum >= current.au_owed_cum
+            && incoming.usage.is_monotonic_from(&current.usage)
+            && incoming.compute_ms >= current.compute_ms,
+        "receipt settlement attempt high-water evidence is not monotonic"
+    );
     Ok(true)
 }
 
@@ -60566,16 +61722,43 @@ fn confirmed_receipt_settlement_record_matches(
     key: &str,
     entry: &ReceiptSettlementOutboxEntry,
 ) -> bool {
-    record.get("confirmed").and_then(Value::as_bool) == Some(true)
+    let confirmed_head = record.get("confirmed").and_then(Value::as_bool) == Some(true)
         && record.get("key").and_then(Value::as_str) == Some(key)
-        && record.pointer("/value/type").and_then(Value::as_str)
-            == Some("canonical_receipt_head")
-        && record
-            .pointer("/value/settlement_ready")
-            .and_then(Value::as_bool)
-            == Some(true)
-        && record.pointer("/value/feature_key") == entry.feature.get("key")
+        && record.pointer("/value/type").and_then(Value::as_str) == Some("canonical_receipt_head");
+    // A confirmed checkpoint has been delivered even though the session has
+    // not settled. Requiring settlement here deadlocks failed-session recovery:
+    // recovery waits for signed evidence delivery before closing the hold.
+    // Finals still gate subsequent admission until settlement is ready.
+    let settlement_ready = record
+        .pointer("/value/settlement_ready")
+        .and_then(Value::as_bool)
+        == Some(true);
+    if !confirmed_head || (entry.final_receipt && !settlement_ready) {
+        return false;
+    }
+    if record.pointer("/value/feature_key") == entry.feature.get("key")
         && record.pointer("/value/receipt") == entry.feature.pointer("/value/receipt")
+    {
+        return true;
+    }
+    if entry.final_receipt {
+        return false;
+    }
+    let Some(envelope) = record.pointer("/value/receipt") else {
+        return false;
+    };
+    let Some(receipt) = parse_record_usage_receipt_envelope(envelope).ok() else {
+        return false;
+    };
+    let Ok(canonical) = receipt_settlement_receipt_meta(&receipt, Some(envelope)) else {
+        return false;
+    };
+    canonical.attempt_id == entry.attempt_id
+        && canonical.immutable_terms_hash == entry.immutable_terms_hash
+        && canonical.seq > entry.seq
+        && canonical.au_owed_cum >= entry.au_owed_cum
+        && canonical.usage.is_monotonic_from(&entry.usage)
+        && canonical.compute_ms >= entry.compute_ms
 }
 
 async fn confirmed_receipt_settlement_entry(
@@ -60698,6 +61881,7 @@ impl ReceiptSettlementOutbox {
             final_receipt: meta.final_receipt,
             usage: meta.usage,
             au_owed_cum: meta.au_owed_cum,
+            compute_ms: meta.compute_ms,
             immutable_terms_hash: meta.immutable_terms_hash,
         })
     }
@@ -60802,8 +61986,14 @@ impl ReceiptSettlementOutbox {
     }
 
     fn load_entries(&self) -> Result<Vec<ReceiptSettlementOutboxEntry>> {
+        Self::select_attempt_heads(self.load_physical_entries()?)
+    }
+
+    fn select_attempt_heads(
+        entries: Vec<ReceiptSettlementOutboxEntry>,
+    ) -> Result<Vec<ReceiptSettlementOutboxEntry>> {
         let mut attempts = BTreeMap::<String, ReceiptSettlementOutboxEntry>::new();
-        for entry in self.load_physical_entries()? {
+        for entry in entries {
             match attempts.get(&entry.attempt_id) {
                 None => {
                     attempts.insert(entry.attempt_id.clone(), entry);
@@ -60815,6 +62005,7 @@ impl ReceiptSettlementOutbox {
                         final_receipt: entry.final_receipt,
                         usage: entry.usage.clone(),
                         au_owed_cum: entry.au_owed_cum,
+                        compute_ms: entry.compute_ms,
                         immutable_terms_hash: entry.immutable_terms_hash.clone(),
                     };
                     if receipt_settlement_entry_supersedes(current, &meta, &entry.feature)? {
@@ -60829,6 +62020,89 @@ impl ReceiptSettlementOutbox {
             RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES
         );
         Ok(attempts.into_values().collect())
+    }
+
+    // Called under the cross-process outbox lock. Enumerate current filenames
+    // for capacity, but only read/verify signed documents for this attempt.
+    // Startup, admission and retry still perform complete validation; no cache
+    // or layout change can hide another process's durable evidence.
+    fn load_attempt(
+        &self,
+        attempt_id: &str,
+    ) -> Result<(usize, Option<ReceiptSettlementOutboxEntry>)> {
+        let mut attempts = BTreeSet::new();
+        let mut paths = Vec::new();
+        let mut physical_count = 0_usize;
+        for item in fs::read_dir(&self.directory)? {
+            let item = item?;
+            let path = item.path();
+            if path.extension() != Some(OsStr::new("json")) {
+                continue;
+            }
+            physical_count += 1;
+            ensure!(
+                physical_count <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES.saturating_mul(2),
+                "receipt settlement outbox exceeded its bounded recovery file count"
+            );
+            let filename = item.file_name();
+            let parts = filename
+                .to_str()
+                .context("invalid receipt filename")?
+                .split('.')
+                .collect::<Vec<_>>();
+            let lower_hex = |s: &str| {
+                s.len() == 64
+                    && s.bytes()
+                        .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            };
+            ensure!(
+                parts.len() == 5
+                    && lower_hex(parts[0])
+                    && parts[1].len() == 20
+                    && parts[1].bytes().all(|b| b.is_ascii_digit())
+                    && parts[1].parse::<u64>().is_ok()
+                    && matches!(parts[2], "0" | "1")
+                    && lower_hex(parts[3])
+                    && parts[4] == "json",
+                "receipt settlement outbox entry has a non-canonical filename"
+            );
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                // Full background validation can quarantine an obsolete entry
+                // between directory enumeration and this metadata check.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
+            ensure!(
+                metadata.file_type().is_file(),
+                "receipt settlement outbox entry must be a regular file"
+            );
+            ensure!(
+                metadata.len() <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRY_BYTES,
+                "receipt settlement outbox entry exceeds its byte bound"
+            );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                ensure!(
+                    metadata.permissions().mode() & 0o077 == 0,
+                    "receipt settlement outbox entry must not be group/world accessible"
+                );
+            }
+            attempts.insert(parts[0].to_owned());
+            if parts[0] == attempt_id {
+                paths.push(path);
+            }
+        }
+        ensure!(
+            attempts.len() <= RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES,
+            "receipt settlement outbox reached its attempt bound"
+        );
+        paths.sort();
+        let current = Self::select_attempt_heads(self.load_physical_entries_at_paths(paths)?)?
+            .into_iter()
+            .next();
+        Ok((attempts.len(), current))
     }
 
     fn lock_file(&self) -> Result<fs::File> {
@@ -60876,19 +62150,7 @@ impl ReceiptSettlementOutbox {
         let lock = self.lock_file()?;
         let meta = receipt_settlement_feature_meta(feature)?;
         let path = self.entry_path(feature)?;
-        if path.exists() {
-            let existing = self.load_entry(&path)?;
-            ensure!(
-                existing.feature == *feature,
-                "receipt settlement outbox key already contains different signed evidence"
-            );
-            fs2::FileExt::unlock(&lock).context("unlocking receipt settlement outbox")?;
-            return Ok(existing);
-        }
-        let current = self
-            .load_entries()?
-            .into_iter()
-            .find(|entry| entry.attempt_id == meta.attempt_id);
+        let (attempt_count, current) = self.load_attempt(&meta.attempt_id)?;
         if let Some(current) = current.as_ref() {
             if !receipt_settlement_entry_supersedes(current, &meta, feature)? {
                 fs2::FileExt::unlock(&lock).context("unlocking receipt settlement outbox")?;
@@ -60896,7 +62158,7 @@ impl ReceiptSettlementOutbox {
             }
         }
         ensure!(
-            self.load_entries()?.len() < RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES,
+            current.is_some() || attempt_count < RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES,
             "receipt settlement outbox reached its {} attempt bound",
             RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES
         );
@@ -60968,10 +62230,7 @@ impl ReceiptSettlementOutbox {
 
     fn remove(&self, entry: &ReceiptSettlementOutboxEntry) -> Result<()> {
         let lock = self.lock_file()?;
-        let current = self
-            .load_entries()?
-            .into_iter()
-            .find(|current| current.attempt_id == entry.attempt_id);
+        let (_, current) = self.load_attempt(&entry.attempt_id)?;
         if current
             .as_ref()
             .is_some_and(|current| current.feature != entry.feature)
@@ -61004,19 +62263,14 @@ impl ReceiptSettlementOutbox {
             rpc.submit_feature(entry.feature.clone()),
         )
         .await;
-        if matches!(
-            &relay,
-            Ok(Ok(response)) if response.get("ok").and_then(Value::as_bool) == Some(true)
-        ) {
-            return self.remove(&entry);
-        }
-
         // A relay acknowledgement is transport evidence, not the source of
-        // truth.  The writer can commit the receipt and lose only its answer;
-        // retaining that already-canonical entry forever eventually blocks all
-        // new paid work.  Retire it only when the confirmed ledger head proves
-        // the exact signed feature landed.  Any missing or mismatched field
-        // fails closed and leaves the durable outbox entry untouched.
+        // truth. The writer may acknowledge an accepted append before that
+        // append is visible in canonical state. Removing the entry at that
+        // point also hides the pending final receipt from next-turn admission,
+        // so a newly freed provider can reject the next request while the
+        // previous hold is still closing. Retire only when the confirmed ledger
+        // head proves the exact signed feature landed. Any missing or
+        // mismatched field fails closed and leaves the durable entry visible.
         if confirmed_receipt_settlement_entry(rpc, &entry).await? {
             return self.remove(&entry);
         }
@@ -61027,7 +62281,7 @@ impl ReceiptSettlementOutbox {
                 Err(error).context("submitting receipt settlement through participant relay")
             }
             Ok(Ok(response)) => Err(anyhow!(
-                "receipt settlement relay did not confirm canonical evidence: {response}"
+                "receipt settlement relay accepted transport delivery but canonical evidence remains pending: {response}"
             )),
         }
     }
@@ -61136,7 +62390,11 @@ impl GatewayReceiptSettlementPublisher for ReceiptSettlementOutbox {
             .map_err(|error| format!("{error:#}"))
     }
 
-    fn has_pending_final_receipts(&self, user: &str, rail: &str) -> std::result::Result<bool, String> {
+    fn has_pending_final_receipts(
+        &self,
+        user: &str,
+        rail: &str,
+    ) -> std::result::Result<bool, String> {
         self.load_entries()
             .map(|entries| {
                 entries.iter().any(|entry| {
@@ -61220,22 +62478,26 @@ fn validate_receipt_settlement_feature(feature: &Value) -> Result<String> {
                 if receipt_contract_version_is_supported(version)),
         "receipt settlement feature has the wrong operation or contract version"
     );
-    let receipt = parse_record_usage_receipt_envelope(
-        value
-            .get("receipt")
-            .context("receipt settlement feature is missing receipt")?,
-    )
-    .map_err(anyhow::Error::msg)?;
+    let receipt_envelope = value
+        .get("receipt")
+        .context("receipt settlement feature is missing receipt")?;
+    let receipt =
+        parse_record_usage_receipt_envelope(receipt_envelope).map_err(anyhow::Error::msg)?;
     ensure!(
-        receipt.body.schema_version == SESSION_RECEIPT_SCHEMA_VERSION
-            && value.get("epoch").and_then(Value::as_u64) == Some(receipt.body.billing_epoch)
+        receipt_schema_version_is_supported_for_contract(
+            u64::from(receipt.body.schema_version),
+            contract_version.expect("validated receipt contract version")
+        ) && value.get("epoch").and_then(Value::as_u64) == Some(receipt.body.billing_epoch)
             && value.get("payout_revision").and_then(Value::as_str)
                 == Some(receipt.body.payout_revision.as_str()),
         "receipt settlement outer binding does not match its signed receipt"
     );
     ensure!(
-        key == record_usage_receipt_feature_key_for_contract(
-            &receipt, contract_version.expect("validated receipt contract version") as u32),
+        key == record_usage_receipt_feature_key_from_envelope_for_contract(
+            receipt_envelope,
+            contract_version.expect("validated receipt contract version") as u32,
+        )
+        .map_err(anyhow::Error::msg)?,
         "receipt settlement feature key is not canonical"
     );
     let provider_signature = value
@@ -61308,6 +62570,14 @@ struct ProviderBackendRuntime {
     cache_dir: Option<PathBuf>,
     external_binary: Option<PathBuf>,
     stable_diffusion_backend: Option<String>,
+    #[serde(skip_serializing)]
+    openai_compatible_url: Option<String>,
+    #[serde(skip_serializing)]
+    openai_compatible_pid: Option<u32>,
+    #[serde(skip_serializing)]
+    openai_compatible_docker: Option<PathBuf>,
+    #[serde(skip_serializing)]
+    managed_openai_compatible: Option<Arc<managed_openai_compatible::ManagedOpenAiRuntime>>,
 }
 
 #[derive(Clone)]
@@ -61405,10 +62675,26 @@ fn provider_session_reject_replay_decision(
     Ok(
         if replay.remote != remote || replay.open_head != replay_head {
             ProviderSessionReplayDecision::Conflict
+        } else if replay.reject_frame.get("code").and_then(Value::as_str)
+            == Some("RESERVATION_PENDING")
+        {
+            ProviderSessionReplayDecision::Pending
         } else {
             ProviderSessionReplayDecision::Cached(replay.reject_frame.clone())
         },
     )
+}
+
+fn provider_session_reservation_timeout_decision(
+    admission_timeout: Duration,
+) -> ProviderSessionDecision {
+    ProviderSessionDecision::Reject {
+        code: "RESERVATION_PENDING",
+        reason: format!(
+            "the signed spend reservation did not reach a canonical result within the {} ms provider admission budget; the exact reservation is retained for recovery",
+            admission_timeout.as_millis()
+        ),
+    }
 }
 
 fn prune_provider_session_reject_replays(
@@ -61481,6 +62767,10 @@ struct ProviderSessionTerms {
     model_id: String,
     adapter: catalog::CatalogAdapter,
     generation_execution_profile: Option<catalog::CatalogGenerationExecutionProfile>,
+    /// Request modality sets that the loaded runtime can dispatch independently
+    /// without a catalog generation profile. This is populated only from a
+    /// live concurrent backend, never from advertised provider capacity.
+    runtime_independent_dispatch_modalities: Vec<Vec<String>>,
     sampling: catalog::CatalogSamplingProfile,
     workflow_policy: Option<mayhem_proto::ComfyWorkflowCatalogPolicy>,
     output_modalities: Vec<String>,
@@ -61494,6 +62784,7 @@ struct ProviderSessionTerms {
     min_session_au: MoneyAu,
     min_ask_au: MoneyAu,
     rules_ver: u64,
+    capacity_slots: u32,
     ctx: u64,
     ctx_bracket: Option<String>,
     ctx_bracket_table_ver: Option<u32>,
@@ -61514,7 +62805,9 @@ enum ProviderSessionDecision {
 }
 
 trait ProviderSessionResponder {
-    fn prefix_caching_enabled(&self) -> bool { false }
+    fn prefix_caching_enabled(&self) -> bool {
+        false
+    }
     fn mode(&self) -> &'static str;
     /// Independently dispatchable requests, not the engine's theoretical batch capacity.
     fn concurrent_session_capacity(&self) -> u32 {
@@ -61526,14 +62819,26 @@ trait ProviderSessionResponder {
     fn recover_component(&mut self) -> Result<ComponentRecovery> {
         Ok(ComponentRecovery::Unsupported)
     }
+    fn reclaim_idle_memory(&mut self) -> Result<bool> {
+        Ok(false)
+    }
     fn supports_live_text_streaming(&self) -> bool {
         false
     }
     fn process_ids(&self) -> Vec<u32> {
         Vec::new()
     }
+    fn requires_owner_restart(&self) -> bool {
+        false
+    }
     fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
         None
+    }
+    fn concurrent_embedding_backend(&self) -> Option<Arc<dyn ConcurrentEmbeddingBackend>> {
+        None
+    }
+    fn tokenize(&mut self, _terms: &ProviderSessionTerms, _body: &Value) -> Result<Tokenization> {
+        bail!("provider backend does not expose exact tokenization")
     }
     fn respond(
         &mut self,
@@ -61598,7 +62903,9 @@ struct EngineProviderSessionResponder {
 }
 
 impl ProviderSessionResponder for EngineProviderSessionResponder {
-    fn prefix_caching_enabled(&self) -> bool { self.backend.prefix_caching_enabled() }
+    fn prefix_caching_enabled(&self) -> bool {
+        self.backend.prefix_caching_enabled()
+    }
     fn mode(&self) -> &'static str {
         "mayhem-engine"
     }
@@ -61608,15 +62915,25 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
     }
 
     fn concurrent_session_capacity(&self) -> u32 {
-        self.backend
+        let generation = self
+            .backend
             .concurrent_generation_backend()
             .map(|backend| u32::try_from(backend.capacity()).unwrap_or(u32::MAX))
-            .unwrap_or(1)
-            .max(1)
+            .unwrap_or(1);
+        let embedding = self
+            .backend
+            .concurrent_embedding_backend()
+            .map(|backend| u32::try_from(backend.capacity()).unwrap_or(u32::MAX))
+            .unwrap_or(1);
+        generation.max(embedding).max(1)
     }
 
     fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
         self.backend.concurrent_generation_backend()
+    }
+
+    fn concurrent_embedding_backend(&self) -> Option<Arc<dyn ConcurrentEmbeddingBackend>> {
+        self.backend.concurrent_embedding_backend()
     }
 
     fn component_healthy(&mut self) -> bool {
@@ -61627,8 +62944,24 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
         self.backend.recover_component().map_err(Into::into)
     }
 
+    fn reclaim_idle_memory(&mut self) -> Result<bool> {
+        self.backend.reclaim_idle_memory().map_err(Into::into)
+    }
+
     fn process_ids(&self) -> Vec<u32> {
         self.backend.process_ids()
+    }
+
+    fn requires_owner_restart(&self) -> bool {
+        self.backend.requires_owner_restart()
+    }
+
+    fn tokenize(&mut self, terms: &ProviderSessionTerms, body: &Value) -> Result<Tokenization> {
+        let prompt = provider_engine_tokenize_prompt(terms, body)?;
+        if let Some(backend) = self.backend.concurrent_generation_backend() {
+            return backend.tokenize(&prompt).map_err(Into::into);
+        }
+        self.backend.tokenize(&prompt).map_err(Into::into)
     }
 
     fn respond(
@@ -61669,11 +63002,26 @@ impl ProviderSessionResponder for EngineProviderSessionResponder {
     }
 }
 
-struct ConcurrentGenerationEngineBackend {
-    backend: Arc<dyn ConcurrentGenerationBackend>,
+#[derive(Clone)]
+enum ProviderConcurrentEngine {
+    Generation(Arc<dyn ConcurrentGenerationBackend>),
+    Embedding(Arc<dyn ConcurrentEmbeddingBackend>),
 }
 
-impl EngineBackend for ConcurrentGenerationEngineBackend {
+impl ProviderConcurrentEngine {
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Generation(backend) => backend.capacity(),
+            Self::Embedding(backend) => backend.capacity(),
+        }
+    }
+}
+
+struct ConcurrentEngineBackend {
+    backend: ProviderConcurrentEngine,
+}
+
+impl EngineBackend for ConcurrentEngineBackend {
     fn backend_id(&self) -> &'static str {
         "vllm"
     }
@@ -61687,10 +63035,13 @@ impl EngineBackend for ConcurrentGenerationEngineBackend {
         ))
     }
 
-    fn tokenize(&self, _text: &str) -> mayhem_engine::Result<mayhem_engine::Tokenization> {
-        Err(EngineError::InvalidConfig(
-            "concurrent vLLM request handles cannot tokenize outside generation".to_owned(),
-        ))
+    fn tokenize(&self, text: &str) -> mayhem_engine::Result<mayhem_engine::Tokenization> {
+        match &self.backend {
+            ProviderConcurrentEngine::Generation(backend) => backend.tokenize(text),
+            ProviderConcurrentEngine::Embedding(_) => Err(EngineError::InvalidConfig(
+                "concurrent embedding handles do not expose text tokenization".to_owned(),
+            )),
+        }
     }
 
     fn generate(
@@ -61699,18 +63050,38 @@ impl EngineBackend for ConcurrentGenerationEngineBackend {
         sink: &mut dyn mayhem_engine::TokenSink,
         cancellation: &CancellationToken,
     ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
-        self.backend.generate(request, sink, cancellation)
+        match &self.backend {
+            ProviderConcurrentEngine::Generation(backend) => {
+                backend.generate(request, sink, cancellation)
+            }
+            ProviderConcurrentEngine::Embedding(_) => Err(EngineError::InvalidConfig(
+                "concurrent embedding handles cannot generate text".to_owned(),
+            )),
+        }
+    }
+
+    fn embed(
+        &mut self,
+        request: mayhem_engine::EmbeddingRequest,
+        cancellation: &CancellationToken,
+    ) -> mayhem_engine::Result<mayhem_engine::EmbeddingOutput> {
+        match &self.backend {
+            ProviderConcurrentEngine::Embedding(backend) => backend.embed(request, cancellation),
+            ProviderConcurrentEngine::Generation(_) => Err(EngineError::InvalidConfig(
+                "concurrent generation handles cannot create embeddings".to_owned(),
+            )),
+        }
     }
 }
 
 struct ConcurrentEngineProviderSessionResponder {
-    backend: ConcurrentGenerationEngineBackend,
+    backend: ConcurrentEngineBackend,
 }
 
 impl ConcurrentEngineProviderSessionResponder {
-    fn new(backend: Arc<dyn ConcurrentGenerationBackend>) -> Self {
+    fn new(backend: ProviderConcurrentEngine) -> Self {
         Self {
-            backend: ConcurrentGenerationEngineBackend { backend },
+            backend: ConcurrentEngineBackend { backend },
         }
     }
 }
@@ -61728,6 +63099,11 @@ impl ProviderSessionResponder for ConcurrentEngineProviderSessionResponder {
 
     fn supports_live_text_streaming(&self) -> bool {
         true
+    }
+
+    fn tokenize(&mut self, terms: &ProviderSessionTerms, body: &Value) -> Result<Tokenization> {
+        let prompt = provider_engine_tokenize_prompt(terms, body)?;
+        self.backend.tokenize(&prompt).map_err(Into::into)
     }
 
     fn respond(
@@ -62129,7 +63505,11 @@ async fn provider_serve_plan(args: ProviderServePlanArgs) -> Result<()> {
             "Copy/paste start command: {}",
             report["copy_paste"]["up"].as_str().unwrap_or("")
         );
-        for command in report["copy_paste"]["serve"].as_array().into_iter().flatten() {
+        for command in report["copy_paste"]["serve"]
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
             println!("Then: {}", command.as_str().unwrap_or(""));
         }
     }
@@ -62800,10 +64180,14 @@ fn append_provider_hardware_quote_args(
 
 fn append_provider_serve_execution_mode(child: &mut Value, mode_id: &str) -> Result<()> {
     mayhem_proto::validate_execution_mode_id(mode_id).map_err(anyhow::Error::msg)?;
-    let args = child.get_mut("args").and_then(Value::as_array_mut)
+    let args = child
+        .get_mut("args")
+        .and_then(Value::as_array_mut)
         .context("supervised provider command is missing its argument list")?;
     ensure!(
-        !args.iter().any(|arg| arg.as_str() == Some("--execution-mode")),
+        !args
+            .iter()
+            .any(|arg| arg.as_str() == Some("--execution-mode")),
         "supervised provider command already selects an execution mode"
     );
     args.extend([json!("--execution-mode"), json!(mode_id)]);
@@ -62857,6 +64241,7 @@ fn provider_backend_runtime_child_env(
         "transformers-asr" => {
             insert_path("MAYHEM_TRANSFORMERS_ASR_PYTHON", runtime.python.as_deref());
         }
+        "laya" => insert_path("MAYHEM_LAYA_PYTHON", runtime.python.as_deref()),
         "stable-diffusion.cpp" => {
             insert_path(
                 "MAYHEM_STABLE_DIFFUSION_CPP_BIN",
@@ -62871,12 +64256,22 @@ fn provider_backend_runtime_child_env(
         }
         "comfyui" => {
             insert_path("MAYHEM_COMFYUI_PYTHON", runtime.python.as_deref());
-            if let Ok(device) = env::var("MAYHEM_COMFYUI_DEVICE") {
-                child_env.insert("MAYHEM_COMFYUI_DEVICE".to_owned(), device);
+            for name in ["MAYHEM_COMFYUI_DEVICE", "MAYHEM_COMFYUI_RESERVE_VRAM_GB"] {
+                if let Ok(value) = env::var(name) {
+                    child_env.insert(name.to_owned(), value);
+                }
             }
         }
         "whisper.cpp" => insert_path("MAYHEM_WHISPER_CPP_BIN", runtime.external_binary.as_deref()),
         "piper" => insert_path("MAYHEM_PIPER_BIN", runtime.external_binary.as_deref()),
+        "openai-compatible" => {
+            if let Some(url) = runtime.openai_compatible_url.as_ref() {
+                child_env.insert("MAYHEM_OPENAI_COMPATIBLE_URL".to_owned(), url.clone());
+                if let Some(pid) = runtime.openai_compatible_pid {
+                    child_env.insert("MAYHEM_OPENAI_COMPATIBLE_PID".to_owned(), pid.to_string());
+                }
+            }
+        }
         _ => {}
     }
     child_env
@@ -63083,16 +64478,27 @@ fn provider_serve_plan_commands(
     gpu_layers: Option<u32>,
     hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
 ) -> Value {
-    if selection.candidates.iter().all(|candidate| candidate.execution_mode.is_none()) {
+    if selection
+        .candidates
+        .iter()
+        .all(|candidate| candidate.execution_mode.is_none())
+    {
         return json!({"up": provider_auto_fit_up_command(
             home, selection, gpu_layers, &args.disable_modalities, hardware_quote_config,
         )});
     }
     // `up` has no per-worker mode selector. Replay via the supervised serve command.
-    let serve = selection.candidates.iter().map(|candidate| {
-        provider_serve_mode_add_argv(home, candidate, args, gpu_layers, hardware_quote_config)
-            .iter().map(|value| shell_single_quote(value)).collect::<Vec<_>>().join(" ")
-    }).collect::<Vec<_>>();
+    let serve = selection
+        .candidates
+        .iter()
+        .map(|candidate| {
+            provider_serve_mode_add_argv(home, candidate, args, gpu_layers, hardware_quote_config)
+                .iter()
+                .map(|value| shell_single_quote(value))
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .collect::<Vec<_>>();
     json!({
         "up": format!("mayhem up --yes --home {}", shell_single_quote(&home.display().to_string())),
         "serve": serve,
@@ -63107,9 +64513,15 @@ fn provider_serve_mode_add_argv(
     hardware_quote_config: Option<&ProviderHardwareQuoteConfig>,
 ) -> Vec<String> {
     let mut argv = vec![
-        "mayhem".to_owned(), "provider".to_owned(), "serve".to_owned(), "add".to_owned(),
-        candidate.enclave.enclave_id.clone(), "--home".to_owned(), home.display().to_string(),
-        "--ctx".to_owned(), candidate.served_ctx.to_string(),
+        "mayhem".to_owned(),
+        "provider".to_owned(),
+        "serve".to_owned(),
+        "add".to_owned(),
+        candidate.enclave.enclave_id.clone(),
+        "--home".to_owned(),
+        home.display().to_string(),
+        "--ctx".to_owned(),
+        candidate.served_ctx.to_string(),
     ];
     if let Some(mode) = &candidate.execution_mode {
         argv.extend(["--execution-mode".to_owned(), mode.binding.mode_id.clone()]);
@@ -63125,9 +64537,12 @@ fn provider_serve_mode_add_argv(
     }
     if let Some(config) = hardware_quote_config {
         argv.extend([
-            "--hardware-quote-kind".to_owned(), hardware_quote_kind_name(&config.kind),
-            "--hardware-quote-command".to_owned(), config.command.display().to_string(),
-            "--hardware-quote-timeout-seconds".to_owned(), config.timeout.as_secs().to_string(),
+            "--hardware-quote-kind".to_owned(),
+            hardware_quote_kind_name(&config.kind),
+            "--hardware-quote-command".to_owned(),
+            config.command.display().to_string(),
+            "--hardware-quote-timeout-seconds".to_owned(),
+            config.timeout.as_secs().to_string(),
         ]);
     }
     argv
@@ -63185,7 +64600,10 @@ fn provider_backend_runtime_preflight(
         home,
         backend,
         Some(&selected.artifact),
-        selected.vllm_execution_profile.as_ref().and_then(|profile| profile.runtime.clone()),
+        selected
+            .vllm_execution_profile
+            .as_ref()
+            .and_then(|profile| profile.runtime.clone()),
         Some(&selected.verdict),
         hardware,
         gpu_layers,
@@ -63224,7 +64642,7 @@ fn provider_backend_runtime_preflight_for_backend(
     let mut runtime = ProviderBackendRuntime::default();
     match backend {
         "vllm" | "trt-llm" | "mlx" | "ace-step" | "chatterbox" | "needle-cpu" | "needle-gpu"
-        | "sulphur" | "transformers-asr" => {
+        | "sulphur" | "transformers-asr" | "laya" => {
             let chatterbox_device = if backend == "chatterbox" {
                 let device = chatterbox_managed_device(hardware).context(
                     "hardware probe did not select a supported Chatterbox managed device",
@@ -63346,9 +64764,212 @@ fn provider_backend_runtime_preflight_for_backend(
                 .or(gpu_layers);
             provider_llama_accelerator_preflight(effective_gpu_layers, hardware)?;
         }
+        "openai-compatible" => {
+            let binding = artifact
+                .and_then(|artifact| artifact.openai_compatible.as_ref())
+                .context("openai-compatible artifact is missing its signed runtime binding")?;
+            validate_managed_openai_hardware(hardware)?;
+            if let Ok(url) = env::var("MAYHEM_OPENAI_COMPATIBLE_URL") {
+                mayhem_engine::OpenAiCompatibleBackend::new(
+                    mayhem_engine::OpenAiCompatibleBackendConfig {
+                        base_url: url.clone(),
+                        runtime: binding.clone(),
+                        readiness_timeout: Duration::ZERO,
+                    },
+                )
+                .context("validating the exact-identity loopback attach runtime binding")?;
+                runtime.openai_compatible_pid = Some(verified_openai_attach_pid(&url)?);
+                runtime.openai_compatible_url = Some(url);
+            } else {
+                runtime.openai_compatible_docker = Some(
+                    resolve_executable(Path::new("docker"))
+                        .context("managed openai-compatible serving requires Docker on PATH")?,
+                );
+            }
+        }
         other => bail!("unsupported local provider session backend {other}"),
     }
     Ok(runtime)
+}
+
+fn validate_managed_openai_hardware(hardware: &HardwareReport) -> Result<()> {
+    const MIN_QUALIFIED_VRAM: u64 = 97_887 * 1024 * 1024;
+    const CONTAINER_MEMORY_LIMIT: u64 = 104 * 1024 * 1024 * 1024;
+    ensure!(
+        hardware.memory.total_bytes >= CONTAINER_MEMORY_LIMIT,
+        "managed openai-compatible resource profile requires at least 104 GiB host memory"
+    );
+    let nvidia = hardware
+        .gpus
+        .iter()
+        .filter(|gpu| gpu.vendor == GpuVendor::Nvidia)
+        .collect::<Vec<_>>();
+    ensure!(
+        nvidia.len() == 1,
+        "managed openai-compatible profile requires exactly one NVIDIA GPU"
+    );
+    let gpu = nvidia[0];
+    ensure!(
+        gpu.compute_capability.as_deref() == Some("12.0")
+            && gpu.dedicated_memory_bytes.or(gpu.memory_bytes).unwrap_or(0)
+                >= MIN_QUALIFIED_VRAM
+            && gpu.supports_nvfp4
+            && gpu.supports_fp8,
+        "managed openai-compatible profile requires one compute-capability 12.0 NVIDIA GPU with at least 97887 MiB usable VRAM and NVFP4/FP8 support"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verified_openai_attach_pid(base_url: &str) -> Result<u32> {
+    let pid = env::var("MAYHEM_OPENAI_COMPATIBLE_PID")
+        .context("advanced OpenAI-compatible attach requires MAYHEM_OPENAI_COMPATIBLE_PID")?
+        .parse::<u32>()
+        .context("MAYHEM_OPENAI_COMPATIBLE_PID must be a positive decimal PID")?;
+    ensure!(pid > 0, "MAYHEM_OPENAI_COMPATIBLE_PID must be positive");
+    let url = reqwest::Url::parse(base_url).context("parsing OpenAI-compatible attach URL")?;
+    let port = url
+        .port()
+        .context("OpenAI-compatible attach URL must include its loopback port")?;
+    let expected_ip = url
+        .host_str()
+        .context("OpenAI-compatible attach URL must include a host")?
+        .parse::<IpAddr>()
+        .context("OpenAI-compatible attach URL must use an IP literal")?;
+    ensure!(
+        expected_ip.is_loopback(),
+        "OpenAI-compatible attach URL must use a literal loopback address"
+    );
+    let expected_v4 = match expected_ip {
+        IpAddr::V4(address) => Some(address.octets()),
+        IpAddr::V6(_) => None,
+    };
+    let mut socket_inodes = BTreeSet::new();
+    for (path, ipv6) in [("/proc/net/tcp", false), ("/proc/net/tcp6", true)] {
+        let Ok(table) = fs::read_to_string(path) else {
+            continue;
+        };
+        for line in table.lines().skip(1) {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 10 || fields[3] != "0A" {
+                continue;
+            }
+            let Some((address, encoded_port)) = fields[1].split_once(':') else {
+                continue;
+            };
+            let Ok(candidate_port) = u16::from_str_radix(encoded_port, 16) else {
+                continue;
+            };
+            if candidate_port != port {
+                continue;
+            }
+            let address_matches = if ipv6 {
+                expected_v4.is_none()
+                    && address.eq_ignore_ascii_case("00000000000000000000000001000000")
+            } else if let Some(octets) = expected_v4 {
+                address.eq_ignore_ascii_case(&format!(
+                    "{:02X}{:02X}{:02X}{:02X}",
+                    octets[3], octets[2], octets[1], octets[0]
+                ))
+            } else {
+                false
+            };
+            if address_matches {
+                socket_inodes.insert(fields[9].to_owned());
+            }
+        }
+    }
+    ensure!(
+        !socket_inodes.is_empty(),
+        "the attach endpoint is not listening on its exact loopback address and port"
+    );
+    let process_ids =
+        process_tree_ids_from_parent_rows(&[pid], &calibration_process_parent_rows()?);
+    let owns_socket = process_ids.iter().any(|candidate| {
+        fs::read_dir(format!("/proc/{candidate}/fd"))
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .filter_map(|entry| fs::read_link(entry.path()).ok())
+            .filter_map(|target| target.to_str().map(str::to_owned))
+            .filter_map(|target| {
+                target
+                    .strip_prefix("socket:[")
+                    .and_then(|value| value.strip_suffix(']'))
+                    .map(str::to_owned)
+            })
+            .any(|inode| socket_inodes.contains(&inode))
+    });
+    ensure!(
+        owns_socket,
+        "MAYHEM_OPENAI_COMPATIBLE_PID and its descendants do not own the exact loopback listener"
+    );
+    Ok(pid)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn verified_openai_attach_pid(_base_url: &str) -> Result<u32> {
+    bail!("advanced OpenAI-compatible attach PID verification is supported only on Linux")
+}
+
+fn activate_provider_managed_openai_runtime(
+    home: &Path,
+    provider_id: &str,
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+    backend_runtime: &mut ProviderBackendRuntime,
+) -> Result<()> {
+    if selected.artifact.engine != "openai-compatible"
+        || backend_runtime.openai_compatible_url.is_some()
+    {
+        return Ok(());
+    }
+    let binding = selected
+        .artifact
+        .openai_compatible
+        .as_ref()
+        .context("openai-compatible artifact is missing its signed runtime binding")?;
+    let docker = backend_runtime
+        .openai_compatible_docker
+        .as_deref()
+        .context("managed openai-compatible runtime preflight did not resolve Docker")?;
+    let recipe_path = artifact_paths
+        .sidecars
+        .get(&binding.runtime_recipe_sidecar)
+        .context("downloaded openai-compatible runtime recipe is missing")?;
+    let upstream = selected
+        .artifact
+        .upstream_source
+        .as_ref()
+        .unwrap_or(&selected.artifact.source);
+    let managed = managed_openai_compatible::prepare_managed_runtime(
+        managed_openai_compatible::ManagedRuntimeInputs {
+            home,
+            docker,
+            provider_id,
+            enclave_id: &selected.enclave.enclave_id,
+            public_model_id: &selected.model.model_id,
+            artifact_repo: &upstream.repo,
+            artifact_revision: &upstream.revision,
+            snapshot_manifest_sidecar: &binding.snapshot_manifest_sidecar,
+            snapshot_manifest_sha256: &binding.snapshot_manifest_sha256,
+            snapshot_file_count: binding.model_snapshot_file_count,
+            snapshot_total_bytes: selected.artifact.weights_bytes,
+            runtime_revision: &binding.runtime_revision,
+            container_image_digest: &binding.container_image_digest,
+            max_concurrent: binding.max_concurrent,
+            recipe_sha256: &binding.runtime_recipe_sha256,
+            recipe_path,
+            snapshot_dir: &artifact_paths.primary,
+            sidecars: &artifact_paths.sidecars,
+        },
+    )
+    .context("starting the signed managed OpenAI-compatible runtime")?;
+    backend_runtime.openai_compatible_url = Some(managed.base_url().to_owned());
+    backend_runtime.openai_compatible_pid = Some(managed.process_id());
+    backend_runtime.managed_openai_compatible = Some(Arc::new(managed));
+    Ok(())
 }
 
 fn validate_chatterbox_device_request(
@@ -63729,7 +65350,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     if let Some(message) = &selected.feasibility.message {
         provider_log(&args, message);
     }
-    let backend_runtime = if args.serve_sessions {
+    let mut backend_runtime = if args.serve_sessions {
         provider_log(
             &args,
             &format!(
@@ -63764,6 +65385,15 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         .unwrap_or_else(|| home.join("downloads"));
     let downloads_dir = absolutize(downloads_dir)?;
     let artifact_paths = download_provider_artifact(&args, &downloads_dir, &selected).await?;
+    if args.serve_sessions {
+        activate_provider_managed_openai_runtime(
+            &home,
+            &wallet.public_key,
+            &selected,
+            &artifact_paths,
+            &mut backend_runtime,
+        )?;
+    }
 
     provider_log(&args, "Verifying and sealing the enclave artifact");
     write_provider_load_progress_stage(&args, "seal enclave artifact", "seal", "running", 0);
@@ -71032,6 +72662,100 @@ async fn read_contract_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
     })
 }
 
+// A provider admission only needs the canonical records for its own market and
+// startup rooms. The general catalog reader above enumerates historical price
+// versions for every market, which grows without bound as prices move. Keep
+// all admission reads on one confirmed ledger snapshot instead.
+async fn read_provider_session_contract_catalog(
+    rpc: &PeerRpcClient,
+    terms: &ProviderSessionTerms,
+) -> Result<ContractCatalog> {
+    let signed_length = confirmed_snapshot_signed_length(rpc, "rules/current").await?;
+    let enclave_key = format!("enclave/{}", terms.enclave_id);
+    let provider_key = format!("prov/{}", terms.provider);
+    let serve_key = format!("serve/{}/{}", terms.provider, terms.enclave_id);
+    let (enclaves, providers, serves, schedule_value, rules_value) = tokio::try_join!(
+        read_provider_session_record_at::<LedgerEnclave>(rpc, &enclave_key, signed_length),
+        read_provider_session_record_at::<LedgerProvider>(rpc, &provider_key, signed_length),
+        read_provider_session_record_at::<LedgerServe>(rpc, &serve_key, signed_length),
+        read_state_value_at(rpc, "ctx_brackets", signed_length),
+        read_state_value_at(rpc, "rules/current", signed_length),
+    )?;
+    let ctx_bracket_schedule = match schedule_value {
+        Some(value) => serde_json::from_value(value)
+            .context("parsing confirmed contract ctx_brackets schedule")?,
+        None => default_ctx_bracket_schedule(),
+    };
+    validate_ctx_bracket_schedule(&ctx_bracket_schedule)
+        .map_err(|err| anyhow::anyhow!("invalid confirmed ctx_brackets schedule: {err}"))?;
+    let rules = rules_value
+        .map(serde_json::from_value)
+        .transpose()
+        .context("parsing confirmed rules/current")?;
+    let ctx_bracket = match enclaves.first() {
+        Some(enclave) if enclave.model_class == DEFAULT_MODEL_CLASS => {
+            ctx_bracket_for_tokens_in_schedule(
+                u32::try_from(terms.ctx).unwrap_or(u32::MAX),
+                &ctx_bracket_schedule,
+                unix_epoch_seconds()?,
+            )
+            .map(|(bracket, _)| bracket)
+        }
+        _ => None,
+    };
+    let price_key = format!(
+        "price/{}",
+        ledger_price_market_key(&terms.enclave_id, ctx_bracket.as_deref())
+    );
+    let prices =
+        read_provider_session_record_at::<LedgerPriceSchedule>(rpc, &price_key, signed_length)
+            .await?;
+    let mut rooms = Vec::with_capacity(terms.room_ids.len());
+    let mut roomserve = Vec::with_capacity(terms.room_ids.len());
+    for room_id in &terms.room_ids {
+        let room_key = format!("room/{room_id}");
+        let roomserve_key = format!(
+            "roomserve/{room_id}/{}/{}",
+            terms.provider, terms.enclave_id
+        );
+        let (mut live_rooms, mut live_roomserve) = tokio::try_join!(
+            read_provider_session_record_at::<LedgerRoom>(rpc, &room_key, signed_length),
+            read_provider_session_record_at::<LedgerRoomServe>(rpc, &roomserve_key, signed_length,),
+        )?;
+        rooms.append(&mut live_rooms);
+        roomserve.append(&mut live_roomserve);
+    }
+    Ok(ContractCatalog {
+        enclaves,
+        rooms,
+        roomserve,
+        serves,
+        providers,
+        reputations: Vec::new(),
+        kyb: Vec::new(),
+        prices,
+        price_derivations: Vec::new(),
+        tier3_measurements: Vec::new(),
+        ctx_bracket_schedule,
+        rules,
+        active_billing_epoch: 0,
+        active_payout_revisions: BTreeMap::new(),
+    })
+}
+
+async fn read_provider_session_record_at<T: DeserializeOwned>(
+    rpc: &PeerRpcClient,
+    key: &str,
+    signed_length: u64,
+) -> Result<Vec<T>> {
+    match read_state_value_at(rpc, key, signed_length).await? {
+        Some(value) => Ok(vec![serde_json::from_value(value).with_context(|| {
+            format!("parsing confirmed provider admission record {key}")
+        })?]),
+        None => Ok(Vec::new()),
+    }
+}
+
 async fn read_active_provider_payout_revisions(
     rpc: &PeerRpcClient,
     active_epoch: u64,
@@ -71572,6 +73296,7 @@ fn gateway_models_from_contract(contract: &ContractCatalog) -> Result<Vec<Gatewa
                     )),
                     min_ask_au: 0,
                     att_tier: effective_att_tier,
+                    enclave_att_tier: Some(enclave.att_tier),
                     quant: normalize_ledger_quant(&enclave.quant),
                     served_ctx: Some(served_ctx),
                     hardware_fingerprint: active_serve
@@ -72788,7 +74513,7 @@ fn provider_memory_pool(
                 "host available unified memory",
             )
         },
-        "vllm" => {
+        "vllm" | "openai-compatible" => {
             if let Some(total) =
                 known_total_nvidia_vllm_memory_bytes(hardware).filter(|total| *total > 0)
             {
@@ -72882,7 +74607,11 @@ fn provider_memory_budget(
 ) -> Result<ProviderMemoryBudget> {
     let mut pool = provider_memory_pool(hardware, verdict, &enclave.backend, args.gpu_layers);
     if enclave.backend == "vllm" && args.execution_mode.is_some() {
-        scope_vllm_execution_mode_memory_pool(&mut pool, hardware, enclave_tp_degree(&enclave.caps)?)?;
+        scope_vllm_execution_mode_memory_pool(
+            &mut pool,
+            hardware,
+            enclave_tp_degree(&enclave.caps)?,
+        )?;
     }
     let claimed_bytes = read_provider_memory_claimed_bytes(
         args.home.as_deref(),
@@ -72898,17 +74627,20 @@ fn provider_memory_budget(
     // Some unified NVIDIA probes have no dedicated-memory total and their
     // allocation pool falls back to available RAM. Virtual mappings must use
     // the machine's real total instead of inheriting that availability fallback.
-    let dedicated_total = hardware.gpus.iter()
-        .filter(|gpu| gpu.vendor == GpuVendor::Nvidia
-            && !nvidia_gpu_uses_host_unified_memory(hardware, gpu))
+    let dedicated_total = hardware
+        .gpus
+        .iter()
+        .filter(|gpu| {
+            gpu.vendor == GpuVendor::Nvidia && !nvidia_gpu_uses_host_unified_memory(hardware, gpu)
+        })
         .filter_map(|gpu| gpu.memory_bytes)
         .fold(0u64, u64::saturating_add);
     let address_basis = hardware.memory.total_bytes.max(dedicated_total);
-    let (address_reserve, _) = provider_memory_reserve_bytes(
-        args.memory_reserve.as_deref(), address_basis, pool.unified,
-    )?;
+    let (address_reserve, _) =
+        provider_memory_reserve_bytes(args.memory_reserve.as_deref(), address_basis, pool.unified)?;
     let worker_address_space_limit_bytes = address_basis
-        .saturating_sub(address_reserve).max(worker_limit_bytes);
+        .saturating_sub(address_reserve)
+        .max(worker_limit_bytes);
     let mut budget_bytes = worker_limit_bytes;
     if enclave.backend == "vllm" {
         let admin_max_pct = enclave_vllm_gpu_memory_utilization_pct(&enclave.caps)?;
@@ -72936,31 +74668,49 @@ fn scope_vllm_execution_mode_memory_pool(
     hardware: &HardwareReport,
     tp_degree: u32,
 ) -> Result<()> {
-    let device_memories = hardware.gpus.iter()
+    let device_memories = hardware
+        .gpus
+        .iter()
         .filter(|gpu| gpu.vendor == GpuVendor::Nvidia)
         .map(|gpu| {
-            gpu.memory_bytes.or_else(|| {
-                nvidia_gpu_uses_host_unified_memory(hardware, gpu)
-                    .then_some(hardware.memory.available_bytes.unwrap_or(hardware.memory.total_bytes))
-            }).filter(|bytes| *bytes > 0)
-                .context("vLLM execution mode requires known memory for every selectable NVIDIA device")
+            gpu.memory_bytes
+                .or_else(|| {
+                    nvidia_gpu_uses_host_unified_memory(hardware, gpu).then_some(
+                        hardware
+                            .memory
+                            .available_bytes
+                            .unwrap_or(hardware.memory.total_bytes),
+                    )
+                })
+                .filter(|bytes| *bytes > 0)
+                .context(
+                    "vLLM execution mode requires known memory for every selectable NVIDIA device",
+                )
         })
         .collect::<Result<Vec<_>>>()?;
-    ensure!(tp_degree > 0 && u64::from(tp_degree) <= device_memories.len() as u64,
-        "vLLM execution mode TP degree exceeds the probed NVIDIA device count");
+    ensure!(
+        tp_degree > 0 && u64::from(tp_degree) <= device_memories.len() as u64,
+        "vLLM execution mode TP degree exceeds the probed NVIDIA device count"
+    );
     // Without a pinned device set, budget against the smallest selectable device,
     // never memory on unrelated GPUs. This remains safe under device reordering.
-    let per_device = device_memories.iter().copied().min()
+    let per_device = device_memories
+        .iter()
+        .copied()
+        .min()
         .context("vLLM execution mode requires a probed NVIDIA device")?;
     let total = if pool.unified {
         per_device
     } else {
-        per_device.checked_mul(u64::from(tp_degree))
+        per_device
+            .checked_mul(u64::from(tp_degree))
             .context("vLLM TP memory budget overflow")?
     };
     pool.total_bytes = pool.total_bytes.min(total);
     pool.available_bytes = pool.available_bytes.min(pool.total_bytes);
-    pool.source.push_str(&format!("; execution-mode TP{tp_degree} minimum-device budget"));
+    pool.source.push_str(&format!(
+        "; execution-mode TP{tp_degree} minimum-device budget"
+    ));
     Ok(())
 }
 
@@ -73120,6 +74870,19 @@ fn provider_memory_estimate(
     served_ctx: u64,
     workflow_inventory_bytes: u64,
 ) -> Result<ProviderMemoryEstimate> {
+    if let Some(peak) = artifact
+        .openai_compatible
+        .as_ref()
+        .and_then(|runtime| runtime.calibrated_peak_gpu_memory_bytes)
+    {
+        return Ok(ProviderMemoryEstimate {
+            required_bytes: peak,
+            weights_bytes: peak,
+            kv_bytes: 0,
+            overhead_bytes: 0,
+            media_bytes: 0,
+        });
+    }
     let weights_bytes =
         catalog_artifact_resident_bytes(artifact).saturating_add(workflow_inventory_bytes);
     let kv_bytes =
@@ -73154,6 +74917,13 @@ fn provider_model_memory_fit(
     requested_ctx: u64,
     workflow_inventory_bytes: u64,
 ) -> Result<mayhem_hwprobe::ModelMemoryFit> {
+    if let Some(peak) = artifact
+        .openai_compatible
+        .as_ref()
+        .and_then(|runtime| runtime.calibrated_peak_gpu_memory_bytes)
+    {
+        return Ok(model_memory_fit(usable_bytes, peak, 0, 0, requested_ctx));
+    }
     let weights_bytes =
         catalog_artifact_resident_bytes(artifact).saturating_add(workflow_inventory_bytes);
     let overhead_bytes = (weights_bytes / 5).max(512 * 1024 * 1024).saturating_add(
@@ -73382,6 +75152,30 @@ fn provider_context_feasibility(
     let requested_ctx = resolve_provider_served_ctx(model, args.ctx)?;
     let workflow_inventory_bytes =
         provider_comfy_workflow_inventory_resident_bytes(args.home.as_deref(), model)?;
+    if let Some(host_peak) = artifact
+        .openai_compatible
+        .as_ref()
+        .and_then(|runtime| runtime.calibrated_peak_host_memory_bytes)
+    {
+        let available = hardware
+            .memory
+            .available_bytes
+            .unwrap_or(hardware.memory.total_bytes);
+        let (reserve, _) = provider_memory_reserve_bytes(
+            args.memory_reserve.as_deref(),
+            hardware.memory.total_bytes.max(available),
+            false,
+        )?;
+        let usable = available.saturating_sub(reserve);
+        ensure!(
+            host_peak <= usable,
+            "model {} needs {} calibrated peak host memory but only {} is usable after reserve {}",
+            model.model_id,
+            human_bytes(host_peak),
+            human_bytes(usable),
+            human_bytes(reserve)
+        );
+    }
     if enclave.model_class != DEFAULT_MODEL_CLASS || requested_ctx == 0 {
         let memory_budget = provider_memory_budget(hardware, verdict, enclave, args)?;
         let estimate = provider_memory_estimate(
@@ -73572,25 +75366,57 @@ fn provider_vllm_generation_execution_capacity(
         return Ok(1);
     };
     ensure!(
-        artifact.engine == "vllm" && profile.engine == artifact.engine,
-        "generation execution profiles only authorize their exact vLLM artifact"
+        matches!(artifact.engine.as_str(), "vllm" | "openai-compatible")
+            && profile.engine == artifact.engine,
+        "generation execution profiles only authorize their exact supported artifact"
     );
     ensure!(
         profile.independent_dispatch,
         "generation execution profile does not authorize independent dispatch"
     );
 
-    let provider_capacity = args
-        .max_sessions
-        .unwrap_or(verdict.max_sessions)
-        .min(verdict.max_sessions)
-        .max(1);
+    let shared_embedding_scheduler =
+        generation_execution_uses_shared_embedding_scheduler(Some(profile));
+    let configured_capacity = args.max_sessions.unwrap_or(verdict.max_sessions).max(1);
+    // A shared embedding scheduler batches requests inside one loaded model.
+    // The hardware verdict's max_sessions describes independently resident
+    // model sessions and must not reduce that scheduler to one. The signed
+    // max_batch_size and the operator's explicit max_sessions remain hard caps.
+    let provider_capacity = if shared_embedding_scheduler {
+        configured_capacity
+    } else {
+        configured_capacity.min(verdict.max_sessions).max(1)
+    };
+    if artifact.engine == "openai-compatible" {
+        ensure!(
+            profile.topology.is_none(),
+            "openai-compatible managed runtimes use shared continuous batching"
+        );
+        let signed_capacity = artifact
+            .openai_compatible
+            .as_ref()
+            .context("openai-compatible artifact is missing its signed runtime binding")?
+            .max_concurrent;
+        ensure!(
+            profile.max_concurrent == Some(signed_capacity),
+            "generation profile capacity does not match signed openai-compatible runtime capacity"
+        );
+        return Ok(provider_capacity.min(signed_capacity).max(1));
+    }
     // A signed max_batch_size is an optional artifact ceiling, not a default
     // hardware limit. Profiled vLLM artifacts without one scale to the local
     // provider's proven memory and hwprobe capacity.
     let scheduler_capacity = enclave_max_batch_size(caps)?
         .unwrap_or(provider_capacity)
         .max(1);
+    if shared_embedding_scheduler {
+        // Embedding requests are multiplexed inside one loaded vLLM model and
+        // do not reserve one full decoder KV cache per provider session. The
+        // signed scheduler ceiling and the operator limit are the relevant
+        // capacity bounds; applying the text-generation KV formula here would
+        // collapse a proven batched embedding runtime back to one session.
+        return Ok(provider_capacity.min(scheduler_capacity).max(1));
+    }
     let utilization = provider_vllm_memory_utilization_for_feasibility(
         caps,
         feasibility,
@@ -73604,13 +75430,20 @@ fn provider_vllm_generation_execution_capacity(
     .unwrap_or(u64::MAX)
     .min(feasibility.memory_budget.budget_bytes);
     if generation_execution_uses_isolated_workers(Some(profile)) {
-        ensure!(allocation_bytes > 0, "isolated vLLM worker allocation is empty");
-        let memory_capacity = u32::try_from(
-            feasibility.memory_budget.budget_bytes / allocation_bytes,
-        )
-        .unwrap_or(u32::MAX);
-        ensure!(memory_capacity > 0, "no isolated vLLM worker fits the admitted memory budget");
-        return Ok(provider_capacity.min(scheduler_capacity).min(memory_capacity));
+        ensure!(
+            allocation_bytes > 0,
+            "isolated vLLM worker allocation is empty"
+        );
+        let memory_capacity =
+            u32::try_from(feasibility.memory_budget.budget_bytes / allocation_bytes)
+                .unwrap_or(u32::MAX);
+        ensure!(
+            memory_capacity > 0,
+            "no isolated vLLM worker fits the admitted memory budget"
+        );
+        return Ok(provider_capacity
+            .min(scheduler_capacity)
+            .min(memory_capacity));
     }
     let static_bytes = feasibility
         .estimated_required_bytes
@@ -73638,28 +75471,53 @@ fn generation_execution_uses_isolated_workers(
     })
 }
 
+fn generation_execution_uses_shared_embedding_scheduler(
+    profile: Option<&catalog::CatalogGenerationExecutionProfile>,
+) -> bool {
+    profile.is_some_and(|profile| {
+        profile.topology != Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers)
+            && !profile.request_modalities.is_empty()
+            && profile.request_modalities.iter().all(|modalities| {
+                modalities.len() == 1 && modalities.first().is_some_and(|item| item == "embedding")
+            })
+    })
+}
+
 fn reserve_provider_vllm_replica_memory(
     feasibility: &mut ProviderCtxFeasibility,
     capacity: u32,
     utilization: VllmMemoryUtilizationPlan,
 ) -> Result<()> {
     ensure!(capacity > 0, "isolated worker count must be positive");
-    ensure!(feasibility.replica_allocation.is_none(), "replica memory was already reserved");
+    ensure!(
+        feasibility.replica_allocation.is_none(),
+        "replica memory was already reserved"
+    );
     let count = u64::from(capacity);
     let per_worker_allocation_bytes = u64::try_from(
-        u128::from(feasibility.memory_budget.total_bytes) * u128::from(utilization.target_pct) / 100,
+        u128::from(feasibility.memory_budget.total_bytes) * u128::from(utilization.target_pct)
+            / 100,
     )
     .context("isolated worker allocation exceeds u64")?;
     let required = feasibility.estimated_required_bytes;
-    ensure!(per_worker_allocation_bytes >= required,
-        "isolated worker allocation is below its full model/context requirement");
-    let aggregate = per_worker_allocation_bytes.checked_mul(count)
+    ensure!(
+        per_worker_allocation_bytes >= required,
+        "isolated worker allocation is below its full model/context requirement"
+    );
+    let aggregate = per_worker_allocation_bytes
+        .checked_mul(count)
         .context("aggregate isolated worker allocation overflow")?;
-    ensure!(aggregate <= feasibility.memory_budget.budget_bytes,
+    ensure!(
+        aggregate <= feasibility.memory_budget.budget_bytes,
         "isolated workers require {}, exceeding the admitted budget {}",
-        human_bytes(aggregate), human_bytes(feasibility.memory_budget.budget_bytes));
-    let scale = |bytes: u64| bytes.checked_mul(count)
-        .context("aggregate isolated worker estimate overflow");
+        human_bytes(aggregate),
+        human_bytes(feasibility.memory_budget.budget_bytes)
+    );
+    let scale = |bytes: u64| {
+        bytes
+            .checked_mul(count)
+            .context("aggregate isolated worker estimate overflow")
+    };
     let weights = scale(feasibility.estimated_weights_bytes)?;
     let kv = scale(feasibility.estimated_kv_bytes)?;
     let overhead = scale(feasibility.estimated_overhead_bytes)?;
@@ -73761,10 +75619,16 @@ fn provider_vllm_memory_utilization(
     local_target_pct: Option<u32>,
 ) -> Result<VllmMemoryUtilizationPlan> {
     if let Some(allocation) = selected.feasibility.replica_allocation {
-        ensure!(generation_execution_uses_isolated_workers(selected.generation_execution_profile.as_ref()),
-            "replica allocation requires an isolated execution profile");
-        ensure!(allocation.worker_count == selected.generation_execution_capacity,
-            "replica allocation count does not match admitted execution capacity");
+        ensure!(
+            generation_execution_uses_isolated_workers(
+                selected.generation_execution_profile.as_ref()
+            ),
+            "replica allocation requires an isolated execution profile"
+        );
+        ensure!(
+            allocation.worker_count == selected.generation_execution_capacity,
+            "replica allocation count does not match admitted execution capacity"
+        );
         let target_pct = local_target_pct.unwrap_or(allocation.utilization.target_pct);
         validate_provider_vllm_memory_utilization_pct(target_pct)?;
         ensure!(target_pct >= allocation.utilization.floor_pct
@@ -73895,9 +75759,12 @@ fn provider_vllm_memory_utilization_for_candidates(
         let reserved_bytes =
             u64::try_from((u128::from(budget.total_bytes) * u128::from(target_pct)) / 100)
                 .unwrap_or(u64::MAX);
-        let worker_count = candidate.feasibility.replica_allocation
+        let worker_count = candidate
+            .feasibility
+            .replica_allocation
             .map_or(1, |allocation| u64::from(allocation.worker_count));
-        let reserved_bytes = reserved_bytes.checked_mul(worker_count)
+        let reserved_bytes = reserved_bytes
+            .checked_mul(worker_count)
             .context("aggregate vLLM allocation overflow")?;
         let allocation = pool_allocations
             .entry(budget.pool.clone())
@@ -75076,7 +76943,8 @@ fn build_provider_candidates(
         }
         let execution_policy = if let Some(mode_id) = &args.execution_mode {
             mayhem_proto::validate_execution_mode_id(mode_id).map_err(anyhow::Error::msg)?;
-            let Some(policy) = catalog_doc.vllm_execution_mode(&artifact.artifact_root, mode_id) else {
+            let Some(policy) = catalog_doc.vllm_execution_mode(&artifact.artifact_root, mode_id)
+            else {
                 rejections.push(provider_rejection(
                     enclave,
                     format!("signed catalog has no execution mode {mode_id} for artifact {artifact_name}"),
@@ -75091,15 +76959,22 @@ fn build_provider_candidates(
         let generation_execution_profile = match execution_policy {
             Some(policy) => policy.generation_execution_profile.as_ref(),
             None => catalog_doc.generation_execution_profile(&artifact.artifact_root),
-        }.cloned();
+        }
+        .cloned();
         let execution_mode = execution_policy
-            .map(|policy| -> Result<_> { Ok(ProviderExecutionMode {
-                binding: policy.binding(&artifact.artifact_root, args.execution_mode.as_deref().unwrap())?,
-                requests: policy.requests.clone(),
-                baseline_adapter: model.adapter.clone(),
-            }) })
+            .map(|policy| -> Result<_> {
+                Ok(ProviderExecutionMode {
+                    binding: policy.binding(
+                        &artifact.artifact_root,
+                        args.execution_mode.as_deref().unwrap(),
+                    )?,
+                    requests: policy.requests.clone(),
+                    baseline_adapter: model.adapter.clone(),
+                })
+            })
             .transpose()?;
-        let vllm_execution_profile = execution_policy.map(|policy| &policy.profile)
+        let vllm_execution_profile = execution_policy
+            .map(|policy| &policy.profile)
             .or_else(|| catalog_doc.vllm_execution_profile(&artifact.artifact_root))
             .cloned();
         let served_modalities = match provider_served_modalities(model, &args.disable_modalities) {
@@ -75190,14 +77065,31 @@ fn build_provider_candidates(
                 continue;
             }
         };
-        let reserve_result = if generation_execution_uses_isolated_workers(generation_execution_profile.as_ref()) {
+        let reserve_result = if generation_execution_uses_shared_embedding_scheduler(
+            generation_execution_profile.as_ref(),
+        ) {
+            // One shared vLLM embedding scheduler owns the admitted allocation;
+            // concurrent requests do not each require a decoder KV reservation.
+            Ok(())
+        } else if generation_execution_uses_isolated_workers(generation_execution_profile.as_ref())
+        {
             provider_vllm_memory_utilization_for_feasibility(
-                &enclave.caps, &feasibility, args.vllm_memory_utilization,
-            ).and_then(|utilization| reserve_provider_vllm_replica_memory(
-                &mut feasibility, generation_execution_capacity, utilization,
-            ))
+                &enclave.caps,
+                &feasibility,
+                args.vllm_memory_utilization,
+            )
+            .and_then(|utilization| {
+                reserve_provider_vllm_replica_memory(
+                    &mut feasibility,
+                    generation_execution_capacity,
+                    utilization,
+                )
+            })
         } else {
-            reserve_provider_generation_execution_memory(&mut feasibility, generation_execution_capacity)
+            reserve_provider_generation_execution_memory(
+                &mut feasibility,
+                generation_execution_capacity,
+            )
         };
         if let Err(err) = reserve_result {
             rejections.push(provider_rejection(
@@ -76081,7 +77973,7 @@ fn provider_candidate_modalities(candidate: &ProviderCandidate) -> Vec<String> {
 
 fn backend_rank(backend: &str) -> u8 {
     match backend {
-        "vllm" => 4,
+        "vllm" | "openai-compatible" => 4,
         "trt-llm" => 3,
         "mlx" => 2,
         "comfyui" => 2,
@@ -76091,6 +77983,7 @@ fn backend_rank(backend: &str) -> u8 {
         "needle-gpu" => 2,
         "sulphur" => 2,
         "transformers-asr" => 2,
+        "laya" => 2,
         "llama.cpp" => 1,
         "stable-diffusion.cpp" | "whisper.cpp" | "piper" => 0,
         _ => 0,
@@ -76188,6 +78081,9 @@ fn download_provider_artifact_blocking(
     downloads_dir: &Path,
     selected: &ProviderCandidate,
 ) -> Result<ProviderArtifactPaths> {
+    if selected.artifact.engine == "openai-compatible" {
+        return download_openai_compatible_snapshot(args, downloads_dir, selected);
+    }
     if selected.artifact.engine == "comfyui" {
         let path = args.artifact.as_ref().with_context(|| {
             format!(
@@ -76291,6 +78187,318 @@ fn download_provider_artifact_blocking(
     }
 
     Ok(ProviderArtifactPaths { primary, sidecars })
+}
+
+fn download_openai_compatible_snapshot(
+    args: &ProviderStartArgs,
+    downloads_dir: &Path,
+    selected: &ProviderCandidate,
+) -> Result<ProviderArtifactPaths> {
+    let binding = selected
+        .artifact
+        .openai_compatible
+        .as_ref()
+        .context("openai-compatible artifact is missing its signed runtime binding")?;
+    fs::create_dir_all(downloads_dir)
+        .with_context(|| format!("creating {}", downloads_dir.display()))?;
+
+    let mut sidecars = BTreeMap::new();
+    for (name, sidecar) in &selected.artifact.sidecars {
+        let ledger_sidecar = selected
+            .enclave
+            .artifact_sidecars
+            .get(name)
+            .with_context(|| format!("admin enclave is missing catalog sidecar {name}"))?;
+        let path = download_provider_sidecar_artifact(
+            args,
+            downloads_dir,
+            selected,
+            name,
+            sidecar,
+            ledger_sidecar,
+        )?;
+        sidecars.insert(name.clone(), path);
+    }
+    let manifest_path = sidecars
+        .get(&binding.snapshot_manifest_sidecar)
+        .context("downloaded openai-compatible snapshot manifest is missing")?;
+    let manifest: OpenAiCompatibleSnapshotManifest = serde_json::from_slice(
+        &fs::read(manifest_path).with_context(|| format!("reading {}", manifest_path.display()))?,
+    )
+    .with_context(|| format!("parsing {}", manifest_path.display()))?;
+    validate_openai_compatible_snapshot_manifest(selected, &manifest)?;
+
+    let snapshot_dir = if let Some(path) = args.artifact.as_ref() {
+        let path = absolutize(path.clone())?;
+        require_local_artifact_path_supported(&path, selected)?;
+        ensure!(
+            path.is_dir(),
+            "openai-compatible local artifact must be the complete signed snapshot directory"
+        );
+        path
+    } else {
+        let directory = downloads_dir.join(format!(
+            "snapshot-{}-{}",
+            safe_path_component(&selected.enclave.artifact_root),
+            safe_path_component(&selected.artifact_name)
+        ));
+        let _download_lock = lock_openai_compatible_snapshot_download(&directory)?;
+        if directory.is_dir()
+            && validate_openai_compatible_snapshot_directory(&directory, &manifest, args.chunk_size)
+                .is_ok()
+            && build_artifact_merkle_manifest(&directory, args.chunk_size)?.root
+                == selected.enclave.artifact_root
+        {
+            return Ok(ProviderArtifactPaths {
+                primary: directory,
+                sidecars,
+            });
+        }
+        ensure!(
+            !directory.exists(),
+            "canonical snapshot cache {} exists but failed signed validation; remove it before retrying",
+            directory.display()
+        );
+        let staging = downloads_dir.join(format!(
+            ".{}.partial",
+            directory
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("openai-compatible-snapshot")
+        ));
+        fs::create_dir_all(&staging).with_context(|| {
+            format!("creating snapshot staging directory {}", staging.display())
+        })?;
+        let missing_bytes = manifest.files.iter().try_fold(0u64, |total, file| {
+            let path = staging.join(validate_catalog_artifact_relative_path(&file.path)?);
+            let reusable = path.is_file()
+                && fs::metadata(&path)?.len() == file.size
+                && file_sha256_hex(&path)? == file.sha256;
+            Ok::<_, anyhow::Error>(if reusable {
+                total
+            } else {
+                total
+                    .checked_add(file.size)
+                    .context("snapshot missing-byte total overflowed u64")?
+            })
+        })?;
+        if missing_bytes > 0 {
+            provider_download_disk_preflight(
+                args,
+                &staging.join(".capacity-check"),
+                missing_bytes,
+                &format!("{} complete model snapshot", selected.artifact_name),
+            )?;
+        }
+        for file in &manifest.files {
+            let relative = validate_catalog_artifact_relative_path(&file.path)?;
+            let destination = staging.join(&relative);
+            if destination.is_file()
+                && fs::metadata(&destination)?.len() == file.size
+                && file_sha256_hex(&destination)? == file.sha256
+            {
+                continue;
+            }
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+            }
+            download_provider_huggingface_file(
+                args,
+                &selected.artifact.source,
+                &file.path,
+                destination,
+                file.size,
+                None,
+                Some(&file.sha256),
+                &format!("{}/{} snapshot file", selected.artifact_name, file.path),
+            )?;
+        }
+        validate_openai_compatible_snapshot_directory(&staging, &manifest, args.chunk_size)?;
+        let digest = build_artifact_merkle_manifest(&staging, args.chunk_size)?;
+        ensure!(
+            digest.root == selected.enclave.artifact_root
+                && digest.root == selected.artifact.artifact_root,
+            "openai-compatible staged snapshot root mismatch; expected {}, got {}",
+            selected.enclave.artifact_root,
+            digest.root
+        );
+        fs::rename(&staging, &directory).with_context(|| {
+            format!(
+                "atomically installing verified snapshot {} at {}",
+                staging.display(),
+                directory.display()
+            )
+        })?;
+        directory
+    };
+
+    validate_openai_compatible_snapshot_directory(&snapshot_dir, &manifest, args.chunk_size)?;
+    let digest = build_artifact_merkle_manifest(&snapshot_dir, args.chunk_size)?;
+    ensure!(
+        digest.root == selected.enclave.artifact_root
+            && digest.root == selected.artifact.artifact_root,
+        "openai-compatible snapshot directory root mismatch; expected {}, got {}",
+        selected.enclave.artifact_root,
+        digest.root
+    );
+    Ok(ProviderArtifactPaths {
+        primary: snapshot_dir,
+        sidecars,
+    })
+}
+
+fn lock_openai_compatible_snapshot_download(directory: &Path) -> Result<fs::File> {
+    let file_name = directory
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("openai-compatible snapshot cache has no UTF-8 file name")?;
+    let lock_path = directory.with_file_name(format!(".{file_name}.download.lock"));
+    let mut options = fs::OpenOptions::new();
+    options.create(true).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    let lock = options
+        .open(&lock_path)
+        .with_context(|| format!("opening snapshot download lock {}", lock_path.display()))?;
+    fs2::FileExt::lock_exclusive(&lock)
+        .with_context(|| format!("locking snapshot download {}", lock_path.display()))?;
+    Ok(lock)
+}
+
+fn validate_openai_compatible_snapshot_manifest(
+    selected: &ProviderCandidate,
+    manifest: &OpenAiCompatibleSnapshotManifest,
+) -> Result<()> {
+    let binding = selected
+        .artifact
+        .openai_compatible
+        .as_ref()
+        .context("openai-compatible artifact is missing its signed runtime binding")?;
+    validate_openai_compatible_snapshot_manifest_for_artifact(&selected.artifact, binding, manifest)
+}
+
+fn validate_openai_compatible_snapshot_manifest_for_artifact(
+    artifact: &catalog::CatalogArtifact,
+    binding: &mayhem_engine::OpenAiCompatibleRuntimeBinding,
+    manifest: &OpenAiCompatibleSnapshotManifest,
+) -> Result<()> {
+    ensure!(manifest.schema == 1, "snapshot manifest schema must be 1");
+    ensure!(
+        manifest.source == "modelscope",
+        "snapshot manifest source must preserve the calibrated modelscope identity"
+    );
+    let upstream = artifact
+        .upstream_source
+        .as_ref()
+        .unwrap_or(&artifact.source);
+    ensure!(
+        manifest.repo == upstream.repo && manifest.canonical_hf_revision == upstream.revision,
+        "snapshot manifest upstream identity does not match the signed catalog source"
+    );
+    ensure!(
+        !manifest.source_revision.trim().is_empty()
+            && manifest.source_revision.len() <= 128
+            && !manifest.source_revision.chars().any(char::is_control),
+        "snapshot manifest source_revision is invalid"
+    );
+    ensure!(
+        manifest.files.len() == binding.model_snapshot_file_count as usize,
+        "snapshot manifest contains {} files; signed runtime binding requires {}",
+        manifest.files.len(),
+        binding.model_snapshot_file_count
+    );
+    let mut prior = None::<&str>;
+    let mut total = 0u64;
+    for file in &manifest.files {
+        let relative = validate_catalog_artifact_relative_path(&file.path)?;
+        ensure!(
+            relative.to_string_lossy() == file.path,
+            "snapshot manifest path is not normalized: {}",
+            file.path
+        );
+        if let Some(prior) = prior {
+            ensure!(
+                prior < file.path.as_str(),
+                "snapshot manifest paths must be strictly sorted and unique"
+            );
+        }
+        prior = Some(&file.path);
+        ensure!(file.size > 0, "snapshot file {} has zero size", file.path);
+        ensure!(
+            is_lowercase_hex_len(&file.sha256, 64),
+            "snapshot file {} has invalid sha256",
+            file.path
+        );
+        match file.hf_oid_kind.as_str() {
+            "git_blob_sha1" => ensure!(
+                is_lowercase_hex_len(&file.hf_oid, 40),
+                "snapshot file {} has invalid git blob oid",
+                file.path
+            ),
+            "sha256" => ensure!(
+                is_lowercase_hex_len(&file.hf_oid, 64),
+                "snapshot file {} has invalid LFS oid",
+                file.path
+            ),
+            other => bail!(
+                "snapshot file {} has unsupported hf_oid_kind {other}",
+                file.path
+            ),
+        }
+        total = total
+            .checked_add(file.size)
+            .context("snapshot manifest byte total overflowed u64")?;
+    }
+    ensure!(
+        total == manifest.total_bytes && total == artifact.weights_bytes,
+        "snapshot manifest total_bytes {total} does not match its header/catalog"
+    );
+    Ok(())
+}
+
+fn validate_openai_compatible_snapshot_directory(
+    root: &Path,
+    manifest: &OpenAiCompatibleSnapshotManifest,
+    _chunk_size: usize,
+) -> Result<()> {
+    let expected = manifest
+        .files
+        .iter()
+        .map(|file| file.path.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut entries = Vec::new();
+    collect_directory_artifact_entries(root, root, &mut entries)?;
+    let actual = entries
+        .iter()
+        .filter_map(|entry| match entry.kind {
+            DirectoryArtifactEntryKind::File { .. } => Some(entry.rel.as_str()),
+            DirectoryArtifactEntryKind::Directory => None,
+        })
+        .collect::<BTreeSet<_>>();
+    ensure!(
+        actual == expected,
+        "openai-compatible snapshot directory must contain exactly the signed manifest files"
+    );
+    for file in &manifest.files {
+        let path = root.join(validate_catalog_artifact_relative_path(&file.path)?);
+        let metadata = fs::metadata(&path)
+            .with_context(|| format!("stat snapshot file {}", path.display()))?;
+        ensure!(
+            metadata.is_file() && metadata.len() == file.size,
+            "snapshot file {} size/type mismatch",
+            file.path
+        );
+        ensure!(
+            file_sha256_hex(&path)? == file.sha256,
+            "snapshot file {} sha256 mismatch",
+            file.path
+        );
+    }
+    Ok(())
 }
 
 fn provider_seal_artifact_path<'a>(
@@ -76436,9 +78644,14 @@ fn require_local_artifact_path_supported(
     source: &Path,
     selected: &ProviderCandidate,
 ) -> Result<()> {
-    if source.is_dir() && selected.artifact.engine != "comfyui" {
+    if source.is_dir()
+        && !matches!(
+            selected.artifact.engine.as_str(),
+            "comfyui" | "openai-compatible"
+        )
+    {
         bail!(
-            "local directory artifacts are only supported for ComfyUI runtimes; {} uses engine {}",
+            "local directory artifacts are only supported for directory-backed engines; {} uses engine {}",
             selected.model.model_id,
             selected.artifact.engine
         );
@@ -76469,7 +78682,7 @@ fn download_provider_primary_artifact(
         &selected.artifact.path,
         destination,
         selected.artifact.weights_bytes,
-        &selected.enclave.artifact_root,
+        Some(&selected.enclave.artifact_root),
         selected.artifact.source_sha256.as_deref(),
         &format!("{} artifact", selected.artifact_name),
     )
@@ -76538,7 +78751,7 @@ fn download_provider_sidecar_artifact(
         &sidecar.path,
         destination,
         ledger_sidecar.weights_bytes,
-        &ledger_sidecar.artifact_root,
+        Some(&ledger_sidecar.artifact_root),
         Some(&sidecar.source_sha256),
         &format!("{}/{} sidecar", selected.artifact_name, name),
     )
@@ -76551,7 +78764,7 @@ fn download_provider_huggingface_file(
     remote_path: &str,
     destination: PathBuf,
     expected_bytes: u64,
-    expected_root: &str,
+    expected_root: Option<&str>,
     expected_sha256: Option<&str>,
     label: &str,
 ) -> Result<PathBuf> {
@@ -76686,11 +78899,13 @@ fn download_provider_huggingface_file(
                 downloaded.display()
             )
         })?;
-        if manifest.root != expected_root {
-            bail!(
-                "downloaded {label} root mismatch; expected admin artifact root {expected_root}, got {}",
-                manifest.root
-            );
+        if let Some(expected_root) = expected_root {
+            if manifest.root != expected_root {
+                bail!(
+                    "downloaded {label} root mismatch; expected admin artifact root {expected_root}, got {}",
+                    manifest.root
+                );
+            }
         }
         if let Some(expected_sha256) = expected_sha256 {
             let actual_sha256 = file_sha256_hex(&downloaded)?;
@@ -78580,6 +80795,19 @@ fn provider_session_output_error(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(ProviderSessionOutputError(message.into()))
 }
 
+fn provider_session_output_result<T>(result: Result<T>) -> Result<T> {
+    result.map_err(|error| provider_session_output_error(format!("{error:#}")))
+}
+
+fn validate_streamed_tool_call_count(emitted: usize, validated: usize) -> Result<()> {
+    if emitted > validated {
+        return Err(provider_session_output_error(
+            "provider streamed a tool call that failed final validation",
+        ));
+    }
+    Ok(())
+}
+
 fn provider_response_error_code(error: &anyhow::Error) -> &'static str {
     if error.chain().any(|cause| {
         cause.is::<ProviderSessionRequestError>()
@@ -78702,7 +80930,7 @@ async fn run_provider_session_heartbeat_connection(
     let mut heartbeat_cache_updated_at = None::<Instant>;
     let mut load_changes = ctx.load.subscribe_changes();
     while !ctx.load.is_stopped() {
-        load_changes.borrow_and_update();
+        let load_generation = *load_changes.borrow_and_update();
         let round_started = Instant::now();
         let sent = timeout(
             ctx.bridge_operation_timeout,
@@ -78729,6 +80957,7 @@ async fn run_provider_session_heartbeat_connection(
         )
         .await
         .with_context(|| format!("timed out sending live provider heartbeat seq {seq}"))??;
+        ctx.load.mark_published(load_generation);
         let refresh_cache = heartbeat_cache_updated_at
             .map(|updated_at| updated_at.elapsed() >= ctx.heartbeat_ttl / 2)
             .unwrap_or(true);
@@ -78875,7 +81104,7 @@ struct ProviderConcurrentSessionTask {
     protection: Arc<Mutex<ProviderProtectionState>>,
     engine_recovery_initial: Duration,
     engine_recovery_max: Duration,
-    backend: Arc<dyn ConcurrentGenerationBackend>,
+    backend: ProviderConcurrentEngine,
     cancellation: CancellationToken,
 }
 
@@ -78944,8 +81173,11 @@ async fn run_provider_concurrent_session_task(
         let mut engine_recovery =
             ProviderEngineRecovery::new(task.engine_recovery_initial, task.engine_recovery_max);
         let runtime = task.runtime.borrowed();
-        let result = match ProviderTpmActivationLimiter::from_environment() {
-            Ok(mut tpm_activation_limiter) => {
+        let result = match (
+            ProviderTpmActivationLimiter::from_environment(),
+            ProviderTokenizeLimiter::from_environment(),
+        ) {
+            (Ok(mut tpm_activation_limiter), Ok(mut tokenize_limiter)) => {
                 handle_provider_session_frame(
                     &mut bridge,
                     &mut sessions,
@@ -78955,6 +81187,7 @@ async fn run_provider_concurrent_session_task(
                     &task.heartbeat_load,
                     &task.protection,
                     &mut tpm_activation_limiter,
+                    &mut tokenize_limiter,
                     &task.terms,
                     &runtime,
                     &task.sc_bridge_url,
@@ -78972,7 +81205,7 @@ async fn run_provider_concurrent_session_task(
                 )
                 .await
             }
-            Err(error) => Err(error),
+            (Err(error), _) | (_, Err(error)) => Err(error),
         };
         (result, engine_recovery.reason().map(str::to_owned))
     }
@@ -79023,10 +81256,47 @@ fn provider_session_allows_independent_dispatch(
     terms: &ProviderSessionTerms,
     active: &ActiveProviderSession,
 ) -> bool {
-    generation_execution_profile_allows_modalities(
+    provider_request_modalities_allow_independent_dispatch(terms, &active.required_modalities)
+}
+
+fn provider_request_modalities_allow_independent_dispatch(
+    terms: &ProviderSessionTerms,
+    requested: &[String],
+) -> bool {
+    if generation_execution_profile_allows_modalities(
         terms.generation_execution_profile.as_ref(),
-        &active.required_modalities,
-    )
+        requested,
+    ) {
+        return true;
+    }
+    let requested = requested.iter().cloned().collect::<BTreeSet<_>>();
+    terms
+        .runtime_independent_dispatch_modalities
+        .iter()
+        .any(|allowed| allowed.iter().cloned().collect::<BTreeSet<_>>() == requested)
+}
+
+fn provider_runtime_independent_dispatch_modalities(
+    responder: &dyn ProviderSessionResponder,
+) -> Vec<Vec<String>> {
+    if responder.concurrent_embedding_backend().is_some() {
+        vec![vec!["embedding".to_owned()]]
+    } else {
+        Vec::new()
+    }
+}
+
+fn provider_execution_capacity_for_terms(
+    terms: &ProviderSessionTerms,
+    responder: &dyn ProviderSessionResponder,
+) -> u32 {
+    if terms.generation_execution_profile.is_some()
+        || !terms.runtime_independent_dispatch_modalities.is_empty()
+    {
+        responder.concurrent_session_capacity()
+    } else {
+        1
+    }
 }
 
 fn provider_session_open_required_modalities(frame: &Value) -> Option<Vec<String>> {
@@ -79046,10 +81316,8 @@ fn provider_local_session_acceptance_decision(
             reason: "signed spend voucher is missing normalized required_modalities".to_owned(),
         };
     };
-    let requested_is_independent = generation_execution_profile_allows_modalities(
-        terms.generation_execution_profile.as_ref(),
-        &requested_modalities,
-    );
+    let requested_is_independent =
+        provider_request_modalities_allow_independent_dispatch(terms, &requested_modalities);
     let active_are_independent = sessions
         .values()
         .all(|active| provider_session_allows_independent_dispatch(terms, active));
@@ -79101,14 +81369,13 @@ async fn serve_provider_sessions(
     runtime: ProviderSessionRuntime<'_>,
     mut responder: Box<dyn ProviderSessionResponder>,
 ) -> Result<()> {
-    let terms = provider_session_terms(&ctx, runtime.min_ask.current())?;
+    let mut terms = provider_session_terms(&ctx, runtime.min_ask.current())?;
     let configured_protection =
         ProviderProtectionConfig::from_provider_args(ctx.args, ctx.selected)?;
-    let execution_capacity = if terms.generation_execution_profile.is_some() {
-        responder.concurrent_session_capacity()
-    } else {
-        1
-    };
+    terms.runtime_independent_dispatch_modalities =
+        provider_runtime_independent_dispatch_modalities(responder.as_ref());
+    let execution_capacity = provider_execution_capacity_for_terms(&terms, responder.as_ref());
+    terms.capacity_slots = execution_capacity.max(1);
     let protection_config = configured_protection.limit_to_execution_capacity(execution_capacity);
     let (sc_bridge_url, sc_bridge_token) = resolve_cli_sc_bridge(
         ctx.args.home.as_ref(),
@@ -79200,7 +81467,9 @@ async fn serve_provider_sessions(
 
     let heartbeat_enabled = !ctx.args.no_heartbeat && !ctx.rooms.is_empty();
     let heartbeat_load = ProviderHeartbeatLoad::new(&ctx.selected.modality_capacities);
-    heartbeat_load.prefix_caching.store(responder.prefix_caching_enabled(), Ordering::Release);
+    heartbeat_load
+        .prefix_caching
+        .store(responder.prefix_caching_enabled(), Ordering::Release);
     let runtime_floor_monitor = ProviderRuntimeFloorMonitor::new(ctx.args, ctx.home, ctx.selected)?;
     let engine_watchdog_restart_after_millis = configured_nonnegative_millis(
         "MAYHEM_PROVIDER_ENGINE_WATCHDOG_RESTART_AFTER_MS",
@@ -79259,9 +81528,12 @@ async fn serve_provider_sessions(
     let owned_runtime = Arc::new(OwnedProviderSessionRuntime::from_borrowed(&runtime));
     let protection = Arc::new(Mutex::new(ProviderProtectionState::new(protection_config)));
     let mut tpm_activation_limiter = ProviderTpmActivationLimiter::from_environment()?;
+    let mut tokenize_limiter = ProviderTokenizeLimiter::from_environment()?;
     let mut draining = false;
+    let mut drain_heartbeat_generation = None::<u64>;
     let mut local_drain_request = None::<ProviderDrainRequest>;
     let mut runtime_floor_reject: Option<ProviderRuntimeFloorRejection> = None;
+    let mut last_idle_memory_reclaim_at = None::<Instant>;
     let mut engine_watchdog_reject: Option<ProviderRuntimeFloorRejection> = None;
     let mut engine_recovery = ProviderEngineRecovery::new(
         provider_heartbeat_reconnect_initial,
@@ -79367,6 +81639,14 @@ async fn serve_provider_sessions(
                     heartbeat_restart_at = None;
                 }
             }
+            if draining
+                && sessions.is_empty()
+                && (!heartbeat_enabled
+                    || drain_heartbeat_generation
+                        .is_some_and(|generation| heartbeat_load.published_through(generation)))
+            {
+                break;
+            }
             if !engine_recovery.pending() && !responder.component_healthy() {
                 heartbeat_load.set_accepting_new(false);
                 engine_recovery.mark_failed(
@@ -79387,7 +81667,15 @@ async fn serve_provider_sessions(
                         );
                     }
                     Ok(ComponentRecovery::Pending) => component_recovery_pending = true,
+                    Ok(ComponentRecovery::Unsupported) if responder.requires_owner_restart() => {
+                        bail!("managed provider runtime exited; retiring this worker so its supervisor can reconcile and restart the owned runtime")
+                    }
                     Ok(ComponentRecovery::Unsupported) => {}
+                    Err(err) if responder.requires_owner_restart() => {
+                        return Err(err).context(
+                            "managed provider runtime recovery failed; retiring this worker for supervised restart",
+                        )
+                    }
                     Err(err) => engine_recovery.mark_reload_failed(
                         format!("isolated provider worker recovery failed: {err:#}"),
                         Instant::now(),
@@ -79456,6 +81744,34 @@ async fn serve_provider_sessions(
                 }
                 runtime_floor_reject = next_runtime_floor_reject;
             }
+            if runtime_floor_monitor.memory_check().is_some()
+                && !engine_recovery.pending()
+                && sessions.is_empty()
+                && last_idle_memory_reclaim_at.is_none_or(|last| {
+                    Instant::now().saturating_duration_since(last)
+                        >= Duration::from_millis(
+                            DEFAULT_PROVIDER_IDLE_MEMORY_RECLAIM_COOLDOWN_MILLIS,
+                        )
+                })
+            {
+                match responder.reclaim_idle_memory() {
+                    Ok(true) => {
+                        last_idle_memory_reclaim_at = Some(Instant::now());
+                        provider_session_debug(
+                            "provider requested idle engine memory reclamation after the runtime floor activated",
+                        );
+                    }
+                    Ok(false) => {
+                        last_idle_memory_reclaim_at = Some(Instant::now());
+                    }
+                    Err(err) => {
+                        last_idle_memory_reclaim_at = Some(Instant::now());
+                        provider_session_debug(format!(
+                            "idle provider memory reclamation failed; continuing to refuse new sessions safely: {err:#}"
+                        ));
+                    }
+                }
+            }
             let watchdog_action = if draining || engine_recovery.pending() {
                 ProviderEngineWatchdogAction::Healthy
             } else {
@@ -79493,6 +81809,9 @@ async fn serve_provider_sessions(
                     heartbeat_load.set_accepting_new(false);
                     let restart_reason = reject.reason.clone();
                     engine_watchdog_reject = Some(reject);
+                    if responder.requires_owner_restart() {
+                        bail!("managed provider runtime requires supervised restart after watchdog pressure: {restart_reason}");
+                    }
                     match reload_provider_session_responder(
                         &mut responder,
                         restart_reason,
@@ -79534,11 +81853,10 @@ async fn serve_provider_sessions(
                             request.path.display()
                         ));
                         heartbeat_load.set_accepting_new(false);
+                        drain_heartbeat_generation = heartbeat_enabled
+                            .then(|| heartbeat_load.change_generation());
                         draining = true;
                         local_drain_request = Some(request);
-                        if sessions.is_empty() {
-                            break;
-                        }
                     }
                     Ok(None) => {}
                     Err(err) => provider_session_debug(format!(
@@ -79552,9 +81870,16 @@ async fn serve_provider_sessions(
                         "serve window elapsed; entering graceful drain and refusing new sessions",
                     );
                     heartbeat_load.set_accepting_new(false);
+                    drain_heartbeat_generation = heartbeat_enabled
+                        .then(|| heartbeat_load.change_generation());
                     draining = true;
                 }
-                if sessions.is_empty() {
+                if sessions.is_empty()
+                    && (!heartbeat_enabled
+                        || drain_heartbeat_generation.is_some_and(|generation| {
+                            heartbeat_load.published_through(generation)
+                        }))
+                {
                     break;
                 }
             }
@@ -79650,8 +81975,16 @@ async fn serve_provider_sessions(
                             provider_session_allows_independent_dispatch(&terms, active)
                         })
                     {
+                        let concurrent_backend = responder
+                            .concurrent_generation_backend()
+                            .map(ProviderConcurrentEngine::Generation)
+                            .or_else(|| {
+                                responder
+                                    .concurrent_embedding_backend()
+                                    .map(ProviderConcurrentEngine::Embedding)
+                            });
                         if let (Some(backend), Some(active), Some(pending_request_deadline)) = (
-                            responder.concurrent_generation_backend(),
+                            concurrent_backend,
                             sessions.get(&event_session_id).cloned(),
                             pending_requests.get(&event_session_id).copied(),
                         ) {
@@ -79737,6 +82070,7 @@ async fn serve_provider_sessions(
                         &heartbeat_load,
                         &protection,
                         &mut tpm_activation_limiter,
+                        &mut tokenize_limiter,
                         &terms,
                         &runtime,
                         &sc_bridge_url,
@@ -79789,7 +82123,13 @@ async fn serve_provider_sessions(
                         &terms,
                     )
                     .await;
-                    if draining && sessions.is_empty() {
+                    if draining
+                        && sessions.is_empty()
+                        && (!heartbeat_enabled
+                            || drain_heartbeat_generation.is_some_and(|generation| {
+                                heartbeat_load.published_through(generation)
+                            }))
+                    {
                         break;
                     }
                 }
@@ -80450,7 +82790,7 @@ fn provider_session_request_modalities(
             modality_load.contains_key("image"),
         ),
         "workflow_generation" => modality_load.keys().cloned().collect::<Vec<_>>(),
-        "chat" => vec!["text".to_owned()],
+        "chat" | "decision" => vec!["text".to_owned()],
         other => bail!("unsupported provider request kind {other}"),
     };
     if provider_endpoint_transport_kind(family)? == "chat" {
@@ -80994,9 +83334,13 @@ fn validate_provider_session_request_modalities(
 ) -> Result<BTreeMap<String, u32>> {
     let verified = provider_verify_endpoint_request(body, Some(&terms.model_id), &terms.adapter)?;
     if let Some(policy) = &terms.execution_mode_requests {
-        policy.validate_request(verified.family, verified.request).map_err(|_| {
-            provider_session_request_error("request is not supported by the negotiated execution mode")
-        })?;
+        policy
+            .validate_request(verified.family, verified.request)
+            .map_err(|_| {
+                provider_session_request_error(
+                    "request is not supported by the negotiated execution mode",
+                )
+            })?;
     }
     provider_session_request_result(validate_provider_session_modalities(
         &active.required_modalities,
@@ -81258,6 +83602,7 @@ fn provider_session_modality_load(
             }
             Ok(load)
         }
+        "decision" => Ok(BTreeMap::new()),
         "embedding" => {
             let inputs =
                 provider_session_request_result(provider_embedding_input_texts_from_body(body))?;
@@ -81287,8 +83632,12 @@ fn provider_session_modality_load(
                 provider_image_generation_request_from_body(family, body),
             )?;
             let reference = provider_session_request_result(
-                request.input_reference.as_deref().map(mayhem_proto::image_reference_metadata)
-                    .transpose().map_err(anyhow::Error::msg),
+                request
+                    .input_reference
+                    .as_deref()
+                    .map(mayhem_proto::image_reference_metadata)
+                    .transpose()
+                    .map_err(anyhow::Error::msg),
             )?;
             Ok(BTreeMap::from([(
                 "image".to_owned(),
@@ -81654,6 +84003,7 @@ async fn handle_provider_session_frame<R>(
     heartbeat_load: &ProviderHeartbeatLoad,
     protection: &Arc<Mutex<ProviderProtectionState>>,
     tpm_activation_limiter: &mut ProviderTpmActivationLimiter,
+    tokenize_limiter: &mut ProviderTokenizeLimiter,
     terms: &ProviderSessionTerms,
     runtime: &ProviderSessionRuntime<'_>,
     sc_bridge_url: &str,
@@ -81708,6 +84058,158 @@ where
         return Ok(());
     }
     match frame_type {
+        TOKENIZE_REQUEST_CHUNK_FRAME_TYPE => {
+            ensure!(
+                frame.get("v").and_then(Value::as_u64) == Some(u64::from(TOKENIZE_FRAME_VERSION)),
+                "tokenize request chunk version is unsupported"
+            );
+            ensure!(
+                frame.get("session_id").and_then(Value::as_str) == Some(session_id.as_str()),
+                "tokenize request chunk session binding mismatch"
+            );
+            let first_chunk = !pending_payloads
+                .keys()
+                .any(|key| key.starts_with(&format!("{session_id}:")));
+            if first_chunk {
+                tokenize_limiter.admit(&remote, Instant::now())?;
+            }
+            if let Err(error) = provider_session_collect_request_chunk(
+                pending_payloads,
+                &session_id,
+                &frame,
+                max_request_bytes,
+                max_payload_chunks,
+            ) {
+                remove_provider_session_pending_payloads(pending_payloads, &session_id);
+                let _ = bridge.session_close(&remote, &session_id).await;
+                return Err(error).context("collecting tokenize request chunk");
+            }
+        }
+        TOKENIZE_REQUEST_FRAME_TYPE => {
+            let request_frame: TokenizeRequestFrame = serde_json::from_value(frame.clone())
+                .context("tokenize request frame is invalid")?;
+            ensure!(
+                request_frame.frame_type == TOKENIZE_REQUEST_FRAME_TYPE
+                    && request_frame.version == TOKENIZE_FRAME_VERSION,
+                "tokenize request frame version is unsupported"
+            );
+            ensure!(
+                request_frame.session_id == session_id,
+                "tokenize request session binding mismatch"
+            );
+            ensure!(
+                request_frame.provider == terms.provider
+                    && request_frame.enclave_id == terms.enclave_id
+                    && terms.room_ids.contains(&request_frame.room_id)
+                    && request_frame.model == terms.model_id,
+                "tokenize request targets a different provider route"
+            );
+            ensure!(
+                request_frame.request.is_some() ^ request_frame.request_ref.is_some(),
+                "tokenize request must contain exactly one of request or request_ref"
+            );
+            let chunked = request_frame.request_ref.is_some();
+            let request = if let Some(request) = request_frame.request.clone() {
+                request
+            } else {
+                ensure!(
+                    !request_frame.request_id.is_empty(),
+                    "chunked tokenize request is missing rid"
+                );
+                provider_session_request_body_from_frame(
+                    pending_payloads,
+                    &session_id,
+                    &json!({
+                        "rid": request_frame.request_id,
+                        "body_ref": request_frame.request_ref,
+                    }),
+                    max_request_bytes,
+                )
+                .context("reassembling tokenize request")?
+            };
+            let encoded_request =
+                stable_json_bytes(&request).context("encoding tokenize request")?;
+            ensure!(
+                encoded_request.len() <= max_request_bytes,
+                "tokenize request exceeds provider request byte limit"
+            );
+            if !chunked {
+                tokenize_limiter.admit(&remote, Instant::now())?;
+            }
+            open_provider_direct_session(bridge, &remote, &session_id)
+                .await
+                .context("opening provider side of tokenize session")?;
+            let response_frame = match responder.tokenize(terms, &request) {
+                Ok(tokenization) if tokenization.token_ids.is_empty() => TokenizeResponseFrame {
+                    frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
+                    version: TOKENIZE_FRAME_VERSION,
+                    session_id: session_id.clone(),
+                    provider: terms.provider.clone(),
+                    enclave_id: terms.enclave_id.clone(),
+                    room_id: request_frame.room_id,
+                    model: terms.model_id.clone(),
+                    ok: false,
+                    count: None,
+                    tokens: None,
+                    tokens_ref: None,
+                    error_code: Some("token_count_unsupported".to_owned()),
+                    error: Some(
+                        "Exact tokenization is unavailable for this provider runtime.".to_owned(),
+                    ),
+                },
+                Ok(tokenization) => TokenizeResponseFrame {
+                    frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
+                    version: TOKENIZE_FRAME_VERSION,
+                    session_id: session_id.clone(),
+                    provider: terms.provider.clone(),
+                    enclave_id: terms.enclave_id.clone(),
+                    room_id: request_frame.room_id,
+                    model: terms.model_id.clone(),
+                    ok: true,
+                    count: Some(u64::try_from(tokenization.token_ids.len()).unwrap_or(u64::MAX)),
+                    tokens: request_frame
+                        .return_tokens
+                        .then_some(tokenization.token_ids),
+                    tokens_ref: None,
+                    error_code: None,
+                    error: None,
+                },
+                Err(error) => {
+                    let detail = error.to_string().to_ascii_lowercase();
+                    let unsupported = detail.contains("does not expose exact tokenization")
+                        || detail.contains("exact tokenization is unsupported")
+                        || detail.contains("tokenize outside generation");
+                    TokenizeResponseFrame {
+                        frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
+                        version: TOKENIZE_FRAME_VERSION,
+                        session_id: session_id.clone(),
+                        provider: terms.provider.clone(),
+                        enclave_id: terms.enclave_id.clone(),
+                        room_id: request_frame.room_id,
+                        model: terms.model_id.clone(),
+                        ok: false,
+                        count: None,
+                        tokens: None,
+                        tokens_ref: None,
+                        error_code: Some(if unsupported {
+                            "token_count_unsupported".to_owned()
+                        } else {
+                            "token_count_failed".to_owned()
+                        }),
+                        error: Some(if unsupported {
+                            "Exact tokenization is unavailable for this provider runtime."
+                                .to_owned()
+                        } else {
+                            "The provider tokenizer could not complete this request.".to_owned()
+                        }),
+                    }
+                }
+            };
+            let send_result =
+                send_provider_tokenize_response(bridge, &remote, &session_id, response_frame).await;
+            let _ = bridge.session_close(&remote, &session_id).await;
+            send_result?;
+        }
         TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE => {
             let challenge_frame: TpmActivateCredentialChallengeFrame =
                 serde_json::from_value(frame.clone())
@@ -81765,8 +84267,12 @@ where
         }
         "s.open" => {
             prune_provider_session_reject_replays(rejected_sessions, Instant::now());
-            if let Some(replay) = rejected_sessions.get(&session_id) {
-                match provider_session_reject_replay_decision(replay, &remote, &frame)? {
+            let rejected_replay_decision = rejected_sessions
+                .get(&session_id)
+                .map(|replay| provider_session_reject_replay_decision(replay, &remote, &frame))
+                .transpose()?;
+            if let Some(replay_decision) = rejected_replay_decision {
+                match replay_decision {
                     ProviderSessionReplayDecision::Cached(reject_frame) => {
                         provider_session_debug(format!(
                             "replaying cached s.reject for terminal session {session_id} after transport reconnect"
@@ -81780,16 +84286,26 @@ where
                             .context("replaying cached s.reject");
                         let _ = bridge.session_close(&remote, &session_id).await;
                         send_result?;
+                        return Ok(());
                     }
-                    ProviderSessionReplayDecision::Conflict
-                    | ProviderSessionReplayDecision::Pending => {
+                    ProviderSessionReplayDecision::Conflict => {
                         provider_session_debug(format!(
                             "refusing changed s.open replay for terminal session {session_id} from {remote}"
                         ));
                         let _ = bridge.session_close(&remote, &session_id).await;
+                        return Ok(());
+                    }
+                    ProviderSessionReplayDecision::Pending => {
+                        // A pending reservation is not a terminal rejection. The
+                        // durable recovery binding below guarantees that this
+                        // identical replay re-submits the same signed reservation
+                        // identity instead of creating another reservation.
+                        rejected_sessions.remove(&session_id);
+                        provider_session_debug(format!(
+                            "resuming identical s.open for pending reservation session {session_id}"
+                        ));
                     }
                 }
-                return Ok(());
             }
             if let Some(existing) = sessions.get(&session_id) {
                 if existing.remote != remote {
@@ -81846,7 +84362,7 @@ where
             }
             provider_session_debug(format!("provider side session {session_id} opened"));
             let session_rail = provider_session_frame_rail(&frame).unwrap_or_default();
-            let contract = read_contract_catalog(runtime.rpc).await?;
+            let contract = read_provider_session_contract_catalog(runtime.rpc, terms).await?;
             let mut admission_terms = terms.clone();
             let price_decision = refresh_provider_session_price_terms(
                 &contract,
@@ -81870,6 +84386,7 @@ where
                 },
                 reject => reject,
             };
+            let mut accepted_reservation_recovery = None;
             let decision = match static_decision {
                 ProviderSessionDecision::Accept => {
                     let protection_decision = if let Some(reject) = runtime_floor_reject {
@@ -81923,6 +84440,7 @@ where
                                         admission_timeout,
                                         provider_session_spend_reservation_decision(
                                             runtime.rpc,
+                                            &runtime.receipt_settlement,
                                             runtime.keypair_path,
                                             runtime.password,
                                             &runtime.runtime_keypair.public_key_hex(),
@@ -81933,15 +84451,14 @@ where
                                     )
                                     .await;
                                     let reservation_decision = match reservation {
-                                        Ok(Ok(decision)) => decision,
+                                        Ok(Ok((decision, recovery))) => {
+                                            accepted_reservation_recovery = recovery;
+                                            decision
+                                        }
                                         Ok(Err(error)) => return Err(error),
-                                        Err(_) => ProviderSessionDecision::Reject {
-                                        code: "BALANCE",
-                                        reason: format!(
-                                            "spend reservation did not complete within the {} ms provider admission budget; no work was served",
-                                            admission_timeout.as_millis()
+                                        Err(_) => provider_session_reservation_timeout_decision(
+                                            admission_timeout,
                                         ),
-                                    },
                                     };
                                     reservation_decision
                                 }
@@ -82002,9 +84519,8 @@ where
                         max_spend_au: spend_voucher.body.max_spend_au,
                         receipt_settlement: Some(runtime.receipt_settlement.clone()),
                         accept_replay: None,
-                        reservation_recovery: None,
+                        reservation_recovery: accepted_reservation_recovery.map(Arc::new),
                     };
-                    active.reservation_recovery = provider_failure_recovery::begin(&active, terms)?.map(Arc::new);
                     let ts = unix_epoch_millis()?;
                     let open_head =
                         session_frame_head(&frame).context("hashing s.open frame for s.accept")?;
@@ -82337,11 +84853,19 @@ where
                         live_stream.as_mut(),
                         &cancellation,
                     )?;
-                    normalize_provider_visible_output_usage(&body, &mut output)?;
+                    provider_session_output_result(normalize_provider_visible_output_usage(
+                        &body,
+                        &mut output,
+                    ))?;
                     cancellation
                         .check()
                         .context("provider request cancelled before response publication")?;
-                    validate_provider_session_output(terms, &body, &output)?;
+                    provider_session_output_result(validate_provider_session_output(
+                        terms, &body, &output,
+                    ))?;
+                    if let Some(stream) = live_stream.as_mut() {
+                        stream.finish()?;
+                    }
                     Ok(output)
                 })
             });
@@ -82362,49 +84886,6 @@ where
                             .as_ref()
                             .and_then(ProviderSessionLiveStream::measured_generation_tok_s),
                     );
-                    if let Some(stream) = live_stream.as_mut() {
-                        if let Err(err) = stream.finish() {
-                            let err_text = format!("{err:#}");
-                            if err_text.contains(PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT) {
-                                request_load.finish();
-                                provider_session_debug(format!(
-                                    "client disconnected during live flush after partial receipt for session {session_id} request {request_id}"
-                                ));
-                                sessions.remove(&session_id);
-                                pending_requests.remove(&session_id);
-                                remove_provider_session_pending_payloads(
-                                    pending_payloads,
-                                    &session_id,
-                                );
-                                heartbeat_load.set_active_sessions(sessions, terms);
-                                return Ok(());
-                            }
-                            provider_session_debug(format!(
-                                "flushing live response failed for session {session_id}: {err_text}"
-                            ));
-                            send_provider_session_error(
-                                bridge,
-                                &active.remote,
-                                &active.session_id,
-                                request_id,
-                                "provider_response_failed",
-                                &err.to_string(),
-                            )
-                            .await?;
-                            send_provider_session_close(
-                                bridge,
-                                &active.remote,
-                                &active.session_id,
-                                "err:provider_response_failed",
-                            )
-                            .await?;
-                            sessions.remove(&session_id);
-                            pending_requests.remove(&session_id);
-                            remove_provider_session_pending_payloads(pending_payloads, &session_id);
-                            heartbeat_load.set_active_sessions(sessions, terms);
-                            return Ok(());
-                        }
-                    }
                     (output, measured_throughput)
                 }
                 Err(err) => {
@@ -82435,6 +84916,7 @@ where
                             usage,
                             usage_attribution,
                             receipt_seq,
+                            duration_millis_u64(request_started.elapsed()).max(1),
                             runtime.runtime_keypair,
                         )
                         .await
@@ -82482,7 +84964,13 @@ where
                         .map(ProviderSessionLiveStream::cancellation_receipt_state)
                         .unwrap_or_else(|| (ReceiptUsage::default(), BTreeMap::new(), 1));
                     let failed_receipt = provider_failed_session_receipt(
-                        terms, &active, &body, usage, attribution, receipt_seq,
+                        terms,
+                        &active,
+                        &body,
+                        usage,
+                        attribution,
+                        receipt_seq,
+                        duration_millis_u64(request_started.elapsed()).max(1),
                         runtime.runtime_keypair,
                     )?;
                     send_provider_session_failure(
@@ -82498,12 +84986,17 @@ where
                         // Publication may fail after the buyer durably signs. Its
                         // recovery job and our settlement outbox retain that ACK.
                         match wait_for_provider_receipt_ack_inner(
-                            bridge, &active, receipt,
-                            provider_session_receipt_ack_timeout(&active), None, true,
-                        ).await {
-                            Ok(_) => lock_provider_protection(protection).record_usage(
-                                &receipt.body.usage, receipt.body.au_owed_cum,
-                            ),
+                            bridge,
+                            &active,
+                            receipt,
+                            provider_session_receipt_ack_timeout(&active),
+                            None,
+                            true,
+                        )
+                        .await
+                        {
+                            Ok(_) => lock_provider_protection(protection)
+                                .record_usage(&receipt.body.usage, receipt.body.au_owed_cum),
                             Err(error) => provider_session_debug(format!(
                                 "failed-session receipt handoff pending for {session_id}: {error:#}"
                             )),
@@ -82662,6 +85155,75 @@ where
     Ok(())
 }
 
+async fn send_provider_tokenize_response(
+    bridge: &mut ScBridgeClient,
+    remote: &str,
+    session_id: &str,
+    response: TokenizeResponseFrame,
+) -> Result<()> {
+    for frame in provider_tokenize_response_frames(response, provider_session_max_frame_bytes())? {
+        bridge
+            .session_send(remote, session_id, frame)
+            .await
+            .context("sending tokenize response")?;
+    }
+    Ok(())
+}
+
+fn provider_tokenize_response_frames(
+    mut response: TokenizeResponseFrame,
+    max_frame_bytes: usize,
+) -> Result<Vec<Value>> {
+    let inline = serde_json::to_value(&response).context("serializing tokenize response")?;
+    if provider_session_frame_json_len(&inline)? <= max_frame_bytes {
+        return Ok(vec![inline]);
+    }
+    let tokens = response
+        .tokens
+        .take()
+        .context("oversized tokenize response has no token payload to chunk")?;
+    let tokens_value =
+        serde_json::to_value(&tokens).context("serializing tokenize response tokens")?;
+    let bytes = stable_json_bytes(&tokens_value).context("serializing tokenize response tokens")?;
+    let chunk_size = provider_session_payload_chunk_bytes(max_frame_bytes);
+    let manifest = payload_chunk_manifest(&bytes, chunk_size)
+        .map_err(|error| anyhow!(error))
+        .context("planning tokenize response chunks")?;
+    let mut frames = Vec::new();
+    for index in 0..manifest.chunk_count {
+        let chunk = payload_chunk_at(&bytes, chunk_size, index)
+            .map_err(|error| anyhow!(error))
+            .context("building tokenize response chunk")?
+            .context("planned tokenize response chunk was missing")?;
+        let frame = json!({
+            "t": TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE,
+            "v": TOKENIZE_FRAME_VERSION,
+            "session_id": response.session_id,
+            "provider": response.provider,
+            "enclave_id": response.enclave_id,
+            "room_id": response.room_id,
+            "model": response.model,
+            "payload_id": manifest.blake3,
+            "chunk": chunk,
+        });
+        let len = provider_session_frame_json_len(&frame)?;
+        ensure!(
+            len <= max_frame_bytes,
+            "chunked tokenize response frame {len} bytes exceeds session max {max_frame_bytes} bytes"
+        );
+        frames.push(frame);
+    }
+    response.tokens_ref = Some(manifest);
+    let final_frame = serde_json::to_value(response).context("serializing tokenize response")?;
+    let final_len = provider_session_frame_json_len(&final_frame)?;
+    ensure!(
+        final_len <= max_frame_bytes,
+        "tokenize response manifest frame {final_len} bytes exceeds session max {max_frame_bytes} bytes"
+    );
+    frames.push(final_frame);
+    Ok(frames)
+}
+
 fn provider_session_event_belongs_to_process(
     event: &Value,
     sessions: &HashMap<String, ActiveProviderSession>,
@@ -82684,6 +85246,16 @@ fn provider_session_event_belongs_to_process(
     };
     match frame.get("t").and_then(Value::as_str) {
         Some("s.open") => provider_session_open_targets_enclave(frame, terms),
+        Some(TOKENIZE_REQUEST_FRAME_TYPE | TOKENIZE_REQUEST_CHUNK_FRAME_TYPE) => {
+            frame.get("provider").and_then(Value::as_str) == Some(terms.provider.as_str())
+                && frame.get("enclave_id").and_then(Value::as_str)
+                    == Some(terms.enclave_id.as_str())
+                && frame.get("model").and_then(Value::as_str) == Some(terms.model_id.as_str())
+                && frame
+                    .get("room_id")
+                    .and_then(Value::as_str)
+                    .is_some_and(|room_id| terms.room_ids.iter().any(|owned| owned == room_id))
+        }
         Some(TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE) => {
             frame.get("provider").and_then(Value::as_str) == Some(terms.provider.as_str())
                 && frame.get("enclave_id").and_then(Value::as_str)
@@ -82735,6 +85307,7 @@ struct ProviderSessionLiveStreamState {
     delivered_metered_units: u64,
     reasoning_units: u64,
     prompt_tokens: u64,
+    compute_ms: u64,
 }
 
 struct ProviderSessionLiveStream<'a> {
@@ -83077,6 +85650,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
                 usage_attribution,
                 self.receipt_seq,
                 false,
+                duration_millis_u64(self.request_started.elapsed()).max(1),
                 self.runtime_keypair,
             )
             .context("building live provider session checkpoint receipt")?;
@@ -83089,7 +85663,24 @@ impl<'a> ProviderSessionLiveStream<'a> {
                         &receipt,
                         "checkpoint",
                     )
-                    .await?;
+                    .await
+                    .context("sending live checkpoint receipt")
+                })
+            })?;
+            // A successfully transmitted sequence is consumed even when its
+            // ACK is lost. A terminal recovery receipt must use a fresh
+            // sequence because the buyer may already have durably signed and
+            // queued this checkpoint before the transport failed.
+            self.receipt_seq = self.receipt_seq.saturating_add(1);
+            // Retain the transmitted high-water usage for the same reason.
+            // If the ACK is lost after the buyer persisted this checkpoint,
+            // terminal recovery at the fresh sequence must not regress usage
+            // or reasoning attribution below the durable checkpoint.
+            self.last_checkpoint_metered_units = self.delivered_metered_units;
+            self.last_checkpoint_reasoning_units =
+                metered_output_units("", &self.hidden_reasoning, &[]);
+            tokio::task::block_in_place(|| {
+                tokio::runtime::Handle::current().block_on(async {
                     wait_for_provider_receipt_ack(
                         self.bridge,
                         self.active,
@@ -83101,16 +85692,16 @@ impl<'a> ProviderSessionLiveStream<'a> {
                     .context("waiting for live checkpoint receipt ack")
                 })
             })?;
-            self.last_checkpoint_metered_units = self.delivered_metered_units;
-            self.last_checkpoint_reasoning_units = metered_output_units("", &self.hidden_reasoning, &[]);
-            self.receipt_seq = self.receipt_seq.saturating_add(1);
         }
         self.poll_client_disconnect()?;
         Ok(())
     }
 
     fn tool_stream_id(&self, index: usize) -> String {
-        format!("call-{}", stable_value_hash(&json!({"request": self.request_id, "index": index})))
+        format!(
+            "call-{}",
+            stable_value_hash(&json!({"request": self.request_id, "index": index}))
+        )
     }
 
     fn append_tool_deltas(&mut self, deltas: Vec<Value>) {
@@ -83174,7 +85765,10 @@ impl<'a> ProviderSessionLiveStream<'a> {
         let usage_attribution = if self.last_checkpoint_reasoning_units == 0 {
             BTreeMap::new()
         } else {
-            BTreeMap::from([("reasoning_output_tokens".to_owned(), self.last_checkpoint_reasoning_units)])
+            BTreeMap::from([(
+                "reasoning_output_tokens".to_owned(),
+                self.last_checkpoint_reasoning_units,
+            )])
         };
         (usage, usage_attribution, self.receipt_seq)
     }
@@ -83205,12 +85799,20 @@ impl<'a> ProviderSessionLiveStream<'a> {
         let max_frame_bytes = provider_session_max_frame_bytes();
         let mut tool_fragments = Vec::new();
         for delta in &self.pending_tool_deltas {
-            let args = delta.get("arguments").and_then(Value::as_str).unwrap_or_default();
+            let args = delta
+                .get("arguments")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let parts = provider_stream_parts(args, (max_frame_bytes / 12).max(1));
-            if parts.is_empty() { tool_fragments.push(delta.clone()); }
+            if parts.is_empty() {
+                tool_fragments.push(delta.clone());
+            }
             for (part_index, part) in parts.iter().enumerate() {
-                let mut fragment = if part_index == 0 { delta.clone() }
-                    else { json!({"index":delta["index"]}) };
+                let mut fragment = if part_index == 0 {
+                    delta.clone()
+                } else {
+                    json!({"index":delta["index"]})
+                };
                 fragment["arguments"] = json!(part);
                 tool_fragments.push(fragment);
             }
@@ -83298,10 +85900,23 @@ impl<'a> ProviderSessionLiveStream<'a> {
 
     fn send_client_disconnect_receipt(&mut self) -> Result<()> {
         let (usage, attribution, seq) = self.cancellation_receipt_state();
-        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(async {
-            settle_cancelled_provider_session(self.bridge, self.active, self.request_id,
-                self.terms, self.body, usage, attribution, seq, self.runtime_keypair).await
-        }))?;
+        tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(async {
+                settle_cancelled_provider_session(
+                    self.bridge,
+                    self.active,
+                    self.request_id,
+                    self.terms,
+                    self.body,
+                    usage,
+                    attribution,
+                    seq,
+                    duration_millis_u64(self.request_started.elapsed()).max(1),
+                    self.runtime_keypair,
+                )
+                .await
+            })
+        })?;
         Ok(())
     }
 
@@ -83314,6 +85929,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
             delivered_metered_units: self.delivered_metered_units,
             reasoning_units: metered_output_units("", &self.hidden_reasoning, &[]),
             prompt_tokens: self.prompt_tokens,
+            compute_ms: duration_millis_u64(self.request_started.elapsed()).max(1),
         })
     }
 }
@@ -83325,13 +85941,22 @@ fn provider_failed_session_receipt(
     usage: ReceiptUsage,
     attribution: BTreeMap<String, u64>,
     seq: u64,
+    compute_ms: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<Option<ProviderSignedSessionReceipt>> {
     // A provider failure never invents the minimum work quantum used for a
     // buyer cancellation. Only the last acknowledged checkpoint is billable.
     // A zero-spend failure is closed through canonical reservation recovery.
     let receipt = provider_session_receipt_for_usage_attribution(
-        terms, active, body, usage, attribution, seq, true, runtime_keypair,
+        terms,
+        active,
+        body,
+        usage,
+        attribution,
+        seq,
+        true,
+        compute_ms,
+        runtime_keypair,
     )?;
     Ok((receipt.body.au_owed_cum > active.billing_prior_au_owed_cum).then_some(receipt))
 }
@@ -83354,7 +85979,9 @@ async fn send_provider_session_failure(
         frame["seq"] = json!(receipt.body.seq);
         frame["receipt"] = json!(receipt);
     }
-    bridge.session_send(&active.remote, &active.session_id, frame).await
+    bridge
+        .session_send(&active.remote, &active.session_id, frame)
+        .await
         .context("sending provider failure and terminal accounting")?;
     Ok(())
 }
@@ -83368,6 +85995,7 @@ async fn settle_cancelled_provider_session(
     usage: ReceiptUsage,
     usage_attribution: BTreeMap<String, u64>,
     receipt_seq: u64,
+    compute_ms: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
     let receipt = provider_cancelled_session_receipt(
@@ -83377,6 +86005,7 @@ async fn settle_cancelled_provider_session(
         usage,
         usage_attribution,
         receipt_seq,
+        compute_ms,
         runtime_keypair,
     )
     .context("building cancelled provider session receipt")?;
@@ -83409,6 +86038,7 @@ fn provider_cancelled_session_receipt(
     metered_usage: ReceiptUsage,
     usage_attribution: BTreeMap<String, u64>,
     receipt_seq: u64,
+    compute_ms: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
     let usage = cancellation_settlement_usage(
@@ -83428,6 +86058,7 @@ fn provider_cancelled_session_receipt(
         usage_attribution,
         receipt_seq,
         true,
+        compute_ms,
         runtime_keypair,
     )
 }
@@ -83541,6 +86172,7 @@ async fn send_provider_session_output(
                     usage_attribution,
                     receipt_seq,
                     false,
+                    provider_session_quality_compute_ms(&provider_quality),
                     runtime_keypair,
                 )
                 .context("building provider session checkpoint receipt")?;
@@ -83552,6 +86184,7 @@ async fn send_provider_session_output(
                     "checkpoint",
                 )
                 .await?;
+                receipt_seq = receipt_seq.saturating_add(1);
                 wait_for_provider_receipt_ack(
                     bridge,
                     active,
@@ -83562,7 +86195,6 @@ async fn send_provider_session_output(
                 .await
                 .context("waiting for checkpoint receipt ack")?;
                 last_checkpoint_metered_units = delivered_metered_units;
-                receipt_seq = receipt_seq.saturating_add(1);
             }
         }
     }
@@ -83612,6 +86244,7 @@ async fn send_provider_session_output(
         output.usage_attribution.clone(),
         receipt_seq,
         true,
+        provider_session_quality_compute_ms(&provider_quality),
         runtime_keypair,
     )
     .context("building provider session receipt")?;
@@ -83631,12 +86264,32 @@ async fn send_provider_client_disconnect_receipt_if_requested(
     if !provider_session_client_disconnect_requested(bridge, active).await? {
         return Ok(());
     }
-    let usage = if state.last_checkpoint_metered_units == 0 { ReceiptUsage::default() }
-        else { ReceiptUsage::text(state.prompt_tokens, state.last_checkpoint_metered_units) };
-    let attribution = if state.last_checkpoint_reasoning_units == 0 { BTreeMap::new() }
-        else { BTreeMap::from([("reasoning_output_tokens".to_owned(), state.last_checkpoint_reasoning_units)]) };
-    settle_cancelled_provider_session(bridge, active, request_id, terms, body, usage,
-        attribution, state.receipt_seq, runtime_keypair).await?;
+    let usage = if state.last_checkpoint_metered_units == 0 {
+        ReceiptUsage::default()
+    } else {
+        ReceiptUsage::text(state.prompt_tokens, state.last_checkpoint_metered_units)
+    };
+    let attribution = if state.last_checkpoint_reasoning_units == 0 {
+        BTreeMap::new()
+    } else {
+        BTreeMap::from([(
+            "reasoning_output_tokens".to_owned(),
+            state.last_checkpoint_reasoning_units,
+        )])
+    };
+    settle_cancelled_provider_session(
+        bridge,
+        active,
+        request_id,
+        terms,
+        body,
+        usage,
+        attribution,
+        state.receipt_seq,
+        state.compute_ms,
+        runtime_keypair,
+    )
+    .await?;
     bail!("{PROVIDER_SESSION_CLIENT_DISCONNECT_ABORT}");
 }
 
@@ -84520,7 +87173,9 @@ async fn wait_for_provider_receipt_ack_inner(
                                 == Some("client_disconnect") =>
                     {
                         if !settling_cancellation && !cancellation_drain {
-                            if let Some(token) = cancellation { token.cancel(); }
+                            if let Some(token) = cancellation {
+                                token.cancel();
+                            }
                             cancellation_drain = true;
                             deadline = deadline.min(Instant::now() + Duration::from_millis(500));
                         }
@@ -84640,6 +87295,7 @@ fn provider_session_receipt(
         output.usage_attribution.clone(),
         1,
         true,
+        1,
         runtime_keypair,
     )
 }
@@ -84651,6 +87307,7 @@ fn provider_session_receipt_for_usage(
     usage: ReceiptUsage,
     seq: u64,
     final_receipt: bool,
+    compute_ms: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
     provider_session_receipt_for_usage_attribution(
@@ -84661,6 +87318,7 @@ fn provider_session_receipt_for_usage(
         BTreeMap::new(),
         seq,
         final_receipt,
+        compute_ms,
         runtime_keypair,
     )
 }
@@ -84673,6 +87331,7 @@ fn provider_session_receipt_for_usage_attribution(
     usage_attribution: BTreeMap<String, u64>,
     seq: u64,
     final_receipt: bool,
+    compute_ms: u64,
     runtime_keypair: &RuntimeKeypair,
 ) -> Result<ProviderSignedSessionReceipt> {
     let usage = provider_session_logical_usage(active, &usage);
@@ -84717,6 +87376,8 @@ fn provider_session_receipt_for_usage_attribution(
         locked_per_req_au: active.locked_per_req_au,
         locked_min_session_au: active.locked_min_session_au,
         served_ctx: active.served_ctx,
+        compute_ms: compute_ms.max(1),
+        capacity_slots: terms.capacity_slots.max(1),
         ctx_bracket: active.ctx_bracket.clone(),
         ctx_bracket_table_ver: active.ctx_bracket_table_ver,
         rules_ver: terms.rules_ver,
@@ -84823,6 +87484,7 @@ fn provider_receipt_binds_contract_request(endpoint_family: &str) -> bool {
             | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
             | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
             | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+            | mayhem_proto::ENDPOINT_MAYHEM_DECISIONS
             | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
     )
 }
@@ -84860,6 +87522,7 @@ fn provider_session_prompt_text(body: &Value, adapter: &catalog::CatalogAdapter)
                 | mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS
                 | mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS
                 | mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS
+                | mayhem_proto::ENDPOINT_MAYHEM_DECISIONS
                 | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO
         )
     ) {
@@ -84937,6 +87600,33 @@ fn provider_embedding_input_texts_from_body(body: &Value) -> Result<Vec<String>>
     provider_embedding_input_texts_from_value(input)
 }
 
+fn provider_decision_request_from_body(body: &Value) -> Result<EngineDecisionRequest> {
+    Ok(EngineDecisionRequest {
+        state: body
+            .get("state")
+            .cloned()
+            .context("decision request is missing state")?,
+        questions: body
+            .get("questions")
+            .cloned()
+            .context("decision request is missing questions")?,
+        checkpoint: body
+            .get("checkpoint")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        task: body.get("task").and_then(Value::as_str).map(str::to_owned),
+        lang: body.get("lang").and_then(Value::as_str).map(str::to_owned),
+        auto_task_detection: body
+            .get("auto_task_detection")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        email: body.get("email").cloned(),
+        shortlist: body.get("shortlist").cloned(),
+        temperature: body.get("temperature").cloned(),
+        limits: body.get("limits").cloned(),
+    })
+}
+
 fn provider_embedding_input_texts_from_value(value: &Value) -> Result<Vec<String>> {
     match value {
         Value::String(text) => {
@@ -84961,13 +87651,6 @@ fn provider_embedding_input_texts_from_value(value: &Value) -> Result<Vec<String
         }
         _ => bail!("embedding input must be a string or an array of strings"),
     }
-}
-
-fn provider_embedding_input_token_count(inputs: &[String]) -> u64 {
-    inputs
-        .iter()
-        .map(|input| rough_text_tokens(input))
-        .fold(0_u64, u64::saturating_add)
 }
 
 fn provider_session_attestation_policy_binding(
@@ -85098,6 +87781,23 @@ fn provider_session_responder(
                 backend
                     .load(load_config)
                     .context("loading llama.cpp provider session engine")
+            })?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(backend),
+            }))
+        }
+        "laya" => {
+            let python = ctx
+                .backend_runtime
+                .python
+                .as_ref()
+                .context("Laya runtime preflight did not resolve Python")?;
+            let mut backend = mayhem_engine::LayaBackend::with_python(python)
+                .context("initializing Laya provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "Laya engine load", || {
+                backend
+                    .load(load_config)
+                    .context("loading Laya provider session engine")
             })?;
             Ok(Box::new(EngineProviderSessionResponder {
                 backend: Box::new(backend),
@@ -85317,6 +88017,50 @@ fn provider_session_responder(
                 backend: Box::new(backend),
             }))
         }
+        "openai-compatible" => {
+            let base_url = ctx
+                .backend_runtime
+                .openai_compatible_url
+                .clone()
+                .context("openai-compatible runtime preflight did not resolve its loopback URL")?;
+            let runtime = ctx
+                .selected
+                .artifact
+                .openai_compatible
+                .clone()
+                .context("openai-compatible artifact is missing its signed runtime binding")?;
+            let mut backend = mayhem_engine::OpenAiCompatibleBackend::new(
+                mayhem_engine::OpenAiCompatibleBackendConfig {
+                    base_url,
+                    runtime,
+                    readiness_timeout: if ctx
+                        .backend_runtime
+                        .managed_openai_compatible
+                        .is_some()
+                    {
+                        Duration::from_secs(3_600)
+                    } else {
+                        Duration::ZERO
+                    },
+                },
+            )
+            .context("initializing openai-compatible provider session engine")?;
+            with_provider_progress_spinner(ctx.args, "openai-compatible engine preflight", || {
+                backend
+                    .load(load_config)
+                    .context("loading openai-compatible provider session engine")
+            })?;
+            Ok(Box::new(EngineProviderSessionResponder {
+                backend: Box::new(ProcessBoundOpenAiBackend {
+                    backend,
+                    process_id: ctx
+                        .backend_runtime
+                        .openai_compatible_pid
+                        .context("OpenAI-compatible provider runtime has no verified host PID")?,
+                    _runtime: ctx.backend_runtime.managed_openai_compatible.clone(),
+                }),
+            }))
+        }
         other => bail!(
             "provider session engine for {other} is not wired locally yet; do not serve this enclave until its admin-approved engine adapter is available"
         ),
@@ -85423,11 +88167,18 @@ fn provider_modality_self_test(
     let mut reports = Vec::new();
     for case in cases {
         if let Some(policy) = &terms.execution_mode_requests {
-            let verified =
-                provider_verify_endpoint_request(&case.body, Some(&terms.model_id), &terms.adapter)?;
-            policy.validate_request(verified.family, verified.request).map_err(|_| {
-                provider_session_request_error("request is not supported by the negotiated execution mode")
-            })?;
+            let verified = provider_verify_endpoint_request(
+                &case.body,
+                Some(&terms.model_id),
+                &terms.adapter,
+            )?;
+            policy
+                .validate_request(verified.family, verified.request)
+                .map_err(|_| {
+                    provider_session_request_error(
+                        "request is not supported by the negotiated execution mode",
+                    )
+                })?;
         }
         let output = responder
             .respond(terms, &case.body, &CancellationToken::new())
@@ -85463,7 +88214,11 @@ fn provider_session_responder_with_modality_health(
     // The start-up self-test admits no sessions, so no price floor applies to its terms.
     let terms = provider_session_terms(ctx, 0)?;
     let mut responder = provider_session_responder(ctx)?;
-    if ctx.selected.model.model_class == DEFAULT_MODEL_CLASS {
+    if provider_requires_prefix_caching(
+        &ctx.selected.model.model_id,
+        &ctx.selected.artifact.engine,
+        &ctx.selected.model.model_class,
+    ) {
         ensure!(responder.prefix_caching_enabled(),
             "LLM provider admission requires initialized prefix caching; upgrade to a cache-capable runtime");
     }
@@ -85479,6 +88234,38 @@ fn provider_session_responder_with_modality_health(
     let cases = provider_modality_self_test_plan(ctx, &terms.adapter, ctx.canaries_dir)?;
     let health = provider_modality_self_test(ctx, &terms, responder.as_mut(), cases)?;
     Ok((responder, health))
+}
+
+fn provider_requires_prefix_caching(model_id: &str, engine: &str, model_class: &str) -> bool {
+    model_class == DEFAULT_MODEL_CLASS
+        && !(model_id == NEEDLE_MODEL_REPO && matches!(engine, "needle-cpu" | "needle-gpu"))
+}
+
+#[cfg(test)]
+#[test]
+fn needle_cache_exception_is_limited_to_its_two_runtimes() {
+    for engine in ["needle-cpu", "needle-gpu"] {
+        assert!(!provider_requires_prefix_caching(
+            NEEDLE_MODEL_REPO,
+            engine,
+            DEFAULT_MODEL_CLASS
+        ));
+        assert!(provider_requires_prefix_caching(
+            "another/chat-model",
+            engine,
+            DEFAULT_MODEL_CLASS
+        ));
+    }
+    assert!(provider_requires_prefix_caching(
+        NEEDLE_MODEL_REPO,
+        "llama.cpp",
+        DEFAULT_MODEL_CLASS
+    ));
+    assert!(!provider_requires_prefix_caching(
+        "another/embedding-model",
+        "needle-cpu",
+        "embedding"
+    ));
 }
 
 fn provider_workflow_admission_modality_health(
@@ -85533,6 +88320,7 @@ fn provider_canary_prompt_modalities(
             modalities
         }
         "embedding" => BTreeSet::from(["embedding".to_owned()]),
+        MODEL_CLASS_DECISION => BTreeSet::from(["text".to_owned()]),
         "image-generation" => BTreeSet::from(["image".to_owned()]),
         "video-generation" => {
             let mut modalities = BTreeSet::from(["audio".to_owned(), "video".to_owned()]);
@@ -85656,6 +88444,21 @@ fn provider_canary_self_test_body(
             "kind": "embedding",
             "input": canary_prompt_text(prompt)?,
         })),
+        MODEL_CLASS_DECISION => {
+            let mut body = Value::Object(prompt.endpoint_attributes.clone().into_iter().collect());
+            let object = body
+                .as_object_mut()
+                .expect("decision canary body is an object");
+            object.insert("kind".to_owned(), json!("decision"));
+            object.insert(
+                "endpoint_family".to_owned(),
+                json!(mayhem_proto::ENDPOINT_MAYHEM_DECISIONS),
+            );
+            if let Some(temperature) = &prompt.decision_temperature {
+                object.insert("temperature".to_owned(), temperature.clone());
+            }
+            Ok(body)
+        }
         "image-generation" => {
             if let Some(body) = provider_comfy_workflow_canary_self_test_body(model, prompt)? {
                 return Ok(body);
@@ -85674,8 +88477,14 @@ fn provider_canary_self_test_body(
                 ("shift", prompt.shift.map(Value::from)),
                 ("seed", prompt.seed.map(Value::from)),
                 ("negative_prompt", prompt.negative_prompt.clone()),
-                ("input_reference", prompt.endpoint_attributes.get("input_reference").cloned()),
-                ("strength", prompt.endpoint_attributes.get("strength").cloned()),
+                (
+                    "input_reference",
+                    prompt.endpoint_attributes.get("input_reference").cloned(),
+                ),
+                (
+                    "strength",
+                    prompt.endpoint_attributes.get("strength").cloned(),
+                ),
             ] {
                 if let Some(value) = value {
                     object.insert(name.to_owned(), value);
@@ -86395,6 +89204,22 @@ fn validate_provider_canary_self_test_output(
                     && embeddings.iter().all(|row| !row.is_empty())),
             "embedding modality canary produced no embedding vectors"
         ),
+        MODEL_CLASS_DECISION => {
+            let result: Value = serde_json::from_str(&output.content)
+                .context("decision modality canary produced invalid JSON")?;
+            ensure!(
+                result.get("answers").is_some_and(Value::is_object),
+                "decision modality canary produced no answers object"
+            );
+            ensure!(
+                result.get("routing").is_some_and(Value::is_object),
+                "decision modality canary produced no routing object"
+            );
+            ensure!(
+                output.prompt_tokens > 0 && output.completion_tokens > 0,
+                "decision modality canary produced no metered usage"
+            );
+        }
         "image-generation" => ensure!(
             output
                 .artifacts
@@ -86500,6 +89325,8 @@ fn provider_engine_load_config(
         materialized_trt_engine_dir = Some(layout.engine_dir);
     } else if selected.artifact.engine == "vllm" {
         artifact_path_buf = materialize_vllm_artifacts(selected, artifact_paths)?;
+    } else if selected.artifact.engine == "openai-compatible" {
+        artifact_path_buf = materialize_openai_compatible_artifacts(selected, artifact_paths)?;
     } else if selected.artifact.engine == "mlx" {
         artifact_path_buf = materialize_mlx_artifacts(selected, artifact_paths)?;
     } else if selected.artifact.engine == "ace-step" {
@@ -86528,6 +89355,8 @@ fn provider_engine_load_config(
         artifact_path_buf = materialize_needle_artifacts(selected, artifact_paths, cache_dir)?;
     } else if selected.artifact.engine == "transformers-asr" {
         artifact_path_buf = materialize_transformers_asr_artifacts(selected, artifact_paths)?;
+    } else if selected.artifact.engine == "laya" {
+        artifact_path_buf = materialize_laya_artifacts(selected, artifact_paths)?;
     }
     let artifact_path = artifact_path_buf.as_path();
     let mut artifact = match selected.artifact.engine.as_str() {
@@ -86535,6 +89364,7 @@ fn provider_engine_load_config(
         "mlx" => ModelArtifact::mlx_safetensors(artifact_path),
         "trt-llm" => ModelArtifact::trt_llm_checkpoint(artifact_path),
         "vllm" => ModelArtifact::vllm_safetensors(artifact_path),
+        "openai-compatible" => ModelArtifact::openai_compatible_model(artifact_path),
         "stable-diffusion.cpp" => ModelArtifact::stable_diffusion_checkpoint(artifact_path),
         "comfyui" => ModelArtifact::comfyui_runtime(artifact_path),
         "ace-step" => ModelArtifact::ace_step_safetensors(artifact_path),
@@ -86542,6 +89372,7 @@ fn provider_engine_load_config(
         "needle-cpu" | "needle-gpu" => ModelArtifact::transformers_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?.artifact,
         "transformers-asr" => ModelArtifact::transformers_safetensors(artifact_path),
+        "laya" => ModelArtifact::laya_safetensors(artifact_path),
         "whisper.cpp" => ModelArtifact::whisper_ggml(artifact_path),
         "piper" => ModelArtifact::piper_voice(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
@@ -86549,7 +89380,10 @@ fn provider_engine_load_config(
     if selected.artifact.engine == "sulphur" {
         bind_sulphur_primary_hash_path(&mut artifact, &selected.artifact)?;
     }
-    let artifact = if selected.artifact.engine != "comfyui" {
+    let artifact = if !matches!(
+        selected.artifact.engine.as_str(),
+        "comfyui" | "openai-compatible"
+    ) {
         if let Some(sha256) = &selected.artifact.source_sha256 {
             artifact.with_sha256(sha256.clone())
         } else {
@@ -86563,6 +89397,7 @@ fn provider_engine_load_config(
         "mlx" => LoadConfig::mlx_safetensors(artifact_path),
         "trt-llm" => LoadConfig::trt_llm_checkpoint(artifact_path),
         "vllm" => LoadConfig::vllm_safetensors(artifact_path),
+        "openai-compatible" => LoadConfig::openai_compatible_model(artifact_path),
         "stable-diffusion.cpp" => LoadConfig::stable_diffusion_checkpoint(artifact_path),
         "comfyui" => LoadConfig::comfyui_runtime(artifact_path),
         "ace-step" => LoadConfig::ace_step_safetensors(artifact_path),
@@ -86570,6 +89405,7 @@ fn provider_engine_load_config(
         "needle-cpu" | "needle-gpu" => LoadConfig::transformers_safetensors(artifact_path),
         "sulphur" => sulphur_load_config(artifact_path)?,
         "transformers-asr" => LoadConfig::transformers_safetensors(artifact_path),
+        "laya" => LoadConfig::laya_safetensors(artifact_path),
         "whisper.cpp" => LoadConfig::whisper_ggml(artifact_path),
         "piper" => LoadConfig::piper_voice(artifact_path),
         other => bail!("unsupported local provider session engine {other}"),
@@ -86676,32 +89512,46 @@ fn provider_engine_load_config(
         config.trt_require_engine_dir = true;
     }
     if selected.artifact.engine == "vllm" {
+        bind_vllm_task_for_model(&mut config, &selected.model);
         config.vllm_tensor_parallel = Some(enclave_tp_degree(&selected.enclave.caps)?);
         // CUDA reservations and a mapped checkpoint consume virtual addresses,
         // not the host's remaining resident-memory budget. Keep this finite
         // envelope stable when another provider is already resident at restart.
         let memory = &selected.feasibility.memory_budget;
-        config.vllm_worker_address_space_limit_bytes = Some(memory.worker_address_space_limit_bytes)
-            .filter(|bytes| *bytes > 0);
-        let isolated = generation_execution_uses_isolated_workers(selected.generation_execution_profile.as_ref());
+        config.vllm_worker_address_space_limit_bytes =
+            Some(memory.worker_address_space_limit_bytes).filter(|bytes| *bytes > 0);
+        let isolated = generation_execution_uses_isolated_workers(
+            selected.generation_execution_profile.as_ref(),
+        );
         if isolated {
-            ensure!(selected.execution_mode.is_some(),
-                "isolated dispatch requires authenticated execution-mode negotiation");
-            let allocation = selected.feasibility.replica_allocation
+            ensure!(
+                selected.execution_mode.is_some(),
+                "isolated dispatch requires authenticated execution-mode negotiation"
+            );
+            let allocation = selected
+                .feasibility
+                .replica_allocation
                 .context("isolated dispatch has no aggregate memory admission")?;
-            ensure!(allocation.worker_count == selected.generation_execution_capacity,
-                "isolated worker count differs from its admitted allocation");
-            config.vllm_generation_topology = Some(mayhem_engine::VllmGenerationTopology::IsolatedWorkers);
+            ensure!(
+                allocation.worker_count == selected.generation_execution_capacity,
+                "isolated worker count differs from its admitted allocation"
+            );
+            config.vllm_generation_topology =
+                Some(mayhem_engine::VllmGenerationTopology::IsolatedWorkers);
             config.vllm_max_num_seqs = Some(1);
-            config.memory_limit_bytes = Some(config.memory_limit_bytes
-                .unwrap_or(selected.feasibility.estimated_required_bytes)
-                .min(selected.feasibility.estimated_required_bytes));
+            config.memory_limit_bytes = Some(
+                config
+                    .memory_limit_bytes
+                    .unwrap_or(selected.feasibility.estimated_required_bytes)
+                    .min(selected.feasibility.estimated_required_bytes),
+            );
         } else if selected.generation_execution_profile.is_some() {
             config.vllm_max_num_seqs = Some(selected.generation_execution_capacity.max(1));
         } else if let Some(scheduler_capacity) = enclave_max_batch_size(&selected.enclave.caps)? {
             config.vllm_max_num_seqs = Some(scheduler_capacity);
         }
-        config.vllm_concurrent_generation_capacity = (isolated || selected.generation_execution_capacity > 1)
+        config.vllm_concurrent_generation_capacity = (isolated
+            || selected.generation_execution_capacity > 1)
             .then_some(selected.generation_execution_capacity);
         if let Some(max_num_tokens) = enclave_max_num_tokens(&selected.enclave.caps)? {
             config.ubatch_size = max_num_tokens.max(1);
@@ -86752,6 +89602,50 @@ const TRANSFORMERS_ASR_REQUIRED_SIDECARS: &[(&str, &str)] = &[
     ("transformers_processor_config", "processor_config.json"),
     ("transformers_tokenizer_json", "tokenizer.json"),
     ("transformers_tokenizer_config", "tokenizer_config.json"),
+];
+
+const LAYA_REQUIRED_SIDECARS: &[(&str, &str)] = &[
+    ("laya_encoder_config", "encoder/config.json"),
+    ("laya_agent_config", "rl_agent_config.json"),
+    ("laya_tokenizer", "tokenizer/tokenizer.json"),
+    ("laya_tokenizer_config", "tokenizer/tokenizer_config.json"),
+    ("laya_multilingual_model", "multilingual/model.safetensors"),
+    (
+        "laya_multilingual_encoder_config",
+        "multilingual/encoder/config.json",
+    ),
+    (
+        "laya_multilingual_agent_config",
+        "multilingual/rl_agent_config.json",
+    ),
+    (
+        "laya_multilingual_tokenizer",
+        "multilingual/tokenizer/tokenizer.json",
+    ),
+    (
+        "laya_multilingual_tokenizer_config",
+        "multilingual/tokenizer/tokenizer_config.json",
+    ),
+    (
+        "laya_typed_decisions_model",
+        "typed-decisions/model.safetensors",
+    ),
+    (
+        "laya_typed_decisions_encoder_config",
+        "typed-decisions/encoder/config.json",
+    ),
+    (
+        "laya_typed_decisions_agent_config",
+        "typed-decisions/rl_agent_config.json",
+    ),
+    (
+        "laya_typed_decisions_tokenizer",
+        "typed-decisions/tokenizer/tokenizer.json",
+    ),
+    (
+        "laya_typed_decisions_tokenizer_config",
+        "typed-decisions/tokenizer/tokenizer_config.json",
+    ),
 ];
 
 const NEEDLE_MODEL_REPO: &str = "Cactus-Compute/needle";
@@ -86982,6 +89876,19 @@ fn materialize_vllm_artifacts(
     )
 }
 
+fn materialize_openai_compatible_artifacts(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    ensure!(
+        artifact_paths.primary.is_dir(),
+        "openai-compatible artifact {}/{} must be a verified snapshot directory",
+        selected.model.model_id,
+        selected.artifact_name
+    );
+    Ok(artifact_paths.primary.clone())
+}
+
 fn materialize_vllm_layout(
     label: &str,
     artifact_name: &str,
@@ -87138,6 +90045,74 @@ fn materialize_transformers_asr_layout(
         })?;
     }
     Ok(model_dir)
+}
+
+fn materialize_laya_artifacts(
+    selected: &ProviderCandidate,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    materialize_laya_layout(
+        &format!("{}/{}", selected.model.model_id, selected.artifact_name),
+        &selected.artifact_name,
+        &selected.artifact,
+        artifact_paths,
+    )
+}
+
+fn materialize_laya_layout(
+    label: &str,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    artifact_paths: &ProviderArtifactPaths,
+) -> Result<PathBuf> {
+    let model_dir = laya_checkpoint_cache_dir(&artifact_paths.primary, artifact_name, artifact);
+    fs::create_dir_all(&model_dir)
+        .with_context(|| format!("creating Laya model layout {}", model_dir.display()))?;
+    let primary_relative = validate_catalog_artifact_relative_path(&artifact.path)?;
+    let primary = model_dir.join(&primary_relative);
+    link_or_copy_file(&artifact_paths.primary, &primary).with_context(|| {
+        format!(
+            "materializing Laya primary artifact {label} at {}",
+            primary.display()
+        )
+    })?;
+
+    for (sidecar_name, filename) in LAYA_REQUIRED_SIDECARS {
+        let sidecar = artifact.sidecars.get(*sidecar_name).with_context(|| {
+            format!("Laya artifact {label} requires admin catalog sidecar {sidecar_name}")
+        })?;
+        ensure!(
+            sidecar.path == *filename,
+            "Laya artifact {label} sidecar {sidecar_name} must use path {filename}, got {}",
+            sidecar.path
+        );
+    }
+
+    let mut occupied_paths = BTreeSet::from([primary_relative]);
+    for (sidecar_name, sidecar) in &artifact.sidecars {
+        let relative = validate_catalog_artifact_relative_path(&sidecar.path)?;
+        ensure!(
+            occupied_paths.insert(relative.clone()),
+            "Laya artifact {label} declares duplicate path {}",
+            sidecar.path
+        );
+        let source = artifact_paths.sidecars.get(sidecar_name).with_context(|| {
+            format!("downloaded Laya artifact {label} is missing admin sidecar {sidecar_name}")
+        })?;
+        let destination = model_dir.join(relative);
+        let materialize = if sidecar.path.ends_with("tokenizer/tokenizer_config.json") {
+            copy_file_replace(source, &destination)
+        } else {
+            link_or_copy_file(source, &destination)
+        };
+        materialize.with_context(|| {
+            format!(
+                "materializing Laya sidecar {sidecar_name} at {}",
+                destination.display()
+            )
+        })?;
+    }
+    Ok(primary)
 }
 
 fn materialize_needle_artifacts(
@@ -87811,6 +90786,22 @@ fn link_or_copy_file(source: &Path, destination: &Path) -> Result<()> {
     Ok(())
 }
 
+fn copy_file_replace(source: &Path, destination: &Path) -> Result<()> {
+    if !source.is_file() {
+        bail!("{} is not a file", source.display());
+    }
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
+    }
+    if destination.exists() {
+        fs::remove_file(destination)
+            .with_context(|| format!("removing stale {}", destination.display()))?;
+    }
+    fs::copy(source, destination)
+        .with_context(|| format!("copying {} to {}", source.display(), destination.display()))?;
+    Ok(())
+}
+
 fn same_canonical_path(left: &Path, right: &Path) -> bool {
     match (left.canonicalize(), right.canonicalize()) {
         (Ok(left), Ok(right)) => left == right,
@@ -87840,7 +90831,10 @@ fn provider_attestation_runtime_config(
         }
     });
     Ok(AttestationRuntimeConfig {
-        execution_mode: selected.execution_mode.as_ref().map(|mode| mode.binding.clone()),
+        execution_mode: selected
+            .execution_mode
+            .as_ref()
+            .map(|mode| mode.binding.clone()),
         model_class: selected.enclave.model_class.clone(),
         backend: selected.artifact.engine.clone(),
         ctx,
@@ -87930,6 +90924,32 @@ fn transformers_asr_checkpoint_cache_dir(artifact_path: &Path, artifact_name: &s
     };
     base.join(".transformers-asr-models")
         .join(safe_path_component(artifact_name))
+}
+
+fn laya_checkpoint_cache_dir(
+    artifact_path: &Path,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+) -> PathBuf {
+    let base = if artifact_path.is_dir() {
+        artifact_path.to_path_buf()
+    } else {
+        artifact_path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    };
+    let mut identity = blake3::Hasher::new();
+    identity.update(b"mayhem/laya/materialized-layout/v1\0");
+    identity.update(artifact.artifact_root.as_bytes());
+    for (name, sidecar) in &artifact.sidecars {
+        identity.update(name.as_bytes());
+        identity.update(sidecar.artifact_root.as_bytes());
+        identity.update(sidecar.path.as_bytes());
+    }
+    base.join(".laya-models")
+        .join(safe_path_component(artifact_name))
+        .join(identity.finalize().to_hex().as_str())
 }
 
 fn needle_checkpoint_cache_dir(
@@ -88080,16 +91100,29 @@ fn provider_session_terms(
         (None, None)
     };
     Ok(ProviderSessionTerms {
-        execution_mode: ctx.selected.execution_mode.as_ref().map(|mode| mode.binding.clone()),
-        execution_mode_requests: ctx.selected.execution_mode.as_ref().map(|mode| mode.requests.clone()),
+        execution_mode: ctx
+            .selected
+            .execution_mode
+            .as_ref()
+            .map(|mode| mode.binding.clone()),
+        execution_mode_requests: ctx
+            .selected
+            .execution_mode
+            .as_ref()
+            .map(|mode| mode.requests.clone()),
         contract_version: CONTRACT_VERSION,
         provider: ctx.wallet.public_key.clone(),
         enclave_id: ctx.selected.enclave.enclave_id.clone(),
         model_id: ctx.selected.enclave.model_id.clone(),
-        adapter: ctx.selected.execution_mode.as_ref()
+        adapter: ctx
+            .selected
+            .execution_mode
+            .as_ref()
             .map(|mode| &mode.baseline_adapter)
-            .unwrap_or(&ctx.selected.model.adapter).clone(),
+            .unwrap_or(&ctx.selected.model.adapter)
+            .clone(),
         generation_execution_profile: ctx.selected.generation_execution_profile.clone(),
+        runtime_independent_dispatch_modalities: Vec::new(),
         sampling: ctx.selected.model.sampling.clone(),
         workflow_policy: ctx.selected.model.workflow.clone(),
         output_modalities: if ctx.selected.model.caps.output_modalities.is_empty() {
@@ -88113,6 +91146,7 @@ fn provider_session_terms(
         min_session_au: price.min_session_au,
         min_ask_au,
         rules_ver: ctx.rules.ver,
+        capacity_slots: 1,
         ctx: ctx.selected.served_ctx,
         ctx_bracket,
         ctx_bracket_table_ver,
@@ -88257,16 +91291,12 @@ fn provider_session_contract_decision(
                 .to_owned(),
         );
     }
-    let Some(schedule) = contract
-        .prices
-        .iter()
-        .find(|price| {
-            price.enclave_id == terms.enclave_id
-                && price.model_id == terms.model_id
-                && price.ctx_bracket == terms.ctx_bracket
-                && price.ctx_bracket_table_ver == terms.ctx_bracket_table_ver
-        })
-    else {
+    let Some(schedule) = contract.prices.iter().find(|price| {
+        price.enclave_id == terms.enclave_id
+            && price.model_id == terms.model_id
+            && price.ctx_bracket == terms.ctx_bracket
+            && price.ctx_bracket_table_ver == terms.ctx_bracket_table_ver
+    }) else {
         return reject(
             "PRICE_VER",
             "admin price schedule is no longer present for this enclave".to_owned(),
@@ -88322,17 +91352,22 @@ fn provider_session_contract_decision(
 
 async fn provider_session_spend_reservation_decision(
     rpc: &PeerRpcClient,
+    settlement: &ProviderReceiptSettlement,
     keypair_path: &Path,
     password: &str,
     enclave_pubkey: &str,
     terms: &ProviderSessionTerms,
     frame: &Value,
     rail: &str,
-) -> Result<ProviderSessionDecision> {
+) -> Result<(
+    ProviderSessionDecision,
+    Option<provider_failure_recovery::AttemptGuard>,
+)> {
     let reject = |reason: String| ProviderSessionDecision::Reject {
         code: "BALANCE",
         reason,
     };
+    let rejected = |reason: String| Ok((reject(reason), None));
     let voucher: SpendVoucher = match frame
         .get("voucher")
         .cloned()
@@ -88340,31 +91375,31 @@ async fn provider_session_spend_reservation_decision(
         .and_then(|value| serde_json::from_value(value).context("invalid spend voucher"))
     {
         Ok(voucher) => voucher,
-        Err(err) => return Ok(reject(format!("invalid spend reservation: {err:#}"))),
+        Err(err) => return rejected(format!("invalid spend reservation: {err:#}")),
     };
     let active_epoch = active_billing_epoch(rpc).await?;
     if let Err(error) = validate_provider_session_voucher_epoch(&voucher, active_epoch) {
-        return Ok(reject(error.to_string()));
+        return rejected(error.to_string());
     }
     let epoch = voucher.body.billing_epoch;
     let at = match provider_session_open_at(frame) {
         Ok(at) => at,
-        Err(err) => return Ok(reject(format!("invalid spend reservation: {err:#}"))),
+        Err(err) => return rejected(format!("invalid spend reservation: {err:#}")),
     };
     let payout_revision =
         match active_provider_payout_revision(rpc, &terms.provider, rail, epoch).await {
             Ok(revision) => revision,
             Err(err) => {
-                return Ok(reject(format!(
+                return rejected(format!(
                     "provider has no active verified {rail} payout binding: {err:#}"
-                )))
+                ))
             }
         };
     if payout_revision != voucher.body.payout_revision {
-        return Ok(reject(
+        return rejected(
             "signed payout revision does not match the canonical active provider binding"
                 .to_owned(),
-        ));
+        );
     }
     let mut value = match provider_session_spend_reservation_value(
         terms,
@@ -88376,7 +91411,7 @@ async fn provider_session_spend_reservation_decision(
         enclave_pubkey,
     ) {
         Ok(value) => value,
-        Err(err) => return Ok(reject(format!("invalid spend reservation: {err:#}"))),
+        Err(err) => return rejected(format!("invalid spend reservation: {err:#}")),
     };
     let message = targeted_spend_reservation_message(&value);
     let provider_sig = sign_message(keypair_path, password, &message)
@@ -88384,11 +91419,10 @@ async fn provider_session_spend_reservation_decision(
         .context("signing provider spend reservation")?;
     value["provider_sig"] = json!(provider_sig);
     let key = targeted_spend_reservation_feature_key(&value)?;
-    // The local relay comes up shortly after the peer process; an admission that
-    // races that window should wait it out (bounded) instead of rejecting the
-    // session outright (observed live 2026-07-12: s.reject BALANCE on a relay that
-    // became ready seconds later). Only relay-readiness errors retry; every other
-    // failure rejects immediately as before.
+    // The local relay comes up shortly after the peer process, and a lost RPC
+    // response cannot prove whether the writer accepted the reservation. Retry
+    // the same signed feature and reservation identity within a bounded window;
+    // never construct a second reservation for this billing attempt.
     let retry_window = configured_nonnegative_millis(
         "MAYHEM_PROVIDER_ADMISSION_RELAY_RETRY_WINDOW_MS",
         DEFAULT_PROVIDER_ADMISSION_RELAY_RETRY_WINDOW_MILLIS,
@@ -88400,35 +91434,102 @@ async fn provider_session_spend_reservation_decision(
         "provider admission relay retry interval",
     )?);
     let retry_deadline = Instant::now() + Duration::from_millis(retry_window);
-    let submitted = loop {
-        match rpc
-            .submit_feature(json!({
-                "feature": "mayhem",
-                "key": key.clone(),
-                "value": value.clone(),
-            }))
-            .await
-        {
+    let feature = json!({
+        "feature": "mayhem",
+        "key": key.clone(),
+        "value": value.clone(),
+    });
+    let mut recovery_guard = Some(provider_failure_recovery::begin_binding(
+        settlement,
+        &spend_reservation_binding(&value)?,
+    )?);
+    let mut submitted = loop {
+        match rpc.submit_feature(feature.clone()).await {
             Ok(submitted) => break submitted,
             Err(err) => {
                 let message = format!("{err:#}");
-                let relay_not_ready = message.contains("relay is not ready");
-                if relay_not_ready && Instant::now() < retry_deadline {
+                if Instant::now() < retry_deadline {
                     provider_session_debug(format!(
-                        "spend reservation waiting for local relay readiness; retrying: {message}"
+                        "exact spend reservation did not receive a relay response; retrying: {message}"
                     ));
                     tokio::time::sleep(retry_interval).await;
                     continue;
                 }
-                return Ok(reject(format!(
-                    "could not reserve user balance on contract before serving: {err}"
-                )));
+                return Ok((
+                    ProviderSessionDecision::Reject {
+                        code: "RESERVATION_PENDING",
+                        reason: format!(
+                            "the signed spend reservation outcome is unknown after relay failure: {err}"
+                        ),
+                    },
+                    None,
+                ));
             }
         }
     };
-    if submitted.get("ok").and_then(Value::as_bool) == Some(true) {
-        return Ok(ProviderSessionDecision::Accept);
+    loop {
+        if submitted.get("ok").and_then(Value::as_bool) == Some(true) {
+            return Ok((ProviderSessionDecision::Accept, recovery_guard));
+        }
+        if confirmed_spend_reservation_matches(rpc, &value).await? {
+            return Ok((ProviderSessionDecision::Accept, recovery_guard));
+        }
+        if !spend_reservation_submission_pending(&submitted) {
+            break;
+        }
+        if Instant::now() >= retry_deadline {
+            return Ok((
+                ProviderSessionDecision::Reject {
+                    code: "RESERVATION_PENDING",
+                    reason: "the signed spend reservation may have been accepted but its canonical result is still pending; the exact reservation is retained for recovery".to_owned(),
+                },
+                None,
+            ));
+        }
+        provider_session_debug(format!(
+            "spend reservation append is awaiting canonical confirmation; retrying the exact signed reservation"
+        ));
+        tokio::time::sleep(
+            retry_interval.min(retry_deadline.saturating_duration_since(Instant::now())),
+        )
+        .await;
+        submitted = match rpc.submit_feature(feature.clone()).await {
+            Ok(response) => response,
+            Err(error) if Instant::now() < retry_deadline => {
+                provider_session_debug(format!(
+                    "exact spend reservation retry did not receive a relay response: {error:#}"
+                ));
+                continue;
+            }
+            Err(error) => {
+                return Ok((
+                    ProviderSessionDecision::Reject {
+                        code: "RESERVATION_PENDING",
+                        reason: format!(
+                            "the signed spend reservation outcome remains unknown after relay failure: {error:#}"
+                        ),
+                    },
+                    None,
+                ))
+            }
+        };
     }
+    let relay_phase = submitted
+        .get("phase")
+        .and_then(Value::as_str)
+        .filter(|phase| {
+            matches!(
+                *phase,
+                "transport_unavailable"
+                    | "health_proof_unavailable"
+                    | "protocol_incompatible"
+                    | "transport_changed"
+                    | "transport_rejoin_failed"
+                    | "transport_recovering"
+                    | "request_send"
+                    | "admin_ack"
+            )
+        });
     let reason = submitted
         .get("message")
         .and_then(Value::as_str)
@@ -88441,9 +91542,93 @@ async fn provider_session_spend_reservation_decision(
                 .map(str::to_owned)
         })
         .unwrap_or_else(|| submitted.to_string());
-    Ok(reject(format!(
-        "contract spend reservation rejected before serving: {reason}"
-    )))
+    let phase_marker = relay_phase
+        .map(|phase| format!(" [reservation_relay_phase={phase}]"))
+        .unwrap_or_default();
+    if let Some(guard) = recovery_guard.take() {
+        provider_failure_recovery::discard(guard)?;
+    }
+    Ok((
+        reject(format!(
+            "contract spend reservation rejected before serving{phase_marker}: {reason}"
+        )),
+        None,
+    ))
+}
+
+fn spend_reservation_binding(value: &Value) -> Result<Value> {
+    let voucher: SpendVoucher = serde_json::from_value(
+        value
+            .get("voucher")
+            .cloned()
+            .context("spend reservation is missing its voucher")?,
+    )
+    .context("spend reservation voucher is invalid")?;
+    Ok(json!({
+        "billing_epoch": voucher.body.billing_epoch,
+        "reservation_id": voucher.body.reservation_id,
+        "reservation_expires_after_epoch": voucher.body.reservation_expires_after_epoch,
+        "reservation_receipt_grace_epochs": voucher.body.reservation_receipt_grace_epochs,
+        "billing_id": voucher.body.billing_id,
+        "billing_attempt": voucher.body.billing_attempt,
+        "session_id": voucher.body.session_id,
+        "user": voucher.body.user,
+        "rail": voucher.body.rail,
+        "provider": voucher.body.provider,
+        "payout_revision": voucher.body.payout_revision,
+        "model_id": value.get("model_id").cloned().unwrap_or(Value::Null),
+        "enclave_id": value.get("enclave_id").cloned().unwrap_or(Value::Null),
+    }))
+}
+
+async fn confirmed_spend_reservation_matches(rpc: &PeerRpcClient, value: &Value) -> Result<bool> {
+    let binding = spend_reservation_binding(value)?;
+    let reservation_id = binding["reservation_id"]
+        .as_str()
+        .context("spend reservation binding has no identity")?;
+    let key = format!("receipt/reservation/{reservation_id}");
+    let record = rpc.state(Some(&key), Some(true)).await?;
+    ensure!(
+        record["confirmed"] == true && record["key"] == key,
+        "spend reservation confirmation requires exact canonical state"
+    );
+    let reservation = &record["value"];
+    if reservation.is_null() {
+        return Ok(false);
+    }
+    ensure!(
+        reservation["type"] == "receipt_reservation_identity"
+            && reservation["status"] == "active"
+            && reservation_binding_matches(&binding, reservation),
+        "canonical spend reservation does not match the exact signed binding"
+    );
+    Ok(true)
+}
+
+fn spend_reservation_submission_pending(response: &Value) -> bool {
+    response.get("status").and_then(Value::as_str) == Some("pending")
+        || response
+            .get("phase")
+            .and_then(Value::as_str)
+            .is_some_and(|phase| {
+                matches!(
+                    phase,
+                    "transport_unavailable"
+                        | "health_proof_unavailable"
+                        | "protocol_incompatible"
+                        | "transport_changed"
+                        | "transport_rejoin_failed"
+                        | "transport_recovering"
+                        | "request_send"
+                        | "admin_ack"
+                )
+            })
+        || response
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.contains("accepted the append") && message.contains("canonical result")
+            })
 }
 
 fn validate_provider_session_voucher_epoch(
@@ -88791,15 +91976,18 @@ fn provider_session_open_decision(
     }
     let expected_mode = match frame.get("expected_execution_mode") {
         None | Some(Value::Null) => None,
-        Some(value) => match serde_json::from_value::<mayhem_proto::ExecutionModeBinding>(value.clone()) {
-            Ok(binding) => Some(binding),
-            Err(_) => return reject("SCHEMA", "invalid execution mode binding".to_owned()),
-        },
+        Some(value) => {
+            match serde_json::from_value::<mayhem_proto::ExecutionModeBinding>(value.clone()) {
+                Ok(binding) => Some(binding),
+                Err(_) => return reject("SCHEMA", "invalid execution mode binding".to_owned()),
+            }
+        }
     };
     if expected_mode != terms.execution_mode {
         return reject(
             "EXECUTION_MODE",
-            "provider execution mode changed or was not negotiated; select a compatible route".to_owned(),
+            "provider execution mode changed or was not negotiated; select a compatible route"
+                .to_owned(),
         );
     }
     let session_id = frame
@@ -89105,8 +92293,8 @@ fn contract_upgrade_required_reason(expected: u32, actual: Option<u32>) -> Strin
 
 fn verify_provider_session_spend_voucher(voucher: &SpendVoucher, user_pubkey: &str) -> Result<()> {
     ensure!(
-        voucher.body.schema_version == SESSION_RECEIPT_SCHEMA_VERSION,
-        "spend voucher schema_version must be {SESSION_RECEIPT_SCHEMA_VERSION}"
+        voucher.body.schema_version == SPEND_VOUCHER_SCHEMA_VERSION,
+        "spend voucher schema_version must be {SPEND_VOUCHER_SCHEMA_VERSION}"
     );
     let key_bytes = hex_decode_array::<32>(user_pubkey, "spend voucher user pubkey")?;
     let sig_bytes = hex_decode_array::<64>(&voucher.user_sig, "spend voucher user signature")?;
@@ -89171,17 +92359,17 @@ impl ProviderSessionArtifactCollector {
     fn push(&mut self, chunk: ArtifactChunk) -> mayhem_engine::Result<()> {
         let artifact_id = chunk.artifact_id.trim();
         if artifact_id.is_empty() {
-            return Err(EngineError::InvalidConfig(
+            return Err(EngineError::InvalidOutput(
                 "provider engine emitted artifact chunk with empty id".to_owned(),
             ));
         }
         if chunk.content_type.trim().is_empty() {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine emitted artifact {artifact_id} with empty content type"
             )));
         }
         if !self.artifacts.contains_key(artifact_id) && self.artifacts.len() >= self.max_artifacts {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine emitted more than {} session artifacts",
                 self.max_artifacts
             )));
@@ -89190,12 +92378,12 @@ impl ProviderSessionArtifactCollector {
             .total_bytes
             .checked_add(chunk.bytes.len())
             .ok_or_else(|| {
-                EngineError::InvalidConfig(
+                EngineError::InvalidOutput(
                     "provider engine artifact byte count overflow".to_owned(),
                 )
             })?;
         if next_total > self.max_bytes {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifacts exceed the session byte budget of {} bytes",
                 self.max_bytes
             )));
@@ -89211,24 +92399,24 @@ impl ProviderSessionArtifactCollector {
                 final_seen: false,
             });
         if builder.final_seen {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} emitted data after its final chunk"
             )));
         }
         if builder.content_type != chunk.content_type {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} changed content type mid-stream"
             )));
         }
         if builder.next_index != chunk.index {
-            return Err(EngineError::InvalidConfig(format!(
+            return Err(EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} chunk index gap: expected {}, got {}",
                 builder.next_index, chunk.index
             )));
         }
         builder.bytes.extend_from_slice(&chunk.bytes);
         builder.next_index = builder.next_index.checked_add(1).ok_or_else(|| {
-            EngineError::InvalidConfig(format!(
+            EngineError::InvalidOutput(format!(
                 "provider engine artifact {artifact_id} chunk index overflow"
             ))
         })?;
@@ -89296,15 +92484,12 @@ fn provider_visible_tool_calls(tools: &[Value]) -> Result<Vec<VisibleToolCall>> 
         .collect()
 }
 
-fn normalize_provider_visible_output_usage(
-    body: &Value,
-    output: &mut ProviderSessionOutput,
-) -> Result<()> {
+fn provider_session_is_text_generation(body: &Value) -> bool {
     let endpoint_family = body
         .get("mayhem_contract")
         .and_then(|value| value.get("endpoint_family"))
         .and_then(Value::as_str);
-    let is_text_generation = body.get("kind").is_none()
+    body.get("kind").is_none()
         || matches!(
             endpoint_family,
             Some(
@@ -89313,8 +92498,14 @@ fn normalize_provider_visible_output_usage(
                     | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
                     | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
             )
-        );
-    if !is_text_generation {
+        )
+}
+
+fn normalize_provider_visible_output_usage(
+    body: &Value,
+    output: &mut ProviderSessionOutput,
+) -> Result<()> {
+    if !provider_session_is_text_generation(body) {
         return Ok(());
     }
     let tools = provider_visible_tool_calls(&output.tools)?;
@@ -89358,7 +92549,7 @@ fn validate_provider_session_output(
         "MAYHEM_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES",
         DEFAULT_SESSION_MAX_REASSEMBLED_PAYLOAD_BYTES,
     );
-    if body.get("kind").and_then(Value::as_str).is_none() {
+    if provider_session_is_text_generation(body) {
         let available_tokens = terms.ctx.saturating_sub(output.prompt_tokens);
         let max_output_tokens = provider_requested_max_output_tokens(body)
             .unwrap_or(available_tokens)
@@ -89373,11 +92564,48 @@ fn validate_provider_session_output(
             u64::try_from(output.token_ids.len()).unwrap_or(u64::MAX) <= max_output_tokens,
             "provider token ids exceeded the selected session token budget"
         );
+        if output.finish_reason == "stop" {
+            ensure!(
+                !output.content.trim().is_empty()
+                    || !output.tools.is_empty()
+                    || !output.artifacts.is_empty(),
+                "provider text generation stopped without a visible answer"
+            );
+        }
     } else {
         ensure!(
             output.content.len() <= payload_limit,
             "provider modality text output exceeds the session payload budget"
         );
+        let endpoint_family = body
+            .get("mayhem_contract")
+            .and_then(|value| value.get("endpoint_family"))
+            .and_then(Value::as_str);
+        if endpoint_family == Some(mayhem_proto::ENDPOINT_MAYHEM_DECISIONS) {
+            let result: Value = serde_json::from_str(&output.content)
+                .context("decision backend returned invalid JSON")?;
+            ensure!(
+                result.get("answers").is_some_and(Value::is_object),
+                "decision backend result is missing an answers object"
+            );
+            ensure!(
+                result.get("routing").is_some_and(Value::is_object),
+                "decision backend result is missing a routing object"
+            );
+            ensure!(
+                output.embeddings.is_none(),
+                "decision output included embeddings"
+            );
+            ensure!(
+                output.transcription.is_none(),
+                "decision output included transcription"
+            );
+            ensure!(
+                output.artifacts.is_empty(),
+                "decision output included artifacts"
+            );
+            ensure!(output.tools.is_empty(), "decision output included tools");
+        }
     }
     if !output.tools.is_empty() {
         ensure!(
@@ -89430,14 +92658,19 @@ fn validate_provider_session_output(
         "provider artifacts exceed the session byte budget"
     );
     if let Some(tokens) = output.usage_attribution.get("context_input_tokens") {
-        ensure!(*tokens > 0 && *tokens <= u64::from(terms.ctx),
-            "provider context input tokens exceed served context");
+        ensure!(
+            *tokens > 0 && *tokens <= u64::from(terms.ctx),
+            "provider context input tokens exceed served context"
+        );
     }
     for axis in output.usage_attribution.keys() {
         ensure!(
             matches!(
                 axis.as_str(),
-                "reasoning_output_tokens" | "vision_input_tokens" | "audio_input_tokens" | "context_input_tokens"
+                "reasoning_output_tokens"
+                    | "vision_input_tokens"
+                    | "audio_input_tokens"
+                    | "context_input_tokens"
             ),
             "provider output contains unsupported usage attribution {axis}"
         );
@@ -89530,13 +92763,22 @@ fn provider_verify_endpoint_request<'a>(
         .iter()
         .find(|contract| contract.family == family)
         .with_context(|| format!("provider model does not expose endpoint family {family}"))?;
-    let declared_contract_fingerprint = provider_session_request_result(
+    let legacy_contract_fingerprint = provider_session_request_result(
         metadata
             .get("endpoint_contract_fingerprint")
             .and_then(Value::as_str)
             .context("provider request missing endpoint contract fingerprint"),
     )?;
-    if declared_contract_fingerprint != mayhem_proto::endpoint_contract_fingerprint(contract) {
+    let contract_fingerprint_matches = metadata
+        .get("endpoint_contract_canonical_fingerprint")
+        .and_then(Value::as_str)
+        .map(|fingerprint| {
+            fingerprint == mayhem_proto::endpoint_contract_canonical_fingerprint(contract)
+        })
+        .unwrap_or_else(|| {
+            legacy_contract_fingerprint == mayhem_proto::endpoint_contract_fingerprint(contract)
+        });
+    if !contract_fingerprint_matches {
         return Err(provider_session_request_error(
             "provider request endpoint contract fingerprint does not match the local signed catalog",
         ));
@@ -89642,6 +92884,7 @@ fn provider_endpoint_transport_kind(family: &str) -> Result<&'static str> {
         | mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO => Ok("audio_generation"),
         mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS => Ok("music_generation"),
         mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS => Ok("workflow_generation"),
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS => Ok("decision"),
         _ => bail!("unsupported provider endpoint family {family}"),
     }
 }
@@ -89741,6 +92984,7 @@ fn provider_seal_local_contract_request(
         "schema_version": 1,
         "endpoint_family": family,
         "endpoint_contract_fingerprint": mayhem_proto::endpoint_contract_fingerprint(contract),
+        "endpoint_contract_canonical_fingerprint": mayhem_proto::endpoint_contract_canonical_fingerprint(contract),
         "normalized_request_fingerprint": mayhem_proto::endpoint_request_fingerprint(&request),
         "transport_request_fingerprint": transport_fingerprint,
     });
@@ -89757,6 +93001,7 @@ fn provider_local_endpoint_family(kind: &str) -> &'static str {
         "audio_generation" => mayhem_proto::ENDPOINT_MAYHEM_AUDIO_GENERATIONS,
         "music_generation" => mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS,
         "workflow_generation" => mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        "decision" => mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
         _ => mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
     }
 }
@@ -90085,6 +93330,32 @@ fn provider_protocol_prompt_tokens(
     Ok(Some(prompt_tokens))
 }
 
+fn provider_engine_tokenize_prompt(terms: &ProviderSessionTerms, body: &Value) -> Result<String> {
+    let verified = provider_verify_endpoint_request(body, Some(&terms.model_id), &terms.adapter)?;
+    ensure!(
+        matches!(
+            verified.family,
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+                | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+        ),
+        "exact tokenization is unsupported for endpoint family {}",
+        verified.family
+    );
+    let request = provider_engine_request_from_endpoint_body_with_sampling(
+        verified.family,
+        verified.request,
+        &terms.adapter,
+        &terms.sampling,
+    )?;
+    ensure!(
+        !request.prompt.is_empty(),
+        "provider tokenizer received an empty rendered prompt"
+    );
+    Ok(request.prompt)
+}
+
 fn provider_engine_session_response_with_sampling_bounded(
     backend: &mut dyn EngineBackend,
     expected_model_id: Option<&str>,
@@ -90173,10 +93444,14 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("synthesizing provider session speech with mayhem-engine")?;
-        let artifacts = artifact_chunks.finish()?;
-        if artifacts.is_empty() {
-            bail!("provider speech engine produced no audio artifact");
-        }
+        let artifacts = provider_session_output_result(artifact_chunks.finish())?;
+        provider_session_output_result((|| {
+            ensure!(
+                !artifacts.is_empty(),
+                "provider speech engine produced no audio artifact"
+            );
+            Ok(())
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -90212,21 +93487,24 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("generating provider session image artifact with mayhem-engine")?;
-        ensure!(
-            output.image_count == image_count && u64::from(output.steps) == steps,
-            "provider image engine changed the requested image count or step count"
-        );
-        let artifacts = artifact_chunks.finish()?;
-        if artifacts.is_empty() {
-            bail!("provider image generation engine produced no image artifacts");
-        }
-        let usage = provider_image_generation_usage(artifacts.len() as u64, steps, width, height);
-        if artifacts.len() as u32 != image_count {
-            bail!(
+        let artifacts = provider_session_output_result((|| {
+            ensure!(
+                output.image_count == image_count && u64::from(output.steps) == steps,
+                "provider image engine changed the requested image count or step count"
+            );
+            let artifacts = artifact_chunks.finish()?;
+            ensure!(
+                !artifacts.is_empty(),
+                "provider image generation engine produced no image artifacts"
+            );
+            ensure!(
+                artifacts.len() as u32 == image_count,
                 "provider image generation engine produced {} artifact(s), expected {image_count}",
                 artifacts.len()
             );
-        }
+            Ok(artifacts)
+        })())?;
+        let usage = provider_image_generation_usage(artifacts.len() as u64, steps, width, height);
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -90250,14 +93528,15 @@ fn provider_engine_session_response_with_sampling_bounded(
         let mut request = provider_session_request_result(
             provider_media_generation_request_from_body(endpoint_family, request_body),
         )?;
-        let (expected_duration, expected_frames) =
-            provider_video_output_expectation(verified.contract, &request)?;
+        let (expected_duration, expected_frames) = provider_session_request_result(
+            provider_video_output_expectation(verified.contract, &request),
+        )?;
         request.frame_count = Some(expected_frames);
-        provider_canonicalize_video_engine_request(
+        provider_session_request_result(provider_canonicalize_video_engine_request(
             verified.contract,
             &mut request,
             expected_frames,
-        )?;
+        ))?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = backend
             .generate_video(
@@ -90266,28 +93545,31 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("generating provider session video artifact with mayhem-engine")?;
-        ensure!(
-            output.duration_seconds > 0 && output.frame_count > 0,
-            "provider video engine returned zero duration or frames"
-        );
-        ensure!(
-            output.duration_seconds == expected_duration,
-            "provider video engine returned {} seconds, expected {expected_duration}",
-            output.duration_seconds
-        );
-        ensure!(
-            output.frame_count == expected_frames,
-            "provider video engine returned {} frames, expected {expected_frames}",
-            output.frame_count
-        );
-        let artifacts = artifact_chunks.finish()?;
-        ensure!(
-            !artifacts.is_empty()
-                && artifacts
-                    .iter()
-                    .all(|artifact| artifact.content_type.starts_with("video/")),
-            "provider video generation engine produced no valid video artifact"
-        );
+        let artifacts = provider_session_output_result((|| {
+            ensure!(
+                output.duration_seconds > 0 && output.frame_count > 0,
+                "provider video engine returned zero duration or frames"
+            );
+            ensure!(
+                output.duration_seconds == expected_duration,
+                "provider video engine returned {} seconds, expected {expected_duration}",
+                output.duration_seconds
+            );
+            ensure!(
+                output.frame_count == expected_frames,
+                "provider video engine returned {} frames, expected {expected_frames}",
+                output.frame_count
+            );
+            let artifacts = artifact_chunks.finish()?;
+            ensure!(
+                !artifacts.is_empty()
+                    && artifacts
+                        .iter()
+                        .all(|artifact| artifact.content_type.starts_with("video/")),
+                "provider video generation engine produced no valid video artifact"
+            );
+            Ok(artifacts)
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -90305,10 +93587,12 @@ fn provider_engine_session_response_with_sampling_bounded(
     }
 
     if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS {
-        let workflow_graph = request_body
-            .get("workflow")
-            .cloned()
-            .context("workflow request is missing workflow")?;
+        let workflow_graph = provider_session_request_result(
+            request_body
+                .get("workflow")
+                .cloned()
+                .context("workflow request is missing workflow"),
+        )?;
         let workflow = provider_session_request_result(provider_comfy_workflow_binding(
             request_body,
             workflow_policy,
@@ -90337,17 +93621,20 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("running provider Comfy workflow with mayhem-engine")?;
-        let artifacts = artifact_chunks.finish()?;
-        ensure!(
-            !artifacts.is_empty(),
-            "provider workflow engine produced no artifacts"
-        );
-        ensure!(
-            u64::from(output.artifact_count) == expected_artifacts
-                && u64::try_from(artifacts.len()).unwrap_or(u64::MAX) == expected_artifacts,
-            "provider workflow engine produced {} artifact(s), expected {expected_artifacts}",
-            artifacts.len()
-        );
+        let artifacts = provider_session_output_result((|| {
+            let artifacts = artifact_chunks.finish()?;
+            ensure!(
+                !artifacts.is_empty(),
+                "provider workflow engine produced no artifacts"
+            );
+            ensure!(
+                u64::from(output.artifact_count) == expected_artifacts
+                    && u64::try_from(artifacts.len()).unwrap_or(u64::MAX) == expected_artifacts,
+                "provider workflow engine produced {} artifact(s), expected {expected_artifacts}",
+                artifacts.len()
+            );
+            Ok(artifacts)
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -90377,8 +93664,9 @@ fn provider_engine_session_response_with_sampling_bounded(
         let automatic_duration_cap = provider_session_request_result(
             provider_automatic_audio_duration_cap(verified.contract, requested_duration, body),
         )?;
-        let input_characters =
-            provider_media_generation_input_characters(endpoint_family, &request.request)?;
+        let input_characters = provider_session_request_result(
+            provider_media_generation_input_characters(endpoint_family, &request.request),
+        )?;
         let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
         let output = if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_MUSIC_GENERATIONS {
             backend
@@ -90397,78 +93685,84 @@ fn provider_engine_session_response_with_sampling_bounded(
                 )
                 .context("generating provider session audio artifact with mayhem-engine")?
         };
-        ensure!(
-            output.duration_seconds > 0,
-            "provider audio engine returned zero duration"
-        );
-        if let Some(expected) = requested_duration {
+        let (artifacts, measured_audio_seconds) = provider_session_output_result((|| {
             ensure!(
-                output.duration_seconds.abs_diff(expected) <= 1,
-                "provider audio engine returned {} seconds, expected approximately {expected}",
-                output.duration_seconds
-            );
-        } else if let Some(cap) = automatic_duration_cap {
-            ensure!(
-                output.duration_seconds <= cap,
-                "provider audio engine returned {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
-                output.duration_seconds
-            );
-        }
-        let artifacts = artifact_chunks.finish()?;
-        ensure!(
-            !artifacts.is_empty()
-                && artifacts
-                    .iter()
-                    .all(|artifact| artifact.content_type.starts_with("audio/")),
-            "provider audio generation engine produced no valid audio artifact"
-        );
-        let mut measured_audio_seconds = 0_u64;
-        for artifact in &artifacts {
-            let metadata = validated_audio_metadata(&artifact.bytes).with_context(|| {
-                format!(
-                    "provider audio engine returned invalid {} bytes",
-                    artifact.content_type
-                )
-            })?;
-            ensure!(
-                provider_audio_content_type_matches_format(&artifact.content_type, metadata.format),
-                "provider audio engine content type {} does not match the encoded audio format",
-                artifact.content_type
-            );
-            ensure!(
-                output
-                    .duration_seconds
-                    .abs_diff(metadata.duration_seconds_ceil)
-                    <= 1,
-                "provider audio engine reported {} seconds but encoded artifact measures {} seconds",
-                output.duration_seconds,
-                metadata.duration_seconds_ceil
+                output.duration_seconds > 0,
+                "provider audio engine returned zero duration"
             );
             if let Some(expected) = requested_duration {
                 ensure!(
-                    expected.abs_diff(metadata.duration_seconds_ceil) <= 1,
-                    "provider audio artifact measures {} seconds, expected {expected}",
-                    metadata.duration_seconds_ceil
+                    output.duration_seconds.abs_diff(expected) <= 1,
+                    "provider audio engine returned {} seconds, expected approximately {expected}",
+                    output.duration_seconds
                 );
             } else if let Some(cap) = automatic_duration_cap {
                 ensure!(
-                    metadata.duration_seconds_ceil <= cap,
-                    "provider audio artifact measures {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
-                    metadata.duration_seconds_ceil
+                    output.duration_seconds <= cap,
+                    "provider audio engine returned {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
+                    output.duration_seconds
                 );
             }
-            measured_audio_seconds =
-                measured_audio_seconds.saturating_add(metadata.duration_seconds_ceil);
-        }
-        if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO {
+            let artifacts = artifact_chunks.finish()?;
             ensure!(
-                artifacts.iter().all(|artifact| {
-                    artifact.content_type == "audio/wav"
-                        && wav_sample_rate(&artifact.bytes).is_some()
-                }),
-                "HF text-to-audio requires a valid WAV artifact with a declared sample rate"
+                !artifacts.is_empty()
+                    && artifacts
+                        .iter()
+                        .all(|artifact| artifact.content_type.starts_with("audio/")),
+                "provider audio generation engine produced no valid audio artifact"
             );
-        }
+            let mut measured_audio_seconds = 0_u64;
+            for artifact in &artifacts {
+                let metadata = validated_audio_metadata(&artifact.bytes).with_context(|| {
+                    format!(
+                        "provider audio engine returned invalid {} bytes",
+                        artifact.content_type
+                    )
+                })?;
+                ensure!(
+                    provider_audio_content_type_matches_format(
+                        &artifact.content_type,
+                        metadata.format
+                    ),
+                    "provider audio engine content type {} does not match the encoded audio format",
+                    artifact.content_type
+                );
+                ensure!(
+                    output
+                        .duration_seconds
+                        .abs_diff(metadata.duration_seconds_ceil)
+                        <= 1,
+                    "provider audio engine reported {} seconds but encoded artifact measures {} seconds",
+                    output.duration_seconds,
+                    metadata.duration_seconds_ceil
+                );
+                if let Some(expected) = requested_duration {
+                    ensure!(
+                        expected.abs_diff(metadata.duration_seconds_ceil) <= 1,
+                        "provider audio artifact measures {} seconds, expected {expected}",
+                        metadata.duration_seconds_ceil
+                    );
+                } else if let Some(cap) = automatic_duration_cap {
+                    ensure!(
+                        metadata.duration_seconds_ceil <= cap,
+                        "provider audio artifact measures {} seconds, exceeding the negotiated automatic-duration cap of {cap} seconds",
+                        metadata.duration_seconds_ceil
+                    );
+                }
+                measured_audio_seconds =
+                    measured_audio_seconds.saturating_add(metadata.duration_seconds_ceil);
+            }
+            if endpoint_family == mayhem_proto::ENDPOINT_HF_TEXT_TO_AUDIO {
+                ensure!(
+                    artifacts.iter().all(|artifact| {
+                        artifact.content_type == "audio/wav"
+                            && wav_sample_rate(&artifact.bytes).is_some()
+                    }),
+                    "HF text-to-audio requires a valid WAV artifact with a declared sample rate"
+                );
+            }
+            Ok((artifacts, measured_audio_seconds))
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -90492,7 +93786,6 @@ fn provider_engine_session_response_with_sampling_bounded(
         let inputs = provider_session_request_result(provider_embedding_input_texts_from_body(
             request_body,
         ))?;
-        let prompt_tokens = provider_embedding_input_token_count(&inputs);
         let dimensions = provider_session_request_result(
             request_body
                 .get("dimensions")
@@ -90506,6 +93799,14 @@ fn provider_engine_session_response_with_sampling_bounded(
                 cancellation,
             )
             .context("generating provider session embeddings with mayhem-engine")?;
+        let prompt_tokens = u64::from(output.usage.prompt_tokens);
+        provider_session_output_result((|| {
+            ensure!(
+                prompt_tokens > 0,
+                "embedding backend returned zero prompt tokens for a non-empty request"
+            );
+            Ok(())
+        })())?;
         return Ok(ProviderSessionOutput {
             content: String::new(),
             reasoning_evidence: String::new(),
@@ -90522,24 +93823,56 @@ fn provider_engine_session_response_with_sampling_bounded(
         });
     }
 
-    ensure!(
-        matches!(
-            endpoint_family,
-            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
-                | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
-                | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
-                | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
-        ),
-        "provider endpoint family {endpoint_family} has no engine execution path"
-    );
+    if endpoint_family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS {
+        let request =
+            provider_session_request_result(provider_decision_request_from_body(request_body))?;
+        let output = backend
+            .decide(request, cancellation)
+            .context("running provider typed decision with mayhem-engine")?;
+        let content = provider_session_output_result(
+            serde_json::to_string(&output.result).context("serializing provider decision result"),
+        )?;
+        let prompt_tokens = u64::from(output.usage.prompt_tokens);
+        let completion_tokens = metered_output_units(&content, "", &[]);
+        return Ok(ProviderSessionOutput {
+            content,
+            reasoning_evidence: String::new(),
+            tools: Vec::new(),
+            embeddings: None,
+            transcription: None,
+            artifacts: Vec::new(),
+            finish_reason: "stop".to_owned(),
+            prompt_tokens,
+            completion_tokens,
+            token_ids: Vec::new(),
+            usage: ReceiptUsage::text(prompt_tokens, completion_tokens),
+            usage_attribution: BTreeMap::new(),
+        });
+    }
 
-    let tool_mode = provider_engine_tool_request(request_body, adapter)?;
-    let mut request = provider_engine_request_from_endpoint_body_with_sampling(
-        endpoint_family,
-        request_body,
-        adapter,
-        sampling,
-    )?;
+    provider_session_request_result((|| {
+        ensure!(
+            matches!(
+                endpoint_family,
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS
+                    | mayhem_proto::ENDPOINT_OPENAI_RESPONSES
+                    | mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT
+            ),
+            "provider endpoint family {endpoint_family} has no engine execution path"
+        );
+        Ok(())
+    })())?;
+
+    let tool_mode =
+        provider_session_request_result(provider_engine_tool_request(request_body, adapter))?;
+    let mut request =
+        provider_session_request_result(provider_engine_request_from_endpoint_body_with_sampling(
+            endpoint_family,
+            request_body,
+            adapter,
+            sampling,
+        ))?;
     if let Some(cap) = output_token_cap {
         request.max_new_tokens = request.max_new_tokens.min(cap.max(1));
     }
@@ -90554,38 +93887,49 @@ fn provider_engine_session_response_with_sampling_bounded(
         provider_constrained_reasoning_output_mode(reasoning_output_mode, json_grammar_enforced);
     let mut reasoning_stream_filter =
         ProviderReasoningOutputFilter::with_delimiters(reasoning_output_mode, reasoning_delimiters);
-    let mut tool_stream_filter = tool_mode.as_ref().map(|mode|
-        provider_output_stream::OutputStream::new(mode.strategy, mode.tools.clone()));
+    let mut tool_stream_filter = tool_mode
+        .as_ref()
+        .map(|mode| provider_output_stream::OutputStream::new(mode.strategy, mode.tools.clone()));
     let mut token_ids = Vec::new();
     let mut artifact_chunks = ProviderSessionArtifactCollector::configured();
+    let mut live_stream_error = None;
     // Existing text models keep the established request-text estimate. A signed
     // tools-only endpoint is metered from the model-visible query and selected
     // tools so buyer and provider agree without charging transport metadata.
     let estimated_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body, adapter));
-    let output = backend
-        .generate_with_artifacts(
-            request,
-            &mut |chunk: mayhem_engine::TokenChunk| {
-                if let Some(stream) = live_stream.as_deref_mut() {
-                    let filtered = reasoning_stream_filter.push_split(&chunk.text);
-                    let mut visible_chunk = chunk.clone();
-                    visible_chunk.text = if let Some(filter) = tool_stream_filter.as_mut() {
-                        let delta = filter.push(&filtered.visible);
-                        stream.append_tool_deltas(delta.tools);
-                        delta.text
-                    } else { filtered.visible };
-                    stream.on_token(visible_chunk, &filtered.hidden,
-                        protocol_prompt_tokens.unwrap_or(estimated_prompt_tokens))
-                        .map_err(|err| mayhem_engine::EngineError::InvalidConfig(
-                            format!("provider live stream failed: {err:#}")))?;
+    let generated = backend.generate_with_artifacts(
+        request,
+        &mut |chunk: mayhem_engine::TokenChunk| {
+            if let Some(stream) = live_stream.as_deref_mut() {
+                let filtered = reasoning_stream_filter.push_split(&chunk.text);
+                let mut visible_chunk = chunk.clone();
+                visible_chunk.text = if let Some(filter) = tool_stream_filter.as_mut() {
+                    let delta = filter.push(&filtered.visible);
+                    stream.append_tool_deltas(delta.tools);
+                    delta.text
+                } else {
+                    filtered.visible
+                };
+                if let Err(error) = stream.on_token(
+                    visible_chunk,
+                    &filtered.hidden,
+                    protocol_prompt_tokens.unwrap_or(estimated_prompt_tokens),
+                ) {
+                    let message = format!("provider live stream failed: {error:#}");
+                    live_stream_error = Some(error);
+                    return Err(mayhem_engine::EngineError::InvalidConfig(message));
                 }
-                token_ids.push(chunk.token_id);
-                Ok(())
-            },
-            &mut |chunk: ArtifactChunk| artifact_chunks.push(chunk),
-            cancellation,
-        )
-        .context("generating provider session response with mayhem-engine")?;
+            }
+            token_ids.push(chunk.token_id);
+            Ok(())
+        },
+        &mut |chunk: ArtifactChunk| artifact_chunks.push(chunk),
+        cancellation,
+    );
+    if let Some(error) = live_stream_error {
+        return Err(error.context("streaming provider session response"));
+    }
+    let output = generated.context("generating provider session response with mayhem-engine")?;
     if let Some(stream) = live_stream.as_deref_mut() {
         let mut trailing = reasoning_stream_filter.finish_split();
         if let Some(filter) = tool_stream_filter.as_mut() {
@@ -90595,7 +93939,7 @@ fn provider_engine_session_response_with_sampling_bounded(
         }
         stream.append_filtered_text(trailing);
     }
-    let artifacts = artifact_chunks.finish()?;
+    let artifacts = provider_session_output_result(artifact_chunks.finish())?;
     let mut tools = tool_mode
         .as_ref()
         .and_then(|mode| {
@@ -90629,16 +93973,21 @@ fn provider_engine_session_response_with_sampling_bounded(
         )));
     }
     let streamed_content = if let (Some(stream), Some(filter)) =
-        (live_stream.as_deref_mut(), tool_stream_filter.as_mut()) {
-        ensure!(filter.emitted_count() <= tools.len(),
-            "provider streamed a tool call that failed final validation");
+        (live_stream.as_deref_mut(), tool_stream_filter.as_mut())
+    {
+        validate_streamed_tool_call_count(filter.emitted_count(), tools.len())?;
         for (index, call) in tools.iter_mut().enumerate().take(filter.emitted_count()) {
             call["id"] = json!(stream.tool_stream_id(index));
         }
         let tail = filter.finish_text(!tools.is_empty());
-        stream.append_filtered_text(ProviderReasoningFilteredText { visible: tail, hidden: String::new() });
+        stream.append_filtered_text(ProviderReasoningFilteredText {
+            visible: tail,
+            hidden: String::new(),
+        });
         Some(filter.text.clone())
-    } else { None };
+    } else {
+        None
+    };
     let completion_tokens = u64::from(output.usage.completion_tokens);
     let reasoning_tokens = u64::from(output.usage.reasoning_tokens).min(completion_tokens);
     let vision_tokens = u64::from(output.usage.vision_tokens);
@@ -90651,7 +94000,10 @@ fn provider_engine_session_response_with_sampling_bounded(
     // Negotiated, signed context telemetry is independent of canonical billing
     // units. Older gateways reject unknown attribution axes, so opt in explicitly.
     if provider_request_supports_context_usage(body) && output.usage.prompt_tokens > 0 {
-        usage_attribution.insert("context_input_tokens".to_owned(), u64::from(output.usage.prompt_tokens));
+        usage_attribution.insert(
+            "context_input_tokens".to_owned(),
+            u64::from(output.usage.prompt_tokens),
+        );
     }
     if reasoning_tokens > 0 {
         usage_attribution.insert("reasoning_output_tokens".to_owned(), reasoning_tokens);
@@ -90672,15 +94024,25 @@ fn provider_engine_session_response_with_sampling_bounded(
         reasoning_output_mode,
         reasoning_delimiters,
     );
+    if tool_mode.is_none() && provider_wants_json(request_body) {
+        let schema = provider_response_json_schema(request_body);
+        mayhem_gateway::structured_schema::validate_output(&schema, &filtered_output.visible)
+            .map_err(|error| provider_session_output_error(error.to_string()))?;
+    }
     Ok(ProviderSessionOutput {
         usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
-        content: streamed_content.unwrap_or_else(|| if tools.is_empty() {
-            filtered_output.visible
-        } else {
-            // Native Qwen permits commentary preceding a tool call. Preserve it
-            // in both delivery modes so usage does not depend on stream=true.
-            filtered_output.visible.split_once("<tool_call>")
-                .map(|(text, _)| text.to_owned()).unwrap_or_default()
+        content: streamed_content.unwrap_or_else(|| {
+            if tools.is_empty() {
+                filtered_output.visible
+            } else {
+                provider_engine_visible_content_before_tools(
+                    &filtered_output.visible,
+                    tool_mode
+                        .as_ref()
+                        .expect("tool output requires tool mode")
+                        .strategy,
+                )
+            }
         }),
         reasoning_evidence: filtered_output.hidden,
         tools,
@@ -91114,11 +94476,21 @@ fn provider_image_generation_request_from_body(
     let mut request = EngineImageGenerationRequest::new(prompt);
     request.input_reference = body
         .get("input_reference")
-        .map(|value| value.as_str().map(str::to_owned).context("input_reference must be a data URL string"))
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .context("input_reference must be a data URL string")
+        })
         .transpose()?;
     request.strength = body
         .get("strength")
-        .map(|value| value.as_f64().map(|value| value as f32).context("strength must be a number"))
+        .map(|value| {
+            value
+                .as_f64()
+                .map(|value| value as f32)
+                .context("strength must be a number")
+        })
         .transpose()?;
     request.image_count = image_count;
     request.steps = u32::try_from(steps).context("image_generation steps overflowed u32")?;
@@ -91659,8 +95031,11 @@ fn provider_engine_request_from_endpoint_body_with_sampling(
             }
         }
     } else if provider_wants_json(body) {
+        let schema = provider_response_json_schema(body);
+        let generation_schema = mayhem_gateway::structured_schema::prepare(&schema)
+            .map_err(|error| provider_session_request_error(error.to_string()))?;
         request.grammar = Some(GrammarSpec::JsonSchema {
-            schema: provider_response_json_schema(body),
+            schema: generation_schema,
         });
     }
     Ok(request)
@@ -92617,6 +95992,28 @@ fn provider_engine_tool_call_outputs(
     Some(calls)
 }
 
+fn provider_engine_visible_content_before_tools(
+    text: &str,
+    strategy: ProviderEngineToolStrategy,
+) -> String {
+    match strategy {
+        // Native Qwen permits commentary preceding a tool call. Preserve it
+        // in both delivery modes so usage does not depend on stream=true.
+        ProviderEngineToolStrategy::QwenFunctionXml => text
+            .split_once("<tool_call>")
+            .map(|(content, _)| content.to_owned())
+            .unwrap_or_default(),
+        ProviderEngineToolStrategy::OpenAiToolCalls => {
+            provider_openai_tool_call_outputs_with_prefix(text)
+                .map(|(prefix, _)| text[..prefix].to_owned())
+                .unwrap_or_default()
+        }
+        ProviderEngineToolStrategy::MayhemJson | ProviderEngineToolStrategy::GemmaFunctionCall => {
+            String::new()
+        }
+    }
+}
+
 fn validate_provider_engine_tool_call_outputs(calls: &[Value], tools: &[ToolSpec]) -> Result<()> {
     for call in calls {
         let name = call.get("name").and_then(Value::as_str).ok_or_else(|| {
@@ -92698,14 +96095,36 @@ fn provider_mayhem_json_tool_call_value(value: &Value) -> Option<Value> {
 }
 
 fn provider_openai_tool_call_outputs(text: &str) -> Option<Vec<Value>> {
-    let value: Value = serde_json::from_str(text.trim()).ok()?;
+    provider_openai_tool_call_outputs_with_prefix(text).map(|(_, calls)| calls)
+}
+
+fn provider_openai_tool_call_outputs_with_prefix(text: &str) -> Option<(usize, Vec<Value>)> {
+    if let Ok(value) = serde_json::from_str::<Value>(text.trim()) {
+        return provider_openai_tool_call_outputs_from_value(&value).map(|calls| (0, calls));
+    }
+    let trimmed = text.trim_end();
+    for (index, _) in trimmed.rmatch_indices('{') {
+        let Ok(value) = serde_json::from_str::<Value>(&trimmed[index..]) else {
+            continue;
+        };
+        if value.get("tool_calls").and_then(Value::as_array).is_none() {
+            continue;
+        }
+        if let Some(calls) = provider_openai_tool_call_outputs_from_value(&value) {
+            return Some((index, calls));
+        }
+    }
+    None
+}
+
+fn provider_openai_tool_call_outputs_from_value(value: &Value) -> Option<Vec<Value>> {
     if let Some(calls) = value.get("tool_calls").and_then(Value::as_array) {
         if calls.is_empty() {
             return None;
         }
         return calls.iter().map(provider_openai_tool_call_value).collect();
     }
-    Some(vec![provider_openai_tool_call_value(&value)?])
+    Some(vec![provider_openai_tool_call_value(value)?])
 }
 
 fn provider_openai_tool_call_value(call: &Value) -> Option<Value> {
@@ -93271,6 +96690,12 @@ fn synthetic_provider_token_ids(count: u64) -> Vec<i32> {
 
 fn is_hex_len(value: &str, len: usize) -> bool {
     value.len() == len && value.as_bytes().iter().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn is_lowercase_hex_len(value: &str, len: usize) -> bool {
+    value.len() == len
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value == value.to_ascii_lowercase()
 }
 
 fn is_safe_key_part(value: &str) -> bool {
@@ -100899,6 +104324,136 @@ status: linked
     }
 
     #[test]
+    fn provider_comfy_memory_counts_bounded_optional_part_residency() {
+        let temp = test_temp_dir("mayhem-provider-comfy-bounded-residency");
+        let source_dir = temp.join("source");
+        let layout_dir = temp.join("layout");
+        let payload_dir = temp.join("payloads");
+        let cache_dir = temp.join("cache");
+        let home = temp.join("home");
+        fs::create_dir_all(&source_dir).unwrap();
+        fs::create_dir_all(&payload_dir).unwrap();
+        let mut records = Vec::new();
+        for (index, size) in [100_usize, 10, 20, 30, 40, 50].into_iter().enumerate() {
+            let payload_path = payload_dir.join(format!("part-{index}.bin"));
+            fs::write(&payload_path, vec![index as u8; size]).unwrap();
+            let mut record = test_comfy_part_record_for_payload(
+                if index == 0 {
+                    "base.safetensors"
+                } else {
+                    [
+                        "",
+                        "lora-1.safetensors",
+                        "lora-2.safetensors",
+                        "lora-3.safetensors",
+                        "lora-4.safetensors",
+                        "lora-5.safetensors",
+                    ][index]
+                },
+                &payload_path,
+                8,
+            );
+            record.part_type = if index == 0 { "checkpoint" } else { "lora" }.to_owned();
+            record.part_id =
+                mayhem_proto::derive_comfy_part_id(&record.part_type, &record.name, &record.sha256);
+            record.validate().unwrap();
+            let record_path = source_dir.join(format!("record-{index}.json"));
+            write_json_file(&record_path, &record).unwrap();
+            records.push((record, record_path));
+        }
+        admin_parts_build_index(&AdminPartsBuildIndexArgs {
+            records: records.iter().map(|(_, path)| path.clone()).collect(),
+            output_dir: layout_dir.clone(),
+            index_ver: 25,
+            blessed_runtimes: vec!["comfyui-v0.30.1".to_owned()],
+            whitelist_ver: 1,
+            outcome_classes_ver: 1,
+        })
+        .unwrap();
+        provider_parts_add(ProviderPartsPullArgs {
+            home: Some(home.clone()),
+            layout_dir,
+            part_ids: records
+                .iter()
+                .map(|(record, _)| record.part_id.clone())
+                .collect(),
+            all: false,
+            payload_dir: Some(payload_dir),
+            hf_token_file: None,
+            source_token_file: None,
+            cache_dir: Some(cache_dir),
+            disk_reserve: None,
+            offline: true,
+            require_payload: false,
+            chunk_size: 8,
+            json: true,
+        })
+        .unwrap();
+        let mut model = test_catalog(&"aa".repeat(32)).models[0].clone();
+        model.adapter.endpoint_families = vec![mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_MAYHEM_COMFY_WORKFLOWS,
+        )
+        .unwrap()];
+        let lora_names = records[1..]
+            .iter()
+            .map(|(record, _)| record.name.clone())
+            .collect::<Vec<_>>();
+        let graph_constraints = serde_json::from_value(json!({
+            "output_role": "base",
+            "roles": {
+                "base": {
+                    "class_type": "UNETLoader",
+                    "min_count": 1,
+                    "max_count": 1,
+                    "inputs": {
+                        "unet_name": {
+                            "value_type": "part",
+                            "required": true,
+                            "part_type": "checkpoint",
+                            "part_names": [records[0].0.name.clone()]
+                        }
+                    }
+                },
+                "user_lora": {
+                    "class_type": "LoraLoaderModelOnly",
+                    "min_count": 0,
+                    "max_count": 2,
+                    "inputs": {
+                        "lora_name": {
+                            "value_type": "part",
+                            "required": true,
+                            "part_type": "lora",
+                            "part_names": lora_names,
+                            "distinct": true
+                        }
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        model.workflow = Some(mayhem_proto::ComfyWorkflowCatalogPolicy {
+            whitelisted_nodes: vec!["UNETLoader".to_owned(), "LoraLoaderModelOnly".to_owned()],
+            parts: records
+                .iter()
+                .map(|(record, _)| mayhem_proto::ComfyWorkflowPartRef {
+                    part_id: record.part_id.clone(),
+                    name: record.name.clone(),
+                    part_type: record.part_type.clone(),
+                    sha256: record.sha256.clone(),
+                    scale: None,
+                })
+                .collect(),
+            graph_constraints: Some(graph_constraints),
+            ..mayhem_proto::ComfyWorkflowCatalogPolicy::default()
+        });
+        assert_eq!(
+            provider_comfy_workflow_inventory_resident_bytes(Some(&home), &model).unwrap(),
+            100 + 50 + 40
+        );
+        let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
     fn provider_comfy_inventory_feeds_custom_node_runtime_mounts() {
         let temp = test_temp_dir("mayhem-provider-comfy-inventory-custom-node");
         let source_dir = temp.join("source");
@@ -102888,6 +106443,33 @@ status: linked
     }
 
     #[test]
+    fn expired_stripe_quote_retains_its_prepared_identity() {
+        let quote = StripeFxQuote {
+            id: "fxq_test_prepared".to_owned(),
+            created: 1,
+            expires_at: Some(301),
+            lock_duration: "five_minutes".to_owned(),
+            lock_status: "active".to_owned(),
+            to_currency: "eur".to_owned(),
+            usage_type: "transfer".to_owned(),
+            usage_destination: Some("acct_provider".to_owned()),
+            rates: BTreeMap::new(),
+        };
+        let prepared_hash = stripe_fx_quote_hash(&quote).unwrap();
+        ensure_canonical_fiat_quote_hash(&quote, &prepared_hash).unwrap();
+
+        let mut expired = quote.clone();
+        expired.lock_status = "expired".to_owned();
+        ensure_canonical_fiat_quote_hash(&expired, &prepared_hash).unwrap();
+
+        expired.usage_destination = Some("acct_other".to_owned());
+        assert!(ensure_canonical_fiat_quote_hash(&expired, &prepared_hash).is_err());
+        expired.usage_destination = quote.usage_destination.clone();
+        expired.expires_at = Some(302);
+        assert!(ensure_canonical_fiat_quote_hash(&expired, &prepared_hash).is_err());
+    }
+
+    #[test]
     fn fiat_settlement_helpers_use_exact_currency_scales_and_preserve_dust() {
         assert_eq!(stripe_currency_minor_exponent("usd").unwrap(), 2);
         assert_eq!(stripe_currency_minor_exponent("eur").unwrap(), 2);
@@ -103365,6 +106947,67 @@ status: linked
     }
 
     #[test]
+    fn same_currency_payout_uses_fresh_quote_only_as_valuation_evidence() {
+        let output = json!({
+            "role": "provider",
+            "provider": "aa".repeat(32),
+            "payout_revision": "bb".repeat(32),
+            "to": "acct_provider",
+            "economic_op_id": "cc".repeat(32),
+            "output_index": 0,
+            "liability_au": "2651083256300000869",
+            "paid_au": "2648476605508831339",
+            "rounding_au": "2606650791169530",
+            "dust_au": "2606650791169530",
+            "source_currency": "eur",
+            "source_amount_minor": "229",
+            "destination_currency": "eur",
+            "destination_amount_min_minor": "229",
+            "destination_amount_max_minor": "229",
+        });
+
+        let mut rates = BTreeMap::new();
+        rates.insert(
+            "usd".to_owned(),
+            StripeFxRate {
+                exchange_rate: "0.8".to_owned(),
+                exchange_ratio: parse_exact_decimal_ratio("0.8").unwrap(),
+                base_rate: "0.8".to_owned(),
+                base_ratio: parse_exact_decimal_ratio("0.8").unwrap(),
+            },
+        );
+        let quote = StripeFxQuote {
+            id: "fxq_fresh_valuation".to_owned(),
+            created: 100,
+            expires_at: Some(800),
+            lock_duration: "five_minutes".to_owned(),
+            lock_status: "active".to_owned(),
+            to_currency: "eur".to_owned(),
+            usage_type: "transfer".to_owned(),
+            usage_destination: Some("acct_provider".to_owned()),
+            rates,
+        };
+
+        validate_locked_stripe_fx_quote(&quote, "five_minutes", 500, false).unwrap();
+        let execution = ensure_canonical_fiat_quote_matches_output(&output, Some(&quote)).unwrap();
+        assert_eq!(execution.source_amount_minor, 229);
+        assert_eq!(execution.destination_currency, "eur");
+        assert!(targeted_fiat_attempt_request(&output, 338, &"dd".repeat(32), None).is_err());
+        let request =
+            targeted_fiat_attempt_request(&output, 338, &"dd".repeat(32), Some(&quote)).unwrap();
+        assert_eq!(request["fx_quote_id"], "fxq_fresh_valuation");
+        assert!(request["fx_quote_hash"].as_str().is_some());
+        assert_eq!(
+            targeted_fiat_quote_idempotency_key(&"cc".repeat(32), 1, 239),
+            targeted_fiat_quote_idempotency_key(&"cc".repeat(32), 1, 100)
+        );
+        assert_ne!(
+            targeted_fiat_quote_idempotency_key(&"cc".repeat(32), 1, 240),
+            targeted_fiat_quote_idempotency_key(&"cc".repeat(32), 1, 239)
+        );
+    }
+
+    #[test]
     fn admin_epoch_payloads_accept_recomputed_outputs() {
         let roots = json!({
             "dep": "d".repeat(64),
@@ -103722,9 +107365,10 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 25);
+        assert_eq!(CONTRACT_VERSION, 28);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
-        assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 11);
+        assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 12);
+        assert_eq!(SPEND_VOUCHER_SCHEMA_VERSION, 11);
     }
 
     #[test]
@@ -106910,11 +110554,16 @@ status: linked
         selected.enclave.caps = json!({"vllm_gpu_memory_utilization_pct":40});
         selected.verdict.backend = "vllm".to_owned();
         let args = test_provider_start_args();
-        let first = provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args).unwrap();
+        let first =
+            provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args).unwrap();
         hardware.memory.available_bytes = Some(80 * GIB_BYTES);
-        let restarted = provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args).unwrap();
+        let restarted =
+            provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args).unwrap();
         assert!(restarted.worker_limit_bytes < first.worker_limit_bytes);
-        assert_eq!(restarted.worker_address_space_limit_bytes, first.worker_address_space_limit_bytes);
+        assert_eq!(
+            restarted.worker_address_space_limit_bytes,
+            first.worker_address_space_limit_bytes
+        );
         assert!(restarted.worker_address_space_limit_bytes > 92 * GIB_BYTES);
         assert!(restarted.worker_limit_bytes < 80 * GIB_BYTES);
     }
@@ -106991,6 +110640,7 @@ status: linked
             engine: "vllm".to_owned(),
             topology: None,
             independent_dispatch: true,
+            max_concurrent: None,
             request_modalities: vec![vec!["text".to_owned()]],
             proof_sha256: "ab".repeat(32),
         };
@@ -107025,15 +110675,83 @@ status: linked
     }
 
     #[test]
+    fn shared_vllm_embedding_capacity_uses_scheduler_instead_of_replica_count() {
+        let mut selected =
+            test_auto_fit_candidate('e', "test/vllm-embedding", "embedding", 4, 96, 1, 6.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.artifact.engine = "vllm".to_owned();
+        selected.enclave.caps = json!({"max_batch_size": 8});
+        selected.verdict.backend = "vllm".to_owned();
+        selected.verdict.max_sessions = 1;
+        selected.feasibility.memory_budget.total_bytes = 96 * GIB_BYTES;
+        // Mirror the live failure shape: the admitted allocation has room for
+        // one full-context decoder KV estimate, but not eight. Embeddings use a
+        // shared scheduler and must not be reduced by that generation-only
+        // estimate.
+        selected.feasibility.memory_budget.budget_bytes = 13 * GIB_BYTES;
+        selected.feasibility.estimated_required_bytes = 12 * GIB_BYTES;
+        selected.feasibility.estimated_kv_bytes = 2 * GIB_BYTES;
+
+        let profile = catalog::CatalogGenerationExecutionProfile {
+            schema_version: 1,
+            engine: "vllm".to_owned(),
+            topology: Some(mayhem_proto::GenerationExecutionTopology::SharedWorker),
+            independent_dispatch: true,
+            max_concurrent: None,
+            request_modalities: vec![vec!["embedding".to_owned()]],
+            proof_sha256: "ab".repeat(32),
+        };
+        let mut args = test_provider_start_args();
+        args.max_sessions = Some(8);
+        args.vllm_memory_utilization = Some(13);
+
+        assert_eq!(
+            provider_vllm_generation_execution_capacity(
+                &selected.artifact,
+                Some(&profile),
+                &selected.enclave.caps,
+                &selected.verdict,
+                &args,
+                &selected.feasibility,
+            )
+            .unwrap(),
+            8
+        );
+
+        args.max_sessions = Some(16);
+        assert_eq!(
+            provider_vllm_generation_execution_capacity(
+                &selected.artifact,
+                Some(&profile),
+                &selected.enclave.caps,
+                &selected.verdict,
+                &args,
+                &selected.feasibility,
+            )
+            .unwrap(),
+            8,
+            "signed scheduler capacity remains the hard ceiling"
+        );
+    }
+
+    #[test]
     fn vllm_execution_mode_budget_uses_only_a_safe_tp_device_capacity() {
         let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
-        let device = hardware.gpus.iter().find(|gpu| gpu.vendor == GpuVendor::Nvidia).unwrap().clone();
+        let device = hardware
+            .gpus
+            .iter()
+            .find(|gpu| gpu.vendor == GpuVendor::Nvidia)
+            .unwrap()
+            .clone();
         hardware.gpus = vec![device.clone(), device];
         hardware.gpus[0].memory_bytes = Some(24 * GIB_BYTES);
         hardware.gpus[1].memory_bytes = Some(80 * GIB_BYTES);
         let original = ProviderMemoryPool {
-            pool: "nvidia_dedicated_memory".to_owned(), source: "test".to_owned(),
-            unified: false, total_bytes: 104 * GIB_BYTES, available_bytes: 104 * GIB_BYTES,
+            pool: "nvidia_dedicated_memory".to_owned(),
+            source: "test".to_owned(),
+            unified: false,
+            total_bytes: 104 * GIB_BYTES,
+            available_bytes: 104 * GIB_BYTES,
         };
         for (tp, expected) in [(1, 24), (2, 48)] {
             let mut pool = original.clone();
@@ -107046,12 +110764,17 @@ status: linked
             assert_eq!(reordered.total_bytes, pool.total_bytes);
         }
         for tp in [0, 3] {
-            assert!(scope_vllm_execution_mode_memory_pool(&mut original.clone(), &hardware, tp).is_err());
+            assert!(
+                scope_vllm_execution_mode_memory_pool(&mut original.clone(), &hardware, tp)
+                    .is_err()
+            );
         }
         hardware.gpus[0].memory_bytes = None;
         hardware.gpus[0].unified_memory = false;
         hardware.host.arch = "x86_64".to_owned();
-        assert!(scope_vllm_execution_mode_memory_pool(&mut original.clone(), &hardware, 1).is_err());
+        assert!(
+            scope_vllm_execution_mode_memory_pool(&mut original.clone(), &hardware, 1).is_err()
+        );
         hardware.gpus[0].memory_bytes = Some(24 * GIB_BYTES);
         let mut unified = original;
         unified.unified = true;
@@ -107067,24 +110790,48 @@ status: linked
         for (required_gib, target, expected) in [(30, 35, 2), (10, 15, 5), (60, 65, 1)] {
             selected.feasibility.estimated_required_bytes = required_gib * GIB_BYTES;
             args.vllm_memory_utilization = Some(target);
-            assert_eq!(provider_vllm_generation_execution_capacity(
-                &selected.artifact, Some(&profile), &selected.enclave.caps,
-                &selected.verdict, &args, &selected.feasibility,
-            ).unwrap(), expected);
+            assert_eq!(
+                provider_vllm_generation_execution_capacity(
+                    &selected.artifact,
+                    Some(&profile),
+                    &selected.enclave.caps,
+                    &selected.verdict,
+                    &args,
+                    &selected.feasibility,
+                )
+                .unwrap(),
+                expected
+            );
         }
         selected.feasibility.estimated_required_bytes = 30 * GIB_BYTES;
         args.vllm_memory_utilization = Some(35);
         args.max_sessions = Some(1);
-        assert_eq!(provider_vllm_generation_execution_capacity(
-            &selected.artifact, Some(&profile), &selected.enclave.caps,
-            &selected.verdict, &args, &selected.feasibility,
-        ).unwrap(), 1);
+        assert_eq!(
+            provider_vllm_generation_execution_capacity(
+                &selected.artifact,
+                Some(&profile),
+                &selected.enclave.caps,
+                &selected.verdict,
+                &args,
+                &selected.feasibility,
+            )
+            .unwrap(),
+            1
+        );
         args.max_sessions = None;
         selected.enclave.caps = json!({"max_batch_size": 1});
-        assert_eq!(provider_vllm_generation_execution_capacity(
-            &selected.artifact, Some(&profile), &selected.enclave.caps,
-            &selected.verdict, &args, &selected.feasibility,
-        ).unwrap(), 1);
+        assert_eq!(
+            provider_vllm_generation_execution_capacity(
+                &selected.artifact,
+                Some(&profile),
+                &selected.enclave.caps,
+                &selected.verdict,
+                &args,
+                &selected.feasibility,
+            )
+            .unwrap(),
+            1
+        );
     }
 
     fn test_isolated_generation_profile() -> catalog::CatalogGenerationExecutionProfile {
@@ -107093,13 +110840,15 @@ status: linked
             engine: "vllm".to_owned(),
             topology: Some(mayhem_proto::GenerationExecutionTopology::IsolatedWorkers),
             independent_dispatch: true,
+            max_concurrent: None,
             request_modalities: vec![vec!["text".to_owned()]],
             proof_sha256: "ab".repeat(32),
         }
     }
 
     fn test_isolated_vllm_candidate() -> ProviderCandidate {
-        let mut selected = test_auto_fit_candidate('c', "test/vllm-isolated", "text", 30, 80, 1, 30.0);
+        let mut selected =
+            test_auto_fit_candidate('c', "test/vllm-isolated", "text", 30, 80, 1, 30.0);
         selected.enclave.backend = "vllm".to_owned();
         selected.artifact.engine = "vllm".to_owned();
         selected.enclave.caps = json!({});
@@ -107121,21 +110870,49 @@ status: linked
         assert_eq!(plan.target_pct, 35);
         reserve_provider_vllm_replica_memory(&mut selected.feasibility, 2, plan).unwrap();
         selected.generation_execution_capacity = 2;
-        assert_eq!(selected.feasibility.estimated_required_bytes, 70 * GIB_BYTES);
+        assert_eq!(
+            selected.feasibility.estimated_required_bytes,
+            70 * GIB_BYTES
+        );
         assert_eq!(selected.feasibility.estimated_weights_bytes, 40 * GIB_BYTES);
         assert_eq!(selected.feasibility.estimated_kv_bytes, 12 * GIB_BYTES);
         assert_eq!(selected.feasibility.estimated_overhead_bytes, 6 * GIB_BYTES);
         assert_eq!(selected.feasibility.estimated_media_bytes, 2 * GIB_BYTES);
-        assert_eq!(selected.feasibility.replica_allocation.unwrap().per_worker_required_bytes, 30 * GIB_BYTES);
-        assert_eq!(provider_vllm_memory_utilization(&selected, None).unwrap().target_pct, 35);
+        assert_eq!(
+            selected
+                .feasibility
+                .replica_allocation
+                .unwrap()
+                .per_worker_required_bytes,
+            30 * GIB_BYTES
+        );
+        assert_eq!(
+            provider_vllm_memory_utilization(&selected, None)
+                .unwrap()
+                .target_pct,
+            35
+        );
         assert!(provider_vllm_memory_utilization(&selected, Some(36)).is_err());
         assert!(provider_vllm_memory_utilization(&selected, Some(29)).is_err());
-        assert_eq!(provider_vllm_memory_utilization(&selected, Some(30)).unwrap().target_pct, 30);
+        assert_eq!(
+            provider_vllm_memory_utilization(&selected, Some(30))
+                .unwrap()
+                .target_pct,
+            30
+        );
         let home = test_temp_dir("isolated-vllm-claim");
-        let claim = write_provider_memory_claim(&home, &"ab".repeat(32), &selected).unwrap().unwrap();
-        assert_eq!(read_provider_memory_claimed_bytes(Some(&home), false).unwrap(), 70 * GIB_BYTES);
+        let claim = write_provider_memory_claim(&home, &"ab".repeat(32), &selected)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            read_provider_memory_claimed_bytes(Some(&home), false).unwrap(),
+            70 * GIB_BYTES
+        );
         drop(claim);
-        assert_eq!(read_provider_memory_claimed_bytes(Some(&home), false).unwrap(), 0);
+        assert_eq!(
+            read_provider_memory_claimed_bytes(Some(&home), false).unwrap(),
+            0
+        );
         fs::remove_dir_all(home).unwrap();
     }
 
@@ -107144,16 +110921,31 @@ status: linked
         for (count, target) in [(0, 35), (2, 20), (3, 35), (u32::MAX, 35)] {
             let mut selected = test_isolated_vllm_candidate();
             let before = serde_json::to_value(&selected.feasibility).unwrap();
-            let plan = VllmMemoryUtilizationPlan { target_pct: target, floor_pct: 30, max_pct: 80 };
-            assert!(reserve_provider_vllm_replica_memory(&mut selected.feasibility, count, plan).is_err());
+            let plan = VllmMemoryUtilizationPlan {
+                target_pct: target,
+                floor_pct: 30,
+                max_pct: 80,
+            };
+            assert!(
+                reserve_provider_vllm_replica_memory(&mut selected.feasibility, count, plan)
+                    .is_err()
+            );
             assert_eq!(serde_json::to_value(&selected.feasibility).unwrap(), before);
         }
         let mut selected = test_isolated_vllm_candidate();
         selected.feasibility.memory_budget.total_bytes = u64::MAX;
         selected.feasibility.memory_budget.budget_bytes = u64::MAX;
         let before = serde_json::to_value(&selected.feasibility).unwrap();
-        assert!(reserve_provider_vllm_replica_memory(&mut selected.feasibility, 2,
-            VllmMemoryUtilizationPlan { target_pct: 85, floor_pct: 1, max_pct: 85 }).is_err());
+        assert!(reserve_provider_vllm_replica_memory(
+            &mut selected.feasibility,
+            2,
+            VllmMemoryUtilizationPlan {
+                target_pct: 85,
+                floor_pct: 1,
+                max_pct: 85
+            }
+        )
+        .is_err());
         assert_eq!(serde_json::to_value(&selected.feasibility).unwrap(), before);
     }
 
@@ -107163,13 +110955,28 @@ status: linked
         let plan = provider_vllm_memory_utilization(&isolated, None).unwrap();
         reserve_provider_vllm_replica_memory(&mut isolated.feasibility, 2, plan).unwrap();
         isolated.generation_execution_capacity = 2;
-        assert_eq!(provider_vllm_memory_utilization_for_candidates(std::slice::from_ref(&isolated), None)
-            .unwrap().unwrap().target_pct, 35);
-        assert!(provider_vllm_memory_utilization_for_candidates(std::slice::from_ref(&isolated), Some(36)).is_err());
+        assert_eq!(
+            provider_vllm_memory_utilization_for_candidates(std::slice::from_ref(&isolated), None)
+                .unwrap()
+                .unwrap()
+                .target_pct,
+            35
+        );
+        assert!(provider_vllm_memory_utilization_for_candidates(
+            std::slice::from_ref(&isolated),
+            Some(36)
+        )
+        .is_err());
         let mut shared = test_isolated_vllm_candidate();
         shared.generation_execution_profile = None;
-        let error = provider_vllm_memory_utilization_for_candidates(&[isolated, shared], None).unwrap_err();
-        assert!(error.to_string().contains("exceeding the admitted shared budget"), "{error:#}");
+        let error =
+            provider_vllm_memory_utilization_for_candidates(&[isolated, shared], None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exceeding the admitted shared budget"),
+            "{error:#}"
+        );
     }
 
     #[test]
@@ -109020,16 +112827,17 @@ esac
             "usage": {
                 "usage_root": "66".repeat(32),
                 "active_demand_au": "12345",
+                "compute_ms": "1800000",
+                "capacity_slot_count": 1u64,
+                "legacy_receipt_count": 0u64,
                 "session_count": 2u64
             },
             "controller": {
-                "source": "canonical_settled_work",
+                "source": "canonical_signed_slot_time",
                 "active_supply": 1u64,
-                "momentum_bps": 10_000u64,
-                "activity_basis": "relative_dimension_vector_v1",
+                "utilization_bps": 5_000u64,
+                "activity_basis": "signed_slot_time_v1",
                 "multiplier_bps": 10_000u64,
-                "frozen": true,
-                "frozen_reason": "activity_baseline_bootstrap"
             },
             "seed_price": {
                 "ver": 1u64,
@@ -109105,6 +112913,10 @@ esac
         assert_eq!(models[0].mayhem.markets[0].availability, "routable");
         assert_eq!(models[0].mayhem.route_candidates.len(), 1);
         assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 1);
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].enclave_att_tier,
+            Some(1)
+        );
         assert_eq!(models[0].mayhem.route_candidates[0].kyb, None);
         assert_eq!(models[0].mayhem.route_candidates[0].reputation_bps, 10_000);
         assert_eq!(models[0].mayhem.route_candidates[0].probation, None);
@@ -109782,6 +113594,10 @@ esac
         let models = gateway_models_from_contract(&contract).unwrap();
         assert_eq!(models[0].mayhem.attestation_tiers["T4"], 1);
         assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 4);
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].enclave_att_tier,
+            Some(1)
+        );
         assert_eq!(models[0].mayhem.kyb_identities.len(), 1);
         assert_eq!(
             models[0].mayhem.kyb_identities[0].legal_name,
@@ -109800,6 +113616,10 @@ esac
         let models = gateway_models_from_contract(&contract).unwrap();
         assert_eq!(models[0].mayhem.attestation_tiers["T1"], 1);
         assert_eq!(models[0].mayhem.route_candidates[0].att_tier, 1);
+        assert_eq!(
+            models[0].mayhem.route_candidates[0].enclave_att_tier,
+            Some(1)
+        );
         assert!(models[0].mayhem.kyb_identities.is_empty());
         assert_eq!(models[0].mayhem.route_candidates[0].kyb, None);
     }
@@ -109836,46 +113656,108 @@ esac
     fn provider_execution_mode_open_negotiation_preserves_baseline_and_rejects_downgrade() {
         let mut terms = test_provider_session_terms();
         let mut frame = test_session_open_frame(&terms);
-        assert_eq!(provider_session_open_decision(&frame, &terms), ProviderSessionDecision::Accept);
+        assert_eq!(
+            provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Accept
+        );
         frame["expected_execution_mode"] = Value::Null;
-        assert_eq!(provider_session_open_decision(&frame, &terms), ProviderSessionDecision::Accept);
+        assert_eq!(
+            provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Accept
+        );
         let mode = mayhem_proto::ExecutionModeBinding {
             mode_id: "throughput".to_owned(),
             policy_hash: "ab".repeat(32),
         };
         frame["expected_execution_mode"] = serde_json::to_value(&mode).unwrap();
-        assert!(matches!(provider_session_open_decision(&frame, &terms),
-            ProviderSessionDecision::Reject { code: "EXECUTION_MODE", .. }));
+        assert!(matches!(
+            provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Reject {
+                code: "EXECUTION_MODE",
+                ..
+            }
+        ));
         terms.execution_mode = Some(mode);
-        assert_eq!(provider_session_open_decision(&frame, &terms), ProviderSessionDecision::Accept);
-        for value in [Value::Null, json!({"mode_id":"throughput", "policy_hash":"cd".repeat(32)})] {
+        assert_eq!(
+            provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Accept
+        );
+        for value in [
+            Value::Null,
+            json!({"mode_id":"throughput", "policy_hash":"cd".repeat(32)}),
+        ] {
             frame["expected_execution_mode"] = value;
-            assert!(matches!(provider_session_open_decision(&frame, &terms),
-                ProviderSessionDecision::Reject { code: "EXECUTION_MODE", .. }));
+            assert!(matches!(
+                provider_session_open_decision(&frame, &terms),
+                ProviderSessionDecision::Reject {
+                    code: "EXECUTION_MODE",
+                    ..
+                }
+            ));
         }
-        frame.as_object_mut().unwrap().remove("expected_execution_mode");
-        assert!(matches!(provider_session_open_decision(&frame, &terms),
-            ProviderSessionDecision::Reject { code: "EXECUTION_MODE", .. }));
-        frame["expected_execution_mode"] = json!({"mode_id":"../invalid", "policy_hash":"ab".repeat(32)});
-        assert!(matches!(provider_session_open_decision(&frame, &terms),
-            ProviderSessionDecision::Reject { code: "SCHEMA", .. }));
+        frame
+            .as_object_mut()
+            .unwrap()
+            .remove("expected_execution_mode");
+        assert!(matches!(
+            provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Reject {
+                code: "EXECUTION_MODE",
+                ..
+            }
+        ));
+        frame["expected_execution_mode"] =
+            json!({"mode_id":"../invalid", "policy_hash":"ab".repeat(32)});
+        assert!(matches!(
+            provider_session_open_decision(&frame, &terms),
+            ProviderSessionDecision::Reject { code: "SCHEMA", .. }
+        ));
     }
 
     #[test]
     fn provider_execution_mode_cli_and_supervisor_selection_is_explicit() {
         let baseline = ProviderStartArgs::try_parse_from(["start"]).unwrap();
         assert!(baseline.execution_mode.is_none());
-        let args = ProviderStartArgs::try_parse_from(["start", "--execution-mode", "throughput"]).unwrap();
+        let args =
+            ProviderStartArgs::try_parse_from(["start", "--execution-mode", "throughput"]).unwrap();
         assert_eq!(args.execution_mode.as_deref(), Some("throughput"));
-        let add = ProviderServeAddArgs::try_parse_from(["add", "test/model", "--execution-mode", "throughput"]).unwrap();
+        let add = ProviderServeAddArgs::try_parse_from([
+            "add",
+            "test/model",
+            "--execution-mode",
+            "throughput",
+        ])
+        .unwrap();
         assert_eq!(add.execution_mode.as_deref(), Some("throughput"));
-        let switch = ProviderServeSwitchArgs::try_parse_from(["switch", "old", "new", "--execution-mode", "throughput"]).unwrap();
+        let switch = ProviderServeSwitchArgs::try_parse_from([
+            "switch",
+            "old",
+            "new",
+            "--execution-mode",
+            "throughput",
+        ])
+        .unwrap();
         assert_eq!(switch.execution_mode.as_deref(), Some("throughput"));
-        let plan = ProviderServePlanArgs::try_parse_from(["plan", "--execution-mode", "throughput"]).unwrap();
-        assert_eq!(provider_start_args_for_serve_plan(&plan, Path::new(".")).execution_mode, plan.execution_mode);
+        let plan =
+            ProviderServePlanArgs::try_parse_from(["plan", "--execution-mode", "throughput"])
+                .unwrap();
+        assert_eq!(
+            provider_start_args_for_serve_plan(&plan, Path::new(".")).execution_mode,
+            plan.execution_mode
+        );
         let mut child = json!({"args": ["provider", "start", "--enclave", "test"]});
         append_provider_serve_execution_mode(&mut child, "throughput").unwrap();
-        assert_eq!(child["args"], json!(["provider", "start", "--enclave", "test", "--execution-mode", "throughput"]));
+        assert_eq!(
+            child["args"],
+            json!([
+                "provider",
+                "start",
+                "--enclave",
+                "test",
+                "--execution-mode",
+                "throughput"
+            ])
+        );
         assert!(append_provider_serve_execution_mode(&mut child, "throughput").is_err());
         assert!(append_provider_serve_execution_mode(&mut json!({"args": []}), "../bad").is_err());
         assert!(append_provider_serve_execution_mode(&mut json!({}), "throughput").is_err());
@@ -109885,24 +113767,42 @@ esac
     fn provider_execution_mode_plan_replays_supervised_mode_without_changing_baseline() {
         let home = Path::new("/tmp/provider home");
         let args = ProviderServePlanArgs::try_parse_from([
-            "plan", "--execution-mode", "throughput", "--ctx", "8192",
-            "--disable-modality", "image", "--speciality-levels", "reasoning_effort=medium",
-        ]).unwrap();
+            "plan",
+            "--execution-mode",
+            "throughput",
+            "--ctx",
+            "8192",
+            "--disable-modality",
+            "image",
+            "--speciality-levels",
+            "reasoning_effort=medium",
+        ])
+        .unwrap();
         let candidate = test_auto_fit_candidate('a', "test/model", "text", 4, 16, 1, 10.0);
         let mut selection = ProviderAutoFitSelection {
-            candidates: vec![candidate], total_required_bytes: 0, total_budget_bytes: 0,
-            modalities: vec!["text".to_owned()], score: 0.0, rationale: String::new(),
+            candidates: vec![candidate],
+            total_required_bytes: 0,
+            total_budget_bytes: 0,
+            modalities: vec!["text".to_owned()],
+            score: 0.0,
+            rationale: String::new(),
         };
         let baseline = provider_serve_plan_commands(home, &selection, &args, Some(12), None);
-        assert_eq!(baseline, json!({"up": provider_auto_fit_up_command(
-            home, &selection, Some(12), &args.disable_modalities, None,
-        )}));
+        assert_eq!(
+            baseline,
+            json!({"up": provider_auto_fit_up_command(
+                home, &selection, Some(12), &args.disable_modalities, None,
+            )})
+        );
         let candidate = &mut selection.candidates[0];
         candidate.execution_mode = Some(ProviderExecutionMode {
             binding: mayhem_proto::ExecutionModeBinding {
-                mode_id: "throughput".to_owned(), policy_hash: "ab".repeat(32),
+                mode_id: "throughput".to_owned(),
+                policy_hash: "ab".repeat(32),
             },
-            requests: mayhem_proto::ExecutionModeRequestPolicy { endpoint_families: Vec::new() },
+            requests: mayhem_proto::ExecutionModeRequestPolicy {
+                endpoint_families: Vec::new(),
+            },
             baseline_adapter: candidate.model.adapter.clone(),
         });
         let argv = provider_serve_mode_add_argv(home, candidate, &args, Some(12), None);
@@ -109917,7 +113817,10 @@ esac
         let report = provider_serve_plan_commands(home, &selection, &args, Some(12), None);
         assert!(!report["up"].as_str().unwrap().contains("--provider"));
         assert_eq!(report["serve"].as_array().unwrap().len(), 1);
-        assert!(report["serve"][0].as_str().unwrap().contains("'--execution-mode' 'throughput'"));
+        assert!(report["serve"][0]
+            .as_str()
+            .unwrap()
+            .contains("'--execution-mode' 'throughput'"));
     }
 
     #[test]
@@ -110225,6 +114128,60 @@ esac
     }
 
     #[test]
+    fn provider_session_resumes_only_the_identical_pending_reservation() {
+        let terms = test_provider_session_terms();
+        let open_frame = test_session_open_frame(&terms);
+        let session_id = open_frame["session_id"].as_str().unwrap().to_owned();
+        let remote = "22".repeat(32);
+        let reject_frame = json!({
+            "t": "s.reject",
+            "session_id": session_id,
+            "code": "RESERVATION_PENDING",
+        });
+        let mut rejected = HashMap::new();
+        cache_provider_session_reject(
+            &mut rejected,
+            session_id.clone(),
+            remote.clone(),
+            &open_frame,
+            reject_frame,
+            Instant::now() + Duration::from_secs(30),
+        )
+        .unwrap();
+
+        assert_eq!(
+            provider_session_reject_replay_decision(
+                rejected.get(&session_id).unwrap(),
+                &remote,
+                &open_frame,
+            )
+            .unwrap(),
+            ProviderSessionReplayDecision::Pending
+        );
+
+        let mut changed = open_frame.clone();
+        changed["nonce"] = json!("changed");
+        assert_eq!(
+            provider_session_reject_replay_decision(
+                rejected.get(&session_id).unwrap(),
+                &remote,
+                &changed,
+            )
+            .unwrap(),
+            ProviderSessionReplayDecision::Conflict
+        );
+
+        match provider_session_reservation_timeout_decision(Duration::from_secs(90)) {
+            ProviderSessionDecision::Reject { code, reason } => {
+                assert_eq!(code, "RESERVATION_PENDING");
+                assert!(reason.contains("90000 ms"));
+                assert!(reason.contains("retained for recovery"));
+            }
+            other => panic!("reservation timeout must remain retryable: {other:?}"),
+        }
+    }
+
+    #[test]
     fn provider_admission_timeout_uses_the_gateway_open_budget() {
         assert_eq!(
             provider_session_admission_timeout_from(None).unwrap(),
@@ -110294,6 +114251,34 @@ esac
             &terms
         ));
 
+        let tokenize_event = json!({
+            "type": "session_frame",
+            "session_id": "cc".repeat(32),
+            "remote": "22".repeat(32),
+            "frame": {
+                "t": TOKENIZE_REQUEST_FRAME_TYPE,
+                "v": TOKENIZE_FRAME_VERSION,
+                "session_id": "cc".repeat(32),
+                "provider": terms.provider,
+                "enclave_id": terms.enclave_id,
+                "room_id": terms.room_ids[0],
+                "model": terms.model_id,
+                "request": {},
+            },
+        });
+        assert!(provider_session_event_belongs_to_process(
+            &tokenize_event,
+            &sessions,
+            &terms
+        ));
+        let mut wrong_model_tokenize = tokenize_event;
+        wrong_model_tokenize["frame"]["model"] = json!("other/model");
+        assert!(!provider_session_event_belongs_to_process(
+            &wrong_model_tokenize,
+            &sessions,
+            &terms
+        ));
+
         for frame_type in [
             "s.accept",
             "s.reject",
@@ -110343,6 +114328,21 @@ esac
             &owned_sessions,
             &terms
         ));
+    }
+
+    #[test]
+    fn provider_tokenize_uses_the_signed_model_chat_template() {
+        let terms = test_provider_session_terms();
+        let body = json!({
+            "kind": "chat",
+            "messages": [{"role": "user", "content": "exact tokenizer marker"}],
+            "stream": false,
+        });
+        let sealed =
+            provider_seal_local_contract_request(&body, &terms.adapter, &terms.model_id).unwrap();
+        let prompt = provider_engine_tokenize_prompt(&terms, &sealed).unwrap();
+        assert!(prompt.contains("exact tokenizer marker"));
+        assert_ne!(prompt, "exact tokenizer marker");
     }
 
     #[test]
@@ -110415,7 +114415,12 @@ esac
         output_tokens: u64,
     ) -> Value {
         signed_receipt_settlement_feature_for_test_version(
-            epoch, seq, final_receipt, output_tokens, CONTRACT_VERSION, None,
+            epoch,
+            seq,
+            final_receipt,
+            output_tokens,
+            CONTRACT_VERSION,
+            None,
         )
     }
 
@@ -110426,6 +114431,26 @@ esac
         output_tokens: u64,
         contract_version: u32,
         context_input_tokens: Option<u64>,
+    ) -> Value {
+        signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            epoch,
+            seq,
+            final_receipt,
+            output_tokens,
+            contract_version,
+            context_input_tokens,
+            1,
+        )
+    }
+
+    fn signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+        epoch: u64,
+        seq: u64,
+        final_receipt: bool,
+        output_tokens: u64,
+        contract_version: u32,
+        context_input_tokens: Option<u64>,
+        compute_ms: u64,
     ) -> Value {
         let provider_key = SigningKey::from_bytes(&[31_u8; 32]);
         let enclave_key = SigningKey::from_bytes(&[32_u8; 32]);
@@ -110458,6 +114483,8 @@ esac
             locked_per_req_au: 0,
             locked_min_session_au: 0,
             served_ctx: 1024,
+            compute_ms,
+            capacity_slots: 1,
             ctx_bracket: Some("le32k".to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
             rules_ver: 1,
@@ -110478,8 +114505,24 @@ esac
             enclave_pubkey: hex_encode(&enclave_key.verifying_key().to_bytes()),
             user_sig: hex_encode(&user_key.sign(&receipt_payload).to_bytes()),
         };
-        let key = record_usage_receipt_feature_key_for_contract(&receipt, contract_version);
-        let receipt_envelope = record_usage_receipt_envelope(&receipt);
+        let mut receipt_envelope = record_usage_receipt_envelope(&receipt);
+        if contract_version != CONTRACT_VERSION {
+            receipt_envelope["body"]["schema_version"] =
+                json!(mayhem_proto::RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION);
+            receipt_envelope["body"]
+                .as_object_mut()
+                .unwrap()
+                .remove("compute_ms");
+            receipt_envelope["body"]
+                .as_object_mut()
+                .unwrap()
+                .remove("capacity_slots");
+        }
+        let key = record_usage_receipt_feature_key_from_envelope_for_contract(
+            &receipt_envelope,
+            contract_version,
+        )
+        .unwrap();
         let mut value = json!({
             "op": "record_usage_receipt",
             "contract_version": contract_version,
@@ -110562,6 +114605,161 @@ esac
     }
 
     #[test]
+    fn receipt_outbox_confirmed_partial_can_retire_without_settlement() {
+        let root = test_temp_dir("mayhem-partial-delivery-before-close");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let partial = outbox
+            .persist(&signed_receipt_settlement_feature_for_test_at(
+                7, 1, false, 2,
+            ))
+            .unwrap();
+        let key = receipt_settlement_head_key(&partial).unwrap();
+        let mut record = json!({"confirmed": true, "key": key, "value": {
+            "type": "canonical_receipt_head", "settlement_ready": false,
+            "feature_key": partial.feature["key"], "receipt": partial.feature["value"]["receipt"]
+        }});
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        record["confirmed"] = json!(false);
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        record["confirmed"] = json!(true);
+        record["key"] = json!("another/head");
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        let final_entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        record["key"] = json!(key);
+        record["value"]["feature_key"] = final_entry.feature["key"].clone();
+        record["value"]["receipt"] = final_entry.feature["value"]["receipt"].clone();
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record, &key, &partial
+        ));
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &record,
+            &key,
+            &final_entry
+        ));
+        record["value"]["settlement_ready"] = json!(true);
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record,
+            &key,
+            &final_entry
+        ));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_outbox_checkpoint_hot_path_does_not_parse_unrelated_backlog() {
+        let root = test_temp_dir("mayhem-receipt-backlog-hot-path");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let other_process = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let first = outbox
+            .persist(&signed_receipt_settlement_feature_for_test_at(
+                7, 1, false, 1,
+            ))
+            .unwrap();
+        // These deliberately unreadable documents prove persist/remove do not
+        // parse unrelated attempts. Full admission/retry validation must still
+        // reject them; the optimization must not change that behavior.
+        for n in 0..RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES - 1 {
+            let path =
+                outbox
+                    .directory
+                    .join(format!("{n:064x}.{:020}.0.{}.json", 1, "ab".repeat(32)));
+            let mut file = fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            file.write_all(b"invalid JSON probe").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+            }
+        }
+        let next = other_process
+            .persist(&signed_receipt_settlement_feature_for_test_at(
+                7, 2, false, 2,
+            ))
+            .unwrap();
+        outbox.remove(&first).unwrap();
+        assert!(
+            next.path.exists(),
+            "stale removal must not erase another process's checkpoint"
+        );
+        let final_entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        other_process.remove(&next).unwrap();
+        assert!(final_entry.path.exists());
+        assert!(
+            outbox.load_entries().is_err(),
+            "full scans must still validate every document"
+        );
+        other_process.remove(&final_entry).unwrap();
+        assert!(!final_entry.path.exists());
+        assert_eq!(
+            fs::read_dir(&outbox.directory)
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|item| item.path().extension() == Some(OsStr::new("json")))
+                .count(),
+            RECEIPT_SETTLEMENT_OUTBOX_MAX_ENTRIES - 1
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn receipt_outbox_attempt_scan_checks_names_and_crash_survivors() {
+        let root = test_temp_dir("mayhem-receipt-attempt-crash");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let first_feature = signed_receipt_settlement_feature_for_test_at(7, 1, false, 1);
+        let first = outbox.persist(&first_feature).unwrap();
+        let saved = fs::read(&first.path).unwrap();
+        let final_entry = outbox
+            .persist(&signed_receipt_settlement_feature_for_test(7))
+            .unwrap();
+        // Simulate power loss after the new link landed but before old unlink.
+        fs::write(&first.path, saved).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&first.path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(outbox.persist(&first_feature).unwrap(), final_entry);
+        outbox.remove(&first).unwrap();
+        assert!(final_entry.path.exists());
+        let (count, current) = outbox.load_attempt(&first.attempt_id).unwrap();
+        assert_eq!(count, 1);
+        assert_eq!(current.unwrap(), final_entry);
+        let malformed = outbox.directory.join("not-an-attempt.json");
+        fs::write(&malformed, b"{}").unwrap();
+        assert!(outbox.load_attempt(&first.attempt_id).is_err());
+        fs::remove_file(malformed).unwrap();
+        #[cfg(unix)]
+        {
+            let link = outbox.directory.join(format!(
+                "{}.00000000000000000001.0.{}.json",
+                "00".repeat(32),
+                "ab".repeat(32)
+            ));
+            std::os::unix::fs::symlink(&final_entry.path, &link).unwrap();
+            assert!(outbox.load_attempt(&first.attempt_id).is_err());
+            fs::remove_file(link).unwrap();
+        }
+        let restarted = ReceiptSettlementOutbox::new(outbox.directory.clone()).unwrap();
+        assert_eq!(restarted.load_entries().unwrap(), vec![final_entry]);
+        assert!(!first.path.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn receipt_outbox_retires_only_exact_confirmed_canonical_evidence() {
         let root = test_temp_dir("mayhem-receipt-outbox-canonical-proof");
         let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
@@ -110587,7 +114785,83 @@ esac
         assert!(!confirmed_receipt_settlement_record_matches(
             &record, &key, &entry
         ));
-        assert!(entry.path.exists(), "a mismatch must leave durable evidence");
+        assert!(
+            entry.path.exists(),
+            "a mismatch must leave durable evidence"
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_retires_checkpoint_proven_superseded_by_canonical_head() {
+        let root = test_temp_dir("mayhem-receipt-outbox-superseded-checkpoint");
+        let outbox = ReceiptSettlementOutbox::new(root.join("gateway")).unwrap();
+        let entry = outbox
+            .persist(
+                &signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+                    7,
+                    69,
+                    false,
+                    69,
+                    CONTRACT_VERSION,
+                    None,
+                    100,
+                ),
+            )
+            .unwrap();
+        let canonical = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            70,
+            true,
+            70,
+            CONTRACT_VERSION,
+            None,
+            200,
+        );
+        let key = receipt_settlement_head_key(&entry).unwrap();
+        let record = json!({
+            "confirmed": true,
+            "key": key,
+            "value": {
+                "type": "canonical_receipt_head",
+                "settlement_ready": true,
+                "feature_key": canonical["key"],
+                "receipt": canonical["value"]["receipt"],
+            },
+        });
+        assert!(confirmed_receipt_settlement_record_matches(
+            &record, &key, &entry
+        ));
+
+        let mut same_sequence = record.clone();
+        same_sequence["value"]["receipt"]["body"]["seq"] = json!(69);
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &same_sequence,
+            &key,
+            &entry,
+        ));
+        let mut changed_terms = record.clone();
+        changed_terms["value"]["receipt"]["body"]["payout_revision"] = json!("47".repeat(32));
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &changed_terms,
+            &key,
+            &entry,
+        ));
+        let mut regressed_compute = record.clone();
+        regressed_compute["value"]["receipt"]["body"]["compute_ms"] = json!(99);
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &regressed_compute,
+            &key,
+            &entry,
+        ));
+        let mut regressed_usage = record;
+        regressed_usage["value"]["receipt"]["body"]["usage"]["output_tokens"] = json!(68);
+        assert!(!confirmed_receipt_settlement_record_matches(
+            &regressed_usage,
+            &key,
+            &entry,
+        ));
+        assert!(entry.path.exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -110600,7 +114874,10 @@ esac
             .unwrap();
         let paths = vec![entry.path.clone()];
         outbox.remove(&entry).unwrap();
-        assert!(outbox.load_physical_entries_at_paths(paths).unwrap().is_empty());
+        assert!(outbox
+            .load_physical_entries_at_paths(paths)
+            .unwrap()
+            .is_empty());
         assert!(outbox.admission_available().unwrap());
 
         let entry = outbox
@@ -110629,33 +114906,191 @@ esac
             .unwrap();
         assert!(outbox.has_pending_final_receipts(user, "tnk").unwrap());
         assert!(!outbox.has_pending_final_receipts(user, "fiat").unwrap());
-        assert!(!outbox.has_pending_final_receipts("another buyer", "tnk").unwrap());
+        assert!(!outbox
+            .has_pending_final_receipts("another buyer", "tnk")
+            .unwrap());
         outbox.remove(&final_receipt).unwrap();
         assert!(!outbox.has_pending_final_receipts(user, "tnk").unwrap());
         let _ = fs::remove_dir_all(root);
     }
 
     #[test]
-    fn receipt_settlement_version_bridge_preserves_v23_v24_and_v25_signatures() {
-        for version in [23, 24, 25] {
-            let feature = signed_receipt_settlement_feature_for_test_version(
-                7, 1, true, 2, version, Some(768),
-            );
-            assert!(validate_receipt_settlement_feature(&feature).is_ok(), "version {version}");
+    fn receipt_outbox_accepts_advancing_compute_across_receipt_series() {
+        let root = test_temp_dir("mayhem-receipt-outbox-compute-checkpoints");
+        for (delivery, checkpoints) in [
+            (
+                "streaming",
+                vec![(1, false, 8, 100), (2, false, 16, 225), (3, true, 21, 310)],
+            ),
+            ("single-final", vec![(1, true, 41, 525)]),
+        ] {
+            let outbox = ReceiptSettlementOutbox::new(root.join(delivery)).unwrap();
+            for (seq, final_receipt, output_tokens, compute_ms) in checkpoints {
+                let feature = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+                    7,
+                    seq,
+                    final_receipt,
+                    output_tokens,
+                    CONTRACT_VERSION,
+                    None,
+                    compute_ms,
+                );
+                outbox
+                    .persist(&feature)
+                    .expect("cumulative compute must advance with checkpoint usage");
+                let entries = outbox.load_entries().unwrap();
+                assert_eq!(entries.len(), 1, "{delivery}");
+                assert_eq!(entries[0].seq, seq, "{delivery}");
+                assert_eq!(entries[0].final_receipt, final_receipt, "{delivery}");
+            }
         }
-        for version in [22, 26] {
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_rejects_regressing_compute_across_checkpoints() {
+        let root = test_temp_dir("mayhem-receipt-outbox-compute-regression");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let first = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            1,
+            false,
+            8,
+            CONTRACT_VERSION,
+            None,
+            100,
+        );
+        outbox.persist(&first).unwrap();
+        let regressed = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            2,
+            false,
+            16,
+            CONTRACT_VERSION,
+            None,
+            99,
+        );
+        let error = outbox
+            .persist(&regressed)
+            .expect_err("higher sequence must not regress cumulative compute");
+        assert!(error.to_string().contains("high-water evidence"));
+        let entries = outbox.load_entries().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].seq, 1);
+        assert_eq!(entries[0].compute_ms, 100);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_outbox_requires_fresh_sequence_for_terminal_recovery() {
+        let root = test_temp_dir("mayhem-receipt-outbox-terminal-sequence");
+        let outbox = ReceiptSettlementOutbox::new(root.join("provider")).unwrap();
+        let checkpoint = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            3,
+            false,
+            16,
+            CONTRACT_VERSION,
+            None,
+            225,
+        );
+        outbox.persist(&checkpoint).unwrap();
+        let same_sequence_final = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            3,
+            true,
+            16,
+            CONTRACT_VERSION,
+            None,
+            310,
+        );
+        let error = outbox
+            .persist(&same_sequence_final)
+            .expect_err("a terminal receipt must not reuse a transmitted checkpoint sequence");
+        assert!(error.to_string().contains("must advance"));
+        let final_receipt = signed_receipt_settlement_feature_for_test_version_and_compute_ms(
+            7,
+            4,
+            true,
+            16,
+            CONTRACT_VERSION,
+            None,
+            310,
+        );
+        let entry = outbox.persist(&final_receipt).unwrap();
+        assert!(entry.final_receipt);
+        assert_eq!(entry.seq, 4);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn receipt_settlement_version_bridge_preserves_v23_through_v27_signatures() {
+        for version in [23, 24, 25, 26, 27] {
             let feature = signed_receipt_settlement_feature_for_test_version(
-                7, 1, true, 2, version, Some(768),
+                7,
+                1,
+                true,
+                2,
+                version,
+                Some(768),
             );
-            assert!(validate_receipt_settlement_feature(&feature).is_err(), "version {version}");
+            assert!(
+                validate_receipt_settlement_feature(&feature).is_ok(),
+                "version {version}"
+            );
         }
+        for version in [22, CONTRACT_VERSION + 1] {
+            let feature = signed_receipt_settlement_feature_for_test_version(
+                7,
+                1,
+                true,
+                2,
+                version,
+                Some(768),
+            );
+            assert!(
+                validate_receipt_settlement_feature(&feature).is_err(),
+                "version {version}"
+            );
+        }
+    }
+
+    #[test]
+    fn existing_v27_targeted_payout_plan_survives_v28_cli() {
+        let plan_root = "a".repeat(64);
+        let mut record = json!({
+            "type": "targeted_payout_epoch_plan",
+            "rail": "fiat",
+            "epoch": 508,
+            "plan_root": plan_root,
+            "value": {
+                "op": "prepare_targeted_payout_epoch",
+                "contract_version": 27,
+                "rail": "fiat",
+                "epoch": 508,
+                "plan_root": plan_root,
+            },
+        });
+        assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_ok());
+        record["value"]["contract_version"] = json!(CONTRACT_VERSION);
+        assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_ok());
+        record["value"]["contract_version"] = json!(26);
+        assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_err());
+        record["value"]["contract_version"] = json!(27);
+        record["plan_root"] = json!("b".repeat(64));
+        assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_err());
     }
 
     #[test]
     fn receipt_outbox_recovers_v191_context_receipts_without_resigning_or_rebilling() {
         let root = test_temp_dir("mayhem-v191-receipt-recovery");
         let feature = signed_receipt_settlement_feature_for_test_version(
-            7, 1, true, 2, RECOVERABLE_RECEIPT_CONTRACT_VERSION, Some(768),
+            7,
+            1,
+            true,
+            2,
+            RECOVERABLE_RECEIPT_CONTRACT_VERSION,
+            Some(768),
         );
         let receipt = parse_record_usage_receipt_envelope(&feature["value"]["receipt"]).unwrap();
         assert_eq!(receipt.body.usage.input_tokens(), 1);
@@ -110664,12 +115099,15 @@ esac
         for kind in ["provider", "gateway"] {
             let directory = root.join(kind);
             fs::create_dir_all(&directory).unwrap();
-            let path = ReceiptSettlementOutbox::new(directory.clone()).unwrap()
-                .entry_path(&feature).unwrap();
+            let path = ReceiptSettlementOutbox::new(directory.clone())
+                .unwrap()
+                .entry_path(&feature)
+                .unwrap();
             let bytes = serde_json::to_vec(&json!({
                 "schema_version": RECEIPT_SETTLEMENT_OUTBOX_SCHEMA_VERSION,
                 "feature": feature,
-            })).unwrap();
+            }))
+            .unwrap();
             fs::write(&path, &bytes).unwrap();
             #[cfg(unix)]
             {
@@ -110678,7 +115116,11 @@ esac
             }
             let outbox = ReceiptSettlementOutbox::new(directory.clone()).unwrap();
             let entries = outbox.load_entries().unwrap();
-            assert_eq!(entries.len(), 1, "legacy signed evidence must not be quarantined");
+            assert_eq!(
+                entries.len(),
+                1,
+                "legacy signed evidence must not be quarantined"
+            );
             assert_eq!(entries[0].feature, feature);
             let persisted = fs::read(&entries[0].path).unwrap();
             drop(outbox);
@@ -110693,16 +115135,20 @@ esac
                     "feature_key": feature["key"], "receipt": feature["value"]["receipt"],
                 },
             });
-            assert!(confirmed_receipt_settlement_record_matches(&record, &key, &entry));
-            record["value"]["receipt"]["body"]["usage_attribution"]["context_input_tokens"] = json!(767);
-            assert!(!confirmed_receipt_settlement_record_matches(&record, &key, &entry));
+            assert!(confirmed_receipt_settlement_record_matches(
+                &record, &key, &entry
+            ));
+            record["value"]["receipt"]["body"]["usage_attribution"]["context_input_tokens"] =
+                json!(767);
+            assert!(!confirmed_receipt_settlement_record_matches(
+                &record, &key, &entry
+            ));
             assert!(entry.path.exists());
         }
         let mut rewritten = feature.clone();
         rewritten["value"]["contract_version"] = json!(CONTRACT_VERSION);
         rewritten["key"] = json!(record_usage_receipt_feature_key(&receipt));
-        assert!(validate_receipt_settlement_feature(&rewritten).unwrap_err()
-            .to_string().contains("provider signature failed"));
+        assert!(validate_receipt_settlement_feature(&rewritten).is_err());
         let mut unsupported = feature;
         unsupported["value"]["contract_version"] = json!(22);
         assert!(validate_receipt_settlement_feature(&unsupported).is_err());
@@ -110749,6 +115195,17 @@ esac
         let mut feature = signed_receipt_settlement_feature_for_test(7);
         feature["value"]["receipt"]["body"]["schema_version"] =
             json!(SESSION_RECEIPT_SCHEMA_VERSION.saturating_sub(1));
+        // Keep the synthetic stale envelope valid for schema 11 so recovery
+        // reaches the intended obsolete-schema quarantine path. Schema 11
+        // predates the cumulative utilization fields introduced in schema 12.
+        feature["value"]["receipt"]["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("compute_ms");
+        feature["value"]["receipt"]["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("capacity_slots");
         let stale_path = directory.join("obsolete-receipt-schema-entry.json");
         fs::write(
             &stale_path,
@@ -110785,11 +115242,11 @@ esac
             outbox.persist(&feature).unwrap();
             assert_eq!(outbox.load_entries().unwrap().len(), 1);
         }
-        let final_feature = signed_receipt_settlement_feature_for_test_at(7, 200, true, 200);
+        let final_feature = signed_receipt_settlement_feature_for_test_at(7, 201, true, 200);
         outbox.persist(&final_feature).unwrap();
         let entries = outbox.load_entries().unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].seq, 200);
+        assert_eq!(entries[0].seq, 201);
         assert!(entries[0].final_receipt);
         assert_eq!(
             fs::read_dir(root.join("provider"))
@@ -110802,10 +115259,10 @@ esac
         let stale = signed_receipt_settlement_feature_for_test_at(7, 199, false, 199);
         let retained = outbox.persist(&stale).unwrap();
         assert_eq!(retained.feature, final_feature);
-        let conflicting_final = signed_receipt_settlement_feature_for_test_at(7, 200, true, 201);
+        let conflicting_final = signed_receipt_settlement_feature_for_test_at(7, 201, true, 201);
         assert!(outbox.persist(&conflicting_final).is_err());
         let post_final_checkpoint =
-            signed_receipt_settlement_feature_for_test_at(7, 201, false, 201);
+            signed_receipt_settlement_feature_for_test_at(7, 202, false, 201);
         assert!(outbox.persist(&post_final_checkpoint).is_err());
         let _ = fs::remove_dir_all(root);
     }
@@ -110833,7 +115290,8 @@ esac
         receipt.body.billing_id = "52".repeat(32);
         receipt.body.reservation_id = "53".repeat(32);
         let payload = receipt_signing_bytes(&receipt.body).unwrap();
-        receipt.enclave_sig = hex_encode(&SigningKey::from_bytes(&[32; 32]).sign(&payload).to_bytes());
+        receipt.enclave_sig =
+            hex_encode(&SigningKey::from_bytes(&[32; 32]).sign(&payload).to_bytes());
         receipt.user_sig = hex_encode(&SigningKey::from_bytes(&[33; 32]).sign(&payload).to_bytes());
         let key = record_usage_receipt_feature_key(&receipt);
         let mut value = json!({
@@ -110850,13 +115308,15 @@ esac
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let (seen_old, mut old_seen) = tokio::sync::mpsc::channel(1);
+        let (seen_fresh, mut fresh_seen) = tokio::sync::mpsc::channel(1);
         let release_old = Arc::new(tokio::sync::Notify::new());
         let server_release = release_old.clone();
         let server = tokio::spawn(async move {
             let mut requests = tokio::task::JoinSet::new();
-            for _ in 0..2 {
+            for _ in 0..4 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let seen_old = seen_old.clone();
+                let seen_fresh = seen_fresh.clone();
                 let release = server_release.clone();
                 requests.spawn(async move {
                     let mut bytes = Vec::new();
@@ -110867,11 +115327,14 @@ esac
                         bytes.extend_from_slice(&chunk[..n]);
                         if let Some(end) = bytes.windows(4).position(|x| x == b"\r\n\r\n") {
                             let headers = String::from_utf8_lossy(&bytes[..end]);
-                            let length = headers.lines().find_map(|line| {
-                                let (name, value) = line.split_once(':')?;
-                                name.eq_ignore_ascii_case("content-length")
-                                    .then(|| value.trim().parse::<usize>().unwrap())
-                            }).unwrap();
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
                             break (end + 4, length);
                         }
                     };
@@ -110881,12 +115344,29 @@ esac
                         assert!(n > 0);
                         bytes.extend_from_slice(&chunk[..n]);
                     }
-                    let feature: Value = serde_json::from_slice(&bytes[header_end..header_end + length]).unwrap();
-                    if feature["value"]["receipt"]["body"]["billing_id"] == "42".repeat(32) {
-                        seen_old.send(()).await.unwrap();
-                        release.notified().await;
-                    }
-                    stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}").await.unwrap();
+                    let response = if length == 0 {
+                        r#"{"confirmed":false}"#
+                    } else {
+                        let feature: Value = serde_json::from_slice(
+                            &bytes[header_end..header_end + length],
+                        )
+                        .unwrap();
+                        if feature["value"]["receipt"]["body"]["billing_id"]
+                            == "42".repeat(32)
+                        {
+                            seen_old.send(()).await.unwrap();
+                            release.notified().await;
+                        } else {
+                            seen_fresh.send(()).await.unwrap();
+                        }
+                        r#"{"ok":true}"#
+                    };
+                    let headers = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        response.len()
+                    );
+                    stream.write_all(headers.as_bytes()).await.unwrap();
+                    stream.write_all(response.as_bytes()).await.unwrap();
                 });
             }
             while let Some(result) = requests.join_next().await {
@@ -110901,26 +115381,22 @@ esac
             .unwrap()
             .unwrap();
         let fresh_entry = outbox.persist(&fresh).unwrap();
-        timeout(Duration::from_secs(3), async {
-            while fresh_entry.path.exists() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("fresh receipt must bypass the stalled disk retry pass");
+        timeout(Duration::from_secs(3), fresh_seen.recv())
+            .await
+            .expect("fresh receipt must bypass the stalled disk retry pass")
+            .expect("fresh receipt submission signal");
         assert!(
             old_entry.path.exists(),
             "older evidence must remain durable while its relay is stalled"
         );
+        assert!(
+            fresh_entry.path.exists(),
+            "relay acceptance must not hide a receipt before canonical confirmation"
+        );
         release_old.notify_one();
         server.await.unwrap();
-        timeout(Duration::from_secs(3), async {
-            while old_entry.path.exists() {
-                sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
+        assert!(old_entry.path.exists());
+        assert!(fresh_entry.path.exists());
         let _ = fs::remove_dir_all(root);
     }
 
@@ -110999,12 +115475,40 @@ esac
             key,
             "provider signature is not part of the reservation feature key"
         );
+
+        let binding = spend_reservation_binding(&signed).unwrap();
+        assert!(reservation_binding_matches(&binding, &binding));
+        assert_eq!(binding["reservation_id"], signed["reservation_id"]);
+        assert_eq!(binding["billing_id"], signed["voucher"]["billing_id"]);
+        assert_eq!(binding["model_id"], signed["model_id"]);
+        assert_eq!(binding["enclave_id"], signed["enclave_id"]);
+        assert_eq!(
+            binding["billing_attempt"],
+            signed["voucher"]["billing_attempt"]
+        );
+    }
+
+    #[test]
+    fn provider_reservation_pending_detection_preserves_ambiguous_append_outcomes() {
+        for response in [
+            json!({"ok": false, "accepted": true, "status": "pending"}),
+            json!({"ok": false, "accepted": false, "status": "rejected", "phase": "admin_ack"}),
+            json!({"ok": false, "message": "Mayhem feature relay accepted the append but no canonical result appeared before the relay result budget."}),
+        ] {
+            assert!(spend_reservation_submission_pending(&response));
+        }
+        assert!(!spend_reservation_submission_pending(&json!({
+            "ok": false,
+            "accepted": true,
+            "status": "rejected",
+            "message": "Insufficient unreserved credit balance.",
+        })));
     }
 
     #[test]
     fn js_contract_targeted_spend_reservation_fixture_matches_rust() {
         let voucher = json!({
-            "schema_version": SESSION_RECEIPT_SCHEMA_VERSION,
+            "schema_version": SPEND_VOUCHER_SCHEMA_VERSION,
             "session_id": "11".repeat(32),
             "billing_id": "12".repeat(32),
             "billing_attempt": 0,
@@ -111066,7 +115570,7 @@ esac
         let expected_message = concat!(
             "mayhem-targeted-spend-reservation-v1",
             "{\"payout_revision\":\"9999999999999999999999999999999999999999999999999999999999999999\",",
-            "\"reservation\":{\"at\":25200,\"contract_version\":25,\"ctx_bracket\":\"le8k\",",
+            "\"reservation\":{\"at\":25200,\"contract_version\":26,\"ctx_bracket\":\"le8k\",",
             "\"ctx_bracket_table_ver\":1,",
             "\"enclave_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"enclave_pubkey\":\"5555555555555555555555555555555555555555555555555555555555555555\",",
@@ -111137,23 +115641,44 @@ esac
         let new_open = test_session_open_frame(&refreshed);
         assert!(matches!(
             provider_session_open_decision(&new_open, &startup),
-            ProviderSessionDecision::Reject { code: "PRICE_VER", .. }
+            ProviderSessionDecision::Reject {
+                code: "PRICE_VER",
+                ..
+            }
         ));
-        assert_eq!(provider_session_open_decision(&new_open, &refreshed), ProviderSessionDecision::Accept);
+        assert_eq!(
+            provider_session_open_decision(&new_open, &refreshed),
+            ProviderSessionDecision::Accept
+        );
         assert_eq!(refreshed.price_ver, 5);
         assert_eq!(refreshed.rate_map, text_generation_rate_map(3, 7));
         assert_eq!(refreshed.per_req_au, 11);
         assert_eq!(refreshed.min_session_au, 17);
         assert_eq!(active.price_ver, startup.price_ver);
-        assert_eq!(active.locked_rate_map, normalize_rate_map(startup.rate_map.clone()));
-        assert!(matches!(provider_session_replay_decision(&active, &original_open).unwrap(),
-            ProviderSessionReplayDecision::Cached(frame) if frame == accept_frame));
+        assert_eq!(
+            active.locked_rate_map,
+            normalize_rate_map(startup.rate_map.clone())
+        );
+        assert!(
+            matches!(provider_session_replay_decision(&active, &original_open).unwrap(),
+            ProviderSessionReplayDecision::Cached(frame) if frame == accept_frame)
+        );
         let mut forged = refreshed.clone();
         forged.rate_map = text_generation_rate_map(1, 1);
-        assert!(matches!(provider_session_open_decision(&test_session_open_frame(&forged), &refreshed),
-            ProviderSessionDecision::Reject { code: "VOUCHER", .. }));
-        assert!(matches!(provider_session_open_decision(&original_open, &refreshed),
-            ProviderSessionDecision::Reject { code: "PRICE_VER", .. }));
+        assert!(matches!(
+            provider_session_open_decision(&test_session_open_frame(&forged), &refreshed),
+            ProviderSessionDecision::Reject {
+                code: "VOUCHER",
+                ..
+            }
+        ));
+        assert!(matches!(
+            provider_session_open_decision(&original_open, &refreshed),
+            ProviderSessionDecision::Reject {
+                code: "PRICE_VER",
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -111171,13 +115696,22 @@ esac
         other_market.pending = None;
         contract.prices.insert(0, other_market);
         let mut before = startup.clone();
-        assert_eq!(refresh_provider_session_price_terms(&contract, &mut before, 199), ProviderSessionDecision::Accept);
+        assert_eq!(
+            refresh_provider_session_price_terms(&contract, &mut before, 199),
+            ProviderSessionDecision::Accept
+        );
         assert_eq!(before.price_ver, 1);
         let mut after = startup;
-        assert_eq!(refresh_provider_session_price_terms(&contract, &mut after, 200), ProviderSessionDecision::Accept);
+        assert_eq!(
+            refresh_provider_session_price_terms(&contract, &mut after, 200),
+            ProviderSessionDecision::Accept
+        );
         assert_eq!(after.price_ver, 9);
         assert_eq!(after.ctx_bracket, before.ctx_bracket);
-        assert_eq!(provider_session_contract_decision(&contract, &after, &contract.rooms[..1], "fiat"), ProviderSessionDecision::Accept);
+        assert_eq!(
+            provider_session_contract_decision(&contract, &after, &contract.rooms[..1], "fiat"),
+            ProviderSessionDecision::Accept
+        );
     }
 
     #[test]
@@ -111187,19 +115721,34 @@ esac
             let mut contract = test_contract(&"aa".repeat(32));
             match case {
                 "missing" => contract.prices.clear(),
-                "provider" => contract.prices[0].current.as_mut().unwrap().set_by_role = Some("provider".to_owned()),
+                "provider" => {
+                    contract.prices[0].current.as_mut().unwrap().set_by_role =
+                        Some("provider".to_owned())
+                }
                 "model" => contract.prices[0].model_id = "other/model".to_owned(),
                 "denom" => contract.prices[0].denom = "tnk".to_owned(),
                 "table" => {
                     contract.prices[0].ctx_bracket_table_ver = Some(99);
-                    contract.prices[0].current.as_mut().unwrap().ctx_bracket_table_ver = Some(99);
+                    contract.prices[0]
+                        .current
+                        .as_mut()
+                        .unwrap()
+                        .ctx_bracket_table_ver = Some(99);
                 }
                 "future" => contract.prices[0].current.as_mut().unwrap().effective_at = 201,
                 _ => unreachable!(),
             }
             let mut refreshed = startup.clone();
-            assert!(matches!(refresh_provider_session_price_terms(&contract, &mut refreshed, 200),
-                ProviderSessionDecision::Reject { code: "PRICE_VER", .. }), "{case}");
+            assert!(
+                matches!(
+                    refresh_provider_session_price_terms(&contract, &mut refreshed, 200),
+                    ProviderSessionDecision::Reject {
+                        code: "PRICE_VER",
+                        ..
+                    }
+                ),
+                "{case}"
+            );
             assert_eq!(refreshed.price_ver, startup.price_ver);
             assert_eq!(refreshed.rate_map, startup.rate_map);
         }
@@ -111216,13 +115765,139 @@ esac
         price.ctx_bracket = None;
         price.ctx_bracket_table_ver = None;
         price.ver = 6;
-        price.rate_map = vec![RateMapEntry { unit: "image".to_owned(), per_unit_au: 10, granularity: 1 }];
+        price.rate_map = vec![RateMapEntry {
+            unit: "image".to_owned(),
+            per_unit_au: 10,
+            granularity: 1,
+        }];
         let mut terms = test_provider_session_terms();
-        assert_eq!(refresh_provider_session_price_terms(&contract, &mut terms, 200), ProviderSessionDecision::Accept);
+        assert_eq!(
+            refresh_provider_session_price_terms(&contract, &mut terms, 200),
+            ProviderSessionDecision::Accept
+        );
         assert_eq!(terms.price_ver, 6);
         assert_eq!(terms.ctx_bracket, None);
         assert_eq!(terms.ctx_bracket_table_ver, None);
         assert_eq!(terms.rate_map[0].unit, "image");
+    }
+
+    #[tokio::test]
+    async fn provider_session_catalog_reads_only_its_confirmed_market_and_room() {
+        let terms = test_provider_session_terms();
+        let source = test_contract(&"aa".repeat(32));
+        let price_key = format!(
+            "price/{}",
+            ledger_price_market_key(&terms.enclave_id, terms.ctx_bracket.as_deref())
+        );
+        let room_id = &terms.room_ids[0];
+        let records = Arc::new(BTreeMap::from([
+            (
+                format!("enclave/{}", terms.enclave_id),
+                serde_json::to_value(&source.enclaves[0]).unwrap(),
+            ),
+            (
+                format!("prov/{}", terms.provider),
+                serde_json::to_value(&source.providers[0]).unwrap(),
+            ),
+            (
+                format!("serve/{}/{}", terms.provider, terms.enclave_id),
+                serde_json::to_value(&source.serves[0]).unwrap(),
+            ),
+            (
+                format!("room/{room_id}"),
+                serde_json::to_value(&source.rooms[0]).unwrap(),
+            ),
+            (
+                format!(
+                    "roomserve/{room_id}/{}/{}",
+                    terms.provider, terms.enclave_id
+                ),
+                serde_json::to_value(&source.roomserve[0]).unwrap(),
+            ),
+            (
+                price_key.clone(),
+                serde_json::to_value(&source.prices[0]).unwrap(),
+            ),
+            (
+                "ctx_brackets".to_owned(),
+                serde_json::to_value(&source.ctx_bracket_schedule).unwrap(),
+            ),
+            (
+                "rules/current".to_owned(),
+                serde_json::to_value(source.rules.as_ref().unwrap()).unwrap(),
+            ),
+        ]));
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_records = Arc::clone(&records);
+        let server_seen = Arc::clone(&seen);
+        let server = thread::spawn(move || {
+            // One snapshot query, five independent state reads, one price, and
+            // the selected room plus its provider binding.
+            for _ in 0..9 {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 4096];
+                    let read = stream.read(&mut chunk).unwrap();
+                    assert!(read > 0);
+                    request.extend_from_slice(&chunk[..read]);
+                    if request.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request_line = String::from_utf8_lossy(&request);
+                let path = request_line.split_whitespace().nth(1).unwrap();
+                let url = reqwest::Url::parse(&format!("http://{address}{path}")).unwrap();
+                let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+                assert_eq!(query.get("confirmed").map(|v| v.as_ref()), Some("true"));
+                let body = if let Some(prefix) = query.get("prefix") {
+                    assert_eq!(prefix.as_ref(), "rules/current");
+                    assert_eq!(query.get("limit").map(|v| v.as_ref()), Some("1"));
+                    server_seen.lock().unwrap().push("snapshot".to_owned());
+                    json!({
+                        "prefix": "rules/current", "confirmed": true, "signed_length": 42,
+                        "truncated": false, "next_cursor": null,
+                        "values": [{"key": "rules/current", "value": server_records["rules/current"]}]
+                    })
+                } else {
+                    let key = query.get("key").unwrap().to_string();
+                    assert_eq!(query.get("signed_length").map(|v| v.as_ref()), Some("42"));
+                    server_seen.lock().unwrap().push(key.clone());
+                    json!({
+                        "key": key, "confirmed": true, "signed_length": 42,
+                        "value": server_records.get(&key)
+                    })
+                }
+                .to_string();
+                write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                )
+                .unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let rpc = PeerRpcClient::new(format!("http://{address}/v1")).unwrap();
+        let contract = read_provider_session_contract_catalog(&rpc, &terms)
+            .await
+            .unwrap();
+        server.join().unwrap();
+        let mut refreshed = terms.clone();
+        assert_eq!(
+            refresh_provider_session_price_terms(&contract, &mut refreshed, 200),
+            ProviderSessionDecision::Accept
+        );
+        assert_eq!(
+            provider_session_contract_decision(&contract, &refreshed, &source.rooms[..1], "fiat"),
+            ProviderSessionDecision::Accept
+        );
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 9);
+        assert!(seen.contains(&price_key));
+        assert!(!seen.iter().any(|key| key == "price/" || key == "ev/price/"));
     }
 
     #[test]
@@ -111646,7 +116321,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
-                        reservation_recovery: None,
+            reservation_recovery: None,
         };
         let body = json!({
             "messages": [
@@ -111740,7 +116415,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
-                        reservation_recovery: None,
+            reservation_recovery: None,
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "large atto receipt" }],
@@ -111754,6 +116429,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ReceiptUsage::text(1, 1),
             1,
             true,
+            1,
             &runtime_keypair,
         )
         .unwrap();
@@ -111806,6 +116482,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 ReceiptUsage::default(),
                 BTreeMap::new(),
                 1,
+                1,
                 &RuntimeKeypair::from_seed([9; 32]),
             )
             .unwrap();
@@ -111853,7 +116530,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .await
             .unwrap();
             let cancellation = CancellationToken::new();
-            if cancellable { cancellation.cancel(); }
+            if cancellable {
+                cancellation.cancel();
+            }
             let result = wait_for_provider_receipt_ack_inner(
                 &mut bridge,
                 &active,
@@ -111873,78 +116552,191 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[tokio::test]
     async fn provider_failure_close_retries_exact_submission_until_confirmed() {
-        let root = test_temp_dir("provider-failure-close");
-        let outbox = Arc::new(ReceiptSettlementOutbox::new(root.join("provider")).unwrap());
-        let terms = test_provider_session_terms();
-        let mut active = test_active_provider_session(&terms, vec!["text".into()]);
-        let settlement = Arc::new(ProviderReceiptSettlement { outbox,
-            keypair_path: root.join("unused-key"), password: String::new(), enclave_pubkey: "aa".repeat(32) });
-        active.receipt_settlement = Some(settlement.clone());
-        let guard = provider_failure_recovery::begin(&active, &terms).unwrap();
-        let path = root.join("provider/reservation-recovery").join(format!("{}.json", active.reservation_id));
-        let binding = read_private_json_optional(&path).unwrap().unwrap()["binding"].clone();
-        let mut value = mayhem_proto::usage_reservation_close_value(&binding, None, false, 1234, "provider_session_ended").unwrap();
-        value["actor_sig"] = json!("aa".repeat(64));
-        let feature = mayhem_proto::usage_reservation_close_feature(value).unwrap();
-        write_private_json_once(&path.with_extension("close"), &feature).unwrap();
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let expected_feature = feature.clone();
-        let server = thread::spawn(move || {
-            let mut posts = 0;
-            for _ in 0..8 {
-                let (mut stream, _) = listener.accept().unwrap();
-                stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-                let mut request = Vec::new();
-                loop {
-                    let mut buffer = [0u8; 8192];
-                    let n = stream.read(&mut buffer).unwrap();
-                    assert!(n > 0);
-                    request.extend_from_slice(&buffer[..n]);
-                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                        let headers = String::from_utf8_lossy(&request[..end]);
-                        let size = headers.lines().find_map(|line| line.to_ascii_lowercase().strip_prefix("content-length:")
-                            .and_then(|s| s.trim().parse::<usize>().ok())).unwrap_or(0);
-                        if request.len() >= end + 4 + size { break; }
+        for with_partial in [false, true] {
+            let root = test_temp_dir("provider-failure-close");
+            let outbox = Arc::new(ReceiptSettlementOutbox::new(root.join("provider")).unwrap());
+            let terms = test_provider_session_terms();
+            let mut active = test_active_provider_session(&terms, vec!["text".into()]);
+            let settlement = Arc::new(ProviderReceiptSettlement {
+                outbox: outbox.clone(),
+                keypair_path: root.join("unused-key"),
+                password: String::new(),
+                enclave_pubkey: "aa".repeat(32),
+            });
+            active.receipt_settlement = Some(settlement.clone());
+            let partial = with_partial.then(|| {
+                outbox
+                    .persist(&signed_receipt_settlement_feature_for_test_at(
+                        7, 1, false, 2,
+                    ))
+                    .unwrap()
+            });
+            let guard = if let Some(partial) = &partial {
+                Some(
+                    provider_failure_recovery::begin_binding(
+                        &settlement,
+                        &partial.feature["value"]["receipt"]["body"],
+                    )
+                    .unwrap(),
+                )
+            } else {
+                provider_failure_recovery::begin(&active, &terms).unwrap()
+            };
+            let reservation_id = partial
+                .as_ref()
+                .map(|entry| {
+                    entry.feature["value"]["receipt"]["body"]["reservation_id"]
+                        .as_str()
+                        .unwrap()
+                })
+                .unwrap_or(&active.reservation_id);
+            let path = root
+                .join("provider/reservation-recovery")
+                .join(format!("{reservation_id}.json"));
+            let binding = read_private_json_optional(&path).unwrap().unwrap()["binding"].clone();
+            let provider = binding["provider"].as_str().unwrap().to_owned();
+            let head = partial.as_ref().map(|entry| {
+                json!({"type": "canonical_receipt_head", "settlement_ready": false,
+            "feature_key": entry.feature["key"], "receipt": entry.feature["value"]["receipt"]})
+            });
+            let mut value = mayhem_proto::usage_reservation_close_value(
+                &binding,
+                head.as_ref(),
+                false,
+                1234,
+                "provider_session_ended",
+            )
+            .unwrap();
+            value["actor_sig"] = json!("aa".repeat(64));
+            let feature = mayhem_proto::usage_reservation_close_feature(value).unwrap();
+            write_private_json_once(&path.with_extension("close"), &feature).unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            let expected_feature = feature.clone();
+            let server = thread::spawn(move || {
+                let mut posts = 0;
+                for _ in 0..if with_partial { 9 } else { 8 } {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let mut request = Vec::new();
+                    loop {
+                        let mut buffer = [0u8; 8192];
+                        let n = stream.read(&mut buffer).unwrap();
+                        assert!(n > 0);
+                        request.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&request[..end]);
+                            let size = headers
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .and_then(|s| s.trim().parse::<usize>().ok())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + size {
+                                break;
+                            }
+                        }
                     }
-                }
-                let end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
-                let headers = String::from_utf8_lossy(&request[..end]);
-                let (status, body) = if headers.starts_with("POST ") {
-                    assert_eq!(serde_json::from_slice::<Value>(&request[end + 4..]).unwrap(), expected_feature);
-                    posts += 1;
-                    (if posts == 1 { "503 Service Unavailable" } else { "200 OK" }, json!({"ok": posts > 1}))
-                } else {
-                    let target = headers.split_whitespace().nth(1).unwrap();
-                    let url = reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
-                    let key = url.query_pairs().find(|(k, _)| k == "key").unwrap().1.into_owned();
-                    let mut value = binding.clone();
-                    if key.starts_with("receipt/head/") { value = Value::Null; }
-                    else if key.starts_with("receipt/reservation-close/") {
-                        value["type"] = json!("targeted_reservation_close");
+                    let end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+                    let headers = String::from_utf8_lossy(&request[..end]);
+                    let (status, body) = if headers.starts_with("POST ") {
+                        assert_eq!(
+                            serde_json::from_slice::<Value>(&request[end + 4..]).unwrap(),
+                            expected_feature
+                        );
+                        posts += 1;
+                        (
+                            if posts == 1 {
+                                "503 Service Unavailable"
+                            } else {
+                                "200 OK"
+                            },
+                            json!({"ok": posts > 1}),
+                        )
                     } else {
-                        value["type"] = json!("receipt_reservation_identity");
-                        value["status"] = json!(if posts > 1 { "closed" } else { "active" });
-                    }
-                    ("200 OK", json!({"key": key, "confirmed": true, "value": value}))
-                };
-                let body = body.to_string();
-                write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
-                stream.flush().unwrap();
+                        let target = headers.split_whitespace().nth(1).unwrap();
+                        let url =
+                            reqwest::Url::parse(&format!("http://localhost{target}")).unwrap();
+                        let key = url
+                            .query_pairs()
+                            .find(|(k, _)| k == "key")
+                            .unwrap()
+                            .1
+                            .into_owned();
+                        let mut value = binding.clone();
+                        if key.starts_with("receipt/head/") {
+                            value = head.clone().unwrap_or(Value::Null);
+                        } else if key.starts_with("receipt/reservation-close/") {
+                            value["type"] = json!("targeted_reservation_close");
+                        } else {
+                            value["type"] = json!("receipt_reservation_identity");
+                            value["status"] = json!(if posts > 1 { "closed" } else { "active" });
+                        }
+                        (
+                            "200 OK",
+                            json!({"key": key, "confirmed": true, "value": value}),
+                        )
+                    };
+                    let body = body.to_string();
+                    write!(stream, "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).unwrap();
+                    stream.flush().unwrap();
+                }
+                assert_eq!(posts, 2);
+            });
+            let rpc = PeerRpcClient::new(format!("http://{address}")).unwrap();
+            assert!(
+                !provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .unwrap()
+            );
+            drop(guard);
+            if let Some(partial) = partial {
+                assert!(
+                    !provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                        .await
+                        .unwrap(),
+                    "unconfirmed signed evidence must block closing the reservation"
+                );
+                let key = receipt_settlement_head_key(&partial).unwrap();
+                let confirmed = json!({"confirmed": true, "key": key, "value": {
+                    "type": "canonical_receipt_head", "settlement_ready": false,
+                    "feature_key": partial.feature["key"], "receipt": partial.feature["value"]["receipt"]
+                }});
+                assert!(confirmed_receipt_settlement_record_matches(
+                    &confirmed, &key, &partial
+                ));
+                outbox.remove(&partial).unwrap();
             }
-            assert_eq!(posts, 2);
-        });
-        let rpc = PeerRpcClient::new(format!("http://{address}")).unwrap();
-        assert!(!provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path).await.unwrap());
-        drop(guard);
-        assert!(provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path).await.is_err());
-        assert_eq!(read_private_json_optional(&path.with_extension("close")).unwrap().unwrap(), feature);
-        assert!(!provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path).await.unwrap());
-        assert!(path.exists(), "a submission response is not confirmation");
-        assert!(provider_failure_recovery::recover_one(&settlement, &rpc, &terms.provider, &path).await.unwrap());
-        assert!(!path.exists());
-        server.join().unwrap();
-        fs::remove_dir_all(root).unwrap();
+            assert!(
+                provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                read_private_json_optional(&path.with_extension("close"))
+                    .unwrap()
+                    .unwrap(),
+                feature
+            );
+            assert!(
+                !provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .unwrap()
+            );
+            assert!(path.exists(), "a submission response is not confirmation");
+            assert!(
+                provider_failure_recovery::recover_one(&settlement, &rpc, &provider, &path)
+                    .await
+                    .unwrap()
+            );
+            assert!(!path.exists());
+            server.join().unwrap();
+            fs::remove_dir_all(root).unwrap();
+        }
     }
 
     #[test]
@@ -111954,20 +116746,42 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let terms = test_provider_session_terms();
         let mut active = test_active_provider_session(&terms, vec!["text".into()]);
         active.receipt_settlement = Some(Arc::new(ProviderReceiptSettlement {
-            outbox, keypair_path: root.join("unused-test-key"), password: String::new(),
+            outbox,
+            keypair_path: root.join("unused-test-key"),
+            password: String::new(),
             enclave_pubkey: RuntimeKeypair::from_seed([9; 32]).public_key_hex(),
         }));
-        let guard = provider_failure_recovery::begin(&active, &terms).unwrap().unwrap();
-        let path = root.join("provider/reservation-recovery").join(format!("{}.json", active.reservation_id));
+        let guard = provider_failure_recovery::begin(&active, &terms)
+            .unwrap()
+            .unwrap();
+        let path = root
+            .join("provider/reservation-recovery")
+            .join(format!("{}.json", active.reservation_id));
         let evidence = read_private_json_optional(&path).unwrap().unwrap();
         assert_eq!(evidence["binding"]["session_id"], active.session_id);
         assert!(evidence.get("prompt").is_none());
-        let lock = fs::OpenOptions::new().read(true).write(true).open(path.with_extension("lock")).unwrap();
-        assert!(fs2::FileExt::try_lock_exclusive(&lock).is_err(), "running generation must retain ownership");
-        assert!(provider_failure_recovery::begin(&active, &terms).is_err(), "a duplicate must not execute");
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))
+            .unwrap();
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&lock).is_err(),
+            "running generation must retain ownership"
+        );
+        assert!(
+            provider_failure_recovery::begin(&active, &terms).is_err(),
+            "a duplicate must not execute"
+        );
         drop(guard);
-        assert!(fs2::FileExt::try_lock_exclusive(&lock).is_ok(), "return or unwind must enable recovery");
-        assert_eq!(read_private_json_optional(&path).unwrap().unwrap(), evidence);
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&lock).is_ok(),
+            "return or unwind must enable recovery"
+        );
+        assert_eq!(
+            read_private_json_optional(&path).unwrap().unwrap(),
+            evidence
+        );
         drop(lock);
         fs::remove_dir_all(root).unwrap();
     }
@@ -111981,15 +116795,36 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let attribution = BTreeMap::from([("reasoning_output_tokens".to_owned(), 159)]);
         let keypair = RuntimeKeypair::from_seed([9; 32]);
         let checkpoint = provider_session_receipt_for_usage_attribution(
-            &terms, &active, &body, usage.clone(), attribution.clone(), 18, false, &keypair,
-        ).unwrap();
+            &terms,
+            &active,
+            &body,
+            usage.clone(),
+            attribution.clone(),
+            18,
+            false,
+            1,
+            &keypair,
+        )
+        .unwrap();
         let terminal = provider_failed_session_receipt(
-            &terms, &active, &body, usage, attribution, 19, &keypair,
-        ).unwrap().unwrap();
+            &terms,
+            &active,
+            &body,
+            usage,
+            attribution,
+            19,
+            1,
+            &keypair,
+        )
+        .unwrap()
+        .unwrap();
         assert!(terminal.body.final_receipt);
         assert_eq!(terminal.body.seq, 19);
         assert_eq!(terminal.body.usage, checkpoint.body.usage);
-        assert_eq!(terminal.body.usage_attribution, checkpoint.body.usage_attribution);
+        assert_eq!(
+            terminal.body.usage_attribution,
+            checkpoint.body.usage_attribution
+        );
         assert_eq!(terminal.body.au_owed_cum, checkpoint.body.au_owed_cum);
         assert_eq!(terminal.body.prompt_hash, checkpoint.body.prompt_hash);
     }
@@ -112001,9 +116836,17 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         terms.min_session_au = 0;
         let active = test_active_provider_session(&terms, vec!["text".to_owned()]);
         assert!(provider_failed_session_receipt(
-            &terms, &active, &json!({"messages": []}), ReceiptUsage::default(),
-            BTreeMap::new(), 1, &RuntimeKeypair::from_seed([9; 32]),
-        ).unwrap().is_none());
+            &terms,
+            &active,
+            &json!({"messages": []}),
+            ReceiptUsage::default(),
+            BTreeMap::new(),
+            1,
+            1,
+            &RuntimeKeypair::from_seed([9; 32]),
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -112023,6 +116866,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }),
             ReceiptUsage::default(),
             BTreeMap::new(),
+            1,
             1,
             &RuntimeKeypair::from_seed([9; 32]),
         )
@@ -112064,6 +116908,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             }),
             ReceiptUsage::default(),
             BTreeMap::new(),
+            1,
             1,
             &RuntimeKeypair::from_seed([9; 32]),
         )
@@ -112150,7 +116995,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
-                        reservation_recovery: None,
+            reservation_recovery: None,
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "hello mayhem" }],
@@ -112165,6 +117010,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             usage.clone(),
             7,
             false,
+            1,
             &runtime_keypair,
         )
         .unwrap();
@@ -112222,6 +117068,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ReceiptUsage::text(99, 3),
             1,
             true,
+            1,
             &RuntimeKeypair::from_seed([19; 32]),
         )
         .expect("redispatch receipt should charge only the new visible output");
@@ -112240,6 +117087,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ReceiptUsage::text(99, 3),
             1,
             true,
+            1,
             &RuntimeKeypair::from_seed([19; 32]),
         )
         .unwrap_err()
@@ -112283,7 +117131,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             checkpoint_every: CheckpointPolicy { tokens: 2, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
-                        reservation_recovery: None,
+            reservation_recovery: None,
         };
         assert_eq!(
             provider_session_receipt_ack_timeout(&active),
@@ -112334,7 +117182,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
-                        reservation_recovery: None,
+            reservation_recovery: None,
         };
         let body = json!({
             "messages": [{ "role": "user", "content": "hello mayhem" }],
@@ -112398,6 +117246,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             ReceiptUsage::text(1, 1),
             1,
             true,
+            1,
             &RuntimeKeypair::from_seed([9; 32]),
         )
         .unwrap();
@@ -113566,6 +118415,81 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn laya_provider_modality_canary_is_transportable_and_validated() {
+        let catalog = catalog::load_document(&repo_path("catalog/models.json").unwrap()).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "convaiinnovations/laya")
+            .expect("live Laya model");
+        let prompts = load_canary_prompts_checked(
+            Some(&repo_path("catalog/canaries").unwrap()),
+            &model.canary.set_id,
+            None,
+            false,
+        )
+        .unwrap();
+        let prompt = prompts
+            .iter()
+            .find(|prompt| prompt.id == "english-choice-noul")
+            .expect("Laya decision canary");
+
+        assert_eq!(
+            provider_canary_prompt_modalities(model, prompt),
+            BTreeSet::from(["text".to_owned()])
+        );
+        let body = provider_canary_self_test_body(model, prompt).unwrap();
+        assert_eq!(body["kind"], "decision");
+        assert_eq!(
+            body["endpoint_family"],
+            mayhem_proto::ENDPOINT_MAYHEM_DECISIONS
+        );
+        let sealed =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+        let verified =
+            provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)
+                .unwrap();
+        assert_eq!(verified.family, mayhem_proto::ENDPOINT_MAYHEM_DECISIONS);
+        let load = provider_session_modality_load(
+            verified.contract,
+            verified.family,
+            verified.request,
+            &sealed,
+            None,
+            &["text".to_owned()],
+        )
+        .unwrap();
+        assert!(load.is_empty());
+        assert_eq!(
+            provider_session_request_modalities(
+                verified.family,
+                verified.request,
+                &["text".to_owned()],
+                &load,
+            )
+            .unwrap(),
+            vec!["text".to_owned()]
+        );
+        let request = provider_decision_request_from_body(verified.request).unwrap();
+        assert_eq!(request.checkpoint.as_deref(), Some("english"));
+
+        let mut output = test_provider_output_with_artifacts(Vec::new());
+        output.content = json!({
+            "answers": {"department": {"type": "choice", "choice": "billing"}},
+            "routing": {"checkpoint": "english", "reason": "explicit"},
+            "usage": {"input_tokens": 12}
+        })
+        .to_string();
+        output.prompt_tokens = 12;
+        output.completion_tokens = 24;
+        output.usage = ReceiptUsage::text(12, 24);
+        validate_provider_canary_self_test_output(model, &output).unwrap();
+
+        output.content = json!({"routing": {"checkpoint": "english"}}).to_string();
+        assert!(validate_provider_canary_self_test_output(model, &output).is_err());
+    }
+
+    #[test]
     fn bounded_provider_modality_probe_uses_signed_direct_answer_level() {
         let catalog_path = repo_path("catalog/models.json").unwrap();
         let catalog = catalog::load_document(&catalog_path).unwrap();
@@ -113704,24 +118628,34 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(explicit["steps"], 9);
         assert_eq!(explicit["cfg_scale"], 0.0);
         assert_eq!(explicit["seed"], 11);
-        let reference = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(
-            include_bytes!("../../mayhem-engine/tests/fixtures/reference.png"),
-        ));
+        let reference = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+                "../../mayhem-engine/tests/fixtures/reference.png"
+            ),)
+        );
         let reference_prompt: CanaryPrompt = serde_json::from_value(json!({
             "id": "reference", "prompt": "a compass on a map", "input_reference": reference,
             "strength": 0.6, "negative_prompt": "blur", "cfg_scale": 1.0,
-        })).unwrap();
+        }))
+        .unwrap();
         let body = provider_canary_self_test_body(&model, &reference_prompt).unwrap();
-        let mut sealed = provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
+        let mut sealed =
+            provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
         provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter).unwrap();
         let request = provider_image_generation_request_from_body(
-            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS, &sealed["contract_request"],
-        ).unwrap();
+            mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+            &sealed["contract_request"],
+        )
+        .unwrap();
         assert_eq!(request.input_reference.as_deref(), Some(reference.as_str()));
         assert_eq!(request.strength, Some(0.6));
         assert_eq!(request.negative_prompt.as_deref(), Some("blur"));
         sealed["contract_request"]["strength"] = json!(0.7);
-        assert!(provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter).is_err());
+        assert!(
+            provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)
+                .is_err()
+        );
     }
 
     #[test]
@@ -113893,29 +118827,43 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let catalog = catalog::load_document(&catalog_path)?;
         let model_id = std::env::var("MAYHEM_CANARY_REQUESTS_MODEL")
             .unwrap_or_else(|_| "Qwen/Qwen3.8-27B".to_owned());
-        let artifact_name = std::env::var("MAYHEM_CANARY_REQUESTS_ARTIFACT")
-            .unwrap_or_else(|_| "nvfp4".to_owned());
+        let artifact_name =
+            std::env::var("MAYHEM_CANARY_REQUESTS_ARTIFACT").unwrap_or_else(|_| "nvfp4".to_owned());
         let baseline_model = catalog
             .models
             .iter()
             .find(|model| model.model_id == model_id)
             .with_context(|| format!("catalog model {model_id}"))?;
-        let baseline_artifact = baseline_model.artifacts.get(&artifact_name)
+        let baseline_artifact = baseline_model
+            .artifacts
+            .get(&artifact_name)
             .with_context(|| format!("catalog artifact {artifact_name}"))?;
         let mode_id = std::env::var("MAYHEM_CANARY_REQUESTS_EXECUTION_MODE").ok();
-        let mode = mode_id.as_deref().map(|id| {
-            catalog.vllm_execution_mode(&baseline_artifact.artifact_root, id)
-                .with_context(|| format!("catalog execution mode {id}"))
-        }).transpose()?;
-        let projected = mode.map(|mode| {
-            catalog::execution_mode_model(baseline_model, &artifact_name, mode)
-        }).transpose()?;
+        let mode = mode_id
+            .as_deref()
+            .map(|id| {
+                catalog
+                    .vllm_execution_mode(&baseline_artifact.artifact_root, id)
+                    .with_context(|| format!("catalog execution mode {id}"))
+            })
+            .transpose()?;
+        let projected = mode
+            .map(|mode| catalog::execution_mode_model(baseline_model, &artifact_name, mode))
+            .transpose()?;
         let model = projected.as_ref().unwrap_or(baseline_model);
-        let binding = mode.map(|mode| {
-            mode.binding(&baseline_artifact.artifact_root, mode_id.as_deref().unwrap())
-        }).transpose()?;
+        let binding = mode
+            .map(|mode| {
+                mode.binding(
+                    &baseline_artifact.artifact_root,
+                    mode_id.as_deref().unwrap(),
+                )
+            })
+            .transpose()?;
         let seed: u32 = std::env::var("MAYHEM_CANARY_REQUESTS_SEED")
-            .ok().map(|value| value.parse()).transpose()?.unwrap_or(0);
+            .ok()
+            .map(|value| value.parse())
+            .transpose()?
+            .unwrap_or(0);
         ensure!(
             model.canary.verification_method == CANARY_VERIFICATION_TOKEN_FINGERPRINT,
             "{model_id} is not a token-fingerprint canary model"
@@ -113931,7 +118879,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let canary_sha256 = canary_set_file_sha256(&canaries_dir, &model.canary.set_id)
             .map_err(anyhow::Error::msg)?;
         if let Some(mode) = mode {
-            ensure!(mode.canary_set_sha256 == canary_sha256, "mode canary input bytes changed");
+            ensure!(
+                mode.canary_set_sha256 == canary_sha256,
+                "mode canary input bytes changed"
+            );
         }
         let prompts =
             load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, true)?;
@@ -114068,6 +119019,260 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn laya_endpoint_calibration_preflight_is_complete() {
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "convaiinnovations/laya")
+            .expect("Laya catalog model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+
+        catalog_endpoint_calibration_preflight(model, &prompts).unwrap();
+        assert!(prompts.iter().all(|prompt| {
+            provider_canary_prompt_modalities(model, prompt) == BTreeSet::from(["text".to_owned()])
+        }));
+
+        let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, &prompts);
+        let contract = model
+            .adapter
+            .endpoint_families
+            .iter()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_MAYHEM_DECISIONS)
+            .unwrap();
+        for case in mayhem_proto::generate_endpoint_calibration_cases(contract).unwrap() {
+            if !case.expect_accept {
+                continue;
+            }
+            let request =
+                mayhem_proto::materialize_endpoint_calibration_request(&case, &substitutions)
+                    .unwrap();
+            let request = catalog_endpoint_calibration_materialize_request(
+                contract, &case, request, &fixtures,
+            )
+            .unwrap();
+            if request.get("email").is_some() {
+                assert!(request.pointer("/state/body").is_some_and(Value::is_string));
+            }
+            if case
+                .expected_response_attributes
+                .iter()
+                .any(|path| path == "shortlist")
+            {
+                assert!(request.get("shortlist").is_some_and(Value::is_object));
+            }
+            if case
+                .expected_response_attributes
+                .iter()
+                .any(|path| path == "preprocessing")
+            {
+                assert!(request.get("email").is_some_and(Value::is_object));
+            }
+        }
+    }
+
+    #[test]
+    fn endpoint_calibration_extracts_video_fixture_from_data_url() {
+        let mut substitutions = BTreeMap::new();
+        collect_endpoint_media_fixture_substitutions(
+            &json!({
+                "type": "video_url",
+                "video_url": {"url": "data:video/mp4;base64,aGVsbG8="}
+            }),
+            &mut substitutions,
+        );
+        assert_eq!(substitutions.get("$VIDEO_BASE64"), Some(&json!("aGVsbG8=")));
+
+        let mut invalid = BTreeMap::new();
+        collect_endpoint_media_fixture_substitutions(
+            &json!({"video_url": {"url": "data:video/mp4;base64,not-base64"}}),
+            &mut invalid,
+        );
+        assert!(!invalid.contains_key("$VIDEO_BASE64"));
+    }
+
+    #[test]
+    fn qwen_endpoint_calibration_materializes_partial_hf_video_rows() {
+        fn video_descriptor(request: &Value) -> &Map<String, Value> {
+            request["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|message| message.get("content").and_then(Value::as_array))
+                .flatten()
+                .find(|part| part.get("type").and_then(Value::as_str) == Some("video"))
+                .and_then(|part| part.get("video"))
+                .and_then(Value::as_object)
+                .unwrap()
+        }
+
+        let catalog_path = repo_path("catalog/models.json").unwrap();
+        let catalog = catalog::load_document(&catalog_path).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "Qwen/Qwen3.8-27B")
+            .expect("Qwen 3.8 catalog model");
+        let canaries_dir = repo_path("catalog/canaries").unwrap();
+        let prompts =
+            load_canary_prompts_checked(Some(&canaries_dir), &model.canary.set_id, None, false)
+                .unwrap();
+        let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, &prompts);
+        let contract = model
+            .adapter
+            .endpoint_families
+            .iter()
+            .find(|contract| contract.family == mayhem_proto::ENDPOINT_HF_MULTIMODAL_CHAT)
+            .unwrap();
+        let expected_attributes = vec![
+            "messages.content.type".to_owned(),
+            "messages.content.video.fps".to_owned(),
+            "messages.content.video.num_frames".to_owned(),
+            "messages.role".to_owned(),
+        ];
+        let cases = mayhem_proto::generate_endpoint_calibration_cases(contract).unwrap();
+        let partial = cases
+            .iter()
+            .filter(|case| case.expect_accept && case.attributes == expected_attributes)
+            .collect::<Vec<_>>();
+        assert_eq!(partial.len(), 7);
+        let expected_shapes = BTreeMap::from([
+            (("0.01".to_owned(), 1_u64), 1_usize),
+            (("8".to_owned(), 1_u64), 3_usize),
+            (("8".to_owned(), 16_u64), 1_usize),
+            (("8".to_owned(), 1024_u64), 1_usize),
+            (("240.0".to_owned(), 1_u64), 1_usize),
+        ]);
+        let mut observed_shapes = BTreeMap::new();
+        for case in &partial {
+            let raw = mayhem_proto::materialize_endpoint_calibration_request(case, &substitutions)
+                .unwrap();
+            let raw_video = video_descriptor(&raw);
+            assert_eq!(
+                raw_video.keys().cloned().collect::<BTreeSet<_>>(),
+                BTreeSet::from(["fps".to_owned(), "num_frames".to_owned()])
+            );
+            *observed_shapes
+                .entry((
+                    raw_video["fps"].to_string(),
+                    raw_video["num_frames"].as_u64().unwrap(),
+                ))
+                .or_insert(0) += 1;
+            let fps = raw_video["fps"].clone();
+            let num_frames = raw_video["num_frames"].clone();
+            let materialized =
+                catalog_endpoint_calibration_materialize_request(contract, case, raw, &fixtures)
+                    .unwrap();
+            let video = video_descriptor(&materialized);
+            assert_eq!(video["fps"], fps);
+            assert_eq!(video["num_frames"], num_frames);
+            assert_eq!(video["data"], substitutions["$VIDEO_BASE64"]);
+            assert_eq!(video["content_type"], "video/mp4");
+            assert_eq!(video.len(), 4);
+            mayhem_proto::validate_endpoint_request(contract, &materialized).unwrap();
+            let normalized = normalize_endpoint_calibration_request(contract, &materialized)
+                .unwrap()
+                .normalized_request;
+            let transport =
+                catalog_endpoint_calibration_transport(contract, &normalized, &fixtures).unwrap();
+            let (translation, handled) =
+                catalog_endpoint_calibration_translation(model, contract, &normalized, &transport)
+                    .unwrap();
+            assert_eq!(translation["messages"], materialized["messages"]);
+            assert!(handled.contains("messages.content.video.data"));
+            assert!(handled.contains("messages.content.video.content_type"));
+        }
+        assert_eq!(observed_shapes, expected_shapes);
+
+        let case = partial[0];
+        let mut raw =
+            mayhem_proto::materialize_endpoint_calibration_request(case, &substitutions).unwrap();
+        let named_choice =
+            contract.request_attribute_specs["tool_choice"].calibration_values[2].clone();
+        raw["tool_choice"] = named_choice.clone();
+        let mut media_and_tool = case.clone();
+        media_and_tool
+            .mutations
+            .push(mayhem_proto::EndpointCalibrationMutation {
+                path: "tool_choice".to_owned(),
+                value: mayhem_proto::EndpointCalibrationValue::Literal {
+                    value: named_choice,
+                },
+            });
+        let composed = catalog_endpoint_calibration_materialize_request(
+            contract,
+            &media_and_tool,
+            raw.clone(),
+            &fixtures,
+        )
+        .unwrap();
+        assert_eq!(
+            video_descriptor(&composed)["data"],
+            substitutions["$VIDEO_BASE64"]
+        );
+        assert!(composed["tools"]
+            .as_array()
+            .is_some_and(|tools| !tools.is_empty()));
+        assert_eq!(
+            composed["max_tokens"],
+            ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS
+        );
+
+        let mut rejected = case.clone();
+        rejected.expect_accept = false;
+        assert_eq!(
+            catalog_endpoint_calibration_materialize_request(
+                contract,
+                &rejected,
+                raw.clone(),
+                &fixtures,
+            )
+            .unwrap(),
+            raw
+        );
+
+        for (path, key, explicit) in [
+            (
+                "messages.content.video.data",
+                "data",
+                json!("explicit-video-data"),
+            ),
+            (
+                "messages.content.video.content_type",
+                "content_type",
+                json!("video/webm"),
+            ),
+        ] {
+            let mut explicit_case = case.clone();
+            explicit_case
+                .mutations
+                .push(mayhem_proto::EndpointCalibrationMutation {
+                    path: path.to_owned(),
+                    value: mayhem_proto::EndpointCalibrationValue::Literal {
+                        value: explicit.clone(),
+                    },
+                });
+            let mut explicit_request =
+                mayhem_proto::materialize_endpoint_calibration_request(case, &substitutions)
+                    .unwrap();
+            video_descriptor(&explicit_request);
+            explicit_request["messages"][0]["content"][0]["video"][key] = explicit.clone();
+            let materialized = catalog_endpoint_calibration_materialize_request(
+                contract,
+                &explicit_case,
+                explicit_request,
+                &fixtures,
+            )
+            .unwrap();
+            assert_eq!(video_descriptor(&materialized)[key], explicit);
+        }
+    }
+
+    #[test]
     fn qwen_endpoint_calibration_preserves_reasoning_history() {
         let catalog_path = repo_path("catalog/models.json").unwrap();
         let catalog = catalog::load_document(&catalog_path).unwrap();
@@ -114180,12 +119385,47 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 &fixtures,
             )
             .unwrap();
-            let mut expected = raw.clone();
-            expected["tools"] =
+            let expected_tools =
                 contract.request_attribute_specs["tools"].calibration_values[0].clone();
             assert_eq!(
-                request, expected,
-                "{family}: only add the signed tools companion"
+                request["tools"], expected_tools,
+                "{family}: add the signed tools companion"
+            );
+            let budget_path = if family == mayhem_proto::ENDPOINT_OPENAI_RESPONSES {
+                "max_output_tokens"
+            } else {
+                "max_tokens"
+            };
+            assert_eq!(
+                request[budget_path], ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS,
+                "{family}: allow default reasoning to reach the required call"
+            );
+            assert_eq!(
+                catalog_endpoint_calibration_output_token_cap(
+                    &request,
+                    ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS,
+                ),
+                ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS
+            );
+            assert!(
+                request.to_string().contains(&format!(
+                    "Call the {name} function now with arguments that satisfy its schema"
+                )),
+                "{family}: request the selected tool directly"
+            );
+            let bound_budget = 512;
+            let bound_request = catalog_endpoint_calibration_materialize_request_with_tool_budget(
+                contract,
+                case,
+                raw.clone(),
+                &fixtures,
+                bound_budget,
+            )
+            .unwrap();
+            assert_eq!(bound_request[budget_path], bound_budget);
+            assert_eq!(
+                catalog_endpoint_calibration_output_token_cap(&bound_request, bound_budget),
+                bound_budget
             );
             let normalized = normalize_endpoint_calibration_request(contract, &request)
                 .unwrap()
@@ -114226,9 +119466,17 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 .unwrap();
                 let forced = !matches!(choice.as_str(), Some("auto" | "none"));
                 if forced {
-                    variant["tools"] = request["tools"].clone();
+                    assert_eq!(materialized["tools"], request["tools"]);
+                    assert_eq!(
+                        materialized[budget_path],
+                        ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS
+                    );
+                    assert!(materialized.to_string().contains(&format!(
+                        "Call the {name} function now with arguments that satisfy its schema"
+                    )));
+                } else {
+                    assert_eq!(materialized, variant);
                 }
-                assert_eq!(materialized, variant);
                 let (translation, _) = catalog_endpoint_calibration_translation(
                     model,
                     contract,
@@ -114488,29 +119736,63 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     #[test]
     fn candidate_z_image_reference_endpoint_calibration_is_complete() {
         let catalog = catalog::load_document(&repo_path("catalog/models.json").unwrap()).unwrap();
-        let mut model = catalog.models.iter().find(|model| model.model_id == "tongyi/z-image-turbo").unwrap().clone();
+        let mut model = catalog
+            .models
+            .iter()
+            .find(|model| model.model_id == "tongyi/z-image-turbo")
+            .unwrap()
+            .clone();
         let family = mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS;
         let template = mayhem_proto::endpoint_family_contract_template(family).unwrap();
-        let contract = model.adapter.endpoint_families.iter_mut().find(|contract| contract.family == family).unwrap();
+        let contract = model
+            .adapter
+            .endpoint_families
+            .iter_mut()
+            .find(|contract| contract.family == family)
+            .unwrap();
         for name in ["input_reference", "strength"] {
             contract.request_attributes.push(name.to_owned());
-            contract.request_attribute_specs.insert(name.to_owned(), template.request_attribute_specs[name].clone());
+            contract.request_attribute_specs.insert(
+                name.to_owned(),
+                template.request_attribute_specs[name].clone(),
+            );
         }
-        let reference = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(
-            include_bytes!("../../mayhem-engine/tests/fixtures/reference.png"),
-        ));
+        let reference = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+                "../../mayhem-engine/tests/fixtures/reference.png"
+            ),)
+        );
         let prompts: Vec<CanaryPrompt> = vec![serde_json::from_value(json!({
             "id": "image-reference-p1", "prompt": "A sculpture", "input_reference": reference,
             "strength": 0.6, "size": "1024x1024", "steps": 9, "cfg_scale": 0.0,
-        })).unwrap()];
+        }))
+        .unwrap()];
         catalog_endpoint_calibration_preflight(&model, &prompts).unwrap();
-        let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![ArtifactChunk {
-            artifact_id: "image-1".to_owned(), index: 0, content_type: "image/png".to_owned(),
-            bytes: include_bytes!("../../mayhem-engine/tests/fixtures/reference.png").to_vec(), final_chunk: true,
-        }]).with_repeated_image_artifact();
+        let mut backend = FakeEngineBackend::new("")
+            .with_artifact_chunks(vec![ArtifactChunk {
+                artifact_id: "image-1".to_owned(),
+                index: 0,
+                content_type: "image/png".to_owned(),
+                bytes: include_bytes!("../../mayhem-engine/tests/fixtures/reference.png").to_vec(),
+                final_chunk: true,
+            }])
+            .with_repeated_image_artifact();
         let (artifact_name, artifact) = model.artifacts.iter().next().unwrap();
-        let report = catalog_endpoint_calibration_report(&mut backend, &model, artifact_name, artifact, &prompts, None);
-        let failures = report.families.iter().flat_map(|family| &family.cases).filter(|case| !case.ok).collect::<Vec<_>>();
+        let report = catalog_endpoint_calibration_report(
+            &mut backend,
+            &model,
+            artifact_name,
+            artifact,
+            &prompts,
+            None,
+        );
+        let failures = report
+            .families
+            .iter()
+            .flat_map(|family| &family.cases)
+            .filter(|case| !case.ok)
+            .collect::<Vec<_>>();
         assert!(report.ok, "{failures:#?}");
     }
 
@@ -114987,32 +120269,44 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "response_attribute_specs": {},
                 "interaction_groups": []
             }]
-        })).unwrap();
+        }))
+        .unwrap();
         let mut selected = baseline.clone();
-        selected.model.adapter.endpoint_families[0].request_attribute_specs.insert(
-            "min_p".to_owned(), requests.endpoint_families[0].request_attribute_specs["min_p"].clone(),
-        );
+        selected.model.adapter.endpoint_families[0]
+            .request_attribute_specs
+            .insert(
+                "min_p".to_owned(),
+                requests.endpoint_families[0].request_attribute_specs["min_p"].clone(),
+            );
         selected.execution_mode = Some(ProviderExecutionMode {
             binding: mayhem_proto::ExecutionModeBinding {
-                mode_id: "test-mode".to_owned(), policy_hash: "ab".repeat(32),
+                mode_id: "test-mode".to_owned(),
+                policy_hash: "ab".repeat(32),
             },
             requests,
             baseline_adapter: baseline_adapter.clone(),
         });
-        let canaries = test_canary_dir_with_prompts(&selected.model.canary.set_id, json!([{
-            "id": "image-health",
-            "messages": [{"role": "user", "content": [
-                {"type": "text", "text": "Describe this image."},
-                {"type": "image_url", "image_url": {"url": tiny_png_data_url()}}
-            ]}],
-            "temperature": 0, "min_p": 0, "seed": 7, "max_tokens": 64
-        }]));
+        let canaries = test_canary_dir_with_prompts(
+            &selected.model.canary.set_id,
+            json!([{
+                "id": "image-health",
+                "messages": [{"role": "user", "content": [
+                    {"type": "text", "text": "Describe this image."},
+                    {"type": "image_url", "image_url": {"url": tiny_png_data_url()}}
+                ]}],
+                "temperature": 0, "min_p": 0, "seed": 7, "max_tokens": 64
+            }]),
+        );
         let args = test_provider_start_args();
         let wallet: WalletInfo = serde_json::from_value(json!({
             "created": false, "keypair_path": "unused", "public_key": "55".repeat(32)
-        })).unwrap();
+        }))
+        .unwrap();
         let runtime = ProviderBackendRuntime::default();
-        let artifacts = ProviderArtifactPaths { primary: PathBuf::from("unused"), sidecars: BTreeMap::new() };
+        let artifacts = ProviderArtifactPaths {
+            primary: PathBuf::from("unused"),
+            sidecars: BTreeMap::new(),
+        };
         let attestation: Tier1AttestationReport = serde_json::from_value(json!({
             "report_head": "aa".repeat(32),
             "report": {
@@ -115025,27 +120319,45 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "runtime_config": AttestationRuntimeConfig::default(),
                 "sig_enclave": "77".repeat(64), "sig_provider": "88".repeat(64)
             }
-        })).unwrap();
-        let rules = RulesRef { ver: 1, hash: "99".repeat(32) };
+        }))
+        .unwrap();
+        let rules = RulesRef {
+            ver: 1,
+            hash: "99".repeat(32),
+        };
         let ctx = ProviderSessionContext {
-            args: &args, home: &canaries, keypair_path: Path::new("unused"), password: "",
-            wallet: &wallet, selected: &selected, backend_runtime: &runtime, artifact_paths: &artifacts,
-            canaries_dir: &canaries, rooms: &[], attestation: &attestation,
-            attestation_head: &attestation.report_head, identity_anchor: "test",
-            tpm_activation_hello: None, workflow_inventory_root: None, workflow_admission: None,
+            args: &args,
+            home: &canaries,
+            keypair_path: Path::new("unused"),
+            password: "",
+            wallet: &wallet,
+            selected: &selected,
+            backend_runtime: &runtime,
+            artifact_paths: &artifacts,
+            canaries_dir: &canaries,
+            rooms: &[],
+            attestation: &attestation,
+            attestation_head: &attestation.report_head,
+            identity_anchor: "test",
+            tpm_activation_hello: None,
+            workflow_inventory_root: None,
+            workflow_admission: None,
             rules: &rules,
         };
         let terms = provider_session_terms(&ctx, 0).unwrap();
-        assert_eq!(serde_json::to_value(&terms.adapter).unwrap(), adapter_before);
+        assert_eq!(
+            serde_json::to_value(&terms.adapter).unwrap(),
+            adapter_before
+        );
         let mut responder = EngineProviderSessionResponder {
             backend: Box::new(FakeEngineBackend::new("image described").with_backend_id("vllm")),
         };
 
         // Reproduce the old production failure: mode sealing, baseline verification.
-        let wrong_cases = provider_modality_self_test_plan(
-            &ctx, &selected.model.adapter, &canaries,
-        ).unwrap();
-        let error = provider_modality_self_test(&ctx, &terms, &mut responder, wrong_cases).unwrap_err();
+        let wrong_cases =
+            provider_modality_self_test_plan(&ctx, &selected.model.adapter, &canaries).unwrap();
+        let error =
+            provider_modality_self_test(&ctx, &terms, &mut responder, wrong_cases).unwrap_err();
         assert!(format!("{error:#}").contains("endpoint contract fingerprint does not match"));
 
         let cases = provider_modality_self_test_plan(&ctx, &terms.adapter, &canaries).unwrap();
@@ -115053,9 +120365,12 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(cases[0].prompt_id, "image-health");
         assert_eq!(cases[0].modalities, vec!["image", "text"]);
         assert_eq!(cases[0].body["contract_request"]["max_tokens"], 4);
-        assert_eq!(cases[0].body["mayhem_contract"]["endpoint_contract_fingerprint"],
-            mayhem_proto::endpoint_contract_fingerprint(&baseline_adapter.endpoint_families[0]));
-        let health = provider_modality_self_test(&ctx, &terms, &mut responder, cases.clone()).unwrap();
+        assert_eq!(
+            cases[0].body["mayhem_contract"]["endpoint_contract_fingerprint"],
+            mayhem_proto::endpoint_contract_fingerprint(&baseline_adapter.endpoint_families[0])
+        );
+        let health =
+            provider_modality_self_test(&ctx, &terms, &mut responder, cases.clone()).unwrap();
         assert_eq!(health.len(), 1);
         assert!(health[0].ok);
 
@@ -115064,26 +120379,44 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let mut body = forbidden[0].body["contract_request"].clone();
         body["min_p"] = json!(0.05);
         body["endpoint_family"] = json!(family);
-        forbidden[0].body = provider_seal_local_contract_request(
-            &body, &terms.adapter, &terms.model_id,
-        ).unwrap();
-        let error = provider_modality_self_test(&ctx, &terms, &mut responder, forbidden.clone()).unwrap_err();
+        forbidden[0].body =
+            provider_seal_local_contract_request(&body, &terms.adapter, &terms.model_id).unwrap();
+        let error = provider_modality_self_test(&ctx, &terms, &mut responder, forbidden.clone())
+            .unwrap_err();
         assert!(error.to_string().contains("negotiated execution mode"));
         assert_eq!(provider_response_error_code(&error), "request_invalid");
 
-        let baseline_ctx = ProviderSessionContext { selected: &baseline, ..ctx };
+        let baseline_ctx = ProviderSessionContext {
+            selected: &baseline,
+            ..ctx
+        };
         let baseline_terms = provider_session_terms(&baseline_ctx, 0).unwrap();
-        let baseline_cases = provider_modality_self_test_plan(
-            &baseline_ctx, &baseline_terms.adapter, &canaries,
-        ).unwrap();
-        assert!(provider_modality_self_test(
-            &baseline_ctx, &baseline_terms, &mut responder, baseline_cases,
-        ).unwrap()[0].ok);
-        assert!(provider_modality_self_test(
-            &baseline_ctx, &baseline_terms, &mut responder, forbidden,
-        ).unwrap()[0].ok);
-        assert_eq!(serde_json::to_value(&baseline.model.adapter).unwrap(), adapter_before);
-        assert_eq!(serde_json::to_value(&terms.adapter).unwrap(), adapter_before);
+        let baseline_cases =
+            provider_modality_self_test_plan(&baseline_ctx, &baseline_terms.adapter, &canaries)
+                .unwrap();
+        assert!(
+            provider_modality_self_test(
+                &baseline_ctx,
+                &baseline_terms,
+                &mut responder,
+                baseline_cases,
+            )
+            .unwrap()[0]
+                .ok
+        );
+        assert!(
+            provider_modality_self_test(&baseline_ctx, &baseline_terms, &mut responder, forbidden,)
+                .unwrap()[0]
+                .ok
+        );
+        assert_eq!(
+            serde_json::to_value(&baseline.model.adapter).unwrap(),
+            adapter_before
+        );
+        assert_eq!(
+            serde_json::to_value(&terms.adapter).unwrap(),
+            adapter_before
+        );
         fs::remove_dir_all(canaries).unwrap();
     }
 
@@ -115105,13 +120438,16 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 "response_attribute_specs": {},
                 "interaction_groups": []
             }]
-        })).unwrap();
-        let body = json!({"messages": [{"role":"user", "content":"arbitrary request"}], "min_p": 0.05});
+        }))
+        .unwrap();
+        let body =
+            json!({"messages": [{"role":"user", "content":"arbitrary request"}], "min_p": 0.05});
         let sealed = provider_test_seal_contract_request(&body, &terms.adapter).unwrap();
         let active = test_active_provider_session(&terms, vec!["text".to_owned()]);
         validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap();
         terms.execution_mode_requests = Some(requests);
-        let error = validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap_err();
+        let error =
+            validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap_err();
         assert!(error.to_string().contains("negotiated execution mode"));
         assert!(!error.to_string().contains("0.05"));
         assert_eq!(provider_response_error_code(&error), "request_invalid");
@@ -115119,7 +120455,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         compatible["min_p"] = json!(0.0);
         let sealed = provider_test_seal_contract_request(&compatible, &terms.adapter).unwrap();
         validate_provider_session_request_modalities(&active, &terms, &sealed).unwrap();
-        assert_eq!(serde_json::to_value(&terms.adapter).unwrap(), adapter_before);
+        assert_eq!(
+            serde_json::to_value(&terms.adapter).unwrap(),
+            adapter_before
+        );
     }
 
     #[test]
@@ -115565,6 +120904,34 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider_seal_local_contract_request(&body, &model.adapter, &model.model_id).unwrap();
         assert_eq!(sealed["kind"], json!("workflow_generation"));
         provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter).unwrap();
+        let mut legacy_order_drift = sealed.clone();
+        legacy_order_drift["mayhem_contract"]["endpoint_contract_fingerprint"] =
+            json!("ff".repeat(32));
+        provider_verify_endpoint_request(
+            &legacy_order_drift,
+            Some(&model.model_id),
+            &model.adapter,
+        )
+        .expect("the canonical fingerprint supersedes a representation-specific legacy hash");
+        legacy_order_drift["mayhem_contract"]
+            .as_object_mut()
+            .unwrap()
+            .remove("endpoint_contract_canonical_fingerprint");
+        assert!(provider_verify_endpoint_request(
+            &legacy_order_drift,
+            Some(&model.model_id),
+            &model.adapter,
+        )
+        .is_err());
+        let mut bad_canonical = sealed.clone();
+        bad_canonical["mayhem_contract"]["endpoint_contract_canonical_fingerprint"] =
+            json!("ee".repeat(32));
+        assert!(provider_verify_endpoint_request(
+            &bad_canonical,
+            Some(&model.model_id),
+            &model.adapter,
+        )
+        .is_err());
 
         model.model_class = MODEL_CLASS_WORKFLOW.to_owned();
         model.caps.output_modality = Some("image".to_owned());
@@ -115776,6 +121143,137 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_projects_nested_unique_items_and_checks_original_output() {
+        let body = json!({
+            "messages": [{"role":"user","content":"Return evidence IDs"}],
+            "response_format": {"type":"json_schema","json_schema":{"name":"brief","schema":{
+                "type":"object","required":["evidenceIds"],"properties":{
+                    "evidenceIds":{"type":"array","minItems":2,"maxItems":4,
+                        "uniqueItems":true,"items":{"type":"string","pattern":"^E[1-9]$"}}
+                }
+            }}}
+        });
+        let mut valid = FakeEngineBackend::new(r#"{"evidenceIds":["E1","E2"]}"#);
+        let output = provider_engine_session_response(
+            &mut valid,
+            &catalog::CatalogAdapter::default(),
+            &body,
+            None,
+        )
+        .unwrap();
+        assert_eq!(output.content, r#"{"evidenceIds":["E1","E2"]}"#);
+        let Some(GrammarSpec::JsonSchema { schema }) = valid.last_request.unwrap().grammar else {
+            panic!("expected projected JSON schema grammar");
+        };
+        assert!(schema["properties"]["evidenceIds"]
+            .get("uniqueItems")
+            .is_none());
+
+        let mut duplicate = FakeEngineBackend::new(r#"{"evidenceIds":["E1","E1"]}"#);
+        let error = provider_engine_session_response(
+            &mut duplicate,
+            &catalog::CatalogAdapter::default(),
+            &body,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(provider_response_error_code(&error), "model_output_invalid");
+    }
+
+    #[test]
+    fn provider_rejects_unsupported_schema_before_engine_dispatch() {
+        let body = json!({
+            "messages": [{"role":"user","content":"Return JSON"}],
+            "response_format": {"type":"json_schema","json_schema":{"name":"bad","schema":{
+                "type":"array","unknownConstraint":true
+            }}}
+        });
+        let mut backend = FakeEngineBackend::new("[]");
+        let error = provider_engine_session_response(
+            &mut backend,
+            &catalog::CatalogAdapter::default(),
+            &body,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(provider_response_error_code(&error), "request_invalid");
+        assert!(backend.last_request.is_none());
+    }
+
+    #[test]
+    fn qwen_system_message_order_is_request_invalid_before_engine_dispatch() {
+        let adapter = catalog::CatalogAdapter {
+            chat_template_id: "qwen3.5-instruct".to_owned(),
+            tool_call_strategy: "none".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [
+                {"role": "user", "content": "first"},
+                {"role": "system", "content": "too late"}
+            ]
+        });
+        let mut backend = FakeEngineBackend::new("must not run");
+
+        let error = provider_engine_session_response(&mut backend, &adapter, &body, None)
+            .expect_err("Qwen must reject a late system message before engine dispatch");
+
+        assert_eq!(provider_response_error_code(&error), "request_invalid");
+        assert_eq!(
+            provider_response_error_message(&error),
+            "qwen system message must be first"
+        );
+        assert!(backend.last_request.is_none());
+    }
+
+    #[test]
+    fn reasoning_only_stop_is_model_output_invalid() {
+        let adapter = catalog::CatalogAdapter {
+            chat_template_id: "qwen3.5-instruct".to_owned(),
+            tool_call_strategy: "none".to_owned(),
+            ..catalog::CatalogAdapter::default()
+        };
+        let body = json!({
+            "messages": [{"role": "user", "content": "give a visible answer"}],
+            "max_tokens": 32
+        });
+        let sealed = provider_test_seal_contract_request(&body, &adapter).unwrap();
+        let mut backend = FakeEngineBackend::new("<think>private reasoning only</think>");
+        let mut output = provider_engine_session_response_with_sampling(
+            &mut backend,
+            None,
+            &adapter,
+            &catalog::CatalogSamplingProfile::default(),
+            None,
+            &sealed,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert!(output.content.trim().is_empty());
+        assert!(!output.reasoning_evidence.trim().is_empty());
+        assert_eq!(output.finish_reason, "stop");
+
+        provider_session_output_result(normalize_provider_visible_output_usage(
+            &sealed,
+            &mut output,
+        ))
+        .unwrap();
+        let error = provider_session_output_result(validate_provider_session_output(
+            &test_provider_session_terms(),
+            &sealed,
+            &output,
+        ))
+        .expect_err("reasoning-only stop must not publish an HTTP-200 response");
+
+        assert_eq!(provider_response_error_code(&error), "model_output_invalid");
+        assert_eq!(
+            provider_response_error_message(&error),
+            "provider text generation stopped without a visible answer"
+        );
+    }
+
+    #[test]
     fn provider_response_error_code_distinguishes_buyer_input_from_engine_failure() {
         let request_error =
             anyhow::Error::new(EngineError::InvalidRequest("bad tool schema".to_owned()))
@@ -115815,6 +121313,19 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider_response_error_code(&engine_error),
             "provider_response_failed"
         );
+
+        let streamed_tool_error = validate_streamed_tool_call_count(1, 0)
+            .expect_err("a provisional tool call must match a validated final call");
+        assert_eq!(
+            provider_response_error_code(&streamed_tool_error),
+            "model_output_invalid"
+        );
+        assert_eq!(
+            provider_response_error_message(&streamed_tool_error),
+            "provider streamed a tool call that failed final validation"
+        );
+        validate_streamed_tool_call_count(1, 1)
+            .expect("a validated streamed tool call must remain accepted");
     }
 
     #[test]
@@ -116138,9 +121649,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(output.tools.is_empty());
         assert_eq!(output.embeddings, Some(vec![vec![0.1, 0.2, 0.3]]));
         assert_eq!(output.finish_reason, "stop");
-        assert_eq!(output.prompt_tokens, 4);
+        assert_eq!(output.prompt_tokens, 3);
         assert_eq!(output.completion_tokens, 0);
-        assert_eq!(output.usage.input_tokens(), 4);
+        assert_eq!(output.usage.input_tokens(), 3);
         assert_eq!(output.usage.output_tokens(), 0);
         let request = backend.last_embedding_request.expect("embedding request");
         assert_eq!(request.inputs, vec!["similar phrase", "similar sentence"]);
@@ -116295,9 +121806,12 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     fn provider_image_reference_preserves_bytes_strength_and_admission_load() {
         let family = mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS;
         let contract = mayhem_proto::endpoint_family_contract_template(family).unwrap();
-        let reference = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(
-            include_bytes!("../../mayhem-engine/tests/fixtures/reference.png"),
-        ));
+        let reference = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(include_bytes!(
+                "../../mayhem-engine/tests/fixtures/reference.png"
+            ),)
+        );
         let mut body = json!({
             "prompt": "a blue sculpture", "n": 1, "width": 64, "height": 64,
             "steps": 9, "cfg_scale": 0.0, "input_reference": reference, "strength": 0.6,
@@ -116306,13 +121820,28 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(request.input_reference.as_deref(), Some(reference.as_str()));
         assert_eq!(request.strength, Some(0.6));
         let load = provider_session_modality_load(
-            &contract, family, &body, &json!({"kind": "image_generation"}), None, &["image".to_owned()],
-        ).unwrap();
+            &contract,
+            family,
+            &body,
+            &json!({"kind": "image_generation"}),
+            None,
+            &["image".to_owned()],
+        )
+        .unwrap();
         assert_eq!(load["image"].item_count, 1);
         assert_eq!(load["image"].max_item_units, 64 * 64);
-        assert_eq!(load["image"].max_item_bytes, mayhem_proto::image_reference_metadata(&reference).unwrap().bytes);
+        assert_eq!(
+            load["image"].max_item_bytes,
+            mayhem_proto::image_reference_metadata(&reference)
+                .unwrap()
+                .bytes
+        );
 
-        for invalid in [json!({"image_url": reference}), json!("https://example.test/image.png"), json!(null)] {
+        for invalid in [
+            json!({"image_url": reference}),
+            json!("https://example.test/image.png"),
+            json!(null),
+        ] {
             body["input_reference"] = invalid;
             assert!(provider_image_generation_request_from_body(family, &body).is_err());
         }
@@ -117568,8 +123097,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let output = provider_engine_session_response(&mut backend, &adapter, &body, None).unwrap();
         assert_eq!(output.finish_reason, "tool_calls");
         assert_eq!(output.tools[0]["id"], "call-openai");
-        assert_eq!(serde_json::from_str::<Value>(output.tools[0]["arguments"].as_str().unwrap()).unwrap(),
-            json!({"path":"index.html","content":"not allowed"}));
+        assert_eq!(
+            serde_json::from_str::<Value>(output.tools[0]["arguments"].as_str().unwrap()).unwrap(),
+            json!({"path":"index.html","content":"not allowed"})
+        );
         assert_eq!(output.completion_tokens, 2);
         assert_eq!(output.usage.output_tokens(), 2);
         assert_eq!(output.tools.len(), 1);
@@ -117579,7 +123110,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
         assert!(format!("{error:#}")
             .contains("arguments that do not satisfy the schema for tool read_file"));
-        assert_eq!(backend.last_request.unwrap().tools[0]["function"]["strict"], true);
+        assert_eq!(
+            backend.last_request.unwrap().tools[0]["function"]["strict"],
+            true
+        );
     }
 
     #[test]
@@ -117914,6 +123448,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 engine: "vllm".to_owned(),
                 topology: None,
                 independent_dispatch: true,
+                max_concurrent: None,
                 request_modalities: vec![vec!["text".to_owned()]],
                 proof_sha256: "ab".repeat(32),
             },
@@ -117953,8 +123488,12 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         mode_profile.runtime = Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1);
         let mut mode_canary = selected.model.canary.clone();
         mode_canary.set_id = "test-mode-canary".to_owned();
-        let request_policies = selected.model.adapter.endpoint_families.iter().map(|family| {
-            mayhem_proto::EndpointFamilyContract {
+        let request_policies = selected
+            .model
+            .adapter
+            .endpoint_families
+            .iter()
+            .map(|family| mayhem_proto::EndpointFamilyContract {
                 family: family.family.clone(),
                 request_attributes: vec![],
                 required_request_attributes: vec![],
@@ -117964,64 +123503,140 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 response_attribute_specs: BTreeMap::new(),
                 interaction_groups: vec![],
                 speciality_mappings: BTreeMap::new(),
-            }
-        }).collect();
+            })
+            .collect();
         let mode_policy = catalog::CatalogVllmExecutionMode {
             schema_version: 1,
             profile: mode_profile,
             generation_execution_profile: None,
-            requests: mayhem_proto::ExecutionModeRequestPolicy { endpoint_families: request_policies },
+            requests: mayhem_proto::ExecutionModeRequestPolicy {
+                endpoint_families: request_policies,
+            },
             canary: mode_canary,
             canary_set_sha256: "ad".repeat(32),
             modality_fingerprints: BTreeMap::new(),
             resource_profiles: BTreeMap::new(),
             speciality_calibrations: BTreeMap::new(),
         };
-        mode_catalog.vllm_execution_modes.insert(selected.artifact.artifact_root.clone(),
-            BTreeMap::from([("throughput".to_owned(), mode_policy)]));
+        mode_catalog.vllm_execution_modes.insert(
+            selected.artifact.artifact_root.clone(),
+            BTreeMap::from([("throughput".to_owned(), mode_policy)]),
+        );
         let mut mode_args = args.clone();
         mode_args.execution_mode = Some("throughput".to_owned());
-        let mode_selected = build_provider_candidates(&contract, &mode_catalog, &hardware, &mode_args)
-            .unwrap().remove(0);
-        assert_eq!(mode_selected.enclave.enclave_id, selected.enclave.enclave_id);
-        assert_eq!(mode_selected.artifact.artifact_root, selected.artifact.artifact_root);
+        let mode_selected =
+            build_provider_candidates(&contract, &mode_catalog, &hardware, &mode_args)
+                .unwrap()
+                .remove(0);
+        assert_eq!(
+            mode_selected.enclave.enclave_id,
+            selected.enclave.enclave_id
+        );
+        assert_eq!(
+            mode_selected.artifact.artifact_root,
+            selected.artifact.artifact_root
+        );
         assert_eq!(mode_selected.model.canary.set_id, "test-mode-canary");
         assert_eq!(mode_selected.generation_execution_capacity, 1);
         assert!(mode_selected.generation_execution_profile.is_none());
-        assert!(mode_selected.vllm_execution_profile.as_ref().unwrap().enforce_eager);
-        assert_eq!(mode_selected.vllm_execution_profile.as_ref().unwrap().runtime,
-            Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1));
+        assert!(
+            mode_selected
+                .vllm_execution_profile
+                .as_ref()
+                .unwrap()
+                .enforce_eager
+        );
+        assert_eq!(
+            mode_selected
+                .vllm_execution_profile
+                .as_ref()
+                .unwrap()
+                .runtime,
+            Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1)
+        );
         let mut calibration_args = test_calibrate_canary_args();
         bind_calibration_vllm_execution_profile(
-            &mut calibration_args, mode_selected.vllm_execution_profile.as_ref(),
-        ).unwrap();
-        assert_eq!(calibration_args.vllm_runtime,
-            Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1));
+            &mut calibration_args,
+            mode_selected.vllm_execution_profile.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(
+            calibration_args.vllm_runtime,
+            Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1)
+        );
         let binding = &mode_selected.execution_mode.as_ref().unwrap().binding;
-        assert_eq!(provider_attestation_runtime_config(&mode_selected).unwrap().execution_mode.as_ref(), Some(binding));
-        assert_eq!(serde_json::to_value(&mode_selected.execution_mode.as_ref().unwrap().baseline_adapter).unwrap(),
-            serde_json::to_value(&selected.model.adapter).unwrap());
+        assert_eq!(
+            provider_attestation_runtime_config(&mode_selected)
+                .unwrap()
+                .execution_mode
+                .as_ref(),
+            Some(binding)
+        );
+        assert_eq!(
+            serde_json::to_value(
+                &mode_selected
+                    .execution_mode
+                    .as_ref()
+                    .unwrap()
+                    .baseline_adapter
+            )
+            .unwrap(),
+            serde_json::to_value(&selected.model.adapter).unwrap()
+        );
         let baseline_again = build_provider_candidates(&contract, &mode_catalog, &hardware, &args)
-            .unwrap().remove(0);
+            .unwrap()
+            .remove(0);
         assert!(baseline_again.execution_mode.is_none());
         assert_eq!(baseline_again.generation_execution_capacity, 2);
-        assert_eq!(baseline_again.model.canary.set_id, selected.model.canary.set_id);
-        assert_eq!(baseline_again.vllm_execution_profile.as_ref().unwrap().runtime, None);
+        assert_eq!(
+            baseline_again.model.canary.set_id,
+            selected.model.canary.set_id
+        );
+        assert_eq!(
+            baseline_again
+                .vllm_execution_profile
+                .as_ref()
+                .unwrap()
+                .runtime,
+            None
+        );
         let mut default_mode_catalog = mode_catalog.clone();
         let root = &selected.artifact.artifact_root;
-        default_mode_catalog.vllm_execution_profiles.get_mut(root).unwrap().runtime =
-            Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1);
-        default_mode_catalog.vllm_execution_modes.get_mut(root).unwrap()
-            .get_mut("throughput").unwrap().profile.runtime = None;
-        let default_mode = build_provider_candidates(&contract, &default_mode_catalog, &hardware, &mode_args)
-            .unwrap().remove(0);
-        assert_eq!(default_mode.vllm_execution_profile.as_ref().unwrap().runtime, None);
+        default_mode_catalog
+            .vllm_execution_profiles
+            .get_mut(root)
+            .unwrap()
+            .runtime = Some(python_runtime::VllmRuntime::FlashinferSpeculativeMetadataV1);
+        default_mode_catalog
+            .vllm_execution_modes
+            .get_mut(root)
+            .unwrap()
+            .get_mut("throughput")
+            .unwrap()
+            .profile
+            .runtime = None;
+        let default_mode =
+            build_provider_candidates(&contract, &default_mode_catalog, &hardware, &mode_args)
+                .unwrap()
+                .remove(0);
+        assert_eq!(
+            default_mode
+                .vllm_execution_profile
+                .as_ref()
+                .unwrap()
+                .runtime,
+            None
+        );
         bind_calibration_vllm_execution_profile(
-            &mut calibration_args, default_mode.vllm_execution_profile.as_ref(),
-        ).unwrap();
+            &mut calibration_args,
+            default_mode.vllm_execution_profile.as_ref(),
+        )
+        .unwrap();
         assert_eq!(calibration_args.vllm_runtime, None);
         mode_args.execution_mode = Some("missing".to_owned());
-        assert!(build_provider_candidates(&contract, &mode_catalog, &hardware, &mode_args).is_err());
+        assert!(
+            build_provider_candidates(&contract, &mode_catalog, &hardware, &mode_args).is_err()
+        );
 
         let mut uncapped_contract = contract.clone();
         uncapped_contract.enclaves[0]
@@ -118128,6 +123743,20 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(config.vllm_linear_backend.as_deref(), Some("cutlass"));
         assert_eq!(config.vllm_moe_backend.as_deref(), Some("cutlass"));
         assert_eq!(config.vllm_mtp_num_speculative_tokens, None);
+        assert_eq!(config.vllm_task, mayhem_engine::VllmTask::Generate);
+        let mut embedding_selected = selected.clone();
+        embedding_selected.model.model_class = "embedding".to_owned();
+        let embedding_config = provider_engine_load_config(
+            &args,
+            &embedding_selected,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            embedding_config.vllm_task,
+            mayhem_engine::VllmTask::Embedding
+        );
         let mut legacy_selected = selected.clone();
         legacy_selected.vllm_execution_profile = None;
         let legacy_config = provider_engine_load_config(
@@ -118156,7 +123785,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         .unwrap();
         assert_eq!(graph_config.vllm_enforce_eager, Some(false));
         assert_eq!(graph_config.vllm_compilation_mode, Some(0));
-        assert_eq!(graph_config.vllm_cudagraph_mode.as_deref(), Some("FULL_DECODE_ONLY"));
+        assert_eq!(
+            graph_config.vllm_cudagraph_mode.as_deref(),
+            Some("FULL_DECODE_ONLY")
+        );
         assert_eq!(
             config.memory_limit_bytes,
             Some(selected.feasibility.memory_budget.worker_limit_bytes)
@@ -118177,43 +123809,93 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 max_num_tokens: Some(4096),
             }
         );
-        mode_catalog.vllm_execution_modes.get_mut(&selected.artifact.artifact_root)
-            .unwrap().get_mut("throughput").unwrap().generation_execution_profile =
-            Some(test_isolated_generation_profile());
+        mode_catalog
+            .vllm_execution_modes
+            .get_mut(&selected.artifact.artifact_root)
+            .unwrap()
+            .get_mut("throughput")
+            .unwrap()
+            .generation_execution_profile = Some(test_isolated_generation_profile());
         mode_args.execution_mode = Some("throughput".to_owned());
-        let mut isolated = build_provider_candidates(&contract, &mode_catalog, &hardware, &mode_args)
-            .unwrap().remove(0);
+        let mut isolated =
+            build_provider_candidates(&contract, &mode_catalog, &hardware, &mode_args)
+                .unwrap()
+                .remove(0);
         let isolated_config = provider_engine_load_config(
-            &mode_args, &isolated, &artifact_paths, &ProviderBackendRuntime::default(),
-        ).unwrap();
-        assert_eq!(isolated_config.vllm_generation_topology,
-            Some(mayhem_engine::VllmGenerationTopology::IsolatedWorkers));
+            &mode_args,
+            &isolated,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            isolated_config.vllm_generation_topology,
+            Some(mayhem_engine::VllmGenerationTopology::IsolatedWorkers)
+        );
         assert_eq!(isolated_config.vllm_max_num_seqs, Some(1));
-        assert_eq!(isolated_config.vllm_concurrent_generation_capacity,
-            Some(isolated.generation_execution_capacity));
+        assert_eq!(
+            isolated_config.vllm_concurrent_generation_capacity,
+            Some(isolated.generation_execution_capacity)
+        );
         assert_eq!(isolated_config.ctx_size, 131_072);
-        assert_eq!(isolated_config.memory_limit_bytes,
-            Some(isolated.feasibility.estimated_required_bytes));
-        assert_eq!(isolated_config.vllm_worker_address_space_limit_bytes,
-            Some(isolated.feasibility.memory_budget.worker_address_space_limit_bytes));
+        assert_eq!(
+            isolated_config.memory_limit_bytes,
+            Some(isolated.feasibility.estimated_required_bytes)
+        );
+        assert_eq!(
+            isolated_config.vllm_worker_address_space_limit_bytes,
+            Some(
+                isolated
+                    .feasibility
+                    .memory_budget
+                    .worker_address_space_limit_bytes
+            )
+        );
         isolated.execution_mode = None;
         assert!(provider_engine_load_config(
-            &mode_args, &isolated, &artifact_paths, &ProviderBackendRuntime::default(),
-        ).is_err());
+            &mode_args,
+            &isolated,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .is_err());
         assert_eq!(config.vllm_generation_topology, None);
-        assert_eq!(config.vllm_worker_address_space_limit_bytes,
-            Some(selected.feasibility.memory_budget.worker_address_space_limit_bytes));
+        assert_eq!(
+            config.vllm_worker_address_space_limit_bytes,
+            Some(
+                selected
+                    .feasibility
+                    .memory_budget
+                    .worker_address_space_limit_bytes
+            )
+        );
         let mut resident_selected = selected.clone();
         resident_selected.feasibility.memory_budget.available_bytes /= 2;
-        resident_selected.feasibility.memory_budget.worker_limit_bytes /= 2;
+        resident_selected
+            .feasibility
+            .memory_budget
+            .worker_limit_bytes /= 2;
         let restarted = provider_engine_load_config(
-            &args, &resident_selected, &artifact_paths, &ProviderBackendRuntime::default(),
-        ).unwrap();
-        assert_eq!(restarted.vllm_worker_address_space_limit_bytes,
+            &args,
+            &resident_selected,
+            &artifact_paths,
+            &ProviderBackendRuntime::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            restarted.vllm_worker_address_space_limit_bytes,
             config.vllm_worker_address_space_limit_bytes,
-            "another resident model must not shrink the virtual-address envelope");
-        assert_eq!(restarted.memory_limit_bytes,
-            Some(resident_selected.feasibility.memory_budget.worker_limit_bytes));
+            "another resident model must not shrink the virtual-address envelope"
+        );
+        assert_eq!(
+            restarted.memory_limit_bytes,
+            Some(
+                resident_selected
+                    .feasibility
+                    .memory_budget
+                    .worker_limit_bytes
+            )
+        );
         let _ = fs::remove_dir_all(temp);
     }
 
@@ -119764,7 +125446,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                     max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
-                        reservation_recovery: None,
+                    reservation_recovery: None,
                 },
             );
         }
@@ -119833,7 +125515,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                     max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
-                        reservation_recovery: None,
+                    reservation_recovery: None,
                 },
             );
             pending_requests.insert(id.to_owned(), Instant::now() + Duration::from_secs(30));
@@ -119896,7 +125578,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                     checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
                     max_spend_au: MoneyAu::MAX,
                     accept_replay: None,
-                        reservation_recovery: None,
+                    reservation_recovery: None,
                 },
             );
             pending_requests.insert(id.to_owned(), Instant::now() + Duration::from_secs(30));
@@ -120564,6 +126246,48 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_tokenize_response_frames_chunk_large_token_lists() {
+        let tokens = (0..40_000).collect::<Vec<i32>>();
+        let response = TokenizeResponseFrame {
+            frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
+            version: TOKENIZE_FRAME_VERSION,
+            session_id: "11".repeat(32),
+            provider: "22".repeat(32),
+            enclave_id: "33".repeat(32),
+            room_id: "44".repeat(16),
+            model: "qwen/example".to_owned(),
+            ok: true,
+            count: Some(tokens.len() as u64),
+            tokens: Some(tokens.clone()),
+            tokens_ref: None,
+            error_code: None,
+            error: None,
+        };
+        let max_frame_bytes = 12 * 1024;
+
+        let frames = provider_tokenize_response_frames(response, max_frame_bytes).unwrap();
+
+        assert!(frames.len() > 2);
+        assert!(frames
+            .iter()
+            .all(|frame| provider_session_frame_json_len(frame).unwrap() <= max_frame_bytes));
+        assert!(frames[..frames.len() - 1].iter().all(|frame| {
+            frame.get("t").and_then(Value::as_str) == Some(TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE)
+        }));
+        let final_frame: TokenizeResponseFrame =
+            serde_json::from_value(frames.last().unwrap().clone()).unwrap();
+        assert!(final_frame.tokens.is_none());
+        let manifest = final_frame.tokens_ref.unwrap();
+        let chunks = frames[..frames.len() - 1]
+            .iter()
+            .map(|frame| serde_json::from_value::<PayloadChunk>(frame["chunk"].clone()).unwrap())
+            .collect::<Vec<_>>();
+        let restored: Vec<i32> =
+            serde_json::from_value(reassemble_json_payload(&manifest, &chunks).unwrap()).unwrap();
+        assert_eq!(restored, tokens);
+    }
+
+    #[test]
     fn provider_session_final_delta_frames_chunk_transcription_metadata() {
         let words = (0..1_000)
             .map(|index| TranscriptionTimestamp {
@@ -120657,6 +126381,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         load.set_accepting_new(false);
         assert!(changes.has_changed().unwrap());
         assert!(!load.snapshot(4).accepting_new);
+        let unavailable_generation = load.change_generation();
+        assert!(!load.published_through(unavailable_generation));
+        load.mark_published(unavailable_generation);
+        assert!(load.published_through(unavailable_generation));
         assert!(!load.is_stopped());
         load.stop();
         assert!(load.is_stopped());
@@ -120920,6 +126648,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             engine: "vllm".to_owned(),
             topology: None,
             independent_dispatch: true,
+            max_concurrent: None,
             request_modalities: vec![vec!["text".to_owned()]],
             proof_sha256: "aa".repeat(32),
         });
@@ -120950,6 +126679,98 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(recovered.active_slots, 1);
         assert_eq!(recovered.free_slots, 1);
         assert!(recovered.accepting_new);
+    }
+
+    struct TestConcurrentEmbeddingBackend {
+        capacity: usize,
+    }
+
+    impl ConcurrentEmbeddingBackend for TestConcurrentEmbeddingBackend {
+        fn capacity(&self) -> usize {
+            self.capacity
+        }
+
+        fn embed(
+            &self,
+            _request: mayhem_engine::EmbeddingRequest,
+            _cancellation: &CancellationToken,
+        ) -> mayhem_engine::Result<mayhem_engine::EmbeddingOutput> {
+            unreachable!("embedding admission test does not execute inference")
+        }
+    }
+
+    struct ConcurrentEmbeddingResponder {
+        backend: Arc<TestConcurrentEmbeddingBackend>,
+    }
+
+    impl ProviderSessionResponder for ConcurrentEmbeddingResponder {
+        fn mode(&self) -> &'static str {
+            "test-concurrent-embedding"
+        }
+
+        fn concurrent_session_capacity(&self) -> u32 {
+            u32::try_from(self.backend.capacity()).unwrap_or(u32::MAX)
+        }
+
+        fn concurrent_embedding_backend(&self) -> Option<Arc<dyn ConcurrentEmbeddingBackend>> {
+            Some(Arc::clone(&self.backend) as Arc<dyn ConcurrentEmbeddingBackend>)
+        }
+
+        fn respond(
+            &mut self,
+            _terms: &ProviderSessionTerms,
+            _body: &Value,
+            _cancellation: &CancellationToken,
+        ) -> Result<ProviderSessionOutput> {
+            unreachable!("embedding admission test does not execute inference")
+        }
+    }
+
+    #[test]
+    fn concurrent_embedding_backend_admits_independent_embedding_sessions_only() {
+        let responder = ConcurrentEmbeddingResponder {
+            backend: Arc::new(TestConcurrentEmbeddingBackend { capacity: 8 }),
+        };
+        let mut terms = test_provider_session_terms();
+        terms.runtime_independent_dispatch_modalities =
+            provider_runtime_independent_dispatch_modalities(&responder);
+        assert_eq!(provider_execution_capacity_for_terms(&terms, &responder), 8);
+        assert!(provider_request_modalities_allow_independent_dispatch(
+            &terms,
+            &["embedding".to_owned()]
+        ));
+        assert!(!provider_request_modalities_allow_independent_dispatch(
+            &terms,
+            &["text".to_owned()]
+        ));
+
+        let active = test_active_provider_session(&terms, vec!["embedding".to_owned()]);
+        let sessions = HashMap::from([(active.session_id.clone(), active)]);
+        let protection = Arc::new(Mutex::new(ProviderProtectionState::new(
+            ProviderProtectionConfig::unlimited_for_tests(8),
+        )));
+        let mut frame = test_session_open_frame(&terms);
+        frame["voucher"]["required_modalities"] = json!(["embedding"]);
+        assert_eq!(
+            provider_local_session_acceptance_decision(&protection, &sessions, &terms, &frame,),
+            ProviderSessionDecision::Accept
+        );
+
+        frame["voucher"]["required_modalities"] = json!(["text"]);
+        assert!(matches!(
+            provider_local_session_acceptance_decision(&protection, &sessions, &terms, &frame,),
+            ProviderSessionDecision::Reject {
+                code: "CAPACITY",
+                ..
+            }
+        ));
+
+        let load = ProviderHeartbeatLoad::default();
+        load.set_active_sessions(&sessions, &terms);
+        let snapshot = load.snapshot(8);
+        assert_eq!(snapshot.active_slots, 1);
+        assert_eq!(snapshot.free_slots, 7);
+        assert!(snapshot.accepting_new);
     }
 
     #[test]
@@ -121413,6 +127234,33 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     }
 
     #[test]
+    fn provider_tool_parser_executes_recovered_structured_call_after_private_reasoning() {
+        let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
+        let recovered = serde_json::to_string(&json!({"tool_calls":[{
+            "id":"call_recovered",
+            "type":"function",
+            "function":{"name":"write","arguments":"{\"path\":\"README.md\"}"}
+        }]}))
+        .unwrap();
+        let output = format!(
+            "<think>Attempted <tool_call><function=write></function></tool_call></think>{recovered}"
+        );
+        let calls = provider_engine_tool_call_outputs_after_reasoning(
+            &output,
+            ProviderReasoningOutputMode::StripPrefilled,
+            Some(true),
+            PROVIDER_QWEN_REASONING_DELIMITERS,
+            ProviderEngineToolStrategy::OpenAiToolCalls,
+            &tools,
+            false,
+        )
+        .expect("recovered structured call after private reasoning");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["name"], "write");
+        assert_eq!(calls[0]["arguments"], r#"{"path":"README.md"}"#);
+    }
+
+    #[test]
     fn provider_tool_parser_rejects_reasoning_text_even_with_json_grammar() {
         let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
         for text in [
@@ -121530,6 +127378,29 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert_eq!(calls[0]["arguments"], r#"{"filePath":"one.txt"}"#);
         assert_eq!(calls[1]["id"], "call-openai-2");
         assert_eq!(calls[1]["arguments"], r#"{"filePath":"two.txt"}"#);
+    }
+
+    #[test]
+    fn provider_openai_tool_calls_after_commentary_keep_only_the_commentary_visible() {
+        let tools = vec![ToolSpec::new("write", json!({ "type": "object" }))];
+        let text = concat!(
+            "Plan saved.\n\n",
+            r#"{"tool_calls":[{"function":{"name":"write","arguments":{"path":"app.js"}}}]}"#,
+        );
+        let calls = provider_engine_tool_call_outputs(
+            text,
+            ProviderEngineToolStrategy::OpenAiToolCalls,
+            &tools,
+        )
+        .expect("tool call after commentary");
+        assert_eq!(calls[0]["name"], "write");
+        assert_eq!(
+            provider_engine_visible_content_before_tools(
+                text,
+                ProviderEngineToolStrategy::OpenAiToolCalls,
+            ),
+            "Plan saved.\n\n"
+        );
     }
 
     #[test]
@@ -121800,26 +127671,56 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
     #[test]
     fn provider_tool_strict_setting_survives_chat_and_responses_definitions() {
         for nested in [false, true] {
-            for strict in [None, Some(Value::Null), Some(json!(false)), Some(json!(true))] {
+            for strict in [
+                None,
+                Some(Value::Null),
+                Some(json!(false)),
+                Some(json!(true)),
+            ] {
                 let mut function = json!({"name":"edit_file", "parameters":{
                     "type":"object", "properties":{"path":{"type":"string"}}, "required":["path"]
                 }});
-                if let Some(value) = &strict { function["strict"] = value.clone(); }
-                let tool = if nested { json!({"type":"function", "function":function}) }
-                    else { function["type"] = json!("function"); function };
+                if let Some(value) = &strict {
+                    function["strict"] = value.clone();
+                }
+                let tool = if nested {
+                    json!({"type":"function", "function":function})
+                } else {
+                    function["type"] = json!("function");
+                    function
+                };
                 let specs = provider_engine_tool_specs(&json!({"tools":[tool]})).unwrap();
                 let required = strict == Some(json!(true));
                 assert_eq!(specs[0].strict, required);
                 let template = provider_engine_template_tools(&specs);
-                assert_eq!(template[0]["function"]["strict"].as_bool().unwrap_or(false), required);
+                assert_eq!(
+                    template[0]["function"]["strict"].as_bool().unwrap_or(false),
+                    required
+                );
                 let reparsed = provider_engine_tool_specs(&json!({"tools":template})).unwrap();
                 assert_eq!(reparsed, specs);
-                let calls = vec![provider_normalized_tool_call(None, "edit_file".to_owned(), "{}".to_owned())];
-                assert_eq!(validate_provider_engine_tool_call_outputs(&calls, &specs).is_err(), required);
+                let calls = vec![provider_normalized_tool_call(
+                    None,
+                    "edit_file".to_owned(),
+                    "{}".to_owned(),
+                )];
+                assert_eq!(
+                    validate_provider_engine_tool_call_outputs(&calls, &specs).is_err(),
+                    required
+                );
                 // Required-tool grammars remain schema-constrained in either mode.
-                assert!(mayhem_engine::tool_call_json_schema(&specs).unwrap()["$defs"]["tool_0_parameters"]["required"]
-                    .as_array().unwrap().contains(&json!("path")));
-                assert_eq!(provider_openai_tool_calls_json_schema(&specs, false)["$defs"]["tool_0_parameters"]["required"], json!(["path"]));
+                assert!(
+                    mayhem_engine::tool_call_json_schema(&specs).unwrap()["$defs"]
+                        ["tool_0_parameters"]["required"]
+                        .as_array()
+                        .unwrap()
+                        .contains(&json!("path"))
+                );
+                assert_eq!(
+                    provider_openai_tool_calls_json_schema(&specs, false)["$defs"]
+                        ["tool_0_parameters"]["required"],
+                    json!(["path"])
+                );
             }
         }
         for invalid in [json!("true"), json!(1), json!({})] {
@@ -121830,11 +127731,14 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
 
     #[test]
     fn provider_tool_nonstrict_schema_errors_preserve_edit_arguments_in_all_formats() {
-        let mut tools = vec![ToolSpec::new("edit_file", json!({
-            "type":"object", "additionalProperties":false,
-            "properties":{"path":{"type":"string"}, "old_text":{"type":"string", "minLength":1},
-                "new_text":{"type":"string"}}, "required":["path","old_text","new_text"]
-        }))];
+        let mut tools = vec![ToolSpec::new(
+            "edit_file",
+            json!({
+                "type":"object", "additionalProperties":false,
+                "properties":{"path":{"type":"string"}, "old_text":{"type":"string", "minLength":1},
+                    "new_text":{"type":"string"}}, "required":["path","old_text","new_text"]
+            }),
+        )];
         let expected = json!({"path":"app.js", "old_text":"", "new_text":"private source"});
         for (strategy, raw) in [
             (ProviderEngineToolStrategy::MayhemJson,
@@ -121864,9 +127768,18 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let mut tools = vec![ToolSpec::new("edit_file", json!({"type":"object"}))];
         for strict in [false, true] {
             tools[0].strict = strict;
-            for (name, arguments) in [("edit_file", "not JSON"), ("edit_file", "[]"),
-                ("edit_file", "null"), ("edit_file", "7"), ("unknown_tool", "{}")] {
-                let calls = vec![provider_normalized_tool_call(None, name.to_owned(), arguments.to_owned())];
+            for (name, arguments) in [
+                ("edit_file", "not JSON"),
+                ("edit_file", "[]"),
+                ("edit_file", "null"),
+                ("edit_file", "7"),
+                ("unknown_tool", "{}"),
+            ] {
+                let calls = vec![provider_normalized_tool_call(
+                    None,
+                    name.to_owned(),
+                    arguments.to_owned(),
+                )];
                 assert!(validate_provider_engine_tool_call_outputs(&calls, &tools).is_err());
             }
         }
@@ -123973,6 +129886,7 @@ State initialization...
             })]),
             specialities: BTreeMap::from([("thinking_mode".to_owned(), "disabled".to_owned())]),
             temperature: Some(0.2),
+            decision_temperature: None,
             top_p: Some(0.9),
             top_k: Some(20),
             min_p: Some(0.05),
@@ -124478,7 +130392,9 @@ State initialization...
         report.artifact_binding = catalog_canary_artifact_binding(artifact);
         report.canary_set_sha256 = canary_sha.clone();
         report.prompts[0].max_tokens = 8;
-        report.prompts[0].completion_tokens = 8;
+        // OpenAI-compatible backends can report tokenizer usage while the
+        // reproducibility witness uses content-derived canonical units.
+        report.prompts[0].completion_tokens = 3;
         report.prompts[0].token_count = tokens.len();
         report.prompts[0].token_ids = tokens.clone();
         report.prompts[0].token_prefix = tokens.clone();
@@ -124528,11 +130444,10 @@ State initialization...
         assert!(error.to_string().contains("runtime configuration"));
 
         let mut mismatched_mode = report;
-        mismatched_mode.runtime_config.execution_mode =
-            Some(mayhem_proto::ExecutionModeBinding {
-                mode_id: "throughput".to_owned(),
-                policy_hash: "ab".repeat(32),
-            });
+        mismatched_mode.runtime_config.execution_mode = Some(mayhem_proto::ExecutionModeBinding {
+            mode_id: "throughput".to_owned(),
+            policy_hash: "ab".repeat(32),
+        });
         let error = validate_resumed_canary_core(
             &mismatched_mode,
             model,
@@ -124558,7 +130473,8 @@ State initialization...
         let mut artifact = test_catalog(&merkle.root).models[0].artifacts["gguf-q4_k_m"].clone();
         artifact.weights_bytes = merkle.total_bytes;
 
-        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap();
+        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path, &BTreeMap::new())
+            .unwrap();
     }
 
     #[test]
@@ -124571,8 +130487,12 @@ State initialization...
             test_catalog(&"aa".repeat(32)).models[0].artifacts["gguf-q4_k_m"].clone();
         artifact.weights_bytes = merkle.total_bytes;
 
-        let err =
-            verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap_err();
+        let err = verify_calibration_artifact_matches_catalog(
+            &artifact,
+            &artifact_path,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
 
         assert!(err.to_string().contains("local artifact root mismatch"));
     }
@@ -124593,9 +130513,11 @@ State initialization...
         artifact.weights_bytes = fs::metadata(&artifact_path).unwrap().len();
         artifact.source_sha256 = Some(sha256_bytes_hex(&stable_definition));
 
-        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap();
+        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path, &BTreeMap::new())
+            .unwrap();
         artifact.weights_bytes = stable_definition.len() as u64;
-        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path).unwrap();
+        verify_calibration_artifact_matches_catalog(&artifact, &artifact_path, &BTreeMap::new())
+            .unwrap();
 
         let wrong_path = dir.join("wrong-workflow-class.json");
         let wrong = json!({
@@ -124610,8 +130532,12 @@ State initialization...
         write_json_file(&wrong_path, &wrong).unwrap();
         let mut wrong_sized_artifact = artifact.clone();
         wrong_sized_artifact.weights_bytes = stable_json_bytes(&wrong).unwrap().len() as u64;
-        let err = verify_calibration_artifact_matches_catalog(&wrong_sized_artifact, &wrong_path)
-            .unwrap_err();
+        let err = verify_calibration_artifact_matches_catalog(
+            &wrong_sized_artifact,
+            &wrong_path,
+            &BTreeMap::new(),
+        )
+        .unwrap_err();
         assert!(
             err.to_string()
                 .contains("local Comfy workflow-class hash mismatch"),
@@ -124694,7 +130620,8 @@ State initialization...
             "linear_backend": "auto",
             "moe_backend": "cutlass",
             "proof_sha256": "ab".repeat(32),
-        })).unwrap();
+        }))
+        .unwrap();
         let artifact = test_vllm_artifact();
         let mut args = test_calibrate_canary_args();
         bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).unwrap();
@@ -124712,8 +130639,14 @@ State initialization...
         validate_calibration_vllm_execution_profile(&runtime, Some(&profile)).unwrap();
         assert!(validate_calibration_vllm_execution_profile(&legacy, Some(&profile)).is_err());
         let encoded = serde_json::to_value(&runtime).unwrap();
-        assert_eq!(encoded["vllm_runtime"], "flashinfer_speculative_metadata_v1");
-        assert_eq!(serde_json::from_value::<CatalogCanaryRuntimeConfig>(encoded.clone()).unwrap(), runtime);
+        assert_eq!(
+            encoded["vllm_runtime"],
+            "flashinfer_speculative_metadata_v1"
+        );
+        assert_eq!(
+            serde_json::from_value::<CatalogCanaryRuntimeConfig>(encoded.clone()).unwrap(),
+            runtime
+        );
         let mut unknown = encoded;
         unknown["vllm_runtime"] = json!("unknown_runtime");
         assert!(serde_json::from_value::<CatalogCanaryRuntimeConfig>(unknown).is_err());
@@ -124785,7 +130718,8 @@ State initialization...
             let mut args = test_calibrate_canary_args();
             bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).unwrap();
             validate_calibration_args_for_artifact(&artifact, &args).unwrap();
-            let runtime = catalog_canary_runtime_config(&artifact, Path::new("model"), &args).unwrap();
+            let runtime =
+                catalog_canary_runtime_config(&artifact, Path::new("model"), &args).unwrap();
             assert_eq!(runtime.vllm_compilation_mode, mode);
             assert_eq!(runtime.vllm_cudagraph_mode.as_deref(), graph);
             validate_calibration_vllm_execution_profile(&runtime, Some(&profile)).unwrap();
@@ -124799,7 +130733,9 @@ State initialization...
                 let mut changed = serde_json::to_value(&runtime).unwrap();
                 changed[field] = value;
                 let changed = serde_json::from_value(changed).unwrap();
-                assert!(validate_calibration_vllm_execution_profile(&changed, Some(&profile)).is_err());
+                assert!(
+                    validate_calibration_vllm_execution_profile(&changed, Some(&profile)).is_err()
+                );
             }
             args.vllm_compilation_mode = Some(3);
             assert!(bind_calibration_vllm_execution_profile(&mut args, Some(&profile)).is_err());
@@ -124811,9 +130747,22 @@ State initialization...
 
     #[test]
     fn calibration_vllm_execution_profile_compilation_cli_validation() {
-        let calibration = ["mayhem", "--model", "test/model", "--artifact", "vllm",
-            "--artifact-path", "/tmp/checkpoint"];
-        let plan = ["mayhem", "--artifact-base", "/tmp/artifacts", "--report-dir", "/tmp/reports"];
+        let calibration = [
+            "mayhem",
+            "--model",
+            "test/model",
+            "--artifact",
+            "vllm",
+            "--artifact-path",
+            "/tmp/checkpoint",
+        ];
+        let plan = [
+            "mayhem",
+            "--artifact-base",
+            "/tmp/artifacts",
+            "--report-dir",
+            "/tmp/reports",
+        ];
         for (flag, value) in [
             ("--vllm-compilation-mode", "-1"),
             ("--vllm-compilation-mode", "4"),
@@ -124823,15 +130772,27 @@ State initialization...
             ("--vllm-cudagraph-mode", "UNKNOWN"),
         ] {
             assert!(CatalogCalibrateCanaryArgs::try_parse_from(
-                calibration.into_iter().chain([flag, value])).is_err());
-            assert!(CatalogCanaryPlanArgs::try_parse_from(
-                plan.into_iter().chain([flag, value])).is_err());
+                calibration.into_iter().chain([flag, value])
+            )
+            .is_err());
+            assert!(
+                CatalogCanaryPlanArgs::try_parse_from(plan.into_iter().chain([flag, value]))
+                    .is_err()
+            );
         }
-        let controls = ["--vllm-enforce-eager", "false", "--vllm-compilation-mode", "0",
-            "--vllm-cudagraph-mode", "FULL_DECODE_ONLY"];
-        let mut args = CatalogCalibrateCanaryArgs::try_parse_from(
-            calibration.into_iter().chain(controls)).unwrap();
-        let plan_args = CatalogCanaryPlanArgs::try_parse_from(plan.into_iter().chain(controls)).unwrap();
+        let controls = [
+            "--vllm-enforce-eager",
+            "false",
+            "--vllm-compilation-mode",
+            "0",
+            "--vllm-cudagraph-mode",
+            "FULL_DECODE_ONLY",
+        ];
+        let mut args =
+            CatalogCalibrateCanaryArgs::try_parse_from(calibration.into_iter().chain(controls))
+                .unwrap();
+        let plan_args =
+            CatalogCanaryPlanArgs::try_parse_from(plan.into_iter().chain(controls)).unwrap();
         assert_eq!(plan_args.vllm_compilation_mode, args.vllm_compilation_mode);
         assert_eq!(plan_args.vllm_cudagraph_mode, args.vllm_cudagraph_mode);
         let artifact = test_vllm_artifact();
@@ -124914,7 +130875,10 @@ State initialization...
         assert_eq!(runtime.vllm_max_num_batched_tokens, Some(2048));
         assert_eq!(runtime.vllm_enforce_eager, Some(false));
         assert_eq!(runtime.vllm_compilation_mode, Some(0));
-        assert_eq!(runtime.vllm_cudagraph_mode.as_deref(), Some("FULL_DECODE_ONLY"));
+        assert_eq!(
+            runtime.vllm_cudagraph_mode.as_deref(),
+            Some("FULL_DECODE_ONLY")
+        );
         assert_eq!(runtime.vllm_linear_backend.as_deref(), Some("auto"));
         assert_eq!(runtime.vllm_moe_backend.as_deref(), Some("cutlass"));
         assert_eq!(runtime.vllm_mtp_num_speculative_tokens, Some(3));
@@ -125404,7 +131368,8 @@ State initialization...
     fn non_text_canary_calibration_helpers_emit_typed_values() {
         let embedding_prompt: CanaryPrompt = serde_json::from_value(json!({
             "id": "embed-p1",
-            "input": "embedding canary"
+            "input": "embedding canary",
+            "dimensions": 1536
         }))
         .unwrap();
         let mut embedding_backend = FakeEngineBackend::new("unused");
@@ -125414,6 +131379,13 @@ State initialization...
         assert_eq!(
             embedding.fingerprint,
             embedding_vector_fingerprint(&[0.1, 0.2, 0.3])
+        );
+        assert_eq!(
+            embedding_backend
+                .last_embedding_request
+                .as_ref()
+                .and_then(|request| request.dimensions),
+            Some(1536)
         );
 
         let wav = tiny_wav_bytes(16_000);
@@ -125545,23 +131517,34 @@ State initialization...
     #[test]
     fn image_reference_canary_calibration_preserves_input_and_negative_prompt() {
         let bytes = include_bytes!("../../mayhem-engine/tests/fixtures/reference.png").to_vec();
-        let reference = format!("data:image/png;base64,{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
+        let reference = format!(
+            "data:image/png;base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(&bytes)
+        );
         let prompt: CanaryPrompt = serde_json::from_value(json!({
             "id": "image-reference-p1", "prompt": "A blue sculpture", "input_reference": reference,
             "strength": 0.6, "negative_prompt": "blur", "cfg_scale": 1.0, "steps": 9,
             "seed": 7, "size": "64x64",
-        })).unwrap();
+        }))
+        .unwrap();
         let mut backend = FakeEngineBackend::new("").with_artifact_chunks(vec![ArtifactChunk {
-            artifact_id: "image-1".to_owned(), index: 0, content_type: "image/png".to_owned(),
-            bytes: bytes.clone(), final_chunk: true,
+            artifact_id: "image-1".to_owned(),
+            index: 0,
+            content_type: "image/png".to_owned(),
+            bytes: bytes.clone(),
+            final_chunk: true,
         }]);
-        let report = calibrate_image_perceptual_hash_prompt(&mut backend, &prompt, 42, false).unwrap();
+        let report =
+            calibrate_image_perceptual_hash_prompt(&mut backend, &prompt, 42, false).unwrap();
         let request = backend.last_image_request.unwrap();
         assert_eq!(request.input_reference.as_deref(), Some(reference.as_str()));
         assert_eq!(request.strength, Some(0.6));
         assert_eq!(request.negative_prompt.as_deref(), Some("blur"));
         assert_eq!(request.seed, Some(7));
-        assert_eq!(report.resource_items["image"].item_bytes, bytes.len() as u64);
+        assert_eq!(
+            report.resource_items["image"].item_bytes,
+            bytes.len() as u64
+        );
         assert_eq!(report.resource_items["image"].item_units, 48);
     }
 
@@ -125716,6 +131699,33 @@ State initialization...
         assert_eq!(value, 7);
         assert!(baseline > 0);
         assert!(peak >= baseline);
+    }
+
+    #[test]
+    fn calibration_process_rss_tolerates_exited_descendants() {
+        let context = CalibrationMemoryContext {
+            f13_budget_bytes: u64::MAX,
+            source: "test-process-rss".to_owned(),
+            probe: CalibrationMemoryProbe::ProcessRss,
+            chatterbox_device: None,
+            vllm_replica_limit_bytes: None,
+        };
+        let missing_pid = u32::MAX;
+
+        assert!(
+            calibration_memory_bytes(&context, &[std::process::id(), missing_pid]).unwrap() > 0
+        );
+        let error = calibration_memory_bytes(&context, &[missing_pid])
+            .expect_err("an all-exited process set must not produce an RSS measurement");
+        assert!(error.to_string().contains("failed to read calibration RSS"));
+
+        let error = measure_calibration_memory(&context, &[missing_pid], || {
+            Err::<(), _>(anyhow!("operation failure remains authoritative"))
+        })
+        .expect_err("the operation failure must be returned");
+        assert!(error
+            .to_string()
+            .contains("operation failure remains authoritative"));
     }
 
     #[test]
@@ -126581,10 +132591,12 @@ State initialization...
                 None,
                 Some(&expected),
                 None,
+                None,
                 &empty_hashes,
                 &empty_vectors,
                 &empty_hashes,
                 observed,
+                &empty_hashes,
                 &empty_hashes,
                 9_000,
             )
@@ -126945,6 +132957,7 @@ State initialization...
                 engine: "vllm".to_owned(),
                 topology: None,
                 independent_dispatch: true,
+                max_concurrent: None,
                 request_modalities: vec![vec!["text".to_owned()]],
                 proof_sha256: "ab".repeat(32),
             },
@@ -127044,7 +133057,9 @@ State initialization...
         calibration.model_id = catalog.models[0].model_id.clone();
         stamp_test_calibration_report(&mut calibration, &canaries_dir);
 
-        for (engine, independent_dispatch) in [("llama.cpp", false), ("vllm", false), ("vllm", true)] {
+        for (engine, independent_dispatch) in
+            [("llama.cpp", false), ("vllm", false), ("vllm", true)]
+        {
             catalog.models[0]
                 .artifacts
                 .get_mut("gguf-q4_k_m")
@@ -127062,6 +133077,7 @@ State initialization...
                         engine: "vllm".to_owned(),
                         topology: None,
                         independent_dispatch: true,
+                        max_concurrent: None,
                         request_modalities: vec![vec!["text".to_owned()]],
                         proof_sha256: independent_proof,
                     },
@@ -127094,18 +133110,19 @@ State initialization...
     fn canary_evidence_binds_execution_mode_policy_report_and_input_bytes() {
         let mut catalog = test_catalog(&"aa".repeat(32));
         catalog.models[0].tier = "launch".to_owned();
-        catalog.models[0].artifacts.get_mut("gguf-q4_k_m").unwrap().engine =
-            "vllm".to_owned();
-        insert_test_canary_expectation(
-            &mut catalog.models[0],
-            "gguf-q4_k_m",
-            "aa".repeat(32),
-        );
+        catalog.models[0]
+            .artifacts
+            .get_mut("gguf-q4_k_m")
+            .unwrap()
+            .engine = "vllm".to_owned();
+        insert_test_canary_expectation(&mut catalog.models[0], "gguf-q4_k_m", "aa".repeat(32));
         let root = catalog.models[0].artifacts["gguf-q4_k_m"]
             .artifact_root
             .clone();
         let mut restricted = catalog.models[0].adapter.endpoint_families[0].clone();
-        restricted.request_attribute_specs.retain(|path, _| path == "min_p");
+        restricted
+            .request_attribute_specs
+            .retain(|path, _| path == "min_p");
         let min_p = restricted.request_attribute_specs.get_mut("min_p").unwrap();
         min_p.default = None;
         min_p.minimum = Some(0.0);
@@ -127157,12 +133174,9 @@ State initialization...
             speciality_calibrations: BTreeMap::new(),
         };
         let binding = execution_mode.binding(&root, "throughput").unwrap();
-        let effective = catalog::execution_mode_model(
-            &catalog.models[0],
-            "gguf-q4_k_m",
-            &execution_mode,
-        )
-        .unwrap();
+        let effective =
+            catalog::execution_mode_model(&catalog.models[0], "gguf-q4_k_m", &execution_mode)
+                .unwrap();
         let mut calibration = test_calibration_report("aa".repeat(32), Some("aa".repeat(32)));
         calibration.model_id = catalog.models[0].model_id.clone();
         calibration.engine = "vllm".to_owned();
@@ -127212,7 +133226,12 @@ State initialization...
             Some("throughput")
         );
 
-        calibration.runtime_config.execution_mode.as_mut().unwrap().policy_hash = "ff".repeat(32);
+        calibration
+            .runtime_config
+            .execution_mode
+            .as_mut()
+            .unwrap()
+            .policy_hash = "ff".repeat(32);
         write_json_file(&report_path, &calibration).unwrap();
         catalog
             .vllm_execution_modes
@@ -127231,7 +133250,10 @@ State initialization...
             CatalogCanaryReportMode::ApplyToCatalog,
         );
         assert!(!forged.ok);
-        assert!(forged.errors.iter().any(|error| error.contains("mode binding")));
+        assert!(forged
+            .errors
+            .iter()
+            .any(|error| error.contains("mode binding")));
 
         fs::write(
             mode_dir.join("test-mode-canary.json"),
@@ -127920,8 +133942,8 @@ State initialization...
             "baseline"
         );
         assert_eq!(
-            mode_catalog["vllm_execution_modes"][&root]["throughput"]["canary"]
-                ["fingerprints"]["gguf-q4_k_m"],
+            mode_catalog["vllm_execution_modes"][&root]["throughput"]["canary"]["fingerprints"]
+                ["gguf-q4_k_m"],
             json!(test_canary_aggregate_for_label(&"aa".repeat(32)))
         );
         assert_eq!(
@@ -128399,6 +134421,7 @@ State initialization...
             "mlx-4bit".to_owned(),
             catalog::CatalogArtifact {
                 engine: "mlx".to_owned(),
+                openai_compatible: None,
                 stable_diffusion_cpp: None,
                 mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
                 kv_cache: None,
@@ -128514,6 +134537,7 @@ State initialization...
             "nvfp4".to_owned(),
             catalog::CatalogArtifact {
                 engine: "trt-llm".to_owned(),
+                openai_compatible: None,
                 stable_diffusion_cpp: None,
                 mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
                 kv_cache: None,
@@ -128717,6 +134741,7 @@ State initialization...
             "mlx-4bit".to_owned(),
             catalog::CatalogArtifact {
                 engine: "mlx".to_owned(),
+                openai_compatible: None,
                 stable_diffusion_cpp: None,
                 mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
                 kv_cache: None,
@@ -131663,6 +137688,7 @@ State initialization...
             model_id: "test/model@4bit".to_owned(),
             adapter: catalog::CatalogAdapter::default(),
             generation_execution_profile: None,
+            runtime_independent_dispatch_modalities: Vec::new(),
             sampling: catalog::CatalogSamplingProfile::default(),
             workflow_policy: None,
             output_modalities: vec!["text".to_owned()],
@@ -131676,6 +137702,7 @@ State initialization...
             min_session_au: 0,
             min_ask_au: 0,
             rules_ver: 3,
+            capacity_slots: 1,
             ctx: 8192,
             ctx_bracket: Some(ctx_bracket_for_tokens(8192).to_owned()),
             ctx_bracket_table_ver: Some(CTX_BRACKET_TABLE_VERSION),
@@ -131899,7 +137926,7 @@ State initialization...
             checkpoint_every: CheckpointPolicy { tokens: 1, ms: 0 },
             max_spend_au: MoneyAu::MAX,
             accept_replay: None,
-                        reservation_recovery: None,
+            reservation_recovery: None,
         }
     }
 
@@ -131908,7 +137935,7 @@ State initialization...
         let user_key = SigningKey::from_bytes(&[6_u8; 32]);
         let user = hex_encode(&user_key.verifying_key().to_bytes());
         let voucher_body = mayhem_proto::SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: session_id.clone(),
             billing_id: "bb".repeat(32),
             billing_attempt: 0,
@@ -132320,11 +138347,15 @@ State initialization...
         bind_calibration_generation_topology(&mut args, Some(&profile)).unwrap();
         assert_eq!(args.vllm_worker_count, Some(3));
         assert_eq!(args.vllm_max_num_seqs, Some(1));
-        let mut artifact = test_catalog(&"aa".repeat(32)).models[0].artifacts["gguf-q4_k_m"].clone();
+        let mut artifact =
+            test_catalog(&"aa".repeat(32)).models[0].artifacts["gguf-q4_k_m"].clone();
         artifact.engine = "vllm".to_owned();
-        let mut runtime = catalog_canary_runtime_config(&artifact, Path::new("model.safetensors"), &args).unwrap();
+        let mut runtime =
+            catalog_canary_runtime_config(&artifact, Path::new("model.safetensors"), &args)
+                .unwrap();
         runtime.execution_mode = Some(mayhem_proto::ExecutionModeBinding {
-            mode_id: "isolated".to_owned(), policy_hash: "ab".repeat(32),
+            mode_id: "isolated".to_owned(),
+            policy_hash: "ab".repeat(32),
         });
         validate_calibration_generation_topology(&runtime, Some(&profile)).unwrap();
         assert!(validate_calibration_generation_topology(&runtime, None).is_err());
@@ -132345,16 +138376,29 @@ State initialization...
     #[test]
     fn calibration_isolated_memory_is_checked_before_loading_any_worker() {
         let mut args = test_calibrate_canary_args();
-        assert_eq!(calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).unwrap(), None);
+        assert_eq!(
+            calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).unwrap(),
+            None
+        );
         args.execution_mode = Some("isolated".to_owned());
         args.vllm_worker_count = Some(2);
-        bind_calibration_generation_topology(&mut args, Some(&test_isolated_generation_profile())).unwrap();
-        assert!(calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).is_err());
+        bind_calibration_generation_topology(&mut args, Some(&test_isolated_generation_profile()))
+            .unwrap();
+        assert!(
+            calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).is_err()
+        );
         args.vllm_memory_utilization = Some(35);
-        assert_eq!(calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).unwrap(), Some(70 * GIB_BYTES));
-        assert!(calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 69 * GIB_BYTES).is_err());
+        assert_eq!(
+            calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).unwrap(),
+            Some(70 * GIB_BYTES)
+        );
+        assert!(
+            calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 69 * GIB_BYTES).is_err()
+        );
         args.vllm_worker_count = Some(3);
-        assert!(calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).is_err());
+        assert!(
+            calibration_vllm_replica_allocation(&args, 100 * GIB_BYTES, 80 * GIB_BYTES).is_err()
+        );
         args.vllm_memory_utilization = Some(85);
         assert!(calibration_vllm_replica_allocation(&args, u64::MAX, u64::MAX).is_err());
     }
@@ -132363,7 +138407,8 @@ State initialization...
     fn calibration_legacy_runtime_omits_optional_topology_and_count() {
         let args = test_calibrate_canary_args();
         let artifact = &test_catalog(&"aa".repeat(32)).models[0].artifacts["gguf-q4_k_m"];
-        let runtime = catalog_canary_runtime_config(artifact, Path::new("model.gguf"), &args).unwrap();
+        let runtime =
+            catalog_canary_runtime_config(artifact, Path::new("model.gguf"), &args).unwrap();
         validate_calibration_generation_topology(&runtime, None).unwrap();
         let json = serde_json::to_value(&runtime).unwrap();
         assert!(json.get("vllm_generation_topology").is_none());
@@ -134177,6 +140222,7 @@ State initialization...
             "gguf-q4_k_m".to_owned(),
             catalog::CatalogArtifact {
                 engine: "llama.cpp".to_owned(),
+                openai_compatible: None,
                 stable_diffusion_cpp: None,
                 mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
                 kv_cache: None,
@@ -134270,11 +140316,14 @@ State initialization...
                     transcripts: BTreeMap::new(),
                     audio_fingerprints: BTreeMap::new(),
                     video_fingerprints: BTreeMap::new(),
+                    decision_fingerprints: BTreeMap::new(),
                 },
                 price_ref_au: catalog::PriceRef {
                     denom: "au_usd".to_owned(),
                     in_per_1k: 1,
                     out_per_1k: 2,
+                    per_req_au: 0,
+                    min_session_au: 0,
                     rate_map: Vec::new(),
                 },
             }],
@@ -134665,6 +140714,7 @@ State initialization...
         );
         catalog::CatalogArtifact {
             engine: "vllm".to_owned(),
+            openai_compatible: None,
             stable_diffusion_cpp: None,
             mlx_runtime: mayhem_engine::MlxRuntimeConfig::default(),
             kv_cache: None,

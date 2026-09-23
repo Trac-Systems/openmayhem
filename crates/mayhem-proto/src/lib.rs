@@ -19,7 +19,8 @@ pub use validated_image::{image_reference_metadata, ImageReferenceMetadata};
 mod reservation_close;
 pub use reservation_close::{
     canonical_usage_receipt_hash, reservation_binding_matches, usage_reservation_close_feature,
-    usage_reservation_close_signing_bytes, usage_reservation_close_value, RESERVATION_BINDING_FIELDS,
+    usage_reservation_close_signing_bytes, usage_reservation_close_value,
+    RESERVATION_BINDING_FIELDS,
 };
 
 pub use comfy_workflow::{
@@ -41,7 +42,8 @@ pub use comfy_workflow_media::{
 pub use endpoint_contract::{
     artifact_generation_inline_audio_load, artifact_generation_input_characters,
     canonicalize_endpoint_request_aliases, endpoint_attribute_value_matches,
-    endpoint_contract_fingerprint, endpoint_family_contract_template, endpoint_request_fingerprint,
+    endpoint_contract_canonical_fingerprint, endpoint_contract_fingerprint,
+    endpoint_family_contract_template, endpoint_request_fingerprint,
     generate_endpoint_calibration_cases, materialize_endpoint_calibration_request,
     materialize_endpoint_request_defaults, openai_responses_input_to_chat_messages,
     validate_endpoint_attribute_value, validate_endpoint_request, validate_endpoint_response,
@@ -63,9 +65,31 @@ pub use validated_audio::{
 };
 
 pub const CRATE_NAME: &str = "mayhem-proto";
-pub const CONTRACT_VERSION: u32 = 25;
-/// Retained schema-11 receipt settlement features accepted across the v25 upgrade.
-pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24];
+
+/// Reconstruct the text used by OpenAI-compatible canary evidence without
+/// retaining transport-specific SSE delta boundaries.
+pub fn openai_compatible_canary_output(reasoning: &str, content: &str) -> String {
+    let mut output = String::new();
+    if !reasoning.is_empty() {
+        output.push_str("<think>");
+        output.push_str(reasoning);
+        output.push_str("</think>");
+    }
+    output.push_str(content);
+    output
+}
+
+/// Return Unicode scalar values for the reconstructed OpenAI-compatible
+/// canary output. These units are evidence-only and do not affect metering.
+pub fn openai_compatible_canary_units(reconstructed_output: &str) -> Vec<i32> {
+    reconstructed_output
+        .chars()
+        .map(|scalar| i32::try_from(u32::from(scalar)).expect("Unicode scalar fits i32"))
+        .collect()
+}
+pub const CONTRACT_VERSION: u32 = 28;
+/// Retained receipt settlement features accepted across the v28 upgrade.
+pub const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS: &[u32] = &[23, 24, 25, 26, 27];
 /// Historical fixture version; use receipt_contract_version_is_supported for admission.
 pub const RECOVERABLE_RECEIPT_CONTRACT_VERSION: u32 = 23;
 pub fn receipt_contract_version_is_supported(version: u64) -> bool {
@@ -73,6 +97,19 @@ pub fn receipt_contract_version_is_supported(version: u64) -> bool {
         || RECOVERABLE_RECEIPT_CONTRACT_VERSIONS
             .iter()
             .any(|prior| version == u64::from(*prior))
+}
+
+pub fn receipt_schema_version_is_supported_for_contract(
+    schema_version: u64,
+    contract_version: u64,
+) -> bool {
+    if contract_version == u64::from(CONTRACT_VERSION) || contract_version == 27 {
+        return schema_version == u64::from(SESSION_RECEIPT_SCHEMA_VERSION);
+    }
+    RECOVERABLE_RECEIPT_CONTRACT_VERSIONS
+        .iter()
+        .any(|prior| contract_version == u64::from(*prior))
+        && schema_version == u64::from(RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION)
 }
 pub const ATTESTATION_SCHEMA_VERSION: u32 = 2;
 pub const ATTESTATION_ALG: &str = "ed25519";
@@ -82,9 +119,18 @@ pub const TPM_ACTIVATE_CREDENTIAL_SCHEMA_VERSION: u32 = 1;
 pub const TPM_ACTIVATE_CREDENTIAL_FRAME_VERSION: u32 = 1;
 pub const TPM_ACTIVATE_CREDENTIAL_CHALLENGE_FRAME_TYPE: &str = "tpm.activate.challenge";
 pub const TPM_ACTIVATE_CREDENTIAL_RESPONSE_FRAME_TYPE: &str = "tpm.activate.response";
+pub const TOKENIZE_REQUEST_FRAME_TYPE: &str = "tokenize.request";
+pub const TOKENIZE_REQUEST_CHUNK_FRAME_TYPE: &str = "tokenize.request_chunk";
+pub const TOKENIZE_RESPONSE_FRAME_TYPE: &str = "tokenize.response";
+pub const TOKENIZE_RESPONSE_CHUNK_FRAME_TYPE: &str = "tokenize.response_chunk";
+pub const TOKENIZE_FRAME_VERSION: u32 = 1;
 pub const TPM_PCR_POLICY_SCHEMA_VERSION: u32 = 2;
 pub const TPM_QUOTE_EVIDENCE_SCHEMA_VERSION: u32 = 1;
-pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 11;
+pub const SESSION_RECEIPT_SCHEMA_VERSION: u32 = 12;
+/// Receipt schema emitted before signed utilization evidence was added.
+/// It remains readable only so already-signed settlement evidence can drain.
+pub const RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION: u32 = 11;
+pub const SPEND_VOUCHER_SCHEMA_VERSION: u32 = 11;
 pub const SIGNING_MESSAGE_VERSION: u32 = 2;
 pub const CTX_BRACKET_TABLE_VERSION: u32 = 1;
 pub const CTX_BRACKETS: &[(u32, &str)] = &[
@@ -353,6 +399,7 @@ pub const ENDPOINT_HF_TEXT_TO_VIDEO: &str = "hf_text_to_video";
 pub const ENDPOINT_MAYHEM_AUDIO_GENERATIONS: &str = "mayhem_audio_generations";
 pub const ENDPOINT_MAYHEM_MUSIC_GENERATIONS: &str = "mayhem_music_generations";
 pub const ENDPOINT_MAYHEM_COMFY_WORKFLOWS: &str = "mayhem_comfy_workflows";
+pub const ENDPOINT_MAYHEM_DECISIONS: &str = "mayhem_decisions";
 pub const ENDPOINT_HF_TEXT_TO_AUDIO: &str = "hf_text_to_audio";
 pub const DEFAULT_SESSION_MAX_FRAME_BYTES: usize = 256 * 1024;
 pub const DEFAULT_SESSION_PAYLOAD_CHUNK_BYTES: usize = 16 * 1024;
@@ -1358,6 +1405,53 @@ pub struct TpmActivateCredentialResponseFrame {
     pub response: TpmActivateCredentialResponse,
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenizeRequestFrame {
+    #[serde(rename = "t")]
+    pub frame_type: String,
+    #[serde(rename = "v")]
+    pub version: u32,
+    pub session_id: String,
+    pub provider: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "String::is_empty", rename = "rid")]
+    pub request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request_ref: Option<PayloadChunkManifest>,
+    #[serde(default)]
+    pub return_tokens: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TokenizeResponseFrame {
+    #[serde(rename = "t")]
+    pub frame_type: String,
+    #[serde(rename = "v")]
+    pub version: u32,
+    pub session_id: String,
+    pub provider: String,
+    pub enclave_id: String,
+    pub room_id: String,
+    pub model: String,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub count: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens: Option<Vec<i32>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_ref: Option<PayloadChunkManifest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TpmHashAlgorithm {
@@ -1744,6 +1838,14 @@ pub fn canonical_usage_unit(unit: &str) -> Option<&'static str> {
     }
 }
 
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReceiptBody {
     pub schema_version: u32,
@@ -1773,6 +1875,10 @@ pub struct ReceiptBody {
     #[serde(with = "decimal_u128")]
     pub locked_min_session_au: MoneyAu,
     pub served_ctx: u32,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub compute_ms: u64,
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub capacity_slots: u32,
     #[serde(default)]
     pub ctx_bracket: Option<String>,
     #[serde(default)]
@@ -1821,6 +1927,27 @@ pub fn record_usage_receipt_envelope(receipt: &SessionReceipt) -> serde_json::Va
 pub fn parse_record_usage_receipt_envelope(
     value: &serde_json::Value,
 ) -> Result<SessionReceipt, String> {
+    let schema_version = value
+        .pointer("/body/schema_version")
+        .and_then(Value::as_u64);
+    let has_compute_ms = value.pointer("/body/compute_ms").is_some();
+    let has_capacity_slots = value.pointer("/body/capacity_slots").is_some();
+    if schema_version == Some(u64::from(RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION))
+        && (has_compute_ms || has_capacity_slots)
+    {
+        return Err(
+            "invalid record usage receipt envelope: schema-11 receipt contains utilization fields"
+                .to_owned(),
+        );
+    }
+    if schema_version == Some(u64::from(SESSION_RECEIPT_SCHEMA_VERSION))
+        && !(has_compute_ms && has_capacity_slots)
+    {
+        return Err(
+            "invalid record usage receipt envelope: schema-12 receipt is missing utilization fields"
+                .to_owned(),
+        );
+    }
     let envelope: RecordUsageReceiptEnvelope = serde_json::from_value(value.clone())
         .map_err(|error| format!("invalid record usage receipt envelope: {error}"))?;
     let receipt = SessionReceipt {
@@ -1852,11 +1979,25 @@ pub fn record_usage_receipt_feature_key_for_contract(
     receipt: &SessionReceipt,
     contract_version: u32,
 ) -> String {
+    record_usage_receipt_feature_key_from_envelope_for_contract(
+        &record_usage_receipt_envelope(receipt),
+        contract_version,
+    )
+    .expect("serializing a receipt feature key cannot fail")
+}
+
+/// Reconstruct a receipt key from the exact signed envelope. This preserves
+/// retained schema-11 evidence rather than adding schema-12 fields to it.
+pub fn record_usage_receipt_feature_key_from_envelope_for_contract(
+    envelope: &serde_json::Value,
+    contract_version: u32,
+) -> Result<String, String> {
+    let receipt = parse_record_usage_receipt_envelope(envelope)?;
     let evidence = serde_json::json!({
         "contract_version": contract_version,
         "epoch": receipt.body.billing_epoch,
         "payout_revision": receipt.body.payout_revision,
-        "receipt": record_usage_receipt_envelope(receipt),
+        "receipt": envelope,
     });
     let key_material = serde_json::json!({
         "domain": "mayhem-record-usage-receipt-feature-v1",
@@ -1864,15 +2005,15 @@ pub fn record_usage_receipt_feature_key_for_contract(
     });
     let digest = stable_json_bytes(&key_material)
         .map(|bytes| blake3::hash(&bytes).to_hex().to_string())
-        .expect("serializing a receipt feature key cannot fail");
-    format!(
+        .map_err(|error| format!("serializing receipt feature key: {error}"))?;
+    Ok(format!(
         "receipt/submit/{}/{}/{}/{}/{}",
         receipt.body.billing_epoch,
         receipt.body.billing_id,
         receipt.body.billing_attempt,
         receipt.body.seq,
         digest
-    )
+    ))
 }
 
 pub fn record_usage_receipt_signing_bytes(
@@ -3454,10 +3595,9 @@ mod tests {
             "request_modalities": [["text"]],
             "proof_sha256": "33".repeat(32),
         });
-        let profile: SerializedGenerationExecutionProfile = serde_json::from_value(
-            serialized_mode["generation_execution_profile"].clone(),
-        )
-        .unwrap();
+        let profile: SerializedGenerationExecutionProfile =
+            serde_json::from_value(serialized_mode["generation_execution_profile"].clone())
+                .unwrap();
         let legacy_profile_bytes = br#"{"schema_version":1,"engine":"vllm","independent_dispatch":true,"request_modalities":[["text"]]}"#;
         assert_eq!(profile.topology, None);
         assert_eq!(serde_json::to_vec(&profile).unwrap(), legacy_profile_bytes);
@@ -3513,12 +3653,10 @@ mod tests {
         let mut hashes = BTreeSet::from([legacy.policy_hash]);
         for topology in ["shared_worker", "isolated_workers"] {
             mode["generation_execution_profile"]["topology"] = json!(topology);
-            let binding =
-                vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
+            let binding = vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
             assert!(hashes.insert(binding.policy_hash.clone()));
             let mut changed_proof = mode.clone();
-            changed_proof["generation_execution_profile"]["proof_sha256"] =
-                json!("44".repeat(32));
+            changed_proof["generation_execution_profile"]["proof_sha256"] = json!("44".repeat(32));
             assert_eq!(
                 vllm_execution_mode_binding(&artifact_root, "throughput", &changed_proof).unwrap(),
                 binding
@@ -3616,7 +3754,10 @@ mod tests {
         let profile: SerializedVllmExecutionProfile =
             serde_json::from_value(mode["profile"].clone()).unwrap();
         assert_eq!(profile.runtime, None);
-        assert!(serde_json::to_value(profile).unwrap().get("runtime").is_none());
+        assert!(serde_json::to_value(profile)
+            .unwrap()
+            .get("runtime")
+            .is_none());
 
         mode["profile"]["runtime"] = Value::Null;
         assert_eq!(
@@ -3626,15 +3767,24 @@ mod tests {
         let profile: SerializedVllmExecutionProfile =
             serde_json::from_value(mode["profile"].clone()).unwrap();
         assert_eq!(profile.runtime, None);
-        assert!(serde_json::to_value(profile).unwrap().get("runtime").is_none());
+        assert!(serde_json::to_value(profile)
+            .unwrap()
+            .get("runtime")
+            .is_none());
 
         let runtime = VllmRuntime::FlashinferSpeculativeMetadataV1;
-        assert_eq!(serde_json::to_value(runtime).unwrap(), json!("flashinfer_speculative_metadata_v1"));
+        assert_eq!(
+            serde_json::to_value(runtime).unwrap(),
+            json!("flashinfer_speculative_metadata_v1")
+        );
         mode["profile"]["runtime"] = serde_json::to_value(runtime).unwrap();
         let profile: SerializedVllmExecutionProfile =
             serde_json::from_value(mode["profile"].clone()).unwrap();
         assert_eq!(profile.runtime, Some(runtime));
-        assert_eq!(serde_json::to_value(profile).unwrap()["runtime"], mode["profile"]["runtime"]);
+        assert_eq!(
+            serde_json::to_value(profile).unwrap()["runtime"],
+            mode["profile"]["runtime"]
+        );
         let selected = vllm_execution_mode_binding(&artifact_root, "throughput", &mode).unwrap();
         assert_ne!(selected, baseline);
         mode["profile"]["proof_sha256"] = json!("ff".repeat(32));
@@ -3643,7 +3793,11 @@ mod tests {
             selected
         );
 
-        for invalid in [json!("unknown_runtime"), json!(1), json!({"runtime": "flashinfer_speculative_metadata_v1"})] {
+        for invalid in [
+            json!("unknown_runtime"),
+            json!(1),
+            json!({"runtime": "flashinfer_speculative_metadata_v1"}),
+        ] {
             mode["profile"]["runtime"] = invalid;
             assert!(vllm_execution_mode_binding(&artifact_root, "throughput", &mode).is_err());
         }
@@ -4430,7 +4584,7 @@ mod tests {
     #[test]
     fn voucher_and_receipt_signing_payloads_are_bound_to_terms() {
         let voucher = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: "sess".to_owned(),
             billing_id: "11".repeat(32),
             billing_attempt: 0,
@@ -4519,6 +4673,8 @@ mod tests {
             locked_per_req_au: 7,
             locked_min_session_au: 11,
             served_ctx: voucher.served_ctx,
+            compute_ms: 1,
+            capacity_slots: 1,
             ctx_bracket: voucher.ctx_bracket.clone(),
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
@@ -4591,6 +4747,36 @@ mod tests {
             receipt_signing_bytes(&workflow_receipt).unwrap(),
             receipt_signing_bytes(&changed).unwrap()
         );
+
+        let current = SessionReceipt {
+            body: receipt.clone(),
+            enclave_sig: "enclave-signature".to_owned(),
+            enclave_pubkey: "enclave-key".to_owned(),
+            user_sig: "user-signature".to_owned(),
+        };
+        let mut incomplete_current = record_usage_receipt_envelope(&current);
+        incomplete_current["body"]
+            .as_object_mut()
+            .unwrap()
+            .remove("compute_ms");
+        assert!(parse_record_usage_receipt_envelope(&incomplete_current).is_err());
+
+        let mut legacy = current;
+        legacy.body.schema_version = RECOVERABLE_SESSION_RECEIPT_SCHEMA_VERSION;
+        legacy.body.compute_ms = 0;
+        legacy.body.capacity_slots = 0;
+        let legacy_envelope = record_usage_receipt_envelope(&legacy);
+        assert!(legacy_envelope["body"].get("compute_ms").is_none());
+        assert!(legacy_envelope["body"].get("capacity_slots").is_none());
+        assert_eq!(
+            parse_record_usage_receipt_envelope(&legacy_envelope).unwrap(),
+            legacy
+        );
+        assert_eq!(
+            record_usage_receipt_feature_key_for_contract(&legacy, 26),
+            record_usage_receipt_feature_key_from_envelope_for_contract(&legacy_envelope, 26)
+                .unwrap()
+        );
     }
 
     #[test]
@@ -4631,7 +4817,7 @@ mod tests {
     #[test]
     fn signing_payloads_use_current_version_only() {
         let voucher = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: "sess".to_owned(),
             billing_id: "11".repeat(32),
             billing_attempt: 0,
@@ -4693,6 +4879,8 @@ mod tests {
             locked_per_req_au: 7,
             locked_min_session_au: 11,
             served_ctx: voucher.served_ctx,
+            compute_ms: 1,
+            capacity_slots: 1,
             ctx_bracket: voucher.ctx_bracket.clone(),
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 1,
@@ -4725,7 +4913,7 @@ mod tests {
             },
         ];
         let voucher = SpendVoucherBody {
-            schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+            schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
             session_id: "sess-au-roundtrip".to_owned(),
             billing_id: "44".repeat(32),
             billing_attempt: 0,
@@ -4810,6 +4998,8 @@ mod tests {
             locked_per_req_au: voucher.locked_per_req_au,
             locked_min_session_au: voucher.locked_min_session_au,
             served_ctx: voucher.served_ctx,
+            compute_ms: 1,
+            capacity_slots: 1,
             ctx_bracket: voucher.ctx_bracket,
             ctx_bracket_table_ver: voucher.ctx_bracket_table_ver,
             rules_ver: 7,
@@ -4823,7 +5013,7 @@ mod tests {
         };
         let expected_receipt = concat!(
             "{\"domain\":\"mayhem-session-receipt\",\"signing_version\":2,\"body\":{",
-            "\"schema_version\":11,\"session_id\":\"sess-au-roundtrip\",",
+            "\"schema_version\":12,\"session_id\":\"sess-au-roundtrip\",",
             "\"billing_id\":\"4444444444444444444444444444444444444444444444444444444444444444\",",
             "\"billing_attempt\":0,\"billing_prior_usage\":{},\"billing_prior_au_owed_cum\":\"0\",",
             "\"billing_epoch\":12,",
@@ -4838,7 +5028,8 @@ mod tests {
             "{\"unit\":\"input_token\",\"per_unit_au\":\"10000000\",\"granularity\":1},",
             "{\"unit\":\"output_token\",\"per_unit_au\":\"2500000000000000\",\"granularity\":1000}",
             "],\"locked_per_req_au\":\"1\",\"locked_min_session_au\":\"2000000000000000000000000\",",
-            "\"served_ctx\":131072,\"ctx_bracket\":\"le128k\",\"ctx_bracket_table_ver\":1,",
+            "\"served_ctx\":131072,\"compute_ms\":1,\"capacity_slots\":1,",
+            "\"ctx_bracket\":\"le128k\",\"ctx_bracket_table_ver\":1,",
             "\"rules_ver\":7,\"usage\":{\"input_token\":3,\"output_token\":5},",
             "\"au_owed_cum\":\"2000000000000000000000001\",",
             "\"prompt_hash\":\"3333333333333333333333333333333333333333333333333333333333333333\",",
@@ -5390,17 +5581,77 @@ mod tests {
             PayloadChunkError::ChunkAfterFinal { .. }
         ));
     }
+
+    #[test]
+    fn tokenize_control_frames_round_trip_with_route_bindings() {
+        let request = TokenizeRequestFrame {
+            frame_type: TOKENIZE_REQUEST_FRAME_TYPE.to_owned(),
+            version: TOKENIZE_FRAME_VERSION,
+            session_id: "11".repeat(32),
+            provider: "22".repeat(32),
+            enclave_id: "33".repeat(32),
+            room_id: "room-1".to_owned(),
+            model: "qwen/example".to_owned(),
+            request_id: String::new(),
+            request: Some(json!({"contract_request": {"messages": []}})),
+            request_ref: None,
+            return_tokens: true,
+        };
+        let encoded = serde_json::to_value(&request).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TokenizeRequestFrame>(encoded).unwrap(),
+            request
+        );
+
+        let response = TokenizeResponseFrame {
+            frame_type: TOKENIZE_RESPONSE_FRAME_TYPE.to_owned(),
+            version: TOKENIZE_FRAME_VERSION,
+            session_id: request.session_id,
+            provider: request.provider,
+            enclave_id: request.enclave_id,
+            room_id: request.room_id,
+            model: request.model,
+            ok: true,
+            count: Some(3),
+            tokens: Some(vec![1, 2, 3]),
+            tokens_ref: None,
+            error_code: None,
+            error: None,
+        };
+        let encoded = serde_json::to_value(&response).unwrap();
+        assert_eq!(
+            serde_json::from_value::<TokenizeResponseFrame>(encoded).unwrap(),
+            response
+        );
+    }
 }
 
 #[cfg(test)]
 mod market_version_bridge_tests {
     #[test]
-    fn receipt_recovery_accepts_v23_v24_and_v25_only() {
-        for version in [23, 24, 25] {
+    fn receipt_recovery_accepts_v23_through_current_only() {
+        for version in [23, 24, 25, 26, 27, 28] {
             assert!(super::receipt_contract_version_is_supported(version));
         }
-        for version in [0, 22, 26, u64::MAX] {
+        for version in [0, 22, 29, u64::MAX] {
             assert!(!super::receipt_contract_version_is_supported(version));
         }
+        for version in [23, 24, 25, 26] {
+            assert!(super::receipt_schema_version_is_supported_for_contract(
+                11, version
+            ));
+            assert!(!super::receipt_schema_version_is_supported_for_contract(
+                12, version
+            ));
+        }
+        assert!(super::receipt_schema_version_is_supported_for_contract(
+            12, 27
+        ));
+        assert!(super::receipt_schema_version_is_supported_for_contract(
+            12, 28
+        ));
+        assert!(!super::receipt_schema_version_is_supported_for_contract(
+            11, 27
+        ));
     }
 }

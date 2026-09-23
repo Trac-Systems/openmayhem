@@ -9,8 +9,8 @@ const LEDGER_RAILS = new Set(['fiat', 'tap', 'tnk']);
 const LEDGER_RAIL_ORDER = ['fiat', 'tap', 'tnk'];
 const MAX_OPERATOR_FEE_BPS = 1_500;
 const TAP_BURN_BPS = 1_000;
-const SESSION_RECEIPT_SCHEMA_VERSION = 11;
-const SETTLEMENT_RECEIPT_SCHEMA_VERSIONS = new Set([10, SESSION_RECEIPT_SCHEMA_VERSION]);
+const SESSION_RECEIPT_SCHEMA_VERSION = 12;
+const SETTLEMENT_RECEIPT_SCHEMA_VERSIONS = new Set([10, 11, SESSION_RECEIPT_SCHEMA_VERSION]);
 const CANONICAL_RECEIPT_SNAPSHOT_SCHEMA_VERSION = 1;
 // trac-peer's canonical feature ceiling is 64,000 bytes. Keep enough room for
 // its compact-encoding envelope instead of discovering an oversized page only
@@ -147,9 +147,12 @@ function addMarketUsage(map, body, sessionId, amount) {
     ...(ctxBracket ? { ctx_bracket: ctxBracket } : {}),
     ...(ctxBracketTableVer ? { ctx_bracket_table_ver: ctxBracketTableVer } : {}),
     demand_au: 0n,
+    compute_ms: 0n,
+    legacy_receipt_count: 0,
     settled_usage: {},
     sessions: new Set(),
     providers: new Set(),
+    provider_capacities: new Map(),
   };
   if ((current.ctx_bracket_table_ver ?? null) !== (ctxBracketTableVer ?? current.ctx_bracket_table_ver ?? null)) {
     throw new Error('receipt ctx_bracket_table_ver mismatch within market usage bucket');
@@ -157,6 +160,20 @@ function addMarketUsage(map, body, sessionId, amount) {
   const next = current.demand_au + amount;
   safeAu(next, 'market demand_au', { allowZero: true });
   current.demand_au = next;
+  if (body.schema_version === SESSION_RECEIPT_SCHEMA_VERSION) {
+    const computeMs = BigInt(safeCount(body.compute_ms, 'receipt compute_ms'));
+    current.compute_ms += computeMs;
+    safeAu(current.compute_ms, 'market compute_ms');
+    const capacitySlots = safeCount(body.capacity_slots, 'receipt capacity_slots');
+    if (capacitySlots > 1_000_000) throw new Error('receipt capacity_slots is too large');
+    current.provider_capacities.set(
+      body.provider,
+      Math.max(current.provider_capacities.get(body.provider) ?? 0, capacitySlots)
+    );
+  } else {
+    current.legacy_receipt_count += 1;
+    safeCount(current.legacy_receipt_count, 'legacy receipt count');
+  }
   const paidUnits = new Set(body.locked_rate_map.map((row) => canonicalUsageUnit(row.unit)));
   const usage = normalizeReceiptUsage(body.usage);
   const prior = normalizeReceiptUsage(body.billing_prior_usage);
@@ -190,8 +207,12 @@ function sortedMarketUsageEntries(map) {
       ...(entry.ctx_bracket ? { ctx_bracket: entry.ctx_bracket } : {}),
       ...(entry.ctx_bracket_table_ver ? { ctx_bracket_table_ver: entry.ctx_bracket_table_ver } : {}),
       demand_au: canonicalAu(entry.demand_au),
+      compute_ms: canonicalAu(entry.compute_ms),
+      legacy_receipt_count: entry.legacy_receipt_count,
       session_count: entry.sessions.size,
       provider_count: entry.providers.size,
+      capacity_slot_count: Array.from(entry.provider_capacities.values())
+        .reduce((sum, slots) => sum + slots, 0),
     }));
 }
 
@@ -299,6 +320,12 @@ function normalizeSettlementReceiptBody(body) {
     throw new Error('receipt billing prior usage requires a prior cumulative amount');
   }
   assertUsageMonotonic(current.billing_prior_usage, current.usage);
+  if (current.schema_version === SESSION_RECEIPT_SCHEMA_VERSION) {
+    safeCount(current.compute_ms, 'receipt compute_ms');
+    if (safeCount(current.capacity_slots, 'receipt capacity_slots') > 1_000_000) {
+      throw new Error('receipt capacity_slots is too large');
+    }
+  }
   if (safeAu(current.au_owed_cum, 'receipt au_owed_cum') <
       safeAu(current.billing_prior_au_owed_cum, 'receipt billing_prior_au_owed_cum', { allowZero: true })) {
     throw new Error('receipt cumulative au regressed below its signed billing baseline');

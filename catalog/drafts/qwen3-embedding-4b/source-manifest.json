@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "source": "huggingface",
+  "repository": "Qwen/Qwen3-Embedding-4B",
+  "revision": "5cf2132abc99cad020ac570b19d031efec650f2b",
+  "license": "apache-2.0",
+  "gated": false,
+  "artifact_format": "safetensors",
+  "weight_bytes": 8043548672,
+  "files": [
+    {
+      "path": "model-00001-of-00002.safetensors",
+      "bytes": 4965826464,
+      "sha256": "e70bfe3c970523fb7ef4eddffed2254ce3f1e7150c3de2af4342de129dd756f8"
+    },
+    {
+      "path": "model-00002-of-00002.safetensors",
+      "bytes": 3077765624,
+      "sha256": "ed1b87c8e9eb7e535a1a155e4fd00d9f4dba80e58a6db48a4c9f82cede7079c1"
+    },
+    {
+      "path": "tokenizer.json",
+      "bytes": 11422947,
+      "sha256": "83cdf8c3a34f68862319cb1810ee7b1e2c0a44e0864ae930194ddb76bb7feb8d"
+    }
+  ],
+  "source_evidence": {
+    "model_api": "source/model-api.json",
+    "tree": "source/tree.json",
+    "config": "source/config.json",
+    "sentence_transformers_config": "source/config_sentence_transformers.json",
+    "modules": "source/modules.json",
+    "pooling": "source/1_Pooling/config.json",
+    "model_card": "source/README.md"
+  },
+  "download_status": "source_verified_not_mirrored"
+}

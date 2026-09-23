@@ -12,7 +12,7 @@ also exported as `contractEpochAdminParamKeys()` / `contractEpochAdminParamDefin
 can assert the live map, not a hand-maintained prose list. The values listed here are defaults
 and bounds, not provider-settable terms.
 
-The current writable source map is exported by `contractEpochAdminParamKeys()` in `intercom/contract/contract.js`; deprecated compatibility records listed below are readable but cannot be set under v25.
+The current writable source map is exported by `contractEpochAdminParamKeys()` in `intercom/contract/contract.js`; deprecated compatibility records listed below remain readable but cannot be set under v27.
 
 ## Epoch, Settlement, And Governance
 
@@ -36,9 +36,9 @@ The current writable source map is exported by `contractEpochAdminParamKeys()` i
 |---|---:|---:|---|
 | `price_rate_limit_seconds` | `21600` | `0 .. 31536000` | Admin seed `P0` change throttle only; market floats are exempt. |
 | `market_target_utilization_bps` | historical | read-only | Deprecated since v25; ignored by activity pricing. |
-| `market_ema_alpha_bps` | `2500` | `1 .. 10000` | Telemetry activity EMA weight per epoch; does not determine price direction. |
-| `market_gain_bps` | `5000` | `1 .. 10000` | Dampening gain toward the desired price. |
-| `market_max_step_bps` | `1000` | `1 .. 10000` | Per-epoch max price movement clamp. |
+| `market_ema_alpha_bps` | historical | read-only | Deprecated in v27; ignored by utilization pricing. |
+| `market_gain_bps` | historical | read-only | Deprecated in v27; ignored by utilization pricing. |
+| `market_max_step_bps` | historical | read-only | Deprecated in v27; the contract uses a fixed 10% step. |
 | `market_cold_start_min_providers` | historical | read-only | Deprecated since v25; ignored by activity pricing. |
 | `market_provider_epoch_target_au` | historical | read-only | Deprecated since v25; ignored by activity pricing. |
 | `market_max_utilization_bps` | historical | read-only | Deprecated since v25; ignored by activity pricing. |
@@ -56,7 +56,7 @@ The current writable source map is exported by `contractEpochAdminParamKeys()` i
 | Intercom contract `epochCommit` / `fraudProof` | `challenge_epochs`, `epoch_seconds`, `fraud_slash_bps` | Stores `provisional_until_epoch`; challenges remain epoch-count based, not wall-clock based. Commit hashes/records and fraud-proof replay bind the active epoch timing. Provider-committer penalties read the active admin slash percentage. |
 | Intercom contract probe/dispute slashing | `fraud_slash_bps`, `dispute_lost_slash_bps` | Canary mismatch, fraud proof, direct dispute-loss reputation events, and dispute resolution all read active admin slash percentages at the event timestamp. |
 | Intercom contract rate gates | `rate_staleness_seconds` | TNK/TAP oracle freshness window. |
-| Intercom contract market tick | `epoch_seconds`, all `market_*` params | Price derivation evidence records the active constants and epoch timing used for replay. |
+| Intercom contract market tick | `epoch_seconds`, `price_min_bps`, `price_max_bps` | Signed receipt slot time determines utilization. The 20%/80% thresholds and 10% step are deterministic protocol constants recorded in derivation evidence. |
 | Context bracket governance | `param_activation_delay_seconds` plus `ctx_brackets` schedule | Admin-only `setCtxBrackets` publishes versioned `current`/`pending` tables. Gateway spend vouchers and providers now read `ctx_brackets` from contract state and settle against the pinned table version instead of a hardcoded runtime table. |
 | Canonical gateway launched by `mayhem use` | `epoch_seconds`, `ctx_brackets` | Gateway-generated reputation-event commands derive their contract epoch from the active admin value, not a fixed one-hour epoch. Gateway session vouchers derive `ctx_bracket`/`ctx_bracket_table_ver` from the active admin context table. |
 | Fiat paygate | `epoch_seconds` | Stripe evidence derives `fiat_deposit` / `fiat_chargeback` epochs from the active admin contract value. Service config `contract.epoch_seconds` is a fallback before a contract param record exists, not the live authority. |
@@ -131,4 +131,4 @@ These are not operating knobs: schema versions, fixed rail names (`fiat`, `tap`,
 
 Simulation-only values such as `intercom/scripts/market-sim.mjs`'s default epoch length do not drive contract state or production evidence.
 
-Contract v25 removes the six deprecated monetary-utilization fields from writable epoch parameters. Active pricing uses activity EMA alpha, gain, step clamp and hard bounds 2500–40000 bps. Both mainnet manifests use exactly 2500/40000. Existing unsafe active/pending records are suppressed and audited by `migrate_market_pricing`. See [the v25 upgrade](../market-activity-pricing-v25.md).
+Contract v27 also removes the activity EMA, gain and configurable step from the active controller. Absolute signed slot utilization uses fixed inclusive thresholds of 20% and 80% and a fixed 10% step. Bounds remain writable within 2500–40000 bps. Existing unsafe active/pending records are suppressed and audited by `migrate_market_pricing`. See [the v27 upgrade](../market-utilization-pricing-v27.md).

@@ -8,6 +8,7 @@ pub mod openai;
 pub mod pricing;
 pub mod provider_table;
 pub mod reputation;
+pub mod structured_schema;
 pub use attestation_policy::*;
 pub use audit::*;
 pub use failover::*;
@@ -3487,17 +3488,38 @@ mod tests {
         let provider = hex::encode(key.verifying_key().to_bytes());
         let now = 1_800_000_000_000;
         let mut heartbeat = signed_heartbeat(&key, &provider, now, "ab");
-        assert_eq!(serde_json::from_value::<ProviderHeartbeat>(heartbeat.clone()).unwrap().prefix_caching, None);
+        assert_eq!(
+            serde_json::from_value::<ProviderHeartbeat>(heartbeat.clone())
+                .unwrap()
+                .prefix_caching,
+            None
+        );
         heartbeat["prefix_caching"] = json!(true);
-        assert!(matches!(verify_heartbeat_signature(&heartbeat, &provider, heartbeat["sig"].as_str().unwrap()),
-            Err(GatewayError::BadHeartbeatSignature { .. })));
+        assert!(matches!(
+            verify_heartbeat_signature(&heartbeat, &provider, heartbeat["sig"].as_str().unwrap()),
+            Err(GatewayError::BadHeartbeatSignature { .. })
+        ));
         let mut body = heartbeat.clone();
         body.as_object_mut().unwrap().remove("sig");
-        heartbeat["sig"] = json!(hex::encode(key.sign(&heartbeat_signing_payload(&body).unwrap()).to_bytes()));
-        verify_heartbeat_signature(&heartbeat, &provider, heartbeat["sig"].as_str().unwrap()).unwrap();
-        assert_eq!(serde_json::from_value::<ProviderHeartbeat>(heartbeat.clone()).unwrap().prefix_caching, Some(true));
+        heartbeat["sig"] = json!(hex::encode(
+            key.sign(&heartbeat_signing_payload(&body).unwrap())
+                .to_bytes()
+        ));
+        verify_heartbeat_signature(&heartbeat, &provider, heartbeat["sig"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(
+            serde_json::from_value::<ProviderHeartbeat>(heartbeat.clone())
+                .unwrap()
+                .prefix_caching,
+            Some(true)
+        );
         heartbeat["prefix_caching"] = json!(false);
-        assert!(verify_heartbeat_signature(&heartbeat, &provider, heartbeat["sig"].as_str().unwrap()).is_err());
+        assert!(verify_heartbeat_signature(
+            &heartbeat,
+            &provider,
+            heartbeat["sig"].as_str().unwrap()
+        )
+        .is_err());
     }
 
     #[test]
