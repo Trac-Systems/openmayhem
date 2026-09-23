@@ -38823,8 +38823,10 @@ fn canonical_targeted_payout_plan(record: &Value, rail: &str, epoch: u64) -> Res
             && record.get("rail").and_then(Value::as_str) == Some(rail)
             && record.get("epoch").and_then(Value::as_u64) == Some(epoch)
             && value.get("op").and_then(Value::as_str) == Some("prepare_targeted_payout_epoch")
-            && value.get("contract_version").and_then(Value::as_u64)
-                == Some(u64::from(CONTRACT_VERSION))
+            && value
+                .get("contract_version")
+                .and_then(Value::as_u64)
+                .is_some_and(|version| version == 27 || version == u64::from(CONTRACT_VERSION))
             && value.get("rail").and_then(Value::as_str) == Some(rail)
             && value.get("epoch").and_then(Value::as_u64) == Some(epoch)
             && record.get("plan_root") == value.get("plan_root"),
@@ -38847,15 +38849,20 @@ async fn ensure_targeted_payout_epoch_plan(
         .and_then(Value::as_u64)
         .context("targeted payout epoch plan is missing epoch")?;
     let record_key = format!("payout/epoch-plan/{rail}/{epoch}");
+    if let Some(existing) = read_confirmed_state_value(rpc, &record_key).await? {
+        let value = canonical_targeted_payout_plan(&existing, rail, epoch)?;
+        ensure!(
+            value == *candidate,
+            "canonical targeted payout epoch plan differs from the locally planned operation"
+        );
+        return Ok((value, existing));
+    }
     let signed = sign_targeted_payout_control(signer, candidate).await?;
-    let record = if let Some(existing) = read_confirmed_state_value(rpc, &record_key).await? {
-        existing
-    } else {
+    let record =
         submit_targeted_payout_control(rpc, signer, candidate, &record_key, None, |record| {
             record.get("value") == Some(&signed)
         })
-        .await?
-    };
+        .await?;
     let value = canonical_targeted_payout_plan(&record, rail, epoch)?;
     ensure!(
         value == signed,
@@ -115046,6 +115053,32 @@ esac
                 "version {version}"
             );
         }
+    }
+
+    #[test]
+    fn existing_v27_targeted_payout_plan_survives_v28_cli() {
+        let plan_root = "a".repeat(64);
+        let mut record = json!({
+            "type": "targeted_payout_epoch_plan",
+            "rail": "fiat",
+            "epoch": 508,
+            "plan_root": plan_root,
+            "value": {
+                "op": "prepare_targeted_payout_epoch",
+                "contract_version": 27,
+                "rail": "fiat",
+                "epoch": 508,
+                "plan_root": plan_root,
+            },
+        });
+        assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_ok());
+        record["value"]["contract_version"] = json!(CONTRACT_VERSION);
+        assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_ok());
+        record["value"]["contract_version"] = json!(26);
+        assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_err());
+        record["value"]["contract_version"] = json!(27);
+        record["plan_root"] = json!("b".repeat(64));
+        assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_err());
     }
 
     #[test]
