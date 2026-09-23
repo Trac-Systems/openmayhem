@@ -1556,6 +1556,10 @@ fn service_create_args(inputs: ServiceCreateInputs<'_>) -> Result<Vec<String>> {
         ("PYTHONPATH", "/mayhem/source/python"),
         ("SGLANG_SM120_ONLINE_MXFP8", "true"),
         ("SGLANG_MM_PREPROCESS_DEVICE", "cpu"),
+        // Constrain native XML tool calls even for tool_choice=auto. Without
+        // this, SGLang can stream an unfinished qwen3_coder call as tool_calls
+        // with arguments that are not valid JSON.
+        ("SGLANG_TOOL_STRICT_LEVEL", "1"),
         ("MAX_TOTAL_TOKENS", "824384"),
         ("CUDA_HOME", "/usr/local/cuda"),
         ("CC", "/usr/bin/gcc"),
@@ -2150,6 +2154,7 @@ mod tests {
             "--memory=104g",
             "--memory-swap=104g",
             "CARGO_BUILD_JOBS=2",
+            "SGLANG_TOOL_STRICT_LEVEL=1",
             "MAX_TOTAL_TOKENS=824384",
         ] {
             assert!(
