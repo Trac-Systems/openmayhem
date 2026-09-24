@@ -5,7 +5,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
 use reqwest::{Client, Url};
@@ -21,6 +21,10 @@ use crate::{
 
 const BACKEND_ID: &str = "openai-compatible";
 const REQUEST_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const IDENTITY_PROBE_INTERVAL: Duration = Duration::from_secs(10);
+const IDENTITY_RETRY_INTERVAL: Duration = Duration::from_secs(2);
+const IDENTITY_UNAVAILABLE_GRACE: Duration = Duration::from_secs(30);
+const IDENTITY_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 const OUTPUT_SHAPE_DIAGNOSTIC_LIMIT: u64 = 64;
 static OUTPUT_SHAPE_DIAGNOSTIC_EMITTED: AtomicU64 = AtomicU64::new(0);
 
@@ -438,6 +442,35 @@ struct LoadedBackend {
 pub struct OpenAiCompatibleBackend {
     config: OpenAiCompatibleBackendConfig,
     loaded: Option<Arc<LoadedBackend>>,
+    identity_health: IdentityHealth,
+}
+
+#[derive(Default)]
+struct IdentityHealth {
+    next_probe_at: Option<Instant>,
+    first_unavailable_at: Option<Instant>,
+    failed: bool,
+}
+
+enum IdentityProbeError {
+    Unavailable {
+        endpoint: &'static str,
+        reason: String,
+    },
+    Mismatch {
+        endpoint: &'static str,
+        reason: String,
+    },
+}
+
+impl IdentityProbeError {
+    fn into_engine_error(self) -> EngineError {
+        match self {
+            Self::Unavailable { endpoint, reason } | Self::Mismatch { endpoint, reason } => {
+                backend_error(format!("/{endpoint} identity check: {reason}"))
+            }
+        }
+    }
 }
 
 impl OpenAiCompatibleBackend {
@@ -447,6 +480,7 @@ impl OpenAiCompatibleBackend {
         Ok(Self {
             config,
             loaded: None,
+            identity_health: IdentityHealth::default(),
         })
     }
 
@@ -491,7 +525,7 @@ impl EngineBackend for OpenAiCompatibleBackend {
         });
         let deadline = std::time::Instant::now() + self.config.readiness_timeout;
         loop {
-            match verify_live_identity(&loaded) {
+            match verify_live_identity(&loaded).map_err(IdentityProbeError::into_engine_error) {
                 Ok(()) => break,
                 Err(error) if std::time::Instant::now() < deadline => {
                     thread::sleep(Duration::from_secs(2));
@@ -507,6 +541,7 @@ impl EngineBackend for OpenAiCompatibleBackend {
         admitted.proven_capabilities = proven_capabilities;
         let admitted = Arc::new(admitted);
         self.loaded = Some(Arc::clone(&admitted));
+        self.identity_health = IdentityHealth::default();
         Ok(LoadedModelInfo {
             backend: BACKEND_ID.to_owned(),
             artifact: config.artifact,
@@ -547,9 +582,50 @@ impl EngineBackend for OpenAiCompatibleBackend {
     }
 
     fn component_healthy(&mut self) -> bool {
-        self.loaded
-            .as_ref()
-            .is_some_and(|loaded| verify_live_identity(loaded).is_ok())
+        let Some(loaded) = self.loaded.as_ref() else {
+            return false;
+        };
+        let now = Instant::now();
+        if self
+            .identity_health
+            .next_probe_at
+            .is_some_and(|at| now < at)
+        {
+            return !self.identity_health.failed;
+        }
+        match verify_live_identity(loaded) {
+            Ok(()) => {
+                if self.identity_health.first_unavailable_at.take().is_some() {
+                    eprintln!("[provider-identity] runtime identity probe recovered");
+                }
+                self.identity_health.failed = false;
+                self.identity_health.next_probe_at = Some(Instant::now() + IDENTITY_PROBE_INTERVAL);
+            }
+            Err(IdentityProbeError::Unavailable { endpoint, reason }) => {
+                let now = Instant::now();
+                let since = *self
+                    .identity_health
+                    .first_unavailable_at
+                    .get_or_insert_with(|| {
+                        eprintln!(
+                            "[provider-identity] /{endpoint} temporarily unavailable: {reason}"
+                        );
+                        now
+                    });
+                self.identity_health.failed =
+                    now.duration_since(since) >= IDENTITY_UNAVAILABLE_GRACE;
+                if self.identity_health.failed {
+                    eprintln!("[provider-identity] runtime identity unavailable beyond grace period; endpoint=/{endpoint} reason={reason}");
+                }
+                self.identity_health.next_probe_at = Some(now + IDENTITY_RETRY_INTERVAL);
+            }
+            Err(IdentityProbeError::Mismatch { endpoint, reason }) => {
+                eprintln!("[provider-identity] signed runtime identity mismatch; endpoint=/{endpoint} reason={reason}");
+                self.identity_health.failed = true;
+                self.identity_health.next_probe_at = Some(Instant::now() + IDENTITY_RETRY_INTERVAL);
+            }
+        }
+        !self.identity_health.failed
     }
 
     fn concurrent_generation_backend(&self) -> Option<Arc<dyn ConcurrentGenerationBackend>> {
@@ -603,30 +679,35 @@ impl ConcurrentGenerationBackend for OpenAiCompatibleConcurrent {
     }
 }
 
-fn verify_live_identity(loaded: &LoadedBackend) -> Result<()> {
+fn verify_live_identity(loaded: &LoadedBackend) -> std::result::Result<(), IdentityProbeError> {
     verify_models_identity(loaded)?;
-    let server_info = get_json(loaded, "server_info")?;
+    let server_info = get_identity_json(loaded, "server_info")?;
     for (pointer, expected) in &loaded.runtime.server_info_checks {
-        let actual = server_info.pointer(pointer).ok_or_else(|| {
-            backend_error(format!(
-                "/server_info omitted signed identity field {pointer}"
-            ))
-        })?;
+        let actual = server_info
+            .pointer(pointer)
+            .ok_or_else(|| IdentityProbeError::Mismatch {
+                endpoint: "server_info",
+                reason: format!("omitted signed identity field {pointer}"),
+            })?;
         if actual != expected {
-            return Err(backend_error(format!(
-                "/server_info identity mismatch at {pointer}: expected {expected}, got {actual}"
-            )));
+            return Err(IdentityProbeError::Mismatch {
+                endpoint: "server_info",
+                reason: format!("identity mismatch at {pointer}"),
+            });
         }
     }
     Ok(())
 }
 
-fn verify_models_identity(loaded: &LoadedBackend) -> Result<()> {
-    let models = get_json(loaded, "v1/models")?;
+fn verify_models_identity(loaded: &LoadedBackend) -> std::result::Result<(), IdentityProbeError> {
+    let models = get_identity_json(loaded, "v1/models")?;
     let entries = models
         .get("data")
         .and_then(Value::as_array)
-        .ok_or_else(|| backend_error("/v1/models response is missing data"))?;
+        .ok_or_else(|| IdentityProbeError::Mismatch {
+            endpoint: "v1/models",
+            reason: "response is missing data".to_owned(),
+        })?;
     let matches = entries
         .iter()
         .filter(|entry| {
@@ -634,20 +715,23 @@ fn verify_models_identity(loaded: &LoadedBackend) -> Result<()> {
         })
         .collect::<Vec<_>>();
     if matches.len() != 1 {
-        return Err(backend_error(format!(
-            "/v1/models must contain the exact signed model ID {:?} once",
-            loaded.runtime.served_model
-        )));
+        return Err(IdentityProbeError::Mismatch {
+            endpoint: "v1/models",
+            reason: "expected signed model ID exactly once".to_owned(),
+        });
     }
     let max_model_len = matches[0]
         .get("max_model_len")
         .and_then(Value::as_u64)
-        .ok_or_else(|| backend_error("/v1/models model is missing max_model_len"))?;
+        .ok_or_else(|| IdentityProbeError::Mismatch {
+            endpoint: "v1/models",
+            reason: "model is missing max_model_len".to_owned(),
+        })?;
     if max_model_len != u64::from(loaded.runtime.served_context) {
-        return Err(backend_error(format!(
-            "/v1/models max_model_len {max_model_len} differs from signed served_context {}",
-            loaded.runtime.served_context
-        )));
+        return Err(IdentityProbeError::Mismatch {
+            endpoint: "v1/models",
+            reason: "max_model_len differs from signed served_context".to_owned(),
+        });
     }
     Ok(())
 }
@@ -1781,13 +1865,45 @@ fn tokenize(loaded: Arc<LoadedBackend>, text: &str) -> Result<Tokenization> {
     Ok(Tokenization { token_ids })
 }
 
-fn get_json(loaded: &LoadedBackend, path: &str) -> Result<Value> {
+fn get_identity_json(
+    loaded: &LoadedBackend,
+    path: &'static str,
+) -> std::result::Result<Value, IdentityProbeError> {
     let client = loaded.client.clone();
-    let url = endpoint_url(&loaded.base_url, path)?;
-    let label = path.to_owned();
+    let url =
+        endpoint_url(&loaded.base_url, path).map_err(|error| IdentityProbeError::Unavailable {
+            endpoint: path,
+            reason: error.to_string(),
+        })?;
     run_async(move || async move {
-        let response = client.get(url).send().await.map_err(map_http_error)?;
-        json_response(response, &label).await
+        let response = client
+            .get(url)
+            .timeout(IDENTITY_REQUEST_TIMEOUT)
+            .send()
+            .await
+            .map_err(|error| {
+                if error.is_timeout() {
+                    backend_error("request timed out")
+                } else if error.is_connect() {
+                    backend_error("connection failed")
+                } else {
+                    backend_error("request failed")
+                }
+            })?;
+        if !response.status().is_success() {
+            return Err(backend_error(format!(
+                "HTTP {}",
+                response.status().as_u16()
+            )));
+        }
+        response
+            .json()
+            .await
+            .map_err(|_| backend_error("invalid JSON response"))
+    })
+    .map_err(|error| IdentityProbeError::Unavailable {
+        endpoint: path,
+        reason: error.to_string(),
     })
 }
 
@@ -2373,10 +2489,19 @@ mod tests {
     }
 
     fn spawn_identity_server(responses: Vec<(&'static str, Value)>) -> String {
+        spawn_identity_server_with_status(
+            responses
+                .into_iter()
+                .map(|(path, body)| (path, 200, body))
+                .collect(),
+        )
+    }
+
+    fn spawn_identity_server_with_status(responses: Vec<(&'static str, u16, Value)>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
         thread::spawn(move || {
-            for (expected_path, body) in responses {
+            for (expected_path, status, body) in responses {
                 let (mut socket, _) = listener.accept().unwrap();
                 let mut request = Vec::new();
                 let mut buffer = [0u8; 4096];
@@ -2395,7 +2520,7 @@ mod tests {
                 let body = serde_json::to_vec(&body).unwrap();
                 write!(
                     socket,
-                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    "HTTP/1.1 {status} Test\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
                     body.len()
                 )
                 .unwrap();
@@ -2440,7 +2565,81 @@ mod tests {
             }),
         }));
         assert!(backend.component_healthy());
+        backend.identity_health.next_probe_at = None;
         assert!(!backend.component_healthy());
+    }
+
+    #[test]
+    fn transient_identity_failure_does_not_retire_live_runtime() {
+        let binding = runtime();
+        let base_url = spawn_identity_server_with_status(vec![
+            ("/v1/models", 503, json!({})),
+            (
+                "/v1/models",
+                200,
+                json!({"data":[{"id":"org/model","max_model_len":524288}]}),
+            ),
+            ("/server_info", 200, json!({"version":"1.0"})),
+        ]);
+        let mut backend = OpenAiCompatibleBackend::new(OpenAiCompatibleBackendConfig {
+            base_url: base_url.clone(),
+            runtime: binding.clone(),
+            readiness_timeout: Duration::ZERO,
+        })
+        .unwrap();
+        backend.loaded = Some(Arc::new(LoadedBackend {
+            client: Client::builder().build().unwrap(),
+            base_url: validate_loopback_base_url(&base_url).unwrap(),
+            runtime: binding,
+            artifact: crate::ModelArtifact::openai_compatible_model("unused"),
+            ctx_size: 1024,
+            proven_capabilities: BTreeSet::new(),
+            gate: Arc::new(GenerationGate {
+                capacity: 2,
+                active: Mutex::new(0),
+                changed: Condvar::new(),
+            }),
+        }));
+        assert!(backend.component_healthy());
+        assert!(backend.component_healthy()); // cached during retry interval
+        assert!(backend.identity_health.first_unavailable_at.is_some());
+        backend.identity_health.next_probe_at = None;
+        assert!(backend.component_healthy());
+        assert!(backend.identity_health.first_unavailable_at.is_none());
+    }
+
+    #[test]
+    fn sustained_identity_failure_retires_runtime_after_grace() {
+        let binding = runtime();
+        let base_url = spawn_identity_server_with_status(vec![
+            ("/v1/models", 503, json!({})),
+            ("/v1/models", 503, json!({})),
+        ]);
+        let mut backend = OpenAiCompatibleBackend::new(OpenAiCompatibleBackendConfig {
+            base_url: base_url.clone(),
+            runtime: binding.clone(),
+            readiness_timeout: Duration::ZERO,
+        })
+        .unwrap();
+        backend.loaded = Some(Arc::new(LoadedBackend {
+            client: Client::builder().build().unwrap(),
+            base_url: validate_loopback_base_url(&base_url).unwrap(),
+            runtime: binding,
+            artifact: crate::ModelArtifact::openai_compatible_model("unused"),
+            ctx_size: 1024,
+            proven_capabilities: BTreeSet::new(),
+            gate: Arc::new(GenerationGate {
+                capacity: 2,
+                active: Mutex::new(0),
+                changed: Condvar::new(),
+            }),
+        }));
+        assert!(backend.component_healthy());
+        backend.identity_health.first_unavailable_at =
+            Some(Instant::now() - IDENTITY_UNAVAILABLE_GRACE - Duration::from_secs(1));
+        backend.identity_health.next_probe_at = None;
+        assert!(!backend.component_healthy());
+        assert!(!backend.component_healthy()); // remains failed until recovery or restart
     }
 
     #[test]

@@ -81737,7 +81737,7 @@ async fn serve_provider_sessions(
                     }
                     Ok(ComponentRecovery::Pending) => component_recovery_pending = true,
                     Ok(ComponentRecovery::Unsupported) if responder.requires_owner_restart() => {
-                        bail!("managed provider runtime exited; retiring this worker so its supervisor can reconcile and restart the owned runtime")
+                        bail!("managed provider runtime failed health verification; retiring this worker so its supervisor can reconcile and restart the owned runtime")
                     }
                     Ok(ComponentRecovery::Unsupported) => {}
                     Err(err) if responder.requires_owner_restart() => {
