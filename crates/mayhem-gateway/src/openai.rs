@@ -9638,6 +9638,14 @@ fn durable_streaming_endpoint_family(family: &str) -> bool {
     )
 }
 
+// The job vault also persists non-streaming requests. Recovery by idempotency
+// key must be available for every signed endpoint family, even when the
+// original response never reached the buyer. Keep the streaming predicate
+// above separate: it governs partial-receipt checkpoint validation.
+fn lookupable_gateway_job_family(family: &str) -> bool {
+    mayhem_proto::endpoint_family_contract_template(family).is_some()
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct GatewayJobKeyLookupQuery {
@@ -9653,9 +9661,9 @@ async fn lookup_gateway_job_by_key(
         Ok(owner) => owner,
         Err(error) => return error.into_response(),
     };
-    if !durable_streaming_endpoint_family(&query.endpoint_family) {
+    if !lookupable_gateway_job_family(&query.endpoint_family) {
         return ApiError::bad_request(
-            "unsupported streaming endpoint family",
+            "unsupported endpoint family",
             Some("endpoint_family"),
         )
         .into_response();

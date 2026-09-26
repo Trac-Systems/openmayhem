@@ -94,6 +94,31 @@ fn adapt(events: SseEventStream, family: &str, model: String) -> ChatResponse {
 }
 
 #[tokio::test]
+async fn idempotency_lookup_recovers_non_streaming_jobs_without_changing_stream_receipt_rules() {
+    let root = tempfile::tempdir().unwrap();
+    let state = GatewayState::from_models(vec![model()])
+        .with_job_store_dir(root.path().join("jobs"))
+        .unwrap();
+    let app = openai_router(state.clone());
+    for family in [
+        mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS,
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+    ] {
+        let headers = headers(family);
+        let raw = json!({"model": model().id, "input": "test"});
+        let job = start(&state, family, &raw, &headers).await;
+        let found = app.clone().oneshot(lookup_request(family, &headers)).await.unwrap();
+        assert_eq!(found.status(), StatusCode::ACCEPTED, "{family}");
+        let found = body(found).await;
+        assert_eq!(found["id"], job.id, "{family}");
+        assert_eq!(found["endpoint_family"], family, "{family}");
+        assert!(!durable_streaming_endpoint_family(family));
+    }
+    assert!(!lookupable_gateway_job_family("unknown_family"));
+}
+
+#[tokio::test]
 async fn content_precedes_receipt_and_terminal_waits_for_durable_ack_on_all_surfaces() {
     for (_, family) in SURFACES {
         let root = tempfile::tempdir().unwrap();
