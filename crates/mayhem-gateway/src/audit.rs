@@ -23,6 +23,7 @@ pub const CANARY_VERIFICATION_EMBEDDING_COSINE: &str = "embedding_cosine";
 pub const CANARY_VERIFICATION_TRANSCRIPT_MATCH: &str = "transcript_match";
 pub const CANARY_VERIFICATION_AUDIO_FINGERPRINT: &str = "audio_fingerprint";
 pub const CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT: &str = "video_av_fingerprint";
+pub const CANARY_VERIFICATION_DECISION_FINGERPRINT: &str = "decision_fingerprint";
 pub const CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE: &str = "attestation_of_compute";
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -151,6 +152,7 @@ pub fn supported_canary_verification_method(method: &str) -> bool {
             | CANARY_VERIFICATION_TRANSCRIPT_MATCH
             | CANARY_VERIFICATION_AUDIO_FINGERPRINT
             | CANARY_VERIFICATION_VIDEO_AV_FINGERPRINT
+            | CANARY_VERIFICATION_DECISION_FINGERPRINT
             | CANARY_VERIFICATION_ATTESTATION_OF_COMPUTE
     )
 }
@@ -1400,6 +1402,53 @@ pub fn evaluate_catalog_canary_video_av_fingerprint_probe(
     }
 }
 
+pub fn evaluate_catalog_canary_decision_fingerprint_probe(
+    spec: &CanaryProbeSpec,
+    expected_fingerprints_by_prompt: &BTreeMap<String, String>,
+    observed_fingerprints_by_prompt: &BTreeMap<String, String>,
+) -> CanaryProbeEvaluation {
+    let total_positions = expected_fingerprints_by_prompt.len() as u32;
+    let matched_positions = expected_fingerprints_by_prompt
+        .iter()
+        .filter(|(prompt_id, expected)| {
+            observed_fingerprints_by_prompt
+                .get(*prompt_id)
+                .is_some_and(|observed| observed == *expected)
+        })
+        .count() as u32;
+    let expected_fingerprint = aggregate_canary_fingerprints(
+        expected_fingerprints_by_prompt
+            .iter()
+            .map(|(prompt_id, fingerprint)| (prompt_id.as_str(), fingerprint.as_str())),
+    );
+    let observed_fingerprint =
+        aggregate_canary_fingerprints(expected_fingerprints_by_prompt.keys().map(|prompt_id| {
+            (
+                prompt_id.as_str(),
+                observed_fingerprints_by_prompt
+                    .get(prompt_id)
+                    .map(String::as_str)
+                    .unwrap_or_default(),
+            )
+        }));
+    let match_bps = if total_positions == 0 {
+        0
+    } else {
+        ((u64::from(matched_positions) * 10_000) / u64::from(total_positions)) as u32
+    };
+    CanaryProbeEvaluation {
+        verification_method: CANARY_VERIFICATION_DECISION_FINGERPRINT.to_owned(),
+        canary_set: spec.canary_set.clone(),
+        prompt_id: spec.prompt_id.clone(),
+        expected_fingerprint,
+        observed_fingerprint,
+        matched_positions,
+        total_positions,
+        match_bps,
+        pass: total_positions > 0 && matched_positions == total_positions,
+    }
+}
+
 pub fn perceptual_hash_match_stats(
     expected_hash: &str,
     observed_hash: &str,
@@ -1546,6 +1595,33 @@ mod tests {
             aggregate,
             aggregate_canary_fingerprints([("b", second.as_str()), ("a", first.as_str())])
         );
+    }
+
+    #[test]
+    fn decision_fingerprint_probe_requires_every_exact_prompt_result() {
+        let expected = BTreeMap::from([
+            ("choice".to_owned(), "11".repeat(32)),
+            ("score".to_owned(), "22".repeat(32)),
+        ]);
+        let passing =
+            evaluate_catalog_canary_decision_fingerprint_probe(&spec(), &expected, &expected);
+        assert!(passing.pass);
+        assert_eq!(passing.matched_positions, 2);
+        assert_eq!(passing.total_positions, 2);
+        assert_eq!(passing.match_bps, 10_000);
+        assert_eq!(
+            passing.verification_method,
+            CANARY_VERIFICATION_DECISION_FINGERPRINT
+        );
+
+        let missing = BTreeMap::from([("choice".to_owned(), "11".repeat(32))]);
+        let failing =
+            evaluate_catalog_canary_decision_fingerprint_probe(&spec(), &expected, &missing);
+        assert!(!failing.pass);
+        assert_eq!(failing.matched_positions, 1);
+        assert_eq!(failing.total_positions, 2);
+        assert_eq!(failing.match_bps, 5_000);
+        assert_ne!(failing.expected_fingerprint, failing.observed_fingerprint);
     }
 
     #[test]

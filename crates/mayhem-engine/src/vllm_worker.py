@@ -35,6 +35,8 @@ cancelled_requests_lock = threading.Lock()
 completed_request_id = 0
 generation_multiplexer = None
 engine_health_monitor = None
+worker_task = "generate"
+embedding_engine_request_ids = {}
 
 
 MAX_KERNEL_BACKEND_LENGTH = 64
@@ -56,6 +58,10 @@ class PromptTooLong(ValueError):
 
 
 def request_error_fields(exc):
+    # Grammar compilation errors are deterministic request-schema failures,
+    # not a reason to cool an otherwise healthy serving route.
+    if str(exc).startswith("Grammar error:"):
+        return {"error_code": "invalid_response_schema"}
     # vLLM v0.24 validates again after multimodal expansion. Match only its
     # explicit decoder-context ValueError, never arbitrary engine/OOM failures.
     # https://github.com/vllm-project/vllm/blob/v0.24.0/vllm/v1/engine/input_processor.py
@@ -179,9 +185,13 @@ async def abort_engine_request(request_id):
     abort = getattr(engine, "abort", None)
     if abort is None:
         return
-    result = abort(f"mayhem-{int(request_id)}")
-    if inspect.isawaitable(result):
-        await result
+    engine_ids = embedding_engine_request_ids.get(
+        int(request_id), (f"mayhem-{int(request_id)}",)
+    )
+    for engine_id in tuple(engine_ids):
+        result = abort(engine_id)
+        if inspect.isawaitable(result):
+            await result
 
 
 class GenerationMultiplexer:
@@ -645,6 +655,8 @@ def effective_execution_properties(initialized_engine, required_kwargs):
         ),
         "enable_prefix_caching": config_value(config_value(config, "cache_config"), "enable_prefix_caching"),
         "mamba_cache_mode": config_value(config_value(config, "cache_config"), "mamba_cache_mode"),
+        "runner": enum_value(config_value(model_config, "runner_type")),
+        "convert": enum_value(config_value(model_config, "convert_type")),
     }
     if "compilation_config" in required_kwargs:
         compilation = config_value(config, "compilation_config")
@@ -1020,6 +1032,9 @@ def create_engine(payload):
     requested_moe_backend = optional_kernel_backend(payload, "vllm_moe_backend")
     requested_mtp_tokens = optional_mtp_num_speculative_tokens(payload)
     requested_compilation_config = optional_compilation_config(payload)
+    task = str(payload.get("task") or "generate")
+    if task not in ("generate", "embedding"):
+        raise ValueError(f"unsupported vLLM task {task!r}")
     kwargs = {
         "model": path,
         "tokenizer": path,
@@ -1045,7 +1060,11 @@ def create_engine(payload):
         "use_fp64_gumbel",
         "async_scheduling",
     }
-    # Required for every provider, including models whose vLLM default is off.
+    if task == "embedding":
+        kwargs["runner"] = "pooling"
+        kwargs["convert"] = "embed"
+        required_options.update(("runner", "convert"))
+    # Required for every provider; vLLM pooling supports prefix reuse as well.
     kwargs["enable_prefix_caching"] = True
     required_options.add("enable_prefix_caching")
     if model_uses_hybrid_attention(path):
@@ -1543,11 +1562,113 @@ async def async_handle_generate(request_id, payload):
     }
 
 
+def embedding_pooling_params(payload):
+    PoolingParams = import_attr(
+        (("vllm.pooling_params", "PoolingParams"), ("vllm", "PoolingParams"))
+    )
+    dimensions = payload.get("dimensions")
+    if dimensions is not None:
+        if type(dimensions) is not int or dimensions < 1:
+            raise ValueError("embedding dimensions must be a positive integer")
+    # Request the native vector and perform MRL slicing locally. Some models
+    # document MRL dimensions without populating vLLM's optional metadata.
+    return PoolingParams(task="embed", dimensions=None)
+
+
+def embedding_vector(output, dimensions=None):
+    pooling_output = getattr(output, "outputs", None)
+    values = getattr(pooling_output, "embedding", None)
+    if values is None:
+        values = getattr(pooling_output, "data", None)
+    if values is None:
+        raise RuntimeError("vLLM embedding output is missing its vector")
+    if hasattr(values, "detach"):
+        values = values.detach().float().cpu().tolist()
+    vector = [float(value) for value in values]
+    if not vector or any(not math.isfinite(value) for value in vector):
+        raise RuntimeError("vLLM embedding output contains no finite vector")
+    if dimensions is not None:
+        if dimensions > len(vector):
+            raise ValueError(
+                f"embedding dimensions {dimensions} exceed native dimension {len(vector)}"
+            )
+        vector = vector[:dimensions]
+        norm = math.sqrt(sum(value * value for value in vector))
+        if not math.isfinite(norm) or norm <= 0:
+            raise RuntimeError("truncated embedding vector has no finite norm")
+        vector = [value / norm for value in vector]
+    return vector
+
+
+async def async_handle_embed(request_id, payload):
+    check_cancelled(request_id)
+    if engine is None:
+        raise RuntimeError("model has not been loaded")
+    if worker_task != "embedding":
+        raise RuntimeError("loaded vLLM model is not an embedding runner")
+    inputs = payload.get("inputs")
+    if not isinstance(inputs, list) or not inputs:
+        raise ValueError("embedding request must include at least one input")
+    if any(not isinstance(item, str) for item in inputs):
+        raise ValueError("embedding inputs must be strings")
+    embedding_pooling_params(payload)
+    engine_ids = tuple(f"mayhem-{int(request_id)}-{index}" for index in range(len(inputs)))
+    embedding_engine_request_ids[int(request_id)] = engine_ids
+
+    async def encode_one(index, text):
+        final = None
+        async for output in engine.encode(
+            prompt=text,
+            pooling_params=embedding_pooling_params(payload),
+            request_id=engine_ids[index],
+        ):
+            if request_cancelled(request_id):
+                raise RequestCancelled("engine request cancelled")
+            final = output
+        if final is None or not getattr(final, "finished", False):
+            raise RuntimeError("vLLM embedding request ended without a final output")
+        prompt_token_ids = getattr(final, "prompt_token_ids", None)
+        if prompt_token_ids is None:
+            raise RuntimeError("vLLM embedding output is missing prompt token usage")
+        return index, embedding_vector(final, payload.get("dimensions")), len(prompt_token_ids)
+
+    tasks = [
+        asyncio.create_task(encode_one(index, text))
+        for index, text in enumerate(inputs)
+    ]
+    try:
+        if engine_health_monitor is not None:
+            engine_health_monitor.raise_if_dead()
+        results = await asyncio.gather(*tasks)
+        check_cancelled(request_id)
+    except BaseException:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await abort_engine_request(request_id)
+        raise
+    finally:
+        embedding_engine_request_ids.pop(int(request_id), None)
+    results.sort(key=lambda item: item[0])
+    prompt_tokens = sum(item[2] for item in results)
+    return {
+        "embeddings": [item[1] for item in results],
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": 0,
+            "total_tokens": prompt_tokens,
+        },
+    }
+
+
 async def handle_load(payload):
     global engine, tokenizer, processor, ctx_size, model_path, generation_multiplexer
-    global execution_properties, engine_health_monitor
+    global execution_properties, engine_health_monitor, worker_task
     model_path = str(payload["path"])
     ctx_size = positive_int(payload.get("ctx_size"), 2048)
+    worker_task = str(payload.get("task") or "generate")
+    if worker_task not in ("generate", "embedding"):
+        raise ValueError(f"unsupported vLLM task {worker_task!r}")
     initialized_engine = create_engine(payload)
     await stop_engine_health_monitor()
     engine = initialized_engine
@@ -1586,7 +1707,7 @@ async def handle_load(payload):
     kv_cache = runtime_kv_cache_info()
     generation_multiplexer = GenerationMultiplexer(
         load_generation_capacity(payload),
-        async_handle_generate,
+        async_handle_embed if worker_task == "embedding" else async_handle_generate,
         abort_engine_request,
         send,
         finish_request,
@@ -1597,7 +1718,11 @@ async def handle_load(payload):
         "n_vocab": int(vocab_size()),
         "kv_cache_size_tokens": kv_cache["size_tokens"],
         "kv_cache_max_concurrency": kv_cache["max_concurrency"],
-        "prefix_caching": config_value(config_value(engine.vllm_config, "cache_config"), "enable_prefix_caching") is True,
+        "task": worker_task,
+        "prefix_caching": config_value(
+            config_value(config_value(engine, "vllm_config"), "cache_config"),
+            "enable_prefix_caching",
+        ) is True,
         "execution": execution_properties,
         "determinism": {
             "async_scheduling": False,
@@ -1686,7 +1811,16 @@ async def run_worker():
                 break
             request_id = int(request.get("id", 0))
             op = str(request.get("op", ""))
-            if op == "generate":
+            request_op = "embed" if worker_task == "embedding" else "generate"
+            # Tokenization uses the already-loaded frontend tokenizer. It does
+            # not touch the generation engine or consume a generation slot, so
+            # it must remain available while generations are active. Draining
+            # here can hold a count request behind a minutes-long inference and
+            # makes the gateway's bounded control request time out.
+            if op == "tokenize":
+                await emit_control_response(request)
+                continue
+            if op == request_op:
                 if generation_multiplexer is None:
                     await emit_control_response(request)
                     continue

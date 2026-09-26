@@ -1,0 +1,10 @@
+{
+  "aborted": true,
+  "done_before_abort": false,
+  "type": "CancelledError",
+  "message": "caller cancelled embedding request",
+  "abort_seconds": 0.0002848817966878414,
+  "recovery_seconds": 7.183610714040697,
+  "recovery_tokens": 6,
+  "passed": true
+}

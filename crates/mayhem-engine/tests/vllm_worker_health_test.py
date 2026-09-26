@@ -22,6 +22,7 @@ def load_health_scope():
         "EngineHealthMonitor",
         "stop_engine_health_monitor",
         "async_handle_generate",
+        "config_value",
         "handle_load",
         "handle",
         "emit_control_response",
@@ -39,6 +40,7 @@ def load_health_scope():
         execution_properties=None,
         batch_invariant=False,
         kernel_policy="auto",
+        worker_task="generate",
         request_queue=queue.Queue(),
     )
     exec(compile(ast.Module(body=retained, type_ignores=[]), WORKER_PATH.name, "exec"), namespace)
@@ -326,6 +328,35 @@ class VllmWorkerHealthTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(monitor._task)
                 self.assertIsNone(self.worker["engine_health_monitor"])
         self.assertEqual(self.messages, [])
+
+    async def test_tokenize_does_not_wait_for_active_generation(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def generate(request_id, payload):
+            started.set()
+            await release.wait()
+            return {"text": "done"}
+
+        self.multiplexer(generate)
+        self.worker["handle"] = lambda request_id, op, payload: (
+            {"token_ids": [7, 8, 9]}
+            if op == "tokenize"
+            else (_ for _ in ()).throw(ValueError(f"unexpected op {op}"))
+        )
+        self.worker["request_queue"].put({"id": 1, "op": "generate", "payload": {}})
+        self.worker["request_queue"].put({"id": 2, "op": "tokenize", "payload": {"text": "hi"}})
+        self.worker["request_queue"].put(None)
+
+        worker = asyncio.create_task(self.worker["run_worker"]())
+        await asyncio.wait_for(started.wait(), timeout=1.0)
+        await self.wait_until(lambda: any(message.get("id") == 2 for message in self.messages))
+        token_response = next(message for message in self.messages if message.get("id") == 2)
+        self.assertEqual(token_response["result"], {"token_ids": [7, 8, 9]})
+        self.assertFalse(worker.done())
+
+        release.set()
+        await asyncio.wait_for(worker, timeout=1.0)
 
 
 if __name__ == "__main__":

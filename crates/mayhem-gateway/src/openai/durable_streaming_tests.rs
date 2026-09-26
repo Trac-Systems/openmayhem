@@ -94,6 +94,31 @@ fn adapt(events: SseEventStream, family: &str, model: String) -> ChatResponse {
 }
 
 #[tokio::test]
+async fn idempotency_lookup_recovers_non_streaming_jobs_without_changing_stream_receipt_rules() {
+    let root = tempfile::tempdir().unwrap();
+    let state = GatewayState::from_models(vec![model()])
+        .with_job_store_dir(root.path().join("jobs"))
+        .unwrap();
+    let app = openai_router(state.clone());
+    for family in [
+        mayhem_proto::ENDPOINT_OPENAI_EMBEDDINGS,
+        mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
+        mayhem_proto::ENDPOINT_OPENAI_IMAGE_GENERATIONS,
+    ] {
+        let headers = headers(family);
+        let raw = json!({"model": model().id, "input": "test"});
+        let job = start(&state, family, &raw, &headers).await;
+        let found = app.clone().oneshot(lookup_request(family, &headers)).await.unwrap();
+        assert_eq!(found.status(), StatusCode::ACCEPTED, "{family}");
+        let found = body(found).await;
+        assert_eq!(found["id"], job.id, "{family}");
+        assert_eq!(found["endpoint_family"], family, "{family}");
+        assert!(!durable_streaming_endpoint_family(family));
+    }
+    assert!(!lookupable_gateway_job_family("unknown_family"));
+}
+
+#[tokio::test]
 async fn content_precedes_receipt_and_terminal_waits_for_durable_ack_on_all_surfaces() {
     for (_, family) in SURFACES {
         let root = tempfile::tempdir().unwrap();
@@ -434,22 +459,49 @@ async fn checkpoint_evidence_survives_failure_restart_and_history_rotation() {
             .body
             .final_receipt
     );
-    assert!(reconcile_pending_gateway_job_once(&restarted, &job.id, &NoDelivery).await.is_err());
-    assert_eq!(restarted.jobs.lock_recover("jobs").get(&job.id, now_secs()).unwrap().unwrap().status,
-        GatewayJobStatus::ReconciliationPending, "a partial receipt alone is not terminal accounting");
+    assert!(
+        reconcile_pending_gateway_job_once(&restarted, &job.id, &NoDelivery)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        restarted
+            .jobs
+            .lock_recover("jobs")
+            .get(&job.id, now_secs())
+            .unwrap()
+            .unwrap()
+            .status,
+        GatewayJobStatus::ReconciliationPending,
+        "a partial receipt alone is not terminal accounting"
+    );
     let proof = failure_recovery::test_closed_proof(&receipt, &ack);
-    let app = axum::Router::new().route("/v1/state", axum::routing::get(
-        move |axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>| {
-            let proof = proof.clone();
-            async move {
-                let key = query.get("key").unwrap();
-                axum::Json(proof.as_object().unwrap().values().find(|state| state["key"].as_str() == Some(key.as_str())).unwrap().clone())
-            }
-        }));
+    let app = axum::Router::new().route(
+        "/v1/state",
+        axum::routing::get(
+            move |axum::extract::Query(query): axum::extract::Query<BTreeMap<String, String>>| {
+                let proof = proof.clone();
+                async move {
+                    let key = query.get("key").unwrap();
+                    axum::Json(
+                        proof
+                            .as_object()
+                            .unwrap()
+                            .values()
+                            .find(|state| state["key"].as_str() == Some(key.as_str()))
+                            .unwrap()
+                            .clone(),
+                    )
+                }
+            },
+        ),
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let restarted = restarted.with_canary_probe_contract_rpc(PeerRpcClient::new(format!("http://{address}/v1")).unwrap());
+    let restarted = restarted.with_canary_probe_contract_rpc(
+        PeerRpcClient::new(format!("http://{address}/v1")).unwrap(),
+    );
     let publisher = Arc::new(TestPublisher::default());
     let restarted = restarted.with_receipt_settlement_publisher(publisher.clone());
     reconcile_pending_gateway_job_once(&restarted, &job.id, &NoDelivery)

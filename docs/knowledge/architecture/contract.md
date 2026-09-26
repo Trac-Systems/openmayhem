@@ -96,12 +96,12 @@ from being truncated, partially applied, or silently reinterpreted during settle
 fraud}/*`, `rate/latest`, `tap/rate/latest`, `payout/*`, `settle/*`, `dep/*`, `fr/<hash>`.
 
 ## Key constants
-`CONTRACT_VERSION 21`, `SESSION_RECEIPT_SCHEMA_VERSION 11`, `SIGNING_MESSAGE_VERSION 2`,
+`CONTRACT_VERSION 27`, `SESSION_RECEIPT_SCHEMA_VERSION 12`, `SIGNING_MESSAGE_VERSION 2`,
 `epoch_seconds 3600`, `challenge_epochs 6`, holdback 24 / new-provider 168, fee cap 1500 bps, TAP
-burn 1000 bps, fraud slash 10000 bps, dispute-lost slash 2000 bps, payout_min $1. Market: target
-activity EMA alpha 2500, gain 5000, max step 1000, hard reference bounds 2500–40000 bps. Provider count does not gate pricing. Rails exactly
+burn 1000 bps, fraud slash 10000 bps, dispute-lost slash 2000 bps, payout_min $1. Market: low/high
+utilization thresholds 2000/8000 bps, fixed step 1000 bps, hard reference bounds 2500–40000 bps. Provider count does not gate pricing. Rails exactly
 {fiat, tap, tnk}. **No staking** — dispute deposits + reputation holdbacks are the only economic
 bonds. Ctx brackets le8k/le32k/le128k/le256k/gt256k. No secrets in these files — only public
 constants and signing-domain strings.
 
-Contract v25 adds admin `migrate_market_pricing` and optional complete `activity_calibration` on model references. Canonical settled usage drives aggregate market activity; a dimension-relative fallback covers legacy references. Recovery accepts original signed v23 and v24 receipts. See [the coordinated upgrade procedure](../../market-activity-pricing-v25.md).
+Contract v27 uses signed provider compute time and execution-slot capacity to derive absolute utilization for every model class. Prices move by a fixed 10% at the inclusive 20% and 80% thresholds while retaining the existing seed bounds. Receipt schema 12 carries the evidence; model recalibration is not required. Recovery accepts retained signed receipt evidence from contract versions 23 through 26. See [the coordinated upgrade procedure](../../market-utilization-pricing-v27.md).

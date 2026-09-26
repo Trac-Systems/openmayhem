@@ -6868,7 +6868,7 @@ mod tests {
     ) -> StoredReceipt {
         let voucher = SpendVoucher {
             body: SpendVoucherBody {
-                schema_version: SESSION_RECEIPT_SCHEMA_VERSION,
+                schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
                 session_id: session_id.to_owned(),
                 billing_id: format!("billing-{session_id}"),
                 billing_attempt: 0,
@@ -6927,6 +6927,8 @@ mod tests {
             locked_per_req_au: 0,
             locked_min_session_au: 0,
             served_ctx: 4_096,
+            compute_ms: 1,
+            capacity_slots: 1,
             ctx_bracket: None,
             ctx_bracket_table_ver: None,
             rules_ver: 1,

@@ -49,7 +49,7 @@ that envelope, receipt application remains capped by `max_apply_batch` (default 
   `new_provider_holdback_epochs` default 168 (one week); release additionally gated by canary-probe
   status and open disputes. Payable = total − held − paid_cum.
 - **Roots:** the final page carries per-epoch evidence roots `dep, use, earn, fee, price` validated
-  against recomputed totals. The market price controller ([The Activity Momentum Pricing Controller](/market/pricing-controller.md)) runs
+  against recomputed totals. The market price controller ([The Utilization-Indexed Pricing Controller](/market/pricing-controller.md)) runs
   inside the same apply.
 
 ## Fraud proofs (permissionless, no admin discretion)

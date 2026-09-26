@@ -40,9 +40,6 @@ const EPOCH_OPERATING_PARAM_VALUES = {
   price_min_bps: 2_500,
   price_max_bps: 30_000,
   price_rate_limit_seconds: 900,
-  market_ema_alpha_bps: 4_000,
-  market_gain_bps: 6_000,
-  market_max_step_bps: 1_500,
   epoch_seconds: 7_200,
   challenge_epochs: 3,
   max_apply_batch: 2_500,
@@ -291,8 +288,6 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
         rate_staleness_seconds: 120,
         uptime_tick_seconds: 1_800,
         price_rate_limit_seconds: 900,
-        market_gain_bps: 7_500,
-        market_ema_alpha_bps: 2_000,
         param_activation_delay_seconds: 3_600,
       },
     }),
@@ -319,8 +314,6 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
       'rate_staleness_seconds',
       'uptime_tick_seconds',
       'price_rate_limit_seconds',
-      'market_gain_bps',
-      'market_ema_alpha_bps',
       'param_activation_delay_seconds',
     ]),
     outsider.publicKey,
@@ -340,10 +333,22 @@ test('MayhemContract setParams is admin-only and inert until the activation dela
     rate_staleness_seconds: 120,
     uptime_tick_seconds: 1_800,
     price_rate_limit_seconds: 900,
-    market_gain_bps: 7_500,
-    market_ema_alpha_bps: 2_000,
     param_activation_delay_seconds: 3_600,
   });
+
+  const deprecatedControllerKnob = await execute(
+    contract,
+    storage,
+    'setParams',
+    makeSetParams({
+      submitted_at: 2 * DAY_SECONDS,
+      effective_at: 3 * DAY_SECONDS,
+      values: { market_gain_bps: 7_500 },
+    }),
+    admin.publicKey,
+    11
+  );
+  assert.match(deprecatedControllerKnob.message, /deprecated and read-only/i);
 });
 
 test('MayhemContract epoch and market epoch controls are admin-governed params', async () => {

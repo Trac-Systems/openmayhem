@@ -20,6 +20,9 @@ const DEFAULT_ANNOUNCE_RETRY_DELAY_MS = 1_000;
 const MAX_ANNOUNCE_RETRY_DELAY_MS = 30_000;
 const DEFAULT_DIRECT_CONNECT_MAX_WAIT_MS = 120_000;
 const DEFAULT_DIRECT_CONNECT_POLL_MS = 100;
+const DEFAULT_DIRECT_RECOVERY_HEALTH_TIMEOUT_MS = 2_000;
+const DEFAULT_DIRECT_RECOVERY_BACKOFF_MS = 250;
+const MAX_DIRECT_CONNECT_FAILURES = 256;
 const DEFAULT_MAX_CHANNELS = 1024;
 const DEFAULT_MAX_CHANNEL_NAME_BYTES = 256;
 const DEFAULT_CHANNEL_OPEN_TIMEOUT_MS = 120_000;
@@ -98,6 +101,8 @@ class Sidechannel extends Feature {
     this.rateLimits = new Map();
     this.preparedConnections = new WeakSet();
     this.closedConnections = new WeakSet();
+    this.directRecoveries = new Map();
+    this.directConnectFailures = new Map();
     this.started = false;
     this._startPromise = null;
     this._startGeneration = 0;
@@ -142,6 +147,16 @@ class Sidechannel extends Feature {
     this.directConnectPollMs = safeIntegerOr(
       config.directConnectPollMs,
       DEFAULT_DIRECT_CONNECT_POLL_MS,
+      { min: 1 }
+    );
+    this.directRecoveryHealthTimeoutMs = safeIntegerOr(
+      config.directRecoveryHealthTimeoutMs,
+      DEFAULT_DIRECT_RECOVERY_HEALTH_TIMEOUT_MS,
+      { min: 1 }
+    );
+    this.directRecoveryBackoffMs = safeIntegerOr(
+      config.directRecoveryBackoffMs,
+      DEFAULT_DIRECT_RECOVERY_BACKOFF_MS,
       { min: 1 }
     );
     this.maxMessageBytes = Number.isSafeInteger(config.maxMessageBytes) && config.maxMessageBytes > 0
@@ -1658,11 +1673,119 @@ class Sidechannel extends Feature {
     return false;
   }
 
+  _directConnectFailureKey(remote, channel) {
+    return `${normalizeKeyHex(remote)}\u0000${normalizeChannel(channel)}`;
+  }
+
+  _setDirectConnectFailure(remote, channel, phase) {
+    const key = this._directConnectFailureKey(remote, channel);
+    if (!phase) {
+      this.directConnectFailures.delete(key);
+      return;
+    }
+    if (!this.directConnectFailures.has(key)
+      && this.directConnectFailures.size >= MAX_DIRECT_CONNECT_FAILURES) {
+      this.directConnectFailures.delete(this.directConnectFailures.keys().next().value);
+    }
+    this.directConnectFailures.set(key, {
+      phase,
+      at: this._now(),
+    });
+  }
+
+  directConnectFailure(remote, channel) {
+    return this.directConnectFailures.get(
+      this._directConnectFailureKey(remote, channel)
+    ) ?? null;
+  }
+
+  _connectionsForDirectPeer(remote) {
+    const target = normalizeKeyHex(remote);
+    if (!target) return [];
+    const swarmConnections = this.peer?.swarm?.connections
+      ? Array.from(this.peer.swarm.connections)
+      : [];
+    return swarmConnections.filter((connection) => (
+      this._getRemoteKey(connection) === target
+      && connection?.destroyed !== true
+      && connection?.closed !== true
+    ));
+  }
+
+  async _recoverUnresponsiveDirectPeer(remote, entry) {
+    const target = normalizeKeyHex(remote);
+    const existing = this.directRecoveries.get(target);
+    if (existing) return await existing;
+
+    let recovery = null;
+    recovery = (async () => {
+      if (this._directPeerChannelReady(target, entry.name)) return 'connected';
+      const connections = this._connectionsForDirectPeer(target);
+      if (connections.length === 0) {
+        this._setDirectConnectFailure(target, entry.name, 'transport_unavailable');
+        return 'unavailable';
+      }
+      const directSession = this.peer?.directSession;
+      if (typeof directSession?.proveConnection !== 'function') {
+        this._setDirectConnectFailure(target, entry.name, 'health_proof_unavailable');
+        return 'health_unavailable';
+      }
+
+      const proofs = await Promise.allSettled(connections.map((connection) => (
+        directSession.proveConnection(connection, this.directRecoveryHealthTimeoutMs)
+      )));
+      if (proofs.some((proof) => proof.status === 'fulfilled')) {
+        this._setDirectConnectFailure(target, entry.name, 'protocol_incompatible');
+        return 'healthy_transport';
+      }
+      if (this._directPeerChannelReady(target, entry.name)) return 'connected';
+
+      const stillCurrent = new Set(this._connectionsForDirectPeer(target));
+      const dead = connections.filter((connection) => stillCurrent.has(connection));
+      const unprobed = Array.from(stillCurrent).filter(
+        (connection) => !connections.includes(connection)
+      );
+      if (unprobed.length > 0) {
+        this._setDirectConnectFailure(target, entry.name, 'transport_changed');
+        return 'changed';
+      }
+      for (const connection of dead) {
+        this._dropConnection(connection);
+        try {
+          connection.destroy?.();
+        } catch (_error) {}
+      }
+
+      const key = b4a.from(target, 'hex');
+      try {
+        this.peer.swarm.leavePeer?.(key);
+      } catch (_error) {}
+      await new Promise((resolve) => setTimeout(resolve, this.directRecoveryBackoffMs));
+      try {
+        this.peer.swarm.joinPeer(key);
+      } catch (_error) {
+        this._setDirectConnectFailure(target, entry.name, 'transport_rejoin_failed');
+        return 'rejoin_failed';
+      }
+      this._setDirectConnectFailure(target, entry.name, 'transport_recovering');
+      return 'recovering';
+    })().finally(() => {
+      if (this.directRecoveries.get(target) === recovery) {
+        this.directRecoveries.delete(target);
+      }
+    });
+    this.directRecoveries.set(target, recovery);
+    return await recovery;
+  }
+
   async connectDirectPeer(remote, channel, waitMs = 15_000) {
     const target = normalizeKeyHex(remote);
     const entry = this._registerChannel(channel);
     if (!target || !entry || typeof this.peer?.swarm?.joinPeer !== 'function') return false;
-    if (this._directPeerChannelReady(target, entry.name)) return true;
+    if (this._directPeerChannelReady(target, entry.name)) {
+      this._setDirectConnectFailure(target, entry.name, null);
+      return true;
+    }
 
     try {
       this.peer.swarm.joinPeer(b4a.from(target, 'hex'));
@@ -1681,9 +1804,13 @@ class Sidechannel extends Feature {
           this._openChannelForConnection(connection, entry);
         }
       }
-      if (this._directPeerChannelReady(target, entry.name)) return true;
+      if (this._directPeerChannelReady(target, entry.name)) {
+        this._setDirectConnectFailure(target, entry.name, null);
+        return true;
+      }
       await new Promise((resolve) => setTimeout(resolve, this.directConnectPollMs));
     }
+    await this._recoverUnresponsiveDirectPeer(target, entry);
     return false;
   }
 
@@ -1990,7 +2117,9 @@ class Sidechannel extends Feature {
     if (!connection || this.closedConnections.has(connection) || this._isBlocked(connection)) return;
     if (!this.preparedConnections.has(connection)) {
       this.preparedConnections.add(connection);
-      connection.on('close', () => this._dropConnection(connection));
+      for (const event of ['error', 'end', 'close']) {
+        connection.on(event, () => this._dropConnection(connection));
+      }
     }
     for (const entry of this.channels.values()) {
       this._openChannelForConnection(connection, entry);
@@ -2029,6 +2158,8 @@ class Sidechannel extends Feature {
     }
     for (const connection of this.connections.keys()) this._dropConnection(connection);
     this.connections.clear();
+    this.directRecoveries.clear();
+    this.directConnectFailures.clear();
     this.rateLimits.clear();
     this.relaySourceLimits.clear();
   }

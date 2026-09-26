@@ -1008,6 +1008,126 @@ On a supported NVIDIA host, use
 `mayhem doctor --provider-backend needle-gpu` before the same managed start.
 Do not map MPS to `needle-gpu` or add a third canonical market.
 
+## Qwen3 Embedding 4B
+
+**Selector and source**
+
+- Model: `Qwen/Qwen3-Embedding-4B`
+- Backend/artifact: vLLM 0.24 pooling / BF16 safetensors
+- Admin mirror:
+  `TracNetwork/mayhem-catalog-Qwen-Qwen3-Embedding-4B-BF16@909825755dc39379f3eb31256602da9cafb29c95`
+- Upstream pin:
+  `Qwen/Qwen3-Embedding-4B@5cf2132abc99cad020ac570b19d031efec650f2b`
+- Primary artifact root:
+  `e228d4e36517c331c3ddf034753cf974a7f73d2ac3dd0be4ef145722eccdc26c`
+- Two weight shards total 8,043,548,672 bytes.
+- Canary:
+  [`canary-qwen3-embedding-4b-bf16-v1.json`](catalog/canaries/canary-qwen3-embedding-4b-bf16-v1.json)
+
+**Hard requirements and surface**
+
+- Linux NVIDIA with compute capability 12.1 is the only calibrated platform.
+  Windows and other backends remain unavailable until they receive separate
+  calibration proof.
+- 16 GiB full-offload target and 32,768 model tokens. The longest accepted
+  caller input is 32,767 tokens because the runtime adds one internal token.
+- Endpoints: OpenAI `/v1/embeddings` and Hugging Face feature extraction.
+  Both accept a string or an ordered array of up to 128 strings. The signed
+  aggregate limit is 256 in-flight items, so two full batches can overlap.
+- Native dimension is 2,560. Matryoshka output supports 32 through 2,560
+  dimensions, including exact 1,536-dimensional vectors. Truncation is followed
+  by L2 normalization.
+- Pooling uses the last non-padding token. Documents have no implicit prefix.
+  Retrieval queries should use
+  `Instruct: {task_description}\nQuery:{query}` with a task-specific instruction.
+- Float and base64 response encodings are supported. Billing counts exact input
+  tokens; embeddings have no output-token charge.
+
+**Measured guidance**
+
+- Cold load: 57.21 seconds.
+- Short-input throughput: 378.51 input tok/s at batch 1, 2,358.46 at batch 8,
+  and 2,432.98 at batch 32.
+- Four concurrent batches of eight reached 5,064.32 input tok/s; eight reached
+  5,920.53 input tok/s without sustained swap growth.
+- Large-batch proof reached 200.25 items/s at batch 128 and 196.45 items/s for
+  two overlapping batches of 128. Two overlapping batches of 256 also passed
+  as unpublished headroom at 189.68 items/s. Process-tree RSS remained about
+  3.49 GB with about 84.2 GB of system memory available.
+- Sustained p50/p90/p99 latency was 38.4/39.5/41.6 ms at batch 1,
+  46.2/79.4/82.1 ms at batch 8, and 169.8/205.6/206.9 ms at batch 32.
+- Exact-runtime vectors matched the official Transformers reference with a
+  minimum cosine similarity of 0.999717 across native and 1,536-dimensional
+  query/document cases.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend vllm
+mayhem up --provider --provider-enclave Qwen/Qwen3-Embedding-4B --yes
+```
+
+The provider's local modality limits may advertise the calibrated batch and
+in-flight capacity. They must remain within the signed endpoint limit and the
+host's measured memory reserve.
+
+## Laya typed decisions
+
+**Selector and source**
+
+- Model: `convaiinnovations/laya`
+- Backend/artifact: native Laya 0.3.5 / BF16 safetensors
+- Admin mirror:
+  `TracNetwork/mayhem-catalog-convaiinnovations-laya@d288cbfe560a0ff904401f57e28820aa140c11e7`
+- Upstream pin:
+  `convaiinnovations/laya@1c5edc17a7acd8701df6fc341c0d179f1c62c982`
+- Runtime requirements SHA-256:
+  `b146de268c7caf04ee58e7c70bde58e7876ee9b280a8de63cf79c68fd06bab14`
+- Canary:
+  [`canary-laya-decision-v1.json`](catalog/canaries/canary-laya-decision-v1.json)
+
+**Hard requirements and surface**
+
+- CUDA is mandatory. The backend fails load if it observes a CPU fallback or
+  does not preload exactly `english`, `multilingual`, and `typed-decisions`.
+- Native ceiling is 1,024 input tokens. The English checkpoint internally uses
+  its shorter documented default where applicable; caller controls remain
+  bounded by the signed `limits` object.
+- Endpoint: Mayhem `POST /v1/decisions`. This model is a structured decision
+  model and is not exposed as chat completion or media generation.
+- `state` accepts a string, JSON object, or conversation array. `questions`
+  accepts ordered `choice`, `score`, and `noul` decisions. Explicit checkpoint,
+  language hint, typed-task routing, opt-in automatic routing, email cleaning,
+  temperature buckets, length controls, and shortlist controls are supported.
+- Choice questions accept at most 20 options normally. Larger signed requests
+  can use shortlist mode, including caller-supplied vectors, within the endpoint
+  bounds.
+- Billing uses exact processed input tokens and one result unit per four bytes
+  of canonical visible decision JSON. The reference is $0.01 per million input
+  or result units, with no fixed request or minimum-session charge. The hard
+  market band remains positive at $0.0025-$0.04 per million units.
+
+**Measured guidance**
+
+- Exact three-checkpoint CUDA load: about 13.5-13.7 seconds.
+- Peak worker GPU allocation: 5,671 MiB.
+- Five-request warm probes on two independent calibration hosts measured
+  20.889 ms and 20.444 ms p95. The fuller mixed probes measured 84.531 ms and
+  84.237 ms p95.
+- One provider process owns one session slot. The launch uses two independent
+  providers for two aggregate slots and failover without sharing mutable router
+  state between requests.
+
+**Start**
+
+```bash
+mayhem doctor --provider-backend laya
+mayhem up --provider --provider-enclave convaiinnovations/laya --yes
+```
+
+The managed provider discovers the signed mirror and builds the pinned Python
+runtime. No request may download weights or lazily load a checkpoint.
+
 ## Verification and troubleshooting
 
 After startup, require all of the following rather than treating process
