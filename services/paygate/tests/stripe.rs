@@ -273,8 +273,16 @@ async fn mock_create_connect_account(
     State(capture): State<StripeCapture>,
     headers: HeaderMap,
     body: Bytes,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     let body = String::from_utf8(body.to_vec()).expect("form body utf8");
+    if body.contains("country=US")
+        && !body.contains("capabilities%5Bcard_payments%5D%5Brequested%5D=true")
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"error": {"message": "You cannot request the transfers capability without the card_payments capability for accounts in US."}})),
+        );
+    }
     if body.contains("type=standard") {
         *capture.connect_account_type.lock().await = Some("standard".to_owned());
     } else if body.contains("type=custom") {
@@ -300,7 +308,10 @@ async fn mock_create_connect_account(
             .map(str::to_owned),
         body: format!("connect-account:{body}"),
     });
-    Json(mock_connect_account(&capture, *capture.connect_ready.lock().await).await)
+    (
+        StatusCode::OK,
+        Json(mock_connect_account(&capture, *capture.connect_ready.lock().await).await),
+    )
 }
 
 async fn mock_retrieve_connect_account(
@@ -1336,6 +1347,56 @@ async fn stripe_direct_and_checkout_integration_reject_non_usd_currency() {
 }
 
 #[tokio::test]
+async fn stripe_connect_us_onboarding_requests_both_capabilities_and_reuses_account() {
+    for account_type in [
+        StripeConnectAccountType::Express,
+        StripeConnectAccountType::Custom,
+        StripeConnectAccountType::Standard,
+    ] {
+        let (stripe_base, capture) = start_mock_stripe().await;
+        *capture.connect_country.lock().await = Some("US".to_owned());
+        *capture.connect_default_currency.lock().await = Some("usd".to_owned());
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = test_config(stripe_base, temp.path().join("stripe-events.jsonl"));
+        config.rails.stripe.connect_account_type = account_type;
+        let state = PaygateState::try_new_with_contract_poster(
+            config,
+            OracleKeypair::from_seed_hex(&"13".repeat(32)).expect("oracle"),
+            Arc::new(RecordingContractPoster::default()),
+        )
+        .expect("state");
+        let app = paygate_router(state);
+        for (nonce, ready) in [('1', false), ('2', true)] {
+            *capture.connect_ready.lock().await = ready;
+            let (status, body) = json_request(
+                app.clone(),
+                Method::POST,
+                "/v1/stripe/connect/onboard",
+                json!({
+                    "provider": "a".repeat(64),
+                    "country": "US",
+                    "request_nonce": nonce.to_string().repeat(64)
+                }),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            // The mock keeps charges_enabled=false: payout readiness must not
+            // depend on this account accepting direct card charges.
+            assert_eq!(body["account"]["ready"], ready);
+            assert_eq!(body["account"]["country"], "US");
+        }
+        let requests = capture.requests.lock().await;
+        let creations: Vec<_> = requests.iter()
+            .filter(|request| request.body.starts_with("connect-account:"))
+            .collect();
+        assert_eq!(creations.len(), 1);
+        assert!(creations[0].body.contains("capabilities%5Btransfers%5D%5Brequested%5D=true"));
+        assert!(creations[0].body.contains("capabilities%5Bcard_payments%5D%5Brequested%5D=true"));
+        assert!(!creations[0].body.contains("service_agreement"));
+    }
+}
+
+#[tokio::test]
 async fn stripe_connect_onboarding_reuses_account_and_reports_ready_status() {
     let (stripe_base, capture) = start_mock_stripe().await;
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1426,6 +1487,8 @@ async fn stripe_connect_onboarding_reuses_account_and_reports_ready_status() {
         request.body.starts_with("connect-account:")
             && request.body.contains("type=express")
             && request.body.contains("country=DE")
+            && !request.body.contains("card_payments")
+            && !request.body.contains("service_agreement")
             && request
                 .body
                 .contains("metadata%5Bmayhem_provider%5D=aaaaaaaa")

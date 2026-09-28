@@ -3477,7 +3477,7 @@ async fn stripe_create_connect_account(
     country: &str,
     rotation_nonce: Option<&str>,
 ) -> Result<VerifiedStripeConnectAccount> {
-    let form = [
+    let mut form = vec![
         ("type", stripe.connect_account_type.as_str().to_owned()),
         ("country", country.to_owned()),
         ("capabilities[transfers][requested]", "true".to_owned()),
@@ -3488,6 +3488,12 @@ async fn stripe_create_connect_account(
             "Mayhem inference provider".to_owned(),
         ),
     ];
+    // US full-service Connect accounts require both capabilities. Keep the
+    // full service agreement: recipient agreements cannot receive Connect
+    // cross-border payouts. Mayhem still uses this account only for payouts.
+    if country == "US" {
+        form.push(("capabilities[card_payments][requested]", "true".to_owned()));
+    }
     let response = http
         .post(format!(
             "{}/v1/accounts",

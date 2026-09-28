@@ -3083,7 +3083,12 @@ test('read-only provider relays bounded Stripe Standard adoption without an acco
   const participant = peerFor(otherKey);
   const signer = peerFor(providerKey);
   const writer = peerFor(adminKey, { writable: true });
-  const adoption = stripeConnectAdoptValue();
+  // The CLI can poll readiness for 900 seconds, but its signed request must
+  // still fit the existing 600-second consent limit.
+  const adoption = stripeConnectAdoptValue(providerKey, {
+    country: 'US',
+    consent_expires_at: Math.floor(Date.now() / 1_000) + 600,
+  });
   const signed = signedServiceValue(
     signer.peer,
     'stripe_connect_adopt',
@@ -3201,6 +3206,9 @@ test('Stripe Standard adoption rejects typed accounts, stale consent, and forged
     { ...stripeConnectAdoptValue(), account_id: 'acct_forbidden' },
     stripeConnectAdoptValue(providerKey, {
       consent_expires_at: Math.floor(Date.now() / 1_000) - 1,
+    }),
+    stripeConnectAdoptValue(providerKey, {
+      consent_expires_at: Math.floor(Date.now() / 1_000) + 900,
     }),
     stripeConnectAdoptValue(providerKey, { country: 'de' }),
   ];

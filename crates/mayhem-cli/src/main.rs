@@ -67382,6 +67382,14 @@ async fn provider_stripe_relink(args: ProviderStripeRelinkArgs) -> Result<()> {
     print_provider_stripe_report(&report, args.provider.json)
 }
 
+fn provider_stripe_adopt_consent_expiry(now: u64, wait_seconds: u64) -> Result<u64> {
+    // The service-request validators accept at most ten minutes of consent.
+    // Account-readiness polling can continue longer; it does not extend consent.
+    const MAX_CONSENT_SECONDS: u64 = 600;
+    now.checked_add(wait_seconds.min(MAX_CONSENT_SECONDS))
+        .context("Stripe adoption consent expiry overflow")
+}
+
 async fn provider_stripe_adopt(args: ProviderStripeAdoptArgs) -> Result<()> {
     ensure!(
         (1..=900).contains(&args.timeout_seconds),
@@ -67397,9 +67405,8 @@ async fn provider_stripe_adopt(args: ProviderStripeAdoptArgs) -> Result<()> {
         "--country must be a two-letter ISO country code"
     );
     let ctx = provider_stripe_context(&args.provider).await?;
-    let consent_expires_at = unix_epoch_seconds()?
-        .checked_add(args.timeout_seconds)
-        .context("Stripe adoption consent expiry overflow")?;
+    let consent_expires_at =
+        provider_stripe_adopt_consent_expiry(unix_epoch_seconds()?, args.timeout_seconds)?;
     let signed = signed_service_request(
         "stripe_connect_adopt",
         &ctx.rpc,
@@ -128759,6 +128766,25 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         let mut mismatch = valid;
         mismatch["copy_paste"]["onboarding_url"] = json!("https://connect.stripe.com/setup/other");
         assert!(provider_stripe_onboarding_url(&mismatch).is_err());
+    }
+
+    #[test]
+    fn provider_stripe_adopt_default_wait_keeps_consent_within_service_limit() {
+        let args = ProviderStripeAdoptArgs::try_parse_from(["adopt", "--country", "US"])
+            .expect("default adoption arguments");
+        let now = 1_900_000_000;
+        assert_eq!(args.timeout_seconds, 900);
+        assert_eq!(
+            provider_stripe_adopt_consent_expiry(now, args.timeout_seconds).unwrap(),
+            now + 600
+        );
+        for seconds in [1, 300, 600] {
+            assert_eq!(
+                provider_stripe_adopt_consent_expiry(now, seconds).unwrap(),
+                now + seconds
+            );
+        }
+        assert!(provider_stripe_adopt_consent_expiry(u64::MAX, 900).is_err());
     }
 
     #[test]
