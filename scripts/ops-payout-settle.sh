@@ -2427,20 +2427,46 @@ settle_tnk() {
   [[ "$attempt_result" == "0" ]] || return "$attempt_result"
   error_file="$work_dir/tnk-attempt-$attempt.stderr.log"
   local tnk_at_file="$work_dir/tnk-settlement-at"
-  if [[ ! -f "$tnk_at_file" ]]; then
-    date +%s >"$tnk_at_file.tmp"
-    mv "$tnk_at_file.tmp" "$tnk_at_file"
-  fi
-  local tnk_settlement_at
-  tnk_settlement_at="$(cat "$tnk_at_file")"
+  local tnk_settlement_at plan_record
+  # A failed, unsubmitted draft is not an economic commitment. Re-plan it at
+  # the current time, otherwise a newer oracle quote makes every retry fail.
+  # Once submitted, the canonical plan owns the immutable timestamp/rate and
+  # the CLI replays that exact plan before it considers any new transfer.
+  plan_record="$(curl -sf -m 10 \
+    "$RPC_URL/state?key=payout/epoch-plan/tnk/$applied_epoch&confirmed=true")" || return 1
+  tnk_settlement_at="$(printf '%s' "$plan_record" | python3 -c '
+import json, sys
+epoch, now = int(sys.argv[1]), int(sys.argv[2])
+record = json.load(sys.stdin)
+if (record.get("confirmed") is not True
+    or record.get("key") != f"payout/epoch-plan/tnk/{epoch}"
+    or type(record.get("signed_length")) is not int
+    or record["signed_length"] <= 0 or "value" not in record):
+    raise SystemExit("TNK planning requires a confirmed canonical plan read")
+plan = record["value"]
+if plan is None:
+    print(now)
+else:
+    payload = plan.get("value") if isinstance(plan, dict) else None
+    if (not isinstance(payload, dict)
+        or plan.get("type") != "targeted_payout_epoch_plan"
+        or plan.get("rail") != "tnk" or plan.get("epoch") != epoch
+        or payload.get("op") != "prepare_targeted_payout_epoch"
+        or payload.get("rail") != "tnk" or payload.get("epoch") != epoch
+        or type(payload.get("at")) is not int or payload["at"] <= 0):
+        raise SystemExit("Invalid canonical TNK plan; refusing to replace its timestamp")
+    print(payload["at"])
+' "$applied_epoch" "$(date +%s)")" || return 1
   positive_integer "$tnk_settlement_at" || {
-    echo "abort: invalid frozen TNK settlement timestamp in $tnk_at_file" >&2
+    echo "abort: invalid TNK settlement timestamp" >&2
     return 1
   }
   if (( tnk_settlement_at < canonical_settlement_unix )); then
     echo "abort: frozen TNK settlement timestamp predates canonical epoch settlement time" >&2
     return 1
   fi
+  printf '%s\n' "$tnk_settlement_at" >"$tnk_at_file.tmp"
+  mv "$tnk_at_file.tmp" "$tnk_at_file"
   local -a args=(
     --home "$ADMIN_HOME"
     --rpc-url "$RPC_URL"

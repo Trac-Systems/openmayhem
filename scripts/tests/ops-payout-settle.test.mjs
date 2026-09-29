@@ -996,6 +996,8 @@ function harness({ bundle = true, emptySeal = !bundle } = {}) {
   writeExecutable(path.join(bin, 'curl'), `#!/usr/bin/env bash
 if [[ "$*" == *"prefix=payout/liability/tnk/"* && "\${MOCK_TNK_OUTSTANDING:-0}" == "1" ]]; then
   printf '%s\\n' '{"values":[{"key":"payout/liability/tnk/provider/revision","value":{"total_au":"10","paid_cum_au":"0"}}]}'
+elif [[ "$*" == *"key=payout/epoch-plan/tnk/"* && -n "\${MOCK_TNK_PLAN_RECORD:-}" ]]; then
+  cat "$MOCK_TNK_PLAN_RECORD"
 elif [[ "$*" =~ key=(payout/epoch-plan/(fiat|tnk)/[0-9]+|settle/targeted/(fiat|tnk)/[0-9]+) ]]; then
   printf '{"key":"%s","confirmed":true,"signed_length":123,"value":null}\\n' "\${BASH_REMATCH[1]}"
 elif [[ "$*" == *"key=settle/targeted/tap/"* ]]; then
@@ -2195,4 +2197,44 @@ test('systemd keeps payout retries separate from non-blocking epoch finalization
     fs.readFileSync(SCRIPT, 'utf8'),
     /FIAT_OPERATOR_CURRENCY|--operator-currency/
   );
+});
+
+
+test('TNK retries refresh only unsubmitted drafts and retain canonical plan time', (t) => {
+  for (const canonical of [false, true]) {
+    const ctx = harness();
+    t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+    const workDir = path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}`);
+    fs.mkdirSync(workDir, { recursive: true });
+    fs.writeFileSync(path.join(workDir, 'tnk-settlement-at'), '950\n');
+    const record = path.join(ctx.root, 'canonical-tnk-plan.json');
+    writeJson(record, {
+      key: 'payout/epoch-plan/tnk/7', confirmed: true, signed_length: 123,
+      value: canonical ? {
+        type: 'targeted_payout_epoch_plan', rail: 'tnk', epoch: 7,
+        value: { op: 'prepare_targeted_payout_epoch', rail: 'tnk', epoch: 7, at: 975 },
+      } : null,
+    });
+    const result = runWorker(ctx, { MOCK_TNK_PLAN_RECORD: record });
+    assert.equal(result.status, 0, result.stderr);
+    const expected = canonical ? 975 : 1000;
+    assert.match(logLines(ctx).find(line => line.startsWith('admin tnk-settlement')),
+      new RegExp(`--at ${expected} `));
+    assert.equal(fs.readFileSync(path.join(workDir, 'tnk-settlement-at'), 'utf8').trim(), String(expected));
+  }
+});
+
+test('TNK refuses an unconfirmed or malformed plan read without changing retained time', (t) => {
+  for (const patch of [{ confirmed: false }, { value: {} }, { key: 'payout/epoch-plan/tnk/8' }, { signed_length: 0 }]) {
+    const ctx = harness();
+    t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+    const workDir = path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}`);
+    fs.mkdirSync(workDir, { recursive: true });
+    fs.writeFileSync(path.join(workDir, 'tnk-settlement-at'), '950\n');
+    const record = path.join(ctx.root, 'canonical-tnk-plan.json');
+    writeJson(record, { key: 'payout/epoch-plan/tnk/7', confirmed: true, signed_length: 123, value: null, ...patch });
+    runWorker(ctx, { MOCK_TNK_PLAN_RECORD: record });
+    assert.equal(logLines(ctx).some(line => line.startsWith('admin tnk-settlement')), false);
+    assert.equal(fs.readFileSync(path.join(workDir, 'tnk-settlement-at'), 'utf8'), '950\n');
+  }
 });
