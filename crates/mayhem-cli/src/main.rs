@@ -18331,13 +18331,46 @@ fn catalog_endpoint_calibration_materialize_tool_request(
     mut request: Value,
     forced_tool_max_output_tokens: u32,
 ) -> Result<Value> {
-    // Supply a companion fixture, never repair an explicit tools value or omission test.
-    if !case.expect_accept
-        || request.get("tools").is_some()
-        || case
-            .mutations
-            .iter()
-            .any(|mutation| mutation.path == "tools" || mutation.path.starts_with("tools."))
+    if !case.expect_accept {
+        return Ok(request);
+    }
+    // A tool boundary probe needs a real task as well as definitions. The
+    // generic text fixture otherwise spends its bounded output on guessing what
+    // "calibration" means. Preserve automatic choice and every tested tools byte.
+    if request.get("tools").is_some() {
+        if request.get("tool_choice").and_then(Value::as_str) != Some("none")
+            && mayhem_proto::validate_endpoint_request(contract, &request).is_ok()
+        {
+            let named = request
+                .get("tool_choice")
+                .and_then(Value::as_object)
+                .and_then(provider_engine_named_tool_choice);
+            let selected = request
+                .get("tools")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(provider_engine_tool_definition)
+                .filter_map(|tool| tool.get("name").and_then(Value::as_str))
+                .find(|name| named.is_none_or(|named| named == *name))
+                .map(str::to_owned);
+            if let Some(selected) = selected {
+                catalog_endpoint_calibration_strengthen_tool_request(
+                    &contract.family,
+                    case,
+                    &mut request,
+                    &selected,
+                    forced_tool_max_output_tokens,
+                )?;
+            }
+        }
+        return Ok(request);
+    }
+    // Supply a companion fixture, never repair an explicit tools omission test.
+    if case
+        .mutations
+        .iter()
+        .any(|mutation| mutation.path == "tools" || mutation.path.starts_with("tools."))
     {
         return Ok(request);
     }
@@ -119682,6 +119715,110 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 catalog_endpoint_calibration_output_token_cap(&request, 512),
                 ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS,
             );
+        }
+    }
+
+    #[test]
+    fn endpoint_calibration_gives_tool_boundaries_a_task_without_rewriting_controls() {
+        let catalog = catalog::load_document(&repo_path("catalog/models.json").unwrap()).unwrap();
+        let model = catalog
+            .models
+            .iter()
+            .find(|m| m.model_id == "Qwen/Qwen3.8-27B")
+            .unwrap();
+        let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, &[]);
+        for family in [
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+        ] {
+            let contract = model
+                .adapter
+                .endpoint_families
+                .iter()
+                .find(|f| f.family == family)
+                .unwrap();
+            let cases = mayhem_proto::generate_endpoint_calibration_cases(contract).unwrap();
+            let case = cases
+                .iter()
+                .find(|c| c.case_kind == "maximum_length_valid" && c.attributes == ["tools"])
+                .unwrap();
+            let raw = mayhem_proto::materialize_endpoint_calibration_request(case, &substitutions)
+                .unwrap();
+            let prepared = catalog_endpoint_calibration_materialize_request(
+                contract,
+                case,
+                raw.clone(),
+                &fixtures,
+            )
+            .unwrap();
+            assert_eq!(prepared["tools"], raw["tools"]);
+            assert_eq!(prepared["tools"].as_array().unwrap().len(), 128);
+            assert_eq!(prepared.get("tool_choice"), raw.get("tool_choice"));
+            assert!(
+                prepared
+                    .to_string()
+                    .contains("Return the function call immediately")
+            );
+            let mut none = raw.clone();
+            none["tool_choice"] = json!("none");
+            assert_eq!(
+                catalog_endpoint_calibration_materialize_request(
+                    contract,
+                    case,
+                    none.clone(),
+                    &fixtures
+                )
+                .unwrap(),
+                none
+            );
+            let mut rejected = case.clone();
+            rejected.expect_accept = false;
+            assert_eq!(
+                catalog_endpoint_calibration_materialize_request(
+                    contract,
+                    &rejected,
+                    raw.clone(),
+                    &fixtures
+                )
+                .unwrap(),
+                raw
+            );
+            let prompt_path = if family == mayhem_proto::ENDPOINT_OPENAI_RESPONSES {
+                "input"
+            } else {
+                "messages"
+            };
+            let budget_path = if family == mayhem_proto::ENDPOINT_OPENAI_RESPONSES {
+                "max_output_tokens"
+            } else {
+                "max_tokens"
+            };
+            let mut boundary = case.clone();
+            boundary
+                .mutations
+                .push(mayhem_proto::EndpointCalibrationMutation {
+                    path: prompt_path.into(),
+                    value: mayhem_proto::EndpointCalibrationValue::Literal {
+                        value: raw[prompt_path].clone(),
+                    },
+                });
+            boundary
+                .mutations
+                .push(mayhem_proto::EndpointCalibrationMutation {
+                    path: budget_path.into(),
+                    value: mayhem_proto::EndpointCalibrationValue::Literal { value: json!(1) },
+                });
+            let mut low = raw;
+            low[budget_path] = json!(1);
+            let unchanged = catalog_endpoint_calibration_materialize_request(
+                contract,
+                &boundary,
+                low.clone(),
+                &fixtures,
+            )
+            .unwrap();
+            assert_eq!(unchanged[prompt_path], low[prompt_path]);
+            assert_eq!(unchanged[budget_path], 1);
         }
     }
 
