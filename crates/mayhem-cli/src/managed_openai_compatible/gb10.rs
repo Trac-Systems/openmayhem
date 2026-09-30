@@ -9,7 +9,11 @@ const SOURCE_REVISION: &str = "d91c3682b0b429e4c70df63cd57f819588ce29b0";
 const WEIGHT_REVISION: &str = "7b719225242aacd3dbd3f9407468c2ee9a9d2594";
 const TABLE_BYTES: u64 = 51_200_245_760;
 const TABLE_SHA256: &str = "b070f9644adf93794d8a1030584ab705809387e64396a9327a68fa3a3a6666b3";
-const FILE_TARGETS: [(&str, &str); 4] = [
+const FILE_TARGETS: [(&str, &str); 5] = [
+    (
+        "tokenizer_manager",
+        "/sgl-workspace/sglang/python/sglang/srt/managers/tokenizer_manager.py",
+    ),
     (
         "model",
         "/sgl-workspace/sglang/python/sglang/srt/models/qwen4_exp.py",
