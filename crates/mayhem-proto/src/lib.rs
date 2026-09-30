@@ -12,6 +12,8 @@ mod comfy_workflow;
 mod comfy_workflow_constraints;
 mod comfy_workflow_media;
 mod endpoint_contract;
+mod managed_execution_mode;
+pub use managed_execution_mode::managed_execution_mode_binding;
 mod parts_catalog;
 mod validated_audio;
 mod validated_image;
@@ -460,6 +462,8 @@ struct SerializedGenerationExecutionProfile {
     schema_version: u32,
     engine: String,
     independent_dispatch: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    max_concurrent: Option<u32>,
     request_modalities: Vec<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     topology: Option<GenerationExecutionTopology>,

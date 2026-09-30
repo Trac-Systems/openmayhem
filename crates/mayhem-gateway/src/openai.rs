@@ -14394,122 +14394,153 @@ fn execution_mode_registry_from_catalog_root(
     canary_json_by_set: &BTreeMap<String, String>,
     canary_sets: &BTreeMap<String, Vec<GatewayCanaryPrompt>>,
 ) -> Result<GatewayExecutionModeRegistry, String> {
-    let Some(raw_registry) = root.get("vllm_execution_modes") else {
+    if root.get("vllm_execution_modes").is_none() && root.get("managed_execution_modes").is_none() {
         return Ok(GatewayExecutionModeRegistry::default());
-    };
-    let raw_registry = raw_registry
-        .as_object()
-        .ok_or_else(|| "vllm_execution_modes must be an object".to_owned())?;
+    }
     let models = root
         .get("models")
         .and_then(Value::as_array)
         .ok_or_else(|| "catalog models must be an array".to_owned())?;
     let mut registry = GatewayExecutionModeRegistry::default();
-    for (artifact_root, raw_modes) in raw_registry {
-        let raw_modes = raw_modes.as_object().ok_or_else(|| {
-            format!("vllm execution modes for artifact {artifact_root} must be an object")
-        })?;
-        let owners = models
-            .iter()
-            .flat_map(|model| {
-                model
-                    .get("artifacts")
-                    .and_then(Value::as_object)
-                    .into_iter()
-                    .flat_map(move |artifacts| {
-                        artifacts.iter().filter_map(move |(name, artifact)| {
-                            (artifact.get("artifact_root").and_then(Value::as_str)
-                                == Some(artifact_root.as_str()))
-                            .then(|| (model, name.clone()))
+    for (map_name, engine) in [
+        ("vllm_execution_modes", "vllm"),
+        ("managed_execution_modes", "openai-compatible"),
+    ] {
+        let Some(raw_registry) = root.get(map_name) else {
+            continue;
+        };
+        let raw_registry = raw_registry
+            .as_object()
+            .ok_or_else(|| format!("{map_name} must be an object"))?;
+        for (artifact_root, raw_modes) in raw_registry {
+            let raw_modes = raw_modes.as_object().ok_or_else(|| {
+                format!("vllm execution modes for artifact {artifact_root} must be an object")
+            })?;
+            let owners = models
+                .iter()
+                .flat_map(|model| {
+                    model
+                        .get("artifacts")
+                        .and_then(Value::as_object)
+                        .into_iter()
+                        .flat_map(move |artifacts| {
+                            artifacts.iter().filter_map(move |(name, artifact)| {
+                                (artifact.get("artifact_root").and_then(Value::as_str)
+                                    == Some(artifact_root.as_str()))
+                                .then(|| (model, name.clone()))
+                            })
                         })
-                    })
-            })
-            .collect::<Vec<_>>();
-        if owners.len() != 1 {
-            return Err(format!(
+                })
+                .collect::<Vec<_>>();
+            if owners.len() != 1 {
+                return Err(format!(
                 "execution-mode artifact root {artifact_root} must have exactly one catalog owner"
             ));
-        }
-        let (owner, artifact_name) = owners[0].clone();
-        let model_id = owner
-            .get("model_id")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "execution-mode owner is missing model_id".to_owned())?;
-        let mut modes = BTreeMap::new();
-        for (mode_id, raw_mode) in raw_modes {
-            let binding = vllm_execution_mode_binding(artifact_root, mode_id, raw_mode)
-                .map_err(|_| format!("execution mode {mode_id} for {artifact_root} is invalid"))?;
-            let mode: GatewaySerializedExecutionMode = serde_json::from_value(raw_mode.clone())
-                .map_err(|_| format!("execution mode {mode_id} for {artifact_root} is invalid"))?;
-            if mode.schema_version != 1 {
-                return Err(format!(
-                    "execution mode {mode_id} for {artifact_root} has unsupported schema version"
-                ));
             }
-            // The proto helper validates the full serialized profile. Reading these
-            // fields here ensures this loader cannot silently accept a partial mode.
-            let _ = (
-                &mode.profile,
-                &mode.generation_execution_profile,
-                &mode.modality_fingerprints,
-                &mode.resource_profiles,
-            );
-            let canary_set = mode
-                .canary
-                .get("set_id")
+            let (owner, artifact_name) = owners[0].clone();
+            let model_id = owner
+                .get("model_id")
                 .and_then(Value::as_str)
-                .ok_or_else(|| format!("execution mode {mode_id} has no canary set"))?;
-            let canary_raw = canary_json_by_set.get(canary_set).ok_or_else(|| {
-                format!("execution mode {mode_id} references an unavailable canary set")
-            })?;
-            let actual_canary_sha256 = format!("{:x}", Sha256::digest(canary_raw.as_bytes()));
-            if actual_canary_sha256 != mode.canary_set_sha256 {
-                return Err(format!(
-                    "execution mode {mode_id} canary bytes do not match the signed digest"
-                ));
-            }
-
-            let mut projected = owner.clone();
-            let projected_object = projected
-                .as_object_mut()
-                .ok_or_else(|| "catalog model must be an object".to_owned())?;
-            projected_object.insert("canary".to_owned(), mode.canary.clone());
-            let artifact = owner
+                .ok_or_else(|| "execution-mode owner is missing model_id".to_owned())?;
+            if owner
                 .get("artifacts")
                 .and_then(|artifacts| artifacts.get(&artifact_name))
-                .cloned()
-                .ok_or_else(|| "execution-mode artifact disappeared".to_owned())?;
-            projected_object.insert(
-                "artifacts".to_owned(),
-                Value::Object(Map::from_iter([(artifact_name.clone(), artifact)])),
-            );
-            projected_object.insert(
-                "speciality_assessment".to_owned(),
-                json!({"calibrated": {artifact_name.clone(): mode.speciality_calibrations}}),
-            );
-            let projected_root = json!({"models": [projected]});
-            let mut projected_registry =
-                canary_registry_from_catalog_root(&projected_root, canary_sets);
-            let canary = projected_registry.models.remove(model_id).ok_or_else(|| {
-                format!("execution mode {mode_id} has no usable mode-specific canary evidence")
-            })?;
-            if !mode_canary_has_exact_evidence(&canary, artifact_root) {
-                return Err(format!(
-                    "execution mode {mode_id} has no exact canary evidence for its artifact"
-                ));
+                .and_then(|artifact| artifact.get("engine"))
+                .and_then(Value::as_str)
+                != Some(engine)
+            {
+                return Err(format!("{map_name} must bind a {engine} artifact"));
             }
-            modes.insert(
-                mode_id.clone(),
-                GatewayExecutionModeConfig {
-                    binding,
-                    requests: mode.requests,
-                    canary,
-                },
-            );
+            let modes = registry
+                .modes_by_artifact_root
+                .entry(artifact_root.clone())
+                .or_default();
+            for (mode_id, raw_mode) in raw_modes {
+                if modes.contains_key(mode_id) {
+                    return Err(format!(
+                        "execution mode {mode_id} for {artifact_root} is ambiguous"
+                    ));
+                }
+                let binding = match engine {
+                    "vllm" => vllm_execution_mode_binding(artifact_root, mode_id, raw_mode),
+                    _ => mayhem_proto::managed_execution_mode_binding(
+                        artifact_root,
+                        mode_id,
+                        raw_mode,
+                    ),
+                }
+                .map_err(|_| format!("execution mode {mode_id} for {artifact_root} is invalid"))?;
+                let mode: GatewaySerializedExecutionMode = serde_json::from_value(raw_mode.clone())
+                    .map_err(|_| {
+                        format!("execution mode {mode_id} for {artifact_root} is invalid")
+                    })?;
+                if mode.schema_version != 1 {
+                    return Err(format!(
+                    "execution mode {mode_id} for {artifact_root} has unsupported schema version"
+                ));
+                }
+                // The proto helper validates the full serialized profile. Reading these
+                // fields here ensures this loader cannot silently accept a partial mode.
+                let _ = (
+                    &mode.profile,
+                    &mode.generation_execution_profile,
+                    &mode.modality_fingerprints,
+                    &mode.resource_profiles,
+                );
+                let canary_set = mode
+                    .canary
+                    .get("set_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| format!("execution mode {mode_id} has no canary set"))?;
+                let canary_raw = canary_json_by_set.get(canary_set).ok_or_else(|| {
+                    format!("execution mode {mode_id} references an unavailable canary set")
+                })?;
+                let actual_canary_sha256 = format!("{:x}", Sha256::digest(canary_raw.as_bytes()));
+                if actual_canary_sha256 != mode.canary_set_sha256 {
+                    return Err(format!(
+                        "execution mode {mode_id} canary bytes do not match the signed digest"
+                    ));
+                }
+
+                let mut projected = owner.clone();
+                let projected_object = projected
+                    .as_object_mut()
+                    .ok_or_else(|| "catalog model must be an object".to_owned())?;
+                projected_object.insert("canary".to_owned(), mode.canary.clone());
+                let artifact = owner
+                    .get("artifacts")
+                    .and_then(|artifacts| artifacts.get(&artifact_name))
+                    .cloned()
+                    .ok_or_else(|| "execution-mode artifact disappeared".to_owned())?;
+                projected_object.insert(
+                    "artifacts".to_owned(),
+                    Value::Object(Map::from_iter([(artifact_name.clone(), artifact)])),
+                );
+                projected_object.insert(
+                    "speciality_assessment".to_owned(),
+                    json!({"calibrated": {artifact_name.clone(): mode.speciality_calibrations}}),
+                );
+                let projected_root = json!({"models": [projected]});
+                let mut projected_registry =
+                    canary_registry_from_catalog_root(&projected_root, canary_sets);
+                let canary = projected_registry.models.remove(model_id).ok_or_else(|| {
+                    format!("execution mode {mode_id} has no usable mode-specific canary evidence")
+                })?;
+                if !mode_canary_has_exact_evidence(&canary, artifact_root) {
+                    return Err(format!(
+                        "execution mode {mode_id} has no exact canary evidence for its artifact"
+                    ));
+                }
+                modes.insert(
+                    mode_id.clone(),
+                    GatewayExecutionModeConfig {
+                        binding,
+                        requests: mode.requests,
+                        canary,
+                    },
+                );
+            }
         }
-        registry
-            .modes_by_artifact_root
-            .insert(artifact_root.clone(), modes);
     }
     Ok(registry)
 }
@@ -46615,89 +46646,260 @@ mod tests {
     }
 
     #[test]
-    fn execution_mode_registry_rejects_missing_or_corrupt_canary_bytes() {
-        let artifact_root = "de".repeat(32);
-        let canary_document = json!({
-            "set_id": "mode-canary-v1",
-            "prompts": [{
-                "id": "fixed",
-                "messages": [{"role": "user", "content": "fixed"}],
-                "max_tokens": 1
-            }]
-        });
-        let canary_raw = serde_json::to_string(&canary_document).unwrap();
-        let document: CanarySetDocument = serde_json::from_str(&canary_raw).unwrap();
-        let prompts = gateway_canary_prompts(document);
-        let prefixes = BTreeMap::from([("fixed".to_owned(), vec![1])]);
-        let fingerprint = aggregate_token_prefixes_for_prompts(&prompts, &prefixes).unwrap();
-        let mode = json!({
-            "schema_version": 1,
-            "profile": {
-                "schema_version": 1,
-                "engine": "vllm",
-                "enforce_eager": true,
-                "linear_backend": "default",
-                "moe_backend": "default",
-                "proof_sha256": "11".repeat(32)
-            },
-            "generation_execution_profile": null,
-            "requests": {
-                "endpoint_families": [mayhem_proto::endpoint_family_contract_template(
-                    mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
-                ).unwrap()]
-            },
-            "canary": {
-                "set_id": "mode-canary-v1",
-                "match_min": 0.9,
-                "verification_method": "token_fingerprint",
-                "fingerprints": {"weights": fingerprint},
-                "token_prefixes": {"weights": {"fixed": [1]}}
-            },
-            "canary_set_sha256": format!("{:x}", Sha256::digest(canary_raw.as_bytes())),
-            "modality_fingerprints": {},
-            "resource_profiles": {},
-            "speciality_calibrations": {}
-        });
-        let catalog = serde_json::to_string(&json!({
-            "models": [{
-                "model_id": "mayhem/mode-test",
-                "tier": "stable",
-                "artifacts": {"weights": {"artifact_root": artifact_root}}
-            }],
-            "vllm_execution_modes": {
-                (artifact_root.clone()): {"fast": mode}
+    fn managed_execution_mode_preserves_submarkets_rails_and_provider_switching() {
+        // Architecture selects authenticated execution evidence. It must not
+        // create a second economic market or bypass a context/tier/rail filter.
+        for context in [8_192, 32_768, 262_144] {
+            for identity_tier in [1, 4] {
+                for rail in ["fiat", "tnk", "tap"] {
+                    for stream in [false, true] {
+                        let (_, mut model, mut request, _) = mode_test_state_and_request();
+                        model.mayhem.caps.ctx = context;
+                        let first = &mut model.mayhem.route_candidates[0];
+                        first.served_ctx = Some(context);
+                        first.att_tier = identity_tier;
+                        let mut second = first.clone();
+                        second.provider = "02".repeat(32);
+                        second.room_id = "a2".repeat(16);
+                        model.mayhem.route_candidates.push(second);
+                        let raw: Value = serde_json::from_str(include_str!(
+                            "../../mayhem-proto/test-data/managed-execution-mode.json"
+                        ))
+                        .unwrap();
+                        let root = model.mayhem.route_candidates[0].artifact_root.clone();
+                        let binding = mayhem_proto::managed_execution_mode_binding(
+                            &root,
+                            "arm-profile",
+                            &raw,
+                        )
+                        .unwrap();
+                        let mut state = test_gateway_state_from_models(vec![model.clone()])
+                            .with_execution_mode_registry(GatewayExecutionModeRegistry {
+                                modes_by_artifact_root: BTreeMap::from([(
+                                    root,
+                                    BTreeMap::from([(
+                                        binding.mode_id.clone(),
+                                        GatewayExecutionModeConfig {
+                                            binding: binding.clone(),
+                                            requests: ExecutionModeRequestPolicy {
+                                                endpoint_families: model
+                                                    .mayhem
+                                                    .adapter
+                                                    .endpoint_families
+                                                    .clone(),
+                                            },
+                                            canary: test_mode_canary_config(),
+                                        },
+                                    )]),
+                                )]),
+                            });
+                        state.receipt_config.rail = rail.to_owned();
+                        request.stream = stream;
+                        request.endpoint_request.as_mut().unwrap()["stream"] = json!(stream);
+                        let now = now_millis_u64();
+                        let mut arm =
+                            heartbeat_for_route(&model, &model.mayhem.route_candidates[1], now + 1);
+                        arm.execution_mode = Some(binding.clone());
+                        state.ingest_provider_heartbeat(arm.clone(), now + 1);
+                        let select = || {
+                            ordered_route_candidates_for_request_with_max_price_seed(
+                                &state,
+                                &model,
+                                &request,
+                                Some(identity_tier),
+                                None,
+                                Some(context),
+                                Some(&model.mayhem.route_candidates[0].quant),
+                                None,
+                                7,
+                            )
+                        };
+                        assert_eq!(
+                            select().len(),
+                            2,
+                            "{context}/{identity_tier}/{rail}/{stream}"
+                        );
+                        let expected_bracket = ctx_bracket_for_tokens_in_schedule(
+                            context,
+                            &state.ctx_bracket_schedule,
+                            now / 1_000,
+                        )
+                        .unwrap()
+                        .0;
+                        let mut vouchers = Vec::new();
+                        for (index, route) in model.mayhem.route_candidates.iter().enumerate() {
+                            let call = state
+                                .prepare_chat_invocation_for_route(
+                                    &model,
+                                    &request,
+                                    Some(route),
+                                    &GatewayRequestOptions::default(),
+                                )
+                                .unwrap();
+                            assert_eq!(
+                                call.enclave_id,
+                                model.mayhem.route_candidates[0].enclave_id
+                            );
+                            assert_eq!(
+                                call.ctx_bracket.as_deref(),
+                                Some(expected_bracket.as_str())
+                            );
+                            assert_eq!(call.rail, rail);
+                            assert_eq!(
+                                call.spend_voucher.body.payout_revision,
+                                route.payout_revisions[rail]
+                            );
+                            assert_eq!(
+                                call.expected_execution_mode,
+                                (index == 1).then(|| binding.clone())
+                            );
+                            vouchers.push(call.spend_voucher.body.clone());
+                        }
+                        assert_eq!(vouchers[0].price_ver, vouchers[1].price_ver);
+                        assert_eq!(vouchers[0].locked_rate_map, vouchers[1].locked_rate_map);
+                        assert_eq!(
+                            vouchers[0].ctx_bracket_table_ver,
+                            vouchers[1].ctx_bracket_table_ver
+                        );
+                        // An occupied baseline leaves ARM selectable, and vice versa.
+                        for busy_index in [0, 1] {
+                            for (index, route) in model.mayhem.route_candidates.iter().enumerate() {
+                                let at = now + 2 + busy_index as u64;
+                                let mut hb = heartbeat_for_route(&model, route, at);
+                                hb.execution_mode = (index == 1).then(|| binding.clone());
+                                if index == busy_index {
+                                    hb.slots.active = 1;
+                                    hb.slots.active_requests = 1;
+                                    hb.q.free_slots = 0;
+                                }
+                                state.ingest_provider_heartbeat(hb, at);
+                            }
+                            let routes = select();
+                            assert_eq!(routes.len(), 1);
+                            assert_eq!(
+                                routes[0].provider,
+                                model.mayhem.route_candidates[1 - busy_index].provider
+                            );
+                        }
+                        // A signed execution mode never makes extra context available.
+                        assert!(ordered_route_candidates_for_request_with_max_price_seed(
+                            &state,
+                            &model,
+                            &request,
+                            None,
+                            None,
+                            Some(context + 1),
+                            None,
+                            None,
+                            7,
+                        )
+                        .is_empty());
+                    }
+                }
             }
-        }))
-        .unwrap();
-        let canaries = BTreeMap::from([("mode-canary-v1".to_owned(), canary_raw.clone())]);
-        let registry =
-            GatewayState::execution_mode_registry_from_catalog_and_canary_json(&catalog, &canaries)
+        }
+    }
+
+    #[test]
+    fn execution_mode_registry_rejects_missing_or_corrupt_canary_bytes() {
+        for engine in ["vllm", "openai-compatible"] {
+            let artifact_root = "de".repeat(32);
+            let canary_document = json!({
+                "set_id": "mode-canary-v1",
+                "prompts": [{
+                    "id": "fixed",
+                    "messages": [{"role": "user", "content": "fixed"}],
+                    "max_tokens": 1
+                }]
+            });
+            let canary_raw = serde_json::to_string(&canary_document).unwrap();
+            let document: CanarySetDocument = serde_json::from_str(&canary_raw).unwrap();
+            let prompts = gateway_canary_prompts(document);
+            let prefixes = BTreeMap::from([("fixed".to_owned(), vec![1])]);
+            let fingerprint = aggregate_token_prefixes_for_prompts(&prompts, &prefixes).unwrap();
+            let mut mode = json!({
+                "schema_version": 1,
+                "profile": {
+                    "schema_version": 1,
+                    "engine": "vllm",
+                    "enforce_eager": true,
+                    "linear_backend": "default",
+                    "moe_backend": "default",
+                    "proof_sha256": "11".repeat(32)
+                },
+                "generation_execution_profile": null,
+                "requests": {
+                    "endpoint_families": [mayhem_proto::endpoint_family_contract_template(
+                        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+                    ).unwrap()]
+                },
+                "canary": {
+                    "set_id": "mode-canary-v1",
+                    "match_min": 0.9,
+                    "verification_method": "token_fingerprint",
+                    "fingerprints": {"weights": fingerprint},
+                    "token_prefixes": {"weights": {"fixed": [1]}}
+                },
+                "canary_set_sha256": format!("{:x}", Sha256::digest(canary_raw.as_bytes())),
+                "modality_fingerprints": {},
+                "resource_profiles": {},
+                "speciality_calibrations": {}
+            });
+            let mode_map = if engine == "openai-compatible" {
+                let fixture: Value = serde_json::from_str(include_str!(
+                    "../../mayhem-proto/test-data/managed-execution-mode.json"
+                ))
                 .unwrap();
-        assert!(registry.modes_by_artifact_root[&artifact_root].contains_key("fast"));
-
-        let mut ambiguous: Value = serde_json::from_str(&catalog).unwrap();
-        ambiguous["models"][0]["artifacts"]["weights-copy"] =
-            json!({"artifact_root": artifact_root});
-        assert!(
-            GatewayState::execution_mode_registry_from_catalog_and_canary_json(
-                &ambiguous.to_string(),
-                &canaries,
+                mode["profile"] = fixture["profile"].clone();
+                "managed_execution_modes"
+            } else {
+                "vllm_execution_modes"
+            };
+            let catalog = serde_json::to_string(&json!({
+                "models": [{
+                    "model_id": "mayhem/mode-test",
+                    "tier": "stable",
+                    "artifacts": {"weights": {"artifact_root": artifact_root, "engine": engine}}
+                }],
+                (mode_map): {
+                    (artifact_root.clone()): {"fast": mode}
+                }
+            }))
+            .unwrap();
+            let canaries = BTreeMap::from([("mode-canary-v1".to_owned(), canary_raw.clone())]);
+            let registry = GatewayState::execution_mode_registry_from_catalog_and_canary_json(
+                &catalog, &canaries,
             )
-            .is_err()
-        );
+            .unwrap();
+            assert!(registry.modes_by_artifact_root[&artifact_root].contains_key("fast"));
 
-        assert!(
-            GatewayState::execution_mode_registry_from_catalog_and_canary_json(
-                &catalog,
-                &BTreeMap::new(),
-            )
-            .is_err()
-        );
-        let corrupt = BTreeMap::from([("mode-canary-v1".to_owned(), format!("{canary_raw}\n"))]);
-        assert!(
-            GatewayState::execution_mode_registry_from_catalog_and_canary_json(&catalog, &corrupt,)
+            let mut ambiguous: Value = serde_json::from_str(&catalog).unwrap();
+            ambiguous["models"][0]["artifacts"]["weights-copy"] =
+                json!({"artifact_root": artifact_root});
+            assert!(
+                GatewayState::execution_mode_registry_from_catalog_and_canary_json(
+                    &ambiguous.to_string(),
+                    &canaries,
+                )
                 .is_err()
-        );
+            );
+
+            assert!(
+                GatewayState::execution_mode_registry_from_catalog_and_canary_json(
+                    &catalog,
+                    &BTreeMap::new(),
+                )
+                .is_err()
+            );
+            let corrupt =
+                BTreeMap::from([("mode-canary-v1".to_owned(), format!("{canary_raw}\n"))]);
+            assert!(
+                GatewayState::execution_mode_registry_from_catalog_and_canary_json(
+                    &catalog, &corrupt,
+                )
+                .is_err()
+            );
+        }
     }
 
     #[test]

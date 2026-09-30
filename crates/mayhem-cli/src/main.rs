@@ -11068,6 +11068,7 @@ fn validate_additive_catalog_update(
         "profiles",
     )?;
     validate_root_owned_map("vllm_execution_modes", "vLLM execution mode", "modes")?;
+    validate_root_owned_map("managed_execution_modes", "managed execution mode", "modes")?;
 
     let changed_authority_fields = ["attestation_policy_chain", "enclave_attestation_bindings"]
         .into_iter()
@@ -16023,7 +16024,7 @@ fn catalog_calibrate_canary(mut args: CatalogCalibrateCanaryArgs) -> Result<()> 
         .as_deref()
         .map(|mode_id| {
             catalog_doc
-                .vllm_execution_mode(&base_artifact.artifact_root, mode_id)
+                .execution_mode(&base_artifact.artifact_root, mode_id)
                 .with_context(|| {
                     format!(
                         "execution mode {mode_id} not found for model {} artifact {}",
@@ -16053,7 +16054,7 @@ fn catalog_calibrate_canary(mut args: CatalogCalibrateCanaryArgs) -> Result<()> 
     bind_calibration_vllm_execution_profile(
         &mut args,
         execution_mode
-            .map(|mode| &mode.profile)
+            .and_then(|mode| mode.profile.vllm())
             .or_else(|| catalog_doc.vllm_execution_profile(&artifact.artifact_root)),
     )?;
     let generation_profile = match execution_mode {
@@ -21235,7 +21236,7 @@ fn catalog_merge_canary_reports(args: CatalogMergeCanaryReportsArgs) -> Result<(
                 )
             })?;
             let mode = catalog_doc
-                .vllm_execution_mode(&artifact.artifact_root, &binding.mode_id)
+                .execution_mode(&artifact.artifact_root, &binding.mode_id)
                 .with_context(|| format!("execution mode {} is absent", binding.mode_id))?;
             let expected_binding = mode.binding(&artifact.artifact_root, &binding.mode_id)?;
             ensure!(
@@ -22124,7 +22125,7 @@ fn catalog_canary_evidence_report(
                 continue;
             };
             let Some(execution_mode) =
-                catalog_doc.vllm_execution_mode(&artifact.artifact_root, &binding.mode_id)
+                catalog_doc.execution_mode(&artifact.artifact_root, &binding.mode_id)
             else {
                 errors.push(format!(
                     "{} references unknown execution mode {} for {} / {}",
@@ -22181,7 +22182,7 @@ fn catalog_canary_evidence_report(
                 artifact,
                 &canaries_dir,
                 catalog_doc
-                    .vllm_execution_mode(&artifact.artifact_root, mode_id)
+                    .execution_mode(&artifact.artifact_root, mode_id)
                     .expect("effective execution mode came from catalog"),
                 mode_id,
                 mode,
@@ -22409,11 +22410,11 @@ fn catalog_canary_evidence_report(
         }
         let vllm_profile = if let Some(binding) = &entry.execution_mode {
             catalog_doc
-                .vllm_execution_mode(
+                .execution_mode(
                     &entry.expected_artifact_binding.artifact_root,
                     &binding.mode_id,
                 )
-                .map(|mode| &mode.profile)
+                .and_then(|mode| mode.profile.vllm())
         } else {
             catalog_doc.vllm_execution_profile(&entry.expected_artifact_binding.artifact_root)
         };
@@ -22429,6 +22430,19 @@ fn catalog_canary_evidence_report(
                 ));
             }
         }
+        if let Some(binding) = &entry.execution_mode {
+            if let Some(profile) = catalog_doc
+                .execution_mode(
+                    &entry.expected_artifact_binding.artifact_root,
+                    &binding.mode_id,
+                )
+                .and_then(|mode| mode.profile.managed())
+            {
+                if profile.proof_sha256 != sha256_bytes_hex(&report_bytes) {
+                    entry.errors.push("managed execution profile proof_sha256 does not match calibration report bytes".to_owned());
+                }
+            }
+        }
         if let Err(error) =
             validate_calibration_vllm_execution_profile(&calibration.runtime_config, vllm_profile)
         {
@@ -22436,7 +22450,7 @@ fn catalog_canary_evidence_report(
         }
         let generation_profile = match &entry.execution_mode {
             Some(binding) => catalog_doc
-                .vllm_execution_mode(
+                .execution_mode(
                     &entry.expected_artifact_binding.artifact_root,
                     &binding.mode_id,
                 )
@@ -22694,7 +22708,7 @@ fn catalog_execution_mode_evidence_entry(
     artifact_name: &str,
     artifact: &catalog::CatalogArtifact,
     canaries_dir: &Path,
-    execution_mode: &catalog::CatalogVllmExecutionMode,
+    execution_mode: &catalog::CatalogExecutionMode,
     mode_id: &str,
     report_mode: CatalogCanaryReportMode,
 ) -> CatalogCanaryEvidenceEntry {
@@ -23845,8 +23859,23 @@ fn apply_execution_mode_canary_report(
         .as_ref()
         .context("execution mode report has no mode binding")?;
     let root = &entry.expected_artifact_binding.artifact_root;
+    let map_names = ["vllm_execution_modes", "managed_execution_modes"];
+    let owners = map_names
+        .into_iter()
+        .filter(|name| {
+            catalog_value
+                .get(name)
+                .and_then(|modes| modes.get(root))
+                .and_then(|modes| modes.get(&binding.mode_id))
+                .is_some()
+        })
+        .collect::<Vec<_>>();
+    ensure!(
+        owners.len() == 1,
+        "execution mode must have exactly one catalog owner"
+    );
     let mode = catalog_value
-        .get_mut("vllm_execution_modes")
+        .get_mut(owners[0])
         .and_then(Value::as_object_mut)
         .and_then(|modes| modes.get_mut(root))
         .and_then(Value::as_object_mut)
@@ -25192,11 +25221,11 @@ fn preflight_catalog_calibration_managed_runtime(
     args: &CatalogCalibrateCanaryArgs,
 ) -> Result<()> {
     if artifact.engine == "openai-compatible" {
-        artifact
+        let binding = artifact
             .openai_compatible
             .as_ref()
             .context("openai-compatible calibration is missing its signed runtime binding")?;
-        validate_managed_openai_hardware(&probe(ProbeOptions::default()))?;
+        validate_managed_openai_hardware(&probe(ProbeOptions::default()), binding)?;
         resolve_executable(Path::new("docker"))
             .context("managed openai-compatible calibration requires Docker on PATH")?;
         return Ok(());
@@ -25661,7 +25690,7 @@ fn catalog_calibration_backend(
                 .openai_compatible
                 .clone()
                 .context("openai-compatible calibration is missing its signed runtime binding")?;
-            validate_managed_openai_hardware(&probe(ProbeOptions::default()))?;
+            validate_managed_openai_hardware(&probe(ProbeOptions::default()), &binding)?;
             let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
             let home = absolutize(home)?;
             fs::create_dir_all(&home).with_context(|| format!("creating {}", home.display()))?;
@@ -49116,9 +49145,8 @@ fn load_catalog_canary_json_by_set(
         .map(|model| model.canary.set_id.as_str())
         .chain(
             catalog
-                .vllm_execution_modes
-                .values()
-                .flat_map(|modes| modes.values().map(|mode| mode.canary.set_id.as_str())),
+                .all_execution_modes()
+                .map(|mode| mode.canary.set_id.as_str()),
         )
         .collect::<BTreeSet<_>>()
     {
@@ -64743,7 +64771,7 @@ fn provider_backend_runtime_preflight_for_backend(
             let binding = artifact
                 .and_then(|artifact| artifact.openai_compatible.as_ref())
                 .context("openai-compatible artifact is missing its signed runtime binding")?;
-            validate_managed_openai_hardware(hardware)?;
+            validate_managed_openai_hardware(hardware, binding)?;
             if let Ok(url) = env::var("MAYHEM_OPENAI_COMPATIBLE_URL") {
                 mayhem_engine::OpenAiCompatibleBackend::new(
                     mayhem_engine::OpenAiCompatibleBackendConfig {
@@ -64767,7 +64795,35 @@ fn provider_backend_runtime_preflight_for_backend(
     Ok(runtime)
 }
 
-fn validate_managed_openai_hardware(hardware: &HardwareReport) -> Result<()> {
+fn validate_managed_openai_hardware(
+    hardware: &HardwareReport,
+    runtime: &mayhem_engine::OpenAiCompatibleRuntimeBinding,
+) -> Result<()> {
+    if runtime.runtime_id == managed_openai_compatible::GB10_RUNTIME_ID {
+        ensure!(
+            hardware.host.os == "linux"
+                && matches!(hardware.host.arch.as_str(), "aarch64" | "arm64"),
+            "GB10 managed runtime requires Linux aarch64"
+        );
+        ensure!(
+            hardware.memory.unified_memory
+                && hardware.memory.total_bytes >= 120 * 1024 * 1024 * 1024,
+            "GB10 managed runtime requires at least 120 GiB unified memory"
+        );
+        let nvidia = hardware
+            .gpus
+            .iter()
+            .filter(|gpu| gpu.vendor == GpuVendor::Nvidia)
+            .collect::<Vec<_>>();
+        ensure!(
+            nvidia.len() == 1
+                && nvidia[0].compute_capability.as_deref() == Some("12.1")
+                && nvidia[0].supports_nvfp4
+                && nvidia[0].supports_fp8,
+            "GB10 managed runtime requires exactly one SM121 NVIDIA GPU with NVFP4/FP8 support"
+        );
+        return Ok(());
+    }
     const MIN_QUALIFIED_VRAM: u64 = 97_887 * 1024 * 1024;
     const CONTAINER_MEMORY_LIMIT: u64 = 104 * 1024 * 1024 * 1024;
     ensure!(
@@ -74205,6 +74261,25 @@ fn resolve_provider_served_ctx(
     }
 }
 
+fn resolve_provider_runtime_ctx(
+    model: &catalog::CatalogModel,
+    artifact: &catalog::CatalogArtifact,
+    requested: Option<u64>,
+) -> Result<u64> {
+    let context = resolve_provider_served_ctx(model, requested)?;
+    let Some(runtime) = artifact.openai_compatible.as_ref() else {
+        return Ok(context);
+    };
+    let limit = u64::from(runtime.served_context);
+    if requested.is_some() {
+        ensure!(
+            context <= limit,
+            "explicit --ctx {context} exceeds the signed runtime's served context {limit}"
+        );
+    }
+    Ok(context.min(limit))
+}
+
 fn provider_context_source(args: &ProviderStartArgs, selected: &ProviderCandidate) -> &'static str {
     if args.ctx.is_some() {
         "cli"
@@ -75131,7 +75206,7 @@ fn provider_context_feasibility(
     schedule: &CtxBracketSchedule,
     at: u64,
 ) -> Result<ProviderCtxFeasibility> {
-    let requested_ctx = resolve_provider_served_ctx(model, args.ctx)?;
+    let requested_ctx = resolve_provider_runtime_ctx(model, artifact, args.ctx)?;
     let workflow_inventory_bytes =
         provider_comfy_workflow_inventory_resident_bytes(args.home.as_deref(), model)?;
     if let Some(host_peak) = artifact
@@ -76925,8 +77000,7 @@ fn build_provider_candidates(
         }
         let execution_policy = if let Some(mode_id) = &args.execution_mode {
             mayhem_proto::validate_execution_mode_id(mode_id).map_err(anyhow::Error::msg)?;
-            let Some(policy) = catalog_doc.vllm_execution_mode(&artifact.artifact_root, mode_id)
-            else {
+            let Some(policy) = catalog_doc.execution_mode(&artifact.artifact_root, mode_id) else {
                 rejections.push(provider_rejection(
                     enclave,
                     format!("signed catalog has no execution mode {mode_id} for artifact {artifact_name}"),
@@ -76956,7 +77030,7 @@ fn build_provider_candidates(
             })
             .transpose()?;
         let vllm_execution_profile = execution_policy
-            .map(|policy| &policy.profile)
+            .and_then(|policy| policy.profile.vllm())
             .or_else(|| catalog_doc.vllm_execution_profile(&artifact.artifact_root))
             .cloned();
         let served_modalities = match provider_served_modalities(model, &args.disable_modalities) {
@@ -76995,6 +77069,31 @@ fn build_provider_candidates(
             .map(|policy| catalog::execution_mode_model(model, &artifact_name, policy))
             .transpose()?;
         let model = mode_model.as_ref().unwrap_or(model);
+        // Only the execution artifact changes. The canonical enclave/price above
+        // remains the baseline identity; never derive a market from this projection.
+        let artifact = model
+            .artifacts
+            .get(&artifact_name)
+            .expect("selected execution artifact")
+            .clone();
+        if let Some(profile) = execution_policy.and_then(|policy| policy.profile.managed()) {
+            let arch = match hardware.host.arch.as_str() {
+                "arm64" => "aarch64",
+                other => other,
+            };
+            if arch != profile.architecture {
+                rejections.push(provider_rejection(
+                    enclave,
+                    "execution mode architecture does not match this host".to_owned(),
+                    None,
+                ));
+                continue;
+            }
+            if let Err(error) = validate_managed_openai_hardware(hardware, &profile.runtime) {
+                rejections.push(provider_rejection(enclave, error.to_string(), None));
+                continue;
+            }
+        }
         let served_specialities =
             match ledger_enclave_served_specialities(enclave, &args.speciality_levels) {
                 Ok(specialities) => specialities,
@@ -110296,6 +110395,34 @@ status: linked
     }
 
     #[test]
+    fn managed_runtime_context_cannot_join_an_unsupported_submarket() {
+        let mut catalog = test_catalog(&"aa".repeat(32));
+        let model = &mut catalog.models[0];
+        model.caps.ctx_max = 524_288;
+        let mut artifact = model.artifacts.values().next().unwrap().clone();
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../mayhem-proto/test-data/managed-execution-mode.json"
+        ))
+        .unwrap();
+        artifact.openai_compatible =
+            Some(serde_json::from_value(fixture["profile"]["runtime"].clone()).unwrap());
+        assert_eq!(
+            resolve_provider_runtime_ctx(model, &artifact, Some(262_144)).unwrap(),
+            262_144
+        );
+        assert!(resolve_provider_runtime_ctx(model, &artifact, Some(524_288)).is_err());
+        assert_eq!(
+            resolve_provider_runtime_ctx(model, &artifact, None).unwrap(),
+            default_provider_served_ctx(model.caps.ctx_max)
+        );
+        artifact.openai_compatible = None;
+        assert_eq!(
+            resolve_provider_runtime_ctx(model, &artifact, Some(524_288)).unwrap(),
+            524_288
+        );
+    }
+
+    #[test]
     fn provider_candidates_default_context_falls_back_to_largest_fitting_bucket() {
         let root = "aa".repeat(32);
         let mut catalog = test_catalog(&root);
@@ -118880,7 +119007,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .as_deref()
             .map(|id| {
                 catalog
-                    .vllm_execution_mode(&baseline_artifact.artifact_root, id)
+                    .execution_mode(&baseline_artifact.artifact_root, id)
                     .with_context(|| format!("catalog execution mode {id}"))
             })
             .transpose()?;
@@ -119023,7 +119150,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 None => catalog.generation_execution_profile(&artifact.artifact_root),
             },
             "vllm_execution_profile": match mode {
-                Some(mode) => Some(&mode.profile),
+                Some(mode) => mode.profile.vllm(),
                 None => catalog.vllm_execution_profile(&artifact.artifact_root),
             },
             "rows": rows,
@@ -123621,9 +123748,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 speciality_mappings: BTreeMap::new(),
             })
             .collect();
-        let mode_policy = catalog::CatalogVllmExecutionMode {
+        let mode_policy = catalog::CatalogExecutionMode {
             schema_version: 1,
-            profile: mode_profile,
+            profile: catalog::CatalogExecutionProfile::Vllm(mode_profile),
             generation_execution_profile: None,
             requests: mayhem_proto::ExecutionModeRequestPolicy {
                 endpoint_families: request_policies,
@@ -123730,6 +123857,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .get_mut("throughput")
             .unwrap()
             .profile
+            .vllm_mut()
+            .unwrap()
             .runtime = None;
         let default_mode =
             build_provider_candidates(&contract, &default_mode_catalog, &hardware, &mode_args)
@@ -133295,9 +133424,9 @@ State initialization...
             speculative_decoding: None,
             proof_sha256: "00".repeat(32),
         };
-        let mut execution_mode = catalog::CatalogVllmExecutionMode {
+        let mut execution_mode = catalog::CatalogExecutionMode {
             schema_version: 1,
-            profile: profile.clone(),
+            profile: catalog::CatalogExecutionProfile::Vllm(profile.clone()),
             generation_execution_profile: None,
             requests: mayhem_proto::ExecutionModeRequestPolicy {
                 endpoint_families: vec![restricted],
@@ -133329,7 +133458,8 @@ State initialization...
         .unwrap();
         calibration.runtime_config.execution_mode = Some(binding.clone());
         let report_path = write_temp_calibration_report(&calibration);
-        execution_mode.profile.proof_sha256 = file_sha256_hex(&report_path).unwrap();
+        execution_mode.profile.vllm_mut().unwrap().proof_sha256 =
+            file_sha256_hex(&report_path).unwrap();
         catalog.vllm_execution_modes.insert(
             root.clone(),
             BTreeMap::from([("throughput".to_owned(), execution_mode)]),
@@ -133375,6 +133505,8 @@ State initialization...
             .get_mut("throughput")
             .unwrap()
             .profile
+            .vllm_mut()
+            .unwrap()
             .proof_sha256 = file_sha256_hex(&report_path).unwrap();
         let forged = catalog_canary_evidence_report(
             &catalog,
@@ -140389,6 +140521,7 @@ State initialization...
             generation_execution_profiles: BTreeMap::new(),
             vllm_execution_profiles: BTreeMap::new(),
             vllm_execution_modes: BTreeMap::new(),
+            managed_execution_modes: BTreeMap::new(),
             models: vec![catalog::CatalogModel {
                 model_id: "test/model@4bit".to_owned(),
                 model_class: DEFAULT_MODEL_CLASS.to_owned(),

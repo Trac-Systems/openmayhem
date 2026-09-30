@@ -13,6 +13,8 @@ use sha2::{Digest as _, Sha256};
 
 const IMAGE: &str =
     "lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1";
+pub(crate) const GB10_RUNTIME_ID: &str = "sglang-gb10";
+mod gb10;
 const SOURCE_FORMAT: &str = "pennyroyal_source_bundle_tar_gzip_v1";
 const SOURCE_LAYOUT: &str = "source";
 const MATERIALIZATION: &str = "derive_from_signed_snapshot_v1";
@@ -39,6 +41,7 @@ const PLE_READER_WHEEL_SHA256: &str =
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum ManagedRuntimeRecipeV1 {
+    Gb10SglangV1(gb10::Recipe),
     PennyroyalFlashNextFrspecV1 {
         schema_version: u32,
         profile_version: u32,
@@ -259,7 +262,6 @@ impl Drop for ManagedContainerOwner {
 pub(crate) fn prepare_managed_runtime(
     inputs: ManagedRuntimeInputs<'_>,
 ) -> Result<ManagedOpenAiRuntime> {
-    platform_preflight()?;
     let recipe_bytes = fs::read(inputs.recipe_path)
         .with_context(|| format!("reading runtime recipe {}", inputs.recipe_path.display()))?;
     ensure!(
@@ -268,6 +270,11 @@ pub(crate) fn prepare_managed_runtime(
     );
     let recipe: ManagedRuntimeRecipeV1 =
         serde_json::from_slice(&recipe_bytes).context("parsing strict managed runtime recipe")?;
+    let recipe = match recipe {
+        ManagedRuntimeRecipeV1::Gb10SglangV1(recipe) => return gb10::prepare(inputs, recipe),
+        legacy => legacy,
+    };
+    platform_preflight()?;
     let ManagedRuntimeRecipeV1::PennyroyalFlashNextFrspecV1 {
         schema_version,
         profile_version,
@@ -277,7 +284,10 @@ pub(crate) fn prepare_managed_runtime(
         proofs,
         ple,
         runtime,
-    } = recipe;
+    } = recipe
+    else {
+        unreachable!("managed ARM recipe was dispatched above")
+    };
     validate_recipe(
         &inputs,
         schema_version,
@@ -377,6 +387,36 @@ pub(crate) fn prepare_managed_runtime(
 
     let port = reserve_loopback_port()?;
     let wrapper = write_launch_wrapper(&managed_root, inputs.public_model_id, port)?;
+    start_owned_runtime(
+        &inputs,
+        &managed_root,
+        lock,
+        port,
+        |container_name, labels| {
+            service_create_args(ServiceCreateInputs {
+                name: container_name,
+                port,
+                model_id: inputs.public_model_id,
+                snapshot: inputs.snapshot_dir,
+                prepared_model: &prepared_model,
+                source: &source_dir,
+                plugin: &plugin_dir,
+                managed_root: &managed_root,
+                seccomp: &seccomp_path,
+                wrapper: &wrapper,
+                labels,
+            })
+        },
+    )
+}
+
+fn start_owned_runtime(
+    inputs: &ManagedRuntimeInputs<'_>,
+    managed_root: &Path,
+    lock: File,
+    port: u16,
+    create: impl FnOnce(&str, &BTreeMap<String, String>) -> Result<Vec<String>>,
+) -> Result<ManagedOpenAiRuntime> {
     let nonce = random_hex(16)?;
     let home_hash = sha256_bytes(inputs.home.as_os_str().as_encoded_bytes());
     let labels = BTreeMap::from([
@@ -401,19 +441,7 @@ pub(crate) fn prepare_managed_runtime(
         labels: labels.clone(),
     };
     atomic_write_private_json(&state_path, &state)?;
-    let create_args = service_create_args(ServiceCreateInputs {
-        name: &container_name,
-        port,
-        model_id: inputs.public_model_id,
-        snapshot: inputs.snapshot_dir,
-        prepared_model: &prepared_model,
-        source: &source_dir,
-        plugin: &plugin_dir,
-        managed_root: &managed_root,
-        seccomp: &seccomp_path,
-        wrapper: &wrapper,
-        labels: &labels,
-    })?;
+    let create_args = create(&container_name, &labels)?;
     let output = run_docker(inputs.docker, &create_args)?;
     let container_id = String::from_utf8(output.stdout)
         .context("Docker returned a non-UTF8 container ID")?
@@ -1626,6 +1654,24 @@ fn run_owned_one_shot_capture(
     envs: &[(&str, &str)],
     command: &[String],
 ) -> Result<Output> {
+    run_owned_one_shot_capture_with_image(
+        docker, root, purpose, recipe, provider, enclave, mounts, envs, command, IMAGE,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_owned_one_shot_capture_with_image(
+    docker: &Path,
+    root: &Path,
+    purpose: &str,
+    recipe: &str,
+    provider: &str,
+    enclave: &str,
+    mounts: &[(&Path, &str, bool)],
+    envs: &[(&str, &str)],
+    command: &[String],
+    image: &str,
+) -> Result<Output> {
     let nonce = random_hex(12)?;
     let container_name = format!("mayhem-{purpose}-{}", &nonce[..12]);
     let labels = BTreeMap::from([
@@ -1678,7 +1724,7 @@ fn run_owned_one_shot_capture(
     for (name, value) in envs {
         args.extend(["--env".to_owned(), format!("{name}={value}")]);
     }
-    args.push(IMAGE.to_owned());
+    args.push(image.to_owned());
     args.extend_from_slice(&command[1..]);
     let created = run_docker(docker, &args)?;
     let id = String::from_utf8(created.stdout)?.trim().to_owned();

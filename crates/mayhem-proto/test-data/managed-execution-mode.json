@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "profile": {
+    "schema_version": 1,
+    "engine": "openai-compatible",
+    "architecture": "aarch64",
+    "runtime": {
+      "schema_version": 1,
+      "lifecycle": "managed_or_verified_attach",
+      "runtime_id": "sglang-gb10",
+      "runtime_version": "1.0.0",
+      "runtime_revision": "abababababababababababababababababababab",
+      "implementation": "sglang",
+      "implementation_version": "1.0.0",
+      "container_image_digest": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "served_model": "example/model",
+      "native_context": 262144,
+      "served_context": 262144,
+      "max_concurrent": 1,
+      "model_snapshot_file_count": 419,
+      "snapshot_manifest_sidecar": "snapshot_manifest",
+      "snapshot_manifest_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "runtime_recipe_sidecar": "gb10_recipe",
+      "runtime_recipe_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "capabilities": [
+        "streaming"
+      ],
+      "server_info_checks": {
+        "/version": "1.0.0"
+      },
+      "preflight": {
+        "non_reasoning_chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "reasoning_chat_template_kwargs": {
+          "enable_thinking": true
+        },
+        "streaming_max_tokens": 32,
+        "tools_max_tokens": 384,
+        "json_max_tokens": 256,
+        "reasoning_max_tokens": 1024,
+        "cache_max_tokens": 32,
+        "cancellation_max_tokens": 4096,
+        "concurrency_max_tokens": 4096,
+        "cancellation_idle_metrics": [
+          "active_requests"
+        ],
+        "concurrency_active_metric": "active_requests"
+      }
+    },
+    "sidecars": {
+      "gb10_recipe": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "example/runtime",
+          "revision": "1111111111111111111111111111111111111111",
+          "publisher_key": null
+        },
+        "path": "gb10-recipe.json",
+        "artifact_root": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "artifact_root_kind": "blake3_merkle_v1",
+        "weights_bytes": 1024,
+        "source_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    },
+    "proof_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "generation_execution_profile": {
+    "schema_version": 1,
+    "engine": "openai-compatible",
+    "independent_dispatch": true,
+    "max_concurrent": 1,
+    "request_modalities": [["text"]],
+    "proof_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+  },
+  "requests": {
+    "endpoint_families": [
+      {
+        "family": "openai_chat_completions",
+        "request_attributes": [],
+        "request_attribute_specs": {},
+        "required_request_attributes": [],
+        "response_attributes": [],
+        "required_response_attributes": [],
+        "response_attribute_specs": {},
+        "interaction_groups": [],
+        "speciality_mappings": {}
+      }
+    ]
+  },
+  "canary": {
+    "set_id": "managed-mode",
+    "match_min": 0.95,
+    "verification_method": "token_fingerprint",
+    "fingerprints": {
+      "weights": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    "token_prefixes": {
+      "weights": {
+        "fixed": [
+          1,
+          2
+        ]
+      }
+    }
+  },
+  "canary_set_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "modality_fingerprints": {},
+  "resource_profiles": {},
+  "speciality_calibrations": {}
+}
