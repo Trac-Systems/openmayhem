@@ -214,7 +214,7 @@ pub(super) fn prepare(
 
 fn image_preflight(docker: &Path) -> Result<()> {
     ensure!(
-        docker_text(docker, &["version", "--format", "{{.Server.Version}}"])? == "29.1.3",
+        docker_text(docker, &["version", "--format", "{{.Server.Version}}"])?.trim() == "29.1.3",
         "GB10 managed runtime requires qualified Docker 29.1.3"
     );
     let info: serde_json::Value =
@@ -484,6 +484,29 @@ mod tests {
         let mut single = recipe();
         single.max_concurrent = 1;
         validate(&inputs(Path::new("/fixture"), &sidecars, &single), &single).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn gb10_preflight_accepts_docker_line_endings_and_rejects_unqualified_engines() {
+        use std::os::unix::fs::PermissionsExt;
+        let root =
+            std::env::temp_dir().join(format!("mayhem-gb10-preflight-{}", random_hex(8).unwrap()));
+        fs::create_dir(&root).unwrap();
+        let docker = root.join("docker");
+        let info = serde_json::json!({"CgroupVersion":"2","CgroupDriver":"systemd","MemoryLimit":true,"SwapLimit":true,"Runtimes":{"nvidia":{}}});
+        let image =
+            serde_json::json!({"Architecture":"arm64","Os":"linux","RepoDigests":[BASE_IMAGE]});
+        for (version, accepted) in [("29.1.3", true), ("29.1.2", false), ("", false)] {
+            fs::write(&docker, format!("#!/bin/sh\ncase \"$1\" in\nversion) echo '{version}';;\ninfo) echo '{info}';;\nimage) echo '{image}';;\n*) exit 1;;\nesac\n")).unwrap();
+            fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
+            assert_eq!(
+                image_preflight(&docker).is_ok(),
+                accepted,
+                "version {version}"
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
