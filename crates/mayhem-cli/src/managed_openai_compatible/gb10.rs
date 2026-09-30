@@ -223,10 +223,11 @@ fn image_preflight(docker: &Path) -> Result<()> {
         info["CgroupVersion"] == "2"
             && info["CgroupDriver"] == "systemd"
             && info["MemoryLimit"] == true
-            && info["SwapLimit"] == true
-            && info["Runtimes"].get("nvidia").is_some(),
-        "GB10 Docker resource controls are unavailable"
+            && info["SwapLimit"] == true,
+        "GB10 Docker cgroup v2 memory/swap controls are unavailable"
     );
+    // GPU device requests are supported by Docker without a named NVIDIA
+    // runtime. The owned GPU container and native preflight prove GPU access.
     if docker_text(
         docker,
         &["image", "inspect", BASE_IMAGE, "--format", "{{.Id}}"],
@@ -307,7 +308,6 @@ fn create_args(
         name,
         "--restart=no",
         "--init",
-        "--runtime=nvidia",
         "--gpus=device=0",
         "--ipc=host",
         "--shm-size=16g",
@@ -494,7 +494,7 @@ mod tests {
             std::env::temp_dir().join(format!("mayhem-gb10-preflight-{}", random_hex(8).unwrap()));
         fs::create_dir(&root).unwrap();
         let docker = root.join("docker");
-        let info = serde_json::json!({"CgroupVersion":"2","CgroupDriver":"systemd","MemoryLimit":true,"SwapLimit":true,"Runtimes":{"nvidia":{}}});
+        let info = serde_json::json!({"CgroupVersion":"2","CgroupDriver":"systemd","MemoryLimit":true,"SwapLimit":true,"Runtimes":{"runc":{}}});
         let image =
             serde_json::json!({"Architecture":"arm64","Os":"linux","RepoDigests":[BASE_IMAGE]});
         for (version, accepted) in [("29.1.3", true), ("29.1.2", false), ("", false)] {
@@ -533,6 +533,8 @@ mod tests {
             30042,
         )
         .unwrap();
+        assert!(!args.iter().any(|arg| arg.starts_with("--runtime=")));
+        assert!(args.iter().any(|arg| arg == "--gpus=device=0"));
         for expected in [
             "--publish=127.0.0.1:30042:30000",
             "--memory=120259084288",
