@@ -9,7 +9,7 @@ const SOURCE_REVISION: &str = "d91c3682b0b429e4c70df63cd57f819588ce29b0";
 const WEIGHT_REVISION: &str = "7b719225242aacd3dbd3f9407468c2ee9a9d2594";
 const TABLE_BYTES: u64 = 51_200_245_760;
 const TABLE_SHA256: &str = "b070f9644adf93794d8a1030584ab705809387e64396a9327a68fa3a3a6666b3";
-const FILE_TARGETS: [(&str, &str); 5] = [
+const FILE_TARGETS: [(&str, &str); 7] = [
     (
         "tokenizer_manager",
         "/sgl-workspace/sglang/python/sglang/srt/managers/tokenizer_manager.py",
@@ -25,6 +25,17 @@ const FILE_TARGETS: [(&str, &str); 5] = [
     (
         "prefill",
         "/sgl-workspace/sglang/python/sglang/srt/layers/attention/qsa/sparse_attn.py",
+    ),
+    // Keep recurrent checkpoints at the signed pool precision. The paired
+    // output kernel retains activation-precision arithmetic without rounding
+    // the state that subsequent prefix-cache hits restore.
+    (
+        "gdn_checkpoint",
+        "/sgl-workspace/sglang/python/sglang/kernels/ops/attention/fla/chunk_delta_h.py",
+    ),
+    (
+        "gdn_output",
+        "/sgl-workspace/sglang/python/sglang/kernels/ops/attention/fla/chunk_o.py",
     ),
     ("prepare_ple", "/mayhem/prepare_ple.py"),
 ];
@@ -476,7 +487,7 @@ mod tests {
         let sidecars = BTreeMap::new();
         let bound_inputs = inputs(Path::new("/fixture"), &sidecars, &baseline);
         validate(&bound_inputs, &baseline).unwrap();
-        for change in 0..8 {
+        for change in 0..10 {
             let mut changed = recipe();
             match change {
                 0 => changed.artifact.revision = "00".repeat(20),
@@ -488,7 +499,13 @@ mod tests {
                 4 => changed.files.get_mut("model").unwrap().sha256 = "11".repeat(32),
                 5 => changed.ple_table_sha256 = "11".repeat(32),
                 6 => changed.base_image = "lmsysorg/sglang:latest".to_owned(),
-                _ => changed.files.get_mut("attention").unwrap().sidecar = "../code".to_owned(),
+                7 => changed.files.get_mut("attention").unwrap().sidecar = "../code".to_owned(),
+                8 => {
+                    changed.files.remove("gdn_checkpoint");
+                }
+                _ => {
+                    changed.files.remove("gdn_output");
+                }
             }
             assert!(
                 validate(&bound_inputs, &changed).is_err(),
