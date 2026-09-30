@@ -393,6 +393,10 @@ struct GenerationGate {
 }
 
 impl GenerationGate {
+    fn is_active(&self) -> bool {
+        self.active.lock().is_ok_and(|active| *active > 0)
+    }
+
     fn acquire(self: &Arc<Self>, cancellation: &CancellationToken) -> Result<GenerationPermit> {
         let mut active = self
             .active
@@ -450,6 +454,12 @@ struct IdentityHealth {
     next_probe_at: Option<Instant>,
     first_unavailable_at: Option<Instant>,
     failed: bool,
+    probe: Option<mpsc::Receiver<IdentityProbeOutcome>>,
+}
+
+struct IdentityProbeOutcome {
+    result: std::result::Result<(), IdentityProbeError>,
+    generation_active: bool,
 }
 
 enum IdentityProbeError {
@@ -585,20 +595,61 @@ impl EngineBackend for OpenAiCompatibleBackend {
         let Some(loaded) = self.loaded.as_ref() else {
             return false;
         };
-        let now = Instant::now();
-        if self
-            .identity_health
-            .next_probe_at
-            .is_some_and(|at| now < at)
-        {
+        // Only one bounded probe is in flight. Health I/O must not block the
+        // provider's request, cancellation, and receipt dispatch loop.
+        let outcome = if let Some(probe) = self.identity_health.probe.as_ref() {
+            match probe.try_recv() {
+                Ok(outcome) => outcome,
+                Err(mpsc::TryRecvError::Empty) => return !self.identity_health.failed,
+                Err(mpsc::TryRecvError::Disconnected) => IdentityProbeOutcome {
+                    result: Err(IdentityProbeError::Unavailable {
+                        endpoint: "identity",
+                        reason: "identity probe worker stopped".to_owned(),
+                    }),
+                    generation_active: false,
+                },
+            }
+        } else {
+            if self
+                .identity_health
+                .next_probe_at
+                .is_some_and(|at| Instant::now() < at)
+            {
+                return !self.identity_health.failed;
+            }
+            let loaded = Arc::clone(loaded);
+            let (tx, rx) = mpsc::sync_channel(1);
+            self.identity_health.probe = Some(rx);
+            thread::spawn(move || {
+                let active_before = loaded.gate.is_active();
+                let result = verify_live_identity(&loaded);
+                let generation_active = active_before || loaded.gate.is_active();
+                let _ = tx.send(IdentityProbeOutcome {
+                    result,
+                    generation_active,
+                });
+            });
             return !self.identity_health.failed;
-        }
-        match verify_live_identity(loaded) {
+        };
+        self.identity_health.probe = None;
+        match outcome.result {
             Ok(()) => {
                 if self.identity_health.first_unavailable_at.take().is_some() {
                     eprintln!("[provider-identity] runtime identity probe recovered");
                 }
                 self.identity_health.failed = false;
+                self.identity_health.next_probe_at = Some(Instant::now() + IDENTITY_PROBE_INTERVAL);
+            }
+            Err(IdentityProbeError::Unavailable {
+                endpoint: "server_info",
+                ..
+            }) if outcome.generation_active && !self.identity_health.failed => {
+                // /v1/models was verified before /server_info. Some servers
+                // obtain runtime details through the inference scheduler, so
+                // prefill can delay that response without losing the runtime.
+                // Keep probing: explicit identity mismatches still retire it,
+                // and unavailable idle runtimes still have the normal grace.
+                self.identity_health.first_unavailable_at = None;
                 self.identity_health.next_probe_at = Some(Instant::now() + IDENTITY_PROBE_INTERVAL);
             }
             Err(IdentityProbeError::Unavailable { endpoint, reason }) => {
@@ -2530,6 +2581,136 @@ mod tests {
         format!("http://{address}/")
     }
 
+    fn finish_identity_probe(backend: &mut OpenAiCompatibleBackend) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut healthy = backend.component_healthy();
+        while backend.identity_health.probe.is_some() {
+            assert!(Instant::now() < deadline, "identity probe did not finish");
+            thread::sleep(Duration::from_millis(1));
+            healthy = backend.component_healthy();
+        }
+        healthy
+    }
+
+    fn identity_test_backend(base_url: String) -> OpenAiCompatibleBackend {
+        let binding = runtime();
+        let mut backend = OpenAiCompatibleBackend::new(OpenAiCompatibleBackendConfig {
+            base_url: base_url.clone(),
+            runtime: binding.clone(),
+            readiness_timeout: Duration::ZERO,
+        })
+        .unwrap();
+        backend.loaded = Some(Arc::new(LoadedBackend {
+            client: Client::builder().build().unwrap(),
+            base_url: validate_loopback_base_url(&base_url).unwrap(),
+            runtime: binding,
+            artifact: crate::ModelArtifact::openai_compatible_model("unused"),
+            ctx_size: 1024,
+            proven_capabilities: BTreeSet::new(),
+            gate: Arc::new(GenerationGate {
+                capacity: 2,
+                active: Mutex::new(0),
+                changed: Condvar::new(),
+            }),
+        }));
+        backend
+    }
+
+    #[test]
+    fn busy_scheduler_identity_unavailability_is_not_runtime_failure() {
+        let models = json!({"data":[{"id":"org/model","max_model_len":524288}]});
+        let base = spawn_identity_server_with_status(vec![
+            ("/v1/models", 200, models.clone()),
+            ("/server_info", 503, json!({})),
+            ("/v1/models", 200, models.clone()),
+            ("/server_info", 503, json!({})),
+            ("/v1/models", 200, models),
+            ("/server_info", 503, json!({})),
+        ]);
+        let mut backend = identity_test_backend(base);
+        let gate = Arc::clone(&backend.loaded.as_ref().unwrap().gate);
+        let permit = gate.acquire(&CancellationToken::new()).unwrap();
+        backend.identity_health.first_unavailable_at =
+            Some(Instant::now() - IDENTITY_UNAVAILABLE_GRACE);
+        assert!(finish_identity_probe(&mut backend));
+        assert!(backend.identity_health.first_unavailable_at.is_none());
+        drop(permit);
+        backend.identity_health.next_probe_at = None;
+        assert!(finish_identity_probe(&mut backend));
+        assert!(backend.identity_health.first_unavailable_at.is_some());
+        backend.identity_health.first_unavailable_at =
+            Some(Instant::now() - IDENTITY_UNAVAILABLE_GRACE);
+        backend.identity_health.next_probe_at = None;
+        assert!(!finish_identity_probe(&mut backend));
+    }
+
+    #[test]
+    fn busy_runtime_identity_mismatch_still_retires_runtime() {
+        let base = spawn_identity_server(vec![
+            (
+                "/v1/models",
+                json!({"data":[{"id":"org/model","max_model_len":524288}]}),
+            ),
+            ("/server_info", json!({"version":"drifted"})),
+        ]);
+        let mut backend = identity_test_backend(base);
+        let _permit = backend
+            .loaded
+            .as_ref()
+            .unwrap()
+            .gate
+            .acquire(&CancellationToken::new())
+            .unwrap();
+        assert!(!finish_identity_probe(&mut backend));
+    }
+
+    #[test]
+    fn busy_runtime_frontend_unavailability_still_retires_runtime() {
+        let base = spawn_identity_server_with_status(vec![("/v1/models", 503, json!({}))]);
+        let mut backend = identity_test_backend(base);
+        let _permit = backend
+            .loaded
+            .as_ref()
+            .unwrap()
+            .gate
+            .acquire(&CancellationToken::new())
+            .unwrap();
+        backend.identity_health.first_unavailable_at =
+            Some(Instant::now() - IDENTITY_UNAVAILABLE_GRACE);
+        assert!(!finish_identity_probe(&mut backend));
+    }
+
+    #[test]
+    fn pending_identity_probe_does_not_block_or_multiply() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/", listener.local_addr().unwrap());
+        let (accepted_tx, accepted_rx) = mpsc::sync_channel(1);
+        let (release_tx, release_rx) = mpsc::sync_channel(1);
+        let server = thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            accepted_tx.send(()).unwrap();
+            release_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // One probe request only, despite repeated provider-loop polls.
+            listener.set_nonblocking(true).unwrap();
+            assert!(
+                matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
+            );
+            socket
+                .write_all(b"HTTP/1.1 503 Busy\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}")
+                .unwrap();
+        });
+        let mut backend = identity_test_backend(base);
+        assert!(backend.component_healthy());
+        accepted_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        for _ in 0..100 {
+            assert!(backend.component_healthy());
+        }
+        assert!(backend.identity_health.probe.is_some());
+        release_tx.send(()).unwrap();
+        assert!(finish_identity_probe(&mut backend));
+        server.join().unwrap();
+    }
+
     #[test]
     fn component_health_rechecks_models_and_signed_server_identity() {
         let binding = runtime();
@@ -2564,9 +2745,9 @@ mod tests {
                 changed: Condvar::new(),
             }),
         }));
-        assert!(backend.component_healthy());
+        assert!(finish_identity_probe(&mut backend));
         backend.identity_health.next_probe_at = None;
-        assert!(!backend.component_healthy());
+        assert!(!finish_identity_probe(&mut backend));
     }
 
     #[test]
@@ -2600,11 +2781,11 @@ mod tests {
                 changed: Condvar::new(),
             }),
         }));
-        assert!(backend.component_healthy());
+        assert!(finish_identity_probe(&mut backend));
         assert!(backend.component_healthy()); // cached during retry interval
         assert!(backend.identity_health.first_unavailable_at.is_some());
         backend.identity_health.next_probe_at = None;
-        assert!(backend.component_healthy());
+        assert!(finish_identity_probe(&mut backend));
         assert!(backend.identity_health.first_unavailable_at.is_none());
     }
 
@@ -2634,11 +2815,11 @@ mod tests {
                 changed: Condvar::new(),
             }),
         }));
-        assert!(backend.component_healthy());
+        assert!(finish_identity_probe(&mut backend));
         backend.identity_health.first_unavailable_at =
             Some(Instant::now() - IDENTITY_UNAVAILABLE_GRACE - Duration::from_secs(1));
         backend.identity_health.next_probe_at = None;
-        assert!(!backend.component_healthy());
+        assert!(!finish_identity_probe(&mut backend));
         assert!(!backend.component_healthy()); // remains failed until recovery or restart
     }
 
