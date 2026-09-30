@@ -3315,7 +3315,7 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long)]
     artifact: String,
 
-    /// Named vLLM execution mode to calibrate. Omit for the baseline model.
+    /// Named signed execution mode to verify. Omit for the baseline model.
     #[arg(long)]
     execution_mode: Option<String>,
 

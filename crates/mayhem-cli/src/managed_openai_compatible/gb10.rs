@@ -346,6 +346,7 @@ fn create_args(
         ("HOME", "/mayhem/home"),
         ("XDG_CACHE_HOME", "/mayhem/cache"),
         ("HF_HUB_OFFLINE", "1"),
+        ("SGLANG_TOOL_STRICT_LEVEL", "1"),
         ("SGLANG_QWEN4_PLE_DISK_CACHE_PATH", "/ple-cache/ple-fp8.raw"),
         (
             "SGLANG_QWEN4_PLE_DISK_CACHE_MANIFEST",
@@ -369,7 +370,7 @@ fn server_args(model: &str, recipe: &Recipe) -> Vec<String> {
         "--fp4-gemm-backend", "flashinfer_cutlass", "--kv-cache-dtype", "fp8_e4m3", "--page-size", "64",
         "--mamba-radix-cache-strategy", "extra_buffer", "--mamba-track-interval", "64", "--max-mamba-cache-size", "20",
         "--mamba-ssm-dtype", "float32", "--chunked-prefill-size", "4096", "--mem-fraction-static", "0.90",
-        "--ple-offload-embedding", "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_coder",
+        "--ple-offload-embedding", "--enable-metrics", "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_coder",
         "--preferred-sampling-params", "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"min_p\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0}",
         "--disable-prefill-cuda-graph", "--cuda-graph-backend-decode", "disabled", "--disable-flashinfer-autotune",
         "--speculative-algorithm", "NEXTN", "--speculative-num-steps", "2", "--speculative-eagle-topk", "1",
@@ -522,6 +523,7 @@ mod tests {
             assert!(args.iter().any(|arg| arg == expected), "{expected}");
         }
         assert!(args.iter().any(|arg| arg.starts_with("--user=")));
+        assert!(args.iter().any(|arg| arg == "SGLANG_TOOL_STRICT_LEVEL=1"));
         assert!(!args
             .iter()
             .any(|arg| arg == "--privileged" || arg == "--network=host"));
@@ -533,6 +535,7 @@ mod tests {
             );
         }
         let server = server_args(&recipe.public_model_id, &recipe);
+        assert!(server.iter().any(|arg| arg == "--enable-metrics"));
         assert!(server
             .windows(2)
             .any(|args| args == ["--context-length", "262144"]));
