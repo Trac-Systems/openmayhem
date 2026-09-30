@@ -60178,6 +60178,7 @@ struct ProviderExecutionMode {
     binding: mayhem_proto::ExecutionModeBinding,
     requests: mayhem_proto::ExecutionModeRequestPolicy,
     baseline_adapter: catalog::CatalogAdapter,
+    runtime_sidecars: BTreeMap<String, LedgerArtifactSidecar>,
 }
 
 #[derive(Debug, Clone)]
@@ -77127,6 +77128,19 @@ fn build_provider_candidates(
                     )?,
                     requests: policy.requests.clone(),
                     baseline_adapter: model.adapter.clone(),
+                    runtime_sidecars: policy
+                        .profile
+                        .managed()
+                        .map(|profile| {
+                            profile
+                                .sidecars
+                                .iter()
+                                .map(|(name, sidecar)| {
+                                    (name.clone(), ledger_sidecar_from_catalog(sidecar))
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default(),
                 })
             })
             .transpose()?;
@@ -78352,11 +78366,7 @@ fn download_provider_artifact_blocking(
 
     let mut sidecars = BTreeMap::new();
     for (name, sidecar) in &selected.artifact.sidecars {
-        let ledger_sidecar = selected
-            .enclave
-            .artifact_sidecars
-            .get(name)
-            .with_context(|| format!("admin enclave is missing catalog sidecar {name}"))?;
+        let ledger_sidecar = provider_sidecar_authority(selected, name, sidecar)?;
         let path = download_provider_sidecar_artifact(
             args,
             downloads_dir,
@@ -78386,11 +78396,7 @@ fn download_openai_compatible_snapshot(
 
     let mut sidecars = BTreeMap::new();
     for (name, sidecar) in &selected.artifact.sidecars {
-        let ledger_sidecar = selected
-            .enclave
-            .artifact_sidecars
-            .get(name)
-            .with_context(|| format!("admin enclave is missing catalog sidecar {name}"))?;
+        let ledger_sidecar = provider_sidecar_authority(selected, name, sidecar)?;
         let path = download_provider_sidecar_artifact(
             args,
             downloads_dir,
@@ -78868,6 +78874,41 @@ fn download_provider_primary_artifact(
         selected.artifact.source_sha256.as_deref(),
         &format!("{} artifact", selected.artifact_name),
     )
+}
+
+fn ledger_sidecar_from_catalog(sidecar: &catalog::CatalogArtifactSidecar) -> LedgerArtifactSidecar {
+    LedgerArtifactSidecar {
+        source: LedgerArtifactSource {
+            kind: sidecar.source.kind.clone(),
+            repo: sidecar.source.repo.clone(),
+            revision: sidecar.source.revision.clone(),
+            path: sidecar.path.clone(),
+        },
+        path: sidecar.path.clone(),
+        artifact_root: sidecar.artifact_root.clone(),
+        artifact_root_kind: sidecar.artifact_root_kind.clone(),
+        weights_bytes: sidecar.weights_bytes,
+        source_sha256: sidecar.source_sha256.to_ascii_lowercase(),
+    }
+}
+
+fn provider_sidecar_authority<'a>(
+    selected: &'a ProviderCandidate,
+    name: &str,
+    sidecar: &catalog::CatalogArtifactSidecar,
+) -> Result<&'a LedgerArtifactSidecar> {
+    // The baseline enclave remains immutable. Extra runtime files are authorized
+    // only by the verified, selected execution profile; never add them to market identity.
+    let authority = selected.enclave.artifact_sidecars.get(name)
+        .or_else(|| selected.execution_mode.as_ref()?.runtime_sidecars.get(name))
+        .with_context(|| format!("neither the admin enclave nor its signed execution mode authorizes catalog sidecar {name}"))?;
+    let mut normalized = authority.clone();
+    normalized.source_sha256.make_ascii_lowercase();
+    ensure!(
+        normalized == ledger_sidecar_from_catalog(sidecar),
+        "catalog sidecar {name} differs from its authorized artifact binding"
+    );
+    Ok(authority)
 }
 
 fn download_provider_sidecar_artifact(
@@ -114051,6 +114092,56 @@ esac
     }
 
     #[test]
+    fn provider_sidecar_authority_preserves_enclave_and_requires_signed_mode_binding() {
+        let mut selected = test_auto_fit_candidate('a', "test/model", "text", 4, 16, 1, 10.0);
+        let sidecar: catalog::CatalogArtifactSidecar = serde_json::from_value(json!({
+            "source": {"kind":"huggingface", "repo":"test/runtime", "revision":"11".repeat(20)},
+            "path":"runtime.py", "artifact_root":"22".repeat(32),
+            "artifact_root_kind":"blake3_merkle_v1", "weights_bytes":123,
+            "source_sha256":"33".repeat(32)
+        }))
+        .unwrap();
+        let authority = ledger_sidecar_from_catalog(&sidecar);
+        selected
+            .enclave
+            .artifact_sidecars
+            .insert("baseline".to_owned(), authority.clone());
+        let before = serde_json::to_value(&selected.enclave).unwrap();
+        assert_eq!(
+            provider_sidecar_authority(&selected, "baseline", &sidecar).unwrap(),
+            &authority
+        );
+        assert!(provider_sidecar_authority(&selected, "runtime", &sidecar).is_err());
+        selected.execution_mode = Some(ProviderExecutionMode {
+            binding: mayhem_proto::ExecutionModeBinding {
+                mode_id: "test-runtime".to_owned(),
+                policy_hash: "44".repeat(32),
+            },
+            requests: mayhem_proto::ExecutionModeRequestPolicy {
+                endpoint_families: Vec::new(),
+            },
+            baseline_adapter: selected.model.adapter.clone(),
+            runtime_sidecars: BTreeMap::from([("runtime".to_owned(), authority.clone())]),
+        });
+        assert_eq!(
+            provider_sidecar_authority(&selected, "runtime", &sidecar).unwrap(),
+            &authority
+        );
+        assert!(provider_sidecar_authority(&selected, "unsigned", &sidecar).is_err());
+        let mut changed = sidecar.clone();
+        changed.source.revision = "55".repeat(20);
+        assert!(provider_sidecar_authority(&selected, "runtime", &changed).is_err());
+        selected
+            .execution_mode
+            .as_mut()
+            .unwrap()
+            .runtime_sidecars
+            .insert("baseline".to_owned(), ledger_sidecar_from_catalog(&changed));
+        assert!(provider_sidecar_authority(&selected, "baseline", &changed).is_err());
+        assert_eq!(serde_json::to_value(&selected.enclave).unwrap(), before);
+    }
+
+    #[test]
     fn provider_execution_mode_cli_and_supervisor_selection_is_explicit() {
         let baseline = ProviderStartArgs::try_parse_from(["start"]).unwrap();
         assert!(baseline.execution_mode.is_none());
@@ -114140,6 +114231,7 @@ esac
                 endpoint_families: Vec::new(),
             },
             baseline_adapter: candidate.model.adapter.clone(),
+            runtime_sidecars: BTreeMap::new(),
         });
         let argv = provider_serve_mode_add_argv(home, candidate, &args, Some(12), None);
         let parsed = ProviderServeAddArgs::try_parse_from(&argv[3..]).unwrap();
@@ -119754,11 +119846,9 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             assert_eq!(prepared["tools"], raw["tools"]);
             assert_eq!(prepared["tools"].as_array().unwrap().len(), 128);
             assert_eq!(prepared.get("tool_choice"), raw.get("tool_choice"));
-            assert!(
-                prepared
-                    .to_string()
-                    .contains("Return the function call immediately")
-            );
+            assert!(prepared
+                .to_string()
+                .contains("Return the function call immediately"));
             let mut none = raw.clone();
             none["tool_choice"] = json!("none");
             assert_eq!(
@@ -120762,6 +120852,7 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             },
             requests,
             baseline_adapter: baseline_adapter.clone(),
+            runtime_sidecars: BTreeMap::new(),
         });
         let canaries = test_canary_dir_with_prompts(
             &selected.model.canary.set_id,
