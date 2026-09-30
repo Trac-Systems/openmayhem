@@ -18683,21 +18683,19 @@ const ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS: u32 = 384;
 
 fn catalog_endpoint_calibration_output_token_cap(
     request: &Value,
-    forced_tool_max_output_tokens: u32,
+    tool_max_output_tokens: u32,
 ) -> u32 {
-    let choice = request.get("tool_choice");
-    let forced = matches!(choice.and_then(Value::as_str), Some("required" | "any"))
-        || choice
-            .and_then(Value::as_object)
-            .and_then(provider_engine_named_tool_choice)
-            .is_some();
-    if forced
+    // Automatic tool selection can produce the same call as a forced choice.
+    // Use the signed runtime's tool budget for both: the shorter text-probe
+    // budget can truncate reasoning followed by otherwise valid arguments.
+    // This only bounds calibration probes; serving request limits are unchanged.
+    if request.get("tool_choice").and_then(Value::as_str) != Some("none")
         && request
             .get("tools")
             .and_then(Value::as_array)
             .is_some_and(|tools| !tools.is_empty())
     {
-        forced_tool_max_output_tokens
+        tool_max_output_tokens
     } else {
         ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS
     }
@@ -119589,6 +119587,40 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 provider_verify_endpoint_request(&sealed, Some(&model.model_id), &model.adapter)
                     .unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn endpoint_calibration_budgets_optional_tool_calls_without_forcing_them() {
+        let tools = json!([{"type":"function","function":{
+            "name":"calibration_tool","parameters":{"type":"object"}
+        }}]);
+        for choice in [
+            None,
+            Some(json!("auto")),
+            Some(json!("required")),
+            Some(json!("any")),
+            Some(json!({"type":"function","function":{"name":"calibration_tool"}})),
+        ] {
+            let mut request = json!({"tools":tools});
+            if let Some(choice) = choice {
+                request["tool_choice"] = choice;
+            }
+            let before = request.clone();
+            assert_eq!(catalog_endpoint_calibration_output_token_cap(&request, 512), 512);
+            assert_eq!(request, before, "budgeting must not force a tool choice");
+        }
+        for request in [
+            json!({}),
+            json!({"tools":[]}),
+            json!({"tools":null}),
+            json!({"tool_choice":"required"}),
+            json!({"tools":tools,"tool_choice":"none"}),
+        ] {
+            assert_eq!(
+                catalog_endpoint_calibration_output_token_cap(&request, 512),
+                ENDPOINT_CALIBRATION_MAX_OUTPUT_TOKENS,
+            );
         }
     }
 
