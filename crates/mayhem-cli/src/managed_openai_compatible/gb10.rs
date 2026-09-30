@@ -311,8 +311,6 @@ fn create_args(
         "--gpus=device=0",
         "--ipc=host",
         "--shm-size=16g",
-        "--memory=112g",
-        "--memory-swap=112g",
         "--pids-limit=32768",
         "--log-driver=json-file",
         "--log-opt=max-size=10m",
@@ -324,6 +322,8 @@ fn create_args(
     .map(str::to_owned)
     .to_vec();
     args.extend([
+        format!("--memory={GB10_CONTAINER_MEMORY_BYTES}"),
+        format!("--memory-swap={GB10_CONTAINER_MEMORY_BYTES}"),
         format!("--publish=127.0.0.1:{port}:30000"),
         format!("--security-opt=seccomp={}", seccomp.display()),
     ]);
@@ -512,8 +512,8 @@ mod tests {
         .unwrap();
         for expected in [
             "--publish=127.0.0.1:30042:30000",
-            "--memory=112g",
-            "--memory-swap=112g",
+            "--memory=120259084288",
+            "--memory-swap=120259084288",
             "--restart=no",
             "--cap-drop=ALL",
             "--log-opt=max-size=10m",

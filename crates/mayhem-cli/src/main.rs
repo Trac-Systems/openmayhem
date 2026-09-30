@@ -64805,10 +64805,15 @@ fn validate_managed_openai_hardware(
                 && matches!(hardware.host.arch.as_str(), "aarch64" | "arm64"),
             "GB10 managed runtime requires Linux aarch64"
         );
+        // Firmware reserves part of installed RAM before Linux reports MemTotal.
+        // Check the actual container envelope, not a rounded DIMM capacity.
+        // Admission separately checks measured peak against available RAM,
+        // the operator's reserve, and other provider memory claims.
         ensure!(
             hardware.memory.unified_memory
-                && hardware.memory.total_bytes >= 120 * 1024 * 1024 * 1024,
-            "GB10 managed runtime requires at least 120 GiB unified memory"
+                && hardware.memory.total_bytes
+                    >= managed_openai_compatible::GB10_CONTAINER_MEMORY_BYTES,
+            "GB10 managed runtime requires unified memory sufficient for its container envelope"
         );
         let nvidia = hardware
             .gpus
@@ -110392,6 +110397,51 @@ status: linked
                 .contains("immutable admin/model/artifact identity"),
             "{err:#}"
         );
+    }
+
+    #[test]
+    fn managed_hardware_admission_uses_os_memory_and_preserves_architecture_limits() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../../mayhem-proto/test-data/managed-execution-mode.json"
+        ))
+        .unwrap();
+        let mut runtime: mayhem_engine::OpenAiCompatibleRuntimeBinding =
+            serde_json::from_value(fixture["profile"]["runtime"].clone()).unwrap();
+        runtime.runtime_id = managed_openai_compatible::GB10_RUNTIME_ID.to_owned();
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidiaArm64);
+        hardware.memory.total_bytes = 128_520_806_400;
+        hardware.memory.unified_memory = true;
+        hardware.gpus.truncate(1);
+        hardware.gpus[0].compute_capability = Some("12.1".to_owned());
+        hardware.gpus[0].supports_nvfp4 = true;
+        hardware.gpus[0].supports_fp8 = true;
+        validate_managed_openai_hardware(&hardware, &runtime).unwrap();
+
+        let supported = hardware.clone();
+        hardware.memory.total_bytes = managed_openai_compatible::GB10_CONTAINER_MEMORY_BYTES - 1;
+        assert!(validate_managed_openai_hardware(&hardware, &runtime).is_err());
+        hardware = supported.clone();
+        hardware.memory.unified_memory = false;
+        assert!(validate_managed_openai_hardware(&hardware, &runtime).is_err());
+        hardware = supported.clone();
+        hardware.host.arch = "x86_64".to_owned();
+        assert!(validate_managed_openai_hardware(&hardware, &runtime).is_err());
+        hardware = supported.clone();
+        hardware.gpus[0].compute_capability = Some("12.0".to_owned());
+        assert!(validate_managed_openai_hardware(&hardware, &runtime).is_err());
+
+        runtime.runtime_id = "sglang".to_owned();
+        hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.memory.total_bytes = 128 * GIB_BYTES;
+        hardware.gpus.truncate(1);
+        hardware.gpus[0].dedicated_memory_bytes = Some(97_887 * 1024 * 1024);
+        hardware.gpus[0].compute_capability = Some("12.0".to_owned());
+        hardware.gpus[0].supports_nvfp4 = true;
+        hardware.gpus[0].supports_fp8 = true;
+        validate_managed_openai_hardware(&hardware, &runtime).unwrap();
+        hardware.gpus[0].dedicated_memory_bytes = Some(96 * GIB_BYTES / 2);
+        assert!(validate_managed_openai_hardware(&hardware, &runtime).is_err());
+        assert!(validate_managed_openai_hardware(&supported, &runtime).is_err());
     }
 
     #[test]

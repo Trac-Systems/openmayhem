@@ -14,6 +14,7 @@ use sha2::{Digest as _, Sha256};
 const IMAGE: &str =
     "lmsysorg/sglang@sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1";
 pub(crate) const GB10_RUNTIME_ID: &str = "sglang-gb10";
+pub(crate) const GB10_CONTAINER_MEMORY_BYTES: u64 = 112 * 1024 * 1024 * 1024;
 mod gb10;
 const SOURCE_FORMAT: &str = "pennyroyal_source_bundle_tar_gzip_v1";
 const SOURCE_LAYOUT: &str = "source";
