@@ -217,9 +217,14 @@ pub(super) fn prepare(
 }
 
 fn image_preflight(docker: &Path) -> Result<()> {
+    let version = docker_text(docker, &["version", "--format", "{{.Server.Version}}"])?;
+    // Both engines were qualified with the same pinned image, explicit seccomp
+    // profile, non-root identity and cgroup controls. Do not accept untested
+    // engines merely because they are newer or share a major version.
     ensure!(
-        docker_text(docker, &["version", "--format", "{{.Server.Version}}"])?.trim() == "29.1.3",
-        "GB10 managed runtime requires qualified Docker 29.1.3"
+        matches!(version.trim(), "29.1.3" | "29.6.2"),
+        "GB10 managed runtime requires qualified Docker 29.1.3 or 29.6.2 (found {})",
+        version.trim()
     );
     let info: serde_json::Value =
         serde_json::from_str(&docker_text(docker, &["info", "--format", "{{json .}}"])?)?;
@@ -506,7 +511,15 @@ mod tests {
         let info = serde_json::json!({"CgroupVersion":"2","CgroupDriver":"systemd","MemoryLimit":true,"SwapLimit":true,"Runtimes":{"runc":{}}});
         let image =
             serde_json::json!({"Architecture":"arm64","Os":"linux","RepoDigests":[BASE_IMAGE]});
-        for (version, accepted) in [("29.1.3", true), ("29.1.2", false), ("", false)] {
+        for (version, accepted) in [
+            ("29.1.3", true),
+            ("29.6.2", true),
+            ("29.1.2", false),
+            ("29.6.1", false),
+            ("29.6.3", false),
+            ("30.0.0", false),
+            ("", false),
+        ] {
             fs::write(&docker, format!("#!/bin/sh\ncase \"$1\" in\nversion) echo '{version}';;\ninfo) echo '{info}';;\nimage) echo '{image}';;\n*) exit 1;;\nesac\n")).unwrap();
             fs::set_permissions(&docker, fs::Permissions::from_mode(0o700)).unwrap();
             assert_eq!(
