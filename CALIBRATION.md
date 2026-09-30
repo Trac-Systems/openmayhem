@@ -23,6 +23,23 @@ parts, policies, and current class status live in
   verify, load, pass canary, and publish fresh heartbeats before starting the
   next worker.
 
+## Incremental endpoint qualification
+
+A calibration-only correction may reuse passing endpoint evidence when the model,
+artifact, runtime, base canaries and speciality bindings are unchanged. Use
+`--resume-core-report <report>` with repeated
+`--rerun-endpoint-attribute <attribute>` options naming **every affected request
+attribute** (for example `tools` and `tool_choice` for a tool-budget correction).
+Without this explicit scope, endpoint qualification still runs the full matrix.
+
+The runner repeats contract/gateway normalization for every case. It executes all
+failed, missing, invalid or changed cases and every case using a selected
+attribute. Only successful cases with matching request, contract, normalization
+and execution evidence are retained. The log records their count and the source
+report fingerprint. This option must not reuse evidence across a changed runtime
+or changes affecting other request behavior; broaden the scope or rerun those
+cases instead. Retained full-context or speed proof is not a new measurement.
+
 ## Market activity calibration
 
 Contract v25 may attach admin-signed `activity_calibration` to a model reference.

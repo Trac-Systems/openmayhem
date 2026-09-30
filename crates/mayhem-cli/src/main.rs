@@ -3367,6 +3367,11 @@ struct CatalogCalibrateCanaryArgs {
     #[arg(long, value_name = "PATH")]
     resume_core_report: Option<PathBuf>,
 
+    /// Explicit incremental endpoint rerun for an unchanged runtime: rerun failed
+    /// cases and cases using these changed attributes; retain only matching passes.
+    #[arg(long, requires = "resume_core_report", value_name = "ATTRIBUTE")]
+    rerun_endpoint_attribute: Vec<String>,
+
     /// Write the calibration report JSON to this path.
     #[arg(long, value_name = "PATH")]
     report_output: Option<PathBuf>,
@@ -16116,6 +16121,22 @@ fn catalog_calibrate_canary(mut args: CatalogCalibrateCanaryArgs) -> Result<()> 
             Ok::<_, anyhow::Error>(report)
         })
         .transpose()?;
+    if !args.rerun_endpoint_attribute.is_empty() {
+        ensure!(
+            resume_core_report.is_some(),
+            "incremental endpoints require validated core evidence"
+        );
+        for attribute in &args.rerun_endpoint_attribute {
+            ensure!(
+                model
+                    .adapter
+                    .endpoint_families
+                    .iter()
+                    .any(|family| family.request_attributes.contains(attribute)),
+                "unknown rerun endpoint attribute {attribute}"
+            );
+        }
+    }
     if artifact.engine == "comfyui" && args.artifact == "workflow-class" {
         ensure!(
             resume_core_report.is_none(),
@@ -16218,14 +16239,30 @@ fn catalog_calibrate_canary(mut args: CatalogCalibrateCanaryArgs) -> Result<()> 
             &report,
             Some(&superseded_artifact_declarations),
         )?;
-        report.endpoint_calibration = catalog_endpoint_calibration_report(
+        let reuse = if args.rerun_endpoint_attribute.is_empty() {
+            None
+        } else {
+            Some(
+                endpoint_calibration::EndpointCalibrationReuse::new(
+                    &report.endpoint_calibration,
+                    &args.rerun_endpoint_attribute,
+                )
+                .map_err(anyhow::Error::msg)?,
+            )
+        };
+        let endpoints = catalog_endpoint_calibration_report_resuming(
             backend.as_mut(),
             model,
             &args.artifact,
             artifact,
             &prompts,
             behavioral_witness,
+            reuse.as_ref(),
         );
+        if let Some(reuse) = reuse.as_ref() {
+            eprintln!("Retained {} endpoint cases from evidence {}; failed, selected and changed requests executed again", reuse.retained.get(), reuse.source_fingerprint);
+        }
+        report.endpoint_calibration = endpoints;
         report.artifact_path = artifact_path.clone();
         report.existing_catalog_fingerprint = existing.clone();
         report.matches_existing_catalog = existing
@@ -17649,7 +17686,27 @@ fn catalog_endpoint_calibration_report(
     artifact_name: &str,
     artifact: &catalog::CatalogArtifact,
     prompts: &[CanaryPrompt],
+    behavioral_witness: Option<EndpointCalibrationBehavioralWitness>,
+) -> EndpointCalibrationReport {
+    catalog_endpoint_calibration_report_resuming(
+        backend,
+        model,
+        artifact_name,
+        artifact,
+        prompts,
+        behavioral_witness,
+        None,
+    )
+}
+
+fn catalog_endpoint_calibration_report_resuming(
+    backend: &mut dyn EngineBackend,
+    model: &catalog::CatalogModel,
+    artifact_name: &str,
+    artifact: &catalog::CatalogArtifact,
+    prompts: &[CanaryPrompt],
     mut behavioral_witness: Option<EndpointCalibrationBehavioralWitness>,
+    reuse: Option<&endpoint_calibration::EndpointCalibrationReuse<'_>>,
 ) -> EndpointCalibrationReport {
     let (substitutions, fixtures) = catalog_endpoint_calibration_fixtures(model, prompts);
     let forced_tool_max_output_tokens = artifact
@@ -17658,7 +17715,7 @@ fn catalog_endpoint_calibration_report(
         .map(|binding| binding.preflight.tools_max_tokens)
         .unwrap_or(ENDPOINT_CALIBRATION_FORCED_TOOL_FALLBACK_MAX_OUTPUT_TOKENS);
     let mut execution_cache = BTreeMap::<(String, String), EndpointCalibrationExecution>::new();
-    run_endpoint_calibration_matrix_with_materializer(
+    endpoint_calibration::run_endpoint_calibration_matrix_retaining(
         &model.adapter.endpoint_families,
         &substitutions,
         |contract, case, request| {
@@ -17707,6 +17764,7 @@ fn catalog_endpoint_calibration_report(
             execution_cache.insert(cache_key, execution.clone());
             Ok(execution)
         },
+        reuse,
     )
 }
 
@@ -119607,7 +119665,10 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 request["tool_choice"] = choice;
             }
             let before = request.clone();
-            assert_eq!(catalog_endpoint_calibration_output_token_cap(&request, 512), 512);
+            assert_eq!(
+                catalog_endpoint_calibration_output_token_cap(&request, 512),
+                512
+            );
             assert_eq!(request, before, "budgeting must not force a tool choice");
         }
         for request in [
@@ -138822,6 +138883,7 @@ State initialization...
             include_output: false,
             artifact_output_dir: None,
             resume_core_report: None,
+            rerun_endpoint_attribute: Vec::new(),
             report_output: None,
             require_match: false,
             trt_engine_dir: None,

@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use mayhem_proto::{
     endpoint_contract_fingerprint, generate_endpoint_calibration_cases,
@@ -82,6 +85,92 @@ pub(crate) struct EndpointCalibrationReport {
     pub(crate) ok: bool,
 }
 
+/// Explicit incremental calibration. Callers must first validate the retained
+/// report's model, artifact/runtime, canaries and speciality evidence. No reuse
+/// occurs by default. Request and normalization bindings are checked again.
+pub(crate) struct EndpointCalibrationReuse<'a> {
+    cases: BTreeMap<(String, String), &'a EndpointCalibrationCaseReport>,
+    rerun_attributes: &'a [String],
+    pub(crate) retained: Cell<usize>,
+    pub(crate) source_fingerprint: String,
+}
+
+impl<'a> EndpointCalibrationReuse<'a> {
+    pub(crate) fn new(
+        report: &'a EndpointCalibrationReport,
+        rerun_attributes: &'a [String],
+    ) -> Result<Self, String> {
+        if report.schema_version != ENDPOINT_CALIBRATION_SCHEMA_VERSION
+            || rerun_attributes.is_empty()
+        {
+            return Err(
+                "Incremental calibration needs supported evidence and explicit changed attributes"
+                    .into(),
+            );
+        }
+        let mut cases = BTreeMap::new();
+        for family in &report.families {
+            for case in &family.cases {
+                if case.endpoint_family != family.endpoint_family
+                    || case.contract_fingerprint != family.contract_fingerprint
+                    || cases
+                        .insert((case.endpoint_family.clone(), case.case_id.clone()), case)
+                        .is_some()
+                {
+                    return Err(
+                        "Retained endpoint evidence has inconsistent or duplicate case identities"
+                            .into(),
+                    );
+                }
+            }
+        }
+        Ok(Self {
+            cases,
+            rerun_attributes,
+            retained: Cell::new(0),
+            source_fingerprint: stable_value_fingerprint(
+                &serde_json::to_value(report).map_err(|e| e.to_string())?,
+            ),
+        })
+    }
+
+    fn get(
+        &self,
+        expected: &EndpointCalibrationCase,
+        request_fingerprint: &str,
+        gateway: &EndpointCalibrationStageReport,
+        normalized: &Value,
+    ) -> Option<EndpointCalibrationCaseReport> {
+        if self
+            .rerun_attributes
+            .iter()
+            .any(|path| expected.attributes.contains(path) || value_has_path(normalized, path))
+        {
+            return None;
+        }
+        let old = *self
+            .cases
+            .get(&(expected.endpoint_family.clone(), expected.case_id.clone()))?;
+        if old.case_kind != expected.case_kind
+            || old.attributes != expected.attributes
+            || old.expect_accept != expected.expect_accept
+            || old.contract_fingerprint != expected.contract_fingerprint
+            || old.request_fingerprint != request_fingerprint
+            || old.gateway_normalization != *gateway
+            || old.contract_validation.fingerprint.as_deref() != Some(request_fingerprint)
+        {
+            return None;
+        }
+        let mut errors = Vec::new();
+        validate_case_stages(expected, old, &mut errors);
+        if !errors.is_empty() {
+            return None;
+        }
+        self.retained.set(self.retained.get() + 1);
+        Some(old.clone())
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct EndpointCalibrationExecution {
     pub(crate) provider_translation_fingerprint: String,
@@ -129,8 +218,26 @@ where
 pub(crate) fn run_endpoint_calibration_matrix_with_materializer<F, M>(
     contracts: &[EndpointFamilyContract],
     substitutions: &BTreeMap<String, Value>,
+    materialize: M,
+    execute: F,
+) -> EndpointCalibrationReport
+where
+    F: FnMut(
+        &EndpointFamilyContract,
+        &EndpointCalibrationCase,
+        &Value,
+    ) -> Result<EndpointCalibrationExecution, String>,
+    M: FnMut(&EndpointFamilyContract, &EndpointCalibrationCase, Value) -> Result<Value, String>,
+{
+    run_endpoint_calibration_matrix_retaining(contracts, substitutions, materialize, execute, None)
+}
+
+pub(crate) fn run_endpoint_calibration_matrix_retaining<F, M>(
+    contracts: &[EndpointFamilyContract],
+    substitutions: &BTreeMap<String, Value>,
     mut materialize: M,
     mut execute: F,
+    reuse: Option<&EndpointCalibrationReuse<'_>>,
 ) -> EndpointCalibrationReport
 where
     F: FnMut(
@@ -143,7 +250,13 @@ where
     let mut families = contracts
         .iter()
         .map(|contract| {
-            run_endpoint_family_calibration(contract, substitutions, &mut materialize, &mut execute)
+            run_endpoint_family_calibration(
+                contract,
+                substitutions,
+                &mut materialize,
+                &mut execute,
+                reuse,
+            )
         })
         .collect::<Vec<_>>();
     families.sort_by(|left, right| left.endpoint_family.cmp(&right.endpoint_family));
@@ -165,6 +278,7 @@ fn run_endpoint_family_calibration<F, M>(
     substitutions: &BTreeMap<String, Value>,
     materialize: &mut M,
     execute: &mut F,
+    reuse: Option<&EndpointCalibrationReuse<'_>>,
 ) -> EndpointFamilyCalibrationReport
 where
     F: FnMut(
@@ -193,7 +307,14 @@ where
     let reports = cases
         .iter()
         .map(|case| {
-            run_endpoint_calibration_case(contract, case, substitutions, materialize, execute)
+            run_endpoint_calibration_case(
+                contract,
+                case,
+                substitutions,
+                materialize,
+                execute,
+                reuse,
+            )
         })
         .collect::<Vec<_>>();
     let ok = !reports.is_empty() && reports.iter().all(|report| report.ok);
@@ -213,6 +334,7 @@ fn run_endpoint_calibration_case<F, M>(
     substitutions: &BTreeMap<String, Value>,
     materialize: &mut M,
     execute: &mut F,
+    reuse: Option<&EndpointCalibrationReuse<'_>>,
 ) -> EndpointCalibrationCaseReport
 where
     F: FnMut(
@@ -292,6 +414,16 @@ where
         }
     };
     let gateway_normalization = passed_stage(Some(normalized.normalized_request_fingerprint));
+    if let Some(retained) = reuse.and_then(|r| {
+        r.get(
+            case,
+            &request_fingerprint,
+            &gateway_normalization,
+            &normalized.normalized_request,
+        )
+    }) {
+        return retained;
+    }
     let execution = match execute(contract, case, &normalized.normalized_request) {
         Ok(execution) => execution,
         Err(error) => {
@@ -861,6 +993,134 @@ fn unresolved_calibration_marker(value: &Value) -> Option<&str> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    fn reuse_execution(
+        contract: &EndpointFamilyContract,
+        request: &Value,
+    ) -> EndpointCalibrationExecution {
+        EndpointCalibrationExecution {
+            provider_translation_fingerprint: "11".repeat(32),
+            handled_request_attributes: contract
+                .request_attributes
+                .iter()
+                .filter(|p| value_has_path(request, p))
+                .cloned()
+                .collect(),
+            backend_execution_fingerprint: "22".repeat(32),
+            backend_proof: EndpointCalibrationBackendProof {
+                kind: EndpointCalibrationBackendProofKind::FullInference,
+                behavioral_witness_fingerprint: None,
+            },
+            response: json!({"id":"cmpl-test","object":"text_completion","created":1,"model":"test/model",
+                "choices":[{"index":0,"text":"ok","finish_reason":"stop"}],
+                "usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2},"mayhem":{}}),
+        }
+    }
+
+    #[test]
+    fn incremental_endpoint_reuse_reruns_failures_changes_and_selected_attributes() {
+        let contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+        )
+        .unwrap();
+        let contracts = std::slice::from_ref(&contract);
+        let substitutions = BTreeMap::from([("$MODEL".to_owned(), json!("test/model"))]);
+        let changed = vec!["temperature".to_owned()];
+        let mut selected = BTreeSet::new();
+        let mut nonselected = Vec::new();
+        let mut old = run_endpoint_calibration_matrix(contracts, &substitutions, |c, case, r| {
+            if case.attributes.contains(&changed[0]) || value_has_path(r, &changed[0]) {
+                selected.insert(case.case_id.clone());
+            } else {
+                nonselected.push(case.case_id.clone());
+            }
+            Ok(reuse_execution(c, r))
+        });
+        assert!(validate_endpoint_calibration_report(contracts, &old).is_empty());
+        assert!(!selected.is_empty() && nonselected.len() > 4);
+        // None of these malformed/stale proofs may be counted as a fresh pass.
+        for (i, id) in nonselected.iter().take(4).enumerate() {
+            let row = old.families[0]
+                .cases
+                .iter_mut()
+                .find(|c| &c.case_id == id)
+                .unwrap();
+            match i {
+                0 => row.ok = false,
+                1 => row.request_fingerprint = "33".repeat(32),
+                2 => row.backend_proof = None,
+                _ => row.gateway_normalization.fingerprint = Some("44".repeat(32)),
+            }
+            selected.insert(id.clone());
+        }
+        let reuse = EndpointCalibrationReuse::new(&old, &changed).unwrap();
+        let mut executed = BTreeSet::new();
+        let report = run_endpoint_calibration_matrix_retaining(
+            contracts,
+            &substitutions,
+            |_, _, r| Ok(r),
+            |c, case, r| {
+                executed.insert(case.case_id.clone());
+                Ok(reuse_execution(c, r))
+            },
+            Some(&reuse),
+        );
+        assert_eq!(executed, selected);
+        assert!(reuse.retained.get() > 0);
+        assert!(validate_endpoint_calibration_report(contracts, &report).is_empty());
+        // An actual repeated failure must still fail the final report.
+        let reuse = EndpointCalibrationReuse::new(&old, &changed).unwrap();
+        let failed = run_endpoint_calibration_matrix_retaining(
+            contracts,
+            &substitutions,
+            |_, _, r| Ok(r),
+            |c, case, r| {
+                if case.case_id == nonselected[0] {
+                    Err("backend failed again".into())
+                } else {
+                    Ok(reuse_execution(c, r))
+                }
+            },
+            Some(&reuse),
+        );
+        assert!(!failed.ok);
+        assert!(!validate_endpoint_calibration_report(contracts, &failed).is_empty());
+    }
+
+    #[test]
+    fn incremental_endpoint_reuse_never_accepts_changed_requests_or_duplicate_evidence() {
+        let contract = mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+        )
+        .unwrap();
+        let contracts = std::slice::from_ref(&contract);
+        let substitutions = BTreeMap::from([("$MODEL".to_owned(), json!("test/model"))]);
+        let old = run_endpoint_calibration_matrix(contracts, &substitutions, |c, _, r| {
+            Ok(reuse_execution(c, r))
+        });
+        let changed = vec!["temperature".to_owned()];
+        let reuse = EndpointCalibrationReuse::new(&old, &changed).unwrap();
+        let altered = BTreeMap::from([("$MODEL".to_owned(), json!("different/model"))]);
+        let mut executed = 0;
+        let report = run_endpoint_calibration_matrix_retaining(
+            contracts,
+            &altered,
+            |_, _, r| Ok(r),
+            |c, _, r| {
+                executed += 1;
+                Ok(reuse_execution(c, r))
+            },
+            Some(&reuse),
+        );
+        assert!(executed > 0);
+        assert_eq!(reuse.retained.get(), 0);
+        assert!(validate_endpoint_calibration_report(contracts, &report).is_empty());
+        let mut duplicate = old.clone();
+        let row = duplicate.families[0].cases[0].clone();
+        duplicate.families[0].cases.push(row);
+        assert!(EndpointCalibrationReuse::new(&duplicate, &changed).is_err());
+        assert!(EndpointCalibrationReuse::new(&old, &[]).is_err());
+    }
 
     #[test]
     fn report_validation_rejects_missing_and_failed_rows() {
