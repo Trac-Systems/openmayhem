@@ -364,12 +364,16 @@ fn create_args(
 }
 
 fn server_args(model: &str, recipe: &Recipe) -> Vec<String> {
+    // Leave enough allocator budget for the qualified fixed KV pool even when
+    // Core's resident startup overhead lowers the initial free-memory sample.
+    // --max-total-tokens still caps the actual allocation at the signed size;
+    // native preflight rejects any smaller pool instead of advertising two slots.
     let mut args = ["serve", "--model-path", "/model", "--served-model-name", model,
         "--chat-template", "/model/chat_template.jinja", "--trust-remote-code", "--host", "0.0.0.0",
         "--port", "30000", "--dtype", "bfloat16", "--quantization", "modelopt_fp4",
         "--fp4-gemm-backend", "flashinfer_cutlass", "--kv-cache-dtype", "fp8_e4m3", "--page-size", "64",
         "--mamba-radix-cache-strategy", "extra_buffer", "--mamba-track-interval", "64", "--max-mamba-cache-size", "20",
-        "--mamba-ssm-dtype", "float32", "--chunked-prefill-size", "4096", "--mem-fraction-static", "0.90",
+        "--mamba-ssm-dtype", "float32", "--chunked-prefill-size", "4096", "--mem-fraction-static", "0.91",
         "--ple-offload-embedding", "--enable-metrics", "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_coder",
         "--preferred-sampling-params", "{\"temperature\":1.0,\"top_p\":0.95,\"top_k\":20,\"min_p\":0.0,\"presence_penalty\":0.0,\"repetition_penalty\":1.0}",
         "--disable-prefill-cuda-graph", "--cuda-graph-backend-decode", "disabled", "--disable-flashinfer-autotune",
