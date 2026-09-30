@@ -376,6 +376,7 @@ fn server_args(model: &str, recipe: &Recipe) -> Vec<String> {
         "--chat-template", "/model/chat_template.jinja", "--trust-remote-code", "--host", "0.0.0.0",
         "--port", "30000", "--dtype", "bfloat16", "--quantization", "modelopt_fp4",
         "--fp4-gemm-backend", "flashinfer_cutlass", "--kv-cache-dtype", "fp8_e4m3", "--page-size", "64",
+        "--enable-deterministic-inference", "--attention-backend", "triton",
         "--mamba-radix-cache-strategy", "extra_buffer", "--mamba-track-interval", "64", "--max-mamba-cache-size", "20",
         "--mamba-ssm-dtype", "float32", "--chunked-prefill-size", "4096", "--mem-fraction-static", "0.91",
         "--ple-offload-embedding", "--enable-metrics", "--reasoning-parser", "qwen3", "--tool-call-parser", "qwen3_coder",
@@ -569,6 +570,14 @@ mod tests {
         }
         let server = server_args(&recipe.public_model_id, &recipe);
         assert!(server.iter().any(|arg| arg == "--enable-metrics"));
+        assert!(server
+            .iter()
+            .any(|arg| arg == "--enable-deterministic-inference"));
+        // SGLang must keep prefix caching enabled under deterministic inference.
+        assert!(server
+            .windows(2)
+            .any(|args| args == ["--attention-backend", "triton"]));
+        assert!(!server.iter().any(|arg| arg == "--disable-radix-cache"));
         assert!(server
             .windows(2)
             .any(|args| args == ["--context-length", "262144"]));
