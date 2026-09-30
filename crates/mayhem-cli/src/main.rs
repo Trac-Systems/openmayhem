@@ -62,10 +62,11 @@ use mayhem_enclave::{
     load_or_create_runtime_keypair_store, measure_binary, prepare_hardware_quote_binding,
     prepare_hardware_quote_binding_for_measured_binary, prepare_tier1_attestation_report,
     prepare_tier1_attestation_report_for_measured_binary, read_sealed_manifest, seal_artifact,
-    seal_artifact_chunks, DownloadReport, HardwareAttestationOptions, HardwareQuoteBindingOptions,
-    KeyContext, MerkleChunk, MerkleManifest, ProgressEvent, ProgressPhase, RuntimeKeyContext,
-    RuntimeKeypair, RuntimeKeypairStoreOptions, SealOptions, Tier1AttestationReport,
-    Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE, SEALED_STORE_MANIFEST,
+    seal_artifact_chunks_fallible, DownloadReport, HardwareAttestationOptions,
+    HardwareQuoteBindingOptions, KeyContext, MerkleChunk, MerkleManifest, ProgressEvent,
+    ProgressPhase, RuntimeKeyContext, RuntimeKeypair, RuntimeKeypairStoreOptions, SealOptions,
+    Tier1AttestationReport, Tier1ExternalProviderAttestationOptions, DEFAULT_CHUNK_SIZE,
+    SEALED_STORE_MANIFEST,
 };
 #[cfg(feature = "comfyui")]
 use mayhem_engine::ComfyUiBackend;
@@ -79508,7 +79509,7 @@ where
         total: Some(metadata.len()),
     });
     let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    let mut builder = VirtualMerkleBuilder::new(chunk_size, false)?;
+    let mut builder = VirtualMerkleBuilder::new(chunk_size)?;
     let mut position = 0_u64;
     let mut buffer = [0_u8; 1024 * 64];
     loop {
@@ -79565,7 +79566,6 @@ where
 struct DirectoryArtifactDigest {
     source_sha256: String,
     merkle: MerkleManifest,
-    seal_chunks: Option<Vec<(MerkleChunk, Vec<u8>)>>,
 }
 
 #[derive(Debug)]
@@ -79586,13 +79586,12 @@ struct VirtualMerkleBuilder {
     buffer: Vec<u8>,
     chunks: Vec<MerkleChunk>,
     leaves: Vec<[u8; 32]>,
-    seal_chunks: Option<Vec<(MerkleChunk, Vec<u8>)>>,
     total_bytes: u64,
     sha256: Sha256,
 }
 
 impl VirtualMerkleBuilder {
-    fn new(chunk_size: usize, collect_seal_chunks: bool) -> Result<Self> {
+    fn new(chunk_size: usize) -> Result<Self> {
         if chunk_size == 0 {
             bail!("--chunk-size must be positive");
         }
@@ -79601,7 +79600,6 @@ impl VirtualMerkleBuilder {
             buffer: Vec::with_capacity(chunk_size),
             chunks: Vec::new(),
             leaves: Vec::new(),
-            seal_chunks: collect_seal_chunks.then(Vec::new),
             total_bytes: 0,
             sha256: Sha256::new(),
         })
@@ -79633,9 +79631,6 @@ impl VirtualMerkleBuilder {
             len,
             blake3: hex_encode(&hash),
         };
-        if let Some(seal_chunks) = self.seal_chunks.as_mut() {
-            seal_chunks.push((chunk.clone(), self.buffer.clone()));
-        }
         self.chunks.push(chunk);
         self.leaves.push(hash);
         self.total_bytes = self.total_bytes.saturating_add(len);
@@ -79653,7 +79648,108 @@ impl VirtualMerkleBuilder {
                 root: hex_encode(&cli_merkle_root_from_leaves(&self.leaves)),
                 chunks: self.chunks,
             },
-            seal_chunks: self.seal_chunks,
+        }
+    }
+}
+
+/// The canonical directory byte stream, opened one file at a time. Payload
+/// memory stays bounded regardless of the checkpoint size.
+struct DirectoryArtifactReader {
+    entries: std::vec::IntoIter<DirectoryArtifactEntry>,
+    header: io::Cursor<Vec<u8>>,
+    next_file: Option<(PathBuf, u64)>,
+    file: Option<fs::File>,
+    remaining: u64,
+    payload_bytes: u64,
+    total_payload_bytes: u64,
+}
+
+impl DirectoryArtifactReader {
+    fn new(root: &Path) -> Result<Self> {
+        ensure!(
+            fs::metadata(root)?.is_dir(),
+            "directory artifact requires a directory"
+        );
+        let mut entries = Vec::new();
+        collect_directory_artifact_entries(root, root, &mut entries)?;
+        entries.sort_by(|a, b| a.rel.cmp(&b.rel));
+        let total_payload_bytes = entries
+            .iter()
+            .filter_map(|e| match e.kind {
+                DirectoryArtifactEntryKind::File { len } => Some(len),
+                DirectoryArtifactEntryKind::Directory => None,
+            })
+            .try_fold(0_u64, |a, n| a.checked_add(n))
+            .context("directory artifact size overflow")?;
+        Ok(Self {
+            entries: entries.into_iter(),
+            header: io::Cursor::new(b"mayhem-directory-artifact-v1\0".to_vec()),
+            next_file: None,
+            file: None,
+            remaining: 0,
+            payload_bytes: 0,
+            total_payload_bytes,
+        })
+    }
+}
+
+impl Read for DirectoryArtifactReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let n = Read::read(&mut self.header, output)?;
+            if n != 0 {
+                return Ok(n);
+            }
+            if let Some((path, len)) = self.next_file.take() {
+                let file = fs::File::open(&path)?;
+                let metadata = file.metadata()?;
+                if !metadata.is_file() || metadata.len() != len {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory artifact file changed before reading",
+                    ));
+                }
+                self.file = Some(file);
+                self.remaining = len;
+            }
+            if let Some(file) = self.file.as_mut() {
+                if self.remaining != 0 {
+                    let limit = self.remaining.min(output.len() as u64) as usize;
+                    let n = file.read(&mut output[..limit])?;
+                    if n == 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "directory artifact file was truncated",
+                        ));
+                    }
+                    self.remaining -= n as u64;
+                    self.payload_bytes += n as u64;
+                    return Ok(n);
+                }
+                if file.read(&mut [0_u8; 1])? != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "directory artifact file grew while reading",
+                    ));
+                }
+                self.file = None;
+                self.header = io::Cursor::new(vec![0]);
+                continue;
+            }
+            let Some(entry) = self.entries.next() else {
+                return Ok(0);
+            };
+            let header = match entry.kind {
+                DirectoryArtifactEntryKind::Directory => format!("dir\0{}\0", entry.rel),
+                DirectoryArtifactEntryKind::File { len } => {
+                    self.next_file = Some((entry.path, len));
+                    format!("file\0{}\0{}\0", entry.rel, len)
+                }
+            };
+            self.header = io::Cursor::new(header.into_bytes());
         }
     }
 }
@@ -79661,96 +79757,85 @@ impl VirtualMerkleBuilder {
 fn build_directory_artifact_digest<F>(
     root: &Path,
     chunk_size: usize,
-    progress: F,
-) -> Result<DirectoryArtifactDigest>
-where
-    F: FnMut(ProgressEvent),
-{
-    build_directory_artifact_digest_inner(root, chunk_size, false, progress)
-}
-
-fn build_directory_artifact_digest_for_sealing<F>(
-    root: &Path,
-    chunk_size: usize,
-    progress: F,
-) -> Result<DirectoryArtifactDigest>
-where
-    F: FnMut(ProgressEvent),
-{
-    build_directory_artifact_digest_inner(root, chunk_size, true, progress)
-}
-
-fn build_directory_artifact_digest_inner<F>(
-    root: &Path,
-    chunk_size: usize,
-    collect_seal_chunks: bool,
     mut progress: F,
 ) -> Result<DirectoryArtifactDigest>
 where
     F: FnMut(ProgressEvent),
 {
-    let metadata = fs::metadata(root).with_context(|| format!("stat {}", root.display()))?;
-    ensure!(
-        metadata.is_dir(),
-        "directory artifact digest requires a directory: {}",
-        root.display()
-    );
-    let mut entries = Vec::new();
-    collect_directory_artifact_entries(root, root, &mut entries)?;
-    entries.sort_by(|left, right| left.rel.cmp(&right.rel));
-    let total_payload_bytes = entries
-        .iter()
-        .filter_map(|entry| match entry.kind {
-            DirectoryArtifactEntryKind::File { len } => Some(len),
-            DirectoryArtifactEntryKind::Directory => None,
-        })
-        .fold(0_u64, |acc, len| acc.saturating_add(len));
+    let mut reader = DirectoryArtifactReader::new(root)?;
+    let mut builder = VirtualMerkleBuilder::new(chunk_size)?;
+    let mut buffer = [0_u8; 64 * 1024];
     progress(ProgressEvent {
         phase: ProgressPhase::Verify,
         path: root.to_path_buf(),
         position: 0,
-        total: Some(total_payload_bytes),
+        total: Some(reader.total_payload_bytes),
     });
-    let mut builder = VirtualMerkleBuilder::new(chunk_size, collect_seal_chunks)?;
-    builder.push(b"mayhem-directory-artifact-v1\0");
-    let mut position = 0_u64;
-    let mut buffer = [0_u8; 1024 * 64];
-    for entry in entries {
-        match entry.kind {
-            DirectoryArtifactEntryKind::Directory => {
-                builder.push(b"dir\0");
-                builder.push(entry.rel.as_bytes());
-                builder.push(b"\0");
-            }
-            DirectoryArtifactEntryKind::File { len } => {
-                builder.push(b"file\0");
-                builder.push(entry.rel.as_bytes());
-                builder.push(b"\0");
-                builder.push(len.to_string().as_bytes());
-                builder.push(b"\0");
-                let mut file = fs::File::open(&entry.path)
-                    .with_context(|| format!("opening {}", entry.path.display()))?;
-                loop {
-                    let read = file
-                        .read(&mut buffer)
-                        .with_context(|| format!("reading {}", entry.path.display()))?;
-                    if read == 0 {
-                        break;
-                    }
-                    builder.push(&buffer[..read]);
-                    position = position.saturating_add(read as u64);
-                    progress(ProgressEvent {
-                        phase: ProgressPhase::Verify,
-                        path: root.to_path_buf(),
-                        position,
-                        total: Some(total_payload_bytes),
-                    });
-                }
-                builder.push(b"\0");
-            }
+    loop {
+        let n = reader
+            .read(&mut buffer)
+            .with_context(|| format!("reading directory artifact {}", root.display()))?;
+        if n == 0 {
+            break;
         }
+        builder.push(&buffer[..n]);
+        progress(ProgressEvent {
+            phase: ProgressPhase::Verify,
+            path: root.to_path_buf(),
+            position: reader.payload_bytes,
+            total: Some(reader.total_payload_bytes),
+        });
     }
     Ok(builder.finish())
+}
+
+/// Lazily materialize exactly one verified chunk. The sealing API rechecks its
+/// length and hash; errors or concurrent file changes cannot publish a manifest.
+fn directory_artifact_seal_chunks(
+    root: &Path,
+    chunks: Vec<MerkleChunk>,
+) -> Result<
+    impl Iterator<Item = std::result::Result<(MerkleChunk, Vec<u8>), mayhem_enclave::EnclaveError>>,
+> {
+    let mut reader = DirectoryArtifactReader::new(root)?;
+    let mut chunks = chunks.into_iter();
+    let mut done = false;
+    Ok(std::iter::from_fn(move || {
+        if done {
+            return None;
+        }
+        let Some(chunk) = chunks.next() else {
+            done = true;
+            return match reader.read(&mut [0_u8; 1]) {
+                Ok(0) => None,
+                Ok(_) => Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "directory artifact grew after verification",
+                )
+                .into())),
+                Err(error) => Some(Err(error.into())),
+            };
+        };
+        let len = match usize::try_from(chunk.len) {
+            Ok(len) => len,
+            Err(_) => {
+                done = true;
+                return Some(Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "artifact chunk length exceeds address space",
+                )
+                .into()));
+            }
+        };
+        let mut data = vec![0_u8; len];
+        match reader.read_exact(&mut data) {
+            Ok(()) => Some(Ok((chunk, data))),
+            Err(error) => {
+                done = true;
+                Some(Err(error.into()))
+            }
+        }
+    }))
 }
 
 fn collect_directory_artifact_entries(
@@ -79951,8 +80036,7 @@ fn seal_provider_artifact(
     }
 
     if artifact_path.is_dir() {
-        let digest =
-            build_directory_artifact_digest_for_sealing(artifact_path, chunk_size, |_| {})?;
+        let digest = build_directory_artifact_digest(artifact_path, chunk_size, |_| {})?;
         if digest.merkle.root != key_context.artifact_root {
             bail!(
                 "local artifact root mismatch for {}; expected admin catalog artifact_root {}, got {}",
@@ -79969,13 +80053,8 @@ fn seal_provider_artifact(
         );
         options.chunk_size = chunk_size;
         options.expected_merkle_root = Some(key_context.artifact_root.clone());
-        let report = seal_artifact_chunks(
-            &options,
-            digest.merkle,
-            digest
-                .seal_chunks
-                .context("directory artifact sealing chunks were not retained")?,
-        )?;
+        let chunks = directory_artifact_seal_chunks(artifact_path, digest.merkle.chunks.clone())?;
+        let report = seal_artifact_chunks_fallible(&options, digest.merkle, chunks)?;
         let manifest = read_sealed_manifest(&report.store_dir)?;
         return Ok(DownloadReport {
             destination: report.store_dir,
@@ -125363,6 +125442,83 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         );
 
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[test]
+    fn directory_artifact_stream_preserves_canonical_bytes_and_chunk_boundaries() {
+        let temp = test_temp_dir("mayhem-directory-stream-format");
+        let root = temp.join("model");
+        fs::create_dir_all(root.join("nested")).unwrap();
+        fs::write(root.join("empty"), []).unwrap();
+        fs::write(root.join("nested/a.bin"), b"abc\0z").unwrap();
+        let expected = [
+            b"mayhem-directory-artifact-v1\0".as_slice(),
+            b"file\0empty\0",
+            b"0\0\0",
+            b"dir\0nested\0",
+            b"file\0nested/a.bin\0",
+            b"5\0abc\0z\0",
+        ]
+        .concat();
+        let flat = temp.join("canonical.bin");
+        fs::write(&flat, &expected).unwrap();
+        for size in [1, 7, 8, 31, 1024] {
+            let digest = build_directory_artifact_digest(&root, size, |_| {}).unwrap();
+            let reference = build_file_payload_digest(&flat, size).unwrap();
+            assert_eq!(digest.source_sha256, reference.source_sha256);
+            assert_eq!(digest.merkle, reference.merkle);
+            let chunks = directory_artifact_seal_chunks(&root, digest.merkle.chunks).unwrap();
+            let mut actual = Vec::new();
+            for chunk in chunks {
+                let (_, bytes) = chunk.unwrap();
+                assert!(bytes.len() <= size);
+                actual.extend(bytes);
+            }
+            assert_eq!(actual, expected);
+        }
+        fs::remove_dir_all(temp).unwrap();
+    }
+
+    #[test]
+    fn directory_artifact_sealing_is_lazy_and_rejects_changed_or_missing_files() {
+        let temp = test_temp_dir("mayhem-directory-stream-errors");
+        let root = temp.join("model");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("a"), vec![3_u8; 32 * 1024]).unwrap();
+        fs::write(root.join("z"), b"original").unwrap();
+        let digest = build_directory_artifact_digest(&root, 4096, |_| {}).unwrap();
+        let context = KeyContext {
+            provider_id: "11".repeat(32),
+            enclave_id: "22".repeat(32),
+            artifact_root: digest.merkle.root.clone(),
+            manifest_hash: "33".repeat(32),
+        };
+        for missing in [false, true] {
+            let store = temp.join(if missing { "missing" } else { "changed" });
+            let mut options = SealOptions::new(&root, &store, context.clone(), vec![7_u8; 32]);
+            options.chunk_size = 4096;
+            options.expected_merkle_root = Some(context.artifact_root.clone());
+            let mut chunks =
+                directory_artifact_seal_chunks(&root, digest.merkle.chunks.clone()).unwrap();
+            let first = chunks.next().unwrap().unwrap();
+            assert_eq!(first.1.len(), 4096);
+            // The later file has not been read: this mutation must be observed,
+            // rather than sealing a retained copy of all checkpoint plaintext.
+            if missing {
+                fs::remove_file(root.join("z")).unwrap();
+            } else {
+                fs::write(root.join("z"), b"modified").unwrap();
+            }
+            let result = seal_artifact_chunks_fallible(
+                &options,
+                digest.merkle.clone(),
+                std::iter::once(Ok(first)).chain(chunks),
+            );
+            assert!(result.is_err());
+            assert!(!store.join(SEALED_STORE_MANIFEST).exists());
+            fs::write(root.join("z"), b"original").unwrap();
+        }
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

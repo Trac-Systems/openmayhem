@@ -1318,6 +1318,19 @@ pub fn seal_artifact_chunks<I>(
 where
     I: IntoIterator<Item = (MerkleChunk, Vec<u8>)>,
 {
+    seal_artifact_chunks_fallible(options, merkle, chunks.into_iter().map(Ok))
+}
+
+/// Seal a fallible, bounded stream without retaining all plaintext in memory.
+/// A producer error returns before the final store manifest is published.
+pub fn seal_artifact_chunks_fallible<I>(
+    options: &SealOptions,
+    merkle: MerkleManifest,
+    chunks: I,
+) -> Result<SealReport>
+where
+    I: IntoIterator<Item = Result<(MerkleChunk, Vec<u8>)>>,
+{
     validate_chunk_size(options.chunk_size)?;
     validate_key_context(&options.key_context)?;
     validate_provider_secret(&options.provider_secret)?;
@@ -1347,7 +1360,8 @@ where
     let mut total_bytes = 0_u64;
     let mut leaves = Vec::with_capacity(merkle.chunks.len());
 
-    for (position, (chunk, plaintext)) in chunks.into_iter().enumerate() {
+    for (position, item) in chunks.into_iter().enumerate() {
+        let (chunk, plaintext) = item?;
         let Some(expected_chunk) = merkle.chunks.get(position) else {
             return Err(EnclaveError::InvalidInput(format!(
                 "too many materialized chunks; first extra chunk index {}",
