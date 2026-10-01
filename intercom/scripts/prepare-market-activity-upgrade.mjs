@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+// Historical v28 preparation. For v29 use prepare-reference-demand-upgrade.mjs.
 // Offline only: read a canonical state export and emit unsigned v28 migration commands.
 import fs from 'node:fs';
 import path from 'node:path';

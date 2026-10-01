@@ -746,19 +746,15 @@ Context is part of the deal too. Providers advertise the context window they ser
 
 ## Pricing
 
-Every market has one price at a time, and everyone active in the same epoch pays that same number. Nobody types the price in. Not providers, not users, and after seeding the starting price once, not us either.
+Markets have a shared price schedule, with separate context or outcome classes where applicable. Contract 29 sets the next quote from signed, settled paid units within 25%–400% of the calibrated reference price. Session prices remain locked at admission; later price changes cannot reprice accepted work.
 
-The clock behind it is the epoch: the network's settlement window, one hour by default. At the end of each hour, all the signed receipts from that hour are settled, and that settlement doubles as the price input for the next hour.
+The settlement epoch is one hour by default. Each market establishes a frozen busy-demand reference from its first 72 usable observations, beginning with paid work. Unit rates are normalized independently before aggregation, so tokens, images, audio and workflow units use the same controller. Existing markets can initialize from bounded, verified historical evidence; new markets hold their current quote during reference construction.
 
-Here is the loop. Each epoch the network measures how busy a market was: paid work that actually settled, divided by the capacity of the providers taking part. Above roughly 85% utilization the price steps up for the next epoch. Below it, the price steps down. A single step is capped at 10%, but steps compound, so a market that stays hot climbs hour after hour until enough supply shows up or demand cools.
+Subsequent hourly demand is normalized against that frozen reference and clipped to 0–1. If `q` is its last-six-observation mean and `s` its last-72-observation mean, the reference-price multiplier is `min(0.25 + 3.75*q, 1 + 3*s*s)`. Prices are calculated directly from the calibrated reference, without compounding previous prices or applying an ordinary percentage-step cap. Sustained busy demand can reach 400%; known empty epochs can reach 25%. A price can leave either bound when the demand signal changes.
 
-Providers steer it with a min-ask, the lowest price they are willing to serve at. When the market price is under your ask, you sit out. That shrinks supply, the market runs hotter, and the price climbs until it crosses your number and you flow back in. An ask does not name the price. It decides when you work, and who is working is what moves the price.
+Missing or incompatible usage evidence holds the quote instead of inventing zero demand. Confirmed zero fulfilled work counts as zero, including outages with no completed work: this controller does not infer lost demand or independent GPU availability. It follows settlement time. A thin launch sample is identified in the evidence, and references never silently retune themselves. Provider counts, slot claims and dollars spent do not choose price direction.
 
-Users steer it from the other side with a max-bid. If the price is above your bid, you get a clear "no provider at your price" and pay nothing. Enough buyers stepping back cools the market, and the price sinks toward where the buyers actually are.
-
-Your session keeps its price. The rate at the moment a session opens is locked into the spend voucher and the provider receipt, and settlement uses that locked rate no matter where the market moves afterwards. Nobody can reprice work you already agreed to.
-
-Two guardrails hold it steady. A market with fewer than two active providers stays pinned at its seed price, so a lone machine cannot steer the controller. And utilization counts only receipt-verified settled work, so posted intent, fake demand, and phantom supply move nothing.
+Providers can set a minimum ask and buyers a maximum bid. Those filters determine whether a request can trade at the current quote; neither guarantees that a future price will cross the selected threshold. FIAT, TNK and TAP keep their existing accounting and settlement rails.
 
 ### What a machine can earn
 

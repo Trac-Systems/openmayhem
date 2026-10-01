@@ -374,7 +374,7 @@ test('MayhemContract bills multimodal LLM input through token rates only', async
   assert.match(doubleBill.message, /unit image is not allowed for model_class text-generation/i);
 });
 
-test('MayhemContract epochApply keeps mid-utilization markets at the current price', async () => {
+test('MayhemContract epochApply holds the current price when legacy settlement lacks metered units', async () => {
   const { contract, storage, provider, admin } = await setupRegisteredEnclave();
   const user = await makeIdentity();
 
@@ -415,8 +415,8 @@ test('MayhemContract epochApply keeps mid-utilization markets at the current pri
       ctx_bracket: priceCtxBracket,
       ctx_bracket_table_ver: priceCtxBracketTableVer,
       ver: 2,
-      utilization_bps: 5_000,
-      multiplier_bps: 10_000,
+      utilization_bps: null,
+      multiplier_bps: null,
       active_supply: 1,
       active_demand_au: '10000000',
       frozen: false,
@@ -428,18 +428,20 @@ test('MayhemContract epochApply keeps mid-utilization markets at the current pri
 
   const schedule = await storage.get(priceKey);
   assert.equal(schedule.value.current.ver, 2);
-  assert.equal(schedule.value.current.price_source, 'market_utilization');
+  assert.equal(schedule.value.current.price_source, 'market_reference_demand');
   assert.deepEqual(schedule.value.current.rate_map, textRateMap(18, 55));
   const priceRoot = (await storage.get('ev/price/1')).value;
   assert.equal(priceRoot.merkle_root, applied.price_root);
   assert.equal(priceRoot.price_count, 1);
   const derivation = (await storage.get(priceEvidenceKey)).value;
   assert.equal(derivation.price_root, applied.price_root);
-  assert.equal(derivation.controller.utilization_bps, 5_000);
-  assert.equal(derivation.controller.multiplier_bps, 10_000);
+  assert.equal(derivation.controller.utilization_bps, null);
+  assert.equal(derivation.controller.multiplier_bps, null);
+  assert.equal(derivation.controller.demand_status, 'unknown_evidence');
+  assert.equal(derivation.schema_version, 4);
 });
 
-test('MayhemContract epochApply uses signed execution capacity, not idle joined wallets', async () => {
+test('MayhemContract epochApply retains signed execution evidence independently of demand pricing', async () => {
   const { contract, storage, provider, admin } = await setupRegisteredEnclave();
   const user = await makeIdentity();
   const idleProvider = await makeIdentity();
@@ -475,14 +477,14 @@ test('MayhemContract epochApply uses signed execution capacity, not idle joined 
   );
   assert.equal(applied.ok, true, applied.message);
   assert.equal(applied.market_prices[0].active_supply, 1);
-  assert.equal(applied.market_prices[0].utilization_bps, 5_000);
+  assert.equal(applied.market_prices[0].utilization_bps, null);
   assert.equal(applied.market_prices[0].frozen, false);
 
   const derivation = (await storage.get(priceEvidenceKey)).value;
   assert.equal(derivation.controller.active_supply, 1);
   assert.equal(derivation.usage.capacity_slot_count, 1);
   assert.equal(derivation.usage.compute_ms, '1800000');
-  assert.equal(derivation.controller.utilization_bps, 5_000);
+  assert.equal(derivation.controller.utilization_bps, null);
 });
 
 test('MayhemContract keeps context brackets as independent price markets', async () => {
@@ -673,8 +675,8 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
       ctx_bracket: priceCtxBracket,
       ctx_bracket_table_ver: priceCtxBracketTableVer,
       ver: 2,
-      utilization_bps: 5_000,
-      multiplier_bps: 10_000,
+      utilization_bps: null,
+      multiplier_bps: null,
       active_supply: 2,
       active_demand_au: '1000000',
       frozen: false,
@@ -685,7 +687,7 @@ test('MayhemContract keeps one enclave price while conserving mixed rail settlem
 
   const schedule = await storage.get(priceKey);
   assert.equal(schedule.value.current.ver, 2);
-  assert.equal(schedule.value.current.price_source, 'market_utilization');
+  assert.equal(schedule.value.current.price_source, 'market_reference_demand');
   assert.equal(await storage.get(`price/${enclaveId}/fiat`), null);
   assert.equal(await storage.get(`price/${enclaveId}/tap`), null);
   assert.equal(await storage.get(`price/${enclaveId}`), null);

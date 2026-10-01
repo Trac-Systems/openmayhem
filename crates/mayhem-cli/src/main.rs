@@ -51196,6 +51196,19 @@ fn price_derivation_summary(derivation: &Value) -> String {
     let leaf = derivation_str(derivation, &["derivation_hash"])
         .map(|value| format!(" leaf={}", short_hash(value)))
         .unwrap_or_default();
+    if basis == "frozen_reference_paid_units_v1" {
+        let status =
+            derivation_str(derivation, &["controller", "demand_status"]).unwrap_or("unknown");
+        let multiplier = derivation_u64(derivation, &["controller", "multiplier_bps"])
+            .map(format_bps)
+            .unwrap_or_else(|| "held".to_owned());
+        let reference = derivation_u64(derivation, &["controller", "demand_reference_version"])
+            .map(|version| format!("v{version}"))
+            .unwrap_or_else(|| "pending".to_owned());
+        return format!(
+            "price {result_ver}; calibrated-reference multiplier {multiplier}; demand reference {reference}; {status}; epoch {epoch}; {sessions} settled sessions; {source}{root}{leaf}"
+        );
+    }
     if derivation.get("controller").is_some_and(|controller| {
         controller.get("activity_basis").is_some_and(|value| {
             matches!(
@@ -107748,7 +107761,7 @@ status: linked
 
     #[test]
     fn launch_contract_versions_are_pinned_for_m1_gating() {
-        assert_eq!(CONTRACT_VERSION, 28);
+        assert_eq!(CONTRACT_VERSION, 29);
         assert_eq!(CONTRACT_SIGNING_MESSAGE_VERSION, 2);
         assert_eq!(SESSION_RECEIPT_SCHEMA_VERSION, 12);
         assert_eq!(SPEND_VOUCHER_SCHEMA_VERSION, 11);

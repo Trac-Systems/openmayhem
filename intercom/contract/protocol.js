@@ -233,6 +233,9 @@ class MayhemProtocol extends Protocol {
     if (json?.op === 'migrate_market_pricing') {
       return { type: 'migrateMarketPricing', value: json };
     }
+    if (json?.op === 'bootstrap_market_demand') {
+      return { type: 'bootstrapMarketDemand', value: json };
+    }
     if (json?.op === 'set_params') {
       return {
         type: 'setParams',

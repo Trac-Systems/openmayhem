@@ -1695,7 +1695,8 @@ test('atomic commit plus page zero safely replaces an unapplied stale commit', a
   }, ctx.admin.publicKey, 301);
   assert.equal(empty.ok, true, empty.message);
   const dormant = (await ctx.storage.get(`price/${ENCLAVE_ID}/le8k`)).value.current;
-  assert.equal(dormant.rate_map[0].per_unit_au, '8');
+  assert.equal(dormant.rate_map[0].per_unit_au, '10');
+  assert.equal(dormant.market.demand_status, 'building_reference');
   assert.deepEqual(dormant.market.settled_usage, {});
 });
 

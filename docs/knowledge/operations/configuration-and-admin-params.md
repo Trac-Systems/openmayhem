@@ -52,14 +52,13 @@ when no record exists. Full default/bounds tables: `docs/reference/intercom-epoc
 (5000), `param_activation_delay_seconds` (86400), `rules_grace_seconds` (1209600),
 `rate_staleness_seconds` (2700).
 
-**Market controller** (see [The Utilization Pricing Controller](../market/pricing-controller.md)) —
-`price_rate_limit_seconds` governs admin seed changes, while hard bounds remain
-`price_min_bps` (2500) / `price_max_bps` (40000). Contract v27 applies fixed protocol rules:
-utilization at or above 80% raises price 10%, utilization at or below 20% lowers price 10%, and
-the middle band holds. The former utilization target, EMA, gain, configurable step,
-provider-dollar target, minimum-provider gate, utilization cap and curve-slope knobs are readable
-historical fields and reject new updates. Run the bounded admin `migrate_market_pricing` plan before
-resuming settlement after upgrade.
+**Market controller** (see [Paid-Demand Pricing](../market/pricing-controller.md)) —
+`price_rate_limit_seconds` governs admin seed changes. Hard bounds remain
+`price_min_bps` (2500) / `price_max_bps` (40000). Contract 29 uses a frozen paid-unit
+reference, six/72 known-observation filters and direct calibrated-reference pricing.
+There is no ordinary step cap. Former utilization, EMA, gain, provider-dollar and
+minimum-provider knobs remain historical and reject new updates. Complete bounded
+market indexing and historical reference initialization before resuming settlement.
 
 **Trust and economics** — `fee_bps` (1500, hard-capped), probation set
 (`probation_successful_sessions`, `probation_seconds`,

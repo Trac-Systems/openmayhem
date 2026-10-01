@@ -5,19 +5,17 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import { consumeCanonicalReplayContext } from 'trac-peer/src/base/canonical-replay.js';
 import PeerWallet from 'trac-wallet';
-import ContractV23 from './history/v23.js';
-import ContractV24 from './history/v24.js';
-import ContractV25 from './history/v25.js';
-import ContractV26 from './history/v26.js';
-import ContractV27 from './history/v27.js';
-import ContractV28 from './history/v28.js';
-import { advanceDemand, demandObservation, DEMAND_CONSTANTS, scaleDemandPrice } from './reference-demand.js';
+import ContractV23 from './v23.js';
+import ContractV24 from './v24.js';
+import ContractV25 from './v25.js';
+import ContractV26 from './v26.js';
+import ContractV27 from './v27.js';
 
-export const CONTRACT_VERSION = 29;
-// Recovery is limited to receipt evidence already signed by v23-v28
+export const CONTRACT_VERSION = 28;
+// Recovery is limited to receipt evidence already signed by v23-v27
 // participants. New prior-version operations are not admitted;
 // separately authenticated canonical replay does not constitute new admission.
-const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25, 26, 27, 28]);
+const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25, 26, 27]);
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -910,8 +908,8 @@ class MayhemContract extends Contract {
       const versioned = versionedMayhemOperation(op);
       const canonicalReplay = consumeCanonicalReplayContext(consensusContext, op, storage);
       const historical = versioned.present && (
-        ([23, 24, 25, 26, 27, 28].includes(versioned.version) && canonicalReplay) ||
-        ([24, 25, 26, 27, 28].includes(versioned.version) &&
+        ([23, 24, 25, 26, 27].includes(versioned.version) && canonicalReplay) ||
+        ([24, 25, 26, 27].includes(versioned.version) &&
           await this.isPreparedCheckpointReplay(op, storage))
       );
       if (historical) {
@@ -926,9 +924,7 @@ class MayhemContract extends Contract {
               ? ContractV25
               : versioned.version === 26
                 ? ContractV26
-                : versioned.version === 27
-                  ? ContractV27
-                  : ContractV28;
+                : ContractV27;
         this._historicalContracts ??= new Map();
         if (!this._historicalContracts.has(versioned.version)) {
           this._historicalContracts.set(versioned.version, new Implementation(this.protocol, this.config));
@@ -1174,20 +1170,6 @@ class MayhemContract extends Contract {
         op: { type: 'string', min: 1, max: 64 },
         at: { type: 'number', integer: true, min: 0 },
         markets: { type: 'array', min: 0, max: 128, items: { type: 'any' } },
-      },
-    });
-
-    this.addSchema('bootstrapMarketDemand', {
-      value: {
-        $$strict: true, $$type: 'object',
-        op: {type: 'string'}, at: {type: 'number', integer: true, min: 0},
-        enclave_id: {type: 'string'}, ctx_bracket: {type: 'string', optional: true},
-        ctx_bracket_table_ver: {type: 'number', integer: true, optional: true},
-        through_epoch: {type: 'number', integer: true, min: 1},
-        expected_price_ver: {type: 'number', integer: true, min: 1},
-        reference_epochs: {type: 'array', min: 1, max: 72, items: {type: 'number', integer: true, min: 1}},
-        history_epochs: {type: 'array', min: 0, max: 72, items: {type: 'number', integer: true, min: 1}},
-        source_hash: {type: 'string', min: 64, max: 64},
       },
     });
 
@@ -3331,7 +3313,7 @@ class MayhemContract extends Contract {
       'record usage receipt envelope'
     );
     if (receiptShapeError) return receiptShapeError;
-    const targetSchemaVersion = value.contract_version === CONTRACT_VERSION || [27, 28].includes(value.contract_version)
+    const targetSchemaVersion = value.contract_version === CONTRACT_VERSION || value.contract_version === 27
       ? SESSION_RECEIPT_SCHEMA_VERSION
       : 11;
     const receipt = await this.normalizeReceiptEnvelope(value.receipt, {
@@ -10238,7 +10220,6 @@ class MayhemContract extends Contract {
     for (const update of marketPriceUpdates) {
       await this.put(update.schedule_key, update.schedule);
       await this.put(update.record_key, update.record);
-      if (update.demand_key) await this.put(update.demand_key, update.demand_state);
     }
 
     const result = {
@@ -11356,7 +11337,6 @@ class MayhemContract extends Contract {
     for (const update of marketPriceUpdates) {
       await this.put(update.schedule_key, update.schedule);
       await this.put(update.record_key, update.record);
-      if (update.demand_key) await this.put(update.demand_key, update.demand_state);
     }
 
     const result = {
@@ -11543,7 +11523,6 @@ class MayhemContract extends Contract {
     for (const update of activityUpdates) {
       await this.put(update.schedule_key, update.schedule);
       await this.put(update.record_key, update.record);
-      if (update.demand_key) await this.put(update.demand_key, update.demand_state);
     }
     await this.put(key, record);
     await this.writePreparedAnchor(previousChallengeAnchor);
@@ -18836,7 +18815,7 @@ class MayhemContract extends Contract {
         !Array.isArray(this.value.markets) || this.value.markets.length > 128) {
       return new Error('Migration requires a timestamp and at most 128 active market rows.');
     }
-    const key = 'market/activity/migration-v4';
+    const key = 'market/activity/migration-v3';
     const existing = await this.get(key);
     const state = await this.epochApplyStateRecord();
     if (state.pending_epoch !== null && state.pending_epoch !== undefined) {
@@ -18888,94 +18867,16 @@ class MayhemContract extends Contract {
     for (const repair of repairs) await this.put(`params/${repair.key}`, repair.after);
     await this.put('market/activity/index', nextIndex);
     await this.put(key, {
-      schema_version: 4, contract_version: CONTRACT_VERSION,
+      schema_version: 3, contract_version: CONTRACT_VERSION,
       hard_min_bps: 2_500, hard_max_bps: 40_000,
-      activity_basis: 'frozen_reference_paid_units_v1',
-      constants: this.marketPriceConstants(),
+      low_utilization_bps: MARKET_UTILIZATION_LOW_BPS,
+      high_utilization_bps: MARKET_UTILIZATION_HIGH_BPS,
+      price_step_bps: MARKET_UTILIZATION_STEP_BPS,
       previous_applied_epoch: state.updated_epoch ?? 0,
       repairs: [...(existing?.repairs ?? []), ...repairs], market_count: index.size,
       migrated_at: existing?.migrated_at ?? this.tx, updated_at: this.tx, migrated_by: this.address,
     });
     return { ok: true, op: 'migrateMarketPricing', idempotent: false, repaired: repairs.length, market_count: index.size };
-  }
-
-  async bootstrapMarketDemand() {
-    const adminError = await this.requireAdmin();
-    if (adminError) return adminError;
-    const v = this.value;
-    const fields = ['op', 'at', 'enclave_id', 'through_epoch', 'expected_price_ver',
-      'reference_epochs', 'history_epochs', 'source_hash',
-      ...(v.ctx_bracket !== undefined ? ['ctx_bracket', 'ctx_bracket_table_ver'] : [])];
-    const shape = this.validateExactCommandValue(fields, 'bootstrap_market_demand');
-    if (shape) return shape;
-    if (!this.isHexBytes(v.source_hash, 32) || !this.isSafeKeyPart(v.enclave_id) ||
-        !Array.isArray(v.reference_epochs) || !v.reference_epochs.length || v.reference_epochs.length > 72 ||
-        !Array.isArray(v.history_epochs) || v.history_epochs.length > 72 ||
-        (v.reference_epochs.length < 72 && v.history_epochs.length)) {
-      return new Error('Invalid bounded demand bootstrap.');
-    }
-    const selected = [...v.reference_epochs, ...v.history_epochs];
-    if (selected.some((epoch, i) => !Number.isSafeInteger(epoch) || epoch < 1 ||
-        epoch > v.through_epoch || (i > 0 && epoch <= selected[i - 1]))) {
-      return new Error('Demand bootstrap epochs must be increasing canonical observations.');
-    }
-    const applied = await this.epochApplyStateRecord();
-    if (applied.pending_epoch != null || applied.updated_epoch !== v.through_epoch) {
-      return new Error('Demand bootstrap requires the captured completed epoch boundary.');
-    }
-    const enclave = await this.get(`enclave/${v.enclave_id}`);
-    if (enclave?.status !== 'active') return new Error('Demand bootstrap requires an active enclave.');
-    const ctx = await this.priceCtxMetaForEnclave(enclave, v.ctx_bracket, v.at, 'Demand bootstrap');
-    if (ctx instanceof Error) return ctx;
-    if ((ctx?.ctx_bracket_table_ver ?? null) !== (v.ctx_bracket_table_ver ?? null)) {
-      return new Error('Demand bootstrap context version is not active.');
-    }
-    const marketKey = this.priceMarketKey(v.enclave_id, v.ctx_bracket ?? null);
-    const stateKey = `market/demand/${marketKey}`;
-    const evidenceKey = `market/demand-bootstrap/${marketKey}`;
-    const digest = b4a.toString(await blake3(b4a.from(stableJson(v))), 'hex');
-    const existing = await this.get(evidenceKey);
-    if (existing) return existing.command_hash === digest
-      ? {ok: true, op: 'bootstrapMarketDemand', idempotent: true}
-      : new Error('Demand reference already bootstrapped; implicit rebaselining is forbidden.');
-    if (await this.get(stateKey)) return new Error('Demand controller already active; bootstrap cannot overwrite it.');
-    const schedule = await this.priceSchedule(this.priceScheduleKey(v.enclave_id, v.ctx_bracket ?? null), enclave, ctx);
-    const current = this.priceActiveEntry(schedule, v.at);
-    if (!current || current.ver !== v.expected_price_ver || this.priceSeedEntry(current)?.set_by_role !== 'admin') {
-      return new Error('Demand bootstrap price changed after preparation.');
-    }
-    let state = null;
-    // Admin chooses evidence via the offline full-coverage preparer. The contract
-    // re-reads and validates its canonical values; commands never supply demand
-    // amounts or an arbitrary multiplier. At most 144 exact records, once.
-    const sourceRows = [];
-    for (const epoch of selected) {
-      const suffix = `${epoch}/${v.enclave_id}${v.ctx_bracket ? `/${v.ctx_bracket}` : ''}`;
-      const row = await this.get(`market/price/${suffix}`) ?? await this.get(`ev/price/${suffix}`);
-      if (row?.type !== 'price_derivation' || row.epoch !== epoch || row.enclave_id !== v.enclave_id ||
-          row.model_id !== enclave.model_id || (row.ctx_bracket ?? null) !== (v.ctx_bracket ?? null)) {
-        return new Error('Demand bootstrap canonical price evidence is absent or mismatched.');
-      }
-      const observation = demandObservation(row);
-      if (observation.units === null) return new Error('Demand bootstrap evidence has no usable paid units.');
-      try { state = advanceDemand(state, observation).state; } catch (error) { return error; }
-      sourceRows.push({epoch, derivation_hash: row.derivation_hash});
-    }
-    if (state.warmup.length !== v.reference_epochs.length && v.reference_epochs.length < 72 ||
-        v.reference_epochs.length === 72 && !state.reference) {
-      return new Error('Demand bootstrap reference must start with paid work.');
-    }
-    // Skip only evidence that the offline complete export classifies as unknown.
-    // This marker prevents a later bootstrap from rewinding the controller.
-    state.last_epoch = v.through_epoch;
-    state.last_observation = null;
-    await this.put(stateKey, state);
-    await this.put(evidenceKey, {schema_version: 1, contract_version: CONTRACT_VERSION,
-      command_hash: digest, source_hash: v.source_hash, observations: sourceRows,
-      through_epoch: v.through_epoch, reference_version: state.reference_version,
-      initialized_by: this.address, initialized_at: this.tx});
-    return {ok: true, op: 'bootstrapMarketDemand', idempotent: false,
-      status: state.status, reference_version: state.reference_version};
   }
 
   validateActivityCalibration(value, modelClass, rateMap = null) {
@@ -19119,7 +19020,12 @@ class MayhemContract extends Contract {
   }
 
   marketPriceConstants() {
-    return { ...DEMAND_CONSTANTS, schema_version: 4, hard_min_bps: 2_500, hard_max_bps: 40_000 };
+    return {
+      schema_version: 3,
+      low_utilization_bps: MARKET_UTILIZATION_LOW_BPS,
+      high_utilization_bps: MARKET_UTILIZATION_HIGH_BPS,
+      price_step_bps: MARKET_UTILIZATION_STEP_BPS,
+    };
   }
 
   marketUtilizationBps(computeMs, capacitySlotCount, epochSeconds) {
@@ -19278,28 +19184,19 @@ class MayhemContract extends Contract {
           !Number.isSafeInteger(legacyReceiptCount) || legacyReceiptCount < 0) {
         return new Error('Market utilization requires canonical signed compute evidence.');
       }
-      // The receipt counters remain audit evidence. Only paid units drive price.
-      const utilizationBps = null;
+      const legacyHold = legacyReceiptCount > 0;
+      const utilizationBps = legacyHold ? null : this.marketUtilizationBps(
+        computeMs, capacitySlotCount, epochSeconds);
+      if (utilizationBps instanceof Error) return utilizationBps;
+      const multiplierBps = legacyHold ? 10_000 :
+        this.marketUtilizationMultiplier(utilizationBps);
+      if (multiplierBps instanceof Error) return multiplierBps;
       const activeSupply = usage.provider_count;
-      const demandKey = `market/demand/${marketKey}`;
-      const priorDemand = await this.get(demandKey);
-      let demand;
-      try {
-        demand = advanceDemand(priorDemand, demandObservation({
-          epoch, epoch_seconds: epochSeconds,
-          usage: {settled_usage: settledUsage, session_count: usage.session_count},
-        }));
-      } catch (error) { return error; }
-      const multiplier = demand.target?.multiplier ?? null;
-      const multiplierBps = multiplier ? Number(
-        (BigInt(multiplier[0]) * 10_000n + BigInt(multiplier[1]) / 2n) / BigInt(multiplier[1])) : null;
-      // Warm-up and unknown observations hold the existing quote. Once known,
-      // scale the calibrated reference directly, never the previous price.
-      const desiredRateMap = multiplier
-        ? modelRef.rate_map.map((row) => ({...row, per_unit_au: scaleDemandPrice(row.per_unit_au, multiplier)}))
-        : cloneValue(current.rate_map);
-      const desiredPerReqAu = multiplier ? scaleDemandPrice(seed.per_req_au, multiplier) : current.per_req_au;
-      const desiredMinSessionAu = multiplier ? scaleDemandPrice(seed.min_session_au, multiplier) : current.min_session_au;
+      // Apply the fixed utilization step directly. No previous-hour activity,
+      // revenue target, EMA, or demand AU enters the direction decision.
+      const desiredRateMap = this.scaleRateMap(current.rate_map, multiplierBps);
+      const desiredPerReqAu = this.scalePriceTerm(current.per_req_au, multiplierBps);
+      const desiredMinSessionAu = this.scalePriceTerm(current.min_session_au, multiplierBps);
       const nextTerms = {
         rate_map: desiredRateMap,
         per_req_au: desiredPerReqAu,
@@ -19307,9 +19204,8 @@ class MayhemContract extends Contract {
       };
       for (const term of Object.values(nextTerms)) if (term instanceof Error) return term;
       for (const field of ['per_req_au', 'min_session_au']) {
-        const reference = BigInt(seed[field]);
-        const lower = (reference + 3n) / 4n;
-        const upper = reference * 4n;
+        const lower = BigInt(this.scalePriceTerm(seed[field], 2_500));
+        const upper = BigInt(this.scalePriceTerm(seed[field], 40_000));
         const amount = BigInt(nextTerms[field]);
         nextTerms[field] = (amount < lower ? lower : amount > upper ? upper : amount).toString();
       }
@@ -19322,10 +19218,11 @@ class MayhemContract extends Contract {
         set_by: seed.set_by, set_by_role: 'admin',
         ...(ctxMeta ? { ctx_bracket: ctxMeta.ctx_bracket,
           ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver } : {}),
-        price_source: 'market_reference_demand', seed,
+        price_source: 'market_utilization', seed,
         market: {
-          schema_version: 4,
-          source: 'canonical_paid_units',
+          schema_version: 3,
+          source: legacyHold ? 'canonical_legacy_receipt_hold' :
+            'canonical_signed_slot_time',
           epoch,
           epoch_seconds: epochSeconds,
           active_supply: activeSupply,
@@ -19333,15 +19230,11 @@ class MayhemContract extends Contract {
           compute_ms: computeMs,
           legacy_receipt_count: legacyReceiptCount,
           utilization_bps: utilizationBps,
-          // Gross AU is accounting evidence, not the demand signal.
+          // Gross AU and metered units remain accounting evidence only.
           active_demand_au: usage.demand_au, session_count: usage.session_count,
           settled_usage: settledUsage,
-          activity_basis: 'frozen_reference_paid_units_v1',
-          demand_reference_version: demand.state.reference_version,
-          demand_reference: cloneValue(demand.state.reference),
-          demand_status: demand.state.status,
-          demand_target: cloneValue(demand.target),
-          demand_state_hash: b4a.toString(await blake3(b4a.from(stableJson(demand.state))), 'hex'),
+          activity_basis: legacyHold ? 'legacy_receipt_hold_v1' :
+            'signed_slot_time_v1',
           modelref_ver: modelRef.ver ?? null,
           activity_initialized: true, multiplier_bps: multiplierBps, constants,
           desired_rate_map: desiredRateMap, desired_per_req_au: desiredPerReqAu,
@@ -19352,7 +19245,6 @@ class MayhemContract extends Contract {
         },
       };
       updates.push({
-        demand_key: demandKey, demand_state: demand.state,
         enclave_id: usage.enclave_id,
         ...(ctxMeta ? { ctx_bracket: ctxMeta.ctx_bracket,
           ctx_bracket_table_ver: ctxMeta.ctx_bracket_table_ver } : {}),
@@ -23293,7 +23185,7 @@ class MayhemContract extends Contract {
     }
     return {
       type: 'price_derivation',
-      schema_version: 4,
+      schema_version: 3,
       epoch,
       at,
       epoch_seconds: epochSeconds,
@@ -23321,11 +23213,6 @@ class MayhemContract extends Contract {
       },
       controller: {
         source: market.source,
-        demand_reference_version: market.demand_reference_version,
-        demand_reference: cloneValue(market.demand_reference),
-        demand_status: market.demand_status,
-        demand_target: cloneValue(market.demand_target),
-        demand_state_hash: market.demand_state_hash,
         active_supply: market.active_supply,
         activity_basis: market.activity_basis,
         utilization_bps: market.utilization_bps,

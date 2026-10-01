@@ -1,50 +1,37 @@
 ---
 type: Reference
-title: "The Utilization Pricing Controller"
-description: "Contract v27 changes prices from signed provider slot utilization, with fixed 10% steps and hard 25%-400% reference bands."
+title: "Frozen-Reference Paid-Demand Pricing"
+description: "Contract 29 prices signed paid demand against a frozen activity reference within the 25%–400% calibrated-price band."
 tags: [pricing, market, controller, contract, au]
-timestamp: 2026-09-20T00:00:00Z
+timestamp: 2026-10-01T00:00:00Z
 ---
 
-# The Utilization Pricing Controller
+# Frozen-reference paid-demand pricing
 
-Contract v27 changes each enclave/context market price once per settled epoch from its absolute utilization:
+Each economic enclave/context market has independent bounded state. Runtime architecture, provider count, execution-slot claims and money spent do not determine price direction. Signed settled paid-unit increments are the input for all model classes. Existing session price locks and FIAT/TNK/TAP accounting remain unchanged.
 
-- utilization at or above 80%: increase every price term by 10%;
-- utilization at or below 20%: decrease every price term by 10%;
-- utilization between 20% and 80%: keep the price unchanged.
+## Reference and target
 
-The boundary values are inclusive. Repeated high-utilization epochs keep raising the price and repeated low-utilization or empty epochs keep lowering it until an existing bound stops movement. The controller does not compare the current hour with the previous hour and has no dollar revenue target.
+The first 72 usable observations, beginning with positive paid work, form a frozen reference. Paid units are normalized to hourly rates. Each axis uses the nearest-rank 75th percentile of its positive reference-window rates. Average the normalized axes, then take the nearest-rank 95th percentile of positive aggregate observations as the busy reference. Fewer than twelve positive observations marks thin evidence; it does not invoke a model-specific correction.
 
-## Signed utilization evidence
+For subsequent observations, average paid-unit ratios against the frozen effective axis references and clip the result to 0–1 before retaining it. Let `q` be the mean of the last six known values and `s` the sum of the last 72 known values divided by 72:
 
-Every schema-12 final receipt commits two provider-measured values:
+`multiplier = min(0.25 + 3.75*q, 1 + 3*s*s)`
 
-- `compute_ms`: elapsed execution time for that request; checkpoint values may only increase;
-- `capacity_slots`: the execution concurrency offered by that provider for the signed attempt; it is immutable within the attempt.
+Scale the calibrated model-reference rate map directly by this multiplier. Fixed request/minimum terms scale their immutable admin seed; zero terms remain zero. Round to atomic units and clamp inward to the 25%–400% hard band. No ordinary percentage-step cap and no compounding of previous prices applies.
 
-The buyer acknowledges the signed provider receipt. Settlement sums `compute_ms` from canonical final receipts and, for each distinct provider observed in a market during the epoch, takes the maximum signed `capacity_slots`. Available slot time is:
+At the default one-hour epoch, 72 hours at the frozen busy rate can reach 400%. From that history, one known empty hour gives 337.5%, and six empty hours give 25%. A steady half-reference rate tends to 175%, rather than re-centering at 100%. The quantized currency terms can remain unchanged for movements below their atomic resolution.
 
-`capacity_slot_count × epoch_seconds × 1000`
+## Evidence and limitations
 
-Utilization is `min(100%, compute_ms / available_slot_time)`. A provider with two slots therefore needs twice as much aggregate compute time as a one-slot provider to reach the same utilization. Text, embeddings, images, audio, video and workflows use the same evidence and thresholds. Catalog `activity_calibration` metadata remains valid, but no longer controls price direction and no recalibration is required for this upgrade.
+Complete zero settled work contributes zero, including during outages with no fulfilled work. Missing/unusable evidence holds the current price and does not advance the known-value windows. A newly positive unit absent from the frozen reference also holds and records `unrecognized_paid_axis`; it requires an explicit future governed basis transition, never automatic retuning. Settlement epochs, not execution timestamps, attribute demand. This proves fulfilled work, not queues, independent intent, profitability or lost demand.
 
-Only canonical settled work enters utilization. Checkpoints, duplicate receipts, redispatch baselines and already billed work do not count twice. Unserved requests and abandoned reservations do not create utilization evidence.
+State contains at most 72 reference observations or 72 clipped values and sixteen axes. Normal updates read one exact demand-state key per market and do not scan receipt or price history. Schema-4 derivations expose the reference version, reference, status, target, controller-state hash, calibrated currency-reference version, locked accounting evidence and resulting quote.
 
-Receipts retained from before contract v27 do not contain signed slot-time fields. They still settle normally. If an epoch contains one, that market records a `legacy_receipt_hold_v1` derivation and keeps its price unchanged for that epoch rather than inventing utilization. The next epoch containing only schema-12 receipts resumes the normal rule automatically.
+## Upgrade
 
-## Price update and bounds
+Contract 29 requires a coordinated contract cutover. Stop transaction producers while all participants change versions, preserve canonical stores and prove the indexer's signed prefix before resuming. Retained versions 23–28 execute their historical contract logic for authenticated replay. Their signed receipt evidence remains recoverable; receipt schema 12 is unchanged.
 
-The selected multiplier, 9000, 10000 or 11000 basis points, is applied directly to every rate-map term plus `per_req_au` and `min_session_au`. Integer rounding preserves a minimum one-atto term when a nonzero price moves.
+At a completed epoch boundary, resolve prior nonempty price commitments, inventory all active price schedules, and run `migrate_market_pricing` to validate bounds and index all markets. The offline `intercom/scripts/prepare-reference-demand-upgrade.mjs` prepares unsigned `bootstrap_market_demand` commands from a complete canonical export. The contract re-reads at most 144 exact historical derivations per market and validates identities, price version and boundary. The trusted admin's complete-export review guarantees first-reference/latest-history selection; the contract does not scan all history to prove that selection.
 
-The result remains clamped to 25%-400% of the immutable admin seed. A zero fixed-term seed stays zero. Admin seed scheduling, session price locks, provider min asks, buyer max bids, rail conservation and fraud-proof roots remain unchanged.
-
-The price derivation records schema 3, the signed compute total, capacity slot count, utilization, selected multiplier, epoch duration, previous price, seed bounds and result. Empty indexed markets use zero utilization and receive the same 10% downward step.
-
-## Migration and operation
-
-`migrate_market_pricing` must run at a completed epoch boundary after all old nonempty price commitments are resolved. It indexes every active base/context market, preserves current prices and seeds, retains the 25%-400% bounds, and records the 20%/80%/10% policy. The offline generator is `intercom/scripts/prepare-market-activity-upgrade.mjs`.
-
-The upgrade requires contract v27 and receipt schema 12 across the writer, gateways, providers and settlement workers. Contract v27 can settle retained signed receipt evidence from contract versions 23 through 26 without rewriting it; the affected market holds price for that settlement epoch because those receipts have no signed slot-time data. Do not mix contract versions while accepting new work.
-
-Utilization proves completed slot occupancy, not queued unmet demand. A fully queued provider can stay below 80% if jobs fail before producing canonical receipts. Signed evidence makes completed activity accountable; it does not prove independent economic intent.
+Bootstrap does not reprice immediately. The next known ordinary observation applies the target. Partial history continues reference formation; absent history is not fabricated. Bootstrap cannot overwrite an already-active reference. Preserve session locks, seed lineage and all currency rails throughout the upgrade.

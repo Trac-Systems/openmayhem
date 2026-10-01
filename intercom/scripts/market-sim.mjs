@@ -2,7 +2,9 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import MayhemContract, { contractParamDefinitions } from '../contract/contract.js';
+// Retained v28 simulator. Current paid-demand scenarios are exercised by
+// tests/reference-demand.test.js; do not present this historical loop as v29.
+import MayhemContract, { contractParamDefinitions } from '../contract/history/v28.js';
 
 const SEED = 1_000_000_000_000_000_000n;
 const DEFAULTS = Object.fromEntries(Object.entries(contractParamDefinitions()).map(([k,v]) => [k,v.default]));
