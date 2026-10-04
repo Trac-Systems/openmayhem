@@ -6599,7 +6599,32 @@ fn gateway_reporting_requirements_for_route(
                 }
                 ReceiptUsage::new(units)
             };
+            let options = GatewayRequestOptions::default();
+            let throughput = if is_token_metered_text {
+                state.generation_floor_tok_s_for_model(model, &options)
+            } else if modalities.iter().any(|modality| modality == "embedding") {
+                state.throughput_floor_for_model(
+                    model,
+                    &options,
+                    DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
+                )
+            } else if modalities
+                .iter()
+                .any(|modality| modality == "video" || modality == "image")
+            {
+                state.throughput_floor_for_model(model, &options, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S)
+            } else if modalities.iter().any(|modality| modality == "audio") {
+                state.throughput_floor_for_model(
+                    model,
+                    &options,
+                    DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR,
+                )
+            } else {
+                None
+            };
             RequestRequirements {
+                min_throughput: throughput.map(|floor| floor.minimum),
+                explicit_throughput_floor: throughput.is_some_and(|floor| floor.explicit),
                 current_rules_ver: state.receipt_config.rules_ver,
                 requires_transport_peer: !state.dev_session_shim,
                 requires_prefix_caching: is_text_generation && !is_needle_cache_exception(model),
@@ -6923,6 +6948,16 @@ fn gateway_registered_route_value(
                 "reason": "local attestation readiness could not be encoded",
             })
         }),
+    );
+    object.insert(
+        "throughput_measured_at_ms".to_owned(),
+        json!(entry.and_then(|entry| entry.heartbeat.as_ref()?.perf.measured_at_ms)),
+    );
+    object.insert(
+        "effective_throughput".to_owned(),
+        json!(
+            entry.and_then(|entry| crate::provider_table::effective_throughput(entry, now_millis))
+        ),
     );
     if fresh {
         if let Some(entry) = entry {
@@ -9662,11 +9697,8 @@ async fn lookup_gateway_job_by_key(
         Err(error) => return error.into_response(),
     };
     if !lookupable_gateway_job_family(&query.endpoint_family) {
-        return ApiError::bad_request(
-            "unsupported endpoint family",
-            Some("endpoint_family"),
-        )
-        .into_response();
+        return ApiError::bad_request("unsupported endpoint family", Some("endpoint_family"))
+            .into_response();
     }
     let key = match headers
         .get("idempotency-key")
@@ -15336,6 +15368,7 @@ fn heartbeat_for_route(
             est_wait_ms: 0,
         },
         perf: HeartbeatPerf {
+            measured_at_ms: Some(now_millis),
             tok_s: Some(50.0),
             ttft_ms: 150,
         },
@@ -25369,7 +25402,8 @@ async fn wait_for_eligible_routes<'a, F>(
 where
     F: FnMut() -> Vec<&'a GatewayRouteCandidate>,
 {
-    wait_for_eligible_routes_with_poll(
+    let started = Instant::now();
+    let outcome = wait_for_eligible_routes_with_poll(
         state,
         model,
         options,
@@ -25379,7 +25413,55 @@ where
         refresh,
         Duration::from_millis(ROUTE_WAIT_POLL_MS),
     )
-    .await
+    .await;
+    if outcome.routes.is_empty() {
+        log_route_admission_exclusions(state, model, options, requirements, started.elapsed());
+    }
+    outcome
+}
+
+// One bounded diagnostic on failed admission, never on each wait poll or token.
+// Only route metadata: no prompt, credential, receipt history or customer identity.
+fn log_route_admission_exclusions(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+    requirements: &RequestRequirements,
+    elapsed: Duration,
+) {
+    let now = now_millis_u64();
+    let entries = state
+        .provider_table
+        .lock_recover("provider table")
+        .entries(now);
+    let mut requirements = requirements.clone();
+    requirements.now_millis = now;
+    let preferred = state.preferred_provider_order(model, options);
+    let routes = model.mayhem.route_candidates.iter().take(16).map(|route| {
+        let entry = dashboard_entry_for_route(&entries, route);
+        let reason = if preferred.as_ref().is_some_and(|providers|
+            !providers.iter().any(|provider| route.provider.eq_ignore_ascii_case(provider))) {
+            Some("preferred_provider_filter")
+        } else {
+            entry.map_or(Some("provider_snapshot_missing"), |entry|
+                selector_route_exclusion_reason(state, route, entry, options.min_att_tier,
+                    options.quant.as_deref(), &requirements, now))
+        };
+        let heartbeat = entry.and_then(|entry| entry.heartbeat.as_ref());
+        json!({"provider": route.provider, "reason": reason,
+            "tok_s": heartbeat.and_then(|hb| hb.perf.tok_s),
+            "measurement_age_ms": heartbeat.and_then(|hb| hb.perf.measured_at_ms).map(|at| now.saturating_sub(at)),
+            "free_slots": heartbeat.map(|hb| hb.q.free_slots),
+            "effective_throughput": entry.and_then(|entry| crate::provider_table::effective_throughput(entry, now))})
+    }).collect::<Vec<_>>();
+    eprintln!(
+        "mayhem route admission unavailable: {}",
+        json!({
+        "model": model.id, "job_id": options.job.as_ref().map(|job| job.id.as_str()),
+        "at_ms": now, "wait_ms": elapsed.as_millis(), "min_throughput": requirements.min_throughput,
+        "explicit_throughput_floor": requirements.explicit_throughput_floor,
+        "route_count": model.mayhem.route_candidates.len(), "routes": routes})
+    );
 }
 
 async fn wait_for_eligible_routes_with_poll<'a, F>(
@@ -28698,7 +28780,7 @@ fn ordered_route_candidates_for_request_with_max_price_seed<'a>(
     max_price_au: Option<MoneyAu>,
     min_ctx: Option<u32>,
     quant: Option<&str>,
-    min_throughput: Option<f64>,
+    min_throughput: Option<ThroughputRequirement>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
@@ -28784,7 +28866,7 @@ fn ordered_route_candidates_for_embedding_with_max_price_seed<'a>(
     min_att_tier: Option<u8>,
     max_price_au: Option<MoneyAu>,
     quant: Option<&str>,
-    min_throughput: Option<f64>,
+    min_throughput: Option<ThroughputRequirement>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
@@ -28869,7 +28951,7 @@ fn ordered_route_candidates_for_image_generation_with_max_price_seed<'a>(
     min_att_tier: Option<u8>,
     max_price_au: Option<MoneyAu>,
     quant: Option<&str>,
-    min_throughput: Option<f64>,
+    min_throughput: Option<ThroughputRequirement>,
     seed: u64,
 ) -> Vec<&'a GatewayRouteCandidate> {
     let now_millis = now_millis_u64();
@@ -29794,6 +29876,14 @@ fn chat_affinity_key(
         })
 }
 
+/// Explicit throughput constraints keep using the last known measured evidence.
+/// Built-in floors permit recovery through normal admission when evidence expires.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ThroughputRequirement {
+    minimum: f64,
+    explicit: bool,
+}
+
 fn request_requirements_for_chat(
     state: &GatewayState,
     model: &GatewayModel,
@@ -29801,7 +29891,7 @@ fn request_requirements_for_chat(
     now_millis: u64,
     max_price_au: Option<MoneyAu>,
     explicit_min_ctx: Option<u32>,
-    min_throughput: Option<f64>,
+    min_throughput: Option<ThroughputRequirement>,
 ) -> RequestRequirements {
     if is_decision_chat_request(request) {
         let (_, input_tokens) = decision_input_token_bounds(request);
@@ -29822,7 +29912,8 @@ fn request_requirements_for_chat(
             input_tokens,
             output_tokens,
             usage: ReceiptUsage::text(input_tokens, output_tokens),
-            min_throughput,
+            min_throughput: min_throughput.map(|floor| floor.minimum),
+            explicit_throughput_floor: min_throughput.is_some_and(|floor| floor.explicit),
             now_millis,
             max_price_au,
             heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
@@ -29862,7 +29953,8 @@ fn request_requirements_for_chat(
         input_tokens,
         output_tokens,
         usage,
-        min_throughput,
+        min_throughput: min_throughput.map(|floor| floor.minimum),
+        explicit_throughput_floor: min_throughput.is_some_and(|floor| floor.explicit),
         now_millis,
         max_price_au,
         heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
@@ -30140,7 +30232,7 @@ fn request_requirements_for_embedding(
     inputs: &[String],
     now_millis: u64,
     max_price_au: Option<MoneyAu>,
-    min_throughput: Option<f64>,
+    min_throughput: Option<ThroughputRequirement>,
 ) -> RequestRequirements {
     let input_tokens = embedding_input_token_count(inputs);
     let max_item_bytes = inputs
@@ -30181,7 +30273,8 @@ fn request_requirements_for_embedding(
         input_tokens,
         output_tokens: 0,
         usage: ReceiptUsage::text(input_tokens, 0),
-        min_throughput,
+        min_throughput: min_throughput.map(|floor| floor.minimum),
+        explicit_throughput_floor: min_throughput.is_some_and(|floor| floor.explicit),
         now_millis,
         max_price_au,
         heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
@@ -30195,7 +30288,7 @@ fn request_requirements_for_image_generation(
     request: &ImageGenerationRequest,
     now_millis: u64,
     max_price_au: Option<MoneyAu>,
-    min_throughput: Option<f64>,
+    min_throughput: Option<ThroughputRequirement>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.prompt);
     let (width, height) = parse_image_generation_size(request)
@@ -30235,7 +30328,8 @@ fn request_requirements_for_image_generation(
         input_tokens,
         output_tokens: 0,
         usage: image_generation_usage_for_request(request),
-        min_throughput,
+        min_throughput: min_throughput.map(|floor| floor.minimum),
+        explicit_throughput_floor: min_throughput.is_some_and(|floor| floor.explicit),
         now_millis,
         max_price_au,
         heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
@@ -30249,7 +30343,7 @@ fn request_requirements_for_audio_speech(
     request: &AudioSpeechRequest,
     now_millis: u64,
     max_price_au: Option<MoneyAu>,
-    min_throughput: Option<f64>,
+    min_throughput: Option<ThroughputRequirement>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.input);
     let estimated_seconds = estimate_audio_speech_seconds(request).max(1);
@@ -30279,7 +30373,8 @@ fn request_requirements_for_audio_speech(
         input_tokens,
         output_tokens: 0,
         usage: audio_speech_usage_for_request(request),
-        min_throughput,
+        min_throughput: min_throughput.map(|floor| floor.minimum),
+        explicit_throughput_floor: min_throughput.is_some_and(|floor| floor.explicit),
         now_millis,
         max_price_au,
         heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
@@ -30293,7 +30388,7 @@ fn request_requirements_for_audio_transcription(
     request: &AudioTranscriptionRequest,
     now_millis: u64,
     max_price_au: Option<MoneyAu>,
-    min_throughput: Option<f64>,
+    min_throughput: Option<ThroughputRequirement>,
 ) -> RequestRequirements {
     let seconds = request.audio_seconds.max(1);
     RequestRequirements {
@@ -30323,7 +30418,8 @@ fn request_requirements_for_audio_transcription(
         input_tokens: request.audio_seconds,
         output_tokens: 0,
         usage: audio_transcription_usage_for_request(request),
-        min_throughput,
+        min_throughput: min_throughput.map(|floor| floor.minimum),
+        explicit_throughput_floor: min_throughput.is_some_and(|floor| floor.explicit),
         now_millis,
         max_price_au,
         heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
@@ -30359,7 +30455,7 @@ fn request_requirements_for_artifact_generation(
     request: &ArtifactGenerationRequest,
     now_millis: u64,
     max_price_au: Option<MoneyAu>,
-    min_throughput: Option<f64>,
+    min_throughput: Option<ThroughputRequirement>,
 ) -> RequestRequirements {
     let input_tokens = rough_tokens(&request.prompt);
     let output_item_units = if let Some(workflow_output) = request.workflow_output.as_ref() {
@@ -30525,7 +30621,8 @@ fn request_requirements_for_artifact_generation(
         input_tokens,
         output_tokens: 0,
         usage: artifact_generation_routing_usage_for_request(request),
-        min_throughput,
+        min_throughput: min_throughput.map(|floor| floor.minimum),
+        explicit_throughput_floor: min_throughput.is_some_and(|floor| floor.explicit),
         now_millis,
         max_price_au,
         heartbeat_ttl_millis: state.provider_heartbeat_ttl_millis,
@@ -36384,16 +36481,16 @@ impl GatewayState {
         &self,
         model: &GatewayModel,
         options: &GatewayRequestOptions,
-    ) -> Option<f64> {
-        if model.mayhem.model_class != DEFAULT_MODEL_CLASS {
-            return options
-                .failover_overrides
-                .min_tok_s
-                .or(model.mayhem.failover.min_tok_s)
-                .or(self.failover_policy.min_tok_s)
-                .filter(|value| value.is_finite() && *value > 0.0);
-        }
-        self.throughput_floor_for_model(model, options, DEFAULT_LLM_GENERATION_FLOOR_TOK_S)
+    ) -> Option<ThroughputRequirement> {
+        self.throughput_floor_for_model(
+            model,
+            options,
+            if model.mayhem.model_class == DEFAULT_MODEL_CLASS {
+                DEFAULT_LLM_GENERATION_FLOOR_TOK_S
+            } else {
+                0.0
+            },
+        )
     }
 
     fn throughput_floor_for_model(
@@ -36401,17 +36498,17 @@ impl GatewayState {
         model: &GatewayModel,
         options: &GatewayRequestOptions,
         default_floor: f64,
-    ) -> Option<f64> {
-        if let Some(user_floor) = options.failover_overrides.min_tok_s {
-            return (user_floor > 0.0).then_some(user_floor);
-        }
-        model
-            .mayhem
-            .failover
+    ) -> Option<ThroughputRequirement> {
+        let explicit = options
+            .failover_overrides
             .min_tok_s
-            .or(self.failover_policy.min_tok_s)
-            .or(Some(default_floor))
-            .filter(|value| value.is_finite() && *value > 0.0)
+            .or(model.mayhem.failover.min_tok_s)
+            .or(self.failover_policy.min_tok_s);
+        let minimum = explicit.unwrap_or(default_floor);
+        (minimum.is_finite() && minimum > 0.0).then_some(ThroughputRequirement {
+            minimum,
+            explicit: explicit.is_some(),
+        })
     }
 
     fn meter_chat_session(
@@ -49231,6 +49328,68 @@ mod tests {
             0xfeed,
         );
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn throughput_reporting_and_dispatch_recover_without_bypassing_explicit_floor() {
+        let model = test_routed_model(1);
+        let now = now_millis_u64();
+        for (age, expected) in [(0, false), (60_001, true)] {
+            let mut heartbeat = heartbeat_for_route(&model, &model.mayhem.route_candidates[0], now);
+            heartbeat.perf.tok_s = Some(3.84);
+            heartbeat.perf.measured_at_ms = Some(now - age);
+            let state = GatewayState::from_models(vec![model.clone()])
+                .with_provider_heartbeats(vec![heartbeat]);
+            let entries = state
+                .provider_table
+                .lock_recover("provider table")
+                .entries(now);
+            let route = &model.mayhem.route_candidates[0];
+            let requirements = gateway_reporting_requirements_for_route(&state, &model, route, now);
+            assert!(!requirements.is_empty());
+            let reporting = requirements.iter().any(|req| {
+                selector_route_is_eligible(&state, route, &entries[0], None, None, req, now)
+            });
+            assert_eq!(reporting, expected, "measurement age {age}");
+            let (_, reason) = gateway_route_availability(
+                &state,
+                &model,
+                route,
+                Some(&entries[0]),
+                reporting,
+                now,
+            );
+            assert_eq!(
+                reason,
+                if expected {
+                    None
+                } else {
+                    Some("throughput_floor")
+                }
+            );
+            let mut options = GatewayRequestOptions::default();
+            options.failover_overrides.min_tok_s = Some(5.0);
+            let strict = state
+                .generation_floor_tok_s_for_model(&model, &options)
+                .unwrap();
+            assert!(strict.explicit);
+            let mut req = requirements[0].clone();
+            req.min_throughput = Some(strict.minimum);
+            req.explicit_throughput_floor = strict.explicit;
+            assert!(!selector_route_is_eligible(
+                &state,
+                route,
+                &entries[0],
+                None,
+                None,
+                &req,
+                now
+            ));
+            options.failover_overrides.min_tok_s = Some(0.0);
+            assert!(state
+                .generation_floor_tok_s_for_model(&model, &options)
+                .is_none());
+        }
     }
 
     #[test]

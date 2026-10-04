@@ -280,6 +280,10 @@ pub struct HeartbeatQueue {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct HeartbeatPerf {
     pub tok_s: Option<f64>,
+    /// Time of the actual completed measurement, not the heartbeat publication.
+    /// Missing timestamps are unknown performance, never fresh evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measured_at_ms: Option<u64>,
     pub ttft_ms: u64,
 }
 
@@ -2791,6 +2795,16 @@ fn compare_field(field: &'static str, expected: &str, actual: &str) -> Result<()
 }
 
 fn validate_heartbeat_fields(heartbeat: &ProviderHeartbeat) -> Result<()> {
+    if heartbeat
+        .perf
+        .measured_at_ms
+        .is_some_and(|at| at > heartbeat.ts)
+    {
+        return Err(GatewayError::BadHeartbeatField {
+            field: "perf.measured_at_ms",
+            reason: "must not be later than the signed heartbeat timestamp".to_owned(),
+        });
+    }
     validate_hex_field("provider", &heartbeat.provider, 32)?;
     validate_hex_field("enclave_id", &heartbeat.enclave_id, 32)?;
     validate_hex_field("room_id", &heartbeat.room_id, 16)?;
@@ -3448,6 +3462,32 @@ mod tests {
             verify_tier1_attestation(&tampered_request),
             Err(GatewayError::BadSignature { .. })
         ));
+    }
+
+    #[test]
+    fn heartbeat_measurement_timestamp_is_optional_signed_and_not_in_the_future() {
+        let signing_key = SigningKey::from_bytes(&[7_u8; 32]);
+        let provider = hex::encode(signing_key.verifying_key().to_bytes());
+        let now = 1_800_000_000_000;
+        let mut hb = signed_heartbeat(&signing_key, &provider, now, "ab");
+        let old: ProviderHeartbeat = serde_json::from_value(hb.clone()).unwrap();
+        assert_eq!(old.perf.measured_at_ms, None);
+        hb["perf"]["measured_at_ms"] = json!(now - 60_001);
+        resign_heartbeat(&signing_key, &mut hb);
+        let accepted = validate_provider_heartbeat(&mut HeartbeatValidationRequest {
+            raw: &hb,
+            now_millis: now,
+            replay_cache: &mut HeartbeatReplayCache::default(),
+            max_age_millis: DEFAULT_HEARTBEAT_MAX_AGE_MILLIS,
+            max_clock_skew_millis: DEFAULT_HEARTBEAT_MAX_CLOCK_SKEW_MILLIS,
+        })
+        .unwrap();
+        assert_eq!(accepted.perf.measured_at_ms, Some(now - 60_001));
+        hb["perf"]["measured_at_ms"] = json!(now);
+        assert!(verify_heartbeat_signature(&hb, &provider, hb["sig"].as_str().unwrap()).is_err());
+        hb["perf"]["measured_at_ms"] = json!(now + 1);
+        resign_heartbeat(&signing_key, &mut hb);
+        assert!(validate_heartbeat_fields(&serde_json::from_value(hb).unwrap()).is_err());
     }
 
     #[test]

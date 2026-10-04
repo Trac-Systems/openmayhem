@@ -7734,7 +7734,11 @@ fn test_provider_heartbeat(
             engine_backlog: 0,
             est_wait_ms: 250,
         },
-        perf: HeartbeatPerf { tok_s, ttft_ms },
+        perf: HeartbeatPerf {
+            tok_s,
+            ttft_ms,
+            measured_at_ms: Some(current_test_millis()),
+        },
         price_ver: candidate.price_ver,
         min_ask_au: 0,
         transport_peer: Some(candidate.provider.clone()),

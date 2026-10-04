@@ -1573,6 +1573,7 @@ fn fixture_heartbeat(
             est_wait_ms: 120 + route_index as u64 * 80,
         },
         perf: HeartbeatPerf {
+            measured_at_ms: Some(now_millis_u64()),
             tok_s: Some(48.5 + route_index as f64 * 7.25),
             ttft_ms: 180 + route_index as u64 * 45,
         },

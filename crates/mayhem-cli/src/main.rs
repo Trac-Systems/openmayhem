@@ -60544,6 +60544,8 @@ struct ProviderLoadSnapshot {
     est_wait_ms: u64,
     ttft_ms: u64,
     measured_tok_s_milli: Option<u64>,
+    throughput_measured_at_ms: Option<u64>,
+    throughput_is_fresh: bool,
     accepting_new: bool,
     modality_at_capacity: bool,
     modality_active_items: BTreeMap<String, u32>,
@@ -60560,6 +60562,8 @@ impl Default for ProviderLoadSnapshot {
             est_wait_ms: 0,
             ttft_ms: 0,
             measured_tok_s_milli: None,
+            throughput_measured_at_ms: None,
+            throughput_is_fresh: false,
             accepting_new: true,
             modality_at_capacity: false,
             modality_active_items: BTreeMap::new(),
@@ -60587,6 +60591,8 @@ impl ProviderLoadSnapshot {
             est_wait_ms: 0,
             ttft_ms: 0,
             measured_tok_s_milli: None,
+            throughput_measured_at_ms: None,
+            throughput_is_fresh: false,
             accepting_new: true,
             modality_at_capacity: false,
             modality_active_items: BTreeMap::new(),
@@ -60602,7 +60608,7 @@ struct ProviderHeartbeatLoad {
     active_requests: Arc<AtomicU64>,
     rolling_turn_ms: Arc<AtomicU64>,
     rolling_ttft_ms: Arc<AtomicU64>,
-    rolling_tok_s_milli: Arc<AtomicU64>,
+    rolling_throughput: Arc<Mutex<Option<(u64, u64)>>>,
     accepting_new: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     modality_active_items: Arc<BTreeMap<String, AtomicU64>>,
@@ -60622,7 +60628,7 @@ impl Default for ProviderHeartbeatLoad {
             active_requests: Arc::new(AtomicU64::new(0)),
             rolling_turn_ms: Arc::new(AtomicU64::new(0)),
             rolling_ttft_ms: Arc::new(AtomicU64::new(0)),
-            rolling_tok_s_milli: Arc::new(AtomicU64::new(0)),
+            rolling_throughput: Arc::new(Mutex::new(None)),
             accepting_new: Arc::new(AtomicBool::new(true)),
             stop: Arc::new(AtomicBool::new(false)),
             modality_active_items: Arc::new(BTreeMap::new()),
@@ -60655,6 +60661,10 @@ impl ProviderHeartbeatLoad {
     }
 
     fn snapshot(&self, max_sessions: u32) -> ProviderLoadSnapshot {
+        self.snapshot_at(max_sessions, unix_epoch_millis().unwrap_or(0))
+    }
+
+    fn snapshot_at(&self, max_sessions: u32, now_ms: u64) -> ProviderLoadSnapshot {
         let active_slots = self.active_slots.load(Ordering::Relaxed);
         let exclusive_session_active = self.exclusive_session_active.load(Ordering::Acquire);
         let active_requests = self.active_requests.load(Ordering::Relaxed);
@@ -60687,10 +60697,17 @@ impl ProviderHeartbeatLoad {
         } else {
             0
         };
-        let measured_tok_s_milli = match self.rolling_tok_s_milli.load(Ordering::Relaxed) {
-            0 => None,
-            value => Some(value),
-        };
+        // One bounded value/time pair; concurrent completions cannot tear a
+        // timestamp away from its sample. Heartbeats never renew measurement age.
+        let measured = *self
+            .rolling_throughput
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let throughput_measured_at_ms = measured.map(|(_, at)| at);
+        let measured_tok_s_milli = measured.map(|(value, _)| value);
+        let throughput_is_fresh = measured.is_some_and(|(_, at)| {
+            mayhem_gateway::provider_table::measurement_is_fresh(at, now_ms)
+        });
         ProviderLoadSnapshot {
             prefix_caching: self.prefix_caching.load(Ordering::Acquire),
             active_slots,
@@ -60700,6 +60717,8 @@ impl ProviderHeartbeatLoad {
             est_wait_ms,
             ttft_ms: self.rolling_ttft_ms.load(Ordering::Relaxed),
             measured_tok_s_milli,
+            throughput_measured_at_ms,
+            throughput_is_fresh,
             accepting_new: self.accepting_new.load(Ordering::Relaxed)
                 && !session_at_capacity
                 && !modality_at_capacity
@@ -60801,6 +60820,19 @@ impl ProviderHeartbeatLoad {
     }
 
     fn record_turn_result(&self, elapsed: Duration, measured_throughput: Option<f64>) {
+        self.record_turn_result_at(
+            elapsed,
+            measured_throughput,
+            unix_epoch_millis().unwrap_or(0),
+        );
+    }
+
+    fn record_turn_result_at(
+        &self,
+        elapsed: Duration,
+        measured_throughput: Option<f64>,
+        now_ms: u64,
+    ) {
         let elapsed_ms = duration_millis_u64(elapsed).max(1);
         self.store_rolling_ms(&self.rolling_turn_ms, elapsed_ms);
         if let Some(measured_throughput) =
@@ -60809,7 +60841,21 @@ impl ProviderHeartbeatLoad {
             let tok_s_milli = (measured_throughput * 1_000.0)
                 .round()
                 .clamp(1.0, u64::MAX as f64) as u64;
-            self.store_rolling_ms(&self.rolling_tok_s_milli, tok_s_milli.max(1));
+            let mut rolling = self
+                .rolling_throughput
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let next = rolling
+                .filter(|(_, at)| mayhem_gateway::provider_table::measurement_is_fresh(*at, now_ms))
+                .map(|(previous, _)| {
+                    previous
+                        .saturating_mul(3)
+                        .saturating_add(tok_s_milli)
+                        .saturating_add(2)
+                        / 4
+                })
+                .unwrap_or(tok_s_milli);
+            *rolling = Some((next, now_ms));
         }
     }
 
@@ -80901,6 +80947,7 @@ async fn send_provider_heartbeat_round(
             "perf": {
                 "tok_s": tok_s,
                 "tok_s_source": tok_s_source,
+                "measured_at_ms": load.throughput_measured_at_ms.filter(|at| *at <= ts),
                 "ttft_ms": load.ttft_ms,
             },
             "price_ver": selected
@@ -81046,7 +81093,16 @@ fn provider_heartbeat_tok_s(
     cold_start_prior: Option<f64>,
 ) -> (Option<f64>, &'static str) {
     if let Some(measured) = load.measured_tok_s_milli {
-        return (Some(measured as f64 / 1000.0), "measured");
+        // Retain one dated value for explicit caller constraints and diagnostics.
+        // Publication never refreshes its age; default routing ignores expired evidence.
+        return (
+            Some(measured as f64 / 1000.0),
+            if load.throughput_is_fresh {
+                "measured"
+            } else {
+                "measurement_expired"
+            },
+        );
     }
     (cold_start_prior, "hwprobe_cold_start_prior")
 }
@@ -127191,6 +127247,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
                 est_wait_ms: 0,
                 ttft_ms: 0,
                 measured_tok_s_milli: None,
+                throughput_measured_at_ms: None,
+                throughput_is_fresh: false,
                 accepting_new: true,
                 modality_at_capacity: false,
                 modality_active_items: BTreeMap::new(),
@@ -127206,6 +127264,32 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         assert!(!load.is_stopped());
         load.stop();
         assert!(load.is_stopped());
+    }
+
+    #[test]
+    fn provider_heartbeat_throughput_expires_and_new_work_resets_the_average() {
+        let load = ProviderHeartbeatLoad::default();
+        let now = 1_000_000;
+        load.record_turn_result_at(Duration::from_secs(2), Some(3.84), now);
+        let fresh = load.snapshot_at(2, now + 60_000);
+        assert_eq!(
+            provider_heartbeat_tok_s(&fresh, Some(60.0)),
+            (Some(3.84), "measured")
+        );
+        let expired = load.snapshot_at(2, now + 60_001);
+        assert_eq!(expired.throughput_measured_at_ms, Some(now));
+        assert_eq!(
+            provider_heartbeat_tok_s(&expired, Some(60.0)),
+            (Some(3.84), "measurement_expired")
+        );
+        // Tokenless completions must not keep an old low measurement alive.
+        load.record_turn_result_at(Duration::from_secs(1), None, now + 60_001);
+        assert!(!load.snapshot_at(2, now + 60_001).throughput_is_fresh);
+        load.record_turn_result_at(Duration::from_secs(1), Some(40.0), now + 60_002);
+        let recovered = load.snapshot_at(2, now + 60_002);
+        assert_eq!(recovered.measured_tok_s_milli, Some(40_000));
+        assert_eq!(recovered.free_slots, 2);
+        assert!(recovered.accepting_new);
     }
 
     #[test]
@@ -127835,6 +127919,8 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             est_wait_ms: 0,
             ttft_ms: 0,
             measured_tok_s_milli: None,
+            throughput_measured_at_ms: None,
+            throughput_is_fresh: false,
             accepting_new: true,
             modality_at_capacity: false,
             modality_active_items: BTreeMap::new(),

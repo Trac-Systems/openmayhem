@@ -24,9 +24,8 @@ pub const DEFAULT_UNDERDELIVERY_EVENT_STREAK: u32 = 2;
 pub const DEFAULT_THROUGHPUT_FACTOR_FLOOR: f64 = 0.1;
 pub const DEFAULT_TRANSIENT_THROUGHPUT_FACTOR_FLOOR: f64 = 0.5;
 pub const DEFAULT_LLM_GENERATION_FLOOR_TOK_S: f64 = 5.0;
-/// A measured throughput sample is an admission hint, not a permanent route
-/// verdict. Providers keep publishing fresh heartbeat performance, so a stale
-/// gateway-local sample must eventually yield to that live signal.
+/// Measurements expire independently of heartbeats. This same bounded window
+/// applies at the provider and buyer; recovery uses normal session admission.
 pub const DEFAULT_THROUGHPUT_OBSERVATION_TTL_MILLIS: u64 = 60_000;
 pub const DEFAULT_LLM_PREFILL_FLOOR_TOK_S: f64 = 100.0;
 pub const DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S: f64 = 10.0;
@@ -254,6 +253,9 @@ pub struct RequestRequirements {
     pub max_price_au: Option<MoneyAu>,
     /// Minimum acceptable throughput in the request modality's natural unit.
     pub min_throughput: Option<f64>,
+    /// Explicit caller/policy floors keep comparing the last known performance.
+    #[serde(default)]
+    pub explicit_throughput_floor: bool,
     pub now_millis: u64,
     pub max_attestation_head_age_millis: u64,
     pub heartbeat_ttl_millis: u64,
@@ -544,6 +546,7 @@ impl Default for RequestRequirements {
             usage: ReceiptUsage::default(),
             max_price_au: None,
             min_throughput: None,
+            explicit_throughput_floor: false,
             now_millis: 0,
             max_attestation_head_age_millis: DEFAULT_ATTESTATION_HEAD_MAX_AGE_MILLIS,
             heartbeat_ttl_millis: DEFAULT_PROVIDER_HEARTBEAT_TTL_MILLIS,
@@ -711,7 +714,12 @@ impl ProviderTable {
             .tok_s
             .filter(|value| value.is_finite() && *value >= 0.0)
         {
-            observed.ewma_tok_s = Some(update_ewma(observed.ewma_tok_s, tok_s, alpha));
+            let previous = observed.ewma_tok_s.filter(|_| {
+                observed
+                    .throughput_observed_at_millis
+                    .is_some_and(|at| measurement_is_fresh(at, now_millis))
+            });
+            observed.ewma_tok_s = Some(update_ewma(previous, tok_s, alpha));
             observed.throughput_observed_at_millis = Some(now_millis);
             if let Some(advertised_tok_s) = advertised_tok_s {
                 let ratio = (tok_s / advertised_tok_s).clamp(0.0, 10.0);
@@ -1089,9 +1097,12 @@ pub fn evaluate_eligibility(
         .min_throughput
         .filter(|value| value.is_finite() && *value > 0.0)
     {
-        if effective_throughput(entry, request.now_millis)
-            .is_some_and(|throughput| throughput < floor)
-        {
+        let measured = latest_throughput(
+            entry,
+            request.now_millis,
+            !request.explicit_throughput_floor,
+        );
+        if measured.is_some_and(|throughput| throughput < floor) {
             return Err(IneligibilityReason::ThroughputFloor);
         }
     }
@@ -1301,26 +1312,38 @@ fn effective_ttft_ms(entry: &ProviderTableEntry) -> f64 {
         .unwrap_or(1.0)
 }
 
-fn effective_throughput(entry: &ProviderTableEntry, now_millis: u64) -> Option<f64> {
-    entry
-        .observed
-        .ewma_tok_s
-        .filter(|_| {
-            entry
-                .observed
-                .throughput_observed_at_millis
-                .is_none_or(|observed_at| {
-                    now_millis.saturating_sub(observed_at)
-                        <= DEFAULT_THROUGHPUT_OBSERVATION_TTL_MILLIS
-                })
+pub(crate) fn effective_throughput(entry: &ProviderTableEntry, now_millis: u64) -> Option<f64> {
+    latest_throughput(entry, now_millis, true)
+}
+
+fn latest_throughput(entry: &ProviderTableEntry, now_millis: u64, fresh_only: bool) -> Option<f64> {
+    let local = entry.observed.ewma_tok_s.and_then(|value| {
+        let at = entry.observed.throughput_observed_at_millis;
+        (!fresh_only || at.is_some_and(|at| measurement_is_fresh(at, now_millis)))
+            .then_some((at.unwrap_or(0), value))
+    });
+    let advertised = entry.heartbeat.as_ref().and_then(|heartbeat| {
+        let at = heartbeat.perf.measured_at_ms;
+        if at.is_some_and(|at| at > heartbeat.ts) {
+            return None;
+        }
+        heartbeat.perf.tok_s.and_then(|value| {
+            (!fresh_only || at.is_some_and(|at| measurement_is_fresh(at, now_millis)))
+                .then_some((at.unwrap_or(0), value))
         })
-        .or_else(|| {
-            entry
-                .heartbeat
-                .as_ref()
-                .and_then(|heartbeat| heartbeat.perf.tok_s)
-        })
-        .filter(|value| value.is_finite() && *value >= 0.0)
+    });
+    // Prefer the newest evidence; buyer observation wins on equal timestamps.
+    [advertised, local]
+        .into_iter()
+        .flatten()
+        .filter(|(_, value)| value.is_finite() && *value >= 0.0)
+        .max_by_key(|(at, _)| *at)
+        .map(|(_, value)| value)
+}
+
+pub fn measurement_is_fresh(measured_at: u64, now_millis: u64) -> bool {
+    measured_at <= now_millis
+        && now_millis - measured_at <= DEFAULT_THROUGHPUT_OBSERVATION_TTL_MILLIS
 }
 
 fn throughput_delivery_ratio(entry: &ProviderTableEntry) -> Option<f64> {
@@ -1659,6 +1682,7 @@ mod tests {
                 est_wait_ms: 0,
             },
             perf: HeartbeatPerf {
+                measured_at_ms: Some(ts),
                 tok_s: Some(50.0),
                 ttft_ms,
             },
@@ -1705,6 +1729,7 @@ mod tests {
                 est_wait_ms: 50,
             },
             perf: HeartbeatPerf {
+                measured_at_ms: Some(ts),
                 tok_s: Some(48.0),
                 ttft_ms: 140,
             },
@@ -2546,6 +2571,97 @@ mod tests {
     }
 
     #[test]
+    fn throughput_measurements_expire_despite_fresh_heartbeats_and_recover() {
+        let now = 1_000_000;
+        let mut table = ProviderTable::new();
+        let contract = contract_record_for(1);
+        let key = key_for(1);
+        table.upsert_contract(contract);
+        let mut hb = heartbeat_for(1, now, 0.2, 100, 9, "44");
+        hb.perf.tok_s = Some(3.84);
+        table.upsert_heartbeat(hb.clone(), now);
+        let mut req = eligible_request(now);
+        req.min_throughput = Some(5.0);
+        assert_eq!(
+            evaluate_eligibility(&table.entries(now)[0], &req),
+            Err(IneligibilityReason::ThroughputFloor)
+        );
+        // Publication and receipt of identical heartbeats cannot renew the measurement.
+        for age in [30_000, 60_000, 60_001, 3 * 86_400_000] {
+            hb.ts = now + age;
+            table.upsert_heartbeat(hb.clone(), now + age);
+            req.now_millis = now + age;
+            let entry = table.entries(req.now_millis).pop().unwrap();
+            assert_eq!(evaluate_eligibility(&entry, &req).is_ok(), age > 60_000);
+            req.explicit_throughput_floor = true;
+            assert_eq!(
+                evaluate_eligibility(&entry, &req),
+                Err(IneligibilityReason::ThroughputFloor)
+            );
+            req.explicit_throughput_floor = false;
+        }
+        hb.perf.tok_s = Some(40.0);
+        hb.perf.measured_at_ms = Some(req.now_millis);
+        table.upsert_heartbeat(hb, req.now_millis);
+        req.explicit_throughput_floor = true;
+        assert!(evaluate_eligibility(&table.entries(req.now_millis)[0], &req).is_ok());
+        table.record_observation_at(
+            &key,
+            ProviderObservationSample {
+                ttft_ms: 20,
+                tok_s: Some(2.0),
+                error: false,
+            },
+            req.now_millis + 1,
+        );
+        let fresh = req.now_millis + DEFAULT_THROUGHPUT_OBSERVATION_TTL_MILLIS + 2;
+        table.record_observation_at(
+            &key,
+            ProviderObservationSample {
+                ttft_ms: 20,
+                tok_s: Some(40.0),
+                error: false,
+            },
+            fresh,
+        );
+        assert_eq!(
+            table.entries(fresh)[0].observed.ewma_tok_s,
+            Some(40.0),
+            "stale EWMA must not poison a new sample"
+        );
+    }
+
+    #[test]
+    fn throughput_explicit_floors_preserve_known_bounds_and_cold_start_semantics() {
+        let now = 1_000_000;
+        for (rate, at, strict_allowed) in [
+            (Some(3.84), None, false),
+            (Some(40.0), None, true),
+            (Some(3.84), Some(now - 60_001), false),
+            (Some(40.0), Some(now - 60_001), true),
+            (None, Some(now), true),
+            (Some(f64::NAN), Some(now), true),
+        ] {
+            let mut entry = entry_for(1, now, 0.2, 100);
+            entry.heartbeat.as_mut().unwrap().perf.tok_s = rate;
+            entry.heartbeat.as_mut().unwrap().perf.measured_at_ms = at;
+            let mut req = eligible_request(now);
+            req.min_throughput = Some(5.0);
+            assert!(evaluate_eligibility(&entry, &req).is_ok());
+            req.explicit_throughput_floor = true;
+            assert_eq!(evaluate_eligibility(&entry, &req).is_ok(), strict_allowed);
+        }
+        let mut entry = entry_for(1, now, 0.2, 100);
+        entry.heartbeat.as_mut().unwrap().perf.tok_s = Some(0.0);
+        let mut req = eligible_request(now);
+        req.min_throughput = Some(5.0);
+        assert_eq!(
+            evaluate_eligibility(&entry, &req),
+            Err(IneligibilityReason::ThroughputFloor)
+        );
+    }
+
+    #[test]
     fn provider_table_rejects_older_heartbeat_overwrites() {
         let now = 1_000_000;
         let mut table = ProviderTable::new();
@@ -3091,6 +3207,7 @@ mod tests {
 
         let request = RequestRequirements {
             min_throughput: None,
+            explicit_throughput_floor: false,
             ..eligible_request(now + 10)
         };
         let entries = table.entries(now + 10);
