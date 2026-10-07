@@ -516,9 +516,16 @@ async function setup() {
   return { admin, provider, storage, contract, revision, outputs };
 }
 
-test('fiat outputs settle independently and an earlier recipient survives later failure', async () => {
+for (const version of new Set([27, 28, CONTRACT_VERSION])) {
+test(`fiat v${version} retained plan settles independently and preserves an earlier recipient`, async () => {
   const ctx = await setup();
   const plan = await buildPlan(ctx);
+  // Model a plan admitted before an upgrade. Subsequent commands still use the
+  // current contract; neither its signature nor its economic identity is rewritten.
+  plan.contract_version = version;
+  plan.admin_sig = signHex(ctx.admin.wallet, targetedPayoutControlMessage(plan));
+  const saved = (await ctx.storage.get('payout/epoch-plan/fiat/1')).value;
+  await ctx.storage.put('payout/epoch-plan/fiat/1', { ...saved, value: plan });
   const providerOutput = ctx.outputs[0];
   assert.equal((await prepareEconomicOutput(ctx, plan, providerOutput)).ok, true);
   const attempt = await prepareAttempt(ctx, plan, providerOutput, 1);
@@ -574,7 +581,9 @@ test('fiat outputs settle independently and an earlier recipient survives later 
     3n * CENT_AU
   );
   assert.equal((await closeEpoch(ctx, plan)).ok, true);
+  assert.equal((await ctx.storage.get('payout/epoch-plan/fiat/1')).value.value.contract_version, version);
 });
+}
 
 test('fiat attempt renewal requires definitive expiry and never follows ambiguity or success', async () => {
   const ctx = await setup();

@@ -661,6 +661,20 @@ function writeV17FiatFixtures(root) {
     outputs: [outputSettlement],
     close,
   });
+  const fundingWait = {
+    ...report(plan, false),
+    feature: planRecord,
+    pending: true,
+    pending_outputs: [{
+      economic_op_id: economicOpId, output_index: 0, reason: 'waiting_for_funds',
+      funding: { currency: 'usd', required_minor: '1', available_minor: '-2',
+        pending_minor: '5', shortfall_minor: '3', sufficient: false },
+    }],
+  };
+  writeJson(path.join(fixtureDir, 'waiting_for_funds.json'), fundingWait);
+  const invalidFundingWait = clone(fundingWait);
+  invalidFundingWait.pending_outputs[0].funding.shortfall_minor = '1';
+  writeJson(path.join(fixtureDir, 'invalid_funding_wait.json'), invalidFundingWait);
 
   const emptyPlan = clone(plan);
   emptyPlan.outcome = 'no_work';
@@ -1100,7 +1114,9 @@ if [[ "$rail" == "fiat-settlement" ]]; then
       cat "$MOCK_FIAT_FIXTURES/$mode-plan.json"
     fi
   elif (( submit == 1 )); then
-    record_external_effect fiat
+    if [[ "$mode" != "waiting_for_funds" && "$mode" != "invalid_funding_wait" ]]; then
+      record_external_effect fiat
+    fi
     cat "$MOCK_FIAT_FIXTURES/\${mode/success/final}.json"
   else
     cat "$MOCK_FIAT_FIXTURES/plan.json"
@@ -2065,6 +2081,46 @@ test('payout worker records canonical no-work outcomes without requiring live ke
   assert.equal(calls.filter((line) => line.startsWith('admin tnk-settlement')).length, 1);
   assert.match(calls.find((line) => line.startsWith('admin fiat-settlement') && line.includes('--submit-transfer')), /--submit/);
   assert.match(calls.find((line) => line.startsWith('admin tnk-settlement') && line.includes('--submit-transfer')), /--submit/);
+});
+
+test('funding wait survives restarts, keeps other rails moving and resumes without operator repair', (t) => {
+  const ctx = harness({ bundle: false });
+  t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+  const settings = { MOCK_FIAT_MODE: 'waiting_for_funds', MAYHEM_PAYOUT_MAX_ATTEMPTS: '2',
+    MAYHEM_PAYOUT_RETRY_BACKOFF_SECONDS: '300' };
+  const workDir = path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}`);
+  for (let i = 0; i < 3; i++) {
+    const waiting = runWorker(ctx, settings);
+    assert.equal(waiting.status, 0, waiting.stderr);
+  }
+  assert.equal(fs.existsSync(path.join(workDir, 'fiat.complete')), false);
+  assert.equal(fs.existsSync(path.join(workDir, 'complete')), false);
+  assert.equal(fs.existsSync(path.join(workDir, 'tnk.complete')), true);
+  assert.equal(fs.existsSync(path.join(workDir, 'tap.complete')), true);
+  const summary = JSON.parse(fs.readFileSync(path.join(workDir, 'summary.json')));
+  assert.equal(summary.rails.fiat.pending[0].funding.shortfall_minor, '3');
+  fs.writeFileSync(ctx.nowFile, '1300\n');
+  const funded = runWorker(ctx, { ...settings, MOCK_FIAT_MODE: 'success' });
+  assert.equal(funded.status, 0, funded.stderr);
+  assert.equal(fs.existsSync(path.join(workDir, 'complete')), true);
+  assert.equal(fs.existsSync(path.join(workDir, 'fiat-pending.json')), false);
+  const events = fs.readFileSync(ctx.payoutEventLog, 'utf8').trim().split('\n');
+  assert.equal(events.filter((event) => event === 'fiat:external-transfer').length, 1);
+  const again = runWorker(ctx, { ...settings, MOCK_FIAT_MODE: 'success' });
+  assert.equal(again.status, 0, again.stderr);
+  assert.equal(fs.readFileSync(ctx.payoutEventLog, 'utf8').trim().split('\n')
+    .filter((event) => event === 'fiat:external-transfer').length, 1);
+});
+
+test('inconsistent funding reports do not become accepted waits or completed payouts', (t) => {
+  const ctx = harness({ bundle: false });
+  t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+  const result = runWorker(ctx, { MOCK_FIAT_MODE: 'invalid_funding_wait' });
+  assert.notEqual(result.status, 0);
+  assert.match(result.stderr, /inconsistent shortfall/);
+  const workDir = path.join(ctx.state, `payout/epoch-7-${APPLY_HASH}`);
+  assert.equal(fs.existsSync(path.join(workDir, 'fiat.complete')), false);
+  assert.equal(fs.existsSync(path.join(workDir, 'fiat-pending.json')), false);
 });
 
 test('bounded payout attempts reopen automatically after backoff and transient recovery', (t) => {

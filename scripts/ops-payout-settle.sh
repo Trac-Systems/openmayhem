@@ -847,6 +847,39 @@ if settlement.get("op") == "prepare_targeted_payout_epoch":
         ):
             raise SystemExit(f"{rail} canonical close does not match its immutable plan")
 
+    if phase == "pending":
+        pending = d.get("pending_outputs")
+        if (rail != "fiat" or already is not None or d.get("pending") is not True
+            or d.get("submitted") is not False or d.get("settlement_state") is not None
+            or d.get("feature_result") is not None
+            or not isinstance(pending, list) or not pending):
+            raise SystemExit("fiat pending report has invalid status")
+        seen = set()
+        for item in pending:
+            index = item.get("output_index")
+            if (not isinstance(index, int) or isinstance(index, bool)
+                or not 0 <= index < len(outputs) or index in seen):
+                raise SystemExit("fiat pending output index is invalid")
+            seen.add(index)
+            output = outputs[index]
+            funding = item.get("funding")
+            if (item.get("reason") != "waiting_for_funds"
+                or item.get("economic_op_id") != output["economic_op_id"]
+                or output.get("role") != "provider" or not isinstance(funding, dict)
+                or funding.get("currency") != output.get("source_currency")
+                or funding.get("required_minor") != output.get("source_amount_minor")):
+                raise SystemExit("fiat funding wait does not match its planned output")
+            for field in ("required_minor", "available_minor", "pending_minor", "shortfall_minor"):
+                if not isinstance(funding.get(field), str) or not re.fullmatch(r"-?(0|[1-9][0-9]*)", funding[field]):
+                    raise SystemExit("fiat funding wait has invalid amounts")
+            required = int(funding["required_minor"])
+            shortfall = max(0, required - int(funding["available_minor"]))
+            if (required <= 0 or int(funding["shortfall_minor"]) != shortfall
+                or funding.get("sufficient") is not (shortfall == 0)
+                or (shortfall == 0 and funding.get("processor_rejected") is not True)):
+                raise SystemExit("fiat funding wait has inconsistent shortfall")
+        raise SystemExit(0)
+
     if already is not None:
         validate_close(already)
         if d.get("submitted") is True:
@@ -2374,11 +2407,18 @@ settle_fiat() {
     echo "fiat: transfer/evidence submit failed on attempt $attempt (see $error_file)" >&2
     return 1
   fi
+  if [[ "$(json_field pending <"$final_tmp")" == "true" ]]; then
+    validate_settlement_report "$final_tmp" fiat pending || return 1
+    mv "$final_tmp" "$work_dir/fiat-pending.json"
+    echo "fiat: waiting for available Stripe funds; automatic retry remains enabled (see $work_dir/fiat-pending.json)"
+    return 2
+  fi
   mv "$final_tmp" "$final_file"
   if ! validate_settlement_report "$final_file" fiat final; then
     echo "fiat: final report did not prove exact settlement (see $final_file)" >&2
     return 1
   fi
+  rm -f "$work_dir/fiat-pending.json"
   if python3 - "$final_file" <<'PY'
 import json, sys
 raise SystemExit(0 if json.load(open(sys.argv[1])).get("already_settled") is not None else 1)
@@ -3042,6 +3082,8 @@ for rail in ("fiat", "tap", "tnk"):
         "complete": os.path.exists(complete),
         "attempts": int(open(attempts).read().strip()) if os.path.exists(attempts) else 0,
         "result": json.load(open(complete)) if os.path.exists(complete) else None,
+        "pending": json.load(open(os.path.join(work_dir, f"{rail}-pending.json"))).get("pending_outputs", [])
+            if os.path.exists(os.path.join(work_dir, f"{rail}-pending.json")) else [],
     }
 with open(target, "w") as out:
     json.dump({
@@ -3077,7 +3119,7 @@ if (( failed != 0 )); then
   exit 1
 fi
 if (( pending != 0 )); then
-  echo "epoch $applied_epoch payout work is queued; awaiting TAP processed evidence"
+  echo "epoch $applied_epoch payout work is queued; automatic reconciliation will retry pending rails"
   exit 0
 fi
 python3 - "$work_dir/complete.tmp" "$work_dir/summary.json" "$applied_epoch" "$apply_hash" <<'PY'

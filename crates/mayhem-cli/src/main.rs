@@ -37575,7 +37575,9 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
             env::var("MAYHEM_STRIPE_MODE").ok().as_deref(),
             stripe_transfer_runtime_is_mainnet()?,
         )?;
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()?;
         let platform = stripe_platform_account(
             &client,
             &api_base_url,
@@ -37594,6 +37596,7 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
     let mut output_settlements = Vec::new();
     let mut payout_preparations = Vec::new();
     let mut attempt_reports = Vec::new();
+    let mut pending_outputs = Vec::new();
     let mut feature_result = None;
     let mut settlement_state = plan.already_settled.clone();
     let mut signer = None;
@@ -37695,202 +37698,235 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                 output_settlements.push(existing);
                 continue;
             }
-            let liability = targeted_payout_output_liability("fiat", &plan.payload, output)?;
-            let kind = if liability.is_some() {
-                "liability"
-            } else {
-                "fee"
-            };
-            let preparation_payload = stable_json_value(&json!({
-                "settlement_op": "settle_targeted_fiat_output",
-                "rail": "fiat",
-                "epoch": epoch,
-                "epoch_apply_hash": plan.payload.get("epoch_apply_hash"),
-                "plan_root": plan.payload.get("plan_root"),
-                "economic_op_id": economic_op_id,
-                "output_index": index,
-                "output": output,
-                "processor": "stripe",
-                "source_currency": output.get("source_currency"),
-            }));
-            let preparation = submit_targeted_payout_preparation(
-                &rpc,
-                signer,
-                "fiat",
-                epoch,
-                &plan.epoch_apply_hash,
-                planned_at,
-                economic_op_id,
-                kind,
-                index,
-                preparation_payload,
-                liability,
-                Vec::new(),
-                true,
-            )
-            .await
-            .with_context(|| format!("anchoring fiat economic output {}", index + 1))?;
-            payout_preparations.push(preparation);
-
-            let mut renewal_count = 0_u32;
-            loop {
-                ensure!(
-                    renewal_count < 16,
-                    "fiat output exceeded the bounded quote-renewal count"
-                );
-                let tail_key = format!("payout/attempt/fiat/{economic_op_id}/latest");
-                let tail = read_confirmed_state_value(&rpc, &tail_key).await?;
-                let attempt_record = if let Some(tail) = tail {
-                    let attempt_id = tail
-                        .get("attempt_id")
-                        .and_then(Value::as_str)
-                        .filter(|value| is_hex_len(value, 64))
-                        .context("canonical fiat attempt tail has an invalid attempt_id")?;
-                    read_confirmed_state_value(
+            let output_result: Result<()> = async {
+                // Do not freeze a short-lived quote/attempt while funds are pending.
+                // Existing attempts must instead reconcile external effects first.
+                if output.get("role").and_then(Value::as_str) == Some("provider")
+                    && read_confirmed_state_value(
                         &rpc,
-                        &format!("payout/attempt/fiat/{economic_op_id}/{attempt_id}"),
+                        &format!("payout/attempt/fiat/{economic_op_id}/latest"),
                     )
                     .await?
-                    .context("canonical fiat attempt tail points to a missing record")?
-                } else {
-                    let quote = if output.get("role").and_then(Value::as_str)
-                        == Some("operator_fee")
-                    {
-                        None
-                    } else if let Some(quote) = initial_attempt_quotes.get(index).cloned().flatten()
-                    {
-                        ensure_canonical_fiat_quote_matches_output(output, Some(&quote))?;
-                        Some(quote)
-                    } else {
-                        create_targeted_fiat_quote(
-                            client,
-                            api_base_url,
-                            secret_key,
-                            output,
-                            1,
-                            args.stripe_transfer_max_attempts,
-                            args.stripe_transfer_retry_ms,
-                        )
-                        .await?
-                    };
-                    prepare_targeted_fiat_attempt(
-                        &rpc,
-                        signer,
-                        &plan.payload,
+                    .is_none()
+                {
+                    require_fiat_output_funding(
+                        client,
+                        api_base_url,
+                        secret_key,
                         output,
-                        1,
-                        now_unix_seconds()?,
-                        quote.as_ref(),
+                        args.stripe_transfer_max_attempts,
+                        args.stripe_transfer_retry_ms,
                     )
-                    .await?
+                    .await?;
+                }
+                let liability = targeted_payout_output_liability("fiat", &plan.payload, output)?;
+                let kind = if liability.is_some() {
+                    "liability"
+                } else {
+                    "fee"
                 };
-                match attempt_record.get("status").and_then(Value::as_str) {
-                    Some("prepared") => {
-                        match execute_canonical_stripe_attempt(
-                            client,
-                            api_base_url,
-                            secret_key,
-                            output,
-                            &attempt_record,
-                            &plan.epoch_apply_hash,
-                            args.stripe_transfer_max_attempts,
-                            args.stripe_transfer_retry_ms,
+                let preparation_payload = stable_json_value(&json!({
+                    "settlement_op": "settle_targeted_fiat_output",
+                    "rail": "fiat",
+                    "epoch": epoch,
+                    "epoch_apply_hash": plan.payload.get("epoch_apply_hash"),
+                    "plan_root": plan.payload.get("plan_root"),
+                    "economic_op_id": economic_op_id,
+                    "output_index": index,
+                    "output": output,
+                    "processor": "stripe",
+                    "source_currency": output.get("source_currency"),
+                }));
+                let preparation = submit_targeted_payout_preparation(
+                    &rpc,
+                    signer,
+                    "fiat",
+                    epoch,
+                    &plan.epoch_apply_hash,
+                    planned_at,
+                    economic_op_id,
+                    kind,
+                    index,
+                    preparation_payload,
+                    liability,
+                    Vec::new(),
+                    true,
+                )
+                .await
+                .with_context(|| format!("anchoring fiat economic output {}", index + 1))?;
+                payout_preparations.push(preparation);
+
+                let mut renewal_count = 0_u32;
+                loop {
+                    ensure!(
+                        renewal_count < 16,
+                        "fiat output exceeded the bounded quote-renewal count"
+                    );
+                    let tail_key = format!("payout/attempt/fiat/{economic_op_id}/latest");
+                    let tail = read_confirmed_state_value(&rpc, &tail_key).await?;
+                    let attempt_record = if let Some(tail) = tail {
+                        let attempt_id = tail
+                            .get("attempt_id")
+                            .and_then(Value::as_str)
+                            .filter(|value| is_hex_len(value, 64))
+                            .context("canonical fiat attempt tail has an invalid attempt_id")?;
+                        read_confirmed_state_value(
+                            &rpc,
+                            &format!("payout/attempt/fiat/{economic_op_id}/{attempt_id}"),
                         )
                         .await?
-                        {
-                            CanonicalFiatAttemptExecution::Succeeded { evidence, report } => {
-                                let terminal = finalize_targeted_fiat_attempt(
-                                    &rpc,
-                                    signer,
-                                    &attempt_record,
-                                    "succeeded",
-                                    now_unix_seconds()?,
-                                    &evidence,
-                                )
-                                .await?;
-                                attempt_reports.push(report);
-                                let settled = settle_targeted_fiat_output(
-                                    &rpc,
-                                    signer,
-                                    &plan.payload,
-                                    output,
-                                    &terminal,
-                                    now_unix_seconds()?,
-                                    &evidence,
-                                )
-                                .await?;
-                                output_settlements.push(settled);
-                                break;
-                            }
-                            CanonicalFiatAttemptExecution::ExpiredPreEffect { evidence } => {
-                                finalize_targeted_fiat_attempt(
-                                    &rpc,
-                                    signer,
-                                    &attempt_record,
-                                    "expired_pre_effect",
-                                    now_unix_seconds()?,
-                                    &evidence,
-                                )
-                                .await?;
-                                renewal_count = renewal_count.saturating_add(1);
-                            }
-                        }
-                    }
-                    Some("succeeded") => {
-                        let evidence = attempt_record
-                            .pointer("/result/evidence")
-                            .cloned()
-                            .context("succeeded canonical fiat attempt is missing evidence")?;
-                        let settled = settle_targeted_fiat_output(
-                            &rpc,
-                            signer,
-                            &plan.payload,
-                            output,
-                            &attempt_record,
-                            now_unix_seconds()?,
-                            &evidence,
-                        )
-                        .await?;
-                        output_settlements.push(settled);
-                        break;
-                    }
-                    Some("expired_pre_effect") => {
-                        let attempt_no = attempt_record
-                            .get("attempt_no")
-                            .and_then(Value::as_u64)
-                            .context("expired fiat attempt is missing attempt_no")?
-                            .checked_add(1)
-                            .context("fiat attempt number overflow")?;
-                        let quote = create_targeted_fiat_quote(
-                            client,
-                            api_base_url,
-                            secret_key,
-                            output,
-                            attempt_no,
-                            args.stripe_transfer_max_attempts,
-                            args.stripe_transfer_retry_ms,
-                        )
-                        .await?;
+                        .context("canonical fiat attempt tail points to a missing record")?
+                    } else {
+                        let quote = if output.get("role").and_then(Value::as_str) == Some("operator_fee") {
+                            None
+                        } else if let Some(quote) = initial_attempt_quotes.get(index).cloned().flatten() {
+                            ensure_canonical_fiat_quote_matches_output(output, Some(&quote))?;
+                            Some(quote)
+                        } else {
+                            create_targeted_fiat_quote(
+                                client,
+                                api_base_url,
+                                secret_key,
+                                output,
+                                1,
+                                args.stripe_transfer_max_attempts,
+                                args.stripe_transfer_retry_ms,
+                            )
+                            .await?
+                        };
                         prepare_targeted_fiat_attempt(
                             &rpc,
                             signer,
                             &plan.payload,
                             output,
-                            attempt_no,
+                            1,
                             now_unix_seconds()?,
                             quote.as_ref(),
                         )
-                        .await?;
-                        renewal_count = renewal_count.saturating_add(1);
+                        .await?
+                    };
+                    match attempt_record.get("status").and_then(Value::as_str) {
+                        Some("prepared") => {
+                            match execute_canonical_stripe_attempt(
+                                client,
+                                api_base_url,
+                                secret_key,
+                                output,
+                                &attempt_record,
+                                &plan.epoch_apply_hash,
+                                args.stripe_transfer_max_attempts,
+                                args.stripe_transfer_retry_ms,
+                            )
+                            .await?
+                            {
+                                CanonicalFiatAttemptExecution::Succeeded { evidence, report } => {
+                                    let terminal = finalize_targeted_fiat_attempt(
+                                        &rpc,
+                                        signer,
+                                        &attempt_record,
+                                        "succeeded",
+                                        now_unix_seconds()?,
+                                        &evidence,
+                                    )
+                                    .await?;
+                                    attempt_reports.push(report);
+                                    let settled = settle_targeted_fiat_output(
+                                        &rpc,
+                                        signer,
+                                        &plan.payload,
+                                        output,
+                                        &terminal,
+                                        now_unix_seconds()?,
+                                        &evidence,
+                                    )
+                                    .await?;
+                                    output_settlements.push(settled);
+                                    break;
+                                }
+                                CanonicalFiatAttemptExecution::ExpiredPreEffect { evidence } => {
+                                    finalize_targeted_fiat_attempt(
+                                        &rpc,
+                                        signer,
+                                        &attempt_record,
+                                        "expired_pre_effect",
+                                        now_unix_seconds()?,
+                                        &evidence,
+                                    )
+                                    .await?;
+                                    renewal_count = renewal_count.saturating_add(1);
+                                }
+                            }
+                        }
+                        Some("succeeded") => {
+                            let evidence = attempt_record
+                                .pointer("/result/evidence")
+                                .cloned()
+                                .context("succeeded canonical fiat attempt is missing evidence")?;
+                            let settled = settle_targeted_fiat_output(
+                                &rpc,
+                                signer,
+                                &plan.payload,
+                                output,
+                                &attempt_record,
+                                now_unix_seconds()?,
+                                &evidence,
+                            )
+                            .await?;
+                            output_settlements.push(settled);
+                            break;
+                        }
+                        Some("expired_pre_effect") => {
+                            let attempt_no = attempt_record
+                                .get("attempt_no")
+                                .and_then(Value::as_u64)
+                                .context("expired fiat attempt is missing attempt_no")?
+                                .checked_add(1)
+                                .context("fiat attempt number overflow")?;
+                            let quote = create_targeted_fiat_quote(
+                                client,
+                                api_base_url,
+                                secret_key,
+                                output,
+                                attempt_no,
+                                args.stripe_transfer_max_attempts,
+                                args.stripe_transfer_retry_ms,
+                            )
+                            .await?;
+                            prepare_targeted_fiat_attempt(
+                                &rpc,
+                                signer,
+                                &plan.payload,
+                                output,
+                                attempt_no,
+                                now_unix_seconds()?,
+                                quote.as_ref(),
+                            )
+                            .await?;
+                            renewal_count = renewal_count.saturating_add(1);
+                        }
+                        Some(status) => bail!("unsupported canonical fiat attempt status {status}"),
+                        None => bail!("canonical fiat attempt is missing status"),
                     }
-                    Some(status) => bail!("unsupported canonical fiat attempt status {status}"),
-                    None => bail!("canonical fiat attempt is missing status"),
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = output_result {
+                if let Some(wait) = error.downcast_ref::<FiatFundingWait>() {
+                    pending_outputs.push(json!({
+                        "economic_op_id": economic_op_id,
+                        "output_index": index,
+                        "reason": "waiting_for_funds",
+                        "funding": wait.0,
+                    }));
+                } else {
+                    return Err(error);
                 }
             }
         }
     }
 
-    if plan.already_settled.is_none() && args.tx.submit && !args.tx.sim {
+    if plan.already_settled.is_none() && args.tx.submit && !args.tx.sim && pending_outputs.is_empty() {
         let signer = signer
             .as_ref()
             .context("fiat settlement requires its canonical admin signer")?;
@@ -37956,6 +37992,9 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         "processor": "stripe",
         "operator_to": operator_to,
         "platform_account": platform_account,
+        "pending": !pending_outputs.is_empty(),
+        "pending_outputs": pending_outputs,
+        "output_settlements": output_settlements,
         "settlement": plan.payload,
         "feature": plan_state,
         "feature_result": feature_result,
@@ -38629,13 +38668,7 @@ async fn submit_targeted_payout_preparation(
         );
     value = stable_json_value(&value);
     let record_key = format!("payout/preparation/{rail}/{economic_op_id}");
-    let exact_record = |record: &Value| {
-        value.as_object().is_some_and(|expected| {
-            expected
-                .iter()
-                .all(|(field, expected)| record.get(field) == Some(expected))
-        }) && record.get("consumed").and_then(Value::as_bool) == Some(false)
-    };
+    let exact_record = |record: &Value| canonical_payout_preparation_matches(record, &value);
     if let Some(existing) = read_confirmed_state_value(rpc, &record_key).await? {
         ensure!(
             exact_record(&existing),
@@ -38932,6 +38965,33 @@ fn targeted_payout_epoch_plan_value(
     })))
 }
 
+fn targeted_payout_record_version_supported(value: &Value) -> bool {
+    value
+        .get("contract_version")
+        .and_then(Value::as_u64)
+        // This record format is supported from v27 onward. A moving two-version
+        // allowlist strands older immutable plans whenever Core upgrades again.
+        .is_some_and(|version| (27..=u64::from(CONTRACT_VERSION)).contains(&version))
+}
+
+fn canonical_payout_preparation_matches(record: &Value, expected: &Value) -> bool {
+    // Only called for confirmed canonical records: their original signature was
+    // checked on admission. Never re-sign or rewrite historical preparations.
+    record.get("type").and_then(Value::as_str) == Some("targeted_payout_preparation")
+        && record.get("consumed").and_then(Value::as_bool) == Some(false)
+        && targeted_payout_record_version_supported(record)
+        && record
+            .get("admin_sig")
+            .and_then(Value::as_str)
+            .is_some_and(|sig| is_hex_len(sig, 128))
+        && expected.as_object().is_some_and(|fields| {
+            fields.iter().all(|(key, value)| {
+                matches!(key.as_str(), "contract_version" | "admin_sig")
+                    || record.get(key) == Some(value)
+            })
+        })
+}
+
 fn canonical_targeted_payout_plan(record: &Value, rail: &str, epoch: u64) -> Result<Value> {
     let value = record
         .get("value")
@@ -38942,10 +39002,7 @@ fn canonical_targeted_payout_plan(record: &Value, rail: &str, epoch: u64) -> Res
             && record.get("rail").and_then(Value::as_str) == Some(rail)
             && record.get("epoch").and_then(Value::as_u64) == Some(epoch)
             && value.get("op").and_then(Value::as_str) == Some("prepare_targeted_payout_epoch")
-            && value
-                .get("contract_version")
-                .and_then(Value::as_u64)
-                .is_some_and(|version| version == 27 || version == u64::from(CONTRACT_VERSION))
+            && targeted_payout_record_version_supported(&value)
             && value.get("rail").and_then(Value::as_str) == Some(rail)
             && value.get("epoch").and_then(Value::as_u64) == Some(epoch)
             && record.get("plan_root") == value.get("plan_root"),
@@ -56662,6 +56719,25 @@ fn stripe_fx_quote_hash(quote: &StripeFxQuote) -> Result<String> {
     })))
 }
 
+fn canonical_fiat_quote_snapshot(
+    mut quote: StripeFxQuote,
+    expected_hash: &str,
+) -> Result<StripeFxQuote> {
+    if stripe_fx_quote_hash(&quote)? == expected_hash {
+        return Ok(quote);
+    }
+    // Stripe mutates lock_status as time passes. Recover the originally signed
+    // snapshot only when that one documented transition explains the hash.
+    // Rates, destination, timestamps and every other field must still match.
+    if quote.lock_status == "expired" {
+        quote.lock_status = "active".to_owned();
+        if stripe_fx_quote_hash(&quote)? == expected_hash {
+            return Ok(quote);
+        }
+    }
+    bail!("canonical fiat attempt FX quote hash mismatch")
+}
+
 fn fiat_fx_plan_report(plan: &FiatFxPlan) -> Value {
     json!({
         "liability_au": money_au_json(plan.liability_au),
@@ -57201,6 +57277,140 @@ enum CanonicalFiatAttemptExecution {
     ExpiredPreEffect { evidence: Value },
 }
 
+#[derive(Debug)]
+struct FiatFundingWait(Value);
+
+#[cfg(test)]
+mod payout_recovery_tests;
+
+impl std::fmt::Display for FiatFundingWait {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Stripe payout is waiting for available funds: {}", self.0)
+    }
+}
+
+impl std::error::Error for FiatFundingWait {}
+
+fn fiat_funding_status(output: &Value, balance: &Value) -> Result<Value> {
+    ensure!(
+        balance.get("object").and_then(Value::as_str) == Some("balance"),
+        "Stripe payout balance response is invalid"
+    );
+    let currency = output
+        .get("source_currency")
+        .and_then(Value::as_str)
+        .context("fiat payout output is missing source currency")?;
+    normalize_admin_fiat_currency(currency)?;
+    let required = output
+        .get("source_amount_minor")
+        .and_then(Value::as_str)
+        .context("fiat payout output is missing source amount")?
+        .parse::<u64>()?;
+    ensure!(required > 0, "fiat payout output amount must be positive");
+    let amount = |field: &str| -> Result<i128> {
+        let entries = balance
+            .get(field)
+            .and_then(Value::as_array)
+            .with_context(|| format!("Stripe payout balance is missing {field}"))?;
+        let mut found = None;
+        for entry in entries {
+            if entry.get("currency").and_then(Value::as_str) == Some(currency) {
+                ensure!(found.is_none(), "Stripe payout balance repeats a currency");
+                found = Some(i128::from(
+                    entry
+                        .get("amount")
+                        .and_then(Value::as_i64)
+                        .context("Stripe payout balance has an invalid amount")?,
+                ));
+            }
+        }
+        Ok(found.unwrap_or(0))
+    };
+    let available = amount("available")?;
+    let pending = amount("pending")?;
+    let shortfall = (i128::from(required) - available).max(0);
+    Ok(json!({
+        "currency": currency,
+        "required_minor": required.to_string(),
+        "available_minor": available.to_string(),
+        "pending_minor": pending.to_string(),
+        "shortfall_minor": shortfall.to_string(),
+        "sufficient": shortfall == 0,
+    }))
+}
+
+async fn fiat_output_funding_status(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    output: &Value,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<Value> {
+    ensure!(max_attempts > 0, "Stripe balance attempts must be positive");
+    for attempt in 1..=max_attempts {
+        let response = client
+            .get(format!("{}/v1/balance", api_base_url.trim_end_matches('/')))
+            .basic_auth(secret_key, Some(""))
+            .header("Stripe-Version", STRIPE_FX_API_VERSION)
+            .timeout(std::time::Duration::from_secs(20))
+            .send()
+            .await;
+        let response = match response {
+            Ok(response) => response,
+            Err(_) if attempt < max_attempts => {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            Err(error) => return Err(error).context("retrieving Stripe payout balance"),
+        };
+        let status = response.status();
+        let body = response.text().await?;
+        if !status.is_success() {
+            if stripe_status_is_retryable(status) && attempt < max_attempts {
+                stripe_retry_sleep(retry_ms, attempt).await;
+                continue;
+            }
+            bail!(
+                "Stripe payout balance API returned {status}: {}",
+                stripe_api_error_message(&body)
+            );
+        }
+        let balance: Value =
+            serde_json::from_str(&body).context("parsing Stripe payout balance")?;
+        ensure!(
+            balance.get("livemode").and_then(Value::as_bool)
+                == Some(secret_key.starts_with("sk_live_")),
+            "Stripe payout balance mode mismatch"
+        );
+        return fiat_funding_status(output, &balance);
+    }
+    unreachable!("positive balance attempts checked above")
+}
+
+async fn require_fiat_output_funding(
+    client: &reqwest::Client,
+    api_base_url: &str,
+    secret_key: &str,
+    output: &Value,
+    max_attempts: u32,
+    retry_ms: u64,
+) -> Result<()> {
+    let status = fiat_output_funding_status(
+        client,
+        api_base_url,
+        secret_key,
+        output,
+        max_attempts,
+        retry_ms,
+    )
+    .await?;
+    if status.get("sufficient").and_then(Value::as_bool) != Some(true) {
+        return Err(FiatFundingWait(status).into());
+    }
+    Ok(())
+}
+
 async fn create_targeted_fiat_quote(
     client: &reqwest::Client,
     api_base_url: &str,
@@ -57393,12 +57603,9 @@ async fn execute_canonical_stripe_attempt(
                 retry_ms,
             )
             .await?;
-            ensure!(
+            Some(canonical_fiat_quote_snapshot(quote,
                 request.get("fx_quote_hash").and_then(Value::as_str)
-                    == Some(stripe_fx_quote_hash(&quote)?.as_str()),
-                "canonical fiat attempt FX quote hash mismatch"
-            );
-            Some(quote)
+                    .context("canonical fiat attempt is missing FX quote hash")?)?)
         }
         None => None,
     };
@@ -57422,6 +57629,9 @@ async fn execute_canonical_stripe_attempt(
     )
     .await?;
     if transfer.is_none() {
+        // A prior successful transfer can be reconciled with an empty balance.
+        // Only a genuinely new external transfer requires available funding.
+        require_fiat_output_funding(client, api_base_url, secret_key, output, max_attempts, retry_ms).await?;
         let idempotency_key = targeted_fiat_attempt_idempotency_key(attempt_id);
         let quote_identity = quote
             .as_ref()
@@ -57492,6 +57702,13 @@ async fn execute_canonical_stripe_attempt(
                 if stripe_status_is_retryable(status) && attempt < max_attempts {
                     stripe_retry_sleep(retry_ms, attempt).await;
                     continue;
+                }
+                if matches!(stripe_api_error_code(&body).as_deref(), Some("balance_insufficient" | "insufficient_funds")) {
+                    // Another debit can consume balance after the preflight. Keep
+                    // the canonical attempt intact for idempotent reconciliation.
+                    let mut funding = fiat_output_funding_status(client, api_base_url, secret_key, output, max_attempts, retry_ms).await?;
+                    funding["processor_rejected"] = json!(true);
+                    return Err(FiatFundingWait(funding).into());
                 }
                 if quote.is_some()
                     && stripe_api_error_code(&body).as_deref() == Some("fx_quote_expired")
@@ -115632,7 +115849,7 @@ esac
     }
 
     #[test]
-    fn existing_v27_targeted_payout_plan_survives_v28_cli() {
+    fn canonical_targeted_payout_plan_preserves_supported_history() {
         let plan_root = "a".repeat(64);
         let mut record = json!({
             "type": "targeted_payout_epoch_plan",
@@ -115647,11 +115864,22 @@ esac
                 "plan_root": plan_root,
             },
         });
-        assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_ok());
-        record["value"]["contract_version"] = json!(CONTRACT_VERSION);
-        assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_ok());
-        record["value"]["contract_version"] = json!(26);
-        assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_err());
+        for rail in ["fiat", "tnk"] {
+            record["rail"] = json!(rail);
+            record["value"]["rail"] = json!(rail);
+            for version in 27..=u64::from(CONTRACT_VERSION) {
+                record["value"]["contract_version"] = json!(version);
+                assert_eq!(canonical_targeted_payout_plan(&record, rail, 508).unwrap(), record["value"]);
+                assert!(canonical_targeted_payout_plan(&record, rail, 509).is_err());
+                assert!(canonical_targeted_payout_plan(&record, "tap", 508).is_err());
+            }
+            for version in [0, 26, u64::from(CONTRACT_VERSION) + 1, u64::MAX] {
+                record["value"]["contract_version"] = json!(version);
+                assert!(canonical_targeted_payout_plan(&record, rail, 508).is_err());
+            }
+        }
+        record["rail"] = json!("fiat");
+        record["value"]["rail"] = json!("fiat");
         record["value"]["contract_version"] = json!(27);
         record["plan_root"] = json!("b".repeat(64));
         assert!(canonical_targeted_payout_plan(&record, "fiat", 508).is_err());
