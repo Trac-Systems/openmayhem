@@ -108,13 +108,38 @@
       "estimated_cost_usd": "0.052580",
       "cost_usd": "0.052580"
     },
-    "artifact_downloads": true
+    "artifact_downloads": true,
+    "landscape_studio": {
+      "settled": true,
+      "co_signed": true,
+      "cost_usd": "0.028440",
+      "decoded_dimensions": [
+        1280,
+        736
+      ],
+      "audio_present": true,
+      "artifact_download": true
+    }
   },
   "notes": [
     "Five native runs used unchanged model parts with other provider runtimes loaded. Minimum available system memory is observed headroom, not a free-memory guarantee.",
     "New signed class requires a new canonical enclave; existing public model and reference tariff remain, but prior enclave spot-price/demand history is not copied.",
     "Paid pixel-frames use requested duration at 24 fps, not internal 17n+5 frame padding.",
     "Existing H3 canary fingerprints and runtime identity are unchanged; focused endpoint policy calibration passed 58/58 cases.",
-    "Broader launch canary audit has pre-existing Needle and Gemma fixture failures; it is not represented as clean."
-  ]
+    "Broader launch canary audit has pre-existing Needle and Gemma fixture failures; it is not represented as clean.",
+    "Expanded presets verified in live Studio, with a paid landscape generation; API portrait and MCP reference-ultrawide generation also settled."
+  ],
+  "api_mcp_preflight": {
+    "invalid_width": 400,
+    "invalid_pixel_count": 400,
+    "invalid_alignment": 400,
+    "below_minimum": 400,
+    "mcp_invalid_estimate_rejected": true,
+    "mcp_changed_request_rejected": true
+  },
+  "site_source_commits": [
+    "78313c6",
+    "99d9713"
+  ],
+  "website_api_deployment_commit": "7806edac6b6dc96572ec475ec75030e209d3c821"
 }
