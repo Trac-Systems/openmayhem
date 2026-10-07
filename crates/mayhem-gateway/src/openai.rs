@@ -10862,6 +10862,25 @@ async fn execute_artifact_generation_endpoint(
             ))
         }
     };
+    // Resolve idempotency first: changed live capacity cannot invalidate a replay.
+    // Async acceptance must not hide a request that no advertised provider can
+    // execute. This uses fresh capacity evidence only; busy/unknown routes keep
+    // their normal wait and cancellation behavior.
+    let selection = artifact_generation_route_selection_request(&request);
+    let requirements = request_requirements_for_artifact_generation(
+        state,
+        &model,
+        &selection,
+        now_millis_u64(),
+        options.max_price_au,
+        None,
+    );
+    if let Err(error) =
+        reject_proven_request_capacity_mismatch(state, &model, &options, &requirements)
+    {
+        job.persist_failure_if_active(&error).await;
+        return Err(error);
+    }
     options.job = Some(job.clone());
     options.client_cancellation = Some(job.cancellation());
     if prefer_async {
@@ -23454,7 +23473,7 @@ async fn run_embedding_with_route_retry(
             )
         },
     )
-    .await;
+    .await?;
     if eligible_routes.is_empty() {
         if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
             return Err(error);
@@ -23696,7 +23715,7 @@ async fn run_image_generation_with_route_retry(
             )
         },
     )
-    .await;
+    .await?;
     if eligible_routes.is_empty() {
         if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
             return Err(error);
@@ -23933,7 +23952,7 @@ async fn run_audio_speech_with_route_retry(
         eligible_routes,
         || ordered_route_candidates_for_audio_speech_with_options(state, model, request, &options),
     )
-    .await;
+    .await?;
     if eligible_routes.is_empty() {
         if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
             return Err(error);
@@ -24174,7 +24193,7 @@ async fn run_audio_transcription_with_route_retry(
             )
         },
     )
-    .await;
+    .await?;
     if eligible_routes.is_empty() {
         if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
             return Err(error);
@@ -24424,7 +24443,7 @@ async fn run_artifact_generation_with_route_retry(
             )
         },
     )
-    .await;
+    .await?;
     if eligible_routes.is_empty() {
         if let Some(error) = preferred_provider_refusal_error(state, model, &options) {
             return Err(error);
@@ -25398,10 +25417,11 @@ async fn wait_for_eligible_routes<'a, F>(
     deadline: RouteWaitDeadline,
     routes: Vec<&'a GatewayRouteCandidate>,
     refresh: F,
-) -> RouteWaitOutcome<'a>
+) -> Result<RouteWaitOutcome<'a>, ApiError>
 where
     F: FnMut() -> Vec<&'a GatewayRouteCandidate>,
 {
+    reject_proven_request_capacity_mismatch(state, model, options, requirements)?;
     let started = Instant::now();
     let outcome = wait_for_eligible_routes_with_poll(
         state,
@@ -25416,8 +25436,9 @@ where
     .await;
     if outcome.routes.is_empty() {
         log_route_admission_exclusions(state, model, options, requirements, started.elapsed());
+        reject_proven_request_capacity_mismatch(state, model, options, requirements)?;
     }
-    outcome
+    Ok(outcome)
 }
 
 // One bounded diagnostic on failed admission, never on each wait poll or token.
@@ -25724,6 +25745,37 @@ fn earliest_otherwise_eligible_route_cooloff(
     every_route_is_cooling.then_some(KnownRouteCooloff { until_millis })
 }
 
+fn route_matches_request_scope(
+    state: &GatewayState,
+    model: &GatewayModel,
+    candidate: &GatewayRouteCandidate,
+    options: &GatewayRequestOptions,
+    required_modalities: &[String],
+    preferred: Option<&[String]>,
+) -> bool {
+    preferred.is_none_or(|providers| {
+        providers
+            .iter()
+            .any(|provider| candidate.provider.eq_ignore_ascii_case(provider))
+    }) && candidate
+        .accepted_rails
+        .iter()
+        .any(|rail| rail == &state.receipt_config.rail)
+        && options
+            .min_att_tier
+            .is_none_or(|tier| candidate.att_tier >= tier)
+        && required_modalities
+            .iter()
+            .all(|modality| candidate.served_modalities.contains(modality))
+        && options.max_price_au.is_none_or(|price| {
+            price_rate_gate_basis_au(route_price_ref_au(model, Some(candidate))) <= price
+        })
+        && options
+            .quant
+            .as_deref()
+            .is_none_or(|quant| candidate.quant.eq_ignore_ascii_case(quant))
+}
+
 fn route_static_filters_have_candidates(
     state: &GatewayState,
     model: &GatewayModel,
@@ -25731,46 +25783,75 @@ fn route_static_filters_have_candidates(
     required_modalities: &[String],
 ) -> bool {
     let preferred = state.preferred_provider_order(model, options);
-    model
-        .mayhem
-        .route_candidates
-        .iter()
-        .filter(|candidate| {
-            preferred.as_ref().map_or(true, |providers| {
-                providers
-                    .iter()
-                    .any(|provider| candidate.provider.eq_ignore_ascii_case(provider))
-            })
-        })
-        .filter(|candidate| {
-            candidate
-                .accepted_rails
-                .iter()
-                .any(|rail| rail == &state.receipt_config.rail)
-        })
-        .filter(|candidate| {
-            options
-                .min_att_tier
-                .map(|min_tier| candidate.att_tier >= min_tier)
-                .unwrap_or(true)
-        })
-        .filter(|candidate| {
-            required_modalities
-                .iter()
-                .all(|modality| candidate.served_modalities.contains(modality))
-        })
-        .filter(|candidate| {
-            options.max_price_au.is_none_or(|max_price_au| {
-                price_rate_gate_basis_au(route_price_ref_au(model, Some(candidate))) <= max_price_au
-            })
-        })
-        .any(|candidate| {
-            options
-                .quant
-                .as_deref()
-                .map(|quant| candidate.quant.eq_ignore_ascii_case(quant))
-                .unwrap_or(true)
-        })
+    model.mayhem.route_candidates.iter().any(|route| {
+        route_matches_request_scope(
+            state,
+            model,
+            route,
+            options,
+            required_modalities,
+            preferred.as_deref(),
+        )
+    })
+}
+
+/// Reject only when every candidate in the caller's route scope has fresh
+/// evidence of a per-request limit violation. Occupancy, drain, cooloff and
+/// missing/stale observations cannot prove that a request is too large.
+/// Look up only this request's routes at admission, never receipt history or
+/// on every capacity-wait poll. A compatible busy provider preserves waiting.
+fn reject_proven_request_capacity_mismatch(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+    requirements: &RequestRequirements,
+) -> Result<(), ApiError> {
+    if requirements.modality_load.is_empty() {
+        return Ok(());
+    }
+    let preferred = state.preferred_provider_order(model, options);
+    let now = now_millis_u64();
+    let table = state.provider_table.lock_recover("provider table");
+    let mut proven_incompatible = false;
+    for route in model.mayhem.route_candidates.iter().filter(|route| {
+        route_matches_request_scope(
+            state,
+            model,
+            route,
+            options,
+            &requirements.required_modalities,
+            preferred.as_deref(),
+        )
+    }) {
+        let Some(heartbeat) =
+            table.fresh_heartbeat(&route_key(route), now, requirements.heartbeat_ttl_millis)
+        else {
+            return Ok(());
+        };
+        let exceeds = requirements.modality_load.iter().any(|(modality, load)| {
+            modality != "text"
+                && heartbeat
+                    .caps
+                    .modality_capacity
+                    .get(modality)
+                    .is_some_and(|capacity| {
+                        load.item_count > capacity.max_items_per_request
+                            || load.max_item_bytes > capacity.max_item_bytes
+                            || load.max_item_units > capacity.max_item_units
+                    })
+        });
+        if !exceeds {
+            return Ok(());
+        }
+        proven_incompatible = true;
+    }
+    if proven_incompatible {
+        return Err(ApiError::bad_request(
+            "request exceeds provider per-request media capacity on every matching route; reduce the number or size of media items",
+            Some("model"),
+        ).with_public_error("request_exceeds_provider_capacity", "request_validation", false));
+    }
+    Ok(())
 }
 
 fn route_wait_expired_error(options: &GatewayRequestOptions) -> ApiError {
@@ -26336,7 +26417,7 @@ async fn prepare_live_direct_chat_session(
         eligible_route_refs,
         || ordered_route_candidates_for_request_with_options(&state, &model, &request, &options),
     )
-    .await;
+    .await?;
     if !model.mayhem.route_candidates.is_empty() && eligible_route_refs.is_empty() {
         if let Some(error) = chat_context_capacity_error(&state, &model, &request, &options) {
             return Err(error);
@@ -28236,7 +28317,7 @@ async fn run_chat_with_route_retry(
         eligible_routes,
         || ordered_route_candidates_for_request_with_options(state, model, request, &options),
     )
-    .await;
+    .await?;
     if !model.mayhem.route_candidates.is_empty() && eligible_routes.is_empty() {
         if let Some(error) = chat_context_capacity_error(state, model, request, &options) {
             return Err(error);
@@ -44017,6 +44098,203 @@ mod tests {
         );
     }
 
+    fn media_capacity_fixture(
+        modality: &str,
+        limits: &[u32],
+    ) -> (GatewayState, GatewayModel, RequestRequirements) {
+        let mut model = test_routed_model(u8::try_from(limits.len()).unwrap());
+        model.mayhem.adapter.modality_set = vec![modality.to_owned()];
+        for route in &mut model.mayhem.route_candidates {
+            route.served_modalities = vec![modality.to_owned()];
+        }
+        let state = GatewayState::from_models(vec![model.clone()]);
+        let now = now_millis_u64();
+        for (route, limit) in model.mayhem.route_candidates.iter().zip(limits) {
+            let mut hb = heartbeat_for_route(&model, route, now);
+            hb.caps.modality_capacity.insert(
+                modality.to_owned(),
+                HeartbeatModalityCapacity {
+                    unit: "item".to_owned(),
+                    max_inflight_items: *limit,
+                    active_items: 0,
+                    max_items_per_request: *limit,
+                    max_item_bytes: 1024,
+                    max_item_units: 1000,
+                    working_set_bytes_per_item: 1,
+                },
+            );
+            hb.sig = "aa".repeat(64);
+            state.ingest_provider_heartbeat(hb, now);
+        }
+        let requirements = RequestRequirements {
+            required_modalities: vec![modality.to_owned()],
+            modality_load: BTreeMap::from([(
+                modality.to_owned(),
+                ModalityRequestLoad {
+                    item_count: 2,
+                    max_item_bytes: 100,
+                    max_item_units: 100,
+                },
+            )]),
+            now_millis: now,
+            ..RequestRequirements::default()
+        };
+        (state, model, requirements)
+    }
+
+    #[test]
+    fn per_request_media_capacity_checks_count_bytes_units_and_scope() {
+        for modality in ["image", "video", "audio"] {
+            let (state, model, mut requirements) = media_capacity_fixture(modality, &[1, 1]);
+            let options = GatewayRequestOptions::default();
+            for axis in 0..3 {
+                let load = requirements.modality_load.get_mut(modality).unwrap();
+                *load = ModalityRequestLoad {
+                    item_count: 1,
+                    max_item_bytes: 100,
+                    max_item_units: 100,
+                };
+                match axis {
+                    0 => load.item_count = 2,
+                    1 => load.max_item_bytes = 1025,
+                    _ => load.max_item_units = 1001,
+                }
+                let err = reject_proven_request_capacity_mismatch(
+                    &state,
+                    &model,
+                    &options,
+                    &requirements,
+                )
+                .unwrap_err();
+                assert_eq!(err.status, StatusCode::BAD_REQUEST);
+                assert_eq!(public_error_code(&err), "request_exceeds_provider_capacity");
+                assert!(!public_error_retryable(&err));
+            }
+            let (state, model, requirements) = media_capacity_fixture(modality, &[1, 2]);
+            assert!(reject_proven_request_capacity_mismatch(
+                &state,
+                &model,
+                &options,
+                &requirements
+            )
+            .is_ok());
+            let pinned = GatewayRequestOptions {
+                preferred_providers: Some(vec![model.mayhem.route_candidates[0].provider.clone()]),
+                ..options.clone()
+            };
+            assert!(reject_proven_request_capacity_mismatch(
+                &state,
+                &model,
+                &pinned,
+                &requirements
+            )
+            .is_err());
+            let absent = GatewayRequestOptions {
+                preferred_providers: Some(vec!["not-present".to_owned()]),
+                ..options
+            };
+            assert!(reject_proven_request_capacity_mismatch(
+                &state,
+                &model,
+                &absent,
+                &requirements
+            )
+            .is_ok());
+        }
+    }
+
+    #[test]
+    fn per_request_media_capacity_preserves_busy_and_unknown_routes() {
+        let (state, model, requirements) = media_capacity_fixture("image", &[1, 2]);
+        let options = GatewayRequestOptions::default();
+        let route = &model.mayhem.route_candidates[1];
+        let now = now_millis_u64();
+        let mut hb = heartbeat_for_route(&model, route, now);
+        hb.caps.modality_capacity.insert(
+            "image".to_owned(),
+            HeartbeatModalityCapacity {
+                unit: "pixel".to_owned(),
+                max_inflight_items: 2,
+                active_items: 2,
+                max_items_per_request: 2,
+                max_item_bytes: 1024,
+                max_item_units: 1000,
+                working_set_bytes_per_item: 1,
+            },
+        );
+        hb.q.free_slots = 0;
+        hb.sig = "aa".repeat(64);
+        state.ingest_provider_heartbeat(hb.clone(), now);
+        assert!(
+            reject_proven_request_capacity_mismatch(&state, &model, &options, &requirements)
+                .is_ok()
+        );
+        // Stale low capacity is not permanent evidence.
+        hb.caps
+            .modality_capacity
+            .get_mut("image")
+            .unwrap()
+            .max_items_per_request = 1;
+        hb.ts = now.saturating_sub(requirements.heartbeat_ttl_millis + 1000);
+        let stale =
+            GatewayState::from_models(vec![model.clone()]).with_provider_heartbeats(vec![hb]);
+        let snapshots = stale.provider_table.lock_recover("test table").entries(now);
+        assert!(snapshots
+            .iter()
+            .all(|entry| !entry.has_fresh_heartbeat(requirements.heartbeat_ttl_millis)));
+        assert!(
+            reject_proven_request_capacity_mismatch(&stale, &model, &options, &requirements)
+                .is_ok()
+        );
+        let missing = GatewayState::from_models(vec![model.clone()]);
+        assert!(
+            reject_proven_request_capacity_mismatch(&missing, &model, &options, &requirements)
+                .is_ok()
+        );
+        let (state, model, _) = media_capacity_fixture("image", &[1]);
+        assert!(reject_proven_request_capacity_mismatch(
+            &state,
+            &model,
+            &options,
+            &RequestRequirements::default()
+        )
+        .is_ok());
+    }
+
+    #[tokio::test]
+    async fn per_request_media_capacity_is_terminal_before_wait_or_provider_attempt() {
+        let (state, model, requirements) = media_capacity_fixture("image", &[1, 1]);
+        let options = GatewayRequestOptions {
+            max_wait_ms: 60_000,
+            ..GatewayRequestOptions::default()
+        };
+        let result = tokio::time::timeout(
+            Duration::from_millis(200),
+            wait_for_eligible_routes(
+                &state,
+                &model,
+                &options,
+                &requirements,
+                RouteWaitDeadline::new(options.max_wait_ms),
+                Vec::new(),
+                || panic!("proven incompatibility must not poll"),
+            ),
+        )
+        .await
+        .expect("reject immediately");
+        let err = result.err().expect("request validation error");
+        assert_eq!(public_error_code(&err), "request_exceeds_provider_capacity");
+        assert!(state
+            .wallet_spend
+            .lock_recover("test spend")
+            .reservations
+            .is_empty());
+        assert!(state
+            .provider_cooloffs
+            .lock_recover("test cooloffs")
+            .is_empty());
+    }
+
     #[tokio::test]
     async fn route_wait_rechecks_until_route_becomes_eligible_or_expires() {
         let model = test_routed_model(1);
@@ -50933,6 +51211,125 @@ mod tests {
         let response = artifact_generation_response_value(&request, &run);
         assert_eq!(response["object"], json!("video"));
         assert_eq!(response["status"], json!("completed"));
+    }
+
+    #[tokio::test]
+    async fn media_capacity_rejects_sync_and_async_before_acceptance_and_preserves_replay() {
+        for asynchronous in [false, true] {
+            let mut model = test_routed_model(1);
+            model.mayhem.model_class = "video-generation".to_owned();
+            model.mayhem.caps.video = true;
+            model.mayhem.caps.output_modality = Some("video".to_owned());
+            model.mayhem.caps.output_modalities = vec!["video".to_owned()];
+            model.mayhem.adapter.modality_set = vec!["video".to_owned()];
+            model.mayhem.route_candidates[0].served_modalities = vec!["video".to_owned()];
+            model.mayhem.adapter.endpoint_families =
+                vec![mayhem_proto::endpoint_family_contract_template(
+                    mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+                )
+                .unwrap()];
+            let mut heartbeat =
+                heartbeat_for_route(&model, &model.mayhem.route_candidates[0], now_millis_u64());
+            heartbeat.caps.modality_capacity.insert(
+                "video".to_owned(),
+                HeartbeatModalityCapacity {
+                    unit: "frame".to_owned(),
+                    max_inflight_items: 1,
+                    active_items: 0,
+                    max_items_per_request: 1,
+                    max_item_bytes: 1_000_000_000,
+                    max_item_units: 1,
+                    working_set_bytes_per_item: 1,
+                },
+            );
+            let state = GatewayState::from_models(vec![model.clone()])
+                .with_provider_heartbeats(vec![heartbeat]);
+            let mut headers = HeaderMap::new();
+            if asynchronous {
+                headers.insert("prefer", HeaderValue::from_static("respond-async"));
+            }
+            headers.insert(
+                "idempotency-key",
+                HeaderValue::from_static("oversized-video"),
+            );
+            let body = json!({"model":model.id, "prompt":"a quiet scene", "seconds":"4"});
+            let result = execute_artifact_generation_endpoint(
+                &state,
+                &headers,
+                body.clone(),
+                mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+                None,
+            )
+            .await;
+            let err = match result {
+                Err(err) => err,
+                _ => panic!("oversized request accepted"),
+            };
+            assert_eq!(err.status, StatusCode::BAD_REQUEST);
+            assert_eq!(public_error_code(&err), "request_exceeds_provider_capacity");
+            assert!(!err.retryable);
+            assert!(state
+                .active_job_cancellations
+                .lock_recover("test cancellations")
+                .is_empty());
+            assert!(state
+                .wallet_spend
+                .lock_recover("test spend")
+                .reservations
+                .is_empty());
+            // A prior completed invocation must still replay even after capacity decreases.
+            headers.insert(
+                "idempotency-key",
+                HeaderValue::from_static("previously-completed-video"),
+            );
+            let normalized = normalize_catalog_endpoint_request(
+                &state,
+                &model.id,
+                mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+                &body,
+            )
+            .unwrap();
+            let PreparedGatewayJob::Started(job) = prepare_gateway_job(
+                &state,
+                &headers,
+                mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+                &model.id,
+                &normalized,
+                &None,
+            )
+            .await
+            .unwrap() else {
+                panic!("fresh job")
+            };
+            state
+                .jobs
+                .lock_recover("test jobs")
+                .complete_with_error_info(
+                    &job.id,
+                    GatewayJobStatus::Completed,
+                    Some(json!({"test":"existing result"})),
+                    Vec::new(),
+                    None,
+                    None,
+                    None,
+                    now_secs(),
+                )
+                .unwrap();
+            job.unregister_cancellation();
+            let result = execute_artifact_generation_endpoint(
+                &state,
+                &headers,
+                body,
+                mayhem_proto::ENDPOINT_OPENAI_VIDEOS,
+                None,
+            )
+            .await
+            .unwrap();
+            let ArtifactEndpointOutcome::Immediate(response) = result else {
+                panic!("replay redispatched")
+            };
+            assert_eq!(response.status(), StatusCode::OK);
+        }
     }
 
     #[tokio::test]

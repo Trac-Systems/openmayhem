@@ -818,6 +818,21 @@ impl ProviderTable {
         })
     }
 
+    /// Look up current capacity evidence for one route without cloning or
+    /// traversing the provider table. Missing or stale evidence is unknown.
+    pub fn fresh_heartbeat(
+        &self,
+        key: &ProviderKey,
+        now_millis: u64,
+        heartbeat_ttl_millis: u64,
+    ) -> Option<&ProviderHeartbeat> {
+        self.contract.get(key)?;
+        let live = self.heartbeats.get(key)?;
+        (now_millis.saturating_sub(live.freshness_at_millis)
+            <= self.heartbeat_ttl_millis.min(heartbeat_ttl_millis))
+        .then_some(&live.heartbeat)
+    }
+
     pub fn entries(&self, now_millis: u64) -> Vec<ProviderTableEntry> {
         self.contract
             .iter()

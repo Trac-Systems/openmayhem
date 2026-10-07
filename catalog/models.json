@@ -30265,7 +30265,8 @@
         ],
         "evidence": [
           "Converted MiniMax_H3_ComfyUI_Workflow_Pack.zip into Mayhem canonical workflow policy JSON; no ZIP-native schema is trusted at runtime.",
-          "Text prompts and optional image references produce video with native audio. Validated canvases use 32-pixel alignment, width 256\u20131472, height 256\u20131280, at most 1,000,000 pixels per frame, up to 10 seconds, one artifact, and steps 4, 6, or 8. Source references retain the existing downsampling policy."
+          "Text prompts and optional image references produce video with native audio. Validated canvases use 32-pixel alignment, width 256\u20131472, height 256\u20131280, at most 1,000,000 pixels per frame, up to 10 seconds, one artifact, and steps 4, 6, or 8. Source references retain the existing downsampling policy.",
+          "First/last-frame conditioning verified with two 4096x4096 images at 1472x672, 243 frames and 8 steps, and identical-frame conditioning at 512x512 with native audio. Retains the calibrated per-image working-set envelope; two input images share one generation session. Native output SHA-256: 2a33fe6719ae9b462a49219465ea3e9fcdbfc912bac179198fcc1650327e9b27, 941b83c5b69ea2e81674c8bf7b91b711d1a5a6abe92d856ec81e9ffbefd5585d."
         ],
         "calibrated_fingerprints": {},
         "resource_profiles": {
@@ -30281,8 +30282,8 @@
               "calibration_baseline_memory_bytes": 17179869184,
               "calibration_peak_memory_bytes": 17383869184,
               "calibration_f13_budget_bytes": 51539607552,
-              "default_max_inflight_items": 1,
-              "default_max_items_per_request": 1
+              "default_max_inflight_items": 2,
+              "default_max_items_per_request": 2
             },
             "video": {
               "unit": "frame",
