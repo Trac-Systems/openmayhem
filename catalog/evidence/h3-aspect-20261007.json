@@ -1,0 +1,120 @@
+{
+  "model": "video.minimax_h3.lowvram_t2v_i2v",
+  "date": "2026-10-07",
+  "core_release": "0.2.268",
+  "ledger_contract_version": 29,
+  "runtime_unchanged": "comfyui-v0.32.0",
+  "catalog_revision": "85d2db25f544a7b259eebc6db3eec05551749d9b",
+  "catalog_blake3": "d340856f00854da3d98f54caecdcdab7e155baa200496d0bd9aebe1f9b413553",
+  "definition_revision": "879ad41ec300b62513303e63e652313b70f732b2",
+  "definition_root": "6b5cf5790611958407b099c0ef0440a6579d18b22094ff6f96d02a0372b42877",
+  "bounds": {
+    "min_width": 256,
+    "max_width": 1472,
+    "min_height": 256,
+    "max_height": 1280,
+    "multiple": 32,
+    "max_pixels": 1000000
+  },
+  "native_runs": [
+    {
+      "case": "landscape-720p",
+      "width": 1280,
+      "height": 736,
+      "requested_seconds": 10,
+      "steps": 4,
+      "elapsed_seconds": 528.22,
+      "min_system_available_bytes": 13614718976,
+      "passed": true,
+      "decoded_dimensions_match": true,
+      "audio_present": true
+    },
+    {
+      "case": "ultrawide-reference-720p",
+      "width": 1472,
+      "height": 640,
+      "requested_seconds": 10,
+      "steps": 8,
+      "elapsed_seconds": 964.4,
+      "min_system_available_bytes": 9074528256,
+      "passed": true,
+      "decoded_dimensions_match": true,
+      "audio_present": true
+    },
+    {
+      "case": "square-720p",
+      "width": 960,
+      "height": 960,
+      "requested_seconds": 2,
+      "steps": 6,
+      "elapsed_seconds": 108.05,
+      "min_system_available_bytes": 15878283264,
+      "passed": true,
+      "decoded_dimensions_match": true,
+      "audio_present": true
+    },
+    {
+      "case": "pixel-boundary",
+      "width": 1472,
+      "height": 672,
+      "requested_seconds": 2,
+      "steps": 4,
+      "elapsed_seconds": 92.04,
+      "min_system_available_bytes": 16169259008,
+      "passed": true,
+      "decoded_dimensions_match": true,
+      "audio_present": true
+    },
+    {
+      "case": "thin-custom",
+      "width": 1472,
+      "height": 256,
+      "requested_seconds": 1,
+      "steps": 4,
+      "elapsed_seconds": 34.01,
+      "min_system_available_bytes": 17051029504,
+      "passed": true,
+      "decoded_dimensions_match": true,
+      "audio_present": true
+    }
+  ],
+  "public_acceptance": [
+    {
+      "name": "public-portrait",
+      "width": 736,
+      "height": 1280,
+      "frames": "22",
+      "duration": "0.916667",
+      "audio": true
+    },
+    {
+      "name": "public-mcp-ultrawide",
+      "width": 1472,
+      "height": 640,
+      "frames": "56",
+      "duration": "2.333333",
+      "audio": true
+    }
+  ],
+  "paid_results": {
+    "portrait_api": {
+      "settled": true,
+      "co_signed": true,
+      "cost_usd": "0.028440"
+    },
+    "ultrawide_reference_mcp": {
+      "settled": true,
+      "co_signed": true,
+      "estimated_cost_usd": "0.052580",
+      "cost_usd": "0.052580"
+    },
+    "artifact_downloads": true
+  },
+  "notes": [
+    "Five native runs used unchanged model parts with other provider runtimes loaded. Minimum available system memory is observed headroom, not a free-memory guarantee.",
+    "New signed class requires a new canonical enclave; existing public model and reference tariff remain, but prior enclave spot-price/demand history is not copied.",
+    "Paid pixel-frames use requested duration at 24 fps, not internal 17n+5 frame padding.",
+    "Existing H3 canary fingerprints and runtime identity are unchanged; focused endpoint policy calibration passed 58/58 cases.",
+    "Broader launch canary audit has pre-existing Needle and Gemma fixture failures; it is not represented as clean."
+  ]
+}

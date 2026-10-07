@@ -29386,13 +29386,13 @@
             "kind": "huggingface",
             "publisher_key": "huggingface-repo",
             "repo": "TracNetwork/openmayhem-parts-index",
-            "revision": "f6fcf5a8d52ef0bf522a3c585ecc7deaa0ab3994"
+            "revision": "879ad41ec300b62513303e63e652313b70f732b2"
           },
           "path": "comfy/outcome-classes/v1/video.minimax_h3.lowvram_t2v_i2v.json",
-          "artifact_root": "97a766e5427a3113f364e7cfaa038a46d4de18a52f966a116a1a5f8c02301c73",
+          "artifact_root": "6b5cf5790611958407b099c0ef0440a6579d18b22094ff6f96d02a0372b42877",
           "artifact_root_kind": "blake3_merkle_v1",
-          "weights_bytes": 1070,
-          "source_sha256": "5873fa3555b8af1542ce27bdc61f04aea184006f5e43d814a4860290acd782ba",
+          "weights_bytes": 817,
+          "source_sha256": "228cedcfcefc7280cf0f565cd40146b5a110049a69fb5421a25a69c4e73459a6",
           "download_check": false,
           "notes": "Signed Comfy outcome-class definition for the converted low-VRAM MiniMax H3 text/image-to-video lane. The workflow uses the W4A8 FL2VA model, INT8 video VAE, native audio VAE, 4/6/8-step turbo LoRAs, and pinned low-VRAM custom nodes through the signed parts inventory."
         }
@@ -29410,7 +29410,7 @@
           "video",
           "audio"
         ],
-        "max_video_width": 736,
+        "max_video_width": 1472,
         "max_video_height": 1280,
         "max_video_frames": 243,
         "max_video_seconds": 10
@@ -30265,7 +30265,7 @@
         ],
         "evidence": [
           "Converted MiniMax_H3_ComfyUI_Workflow_Pack.zip into Mayhem canonical workflow policy JSON; no ZIP-native schema is trusted at runtime.",
-          "This low-VRAM lane supports text prompts plus optional image references through input_files, and serves video with native audio. The output render is limited to 736x1280, 10 seconds, one artifact, and user-selectable steps 4, 6, or 8; request-bound source reference images may be larger and are downsampled inside the signed workflow."
+          "Text prompts and optional image references produce video with native audio. Validated canvases use 32-pixel alignment, width 256\u20131472, height 256\u20131280, at most 1,000,000 pixels per frame, up to 10 seconds, one artifact, and steps 4, 6, or 8. Source references retain the existing downsampling policy."
         ],
         "calibrated_fingerprints": {},
         "resource_profiles": {
@@ -30406,6 +30406,23 @@
         "runtime_id": "comfyui-v0.32.0",
         "outcome_class": "video.minimax_h3.lowvram_t2v_i2v",
         "outcome_class_definition": {
+          "schema": "openmayhem.comfy.outcome-class-grid.v1",
+          "grid_version": 2,
+          "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-published",
+          "class_id": "video.minimax_h3.lowvram_t2v_i2v",
+          "title": "MiniMax H3 low-VRAM text/image-to-video with native audio",
+          "media": "video",
+          "lane": "minimax-h3-lowvram",
+          "pricing_unit": "pixel_frame",
+          "rate_map": [
+            {
+              "unit": "pixel_frame",
+              "per_unit_au": "1067672950634057",
+              "granularity": 1000000
+            }
+          ],
+          "per_req_au": "4300000000000000",
+          "min_session_au": "0",
           "caps": {
             "allowed_steps": [
               4,
@@ -30418,7 +30435,7 @@
             "max_megapixels_per_frame": "1",
             "max_seconds": 10,
             "native_max_height": 1280,
-            "native_max_width": 736,
+            "native_max_width": 1472,
             "output_modalities": [
               "video",
               "audio"
@@ -30433,29 +30450,12 @@
             ],
             "trained_frames_max": 243,
             "trained_frames_min": 240
-          },
-          "class_id": "video.minimax_h3.lowvram_t2v_i2v",
-          "grid_version": 2,
-          "lane": "minimax-h3-lowvram",
-          "media": "video",
-          "min_session_au": "0",
-          "per_req_au": "4300000000000000",
-          "pricing_unit": "pixel_frame",
-          "rate_map": [
-            {
-              "granularity": 1000000,
-              "per_unit_au": "1067672950634057",
-              "unit": "pixel_frame"
-            }
-          ],
-          "schema": "openmayhem.comfy.outcome-class-grid.v1",
-          "source": "COMFY-CHEATSHEET.md#minimax-h3-low-vram-published",
-          "title": "MiniMax H3 low-VRAM text/image-to-video with native audio"
+          }
         },
         "pricing_unit": "pixel_frame",
         "inventory_root": "f5ea23a6e3557c7ec434b264c16608cce3ce19c908f26eec54c347252761a72c",
         "max_nodes": 32,
-        "max_width": 736,
+        "max_width": 1472,
         "max_height": 1280,
         "max_frames": 243,
         "max_duration_seconds": 10,
@@ -30465,7 +30465,14 @@
           6,
           8
         ],
-        "max_artifacts": 1
+        "max_artifacts": 1,
+        "dimension_bounds": {
+          "min_width": 256,
+          "min_height": 256,
+          "max_pixels": 1000000,
+          "width_multiple": 32,
+          "height_multiple": 32
+        }
       },
       "canary": {
         "set_id": "canary-minimax-h3-lowvram-workflow-launch-v1",
@@ -48733,7 +48740,7 @@
             "interaction_groups": []
           }
         ],
-      "chat_template_id": "generic_chatml",
+        "chat_template_id": "generic_chatml",
         "tool_call_strategy": "none",
         "reasoning_passthrough": "strip",
         "modality_set": [
@@ -48755,20 +48762,20 @@
         },
         "resource_profiles": {}
       },
-    "speciality_assessment": {
-      "detected": [],
-      "evidence": [
-        "Pinned upstream card, configuration files, SDK implementation, and checkpoint inventory were reviewed; Laya exposes checkpoint and decision-question selection through its signed decision endpoint rather than text-generation speciality controls."
-      ],
+      "speciality_assessment": {
+        "detected": [],
+        "evidence": [
+          "Pinned upstream card, configuration files, SDK implementation, and checkpoint inventory were reviewed; Laya exposes checkpoint and decision-question selection through its signed decision endpoint rather than text-generation speciality controls."
+        ],
         "unsupported": {},
         "calibrated": {}
       },
       "sampling": {},
       "canary": {
-      "set_id": "canary-laya-decision-v1",
-      "match_min": 1,
-      "verification_method": "decision_fingerprint",
-      "fingerprints": {},
+        "set_id": "canary-laya-decision-v1",
+        "match_min": 1,
+        "verification_method": "decision_fingerprint",
+        "fingerprints": {},
         "token_prefixes": {},
         "perceptual_hashes": {},
         "embedding_vectors": {},
