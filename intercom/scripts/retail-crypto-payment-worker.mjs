@@ -10,6 +10,7 @@ import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { TAP_DEPOSIT_EVENT_SIGNATURE, tapDepositKey } from '../../contracts/scripts/tap-deposit-watcher.mjs';
 import { createLocalConfig, sleep } from './msb-local-common.mjs';
 import { waitForMinimumSignedLength } from './msb-reader-catchup.mjs';
+import { readSettlementHealth } from './retail-crypto-settlement-health.mjs';
 import {
   ERC20_TRANSFER_TOPIC,
   RetryWork,
@@ -20,7 +21,6 @@ import {
   normalizeHex64,
   normalizeTnkAddress,
   parseHexInt,
-  summarizePayoutLiabilities,
   tnkVerificationWindow,
   uniqueIntentByAmount,
   validateTapBridgePreflight,
@@ -306,40 +306,12 @@ async function coreWorkingFunds(config, rail) {
   return { balanceAu: BigInt(value.au), heldAu: legacy - released + summary, signedLength };
 }
 
-function exactEpoch(values, prefix) {
-  let latest = 0;
-  for (const entry of values ?? []) {
-    const tail = String(entry?.key ?? '').slice(prefix.length);
-    if (/^[1-9][0-9]*$/.test(tail)) latest = Math.max(latest, Number(tail));
-  }
-  return latest;
-}
-
 async function coreSettlementState(config, rail) {
-  const name = rail.toLowerCase();
-  const settlementPrefix = `settle/targeted/${name}/`;
-  const [liabilityRecords, settlementRecords, applyRecords] = await Promise.all([
-    readCore(config.coreRpc, `payout/liability/${name}/`, { prefix: true }),
-    readCore(config.coreRpc, settlementPrefix, { prefix: true }),
-    readCore(config.coreRpc, 'epoch/apply-anchor/', { prefix: true }),
-  ]);
-  if (liabilityRecords.truncated || settlementRecords.truncated || applyRecords.truncated) {
-    throw new RetryWork('settlement_state_truncated', 60);
-  }
-  const liabilities = summarizePayoutLiabilities(liabilityRecords.values ?? [], rail);
-  const currentEpoch = exactEpoch(applyRecords.values, 'epoch/apply-anchor/');
-  const lastSettledEpoch = exactEpoch(settlementRecords.values, settlementPrefix);
-  const lag = Math.max(0, currentEpoch - lastSettledEpoch);
-  const payoutStatus = liabilities.payableAu === 0n
-    ? 'current'
-    : lag <= config.settlementMaxEpochLag ? 'pending' : 'lagging';
-  return {
-    ...liabilities,
-    currentEpoch,
-    lastSettledEpoch,
-    payoutStatus,
-    lag,
-  };
+  return readSettlementHealth({
+    read: (key, options) => readCore(config.coreRpc, key, options),
+    rail,
+    maxEpochLag: config.settlementMaxEpochLag,
+  });
 }
 
 function erc20BalanceCall(address) {
