@@ -23,7 +23,7 @@ pub enum Operation {
     Decisions,
 }
 
-#[derive(Clone, Copy, Default, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorProfile {
     #[default]

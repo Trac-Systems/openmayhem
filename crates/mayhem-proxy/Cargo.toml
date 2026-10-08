@@ -18,7 +18,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
 thiserror = "2"
-tokio = { version = "1", features = ["macros", "rt", "sync", "time", "signal"] }
+tokio = { version = "1", features = ["macros", "rt", "sync", "time", "signal", "process", "io-util"] }
 url = "2"
 zeroize = "1"
 

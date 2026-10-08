@@ -10,6 +10,7 @@ pub mod connector;
 pub mod discovery;
 pub mod matching;
 pub mod supervisor;
+pub mod worker;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

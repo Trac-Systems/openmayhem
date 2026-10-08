@@ -361,7 +361,8 @@ async fn decode_http_failure(mut response: Response, profile: ErrorProfile) -> F
     )
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WireFormat {
     Json,
     Sse,
