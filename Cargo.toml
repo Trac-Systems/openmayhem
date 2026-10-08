@@ -11,6 +11,7 @@ members = [
     "crates/mayhem-hwprobe",
     "crates/mayhem-pay",
     "crates/mayhem-proto",
+    "crates/mayhem-proxy",
     "crates/mayhem-windows-sandbox",
     "crates/mayhemd",
     "services/paygate",

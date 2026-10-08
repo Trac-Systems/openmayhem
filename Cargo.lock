@@ -2741,6 +2741,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "mayhem-proxy"
+version = "0.2.271"
+dependencies = [
+ "mayhem-proto",
+ "redb",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "url",
+]
+
+[[package]]
 name = "mayhem-windows-sandbox"
 version = "0.2.271"
 dependencies = [
