@@ -7,6 +7,7 @@
 
 use crate::{
     attempts::{self, Digest, Event, FailureSnapshot, Journal, Phase, Record},
+    capacity,
     connector::{
         failure::{Code, Execution, Failure, Scope, Stage},
         http::{HttpConnection, WireFormat},
@@ -24,6 +25,8 @@ use tokio::sync::{watch, Semaphore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("proxy shared capacity: {0}")]
+    Capacity(#[from] capacity::Error),
     #[error("proxy execution configuration is invalid")]
     Configuration,
     #[error("proxy execution storage is at capacity")]
@@ -69,6 +72,13 @@ impl Storage {
         &self,
         operation: impl FnOnce(&Journal) -> attempts::Result<T> + Send + 'static,
     ) -> Result<T> {
+        self.run_checked(move |journal| operation(journal).map_err(Error::Journal))
+            .await
+    }
+    async fn run_checked<T: Send + 'static>(
+        &self,
+        operation: impl FnOnce(&Journal) -> Result<T> + Send + 'static,
+    ) -> Result<T> {
         let permit = self
             .slots
             .clone()
@@ -81,7 +91,6 @@ impl Storage {
         })
         .await
         .map_err(|_| Error::StorageWorker)?
-        .map_err(Error::Journal)
     }
     async fn current(&self, invocation: &Digest) -> Result<Record> {
         let key = invocation.clone();
@@ -154,6 +163,7 @@ pub struct Executor {
     adapter: Arc<Adapter>,
     pool: Arc<Pool>,
     storage: Arc<Storage>,
+    capacity: Option<(Arc<capacity::Authority>, Digest)>,
 }
 impl Executor {
     pub fn new(
@@ -173,7 +183,18 @@ impl Executor {
             adapter,
             pool,
             storage,
+            capacity: None,
         })
+    }
+
+    /// Configure shared local admission for this exact route. Both JSON and stream
+    /// paths then require the accepted lease immediately before durable dispatch.
+    /// This does not itself acquire capacity, authorize money, or reconcile outcomes.
+    /// The unrestricted constructor remains for lower-level protocol verification;
+    /// the public paid controller must use this configured authority.
+    pub fn with_capacity(mut self, authority: Arc<capacity::Authority>, route: Digest) -> Self {
+        self.capacity = Some((authority, route));
+        self
     }
 
     /// `invocation` must already name a durably accepted Core reservation/offer
@@ -293,9 +314,36 @@ impl Executor {
                 j.retain_request(&payload_key, attempt, &owned_body, limits.response_bytes)
             })
             .await?;
+        let capacity = self.capacity.clone();
         let ticket = self
             .storage
-            .run(move |j| j.begin_dispatch(&key, generation, now_ms()))
+            .run_checked(move |j| {
+                // Re-read one exact record after local decoder startup. Never mark
+                // capacity sent for a duplicate/stale/replaced attempt.
+                let current = j.get(&key)?.ok_or(attempts::Error::NotFound)?;
+                if current.generation != generation || current.attempt != attempt {
+                    return Err(attempts::Error::Stale.into());
+                }
+                if current.phase != Phase::Prepared {
+                    return Err(Error::RecoveryRequired);
+                }
+                if current.cancellation_requested {
+                    return Err(Error::Cancelled);
+                }
+                if let Some((authority, route)) = capacity {
+                    authority.dispatch_accepted(
+                        &current.binding.capacity_lease,
+                        &capacity::Work {
+                            invocation: key.clone(),
+                            request_hash: current.binding.request_hash.clone(),
+                        },
+                        &route,
+                    )?;
+                }
+                // If this write fails after capacity committed, the lease remains
+                // occupied/uncertain. No rollback, expiry or destructor frees it.
+                Ok(j.begin_dispatch(&key, generation, now_ms())?)
+            })
             .await?;
         let active = ready.attach(ticket)?;
         let public_id = format!("proxy_{}", record.invocation.as_str());

@@ -137,7 +137,7 @@ pub struct Identity {
     pub controller_pubkey: Digest,
 }
 impl Identity {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         require(
             !self.network_id.is_empty()
                 && self.network_id.len() <= 128
@@ -949,7 +949,7 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 }
 
 #[cfg(unix)]
-fn private_file(path: &Path) -> Result<std::fs::File> {
+pub(crate) fn private_file(path: &Path) -> Result<std::fs::File> {
     use rustix::fs::{fstat, open, FileType, Mode, OFlags};
     use std::os::unix::fs::MetadataExt;
     let parent = std::fs::metadata(path.parent().ok_or(Error::File)?).map_err(|_| Error::File)?;
@@ -974,7 +974,7 @@ fn private_file(path: &Path) -> Result<std::fs::File> {
     Ok(fd.into())
 }
 #[cfg(not(unix))]
-fn private_file(_: &Path) -> Result<std::fs::File> {
+pub(crate) fn private_file(_: &Path) -> Result<std::fs::File> {
     Err(Error::UnsupportedFileProtection)
 }
 

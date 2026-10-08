@@ -213,6 +213,16 @@ impl Fixture {
         self.prepare_kind(n, body, rail, false)
     }
     fn prepare_kind(&self, n: u64, body: &[u8], rail: ProxyRail, stream: bool) -> attempts::Record {
+        self.prepare_with_lease(n, body, rail, stream, d(11))
+    }
+    fn prepare_with_lease(
+        &self,
+        n: u64,
+        body: &[u8],
+        rail: ProxyRail,
+        stream: bool,
+        capacity_lease: Digest,
+    ) -> attempts::Record {
         let request = if stream {
             self.adapter.prepare_stream(body).unwrap()
         } else {
@@ -259,7 +269,7 @@ impl Fixture {
                     metering_policy: request.metering_policy_hash(),
                     accepted_terms: d(9),
                     reservation: d(10),
-                    capacity_lease: d(11),
+                    capacity_lease,
                     connection_digest: self.connection.fingerprint().clone(),
                     connection_revision: self.connection.revision(),
                     recipe_digest: self.adapter.recipe_hash().clone(),
@@ -1391,4 +1401,292 @@ async fn terminal_marker_finishes_even_when_upstream_keeps_sse_connection_open()
         result.unwrap().unwrap().reply.body["choices"][0]["message"]["content"],
         "ready"
     );
+}
+
+fn shared_capacity(f: &Fixture) -> Arc<mayhem_proxy::capacity::Authority> {
+    use mayhem_proxy::capacity::*;
+    let a = Arc::new(
+        Authority::open(
+            f._store.path().join("capacity"),
+            Identity {
+                network_id: "918".into(),
+                msb_bootstrap: d(1),
+                subnet_bootstrap: d(2),
+                controller_pubkey: d(3),
+            },
+            Limits {
+                max_groups: 4,
+                max_routes: 8,
+                max_leases: 20,
+                max_evidence_age: Duration::from_secs(60),
+            },
+        )
+        .unwrap(),
+    );
+    a.configure_group(d(200), 2).unwrap();
+    a.configure_route(Route {
+        id: d(201),
+        group: d(200),
+        lane: Lane::Proxy,
+        max_concurrency: 2,
+    })
+    .unwrap();
+    for scope in [Scope::Group(d(200)), Scope::Route(d(201))] {
+        capacity_ready(&a, scope);
+    }
+    a
+}
+fn capacity_ready(a: &mayhem_proxy::capacity::Authority, scope: mayhem_proxy::capacity::Scope) {
+    use mayhem_proxy::capacity::*;
+    let ticket = a.begin_observation(scope).unwrap();
+    a.observe(
+        ticket,
+        Evidence {
+            state: Readiness::Ready,
+            allowance: 2,
+            age: Duration::ZERO,
+            valid_for: Duration::from_secs(60),
+        },
+    )
+    .unwrap();
+}
+fn reserve_execution(
+    f: &Fixture,
+    a: &mayhem_proxy::capacity::Authority,
+    n: u64,
+    bytes: &[u8],
+    stream: bool,
+) -> (attempts::Record, mayhem_proxy::capacity::Reservation) {
+    let request = if stream {
+        f.adapter.prepare_stream(bytes).unwrap()
+    } else {
+        f.adapter.prepare_json(bytes).unwrap()
+    };
+    let r = a
+        .reserve(
+            &d(201),
+            mayhem_proxy::capacity::Work {
+                invocation: d(n),
+                request_hash: request.request_hash().clone(),
+            },
+        )
+        .unwrap();
+    let record = f.prepare_with_lease(n, bytes, ProxyRail::Tnk, stream, r.lease().id.clone());
+    (record, r)
+}
+
+#[tokio::test]
+async fn shared_capacity_guards_real_json_and_stream_dispatch_and_never_auto_releases_on_return() {
+    use mayhem_proxy::capacity;
+    for streaming in [false, true] {
+        let b = if streaming {
+            backend_raw(
+                200,
+                sse(
+                    &[delta("hello", json!(null)), delta("", json!("stop"))],
+                    true,
+                ),
+                "text/event-stream",
+                Duration::ZERO,
+            )
+            .await
+        } else {
+            backend(200, answer(), Duration::ZERO).await
+        };
+        let mut f = Fixture::new(&b.base, ProxyEndpoint::Chat);
+        let a = shared_capacity(&f);
+        let bytes = if streaming { stream_request() } else { chat() };
+        let (record, reservation) = reserve_execution(&f, &a, 1, &bytes, streaming);
+        f.executor = f.executor.with_capacity(a.clone(), d(201));
+        let cancel = Cancellation::default();
+        let reply = if streaming {
+            f.executor
+                .execute_stream(&record.invocation, &bytes, &cancel, |_| async { Ok(()) })
+                .await
+                .unwrap()
+        } else {
+            f.executor
+                .execute_json(&record.invocation, &bytes, &cancel)
+                .await
+                .unwrap()
+        };
+        assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+        let lease = a.lease(&reservation.lease().id).unwrap().unwrap();
+        assert_eq!(lease.phase, capacity::Phase::Dispatched);
+        assert_eq!(a.status(&d(201)).unwrap().group_occupied, 1);
+        assert!(matches!(
+            f.executor
+                .execute_json(&record.invocation, &chat(), &cancel)
+                .await,
+            Err(Error::RecoveryRequired) | Err(Error::Binding)
+        ));
+        assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+        // Only the parent's explicitly retained and validated outcome closes capacity.
+        assert!(a
+            .complete(capacity::VerifiedCompletion {
+                lease,
+                evidence: reply.result_digest
+            })
+            .unwrap());
+        assert_eq!(a.status(&d(201)).unwrap().available, 2);
+    }
+}
+
+#[tokio::test]
+async fn busy_after_reservation_stops_the_http_post_and_recovery_can_use_same_unsent_attempt() {
+    use mayhem_proxy::capacity::*;
+    let b = backend(200, answer(), Duration::ZERO).await;
+    let mut f = Fixture::new(&b.base, ProxyEndpoint::Chat);
+    let a = shared_capacity(&f);
+    let bytes = chat();
+    let (record, reservation) = reserve_execution(&f, &a, 1, &bytes, false);
+    f.executor = f.executor.with_capacity(a.clone(), d(201));
+    let ticket = a.begin_observation(Scope::Group(d(200))).unwrap();
+    a.observe(
+        ticket,
+        Evidence {
+            state: Readiness::Busy,
+            allowance: 0,
+            age: Duration::ZERO,
+            valid_for: Duration::from_secs(60),
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        f.executor
+            .execute_json(&record.invocation, &bytes, &Cancellation::default())
+            .await,
+        Err(mayhem_proxy::execution::Error::Capacity(
+            mayhem_proxy::capacity::Error::Busy
+        ))
+    ));
+    assert_eq!(b.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        f.journal.get(&record.invocation).unwrap().unwrap().phase,
+        attempts::Phase::Prepared
+    );
+    capacity_ready(&a, Scope::Group(d(200)));
+    f.executor
+        .execute_json(&record.invocation, &bytes, &Cancellation::default())
+        .await
+        .unwrap();
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        a.lease(&reservation.lease().id).unwrap().unwrap().phase,
+        mayhem_proxy::capacity::Phase::Dispatched
+    );
+}
+
+#[tokio::test]
+async fn missing_or_mismatched_capacity_never_reaches_real_upstream() {
+    for wrong in ["id", "route", "invocation", "body"] {
+        let b = backend(200, answer(), Duration::ZERO).await;
+        let mut f = Fixture::new(&b.base, ProxyEndpoint::Chat);
+        let a = shared_capacity(&f);
+        let bytes = chat();
+        let mut work = mayhem_proxy::capacity::Work {
+            invocation: d(1),
+            request_hash: f
+                .adapter
+                .prepare_json(&bytes)
+                .unwrap()
+                .request_hash()
+                .clone(),
+        };
+        if wrong == "invocation" {
+            work.invocation = d(999);
+        }
+        if wrong == "body" {
+            work.request_hash = d(999);
+        }
+        let reservation = a.reserve(&d(201), work).unwrap();
+        let lease = if wrong == "id" {
+            d(999)
+        } else {
+            reservation.lease().id.clone()
+        };
+        let record = f.prepare_with_lease(1, &bytes, ProxyRail::Tap, false, lease);
+        f.executor = f
+            .executor
+            .with_capacity(a.clone(), if wrong == "route" { d(999) } else { d(201) });
+        assert!(
+            matches!(
+                f.executor
+                    .execute_json(&record.invocation, &bytes, &Cancellation::default())
+                    .await,
+                Err(Error::Capacity(_))
+            ),
+            "{wrong}"
+        );
+        assert_eq!(b.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            f.journal.get(&record.invocation).unwrap().unwrap().phase,
+            Phase::Prepared
+        );
+        a.cancel_reserved(reservation).unwrap();
+    }
+}
+
+#[tokio::test]
+async fn dropped_guarded_transport_keeps_capacity_occupied_and_cannot_redispatch() {
+    let b = backend(200, answer(), Duration::from_millis(250)).await;
+    let mut f = Fixture::new(&b.base, ProxyEndpoint::Chat);
+    let a = shared_capacity(&f);
+    let bytes = chat();
+    let (record, reservation) = reserve_execution(&f, &a, 1, &bytes, false);
+    f.executor = f.executor.with_capacity(a.clone(), d(201));
+    let cancel = Cancellation::default();
+    {
+        let future = f.executor.execute_json(&record.invocation, &bytes, &cancel);
+        tokio::pin!(future);
+        tokio::select! { result=&mut future=>panic!("unexpected early result {result:?}"),_=async { while b.calls.load(Ordering::SeqCst) == 0 { tokio::time::sleep(Duration::from_millis(2)).await; } }=>() }
+    }
+    assert_eq!(a.status(&d(201)).unwrap().group_occupied, 1);
+    assert_eq!(
+        a.lease(&reservation.lease().id).unwrap().unwrap().phase,
+        mayhem_proxy::capacity::Phase::Dispatched
+    );
+    assert!(matches!(
+        f.executor
+            .execute_json(&record.invocation, &bytes, &cancel)
+            .await,
+        Err(Error::RecoveryRequired)
+    ));
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn guarded_concurrent_replay_has_one_post_and_two_store_gap_requires_reconciliation() {
+    for gap in [false, true] {
+        let b = backend(200, answer(), Duration::from_millis(30)).await;
+        let mut f = Fixture::new(&b.base, ProxyEndpoint::Chat);
+        let a = shared_capacity(&f);
+        let bytes = chat();
+        let (record, reservation) = reserve_execution(&f, &a, 1, &bytes, false);
+        if gap {
+            drop(a.dispatch(&reservation).unwrap());
+        }
+        f.executor = f.executor.with_capacity(a.clone(), d(201));
+        let cancel = Cancellation::default();
+        let (one, two) = tokio::join!(
+            f.executor.execute_json(&record.invocation, &bytes, &cancel),
+            f.executor.execute_json(&record.invocation, &bytes, &cancel)
+        );
+        if gap {
+            assert!(one.is_err() && two.is_err());
+            assert_eq!(b.calls.load(Ordering::SeqCst), 0);
+            assert_eq!(
+                f.journal.get(&record.invocation).unwrap().unwrap().phase,
+                Phase::Prepared
+            );
+        } else {
+            assert_eq!(usize::from(one.is_ok()) + usize::from(two.is_ok()), 1);
+            assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+        }
+        assert_eq!(a.status(&d(201)).unwrap().group_occupied, 1);
+        assert_eq!(
+            a.lease(&reservation.lease().id).unwrap().unwrap().phase,
+            mayhem_proxy::capacity::Phase::Dispatched
+        );
+    }
 }
