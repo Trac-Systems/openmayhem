@@ -377,14 +377,21 @@ impl Verifier {
                     .ok_or_else(bad_output)?
                 {
                     match item.get("type").and_then(Value::as_str) {
-                        Some("function_call") => self.tool(
-                            item.get("name")
-                                .and_then(Value::as_str)
-                                .ok_or_else(bad_output)?,
-                            item.get("arguments")
-                                .and_then(Value::as_str)
-                                .ok_or_else(bad_output)?,
-                        )?,
+                        Some("function_call")
+                            if !(value.get("status").and_then(Value::as_str)
+                                == Some("incomplete")
+                                && item.get("status").and_then(Value::as_str)
+                                    == Some("incomplete")) =>
+                        {
+                            self.tool(
+                                item.get("name")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(bad_output)?,
+                                item.get("arguments")
+                                    .and_then(Value::as_str)
+                                    .ok_or_else(bad_output)?,
+                            )?
+                        }
                         Some("message")
                             if value.get("status").and_then(Value::as_str) == Some("completed") =>
                         {

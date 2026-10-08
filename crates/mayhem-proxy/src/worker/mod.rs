@@ -250,7 +250,10 @@ fn emit(
             let value = serde_json::from_slice::<serde_json::Value>(&body).ok();
             if value.as_ref().is_some_and(|v| {
                 v.get("error").is_some_and(serde_json::Value::is_object)
-                    || v.get("type").and_then(serde_json::Value::as_str) == Some("error")
+                    || matches!(
+                        v.get("type").and_then(serde_json::Value::as_str),
+                        Some("error" | "response.failed")
+                    )
             }) {
                 return Err(protocol());
             }

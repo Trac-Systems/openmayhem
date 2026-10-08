@@ -3,6 +3,7 @@
 //! Full structured-output/tool-argument schema validation belongs to the bounded
 //! semantic verifier before this result may authorize delivery/execution/settlement.
 
+mod responses_stream;
 pub mod stream;
 
 use crate::{
@@ -71,6 +72,107 @@ fn name(s: &str) -> bool {
 }
 fn string<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
     v.get(key).and_then(Value::as_str).ok_or(Error::Protocol)
+}
+
+// Known public response data only. Consumers must still render text/URLs as
+// untrusted model output; these references never authorize broker URL fetching.
+fn response_part(value: &Value, item_kind: &str, summary: bool) -> Result<Value> {
+    let kind = string(value, "type")?;
+    require(match (item_kind, summary, kind) {
+        ("message", false, "output_text" | "refusal")
+        | ("reasoning", false, "reasoning_text")
+        | ("reasoning", true, "summary_text") => true,
+        _ => false,
+    })?;
+    let key = if kind == "refusal" { "refusal" } else { "text" };
+    let mut result = json!({"type":kind,key:string(value,key)?});
+    if kind == "output_text" {
+        let annotations = match value.get("annotations") {
+            Some(v) => v
+                .as_array()
+                .ok_or(Error::Protocol)?
+                .iter()
+                .map(response_annotation)
+                .collect::<Result<Vec<_>>>()?,
+            None => vec![],
+        };
+        result["annotations"] = json!(annotations);
+        result["logprobs"] = value
+            .get("logprobs")
+            .map(response_logprobs)
+            .transpose()?
+            .unwrap_or_else(|| json!([]));
+    }
+    Ok(result)
+}
+fn response_annotation(value: &Value) -> Result<Value> {
+    if value.is_null() {
+        return Ok(Value::Null);
+    }
+    let kind = string(value, "type")?;
+    let (strings, numbers): (&[&str], &[&str]) = match kind {
+        "url_citation" => (&["url", "title"], &["start_index", "end_index"]),
+        "file_citation" => (&["file_id", "filename"], &["index"]),
+        "container_file_citation" => (
+            &["container_id", "file_id", "filename"],
+            &["start_index", "end_index"],
+        ),
+        "file_path" => (&["file_id"], &["index"]),
+        _ => return Err(Error::Protocol),
+    };
+    let mut clean = json!({"type":kind});
+    for key in strings {
+        clean[*key] = json!(string(value, key)?);
+    }
+    for key in numbers {
+        let n = value
+            .get(*key)
+            .and_then(Value::as_u64)
+            .ok_or(Error::Protocol)?;
+        require(n <= 9_007_199_254_740_991)?;
+        clean[*key] = json!(n);
+    }
+    if numbers.contains(&"start_index") {
+        require(clean["start_index"].as_u64() <= clean["end_index"].as_u64())?;
+    }
+    if kind == "url_citation" {
+        let u = url::Url::parse(string(value, "url")?).map_err(|_| Error::Protocol)?;
+        require(
+            matches!(u.scheme(), "http" | "https")
+                && u.host_str().is_some()
+                && u.username().is_empty()
+                && u.password().is_none(),
+        )?;
+    }
+    Ok(clean)
+}
+fn response_logprobs(value: &Value) -> Result<Value> {
+    fn token(value: &Value) -> Result<Value> {
+        require(value.is_object())?;
+        let mut out = json!({});
+        if let Some(t) = value.get("token") {
+            require(t.is_string())?;
+            out["token"] = t.clone();
+        }
+        if let Some(p) = value.get("logprob") {
+            require(p.as_f64().is_some_and(|v| v.is_finite() && v <= 0.))?;
+            out["logprob"] = p.clone();
+        }
+        require(!out.as_object().unwrap().is_empty())?;
+        Ok(out)
+    }
+    let values = value.as_array().ok_or(Error::Protocol)?;
+    let mut clean = Vec::with_capacity(values.len());
+    for value in values {
+        let mut t = token(value)?;
+        if let Some(top) = value.get("top_logprobs") {
+            let top = top.as_array().ok_or(Error::Protocol)?;
+            require(top.len() <= 20)?;
+            t["top_logprobs"] = Value::Array(top.iter().map(token).collect::<Result<Vec<_>>>()?);
+        }
+        clean.push(t);
+    }
+    Ok(Value::Array(clean))
 }
 
 /// Explicit local resource bounds, not maximum model context or generation time.
@@ -185,7 +287,7 @@ impl Adapter {
     pub fn prepare_stream(&self, bytes: &[u8]) -> Result<Request> {
         if !matches!(
             self.endpoint,
-            ProxyEndpoint::Chat | ProxyEndpoint::Completions
+            ProxyEndpoint::Chat | ProxyEndpoint::Completions | ProxyEndpoint::Responses
         ) {
             return Err(invalid(Some("stream"), Code::UnsupportedControl));
         }
@@ -590,63 +692,25 @@ impl Request {
             .and_then(Value::as_array)
             .ok_or(Error::Protocol)?;
         require(raw.len() <= self.limits.tools + self.limits.choices)?;
-        let function_items = Value::Array(
-            raw.iter()
-                .filter(|v| v.get("type").and_then(Value::as_str) == Some("function_call"))
-                .cloned()
-                .collect(),
-        );
-        let calls = self.calls(&function_items, true)?;
-        let mut calls = calls.into_iter();
+        let mut call_ids = BTreeSet::new();
         let mut output = Vec::with_capacity(raw.len());
         let mut ids = BTreeSet::new();
         let mut refusal = false;
         for item in raw {
             let id = string(item, "id")?;
             require(identifier(id) && ids.insert(id))?;
-            let cleaned = match string(item, "type")? {
-                "function_call" => calls.next().ok_or(Error::Protocol)?,
-                "message" => {
-                    require(string(item, "role")? == "assistant")?;
-                    require(item.get("status").is_none_or(|s| {
-                        s == "completed" || (status == "incomplete" && s == "incomplete")
-                    }))?;
-                    let parts = item
-                        .get("content")
-                        .and_then(Value::as_array)
-                        .ok_or(Error::Protocol)?;
-                    let mut content = Vec::with_capacity(parts.len());
-                    for part in parts {
-                        match string(part,"type")? {
-                            "output_text" => content.push(json!({"type":"output_text","text":string(part,"text")?,"annotations":[]})),
-                            "refusal" => { refusal=true; content.push(json!({"type":"refusal","refusal":string(part,"refusal")?})); },
-                            _ => return Err(Error::Protocol),
-                        }
-                    }
-                    json!({"id":id,"type":"message","role":"assistant","status":if status=="completed" {"completed"} else {"incomplete"},"content":content})
-                }
-                "reasoning" => {
-                    let summary = item
-                        .get("summary")
-                        .and_then(Value::as_array)
-                        .ok_or(Error::Protocol)?;
-                    let mut clean = Vec::with_capacity(summary.len());
-                    for part in summary {
-                        require(string(part, "type")? == "summary_text")?;
-                        clean.push(json!({"type":"summary_text","text":string(part,"text")?}));
-                    }
-                    json!({"id":id,"type":"reasoning","summary":clean})
-                }
-                _ => return Err(Error::Protocol),
-            };
+            let cleaned = self.response_item(item, status)?;
+            if cleaned["type"] == "function_call" {
+                require(call_ids.insert(string(item, "call_id")?))?;
+            }
+            refusal |= cleaned
+                .get("content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| parts.iter().any(|p| p["type"] == "refusal"));
             output.push(cleaned);
         }
-        require(
-            !self.require_tool
-                || !function_items.as_array().unwrap().is_empty()
-                || refusal
-                || status == "incomplete",
-        )?;
+        require(!self.require_tool || !call_ids.is_empty() || refusal || status == "incomplete")?;
+        require(call_ids.len() <= self.limits.tools && (self.parallel || call_ids.len() <= 1))?;
         let mut result = json!({"object":"response","status":status,"output":output});
         if status == "incomplete" {
             let reason = value
@@ -657,6 +721,82 @@ impl Request {
             result["incomplete_details"] = json!({"reason":reason});
         }
         Ok(result)
+    }
+    fn response_item(&self, item: &Value, response_status: &str) -> Result<Value> {
+        let id = string(item, "id")?;
+        require(identifier(id))?;
+        let kind = string(item, "type")?;
+        let status = item
+            .get("status")
+            .map(|_| string(item, "status"))
+            .transpose()?;
+        require(status.is_none_or(|s| {
+            s == "completed"
+                || (response_status == "in_progress" && s == "in_progress")
+                || (response_status == "incomplete" && s == "incomplete")
+        }))?;
+        if response_status == "in_progress" {
+            require(status.is_none_or(|s| s == "in_progress"))?;
+        }
+        let status = status.unwrap_or(response_status);
+        match kind {
+            "function_call" => {
+                let call_id = string(item, "call_id")?;
+                let name = string(item, "name")?;
+                let arguments = string(item, "arguments")?;
+                require(
+                    !self.forbid_tools
+                        && identifier(call_id)
+                        && self.tools.contains(name)
+                        && self.forced_tool.as_ref().is_none_or(|n| n == name),
+                )?;
+                if status == "completed" {
+                    let parsed: Value =
+                        serde_json::from_str(arguments).map_err(|_| Error::Protocol)?;
+                    require(parsed.is_object())?;
+                }
+                Ok(
+                    json!({"id":id,"type":kind,"call_id":call_id,"name":name,"arguments":arguments,"status":status}),
+                )
+            }
+            "message" | "reasoning" => {
+                let mut result = json!({"id":id,"type":kind});
+                if kind == "message" {
+                    require(string(item, "role")? == "assistant")?;
+                    result["role"] = json!("assistant");
+                    result["status"] = json!(status);
+                    require(item.get("content").is_some())?;
+                } else if item.get("status").is_some() {
+                    result["status"] = json!(status);
+                }
+                for (field, summary) in [("content", false), ("summary", true)] {
+                    if summary && kind != "reasoning" {
+                        continue;
+                    }
+                    let parts = match item.get(field) {
+                        Some(v) => v.as_array().ok_or(Error::Protocol)?,
+                        None => {
+                            result[field] = json!([]);
+                            continue;
+                        }
+                    };
+                    result[field] = Value::Array(
+                        parts
+                            .iter()
+                            .map(|p| response_part(p, kind, summary))
+                            .collect::<Result<Vec<_>>>()?,
+                    );
+                }
+                if kind == "reasoning" {
+                    if let Some(v) = item.get("encrypted_content").filter(|v| !v.is_null()) {
+                        require(v.is_string())?;
+                        result["encrypted_content"] = v.clone();
+                    }
+                }
+                Ok(result)
+            }
+            _ => Err(Error::Protocol),
+        }
     }
     fn decode_decisions(&self, value: &Value) -> Result<Value> {
         let answers = value

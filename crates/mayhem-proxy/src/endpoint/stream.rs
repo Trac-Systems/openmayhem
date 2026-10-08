@@ -21,6 +21,46 @@ struct Choice {
     finish: Option<String>,
 }
 pub struct Stream<'a> {
+    kind: Kind<'a>,
+}
+enum Kind<'a> {
+    Completion(CompletionStream<'a>),
+    Responses(super::responses_stream::ResponsesStream<'a>),
+}
+impl<'a> Stream<'a> {
+    pub fn new(request: &'a Request, public_id: &str, created: u64) -> Result<Self> {
+        Ok(Self {
+            kind: if request.endpoint == ProxyEndpoint::Responses {
+                Kind::Responses(super::responses_stream::ResponsesStream::new(
+                    request, public_id, created,
+                )?)
+            } else {
+                Kind::Completion(CompletionStream::new(request, public_id, created)?)
+            },
+        })
+    }
+    pub fn is_done(&self) -> bool {
+        match &self.kind {
+            Kind::Completion(s) => s.is_done(),
+            Kind::Responses(s) => s.is_done(),
+        }
+    }
+    /// Deltas are provisional, including function arguments. Completion events
+    /// belong to the final verified/durable reply, not this consumer callback.
+    pub fn push(&mut self, frame: Decoded) -> Result<Option<Value>> {
+        match &mut self.kind {
+            Kind::Completion(s) => s.push(frame),
+            Kind::Responses(s) => s.push(frame),
+        }
+    }
+    pub fn finish(self) -> Result<Value> {
+        match self.kind {
+            Kind::Completion(s) => s.finish(),
+            Kind::Responses(s) => s.finish(),
+        }
+    }
+}
+struct CompletionStream<'a> {
     request: &'a Request,
     public_id: String,
     created: u64,
@@ -31,7 +71,7 @@ pub struct Stream<'a> {
     done: bool,
     failed: bool,
 }
-impl<'a> Stream<'a> {
+impl<'a> CompletionStream<'a> {
     pub fn new(request: &'a Request, public_id: &str, created: u64) -> Result<Self> {
         if !request.streaming
             || !identifier(public_id)

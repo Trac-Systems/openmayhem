@@ -29,6 +29,8 @@ use tokio::{
     net::TcpListener,
     task::JoinHandle,
 };
+#[path = "support/responses.rs"]
+mod response_fixture;
 
 fn d(n: u64) -> Digest {
     Digest::new(format!("{n:064x}")).unwrap()
@@ -633,6 +635,135 @@ fn stream_request() -> Vec<u8> {
     let mut body: Value = serde_json::from_slice(&chat()).unwrap();
     body["stream"] = json!(true);
     serde_json::to_vec(&body).unwrap()
+}
+
+#[tokio::test]
+async fn responses_events_use_real_worker_schema_checks_and_never_emit_unverified_completion() {
+    for (arguments, valid) in [
+        (r#"{"city":"München"}"#, true),
+        (r#"{"city":12}"#, false),
+        ("{}", false),
+    ] {
+        let events = response_fixture::flow(arguments);
+        let backend = backend_raw(
+            200,
+            sse(&events, false),
+            "text/event-stream",
+            Duration::ZERO,
+        )
+        .await;
+        let fixture = Fixture::new(&backend.base, ProxyEndpoint::Responses);
+        let bytes = response_fixture::body();
+        let record = fixture.prepare_kind(1, &bytes, ProxyRail::Tap, true);
+        let mut provisional = Vec::new();
+        let result = fixture
+            .executor
+            .execute_stream(&record.invocation, &bytes, &Cancellation::default(), |v| {
+                provisional.push(v);
+                async { Ok(()) }
+            })
+            .await;
+        assert_eq!(result.is_ok(), valid, "{arguments}: {result:?}");
+        assert!(!provisional.is_empty());
+        for value in provisional {
+            assert!(!value["type"].as_str().unwrap().ends_with(".done"));
+            assert_ne!(value["type"], "response.completed");
+            assert!(!value.to_string().contains("private-upstream-settings"));
+            assert!(value.get("usage").is_none());
+        }
+        if valid {
+            let result = result.unwrap();
+            assert_eq!(result.reply.body["output"][2]["arguments"], arguments);
+            assert_eq!(result.reply.body["model"], "public-model");
+            assert_eq!(result.reply.reported_usage.unwrap().output_tokens, 12);
+            assert!(result.reply.body.get("usage").is_none());
+        }
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        let current = fixture.journal.get(&record.invocation).unwrap().unwrap();
+        assert_eq!(current.phase, Phase::Dispatched);
+        assert_eq!(current.last_failure.is_some(), !valid);
+        assert!(current.closure.is_none());
+    }
+}
+
+#[tokio::test]
+async fn responses_failed_envelope_retains_safe_cause_without_vendor_text_or_replay() {
+    for (code, expected) in [
+        ("invalid_api_key", Code::UpstreamAuthentication),
+        ("insufficient_quota", Code::UpstreamPaymentRequired),
+        ("server_error", Code::UpstreamUnavailable),
+    ] {
+        let mut events = response_fixture::flow(r#"{"city":"München"}"#);
+        events.truncate(2);
+        response_fixture::append(
+            &mut events,
+            "response.failed",
+            json!({"response":{"id":"upstream-response","object":"response","status":"failed","error":{"code":code,"message":"private-credential-data"}}}),
+        );
+        let backend = backend_raw(
+            200,
+            sse(&events, false),
+            "text/event-stream",
+            Duration::ZERO,
+        )
+        .await;
+        let fixture = Fixture::new(&backend.base, ProxyEndpoint::Responses);
+        let bytes = response_fixture::body();
+        let r = fixture.prepare_kind(1, &bytes, ProxyRail::Fiat, true);
+        let result = fixture
+            .executor
+            .execute_stream(&r.invocation, &bytes, &Cancellation::default(), |_| async {
+                Ok(())
+            })
+            .await;
+        assert!(result.is_err());
+        assert!(!format!("{result:?}").contains("private-credential-data"));
+        let current = fixture.journal.get(&r.invocation).unwrap().unwrap();
+        let failure = current.last_failure.unwrap();
+        assert_eq!(failure.code, expected);
+        assert_eq!(failure.execution, Execution::Unknown);
+        assert!(current.closure.is_none());
+        assert!(matches!(
+            fixture
+                .executor
+                .execute_stream(&r.invocation, &bytes, &Cancellation::default(), |_| async {
+                    Ok(())
+                })
+                .await,
+            Err(Error::RecoveryRequired)
+        ));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn responses_structured_text_checks_original_schema_and_allows_explicit_refusal() {
+    for (text, refusal, valid) in [
+        (r#"{"ids":["a","b"]}"#, false, true),
+        (r#"{"ids":["a","a"]}"#, false, false),
+        ("Cannot answer", true, true),
+    ] {
+        let events = response_fixture::text_flow(text, refusal);
+        let backend = backend_raw(
+            200,
+            sse(&events, false),
+            "text/event-stream",
+            Duration::ZERO,
+        )
+        .await;
+        let fixture = Fixture::new(&backend.base, ProxyEndpoint::Responses);
+        let bytes=serde_json::to_vec(&json!({"model":"public-model","input":"Give unique ids","stream":true,
+            "text":{"format":{"type":"json_schema","name":"ids","strict":true,"schema":{"type":"object","required":["ids"],"properties":{"ids":{"type":"array","uniqueItems":true,"items":{"type":"string"},"minItems":2}}}}}})).unwrap();
+        let r = fixture.prepare_kind(1, &bytes, ProxyRail::Tnk, true);
+        let result = fixture
+            .executor
+            .execute_stream(&r.invocation, &bytes, &Cancellation::default(), |_| async {
+                Ok(())
+            })
+            .await;
+        assert_eq!(result.is_ok(), valid, "{text}: {result:?}");
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
 }
 
 #[tokio::test]

@@ -172,7 +172,9 @@ pub fn openai_stream_error(body: &[u8]) -> Option<Failure> {
         return None;
     }
     let value: Value = serde_json::from_slice(body).ok()?;
-    let normalized = if value.get("error").is_some_and(Value::is_object) {
+    let normalized = if value.get("type").and_then(Value::as_str) == Some("response.failed") {
+        serde_json::json!({"error":value.pointer("/response/error")?})
+    } else if value.get("error").is_some_and(Value::is_object) {
         value
     } else if value.get("type").and_then(Value::as_str) == Some("error") {
         serde_json::json!({"error": value})
@@ -224,7 +226,7 @@ pub fn openai_error(
         }
         (404 | 405, _) => (Code::UpstreamEndpointUnavailable, Scope::Connection),
         (408 | 504, _) => (Code::UpstreamTimeout, Scope::Model),
-        (500..=599, _) => (Code::UpstreamUnavailable, Scope::Model),
+        (500..=599, _) | (_, Some("server_error")) => (Code::UpstreamUnavailable, Scope::Model),
         _ => (Code::UpstreamProtocol, Scope::Model),
     };
     let mut failure = Failure::new(code, scope, Stage::ResponseHeaders, Execution::Unknown);
@@ -248,6 +250,7 @@ pub(crate) fn safe_upstream_code(value: &str) -> Option<&'static str> {
         Some("insufficient_quota") => Some("insufficient_quota"),
         Some("invalid_api_key") => Some("invalid_api_key"),
         Some("overloaded_error") => Some("overloaded_error"),
+        Some("server_error") => Some("server_error"),
         _ => None,
     }
 }
