@@ -1,10 +1,11 @@
 #![forbid(unsafe_code)]
 
-//! Proxy-only control-plane components. A catalog record is neither runtime
+//! Proxy-only control and connector components. A catalog record is neither runtime
 //! capacity evidence nor authorization to accept or settle an inference request.
 
 pub mod catalog;
 pub mod cli;
+pub mod connector;
 pub mod discovery;
 pub mod matching;
 pub mod supervisor;

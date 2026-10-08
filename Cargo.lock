@@ -2115,6 +2115,9 @@ name = "ipnet"
 version = "2.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
+dependencies = [
+ "serde",
+]
 
 [[package]]
 name = "is_terminal_polyfill"
@@ -2747,16 +2750,21 @@ version = "0.2.271"
 dependencies = [
  "base64 0.22.1",
  "blake3",
+ "bytes",
  "clap",
+ "httpdate",
+ "ipnet",
  "mayhem-proto",
  "redb",
  "reqwest",
+ "rustix",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "url",
+ "zeroize",
 ]
 
 [[package]]
