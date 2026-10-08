@@ -4,7 +4,10 @@
 //! capacity evidence nor authorization to accept or settle an inference request.
 
 pub mod catalog;
+pub mod cli;
 pub mod discovery;
+pub mod matching;
+pub mod supervisor;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

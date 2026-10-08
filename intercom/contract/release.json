@@ -2,7 +2,7 @@
   "schema": 1,
   "release_version": "0.2.271",
   "contract_version": 30,
-  "contract_code_sha256": "9c47b6267594a97bc3930ef959bcdfb0b05a88e01fc36b627c4c675cd76c6066",
+  "contract_code_sha256": "e1e851c7ffd1791198218e2f85543a486417a7debd07438268ebbf6e8095b562",
   "files": [
     {
       "path": "contract/contract.js",
@@ -78,7 +78,7 @@
     },
     {
       "path": "features/mayhem/proxy-discovery.js",
-      "sha256": "139a5ef7de5fe48f5c66996b80f0f8655842213fcea91f553f445fdf007a54ce"
+      "sha256": "793ef0a47f11219fdcc67a824f640489de9de492b460b40ac19bb4b3b503966d"
     },
     {
       "path": "features/mayhem/proxy-publication-journal.js",

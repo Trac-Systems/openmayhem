@@ -511,6 +511,11 @@ enum Commands {
 
 #[derive(Debug, Subcommand)]
 enum ProviderCommands {
+    /// Configure and inspect the separate proxy lane (LLMs and decisions).
+    Proxy {
+        #[command(subcommand)]
+        command: mayhem_proxy::cli::Command,
+    },
     /// List this provider wallet's active canonical enclaves and rooms.
     List(ProviderListArgs),
     /// Show provider serving state and local gateway route visibility.
@@ -7234,6 +7239,13 @@ async fn mayhem_main() -> Result<()> {
 
 async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()> {
     let result = match command {
+        ProviderCommands::Proxy { command } => {
+            // Proxy errors already have sanitized, actionable Display messages.
+            // The native model-setup mapper would discard their actual cause.
+            return mayhem_proxy::cli::run(command).await.map_err(|error| {
+                if verbose { anyhow::Error::new(error) } else { anyhow::anyhow!(error.to_string()) }
+            });
+        }
         ProviderCommands::List(args) => provider_list(args).await,
         ProviderCommands::Health(args) => provider_health(args).await,
         ProviderCommands::Rails { command } => match command {

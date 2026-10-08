@@ -99,6 +99,54 @@ fn incomplete_snapshot_survives_restart_and_is_never_visible() {
 }
 
 #[test]
+fn long_traversal_freshness_uses_first_observation_across_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("catalog");
+    {
+        let catalog = open(&path);
+        catalog
+            .apply(
+                &catalog.refresh_ticket().unwrap(),
+                &page(10, vec![row(1)], None, Some(1)),
+                1000,
+            )
+            .unwrap();
+    }
+    let catalog = open(&path);
+    let status = catalog
+        .apply(
+            &catalog.refresh_ticket().unwrap(),
+            &page(10, vec![row(2)], None, None),
+            100000,
+        )
+        .unwrap();
+    assert_eq!(
+        status.committed.as_ref().unwrap().observed_at_ms,
+        Some(1000)
+    );
+    assert!(!status.discovery_is_fresh(100001, 2000));
+    let status = catalog
+        .apply(
+            &catalog.refresh_ticket().unwrap(),
+            &page(11, vec![], Some(proof(10)), None),
+            100002,
+        )
+        .unwrap();
+    assert!(
+        status.discovery_is_fresh(100003, 2000),
+        "a fresh complete delta restores freshness"
+    );
+    let mut legacy = serde_json::to_value(status.committed.as_ref().unwrap()).unwrap();
+    legacy.as_object_mut().unwrap().remove("observed_at_ms");
+    let mut unknown_age = status.clone();
+    unknown_age.committed = Some(serde_json::from_value(legacy).unwrap());
+    assert!(
+        !unknown_age.discovery_is_fresh(100003, 2000),
+        "unknown old-cache age is not fresh evidence"
+    );
+}
+
+#[test]
 fn delta_delete_update_and_insertion_commit_together_and_fence_stale_responses() {
     let dir = tempfile::tempdir().unwrap();
     let catalog = open(&dir.path().join("catalog"));

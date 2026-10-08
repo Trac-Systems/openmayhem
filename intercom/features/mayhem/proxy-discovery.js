@@ -164,8 +164,10 @@ export function createProxyDiscovery(peer, contractVersion, {
       const base = { version: 1, network: network(current.context), query: queryBinding(query), proof: current.proof };
       // Partial pages never advance a hydration checkpoint. Apply all pages before
       // replacing a previous checkpoint, and revalidate eligibility before dispatch.
+      // Expire idle cursors, not an actively advancing large traversal. Each token
+      // still pins the original snapshot and the last row actually returned.
       const nextCursor = truncated ? signToken({ ...base, kind: 'page', since, after,
-        issued_at: page?.issued_at ?? at, expires_at: page?.expires_at ?? at + pageMaxAgeMs }) : null;
+        issued_at: at, expires_at: at + pageMaxAgeMs }) : null;
       const checkpoint = truncated ? null : signToken({ ...base, kind: 'checkpoint', since: null, after: null,
         issued_at: at, expires_at: at + checkpointMaxAgeMs });
       return { ok: true, lane: 'proxy', schema_version: 1, request_nonce: request.request_nonce,

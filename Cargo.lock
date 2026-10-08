@@ -2580,6 +2580,7 @@ dependencies = [
  "mayhem-gateway",
  "mayhem-hwprobe",
  "mayhem-proto",
+ "mayhem-proxy",
  "reqwest",
  "semver",
  "serde",
@@ -2744,6 +2745,9 @@ dependencies = [
 name = "mayhem-proxy"
 version = "0.2.271"
 dependencies = [
+ "base64 0.22.1",
+ "blake3",
+ "clap",
  "mayhem-proto",
  "redb",
  "reqwest",

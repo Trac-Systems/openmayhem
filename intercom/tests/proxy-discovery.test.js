@@ -187,6 +187,25 @@ test('cursor signatures, expiry, query/network binding and snapshot identity fai
   assert.equal((await f.request(query)).ok, true, 'expiry permits fresh traversal');
 });
 
+test('active pagination renews cursor inactivity expiry without changing the snapshot', async t => {
+  const f = await fixture(t, { pageMaxAgeMs: 1000 });
+  await f.write(project(Array.from({ length: 5 }, (_, n) => [`proxy/v1/market/${hex(n + 1)}`, market(n + 1)])));
+  const query = { kind: 'markets', limit: 1 };
+  let page = await f.request(query);
+  const proof = page.proof;
+  const ids = [page.entries[0].value.id];
+  for (let n = 0; n < 2; n++) {
+    f.tick(800);
+    page = await f.request({ ...query, cursor: page.next_cursor });
+    assert.deepEqual(page.proof, proof);
+    ids.push(page.entries[0].value.id);
+    assert.equal(page.checkpoint, null);
+  }
+  assert.deepEqual(ids, [1, 2, 3], 'active traversal survives its first token expiry');
+  f.tick(1001);
+  await assert.rejects(f.request({ ...query, cursor: page.next_cursor }), error => error.code === 'proxy_cursor_expired');
+});
+
 test('byte and record bounds paginate large rows without dropping the first over-budget record', async t => {
   const f = await fixture(t);
   await f.write(Array.from({ length: 25 }, (_, n) => [`${CATALOG}markets/${hex(n + 1)}`, { id: n, description: 'x'.repeat(16000) }]));

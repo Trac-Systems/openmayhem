@@ -15,6 +15,7 @@ use crate::discovery::{
     Context, DiscoveryClient, Entry, Identity, Mode, Page, Proof, Query, CATALOG_PREFIX,
     MAX_PAGE_ENTRIES, MAX_PAGE_ENTRY_BYTES,
 };
+use crate::matching::{update_index, INDEX, INDEX_VERSION, STAGED_INDEX};
 use crate::{db, invalid, require, Error, Result};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("proxy_catalog_metadata_v1");
@@ -31,6 +32,10 @@ pub struct Committed {
     pub context: Context,
     pub checkpoint: String,
     pub completed_at_ms: u64,
+    /// First observation of this pinned snapshot, not the end of pagination.
+    /// Old cache metadata without this field remains stale until refreshed.
+    #[serde(default)]
+    pub observed_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -42,12 +47,16 @@ struct Pending {
     mode: Mode,
     last_key: String,
     next_cursor: String,
+    #[serde(default)]
+    observed_at_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct State {
     schema_version: u32,
+    #[serde(default)]
+    index_version: u32,
     identity: Identity,
     generation: u64,
     invalidated: bool,
@@ -70,7 +79,10 @@ impl State {
         if self.identity != *identity {
             return Err(Error::Identity);
         }
-        require(self.schema_version == 1, "unsupported catalog cache schema")?;
+        require(
+            self.schema_version == 1 && self.index_version <= INDEX_VERSION,
+            "unsupported catalog cache schema",
+        )?;
         if let Some(c) = &self.committed {
             c.proof.validate()?;
             require(
@@ -164,9 +176,10 @@ impl Status {
         !self.invalidated
             && max_age_ms > 0
             && self.committed.as_ref().is_some_and(|c| {
-                now_ms
-                    .checked_sub(c.completed_at_ms)
-                    .is_some_and(|age| age <= max_age_ms)
+                now_ms >= c.completed_at_ms
+                    && c.observed_at_ms
+                        .and_then(|observed| now_ms.checked_sub(observed))
+                        .is_some_and(|age| age <= max_age_ms)
             })
     }
 }
@@ -205,7 +218,7 @@ impl Catalog {
                 .map(|v| decode_state(v.value(), &identity))
                 .transpose()?
         };
-        if let Some(state) = existing {
+        if let Some(mut state) = existing {
             // Check the bounded metadata/table boundary, without reading every
             // catalog record during startup. Missing tables are corruption.
             let tables = db(tx.list_tables())?.collect::<Vec<_>>();
@@ -219,13 +232,43 @@ impl Catalog {
                 has_staged == state.pending.is_some(),
                 "catalog staging state is inconsistent",
             )?;
-            if let Some(pending) = state.pending {
+            if let Some(pending) = &state.pending {
                 let staged = db(tx.open_table(STAGED))?;
                 let last = db(staged.last())?;
                 require(
                     last.as_ref()
                         .is_some_and(|(key, _)| key.value() == pending.last_key),
                     "catalog staged boundary is inconsistent",
+                )?;
+            }
+            if state.index_version < INDEX_VERSION {
+                // Rebuild derived indexes through bounded background hydration,
+                // never a startup scan of the entire old cache or ledger.
+                require(
+                    !tables
+                        .iter()
+                        .any(|t| t.name() == INDEX.name() || t.name() == STAGED_INDEX.name()),
+                    "unexpected prior catalog index",
+                )?;
+                db(tx.delete_table(STAGED))?;
+                db(tx.open_table(INDEX))?;
+                state.pending = None;
+                state.invalidated = true;
+                state.index_version = INDEX_VERSION;
+                state.advance()?;
+                save_state(&tx, &state)?;
+            } else {
+                require(
+                    tables.iter().any(|t| t.name() == INDEX.name()),
+                    "catalog match index is missing",
+                )?;
+                require(
+                    tables.iter().any(|t| t.name() == STAGED_INDEX.name())
+                        == state
+                            .pending
+                            .as_ref()
+                            .is_some_and(|p| p.mode == Mode::Snapshot),
+                    "catalog staged index is inconsistent",
                 )?;
             }
         } else {
@@ -236,10 +279,12 @@ impl Catalog {
                 "unrecognized catalog database",
             )?;
             db(tx.open_table(CURRENT))?;
+            db(tx.open_table(INDEX))?;
             save_state(
                 &tx,
                 &State {
                     schema_version: 1,
+                    index_version: INDEX_VERSION,
                     identity: identity.clone(),
                     generation: 0,
                     invalidated: true,
@@ -332,20 +377,35 @@ impl Catalog {
                 "initial refresh must be a full snapshot",
             )?;
         }
+        // A long traversal must not make an old snapshot appear newly observed.
+        // Preserve None from older pending metadata; its age is unknown.
+        let observed_at_ms = state
+            .pending
+            .as_ref()
+            .map_or(Some(completed_at_ms), |pending| pending.observed_at_ms);
         // A new traversal starts from an empty staging table. Writes and cursor
         // persist together in one crash-safe transaction after full validation.
         if page.mode == Mode::Snapshot || page.truncated {
             let mut staged = db(tx.open_table(STAGED))?;
+            let mut staged_index = if page.mode == Mode::Snapshot {
+                Some(db(tx.open_table(STAGED_INDEX))?)
+            } else {
+                None
+            };
             if state.pending.is_none() {
                 require(db(staged.is_empty())?, "orphaned catalog staging data")?;
             }
             for entry in &page.entries {
                 let bytes = serde_json::to_vec(&entry.value)?;
                 db(staged.insert(entry.key.as_str(), bytes.as_slice()))?;
+                if let Some(index) = staged_index.as_mut() {
+                    update_index(index, &entry.key, None, &entry.value)?;
+                }
             }
         }
         if page.truncated {
             state.pending = Some(Pending {
+                observed_at_ms,
                 proof: page.proof.clone(),
                 context: page.context.clone(),
                 base_proof: page.base_proof.clone(),
@@ -366,16 +426,28 @@ impl Catalog {
                 Mode::Snapshot => {
                     db(tx.delete_table(CURRENT))?;
                     db(tx.rename_table(STAGED, CURRENT))?;
+                    db(tx.delete_table(INDEX))?;
+                    db(tx.rename_table(STAGED_INDEX, INDEX))?;
                 }
                 Mode::Changes => {
                     // Stream only the changed rows from disk; no history scan,
                     // whole-catalog clone or materialized delta vector.
                     {
                         let mut current = db(tx.open_table(CURRENT))?;
+                        let mut index = db(tx.open_table(INDEX))?;
                         if state.pending.is_some() {
                             let staged = db(tx.open_table(STAGED))?;
                             for entry in db(staged.iter())? {
                                 let (key, value) = db(entry)?;
+                                let old = db(current.get(key.value()))?
+                                    .map(|v| serde_json::from_slice::<Value>(v.value()))
+                                    .transpose()?;
+                                update_index(
+                                    &mut index,
+                                    key.value(),
+                                    old.as_ref(),
+                                    &serde_json::from_slice(value.value())?,
+                                )?;
                                 if value.value() == b"null" {
                                     db(current.remove(key.value()))?;
                                 } else {
@@ -387,6 +459,10 @@ impl Catalog {
                         // write it twice or mutate a table being retired in this
                         // same transaction (unsupported by the pinned redb).
                         for entry in &page.entries {
+                            let old = db(current.get(entry.key.as_str()))?
+                                .map(|v| serde_json::from_slice::<Value>(v.value()))
+                                .transpose()?;
+                            update_index(&mut index, &entry.key, old.as_ref(), &entry.value)?;
                             if entry.value.is_null() {
                                 db(current.remove(entry.key.as_str()))?;
                             } else {
@@ -399,6 +475,7 @@ impl Catalog {
                 }
             }
             state.committed = Some(Committed {
+                observed_at_ms,
                 proof: page.proof.clone(),
                 context: page.context.clone(),
                 checkpoint: page
@@ -423,6 +500,7 @@ impl Catalog {
         let tx = db(self.database.begin_write())?;
         let mut state = self.state_for_ticket(&tx, ticket)?;
         db(tx.delete_table(STAGED))?;
+        db(tx.delete_table(STAGED_INDEX))?;
         state.pending = None;
         state.invalidated = true;
         state.advance()?;
@@ -497,7 +575,7 @@ pub enum RefreshOutcome {
 /// The metadata and rows share a single MVCC read snapshot, even if a refresh
 /// commits concurrently. Drop promptly; retaining old readers retains disk pages.
 pub struct CatalogRead {
-    tx: ReadTransaction,
+    pub(crate) tx: ReadTransaction,
     state: State,
 }
 

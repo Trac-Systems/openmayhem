@@ -35,7 +35,12 @@ const peer = { ...registry.peer,
 };
 let now = 100000;
 const feature = new MayhemFeature(peer, {}); feature.key = 'mayhem';
-feature.proxyDiscovery = createProxyDiscovery(peer, CONTRACT_VERSION, { now: () => now });
+const discover = createProxyDiscovery(peer, CONTRACT_VERSION, { now: () => now });
+let failed = false;
+feature.proxyDiscovery = async request => {
+  if (failed) throw Object.assign(new Error('fixture busy'), { code: 'proxy_discovery_busy' });
+  return discover(request);
+};
 peer.protocol = { instance: { features: { mayhem: feature } } };
 const server = createServer(peer);
 await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
@@ -49,6 +54,8 @@ try {
       await write([...registry.storage.values]);
       await write([[extra[0][0], null], [extra[1][0], { enabled: false, label: 'Family 1' }]]);
     } else if (command === 'expire') { now += 8 * 24 * 60 * 60 * 1000; }
+    else if (command === 'fail') { failed = true; }
+    else if (command === 'recover') { failed = false; }
     else if (command === 'stop') break;
     else throw new Error('Unknown fixture command');
     console.log(JSON.stringify({ done: command }));
