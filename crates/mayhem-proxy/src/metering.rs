@@ -577,3 +577,56 @@ pub fn price_completed(recovery: &Recovery, remaining_au: MoneyAu) -> Result<Ver
         subtotal_au,
     })
 }
+
+/// Prepare an UNSIGNED final receipt from owned, independently recounted output.
+/// The parent supplies retained canonical terms/policy and an exact prior head.
+/// This does not authorize signatures, debit a buyer, release a hold or update a
+/// payout. Current offers, contract version and wall-clock quote expiry are not
+/// consulted when recovering previously accepted work.
+pub fn draft_completed_receipt(
+    recovery: &Recovery,
+    terms: &mayhem_proto::proxy::finance::ProxySpendTerms,
+    policy: &mayhem_proto::proxy::finance::ProxySettlementPolicy,
+    seq: u64,
+    at_ms: u64,
+    previous: Option<&mayhem_proto::proxy::finance::ProxyReceiptBody>,
+) -> Result<mayhem_proto::proxy::finance::ProxyReceiptBody> {
+    use mayhem_proto::proxy::finance::{ProxyReceiptBody, ProxyReceiptOutcome};
+    let b = &recovery.record.binding;
+    if terms.digest().map_err(|_| Error::Offer)? != b.accepted_terms.as_str()
+        || terms.request_hash != b.request_hash.as_str()
+        || terms.contract_version != b.contract_version
+        || terms.reservation_id != b.reservation.as_str()
+        || terms.capacity_lease != b.capacity_lease.as_str()
+        || terms.endpoint_contract != b.endpoint_contract.as_str()
+        || terms.recipe_hash != b.recipe_digest.as_str()
+        || terms.connection_digest != b.connection_digest.as_str()
+        || terms.connection_revision != b.connection_revision
+        || terms.offer.digest().map_err(|_| Error::Offer)? != b.offer_digest.as_str()
+        || terms.rail != b.rail
+    {
+        return Err(Error::Offer);
+    }
+    let verified = price_completed(recovery, terms.max_spend_au)?;
+    let receipt = ProxyReceiptBody {
+        schema_version: 1,
+        lane: mayhem_proto::proxy::ProxyLane::Proxy,
+        accepted_terms: b.accepted_terms.as_str().into(),
+        seq,
+        final_receipt: true,
+        outcome: ProxyReceiptOutcome::Complete,
+        result_hash: verified.result_digest.as_str().into(),
+        observation_hash: verified.digest()?.as_str().into(),
+        usage: verified.observation.units,
+        au_owed_cum: verified.subtotal_au,
+        billing_au_owed_cum: terms
+            .prior_spend_au
+            .checked_add(verified.subtotal_au)
+            .ok_or(Error::Overflow)?,
+        at_ms,
+    };
+    receipt
+        .validate_for(terms, policy, previous)
+        .map_err(|_| Error::Evidence)?;
+    Ok(receipt)
+}

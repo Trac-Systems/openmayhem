@@ -133,6 +133,10 @@ function signingBytes(domain, value) {
   return b4a.from(`${domain}\0${canonicalBody(value)}`, 'utf8');
 }
 
+// Identical bounded canonicalization for proxy financial records, without
+// changing native voucher/receipt bytes or introducing another JSON encoder.
+export { signingBytes as proxyCanonicalSigningBytes };
+
 export function validateProxyMarket(value) {
   shape(value, ['schema_version', 'lane', 'creator_pubkey', 'slug', 'model', 'family', 'endpoints', 'metering', 'pricing']);
   base(value);

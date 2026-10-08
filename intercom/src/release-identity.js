@@ -16,6 +16,7 @@ export const CONTRACT_CODE_PATHS = Object.freeze([
   'contract/protocol.js',
   'contract/proxy-context.js',
   'contract/proxy-discovery.js',
+  'contract/proxy-finance.js',
   'contract/proxy-policy.js',
   'contract/proxy-protocol.js',
   'contract/proxy-registry.js',

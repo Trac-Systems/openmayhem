@@ -2,7 +2,7 @@
   "schema": 1,
   "release_version": "0.2.271",
   "contract_version": 30,
-  "contract_code_sha256": "e1e851c7ffd1791198218e2f85543a486417a7debd07438268ebbf6e8095b562",
+  "contract_code_sha256": "486c07fcba1394b38b16a763c1e74197bf400a08f0577aafa8301ca1b24c6338",
   "files": [
     {
       "path": "contract/contract.js",
@@ -49,12 +49,16 @@
       "sha256": "5207336c9f2ea152b3b8d3c799e65bbe0e0aebe62156423d6190d0b4d19111a0"
     },
     {
+      "path": "contract/proxy-finance.js",
+      "sha256": "9c0aa8f6af75d74b5fd50d78dc15290a5e4d795b5f8031497f86e507a2899f3d"
+    },
+    {
       "path": "contract/proxy-policy.js",
       "sha256": "de1884ef3c1ebd2cb7f9a35e5ea7e0fe05fff361410e014c73193accff403663"
     },
     {
       "path": "contract/proxy-protocol.js",
-      "sha256": "84993a6fda6c2c1db6ecfce678ca3961a811a2362f92e12c4d4b991e26c7d46d"
+      "sha256": "d7ffea33510e08b8f97b1b32fa3771aa27d7ba72dd4ce6d86c08f78be34c2e54"
     },
     {
       "path": "contract/proxy-registry.js",

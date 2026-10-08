@@ -11,6 +11,8 @@ use serde_json::Value;
 
 use crate::{decimal_u128, MoneyAu};
 
+pub mod finance;
+
 pub const PROXY_SCHEMA_VERSION: u32 = 1;
 pub const PROXY_MARKET_DOMAIN: &str = "mayhem/proxy/market/v1";
 pub const PROXY_MEMBERSHIP_DOMAIN: &str = "mayhem/proxy/membership/v1";

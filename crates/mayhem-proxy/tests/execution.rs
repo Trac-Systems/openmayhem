@@ -497,6 +497,30 @@ async fn owned_usage_prices_the_accepted_offer_once_with_rail_and_budget_binding
             };
             let mut binding = b.clone();
             binding.offer_digest = Digest::new(offer.digest().unwrap()).unwrap();
+            // Wire terms are supplied by the parent; this test verifies the real
+            // HTTP -> worker -> retained evidence -> unsigned receipt boundary.
+            let wire: Value = serde_json::from_str(include_str!(
+                "../../mayhem-proto/tests/fixtures/proxy-finance-v1.json"
+            ))
+            .unwrap();
+            let financial_policy: mayhem_proto::proxy::finance::ProxySettlementPolicy =
+                serde_json::from_value(wire["cases"][0]["policy"].clone()).unwrap();
+            let mut terms: mayhem_proto::proxy::finance::ProxySpendTerms =
+                serde_json::from_value(wire["cases"][0]["terms"].clone()).unwrap();
+            terms.offer = offer.clone();
+            terms.rail = rail;
+            terms.request_hash = binding.request_hash.as_str().into();
+            terms.reservation_id = binding.reservation.as_str().into();
+            terms.capacity_lease = binding.capacity_lease.as_str().into();
+            terms.endpoint_contract = binding.endpoint_contract.as_str().into();
+            terms.recipe_hash = binding.recipe_digest.as_str().into();
+            terms.connection_digest = binding.connection_digest.as_str().into();
+            terms.connection_revision = binding.connection_revision;
+            terms.max_usage = offer.rates.iter().map(|r| (r.unit.clone(), 1024)).collect();
+            terms.max_spend_au = offer.cost(&terms.max_usage).unwrap();
+            terms.max_total_spend_au =
+                terms.prior_spend_au + terms.prior_reserved_au + terms.max_spend_au;
+            binding.accepted_terms = Digest::new(terms.digest().unwrap()).unwrap();
             let r = fixture.journal.prepare(d(n + 100), binding, 1000).unwrap();
             fixture
                 .journal
@@ -524,6 +548,48 @@ async fn owned_usage_prices_the_accepted_offer_once_with_rail_and_budget_binding
                 .fold(5, |s, n| s + (u128::from(*n) * 7).div_ceil(3))
                 .max(10);
             assert_eq!(quoted.subtotal_au, expected);
+            let receipt =
+                metering::draft_completed_receipt(&saved, &terms, &financial_policy, 1, 2000, None)
+                    .unwrap();
+            assert_eq!(receipt.au_owed_cum, expected);
+            assert_eq!(receipt.billing_au_owed_cum, expected + terms.prior_spend_au);
+            assert_eq!(receipt.usage, quoted.observation.units);
+            let original_digest = receipt.digest().unwrap();
+            let reopened = fixture.journal.recover(&r.invocation, r.attempt).unwrap();
+            assert_eq!(
+                metering::draft_completed_receipt(
+                    &reopened,
+                    &terms,
+                    &financial_policy,
+                    1,
+                    2000,
+                    Some(&receipt)
+                )
+                .unwrap()
+                .digest()
+                .unwrap(),
+                original_digest
+            );
+            let mut repriced = terms.clone();
+            repriced.offer.rates[0].per_unit_au += 1;
+            assert!(metering::draft_completed_receipt(
+                &saved,
+                &repriced,
+                &financial_policy,
+                1,
+                2000,
+                None
+            )
+            .is_err());
+            assert!(metering::draft_completed_receipt(
+                &saved,
+                &terms,
+                &financial_policy,
+                2,
+                2001,
+                Some(&receipt)
+            )
+            .is_err());
             assert_eq!(
                 metering::price_completed(&saved, expected)
                     .unwrap()
