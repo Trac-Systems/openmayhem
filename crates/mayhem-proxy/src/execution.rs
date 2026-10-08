@@ -1,8 +1,8 @@
 //! Parent-owned, one-attempt JSON and stream execution. This connects durable intent, the
 //! protected HTTP broker and a supervised decoder without retrying a POST.
 //! Canonical offer/reservation/lease acceptance precedes this API. The returned
-//! reply passes protocol and supported schema checks, but still needs retained
-//! result evidence and independently verified Core metering. This module cannot
+//! reply passes protocol and supported schema checks and is retained privately,
+//! but still needs independently verified Core metering. This module cannot
 //! close holds, sign receipts or release model slots.
 
 use crate::{
@@ -87,6 +87,12 @@ impl Storage {
         let key = invocation.clone();
         self.run(move |j| j.get(&key)?.ok_or(attempts::Error::NotFound))
             .await
+    }
+    /// Local exact-attempt recovery only. No upstream request or financial action.
+    /// The caller must authorize ownership before returning payloads to a buyer.
+    pub async fn recover(&self, invocation: &Digest, attempt: u64) -> Result<attempts::Recovery> {
+        let key = invocation.clone();
+        self.run(move |j| j.recover(&key, attempt)).await
     }
     async fn event(&self, invocation: &Digest, attempt: u64, event: Event) -> Result<Record> {
         let key = invocation.clone();
@@ -267,6 +273,14 @@ impl Executor {
         }
         let key = invocation.clone();
         let generation = record.generation;
+        let attempt = record.attempt;
+        let owned_body = bytes.to_vec();
+        let payload_key = key.clone();
+        self.storage
+            .run(move |j| {
+                j.retain_request(&payload_key, attempt, &owned_body, limits.response_bytes)
+            })
+            .await?;
         let ticket = self
             .storage
             .run(move |j| j.begin_dispatch(&key, generation, now_ms()))
@@ -291,11 +305,14 @@ impl Executor {
         // a scan of receipts. On future drop the durable Dispatched record remains.
         match outcome {
             Ok(reply) => {
-                if let Some(id) = reply.upstream_id.clone() {
-                    self.storage
-                        .event(invocation, record.attempt, Event::Accepted(id))
-                        .await?;
-                }
+                let key = invocation.clone();
+                let attempt = record.attempt;
+                // Retain the complete validated result before exposing a final
+                // success. Even a late cancellation needs this recovery evidence.
+                let owned = self
+                    .storage
+                    .run(move |j| j.retain_result(&key, attempt, &reply, now_ms()))
+                    .await?;
                 // Check cancellation written by another controller while in flight.
                 let current = self.storage.current(invocation).await?;
                 if current.attempt != record.attempt || current.phase != Phase::Dispatched {
@@ -309,7 +326,8 @@ impl Executor {
                 }
                 Ok(UnsettledReply {
                     attempt: current,
-                    reply,
+                    reply: owned.reply,
+                    result_digest: owned.digest,
                 })
             }
             Err(Error::Cancelled) => {
@@ -319,6 +337,15 @@ impl Executor {
                 Err(Error::Cancelled)
             }
             Err(error) => {
+                // Parent storage failure is not evidence against the upstream.
+                // Retain the uncertain attempt; a failing journal cannot safely
+                // manufacture a provider-fault observation or release anything.
+                if matches!(
+                    &error,
+                    Error::Journal(_) | Error::StorageCapacity | Error::StorageWorker
+                ) {
+                    return Err(error);
+                }
                 let failure = match &error {
                     Error::Upstream(f) => f.clone(),
                     Error::Decoder(worker::Error::Upstream(f)) => f.clone(),
@@ -372,6 +399,7 @@ impl Executor {
             .await?;
         let mut stream =
             crate::endpoint::stream::Stream::new(request, public_id, record.created_at_ms / 1000)?;
+        let mut saved_upstream_id = false;
         while let Some(chunk) = response.next_chunk().await.map_err(Error::Upstream)? {
             let mut receive = |frame| {
                 let piece = stream.push(frame).map_err(|_| worker::Error::Protocol);
@@ -387,14 +415,27 @@ impl Executor {
                     Ok(())
                 }
             };
-            decoder.push(&chunk, &mut receive).await.map_err(|e| {
+            let pushed = decoder.push(&chunk, &mut receive).await;
+            drop(receive);
+            if !saved_upstream_id {
+                if let Some(id) = stream.upstream_id() {
+                    self.storage
+                        .event(
+                            &record.invocation,
+                            record.attempt,
+                            Event::Accepted(attempts::RemoteId::new(id)?),
+                        )
+                        .await?;
+                    saved_upstream_id = true;
+                }
+            }
+            pushed.map_err(|e| {
                 if matches!(e, worker::Error::Cancelled) {
                     Error::Cancelled
                 } else {
                     Error::Decoder(e)
                 }
             })?;
-            drop(receive);
             if stream.is_done() {
                 break;
             }
@@ -487,11 +528,13 @@ impl Executor {
 }
 
 /// No automatic settlement or buyer delivery. The integration must validate
-/// remaining endpoint capabilities, meter independently, durably retain this result
-/// and reconcile accepted financial/capacity state before closing the journal.
+/// remaining endpoint capabilities, meter independently and reconcile accepted
+/// financial/capacity state before closing the journal. The result is retained.
 pub struct UnsettledReply {
     pub attempt: Record,
     pub reply: ProtocolReply,
+    /// Private retained result commitment, not independently metered usage or a receipt.
+    pub result_digest: Digest,
 }
 impl fmt::Debug for UnsettledReply {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

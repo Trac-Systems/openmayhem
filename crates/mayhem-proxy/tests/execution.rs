@@ -139,6 +139,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(base: &str, endpoint: ProxyEndpoint) -> Self {
+        Self::with_payload_limit(base, endpoint, 128 * 1024 * 1024)
+    }
+    fn with_payload_limit(base: &str, endpoint: ProxyEndpoint, payload_limit: u64) -> Self {
         let store = dir();
         let work = dir();
         let journal = Arc::new(
@@ -154,6 +157,7 @@ impl Fixture {
                     max_records: 50,
                     max_unfinished: 50,
                     closed_retention_ms: 1000,
+                    max_payload_bytes: payload_limit,
                 },
             )
             .unwrap(),
@@ -767,6 +771,90 @@ async fn responses_structured_text_checks_original_schema_and_allows_explicit_re
 }
 
 #[tokio::test]
+async fn storage_capacity_is_reserved_before_post_and_retained_result_recovers_without_network() {
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let blocked = Fixture::with_payload_limit(&backend.base, ProxyEndpoint::Chat, 1);
+    let body = chat();
+    let r = blocked.prepare(1, &body, ProxyRail::Fiat);
+    assert!(matches!(
+        blocked
+            .executor
+            .execute_json(&r.invocation, &body, &Cancellation::default())
+            .await,
+        Err(Error::Journal(attempts::Error::Capacity))
+    ));
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        blocked.journal.get(&r.invocation).unwrap().unwrap().phase,
+        Phase::Prepared
+    );
+
+    let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let r = fixture.prepare(2, &body, ProxyRail::Tap);
+    let result = fixture
+        .executor
+        .execute_json(&r.invocation, &body, &Cancellation::default())
+        .await
+        .unwrap();
+    let expected = result.reply.body.clone();
+    let commitment = result.result_digest.clone();
+    assert!(fixture.journal.allocated_payload_bytes().unwrap() > 0);
+    assert_eq!(fixture.journal.prune_closed(u64::MAX, 64).unwrap(), 0);
+    let Fixture {
+        _store: store,
+        _work: work,
+        journal,
+        executor,
+        adapter,
+        connection,
+    } = fixture;
+    drop(executor);
+    drop(journal);
+    drop(adapter);
+    drop(connection);
+    let reopened = Arc::new(
+        Journal::open(
+            store.path().join("journal"),
+            Identity {
+                network_id: "918".into(),
+                msb_bootstrap: d(1),
+                subnet_bootstrap: d(2),
+                controller_pubkey: d(3),
+            },
+            attempts::Limits {
+                max_records: 50,
+                max_unfinished: 50,
+                closed_retention_ms: 1000,
+                max_payload_bytes: 1,
+            },
+        )
+        .unwrap(),
+    );
+    let storage = Storage::new(reopened.clone(), 2).unwrap();
+    let recovered = storage.recover(&r.invocation, r.attempt).await.unwrap();
+    assert_eq!(recovered.request.unwrap().body, body);
+    let retained = recovered.result.unwrap();
+    assert_eq!(retained.reply.body, expected);
+    assert_eq!(retained.digest, commitment);
+    assert_eq!(recovered.record.binding.rail, ProxyRail::Tap);
+    assert_eq!(recovered.record.phase, Phase::Dispatched);
+    assert!(recovered.record.closure.is_none());
+    assert!(reopened
+        .begin_dispatch(
+            &r.invocation,
+            recovered.record.generation,
+            recovered.record.updated_at_ms
+        )
+        .is_err());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert!(!format!("{retained:?}").contains("hello"));
+    drop(storage);
+    drop(reopened);
+    drop(work);
+    drop(store);
+}
+
+#[tokio::test]
 async fn streaming_delivers_only_provisional_chunks_and_preserves_final_shape() {
     let chunks = [
         delta("Hello ", Value::Null),
@@ -879,6 +967,9 @@ async fn missing_terminal_changed_provider_and_midstream_error_are_not_success()
                 Code::UpstreamProtocol
             }
         );
+        assert_eq!(current.remote_id.unwrap().as_str(), "stream_1");
+        let retained = fixture.journal.recover(&r.invocation, r.attempt).unwrap();
+        assert!(retained.request.is_some() && retained.result.is_none());
     }
 }
 

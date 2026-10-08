@@ -45,6 +45,12 @@ impl<'a> Stream<'a> {
             Kind::Responses(s) => s.is_done(),
         }
     }
+    pub fn upstream_id(&self) -> Option<&str> {
+        match &self.kind {
+            Kind::Completion(s) => s.upstream_id.as_deref(),
+            Kind::Responses(s) => s.upstream_id(),
+        }
+    }
     /// Deltas are provisional, including function arguments. Completion events
     /// belong to the final verified/durable reply, not this consumer callback.
     pub fn push(&mut self, frame: Decoded) -> Result<Option<Value>> {

@@ -54,6 +54,9 @@ impl<'a> ResponsesStream<'a> {
     pub(super) fn is_done(&self) -> bool {
         self.terminal.is_some() && !self.failed
     }
+    pub(super) fn upstream_id(&self) -> Option<&str> {
+        self.upstream_id.as_deref()
+    }
     pub(super) fn push(&mut self, frame: Decoded) -> Result<Option<Value>> {
         if self.failed {
             return Err(Error::Protocol);

@@ -274,6 +274,29 @@ fn response_function_calls_are_checked_and_vendor_control_fields_removed() {
 }
 
 #[test]
+fn normalized_result_cannot_expand_beyond_reserved_response_body_capacity() {
+    let raw = json!({"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}]});
+    let adapter = Adapter::new(
+        ProxyEndpoint::Chat,
+        endpoint_family_contract_template(mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS).unwrap(),
+        "backend".into(),
+        Limits {
+            request_bytes: 1024,
+            response_bytes: serde_json::to_vec(&raw).unwrap().len(),
+            choices: 1,
+            tools: 1,
+            questions: 1,
+            decision_options: 1,
+        },
+    )
+    .unwrap();
+    let request = adapter
+        .prepare_json(br#"{"model":"public-model","messages":[{"role":"user","content":"hi"}]}"#)
+        .unwrap();
+    assert!(request.decode_json(raw, "public_id", 0).is_err());
+}
+
+#[test]
 fn decisions_validate_every_question_type_exact_ids_labels_probabilities_and_scores() {
     let adapter = adapter(ProxyEndpoint::Decisions);
     let body = json!({"model":"decisions","state":"An ordinary text","questions":{"topic":{"type":"choice","instructions":"topic","criteria":{"a":"A","b":"B","c":"C"}},"grade":{"type":"score","instructions":"grade","criteria":["low","high"]},"urgent":{"type":"noul","instructions":"urgent?"}}});

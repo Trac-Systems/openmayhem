@@ -494,13 +494,16 @@ impl fmt::Debug for Request {
 }
 
 /// Validated *syntax and consistency*, never trusted for billing or rate floors.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReportedUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_input_tokens: Option<u64>,
     pub reasoning_tokens: Option<u64>,
 }
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ProtocolReply {
     pub body: Value,
     pub reported_usage: Option<ReportedUsage>,
@@ -570,6 +573,14 @@ impl Request {
         }] = json!(created);
         // Deliberately do not copy upstream mayhem/receipt/cost/provider metadata.
         // Independent metering will populate the public usage/receipt fields.
+        // Added public identities/defaults must fit the same result bound. This
+        // also makes pre-dispatch storage reservation sufficient for this body.
+        require(
+            serde_json::to_vec(&body)
+                .map_err(|_| Error::Protocol)?
+                .len()
+                <= self.limits.response_bytes,
+        )?;
         Ok(ProtocolReply {
             body,
             reported_usage,

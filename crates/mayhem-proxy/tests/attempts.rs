@@ -34,6 +34,7 @@ fn limits() -> Limits {
         max_records: 500,
         max_unfinished: 200,
         closed_retention_ms: 1000,
+        max_payload_bytes: 128 * 1024 * 1024,
     }
 }
 fn binding() -> Binding {
@@ -441,6 +442,7 @@ fn full_journal_refuses_new_work_but_allows_recovery_closure_and_replay() {
         max_records: 2,
         max_unfinished: 1,
         closed_retention_ms: 1000,
+        max_payload_bytes: 128 * 1024 * 1024,
     };
     let j = Journal::open(&path, identity(), tiny).unwrap();
     let r = prepared(&j, 1);
@@ -592,6 +594,7 @@ fn shortening_retention_cannot_overwrite_an_older_attempt_when_a_key_is_reused()
         identity(),
         Limits {
             closed_retention_ms: 1,
+            max_payload_bytes: 128 * 1024 * 1024,
             ..limits()
         },
     )

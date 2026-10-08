@@ -4,7 +4,11 @@
 //! Losing an acknowledgment leaves uncertainty, not permission for a fresh POST.
 //! Only independently checked evidence may resolve an attempt or acknowledge its
 //! financial/capacity closure. Hashes here bind that evidence; they do not verify it.
-//! No prompts, credentials, token history or connector-authored monetary values.
+//! Private bounded request/result payloads live in separate owned tables. They
+//! are not diagnostic logs. No credentials or connector-authored monetary values.
+
+mod payloads;
+pub use payloads::{OwnedRequest, OwnedResult, Recovery};
 
 use std::{
     fmt,
@@ -369,6 +373,9 @@ pub struct Limits {
     pub max_unfinished: u64,
     /// Explicit caller policy; no implicit commercial retention promise.
     pub closed_retention_ms: u64,
+    /// Logical bytes held for private request/results, including reserved result
+    /// space before dispatch. Filesystem pages and journal overhead are additional.
+    pub max_payload_bytes: u64,
 }
 impl Limits {
     fn validate(&self) -> Result<()> {
@@ -389,6 +396,8 @@ struct Meta {
     records: u64,
     unfinished: u64,
     generation: u64,
+    #[serde(default)]
+    payload_bytes: u64,
 }
 
 /// Not Clone/Serialize: only a successful fresh dispatch transition issues one.
@@ -461,11 +470,11 @@ impl Journal {
         let meta = storage(meta_table.get("state"))?
             .map(|v| decode::<Meta>(v.value()))
             .transpose()?;
-        if let Some(meta) = meta {
+        if let Some(mut meta) = meta {
             if meta.identity != identity {
                 return Err(Error::Identity);
             }
-            require(meta.schema == 1)?;
+            require(matches!(meta.schema, 1 | 2))?;
             require(
                 [
                     REQUESTS.name(),
@@ -497,18 +506,26 @@ impl Journal {
                         .checked_sub(meta.unfinished)
                         .ok_or(Error::Invalid)?,
             )?;
+            payloads::initialize(&tx, meta.schema == 1)?;
+            if meta.schema == 1 {
+                require(meta.payload_bytes == 0)?;
+                meta.schema = 2;
+                storage(meta_table.insert("state", encode(&meta)?.as_slice()))?;
+            }
         } else {
             require(names.is_empty())?;
             storage(tx.open_table(REQUESTS))?;
             storage(tx.open_table(RECORDS))?;
             storage(tx.open_table(UNFINISHED))?;
             storage(tx.open_table(EXPIRY))?;
+            payloads::initialize(&tx, true)?;
             let meta = Meta {
-                schema: 1,
+                schema: 2,
                 identity,
                 records: 0,
                 unfinished: 0,
                 generation: 0,
+                payload_bytes: 0,
             };
             storage(meta_table.insert("state", encode(&meta)?.as_slice()))?;
         }
@@ -702,6 +719,7 @@ impl Journal {
                 }
             }
             Event::Resolve(resolution) if r.phase == Phase::Dispatched => {
+                payloads::verify_resolution(&tx, &r.key(), &resolution)?;
                 if matches!(resolution, Resolution::NotExecuted { .. })
                     && r.output_may_have_been_delivered
                 {
@@ -836,6 +854,7 @@ impl Journal {
             if is_current {
                 storage(requests.remove(record.invocation.as_str()))?;
             }
+            payloads::prune(&tx, record_key, &mut meta)?;
             storage(records.remove(record_key.as_str()))?;
             storage(expiry.remove(key.as_str()))?;
             meta.records = meta.records.checked_sub(1).ok_or(Error::Invalid)?;
@@ -1043,6 +1062,7 @@ mod tests {
                     max_records: 10,
                     max_unfinished: 10,
                     closed_retention_ms: 1000,
+                    max_payload_bytes: 128 * 1024 * 1024,
                 },
             )
             .unwrap();

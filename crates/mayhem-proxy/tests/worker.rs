@@ -38,6 +38,7 @@ fn journal(path: &Path) -> Journal {
             max_records: 200,
             max_unfinished: 200,
             closed_retention_ms: 1000,
+            max_payload_bytes: 128 * 1024 * 1024,
         },
     )
     .unwrap()
