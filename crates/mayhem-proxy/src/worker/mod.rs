@@ -1,7 +1,8 @@
 //! Bundled decoder process, outside the financial kernel. Networking/credentials
 //! stay in the parent. IPC carries one bound attempt's model bytes and parsed
 //! frames, never receipt signing requests, prices, filesystem paths or URLs to fetch.
-//! Framing/JSON success is not endpoint validity or permission to settle a receipt.
+//! Framing/JSON success alone is not endpoint validity. Optional bound schema
+//! verification adds semantic checks but never permission to settle a receipt.
 
 pub mod host;
 mod wire;
@@ -22,7 +23,7 @@ use std::{
 };
 use wire::*;
 
-pub const ABI: u32 = 1;
+pub const ABI: u32 = 2;
 pub const RELEASE: &str = env!("CARGO_PKG_VERSION");
 pub const CHUNK_BYTES: usize = 64 * 1024;
 const CONTROL_BYTES: usize = 4096;
@@ -124,6 +125,7 @@ pub struct Init {
     pub format: WireFormat,
     pub error_profile: ErrorProfile,
     pub limits: DecodeLimits,
+    pub semantic_policy: Option<Digest>,
 }
 impl Init {
     pub fn new(
@@ -139,12 +141,23 @@ impl Init {
             format,
             error_profile,
             limits,
+            semantic_policy: None,
         };
         init.validate()?;
         Ok(init)
     }
+    pub fn with_semantics(mut self, policy: &crate::semantics::Policy) -> Result<Self> {
+        self.semantic_policy = Some(policy.digest().map_err(Error::Upstream)?);
+        self.validate()?;
+        Ok(self)
+    }
     fn validate(&self) -> Result<()> {
         self.limits.validate()?;
+        if self.semantic_policy.is_some()
+            && !matches!(self.format, WireFormat::Json | WireFormat::Sse)
+        {
+            return Err(Error::Configuration);
+        }
         if self.abi != ABI || self.release != RELEASE || self.session.attempt == 0 {
             return Err(Error::Identity);
         }
@@ -215,7 +228,12 @@ fn json<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>> {
     Ok(writer.bytes)
 }
 
-fn emit(w: &mut impl Write, event: Decoded, init: &Init) -> std::result::Result<(), Failure> {
+fn emit(
+    w: &mut impl Write,
+    event: Decoded,
+    init: &Init,
+    verifier: Option<&crate::semantics::Verifier>,
+) -> std::result::Result<(), Failure> {
     if matches!(init.error_profile, ErrorProfile::OpenAi) {
         let body = match &event {
             Decoded::Sse { data, .. } => data.as_bytes().to_vec(),
@@ -238,6 +256,12 @@ fn emit(w: &mut impl Write, event: Decoded, init: &Init) -> std::result::Result<
             }
         }
     }
+    if let Some(verifier) = verifier {
+        match &event {
+            Decoded::Json { value } => verifier.verify(value)?,
+            _ => return Err(protocol()),
+        }
+    }
     let bytes = json(&event, init.limits.ipc_bytes()).map_err(|_| too_large())?;
     write_packet(w, EVENT, &bytes).map_err(|_| protocol())
 }
@@ -246,7 +270,7 @@ fn emit_frame(w: &mut impl Write, frame: Frame, init: &Init) -> std::result::Res
         Frame::Sse { event, data, id } => Decoded::Sse { event, data, id },
         Frame::Ndjson(value) => Decoded::Ndjson { value },
     };
-    emit(w, event, init)
+    emit(w, event, init, None)
 }
 
 /// One attempt, then exit. No shell, network, model execution or filesystem API.
@@ -270,13 +294,58 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> Result<()> {
         Some(Decoder::new(init.format, init.limits.max_event_bytes).map_err(Error::Upstream)?)
     };
     let mut bytes = Vec::new();
+    let mut policy_bytes = Vec::new();
+    let mut verifier = None;
+    let mut frames_ended = false;
     let mut received = 0usize;
     let mut sequence = 0u64;
     loop {
         let packet = read_packet(&mut input, CHUNK_BYTES)?.ok_or(Error::Protocol)?;
         sequence = sequence.checked_add(1).ok_or(Error::Protocol)?;
         let result = match packet.kind {
-            CHUNK if !packet.bytes.is_empty() => {
+            POLICY_CHUNK
+                if init.semantic_policy.is_some()
+                    && verifier.is_none()
+                    && received == 0
+                    && !packet.bytes.is_empty() =>
+            {
+                if packet.bytes.len()
+                    > crate::semantics::MAX_POLICY_BYTES.saturating_sub(policy_bytes.len())
+                {
+                    Err(crate::semantics::bad_schema("tools"))
+                } else {
+                    policy_bytes.extend_from_slice(&packet.bytes);
+                    Ok(())
+                }
+            }
+            POLICY_END
+                if init.semantic_policy.is_some()
+                    && verifier.is_none()
+                    && received == 0
+                    && packet.bytes.is_empty() =>
+            {
+                let compile = || -> std::result::Result<crate::semantics::Verifier, Failure> {
+                    let policy: crate::semantics::Policy = serde_json::from_slice(&policy_bytes)
+                        .map_err(|_| crate::semantics::bad_schema("tools"))?;
+                    if Some(policy.digest()?) != init.semantic_policy {
+                        return Err(crate::semantics::bad_schema("tools"));
+                    }
+                    crate::semantics::Verifier::new(policy)
+                };
+                match compile() {
+                    Ok(v) => {
+                        verifier = Some(v);
+                        policy_bytes = Vec::new();
+                        Ok(())
+                    }
+                    Err(f) => Err(f),
+                }
+            }
+            CHUNK
+                if !frames_ended
+                    && !packet.bytes.is_empty()
+                    && (init.semantic_policy.is_none() || verifier.is_some()) =>
+            {
                 if packet.bytes.len() > init.limits.max_total_bytes.saturating_sub(received) {
                     Err(too_large())
                 } else {
@@ -293,15 +362,50 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> Result<()> {
                     }
                 }
             }
-            FINISH if packet.bytes.is_empty() => {
+            FINISH
+                if packet.bytes.is_empty()
+                    && !frames_ended
+                    && !(verifier.is_some() && decoder.is_some())
+                    && (init.semantic_policy.is_none() || verifier.is_some()) =>
+            {
                 if let Some(decoder) = &mut decoder {
                     decoder.finish(|event| emit_frame(&mut output, event, &init))
                 } else {
                     serde_json::from_slice(&bytes)
                         .map_err(|_| protocol())
-                        .and_then(|value| emit(&mut output, Decoded::Json { value }, &init))
+                        .and_then(|value| {
+                            emit(
+                                &mut output,
+                                Decoded::Json { value },
+                                &init,
+                                verifier.as_ref(),
+                            )
+                        })
                 }
             }
+            FRAME_END
+                if packet.bytes.is_empty()
+                    && verifier.is_some()
+                    && decoder.is_some()
+                    && !frames_ended =>
+            {
+                frames_ended = true;
+                decoder
+                    .as_mut()
+                    .ok_or(Error::Protocol)?
+                    .finish(|event| emit_frame(&mut output, event, &init))
+            }
+            VERIFY_CHUNK if frames_ended && !packet.bytes.is_empty() => {
+                if packet.bytes.len() > init.limits.max_event_bytes.saturating_sub(bytes.len()) {
+                    Err(too_large())
+                } else {
+                    bytes.extend_from_slice(&packet.bytes);
+                    Ok(())
+                }
+            }
+            VERIFY_END if frames_ended && packet.bytes.is_empty() => serde_json::from_slice(&bytes)
+                .map_err(|_| protocol())
+                .and_then(|value| verifier.as_ref().ok_or_else(protocol)?.verify(&value)),
             _ => return Err(Error::Protocol),
         };
         if let Err(failure) = result {
@@ -312,7 +416,7 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> Result<()> {
             )?;
             return Err(Error::Upstream(failure));
         }
-        if packet.kind == FINISH {
+        if matches!(packet.kind, FINISH | VERIFY_END) {
             write_packet(&mut output, END, &sequence.to_le_bytes())?;
             return Ok(());
         }
@@ -351,6 +455,7 @@ mod tests {
             },
             format,
             error_profile: ErrorProfile::OpenAi,
+            semantic_policy: None,
             limits: DecodeLimits {
                 max_total_bytes: 128 * 1024,
                 max_event_bytes: 32 * 1024,

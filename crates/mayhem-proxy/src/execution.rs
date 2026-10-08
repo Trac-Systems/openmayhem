@@ -1,8 +1,9 @@
-//! Parent-owned, one-attempt JSON execution. This connects durable intent, the
+//! Parent-owned, one-attempt JSON and stream execution. This connects durable intent, the
 //! protected HTTP broker and a supervised decoder without retrying a POST.
 //! Canonical offer/reservation/lease acceptance precedes this API. The returned
-//! reply still needs semantic verification, retained result evidence and Core
-//! metering; this module cannot close holds, sign receipts or release model slots.
+//! reply passes protocol and supported schema checks, but still needs retained
+//! result evidence and independently verified Core metering. This module cannot
+//! close holds, sign receipts or release model slots.
 
 use crate::{
     attempts::{self, Digest, Event, FailureSnapshot, Journal, Phase, Record},
@@ -15,6 +16,7 @@ use crate::{
 };
 use std::{
     fmt,
+    future::Future,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -177,7 +179,41 @@ impl Executor {
         bytes: &[u8],
         cancel: &Cancellation,
     ) -> Result<UnsettledReply> {
-        let request = self.adapter.prepare_json(bytes)?;
+        self.execute(invocation, bytes, cancel, false, |_| async { Ok(()) })
+            .await
+    }
+    /// Provisional deltas only. The caller owns final public framing after result
+    /// retention and financial reconciliation; no success marker is emitted here.
+    pub async fn execute_stream<F, Fut>(
+        &self,
+        invocation: &Digest,
+        bytes: &[u8],
+        cancel: &Cancellation,
+        emit: F,
+    ) -> Result<UnsettledReply>
+    where
+        F: FnMut(serde_json::Value) -> Fut,
+        Fut: Future<Output = std::result::Result<(), ()>>,
+    {
+        self.execute(invocation, bytes, cancel, true, emit).await
+    }
+    async fn execute<F, Fut>(
+        &self,
+        invocation: &Digest,
+        bytes: &[u8],
+        cancel: &Cancellation,
+        streaming: bool,
+        mut emit: F,
+    ) -> Result<UnsettledReply>
+    where
+        F: FnMut(serde_json::Value) -> Fut,
+        Fut: Future<Output = std::result::Result<(), ()>>,
+    {
+        let request = if streaming {
+            self.adapter.prepare_stream(bytes)?
+        } else {
+            self.adapter.prepare_json(bytes)?
+        };
         let record = self.storage.current(invocation).await?;
         if !request.matches_binding(&record.binding)
             || &record.binding.connection_digest != self.connection.fingerprint()
@@ -199,17 +235,24 @@ impl Executor {
         let limits = self.adapter.limits();
         let init = Init::new(
             &record,
-            WireFormat::Json,
+            if streaming {
+                WireFormat::Sse
+            } else {
+                WireFormat::Json
+            },
             self.connection.error_profile(),
             DecodeLimits {
                 max_total_bytes: limits.response_bytes,
                 max_event_bytes: limits.response_bytes,
             },
-        )?;
+        )?
+        .with_semantics(request.semantic_policy())?;
         // Reserve decoder resources and verify the exact worker release BEFORE
         // the commit-before-send fence. Startup failure does not dispatch anything.
         let ready = tokio::select! {
-            result=self.pool.start(init) => result?,
+            result=async {
+                self.pool.start(init).await?.configure_semantics(request.semantic_policy()).await
+            } => result?,
             _=cancel.cancelled() => {
                 self.storage.event(invocation,record.attempt,Event::CancelRequested).await?;
                 return Err(Error::Cancelled);
@@ -230,7 +273,15 @@ impl Executor {
             .await?;
         let active = ready.attach(ticket)?;
         let public_id = format!("proxy_{}", record.invocation.as_str());
-        let operation = self.perform(&request, active, &public_id, record.created_at_ms / 1000);
+        let operation = async {
+            if streaming {
+                self.perform_stream(&request, active, &public_id, &record, &mut emit)
+                    .await
+            } else {
+                self.perform(&request, active, &public_id, record.created_at_ms / 1000)
+                    .await
+            }
+        };
         let outcome = tokio::select! {
             biased;
             _=cancel.cancelled() => Err(Error::Cancelled),
@@ -289,6 +340,99 @@ impl Executor {
             }
         }
     }
+    async fn perform_stream<F, Fut>(
+        &self,
+        request: &Request,
+        mut decoder: worker::host::Active,
+        public_id: &str,
+        record: &Record,
+        emit: &mut F,
+    ) -> Result<ProtocolReply>
+    where
+        F: FnMut(serde_json::Value) -> Fut,
+        Fut: Future<Output = std::result::Result<(), ()>>,
+    {
+        let mut response = self
+            .connection
+            .send(self.adapter.operation(), Some(request.body().to_vec()))
+            .await
+            .map_err(Error::Upstream)?;
+        if response.status != 200 || response.format != WireFormat::Sse {
+            return Err(Error::Upstream(Failure::new(
+                Code::UpstreamProtocol,
+                Scope::Model,
+                Stage::ResponseHeaders,
+                Execution::Unknown,
+            )));
+        }
+        // Persist delivery intent ONCE before calling any consumer. This is
+        // conservative even when the upstream fails before its first text byte.
+        self.storage
+            .event(&record.invocation, record.attempt, Event::FirstOutput)
+            .await?;
+        let mut stream =
+            crate::endpoint::stream::Stream::new(request, public_id, record.created_at_ms / 1000)?;
+        while let Some(chunk) = response.next_chunk().await.map_err(Error::Upstream)? {
+            let mut receive = |frame| {
+                let piece = stream.push(frame).map_err(|_| worker::Error::Protocol);
+                let future = match piece {
+                    Ok(Some(value)) => Ok(Some(emit(value))),
+                    Ok(None) => Ok(None),
+                    Err(e) => Err(e),
+                };
+                async move {
+                    if let Some(f) = future? {
+                        f.await.map_err(|_| worker::Error::Cancelled)?;
+                    }
+                    Ok(())
+                }
+            };
+            decoder.push(&chunk, &mut receive).await.map_err(|e| {
+                if matches!(e, worker::Error::Cancelled) {
+                    Error::Cancelled
+                } else {
+                    Error::Decoder(e)
+                }
+            })?;
+            drop(receive);
+            if stream.is_done() {
+                break;
+            }
+        }
+        // [DONE] is terminal in this profile. A conforming long-lived SSE HTTP
+        // connection need not close before result verification can finish.
+        drop(response);
+        let mut receive = |frame| {
+            let piece = stream.push(frame).map_err(|_| worker::Error::Protocol);
+            let future = match piece {
+                Ok(Some(value)) => Ok(Some(emit(value))),
+                Ok(None) => Ok(None),
+                Err(e) => Err(e),
+            };
+            async move {
+                if let Some(f) = future? {
+                    f.await.map_err(|_| worker::Error::Cancelled)?;
+                }
+                Ok(())
+            }
+        };
+        decoder
+            .finish_stream_frames(&mut receive)
+            .await
+            .map_err(|e| {
+                if matches!(e, worker::Error::Cancelled) {
+                    Error::Cancelled
+                } else {
+                    Error::Decoder(e)
+                }
+            })?;
+        drop(receive);
+        let result = stream.finish()?;
+        decoder.verify_stream_result(&result).await?;
+        request
+            .decode_json(result, public_id, record.created_at_ms / 1000)
+            .map_err(Error::Endpoint)
+    }
     async fn perform(
         &self,
         request: &Request,
@@ -342,8 +486,8 @@ impl Executor {
     }
 }
 
-/// No automatic settlement or buyer delivery. The integration must validate any
-/// requested output/tool schemas, meter independently, durably retain this result
+/// No automatic settlement or buyer delivery. The integration must validate
+/// remaining endpoint capabilities, meter independently, durably retain this result
 /// and reconcile accepted financial/capacity state before closing the journal.
 pub struct UnsettledReply {
     pub attempt: Record,

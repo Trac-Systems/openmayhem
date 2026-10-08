@@ -11,6 +11,7 @@ pub mod discovery;
 pub mod endpoint;
 pub mod execution;
 pub mod matching;
+pub mod semantics;
 pub mod supervisor;
 pub mod worker;
 

@@ -2754,6 +2754,7 @@ dependencies = [
  "clap",
  "httpdate",
  "ipnet",
+ "jsonschema",
  "mayhem-proto",
  "redb",
  "reqwest",

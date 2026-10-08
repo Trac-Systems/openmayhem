@@ -3,6 +3,8 @@
 //! Full structured-output/tool-argument schema validation belongs to the bounded
 //! semantic verifier before this result may authorize delivery/execution/settlement.
 
+pub mod stream;
+
 use crate::{
     attempts::Digest,
     connector::{
@@ -178,6 +180,18 @@ impl Adapter {
     /// No settings are removed to make a backend accept a request. This adapter
     /// explicitly handles JSON replies; streaming is a separate execution path.
     pub fn prepare_json(&self, bytes: &[u8]) -> Result<Request> {
+        self.prepare(bytes, false)
+    }
+    pub fn prepare_stream(&self, bytes: &[u8]) -> Result<Request> {
+        if !matches!(
+            self.endpoint,
+            ProxyEndpoint::Chat | ProxyEndpoint::Completions
+        ) {
+            return Err(invalid(Some("stream"), Code::UnsupportedControl));
+        }
+        self.prepare(bytes, true)
+    }
+    fn prepare(&self, bytes: &[u8], streaming: bool) -> Result<Request> {
         if bytes.len() > self.limits.request_bytes {
             return Err(invalid(None, Code::RequestTooLarge));
         }
@@ -190,10 +204,13 @@ impl Adapter {
                 .and_then(crate::connector::failure::safe_parameter);
             invalid(param, Code::InvalidRequest)
         })?;
-        if original
-            .get("stream")
-            .is_some_and(|v| v != &Value::Bool(false))
-        {
+        if if streaming {
+            original.get("stream") != Some(&Value::Bool(true))
+        } else {
+            original
+                .get("stream")
+                .is_some_and(|v| v != &Value::Bool(false))
+        } {
             return Err(invalid(Some("stream"), Code::UnsupportedControl));
         }
         // This is stateless Responses. Never inherit vendor-side history or stores.
@@ -305,6 +322,9 @@ impl Adapter {
         } else {
             BTreeMap::new()
         };
+        let semantic_policy =
+            crate::semantics::Policy::from_request(self.endpoint, request_hash.clone(), &original)
+                .map_err(Error::Request)?;
         let mut body = original;
         body["model"] = json!(self.upstream_model);
         // OpenAI Responses defaults may otherwise retain vendor-side state. This
@@ -332,6 +352,8 @@ impl Adapter {
             parallel,
             questions,
             limits: self.limits,
+            semantic_policy,
+            streaming,
         })
     }
 }
@@ -358,6 +380,8 @@ pub struct Request {
     parallel: bool,
     questions: BTreeMap<String, Question>,
     limits: Limits,
+    semantic_policy: crate::semantics::Policy,
+    streaming: bool,
 }
 impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -387,6 +411,9 @@ impl fmt::Debug for ProtocolReply {
 }
 
 impl Request {
+    pub fn semantic_policy(&self) -> &crate::semantics::Policy {
+        &self.semantic_policy
+    }
     pub fn request_hash(&self) -> &Digest {
         &self.request_hash
     }

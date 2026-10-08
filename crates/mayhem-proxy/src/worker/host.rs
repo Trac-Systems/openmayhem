@@ -118,6 +118,13 @@ impl Pool {
                     .ok_or(Error::Configuration)?,
             )
             .and_then(|n| n.checked_add(CHUNK_BYTES * 2))
+            .and_then(|n| {
+                n.checked_add(if init.semantic_policy.is_some() {
+                    crate::semantics::MAX_POLICY_BYTES * 2
+                } else {
+                    0
+                })
+            })
             .ok_or(Error::Configuration)?;
         let buffers = self
             .buffers
@@ -170,6 +177,9 @@ impl Pool {
             resources: Some(resources),
             format: init.format,
             received_event_bytes: 0,
+            semantic_policy: init.semantic_policy.clone(),
+            semantics_ready: false,
+            frames_ended: false,
         };
         let hello = json(&init, CONTROL_BYTES)?;
         let handshake = async {
@@ -196,9 +206,30 @@ pub struct Prepared {
     io: Worker,
 }
 impl Prepared {
+    pub async fn configure_semantics(mut self, policy: &crate::semantics::Policy) -> Result<Self> {
+        if self.io.semantics_ready
+            || self.io.semantic_policy.as_ref() != Some(&policy.digest().map_err(Error::Upstream)?)
+        {
+            return Err(Error::Identity);
+        }
+        let bytes = policy.bytes().map_err(Error::Upstream)?;
+        for chunk in bytes.chunks(CHUNK_BYTES) {
+            self.io
+                .exchange(POLICY_CHUNK, chunk, |_| async { Err(Error::Protocol) })
+                .await?;
+        }
+        self.io
+            .exchange(POLICY_END, &[], |_| async { Err(Error::Protocol) })
+            .await?;
+        self.io.semantics_ready = true;
+        Ok(self)
+    }
     /// Consumes the journal-issued ticket exactly once. Full Core admission and
     /// connection/recipe/request validation still precede transport dispatch.
     pub fn attach(self, ticket: DispatchTicket) -> Result<Active> {
+        if self.io.semantic_policy.is_some() && !self.io.semantics_ready {
+            return Err(Error::Configuration);
+        }
         let record = ticket.record();
         if record.phase != Phase::Dispatched || Session::from_record(record)? != self.io.session {
             return Err(Error::Identity);
@@ -241,6 +272,32 @@ impl Active {
     pub fn cancellation(&self) -> Cancellation {
         self.io.cancellation()
     }
+    pub async fn finish_stream_frames<F, Fut>(&mut self, emit: F) -> Result<()>
+    where
+        F: FnMut(Decoded) -> Fut,
+        Fut: Future<Output = Result<()>>,
+    {
+        if self.io.format != WireFormat::Sse || !self.io.semantics_ready || self.io.frames_ended {
+            return Err(Error::Configuration);
+        }
+        self.io.exchange(FRAME_END, &[], emit).await?;
+        self.io.frames_ended = true;
+        Ok(())
+    }
+    pub async fn verify_stream_result(&mut self, result: &serde_json::Value) -> Result<()> {
+        if !self.io.frames_ended || !self.io.semantics_ready {
+            return Err(Error::Configuration);
+        }
+        let bytes = json(result, self.io.limits.max_event_bytes)?;
+        for chunk in bytes.chunks(CHUNK_BYTES) {
+            self.io
+                .exchange(VERIFY_CHUNK, chunk, |_| async { Err(Error::Protocol) })
+                .await?;
+        }
+        self.io
+            .exchange(VERIFY_END, &[], |_| async { Err(Error::Protocol) })
+            .await
+    }
     pub async fn push<F, Fut>(&mut self, bytes: &[u8], emit: F) -> Result<()>
     where
         F: FnMut(Decoded) -> Fut,
@@ -251,8 +308,9 @@ impl Active {
         }
         self.io.exchange(CHUNK, bytes, emit).await
     }
-    /// This means framing ended, not a validated model completion. The endpoint
-    /// adapter must still reject missing finish markers/tools/usage/choice results.
+    /// For JSON this also runs the configured semantic verifier. The parent
+    /// still validates request-bound protocol fields and independently meters.
+    /// Configured SSE uses finish_stream_frames + verify_stream_result instead.
     pub async fn finish<F, Fut>(&mut self, emit: F) -> Result<()>
     where
         F: FnMut(Decoded) -> Fut,
@@ -279,6 +337,9 @@ struct Worker {
     resources: Option<Arc<(OwnedSemaphorePermit, OwnedSemaphorePermit)>>,
     format: WireFormat,
     received_event_bytes: usize,
+    semantic_policy: Option<Digest>,
+    semantics_ready: bool,
+    frames_ended: bool,
 }
 impl Drop for Worker {
     fn drop(&mut self) {
@@ -335,7 +396,9 @@ impl Worker {
         let mut events = 0usize;
         // At most one buffered event plus events completed by this input chunk.
         // The shortest NDJSON record is one JSON byte plus its newline.
-        let max_events = if kind == FINISH {
+        let max_events = if matches!(kind, POLICY_CHUNK | POLICY_END | VERIFY_CHUNK | VERIFY_END) {
+            0
+        } else if matches!(kind, FINISH | FRAME_END) {
             1
         } else {
             bytes.len() / 2 + 1
@@ -394,7 +457,15 @@ impl Worker {
                     }
                     let failure: FailureSnapshot =
                         serde_json::from_slice(&packet.bytes).map_err(|_| Error::Protocol)?;
-                    if failure.execution != Execution::Unknown
+                    if matches!(kind, POLICY_CHUNK | POLICY_END) {
+                        if failure.execution != Execution::NotDispatched
+                            || failure.stage != Stage::BeforeDispatch
+                            || failure.scope != Scope::Request
+                            || failure.code != Code::InvalidSchema
+                        {
+                            return Err(Error::Protocol);
+                        }
+                    } else if failure.execution != Execution::Unknown
                         || failure.stage != Stage::ResponseBody
                     {
                         return Err(Error::Protocol);
@@ -404,7 +475,12 @@ impl Worker {
                     ));
                 }
                 ACK | END => {
-                    if packet.kind != if kind == FINISH { END } else { ACK }
+                    if packet.kind
+                        != if matches!(kind, FINISH | VERIFY_END) {
+                            END
+                        } else {
+                            ACK
+                        }
                         || packet.bytes.as_slice() != self.sequence.to_le_bytes()
                     {
                         return Err(Error::Protocol);
@@ -412,7 +488,7 @@ impl Worker {
                     if kind == FINISH && self.format == WireFormat::Json && events != 1 {
                         return Err(Error::Protocol);
                     }
-                    if kind == FINISH {
+                    if matches!(kind, FINISH | VERIFY_END) {
                         self.finished = true;
                         if let Some(mut input) = self.input.take() {
                             let _ = input.shutdown().await;

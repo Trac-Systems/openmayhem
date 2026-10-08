@@ -50,6 +50,20 @@ impl Drop for Backend {
     }
 }
 async fn backend(status: u16, body: Value, delay: Duration) -> Backend {
+    backend_raw(
+        status,
+        serde_json::to_vec(&body).unwrap(),
+        "application/json",
+        delay,
+    )
+    .await
+}
+async fn backend_raw(
+    status: u16,
+    body: Vec<u8>,
+    content_type: &'static str,
+    delay: Duration,
+) -> Backend {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/v1/", listener.local_addr().unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
@@ -95,8 +109,7 @@ async fn backend(status: u16, body: Value, delay: Duration) -> Backend {
                 .unwrap()
                 .push(serde_json::from_slice(&bytes[boundary..boundary + length]).unwrap());
             tokio::time::sleep(delay).await;
-            let body = serde_json::to_vec(&body).unwrap();
-            let header=format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+            let header=format!("HTTP/1.1 {status} Fixture\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
             if socket.write_all(header.as_bytes()).await.is_err() {
                 continue;
             }
@@ -191,7 +204,14 @@ impl Fixture {
         }
     }
     fn prepare(&self, n: u64, body: &[u8], rail: ProxyRail) -> attempts::Record {
-        let request = self.adapter.prepare_json(body).unwrap();
+        self.prepare_kind(n, body, rail, false)
+    }
+    fn prepare_kind(&self, n: u64, body: &[u8], rail: ProxyRail, stream: bool) -> attempts::Record {
+        let request = if stream {
+            self.adapter.prepare_stream(body).unwrap()
+        } else {
+            self.adapter.prepare_json(body).unwrap()
+        };
         self.journal
             .prepare(
                 d(n),
@@ -504,4 +524,327 @@ async fn dropped_caller_future_leaves_a_recoverable_attempt_without_redispatch()
         Err(Error::RecoveryRequired)
     ));
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn invalid_or_remote_schema_never_dispatches_or_changes_attempt_phase() {
+    for schema in [
+        json!({"type":"not-a-type"}),
+        json!({"$ref":"http://127.0.0.1:18081/private"}),
+        json!({"type":"array","misspelledUniqueItems":true}),
+    ] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let mut body: Value = serde_json::from_slice(&chat()).unwrap();
+        body["response_format"] = json!({"type":"json_schema","json_schema":{"name":"result","strict":true,"schema":schema}});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let record = fixture.prepare(1, &bytes, ProxyRail::Fiat);
+        let err = fixture
+            .executor
+            .execute_json(&record.invocation, &bytes, &Cancellation::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err,Error::Decoder(mayhem_proxy::worker::Error::Upstream(ref f)) if f.code==Code::InvalidSchema && f.execution==Execution::NotDispatched)
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            fixture
+                .journal
+                .get(&record.invocation)
+                .unwrap()
+                .unwrap()
+                .phase,
+            Phase::Prepared
+        );
+    }
+}
+
+#[tokio::test]
+async fn original_structured_schema_is_checked_in_real_worker_before_returning_result() {
+    for (content, valid) in [
+        (r#"{"ids":["E1","E2"]}"#, true),
+        (r#"{"ids":["E1","E1"]}"#, false),
+        (r#"{"ids":["E1",7]}"#, false),
+    ] {
+        let mut response = answer();
+        response["choices"][0]["message"]["content"] = json!(content);
+        let backend = backend(200, response, Duration::ZERO).await;
+        let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let mut body: Value = serde_json::from_slice(&chat()).unwrap();
+        body["response_format"] = json!({"type":"json_schema","json_schema":{"name":"result","strict":true,"schema":{"type":"object","required":["ids"],"properties":{"ids":{"type":"array","minItems":2,"uniqueItems":true,"items":{"type":"string"}}}}}});
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let record = fixture.prepare(1, &bytes, ProxyRail::Tnk);
+        let result = fixture
+            .executor
+            .execute_json(&record.invocation, &bytes, &Cancellation::default())
+            .await;
+        assert_eq!(result.is_ok(), valid, "{content}: {result:?}");
+        if valid {
+            assert_eq!(
+                result.unwrap().reply.body["choices"][0]["message"]["content"],
+                content
+            );
+        }
+        let current = fixture.journal.get(&record.invocation).unwrap().unwrap();
+        assert_eq!(current.phase, Phase::Dispatched);
+        assert_eq!(current.last_failure.is_some(), !valid);
+        assert!(current.closure.is_none());
+    }
+}
+
+#[tokio::test]
+async fn tool_argument_schema_violation_is_not_returned_as_an_executable_call() {
+    for arguments in [r#"{"path":7}"#, r#"{}"#, r#"{"path":"src/game.js"}"#] {
+        let mut response = answer();
+        response["choices"][0]["finish_reason"] = json!("tool_calls");
+        response["choices"][0]["message"]["tool_calls"] = json!([{"id":"call_1","type":"function","function":{"name":"read_file","arguments":arguments}}]);
+        let backend = backend(200, response, Duration::ZERO).await;
+        let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let mut body: Value = serde_json::from_slice(&chat()).unwrap();
+        body["tools"] = json!([{"type":"function","function":{"name":"read_file","parameters":{"type":"object","required":["path"],"properties":{"path":{"type":"string"}},"additionalProperties":false}}}]);
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let record = fixture.prepare(1, &bytes, ProxyRail::Tap);
+        let result = fixture
+            .executor
+            .execute_json(&record.invocation, &bytes, &Cancellation::default())
+            .await;
+        assert_eq!(result.is_ok(), arguments.contains("src/game.js"));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+fn sse(chunks: &[Value], done: bool) -> Vec<u8> {
+    let mut text = String::new();
+    for chunk in chunks {
+        text.push_str("data: ");
+        text.push_str(&chunk.to_string());
+        text.push_str("\n\n");
+    }
+    if done {
+        text.push_str("data: [DONE]\n\n");
+    }
+    text.into_bytes()
+}
+fn delta(content: &str, finish: Value) -> Value {
+    json!({"id":"stream_1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":content},"finish_reason":finish}]})
+}
+fn stream_request() -> Vec<u8> {
+    let mut body: Value = serde_json::from_slice(&chat()).unwrap();
+    body["stream"] = json!(true);
+    serde_json::to_vec(&body).unwrap()
+}
+
+#[tokio::test]
+async fn streaming_delivers_only_provisional_chunks_and_preserves_final_shape() {
+    let chunks = [
+        delta("Hello ", Value::Null),
+        delta("世界", Value::Null),
+        delta("", json!("stop")),
+        json!({"id":"stream_1","choices":[],"usage":{"prompt_tokens":2,"completion_tokens":3,"total_tokens":5}}),
+    ];
+    let backend = backend_raw(200, sse(&chunks, true), "text/event-stream", Duration::ZERO).await;
+    let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let body = stream_request();
+    let r = fixture.prepare_kind(1, &body, ProxyRail::Tap, true);
+    let mut received = Vec::new();
+    let result = fixture
+        .executor
+        .execute_stream(&r.invocation, &body, &Cancellation::default(), |value| {
+            received.push(value);
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+    assert_eq!(
+        result.reply.body["choices"][0]["message"]["content"],
+        "Hello 世界"
+    );
+    assert_eq!(result.reply.body["choices"][0]["finish_reason"], "stop");
+    assert_eq!(result.reply.reported_usage.unwrap().output_tokens, 3);
+    assert!(!received.is_empty());
+    for chunk in received {
+        assert_eq!(chunk["model"], "public-model");
+        for choice in chunk["choices"].as_array().unwrap() {
+            assert!(choice["finish_reason"].is_null());
+        }
+    }
+    let current = fixture.journal.get(&r.invocation).unwrap().unwrap();
+    assert!(current.output_may_have_been_delivered);
+    assert!(current.closure.is_none());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn streamed_tool_arguments_are_reassembled_exactly_and_schema_checked() {
+    for (args, valid) in [
+        ("{\"path\":\"src/世界.js\"}", true),
+        ("{\"path\":7}", false),
+        ("{\"path\":", false),
+    ] {
+        let chunks = [
+            json!({"id":"stream_1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"c","type":"function","function":{"name":"read_","arguments":""}}]},"finish_reason":null}]}),
+            json!({"id":"stream_1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"file","arguments":args}}]},"finish_reason":"tool_calls"}]}),
+        ];
+        let backend =
+            backend_raw(200, sse(&chunks, true), "text/event-stream", Duration::ZERO).await;
+        let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let mut body: Value = serde_json::from_slice(&stream_request()).unwrap();
+        body["tools"] = json!([{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]);
+        let body = serde_json::to_vec(&body).unwrap();
+        let r = fixture.prepare_kind(1, &body, ProxyRail::Fiat, true);
+        let result = fixture
+            .executor
+            .execute_stream(&r.invocation, &body, &Cancellation::default(), |_| async {
+                Ok(())
+            })
+            .await;
+        assert_eq!(result.is_ok(), valid, "{args}: {result:?}");
+        if valid {
+            assert_eq!(
+                result.unwrap().reply.body["choices"][0]["message"]["tool_calls"][0]["function"]
+                    ["arguments"],
+                args
+            );
+        }
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    }
+}
+
+#[tokio::test]
+async fn missing_terminal_changed_provider_and_midstream_error_are_not_success() {
+    for case in 0..4 {
+        let mut chunks = vec![delta("partial", Value::Null), delta("", json!("stop"))];
+        let done = case != 0;
+        match case {
+            1 => chunks[1]["id"] = json!("another_provider_response"),
+            2 => chunks[1]["choices"][0]["finish_reason"] = Value::Null,
+            3 => {
+                chunks[1] = json!({"error":{"code":"rate_limit_exceeded","message":"private-upstream-details"}})
+            }
+            _ => (),
+        }
+        let backend =
+            backend_raw(200, sse(&chunks, done), "text/event-stream", Duration::ZERO).await;
+        let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let body = stream_request();
+        let r = fixture.prepare_kind(1, &body, ProxyRail::Tnk, true);
+        let result = fixture
+            .executor
+            .execute_stream(&r.invocation, &body, &Cancellation::default(), |_| async {
+                Ok(())
+            })
+            .await;
+        assert!(result.is_err(), "case {case}");
+        assert!(!format!("{result:?}").contains("private-upstream-details"));
+        let current = fixture.journal.get(&r.invocation).unwrap().unwrap();
+        assert_eq!(current.phase, Phase::Dispatched);
+        assert!(current.closure.is_none());
+        assert_eq!(
+            current.last_failure.unwrap().code,
+            if case == 3 {
+                Code::UpstreamRateLimited
+            } else {
+                Code::UpstreamProtocol
+            }
+        );
+    }
+}
+
+#[tokio::test]
+async fn client_stream_sink_failure_is_cancellation_not_provider_cooldown() {
+    let backend = backend_raw(
+        200,
+        sse(
+            &[delta("text", Value::Null), delta("", json!("stop"))],
+            true,
+        ),
+        "text/event-stream",
+        Duration::ZERO,
+    )
+    .await;
+    let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let body = stream_request();
+    let r = fixture.prepare_kind(1, &body, ProxyRail::Fiat, true);
+    let result = fixture
+        .executor
+        .execute_stream(&r.invocation, &body, &Cancellation::default(), |_| async {
+            Err(())
+        })
+        .await;
+    assert!(matches!(result, Err(Error::Cancelled)));
+    let current = fixture.journal.get(&r.invocation).unwrap().unwrap();
+    assert!(current.cancellation_requested);
+    assert!(current.last_failure.is_none());
+    assert!(current.closure.is_none());
+}
+
+#[tokio::test]
+async fn legacy_completion_stream_uses_text_shape_and_never_invents_chat_messages() {
+    let chunks = [
+        json!({"id":"c","object":"text_completion","choices":[{"index":0,"text":"hello","finish_reason":null}]}),
+        json!({"id":"c","object":"text_completion","choices":[{"index":0,"text":" world","finish_reason":"length"}]}),
+    ];
+    let backend = backend_raw(200, sse(&chunks, true), "text/event-stream", Duration::ZERO).await;
+    let fixture = Fixture::new(&backend.base, ProxyEndpoint::Completions);
+    let body = serde_json::to_vec(&json!({"model":"m","prompt":"hi","stream":true})).unwrap();
+    let r = fixture.prepare_kind(1, &body, ProxyRail::Fiat, true);
+    let result = fixture
+        .executor
+        .execute_stream(&r.invocation, &body, &Cancellation::default(), |value| {
+            assert!(value["choices"][0].get("text").is_some());
+            async { Ok(()) }
+        })
+        .await
+        .unwrap();
+    assert_eq!(result.reply.body["choices"][0]["text"], "hello world");
+    assert_eq!(result.reply.body["choices"][0]["finish_reason"], "length");
+}
+
+#[tokio::test]
+async fn terminal_marker_finishes_even_when_upstream_keeps_sse_connection_open() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1/", listener.local_addr().unwrap());
+    let body = sse(&[delta("ready", json!("stop"))], true);
+    let task = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut bytes = Vec::new();
+        let mut buf = [0; 1024];
+        loop {
+            let n = socket.read(&mut buf).await.unwrap();
+            if n == 0 {
+                return;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+            if bytes.windows(4).any(|w| w == b"\r\n\r\n") {
+                break;
+            }
+        }
+        socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+        let frame = format!("{:x}\r\n", body.len());
+        socket.write_all(frame.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+        socket.write_all(b"\r\n").await.unwrap();
+        // Deliberately never send a zero chunk/EOF. Test timeout is not a model limit.
+        std::future::pending::<()>().await;
+    });
+    let fixture = Fixture::new(&base, ProxyEndpoint::Chat);
+    let bytes = stream_request();
+    let r = fixture.prepare_kind(1, &bytes, ProxyRail::Fiat, true);
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        fixture.executor.execute_stream(
+            &r.invocation,
+            &bytes,
+            &Cancellation::default(),
+            |_| async { Ok(()) },
+        ),
+    )
+    .await;
+    task.abort();
+    let _ = task.await;
+    assert_eq!(
+        result.unwrap().unwrap().reply.body["choices"][0]["message"]["content"],
+        "ready"
+    );
 }

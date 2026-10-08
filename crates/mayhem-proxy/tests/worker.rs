@@ -89,6 +89,43 @@ fn init(r: &Record, format: WireFormat) -> Init {
 fn pool(work: &Path, limits: PoolLimits) -> Pool {
     Pool::new(env!("CARGO_BIN_EXE_mayhem-proxy-worker"), work, limits).unwrap()
 }
+
+#[tokio::test]
+async fn semantic_policy_is_bound_and_must_compile_before_worker_activation() {
+    use mayhem_proxy::semantics::{Output, Policy};
+    let store = dir();
+    let work = dir();
+    let journal = journal(&store.path().join("attempts"));
+    let pool = pool(work.path(), limits(2));
+    let record = record(&journal, 1);
+    let policy = Policy {
+        endpoint: mayhem_proto::proxy::ProxyEndpoint::Chat,
+        request_hash: record.binding.request_hash.clone(),
+        tools: Default::default(),
+        output: Output::JsonObject,
+    };
+    let init = init(&record, WireFormat::Json)
+        .with_semantics(&policy)
+        .unwrap();
+    let prepared = pool.start(init.clone()).await.unwrap();
+    let ticket = journal
+        .begin_dispatch(&record.invocation, record.generation, 101)
+        .unwrap();
+    assert!(
+        matches!(prepared.attach(ticket), Err(worker::Error::Configuration)),
+        "policy compilation cannot be skipped"
+    );
+    let prepared = pool.start(init).await.unwrap();
+    let mut different = policy;
+    different.output = Output::Text;
+    assert!(
+        matches!(
+            prepared.configure_semantics(&different).await,
+            Err(worker::Error::Identity)
+        ),
+        "cannot swap output constraints"
+    );
+}
 async fn active(pool: &Pool, j: &Journal, r: &Record, format: WireFormat) -> Active {
     let ready = pool.start(init(r, format)).await.unwrap();
     let ticket = j.begin_dispatch(&r.invocation, r.generation, 101).unwrap();

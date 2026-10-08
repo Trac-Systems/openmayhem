@@ -10,6 +10,7 @@ use std::{fmt, time::SystemTime};
 #[serde(rename_all = "snake_case")]
 pub enum Code {
     InvalidRequest,
+    InvalidSchema,
     UnsupportedControl,
     ContextTooLarge,
     UpstreamBusy,
@@ -90,6 +91,7 @@ impl Failure {
     pub fn retry_advice(&self) -> RetryAdvice {
         match self.code {
             Code::InvalidRequest
+            | Code::InvalidSchema
             | Code::UnsupportedControl
             | Code::ContextTooLarge
             | Code::RequestTooLarge => RetryAdvice::CorrectRequest,
@@ -106,7 +108,10 @@ impl Failure {
     /// Upstream 401/402 must never impersonate buyer auth or balance failure.
     pub fn public_status(&self) -> u16 {
         match self.code {
-            Code::InvalidRequest | Code::UnsupportedControl | Code::ContextTooLarge => 400,
+            Code::InvalidRequest
+            | Code::InvalidSchema
+            | Code::UnsupportedControl
+            | Code::ContextTooLarge => 400,
             Code::RequestTooLarge => 413,
             Code::LocalCapacity
             | Code::UpstreamBusy
@@ -121,6 +126,9 @@ impl Failure {
     pub fn message(&self) -> &'static str {
         match self.code {
             Code::InvalidRequest => "The upstream rejected the request arguments.",
+            Code::InvalidSchema => {
+                "The requested JSON schema is invalid or exceeds this adapter's supported limits."
+            }
             Code::UnsupportedControl => {
                 "The selected upstream does not support a requested setting."
             }
