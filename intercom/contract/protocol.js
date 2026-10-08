@@ -2,6 +2,7 @@ import { Protocol } from 'trac-peer';
 import b4a from 'b4a';
 import { createHash } from 'trac-peer/src/utils/types.js';
 import MayhemContract, { CONTRACT_VERSION } from './contract.js';
+import { assertProxyPublicationNotPaid } from './proxy-protocol.js';
 
 const DEFAULT_MAYHEM_TX_MAX_BYTES = 64_000;
 const DEFAULT_MAYHEM_FEATURE_MAX_BYTES = 64_000;
@@ -28,6 +29,10 @@ const uniqueByJson = (values) => {
 
 export const mayhemFeatureParticipant = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (value.op === 'proxy_registry') {
+    const provider = String(value.intent?.provider_pubkey ?? '').toLowerCase();
+    return /^[0-9a-f]{64}$/.test(provider) ? provider : null;
+  }
   if (value.op === 'record_usage_receipt') {
     const provider = String(value.receipt?.body?.provider ?? '').toLowerCase();
     return /^[0-9a-f]{64}$/.test(provider) ? provider : null;
@@ -122,6 +127,7 @@ class MayhemProtocol extends Protocol {
   }
 
   async broadcastTransaction(value, sim = false, surrogate = null) {
+    assertProxyPublicationNotPaid(value);
     return await super.broadcastTransaction(
       this.versionedTransactionObject(value),
       sim,
@@ -130,6 +136,7 @@ class MayhemProtocol extends Protocol {
   }
 
   async preparePaidTransaction(value) {
+    assertProxyPublicationNotPaid(value);
     const dispatch = this.versionedTransactionObject(value);
     const peer = this.peer;
     if (!peer.base.writable || !peer.wallet.publicKey || !peer.wallet.secretKey || !peer.writerLocalKey) {
@@ -159,6 +166,7 @@ class MayhemProtocol extends Protocol {
 
   async broadcastPreparedTransaction(prepared) {
     // Preserve the persisted dispatch bytes, including its contract revision.
+    assertProxyPublicationNotPaid(prepared.dispatch);
     return await super.broadcastTransaction(prepared.dispatch, false, prepared.surrogate);
   }
 
@@ -212,6 +220,7 @@ class MayhemProtocol extends Protocol {
     }
 
     const json = this.safeJsonParse(command);
+    assertProxyPublicationNotPaid(json);
     if (json?.op === 'noop') {
       return {
         type: 'noop',

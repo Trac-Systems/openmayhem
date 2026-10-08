@@ -4,6 +4,7 @@
 // fee worker/network/history lookup on subsequent publications or inference turns.
 import { validateProxyOperationEnvelope, proxyRegistryFeatureKey } from '../../contract/proxy-protocol.js';
 import { prepareProxyRegistryMutation } from '../../contract/proxy-registry.js';
+import { validateProxyPolicy, proxyPolicyFeatureKey, prepareProxyPolicyMutation } from '../../contract/proxy-policy.js';
 
 export { proxyRegistryFeatureKey } from '../../contract/proxy-protocol.js';
 
@@ -30,6 +31,27 @@ export async function admitProxyRegistryFeature({ featureKey, envelope, withCano
     if (plan.duplicate) return { duplicate: true, result: plan.result };
     // No prepared writes cross the ingress boundary. Application re-derives them
     // against its then-current canonical state, preventing a forged write plan.
+    return await forward({ featureKey, envelope });
+  });
+}
+
+// Only the canonical admin may call this. Policy still needs the same snapshot
+// and pre-append validation; a metadata edit cannot append an invalid policy.
+export async function admitProxyPolicyFeature({ featureKey, envelope, withCanonicalSnapshot, forward }) {
+  validateProxyPolicy(envelope);
+  envelope = JSON.parse(JSON.stringify(envelope));
+  if (typeof withCanonicalSnapshot !== 'function' || typeof forward !== 'function') {
+    throw new Error('Proxy canonical admission is not configured.');
+  }
+  if (featureKey !== await proxyPolicyFeatureKey(envelope)) throw new Error('Invalid proxy policy feature key.');
+  return await withCanonicalSnapshot(async snapshot => {
+    if (typeof snapshot?.assertCurrent !== 'function' || typeof snapshot?.read !== 'function') {
+      throw new Error('Proxy canonical snapshot is incomplete.');
+    }
+    await snapshot.assertCurrent();
+    const plan = await prepareProxyPolicyMutation(envelope, snapshot.context, snapshot.read);
+    await snapshot.assertCurrent();
+    if (plan.duplicate) return { duplicate: true, result: plan.result };
     return await forward({ featureKey, envelope });
   });
 }

@@ -6,6 +6,28 @@ import { blake3 } from '@tracsystems/blake3';
 
 export const PROXY_SCHEMA_VERSION = 1;
 export const PROXY_MAX_RECORD_BYTES = 16_384;
+
+export const isProxyPublication = value => value?.op === 'proxy_registry' || value?.op === 'proxy_policy';
+
+// Paid transaction preparation/broadcast and admin-command wrappers are not a
+// second publication lane. Inspect only known transport carriers, not arbitrary
+// model inputs/metadata. This check must happen BEFORE any MSB transmission.
+export function assertProxyPublicationNotPaid(command) {
+  const pending = [command];
+  const visited = new Set();
+  while (pending.length > 0) {
+    const value = pending.pop();
+    if (!value || typeof value !== 'object' || Array.isArray(value) || visited.has(value)) continue;
+    visited.add(value);
+    if (isProxyPublication(value) || ['proxyRegistry', 'proxyPolicy', 'proxy_registry', 'proxy_policy'].includes(value.type)) {
+      throw new ProxyValidationError('Proxy publication requires the admitted feature path, not a paid or wrapped transaction.');
+    }
+    if (visited.size > 16) throw new ProxyValidationError('Transaction transport nesting exceeds the supported bound.');
+    for (const field of ['value', 'dispatch', 'prepared_command']) {
+      if (value[field] && typeof value[field] === 'object') pending.push(value[field]);
+    }
+  }
+}
 export const PROXY_MARKET_DOMAIN = 'mayhem/proxy/market/v1';
 export const PROXY_MEMBERSHIP_DOMAIN = 'mayhem/proxy/membership/v1';
 export const PROXY_OFFER_DOMAIN = 'mayhem/proxy/offer/v1';

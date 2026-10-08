@@ -5,6 +5,8 @@ import { blake3 } from '@tracsystems/blake3';
 import { keccak256 } from 'ethereum-cryptography/keccak';
 import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import PeerWallet from 'trac-wallet';
+import { assertProxyPublicationNotPaid, isProxyPublication } from '../../contract/proxy-protocol.js';
+import { admitProxyRegistryFeature, admitProxyPolicyFeature } from './proxy-admission.js';
 import {
   CONTRACT_VERSION,
   PAYOUT_INTENT_MAX_EXPIRY_EPOCHS_DEFAULT,
@@ -301,6 +303,10 @@ const validStripeCheckoutPayload = (value) => {
 
 const participantFor = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  if (value.op === 'proxy_registry') {
+    const provider = normalizeKey(value.intent?.provider_pubkey);
+    return /^[0-9a-f]{64}$/.test(provider) ? provider : null;
+  }
   if (value.op === 'admin_contract_tx') return normalizeKey(value.address);
   if (value.op === 'consent' || value.op === 'deposit_tnk') return normalizeKey(value.sender);
   if (value.op === 'tap_account_bind') return normalizeKey(value.user);
@@ -434,6 +440,10 @@ class MayhemFeature extends Feature {
       ? config.processedInFlightMax
       : DEFAULT_PROCESSED_IN_FLIGHT_MAX;
     this.serviceHandler = typeof config.serviceHandler === 'function' ? config.serviceHandler : null;
+    // Trusted process configuration, never a request option. Until the canonical
+    // snapshot/journal adapter is installed, proxy publication fails closed.
+    this.withProxyCanonicalSnapshot = typeof config.withProxyCanonicalSnapshot === 'function'
+      ? config.withProxyCanonicalSnapshot : null;
     this.adminTxHandler = typeof config.adminTxHandler === 'function'
       ? config.adminTxHandler
       : async (value) => {
@@ -486,12 +496,37 @@ class MayhemFeature extends Feature {
     return await this.submit(key, value);
   }
 
+  async append(key, value) {
+    if (isProxyPublication(value) || value?.op === 'admin_contract_tx') return await this.submit(key, value);
+    return await super.append(key, value);
+  }
+
   async submit(key, value, { nonce = null } = {}) {
     const admin = await this._adminKey();
     const self = normalizeKey(this.peer?.wallet?.publicKey);
     if (!this.peer.base?.writable || !admin || self !== admin) {
       throw new Error('Peer subnet is not the canonical writable admin.');
     }
+    if (isProxyPublication(value)) {
+      return await this._admitProxyPublication(key, value,
+        ({ featureKey, envelope }) => this._submitFeature(featureKey, envelope, { nonce }));
+    }
+    return await this._submitFeature(key, value, { nonce });
+  }
+
+  async _admitProxyPublication(key, value, forward) {
+    const gate = value.op === 'proxy_registry' ? admitProxyRegistryFeature : admitProxyPolicyFeature;
+    const result = await gate({ featureKey: key, envelope: value,
+      withCanonicalSnapshot: this.withProxyCanonicalSnapshot,
+      verifySignature: (signature, bytes, signer) => verifyEd25519Hex(this.peer.wallet, signature, bytes, signer),
+      forward });
+    if (result?.duplicate !== true) return result;
+    return { ok: true, accepted: false, status: 'applied', duplicate: true,
+      feature: this.key || 'mayhem', key, result: result.result,
+      message: 'Proxy operation was already applied; no new append was made.' };
+  }
+
+  async _submitFeature(key, value, { nonce = null } = {}) {
     if (value?.op === 'admin_contract_tx') {
       const validationError = await this._validateAdminTx(key, value);
       if (validationError) {
@@ -600,6 +635,15 @@ class MayhemFeature extends Feature {
   }
 
   async relay(key, value) {
+    if (value?.op === 'proxy_policy') throw new Error('Proxy policy requires the canonical admin writer.');
+    if (value?.op === 'proxy_registry') {
+      return await this._admitProxyPublication(key, value,
+        ({ featureKey, envelope }) => this._relayFeature(featureKey, envelope));
+    }
+    return await this._relayFeature(key, value);
+  }
+
+  async _relayFeature(key, value) {
     const feature = this.key || 'mayhem';
     const actor = participantFor(value);
     const self = normalizeKey(this.peer?.wallet?.publicKey);
@@ -1908,6 +1952,11 @@ class MayhemFeature extends Feature {
   }
 
   async _validateAdminTx(key, value) {
+    try {
+      assertProxyPublicationNotPaid(value?.prepared_command);
+    } catch (error) {
+      return error.message;
+    }
     const allowed = new Set([
       'op',
       'tx',
