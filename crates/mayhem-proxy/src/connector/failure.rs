@@ -2,11 +2,11 @@
 //! parameter values never become diagnostic strings or automatically authorize
 //! retry/settlement. A documented adapter can add stronger execution evidence.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{fmt, time::SystemTime};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Code {
     InvalidRequest,
@@ -27,7 +27,7 @@ pub enum Code {
     ResponseTooLarge,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Scope {
     Request,
@@ -35,7 +35,7 @@ pub enum Scope {
     Connection,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
     BeforeDispatch,
@@ -45,7 +45,7 @@ pub enum Stage {
     ResponseBody,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Execution {
     NotDispatched,
@@ -198,17 +198,7 @@ pub fn openai_error(
             .and_then(Value::as_str)
             .or_else(|| e.get("type").and_then(Value::as_str))
     });
-    let known = match raw {
-        Some("context_length_exceeded") => Some("context_length_exceeded"),
-        Some("unsupported_parameter") => Some("unsupported_parameter"),
-        Some("invalid_request_error") => Some("invalid_request_error"),
-        Some("model_not_found") => Some("model_not_found"),
-        Some("rate_limit_exceeded") => Some("rate_limit_exceeded"),
-        Some("insufficient_quota") => Some("insufficient_quota"),
-        Some("invalid_api_key") => Some("invalid_api_key"),
-        Some("overloaded_error") => Some("overloaded_error"),
-        _ => None,
-    };
+    let known = raw.and_then(safe_upstream_code);
     let (code, scope) = match (status, known) {
         (401 | 403, _) => (Code::UpstreamAuthentication, Scope::Connection),
         (402, _) => (Code::UpstreamPaymentRequired, Scope::Connection),
@@ -232,8 +222,31 @@ pub fn openai_error(
     let mut failure = Failure::new(code, scope, Stage::ResponseHeaders, Execution::Unknown);
     failure.upstream_status = Some(status);
     failure.upstream_code = known;
+    failure.parameter = error
+        .and_then(|e| e.get("param"))
+        .and_then(Value::as_str)
+        .and_then(safe_parameter);
+    failure.retry_after_ms = retry_after.and_then(|value| parse_retry_after(value, now));
+    failure
+}
+
+pub(crate) fn safe_upstream_code(value: &str) -> Option<&'static str> {
+    match Some(value) {
+        Some("context_length_exceeded") => Some("context_length_exceeded"),
+        Some("unsupported_parameter") => Some("unsupported_parameter"),
+        Some("invalid_request_error") => Some("invalid_request_error"),
+        Some("model_not_found") => Some("model_not_found"),
+        Some("rate_limit_exceeded") => Some("rate_limit_exceeded"),
+        Some("insufficient_quota") => Some("insufficient_quota"),
+        Some("invalid_api_key") => Some("invalid_api_key"),
+        Some("overloaded_error") => Some("overloaded_error"),
+        _ => None,
+    }
+}
+
+pub(crate) fn safe_parameter(value: &str) -> Option<&'static str> {
     // Only known public root fields, never user-controlled schema/property names.
-    failure.parameter = match error.and_then(|e| e.get("param")).and_then(Value::as_str) {
+    match Some(value) {
         Some("messages") => Some("messages"),
         Some("input") => Some("input"),
         Some("tools") => Some("tools"),
@@ -242,9 +255,7 @@ pub fn openai_error(
         Some("temperature") => Some("temperature"),
         Some("model") => Some("model"),
         _ => None,
-    };
-    failure.retry_after_ms = retry_after.and_then(|value| parse_retry_after(value, now));
-    failure
+    }
 }
 
 pub fn parse_retry_after(value: &str, now: SystemTime) -> Option<u64> {

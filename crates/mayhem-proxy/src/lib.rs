@@ -3,6 +3,7 @@
 //! Proxy-only control and connector components. A catalog record is neither runtime
 //! capacity evidence nor authorization to accept or settle an inference request.
 
+pub mod attempts;
 pub mod catalog;
 pub mod cli;
 pub mod connector;
