@@ -69,6 +69,7 @@ impl fmt::Debug for OwnedResult {
 #[derive(Debug)]
 pub struct Recovery {
     pub record: Record,
+    pub acceptance: Option<OwnedAcceptance>,
     pub request: Option<OwnedRequest>,
     pub result: Option<OwnedResult>,
 }
@@ -266,10 +267,12 @@ impl Journal {
             return Err(Error::NotFound);
         }
         let record = read_record(&records, invocation, attempt)?;
+        let acceptance = super::acceptance::read(&tx, &record)?;
         let table = storage(tx.open_table(PAYLOADS))?;
         let Some(p) = payload(&table, &record.key())? else {
             return Ok(Recovery {
                 record,
+                acceptance,
                 request: None,
                 result: None,
             });
@@ -301,6 +304,7 @@ impl Journal {
         };
         Ok(Recovery {
             record,
+            acceptance,
             request,
             result,
         })
@@ -315,6 +319,7 @@ impl Journal {
     }
 }
 pub(super) fn prune(tx: &redb::WriteTransaction, key: &str, meta: &mut Meta) -> Result<()> {
+    super::acceptance::prune(tx, key, meta)?;
     let mut table = storage(tx.open_table(PAYLOADS))?;
     let Some(p) = payload(&table, key)? else {
         return Ok(());
@@ -586,7 +591,12 @@ mod tests {
             .record()
             .clone();
         let tx = j.transaction().unwrap();
-        for name in [PAYLOADS.name(), INPUT.name(), OUTPUT.name()] {
+        for name in [
+            PAYLOADS.name(),
+            INPUT.name(),
+            OUTPUT.name(),
+            "proxy_accepted_snapshots_v1",
+        ] {
             tx.delete_table(TableDefinition::<&str, &[u8]>::new(name))
                 .unwrap();
         }

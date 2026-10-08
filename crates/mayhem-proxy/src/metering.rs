@@ -8,12 +8,17 @@ use crate::{
 };
 use mayhem_proto::{
     metered_output_units, normalized_request_prompt_units,
-    proxy::{ProxyEndpoint, ProxyMeteringContract, ProxyOffer},
+    proxy::{ProxyEndpoint, ProxyMeteringContract},
     MoneyAu, VisibleToolCall,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use std::{collections::BTreeMap, fmt};
+
+// Existing native helpers implement this policy's numerical unit. A future
+// change must add a new policy, not silently reinterpret accepted v1 offers.
+const _: () = assert!(mayhem_proto::NORMALIZED_REQUEST_BYTES_PER_PROMPT_UNIT == 4);
+const _: () = assert!(mayhem_proto::VISIBLE_OUTPUT_BYTES_PER_UNIT == 4);
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -522,13 +527,12 @@ impl VerifiedSubtotal {
 /// Exact-key owned recovery is the evidence source, not an upstream usage total.
 /// `remaining_au` must come from locked parent authorization, never the connector.
 /// This performs no I/O, payout, hold release, receipt lookup or current-offer lookup.
-pub fn price_completed(
-    recovery: &Recovery,
-    accepted_offer: &ProxyOffer,
-    remaining_au: MoneyAu,
-) -> Result<VerifiedSubtotal> {
+pub fn price_completed(recovery: &Recovery, remaining_au: MoneyAu) -> Result<VerifiedSubtotal> {
     let r = &recovery.record;
     let b = &r.binding;
+    let accepted = recovery.acceptance.as_ref().ok_or(Error::Offer)?;
+    accepted.validate_for(r).map_err(|_| Error::Offer)?;
+    let accepted_offer = &accepted.snapshot.offer;
     let input = &recovery.request.as_ref().ok_or(Error::Evidence)?.body;
     let output = recovery.result.as_ref().ok_or(Error::Evidence)?;
     let policy = Policy::resolve(b.endpoint, &b.metering_policy)?;

@@ -218,7 +218,34 @@ impl Fixture {
         } else {
             self.adapter.prepare_json(body).unwrap()
         };
-        self.journal
+        let policy = mayhem_proxy::metering::Policy::for_endpoint(request.endpoint());
+        let offer = mayhem_proto::proxy::ProxyOffer {
+            schema_version: 1,
+            lane: mayhem_proto::proxy::ProxyLane::Proxy,
+            market_id: d(6).as_str().into(),
+            provider_pubkey: d(5).as_str().into(),
+            membership_revision: 1,
+            revision: 1,
+            endpoint: request.endpoint(),
+            ctx_bracket: "ctx_1024".into(),
+            outcome_class: String::new(),
+            metering_policy_hash: policy.hash().as_str().into(),
+            rates: policy
+                .contract()
+                .units
+                .into_iter()
+                .map(|unit| mayhem_proto::proxy::ProxyRate {
+                    unit,
+                    per_unit_au: 1,
+                    granularity: 1,
+                })
+                .collect(),
+            per_request_au: 0,
+            min_session_au: 0,
+            accepted_rails: vec![rail],
+        };
+        let record = self
+            .journal
             .prepare(
                 d(n),
                 Binding {
@@ -227,7 +254,7 @@ impl Fixture {
                     contract_version: 30,
                     provider_pubkey: d(5),
                     market_id: d(6),
-                    offer_digest: d(7),
+                    offer_digest: Digest::new(offer.digest().unwrap()).unwrap(),
                     endpoint_contract: self.adapter.contract_hash().clone(),
                     metering_policy: request.metering_policy_hash(),
                     accepted_terms: d(9),
@@ -240,7 +267,18 @@ impl Fixture {
                 },
                 1000,
             )
-            .unwrap()
+            .unwrap();
+        self.journal
+            .retain_acceptance(
+                &record.invocation,
+                record.attempt,
+                &attempts::AcceptanceSnapshot {
+                    adapter: self.adapter.snapshot(),
+                    offer,
+                },
+            )
+            .unwrap();
+        record
     }
 }
 fn chat() -> Vec<u8> {
@@ -461,12 +499,23 @@ async fn owned_usage_prices_the_accepted_offer_once_with_rail_and_budget_binding
             binding.offer_digest = Digest::new(offer.digest().unwrap()).unwrap();
             let r = fixture.journal.prepare(d(n + 100), binding, 1000).unwrap();
             fixture
+                .journal
+                .retain_acceptance(
+                    &r.invocation,
+                    r.attempt,
+                    &attempts::AcceptanceSnapshot {
+                        adapter: fixture.adapter.snapshot(),
+                        offer: offer.clone(),
+                    },
+                )
+                .unwrap();
+            fixture
                 .executor
                 .execute_json(&r.invocation, &body, &Cancellation::default())
                 .await
                 .unwrap();
             let mut saved = fixture.journal.recover(&r.invocation, r.attempt).unwrap();
-            let quoted = metering::price_completed(&saved, &offer, u128::MAX).unwrap();
+            let quoted = metering::price_completed(&saved, u128::MAX).unwrap();
             assert_eq!(quoted.binding.rail, rail);
             let expected = quoted
                 .observation
@@ -476,14 +525,14 @@ async fn owned_usage_prices_the_accepted_offer_once_with_rail_and_budget_binding
                 .max(10);
             assert_eq!(quoted.subtotal_au, expected);
             assert_eq!(
-                metering::price_completed(&saved, &offer, expected)
+                metering::price_completed(&saved, expected)
                     .unwrap()
                     .digest()
                     .unwrap(),
                 quoted.digest().unwrap()
             );
             assert!(matches!(
-                metering::price_completed(&saved, &offer, expected - 1),
+                metering::price_completed(&saved, expected - 1),
                 Err(metering::Error::Budget)
             ));
             for edit in 0..6 {
@@ -502,11 +551,13 @@ async fn owned_usage_prices_the_accepted_offer_once_with_rail_and_budget_binding
                     4 => wrong.market_id = d(99).as_str().into(),
                     _ => wrong.metering_policy_hash = d(99).as_str().into(),
                 }
+                saved.acceptance.as_mut().unwrap().snapshot.offer = wrong;
                 assert!(matches!(
-                    metering::price_completed(&saved, &wrong, u128::MAX),
+                    metering::price_completed(&saved, u128::MAX),
                     Err(metering::Error::Offer)
                 ));
             }
+            saved = fixture.journal.recover(&r.invocation, r.attempt).unwrap();
             let observed = saved
                 .result
                 .as_mut()
@@ -517,13 +568,13 @@ async fn owned_usage_prices_the_accepted_offer_once_with_rail_and_budget_binding
                 .unwrap();
             *observed.units.values_mut().next().unwrap() += 1;
             assert!(matches!(
-                metering::price_completed(&saved, &offer, u128::MAX),
+                metering::price_completed(&saved, u128::MAX),
                 Err(metering::Error::Evidence)
             ));
             saved = fixture.journal.recover(&r.invocation, r.attempt).unwrap();
             saved.record.cancellation_requested = true;
             assert!(matches!(
-                metering::price_completed(&saved, &offer, u128::MAX),
+                metering::price_completed(&saved, u128::MAX),
                 Err(metering::Error::OutcomePolicyRequired)
             ));
             assert_eq!(
@@ -924,7 +975,7 @@ async fn responses_structured_text_checks_original_schema_and_allows_explicit_re
 #[tokio::test]
 async fn storage_capacity_is_reserved_before_post_and_retained_result_recovers_without_network() {
     let backend = backend(200, answer(), Duration::ZERO).await;
-    let blocked = Fixture::with_payload_limit(&backend.base, ProxyEndpoint::Chat, 1);
+    let blocked = Fixture::with_payload_limit(&backend.base, ProxyEndpoint::Chat, 64 * 1024);
     let body = chat();
     let r = blocked.prepare(1, &body, ProxyRail::Fiat);
     assert!(matches!(
@@ -983,6 +1034,34 @@ async fn storage_capacity_is_reserved_before_post_and_retained_result_recovers_w
     );
     let storage = Storage::new(reopened.clone(), 2).unwrap();
     let recovered = storage.recover(&r.invocation, r.attempt).await.unwrap();
+    let quote = mayhem_proxy::metering::price_completed(&recovered, u128::MAX).unwrap();
+    let snapshot = recovered.acceptance.as_ref().unwrap();
+    let restored = Adapter::restore(snapshot.snapshot.adapter.clone()).unwrap();
+    assert_eq!(restored.recipe_hash(), &r.binding.recipe_digest);
+    assert_eq!(
+        restored.prepare_json(&body).unwrap().request_hash(),
+        &r.binding.request_hash
+    );
+    assert_eq!(quote.binding.rail, ProxyRail::Tap);
+    let mut changed = snapshot.snapshot.clone();
+    changed.adapter.upstream_model = "new-private-model".into();
+    assert!(matches!(
+        reopened.retain_acceptance(&r.invocation, r.attempt, &changed),
+        Err(attempts::Error::Conflict)
+    ));
+    changed = snapshot.snapshot.clone();
+    changed.offer.revision += 1;
+    changed.offer.rates[0].per_unit_au += 100;
+    assert!(matches!(
+        reopened.retain_acceptance(&r.invocation, r.attempt, &changed),
+        Err(attempts::Error::Conflict)
+    ));
+    assert_eq!(
+        reopened
+            .retain_acceptance(&r.invocation, r.attempt, &snapshot.snapshot)
+            .unwrap(),
+        snapshot.digest
+    );
     assert_eq!(recovered.request.unwrap().body, body);
     let retained = recovered.result.unwrap();
     assert_eq!(retained.reply.body, expected);
@@ -1003,6 +1082,32 @@ async fn storage_capacity_is_reserved_before_post_and_retained_result_recovers_w
     drop(reopened);
     drop(work);
     drop(store);
+}
+
+#[tokio::test]
+async fn matching_but_unretained_acceptance_cannot_dispatch() {
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let body = chat();
+    let valid = fixture.prepare(1, &body, ProxyRail::Fiat);
+    let missing = fixture.journal.prepare(d(2), valid.binding, 1000).unwrap();
+    assert!(matches!(
+        fixture
+            .executor
+            .execute_json(&missing.invocation, &body, &Cancellation::default())
+            .await,
+        Err(Error::Binding)
+    ));
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        fixture
+            .journal
+            .get(&missing.invocation)
+            .unwrap()
+            .unwrap()
+            .phase,
+        Phase::Prepared
+    );
 }
 
 #[tokio::test]

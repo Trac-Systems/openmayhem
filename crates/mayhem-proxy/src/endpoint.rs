@@ -216,6 +216,25 @@ pub struct Adapter {
     upstream_model: String,
     limits: Limits,
 }
+
+/// Private recovery data. Includes the original endpoint contract and upstream
+/// model mapping, but no network address, credential, executable or financial key.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdapterSnapshot {
+    pub version: u32,
+    pub endpoint: ProxyEndpoint,
+    pub contract: EndpointFamilyContract,
+    pub upstream_model: String,
+    pub limits: Limits,
+}
+impl fmt::Debug for AdapterSnapshot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("AdapterSnapshot")
+            .field("endpoint", &self.endpoint)
+            .finish_non_exhaustive()
+    }
+}
 impl fmt::Debug for Adapter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Adapter")
@@ -224,6 +243,26 @@ impl fmt::Debug for Adapter {
     }
 }
 impl Adapter {
+    pub fn snapshot(&self) -> AdapterSnapshot {
+        AdapterSnapshot {
+            version: 1,
+            endpoint: self.endpoint,
+            contract: self.contract.clone(),
+            upstream_model: self.upstream_model.clone(),
+            limits: self.limits,
+        }
+    }
+    pub fn restore(snapshot: AdapterSnapshot) -> Result<Self> {
+        if snapshot.version != 1 {
+            return Err(Error::Configuration);
+        }
+        Self::new(
+            snapshot.endpoint,
+            snapshot.contract,
+            snapshot.upstream_model,
+            snapshot.limits,
+        )
+    }
     pub fn new(
         endpoint: ProxyEndpoint,
         contract: EndpointFamilyContract,

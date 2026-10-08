@@ -7,7 +7,9 @@
 //! Private bounded request/result payloads live in separate owned tables. They
 //! are not diagnostic logs. No credentials or connector-authored monetary values.
 
+mod acceptance;
 mod payloads;
+pub use acceptance::{AcceptanceSnapshot, OwnedAcceptance};
 pub use payloads::{OwnedRequest, OwnedResult, Recovery};
 
 use std::{
@@ -474,7 +476,7 @@ impl Journal {
             if meta.identity != identity {
                 return Err(Error::Identity);
             }
-            require(matches!(meta.schema, 1 | 2))?;
+            require(matches!(meta.schema, 1 | 2 | 3))?;
             require(
                 [
                     REQUESTS.name(),
@@ -507,9 +509,12 @@ impl Journal {
                         .ok_or(Error::Invalid)?,
             )?;
             payloads::initialize(&tx, meta.schema == 1)?;
+            acceptance::initialize(&tx, meta.schema < 3)?;
             if meta.schema == 1 {
                 require(meta.payload_bytes == 0)?;
-                meta.schema = 2;
+            }
+            if meta.schema < 3 {
+                meta.schema = 3;
                 storage(meta_table.insert("state", encode(&meta)?.as_slice()))?;
             }
         } else {
@@ -519,8 +524,9 @@ impl Journal {
             storage(tx.open_table(UNFINISHED))?;
             storage(tx.open_table(EXPIRY))?;
             payloads::initialize(&tx, true)?;
+            acceptance::initialize(&tx, true)?;
             let meta = Meta {
-                schema: 2,
+                schema: 3,
                 identity,
                 records: 0,
                 unfinished: 0,

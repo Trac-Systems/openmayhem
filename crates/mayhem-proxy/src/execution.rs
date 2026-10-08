@@ -233,6 +233,17 @@ impl Executor {
             Phase::Resolved | Phase::Closed => return Err(Error::ExistingResult),
             Phase::Prepared => (),
         }
+        let key = invocation.clone();
+        let attempt = record.attempt;
+        // The exact original recipe/contract/offer must survive reconfiguration.
+        // This is one bounded key read, never a current-catalog or receipt scan.
+        let accepted = self
+            .storage
+            .run(move |j| j.accepted_snapshot(&key, attempt))
+            .await?;
+        if accepted.is_none() {
+            return Err(Error::Binding);
+        }
         if record.cancellation_requested || cancel.is_cancelled() {
             self.storage
                 .event(invocation, record.attempt, Event::CancelRequested)

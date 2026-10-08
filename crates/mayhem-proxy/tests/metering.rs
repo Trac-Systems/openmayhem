@@ -149,6 +149,7 @@ fn canonical_input_has_no_key_order_whitespace_or_model_name_price_effect() {
         .observe(&result)
         .unwrap();
     assert_eq!(a.units, b.units);
+    assert_eq!(a.units["input_token"], 12); // fixed v1 canonical JSON projection
     assert_ne!(a.request_hash, b.request_hash);
     assert!(Policy::resolve(ProxyEndpoint::Decisions, &p.hash()).is_err());
     assert_eq!(p.contract().units, vec!["input_token", "output_token"]);
