@@ -1,0 +1,648 @@
+{
+  "cases": [
+    {
+      "name": "llm-create_market",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "create_market",
+          "market": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "creator_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "slug": "test-llm",
+            "model": {
+              "family_id": "other",
+              "model_id": "example/Unicode-é-模型-🦉",
+              "revision": "",
+              "quantization": ""
+            },
+            "family": "llm",
+            "endpoints": [
+              {
+                "endpoint": "openai_chat_completions",
+                "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+              },
+              {
+                "endpoint": "openai_completions",
+                "contract_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "endpoint": "openai_responses",
+                "contract_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+              }
+            ],
+            "metering": {
+              "policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "units": [
+                "input_token",
+                "output_token"
+              ]
+            },
+            "pricing": "provider_offers"
+          },
+          "membership": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "market_id": "d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b",
+            "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "revision": 1,
+            "endpoints": [
+              {
+                "endpoint": "openai_chat_completions",
+                "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+              },
+              {
+                "endpoint": "openai_completions",
+                "contract_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "endpoint": "openai_responses",
+                "contract_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+              }
+            ],
+            "served_context": 262144,
+            "max_concurrency": 2,
+            "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "connection_revision": 1,
+            "capacity_group": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "accepted_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ]
+          }
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "852bce238f0a63843d100a0e226501fd95149af4227e0d474855f833eb98bad6",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"kind\":\"create_market\",\"market\":{\"creator_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"openai_chat_completions\"},{\"contract_hash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"endpoint\":\"openai_completions\"},{\"contract_hash\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"endpoint\":\"openai_responses\"}],\"family\":\"llm\",\"lane\":\"proxy\",\"metering\":{\"policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"units\":[\"input_token\",\"output_token\"]},\"model\":{\"family_id\":\"other\",\"model_id\":\"example/Unicode-é-模型-🦉\",\"quantization\":\"\",\"revision\":\"\"},\"pricing\":\"provider_offers\",\"schema_version\":1,\"slug\":\"test-llm\"},\"membership\":{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"capacity_group\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"connection_revision\":1,\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"openai_chat_completions\"},{\"contract_hash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"endpoint\":\"openai_completions\"},{\"contract_hash\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"endpoint\":\"openai_responses\"}],\"lane\":\"proxy\",\"market_id\":\"d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b\",\"max_concurrency\":2,\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"recipe_hash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"revision\":1,\"schema_version\":1,\"served_context\":262144}},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    },
+    {
+      "name": "llm-join_market",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "join_market",
+          "membership": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "market_id": "d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b",
+            "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "revision": 1,
+            "endpoints": [
+              {
+                "endpoint": "openai_chat_completions",
+                "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+              },
+              {
+                "endpoint": "openai_completions",
+                "contract_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "endpoint": "openai_responses",
+                "contract_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+              }
+            ],
+            "served_context": 262144,
+            "max_concurrency": 2,
+            "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "connection_revision": 1,
+            "capacity_group": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "accepted_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ]
+          }
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "d07d72c11eebbb5e4de11427d99614b236d57e2e5d4669c7bed60f113e4a5d5e",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"kind\":\"join_market\",\"membership\":{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"capacity_group\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"connection_revision\":1,\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"openai_chat_completions\"},{\"contract_hash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"endpoint\":\"openai_completions\"},{\"contract_hash\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"endpoint\":\"openai_responses\"}],\"lane\":\"proxy\",\"market_id\":\"d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b\",\"max_concurrency\":2,\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"recipe_hash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"revision\":1,\"schema_version\":1,\"served_context\":262144}},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    },
+    {
+      "name": "llm-update_membership",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "update_membership",
+          "membership": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "market_id": "d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b",
+            "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "revision": 2,
+            "endpoints": [
+              {
+                "endpoint": "openai_chat_completions",
+                "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+              },
+              {
+                "endpoint": "openai_completions",
+                "contract_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "endpoint": "openai_responses",
+                "contract_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+              }
+            ],
+            "served_context": 262144,
+            "max_concurrency": 2,
+            "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "connection_revision": 1,
+            "capacity_group": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "accepted_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ]
+          }
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "a1676d3044f0f68269a3d1a9b21881802e430b19b7b607b4bd5ee037213be89f",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"kind\":\"update_membership\",\"membership\":{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"capacity_group\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"connection_revision\":1,\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"openai_chat_completions\"},{\"contract_hash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"endpoint\":\"openai_completions\"},{\"contract_hash\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"endpoint\":\"openai_responses\"}],\"lane\":\"proxy\",\"market_id\":\"d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b\",\"max_concurrency\":2,\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"recipe_hash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"revision\":2,\"schema_version\":1,\"served_context\":262144}},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    },
+    {
+      "name": "llm-set_offer",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "set_offer",
+          "offer": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "market_id": "d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b",
+            "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "membership_revision": 1,
+            "revision": 1,
+            "endpoint": "openai_chat_completions",
+            "ctx_bracket": "le256k",
+            "outcome_class": "",
+            "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "rates": [
+              {
+                "unit": "input_token",
+                "per_unit_au": "1000000000000",
+                "granularity": 1000000
+              },
+              {
+                "unit": "output_token",
+                "per_unit_au": "2000000000000",
+                "granularity": 1000000
+              }
+            ],
+            "per_request_au": "0",
+            "min_session_au": "0",
+            "accepted_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ]
+          }
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "8d6376cf3812b346ec2d6907773a7a157ca601435ce045124ad80e524a63a603",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"kind\":\"set_offer\",\"offer\":{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"ctx_bracket\":\"le256k\",\"endpoint\":\"openai_chat_completions\",\"lane\":\"proxy\",\"market_id\":\"d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b\",\"membership_revision\":1,\"metering_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"min_session_au\":\"0\",\"outcome_class\":\"\",\"per_request_au\":\"0\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"rates\":[{\"granularity\":1000000,\"per_unit_au\":\"1000000000000\",\"unit\":\"input_token\"},{\"granularity\":1000000,\"per_unit_au\":\"2000000000000\",\"unit\":\"output_token\"}],\"revision\":1,\"schema_version\":1}},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    },
+    {
+      "name": "llm-withdraw_offer",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "withdraw_offer",
+          "market_id": "d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b",
+          "endpoint": "openai_chat_completions",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "revision": 2
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "61c8f574b6ea7e14b256fb9976d9582722ee5e8ae485fc6121cfeff12a0c713b",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"ctx_bracket\":\"le256k\",\"endpoint\":\"openai_chat_completions\",\"kind\":\"withdraw_offer\",\"market_id\":\"d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b\",\"outcome_class\":\"\",\"revision\":2},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    },
+    {
+      "name": "llm-leave_market",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "leave_market",
+          "market_id": "d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b",
+          "revision": 2
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "6ab6387c9acfd2fb83e8826aabe981d60196495937f29abb62da20d91e9378d7",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"kind\":\"leave_market\",\"market_id\":\"d7193e099404bee2b03691118e11d268656ccb37269e3142d536ef301ddc566b\",\"revision\":2},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    },
+    {
+      "name": "decisions-create_market",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "create_market",
+          "market": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "creator_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "slug": "test-decisions",
+            "model": {
+              "family_id": "other",
+              "model_id": "example/Unicode-é-模型-🦉",
+              "revision": "",
+              "quantization": ""
+            },
+            "family": "decisions",
+            "endpoints": [
+              {
+                "endpoint": "mayhem_decisions",
+                "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+              }
+            ],
+            "metering": {
+              "policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+              "units": [
+                "decision",
+                "input_character"
+              ]
+            },
+            "pricing": "provider_offers"
+          },
+          "membership": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "market_id": "a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b",
+            "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "revision": 1,
+            "endpoints": [
+              {
+                "endpoint": "mayhem_decisions",
+                "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+              }
+            ],
+            "served_context": 1024,
+            "max_concurrency": 2,
+            "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "connection_revision": 1,
+            "capacity_group": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "accepted_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ]
+          }
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "27177ce60d88944a88bc783545a43dff3431482d1f5e41e014d1b30d6f8dfa41",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"kind\":\"create_market\",\"market\":{\"creator_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"mayhem_decisions\"}],\"family\":\"decisions\",\"lane\":\"proxy\",\"metering\":{\"policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"units\":[\"decision\",\"input_character\"]},\"model\":{\"family_id\":\"other\",\"model_id\":\"example/Unicode-é-模型-🦉\",\"quantization\":\"\",\"revision\":\"\"},\"pricing\":\"provider_offers\",\"schema_version\":1,\"slug\":\"test-decisions\"},\"membership\":{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"capacity_group\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"connection_revision\":1,\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"mayhem_decisions\"}],\"lane\":\"proxy\",\"market_id\":\"a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b\",\"max_concurrency\":2,\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"recipe_hash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"revision\":1,\"schema_version\":1,\"served_context\":1024}},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    },
+    {
+      "name": "decisions-join_market",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "join_market",
+          "membership": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "market_id": "a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b",
+            "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "revision": 1,
+            "endpoints": [
+              {
+                "endpoint": "mayhem_decisions",
+                "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+              }
+            ],
+            "served_context": 1024,
+            "max_concurrency": 2,
+            "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "connection_revision": 1,
+            "capacity_group": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "accepted_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ]
+          }
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "99d21809cdfa9d2641f72ec1940d558a2174dfaddc83282de33ec99ebc3e1653",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"kind\":\"join_market\",\"membership\":{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"capacity_group\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"connection_revision\":1,\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"mayhem_decisions\"}],\"lane\":\"proxy\",\"market_id\":\"a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b\",\"max_concurrency\":2,\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"recipe_hash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"revision\":1,\"schema_version\":1,\"served_context\":1024}},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    },
+    {
+      "name": "decisions-update_membership",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "update_membership",
+          "membership": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "market_id": "a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b",
+            "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "revision": 2,
+            "endpoints": [
+              {
+                "endpoint": "mayhem_decisions",
+                "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+              }
+            ],
+            "served_context": 1024,
+            "max_concurrency": 2,
+            "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+            "connection_revision": 1,
+            "capacity_group": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+            "accepted_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ]
+          }
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "5f8724a8492506584af2f0491c2c9bab9d2492fbb1426fee9b4880c537ce4cdb",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"kind\":\"update_membership\",\"membership\":{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"capacity_group\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"connection_revision\":1,\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"mayhem_decisions\"}],\"lane\":\"proxy\",\"market_id\":\"a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b\",\"max_concurrency\":2,\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"recipe_hash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"revision\":2,\"schema_version\":1,\"served_context\":1024}},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    },
+    {
+      "name": "decisions-set_offer",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "set_offer",
+          "offer": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "market_id": "a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b",
+            "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "membership_revision": 1,
+            "revision": 1,
+            "endpoint": "mayhem_decisions",
+            "ctx_bracket": "le8k",
+            "outcome_class": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+            "rates": [
+              {
+                "unit": "decision",
+                "per_unit_au": "1000000000000",
+                "granularity": 1000000
+              },
+              {
+                "unit": "input_character",
+                "per_unit_au": "2000000000000",
+                "granularity": 1000000
+              }
+            ],
+            "per_request_au": "0",
+            "min_session_au": "0",
+            "accepted_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ]
+          }
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "528c0cb2bb0c5e7790b7022cf935819ae5bf123f248e58d63da344cf0a34f0ab",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"kind\":\"set_offer\",\"offer\":{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"ctx_bracket\":\"le8k\",\"endpoint\":\"mayhem_decisions\",\"lane\":\"proxy\",\"market_id\":\"a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b\",\"membership_revision\":1,\"metering_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"min_session_au\":\"0\",\"outcome_class\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"per_request_au\":\"0\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"rates\":[{\"granularity\":1000000,\"per_unit_au\":\"1000000000000\",\"unit\":\"decision\"},{\"granularity\":1000000,\"per_unit_au\":\"2000000000000\",\"unit\":\"input_character\"}],\"revision\":1,\"schema_version\":1}},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    },
+    {
+      "name": "decisions-withdraw_offer",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "withdraw_offer",
+          "market_id": "a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b",
+          "endpoint": "mayhem_decisions",
+          "ctx_bracket": "le8k",
+          "outcome_class": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "revision": 2
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "3ba9618199f109370283dedd49224b8da343dabd8b77bd5da4067d59d9e7d798",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"ctx_bracket\":\"le8k\",\"endpoint\":\"mayhem_decisions\",\"kind\":\"withdraw_offer\",\"market_id\":\"a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b\",\"outcome_class\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"revision\":2},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    },
+    {
+      "name": "decisions-leave_market",
+      "intent": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "sequence": 1,
+        "action": {
+          "kind": "leave_market",
+          "market_id": "a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b",
+          "revision": 2
+        },
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
+      },
+      "digest": "175d170b323c33931dc9ee6da4623a5a0d4824237afd577aeb130c3c5ac76796",
+      "signing_utf8": "mayhem/proxy/operation/v1\u0000{\"action\":{\"kind\":\"leave_market\",\"market_id\":\"a67f619628222dad6c3f0dc75006ac51da15723340a9a894538cca623fa6019b\",\"revision\":2},\"contract_version\":29,\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"schema_version\":1,\"sequence\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\"}"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "wrong lane",
+      "base": "llm-create_market",
+      "path": "/lane",
+      "value": "native"
+    },
+    {
+      "name": "unknown version",
+      "base": "llm-create_market",
+      "path": "/schema_version",
+      "value": 2
+    },
+    {
+      "name": "network URL",
+      "base": "llm-create_market",
+      "path": "/network_id",
+      "value": "https://network.invalid"
+    },
+    {
+      "name": "zero contract",
+      "base": "llm-create_market",
+      "path": "/contract_version",
+      "value": 0
+    },
+    {
+      "name": "unsafe sequence",
+      "base": "llm-create_market",
+      "path": "/sequence",
+      "value": 9007199254740992
+    },
+    {
+      "name": "fractional sequence",
+      "base": "llm-create_market",
+      "path": "/sequence",
+      "value": 1.5
+    },
+    {
+      "name": "string sequence",
+      "base": "llm-create_market",
+      "path": "/sequence",
+      "value": "1"
+    },
+    {
+      "name": "zero sequence",
+      "base": "llm-create_market",
+      "path": "/sequence",
+      "value": 0
+    },
+    {
+      "name": "forged creator",
+      "base": "llm-create_market",
+      "path": "/action/market/creator_pubkey",
+      "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "name": "other member",
+      "base": "llm-join_market",
+      "path": "/action/membership/provider_pubkey",
+      "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "name": "other offer",
+      "base": "llm-set_offer",
+      "path": "/action/offer/provider_pubkey",
+      "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+    },
+    {
+      "name": "private upstream",
+      "base": "llm-create_market",
+      "path": "/action/upstream_url",
+      "value": "http://127.0.0.1/admin"
+    },
+    {
+      "name": "unknown op",
+      "base": "llm-join_market",
+      "path": "/action/kind",
+      "value": "register_provider"
+    },
+    {
+      "name": "media endpoint",
+      "base": "llm-withdraw_offer",
+      "path": "/action/endpoint",
+      "value": "images"
+    },
+    {
+      "name": "bad outcome",
+      "base": "llm-withdraw_offer",
+      "path": "/action/outcome_class",
+      "value": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+    },
+    {
+      "name": "path bracket",
+      "base": "llm-withdraw_offer",
+      "path": "/action/ctx_bracket",
+      "value": "../../payout"
+    },
+    {
+      "name": "native alias",
+      "base": "llm-leave_market",
+      "path": "/action/market_id",
+      "value": "native-model"
+    },
+    {
+      "name": "zero leave revision",
+      "base": "llm-leave_market",
+      "path": "/action/revision",
+      "value": 0
+    },
+    {
+      "name": "extra envelope field",
+      "base": "llm-set_offer",
+      "path": "/payout_destination",
+      "value": "attacker"
+    },
+    {
+      "name": "malformed operation subnet",
+      "base": "llm-create_market",
+      "path": "/subnet_bootstrap",
+      "value": "same-label-different-ledger"
+    },
+    {
+      "name": "malformed operation MSB",
+      "base": "llm-create_market",
+      "path": "/msb_bootstrap",
+      "value": ""
+    }
+  ]
+}

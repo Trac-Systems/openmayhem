@@ -104,13 +104,14 @@
         "market": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
         "membership": "104dcc56204ef1df54ebe5cb22bd3cd25f8283986b91029d125ad0f022f3b90b",
         "offer": "21368eea44c23e217800c58749e5f3a496d84cbac8ec6ca2dc0af1f1a81d3a1d",
-        "permit": "a1828d6f924bd4f6cbc66d5fc147a0d1a10db1d0400d89a384c953846b9ec02e"
+        "permit": "103f5abf34197436f16cae4b998d50eae402e1a137b7db6d6c8b2f7852c742cd",
+        "offer_slot": "c6fb4104d1dd4b741b3be0bd3420947cf9b9f0a5029e3a9744e2752d91f0925b"
       },
       "signing_utf8": {
         "market": "mayhem/proxy/market/v1\u0000{\"creator_pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"openai_chat_completions\"},{\"contract_hash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"endpoint\":\"openai_completions\"},{\"contract_hash\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"endpoint\":\"openai_responses\"}],\"family\":\"llm\",\"lane\":\"proxy\",\"metering\":{\"policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"units\":[\"input_token\",\"output_token\"]},\"model\":{\"family_id\":\"other\",\"model_id\":\"example/Unicode-é-模型-🦉\",\"quantization\":\"\",\"revision\":\"\"},\"pricing\":\"provider_offers\",\"schema_version\":1,\"slug\":\"test-llm\"}",
         "membership": "mayhem/proxy/membership/v1\u0000{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"capacity_group\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"connection_revision\":1,\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"openai_chat_completions\"},{\"contract_hash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"endpoint\":\"openai_completions\"},{\"contract_hash\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"endpoint\":\"openai_responses\"}],\"lane\":\"proxy\",\"market_id\":\"e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5\",\"max_concurrency\":2,\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"recipe_hash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"revision\":1,\"schema_version\":1,\"served_context\":262144}",
         "offer": "mayhem/proxy/offer/v1\u0000{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"ctx_bracket\":\"le256k\",\"endpoint\":\"openai_chat_completions\",\"lane\":\"proxy\",\"market_id\":\"e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5\",\"membership_revision\":1,\"metering_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"min_session_au\":\"0\",\"outcome_class\":\"\",\"per_request_au\":\"0\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"rates\":[{\"granularity\":1000000,\"per_unit_au\":\"1000000000000\",\"unit\":\"input_token\"},{\"granularity\":1000000,\"per_unit_au\":\"2000000000000\",\"unit\":\"output_token\"}],\"revision\":1,\"schema_version\":1}",
-        "permit": "mayhem/proxy/admission/v1\u0000{\"accepted_amount\":\"100000000000000000000\",\"accepted_value_au\":\"10000000000000000000\",\"contract_version\":29,\"entitlement_id\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"evidence_commitment\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"expires_after_epoch\":110,\"fee_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"initial_operation_digest\":\"e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5\",\"invoice_commitment\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"issuance_revision\":1,\"issuer_pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"lane\":\"proxy\",\"network_id\":\"proxy-fixture-network\",\"nonce\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"purpose\":\"proxy_admission_fee\",\"rail\":\"tnk\",\"schema_version\":1,\"valid_from_epoch\":100}"
+        "permit": "mayhem/proxy/admission/v1\u0000{\"accepted_amount\":\"100000000000000000000\",\"accepted_value_au\":\"10000000000000000000\",\"contract_version\":29,\"entitlement_id\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"evidence_commitment\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"expires_after_epoch\":110,\"fee_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"initial_operation_digest\":\"e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5\",\"invoice_commitment\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"issuance_revision\":1,\"issuer_pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"nonce\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"purpose\":\"proxy_admission_fee\",\"rail\":\"tnk\",\"schema_version\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"valid_from_epoch\":100}"
       },
       "permit": {
         "schema_version": 1,
@@ -131,7 +132,9 @@
         "accepted_amount": "100000000000000000000",
         "accepted_value_au": "10000000000000000000",
         "valid_from_epoch": 100,
-        "expires_after_epoch": 110
+        "expires_after_epoch": 110,
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
       }
     },
     {
@@ -221,13 +224,14 @@
         "market": "839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61",
         "membership": "e04cf2cb8c33caf549e3a39c9278030e2e9b8b7051d2c6d9999521dcce0dd74a",
         "offer": "a4932dd1c3c45265c4b772ed6687ef6b5d0fba8f66e87cf228d9667e6a98557c",
-        "permit": "be85273870132903eb6787945252fa906fb05fb16e468e8e324480451e8ae755"
+        "permit": "9eba51ef04e73c8627fe5130f4e407f0de0640a2fde8ade3672bd5071863f17f",
+        "offer_slot": "fa91a29f0fb2d1b2fffb18fa58e676268b39219f1975094740e20102f81a2a26"
       },
       "signing_utf8": {
         "market": "mayhem/proxy/market/v1\u0000{\"creator_pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"mayhem_decisions\"}],\"family\":\"decisions\",\"lane\":\"proxy\",\"metering\":{\"policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"units\":[\"decision\",\"input_character\"]},\"model\":{\"family_id\":\"other\",\"model_id\":\"example/Unicode-é-模型-🦉\",\"quantization\":\"\",\"revision\":\"\"},\"pricing\":\"provider_offers\",\"schema_version\":1,\"slug\":\"test-decisions\"}",
         "membership": "mayhem/proxy/membership/v1\u0000{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"capacity_group\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"connection_revision\":1,\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"mayhem_decisions\"}],\"lane\":\"proxy\",\"market_id\":\"839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61\",\"max_concurrency\":2,\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"recipe_hash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"revision\":1,\"schema_version\":1,\"served_context\":1024}",
         "offer": "mayhem/proxy/offer/v1\u0000{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"ctx_bracket\":\"le8k\",\"endpoint\":\"mayhem_decisions\",\"lane\":\"proxy\",\"market_id\":\"839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61\",\"membership_revision\":1,\"metering_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"min_session_au\":\"0\",\"outcome_class\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"per_request_au\":\"0\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"rates\":[{\"granularity\":1000000,\"per_unit_au\":\"1000000000000\",\"unit\":\"decision\"},{\"granularity\":1000000,\"per_unit_au\":\"2000000000000\",\"unit\":\"input_character\"}],\"revision\":1,\"schema_version\":1}",
-        "permit": "mayhem/proxy/admission/v1\u0000{\"accepted_amount\":\"100000000000000000000\",\"accepted_value_au\":\"10000000000000000000\",\"contract_version\":29,\"entitlement_id\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"evidence_commitment\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"expires_after_epoch\":110,\"fee_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"initial_operation_digest\":\"839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61\",\"invoice_commitment\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"issuance_revision\":1,\"issuer_pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"lane\":\"proxy\",\"network_id\":\"proxy-fixture-network\",\"nonce\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"purpose\":\"proxy_admission_fee\",\"rail\":\"fiat\",\"schema_version\":1,\"valid_from_epoch\":100}"
+        "permit": "mayhem/proxy/admission/v1\u0000{\"accepted_amount\":\"100000000000000000000\",\"accepted_value_au\":\"10000000000000000000\",\"contract_version\":29,\"entitlement_id\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"evidence_commitment\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"expires_after_epoch\":110,\"fee_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"initial_operation_digest\":\"839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61\",\"invoice_commitment\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"issuance_revision\":1,\"issuer_pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"lane\":\"proxy\",\"msb_bootstrap\":\"4444444444444444444444444444444444444444444444444444444444444444\",\"network_id\":\"proxy-fixture-network\",\"nonce\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"purpose\":\"proxy_admission_fee\",\"rail\":\"fiat\",\"schema_version\":1,\"subnet_bootstrap\":\"5555555555555555555555555555555555555555555555555555555555555555\",\"valid_from_epoch\":100}"
       },
       "permit": {
         "schema_version": 1,
@@ -248,7 +252,9 @@
         "accepted_amount": "100000000000000000000",
         "accepted_value_au": "10000000000000000000",
         "valid_from_epoch": 100,
-        "expires_after_epoch": 110
+        "expires_after_epoch": 110,
+        "msb_bootstrap": "4444444444444444444444444444444444444444444444444444444444444444",
+        "subnet_bootstrap": "5555555555555555555555555555555555555555555555555555555555555555"
       }
     }
   ],
@@ -977,6 +983,21 @@
       "op": "set",
       "base": "llm",
       "binding": false
+    },
+    {
+      "name": "missing admission subnet",
+      "base": "llm",
+      "record": "permit",
+      "path": "/subnet_bootstrap",
+      "op": "remove"
+    },
+    {
+      "name": "invalid admission MSB",
+      "base": "llm",
+      "record": "permit",
+      "path": "/msb_bootstrap",
+      "value": "another-network",
+      "op": "replace"
     }
   ]
 }

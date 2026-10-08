@@ -52,6 +52,7 @@ fn proxy_rust_and_javascript_sign_identical_bytes_and_hashes() {
         assert_eq!(market.id().unwrap(), row["digests"]["market"]);
         assert_eq!(member.digest().unwrap(), row["digests"]["membership"]);
         assert_eq!(offer.digest().unwrap(), row["digests"]["offer"]);
+        assert_eq!(offer.slot_id().unwrap(), row["digests"]["offer_slot"]);
         assert_eq!(permit.digest().unwrap(), row["digests"]["permit"]);
         assert_eq!(
             String::from_utf8(permit.signing_bytes().unwrap()).unwrap(),

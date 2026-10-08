@@ -10,6 +10,8 @@ export const PROXY_MARKET_DOMAIN = 'mayhem/proxy/market/v1';
 export const PROXY_MEMBERSHIP_DOMAIN = 'mayhem/proxy/membership/v1';
 export const PROXY_OFFER_DOMAIN = 'mayhem/proxy/offer/v1';
 export const PROXY_ADMISSION_DOMAIN = 'mayhem/proxy/admission/v1';
+export const PROXY_OPERATION_DOMAIN = 'mayhem/proxy/operation/v1';
+export const PROXY_OFFER_SLOT_DOMAIN = 'mayhem/proxy/offer-slot/v1';
 export const PROXY_ADMISSION_FEE_AU = '10000000000000000000';
 const U128_MAX = (1n << 128n) - 1n;
 const U32_MAX = 0xffff_ffff;
@@ -174,7 +176,7 @@ export async function proxyMembershipDigest(value) {
 }
 
 export function validateProxyAdmissionPermit(value) {
-  shape(value, ['schema_version', 'lane', 'purpose', 'network_id', 'contract_version', 'provider_pubkey',
+  shape(value, ['schema_version', 'lane', 'purpose', 'network_id', 'msb_bootstrap', 'subnet_bootstrap', 'contract_version', 'provider_pubkey',
     'issuer_pubkey', 'entitlement_id', 'fee_policy_hash', 'invoice_commitment', 'evidence_commitment',
     'initial_operation_digest', 'nonce', 'issuance_revision', 'rail', 'accepted_amount', 'accepted_value_au',
     'valid_from_epoch', 'expires_after_epoch']);
@@ -182,7 +184,7 @@ export function validateProxyAdmissionPermit(value) {
   requireValue(value.purpose === 'proxy_admission_fee', 'wrong proxy admission purpose');
   requireValue(typeof value.network_id === 'string' && /^[a-z0-9_-]{1,128}$/.test(value.network_id), 'invalid proxy admission network');
   integer(value.contract_version, 1, U32_MAX);
-  for (const field of ['provider_pubkey', 'issuer_pubkey', 'entitlement_id', 'fee_policy_hash',
+  for (const field of ['msb_bootstrap', 'subnet_bootstrap', 'provider_pubkey', 'issuer_pubkey', 'entitlement_id', 'fee_policy_hash',
     'invoice_commitment', 'evidence_commitment', 'initial_operation_digest', 'nonce']) hex(value[field]);
   integer(value.issuance_revision);
   integer(value.valid_from_epoch);
@@ -211,12 +213,15 @@ export async function verifyProxyAdmissionPermit(envelope, context, verifySignat
   shape(envelope, ['permit', 'issuer_signature']);
   const value = validateProxyAdmissionPermit(envelope.permit);
   requireValue(typeof envelope.issuer_signature === 'string' && /^[0-9a-f]{128}$/.test(envelope.issuer_signature), 'invalid proxy issuer signature');
-  shape(context, ['network_id', 'contract_version', 'provider_pubkey', 'initial_operation_digest',
+  shape(context, ['network_id', 'msb_bootstrap', 'subnet_bootstrap', 'contract_version', 'provider_pubkey', 'initial_operation_digest',
     'fee_policy_hash', 'epoch', 'max_permit_epochs', 'active_issuers']);
   integer(context.epoch);
   integer(context.max_permit_epochs);
   integer(context.contract_version, 1, U32_MAX);
-  requireValue(value.network_id === context.network_id && value.contract_version === context.contract_version,
+  hex(context.msb_bootstrap);
+  hex(context.subnet_bootstrap);
+  requireValue(value.network_id === context.network_id && value.msb_bootstrap === context.msb_bootstrap
+    && value.subnet_bootstrap === context.subnet_bootstrap && value.contract_version === context.contract_version,
     'proxy admission network/contract mismatch');
   requireValue(value.provider_pubkey === context.provider_pubkey && value.initial_operation_digest === context.initial_operation_digest,
     'proxy admission provider/operation mismatch');
@@ -289,6 +294,21 @@ export async function proxyOfferDigest(value) {
   return b4a.toString(await blake3(proxyOfferSigningBytes(value)), 'hex');
 }
 
+// Stable slot identity excludes mutable rates and revisions. Hashing the tuple
+// keeps indexed keys inside the existing 256-byte state/RPC key limit, including
+// maximal context identifiers and decision outcome classes.
+export async function proxyOfferSlotId(value) {
+  shape(value, ['endpoint', 'ctx_bracket', 'outcome_class']);
+  requireValue(ENDPOINTS.includes(value.endpoint), 'unsupported proxy endpoint');
+  identifier(value.ctx_bracket);
+  requireValue(typeof value.outcome_class === 'string', 'invalid proxy outcome class');
+  if (value.outcome_class !== '') {
+    hex(value.outcome_class);
+    requireValue(value.endpoint === 'mayhem_decisions', 'outcome class requires a decisions endpoint');
+  }
+  return b4a.toString(await blake3(signingBytes(PROXY_OFFER_SLOT_DOMAIN, value)), 'hex');
+}
+
 // Cumulative subtotal for one logical request/session, never summed per stream chunk.
 // Caller verifies usage evidence, locked acceptance and platform fees.
 export function proxyOfferCost(value, usage) {
@@ -308,4 +328,82 @@ export function proxyOfferCost(value, usage) {
   }
   const minimum = money(value.min_session_au);
   return (total < minimum ? minimum : total).toString();
+}
+
+// One strictly ordered stream of registry mutations per provider. The registry
+// retains the latest sequence/digest/result, not an ever-growing nonce history.
+export function validateProxyOperation(value) {
+  shape(value, ['schema_version', 'lane', 'network_id', 'msb_bootstrap', 'subnet_bootstrap', 'contract_version', 'provider_pubkey', 'sequence', 'action']);
+  base(value);
+  requireValue(typeof value.network_id === 'string' && /^[a-z0-9_-]{1,128}$/.test(value.network_id), 'invalid proxy operation network');
+  hex(value.msb_bootstrap);
+  hex(value.subnet_bootstrap);
+  integer(value.contract_version, 1, U32_MAX);
+  hex(value.provider_pubkey);
+  integer(value.sequence);
+  const action = value.action;
+  requireValue(action !== null && typeof action === 'object', 'invalid proxy action');
+  switch (action.kind) {
+    case 'create_market':
+      shape(action, ['kind', 'market', 'membership']);
+      validateProxyMarket(action.market);
+      requireValue(action.market.creator_pubkey === value.provider_pubkey, 'proxy creator signature required');
+      validateProxyMembership(action.membership);
+      requireValue(action.membership.provider_pubkey === value.provider_pubkey, 'proxy membership signer mismatch');
+      break;
+    case 'join_market':
+    case 'update_membership':
+      shape(action, ['kind', 'membership']);
+      validateProxyMembership(action.membership);
+      requireValue(action.membership.provider_pubkey === value.provider_pubkey, 'proxy membership signer mismatch');
+      break;
+    case 'set_offer':
+      shape(action, ['kind', 'offer']);
+      validateProxyOffer(action.offer);
+      requireValue(action.offer.provider_pubkey === value.provider_pubkey, 'proxy offer signer mismatch');
+      break;
+    case 'withdraw_offer':
+      shape(action, ['kind', 'market_id', 'endpoint', 'ctx_bracket', 'outcome_class', 'revision']);
+      hex(action.market_id);
+      requireValue(ENDPOINTS.includes(action.endpoint), 'unsupported proxy endpoint');
+      identifier(action.ctx_bracket);
+      requireValue(typeof action.outcome_class === 'string', 'invalid proxy outcome class');
+      if (action.outcome_class !== '') {
+        hex(action.outcome_class);
+        requireValue(action.endpoint === 'mayhem_decisions', 'outcome class requires a decisions endpoint');
+      }
+      integer(action.revision);
+      break;
+    case 'leave_market':
+      shape(action, ['kind', 'market_id', 'revision']);
+      hex(action.market_id);
+      integer(action.revision);
+      break;
+    default: throw new Error('unsupported proxy action');
+  }
+  canonicalBody(value);
+  return value;
+}
+
+export function proxyOperationSigningBytes(value) {
+  validateProxyOperation(value);
+  return signingBytes(PROXY_OPERATION_DOMAIN, value);
+}
+
+export async function proxyOperationDigest(value) {
+  return b4a.toString(await blake3(proxyOperationSigningBytes(value)), 'hex');
+}
+
+export function validateProxyOperationEnvelope(value) {
+  shape(value, ['op', 'intent', 'provider_signature', 'admission']);
+  requireValue(value.op === 'proxy_registry', 'wrong proxy operation envelope');
+  validateProxyOperation(value.intent);
+  requireValue(typeof value.provider_signature === 'string' && /^[0-9a-f]{128}$/.test(value.provider_signature), 'invalid proxy provider signature');
+  if (value.admission !== null) {
+    shape(value.admission, ['permit', 'issuer_signature']);
+    validateProxyAdmissionPermit(value.admission.permit);
+    requireValue(typeof value.admission.issuer_signature === 'string' && /^[0-9a-f]{128}$/.test(value.admission.issuer_signature), 'invalid proxy issuer signature');
+  }
+  canonicalBody(value);
+  return value;
 }

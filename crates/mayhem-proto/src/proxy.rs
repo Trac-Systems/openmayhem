@@ -16,6 +16,8 @@ pub const PROXY_MARKET_DOMAIN: &str = "mayhem/proxy/market/v1";
 pub const PROXY_MEMBERSHIP_DOMAIN: &str = "mayhem/proxy/membership/v1";
 pub const PROXY_OFFER_DOMAIN: &str = "mayhem/proxy/offer/v1";
 pub const PROXY_ADMISSION_DOMAIN: &str = "mayhem/proxy/admission/v1";
+pub const PROXY_OPERATION_DOMAIN: &str = "mayhem/proxy/operation/v1";
+pub const PROXY_OFFER_SLOT_DOMAIN: &str = "mayhem/proxy/offer-slot/v1";
 pub const PROXY_ADMISSION_FEE_AU: MoneyAu = 10_000_000_000_000_000_000;
 pub const PROXY_MAX_RECORD_BYTES: usize = 16_384;
 pub const PROXY_MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
@@ -128,6 +130,8 @@ pub struct ProxyAdmissionPermit {
     pub lane: ProxyLane,
     pub purpose: ProxyAdmissionPurpose,
     pub network_id: String,
+    pub msb_bootstrap: String,
+    pub subnet_bootstrap: String,
     #[serde(deserialize_with = "safe_u32")]
     pub contract_version: u32,
     pub provider_pubkey: String,
@@ -209,6 +213,146 @@ pub struct ProxyOffer {
     #[serde(with = "decimal_u128")]
     pub min_session_au: MoneyAu,
     pub accepted_rails: Vec<ProxyRail>,
+}
+
+/// Provider-signed registry mutation. Sequence is a durable per-provider high-water
+/// mark; only the exact latest accepted operation can be replayed as a success.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyOperation {
+    #[serde(deserialize_with = "safe_u32")]
+    pub schema_version: u32,
+    pub lane: ProxyLane,
+    pub network_id: String,
+    pub msb_bootstrap: String,
+    pub subnet_bootstrap: String,
+    #[serde(deserialize_with = "safe_u32")]
+    pub contract_version: u32,
+    pub provider_pubkey: String,
+    #[serde(deserialize_with = "safe_u64")]
+    pub sequence: u64,
+    pub action: ProxyAction,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ProxyAction {
+    CreateMarket {
+        market: ProxyMarketDescriptor,
+        membership: ProxyMembership,
+    },
+    JoinMarket {
+        membership: ProxyMembership,
+    },
+    UpdateMembership {
+        membership: ProxyMembership,
+    },
+    SetOffer {
+        offer: ProxyOffer,
+    },
+    WithdrawOffer {
+        market_id: String,
+        endpoint: ProxyEndpoint,
+        ctx_bracket: String,
+        outcome_class: String,
+        #[serde(deserialize_with = "safe_u64")]
+        revision: u64,
+    },
+    LeaveMarket {
+        market_id: String,
+        #[serde(deserialize_with = "safe_u64")]
+        revision: u64,
+    },
+}
+
+impl ProxyOperation {
+    pub fn validate(&self) -> Result<(), String> {
+        ensure(
+            self.schema_version == PROXY_SCHEMA_VERSION,
+            "unsupported proxy schema version",
+        )?;
+        ensure(
+            !self.network_id.is_empty()
+                && self.network_id.len() <= 128
+                && self.network_id.bytes().all(|c| {
+                    c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-' || c == b'_'
+                }),
+            "invalid proxy operation network",
+        )?;
+        ensure(
+            self.contract_version > 0,
+            "invalid proxy operation contract version",
+        )?;
+        hex_digest(&self.msb_bootstrap)?;
+        hex_digest(&self.subnet_bootstrap)?;
+        hex_digest(&self.provider_pubkey)?;
+        revision(self.sequence)?;
+        match &self.action {
+            ProxyAction::CreateMarket { market, membership } => {
+                market.validate()?;
+                ensure(
+                    market.creator_pubkey == self.provider_pubkey,
+                    "proxy creator signature required",
+                )?;
+                membership.validate()?;
+                ensure(
+                    membership.provider_pubkey == self.provider_pubkey,
+                    "proxy membership signer mismatch",
+                )?;
+            }
+            ProxyAction::JoinMarket { membership }
+            | ProxyAction::UpdateMembership { membership } => {
+                membership.validate()?;
+                ensure(
+                    membership.provider_pubkey == self.provider_pubkey,
+                    "proxy membership signer mismatch",
+                )?;
+            }
+            ProxyAction::SetOffer { offer } => {
+                offer.validate()?;
+                ensure(
+                    offer.provider_pubkey == self.provider_pubkey,
+                    "proxy offer signer mismatch",
+                )?;
+            }
+            ProxyAction::WithdrawOffer {
+                market_id,
+                endpoint,
+                ctx_bracket,
+                outcome_class,
+                revision: rev,
+            } => {
+                hex_digest(market_id)?;
+                identifier(ctx_bracket)?;
+                if !outcome_class.is_empty() {
+                    hex_digest(outcome_class)?;
+                    ensure(
+                        *endpoint == ProxyEndpoint::Decisions,
+                        "outcome class requires a decisions endpoint",
+                    )?;
+                }
+                revision(*rev)?;
+            }
+            ProxyAction::LeaveMarket {
+                market_id,
+                revision: rev,
+            } => {
+                hex_digest(market_id)?;
+                revision(*rev)?;
+            }
+        }
+        canonical_body(self).map(|_| ())
+    }
+
+    pub fn digest(&self) -> Result<String, String> {
+        self.validate()?;
+        digest(PROXY_OPERATION_DOMAIN, self)
+    }
+
+    pub fn signing_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        signing_bytes(PROXY_OPERATION_DOMAIN, self)
+    }
 }
 
 // JSON's integral values may be spelled 1, 1.0 or 1e0. Normalize all three
@@ -426,6 +570,8 @@ impl ProxyAdmissionPermit {
             "invalid proxy admission contract version",
         )?;
         for value in [
+            &self.msb_bootstrap,
+            &self.subnet_bootstrap,
             &self.provider_pubkey,
             &self.issuer_pubkey,
             &self.entitlement_id,
@@ -463,6 +609,20 @@ impl ProxyAdmissionPermit {
 }
 
 impl ProxyOffer {
+    /// Index identity of this provider's submarket. Rates and offer revisions do
+    /// not change the slot. The hash bounds state keys independent of labels.
+    pub fn slot_id(&self) -> Result<String, String> {
+        self.validate()?;
+        digest(
+            PROXY_OFFER_SLOT_DOMAIN,
+            &serde_json::json!({
+                "endpoint": self.endpoint,
+                "ctx_bracket": self.ctx_bracket,
+                "outcome_class": self.outcome_class,
+            }),
+        )
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         ensure(
             self.schema_version == PROXY_SCHEMA_VERSION,

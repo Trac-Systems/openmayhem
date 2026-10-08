@@ -111,7 +111,8 @@ test('proxy admission verifies a real signature and all canonical context bindin
   permit.issuer_pubkey = issuer.publicKey;
   const verify = makeVerifier(issuer.wallet).verify;
   const context = {
-    network_id: permit.network_id, contract_version: permit.contract_version, provider_pubkey: permit.provider_pubkey,
+    network_id: permit.network_id, msb_bootstrap: permit.msb_bootstrap, subnet_bootstrap: permit.subnet_bootstrap,
+    contract_version: permit.contract_version, provider_pubkey: permit.provider_pubkey,
     initial_operation_digest: permit.initial_operation_digest, fee_policy_hash: permit.fee_policy_hash,
     epoch: 105, max_permit_epochs: 11, active_issuers: [issuer.publicKey],
   };
@@ -123,7 +124,8 @@ test('proxy admission verifies a real signature and all canonical context bindin
   }
   const envelope = signed(permit);
   for (const alteration of [
-    {network_id: 'another-network'}, {contract_version: 30}, {provider_pubkey: stranger.publicKey},
+    {network_id: 'another-network'}, {msb_bootstrap: '1'.repeat(64)}, {subnet_bootstrap: '2'.repeat(64)},
+    {contract_version: 30}, {provider_pubkey: stranger.publicKey},
     {initial_operation_digest: '0'.repeat(64)}, {fee_policy_hash: '0'.repeat(64)}, {epoch: 99}, {epoch: 111},
     {max_permit_epochs: 10}, {active_issuers: []}, {active_issuers: [stranger.publicKey]},
   ]) await assert.rejects(verifyProxyAdmissionPermit(envelope, {...context, ...alteration}, verify));
