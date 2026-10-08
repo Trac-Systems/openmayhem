@@ -109,6 +109,79 @@ struct Paid {
     lease: Digest,
 }
 impl Paid {
+    fn reopen(self) -> Self {
+        let Self {
+            _fixture: f,
+            peer,
+            executor,
+            journal,
+            authority,
+            authorization,
+            record,
+            lease,
+        } = self;
+        drop(executor);
+        drop(journal);
+        drop(authority);
+        let journal = Arc::new(
+            Journal::open(
+                f._store.path().join("paid-journal"),
+                peer.identity.clone(),
+                attempts::Limits {
+                    max_records: 50,
+                    max_unfinished: 50,
+                    closed_retention_ms: 1000,
+                    max_payload_bytes: 128 * 1024 * 1024,
+                },
+            )
+            .unwrap(),
+        );
+        let authority = Arc::new(
+            capacity::Authority::open(
+                f._store.path().join("paid-capacity"),
+                peer.identity.clone(),
+                capacity::Limits {
+                    max_groups: 4,
+                    max_routes: 8,
+                    max_leases: 50,
+                    max_evidence_age: Duration::from_secs(60),
+                },
+            )
+            .unwrap(),
+        );
+        let pool = Arc::new(
+            Pool::new(
+                env!("CARGO_BIN_EXE_mayhem-proxy-worker"),
+                f._work.path(),
+                PoolLimits {
+                    max_children: 2,
+                    max_buffer_bytes: 64 * 1024 * 1024,
+                    startup_timeout: Duration::from_secs(5),
+                    processing_timeout: Duration::from_secs(3),
+                },
+            )
+            .unwrap(),
+        );
+        let executor = Executor::new(
+            f.connection.clone(),
+            f.adapter.clone(),
+            pool,
+            Arc::new(Storage::new(journal.clone(), 8).unwrap()),
+        )
+        .unwrap();
+        let executor =
+            PaidExecutor::new(executor, peer.client.clone(), authority.clone(), d(201)).unwrap();
+        Self {
+            _fixture: f,
+            peer,
+            executor,
+            journal,
+            authority,
+            authorization,
+            record,
+            lease,
+        }
+    }
     async fn start(
         base: &str,
         endpoint: ProxyEndpoint,
@@ -225,6 +298,398 @@ fn cases() -> Vec<(ProxyEndpoint, Vec<u8>, Value)> {
 ]
 }
 
+async fn signed_completed(p: &mut Paid) -> mayhem_proto::proxy::finance::ProxyUsageReceipt {
+    let draft = p
+        .executor
+        .prepare_completed_receipt(&p.record.invocation, p.record.attempt)
+        .await
+        .unwrap();
+    let sigs = p
+        .peer
+        .command(&json!({"sign_receipt":draft.body}).to_string())
+        .await;
+    let saved = p
+        .journal
+        .recover(&p.record.invocation, p.record.attempt)
+        .unwrap();
+    let accepted = saved.financial.as_ref().unwrap().accepted();
+    let approval = mayhem_proxy::receipts::approve_completed(
+        &draft,
+        sigs["provider_sig"].as_str().unwrap(),
+        &accepted.authorization,
+        &accepted.settlement_policy,
+        &saved.acceptance.as_ref().unwrap().snapshot,
+        &saved.request.as_ref().unwrap().body,
+        &saved.result.as_ref().unwrap().reply,
+    )
+    .unwrap();
+    assert!(mayhem_proxy::receipts::verify_signature(
+        sigs["buyer_sig"].as_str().unwrap(),
+        approval.signing_bytes(),
+        &p.authorization.terms.buyer_pubkey
+    ));
+    mayhem_proto::proxy::finance::ProxyUsageReceipt {
+        body: draft.body,
+        buyer_sig: sigs["buyer_sig"].as_str().unwrap().into(),
+        provider_sig: sigs["provider_sig"].as_str().unwrap().into(),
+    }
+}
+
+#[tokio::test]
+async fn paid_completed_receipts_recount_sign_publish_and_close_each_endpoint_and_rail() {
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        for (endpoint, bytes, response) in cases() {
+            let backend = backend(200, response, Duration::ZERO).await;
+            let mut p = Paid::start(&backend.base, endpoint, rail, &bytes, false).await;
+            assert!(p
+                .executor
+                .prepare_completed_receipt(&p.record.invocation, p.record.attempt)
+                .await
+                .is_err());
+            p.executor
+                .execute_json(&p.record.invocation, &bytes, &Cancellation::default())
+                .await
+                .unwrap();
+            let receipt = signed_completed(&mut p).await;
+            p.executor
+                .retain_completed_receipt(&p.record.invocation, p.record.attempt, &receipt)
+                .await
+                .unwrap();
+            assert_eq!(
+                p.journal.get(&p.record.invocation).unwrap().unwrap().phase,
+                Phase::Resolved
+            );
+            assert!(p.authority.lease(&p.lease).unwrap().is_some());
+            assert!(p
+                .executor
+                .publish_completed_receipt(&p.record.invocation, p.record.attempt)
+                .await
+                .unwrap());
+            assert!(p
+                .executor
+                .publish_completed_receipt(&p.record.invocation, p.record.attempt)
+                .await
+                .unwrap());
+            let observed = p.peer.client.observe(&p.authorization).await.unwrap();
+            assert!(observed.confirms_receipt(&receipt).unwrap());
+            assert!(observed.initial_binding().is_err());
+            let stats = p.peer.command("status").await;
+            assert_eq!(stats["submissions"], 1);
+            assert_eq!(stats["publications"], 1);
+            assert!(p.authority.lease(&p.lease).unwrap().is_none());
+            let closed = p.journal.get(&p.record.invocation).unwrap().unwrap();
+            assert_eq!(closed.phase, Phase::Closed);
+            assert!(p.journal.allocated_payload_bytes().unwrap() > 0);
+            assert_eq!(
+                p.journal
+                    .prune_closed(closed.expires_at_ms.unwrap(), 1)
+                    .unwrap(),
+                1
+            );
+            assert_eq!(p.journal.allocated_payload_bytes().unwrap(), 0);
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            p.peer.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn paid_receipt_http_ack_is_not_canonical_confirmation_and_ack_loss_recovers_same_receipt() {
+    for mode in ["publish_pending", "publish_lost_ack"] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let mut p = Paid::start(
+            &backend.base,
+            ProxyEndpoint::Chat,
+            ProxyRail::Fiat,
+            &chat(),
+            false,
+        )
+        .await;
+        p.executor
+            .execute_json(&p.record.invocation, &chat(), &Cancellation::default())
+            .await
+            .unwrap();
+        let receipt = signed_completed(&mut p).await;
+        p.executor
+            .retain_completed_receipt(&p.record.invocation, p.record.attempt, &receipt)
+            .await
+            .unwrap();
+        p.peer.command(mode).await;
+        let done = p
+            .executor
+            .publish_completed_receipt(&p.record.invocation, p.record.attempt)
+            .await
+            .unwrap();
+        assert_eq!(done, mode == "publish_lost_ack");
+        if !done {
+            assert_eq!(
+                p.journal.get(&p.record.invocation).unwrap().unwrap().phase,
+                Phase::Resolved
+            );
+            assert!(p.authority.lease(&p.lease).unwrap().is_some());
+            p.peer.command("flush_publication").await;
+        }
+        assert!(p
+            .executor
+            .publish_completed_receipt(&p.record.invocation, p.record.attempt)
+            .await
+            .unwrap());
+        let stats = p.peer.command("status").await;
+        assert_eq!(stats["submissions"], 1);
+        assert_eq!(stats["publications"], 1);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        p.peer.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn paid_receipt_buyer_rejects_altered_output_usage_body_signature_and_identity() {
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let mut p = Paid::start(
+        &backend.base,
+        ProxyEndpoint::Chat,
+        ProxyRail::Tap,
+        &chat(),
+        false,
+    )
+    .await;
+    p.executor
+        .execute_json(&p.record.invocation, &chat(), &Cancellation::default())
+        .await
+        .unwrap();
+    let receipt = signed_completed(&mut p).await;
+    let draft = p
+        .journal
+        .completed_draft(&p.record.invocation, p.record.attempt)
+        .unwrap()
+        .unwrap();
+    let saved = p
+        .journal
+        .recover(&p.record.invocation, p.record.attempt)
+        .unwrap();
+    let accepted = saved.financial.as_ref().unwrap().accepted();
+    let snapshot = &saved.acceptance.as_ref().unwrap().snapshot;
+    let input = &saved.request.as_ref().unwrap().body;
+    let output = &saved.result.as_ref().unwrap().reply;
+    for fault in [
+        "output",
+        "usage",
+        "result",
+        "observation",
+        "invocation",
+        "attempt",
+        "request",
+        "signature",
+        "authorization",
+    ] {
+        let mut d = draft.clone();
+        let mut reply: mayhem_proxy::endpoint::ProtocolReply =
+            serde_json::from_value(serde_json::to_value(output).unwrap()).unwrap();
+        let mut request = input.clone();
+        let mut authorization = accepted.authorization.clone();
+        match fault {
+            "output" => {
+                reply.body["choices"][0]["message"]["content"] = json!("changed received answer")
+            }
+            "usage" => *d.body.usage.values_mut().next().unwrap() += 1,
+            "result" => d.body.result_hash = "0".repeat(64),
+            "observation" => d.body.observation_hash = "0".repeat(64),
+            "invocation" => d.invocation = super::d(8),
+            "attempt" => d.attempt += 1,
+            "request" => request = serde_json::to_vec(
+                &json!({"model":"public-model","messages":[{"role":"user","content":"different"}]}),
+            )
+            .unwrap(),
+            "authorization" => authorization.terms.buyer_pubkey = "0".repeat(64),
+            _ => {}
+        }
+        // Re-sign changed provider bodies: the buyer must independently detect
+        // incorrect evidence, not merely rely on rejecting an invalid signature.
+        let sigs = p
+            .peer
+            .command(&json!({"sign_receipt":d.body}).to_string())
+            .await;
+        let signature = if fault == "signature" {
+            "0".repeat(128)
+        } else {
+            sigs["provider_sig"].as_str().unwrap().into()
+        };
+        assert!(
+            mayhem_proxy::receipts::approve_completed(
+                &d,
+                &signature,
+                &authorization,
+                &accepted.settlement_policy,
+                snapshot,
+                &request,
+                &reply
+            )
+            .is_err(),
+            "{fault}"
+        );
+    }
+    let mut altered = receipt.clone();
+    altered.body.at_ms += 1;
+    let sigs = p
+        .peer
+        .command(&json!({"sign_receipt":altered.body}).to_string())
+        .await;
+    altered.provider_sig = sigs["provider_sig"].as_str().unwrap().into();
+    altered.buyer_sig = sigs["buyer_sig"].as_str().unwrap().into();
+    assert!(p
+        .executor
+        .retain_completed_receipt(&p.record.invocation, p.record.attempt, &altered)
+        .await
+        .is_err());
+    p.executor
+        .retain_completed_receipt(&p.record.invocation, p.record.attempt, &receipt)
+        .await
+        .unwrap();
+    assert_eq!(p.peer.command("status").await["submissions"], 0);
+    p.peer.stop().await;
+}
+
+#[tokio::test]
+async fn paid_completed_receipt_concurrent_signer_recovery_keeps_one_body() {
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let mut p = Paid::start(
+        &backend.base,
+        ProxyEndpoint::Chat,
+        ProxyRail::Tnk,
+        &chat(),
+        false,
+    )
+    .await;
+    p.executor
+        .execute_json(&p.record.invocation, &chat(), &Cancellation::default())
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        p.executor
+            .prepare_completed_receipt(&p.record.invocation, p.record.attempt),
+        p.executor
+            .prepare_completed_receipt(&p.record.invocation, p.record.attempt)
+    );
+    assert_eq!(a.unwrap(), b.unwrap());
+    let receipt = signed_completed(&mut p).await;
+    p.executor
+        .retain_completed_receipt(&p.record.invocation, p.record.attempt, &receipt)
+        .await
+        .unwrap();
+    let (a, b) = tokio::join!(
+        p.executor
+            .publish_completed_receipt(&p.record.invocation, p.record.attempt),
+        p.executor
+            .publish_completed_receipt(&p.record.invocation, p.record.attempt)
+    );
+    assert!(a.unwrap() && b.unwrap());
+    assert_eq!(p.peer.command("status").await["publications"], 1);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    p.peer.stop().await;
+}
+
+#[tokio::test]
+async fn paid_completed_receipt_recovers_draft_signatures_and_canonical_ack_across_restart() {
+    for stage in ["draft", "signed", "canonical"] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let mut p = Paid::start(
+            &backend.base,
+            ProxyEndpoint::Chat,
+            ProxyRail::Tnk,
+            &chat(),
+            false,
+        )
+        .await;
+        p.executor
+            .execute_json(&p.record.invocation, &chat(), &Cancellation::default())
+            .await
+            .unwrap();
+        let receipt = signed_completed(&mut p).await;
+        let allocated = p.journal.allocated_payload_bytes().unwrap();
+        if stage != "draft" {
+            p.executor
+                .retain_completed_receipt(&p.record.invocation, p.record.attempt, &receipt)
+                .await
+                .unwrap();
+        }
+        if stage == "canonical" {
+            p.peer.command("publish_pending").await;
+            assert!(!p
+                .executor
+                .publish_completed_receipt(&p.record.invocation, p.record.attempt)
+                .await
+                .unwrap());
+            p.peer.command("flush_publication").await;
+        }
+        let mut p = p.reopen();
+        assert_eq!(p.journal.allocated_payload_bytes().unwrap(), allocated);
+        assert_eq!(
+            p.authority.lease(&p.lease).unwrap().unwrap().phase,
+            capacity::Phase::Uncertain
+        );
+        let draft = p
+            .executor
+            .prepare_completed_receipt(&p.record.invocation, p.record.attempt)
+            .await
+            .unwrap();
+        assert_eq!(draft.body, receipt.body);
+        p.executor
+            .retain_completed_receipt(&p.record.invocation, p.record.attempt, &receipt)
+            .await
+            .unwrap();
+        assert!(p
+            .executor
+            .publish_completed_receipt(&p.record.invocation, p.record.attempt)
+            .await
+            .unwrap());
+        let stats = p.peer.command("status").await;
+        assert_eq!(stats["submissions"], 1);
+        assert_eq!(stats["publications"], 1);
+        assert_eq!(
+            p.authority.status(&d(201)).unwrap().state,
+            capacity::Readiness::Checking
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        p.peer.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn paid_completed_receipt_conflicting_canonical_final_never_overwrites_or_closes_local_outcome(
+) {
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let mut p = Paid::start(
+        &backend.base,
+        ProxyEndpoint::Chat,
+        ProxyRail::Fiat,
+        &chat(),
+        false,
+    )
+    .await;
+    p.executor
+        .execute_json(&p.record.invocation, &chat(), &Cancellation::default())
+        .await
+        .unwrap();
+    let receipt = signed_completed(&mut p).await;
+    p.executor
+        .retain_completed_receipt(&p.record.invocation, p.record.attempt, &receipt)
+        .await
+        .unwrap();
+    p.peer.command("final").await;
+    assert!(p
+        .executor
+        .publish_completed_receipt(&p.record.invocation, p.record.attempt)
+        .await
+        .is_err());
+    assert_eq!(
+        p.journal.get(&p.record.invocation).unwrap().unwrap().phase,
+        Phase::Resolved
+    );
+    assert_eq!(p.peer.command("status").await["submissions"], 0);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    p.peer.stop().await;
+}
+
 #[tokio::test]
 async fn canonical_paid_gate_executes_all_four_endpoints_all_three_rails_with_real_http_and_owned_recovery(
 ) {
@@ -326,6 +791,17 @@ async fn canonical_paid_gate_streams_on_each_rail_without_per_chunk_financial_re
             1,
             "one exact canonical read per dispatch, never per chunk"
         );
+        let receipt = signed_completed(&mut p).await;
+        p.executor
+            .retain_completed_receipt(&p.record.invocation, p.record.attempt, &receipt)
+            .await
+            .unwrap();
+        assert!(p
+            .executor
+            .publish_completed_receipt(&p.record.invocation, p.record.attempt)
+            .await
+            .unwrap());
+        assert_eq!(p.peer.command("status").await["publications"], 1);
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         p.peer.stop().await;
     }

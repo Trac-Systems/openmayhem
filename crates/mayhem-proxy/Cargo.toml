@@ -10,6 +10,7 @@ base64 = "0.22"
 blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 bytes = "1"
+ed25519-dalek = "2"
 httpdate = "1"
 getrandom = "0.3"
 ipnet = { version = "2", features = ["serde"] }

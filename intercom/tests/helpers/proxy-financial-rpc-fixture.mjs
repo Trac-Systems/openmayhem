@@ -14,6 +14,8 @@ import { CONTRACT_VERSION } from '../../contract/contract.js';
 import { proxyReceiptFixture } from './proxy-finance.js';
 import { closure } from './proxy-closure.js';
 import { prepareProxyClose } from '../../contract/proxy-closure.js';
+import { proxyBuyerReceiptSigningBytes, proxyProviderReceiptSigningBytes } from '../../contract/proxy-finance.js';
+import { proxyUsageFeatureKey } from '../../contract/proxy-reservations.js';
 const execution=process.argv[4]?JSON.parse(process.argv[4]):null;
 const f=await proxyReceiptFixture(process.argv[2]??'tnk',process.argv[3]??'llm',execution,Boolean(execution));
 let reserved=!execution;
@@ -40,6 +42,26 @@ const local={...peer,wallet:wallet(f.provider)};
 const participant=new MayhemFeature(local,{});participant.key='mayhem';
 participant._adminKey=async()=>f.admin.publicKey;
 let mutation=null,calls=0;
+let submissions=0,publications=0,pending=null,publicationMode=null,publicationTail=Promise.resolve();
+// Test transport uses the actual RPC, receipt validator/accounting planner and
+// canonical signed-view service. The remote relay/indexer transport is simulated;
+// its durable append journal has separate real-Autobase integration coverage.
+async function applyReceipt(key,value) {
+  if(key!==await proxyUsageFeatureKey(value))throw new Error('fixture publication key differs');
+  const plan=await f.finalize(value);
+  if(plan.writes.length) {await f.apply(plan);await sync();publications++;}
+  return plan.result;
+}
+participant.relay=(key,value)=>{
+  const job=publicationTail.then(async()=>{
+    submissions++;
+    if(publicationMode==='pending') {pending={key,value};return {ok:true,pending:true};}
+    const result=await applyReceipt(key,value);
+    if(publicationMode==='lost_ack')throw new Error('fixture lost acknowledgment after canonical application');
+    return result;
+  });
+  publicationTail=job.catch(()=>{});return job;
+};
 participant.requestService=async(service,request)=>{
   calls++;
   if(mutation==='delay')await new Promise(resolve=>setTimeout(resolve,250));
@@ -63,6 +85,11 @@ try {
     if(command==='stop')break;
     if(command.startsWith('{')) {
       const request=JSON.parse(command);
+      if(request.sign_receipt) {
+        const body=request.sign_receipt;
+        console.log(JSON.stringify({provider_sig:b4a.toString(f.provider.wallet.sign(proxyProviderReceiptSigningBytes(body)),'hex'),
+          buyer_sig:b4a.toString(f.buyer.wallet.sign(proxyBuyerReceiptSigningBytes(body)),'hex')}));continue;
+      }
       if(reserved||Object.keys(request).join(',')!=='reserve'||!/^[0-9a-f]{64}$/.test(request.reserve))throw new Error('invalid fixture reservation');
       f.terms.capacity_lease=request.reserve;
       await f.apply(await f.prepare(f.authorize(f.terms)));await sync();reserved=true;
@@ -73,9 +100,12 @@ try {
     else if(command==='foreign')participant.peer.wallet=wallet(f.buyer); // Expected local actor/transport remains provider.
     else if(command==='reset')mutation=null;
     else if(command==='status'){}
+    else if(command==='publish_pending')publicationMode='pending';
+    else if(command==='publish_lost_ack')publicationMode='lost_ack';
+    else if(command==='flush_publication') {if(pending){await applyReceipt(pending.key,pending.value);pending=null;}publicationMode=null;}
     else if(['nonce','network','hold','signature','unknown','delay'].includes(command))mutation=command;
     else throw new Error('unknown fixture command');
-    console.log(JSON.stringify({done:command,calls}));
+    console.log(JSON.stringify({done:command,calls,submissions,publications}));
   }
 } finally {
   await participant.stop();await admin.stop();server.closeAllConnections();

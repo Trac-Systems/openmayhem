@@ -114,10 +114,22 @@ fn request_digest(record: &Record, body: &[u8]) -> Result<Digest> {
     ))
 }
 fn result_digest(record: &Record, bytes: &[u8]) -> Result<Digest> {
+    result_commitment(&record.invocation, record.attempt, &record.binding, bytes)
+}
+pub(crate) fn result_commitment(
+    invocation: &Digest,
+    attempt: u64,
+    binding: &Binding,
+    bytes: &[u8],
+) -> Result<Digest> {
     require(!bytes.is_empty() && bytes.len() <= MAX_BODY + RESULT_OVERHEAD)?;
     Ok(Digest::hash(
         "mayhem/proxy/owned-result/v1",
-        &[record.key().as_bytes(), &encode(&record.binding)?, bytes],
+        &[
+            record_key(invocation, attempt).as_bytes(),
+            &encode(binding)?,
+            bytes,
+        ],
     ))
 }
 impl Journal {
@@ -601,6 +613,7 @@ mod tests {
             OUTPUT.name(),
             "proxy_accepted_snapshots_v1",
             "proxy_accepted_finance_v1",
+            "proxy_attempt_outcomes_v1",
         ] {
             tx.delete_table(TableDefinition::<&str, &[u8]>::new(name))
                 .unwrap();

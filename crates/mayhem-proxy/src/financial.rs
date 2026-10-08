@@ -7,7 +7,7 @@ use crate::{
     invalid, require, Error, Result,
 };
 use mayhem_proto::proxy::{
-    finance::{ProxySettlementPolicy, ProxySpendAuthorization},
+    finance::{ProxySettlementPolicy, ProxySpendAuthorization, ProxyUsageReceipt},
     PROXY_MAX_SAFE_INTEGER,
 };
 use serde::{Deserialize, Serialize};
@@ -57,6 +57,67 @@ pub struct Observation {
     started: Instant,
 }
 impl Observation {
+    pub fn receipt_head(&self) -> Result<Option<ProxyUsageReceipt>> {
+        require(
+            self.started.elapsed() <= FRESHNESS,
+            "canonical financial observation expired",
+        )?;
+        let head = &self.wire.receipt_head;
+        if head.is_null() {
+            return Ok(None);
+        }
+        let receipt: ProxyUsageReceipt = serde_json::from_value(head["receipt"].clone())?;
+        let accepted = &self.wire.accepted;
+        receipt
+            .verify(
+                &accepted.authorization.terms,
+                &accepted.settlement_policy,
+                None,
+                crate::receipts::verify_signature,
+            )
+            .map_err(|_| invalid("canonical receipt signatures rejected"))?;
+        require(
+            head["type"] == "canonical_receipt_head"
+                && head["lane"] == "proxy"
+                && head["accepted_terms"] == self.wire.accepted_terms
+                && receipt.body.accepted_terms == self.wire.accepted_terms
+                && head["receipt_hash"]
+                    == receipt
+                        .body
+                        .digest()
+                        .map_err(|_| invalid("invalid canonical receipt"))?
+                && head["receipt_seq"] == receipt.body.seq
+                && head["settlement_ready"] == receipt.body.final_receipt,
+            "canonical receipt differs",
+        )?;
+        Ok(Some(receipt))
+    }
+    /// Exact canonical finalization resolves only the financial part of recovery.
+    /// It does not prove backend capacity was released or a payout delivered.
+    pub fn confirms_receipt(&self, expected: &ProxyUsageReceipt) -> Result<bool> {
+        let Some(actual) = self.receipt_head()? else {
+            return Ok(false);
+        };
+        if !actual.body.final_receipt {
+            return Ok(false);
+        }
+        require(
+            &actual == expected,
+            "canonical final receipt conflicts with retained outcome",
+        )?;
+        let t = &self.wire.accepted.authorization.terms;
+        let r = &self.wire.reservation;
+        require(
+            r["status"] == "closed"
+                && r["reservation_id"] == t.reservation_id
+                && r["user"] == t.buyer_pubkey
+                && r["provider"] == t.offer.provider_pubkey
+                && r["rail"] == serde_json::to_value(t.rail)?
+                && !r["closed_at"].is_null(),
+            "canonical financial closure differs",
+        )?;
+        Ok(true)
+    }
     pub fn accepted(&self) -> &Accepted {
         &self.wire.accepted
     }
@@ -144,7 +205,9 @@ impl Observation {
 }
 
 fn binding(accepted: &Accepted) -> Result<Binding> {
-    let t = &accepted.authorization.terms;
+    terms_binding(&accepted.authorization.terms)
+}
+pub(crate) fn terms_binding(t: &mayhem_proto::proxy::finance::ProxySpendTerms) -> Result<Binding> {
     let d = |s: &str| Digest::new(s).map_err(|_| invalid("invalid financial digest"));
     Ok(Binding {
         request_hash: d(&t.request_hash)?,
@@ -155,7 +218,7 @@ fn binding(accepted: &Accepted) -> Result<Binding> {
         offer_digest: d(&t.offer.digest().map_err(|_| invalid("invalid offer"))?)?,
         endpoint_contract: d(&t.endpoint_contract)?,
         metering_policy: d(&t.offer.metering_policy_hash)?,
-        accepted_terms: d(&accepted.accepted_terms)?,
+        accepted_terms: d(&t.digest().map_err(|_| invalid("invalid financial terms"))?)?,
         reservation: d(&t.reservation_id)?,
         capacity_lease: d(&t.capacity_lease)?,
         connection_digest: d(&t.connection_digest)?,
@@ -222,6 +285,7 @@ impl Retained {
 pub struct Client {
     http: reqwest::Client,
     endpoint: Url,
+    publication_endpoint: Url,
     identity: Identity,
     requester: String,
     // Bounded control I/O; it neither occupies nor represents inference slots.
@@ -258,6 +322,9 @@ impl Client {
         let endpoint = base
             .join("proxy/financial-state")
             .map_err(|_| invalid("invalid peer RPC path"))?;
+        let publication_endpoint = base
+            .join("contract/feature")
+            .map_err(|_| invalid("invalid peer RPC path"))?;
         let http = reqwest::Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
@@ -267,6 +334,7 @@ impl Client {
         Ok(Self {
             http,
             endpoint,
+            publication_endpoint,
             identity,
             requester,
             slots: tokio::sync::Semaphore::new(max_reads),
@@ -277,6 +345,67 @@ impl Client {
     }
     pub(crate) fn requester(&self) -> &str {
         &self.requester
+    }
+    /// Submit the same durable, dual-signed receipt through the existing canonical
+    /// publication journal. HTTP success is NOT settlement confirmation. Ambiguous
+    /// submission must be followed by observation of the same accepted terms.
+    pub async fn submit_receipt(
+        &self,
+        authorization: &ProxySpendAuthorization,
+        policy: &ProxySettlementPolicy,
+        receipt: &ProxyUsageReceipt,
+    ) -> Result<()> {
+        let _permit = self
+            .slots
+            .try_acquire()
+            .map_err(|_| invalid("financial publication capacity unavailable"))?;
+        let t = &authorization.terms;
+        require(
+            t.network_id == self.identity.network_id
+                && t.msb_bootstrap == self.identity.msb_bootstrap
+                && t.subnet_bootstrap == self.identity.subnet_bootstrap
+                && t.offer.provider_pubkey == self.requester,
+            "financial publication identity differs",
+        )?;
+        authorization
+            .verify(crate::receipts::verify_signature)
+            .map_err(|_| invalid("accepted signatures rejected"))?;
+        receipt
+            .verify(t, policy, None, crate::receipts::verify_signature)
+            .map_err(|_| invalid("receipt signatures rejected"))?;
+        let key = format!(
+            "proxy/usage/{}",
+            receipt
+                .body
+                .digest()
+                .map_err(|_| invalid("invalid receipt"))?
+        );
+        let bytes = serde_json::to_vec(&json!({"feature":"mayhem","key":key,
+            "value":{"op":"proxy_record_usage","provider":self.requester,"receipt":receipt}}))?;
+        require(
+            bytes.len() <= MAX_BYTES,
+            "financial publication exceeds bound",
+        )?;
+        let mut response = self
+            .http
+            .post(self.publication_endpoint.clone())
+            .header("content-type", "application/json")
+            .body(bytes)
+            .send()
+            .await
+            .map_err(Error::Transport)?;
+        require(
+            response.status().is_success(),
+            "financial publication needs reconciliation",
+        )?;
+        let mut size = 0usize;
+        while let Some(chunk) = response.chunk().await.map_err(Error::Transport)? {
+            size = size
+                .checked_add(chunk.len())
+                .ok_or_else(|| invalid("financial reply exceeds bound"))?;
+            require(size <= MAX_BYTES, "financial reply exceeds bound")?;
+        }
+        Ok(())
     }
     pub async fn observe(&self, authorization: &ProxySpendAuthorization) -> Result<Observation> {
         let _permit = self

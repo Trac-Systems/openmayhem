@@ -66,6 +66,41 @@ fn event(j: &Journal, r: Record, e: Event) -> Record {
 fn prepared(j: &Journal, n: u64) -> Record {
     j.prepare(digest(n), binding(), 100).unwrap()
 }
+
+#[test]
+fn reserved_receipt_storage_is_bounded_idempotent_and_pruned_with_the_closed_attempt() {
+    let dir = private_dir();
+    let path = dir.path().join("journal");
+    let mut l = limits();
+    l.max_payload_bytes = 65536;
+    let j = Journal::open(&path, identity(), l).unwrap();
+    let r = prepared(&j, 1);
+    j.reserve_outcome(&r.invocation, r.attempt).unwrap();
+    j.reserve_outcome(&r.invocation, r.attempt).unwrap();
+    assert_eq!(j.allocated_payload_bytes().unwrap(), 65536);
+    let second = prepared(&j, 2);
+    assert!(matches!(
+        j.reserve_outcome(&second.invocation, second.attempt),
+        Err(Error::Capacity)
+    ));
+    assert_eq!(
+        j.get(&second.invocation).unwrap().unwrap().phase,
+        Phase::Prepared
+    );
+    let r = event(&j, r, Event::CancelRequested);
+    let closed = event(&j, r, Event::Close(digest(800)));
+    assert_eq!(j.prune_closed(closed.expires_at_ms.unwrap(), 1).unwrap(), 1);
+    assert_eq!(j.allocated_payload_bytes().unwrap(), 0);
+    j.reserve_outcome(&second.invocation, second.attempt)
+        .unwrap();
+    drop(j);
+    let j = Journal::open(&path, identity(), l).unwrap();
+    assert_eq!(j.allocated_payload_bytes().unwrap(), 65536);
+    assert!(j
+        .completed_draft(&second.invocation, second.attempt)
+        .unwrap()
+        .is_none());
+}
 fn dispatch(j: &Journal, r: Record) -> Record {
     j.begin_dispatch(&r.invocation, r.generation, r.updated_at_ms + 1)
         .unwrap()

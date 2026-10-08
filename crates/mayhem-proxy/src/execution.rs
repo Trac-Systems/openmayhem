@@ -367,6 +367,7 @@ impl Executor {
                         return Err(Error::Binding);
                     }
                     j.retain_financial_acceptance(&key, attempt, observation)?;
+                    j.reserve_outcome(&key, attempt)?;
                 }
                 if let Some((authority, route)) = capacity {
                     authority.dispatch_accepted(

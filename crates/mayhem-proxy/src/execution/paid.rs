@@ -13,6 +13,163 @@ pub struct PaidExecutor {
     route: Digest,
 }
 impl PaidExecutor {
+    /// Freeze the final body before requesting either signature. Repeated calls
+    /// recover its original timestamp/sequence, even after an interrupted signer.
+    pub async fn prepare_completed_receipt(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+    ) -> Result<attempts::CompletedDraft> {
+        let key = invocation.clone();
+        if let Some(draft) = self
+            .executor
+            .storage
+            .run(move |j| j.completed_draft(&key, attempt))
+            .await?
+        {
+            return Ok(draft);
+        }
+        let saved = self.recover(invocation, attempt).await?;
+        let accepted = saved.financial.as_ref().ok_or(Error::Binding)?.accepted();
+        let observed = self
+            .financial
+            .observe(&accepted.authorization)
+            .await
+            .map_err(Error::Financial)?;
+        if observed.is_closed() {
+            return Err(Error::RecoveryRequired);
+        }
+        let previous = observed.receipt_head().map_err(Error::Financial)?;
+        if previous.as_ref().is_some_and(|r| r.body.final_receipt) {
+            return Err(Error::RecoveryRequired);
+        }
+        let key = invocation.clone();
+        self.executor
+            .storage
+            .run_checked(move |j| {
+                // Check freshness again after scheduling bounded storage work.
+                observed.receipt_head().map_err(Error::Financial)?;
+                j.reserve_outcome(&key, attempt)?;
+                Ok(j.prepare_completed_draft(&key, attempt, now_ms(), previous.map(|v| v.body))?)
+            })
+            .await
+    }
+    pub async fn retain_completed_receipt(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+        receipt: &mayhem_proto::proxy::finance::ProxyUsageReceipt,
+    ) -> Result<()> {
+        let key = invocation.clone();
+        let receipt = receipt.clone();
+        self.executor
+            .storage
+            .run(move |j| j.retain_completed_receipt(&key, attempt, &receipt))
+            .await
+    }
+    /// Observe -> submit the identical retained envelope if needed -> observe.
+    /// No inference retry, timer-based financial release or receipt history scan.
+    /// False means the exact receipt is still awaiting canonical confirmation.
+    pub async fn publish_completed_receipt(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+    ) -> Result<bool> {
+        let key = invocation.clone();
+        let receipt = self
+            .executor
+            .storage
+            .run(move |j| j.completed_receipt(&key, attempt))
+            .await?
+            .ok_or(Error::RecoveryRequired)?;
+        let saved = self.recover(invocation, attempt).await?;
+        let digest = Digest::new(receipt.body.digest().map_err(|_| Error::Binding)?)?;
+        if saved.record.phase == Phase::Closed {
+            return if saved.record.closure == Some(digest) {
+                Ok(true)
+            } else {
+                Err(Error::Binding)
+            };
+        }
+        let accepted = saved.financial.as_ref().ok_or(Error::Binding)?.accepted();
+        let mut observation = self
+            .financial
+            .observe(&accepted.authorization)
+            .await
+            .map_err(Error::Financial)?;
+        if !observation
+            .confirms_receipt(&receipt)
+            .map_err(Error::Financial)?
+        {
+            if observation.is_closed() {
+                return Err(Error::RecoveryRequired);
+            }
+            let submission = self
+                .financial
+                .submit_receipt(
+                    &accepted.authorization,
+                    &accepted.settlement_policy,
+                    &receipt,
+                )
+                .await;
+            observation = self
+                .financial
+                .observe(&accepted.authorization)
+                .await
+                .map_err(Error::Financial)?;
+            if !observation
+                .confirms_receipt(&receipt)
+                .map_err(Error::Financial)?
+            {
+                submission.map_err(Error::Financial)?;
+                return Ok(false);
+            }
+        }
+        self.reconcile_capacity(invocation, attempt).await?;
+        let key = invocation.clone();
+        let authority = self.authority.clone();
+        self.executor
+            .storage
+            .run_checked(move |j| {
+                if !observation
+                    .confirms_receipt(&receipt)
+                    .map_err(Error::Financial)?
+                {
+                    return Err(Error::RecoveryRequired);
+                }
+                let r = j.get(&key)?.ok_or(attempts::Error::NotFound)?;
+                if r.attempt != attempt
+                    || j.completed_receipt(&key, attempt)?.as_ref() != Some(&receipt)
+                    || authority.lease(&r.binding.capacity_lease)?.is_some()
+                {
+                    return Err(Error::Binding);
+                }
+                if r.phase == Phase::Closed {
+                    return if r.closure == Some(digest) {
+                        Ok(true)
+                    } else {
+                        Err(Error::Binding)
+                    };
+                }
+                if let Err(error) =
+                    j.advance(&key, r.generation, Event::Close(digest.clone()), now_ms())
+                {
+                    // Another reconciliation can win after the read above. Accept
+                    // only its exact durable closure, not an arbitrary stale update.
+                    let same = matches!(error, attempts::Error::Stale)
+                        && j.get(&key)?.is_some_and(|latest| {
+                            latest.attempt == attempt
+                                && latest.phase == Phase::Closed
+                                && latest.closure == Some(digest)
+                        });
+                    if !same {
+                        return Err(error.into());
+                    }
+                }
+                Ok(true)
+            })
+            .await
+    }
     pub fn new(
         mut executor: Executor,
         financial: Arc<financial::Client>,
@@ -122,6 +279,7 @@ impl PaidExecutor {
                     &body,
                     result_allowance,
                 )?;
+                journal.reserve_outcome(&record.invocation, record.attempt)?;
                 Ok(record)
             })
             .await
