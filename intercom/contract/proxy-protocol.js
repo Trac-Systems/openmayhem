@@ -7,7 +7,7 @@ import { blake3 } from '@tracsystems/blake3';
 export const PROXY_SCHEMA_VERSION = 1;
 export const PROXY_MAX_RECORD_BYTES = 16_384;
 
-export const isProxyPublication = value => value?.op === 'proxy_registry' || value?.op === 'proxy_policy';
+export const isProxyPublication = value => ['proxy_registry', 'proxy_policy', 'proxy_spend_reserve', 'proxy_record_usage'].includes(value?.op);
 
 // Paid transaction preparation/broadcast and admin-command wrappers are not a
 // second publication lane. Inspect only known transport carriers, not arbitrary
@@ -19,7 +19,8 @@ export function assertProxyPublicationNotPaid(command) {
     const value = pending.pop();
     if (!value || typeof value !== 'object' || Array.isArray(value) || visited.has(value)) continue;
     visited.add(value);
-    if (isProxyPublication(value) || ['proxyRegistry', 'proxyPolicy', 'proxy_registry', 'proxy_policy'].includes(value.type)) {
+    if (isProxyPublication(value) || ['proxyRegistry', 'proxyPolicy', 'proxySpendReserve', 'proxyRecordUsage',
+      'proxy_registry', 'proxy_policy', 'proxy_spend_reserve', 'proxy_record_usage'].includes(value.type)) {
       throw new ProxyValidationError('Proxy publication requires the admitted feature path, not a paid or wrapped transaction.');
     }
     if (visited.size > 16) throw new ProxyValidationError('Transaction transport nesting exceeds the supported bound.');

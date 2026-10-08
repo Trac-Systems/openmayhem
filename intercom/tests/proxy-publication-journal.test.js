@@ -15,9 +15,24 @@ import { proxyRegistryFeatureKey } from '../contract/proxy-protocol.js';
 import { proxyContractFixture } from './helpers/proxy.js';
 import { createProxyCanonicalSnapshot } from '../features/mayhem/proxy-canonical-view.js';
 import { createProxyPublicationTransport, installProxyPublicationController } from '../features/mayhem/proxy-publication-transport.js';
-import { ProxyPublicationJournal, ProxyPublicationController } from '../features/mayhem/proxy-publication-journal.js';
+import { ProxyPublicationJournal, ProxyPublicationController, proxyPublicationsConflict } from '../features/mayhem/proxy-publication-journal.js';
 
 const clone = value => JSON.parse(JSON.stringify(value));
+
+test('dependency fences permit independent work but prevent cross-provider balance/quota races', () => {
+  const a = { scope: 'provider:a', fences: { reads: ['shared-policy', 'balance-a'], writes: ['balance-a'] } };
+  const b = { scope: 'provider:b', fences: { reads: ['shared-policy', 'balance-b'], writes: ['balance-b'] } };
+  assert.equal(proxyPublicationsConflict(a, b), false);
+  for (const other of [
+    { ...b, fences: { reads: ['balance-a'], writes: [] } },
+    { ...b, fences: { reads: [], writes: ['balance-a'] } },
+    { ...b, fences: { reads: [], writes: ['shared-policy'] } },
+  ]) {
+    assert.equal(proxyPublicationsConflict(a, other), true);
+    assert.equal(proxyPublicationsConflict(other, a), true);
+  }
+  assert.equal(proxyPublicationsConflict(a, { scope: 'legacy' }), true);
+});
 
 async function fixture(t, { maxEntries = 16 } = {}) {
   const f = await proxyContractFixture();

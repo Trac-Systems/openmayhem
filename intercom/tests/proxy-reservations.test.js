@@ -17,7 +17,7 @@ for(const family of ['llm','decisions'])for(const rail of ['fiat','tnk','tap']) 
     const f=await fixture(rail,family); const before=f.storage.snapshotBytes();
     const envelope=f.authorize(f.terms); const plan=await f.prepare(envelope);
     assert.equal(f.storage.snapshotBytes(),before,'planning must not write');
-    assert.equal(plan.writes.length,7); assert.equal(plan.result.available_au,'50');
+    assert.equal(plan.writes.length,9); assert.equal(plan.result.available_au,'50');
     assert.equal(plan.result.reserved_au,String(BigInt(f.terms.max_spend_au)+50n));
     assert.ok(f.reads.length<50,'exact-key reads must remain bounded');
     assert.ok(plan.writes.every(w=>!w.key.startsWith('bal/')&&!w.key.startsWith('payout/')&&!w.key.startsWith('price/')));

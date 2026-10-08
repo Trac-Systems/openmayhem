@@ -17,6 +17,8 @@ export async function proxyReservationFixture(rail='tnk',family='llm') {
   const f=await proxyContractFixture(family,rail);
   assert.equal((await f.submit(await f.create())).ok,true);
   assert.equal((await f.submit(await f.envelope({kind:'set_offer',offer:f.offer}))).ok,true);
+  assert.equal((await f.policy({kind:'configure_finance',policy:{enabled:true,
+    max_reservations_per_epoch:1000,max_reservations_per_provider_epoch:100,max_checkpoints_per_reservation:8}})).ok,true);
   const buyer=await makeIdentity();
   const row=clone(cases.find(r=>r.terms.rail===rail&&r.terms.offer.endpoint===(family==='llm'?'openai_chat_completions':'mayhem_decisions')));
   const rules={ver:1,hash:h(800)};
@@ -33,9 +35,9 @@ export async function proxyReservationFixture(rail='tnk',family='llm') {
   if(rail==='fiat') {
     const verification={type:'stripe_payout_verification',provider:f.provider.publicKey,target:payout.target,
       revision:h(803),processor_revision:payout.stripe_processor_revision,ready:true};
-    await f.storage.put('test/stripe-verification',verification);
+    await f.storage.put('payout/stripe-verified/fixture',verification);
     await f.storage.put(f.contract.providerStripePayoutVerificationTargetKey(f.provider.publicKey,payout.target),
-      {...verification,record_key:'test/stripe-verification'});
+      {...verification,record_key:'payout/stripe-verified/fixture'});
   }
   const policy=row.policy;
   const policyHash=await proxySettlementPolicyDigest(policy);
@@ -77,7 +79,7 @@ export async function proxyReceiptFixture(rail='tnk',family='llm') {
     const body={schema_version:1,lane:'proxy',accepted_terms:await proxySpendTermsDigest(f.terms),
       seq,final,outcome:final?'complete':'running',result_hash:h(950),observation_hash:h(951),
       usage,au_owed_cum:au,billing_au_owed_cum:au,at_ms:2000+seq,...changes};
-    return {op:'proxy_record_usage',receipt:{body,buyer_sig:sign(f.buyer.wallet,proxyBuyerReceiptSigningBytes(body)),
+    return {op:'proxy_record_usage',provider:f.provider.publicKey,receipt:{body,buyer_sig:sign(f.buyer.wallet,proxyBuyerReceiptSigningBytes(body)),
       provider_sig:sign(f.provider.wallet,proxyProviderReceiptSigningBytes(body))}};
   };
   const finalize=e=>prepareProxyUsageReceipt(f.ledger,e,f.context,f.peer.wallet.verify);

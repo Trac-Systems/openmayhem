@@ -1,8 +1,8 @@
 import b4a from 'b4a';
 import crypto from 'crypto';
 import { proxyRuntimeContext } from '../../contract/proxy-context.js';
-import { proxyRegistryFeatureKey, PROXY_MAX_RECORD_BYTES } from '../../contract/proxy-protocol.js';
-import { proxyPolicyFeatureKey } from '../../contract/proxy-policy.js';
+import { PROXY_MAX_RECORD_BYTES } from '../../contract/proxy-protocol.js';
+import { proxyPublicationFeatureKey, proxyPublicationParticipant } from '../../contract/proxy-publication.js';
 import { validateProxyPendingEntry, ProxyPublicationJournal, ProxyPublicationController } from './proxy-publication-journal.js';
 import { createProxyCanonicalSnapshot } from './proxy-canonical-view.js';
 
@@ -34,17 +34,19 @@ export function createProxyPublicationTransport(peer, contractVersion) {
     if (hex(base.key) !== context.subnet_bootstrap) fail('configured subnet differs from writer');
     return { ...context, admin: hex(peer.wallet.publicKey), writer_key: source.writer_key, writer_fork: source.fork };
   };
-  const featureKey = envelope => envelope?.op === 'proxy_registry'
-    ? proxyRegistryFeatureKey(envelope) : proxyPolicyFeatureKey(envelope);
+  const featureKey = proxyPublicationFeatureKey;
   const signedHash = (envelope, nonce) => hex(peer.wallet.sign(`${JSON.stringify(envelope)}${nonce}`));
 
-  const prepare = async (key, envelope) => {
+  const prepare = async (key, envelope, { fences } = {}) => {
     if (key !== await featureKey(envelope)) fail('feature key differs from signed operation');
     const { source } = runtime();
     const nonce = crypto.randomBytes(32).toString('hex');
     const hash = signedHash(envelope, nonce);
     const entry = { key, envelope: JSON.parse(JSON.stringify(envelope)), nonce, hash, result_key: `fr/${hash}`,
-      scope: envelope.op === 'proxy_registry' ? `provider:${envelope.intent.provider_pubkey}` : 'admin:policy',
+      scope: envelope.op === 'proxy_policy' ? 'admin:policy'
+        : envelope.op === 'proxy_registry' ? `provider:${proxyPublicationParticipant(envelope)}`
+          : `financial:${envelope.receipt?.body.accepted_terms ?? key.slice('proxy/spend/'.length)}`,
+      ...(fences ? { fences: JSON.parse(JSON.stringify(fences)) } : {}),
       source: { ...source, checked_length: source.length, found_index: null }, created_at: Date.now() };
     validateProxyPendingEntry(entry);
     return entry;
@@ -146,8 +148,7 @@ export async function installProxyPublicationController(feature, { directory, co
     for (const entry of journal.list()) {
       validateProxyPendingEntry(entry);
       const hash = hex(feature.peer.wallet.sign(`${JSON.stringify(entry.envelope)}${entry.nonce}`));
-      const key = entry.envelope.op === 'proxy_registry'
-        ? await proxyRegistryFeatureKey(entry.envelope) : await proxyPolicyFeatureKey(entry.envelope);
+      const key = await proxyPublicationFeatureKey(entry.envelope);
       if (key !== entry.key || hash !== entry.hash) fail('saved publication binding is invalid');
     }
     const controller = new ProxyPublicationController({ journal, ...transport,

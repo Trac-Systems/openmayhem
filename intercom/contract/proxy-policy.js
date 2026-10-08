@@ -5,6 +5,7 @@ import { blake3 } from '@tracsystems/blake3';
 import { ProxyValidationError, PROXY_MAX_RECORD_BYTES } from './proxy-protocol.js';
 import { PROXY_PREFIX, proxyRegistryKeys, validateProxyRegistryConfig } from './proxy-registry.js';
 import { withProxyDiscoveryWrites } from './proxy-discovery.js';
+import { PROXY_FINANCE_POLICY_KEY, validateProxyFinancePolicy } from './proxy-finance-policy.js';
 import { validateProxySettlementPolicy, proxySettlementPolicyDigest } from './proxy-finance.js';
 
 const check = (ok, message) => { if (!ok) throw new ProxyValidationError(message); };
@@ -83,6 +84,10 @@ export function validateProxyPolicy(value) {
       // The hash identifies an implementation-reviewed metering contract. The
       // connector/receipt verifier must implement it before routing can admit it.
       break;
+    case 'configure_finance':
+      shape(action, ['kind', 'policy']);
+      validateProxyFinancePolicy(action.policy);
+      break;
     case 'set_settlement':
       shape(action, ['kind', 'policy_hash', 'enabled', 'policy']);
       hex(action.policy_hash); bool(action.enabled); validateProxySettlementPolicy(action.policy);
@@ -136,6 +141,9 @@ export async function prepareProxyPolicyMutation(value, context, read) {
       break;
     case 'set_metering':
       target = `${PROXY_PREFIX}metering-policy/${action.policy_hash}`; record = action.policy;
+      break;
+    case 'configure_finance':
+      target = PROXY_FINANCE_POLICY_KEY; record = action.policy;
       break;
     case 'set_settlement':
       check(await proxySettlementPolicyDigest(action.policy) === action.policy_hash,

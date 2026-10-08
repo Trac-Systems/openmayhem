@@ -2,10 +2,10 @@
 // never request-provided state. Run this before BOTH forwarding and writer append.
 // The contract repeats the same transition checks during application. There is no
 // fee worker/network/history lookup on subsequent publications or inference turns.
-import { validateProxyOperationEnvelope, proxyRegistryFeatureKey, PROXY_MAX_RECORD_BYTES } from '../../contract/proxy-protocol.js';
+import { PROXY_MAX_RECORD_BYTES } from '../../contract/proxy-protocol.js';
 import b4a from 'b4a';
-import { prepareProxyRegistryMutation } from '../../contract/proxy-registry.js';
-import { validateProxyPolicy, proxyPolicyFeatureKey, prepareProxyPolicyMutation } from '../../contract/proxy-policy.js';
+import MayhemContract from '../../contract/contract.js';
+import { validateProxyPublication, proxyPublicationFeatureKey, prepareProxyPublication } from '../../contract/proxy-publication.js';
 
 export { proxyRegistryFeatureKey } from '../../contract/proxy-protocol.js';
 
@@ -20,7 +20,8 @@ export function validateProxyPreflightRequest(value) {
       b4a.byteLength(JSON.stringify(value)) > PROXY_MAX_RECORD_BYTES + 512) {
     throw new Error('Invalid proxy admission preflight request.');
   }
-  validateProxyOperationEnvelope(value.envelope);
+  validateProxyPublication(value.envelope);
+  if (value.envelope.op === 'proxy_policy') throw new Error('Proxy policy requires the canonical admin writer.');
 }
 
 // This service returns no publication permit and performs no write. The signed
@@ -34,11 +35,11 @@ export async function preflightProxyRegistry({ request, withCanonicalSnapshot, v
   let proof;
   const result = await admitProxyRegistryFeature({ featureKey: request.feature_key, envelope: request.envelope,
     verifySignature,
-    withCanonicalSnapshot: body => withCanonicalSnapshot(snapshot => {
+    withCanonicalSnapshot: (body, options) => withCanonicalSnapshot(snapshot => {
       context = snapshot.context;
       proof = snapshot.proof;
       return body(snapshot);
-    }),
+    }, options),
     forward: async () => ({ duplicate: false }),
   });
   return { ok: true, status: result.duplicate ? 'applied' : 'admissible',
@@ -52,44 +53,35 @@ export async function preflightProxyRegistry({ request, withCanonicalSnapshot, v
 // merely signed is not enough to establish that it is the canonical current view.
 // Snapshot acquisition, writer pending deduplication and dispatch journaling are
 // transport responsibilities; this helper does not claim to implement them.
-export async function admitProxyRegistryFeature({ featureKey, envelope, withCanonicalSnapshot, verifySignature, forward }) {
-  validateProxyOperationEnvelope(envelope);
+export async function admitProxyPublicationFeature({ featureKey, envelope, withCanonicalSnapshot, verifySignature, forward }) {
+  validateProxyPublication(envelope);
   envelope = JSON.parse(JSON.stringify(envelope));
-  if (typeof withCanonicalSnapshot !== 'function' || typeof verifySignature !== 'function' || typeof forward !== 'function') {
+  if (typeof withCanonicalSnapshot !== 'function' || typeof forward !== 'function'
+      || (envelope.op !== 'proxy_policy' && typeof verifySignature !== 'function')) {
     throw new Error('Proxy canonical admission is not configured.');
   }
-  if (featureKey !== await proxyRegistryFeatureKey(envelope)) throw new Error('Invalid proxy registry feature key.');
+  if (featureKey !== await proxyPublicationFeatureKey(envelope)) throw new Error('Invalid proxy publication feature key.');
+  const financial = envelope.op === 'proxy_spend_reserve' || envelope.op === 'proxy_record_usage';
   return await withCanonicalSnapshot(async snapshot => {
     if (typeof snapshot?.assertCurrent !== 'function' || typeof snapshot?.read !== 'function') {
       throw new Error('Proxy canonical snapshot is incomplete.');
     }
+    const reads = new Set();
+    const ledger = Object.create(MayhemContract.prototype);
+    ledger.get = async key => { reads.add(key); return await snapshot.read(key); };
+    ledger.put = ledger.del = () => { throw new Error('Admission cannot mutate the canonical snapshot.'); };
     await snapshot.assertCurrent();
-    const plan = await prepareProxyRegistryMutation(envelope, snapshot.context, snapshot.read, verifySignature);
+    const plan = await prepareProxyPublication(ledger, envelope, snapshot.context, verifySignature);
     await snapshot.assertCurrent();
     if (plan.duplicate) return { duplicate: true, result: plan.result };
-    // No prepared writes cross the ingress boundary. Application re-derives them
-    // against its then-current canonical state, preventing a forged write plan.
-    return await forward({ featureKey, envelope });
-  });
+    // Only dependency keys accompany this trusted local callback. Prepared values
+    // never cross ingress; application derives them from its current atomic batch.
+    return await forward({ featureKey, envelope, fences: {
+      reads: [...reads].sort(), writes: [...new Set(plan.writes.map(write => write.key))].sort(),
+    } });
+  }, { financial });
 }
 
-// Only the canonical admin may call this. Policy still needs the same snapshot
-// and pre-append validation; a metadata edit cannot append an invalid policy.
-export async function admitProxyPolicyFeature({ featureKey, envelope, withCanonicalSnapshot, forward }) {
-  validateProxyPolicy(envelope);
-  envelope = JSON.parse(JSON.stringify(envelope));
-  if (typeof withCanonicalSnapshot !== 'function' || typeof forward !== 'function') {
-    throw new Error('Proxy canonical admission is not configured.');
-  }
-  if (featureKey !== await proxyPolicyFeatureKey(envelope)) throw new Error('Invalid proxy policy feature key.');
-  return await withCanonicalSnapshot(async snapshot => {
-    if (typeof snapshot?.assertCurrent !== 'function' || typeof snapshot?.read !== 'function') {
-      throw new Error('Proxy canonical snapshot is incomplete.');
-    }
-    await snapshot.assertCurrent();
-    const plan = await prepareProxyPolicyMutation(envelope, snapshot.context, snapshot.read);
-    await snapshot.assertCurrent();
-    if (plan.duplicate) return { duplicate: true, result: plan.result };
-    return await forward({ featureKey, envelope });
-  });
-}
+// Retain internal call-site compatibility; both names use the same gate.
+export const admitProxyRegistryFeature = admitProxyPublicationFeature;
+export const admitProxyPolicyFeature = admitProxyPublicationFeature;

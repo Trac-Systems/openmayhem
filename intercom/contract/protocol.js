@@ -1,3 +1,4 @@
+import { proxyPublicationParticipant } from './proxy-publication.js';
 import { Protocol } from 'trac-peer';
 import b4a from 'b4a';
 import { createHash } from 'trac-peer/src/utils/types.js';
@@ -29,10 +30,8 @@ const uniqueByJson = (values) => {
 
 export const mayhemFeatureParticipant = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  if (value.op === 'proxy_registry') {
-    const provider = String(value.intent?.provider_pubkey ?? '').toLowerCase();
-    return /^[0-9a-f]{64}$/.test(provider) ? provider : null;
-  }
+  const proxyActor = proxyPublicationParticipant(value);
+  if (proxyActor) return proxyActor;
   if (value.op === 'record_usage_receipt') {
     const provider = String(value.receipt?.body?.provider ?? '').toLowerCase();
     return /^[0-9a-f]{64}$/.test(provider) ? provider : null;

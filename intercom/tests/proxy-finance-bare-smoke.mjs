@@ -47,7 +47,7 @@ await normalizeProxySpendSessionRecord(session,t.buyer_pubkey,t.rail,t.reservati
 const ledger=new MayhemContract({peer:{}},{}), records=new Map();
 ledger.get=async key=>records.get(key)??null;
 ledger.put=ledger.del=()=>{throw new Error('planner wrote during validation');};
-records.set(proxyReservationKeys.accepted(digest),{type:'proxy_accepted_spend',accepted_terms:digest,authorization,settlement_policy:r.policy});
+records.set(proxyReservationKeys.accepted(digest),{type:'proxy_accepted_spend',accepted_terms:digest,authorization,settlement_policy:r.policy,max_checkpoints:8});
 records.set('epoch/apply/state',{updated_epoch:t.billing_epoch-1,pending_epoch:null});
 const sessionKey=ledger.targetedSpendSessionKey(t.buyer_pubkey,t.rail,t.reservation_id);
 records.set(sessionKey,session);
@@ -59,7 +59,7 @@ records.set(ledger.receiptBillingKey(t.billing_id),{type:'proxy_billing_anchor',
 records.set(ledger.receiptReservationKey(t.reservation_id),{type:'receipt_reservation_identity',lane:'proxy',accepted_terms:digest,
   ...identity,status:'active',closed_at:null,close_record_key:null});
 const body={...r.receipt,accepted_terms:digest,billing_au_owed_cum:r.receipt.au_owed_cum};
-const envelope={op:'proxy_record_usage',receipt:{body,buyer_sig:sign(buyer,f.proxyBuyerReceiptSigningBytes(body)),
+const envelope={op:'proxy_record_usage',provider:t.offer.provider_pubkey,receipt:{body,buyer_sig:sign(buyer,f.proxyBuyerReceiptSigningBytes(body)),
   provider_sig:sign(provider,f.proxyProviderReceiptSigningBytes(body))}};
 const plan=await prepareProxyUsageReceipt(ledger,envelope,t,verify);
 check(plan.result.au===body.au_owed_cum&&!plan.duplicate,'receipt plan failed');

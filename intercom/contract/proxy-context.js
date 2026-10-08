@@ -3,6 +3,14 @@ import { ProxyValidationError } from './proxy-protocol.js';
 
 const hex = value => b4a.isBuffer(value) ? b4a.toString(value, 'hex') : String(value ?? '').toLowerCase();
 
+// Modern settlement records use updated_epoch. Legacy fixtures/records may use
+// epoch; a pending epoch has not completed and must not advance admission time.
+export function proxyAppliedEpoch(state) {
+  const epoch = state?.updated_epoch ?? state?.epoch ?? 0;
+  if (!Number.isSafeInteger(epoch) || epoch < 0) throw new ProxyValidationError('Invalid canonical proxy epoch.');
+  return epoch;
+}
+
 // Local protocol configuration supplies network identity. Epoch comes from the
 // same canonical checkout used for admission, or the current consensus batch.
 export function proxyRuntimeContext(peer, contractVersion, epoch) {

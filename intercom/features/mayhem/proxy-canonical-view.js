@@ -2,7 +2,7 @@
 // this adapter: their signed local view is not proof of the current canonical
 // head. They obtain authenticated preflight from the indexer service instead.
 import b4a from 'b4a';
-import { proxyRuntimeContext } from '../../contract/proxy-context.js';
+import { proxyRuntimeContext, proxyAppliedEpoch } from '../../contract/proxy-context.js';
 import { PROXY_MAX_RECORD_BYTES } from '../../contract/proxy-protocol.js';
 
 const hex = value => b4a.isBuffer(value) ? b4a.toString(value, 'hex') : String(value ?? '').toLowerCase();
@@ -66,7 +66,7 @@ export function createProxyCanonicalReader(peer, contractVersion) {
       if (requested && (await before.base.view.get('admin', { timeout: READ_TIMEOUT_MS }))?.value !== before.admin) {
         fail('current canonical admin differs');
       }
-      const epoch = (await read('epoch/apply/state'))?.epoch ?? 0;
+      const epoch = proxyAppliedEpoch(await read('epoch/apply/state'));
       const context = proxyRuntimeContext(peer, contractVersion, epoch);
       if (hex(before.base.key) !== context.subnet_bootstrap) fail('configured bootstrap differs from canonical indexer');
       return { ...before, length, view, read, context,
@@ -89,13 +89,14 @@ export function createProxyCanonicalReader(peer, contractVersion) {
 
 export function createProxyCanonicalSnapshot(peer, contractVersion) {
   const { pin } = createProxyCanonicalReader(peer, contractVersion);
-  return async body => {
+  return async (body, { financial = false } = {}) => {
     const initial = await pin();
     const observed = new Map();
     let readBytes = 0;
     try {
       const read = async key => {
-        if (typeof key !== 'string' || key.length > 256 || !key.startsWith('proxy/v1/')) fail('invalid registry read key');
+        if (typeof key !== 'string' || key.length > 256 || !(key.startsWith('proxy/v1/') ||
+            (financial && financialReadKey(key)))) fail('invalid registry read key');
         if (observed.has(key)) return clone(observed.get(key));
         if (observed.size >= MAX_KEYS) fail('registry read count exceeds its bound');
         const value = await initial.read(key);
@@ -123,4 +124,11 @@ export function createProxyCanonicalSnapshot(peer, contractVersion) {
       return await body({ context: initial.context, proof: initial.proof, read, assertCurrent });
     } finally { await initial.view.close(); }
   };
+}
+
+// Exact-key reads only, never prefix/range queries. Values still count against
+// the same snapshot key/byte bounds and are revalidated before dispatch.
+function financialReadKey(key) {
+  return ['epoch/apply/state', 'rules/current', 'payments/current', 'receipt/ingress'].includes(key)
+    || /^(?:prov|bal|hold\/targeted-(?:outstanding|summary|legacy-release|session|session-index|billing)|payout\/(?:binding|current|stripe-verified)|receipt\/(?:billing|reservation|reservation-close|head|consumed|epoch)|epoch\/freeze)\/[A-Za-z0-9_/-]+$/.test(key);
 }

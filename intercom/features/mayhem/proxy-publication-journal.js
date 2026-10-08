@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import b4a from 'b4a';
 import nativeFs from 'fs-native-extensions';
-import { PROXY_MAX_RECORD_BYTES } from '../../contract/proxy-protocol.js';
+import { PROXY_MAX_RECORD_BYTES, isProxyPublication } from '../../contract/proxy-protocol.js';
 
 const clone = value => JSON.parse(JSON.stringify(value));
 const stable = value => JSON.stringify(value, (_, item) => item && typeof item === 'object' && !Array.isArray(item)
@@ -14,12 +14,31 @@ const integer = value => Number.isSafeInteger(value) && value >= 0;
 // Publication-only bounds, not catalog limits. No completed history is retained:
 // the canonical registry/fr records provide durable completion deduplication.
 export const PROXY_PENDING_DEFAULT_MAX = 256;
-const MAX_ENTRY_BYTES = PROXY_MAX_RECORD_BYTES + 4096;
+const MAX_ENTRY_BYTES = PROXY_MAX_RECORD_BYTES + 72_000;
+
+export function validateProxyPublicationFences(fences) {
+  if (!fences || Object.keys(fences).sort().join('|') !== 'reads|writes') fail('invalid publication fences');
+  for (const keys of [fences.reads, fences.writes]) {
+    if (!Array.isArray(keys) || keys.length > 128 || keys.some((key, index) =>
+      typeof key !== 'string' || !key.length || key.length > 256 || (index && keys[index - 1] >= key))) {
+      fail('invalid publication dependency keys');
+    }
+  }
+}
+
+export function proxyPublicationsConflict(a, b) {
+  if (a.scope === b.scope) return true;
+  // Old local journal entries had only a provider fence. Recover these first.
+  if (!a.fences || !b.fences) return Boolean(a.fences || b.fences);
+  const aw = new Set(a.fences.writes), bw = new Set(b.fences.writes);
+  return b.fences.reads.some(key => aw.has(key)) || a.fences.reads.some(key => bw.has(key))
+    || b.fences.writes.some(key => aw.has(key));
+}
 
 export function validateProxyPendingEntry(entry) {
   if (!entry || typeof entry !== 'object' || Array.isArray(entry) ||
       JSON.stringify(Object.keys(entry).sort()) !== JSON.stringify([
-        'created_at', 'envelope', 'hash', 'key', 'nonce', 'result_key', 'scope', 'source',
+        'created_at', 'envelope', ...(Object.hasOwn(entry, 'fences') ? ['fences'] : []), 'hash', 'key', 'nonce', 'result_key', 'scope', 'source',
       ]) || typeof entry.key !== 'string' || entry.key.length > 256 || !entry.key.startsWith('proxy/') ||
       typeof entry.scope !== 'string' || entry.scope.length > 96 ||
       !hex(entry.nonce) || !/^[0-9a-f]{128}$/.test(entry.hash) ||
@@ -30,8 +49,10 @@ export function validateProxyPendingEntry(entry) {
       !(entry.source.found_index === null || (integer(entry.source.found_index) && entry.source.found_index >= entry.source.length &&
         entry.source.found_index < entry.source.checked_length)) ||
       JSON.stringify(Object.keys(entry.source).sort()) !== JSON.stringify(['checked_length', 'fork', 'found_index', 'length', 'writer_key']) ||
-      !['proxy_registry', 'proxy_policy'].includes(entry.envelope?.op) ||
+      !isProxyPublication(entry.envelope) ||
       b4a.byteLength(JSON.stringify(entry)) > MAX_ENTRY_BYTES) fail('invalid pending record');
+  if (entry.fences) validateProxyPublicationFences(entry.fences);
+  else if (['proxy_spend_reserve', 'proxy_record_usage'].includes(entry.envelope.op)) fail('financial publication fences are required');
 }
 
 // One small bounded file, exclusive OS lock, and asynchronous durable replacement.
@@ -85,7 +106,8 @@ export class ProxyPublicationJournal {
         const scopes = new Set();
         for (const entry of state.entries) {
           validateProxyPendingEntry(entry);
-          if (this.entries.has(entry.key) || scopes.has(entry.scope)) fail('duplicate pending identity/scope');
+          if (this.entries.has(entry.key) || scopes.has(entry.scope) ||
+              [...this.entries.values()].some(other => proxyPublicationsConflict(entry, other))) fail('conflicting pending identity/dependencies');
           this.entries.set(entry.key, clone(entry)); scopes.add(entry.scope);
         }
       } finally { await file.close(); }
@@ -144,7 +166,9 @@ export class ProxyPublicationJournal {
         return false;
       }
       if (entries.size >= this.maxEntries) fail('pending capacity reached');
-      if ([...entries.values()].some(value => value.scope === entry.scope)) fail('another operation in this provider/policy scope is pending');
+      if ([...entries.values()].some(value => proxyPublicationsConflict(entry, value))) {
+        fail('another operation in this provider/policy scope is pending or an accounting dependency is reserved; recover it before retrying');
+      }
       entries.set(entry.key, entry); return true;
     });
   }
@@ -189,7 +213,7 @@ export class ProxyPublicationController {
   pending(entry, reason = 'awaiting_canonical_result') {
     return { ok: false, accepted: true, status: 'pending', feature: 'mayhem', key: entry.key,
       hash: entry.hash, result_key: entry.result_key, recovery_reason: reason,
-      message: 'Proxy publication is retained for canonical recovery; do not submit a different operation for this provider yet.' };
+      message: 'Proxy publication is retained for canonical recovery; retry this same operation to recover its outcome.' };
   }
 
   async submit(key, envelope) {
@@ -221,15 +245,16 @@ export class ProxyPublicationController {
     }
     let dispatchStarted = false;
     try {
-      const response = await this.admit(key, envelope, async () => {
+      const response = await this.admit(key, envelope, async ({ fences } = {}) => {
         if (this.closed) fail('controller is stopping');
         if (!entry) {
-          entry = await this.prepare(key, envelope);
+          entry = await this.prepare(key, envelope, { fences });
           await this.journal.put(entry);
         }
         // Durable I/O may yield to a revocation or another registry operation.
         // Revalidate after persistence, immediately before dispatch.
-        return await this.admit(key, entry.envelope, async () => {
+        return await this.admit(key, entry.envelope, async ({ fences: refreshed } = {}) => {
+          if (entry.fences && stable(refreshed) !== stable(entry.fences)) fail('admission dependencies changed; retry the same operation');
           if (this.closed) fail('controller is stopping');
           dispatchStarted = true;
           // Exactly the saved nonce and envelope; a retry never invents another hash.

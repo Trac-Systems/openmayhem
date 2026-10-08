@@ -6,6 +6,7 @@
 import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 import { ProxyValidationError, proxyCanonicalSigningBytes } from './proxy-protocol.js';
+import { prepareProxyFinancialAdmission } from './proxy-finance-policy.js';
 import { readActiveProxyOffer } from './proxy-registry.js';
 import { proxySpendTermsDigest, proxySettlementPolicyDigest, validateProxySpendTerms,
   validateProxyNewAcceptance, verifyProxySpendAuthorization, validateProxyReceiptBody,
@@ -105,6 +106,7 @@ export async function prepareProxyReservation(ledger,envelope,context,verify) {
   need(Number.isSafeInteger(activeEpoch)&&t.billing_epoch===activeEpoch,'proxy reservation is not for active billing epoch');
   const selected=await readActiveProxyOffer(t.offer,context,path=>ledger.get(path));
   need(selected!==null,'proxy offer is no longer active or admitted');
+  const admission=await prepareProxyFinancialAdmission(path=>ledger.get(path),t.offer.provider_pubkey,activeEpoch);
   const policyRecord=await ledger.get(proxyReservationKeys.settlementPolicy(t.settlement_policy_hash));
   need(policyRecord?.enabled===true,'proxy settlement policy is not enabled');
   await validateProxyNewAcceptance(t,selected.market,selected.membership,selected.offer,policyRecord.policy,activeEpoch);
@@ -142,6 +144,7 @@ export async function prepareProxyReservation(ledger,envelope,context,verify) {
   const result={ok:true,op:'proxySpendReserve',accepted_terms:digest,...id,
     reserved_au:total,available_au:checked(ledger.safeSubAu(balance.au,total))};
   return {duplicate:false,result,writes:[
+    ...admission.writes,
     {key:ledger.targetedSpendSummaryKey(t.buyer_pubkey,t.rail),value:{...accounting.summary,
       reserved_au:reserved,balance_au_at_last_reserve:balance.au,updated_at:key}},
     {key:sessionKey,value:session},
@@ -153,12 +156,14 @@ export async function prepareProxyReservation(ledger,envelope,context,verify) {
     {key:reservationKey,value:{type:'receipt_reservation_identity',lane:'proxy',accepted_terms:digest,...id,
       status:'active',closed_at:null,close_record_key:null,recorded_at:key}},
     {key:acceptedKey,value:{type:'proxy_accepted_spend',accepted_terms:digest,
-      authorization:envelope.authorization,settlement_policy:copy(policyRecord.policy),result,recorded_at:key}},
+      authorization:envelope.authorization,settlement_policy:copy(policyRecord.policy),
+      max_checkpoints:admission.policy.max_checkpoints_per_reservation,result,recorded_at:key}},
   ]};
 }
 
 export function validateProxyUsageEnvelope(v) {
-  shape(v,['op','receipt']);
+  shape(v,['op','provider','receipt']);
+  need(typeof v.provider==='string'&&/^[0-9a-f]{64}$/.test(v.provider),'invalid proxy receipt provider');
   need(v.op==='proxy_record_usage','invalid proxy usage operation');
   shape(v.receipt,['body','buyer_sig','provider_sig']);
   validateProxyReceiptBody(v.receipt.body);
@@ -176,6 +181,7 @@ async function acceptedSpend(ledger,digest) {
   need(accepted?.type==='proxy_accepted_spend'&&accepted.accepted_terms===digest,'proxy accepted spend is missing');
   const t=accepted.authorization?.terms;
   need(await proxySpendTermsDigest(t)===digest,'proxy accepted spend terms changed');
+  integer(accepted.max_checkpoints);
   need(await proxySettlementPolicyDigest(accepted.settlement_policy)===t.settlement_policy_hash,'proxy accepted settlement policy changed');
   return accepted;
 }
@@ -195,6 +201,8 @@ export async function validateProxyCanonicalReceiptHead(ledger,head) {
   const t=accepted.authorization.terms, body=head.receipt?.body;
   await validateProxyReceiptFor(body,t,accepted.settlement_policy);
   headIdentity(head,t);
+  integer(head.checkpoint_count);
+  need(head.checkpoint_count<=accepted.max_checkpoints,'proxy checkpoint count exceeds accepted publication budget');
   need(head.receipt_seq===body.seq&&head.receipt_hash===await proxyReceiptDigest(body)
     &&head.incremental_au===body.au_owed_cum,'proxy receipt head amount or digest mismatch');
   need(head.settlement_ready===body.final,'proxy receipt head finality mismatch');
@@ -214,6 +222,7 @@ export async function prepareProxyUsageReceipt(ledger,envelope,context,verify) {
   const receipt=envelope.receipt, body=receipt.body;
   const accepted=await acceptedSpend(ledger,body.accepted_terms);
   const t=accepted.authorization.terms;
+  need(envelope.provider===t.offer.provider_pubkey,'proxy receipt provider does not match accepted terms');
   for(const k of ['network_id','msb_bootstrap','subnet_bootstrap'])need(t[k]===context[k],'proxy receipt network mismatch');
   const headKey=ledger.receiptHeadKey(t.billing_id,t.billing_attempt);
   const previous=await ledger.get(headKey);
@@ -228,6 +237,8 @@ export async function prepareProxyUsageReceipt(ledger,envelope,context,verify) {
     epoch:head.settlement_epoch,receipt_seq:head.receipt_seq,receipt_hash:head.receipt_hash,
     final:head.settlement_ready,au:head.incremental_au});
   if(previous!==null&&same(previous.receipt,receipt))return {duplicate:true,writes:[],result:result(previous)};
+  const checkpointCount=(previous?.checkpoint_count??0)+(body.final?0:1);
+  need(Number.isSafeInteger(checkpointCount)&&checkpointCount<=accepted.max_checkpoints,'Proxy checkpoint publication budget reached; retain progress locally and submit the final receipt.');
   need(previous?.settlement_ready!==true,'proxy finalized receipt cannot change');
   need(await ledger.get(ledger.receiptConsumedKey(t.billing_id,t.billing_attempt))===null,'proxy consumed receipt cannot advance');
   const anchorKey=ledger.receiptBillingKey(t.billing_id), anchor=await ledger.get(anchorKey);
@@ -255,7 +266,7 @@ export async function prepareProxyUsageReceipt(ledger,envelope,context,verify) {
     index_position:index?.position??null,settlement_ready:body.final,user:t.buyer_pubkey,rail:t.rail,
     provider:t.offer.provider_pubkey,payout_revision:t.payout_revision,session_id:t.session_id,
     reservation_id:t.reservation_id,receipt_seq:body.seq,receipt_hash:receiptHash,
-    incremental_au:body.au_owed_cum,receipt,feature_key:key,updated_at:key};
+    incremental_au:body.au_owed_cum,checkpoint_count:checkpointCount,receipt,feature_key:key,updated_at:key};
   const writes=[{key:headKey,value:head}];
   if(body.final) {
     const closeKey=ledger.receiptReservationCloseKey(t.reservation_id);

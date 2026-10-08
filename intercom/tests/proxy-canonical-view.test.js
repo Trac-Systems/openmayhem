@@ -109,3 +109,23 @@ test('snapshot callback failure closes only its sessions and preserves native av
   await f.snapshot(async s => assert.deepEqual(await s.read('proxy/v1/config'), { enabled: true }));
   assert.equal((await f.base.view.get('native/after-failure')).value, 1);
 });
+
+test('current settlement epoch and scoped financial reads are pinned and revalidated', async t => {
+  const f = await fixture(t);
+  await f.write([['epoch/apply/state', { updated_epoch: 110, pending_epoch: 111 }], ['bal/customer/tnk', { au: '100' }]]);
+  await f.snapshot(async s => {
+    assert.equal(s.context.epoch, 110);
+    await assert.rejects(s.read('bal/customer/tnk'), /invalid registry read key/);
+  });
+  await f.snapshot(async s => {
+    assert.deepEqual(await s.read('bal/customer/tnk'), { au: '100' });
+    await assert.rejects(s.read('private/operator/key'), /invalid registry read key/);
+    await f.write([['bal/customer/tnk', { au: '90' }]]);
+    await assert.rejects(s.assertCurrent(), /state changed/);
+    assert.deepEqual(await s.read('bal/customer/tnk'), { au: '100' });
+  }, { financial: true });
+  await f.snapshot(async s => {
+    await f.write([['epoch/apply/state', { updated_epoch: 111, pending_epoch: null }]]);
+    await assert.rejects(s.assertCurrent(), /context changed/);
+  }, { financial: true });
+});

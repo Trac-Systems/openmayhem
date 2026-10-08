@@ -1,3 +1,4 @@
+import { validateProxyPublication, proxyPublicationFeatureKey, proxyPublicationParticipant } from '../../contract/proxy-publication.js';
 import Feature from 'trac-peer/src/artifacts/feature.js';
 import crypto from 'crypto';
 import b4a from 'b4a';
@@ -5,7 +6,7 @@ import { blake3 } from '@tracsystems/blake3';
 import { keccak256 } from 'ethereum-cryptography/keccak';
 import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import PeerWallet from 'trac-wallet';
-import { assertProxyPublicationNotPaid, isProxyPublication, validateProxyOperationEnvelope, proxyRegistryFeatureKey } from '../../contract/proxy-protocol.js';
+import { assertProxyPublicationNotPaid, isProxyPublication } from '../../contract/proxy-protocol.js';
 import { proxyRuntimeContext } from '../../contract/proxy-context.js';
 import { admitProxyRegistryFeature, admitProxyPolicyFeature, preflightProxyRegistry,
   validateProxyPreflightRequest, PROXY_PREFLIGHT_SERVICE, PROXY_PREFLIGHT_MAX_AGE_MS } from './proxy-admission.js';
@@ -308,10 +309,8 @@ const validStripeCheckoutPayload = (value) => {
 
 const participantFor = (value) => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
-  if (value.op === 'proxy_registry') {
-    const provider = normalizeKey(value.intent?.provider_pubkey);
-    return /^[0-9a-f]{64}$/.test(provider) ? provider : null;
-  }
+  const proxyActor = proxyPublicationParticipant(value);
+  if (proxyActor) return proxyActor;
   if (value.op === 'admin_contract_tx') return normalizeKey(value.address);
   if (value.op === 'consent' || value.op === 'deposit_tnk') return normalizeKey(value.sender);
   if (value.op === 'tap_account_bind') return normalizeKey(value.user);
@@ -650,8 +649,8 @@ class MayhemFeature extends Feature {
 
   async relay(key, value) {
     if (value?.op === 'proxy_policy') throw new Error('Proxy policy requires the canonical admin writer.');
-    if (value?.op === 'proxy_registry') {
-      validateProxyOperationEnvelope(value);
+    if (isProxyPublication(value)) {
+      validateProxyPublication(value);
       value = JSON.parse(JSON.stringify(value));
       const preflight = await this._requestProxyPreflight(key, value);
       if (preflight.status === 'applied') return this._proxyDuplicateResult(key, preflight.result);
@@ -685,7 +684,7 @@ class MayhemFeature extends Feature {
   }
 
   async _requestProxyPreflight(key, value) {
-    if (key !== await proxyRegistryFeatureKey(value)) throw new Error('Invalid proxy registry feature key.');
+    if (key !== await proxyPublicationFeatureKey(value)) throw new Error('Invalid proxy publication feature key.');
     const requester = normalizeKey(this.peer?.wallet?.publicKey);
     const admin = await this._adminKey();
     const payload = { requester, request_nonce: crypto.randomBytes(32).toString('hex'), feature_key: key, envelope: value };

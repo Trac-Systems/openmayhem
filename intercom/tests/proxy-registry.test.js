@@ -330,7 +330,10 @@ test('pre-forwarding gate returns exact applied retry without another append', a
   const send = () => admitProxyRegistryFeature({ featureKey, envelope, withCanonicalSnapshot,
     verifySignature: makeVerifier(f.provider.wallet).verify, forward: async request => {
       forwarded++;
-      assert.deepEqual(Object.keys(request).sort(), ['envelope', 'featureKey']);
+      assert.deepEqual(Object.keys(request).sort(), ['envelope', 'featureKey', 'fences']);
+      assert.deepEqual(Object.keys(request.fences).sort(), ['reads', 'writes']);
+      assert.ok(request.fences.reads.every(key => typeof key === 'string' && key.startsWith('proxy/v1/')));
+      assert.ok(request.fences.writes.every(key => typeof key === 'string' && key.startsWith('proxy/v1/')));
       return await f.apply(request.envelope);
     } });
   assert.equal((await send()).duplicate, false);

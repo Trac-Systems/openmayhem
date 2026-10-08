@@ -12,10 +12,9 @@ import ContractV26 from './history/v26.js';
 import ContractV27 from './history/v27.js';
 import ContractV28 from './history/v28.js';
 import ContractV29 from './history/v29.js';
-import { ProxyValidationError, proxyRegistryFeatureKey } from './proxy-protocol.js';
-import { prepareProxyRegistryMutation } from './proxy-registry.js';
-import { prepareProxyPolicyMutation, proxyPolicyFeatureKey } from './proxy-policy.js';
-import { proxyRuntimeContext } from './proxy-context.js';
+import { ProxyValidationError, isProxyPublication } from './proxy-protocol.js';
+import { proxyRuntimeContext, proxyAppliedEpoch } from './proxy-context.js';
+import { prepareProxyPublication, proxyPublicationFeatureKey } from './proxy-publication.js';
 import { normalizeProxySpendSessionRecord, validateProxyCanonicalReceiptHead } from './proxy-reservations.js';
 import { advanceDemand, demandObservation, DEMAND_CONSTANTS, scaleDemandPrice } from './reference-demand.js';
 
@@ -1665,22 +1664,17 @@ class MayhemContract extends Contract {
     if (adminError) return adminError;
     let plan;
     try {
-      const context = proxyRuntimeContext(this.protocol?.peer, CONTRACT_VERSION, await this.currentAppliedEpoch());
-      const read = path => this.get(path);
-      if (value.op === 'proxy_policy') {
-        if (key !== await proxyPolicyFeatureKey(value)) return new Error('Invalid proxy policy feature key.');
-        plan = await prepareProxyPolicyMutation(value, context, read);
-      } else {
-        if (key !== await proxyRegistryFeatureKey(value)) return new Error('Invalid proxy registry feature key.');
-        const verify = (signature, bytes, publicKey) => this.protocol.peer.wallet.verify(signature, bytes, publicKey);
-        plan = await prepareProxyRegistryMutation(value, context, read, verify);
-      }
+      const context = proxyRuntimeContext(this.protocol?.peer, CONTRACT_VERSION,
+        proxyAppliedEpoch(await this.get('epoch/apply/state')));
+      if (key !== await proxyPublicationFeatureKey(value)) return new Error('Invalid proxy publication feature key.');
+      const verify = (signature, bytes, publicKey) => this.protocol.peer.wallet.verify(signature, bytes, publicKey);
+      plan = await prepareProxyPublication(this, value, context, verify);
     } catch (error) {
       if (error instanceof ProxyValidationError) return new Error(error.message);
       throw error; // Storage/crypto/runtime errors must abort apply, not become rejection.
     }
     for (const write of plan.writes) {
-      if (write.value === null) await this.del(write.key);
+      if (write.delete === true || write.value === null) await this.del(write.key);
       else await this.put(write.key, write.value);
     }
     return { ok: true, duplicate: plan.duplicate, ...plan.result };
@@ -1696,7 +1690,7 @@ class MayhemContract extends Contract {
     if (typeof key !== 'string' || !value || typeof value !== 'object' || Array.isArray(value)) {
       return;
     }
-    if (value.op === 'proxy_registry' || value.op === 'proxy_policy') {
+    if (isProxyPublication(value)) {
       const result = await this.applyProxyFeature(key, value);
       this._mayhemLastFeatureResult = result;
       return result;
