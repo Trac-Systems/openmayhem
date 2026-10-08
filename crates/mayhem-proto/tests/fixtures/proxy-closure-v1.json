@@ -1,0 +1,1258 @@
+{
+  "cases": [
+    {
+      "name": "openai_chat_completions/fiat",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "1111111111111111111111111111111111111111111111111111111111111111",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_chat_completions",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "7",
+              "granularity": 3
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "13",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "fiat",
+        "served_context": 262144,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "input_token": 1024,
+          "output_token": 1024
+        },
+        "max_spend_au": "6833",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "6879"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "b6d97644d37831cb6d4aaa5dffd9a6053f83f9720e5d3bb6bb97e4ff764d4566",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "b6d97644d37831cb6d4aaa5dffd9a6053f83f9720e5d3bb6bb97e4ff764d4566",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "b6d97644d37831cb6d4aaa5dffd9a6053f83f9720e5d3bb6bb97e4ff764d4566",
+        "closure": "1bd8ee0779208d65318218cff73d1edf82f1d2e35cdf176cf68526ca4c23ba08",
+        "expiry": "3459bd2af38babbb01dbbe43d159b9b05370e0b5e03093469ca847f5e07b3495"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"b6d97644d37831cb6d4aaa5dffd9a6053f83f9720e5d3bb6bb97e4ff764d4566\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"b6d97644d37831cb6d4aaa5dffd9a6053f83f9720e5d3bb6bb97e4ff764d4566\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"b6d97644d37831cb6d4aaa5dffd9a6053f83f9720e5d3bb6bb97e4ff764d4566\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    },
+    {
+      "name": "openai_chat_completions/tnk",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "1111111111111111111111111111111111111111111111111111111111111111",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_chat_completions",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "7",
+              "granularity": 3
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "13",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "tnk",
+        "served_context": 262144,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "input_token": 1024,
+          "output_token": 1024
+        },
+        "max_spend_au": "6833",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "6879"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "c6e65a04945af6c9a0521f6482046b4d35fd95face138d472e58a8ab4b1f3ccc",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "c6e65a04945af6c9a0521f6482046b4d35fd95face138d472e58a8ab4b1f3ccc",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "c6e65a04945af6c9a0521f6482046b4d35fd95face138d472e58a8ab4b1f3ccc",
+        "closure": "1b97c18b2101be9e3dc3beff69392239b47a717c76facf016d866f63a99f5109",
+        "expiry": "935e9920d1eeb51531ab1fc2e606d15884647913bb571ea6d40ee60a6ecf3d7b"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"c6e65a04945af6c9a0521f6482046b4d35fd95face138d472e58a8ab4b1f3ccc\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"c6e65a04945af6c9a0521f6482046b4d35fd95face138d472e58a8ab4b1f3ccc\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"c6e65a04945af6c9a0521f6482046b4d35fd95face138d472e58a8ab4b1f3ccc\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    },
+    {
+      "name": "openai_chat_completions/tap",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "1111111111111111111111111111111111111111111111111111111111111111",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_chat_completions",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "7",
+              "granularity": 3
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "13",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "tap",
+        "served_context": 262144,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "input_token": 1024,
+          "output_token": 1024
+        },
+        "max_spend_au": "6833",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "6879"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "9a3681a07c2aafa79750b5fe97bc9df7641a309f38869125ff1b315f790c1c07",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "9a3681a07c2aafa79750b5fe97bc9df7641a309f38869125ff1b315f790c1c07",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "9a3681a07c2aafa79750b5fe97bc9df7641a309f38869125ff1b315f790c1c07",
+        "closure": "08a809669d45f1d426d4ea411e225c729776571bdc4632054c7203fef5c5e0f4",
+        "expiry": "e24040160c8c1c0faaa0cf20c9614f44c1dfc66337b62fa75e65a722a4ded32c"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"9a3681a07c2aafa79750b5fe97bc9df7641a309f38869125ff1b315f790c1c07\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"9a3681a07c2aafa79750b5fe97bc9df7641a309f38869125ff1b315f790c1c07\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"9a3681a07c2aafa79750b5fe97bc9df7641a309f38869125ff1b315f790c1c07\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    },
+    {
+      "name": "openai_completions/fiat",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "2222222222222222222222222222222222222222222222222222222222222222",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_completions",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "7",
+              "granularity": 3
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "13",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "fiat",
+        "served_context": 262144,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "input_token": 1024,
+          "output_token": 1024
+        },
+        "max_spend_au": "6833",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "6879"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "8dbd222db12816507a883c8a6a3eb8629ec4c60655f069cb05963831b8ee1d70",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "8dbd222db12816507a883c8a6a3eb8629ec4c60655f069cb05963831b8ee1d70",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "8dbd222db12816507a883c8a6a3eb8629ec4c60655f069cb05963831b8ee1d70",
+        "closure": "0165f0f2d644eef458fe62df5290d4637ff7bf97a13e76a889b94dd25e087129",
+        "expiry": "d1af63d628585fa08c51567e61ac7a3be8f602eba2864989090e4b9706687558"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"8dbd222db12816507a883c8a6a3eb8629ec4c60655f069cb05963831b8ee1d70\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"8dbd222db12816507a883c8a6a3eb8629ec4c60655f069cb05963831b8ee1d70\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"8dbd222db12816507a883c8a6a3eb8629ec4c60655f069cb05963831b8ee1d70\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    },
+    {
+      "name": "openai_completions/tnk",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "2222222222222222222222222222222222222222222222222222222222222222",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_completions",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "7",
+              "granularity": 3
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "13",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "tnk",
+        "served_context": 262144,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "input_token": 1024,
+          "output_token": 1024
+        },
+        "max_spend_au": "6833",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "6879"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "797f1ba1e79d79e842f7fe3ceef773cc21c1249a90decf0af8726e90612a29fd",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "797f1ba1e79d79e842f7fe3ceef773cc21c1249a90decf0af8726e90612a29fd",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "797f1ba1e79d79e842f7fe3ceef773cc21c1249a90decf0af8726e90612a29fd",
+        "closure": "d35b8a47fba788c01eee182139402f8b5e7040cba38b95806b2d90c45cb03c2f",
+        "expiry": "f29673434966004e7d5d6eb058c1d2ddc4b21f82e9f730338804ce752f20ea1b"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"797f1ba1e79d79e842f7fe3ceef773cc21c1249a90decf0af8726e90612a29fd\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"797f1ba1e79d79e842f7fe3ceef773cc21c1249a90decf0af8726e90612a29fd\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"797f1ba1e79d79e842f7fe3ceef773cc21c1249a90decf0af8726e90612a29fd\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    },
+    {
+      "name": "openai_completions/tap",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "2222222222222222222222222222222222222222222222222222222222222222",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_completions",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "7",
+              "granularity": 3
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "13",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "tap",
+        "served_context": 262144,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "input_token": 1024,
+          "output_token": 1024
+        },
+        "max_spend_au": "6833",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "6879"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "4d9592e5b5dd505ae742aa69962e31f420ea2d826180e163025b170ab01c6fbd",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "4d9592e5b5dd505ae742aa69962e31f420ea2d826180e163025b170ab01c6fbd",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "4d9592e5b5dd505ae742aa69962e31f420ea2d826180e163025b170ab01c6fbd",
+        "closure": "ff320cf93ca78df77a196eba144f7ed094acf484d765a2b5d1b3800581810cb7",
+        "expiry": "08ea96d7eeac71d25864650e4fcc0b1407edef0f2a4db0e7f9654a8dbdaa1616"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"4d9592e5b5dd505ae742aa69962e31f420ea2d826180e163025b170ab01c6fbd\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"4d9592e5b5dd505ae742aa69962e31f420ea2d826180e163025b170ab01c6fbd\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"4d9592e5b5dd505ae742aa69962e31f420ea2d826180e163025b170ab01c6fbd\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    },
+    {
+      "name": "openai_responses/fiat",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "3333333333333333333333333333333333333333333333333333333333333333",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_responses",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "7",
+              "granularity": 3
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "13",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "fiat",
+        "served_context": 262144,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "input_token": 1024,
+          "output_token": 1024
+        },
+        "max_spend_au": "6833",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "6879"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "dae722d038159822f2a7af303a2f6586ef47cd89137156cd5e731b3c008f5d14",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "dae722d038159822f2a7af303a2f6586ef47cd89137156cd5e731b3c008f5d14",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "dae722d038159822f2a7af303a2f6586ef47cd89137156cd5e731b3c008f5d14",
+        "closure": "7c4489e4d02c114925bc50e24b1247f4efcd45871523a49ce2bfa80467b7e405",
+        "expiry": "934548e3d08ce61248e2120a2c7d81391c151b051a192e7cff5b21d2a19aae61"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"dae722d038159822f2a7af303a2f6586ef47cd89137156cd5e731b3c008f5d14\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"dae722d038159822f2a7af303a2f6586ef47cd89137156cd5e731b3c008f5d14\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"dae722d038159822f2a7af303a2f6586ef47cd89137156cd5e731b3c008f5d14\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    },
+    {
+      "name": "openai_responses/tnk",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "3333333333333333333333333333333333333333333333333333333333333333",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_responses",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "7",
+              "granularity": 3
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "13",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "tnk",
+        "served_context": 262144,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "input_token": 1024,
+          "output_token": 1024
+        },
+        "max_spend_au": "6833",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "6879"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "fc5f00a650df8196ae9124ca72dd79b4c53d0bdb98d00c95e1742efb319e2f40",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "fc5f00a650df8196ae9124ca72dd79b4c53d0bdb98d00c95e1742efb319e2f40",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "fc5f00a650df8196ae9124ca72dd79b4c53d0bdb98d00c95e1742efb319e2f40",
+        "closure": "1f7075e301e122c2cddef739aa9adef76f4aac1fbfbe1e008709d6216b4cda6b",
+        "expiry": "1d9ac39f8348bda9dd2b848fd548dbf4f3ed2c97f41d672791c54ffe655d58af"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"fc5f00a650df8196ae9124ca72dd79b4c53d0bdb98d00c95e1742efb319e2f40\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"fc5f00a650df8196ae9124ca72dd79b4c53d0bdb98d00c95e1742efb319e2f40\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"fc5f00a650df8196ae9124ca72dd79b4c53d0bdb98d00c95e1742efb319e2f40\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    },
+    {
+      "name": "openai_responses/tap",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "3333333333333333333333333333333333333333333333333333333333333333",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_responses",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "7",
+              "granularity": 3
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "13",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "tap",
+        "served_context": 262144,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "input_token": 1024,
+          "output_token": 1024
+        },
+        "max_spend_au": "6833",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "6879"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "d3ad3f5e09686a9caf250cc2968c2e79f988e58906c3777aba9bc6fe7b9a4aa0",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "d3ad3f5e09686a9caf250cc2968c2e79f988e58906c3777aba9bc6fe7b9a4aa0",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "d3ad3f5e09686a9caf250cc2968c2e79f988e58906c3777aba9bc6fe7b9a4aa0",
+        "closure": "40ca940fe2a8c7d99c3c53f95ee1b421c7a6d2e21a48dca38f1f7fa753874b1c",
+        "expiry": "1280a24c9d920cb433e539dfc6461e5bd2b25c1e715e1b552cb048c50d2db08b"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"d3ad3f5e09686a9caf250cc2968c2e79f988e58906c3777aba9bc6fe7b9a4aa0\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"d3ad3f5e09686a9caf250cc2968c2e79f988e58906c3777aba9bc6fe7b9a4aa0\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"d3ad3f5e09686a9caf250cc2968c2e79f988e58906c3777aba9bc6fe7b9a4aa0\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    },
+    {
+      "name": "mayhem_decisions/fiat",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "1111111111111111111111111111111111111111111111111111111111111111",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "9ced20ce56b6cc1dbc89f5aa489e8cad48305b8d19b14fa299150c5049cd7ca3",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "mayhem_decisions",
+          "ctx_bracket": "le8k",
+          "outcome_class": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "decision",
+              "per_unit_au": "7",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "fiat",
+        "served_context": 1024,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "decision": 1024
+        },
+        "max_spend_au": "2395",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "2441"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "abdb2ebe03da381b660a4cf6adc417a182806550e2fb0b9648d77e99fde582ce",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "abdb2ebe03da381b660a4cf6adc417a182806550e2fb0b9648d77e99fde582ce",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "abdb2ebe03da381b660a4cf6adc417a182806550e2fb0b9648d77e99fde582ce",
+        "closure": "195004dd4491afe61f077c2d9f88ab8340e7765eb92091ed5c721179594a3c64",
+        "expiry": "1428a2ed625f01ca5ca0d1d45e95410e55f9b6f5763f1740612c09c70b5e2729"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"abdb2ebe03da381b660a4cf6adc417a182806550e2fb0b9648d77e99fde582ce\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"abdb2ebe03da381b660a4cf6adc417a182806550e2fb0b9648d77e99fde582ce\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"abdb2ebe03da381b660a4cf6adc417a182806550e2fb0b9648d77e99fde582ce\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    },
+    {
+      "name": "mayhem_decisions/tnk",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "1111111111111111111111111111111111111111111111111111111111111111",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "9ced20ce56b6cc1dbc89f5aa489e8cad48305b8d19b14fa299150c5049cd7ca3",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "mayhem_decisions",
+          "ctx_bracket": "le8k",
+          "outcome_class": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "decision",
+              "per_unit_au": "7",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "tnk",
+        "served_context": 1024,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "decision": 1024
+        },
+        "max_spend_au": "2395",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "2441"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "69f67f408d07cd65a8af52f43143141de728a75bb0d041be23b5092574c65575",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "69f67f408d07cd65a8af52f43143141de728a75bb0d041be23b5092574c65575",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "69f67f408d07cd65a8af52f43143141de728a75bb0d041be23b5092574c65575",
+        "closure": "b294378c2981454e2df8c31da4f4e32fd128c4bc0d4d1cb24cfdd5832351a5d5",
+        "expiry": "aaea5a9a6327cc08e29676bf7df55aee804378454bb84e3760274c19dbdb49cb"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"69f67f408d07cd65a8af52f43143141de728a75bb0d041be23b5092574c65575\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"69f67f408d07cd65a8af52f43143141de728a75bb0d041be23b5092574c65575\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"69f67f408d07cd65a8af52f43143141de728a75bb0d041be23b5092574c65575\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    },
+    {
+      "name": "mayhem_decisions/tap",
+      "terms": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "network_id": "test-network",
+        "msb_bootstrap": "1111111111111111111111111111111111111111111111111111111111111111",
+        "subnet_bootstrap": "2222222222222222222222222222222222222222222222222222222222222222",
+        "contract_version": 30,
+        "buyer_pubkey": "3333333333333333333333333333333333333333333333333333333333333333",
+        "billing_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "billing_attempt": 2,
+        "session_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "reservation_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "billing_epoch": 51,
+        "acceptance_expires_after_epoch": 51,
+        "reservation_expires_after_epoch": 70,
+        "reservation_receipt_grace_epochs": 4,
+        "payout_revision": "7777777777777777777777777777777777777777777777777777777777777777",
+        "request_hash": "8888888888888888888888888888888888888888888888888888888888888888",
+        "endpoint_contract": "1111111111111111111111111111111111111111111111111111111111111111",
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_digest": "9999999999999999999999999999999999999999999999999999999999999999",
+        "connection_revision": 1,
+        "capacity_lease": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "9ced20ce56b6cc1dbc89f5aa489e8cad48305b8d19b14fa299150c5049cd7ca3",
+          "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "mayhem_decisions",
+          "ctx_bracket": "le8k",
+          "outcome_class": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "rates": [
+            {
+              "unit": "decision",
+              "per_unit_au": "7",
+              "granularity": 3
+            }
+          ],
+          "per_request_au": "5",
+          "min_session_au": "11",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "rail": "tap",
+        "served_context": 1024,
+        "settlement_policy_hash": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "payment_terms_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "rules_ver": 1,
+        "max_usage": {
+          "decision": 1024
+        },
+        "max_spend_au": "2395",
+        "prior_spend_au": "29",
+        "prior_reserved_au": "17",
+        "max_total_spend_au": "2441"
+      },
+      "policy": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "payable_outcomes": [
+          "complete"
+        ],
+        "allow_checkpoints": true,
+        "hold_expiry": "release_unfinalized_and_block_retry"
+      },
+      "closure": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "533516c6a2ea3631f9ec025cbb7830e68a4a2a6a8034a3d414bc374aa9f949c2",
+        "outcome": "cancelled",
+        "evidence_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "at_ms": 3000
+      },
+      "expiry": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "accepted_terms": "533516c6a2ea3631f9ec025cbb7830e68a4a2a6a8034a3d414bc374aa9f949c2",
+        "observed_epoch": 75,
+        "at_ms": 4000
+      },
+      "digests": {
+        "policy": "ec122d47df0c892caad2d7150d3f8a571b7020974b1941d84411dea7821ee057",
+        "terms": "533516c6a2ea3631f9ec025cbb7830e68a4a2a6a8034a3d414bc374aa9f949c2",
+        "closure": "463b3b060fdcd82f5b3deafe889b46aeca134061b8a8dcf10e5f878b3399da5a",
+        "expiry": "f0b2dc81656468d8334247f36f5431caf62a27fd73c605a88207a45e42f5f060"
+      },
+      "signing_utf8": {
+        "buyer_closure": "mayhem/proxy/buyer-reservation-closure/v1\u0000{\"accepted_terms\":\"533516c6a2ea3631f9ec025cbb7830e68a4a2a6a8034a3d414bc374aa9f949c2\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "provider_closure": "mayhem/proxy/provider-reservation-closure/v1\u0000{\"accepted_terms\":\"533516c6a2ea3631f9ec025cbb7830e68a4a2a6a8034a3d414bc374aa9f949c2\",\"at_ms\":3000,\"evidence_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"lane\":\"proxy\",\"outcome\":\"cancelled\",\"schema_version\":1}",
+        "buyer_expiry": "mayhem/proxy/buyer-reservation-expiry/v1\u0000{\"accepted_terms\":\"533516c6a2ea3631f9ec025cbb7830e68a4a2a6a8034a3d414bc374aa9f949c2\",\"at_ms\":4000,\"lane\":\"proxy\",\"observed_epoch\":75,\"schema_version\":1}"
+      }
+    }
+  ]
+}

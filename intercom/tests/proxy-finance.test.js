@@ -120,3 +120,28 @@ test('real buyer and provider signatures bind both roles, exact bodies and retai
     assert.throws(()=>f.verifyProxySpendAuthorization(auth,()=>Promise.resolve(true)));
   }
 });
+
+test('closure and opt-in expiry cross-language fixtures preserve signing roles and deadlines',async()=>{
+  const {financialClosureCases}=await import('./helpers/proxy-finance-fixtures.js');
+  const rows=JSON.parse(fs.readFileSync(new URL('../../crates/mayhem-proto/tests/fixtures/proxy-closure-v1.json',import.meta.url))).cases;
+  assert.deepEqual(await financialClosureCases(),rows);
+  const buyer=await makeIdentity(),provider=await makeIdentity();
+  const verify=makeVerifier(buyer.wallet).verify;
+  const sign=(who,bytes)=>b4a.toString(who.wallet.sign(bytes),'hex');
+  for(const row of rows) {
+    const terms={...row.terms,buyer_pubkey:buyer.publicKey,offer:{...row.terms.offer,provider_pubkey:provider.publicKey}};
+    const digest=await f.proxySpendTermsDigest(terms);
+    const body={...row.closure,accepted_terms:digest};
+    const closure={body,buyer_sig:sign(buyer,f.proxyBuyerClosureSigningBytes(body)),provider_sig:sign(provider,f.proxyProviderClosureSigningBytes(body))};
+    await f.verifyProxyClosure(closure,terms,verify);
+    await assert.rejects(f.verifyProxyClosure({...closure,provider_sig:closure.buyer_sig},terms,verify),/signature/);
+    const eb={...row.expiry,accepted_terms:digest};
+    const expiry={body:eb,buyer_sig:sign(buyer,f.proxyBuyerExpirySigningBytes(eb))};
+    await f.verifyProxyExpiry(expiry,terms,row.policy,75,verify);
+    await assert.rejects(f.verifyProxyExpiry(expiry,terms,row.policy,74,verify),/grace/);
+    await assert.rejects(f.verifyProxyExpiry(expiry,terms,row.policy,75,()=>Promise.resolve(true)),/signature/);
+    const old={...row.policy};delete old.hold_expiry;
+    await assert.rejects(f.verifyProxyExpiry(expiry,terms,old,75,verify),/policy/);
+    for(const invalid of [null,'release_and_retry',false,{}])assert.throws(()=>f.validateProxySettlementPolicy({...row.policy,hold_expiry:invalid}));
+  }
+});

@@ -52,7 +52,7 @@ export function validateProxyPendingEntry(entry) {
       !isProxyPublication(entry.envelope) ||
       b4a.byteLength(JSON.stringify(entry)) > MAX_ENTRY_BYTES) fail('invalid pending record');
   if (entry.fences) validateProxyPublicationFences(entry.fences);
-  else if (['proxy_spend_reserve', 'proxy_record_usage'].includes(entry.envelope.op)) fail('financial publication fences are required');
+  else if (['proxy_spend_reserve', 'proxy_record_usage', 'proxy_close_reservation', 'proxy_expire_reservation'].includes(entry.envelope.op)) fail('financial publication fences are required');
 }
 
 // One small bounded file, exclusive OS lock, and asynchronous durable replacement.

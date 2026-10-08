@@ -16,13 +16,17 @@ import { createProxyCanonicalSnapshot } from '../features/mayhem/proxy-canonical
 import { createProxyPublicationTransport } from '../features/mayhem/proxy-publication-transport.js';
 import { ProxyPublicationController, ProxyPublicationJournal } from '../features/mayhem/proxy-publication-journal.js';
 import { proxyPublicationFeatureKey } from '../contract/proxy-publication.js';
-import { proxySpendTermsDigest, proxyBuyerReceiptSigningBytes, proxyProviderReceiptSigningBytes } from '../contract/proxy-finance.js';
+import { proxySettlementPolicyDigest, proxySpendTermsDigest, proxyBuyerReceiptSigningBytes, proxyProviderReceiptSigningBytes } from '../contract/proxy-finance.js';
 import { proxyOfferCost } from '../contract/proxy-protocol.js';
 import { submitMayhemFeature } from '../src/rpc.js';
 import { proxyReservationFixture } from './helpers/proxy-finance.js';
 
+import { closure, expiry, nextAttempt } from './helpers/proxy-closure.js';
+import { proxyReservationKeys } from '../contract/proxy-reservations.js';
+
 const hex = value => b4a.toString(value, 'hex');
 const copy = structuredClone;
+const financialResult = response => response.result?.result ?? response.result;
 const sign = (wallet, bytes) => hex(wallet.sign(bytes));
 
 async function fixture(t, rail = 'tnk', family = 'llm') {
@@ -257,4 +261,69 @@ test('participant obtains authenticated financial preflight from the writer with
   assert.equal(replay.status, 'applied');
   assert.equal(replay.result.au, receipt.receipt.body.au_owed_cum);
   assert.equal(f.appends, 2);
+});
+
+
+for(const family of ['llm','decisions'])for(const rail of ['fiat','tnk','tap']) {
+  test(`${family}/${rail}: real closure lost ACK/restart releases once and admits next attempt`,async t=>{
+    const f=await fixture(t,rail,family);
+    assert.equal((await f.submit(f.authorize(f.terms))).ok,true);
+    const e=await closure(f);
+    assert.equal(participantFor(e),f.provider.publicKey);
+    assert.equal(mayhemFeatureParticipant(e),f.provider.publicKey);
+    const append=f.controller.append;
+    f.controller.append=async entry=>{await append(entry);throw new Error('injected lost closure ACK');};
+    assert.equal((await f.submit(e)).status,'pending');
+    assert.equal((await f.read(f.summaryKey)).reserved_au,'50');
+    await f.reopen(); const count=f.appends;
+    const recovered=await f.submit(e);
+    assert.equal(recovered.ok,true); assert.equal(financialResult(recovered).retry_safe,true);
+    assert.equal(f.appends,count,'restart recovery must not append closure again');
+    Object.assign(f.terms,nextAttempt(f.terms));
+    assert.equal((await f.submit(f.authorize(f.terms))).ok,true);
+    assert.equal((await f.read(f.ledger.receiptBillingKey(f.terms.billing_id))).latest_attempt,2);
+    assert.equal((await f.submit(await f.receipt())).ok,true);
+    assert.equal((await f.read(f.ledger.receiptEpochIndexKey(101))).count,1);
+    assert.deepEqual(await f.read(f.balanceKey),f.balance);
+    assert.deepEqual(await f.read('payout/epoch/542'),{status:'prepared',native:true});
+  });
+}
+
+test('canonical completed epoch controls expiry, unknown retry is fenced through restart, later proof resolves',async t=>{
+  const f=await fixture(t);
+  f.settlementPolicy.hold_expiry='release_unfinalized_and_block_retry';
+  f.terms.settlement_policy_hash=await proxySettlementPolicyDigest(f.settlementPolicy);
+  await f.seed([[proxyReservationKeys.settlementPolicy(f.terms.settlement_policy_hash),{enabled:true,policy:f.settlementPolicy}]]);
+  assert.equal((await f.submit(f.authorize(f.terms))).ok,true);
+  const e=await expiry(f), done=e.expiry.body.observed_epoch;
+  assert.equal(participantFor(e),f.buyer.publicKey);
+  assert.equal(mayhemFeatureParticipant(e),f.buyer.publicKey);
+  // Pending epoch is NOT proof that the receipt grace is over.
+  await f.seed([['epoch/apply/state',{updated_epoch:done-1,pending_epoch:done}]]);
+  const before=f.appends;
+  await assert.rejects(f.submit(e),/grace/); assert.equal(f.appends,before);
+  await f.seed([['epoch/apply/state',{updated_epoch:done,pending_epoch:null}]]);
+  assert.equal(financialResult(await f.submit(e)).retry_safe,false);
+  assert.equal((await f.read(f.summaryKey)).reserved_au,'50');
+  await f.reopen(); assert.equal(financialResult(await f.submit(e)).execution,'unknown');
+  const next=nextAttempt(f.terms,{billing_epoch:done+1,acceptance_expires_after_epoch:done+1,reservation_expires_after_epoch:done+20});
+  await assert.rejects(f.submit(f.authorize(next)),/recover/);
+  assert.equal(financialResult(await f.submit(await closure(f,'cancelled'))).retry_safe,true);
+  assert.equal((await f.read(f.summaryKey)).reserved_au,'50');
+  assert.equal((await f.submit(f.authorize(next))).ok,true);
+});
+
+test('forged closure/expiry and paid aliases fail before canonical append',async t=>{
+  const f=await fixture(t);assert.equal((await f.submit(f.authorize(f.terms))).ok,true);
+  const e=await closure(f), x=await expiry(f), count=f.appends;
+  await assert.rejects(f.submit({...e,closure:{...e.closure,provider_sig:'0'.repeat(128)}}),/signature/);
+  await assert.rejects(f.submit(x),/not enabled/);
+  const {assertProxyPublicationNotPaid}=await import('../contract/proxy-protocol.js');
+  for(const op of [e,x]) {
+    for(const value of [op,{type:op.op},{dispatch:op},{prepared_command:{value:op}}]) {
+      assert.throws(()=>assertProxyPublicationNotPaid(value),/admitted feature/);
+    }
+  }
+  assert.equal(f.appends,count);
+  assert.equal((await f.submit(e)).ok,true);
 });

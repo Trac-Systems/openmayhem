@@ -22,6 +22,12 @@ pub struct ProxySettlementPolicy {
     pub lane: ProxyLane,
     pub payable_outcomes: Vec<ProxyReceiptOutcome>,
     pub allow_checkpoints: bool,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_hold_expiry"
+    )]
+    pub hold_expiry: Option<ProxyHoldExpiry>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -438,6 +444,186 @@ impl ProxyUsageReceipt {
                 &terms.offer.provider_pubkey,
             ),
             "proxy receipt signature rejected",
+        )?;
+        canonical_body(self).map(|_| ())
+    }
+}
+
+pub const CLOSURE_DOMAIN: &str = "mayhem/proxy/reservation-closure/v1";
+pub const BUYER_CLOSURE_DOMAIN: &str = "mayhem/proxy/buyer-reservation-closure/v1";
+pub const PROVIDER_CLOSURE_DOMAIN: &str = "mayhem/proxy/provider-reservation-closure/v1";
+pub const EXPIRY_DOMAIN: &str = "mayhem/proxy/reservation-expiry/v1";
+pub const BUYER_EXPIRY_DOMAIN: &str = "mayhem/proxy/buyer-reservation-expiry/v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyHoldExpiry {
+    ReleaseUnfinalizedAndBlockRetry,
+}
+
+// Absence preserves old policy digests; explicit null is not a policy.
+fn present_hold_expiry<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<ProxyHoldExpiry>, D::Error> {
+    ProxyHoldExpiry::deserialize(d).map(Some)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyClosureOutcome {
+    NotExecuted,
+    Cancelled,
+    Failed,
+    CompletedUnbilled,
+}
+
+/// A mutual charge waiver with known execution outcome. This wire record alone
+/// cannot establish that an opaque upstream has actually stopped; the controller
+/// must retain and verify its evidence before signing or releasing capacity.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyClosureBody {
+    #[serde(deserialize_with = "safe_u32")]
+    pub schema_version: u32,
+    pub lane: ProxyLane,
+    pub accepted_terms: String,
+    pub outcome: ProxyClosureOutcome,
+    pub evidence_hash: String,
+    #[serde(deserialize_with = "safe_u64")]
+    pub at_ms: u64,
+}
+impl ProxyClosureBody {
+    pub fn validate(&self) -> Result<(), String> {
+        ensure(
+            self.schema_version == 1 && self.at_ms <= PROXY_MAX_SAFE_INTEGER,
+            "invalid proxy closure schema/time",
+        )?;
+        hex_digest(&self.accepted_terms)?;
+        hex_digest(&self.evidence_hash)?;
+        canonical_body(self).map(|_| ())
+    }
+    pub fn digest(&self) -> Result<String, String> {
+        self.validate()?;
+        digest(CLOSURE_DOMAIN, self)
+    }
+    pub fn buyer_signing_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        signing_bytes(BUYER_CLOSURE_DOMAIN, self)
+    }
+    pub fn provider_signing_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        signing_bytes(PROVIDER_CLOSURE_DOMAIN, self)
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyReservationClosure {
+    pub body: ProxyClosureBody,
+    pub buyer_sig: String,
+    pub provider_sig: String,
+}
+impl ProxyReservationClosure {
+    pub fn verify(
+        &self,
+        terms: &ProxySpendTerms,
+        verify: impl Fn(&str, &[u8], &str) -> bool,
+    ) -> Result<(), String> {
+        self.body.validate()?;
+        ensure(
+            self.body.accepted_terms == terms.digest()?,
+            "proxy closure terms mismatch",
+        )?;
+        signature(&self.buyer_sig)?;
+        signature(&self.provider_sig)?;
+        ensure(
+            verify(
+                &self.buyer_sig,
+                &self.body.buyer_signing_bytes()?,
+                &terms.buyer_pubkey,
+            ) && verify(
+                &self.provider_sig,
+                &self.body.provider_signing_bytes()?,
+                &terms.offer.provider_pubkey,
+            ),
+            "proxy closure signature rejected",
+        )?;
+        canonical_body(self).map(|_| ())
+    }
+}
+
+/// Releasing an expired financial hold does not resolve remote execution and
+/// must not grant permission to redispatch or release an uncertain capacity slot.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyExpiryBody {
+    #[serde(deserialize_with = "safe_u32")]
+    pub schema_version: u32,
+    pub lane: ProxyLane,
+    pub accepted_terms: String,
+    #[serde(deserialize_with = "safe_u64")]
+    pub observed_epoch: u64,
+    #[serde(deserialize_with = "safe_u64")]
+    pub at_ms: u64,
+}
+impl ProxyExpiryBody {
+    pub fn validate(&self) -> Result<(), String> {
+        ensure(
+            self.schema_version == 1 && self.at_ms <= PROXY_MAX_SAFE_INTEGER,
+            "invalid proxy expiry schema/time",
+        )?;
+        hex_digest(&self.accepted_terms)?;
+        revision(self.observed_epoch)?;
+        canonical_body(self).map(|_| ())
+    }
+    pub fn digest(&self) -> Result<String, String> {
+        self.validate()?;
+        digest(EXPIRY_DOMAIN, self)
+    }
+    pub fn buyer_signing_bytes(&self) -> Result<Vec<u8>, String> {
+        self.validate()?;
+        signing_bytes(BUYER_EXPIRY_DOMAIN, self)
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProxyReservationExpiry {
+    pub body: ProxyExpiryBody,
+    pub buyer_sig: String,
+}
+impl ProxyReservationExpiry {
+    pub fn verify(
+        &self,
+        terms: &ProxySpendTerms,
+        policy: &ProxySettlementPolicy,
+        epoch: u64,
+        verify: impl Fn(&str, &[u8], &str) -> bool,
+    ) -> Result<(), String> {
+        self.body.validate()?;
+        ensure(
+            self.body.accepted_terms == terms.digest()?,
+            "proxy expiry terms mismatch",
+        )?;
+        ensure(
+            policy.digest()? == terms.settlement_policy_hash
+                && policy.hold_expiry == Some(ProxyHoldExpiry::ReleaseUnfinalizedAndBlockRetry),
+            "proxy expiry is not enabled by accepted policy",
+        )?;
+        ensure(
+            epoch <= PROXY_MAX_SAFE_INTEGER
+                && self.body.observed_epoch <= epoch
+                && self.body.observed_epoch
+                    > terms.reservation_expires_after_epoch
+                        + terms.reservation_receipt_grace_epochs,
+            "proxy reservation receipt grace has not expired",
+        )?;
+        signature(&self.buyer_sig)?;
+        ensure(
+            verify(
+                &self.buyer_sig,
+                &self.body.buyer_signing_bytes()?,
+                &terms.buyer_pubkey,
+            ),
+            "proxy expiry signature rejected",
         )?;
         canonical_body(self).map(|_| ())
     }

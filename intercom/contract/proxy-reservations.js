@@ -10,7 +10,7 @@ import { prepareProxyFinancialAdmission } from './proxy-finance-policy.js';
 import { readActiveProxyOffer } from './proxy-registry.js';
 import { proxySpendTermsDigest, proxySettlementPolicyDigest, validateProxySpendTerms,
   validateProxyNewAcceptance, verifyProxySpendAuthorization, validateProxyReceiptBody,
-  validateProxyReceiptFor, proxyReceiptDigest, verifyProxyUsageReceipt } from './proxy-finance.js';
+  validateProxyReceiptFor, proxyReceiptDigest, verifyProxyUsageReceipt, verifyProxyClosure } from './proxy-finance.js';
 
 const copy=v=>JSON.parse(JSON.stringify(v));
 const need=(v,m)=>{if(!v)throw new ProxyValidationError(m);};
@@ -28,6 +28,8 @@ const IDENTITY_FIELDS=['billing_id','billing_attempt','billing_epoch','reservati
 
 export const proxyReservationKeys={
   accepted:digest=>`proxy/v1/accepted/${digest}`,
+  resolution:digest=>`proxy/v1/resolution/${digest}`,
+  expiry:digest=>`proxy/v1/expiry/${digest}`,
   settlementPolicy:digest=>`proxy/v1/settlement-policy/${digest}`,
 };
 
@@ -121,10 +123,35 @@ export async function prepareProxyReservation(ledger,envelope,context,verify) {
   const accounting=checked(await ledger.targetedSpendAccountingState(t.buyer_pubkey,t.rail));
   const anchorKey=ledger.receiptBillingKey(t.billing_id);
   const oldAnchor=await ledger.get(anchorKey);
-  // Sequential retries are integrated with canonical receipt/close transitions in
-  // the next step. Never guess prior cost or allow a second uncertain dispatch.
-  need(oldAnchor===null,'proxy billing already exists; recover the accepted attempt');
-  need(t.billing_attempt===1&&t.prior_spend_au==='0'&&t.prior_reserved_au==='0','new proxy billing must begin without claimed prior work');
+  if(oldAnchor===null) {
+    need(t.billing_attempt===1&&t.prior_spend_au==='0'&&t.prior_reserved_au==='0','new proxy billing must begin without claimed prior work');
+  } else {
+    const previous=await acceptedSpend(ledger,oldAnchor.latest_accepted_terms);
+    const prior=previous.authorization.terms;
+    await validateProxyBillingAnchor(oldAnchor,prior,false);
+    need(oldAnchor.active_reservation_id===null&&oldAnchor.reserved_au==='0'&&!oldAnchor.retry_blocked,
+      'proxy billing already exists; recover the accepted attempt before retrying');
+    need(t.billing_attempt===oldAnchor.latest_attempt+1&&Number.isSafeInteger(t.billing_attempt), 'proxy retry attempt is not sequential');
+    need(t.buyer_pubkey===oldAnchor.user&&t.rail===oldAnchor.rail&&t.request_hash===oldAnchor.request_hash
+      &&t.endpoint_contract===oldAnchor.endpoint_contract&&t.max_total_spend_au===oldAnchor.max_total_spend_au,
+      'proxy retry changed logical request, buyer, rail, endpoint or spending cap');
+    need(t.session_id!==prior.session_id&&t.reservation_id!==prior.reservation_id&&t.capacity_lease!==prior.capacity_lease,
+      'proxy retry requires fresh session, reservation and capacity lease');
+    need(t.prior_spend_au===oldAnchor.spent_au&&t.prior_reserved_au==='0','proxy retry prior exposure differs from canonical accounting');
+    const resolved=await ledger.get(proxyReservationKeys.resolution(oldAnchor.latest_accepted_terms));
+    const head=await ledger.get(ledger.receiptHeadKey(prior.billing_id,prior.billing_attempt));
+    if(resolved!==null) {
+      need(resolved.type==='proxy_execution_resolution'&&resolved.accepted_terms===oldAnchor.latest_accepted_terms,
+        'proxy retry resolution is inconsistent');
+      await verifyProxyClosure(resolved.closure,prior,verify);
+      need(oldAnchor.spent_au===prior.prior_spend_au,'proxy retry waived attempt changed cumulative spend');
+    } else {
+      need(head?.settlement_ready===true,'proxy retry requires a known terminal result');
+      await validateProxyCanonicalReceiptHead(ledger,head);
+      need(head.accepted_terms===oldAnchor.latest_accepted_terms&&head.receipt.body.billing_au_owed_cum===oldAnchor.spent_au,
+        'proxy retry prior receipt amount differs');
+    }
+  }
   const sessionKey=ledger.targetedSpendSessionKey(t.buyer_pubkey,t.rail,t.reservation_id);
   const sessionIndexKey=ledger.targetedSpendSessionIndexKey(t.buyer_pubkey,t.rail,t.session_id);
   const billingAttemptKey=ledger.targetedSpendBillingAttemptKey(t.buyer_pubkey,t.rail,t.billing_id,t.billing_attempt);
@@ -151,8 +178,9 @@ export async function prepareProxyReservation(ledger,envelope,context,verify) {
     {key:sessionIndexKey,value:ledger.targetedSpendReservationIndexRecord(session,sessionKey,key)},
     {key:billingAttemptKey,value:ledger.targetedSpendReservationIndexRecord(session,sessionKey,key)},
     {key:anchorKey,value:{type:'proxy_billing_anchor',lane:'proxy',billing_id:t.billing_id,user:t.buyer_pubkey,
-      max_total_spend_au:t.max_total_spend_au,latest_attempt:t.billing_attempt,spent_au:'0',reserved_au:t.max_spend_au,
-      active_reservation_id:t.reservation_id,created_at:key,updated_at:key}},
+      rail:t.rail,request_hash:t.request_hash,endpoint_contract:t.endpoint_contract,latest_accepted_terms:digest,retry_blocked:false,
+      max_total_spend_au:t.max_total_spend_au,latest_attempt:t.billing_attempt,spent_au:t.prior_spend_au,reserved_au:t.max_spend_au,
+      active_reservation_id:t.reservation_id,created_at:oldAnchor?.created_at??key,updated_at:key}},
     {key:reservationKey,value:{type:'receipt_reservation_identity',lane:'proxy',accepted_terms:digest,...id,
       status:'active',closed_at:null,close_record_key:null,recorded_at:key}},
     {key:acceptedKey,value:{type:'proxy_accepted_spend',accepted_terms:digest,
@@ -176,7 +204,7 @@ export async function proxyUsageFeatureKey(v) {
   return `proxy/usage/${await proxyReceiptDigest(v.receipt.body)}`;
 }
 
-async function acceptedSpend(ledger,digest) {
+export async function acceptedSpend(ledger,digest) {
   const accepted=await ledger.get(proxyReservationKeys.accepted(digest));
   need(accepted?.type==='proxy_accepted_spend'&&accepted.accepted_terms===digest,'proxy accepted spend is missing');
   const t=accepted.authorization?.terms;
@@ -242,11 +270,7 @@ export async function prepareProxyUsageReceipt(ledger,envelope,context,verify) {
   need(previous?.settlement_ready!==true,'proxy finalized receipt cannot change');
   need(await ledger.get(ledger.receiptConsumedKey(t.billing_id,t.billing_attempt))===null,'proxy consumed receipt cannot advance');
   const anchorKey=ledger.receiptBillingKey(t.billing_id), anchor=await ledger.get(anchorKey);
-  need(anchor?.type==='proxy_billing_anchor'&&anchor.lane==='proxy'&&anchor.billing_id===t.billing_id
-    &&anchor.user===t.buyer_pubkey&&anchor.latest_attempt===t.billing_attempt
-    &&anchor.active_reservation_id===t.reservation_id&&anchor.max_total_spend_au===t.max_total_spend_au
-    &&anchor.spent_au===t.prior_spend_au&&anchor.reserved_au===t.max_spend_au
-    &&t.prior_reserved_au==='0','proxy receipt billing anchor is inconsistent');
+  await validateProxyBillingAnchor(anchor,t,true);
   const state=checked(await ledger.targetedSpendReservationState(t.buyer_pubkey,t.rail,t.reservation_id,t.session_id));
   need(state.kind==='sharded'&&state.session.lane==='proxy'&&state.session.accepted_terms===body.accepted_terms
     &&state.session.settlement_ready===false&&same(state.session.authorization,accepted.authorization)
@@ -289,4 +313,18 @@ export async function prepareProxyUsageReceipt(ledger,envelope,context,verify) {
     }
   }
   return {duplicate:false,writes,result:result(head)};
+}
+
+
+export async function validateProxyBillingAnchor(anchor,t,active) {
+  need(anchor?.type==='proxy_billing_anchor'&&anchor.lane==='proxy'&&anchor.billing_id===t.billing_id
+    &&anchor.user===t.buyer_pubkey&&anchor.rail===t.rail&&anchor.request_hash===t.request_hash
+    &&anchor.endpoint_contract===t.endpoint_contract&&anchor.latest_attempt===t.billing_attempt
+    &&anchor.latest_accepted_terms===await proxySpendTermsDigest(t)
+    &&anchor.max_total_spend_au===t.max_total_spend_au&&typeof anchor.retry_blocked==='boolean',
+    'proxy billing anchor identity is inconsistent');
+  money(anchor.spent_au); money(anchor.reserved_au); ref(anchor.created_at); ref(anchor.updated_at);
+  if(active)need(anchor.active_reservation_id===t.reservation_id&&anchor.spent_au===t.prior_spend_au
+    &&anchor.reserved_au===t.max_spend_au&&t.prior_reserved_au==='0'&&!anchor.retry_blocked,
+    'proxy receipt billing anchor is inconsistent');
 }

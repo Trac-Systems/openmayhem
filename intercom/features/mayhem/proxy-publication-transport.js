@@ -45,7 +45,7 @@ export function createProxyPublicationTransport(peer, contractVersion) {
     const entry = { key, envelope: JSON.parse(JSON.stringify(envelope)), nonce, hash, result_key: `fr/${hash}`,
       scope: envelope.op === 'proxy_policy' ? 'admin:policy'
         : envelope.op === 'proxy_registry' ? `provider:${proxyPublicationParticipant(envelope)}`
-          : `financial:${envelope.receipt?.body.accepted_terms ?? key.slice('proxy/spend/'.length)}`,
+          : `financial:${envelope.receipt?.body.accepted_terms ?? envelope.closure?.body.accepted_terms ?? envelope.expiry?.body.accepted_terms ?? key.slice('proxy/spend/'.length)}`,
       ...(fences ? { fences: JSON.parse(JSON.stringify(fences)) } : {}),
       source: { ...source, checked_length: source.length, found_index: null }, created_at: Date.now() };
     validateProxyPendingEntry(entry);

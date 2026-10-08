@@ -342,3 +342,74 @@ fn unresolved_exposure_is_not_reset_on_retry_or_included_as_delivered_work() {
     over.prior_reserved_au = u128::MAX;
     assert!(over.validate().is_err());
 }
+
+#[test]
+fn closure_expiry_vectors_and_original_policy_opt_in_match_javascript() {
+    let fixtures: Value =
+        serde_json::from_str(include_str!("fixtures/proxy-closure-v1.json")).unwrap();
+    for row in fixtures["cases"].as_array().unwrap() {
+        let terms: ProxySpendTerms = decode(&row["terms"]);
+        let policy: ProxySettlementPolicy = decode(&row["policy"]);
+        let closure: ProxyClosureBody = decode(&row["closure"]);
+        let expiry: ProxyExpiryBody = decode(&row["expiry"]);
+        assert_eq!(policy.digest().unwrap(), row["digests"]["policy"]);
+        assert_eq!(terms.digest().unwrap(), row["digests"]["terms"]);
+        assert_eq!(closure.digest().unwrap(), row["digests"]["closure"]);
+        assert_eq!(expiry.digest().unwrap(), row["digests"]["expiry"]);
+        for (name, bytes) in [
+            ("buyer_closure", closure.buyer_signing_bytes().unwrap()),
+            (
+                "provider_closure",
+                closure.provider_signing_bytes().unwrap(),
+            ),
+            ("buyer_expiry", expiry.buyer_signing_bytes().unwrap()),
+        ] {
+            assert_eq!(String::from_utf8(bytes).unwrap(), row["signing_utf8"][name]);
+        }
+        let signed = ProxyReservationClosure {
+            body: closure.clone(),
+            buyer_sig: "a".repeat(128),
+            provider_sig: "b".repeat(128),
+        };
+        signed
+            .verify(&terms, |sig, bytes, key| {
+                (sig == "a".repeat(128)
+                    && bytes == closure.buyer_signing_bytes().unwrap()
+                    && key == terms.buyer_pubkey)
+                    || (sig == "b".repeat(128)
+                        && bytes == closure.provider_signing_bytes().unwrap()
+                        && key == terms.offer.provider_pubkey)
+            })
+            .unwrap();
+        assert!(signed.verify(&terms, |_, _, _| false).is_err());
+        let signed = ProxyReservationExpiry {
+            body: expiry.clone(),
+            buyer_sig: "a".repeat(128),
+        };
+        signed
+            .verify(&terms, &policy, 75, |_, bytes, key| {
+                bytes == expiry.buyer_signing_bytes().unwrap() && key == terms.buyer_pubkey
+            })
+            .unwrap();
+        assert!(signed.verify(&terms, &policy, 74, |_, _, _| true).is_err());
+        assert!(signed.verify(&terms, &policy, 75, |_, _, _| false).is_err());
+        let mut disabled = policy.clone();
+        disabled.hold_expiry = None;
+        assert!(signed
+            .verify(&terms, &disabled, 75, |_, _, _| true)
+            .is_err());
+        for bad in [Value::Null, json!(false), json!("release_and_retry")] {
+            let mut value = row["policy"].clone();
+            value["hold_expiry"] = bad;
+            assert!(serde_json::from_value::<ProxySettlementPolicy>(value).is_err());
+        }
+        let mut unsafe_time = row["closure"].clone();
+        unsafe_time["at_ms"] = json!(9007199254740992_u64);
+        assert!(serde_json::from_value::<ProxyClosureBody>(unsafe_time).is_err());
+        let mut wrong_terms = terms.clone();
+        wrong_terms.billing_id = "e".repeat(64);
+        assert!(signed
+            .verify(&wrong_terms, &policy, 75, |_, _, _| true)
+            .is_err());
+    }
+}

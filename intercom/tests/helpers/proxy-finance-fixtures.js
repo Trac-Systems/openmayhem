@@ -52,3 +52,22 @@ export async function financialCases() {
   }
   return cases;
 }
+
+
+export async function financialClosureCases() {
+  const rows=[];
+  for(const row of await financialCases()) {
+    const policy={...row.policy,hold_expiry:'release_unfinalized_and_block_retry'};
+    const terms={...row.terms,settlement_policy_hash:await f.proxySettlementPolicyDigest(policy)};
+    const closure={schema_version:1,lane:'proxy',accepted_terms:await f.proxySpendTermsDigest(terms),
+      outcome:'cancelled',evidence_hash:'d'.repeat(64),at_ms:3000};
+    const expiry={schema_version:1,lane:'proxy',accepted_terms:closure.accepted_terms,observed_epoch:75,at_ms:4000};
+    rows.push({name:row.name,terms,policy,closure,expiry,
+      digests:{policy:await f.proxySettlementPolicyDigest(policy),terms:closure.accepted_terms,
+        closure:await f.proxyClosureDigest(closure),expiry:await f.proxyExpiryDigest(expiry)},
+      signing_utf8:{buyer_closure:f.proxyBuyerClosureSigningBytes(closure).toString('utf8'),
+        provider_closure:f.proxyProviderClosureSigningBytes(closure).toString('utf8'),
+        buyer_expiry:f.proxyBuyerExpirySigningBytes(expiry).toString('utf8')}});
+  }
+  return rows;
+}

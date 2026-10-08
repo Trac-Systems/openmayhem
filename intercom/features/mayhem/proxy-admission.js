@@ -61,7 +61,7 @@ export async function admitProxyPublicationFeature({ featureKey, envelope, withC
     throw new Error('Proxy canonical admission is not configured.');
   }
   if (featureKey !== await proxyPublicationFeatureKey(envelope)) throw new Error('Invalid proxy publication feature key.');
-  const financial = envelope.op === 'proxy_spend_reserve' || envelope.op === 'proxy_record_usage';
+  const financial = ['proxy_spend_reserve', 'proxy_record_usage', 'proxy_close_reservation', 'proxy_expire_reservation'].includes(envelope.op);
   return await withCanonicalSnapshot(async snapshot => {
     if (typeof snapshot?.assertCurrent !== 'function' || typeof snapshot?.read !== 'function') {
       throw new Error('Proxy canonical snapshot is incomplete.');

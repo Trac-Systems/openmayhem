@@ -14,6 +14,11 @@ export const PROXY_RECEIPT_DOMAIN = 'mayhem/proxy/usage-receipt/v1';
 export const PROXY_BUYER_RECEIPT_DOMAIN = 'mayhem/proxy/buyer-usage-ack/v1';
 export const PROXY_PROVIDER_RECEIPT_DOMAIN = 'mayhem/proxy/provider-usage-receipt/v1';
 export const PROXY_SETTLEMENT_POLICY_DOMAIN = 'mayhem/proxy/settlement-policy/v1';
+export const PROXY_CLOSURE_DOMAIN = 'mayhem/proxy/reservation-closure/v1';
+export const PROXY_BUYER_CLOSURE_DOMAIN = 'mayhem/proxy/buyer-reservation-closure/v1';
+export const PROXY_PROVIDER_CLOSURE_DOMAIN = 'mayhem/proxy/provider-reservation-closure/v1';
+export const PROXY_EXPIRY_DOMAIN = 'mayhem/proxy/reservation-expiry/v1';
+export const PROXY_BUYER_EXPIRY_DOMAIN = 'mayhem/proxy/buyer-reservation-expiry/v1';
 const MAX = Number.MAX_SAFE_INTEGER;
 const U128_MAX = (1n << 128n) - 1n;
 const OUTCOMES = ['cancelled', 'complete', 'partial', 'refused', 'running'];
@@ -52,7 +57,9 @@ function usage(v, offer = null) {
 }
 
 export function validateProxySettlementPolicy(v) {
-  shape(v,['schema_version','lane','payable_outcomes','allow_checkpoints']); base(v);
+  shape(v,['schema_version','lane','payable_outcomes','allow_checkpoints',
+    ...(v && Object.hasOwn(v,'hold_expiry') ? ['hold_expiry'] : [])]); base(v);
+  if(Object.hasOwn(v,'hold_expiry'))need(v.hold_expiry==='release_unfinalized_and_block_retry', 'unsupported proxy hold expiry policy');
   need(typeof v.allow_checkpoints === 'boolean', 'invalid proxy checkpoint policy');
   const o = v.payable_outcomes;
   need(Array.isArray(o) && o.length > 0 && o.length <= 4 && o.includes('complete')
@@ -140,4 +147,46 @@ export async function verifyProxyUsageReceipt(v,terms,policy,previous,verify) {
     && verify(v.provider_sig,proxyProviderReceiptSigningBytes(v.body),terms.offer.provider_pubkey) === true,
     'proxy receipt signature rejected');
   proxyCanonicalSigningBytes('proxy-receipt-envelope-bound',v);
+}
+
+// Both parties may waive an attempt's unfinalized charge once its remote outcome
+// is known. This is not a paid usage receipt or evidence that arbitrary external
+// execution really stopped; the trusted controller must establish that evidence.
+export function validateProxyClosureBody(v) {
+  shape(v,['schema_version','lane','accepted_terms','outcome','evidence_hash','at_ms']); base(v);
+  hex(v.accepted_terms); hex(v.evidence_hash); integer(v.at_ms);
+  need(['not_executed','cancelled','failed','completed_unbilled'].includes(v.outcome),'invalid proxy closure outcome');
+  proxyCanonicalSigningBytes(PROXY_CLOSURE_DOMAIN,v);
+}
+export async function proxyClosureDigest(v) { validateProxyClosureBody(v); return hash(PROXY_CLOSURE_DOMAIN,v); }
+export function proxyBuyerClosureSigningBytes(v) { validateProxyClosureBody(v); return proxyCanonicalSigningBytes(PROXY_BUYER_CLOSURE_DOMAIN,v); }
+export function proxyProviderClosureSigningBytes(v) { validateProxyClosureBody(v); return proxyCanonicalSigningBytes(PROXY_PROVIDER_CLOSURE_DOMAIN,v); }
+export async function verifyProxyClosure(v,terms,verify) {
+  shape(v,['body','buyer_sig','provider_sig']); signature(v.buyer_sig); signature(v.provider_sig);
+  validateProxyClosureBody(v.body);
+  need(v.body.accepted_terms===await proxySpendTermsDigest(terms),'proxy closure terms mismatch');
+  need(verify(v.buyer_sig,proxyBuyerClosureSigningBytes(v.body),terms.buyer_pubkey)===true
+    &&verify(v.provider_sig,proxyProviderClosureSigningBytes(v.body),terms.offer.provider_pubkey)===true,'proxy closure signature rejected');
+  proxyCanonicalSigningBytes('proxy-closure-envelope-bound',v);
+}
+
+// Expiry is buyer-authorized financial cleanup under the originally accepted
+// policy. It explicitly does NOT establish backend termination or permit retry.
+export function validateProxyExpiryBody(v) {
+  shape(v,['schema_version','lane','accepted_terms','observed_epoch','at_ms']); base(v);
+  hex(v.accepted_terms); integer(v.observed_epoch,1); integer(v.at_ms);
+  proxyCanonicalSigningBytes(PROXY_EXPIRY_DOMAIN,v);
+}
+export async function proxyExpiryDigest(v) { validateProxyExpiryBody(v); return hash(PROXY_EXPIRY_DOMAIN,v); }
+export function proxyBuyerExpirySigningBytes(v) { validateProxyExpiryBody(v); return proxyCanonicalSigningBytes(PROXY_BUYER_EXPIRY_DOMAIN,v); }
+export async function verifyProxyExpiry(v,terms,policy,epoch,verify) {
+  shape(v,['body','buyer_sig']); signature(v.buyer_sig); validateProxyExpiryBody(v.body);
+  need(v.body.accepted_terms===await proxySpendTermsDigest(terms),'proxy expiry terms mismatch');
+  need(await proxySettlementPolicyDigest(policy)===terms.settlement_policy_hash
+    &&policy.hold_expiry==='release_unfinalized_and_block_retry','proxy expiry is not enabled by accepted policy');
+  integer(epoch);
+  need(v.body.observed_epoch<=epoch&&v.body.observed_epoch>terms.reservation_expires_after_epoch+terms.reservation_receipt_grace_epochs,
+    'proxy reservation receipt grace has not expired');
+  need(verify(v.buyer_sig,proxyBuyerExpirySigningBytes(v.body),terms.buyer_pubkey)===true,'proxy expiry signature rejected');
+  proxyCanonicalSigningBytes('proxy-expiry-envelope-bound',v);
 }

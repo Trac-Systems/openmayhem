@@ -55,7 +55,8 @@ records.set(ledger.targetedSpendSummaryKey(t.buyer_pubkey,t.rail),{type:'targete
   denom:'au_usd',reserved_au:t.max_spend_au,balance_au_at_last_reserve:t.max_spend_au,updated_at:'test/reserve'});
 records.set(ledger.receiptBillingKey(t.billing_id),{type:'proxy_billing_anchor',lane:'proxy',billing_id:t.billing_id,user:t.buyer_pubkey,
   latest_attempt:t.billing_attempt,active_reservation_id:t.reservation_id,max_total_spend_au:t.max_total_spend_au,
-  spent_au:'0',reserved_au:t.max_spend_au});
+  rail:t.rail,request_hash:t.request_hash,endpoint_contract:t.endpoint_contract,latest_accepted_terms:digest,retry_blocked:false,
+  created_at:'test/reserve',updated_at:'test/reserve',spent_au:'0',reserved_au:t.max_spend_au});
 records.set(ledger.receiptReservationKey(t.reservation_id),{type:'receipt_reservation_identity',lane:'proxy',accepted_terms:digest,
   ...identity,status:'active',closed_at:null,close_record_key:null});
 const body={...r.receipt,accepted_terms:digest,billing_au_owed_cum:r.receipt.au_owed_cum};
@@ -67,3 +68,17 @@ for(const w of plan.writes)if(w.delete)records.delete(w.key);else records.set(w.
 check(records.get(sessionKey).max_spend_au===body.au_owed_cum,'final hold differs from verified charge');
 check((await prepareProxyUsageReceipt(ledger,envelope,t,verify)).duplicate,'receipt replay failed');
 console.log('Bare proxy finance: 12 wire vectors, real signatures, shared hold/index finalization and exact replay passed.');
+
+const closureCases=JSON.parse(fs.readFileSync('crates/mayhem-proto/tests/fixtures/proxy-closure-v1.json','utf8')).cases;
+for(const row of closureCases) {
+  check(await f.proxySettlementPolicyDigest(row.policy)===row.digests.policy,'expiry policy digest changed');
+  check(await f.proxyClosureDigest(row.closure)===row.digests.closure,'closure digest changed');
+  check(await f.proxyExpiryDigest(row.expiry)===row.digests.expiry,'expiry digest changed');
+  check(f.proxyBuyerClosureSigningBytes(row.closure).toString('utf8')===row.signing_utf8.buyer_closure,'closure signing changed');
+  check(f.proxyProviderClosureSigningBytes(row.closure).toString('utf8')===row.signing_utf8.provider_closure,'provider closure signing changed');
+  check(f.proxyBuyerExpirySigningBytes(row.expiry).toString('utf8')===row.signing_utf8.buyer_expiry,'expiry signing changed');
+}
+const cb={schema_version:1,lane:'proxy',accepted_terms:digest,outcome:'cancelled',evidence_hash:'e'.repeat(64),at_ms:4000};
+await f.verifyProxyClosure({body:cb,buyer_sig:sign(buyer,f.proxyBuyerClosureSigningBytes(cb)),
+  provider_sig:sign(provider,f.proxyProviderClosureSigningBytes(cb))},t,verify);
+console.log('Bare proxy closure: 12 endpoint/rail vectors and actual role-separated closure signatures passed.');
