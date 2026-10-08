@@ -447,6 +447,7 @@ class MayhemFeature extends Feature {
     // snapshot/journal adapter is installed, proxy publication fails closed.
     this.withProxyCanonicalSnapshot = typeof config.withProxyCanonicalSnapshot === 'function'
       ? config.withProxyCanonicalSnapshot : null;
+    this.proxyPublicationController = null;
     this.adminTxHandler = typeof config.adminTxHandler === 'function'
       ? config.adminTxHandler
       : async (value) => {
@@ -511,8 +512,8 @@ class MayhemFeature extends Feature {
       throw new Error('Peer subnet is not the canonical writable admin.');
     }
     if (isProxyPublication(value)) {
-      return await this._admitProxyPublication(key, value,
-        ({ featureKey, envelope }) => this._submitFeature(featureKey, envelope, { nonce }));
+      if (!this.proxyPublicationController) throw new Error('Proxy publication recovery is not configured.');
+      return await this.proxyPublicationController.submit(key, value);
     }
     return await this._submitFeature(key, value, { nonce });
   }
@@ -2141,6 +2142,7 @@ class MayhemFeature extends Feature {
 
   async stop() {
     this.stopped = true;
+    this.proxyPublicationController?.stop();
     for (const [requestId, pending] of this.pending) {
       pending.resolve(relayError('Mayhem feature relay stopped.', requestId));
     }

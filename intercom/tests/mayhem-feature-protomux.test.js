@@ -20,6 +20,7 @@ import { CONTRACT_VERSION } from '../contract/contract.js';
 import { proxyRegistryFeatureKey } from '../contract/proxy-protocol.js';
 import { proxyContractFixture } from './helpers/proxy.js';
 import { createProxyCanonicalSnapshot } from '../features/mayhem/proxy-canonical-view.js';
+import { installProxyPublicationController } from '../features/mayhem/proxy-publication-transport.js';
 
 class HexWallet extends PeerWallet {
   get publicKey() {
@@ -478,10 +479,6 @@ test('proxy preflight and publication cross signed Protomux into the actual cano
           } else if (operation?.type === 'feature') {
             featureAppends++;
             await f.contract.execute(operation, batch);
-            const result = f.contract._mayhemLastFeatureResult;
-            await batch.put(`fr/${operation.value.dispatch.hash}`, result instanceof Error
-              ? { ok: false, status: 'rejected', error: { message: result.message } }
-              : { ok: true, status: 'applied', result });
           }
         }
         await batch.flush();
@@ -489,12 +486,13 @@ test('proxy preflight and publication cross signed Protomux into the actual cano
     } });
   let writerFeature;
   let providerFeature;
+  let proxyController;
   let connections = [];
   t.after(async () => {
     if (writerFeature) await writerFeature.stop();
     if (providerFeature) await providerFeature.stop();
     for (const connection of connections) connection.destroy();
-    await base.close(); await store.close(); fs.rmSync(root, { recursive: true, force: true });
+    await base.close(); await proxyController?.close(); await store.close(); fs.rmSync(root, { recursive: true, force: true });
   });
   await base.ready();
   const bootstrap = b4a.toString(base.key, 'hex');
@@ -530,6 +528,9 @@ test('proxy preflight and publication cross signed Protomux into the actual cano
     withProxyCanonicalSnapshot: createProxyCanonicalSnapshot(writer, CONTRACT_VERSION) });
   providerFeature = new MayhemFeature(provider, { timeoutMs: 2000, retryMs: 50 });
   writerFeature.key = 'mayhem'; providerFeature.key = 'mayhem';
+  proxyController = await installProxyPublicationController(writerFeature, {
+    directory: path.join(root, 'proxy-publications'), contractVersion: CONTRACT_VERSION,
+  });
   const preflights = new Set();
   const forwarded = new Set();
   writer.sidechannel = new Sidechannel(writer, sidechannelConfig((channel, payload) => {

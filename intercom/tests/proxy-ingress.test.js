@@ -83,6 +83,13 @@ async function fixture({ snapshot = true, participant = false } = {}) {
   const feature = new MayhemFeature(peer, config);
   feature.key = 'mayhem';
   peer.protocol.instance.features.mayhem = feature;
+  // These component tests isolate admission; durable transport is exercised with
+  // real stores/journals in proxy-publication-journal and Protomux integration.
+  if (snapshot) feature.proxyPublicationController = {
+    submit: (key, value) => feature._admitProxyPublication(key, value,
+      ({ featureKey, envelope }) => feature._submitFeature(featureKey, envelope)),
+    stop() {},
+  };
   if (participant) {
     const writer = new MayhemFeature({ ...peer,
       wallet: { ...f.peer.wallet, publicKey: f.admin.publicKey },

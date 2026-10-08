@@ -1403,6 +1403,7 @@ joinCanonicalPeers(peer, peerDirectPeers);
 await hydrateAdminWriterViews(peer);
 
 let mayhemFeature = null;
+let proxyPublicationController = null;
 {
   const admin = await peer.base.view.get('admin');
   mayhemFeature = new MayhemFeature(peer, {
@@ -1418,6 +1419,20 @@ let mayhemFeature = null;
   });
   await peer.protocol.instance.addFeature('mayhem', mayhemFeature);
   peer.mayhemFeature = mayhemFeature;
+  // Explicitly opt in on the canonical writer only. A broken proxy journal must
+  // disable proxy publications, never bring native inference/payout workers down.
+  if (env.MAYHEM_PROXY_PUBLICATIONS === '1' && admin?.value === peer.wallet.publicKey && peer.base.isIndexer) {
+    try {
+      const { installProxyPublicationController } = await import('../features/mayhem/proxy-publication-transport.js');
+      proxyPublicationController = await installProxyPublicationController(mayhemFeature, {
+        directory: path.resolve(peerStoresDirectory, peerStoreName, 'proxy-publications'),
+        contractVersion: releaseIdentity.contractVersion,
+      });
+      console.log('Proxy publication recovery: configured (canonical policy still controls admission).');
+    } catch (error) {
+      console.error('Proxy publications disabled; local journal recovery required:', error?.message ?? error);
+    }
+  }
   if (admin && admin.value === peer.wallet.publicKey) {
     console.log('Mayhem Feature: ready (free admin-oracle lifecycle/evidence writer)');
   } else if (peer.base.writable) {
@@ -1742,6 +1757,7 @@ if (keepAlive) {
     try {
       await peer.close?.();
     } catch (_e) {}
+    try { await proxyPublicationController?.close(); } catch (_e) {}
     try {
       await msb.close?.();
     } catch (_e) {}
