@@ -1,5 +1,5 @@
-//! Request-bound, non-streaming protocol adapters. Provider JSON is never a Core
-//! receipt. Token counts here are explicitly upstream claims, not verified usage.
+//! Request-bound JSON/stream protocol adapters. Provider JSON is never a Core
+//! receipt. Upstream counts remain claims; observed_usage is independently derived.
 //! Full structured-output/tool-argument schema validation belongs to the bounded
 //! semantic verifier before this result may authorize delivery/execution/settlement.
 
@@ -427,6 +427,18 @@ impl Adapter {
         let semantic_policy =
             crate::semantics::Policy::from_request(self.endpoint, request_hash.clone(), &original)
                 .map_err(Error::Request)?;
+        let metering = crate::metering::Policy::for_endpoint(self.endpoint)
+            .prepare(self.endpoint, &original)
+            .map_err(|_| {
+                invalid(
+                    Some(if self.endpoint == ProxyEndpoint::Chat {
+                        "messages"
+                    } else {
+                        "input"
+                    }),
+                    Code::UnsupportedControl,
+                )
+            })?;
         let mut body = original;
         body["model"] = json!(self.upstream_model);
         // OpenAI Responses defaults may otherwise retain vendor-side state. This
@@ -455,6 +467,7 @@ impl Adapter {
             questions,
             limits: self.limits,
             semantic_policy,
+            metering,
             streaming,
         })
     }
@@ -483,6 +496,7 @@ pub struct Request {
     questions: BTreeMap<String, Question>,
     limits: Limits,
     semantic_policy: crate::semantics::Policy,
+    metering: crate::metering::Prepared,
     streaming: bool,
 }
 impl fmt::Debug for Request {
@@ -507,6 +521,10 @@ pub struct ReportedUsage {
 pub struct ProtocolReply {
     pub body: Value,
     pub reported_usage: Option<ReportedUsage>,
+    /// Recomputed from observable input/result; not a receipt or authorization.
+    /// Legacy retained results lack this and require explicit verification.
+    #[serde(default)]
+    pub observed_usage: Option<crate::metering::Observation>,
     pub upstream_id: Option<crate::attempts::RemoteId>,
 }
 impl fmt::Debug for ProtocolReply {
@@ -521,6 +539,9 @@ impl Request {
     }
     pub fn request_hash(&self) -> &Digest {
         &self.request_hash
+    }
+    pub fn metering_policy_hash(&self) -> Digest {
+        self.metering.policy_hash()
     }
     pub fn endpoint(&self) -> ProxyEndpoint {
         self.endpoint
@@ -581,9 +602,11 @@ impl Request {
                 .len()
                 <= self.limits.response_bytes,
         )?;
+        let observed_usage = Some(self.metering.observe(&body).map_err(|_| Error::Protocol)?);
         Ok(ProtocolReply {
             body,
             reported_usage,
+            observed_usage,
             upstream_id,
         })
     }

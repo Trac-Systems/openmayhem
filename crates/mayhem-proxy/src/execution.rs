@@ -2,7 +2,7 @@
 //! protected HTTP broker and a supervised decoder without retrying a POST.
 //! Canonical offer/reservation/lease acceptance precedes this API. The returned
 //! reply passes protocol and supported schema checks and is retained privately,
-//! but still needs independently verified Core metering. This module cannot
+//! with independently counted quantities, but not financial authority. This module cannot
 //! close holds, sign receipts or release model slots.
 
 use crate::{
@@ -222,6 +222,7 @@ impl Executor {
         };
         let record = self.storage.current(invocation).await?;
         if !request.matches_binding(&record.binding)
+            || request.metering_policy_hash() != record.binding.metering_policy
             || &record.binding.connection_digest != self.connection.fingerprint()
             || record.binding.connection_revision != self.connection.revision()
         {
@@ -528,12 +529,12 @@ impl Executor {
 }
 
 /// No automatic settlement or buyer delivery. The integration must validate
-/// remaining endpoint capabilities, meter independently and reconcile accepted
+/// remaining endpoint capabilities, verify accepted rates and reconcile accepted
 /// financial/capacity state before closing the journal. The result is retained.
 pub struct UnsettledReply {
     pub attempt: Record,
     pub reply: ProtocolReply,
-    /// Private retained result commitment, not independently metered usage or a receipt.
+    /// Private retained result commitment; not a settlement receipt.
     pub result_digest: Digest,
 }
 impl fmt::Debug for UnsettledReply {

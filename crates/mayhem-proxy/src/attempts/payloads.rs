@@ -1,7 +1,7 @@
 //! Owned payloads share the journal transaction/lock/identity and expiry index.
 //! Request body is retained before POST and result capacity is reserved then.
 //! Payloads never enter Debug, logs, discovery or ledger records. A stored result
-//! passed endpoint/schema checks, not independent metering/financial settlement.
+//! passed endpoint/schema checks. Observed quantities do not imply settlement.
 
 use super::*;
 use crate::endpoint::ProtocolReply;
@@ -437,6 +437,7 @@ mod tests {
         ProtocolReply {
             body: json!({"id":format!("proxy_{}",r.invocation.as_str()),"model":"m","object":"chat.completion","choices":[{"index":0,"message":{"role":"assistant","content":"private-result-fixture"},"finish_reason":"stop"}]}),
             reported_usage: None,
+            observed_usage: None,
             upstream_id: Some(RemoteId::new("opaque-upstream-id").unwrap()),
         }
     }

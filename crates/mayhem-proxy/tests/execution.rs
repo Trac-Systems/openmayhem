@@ -229,7 +229,7 @@ impl Fixture {
                     market_id: d(6),
                     offer_digest: d(7),
                     endpoint_contract: self.adapter.contract_hash().clone(),
-                    metering_policy: d(8),
+                    metering_policy: request.metering_policy_hash(),
                     accepted_terms: d(9),
                     reservation: d(10),
                     capacity_lease: d(11),
@@ -361,14 +361,15 @@ async fn wrong_request_contract_recipe_connection_or_revision_never_reaches_upst
     let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
     let bytes = chat();
     let base = fixture.prepare(1, &bytes, ProxyRail::Fiat);
-    for n in 2..7 {
+    for n in 2..8 {
         let mut binding = base.binding.clone();
         match n {
             2 => binding.request_hash = d(90),
             3 => binding.endpoint_contract = d(90),
             4 => binding.recipe_digest = d(90),
             5 => binding.connection_digest = d(90),
-            _ => binding.connection_revision = 2,
+            6 => binding.connection_revision = 2,
+            _ => binding.metering_policy = d(90),
         }
         fixture.journal.prepare(d(n), binding, 1000).unwrap();
         assert!(matches!(
@@ -393,6 +394,156 @@ async fn wrong_request_contract_recipe_connection_or_revision_never_reaches_upst
         Err(Error::Endpoint(_))
     ));
     assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn owned_usage_prices_the_accepted_offer_once_with_rail_and_budget_binding() {
+    use mayhem_proto::proxy::{ProxyLane, ProxyOffer, ProxyRate};
+    use mayhem_proxy::metering::{self, Policy};
+    for endpoint in [
+        ProxyEndpoint::Chat,
+        ProxyEndpoint::Completions,
+        ProxyEndpoint::Responses,
+        ProxyEndpoint::Decisions,
+    ] {
+        let (input, output) = match endpoint {
+            ProxyEndpoint::Chat => (serde_json::from_slice(&chat()).unwrap(), answer()),
+            ProxyEndpoint::Completions => (
+                json!({"model":"public","prompt":"hello"}),
+                json!({"choices":[{"index":0,"text":"hello","finish_reason":"stop"}]}),
+            ),
+            ProxyEndpoint::Responses => (
+                json!({"model":"public","input":"hello"}),
+                json!({"status":"completed","output":[{"id":"m1","type":"message","role":"assistant","content":[{"type":"output_text","text":"hello"}]}]}),
+            ),
+            ProxyEndpoint::Decisions => (
+                json!({"model":"public","state":"hello","questions":{"q":{"type":"noul","instructions":"hello?"}}}),
+                json!({"answers":{"q":{"type":"noul","noul":0.9}}}),
+            ),
+        };
+        let backend = backend(200, output, Duration::ZERO).await;
+        let fixture = Fixture::new(&backend.base, endpoint);
+        let body = serde_json::to_vec(&input).unwrap();
+        for (i, rail) in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap]
+            .into_iter()
+            .enumerate()
+        {
+            let n = 100 + i as u64;
+            let base = fixture.prepare(n, &body, rail);
+            let b = &base.binding;
+            let policy = Policy::for_endpoint(endpoint);
+            let offer = ProxyOffer {
+                schema_version: 1,
+                lane: ProxyLane::Proxy,
+                market_id: b.market_id.as_str().into(),
+                provider_pubkey: b.provider_pubkey.as_str().into(),
+                membership_revision: 1,
+                revision: 7,
+                endpoint,
+                ctx_bracket: "ctx_1024".into(),
+                outcome_class: String::new(),
+                metering_policy_hash: policy.hash().as_str().into(),
+                rates: policy
+                    .contract()
+                    .units
+                    .into_iter()
+                    .map(|unit| ProxyRate {
+                        unit,
+                        per_unit_au: 7,
+                        granularity: 3,
+                    })
+                    .collect(),
+                per_request_au: 5,
+                min_session_au: 10,
+                accepted_rails: vec![rail],
+            };
+            let mut binding = b.clone();
+            binding.offer_digest = Digest::new(offer.digest().unwrap()).unwrap();
+            let r = fixture.journal.prepare(d(n + 100), binding, 1000).unwrap();
+            fixture
+                .executor
+                .execute_json(&r.invocation, &body, &Cancellation::default())
+                .await
+                .unwrap();
+            let mut saved = fixture.journal.recover(&r.invocation, r.attempt).unwrap();
+            let quoted = metering::price_completed(&saved, &offer, u128::MAX).unwrap();
+            assert_eq!(quoted.binding.rail, rail);
+            let expected = quoted
+                .observation
+                .units
+                .values()
+                .fold(5, |s, n| s + (u128::from(*n) * 7).div_ceil(3))
+                .max(10);
+            assert_eq!(quoted.subtotal_au, expected);
+            assert_eq!(
+                metering::price_completed(&saved, &offer, expected)
+                    .unwrap()
+                    .digest()
+                    .unwrap(),
+                quoted.digest().unwrap()
+            );
+            assert!(matches!(
+                metering::price_completed(&saved, &offer, expected - 1),
+                Err(metering::Error::Budget)
+            ));
+            for edit in 0..6 {
+                let mut wrong = offer.clone();
+                match edit {
+                    0 => wrong.revision += 1,
+                    1 => wrong.rates[0].per_unit_au += 1,
+                    2 => wrong.provider_pubkey = d(99).as_str().into(),
+                    3 => {
+                        wrong.accepted_rails = vec![if rail == ProxyRail::Fiat {
+                            ProxyRail::Tap
+                        } else {
+                            ProxyRail::Fiat
+                        }]
+                    }
+                    4 => wrong.market_id = d(99).as_str().into(),
+                    _ => wrong.metering_policy_hash = d(99).as_str().into(),
+                }
+                assert!(matches!(
+                    metering::price_completed(&saved, &wrong, u128::MAX),
+                    Err(metering::Error::Offer)
+                ));
+            }
+            let observed = saved
+                .result
+                .as_mut()
+                .unwrap()
+                .reply
+                .observed_usage
+                .as_mut()
+                .unwrap();
+            *observed.units.values_mut().next().unwrap() += 1;
+            assert!(matches!(
+                metering::price_completed(&saved, &offer, u128::MAX),
+                Err(metering::Error::Evidence)
+            ));
+            saved = fixture.journal.recover(&r.invocation, r.attempt).unwrap();
+            saved.record.cancellation_requested = true;
+            assert!(matches!(
+                metering::price_completed(&saved, &offer, u128::MAX),
+                Err(metering::Error::OutcomePolicyRequired)
+            ));
+            assert_eq!(
+                fixture.journal.get(&r.invocation).unwrap().unwrap().phase,
+                Phase::Dispatched
+            );
+            assert!(fixture
+                .journal
+                .get(&r.invocation)
+                .unwrap()
+                .unwrap()
+                .resolution
+                .is_none());
+        }
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            3,
+            "pricing/recovery must not call upstream again"
+        );
+    }
 }
 
 #[tokio::test]
