@@ -20,6 +20,7 @@ export const CONTRACT_CODE_PATHS = Object.freeze([
   'contract/proxy-policy.js',
   'contract/proxy-protocol.js',
   'contract/proxy-registry.js',
+  'contract/proxy-reservations.js',
   'contract/reference-demand.js',
   'features/mayhem/index.js',
   'features/mayhem/proxy-admission.js',

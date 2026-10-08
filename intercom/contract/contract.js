@@ -16,6 +16,7 @@ import { ProxyValidationError, proxyRegistryFeatureKey } from './proxy-protocol.
 import { prepareProxyRegistryMutation } from './proxy-registry.js';
 import { prepareProxyPolicyMutation, proxyPolicyFeatureKey } from './proxy-policy.js';
 import { proxyRuntimeContext } from './proxy-context.js';
+import { normalizeProxySpendSessionRecord, validateProxyCanonicalReceiptHead } from './proxy-reservations.js';
 import { advanceDemand, demandObservation, DEMAND_CONSTANTS, scaleDemandPrice } from './reference-demand.js';
 
 export const CONTRACT_VERSION = 30;
@@ -3944,6 +3945,13 @@ class MayhemContract extends Contract {
         record.type !== 'targeted_spend_session') {
       return new Error('Targeted spend session record must be a session object.');
     }
+    if (record.lane === 'proxy') {
+      try { return await normalizeProxySpendSessionRecord(record, user, rail, reservationId); }
+      catch (error) {
+        if (error instanceof ProxyValidationError) return new Error(error.message);
+        throw error;
+      }
+    }
     const session = { ...record };
     delete session.type;
     delete session.updated_at;
@@ -4642,6 +4650,9 @@ class MayhemContract extends Contract {
 
     const reservationKey = this.receiptReservationKey(normalized.reservation_id);
     const reservation = await this.get(reservationKey);
+    if (reservation?.lane === 'proxy') {
+      return new Error('Proxy reservations require proxy receipt or close operations.');
+    }
     if (!reservation ||
         reservation.type !== 'receipt_reservation_identity' ||
         reservation.status !== 'active' ||
@@ -5115,6 +5126,7 @@ class MayhemContract extends Contract {
           commitTransition: options.commitTransition ?? null,
           providerSettlementDeltas,
           canonicalMarketUsage: reservationBindings.market_usage,
+          canonicalProxyUsage: reservationBindings.proxy_usage,
         }
       );
     } finally {
@@ -10420,10 +10432,17 @@ class MayhemContract extends Contract {
     }
     const boundedReceiptSettlement =
       epochCommit.apply_mode === 'targeted_receipt_pages_v1';
+    const proxyPage = options.canonicalProxyUsage ?? { au: ZERO_AU, count: 0 };
+    const proxyPageAu = this.normalizeAu(proxyPage.au, 'canonical proxy page usage');
+    if (proxyPageAu instanceof Error || !Number.isSafeInteger(proxyPage.count) ||
+        proxyPage.count < 0 || proxyPage.count > allocations.length ||
+        (proxyPage.count === 0) !== this.isZeroAu(proxyPageAu)) {
+      return new Error('Canonical proxy page usage is invalid.');
+    }
     const canonicalPageMarketUsageMap = new Map();
     if (boundedReceiptSettlement) {
       if (!Array.isArray(options.canonicalMarketUsage) ||
-          options.canonicalMarketUsage.length === 0) {
+          (options.canonicalMarketUsage.length === 0 && proxyPage.count === 0)) {
         return new Error('Bounded receipt canonical market usage is missing.');
       }
       let canonicalPageDemandAu = ZERO_AU;
@@ -10512,8 +10531,9 @@ class MayhemContract extends Contract {
           provider_capacities: providerCapacities,
         });
       }
-      if (this.compareAu(canonicalPageDemandAu, grossTotal) !== 0 ||
-          canonicalPageSessionCount !== allocations.length) {
+      const accountedPageAu = this.safeAddAu(canonicalPageDemandAu, proxyPageAu);
+      if (accountedPageAu instanceof Error || this.compareAu(accountedPageAu, grossTotal) !== 0 ||
+          canonicalPageSessionCount + proxyPage.count !== allocations.length) {
         return new Error('Bounded receipt canonical market usage does not match page allocations.');
       }
     }
@@ -10530,11 +10550,13 @@ class MayhemContract extends Contract {
           'Bounded receipt settlement requires earning_finals and market_usage on its final page only.'
         );
       }
-      if (lastPage && this.compareAu(marketUsageTotal, epochCommit.totals.use_au) !== 0) {
-        return new Error('Final epoch market usage demand must equal committed usage.');
+    } else if (marketUsageProvided) {
+      const accountedAu = this.safeAddAu(marketUsageTotal, proxyPageAu);
+      if (accountedAu instanceof Error || this.compareAu(accountedAu, grossTotal) !== 0) {
+        return new Error(this.isZeroAu(proxyPageAu)
+          ? 'Epoch market usage demand must equal gross provider earnings.'
+          : 'Epoch native market plus proxy usage must equal gross provider earnings.');
       }
-    } else if (marketUsageProvided && this.compareAu(marketUsageTotal, grossTotal) !== 0) {
-      return new Error('Epoch market usage demand must equal gross provider earnings.');
     }
 
     const applyState = await this.epochApplyStateRecord();
@@ -10544,10 +10566,29 @@ class MayhemContract extends Contract {
       page,
       lastPage
     );
-    const previousApplyHash = replayPosition
-      ? (applyState.last_apply_previous_hash ?? null)
-      : page === 0
-        ? null
+    // Carry a single aggregate alongside existing bounded receipt-page state.
+    // Proxy money settles on the same rails but never creates native demand.
+    const priorProxyAu = replayPosition
+      ? (applyState.last_receipt_proxy_use_au ?? ZERO_AU)
+      : page === 0 ? ZERO_AU : (applyState.pending_receipt_proxy_use_au ?? ZERO_AU);
+    const cumulativeProxyAu = replayPosition
+      ? this.normalizeAu(priorProxyAu, 'replayed proxy usage')
+      : this.safeAddAu(priorProxyAu, proxyPageAu);
+    if (cumulativeProxyAu instanceof Error) return cumulativeProxyAu;
+    if (boundedReceiptSettlement && lastPage) {
+      const accountedAu = this.safeAddAu(marketUsageTotal, cumulativeProxyAu);
+      if (accountedAu instanceof Error || this.compareAu(accountedAu, epochCommit.totals.use_au) !== 0) {
+        return new Error(this.isZeroAu(cumulativeProxyAu)
+          ? 'Final epoch market usage demand must equal committed usage.'
+          : 'Final native market plus proxy usage must equal committed usage.');
+      }
+    }
+    // Page zero starts a new page chain on both first application and replay.
+    // The previous epoch's apply hash must not change its replay identity.
+    const previousApplyHash = page === 0
+      ? null
+      : replayPosition
+        ? (applyState.last_apply_previous_hash ?? null)
         : applyState.last_apply_hash;
     const expectedStatePrefix = replayPosition ? 'last_receipt' : 'pending_receipt';
     if (replayPosition || page > 0) {
@@ -11301,6 +11342,7 @@ class MayhemContract extends Contract {
         earn_cum_au: epochEarnCumAu,
         fee_au: epochFeeAu,
         burn_au: epochBurnAu,
+        ...(!this.isZeroAu(cumulativeProxyAu) ? { proxy_use_au: cumulativeProxyAu } : {}),
       },
     });
     const previousChallengeAnchor = await this.prepareCanaryChallengeAnchor(applyState);
@@ -17493,6 +17535,8 @@ class MayhemContract extends Contract {
     const sessions = new Set();
     const billingAttempts = new Set();
     const marketUsage = new Map();
+    let proxyUsageAu = ZERO_AU;
+    let proxyUsageCount = 0;
     for (const allocation of value.allocations) {
       if (sessions.has(allocation.session_id)) {
         return new Error('Targeted epoch session allocation is duplicated.');
@@ -17524,85 +17568,96 @@ class MayhemContract extends Contract {
           this.compareAu(head.incremental_au, allocation.au) !== 0) {
         return new Error('Targeted epoch allocation does not match its canonical receipt head.');
       }
-      const receiptBody = head.receipt?.body;
-      if (!receiptBody ||
-          receiptBody.session_id !== allocation.session_id ||
-          receiptBody.provider !== allocation.provider ||
-          !this.isSafeKeyPart(receiptBody.enclave_id) ||
-          (receiptBody.ctx_bracket !== undefined &&
-            receiptBody.ctx_bracket !== null &&
-            !this.isSafeKeyPart(receiptBody.ctx_bracket)) ||
-          (receiptBody.ctx_bracket_table_ver !== undefined &&
-            receiptBody.ctx_bracket_table_ver !== null &&
-            (!Number.isSafeInteger(receiptBody.ctx_bracket_table_ver) ||
-              receiptBody.ctx_bracket_table_ver < 1))) {
-        return new Error('Canonical receipt market identity is invalid.');
-      }
-      const marketKey = this.priceMarketKey(
-        receiptBody.enclave_id,
-        receiptBody.ctx_bracket ?? null
-      );
-      const currentMarket = marketUsage.get(marketKey) ?? {
-        enclave_id: receiptBody.enclave_id,
-        ...(receiptBody.ctx_bracket ? { ctx_bracket: receiptBody.ctx_bracket } : {}),
-        ...(receiptBody.ctx_bracket_table_ver ? {
-          ctx_bracket_table_ver: receiptBody.ctx_bracket_table_ver,
-        } : {}),
-          demand_au: ZERO_AU,
-          settled_usage: {},
-          compute_ms: ZERO_AU,
-          legacy_receipt_count: 0,
-          session_count: 0,
-          providers: new Set(),
-          provider_capacities: new Map(),
-      };
-      if ((currentMarket.ctx_bracket_table_ver ?? null) !==
-          (receiptBody.ctx_bracket_table_ver ?? currentMarket.ctx_bracket_table_ver ?? null)) {
-        return new Error('Canonical receipt market context version changed within an epoch.');
-      }
-      const marketDemandAu = this.safeAddAu(currentMarket.demand_au, allocation.au);
-      const marketSessionCount = this.safeAddCount(
-        currentMarket.session_count,
-        1,
-        'canonical receipt market session count'
-      );
-      if (marketDemandAu instanceof Error || marketSessionCount instanceof Error) {
-        return new Error('Canonical receipt market usage overflow.');
-      }
-      const increment = this.incrementalSettledUsage(receiptBody);
-      if (increment instanceof Error) return increment;
-      const settledUsage = this.addSettledUsage(currentMarket.settled_usage, increment);
-      if (settledUsage instanceof Error) return settledUsage;
-      currentMarket.settled_usage = settledUsage;
-      if (receiptBody.schema_version === SESSION_RECEIPT_SCHEMA_VERSION) {
-        const computeMs = this.safeAddAu(
-          currentMarket.compute_ms,
-          String(receiptBody.compute_ms)
-        );
-        if (computeMs instanceof Error) {
-          return new Error('Canonical receipt market compute duration overflow.');
+      if (head.lane === 'proxy') {
+        try { await validateProxyCanonicalReceiptHead(this, head); }
+        catch (error) {
+          if (error instanceof ProxyValidationError) return new Error(error.message);
+          throw error;
         }
-        currentMarket.compute_ms = computeMs;
-        currentMarket.provider_capacities.set(
-          allocation.provider,
-          Math.max(
-            currentMarket.provider_capacities.get(allocation.provider) ?? 0,
-            receiptBody.capacity_slots
-          )
-        );
+        proxyUsageAu = this.safeAddAu(proxyUsageAu, allocation.au);
+        if (proxyUsageAu instanceof Error) return proxyUsageAu;
+        proxyUsageCount++;
       } else {
-        const legacyReceiptCount = this.safeAddCount(
-          currentMarket.legacy_receipt_count,
-          1,
-          'canonical legacy receipt count'
+        const receiptBody = head.receipt?.body;
+        if (!receiptBody ||
+            receiptBody.session_id !== allocation.session_id ||
+            receiptBody.provider !== allocation.provider ||
+            !this.isSafeKeyPart(receiptBody.enclave_id) ||
+            (receiptBody.ctx_bracket !== undefined &&
+              receiptBody.ctx_bracket !== null &&
+              !this.isSafeKeyPart(receiptBody.ctx_bracket)) ||
+            (receiptBody.ctx_bracket_table_ver !== undefined &&
+              receiptBody.ctx_bracket_table_ver !== null &&
+              (!Number.isSafeInteger(receiptBody.ctx_bracket_table_ver) ||
+                receiptBody.ctx_bracket_table_ver < 1))) {
+          return new Error('Canonical receipt market identity is invalid.');
+        }
+        const marketKey = this.priceMarketKey(
+          receiptBody.enclave_id,
+          receiptBody.ctx_bracket ?? null
         );
-        if (legacyReceiptCount instanceof Error) return legacyReceiptCount;
-        currentMarket.legacy_receipt_count = legacyReceiptCount;
+        const currentMarket = marketUsage.get(marketKey) ?? {
+          enclave_id: receiptBody.enclave_id,
+          ...(receiptBody.ctx_bracket ? { ctx_bracket: receiptBody.ctx_bracket } : {}),
+          ...(receiptBody.ctx_bracket_table_ver ? {
+            ctx_bracket_table_ver: receiptBody.ctx_bracket_table_ver,
+          } : {}),
+            demand_au: ZERO_AU,
+            settled_usage: {},
+            compute_ms: ZERO_AU,
+            legacy_receipt_count: 0,
+            session_count: 0,
+            providers: new Set(),
+            provider_capacities: new Map(),
+        };
+        if ((currentMarket.ctx_bracket_table_ver ?? null) !==
+            (receiptBody.ctx_bracket_table_ver ?? currentMarket.ctx_bracket_table_ver ?? null)) {
+          return new Error('Canonical receipt market context version changed within an epoch.');
+        }
+        const marketDemandAu = this.safeAddAu(currentMarket.demand_au, allocation.au);
+        const marketSessionCount = this.safeAddCount(
+          currentMarket.session_count,
+          1,
+          'canonical receipt market session count'
+        );
+        if (marketDemandAu instanceof Error || marketSessionCount instanceof Error) {
+          return new Error('Canonical receipt market usage overflow.');
+        }
+        const increment = this.incrementalSettledUsage(receiptBody);
+        if (increment instanceof Error) return increment;
+        const settledUsage = this.addSettledUsage(currentMarket.settled_usage, increment);
+        if (settledUsage instanceof Error) return settledUsage;
+        currentMarket.settled_usage = settledUsage;
+        if (receiptBody.schema_version === SESSION_RECEIPT_SCHEMA_VERSION) {
+          const computeMs = this.safeAddAu(
+            currentMarket.compute_ms,
+            String(receiptBody.compute_ms)
+          );
+          if (computeMs instanceof Error) {
+            return new Error('Canonical receipt market compute duration overflow.');
+          }
+          currentMarket.compute_ms = computeMs;
+          currentMarket.provider_capacities.set(
+            allocation.provider,
+            Math.max(
+              currentMarket.provider_capacities.get(allocation.provider) ?? 0,
+              receiptBody.capacity_slots
+            )
+          );
+        } else {
+          const legacyReceiptCount = this.safeAddCount(
+            currentMarket.legacy_receipt_count,
+            1,
+            'canonical legacy receipt count'
+          );
+          if (legacyReceiptCount instanceof Error) return legacyReceiptCount;
+          currentMarket.legacy_receipt_count = legacyReceiptCount;
+        }
+        currentMarket.demand_au = marketDemandAu;
+        currentMarket.session_count = marketSessionCount;
+        currentMarket.providers.add(allocation.provider);
+        marketUsage.set(marketKey, currentMarket);
       }
-      currentMarket.demand_au = marketDemandAu;
-      currentMarket.session_count = marketSessionCount;
-      currentMarket.providers.add(allocation.provider);
-      marketUsage.set(marketKey, currentMarket);
       const consumeKey = this.receiptConsumedKey(
         allocation.billing_id,
         allocation.billing_attempt
@@ -17638,6 +17693,8 @@ class MayhemContract extends Contract {
             session.billing_epoch !== allocation.billing_epoch ||
             session.provider !== allocation.provider ||
             session.payout_revision !== allocation.payout_revision ||
+            (head.lane === 'proxy' && (session.lane !== 'proxy' ||
+              session.accepted_terms !== head.accepted_terms)) ||
             session.settlement_ready !== true) {
           return new Error('Targeted epoch allocation does not match its reserved session.');
         }
@@ -17733,6 +17790,7 @@ class MayhemContract extends Contract {
         value: summary,
       })),
       session_deletes: [...new Set(sessionDeletes)],
+      proxy_usage: { au: proxyUsageAu, count: proxyUsageCount },
       market_usage: Array.from(marketUsage.values())
         .sort((left, right) => (
           compareCodepoint(left.enclave_id, right.enclave_id) ||
@@ -21018,6 +21076,8 @@ class MayhemContract extends Contract {
         last_receipt_earn_cum_au: receiptApply.earn_cum_au,
         last_receipt_fee_au: receiptApply.fee_au,
         last_receipt_burn_au: receiptApply.burn_au,
+        ...(receiptApply.proxy_use_au !== undefined || hasOwn(applyState, 'last_receipt_proxy_use_au')
+          ? { last_receipt_proxy_use_au: receiptApply.proxy_use_au ?? ZERO_AU } : {}),
       } : {}),
     };
     if (lastPage) {
@@ -21041,6 +21101,8 @@ class MayhemContract extends Contract {
           pending_receipt_earn_cum_au: null,
           pending_receipt_fee_au: null,
           pending_receipt_burn_au: null,
+          ...(receiptApply.proxy_use_au !== undefined || hasOwn(applyState, 'pending_receipt_proxy_use_au')
+            ? { pending_receipt_proxy_use_au: null } : {}),
         } : {}),
         last_page: page,
       };
@@ -21063,6 +21125,8 @@ class MayhemContract extends Contract {
         pending_receipt_earn_cum_au: receiptApply.earn_cum_au,
         pending_receipt_fee_au: receiptApply.fee_au,
         pending_receipt_burn_au: receiptApply.burn_au,
+        ...(receiptApply.proxy_use_au !== undefined || hasOwn(applyState, 'pending_receipt_proxy_use_au')
+          ? { pending_receipt_proxy_use_au: receiptApply.proxy_use_au ?? ZERO_AU } : {}),
       } : {}),
       updated_epoch: applyState.updated_epoch,
       last_page: page,
@@ -23246,6 +23310,13 @@ class MayhemContract extends Contract {
   }
 
   receiptLeafEnvelope(envelope) {
+    if (envelope.body?.lane === 'proxy') {
+      return {
+        body: cloneValue(envelope.body),
+        buyer_sig: envelope.buyer_sig,
+        provider_sig: envelope.provider_sig,
+      };
+    }
     return {
       body: cloneValue(envelope.body),
       enclave_sig: envelope.enclave_sig,
@@ -23465,6 +23536,7 @@ class MayhemContract extends Contract {
     const freeze = await this.validateFrozenEpoch(epoch, at, index);
     if (freeze) return freeze;
     const markets = new Map(); const leaves = []; const seen = new Set();
+    let proxyDemandAu = ZERO_AU;
     for (let page = 0; page < index.page_count; page++) {
       const record = await this.get(this.receiptEpochPageKey(epoch, page));
       if (record?.type !== 'canonical_receipt_epoch_page' || record.epoch !== epoch ||
@@ -23480,6 +23552,17 @@ class MayhemContract extends Contract {
             head.settlement_epoch !== epoch || head.settlement_ready !== true ||
             head.billing_id !== identity.billing_id || head.billing_attempt !== identity.billing_attempt) {
           return new Error('Activity commitment requires canonical final receipt heads.');
+        }
+        leaves.push(await this.usageLeafHash(head.receipt));
+        if (head.lane === 'proxy') {
+          try { await validateProxyCanonicalReceiptHead(this, head); }
+          catch (error) {
+            if (error instanceof ProxyValidationError) return new Error(error.message);
+            throw error;
+          }
+          proxyDemandAu = this.safeAddAu(proxyDemandAu, head.incremental_au);
+          if (proxyDemandAu instanceof Error) return proxyDemandAu;
+          continue;
         }
         const body = head.receipt.body;
         const marketKey = this.priceMarketKey(body.enclave_id, body.ctx_bracket ?? null);
@@ -23514,7 +23597,6 @@ class MayhemContract extends Contract {
         row.session_count++;
         row.providers.add(head.provider);
         markets.set(marketKey, row);
-        leaves.push(await this.usageLeafHash(head.receipt));
       }
     }
     if (seen.size !== index.count || markets.size !== 1 || leaves.some((leaf) => leaf instanceof Error)) {
@@ -23529,7 +23611,7 @@ class MayhemContract extends Contract {
       publicRow.provider_count = providers.size;
       publicRow.capacity_slot_count = Array.from(providerCapacities.values())
         .reduce((sum, slots) => sum + slots, 0);
-      if (publicRow.demand_au !== totals.use_au) return new Error('Activity commitment gross total mismatch.');
+      if (this.safeAddAu(publicRow.demand_au, proxyDemandAu) !== totals.use_au) return new Error('Activity commitment gross total mismatch.');
       usage.set(key, publicRow);
       canonical.set(key, { ...publicRow, settled_usage });
     }

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import b4a from 'b4a';
 import PeerWallet from 'trac-wallet';
+import {proxyReceiptFixture} from './helpers/proxy-finance.js';
 import MayhemContract, {
   CONTRACT_VERSION,
   SESSION_RECEIPT_SCHEMA_VERSION,
@@ -710,6 +711,95 @@ async function submitCommitTargetedPageZero(ctx, value) {
   );
   return { key, result: result ?? ctx.contract._mayhemLastFeatureResult };
 }
+
+test('single-page native settlement replays after an earlier epoch has an apply hash', async () => {
+  const ctx = await setupContract();
+  await ctx.storage.put('epoch/apply/state', {
+    updated_epoch: 1, pending_epoch: null, last_apply_hash: 'ab'.repeat(32),
+    last_settlement_unix: 3600, updated_at: makeTxKey(90),
+  });
+  const reservation = await submitReservation(ctx, { epoch: 2 });
+  assert.equal(reservation.result.ok, true, reservation.result.message);
+  const recorded = await submitReceipt(ctx, receiptValue(ctx, reservation, { final: true }));
+  assert.equal(recorded.result.ok, true, recorded.result.message);
+  const head = (await ctx.storage.get(`receipt/head/${reservation.value.voucher.billing_id}/0`)).value;
+  const commit = await commitEpoch(ctx, { epoch: 2, count: 1, useAu: '100' });
+  const value = await targetedApplyValue(ctx, { heads: [head], commitHash: commit.commit_hash });
+  const first = await submitTargetedApply(ctx, value);
+  assert.equal(first.result.ok, true, first.result.message);
+  const before = ctx.storage.snapshotBytes();
+  const replay = await submitTargetedApply(ctx, value);
+  assert.equal(replay.result.ok, true, replay.result.message);
+  assert.equal(replay.result.idempotent, true);
+  assert.equal(ctx.storage.snapshotBytes(), before);
+});
+
+test('native and proxy receipts settle together without proxy work entering native demand pricing', async () => {
+  const ctx = await setupContract();
+  await ctx.storage.put('epoch/apply/state', {
+    updated_epoch: 100, pending_epoch: null, last_apply_hash: 'ab'.repeat(32), last_settlement_unix: 360000,
+  });
+  const reservation = await submitReservation(ctx, { epoch: 101 });
+  assert.equal(reservation.result.ok, true, reservation.result.message);
+  const recorded = await submitReceipt(ctx, receiptValue(ctx, reservation, { final: true }));
+  assert.equal(recorded.result.ok, true, recorded.result.message);
+  const native = (await ctx.storage.get(`receipt/head/${reservation.value.voucher.billing_id}/0`)).value;
+  const proxy = await proxyReceiptFixture('tnk');
+  // Two independently admitted providers/accounts share one canonical ledger.
+  // Keep this ledger's admin, rules and epoch cursor; copy only the other
+  // fixture's admitted records and funded account before its receipt arrives.
+  for (const [key, value] of proxy.storage.values) {
+    if (!['admin', 'rules/current', 'epoch/apply/state'].includes(key)) await ctx.storage.put(key, value);
+  }
+  proxy.ledger.get = async key => (await ctx.storage.get(key))?.value ?? null;
+  const plan = await proxy.finalize(await proxy.receipt());
+  for (const w of plan.writes) if (w.delete) await ctx.storage.del(w.key); else await ctx.storage.put(w.key, w.value);
+  const external = await proxy.ledger.get(proxy.ledger.receiptHeadKey(proxy.terms.billing_id, 1));
+  const heads = [native, external], epoch = 101, at = epoch * 3600;
+  const frozen = await execute(ctx.contract, ctx.storage, 'epochFreeze', {op:'epoch_freeze', epoch, at}, ctx.admin.publicKey, 990);
+  assert.equal(frozen.ok, true, frozen.message);
+  const final = heads.map(head => ({rail:head.rail, provider:head.provider, gross_au:head.incremental_au,
+    net_au:String(BigInt(head.incremental_au)*85n/100n), cumulative_au:String(BigInt(head.incremental_au)*85n/100n)}))
+    .sort((a,b)=>a.provider<b.provider?-1:1);
+  const gross = heads.reduce((n,h)=>n+BigInt(h.incremental_au),0n), fee = gross*15n/100n, net = gross-fee;
+  const roots = {dep:await proxy.ledger.merkleRoot('dep',[]),
+    use:await proxy.ledger.merkleRoot('use',await Promise.all(heads.map(h=>proxy.ledger.usageLeafHash(h.receipt)))),
+    earn:await proxy.ledger.merkleRoot('earn',await Promise.all(final.map(f=>proxy.ledger.opaqueHash('mayhem-earn-leaf-v1',f)))),
+    fee:await proxy.ledger.opaqueHash('mayhem-fee-root-v1',{epoch,fee_au:String(fee),fee_cum_au:String(fee),burn_au:'0',burn_cum_au:'0',tap_burn_bps:1000}),
+    price:await proxy.ledger.priceDerivationRoot([])};
+  const totals = {dep_count:0,dep_au:'0',use_count:2,use_au:String(gross),provider_count:2,earn_au:String(net),
+    fee_au:String(fee),fee_cum_au:String(fee),burn_au:'0',burn_cum_au:'0',price_count:0};
+  const activity = await proxy.ledger.prepareCommittedActivityEvidence({epoch,at,epochSeconds:3600,
+    roots,totals:{...totals,price_count:1}});
+  assert.ok(!(activity instanceof Error),activity.message);
+  assert.equal(activity.price_usage.demand_au,'100');
+  assert.equal(activity.price_usage.session_count,1);
+  const value = {op:'commit_apply_targeted_epoch_page0',epoch,at,roots,totals,
+    epoch_commit_hash:await proxy.ledger.epochCommitHash({epoch,epoch_seconds:3600,roots,totals}),
+    receipt_index:await proxy.ledger.get(proxy.ledger.receiptEpochIndexKey(epoch)),last_page:true,
+    debits:heads.map(h=>({rail:h.rail,user:h.user,au:h.incremental_au})).sort((a,b)=>a.user<b.user?-1:1),
+    earnings:heads.map(h=>({rail:h.rail,provider:h.provider,gross_au:h.incremental_au,payout_revision:h.payout_revision})).sort((a,b)=>a.provider<b.provider?-1:1),
+    allocations:heads.map(h=>allocationFor(ctx,h)).sort((a,b)=>a.user<b.user?-1:1),earning_finals:final,
+    market_usage:[{enclave_id:ENCLAVE_ID,ctx_bracket:'le8k',ctx_bracket_table_ver:1,demand_au:'100',
+      session_count:1,provider_count:1,compute_ms:'1000',legacy_receipt_count:0,capacity_slot_count:1}]};
+  const key = await proxy.ledger.commitTargetedEpochPageZeroFeatureKey(value);
+  assert.ok(!(key instanceof Error),key.message);
+  const beforeNative = (await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au;
+  const beforeProxy = (await ctx.storage.get(proxy.balanceKey)).value.au;
+  const result = await executeFeature(ctx.contract,ctx.storage,'mayhem_feature',key,value,ctx.admin.publicKey);
+  assert.equal(result.ok,true,result.message);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au,String(BigInt(beforeNative)-100n));
+  assert.equal((await ctx.storage.get(proxy.balanceKey)).value.au,String(BigInt(beforeProxy)-BigInt(external.incremental_au)));
+  const marker = (await ctx.storage.get(`epoch/market-usage/101/${ENCLAVE_ID}/ctx/le8k`)).value;
+  assert.equal(marker.demand_au,'100'); assert.equal(marker.session_count,1); assert.equal(marker.compute_ms,'1000');
+  assert.equal((await ctx.storage.get('epoch/apply/state')).value.last_receipt_proxy_use_au,external.incremental_au);
+  assert.equal((await ctx.storage.get('epoch/apply/state')).value.last_receipt_market_count,1);
+  for (const h of heads) assert.equal((await ctx.storage.get(ctx.contract.providerPayoutLiabilityKey(h.provider,h.rail,h.payout_revision))).value.total_au,
+    String(BigInt(h.incremental_au)*85n/100n));
+  const after = ctx.storage.snapshotBytes();
+  const replay = await executeFeature(ctx.contract,ctx.storage,'mayhem_feature',key,value,ctx.admin.publicKey);
+  assert.equal(replay.ok,true,replay.message); assert.equal(replay.idempotent,true); assert.equal(ctx.storage.snapshotBytes(),after);
+});
 
 test('only the provider can immediately close an outstanding reservation', async () => {
   const ctx = await setupContract();

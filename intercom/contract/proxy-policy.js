@@ -5,6 +5,7 @@ import { blake3 } from '@tracsystems/blake3';
 import { ProxyValidationError, PROXY_MAX_RECORD_BYTES } from './proxy-protocol.js';
 import { PROXY_PREFIX, proxyRegistryKeys, validateProxyRegistryConfig } from './proxy-registry.js';
 import { withProxyDiscoveryWrites } from './proxy-discovery.js';
+import { validateProxySettlementPolicy, proxySettlementPolicyDigest } from './proxy-finance.js';
 
 const check = (ok, message) => { if (!ok) throw new ProxyValidationError(message); };
 const hex = value => check(typeof value === 'string' && /^[0-9a-f]{64}$/.test(value), 'invalid proxy policy digest');
@@ -82,6 +83,10 @@ export function validateProxyPolicy(value) {
       // The hash identifies an implementation-reviewed metering contract. The
       // connector/receipt verifier must implement it before routing can admit it.
       break;
+    case 'set_settlement':
+      shape(action, ['kind', 'policy_hash', 'enabled', 'policy']);
+      hex(action.policy_hash); bool(action.enabled); validateProxySettlementPolicy(action.policy);
+      break;
     case 'set_status':
       shape(action, ['kind', 'scope', 'id', 'revoked', 'reason_hash']);
       check(['provider', 'admission'].includes(action.scope), 'invalid proxy revocation scope');
@@ -132,6 +137,12 @@ export async function prepareProxyPolicyMutation(value, context, read) {
     case 'set_metering':
       target = `${PROXY_PREFIX}metering-policy/${action.policy_hash}`; record = action.policy;
       break;
+    case 'set_settlement':
+      check(await proxySettlementPolicyDigest(action.policy) === action.policy_hash,
+        'proxy settlement policy hash mismatch');
+      target = `${PROXY_PREFIX}settlement-policy/${action.policy_hash}`;
+      record = { enabled: action.enabled, policy: action.policy };
+      break;
     case 'set_status':
       target = `${PROXY_PREFIX}${action.scope}-revoked/${action.id}`;
       record = action.revoked ? { reason_hash: action.reason_hash, revision: value.revision } : null;
@@ -146,7 +157,7 @@ export async function prepareProxyPolicyMutation(value, context, read) {
       break;
     }
   }
-  if (action.kind === 'set_endpoint' || action.kind === 'set_metering') {
+  if (action.kind === 'set_endpoint' || action.kind === 'set_metering' || action.kind === 'set_settlement') {
     const old = await read(target);
     if (old) {
       const { enabled: oldEnabled, ...oldDefinition } = old;

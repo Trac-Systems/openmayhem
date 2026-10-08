@@ -2,11 +2,11 @@
   "schema": 1,
   "release_version": "0.2.271",
   "contract_version": 30,
-  "contract_code_sha256": "486c07fcba1394b38b16a763c1e74197bf400a08f0577aafa8301ca1b24c6338",
+  "contract_code_sha256": "1ede2c91cd4e58dc48fecdd2608196b66172da5fd823ea261e3c6bab13759979",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "0585b378d6ab1f8c856fea4511d770777285adf8c2f7a6c3cff148bd35749b83"
+      "sha256": "0d03d78539a3c703eb4b2e23e4a826872a94ed6d9c6473aeb83ec8d76aa363da"
     },
     {
       "path": "contract/history/v23.js",
@@ -54,7 +54,7 @@
     },
     {
       "path": "contract/proxy-policy.js",
-      "sha256": "de1884ef3c1ebd2cb7f9a35e5ea7e0fe05fff361410e014c73193accff403663"
+      "sha256": "5119c1948924deb54d59763896c66a5d375908f495ba2ad0f0b8ef516b56c5ff"
     },
     {
       "path": "contract/proxy-protocol.js",
@@ -63,6 +63,10 @@
     {
       "path": "contract/proxy-registry.js",
       "sha256": "5de2c271ac0935e4225581d8e420541c17e8e32c9ae98518a7a458e50dee98f8"
+    },
+    {
+      "path": "contract/proxy-reservations.js",
+      "sha256": "1b14d91250e36e1b19b269f78989099ec5869e70a28ca3a858122dcfbf6baced"
     },
     {
       "path": "contract/reference-demand.js",
