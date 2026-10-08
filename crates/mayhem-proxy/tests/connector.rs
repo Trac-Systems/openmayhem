@@ -32,6 +32,44 @@ fn connection(base: &str) -> HttpConnection {
 }
 
 #[test]
+fn connection_commitment_binds_dispatch_authority_without_loading_credentials() {
+    let config = configuration("http://127.0.0.1:18081/v1/");
+    let reference = configured(config.clone()).fingerprint().unwrap();
+    for (key, value) in [
+        ("revision", serde_json::json!(2)),
+        ("base_url", serde_json::json!("http://127.0.0.1:18082/v1/")),
+        (
+            "paths",
+            serde_json::json!({"models":"models","chat_completions":"other"}),
+        ),
+        ("error_profile", serde_json::json!("http_status")),
+        (
+            "authentication",
+            serde_json::json!({"type":"bearer","secret":{"source":"environment","name":"MAYHEM_PROXY_FIXTURE_NOT_LOADED"}}),
+        ),
+    ] {
+        let mut changed = config.clone();
+        changed[key] = value;
+        assert_ne!(
+            configured(changed).fingerprint().unwrap(),
+            reference,
+            "{key}"
+        );
+    }
+    // Equivalent parsed configuration is stable, independently of object order.
+    let reversed = serde_json::Value::Object(
+        config
+            .as_object()
+            .unwrap()
+            .iter()
+            .rev()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect(),
+    );
+    assert_eq!(configured(reversed).fingerprint().unwrap(), reference);
+}
+
+#[test]
 fn upstream_errors_preserve_class_scope_and_uncertainty_without_vendor_text() {
     let now = UNIX_EPOCH + Duration::from_secs(1000);
     for (status, vendor, expected, scope, public) in [

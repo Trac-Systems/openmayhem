@@ -137,7 +137,8 @@ pub struct HttpConnection {
     limits: Limits,
     error_profile: ErrorProfile,
     permits: Arc<Semaphore>,
-    pub revision: u64,
+    revision: u64,
+    fingerprint: crate::attempts::Digest,
 }
 
 impl fmt::Debug for HttpConnection {
@@ -164,6 +165,7 @@ impl HttpConnection {
         resolver: Arc<dyn Resolve>,
     ) -> SetupResult<Self> {
         let base = config.validate()?;
+        let fingerprint = config.fingerprint()?;
         let mut paths = BTreeMap::new();
         for (operation, path) in &config.paths {
             let url = base
@@ -200,7 +202,21 @@ impl HttpConnection {
             limits: config.limits,
             error_profile: config.error_profile,
             revision: config.revision,
+            fingerprint,
         })
+    }
+
+    pub fn fingerprint(&self) -> &crate::attempts::Digest {
+        &self.fingerprint
+    }
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn limits(&self) -> &Limits {
+        &self.limits
+    }
+    pub fn error_profile(&self) -> ErrorProfile {
+        self.error_profile
     }
 
     /// The caller must already have validated the public request and saved its

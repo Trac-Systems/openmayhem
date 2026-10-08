@@ -8,6 +8,8 @@ pub mod catalog;
 pub mod cli;
 pub mod connector;
 pub mod discovery;
+pub mod endpoint;
+pub mod execution;
 pub mod matching;
 pub mod supervisor;
 pub mod worker;

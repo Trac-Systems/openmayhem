@@ -1,7 +1,7 @@
 use super::{require, SetupError, SetupResult};
 use ipnet::IpNet;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fmt,
@@ -13,7 +13,7 @@ use std::{
 use url::{Host, Url};
 use zeroize::Zeroizing;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Operation {
     Models,
@@ -41,7 +41,7 @@ impl Operation {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NetworkPolicy {
     PublicHttps,
@@ -171,7 +171,7 @@ impl NetworkPolicy {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(tag = "source", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SecretSource {
     File { path: PathBuf },
@@ -205,7 +205,7 @@ impl SecretSource {
     }
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Default, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Authentication {
     #[default]
@@ -219,7 +219,7 @@ pub enum Authentication {
     },
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
     pub max_in_flight: usize,
@@ -269,7 +269,7 @@ impl Limits {
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ConnectionConfig {
     pub schema_version: u32,
@@ -341,6 +341,15 @@ fn allowed_header(name: &str) -> SetupResult<HeaderName> {
 }
 
 impl ConnectionConfig {
+    /// Private configuration commitment; credential sources are bound, never the
+    /// loaded credential value. Rotation requires a new connection revision.
+    pub fn fingerprint(&self) -> SetupResult<crate::attempts::Digest> {
+        self.validate()?;
+        let value = serde_json::to_value(self)
+            .map_err(|_| SetupError::Invalid("invalid connection commitment"))?;
+        crate::endpoint::digest("mayhem/proxy/connection/v1", &value)
+            .map_err(|_| SetupError::Invalid("invalid connection commitment"))
+    }
     pub fn load(path: &Path) -> SetupResult<Self> {
         let bytes = private_file(path, 32 * 1024)?;
         let mut config: Self = serde_json::from_slice(&bytes)
