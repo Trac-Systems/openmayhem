@@ -2,7 +2,7 @@
   "schema": 1,
   "release_version": "0.2.271",
   "contract_version": 30,
-  "contract_code_sha256": "5006daf7cd86e10d8031b3f3e1c005ebcd4d3819741f79a798594d83d94dd744",
+  "contract_code_sha256": "9c47b6267594a97bc3930ef959bcdfb0b05a88e01fc36b627c4c675cd76c6066",
   "files": [
     {
       "path": "contract/contract.js",
@@ -45,8 +45,12 @@
       "sha256": "7ee89438e9c4ee7057cd1e44db4ec1d0bd06b9fe79c38325e1ba3874b86ea91e"
     },
     {
+      "path": "contract/proxy-discovery.js",
+      "sha256": "5207336c9f2ea152b3b8d3c799e65bbe0e0aebe62156423d6190d0b4d19111a0"
+    },
+    {
       "path": "contract/proxy-policy.js",
-      "sha256": "6df9bd9817877eee77a0472cbeeddd935b254577faf16f6477a1ce8cb8eb0043"
+      "sha256": "de1884ef3c1ebd2cb7f9a35e5ea7e0fe05fff361410e014c73193accff403663"
     },
     {
       "path": "contract/proxy-protocol.js",
@@ -54,7 +58,7 @@
     },
     {
       "path": "contract/proxy-registry.js",
-      "sha256": "40d66f3c429180e4b8ff18d181916f42658f3877985fff003729f32e5ada06b3"
+      "sha256": "5de2c271ac0935e4225581d8e420541c17e8e32c9ae98518a7a458e50dee98f8"
     },
     {
       "path": "contract/reference-demand.js",
@@ -62,7 +66,7 @@
     },
     {
       "path": "features/mayhem/index.js",
-      "sha256": "8e82fdd29c99d38481f0cfd22f9b8352decb3ba55512797b8847cbddfe941275"
+      "sha256": "5746bd26ec1bd0ad4707c10351b5e54edc30abd3a13c618a1e087d12e777c550"
     },
     {
       "path": "features/mayhem/proxy-admission.js",
@@ -70,7 +74,11 @@
     },
     {
       "path": "features/mayhem/proxy-canonical-view.js",
-      "sha256": "5fa24d168f6b914d278f5933e6c7db9775d496df76cbbdd195ebdbc66e78858d"
+      "sha256": "cbc8d83b2d82342fe192a723f6088742f6c37f3690e731cc50ef4b131437ff9b"
+    },
+    {
+      "path": "features/mayhem/proxy-discovery.js",
+      "sha256": "139a5ef7de5fe48f5c66996b80f0f8655842213fcea91f553f445fdf007a54ce"
     },
     {
       "path": "features/mayhem/proxy-publication-journal.js",

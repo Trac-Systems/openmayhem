@@ -398,6 +398,13 @@ export async function submitMayhemFeature(peer, body) {
   return await registered.relay(key, body.value);
 }
 
+export async function discoverProxyCatalog(peer, body) {
+  if (!isObject(body) || Object.keys(body).length !== 1 || !isObject(body.query)) throw new Error('Invalid proxy discovery body.');
+  const feature = peer.protocol?.instance?.features?.mayhem;
+  if (typeof feature?.discoverProxyCatalog !== 'function') throw new Error('Proxy discovery relay is not ready.');
+  return await feature.discoverProxyCatalog(body.query);
+}
+
 export async function requestStripeCheckout(peer, body) {
   if (!isObject(body)) throw new Error('Missing JSON body.');
   if (!isObject(body.payload) || typeof body.payload.who !== 'string' || !body.payload.who.trim()) {
@@ -446,6 +453,10 @@ export async function requestProviderPayoutContext(peer, body) {
 }
 
 const errorResponse = (error) => {
+  if (['proxy_cursor_expired', 'proxy_cursor_invalidated'].includes(error?.code)) return [409, error.message];
+  if (error?.code === 'proxy_discovery_invalid') return [400, error.message];
+  if (error?.code === 'proxy_discovery_timeout') return [504, error.message];
+  if (['proxy_discovery_busy', 'proxy_discovery_unavailable'].includes(error?.code)) return [503, error.message];
   if (error?.code === 'BODY_TOO_LARGE') return [413, error.message];
   if (error?.code === 'BAD_JSON') return [400, error.message];
   const message = String(error?.message || '');
@@ -533,6 +544,10 @@ export const createServer = (
           );
         }
       }
+      if (req.method === 'POST' && requestPath === '/v1/proxy/discovery') {
+        const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 10_240) });
+        return respond(200, await discoverProxyCatalog(peer, body));
+      }
       if (req.method === 'POST' && requestPath === '/v1/contract/feature') {
         const body = await readJsonBody(req, { maxBytes: maxBodyBytes });
         return respond(200, await submitMayhemFeature(peer, body));
@@ -570,7 +585,8 @@ export const createServer = (
     } catch (error) {
       const [code, message] = errorResponse(error);
       if (code === 500) console.error('RPC handler error:', error);
-      respond(code, { error: message });
+      respond(code, { error: message, ...(requestPath === '/v1/proxy/discovery'
+        ? { code: error?.code ?? (code === 400 ? 'proxy_discovery_invalid' : 'proxy_discovery_unavailable') } : {}) });
     }
   });
 };

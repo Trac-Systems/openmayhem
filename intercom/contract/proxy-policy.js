@@ -4,6 +4,7 @@ import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
 import { ProxyValidationError, PROXY_MAX_RECORD_BYTES } from './proxy-protocol.js';
 import { PROXY_PREFIX, proxyRegistryKeys, validateProxyRegistryConfig } from './proxy-registry.js';
+import { withProxyDiscoveryWrites } from './proxy-discovery.js';
 
 const check = (ok, message) => { if (!ok) throw new ProxyValidationError(message); };
 const hex = value => check(typeof value === 'string' && /^[0-9a-f]{64}$/.test(value), 'invalid proxy policy digest');
@@ -154,6 +155,6 @@ export async function prepareProxyPolicyMutation(value, context, read) {
     }
   }
   const result = { revision: value.revision, operation_key: operationKey, action: action.kind };
-  return { duplicate: false, result, writes: [{ key: target, value: record },
-    { key: headKey, value: { ...result, result } }] };
+  return { duplicate: false, result, writes: withProxyDiscoveryWrites([{ key: target, value: record },
+    { key: headKey, value: { ...result, result } }]) };
 }

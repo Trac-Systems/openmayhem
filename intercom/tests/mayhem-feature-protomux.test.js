@@ -560,4 +560,15 @@ test('proxy preflight and publication cross signed Protomux into the actual cano
   assert.equal(preflights.size, 3, 'each invocation gets a fresh signed preflight, including retries');
   assert.equal((await base.view.get(`proxy/v1/provider/${f.provider.publicKey}`)).value.sequence, 1);
   assert.deepEqual((await base.view.get('payout/epoch/542')).value, { status: 'prepared', native: true });
+  const signedLength = base.view.core.signedLength;
+  const discovery = await providerFeature.discoverProxyCatalog({ kind: 'markets', filter: { family_id: 'other' } });
+  assert.equal(discovery.entries.length, 1);
+  assert.deepEqual(discovery.entries[0].value, f.market);
+  assert.equal(discovery.proof.signed_length, signedLength);
+  assert.equal(featureAppends, 1, 'authenticated discovery cannot append a transaction');
+  assert.equal(base.view.core.signedLength, signedLength);
+  const againDiscovery = await providerFeature.discoverProxyCatalog({ kind: 'markets', filter: { family_id: 'other' }, since: discovery.checkpoint });
+  assert.deepEqual(againDiscovery.entries, []);
+  assert.notEqual(againDiscovery.request_nonce, discovery.request_nonce, 'a fresh read is not a cached old challenge');
+  await assert.rejects(providerFeature.discoverProxyCatalog({ kind: 'markets', prefix: 'bal/' }), /Invalid/);
 });

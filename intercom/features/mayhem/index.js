@@ -9,6 +9,9 @@ import { assertProxyPublicationNotPaid, isProxyPublication, validateProxyOperati
 import { proxyRuntimeContext } from '../../contract/proxy-context.js';
 import { admitProxyRegistryFeature, admitProxyPolicyFeature, preflightProxyRegistry,
   validateProxyPreflightRequest, PROXY_PREFLIGHT_SERVICE, PROXY_PREFLIGHT_MAX_AGE_MS } from './proxy-admission.js';
+import { createProxyDiscovery, normalizeProxyDiscoveryQuery, validateProxyDiscoveryRequest,
+  PROXY_DISCOVERY_SERVICE, PROXY_DISCOVERY_MAX_PAGE_BYTES } from './proxy-discovery.js';
+import { validateProxySnapshotProof } from './proxy-canonical-view.js';
 import {
   CONTRACT_VERSION,
   PAYOUT_INTENT_MAX_EXPIRY_EPOCHS_DEFAULT,
@@ -365,7 +368,7 @@ const serviceParticipantFor = (service, value) => {
     return null;
   }
   if (service === 'stripe_checkout') return normalizeKey(value.who);
-  if (service === PROXY_PREFLIGHT_SERVICE) return normalizeKey(value.requester);
+  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE) return normalizeKey(value.requester);
   if ([
     'provider_payout_context',
     'stripe_connect_adopt',
@@ -448,6 +451,9 @@ class MayhemFeature extends Feature {
     this.withProxyCanonicalSnapshot = typeof config.withProxyCanonicalSnapshot === 'function'
       ? config.withProxyCanonicalSnapshot : null;
     this.proxyPublicationController = null;
+    this.proxyDiscovery = createProxyDiscovery(peer, CONTRACT_VERSION);
+    this.proxyDiscoveryTimeoutMs = Number.isSafeInteger(config.proxyDiscoveryTimeoutMs) && config.proxyDiscoveryTimeoutMs > 0
+      ? config.proxyDiscoveryTimeoutMs : 15_000;
     this.adminTxHandler = typeof config.adminTxHandler === 'function'
       ? config.adminTxHandler
       : async (value) => {
@@ -653,6 +659,31 @@ class MayhemFeature extends Feature {
     return await this._relayFeature(key, value);
   }
 
+  async discoverProxyCatalog(query) {
+    query = normalizeProxyDiscoveryQuery(query);
+    const requester = normalizeKey(this.peer?.wallet?.publicKey);
+    const admin = await this._adminKey();
+    const payload = { requester, request_nonce: crypto.randomBytes(32).toString('hex'), query };
+    validateProxyDiscoveryRequest(payload);
+    const identity = { actor: requester, admin, transport: requester, payload };
+    const signature = this.peer.wallet.sign(b4a.from(serviceSigningMessage(PROXY_DISCOVERY_SERVICE, identity)));
+    const result = await this.requestService(PROXY_DISCOVERY_SERVICE, { ...identity,
+      signing_version: SERVICE_SIGNING_VERSION,
+      signature: b4a.isBuffer(signature) ? b4a.toString(signature, 'hex') : signature });
+    if (result?.ok !== true) throw Object.assign(new Error(result?.message || 'Proxy discovery is unavailable.'),
+      { code: typeof result?.code === 'string' && result.code.startsWith('proxy_') ? result.code : 'proxy_discovery_unavailable' });
+    const context = proxyRuntimeContext(this.peer, CONTRACT_VERSION, result.context?.epoch);
+    const { cursor, since, ...binding } = query;
+    if (result.request_nonce !== payload.request_nonce || result.lane !== 'proxy' || result.schema_version !== 1 ||
+        stableJson(result.context) !== stableJson(context) || stableJson(result.query) !== stableJson(binding) ||
+        !Array.isArray(result.entries) || result.entries.length > query.limit ||
+        b4a.byteLength(JSON.stringify(result)) > PROXY_DISCOVERY_MAX_PAGE_BYTES + 16_384) {
+      throw new Error('Proxy discovery response does not match this query/network.');
+    }
+    validateProxySnapshotProof(result.proof);
+    return result;
+  }
+
   async _requestProxyPreflight(key, value) {
     if (key !== await proxyRegistryFeatureKey(value)) throw new Error('Invalid proxy registry feature key.');
     const requester = normalizeKey(this.peer?.wallet?.publicKey);
@@ -797,6 +828,8 @@ class MayhemFeature extends Feature {
         'Mayhem service relay could not establish its direct channel to the canonical admin.',
       unsentMessage: 'Mayhem service relay could not send the signed request.',
       timeoutMessage: 'Mayhem service relay timed out before the admin replied.',
+      // This is a read-only catalog deadline, never an inference/job lifetime cap.
+      timeoutMs: service === PROXY_DISCOVERY_SERVICE ? this.proxyDiscoveryTimeoutMs : this.timeoutMs,
     });
   }
 
@@ -809,6 +842,7 @@ class MayhemFeature extends Feature {
     unavailableMessage,
     unsentMessage,
     timeoutMessage,
+    timeoutMs = this.timeoutMs,
   }) {
     let resolvePending;
     const promise = new Promise((resolve) => {
@@ -855,7 +889,7 @@ class MayhemFeature extends Feature {
       if (typeof retryTimer?.unref === 'function') retryTimer.unref();
     };
     scheduleRetry();
-    const timeout = this.timeoutMs > 0
+    const timeout = timeoutMs > 0
       ? setTimeout(() => {
           const current = pending.get(requestId);
           if (!current) return;
@@ -871,7 +905,7 @@ class MayhemFeature extends Feature {
               ? 'request_send'
               : 'admin_ack';
           current.resolve(relayError(messageText, requestId, phase));
-        }, this.timeoutMs)
+        }, timeoutMs)
       : null;
     void attempt();
 
@@ -938,6 +972,9 @@ class MayhemFeature extends Feature {
     const payload = stableValue(value.payload);
     if (service === PROXY_PREFLIGHT_SERVICE) {
       try { validateProxyPreflightRequest(payload); } catch { return null; }
+    }
+    if (service === PROXY_DISCOVERY_SERVICE) {
+      try { validateProxyDiscoveryRequest(payload); } catch { return null; }
     }
     if (!/^[0-9a-f]{64}$/.test(actor) ||
         !/^[0-9a-f]{64}$/.test(admin) ||
@@ -1093,6 +1130,14 @@ class MayhemFeature extends Feature {
   }
 
   async _handleService(service, value, authorization) {
+    if (service === PROXY_DISCOVERY_SERVICE) {
+      try { return await this.proxyDiscovery(value); }
+      catch (error) {
+        const known = typeof error?.code === 'string' && error.code.startsWith('proxy_');
+        return { ok: false, code: known ? error.code : 'proxy_discovery_unavailable',
+          message: known ? error.message : 'Proxy discovery is temporarily unavailable.', request_nonce: value.request_nonce };
+      }
+    }
     if (service === PROXY_PREFLIGHT_SERVICE) {
       return await preflightProxyRegistry({ request: value,
         withCanonicalSnapshot: this.withProxyCanonicalSnapshot,

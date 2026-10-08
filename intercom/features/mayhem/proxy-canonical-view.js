@@ -1,4 +1,4 @@
-// Publication-only reads from the canonical admin indexer. Readers never use
+// Canonical reads from the admin indexer. Ordinary readers never use
 // this adapter: their signed local view is not proof of the current canonical
 // head. They obtain authenticated preflight from the indexer service instead.
 import b4a from 'b4a';
@@ -7,14 +7,22 @@ import { PROXY_MAX_RECORD_BYTES } from '../../contract/proxy-protocol.js';
 
 const hex = value => b4a.isBuffer(value) ? b4a.toString(value, 'hex') : String(value ?? '').toLowerCase();
 const clone = value => value === null ? null : JSON.parse(JSON.stringify(value));
-const fail = message => { throw new Error(`Proxy canonical snapshot unavailable: ${message}.`); };
+const fail = (message, code) => { throw Object.assign(new Error(`Proxy canonical snapshot unavailable: ${message}.`), code ? { code } : {}); };
 const READ_TIMEOUT_MS = 5_000;
 // Bounds apply to one registry mutation, not model context, catalog size or
 // inference. A mutation reads only the exact keys required by its wire schema.
 const MAX_KEYS = 128;
 const MAX_READ_BYTES = PROXY_MAX_RECORD_BYTES * MAX_KEYS;
 
-export function createProxyCanonicalSnapshot(peer, contractVersion) {
+export function validateProxySnapshotProof(proof) {
+  if (!proof || typeof proof !== 'object' || Array.isArray(proof) ||
+      JSON.stringify(Object.keys(proof).sort()) !== JSON.stringify(['fork', 'signed_length', 'tree_hash', 'view_key']) ||
+      !/^[0-9a-f]{64}$/.test(proof.view_key) || !/^[0-9a-f]{64}$/.test(proof.tree_hash) ||
+      !Number.isSafeInteger(proof.fork) || proof.fork < 0 ||
+      !Number.isSafeInteger(proof.signed_length) || proof.signed_length < 1) fail('invalid snapshot proof');
+}
+
+export function createProxyCanonicalReader(peer, contractVersion) {
   const runtime = () => {
     const base = peer?.base;
     const core = base?.view?.core;
@@ -33,32 +41,54 @@ export function createProxyCanonicalSnapshot(peer, contractVersion) {
     return { base, core, applied, length, key, fork, admin };
   };
 
-  const pin = async () => {
+  const pin = async (requested = null) => {
     const before = runtime();
+    if (requested !== null) {
+      validateProxySnapshotProof(requested);
+      if (requested.view_key !== before.key || requested.fork !== before.fork ||
+          requested.signed_length > before.length) fail('requested snapshot is not on the canonical signed fork', 'proxy_cursor_invalidated');
+    }
+    const length = requested?.signed_length ?? before.length;
     const [viewHash, appliedHash] = await Promise.all([
-      before.core.treeHash(before.length), before.applied.treeHash(before.length),
+      before.core.treeHash(length), before.applied.treeHash(length),
     ]);
     const after = runtime();
     if (after.base !== before.base || after.core !== before.core || after.applied !== before.applied ||
         after.key !== before.key || after.fork !== before.fork || after.admin !== before.admin ||
         after.length < before.length || !b4a.equals(viewHash, appliedHash)) fail('read view differs from canonical applied prefix');
-    const view = before.base.view.checkout(before.length);
+    if (requested && hex(viewHash) !== requested.tree_hash) fail('requested snapshot hash changed', 'proxy_cursor_invalidated');
+    const view = before.base.view.checkout(length);
     try {
       await view.ready();
       if (hex(view.core.key) !== before.key || view.core.fork !== before.fork) fail('checkout identity changed');
       const read = async key => clone((await view.get(key, { timeout: READ_TIMEOUT_MS }))?.value ?? null);
       if (await read('admin') !== before.admin) fail('local identity is not the canonical admin');
+      if (requested && (await before.base.view.get('admin', { timeout: READ_TIMEOUT_MS }))?.value !== before.admin) {
+        fail('current canonical admin differs');
+      }
       const epoch = (await read('epoch/apply/state'))?.epoch ?? 0;
       const context = proxyRuntimeContext(peer, contractVersion, epoch);
       if (hex(before.base.key) !== context.subnet_bootstrap) fail('configured bootstrap differs from canonical indexer');
-      return { ...before, view, read, context,
-        proof: { view_key: before.key, fork: before.fork, signed_length: before.length, tree_hash: hex(viewHash) } };
+      return { ...before, length, view, read, context,
+        assertCanonical: () => {
+          const current = runtime();
+          if (current.base !== before.base || current.key !== before.key || current.fork !== before.fork ||
+              current.length < length || current.admin !== before.admin ||
+              JSON.stringify(proxyRuntimeContext(peer, contractVersion, epoch)) !== JSON.stringify(context)) {
+            fail('canonical snapshot identity changed');
+          }
+        },
+        proof: { view_key: before.key, fork: before.fork, signed_length: length, tree_hash: hex(viewHash) } };
     } catch (error) {
       await view.close();
       throw error;
     }
   };
+  return { pin };
+}
 
+export function createProxyCanonicalSnapshot(peer, contractVersion) {
+  const { pin } = createProxyCanonicalReader(peer, contractVersion);
   return async body => {
     const initial = await pin();
     const observed = new Map();

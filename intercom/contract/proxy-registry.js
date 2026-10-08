@@ -9,6 +9,7 @@ import {
   validateProxyOfferForMembership, verifyProxyAdmissionPermit, proxyAdmissionDigest,
   proxyOfferDigest, proxyOfferSlotId, ProxyValidationError,
 } from './proxy-protocol.js';
+import { withProxyDiscoveryWrites } from './proxy-discovery.js';
 
 export const PROXY_PREFIX = 'proxy/v1/';
 const key = (...parts) => PROXY_PREFIX + parts.join('/');
@@ -217,7 +218,7 @@ export async function prepareProxyRegistryMutation(envelope, context, read, veri
   provider.result = result;
   put(providerKey, provider);
   put(globalKey, global);
-  return { duplicate: false, result, writes: [...writes.values()] };
+  return { duplicate: false, result, writes: withProxyDiscoveryWrites([...writes.values()]) };
 }
 
 // New-acceptance eligibility only. Never use this to reprice or refuse settlement
