@@ -1934,12 +1934,12 @@ test('canonical receipt metadata rejects count and revision overflow', async () 
 });
 
 
-test('v27 settles retained v23-v26 schema-11 receipts without rewriting signatures or billing', async () => {
-  for (const contractVersion of [23, 24, 25, 26, CONTRACT_VERSION]) {
+test('current contract settles retained v23-v29 receipts without rewriting signatures or billing', async () => {
+  for (const contractVersion of [23, 24, 25, 26, 27, 28, 29, CONTRACT_VERSION]) {
     const ctx = await setupContract();
     const reservation = await submitReservation(ctx);
     const value = receiptValue(ctx, reservation, {
-      schemaVersion: contractVersion === CONTRACT_VERSION ?
+      schemaVersion: contractVersion >= 27 ?
         SESSION_RECEIPT_SCHEMA_VERSION : 11,
       final: true,
       bodyOverrides: { usage_attribution: { context_input_tokens: 1200 } },

@@ -7,13 +7,13 @@ import {
   validateProxyOperationEnvelope, proxyOperationSigningBytes, proxyOperationDigest,
   proxyMarketId, proxyMarketHandle, validateProxyMembershipForMarket,
   validateProxyOfferForMembership, verifyProxyAdmissionPermit, proxyAdmissionDigest,
-  proxyOfferDigest, proxyOfferSlotId,
+  proxyOfferDigest, proxyOfferSlotId, ProxyValidationError,
 } from './proxy-protocol.js';
 
 export const PROXY_PREFIX = 'proxy/v1/';
 const key = (...parts) => PROXY_PREFIX + parts.join('/');
 const copy = value => value === null ? null : JSON.parse(JSON.stringify(value));
-const check = (ok, message) => { if (!ok) throw new Error(message); };
+const check = (ok, message) => { if (!ok) throw new ProxyValidationError(message); };
 const count = (value, name, minimum = 0) => {
   check(Number.isSafeInteger(value) && value >= minimum, `invalid proxy ${name}`);
   return value;
@@ -29,7 +29,7 @@ export const proxyRegistryKeys = Object.freeze({
     key('offer', market, provider, await proxyOfferSlotId({ endpoint, ctx_bracket: context, outcome_class: outcome })),
 });
 
-function configIsValid(config, context) {
+export function validateProxyRegistryConfig(config, context) {
   check(config?.network_id === context.network_id && config?.contract_version === context.contract_version
     && config?.msb_bootstrap === context.msb_bootstrap && config?.subnet_bootstrap === context.subnet_bootstrap,
     'proxy registry not configured for this network/contract');
@@ -83,7 +83,7 @@ export async function prepareProxyRegistryMutation(envelope, context, read, veri
   }
   check(intent.sequence === increment(count(previous?.sequence ?? 0, 'provider sequence')), 'stale or out-of-order proxy operation');
   const config = copy(await read(proxyRegistryKeys.config));
-  configIsValid(config, context);
+  validateProxyRegistryConfig(config, context);
   const action = intent.action;
   const withdrawal = action.kind === 'leave_market' || action.kind === 'withdraw_offer';
   check(config.enabled || withdrawal, 'new proxy activity is disabled');
@@ -232,7 +232,7 @@ export async function readActiveProxyOffer(selection, context, read) {
   selection = copy(selection);
   context = copy(context);
   const config = await read(proxyRegistryKeys.config);
-  configIsValid(config, context);
+  validateProxyRegistryConfig(config, context);
   if (!config.enabled) return null;
   const provider = await read(proxyRegistryKeys.provider(selection.provider_pubkey));
   if (!provider?.entitlement?.id || await read(key('provider-revoked', selection.provider_pubkey))

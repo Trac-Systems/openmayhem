@@ -18,8 +18,10 @@ const U32_MAX = 0xffff_ffff;
 const RAILS = ['fiat', 'tap', 'tnk'];
 const ENDPOINTS = ['mayhem_decisions', 'openai_chat_completions', 'openai_completions', 'openai_responses'];
 
+export class ProxyValidationError extends Error {}
+
 function requireValue(condition, message) {
-  if (!condition) throw new Error(message);
+  if (!condition) throw new ProxyValidationError(message);
 }
 
 function shape(value, fields) {
@@ -379,7 +381,7 @@ export function validateProxyOperation(value) {
       hex(action.market_id);
       integer(action.revision);
       break;
-    default: throw new Error('unsupported proxy action');
+    default: throw new ProxyValidationError('unsupported proxy action');
   }
   canonicalBody(value);
   return value;
@@ -406,4 +408,10 @@ export function validateProxyOperationEnvelope(value) {
   }
   canonicalBody(value);
   return value;
+}
+
+export async function proxyRegistryFeatureKey(envelope) {
+  validateProxyOperationEnvelope(envelope);
+  const intent = envelope.intent;
+  return `proxy/registry/${intent.provider_pubkey}/${intent.sequence}/${await proxyOperationDigest(intent)}`;
 }

@@ -2,14 +2,10 @@
 // never request-provided state. Run this before BOTH forwarding and writer append.
 // The contract repeats the same transition checks during application. There is no
 // fee worker/network/history lookup on subsequent publications or inference turns.
-import { validateProxyOperationEnvelope, proxyOperationDigest } from '../../contract/proxy-protocol.js';
+import { validateProxyOperationEnvelope, proxyRegistryFeatureKey } from '../../contract/proxy-protocol.js';
 import { prepareProxyRegistryMutation } from '../../contract/proxy-registry.js';
 
-export async function proxyRegistryFeatureKey(envelope) {
-  validateProxyOperationEnvelope(envelope);
-  const intent = envelope.intent;
-  return `proxy/registry/${intent.provider_pubkey}/${intent.sequence}/${await proxyOperationDigest(intent)}`;
-}
+export { proxyRegistryFeatureKey } from '../../contract/proxy-protocol.js';
 
 // withCanonicalSnapshot pins the indexer-authenticated signed checkout and closes
 // it in finally. Its assertCurrent() must reject a stale/wrong-fork view and changed

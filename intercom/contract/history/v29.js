@@ -5,24 +5,19 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import { consumeCanonicalReplayContext } from 'trac-peer/src/base/canonical-replay.js';
 import PeerWallet from 'trac-wallet';
-import ContractV23 from './history/v23.js';
-import ContractV24 from './history/v24.js';
-import ContractV25 from './history/v25.js';
-import ContractV26 from './history/v26.js';
-import ContractV27 from './history/v27.js';
-import ContractV28 from './history/v28.js';
-import ContractV29 from './history/v29.js';
-import { ProxyValidationError, proxyRegistryFeatureKey } from './proxy-protocol.js';
-import { prepareProxyRegistryMutation } from './proxy-registry.js';
-import { prepareProxyPolicyMutation, proxyPolicyFeatureKey } from './proxy-policy.js';
-import { proxyRuntimeContext } from './proxy-context.js';
-import { advanceDemand, demandObservation, DEMAND_CONSTANTS, scaleDemandPrice } from './reference-demand.js';
+import ContractV23 from './v23.js';
+import ContractV24 from './v24.js';
+import ContractV25 from './v25.js';
+import ContractV26 from './v26.js';
+import ContractV27 from './v27.js';
+import ContractV28 from './v28.js';
+import { advanceDemand, demandObservation, DEMAND_CONSTANTS, scaleDemandPrice } from '../reference-demand.js';
 
-export const CONTRACT_VERSION = 30;
-// Recovery is limited to receipt evidence already signed by v23-v29
+export const CONTRACT_VERSION = 29;
+// Recovery is limited to receipt evidence already signed by v23-v28
 // participants. New prior-version operations are not admitted;
 // separately authenticated canonical replay does not constitute new admission.
-const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25, 26, 27, 28, 29]);
+const RECOVERABLE_RECEIPT_CONTRACT_VERSIONS = new Set([23, 24, 25, 26, 27, 28]);
 const SIGNING_MESSAGE_VERSION = 2;
 const CURRENT_RULES_KEY = 'rules/current';
 const PROVIDER_ACCEPTED_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -915,8 +910,8 @@ class MayhemContract extends Contract {
       const versioned = versionedMayhemOperation(op);
       const canonicalReplay = consumeCanonicalReplayContext(consensusContext, op, storage);
       const historical = versioned.present && (
-        ([23, 24, 25, 26, 27, 28, 29].includes(versioned.version) && canonicalReplay) ||
-        ([24, 25, 26, 27, 28, 29].includes(versioned.version) &&
+        ([23, 24, 25, 26, 27, 28].includes(versioned.version) && canonicalReplay) ||
+        ([24, 25, 26, 27, 28].includes(versioned.version) &&
           await this.isPreparedCheckpointReplay(op, storage))
       );
       if (historical) {
@@ -933,9 +928,7 @@ class MayhemContract extends Contract {
                 ? ContractV26
                 : versioned.version === 27
                   ? ContractV27
-                  : versioned.version === 28
-                    ? ContractV28
-                    : ContractV29;
+                  : ContractV28;
         this._historicalContracts ??= new Map();
         if (!this._historicalContracts.has(versioned.version)) {
           this._historicalContracts.set(versioned.version, new Implementation(this.protocol, this.config));
@@ -1654,37 +1647,6 @@ class MayhemContract extends Contract {
     return value;
   }
 
-  async applyProxyFeature(key, value) {
-    // Proxy mutations have one transport: an admin-forwarded Mayhem feature with
-    // provider/fee signatures inside it. Paid/native aliases cannot bypass it.
-    if (!this.isFeature() || this._mayhemExecutionType !== 'feature') {
-      return new Error('Proxy publication requires the admitted feature path.');
-    }
-    const adminError = await this.requireAdmin(this.address);
-    if (adminError) return adminError;
-    let plan;
-    try {
-      const context = proxyRuntimeContext(this.protocol?.peer, CONTRACT_VERSION, await this.currentAppliedEpoch());
-      const read = path => this.get(path);
-      if (value.op === 'proxy_policy') {
-        if (key !== await proxyPolicyFeatureKey(value)) return new Error('Invalid proxy policy feature key.');
-        plan = await prepareProxyPolicyMutation(value, context, read);
-      } else {
-        if (key !== await proxyRegistryFeatureKey(value)) return new Error('Invalid proxy registry feature key.');
-        const verify = (signature, bytes, publicKey) => this.protocol.peer.wallet.verify(signature, bytes, publicKey);
-        plan = await prepareProxyRegistryMutation(value, context, read, verify);
-      }
-    } catch (error) {
-      if (error instanceof ProxyValidationError) return new Error(error.message);
-      throw error; // Storage/crypto/runtime errors must abort apply, not become rejection.
-    }
-    for (const write of plan.writes) {
-      if (write.value === null) await this.del(write.key);
-      else await this.put(write.key, write.value);
-    }
-    return { ok: true, duplicate: plan.duplicate, ...plan.result };
-  }
-
   async mayhemFeature() {
     this._mayhemLastFeatureResult = undefined;
     const rawKey = this.op?.key;
@@ -1694,11 +1656,6 @@ class MayhemContract extends Contract {
     const value = this.value;
     if (typeof key !== 'string' || !value || typeof value !== 'object' || Array.isArray(value)) {
       return;
-    }
-    if (value.op === 'proxy_registry' || value.op === 'proxy_policy') {
-      const result = await this.applyProxyFeature(key, value);
-      this._mayhemLastFeatureResult = result;
-      return result;
     }
     if (value.op === 'deposit_tnk') {
       const result = await this.applyDepositTnkFeature(key, value);
@@ -3374,7 +3331,7 @@ class MayhemContract extends Contract {
       'record usage receipt envelope'
     );
     if (receiptShapeError) return receiptShapeError;
-    const targetSchemaVersion = value.contract_version === CONTRACT_VERSION || [27, 28, 29].includes(value.contract_version)
+    const targetSchemaVersion = value.contract_version === CONTRACT_VERSION || [27, 28].includes(value.contract_version)
       ? SESSION_RECEIPT_SCHEMA_VERSION
       : 11;
     const receipt = await this.normalizeReceiptEnvelope(value.receipt, {

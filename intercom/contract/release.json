@@ -1,12 +1,12 @@
 {
   "schema": 1,
   "release_version": "0.2.271",
-  "contract_version": 29,
-  "contract_code_sha256": "81243f49b42eb2df79f0116af9f3a018246f273d6488d1a1229f3eecd9782263",
+  "contract_version": 30,
+  "contract_code_sha256": "989e370dd6bc4088cd324e4cfca1d56b5d8d313af3ede2ec29d1bcc926b6ffa6",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "3123db7528a782e7a5d1ea928658c5c5d0a24fe75d2210a0282bebaddb7c50f6"
+      "sha256": "0585b378d6ab1f8c856fea4511d770777285adf8c2f7a6c3cff148bd35749b83"
     },
     {
       "path": "contract/history/v23.js",
@@ -33,8 +33,28 @@
       "sha256": "e70b13475e091f75096ee6b39a8f7727b4053066700c0ddadbbc1e35d54e9953"
     },
     {
+      "path": "contract/history/v29.js",
+      "sha256": "540a9aaa535b15d7fc05d9b916829c3837770b4f41c57152661ac650d0051ee6"
+    },
+    {
       "path": "contract/protocol.js",
       "sha256": "ebe02c46149b1fcaea1ee574a05e821ea863ceb06926fd872abeb764ea36a673"
+    },
+    {
+      "path": "contract/proxy-context.js",
+      "sha256": "7ee89438e9c4ee7057cd1e44db4ec1d0bd06b9fe79c38325e1ba3874b86ea91e"
+    },
+    {
+      "path": "contract/proxy-policy.js",
+      "sha256": "6df9bd9817877eee77a0472cbeeddd935b254577faf16f6477a1ce8cb8eb0043"
+    },
+    {
+      "path": "contract/proxy-protocol.js",
+      "sha256": "792af0b9798944e0fa193d213b3720c2a09f77476f1f302987d1a6694fb79697"
+    },
+    {
+      "path": "contract/proxy-registry.js",
+      "sha256": "40d66f3c429180e4b8ff18d181916f42658f3877985fff003729f32e5ada06b3"
     },
     {
       "path": "contract/reference-demand.js",
@@ -43,6 +63,10 @@
     {
       "path": "features/mayhem/index.js",
       "sha256": "10f189b71763014d77bd100506b3596c8aad1b49a01d160d32ab60f9b0af53af"
+    },
+    {
+      "path": "features/mayhem/proxy-admission.js",
+      "sha256": "00c5892a5dfa4fe3fffc8cc09ee57afd14869ed91ab1d0d6c68bd87b37fe20f9"
     },
     {
       "path": "trac/trac-peer/src/artifacts/contract.js",
