@@ -8,6 +8,9 @@ import {prepareProxyReservation,proxyReservationFeatureKey,
   validateProxyCanonicalReceiptHead} from '../contract/proxy-reservations.js';
 
 import {proxyReservationFixture as fixture,proxyReceiptFixture as receiptFixture} from './helpers/proxy-finance.js';
+import { recomputeEpoch } from '../scripts/recompute-epoch-roots.mjs';
+import { proxyEpochBundle } from './helpers/proxy-epoch.js';
+
 const clone=structuredClone;
 const h=n=>n.toString(16).padStart(64,'0');
 const sign=(wallet,bytes)=>b4a.toString(wallet.sign(bytes),'hex');
@@ -184,6 +187,10 @@ async function epochFixture(rail,{two=false}={}) {
       burn_au:String(burn),burn_cum_au:String(burn),tap_burn_bps:1000}),price:await f.ledger.priceDerivationRoot([])};
   const totals={dep_count:0,dep_au:'0',use_count:heads.length,use_au:String(gross),provider_count:1,earn_au:String(net),
     fee_au:String(fee),fee_cum_au:String(fee),burn_au:String(burn),burn_cum_au:String(burn),price_count:0};
+  const recomputed=await recomputeEpoch(await proxyEpochBundle(f.ledger,heads,epoch,{fee_bps:params.fee_bps,epoch_seconds:params.epoch_seconds}));
+  assert.deepEqual(recomputed.roots,roots,'writer roots must match independent contract hash computation');
+  assert.deepEqual(recomputed.totals,totals,'writer money totals must match independent accounting');
+  assert.deepEqual(recomputed.market_usage,[]); assert.deepEqual(recomputed.market_activity,[]);
   const v={op:'commit_apply_targeted_epoch_page0',epoch,at,
     epoch_commit_hash:await f.ledger.epochCommitHash({epoch,epoch_seconds:params.epoch_seconds,roots,totals}),
     receipt_index:await f.read(f.ledger.receiptEpochIndexKey(epoch)),
@@ -195,7 +202,7 @@ async function epochFixture(rail,{two=false}={}) {
     assert.ok(!(key instanceof Error),key.message);
     return executeFeature(f.contract,f.storage,'mayhem_feature',key,value,f.admin.publicKey);
   };
-  return {...f,head,heads,v,settle,gross,fee,burn,net};
+  return {...f,head,heads,v,settle,gross,fee,burn,net,recomputed};
 }
 
 for(const rail of ['fiat','tnk','tap'])test(`shared ${rail} epoch settlement debits proxy work once and creates the normal payout liability`,async()=>{
@@ -341,4 +348,23 @@ test('proxy sessions reject forged common identity, holds and policy; native rec
   }
   assert.equal((await f.ledger.normalizeTargetedSpendSessionRecord({...session,lane:'native'},f.buyer.publicKey,'tnk')) instanceof Error,true);
   assert.ok((await proxyReservationFeatureKey(f.authorize(f.terms))).length<=256);
+});
+
+
+for(const rail of ['fiat','tnk','tap'])test(`writer-produced ${rail} proxy pages apply without native market activity`,async()=>{
+  const f=await epochFixture(rail,{two:true});
+  for(const page of f.recomputed.apply_pages) {
+    const {page_sha256,max_feature_operation_json_bytes,...fields}=page;
+    assert.ok(max_feature_operation_json_bytes<=60000);
+    const value={...fields,epoch:f.v.epoch,at:f.v.at,epoch_commit_hash:f.v.epoch_commit_hash,
+      op:page.page===0?'commit_apply_targeted_epoch_page0':'apply_targeted_epoch'};
+    if(page.page===0) {delete value.page;value.roots=f.recomputed.roots;value.totals=f.recomputed.totals;}
+    const key=page.page===0?await f.ledger.commitTargetedEpochPageZeroFeatureKey(value):await f.ledger.targetedEpochFeatureKey(value);
+    assert.ok(!(key instanceof Error),key.message);
+    const result=await executeFeature(f.contract,f.storage,'mayhem_feature',key,value,f.admin.publicKey);
+    assert.equal(result.ok,true,result.message);
+  }
+  assert.equal((await f.read(f.summaryKey)).reserved_au,'50');
+  assert.equal((await f.read('epoch/apply/state')).last_receipt_proxy_use_au,String(f.gross));
+  assert.equal((await f.read(f.ledger.providerPayoutLiabilityKey(f.provider.publicKey,rail,f.payout.revision))).total_au,String(f.net));
 });

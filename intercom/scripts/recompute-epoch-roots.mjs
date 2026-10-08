@@ -3,6 +3,8 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
+import { proxyEpochAcceptances, proxyEpochReceipt } from './proxy-epoch.mjs';
+import { proxyReceiptDigest } from '../contract/proxy-finance.js';
 
 const ROOT_KINDS = ['dep', 'use', 'earn', 'fee', 'price'];
 const LEDGER_RAILS = new Set(['fiat', 'tap', 'tnk']);
@@ -571,7 +573,7 @@ function targetedEpochFeatureOperationJsonBytes(
   const materialized = {
     ...materializeApplyPage(state, page, receiptIndex),
     ...(earningFinals.length > 0 ? { earning_finals: earningFinals } : {}),
-    ...(marketUsage.length > 0 ? { market_usage: marketUsage } : {}),
+    ...((earningFinals.length > 0 || marketUsage.length > 0) ? { market_usage: marketUsage } : {}),
   };
   const key = `epoch/targeted/${Number.MAX_SAFE_INTEGER}/${'0'.repeat(64)}`;
   const common = {
@@ -686,7 +688,7 @@ function addApplyPageRow(state, row) {
     row.allocation.payout_revision,
     amount
   );
-  addMarketUsage(state.marketUsage, row.body, row.allocation.session_id, amount);
+  if (row.body.lane !== 'proxy') addMarketUsage(state.marketUsage, row.body, row.allocation.session_id, amount);
 }
 
 function materializeApplyPage(state, page, receiptIndex) {
@@ -814,6 +816,9 @@ function receiptEnvelope(entry) {
 }
 
 function receiptLeafEnvelope(envelope) {
+  if (envelope.body?.lane === 'proxy') return {
+    body: stableValue(envelope.body), buyer_sig: envelope.buyer_sig, provider_sig: envelope.provider_sig,
+  };
   return {
     body: stableValue(envelope.body),
     enclave_sig: envelope.enclave_sig,
@@ -979,20 +984,31 @@ export async function recomputeEpoch(bundle) {
   const allocationRows = [];
   const seenBillingAttempts = new Map();
 
-  const normalizedReceipts = receipts
-    .map((entry) => {
+  const proxyAccepted = proxyEpochAcceptances(bundle, receipts);
+  const normalizedReceipts = [];
+  // Bounded by the frozen index; avoid spawning one crypto task per epoch row.
+  for (const entry of receipts) {
+    if (entry.lane === 'proxy' || entry.receipt?.body?.lane === 'proxy') {
+      normalizedReceipts.push(await proxyEpochReceipt(entry, proxyAccepted, epoch));
+    } else {
+      if (entry.lane != null && entry.lane !== 'native') throw new Error('unknown receipt lane');
       const envelope = receiptEnvelope(entry);
       const head = canonicalReceiptHead(entry, envelope, epoch);
-      return { entry, envelope, head };
-    })
-    .sort((a, b) => (
-      String(a.envelope.body.billing_id).localeCompare(String(b.envelope.body.billing_id)) ||
-      Number(a.envelope.body.billing_attempt ?? 0) - Number(b.envelope.body.billing_attempt ?? 0) ||
-      Number(a.envelope.body.seq ?? 0) - Number(b.envelope.body.seq ?? 0)
-    ));
-
-  for (const { entry, envelope, head } of normalizedReceipts) {
-    const { body } = envelope;
+      normalizedReceipts.push({ entry, envelope, head, body:envelope.body, proxy:false });
+    }
+  }
+  normalizedReceipts.sort((a, b) => (
+    String(a.body.billing_id).localeCompare(String(b.body.billing_id)) ||
+    Number(a.body.billing_attempt ?? 0) - Number(b.body.billing_attempt ?? 0) ||
+    Number(a.body.seq ?? 0) - Number(b.body.seq ?? 0)
+  ));
+  const billingLanes = new Map();
+  for (const { entry, envelope, head, body, proxy } of normalizedReceipts) {
+    const lane = proxy ? 'proxy' : 'native';
+    if (billingLanes.has(body.billing_id) && billingLanes.get(body.billing_id) !== lane) {
+      throw new Error('logical billing cannot cross native and proxy lanes');
+    }
+    billingLanes.set(body.billing_id, lane);
     for (const field of ['session_id', 'user', 'provider']) {
       if (typeof body[field] !== 'string' || body[field].length === 0) {
         throw new Error(`receipt ${field} is required`);
@@ -1011,14 +1027,19 @@ export async function recomputeEpoch(bundle) {
       continue;
     }
     seenBillingAttempts.set(identity, fingerprint);
-    const computedReceiptHash = await opaqueHash(
+    const computedReceiptHash = proxy ? await proxyReceiptDigest(envelope.body) : await opaqueHash(
       'mayhem-canonical-receipt-v1',
       canonicalReceiptEnvelope(envelope)
     );
     if (computedReceiptHash !== head.receipt_hash) {
       throw new Error('canonical receipt head hash does not match signed receipt envelope');
     }
-    const settleAu = receiptAmount(entry, body, billingStates);
+    if (proxy && (entry.settle_au !== undefined || entry.au_delta !== undefined)) {
+      throw new Error('proxy settlement amount cannot override the signed receipt');
+    }
+    // Proxy cumulative billing includes prior attempts, including other epochs;
+    // this final contributes only this attempt's already-priced signed amount.
+    const settleAu = proxy ? safeAu(envelope.body.au_owed_cum,'proxy attempt amount') : receiptAmount(entry, body, billingStates);
     if (canonicalAu(settleAu) !== head.incremental_au) {
       throw new Error('canonical receipt incremental_au does not match signed billing high-water');
     }
@@ -1038,7 +1059,7 @@ export async function recomputeEpoch(bundle) {
       body.payout_revision,
       settleAu
     );
-    addMarketUsage(marketUsageMap, body, body.session_id, settleAu);
+    if (!proxy) addMarketUsage(marketUsageMap, body, body.session_id, settleAu);
     usageLeaves.push(await opaqueHash('mayhem-usage-leaf-v1', receiptLeafEnvelope(envelope)));
     const allocation = {
       session_id: body.session_id,

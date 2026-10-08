@@ -7,6 +7,9 @@ import test from 'node:test';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { fileURLToPath } from 'node:url';
 
+import { proxyReceiptFixture } from '../../intercom/tests/helpers/proxy-finance.js';
+import { proxyReservationKeys } from '../../intercom/contract/proxy-reservations.js';
+
 import { opaqueHash } from '../../intercom/scripts/recompute-epoch-roots.mjs';
 
 const ROOT = fileURLToPath(new URL('../..', import.meta.url));
@@ -79,6 +82,8 @@ async function harness({
   driftAtIndexRead = null,
   bareIndexOnly = false,
   staleSnapshotAndCommit = false,
+  proxyFixtures = [],
+  nativeReceipts = true,
   settlementEpoch = 1,
   billingEpoch = settlementEpoch,
   schemaVersion = 11,
@@ -96,11 +101,11 @@ async function harness({
   fs.mkdirSync(stateDir, { recursive: true });
   fs.symlinkSync(process.execPath, path.join(bin, 'node'));
 
-  const heads = [
+  const heads = [...(nativeReceipts ? [
     await receiptHead(3, { settlementEpoch, billingEpoch, schemaVersion }),
     await receiptHead(1, { settlementEpoch, billingEpoch, schemaVersion }),
     await receiptHead(2, { settlementEpoch, billingEpoch, schemaVersion }),
-  ];
+  ] : []), ...proxyFixtures.map(f=>f.head)];
   const index = {
     type: 'canonical_receipt_epoch_index',
     epoch: settlementEpoch,
@@ -142,6 +147,7 @@ async function harness({
   for (const head of heads) {
     records[`receipt/head/${head.billing_id}/${head.billing_attempt}`] = head;
   }
+  for (const fixture of proxyFixtures) records[proxyReservationKeys.accepted(fixture.head.accepted_terms)] = fixture.accepted;
   if (staleSnapshotAndCommit) {
     const staleRunDir = path.join(stateDir, `epochs/epoch-${settlementEpoch}`);
     fs.mkdirSync(staleRunDir, { recursive: true });
@@ -259,7 +265,7 @@ const server = http.createServer((req, res) => {
       if (allocationAu !== earningAu) errors.push('earnings');
       const hasFinalEvidence = value.last_page === true;
       if (hasFinalEvidence) {
-        if (!Array.isArray(value.market_usage) || value.market_usage.length === 0 ||
+        if (!Array.isArray(value.market_usage) ||
             !Array.isArray(value.earning_finals) || value.earning_finals.length === 0) {
           errors.push('final_evidence');
         } else {
@@ -267,7 +273,8 @@ const server = http.createServer((req, res) => {
             (sum, entry) => sum + BigInt(entry.demand_au),
             0n,
           );
-          if (usageAu !== BigInt(index.count)) errors.push('market_usage');
+          const nativeCount=Object.entries(state.records).filter(([key,head])=>key.startsWith('receipt/head/') && head.lane !== 'proxy').length;
+          if (usageAu !== BigInt(nativeCount)) errors.push('market_usage');
         }
       } else if (value.market_usage !== undefined || value.earning_finals !== undefined) {
         errors.push('early_final_evidence');
@@ -593,4 +600,46 @@ test('finalizer requires the exact receipt epoch index key and rejects the bare 
   assert.equal(state.commit, null);
   assert.equal(state.features.length, 0);
   assert.equal(state.apply.updated_epoch, 0);
+});
+
+
+async function actualProxyReceipt(rail='tnk') {
+  const f=await proxyReceiptFixture(rail);
+  await f.apply(await f.finalize(await f.receipt()));
+  const head=await f.read(f.ledger.receiptHeadKey(f.terms.billing_id,1));
+  return {head,accepted:await f.read(proxyReservationKeys.accepted(head.accepted_terms))};
+}
+
+for(const rail of ['fiat','tnk','tap'])test(`actual finalizer exports exact ${rail} proxy acceptance and submits shared pages`,async t=>{
+  const proxy=await actualProxyReceipt(rail);
+  const ctx=await harness({settlementEpoch:101,nativeReceipts:false,proxyFixtures:[proxy]});
+  t.after(()=>ctx.close());
+  const result=ctx.run();assert.equal(result.status,0,`${result.stdout}\n${result.stderr}`);
+  const state=ctx.state(); assert.equal(state.apply.updated_epoch,101);
+  assert.deepEqual(state.features.at(-1).value.market_usage,[]);
+  assert.equal(state.features[0].value.allocations[0].provider,proxy.head.provider);
+  assert.equal(state.features[0].value.allocations[0].au,proxy.head.incremental_au);
+  assert.equal(state.requested_keys.filter(k=>k===proxyReservationKeys.accepted(proxy.head.accepted_terms)).length,1);
+  const bundle=JSON.parse(fs.readFileSync(path.join(ctx.stateDir,'epochs/epoch-101/epoch-bundle.json')));
+  assert.deepEqual(bundle.proxy_acceptances[proxy.head.accepted_terms],proxy.accepted);
+});
+
+test('actual finalizer resumes mixed native/proxy pages without changing native usage or refetching history',async t=>{
+  const proxy=await actualProxyReceipt();
+  const ctx=await harness({settlementEpoch:101,proxyFixtures:[proxy],failPageOnce:1});
+  t.after(()=>ctx.close());
+  const first=ctx.run();assert.notEqual(first.status,0);
+  const second=ctx.run();assert.equal(second.status,0,`${second.stdout}\n${second.stderr}`);
+  const state=ctx.state();assert.equal(state.apply.updated_epoch,101);
+  const last=state.features.at(-1).value;
+  assert.equal(last.market_usage.reduce((n,row)=>n+BigInt(row.demand_au),0n),3n);
+  assert.equal(state.requested_keys.filter(k=>k===proxyReservationKeys.accepted(proxy.head.accepted_terms)).length,1);
+});
+
+test('invalid proxy financial signature stops finalizer before committing any epoch',async t=>{
+  const proxy=await actualProxyReceipt();proxy.accepted.authorization.buyer_sig='0'.repeat(128);
+  const ctx=await harness({settlementEpoch:101,proxyFixtures:[proxy]});t.after(()=>ctx.close());
+  const result=ctx.run();assert.notEqual(result.status,0);
+  assert.match(result.stderr,/signature rejected/);
+  assert.equal(ctx.state().features.length,0);
 });

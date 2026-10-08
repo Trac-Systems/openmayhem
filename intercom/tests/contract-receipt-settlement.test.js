@@ -1,3 +1,5 @@
+import { recomputeEpoch } from '../scripts/recompute-epoch-roots.mjs';
+import { proxyEpochBundle } from './helpers/proxy-epoch.js';
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import b4a from 'b4a';
@@ -782,6 +784,12 @@ test('native and proxy receipts settle together without proxy work entering nati
     allocations:heads.map(h=>allocationFor(ctx,h)).sort((a,b)=>a.user<b.user?-1:1),earning_finals:final,
     market_usage:[{enclave_id:ENCLAVE_ID,ctx_bracket:'le8k',ctx_bracket_table_ver:1,demand_au:'100',
       session_count:1,provider_count:1,compute_ms:'1000',legacy_receipt_count:0,capacity_slot_count:1}]};
+  const recomputed = await recomputeEpoch(await proxyEpochBundle(proxy.ledger,heads,epoch,{maxApplyBatch:100}));
+  assert.deepEqual(recomputed.roots,roots); assert.deepEqual(recomputed.totals,totals);
+  assert.deepEqual(recomputed.market_usage,value.market_usage);
+  Object.assign(value,{debits:recomputed.apply_pages[0].debits,earnings:recomputed.apply_pages[0].earnings,
+    allocations:recomputed.apply_pages[0].allocations,earning_finals:recomputed.apply_pages[0].earning_finals,
+    market_usage:recomputed.apply_pages[0].market_usage});
   const key = await proxy.ledger.commitTargetedEpochPageZeroFeatureKey(value);
   assert.ok(!(key instanceof Error),key.message);
   const beforeNative = (await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au;

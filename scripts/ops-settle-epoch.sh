@@ -654,6 +654,7 @@ if len({(item["billing_id"], item["billing_attempt"]) for item in identities}) !
     raise SystemExit("canonical receipt identities contain a replay")
 
 heads = []
+proxy_acceptances = {}
 for identity in identities:
     head_key = f"receipt/head/{identity['billing_id']}/{identity['billing_attempt']}"
     head = state(head_key)
@@ -676,16 +677,40 @@ for identity in identities:
     canonical_au(head.get("incremental_au"), "canonical receipt head incremental_au", allow_zero=False)
     receipt = head.get("receipt")
     body = receipt.get("body") if isinstance(receipt, dict) else None
-    if not isinstance(body, dict) or body.get("schema_version") not in {10, 11, 12}:
-        raise SystemExit("canonical receipt head must contain a signed receipt schema 10, 11 or 12")
-    if (
-        body.get("billing_id") != identity["billing_id"]
-        or body.get("billing_attempt") != identity["billing_attempt"]
-        or body.get("billing_epoch") != billing_epoch
-        or body.get("reservation_id") != reservation_id
-        or body.get("payout_revision") != payout_revision
-    ):
-        raise SystemExit("canonical receipt head fields do not match its signed receipt body")
+    if head.get("lane") == "proxy":
+        accepted_hash = hex32(head.get("accepted_terms"), "proxy accepted terms")
+        if not isinstance(body, dict) or body.get("schema_version") != 1 or body.get("lane") != "proxy" or body.get("accepted_terms") != accepted_hash:
+            raise SystemExit("proxy receipt body does not match its accepted terms")
+        if head.get("settlement_ready") is not True or body.get("final") is not True:
+            raise SystemExit("proxy settlement requires a final receipt")
+        if accepted_hash not in proxy_acceptances:
+            proxy_acceptances[accepted_hash] = state(f"proxy/v1/accepted/{accepted_hash}")
+        accepted = proxy_acceptances[accepted_hash]
+        if not isinstance(accepted, dict) or accepted.get("type") != "proxy_accepted_spend" or accepted.get("accepted_terms") != accepted_hash:
+            raise SystemExit("proxy accepted-spend record is missing or mismatched")
+        terms = accepted.get("authorization", {}).get("terms")
+        if not isinstance(terms, dict):
+            raise SystemExit("proxy accepted-spend terms are missing")
+        for field in ("billing_id", "billing_attempt", "billing_epoch", "session_id", "reservation_id", "payout_revision", "rail"):
+            if head.get(field) != terms.get(field):
+                raise SystemExit(f"proxy head {field} does not match its accepted spend")
+        if head.get("user") != terms.get("buyer_pubkey") or head.get("provider") != terms.get("offer", {}).get("provider_pubkey"):
+            raise SystemExit("proxy receipt payment parties do not match accepted spend")
+        # The recomputation step verifies exact term/policy digests, signatures,
+        # immutable price, usage and head fields before any epoch commit.
+    else:
+        if head.get("lane") not in (None, "native"):
+            raise SystemExit("unknown canonical receipt lane")
+        if not isinstance(body, dict) or body.get("schema_version") not in {10, 11, 12}:
+            raise SystemExit("canonical receipt head must contain a signed receipt schema 10, 11 or 12")
+        if (
+            body.get("billing_id") != identity["billing_id"]
+            or body.get("billing_attempt") != identity["billing_attempt"]
+            or body.get("billing_epoch") != billing_epoch
+            or body.get("reservation_id") != reservation_id
+            or body.get("payout_revision") != payout_revision
+        ):
+            raise SystemExit("canonical receipt head fields do not match its signed receipt body")
     heads.append(head)
 
 snapshot = {
@@ -701,7 +726,7 @@ fsync_json(snapshot_path, snapshot)
 
 pairs = set()
 for head in heads:
-    body = head["receipt"]["body"]
+    body = head if head.get("lane") == "proxy" else head["receipt"]["body"]
     rail = body.get("rail")
     provider = body.get("provider")
     if rail not in {"fiat", "tap", "tnk"} or not isinstance(provider, str) or not provider:
@@ -759,6 +784,8 @@ bundle = {
     "prior_fee_cum_au": str(fee_cum),
     "prior_burn_cum_au": str(burn_cum),
 }
+if proxy_acceptances:
+    bundle["proxy_acceptances"] = proxy_acceptances
 deposit = state(f"ev/dep/{epoch}", required=False)
 if deposit is not None:
     if (
@@ -918,6 +945,15 @@ if not isinstance(expected_count, int) or isinstance(expected_count, bool) or ex
 
 cumulative = 0
 settled_au = canonical_au(recomputed.get("totals", {}).get("use_au"), "epoch use_au")
+heads = snapshot.get("heads", [])
+if len(heads) != expected_count:
+    raise SystemExit("frozen receipt heads do not match index count")
+proxy_settled_au = sum(canonical_au(head.get("incremental_au"), "proxy epoch usage") for head in heads if head.get("lane") == "proxy")
+native_count = sum(1 for head in heads if head.get("lane") != "proxy")
+if sum(canonical_au(head.get("incremental_au"), "frozen receipt usage") for head in heads) != settled_au:
+    raise SystemExit("epoch usage does not reconcile with frozen native and proxy receipts")
+native_settled_au = settled_au - proxy_settled_au
+
 for number, page in enumerate(pages):
     if (
         not isinstance(page, dict)
@@ -973,14 +1009,14 @@ for number, page in enumerate(pages):
     if expected_last:
         if not isinstance(earning_finals, list) or not earning_finals:
             raise SystemExit("final targeted apply page is missing earning_finals")
-        if not isinstance(market_usage, list) or not market_usage:
+        if not isinstance(market_usage, list) or (native_count > 0 and not market_usage):
             raise SystemExit("final targeted apply page is missing market_usage")
         market_total = sum(
             canonical_au(entry.get("demand_au"), "final market usage demand")
             for entry in market_usage
         )
-        if market_total != settled_au:
-            raise SystemExit("final market usage does not reconcile with epoch usage")
+        if market_total != native_settled_au:
+            raise SystemExit("final market usage does not reconcile with native epoch usage")
     elif earning_finals is not None or market_usage is not None:
         raise SystemExit("non-final targeted apply page carries final evidence")
     submission = {
