@@ -5,8 +5,10 @@ import { blake3 } from '@tracsystems/blake3';
 import { keccak256 } from 'ethereum-cryptography/keccak';
 import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import PeerWallet from 'trac-wallet';
-import { assertProxyPublicationNotPaid, isProxyPublication } from '../../contract/proxy-protocol.js';
-import { admitProxyRegistryFeature, admitProxyPolicyFeature } from './proxy-admission.js';
+import { assertProxyPublicationNotPaid, isProxyPublication, validateProxyOperationEnvelope, proxyRegistryFeatureKey } from '../../contract/proxy-protocol.js';
+import { proxyRuntimeContext } from '../../contract/proxy-context.js';
+import { admitProxyRegistryFeature, admitProxyPolicyFeature, preflightProxyRegistry,
+  validateProxyPreflightRequest, PROXY_PREFLIGHT_SERVICE, PROXY_PREFLIGHT_MAX_AGE_MS } from './proxy-admission.js';
 import {
   CONTRACT_VERSION,
   PAYOUT_INTENT_MAX_EXPIRY_EPOCHS_DEFAULT,
@@ -363,6 +365,7 @@ const serviceParticipantFor = (service, value) => {
     return null;
   }
   if (service === 'stripe_checkout') return normalizeKey(value.who);
+  if (service === PROXY_PREFLIGHT_SERVICE) return normalizeKey(value.requester);
   if ([
     'provider_payout_context',
     'stripe_connect_adopt',
@@ -521,8 +524,12 @@ class MayhemFeature extends Feature {
       verifySignature: (signature, bytes, signer) => verifyEd25519Hex(this.peer.wallet, signature, bytes, signer),
       forward });
     if (result?.duplicate !== true) return result;
+    return this._proxyDuplicateResult(key, result.result);
+  }
+
+  _proxyDuplicateResult(key, result) {
     return { ok: true, accepted: false, status: 'applied', duplicate: true,
-      feature: this.key || 'mayhem', key, result: result.result,
+      feature: this.key || 'mayhem', key, result,
       message: 'Proxy operation was already applied; no new append was made.' };
   }
 
@@ -637,10 +644,40 @@ class MayhemFeature extends Feature {
   async relay(key, value) {
     if (value?.op === 'proxy_policy') throw new Error('Proxy policy requires the canonical admin writer.');
     if (value?.op === 'proxy_registry') {
-      return await this._admitProxyPublication(key, value,
-        ({ featureKey, envelope }) => this._relayFeature(featureKey, envelope));
+      validateProxyOperationEnvelope(value);
+      value = JSON.parse(JSON.stringify(value));
+      const preflight = await this._requestProxyPreflight(key, value);
+      if (preflight.status === 'applied') return this._proxyDuplicateResult(key, preflight.result);
     }
     return await this._relayFeature(key, value);
+  }
+
+  async _requestProxyPreflight(key, value) {
+    if (key !== await proxyRegistryFeatureKey(value)) throw new Error('Invalid proxy registry feature key.');
+    const requester = normalizeKey(this.peer?.wallet?.publicKey);
+    const admin = await this._adminKey();
+    const payload = { requester, request_nonce: crypto.randomBytes(32).toString('hex'), feature_key: key, envelope: value };
+    validateProxyPreflightRequest(payload);
+    const identity = { actor: requester, admin, transport: requester, payload };
+    const signature = this.peer.wallet.sign(b4a.from(serviceSigningMessage(PROXY_PREFLIGHT_SERVICE, identity)));
+    const started = Date.now();
+    const result = await this.requestService(PROXY_PREFLIGHT_SERVICE, { ...identity,
+      signing_version: SERVICE_SIGNING_VERSION,
+      signature: b4a.isBuffer(signature) ? b4a.toString(signature, 'hex') : signature });
+    const elapsed = Date.now() - started;
+    if (elapsed < 0 || elapsed > PROXY_PREFLIGHT_MAX_AGE_MS) throw new Error('Proxy preflight expired; retry the same signed operation.');
+    if (result?.ok !== true) throw new Error(result?.message || 'Proxy preflight is unavailable.');
+    const context = proxyRuntimeContext(this.peer, CONTRACT_VERSION, result.context?.epoch);
+    const proof = result.proof;
+    if (result.feature_key !== key || result.request_nonce !== payload.request_nonce ||
+        !['applied', 'admissible'].includes(result.status) || stableJson(context) !== stableJson(result.context) ||
+        !/^[0-9a-f]{64}$/.test(proof?.view_key) || !/^[0-9a-f]{64}$/.test(proof?.tree_hash) ||
+        !Number.isSafeInteger(proof?.signed_length) || proof.signed_length < 1 ||
+        !Number.isSafeInteger(proof?.fork) || proof.fork < 0 ||
+        (result.status === 'applied' && (!result.result || typeof result.result !== 'object'))) {
+      throw new Error('Proxy preflight response does not match this operation/network.');
+    }
+    return result;
   }
 
   async _relayFeature(key, value) {
@@ -898,6 +935,9 @@ class MayhemFeature extends Feature {
     const transport = normalizeKey(value.transport);
     const signature = String(value.signature ?? '').toLowerCase();
     const payload = stableValue(value.payload);
+    if (service === PROXY_PREFLIGHT_SERVICE) {
+      try { validateProxyPreflightRequest(payload); } catch { return null; }
+    }
     if (!/^[0-9a-f]{64}$/.test(actor) ||
         !/^[0-9a-f]{64}$/.test(admin) ||
         !/^[0-9a-f]{64}$/.test(transport) ||
@@ -1052,6 +1092,11 @@ class MayhemFeature extends Feature {
   }
 
   async _handleService(service, value, authorization) {
+    if (service === PROXY_PREFLIGHT_SERVICE) {
+      return await preflightProxyRegistry({ request: value,
+        withCanonicalSnapshot: this.withProxyCanonicalSnapshot,
+        verifySignature: (signature, bytes, signer) => verifyEd25519Hex(this.peer.wallet, signature, bytes, signer) });
+    }
     if (service === 'provider_payout_context') {
       return await this._providerPayoutContext(value);
     }

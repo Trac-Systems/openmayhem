@@ -69,17 +69,30 @@ async function fixture({ snapshot = true, participant = false } = {}) {
     protocol: { instance: { generateNonce: () => 'a'.repeat(64), featMaxBytes: () => 64000, features: {} } },
     sidechannel: { started: true, broadcast: () => { forwarded++; } },
   };
-  const feature = new MayhemFeature(peer, { resultTimeoutMs: 20,
+  const config = { resultTimeoutMs: 20,
     withProxyCanonicalSnapshot: snapshot ? async body => {
       const pinned = MemoryStorage.fromSnapshotBytes(f.storage.snapshotBytes());
-      return await body({ context: clone(f.context), read: async key => (await pinned.get(key))?.value ?? null,
+      return await body({ context: clone(f.context),
+        proof: { view_key: '1'.repeat(64), tree_hash: '2'.repeat(64), fork: 0, signed_length: 10 },
+        read: async key => (await pinned.get(key))?.value ?? null,
         assertCurrent: async () => {
           checks++;
           if (invalidateAt && checks >= invalidateAt) throw new Error('canonical snapshot changed');
         } });
-    } : null });
+    } : null };
+  const feature = new MayhemFeature(peer, config);
   feature.key = 'mayhem';
   peer.protocol.instance.features.mayhem = feature;
+  if (participant) {
+    const writer = new MayhemFeature({ ...peer,
+      wallet: { ...f.peer.wallet, publicKey: f.admin.publicKey },
+      base: { ...peer.base, writable: true } }, config);
+    feature.requestService = async (service, envelope) => {
+      const authorization = writer._verifyServiceRequest(service, envelope, { admin: f.admin.publicKey, transport: publicKey });
+      assert.ok(authorization, 'preflight request must be authenticated');
+      return await writer._handleService(service, authorization.payload, authorization);
+    };
+  }
   return { ...f, peer, feature, get appended() { return appended; }, get forwarded() { return forwarded; },
     expireAfterFirstCheck: () => { invalidateAt = checks + 2; } };
 }
@@ -187,4 +200,32 @@ test('provider forwarding uses the validated signed operation and never a write 
   assert.deepEqual(forwarded[0].message.value, value);
   assert.deepEqual(Object.keys(forwarded[0].message.value).sort(), ['admission', 'intent', 'op', 'provider_signature']);
   assert.equal(f.appended, 0);
+});
+
+test('provider rejects mismatched challenge, operation, network and view evidence before forwarding', async () => {
+  for (const change of [
+    reply => { reply.request_nonce = '0'.repeat(64); },
+    reply => { reply.feature_key = 'another-operation'; },
+    reply => { reply.context.msb_bootstrap = '0'.repeat(64); },
+    reply => { reply.proof.signed_length = 0; },
+    reply => { reply.proof.tree_hash = null; },
+  ]) {
+    const f = await fixture({ participant: true });
+    const request = f.feature.requestService.bind(f.feature);
+    f.feature.requestService = async (...args) => { const reply = await request(...args); change(reply); return reply; };
+    const envelope = await f.create();
+    await assert.rejects(f.feature.relay(await proxyRegistryFeatureKey(envelope), envelope), /does not match/);
+    assert.equal(f.forwarded, 0);
+  }
+});
+
+test('slow preflight cannot authorize a later publication or impose an inference timeout', async t => {
+  const f = await fixture({ participant: true });
+  let now = 1000;
+  t.mock.method(Date, 'now', () => now);
+  const request = f.feature.requestService.bind(f.feature);
+  f.feature.requestService = async (...args) => { const reply = await request(...args); now += 15001; return reply; };
+  const envelope = await f.create();
+  await assert.rejects(f.feature.relay(await proxyRegistryFeatureKey(envelope), envelope), /preflight expired/);
+  assert.equal(f.forwarded, 0);
 });

@@ -2,11 +2,49 @@
 // never request-provided state. Run this before BOTH forwarding and writer append.
 // The contract repeats the same transition checks during application. There is no
 // fee worker/network/history lookup on subsequent publications or inference turns.
-import { validateProxyOperationEnvelope, proxyRegistryFeatureKey } from '../../contract/proxy-protocol.js';
+import { validateProxyOperationEnvelope, proxyRegistryFeatureKey, PROXY_MAX_RECORD_BYTES } from '../../contract/proxy-protocol.js';
+import b4a from 'b4a';
 import { prepareProxyRegistryMutation } from '../../contract/proxy-registry.js';
 import { validateProxyPolicy, proxyPolicyFeatureKey, prepareProxyPolicyMutation } from '../../contract/proxy-policy.js';
 
 export { proxyRegistryFeatureKey } from '../../contract/proxy-protocol.js';
+
+export const PROXY_PREFLIGHT_SERVICE = 'proxy_admission_preflight';
+export const PROXY_PREFLIGHT_MAX_AGE_MS = 15_000;
+
+export function validateProxyPreflightRequest(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value) ||
+      JSON.stringify(Object.keys(value).sort()) !== JSON.stringify(['envelope', 'feature_key', 'request_nonce', 'requester']) ||
+      !/^[0-9a-f]{64}$/.test(value.requester) || !/^[0-9a-f]{64}$/.test(value.request_nonce) ||
+      typeof value.feature_key !== 'string' || value.feature_key.length > 256 ||
+      b4a.byteLength(JSON.stringify(value)) > PROXY_MAX_RECORD_BYTES + 512) {
+    throw new Error('Invalid proxy admission preflight request.');
+  }
+  validateProxyOperationEnvelope(value.envelope);
+}
+
+// This service returns no publication permit and performs no write. The signed
+// service transport binds a fresh challenge and exact operation to the admin's
+// response; writer admission still revalidates immediately before append.
+export async function preflightProxyRegistry({ request, withCanonicalSnapshot, verifySignature }) {
+  validateProxyPreflightRequest(request);
+  request = JSON.parse(JSON.stringify(request));
+  if (typeof withCanonicalSnapshot !== 'function') throw new Error('Proxy canonical admission is not configured.');
+  let context;
+  let proof;
+  const result = await admitProxyRegistryFeature({ featureKey: request.feature_key, envelope: request.envelope,
+    verifySignature,
+    withCanonicalSnapshot: body => withCanonicalSnapshot(snapshot => {
+      context = snapshot.context;
+      proof = snapshot.proof;
+      return body(snapshot);
+    }),
+    forward: async () => ({ duplicate: false }),
+  });
+  return { ok: true, status: result.duplicate ? 'applied' : 'admissible',
+    request_nonce: request.request_nonce, feature_key: request.feature_key,
+    context, proof, ...(result.duplicate ? { result: result.result } : {}) };
+}
 
 // withCanonicalSnapshot pins the indexer-authenticated signed checkout and closes
 // it in finally. Its assertCurrent() must reject a stale/wrong-fork view and changed

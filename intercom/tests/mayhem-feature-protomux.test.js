@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import { Duplex } from 'node:stream';
 import test from 'node:test';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import Autobase from 'autobase';
+import Corestore from 'corestore';
+import Hyperbee from 'hyperbee';
 import b4a from 'b4a';
 import Protomux from 'protomux';
 import PeerWallet from 'trac-wallet';
@@ -10,6 +16,10 @@ import MayhemFeature, {
   MAYHEM_RELAY_POW_EXEMPT_CONTROLS,
 } from '../features/mayhem/index.js';
 import Sidechannel from '../features/sidechannel/index.js';
+import { CONTRACT_VERSION } from '../contract/contract.js';
+import { proxyRegistryFeatureKey } from '../contract/proxy-protocol.js';
+import { proxyContractFixture } from './helpers/proxy.js';
+import { createProxyCanonicalSnapshot } from '../features/mayhem/proxy-canonical-view.js';
 
 class HexWallet extends PeerWallet {
   get publicKey() {
@@ -449,4 +459,104 @@ test('a canonical result returns over real Protomux without a synthetic ACK appe
   await participantFeature.stop();
   await writerFeature.stop();
   for (const connection of connections) connection.destroy();
+});
+
+test('proxy preflight and publication cross signed Protomux into the actual canonical registry view', async t => {
+  const f = await proxyContractFixture();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-proxy-relay-'));
+  const store = new Corestore(root);
+  let featureAppends = 0;
+  const base = new Autobase(store, null, { ackInterval: 0, valueEncoding: 'json',
+    open: views => new Hyperbee(views.get('view'), { extension: false, keyEncoding: 'utf-8', valueEncoding: 'json' }),
+    apply: async (nodes, view) => {
+      const batch = view.batch();
+      try {
+        for (const node of nodes) {
+          const operation = node.value;
+          if (operation?.type === 'test_seed') {
+            for (const [key, value] of operation.entries) await batch.put(key, value);
+          } else if (operation?.type === 'feature') {
+            featureAppends++;
+            await f.contract.execute(operation, batch);
+            const result = f.contract._mayhemLastFeatureResult;
+            await batch.put(`fr/${operation.value.dispatch.hash}`, result instanceof Error
+              ? { ok: false, status: 'rejected', error: { message: result.message } }
+              : { ok: true, status: 'applied', result });
+          }
+        }
+        await batch.flush();
+      } finally { await batch.close(); }
+    } });
+  let writerFeature;
+  let providerFeature;
+  let connections = [];
+  t.after(async () => {
+    if (writerFeature) await writerFeature.stop();
+    if (providerFeature) await providerFeature.stop();
+    for (const connection of connections) connection.destroy();
+    await base.close(); await store.close(); fs.rmSync(root, { recursive: true, force: true });
+  });
+  await base.ready();
+  const bootstrap = b4a.toString(base.key, 'hex');
+  f.network.subnet_bootstrap = bootstrap;
+  f.context.subnet_bootstrap = bootstrap;
+  f.peer.config.bootstrap = bootstrap;
+  f.config.subnet_bootstrap = bootstrap;
+  await f.storage.put('proxy/v1/config', f.config);
+  await base.append({ type: 'test_seed', entries: [...f.storage.values.entries()] });
+  await base.update();
+
+  const adaptWallet = (identity) => ({
+    publicKey: identity.publicKey,
+    sign: message => b4a.toString(identity.wallet.sign(b4a.isBuffer(message) ? message : b4a.from(String(message))), 'hex'),
+    verify: (signature, message, key) => PeerWallet.verify(
+      b4a.isBuffer(signature) ? signature : b4a.from(signature, 'hex'),
+      b4a.isBuffer(message) ? message : b4a.from(String(message)),
+      b4a.isBuffer(key) ? key : b4a.from(key, 'hex')),
+  });
+  const writer = f.peer;
+  writer.base = base;
+  writer.wallet = adaptWallet(f.admin);
+  writer.protocol = { instance: { features: {}, featMaxBytes: () => 64000 } };
+  writer.contract = { instance: f.contract };
+  writer.swarm = { connections: new Set(), joinPeer() {} };
+  const provider = peerFor(adaptWallet(f.provider), f.admin.publicKey, false);
+  provider.config = { ...writer.config };
+  provider.msbClient = { ...writer.msbClient };
+  provider.swarm = { connections: new Set(), joinPeer() {} };
+  // The provider deliberately has no proxy registry state. Its only local
+  // authority hint is admin; admission must come from the signed indexer service.
+  writerFeature = new MayhemFeature(writer, { resultTimeoutMs: 1000, resultRetryMs: 50,
+    withProxyCanonicalSnapshot: createProxyCanonicalSnapshot(writer, CONTRACT_VERSION) });
+  providerFeature = new MayhemFeature(provider, { timeoutMs: 2000, retryMs: 50 });
+  writerFeature.key = 'mayhem'; providerFeature.key = 'mayhem';
+  const preflights = new Set();
+  const forwarded = new Set();
+  writer.sidechannel = new Sidechannel(writer, sidechannelConfig((channel, payload) => {
+    if (payload.message.control === 'mayhem_service_request') preflights.add(payload.message.request_id);
+    if (payload.message.control === 'mayhem_feature_request') forwarded.add(payload.message.request_id);
+    return writerFeature.handleSidechannelMessage(channel, payload);
+  }));
+  provider.sidechannel = new Sidechannel(provider, sidechannelConfig((channel, payload) =>
+    providerFeature.handleSidechannelMessage(channel, payload)));
+  writer.sidechannel.started = true; provider.sidechannel.started = true;
+  connections = connectSidechannels(provider, provider.sidechannel, writer, writer.sidechannel);
+  await waitFor(() => provider.sidechannel._directPeerChannelReady(f.admin.publicKey, MAYHEM_RELAY_CHANNEL));
+
+  const envelope = await f.create();
+  const unpaid = structuredClone(envelope); unpaid.admission = null;
+  await assert.rejects(providerFeature.relay(await proxyRegistryFeatureKey(unpaid), unpaid), /admission/);
+  assert.equal(featureAppends, 0);
+  assert.equal(forwarded.size, 0, 'failed preflight must not forward a ledger publication');
+  const key = await proxyRegistryFeatureKey(envelope);
+  const first = await providerFeature.relay(key, envelope);
+  assert.equal(first.ok, true);
+  assert.equal(featureAppends, 1);
+  const again = await providerFeature.relay(key, envelope);
+  assert.equal(again.duplicate, true);
+  assert.equal(featureAppends, 1);
+  assert.equal(forwarded.size, 1);
+  assert.equal(preflights.size, 3, 'each invocation gets a fresh signed preflight, including retries');
+  assert.equal((await base.view.get(`proxy/v1/provider/${f.provider.publicKey}`)).value.sequence, 1);
+  assert.deepEqual((await base.view.get('payout/epoch/542')).value, { status: 'prepared', native: true });
 });

@@ -21,6 +21,7 @@ export const CONTRACT_CODE_PATHS = Object.freeze([
   'contract/reference-demand.js',
   'features/mayhem/index.js',
   'features/mayhem/proxy-admission.js',
+  'features/mayhem/proxy-canonical-view.js',
   'trac/trac-peer/src/artifacts/contract.js',
   'trac/trac-peer/src/base/canonical-replay.js',
   'trac/trac-peer/src/index.js',
