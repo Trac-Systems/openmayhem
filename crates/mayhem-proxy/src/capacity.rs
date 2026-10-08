@@ -288,6 +288,7 @@ pub struct Page {
 }
 
 pub struct Authority {
+    identity: Identity,
     nonce: Digest,
     database: Database,
     limits: Limits,
@@ -373,6 +374,7 @@ impl Authority {
         let nonce =
             Digest::new(blake3::hash(&nonce).to_hex().to_string()).map_err(|_| Error::Invalid)?;
         Ok(Self {
+            identity: m.identity,
             nonce,
             database,
             limits,
@@ -381,6 +383,9 @@ impl Authority {
             failed: AtomicBool::new(false),
             writer: Mutex::new(()),
         })
+    }
+    pub(crate) fn identity(&self) -> &Identity {
+        &self.identity
     }
     fn now(&self) -> Result<u64> {
         u64::try_from(self.started.elapsed().as_millis()).map_err(|_| Error::Invalid)

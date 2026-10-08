@@ -272,6 +272,12 @@ impl Client {
             slots: tokio::sync::Semaphore::new(max_reads),
         })
     }
+    pub(crate) fn identity(&self) -> &Identity {
+        &self.identity
+    }
+    pub(crate) fn requester(&self) -> &str {
+        &self.requester
+    }
     pub async fn observe(&self, authorization: &ProxySpendAuthorization) -> Result<Observation> {
         let _permit = self
             .slots

@@ -320,6 +320,22 @@ pub struct Record {
     pub expires_at_ms: Option<u64>,
 }
 impl Record {
+    /// Only the journal's pre-dispatch cancellation transition emits this evidence.
+    /// A transport timeout or a generic financial closure cannot substitute for it.
+    pub(crate) fn unsent_cancellation_evidence(&self) -> Option<Digest> {
+        if !self.cancellation_requested || !matches!(self.phase, Phase::Resolved | Phase::Closed) {
+            return None;
+        }
+        let expected = Digest::hash(
+            "mayhem/proxy/local-cancel-before-dispatch/v1",
+            &[self.invocation.0.as_bytes(), &self.attempt.to_le_bytes()],
+        );
+        match &self.resolution {
+            Some(Resolution::NotExecuted { evidence }) if evidence == &expected => Some(expected),
+            _ => None,
+        }
+    }
+
     fn validate(&self) -> Result<()> {
         self.binding.validate()?;
         require(
@@ -567,6 +583,13 @@ impl Journal {
             return Err(Error::Storage);
         }
         Ok(())
+    }
+
+    pub(crate) fn identity(&self) -> Result<Identity> {
+        let tx = storage(self.database.begin_read())?;
+        let table = storage(tx.open_table(META))?;
+        let raw = storage(table.get("state"))?.ok_or(Error::Invalid)?;
+        Ok(decode::<Meta>(raw.value())?.identity)
     }
 
     /// First acceptance only. Same-key replay returns the pinned attempt even if

@@ -12,7 +12,7 @@ const clone = value => JSON.parse(JSON.stringify(value));
 const hex = value => value.toString(16).padStart(64, '0');
 const sign = (wallet, bytes) => b4a.toString(wallet.sign(bytes), 'hex');
 
-export async function proxyContractFixture(family = 'llm', rail = 'fiat') {
+export async function proxyContractFixture(family = 'llm', rail = 'fiat', execution = null) {
   const admin = await makeIdentity();
   const provider = await makeIdentity();
   const issuer = await makeIdentity();
@@ -23,6 +23,18 @@ export async function proxyContractFixture(family = 'llm', rail = 'fiat') {
   const context = proxyRuntimeContext(peer, CONTRACT_VERSION, 100);
   const { epoch, ...network } = context;
   const row = clone(wire.cases.find(c => c.name === family));
+  if (execution) {
+    // Real Rust adapter commitments supplied by the isolated paid-execution fixture.
+    row.market.endpoints = [{endpoint:execution.endpoint,contract_hash:execution.endpoint_contract}];
+    row.market.metering = clone(execution.metering);
+    row.membership.endpoints = clone(row.market.endpoints);
+    row.membership.recipe_hash = execution.recipe_hash;
+    row.membership.connection_revision = execution.connection_revision;
+    row.membership.capacity_group = execution.capacity_group;
+    row.offer.endpoint = execution.endpoint;
+    row.offer.metering_policy_hash = execution.metering.policy_hash;
+    row.offer.rates = execution.metering.units.map(unit=>({unit,per_unit_au:'1',granularity:1}));
+  }
   row.market.creator_pubkey = provider.publicKey;
   row.membership.provider_pubkey = provider.publicKey;
   row.membership.market_id = await proxyMarketId(row.market);

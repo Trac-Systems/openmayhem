@@ -3,7 +3,11 @@
 //! Canonical offer/reservation/lease acceptance precedes this API. The returned
 //! reply passes protocol and supported schema checks and is retained privately,
 //! with independently counted quantities, but not financial authority. This module cannot
-//! close holds, sign receipts or release model slots.
+//! close holds or sign receipts. The paid wrapper separately reconciles local
+//! capacity from retained terminal output or proven pre-send cancellation.
+
+mod paid;
+pub use paid::PaidExecutor;
 
 use crate::{
     attempts::{self, Digest, Event, FailureSnapshot, Journal, Phase, Record},
@@ -13,6 +17,7 @@ use crate::{
         http::{HttpConnection, WireFormat},
     },
     endpoint::{Adapter, ProtocolReply, Request},
+    financial,
     worker::{self, host::Pool, DecodeLimits, Decoded, Init},
 };
 use std::{
@@ -25,6 +30,8 @@ use tokio::sync::{watch, Semaphore};
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("proxy financial admission is unavailable or invalid")]
+    Financial(#[source] crate::Error),
     #[error("proxy shared capacity: {0}")]
     Capacity(#[from] capacity::Error),
     #[error("proxy execution configuration is invalid")]
@@ -164,6 +171,7 @@ pub struct Executor {
     pool: Arc<Pool>,
     storage: Arc<Storage>,
     capacity: Option<(Arc<capacity::Authority>, Digest)>,
+    financial: Option<Arc<financial::Client>>,
 }
 impl Executor {
     pub fn new(
@@ -184,6 +192,7 @@ impl Executor {
             pool,
             storage,
             capacity: None,
+            financial: None,
         })
     }
 
@@ -314,6 +323,29 @@ impl Executor {
                 j.retain_request(&payload_key, attempt, &owned_body, limits.response_bytes)
             })
             .await?;
+        // Freshness is checked after decoder startup and input retention, immediately
+        // before dispatch. Stored accepted terms are never themselves a fresh proof.
+        let observation = if let Some(client) = &self.financial {
+            let k = key.clone();
+            let retained = self
+                .storage
+                .run(move |j| j.financial_acceptance(&k, attempt))
+                .await?
+                .ok_or(Error::Binding)?;
+            let observed = tokio::select! {
+                result=client.observe(&retained.accepted().authorization) => result.map_err(Error::Financial)?,
+                _=cancel.cancelled() => {
+                    self.storage.event(invocation, record.attempt, Event::CancelRequested).await?;
+                    return Err(Error::Cancelled);
+                },
+            };
+            if observed.initial_binding().map_err(Error::Financial)? != record.binding {
+                return Err(Error::Binding);
+            }
+            Some(observed)
+        } else {
+            None
+        };
         let capacity = self.capacity.clone();
         let ticket = self
             .storage
@@ -330,6 +362,12 @@ impl Executor {
                 if current.cancellation_requested {
                     return Err(Error::Cancelled);
                 }
+                if let Some(observation) = &observation {
+                    if observation.initial_binding().map_err(Error::Financial)? != current.binding {
+                        return Err(Error::Binding);
+                    }
+                    j.retain_financial_acceptance(&key, attempt, observation)?;
+                }
                 if let Some((authority, route)) = capacity {
                     authority.dispatch_accepted(
                         &current.binding.capacity_lease,
@@ -342,6 +380,13 @@ impl Executor {
                 }
                 // If this write fails after capacity committed, the lease remains
                 // occupied/uncertain. No rollback, expiry or destructor frees it.
+                // Capacity fsync may have taken time. Do not turn an expired
+                // financial observation into permission merely because a slot exists.
+                if let Some(observation) = &observation {
+                    if observation.initial_binding().map_err(Error::Financial)? != current.binding {
+                        return Err(Error::Binding);
+                    }
+                }
                 Ok(j.begin_dispatch(&key, generation, now_ms())?)
             })
             .await?;

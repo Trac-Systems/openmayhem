@@ -14,7 +14,9 @@ import { CONTRACT_VERSION } from '../../contract/contract.js';
 import { proxyReceiptFixture } from './proxy-finance.js';
 import { closure } from './proxy-closure.js';
 import { prepareProxyClose } from '../../contract/proxy-closure.js';
-const f=await proxyReceiptFixture(process.argv[2]??'tnk',process.argv[3]??'llm');
+const execution=process.argv[4]?JSON.parse(process.argv[4]):null;
+const f=await proxyReceiptFixture(process.argv[2]??'tnk',process.argv[3]??'llm',execution,Boolean(execution));
+let reserved=!execution;
 const root=await fs.mkdtemp(path.join(os.tmpdir(),'proxy-finance-rpc-'));
 const store=new Corestore(root);
 const view=new Hyperbee(store.get({name:'financial'}),{keyEncoding:'utf-8',valueEncoding:'json',extension:false});
@@ -40,6 +42,7 @@ participant._adminKey=async()=>f.admin.publicKey;
 let mutation=null,calls=0;
 participant.requestService=async(service,request)=>{
   calls++;
+  if(mutation==='delay')await new Promise(resolve=>setTimeout(resolve,250));
   const verified=admin._verifyServiceRequest(service,request,{admin:f.admin.publicKey,transport:f.provider.publicKey});
   if(!verified)throw new Error('fixture signature rejected');
   const result=await admin._handleService(service,verified.payload,verified);
@@ -58,11 +61,19 @@ console.log(JSON.stringify({url:`http://127.0.0.1:${server.address().port}/v1`,i
 try {
   for await(const command of readline.createInterface({input:process.stdin})) {
     if(command==='stop')break;
+    if(command.startsWith('{')) {
+      const request=JSON.parse(command);
+      if(reserved||Object.keys(request).join(',')!=='reserve'||!/^[0-9a-f]{64}$/.test(request.reserve))throw new Error('invalid fixture reservation');
+      f.terms.capacity_lease=request.reserve;
+      await f.apply(await f.prepare(f.authorize(f.terms)));await sync();reserved=true;
+      console.log(JSON.stringify({done:'reserve',authorization:f.authorize(f.terms).authorization}));continue;
+    }
     if(command==='final') {await f.apply(await f.finalize(await f.receipt()));await sync();}
     else if(command==='close') {await f.apply(await prepareProxyClose(f.ledger,await closure(f),f.context,f.peer.wallet.verify));await sync();}
     else if(command==='foreign')participant.peer.wallet=wallet(f.buyer); // Expected local actor/transport remains provider.
     else if(command==='reset')mutation=null;
-    else if(['nonce','network','hold','signature','unknown'].includes(command))mutation=command;
+    else if(command==='status'){}
+    else if(['nonce','network','hold','signature','unknown','delay'].includes(command))mutation=command;
     else throw new Error('unknown fixture command');
     console.log(JSON.stringify({done:command,calls}));
   }

@@ -13,8 +13,8 @@ const clone=structuredClone;
 const h=n=>n.toString(16).padStart(64,'0');
 const sign=(wallet,bytes)=>b4a.toString(wallet.sign(bytes),'hex');
 
-export async function proxyReservationFixture(rail='tnk',family='llm') {
-  const f=await proxyContractFixture(family,rail);
+export async function proxyReservationFixture(rail='tnk',family='llm',execution=null) {
+  const f=await proxyContractFixture(family,rail,execution);
   assert.equal((await f.submit(await f.create())).ok,true);
   assert.equal((await f.submit(await f.envelope({kind:'set_offer',offer:f.offer}))).ok,true);
   assert.equal((await f.policy({kind:'configure_finance',policy:{enabled:true,
@@ -49,6 +49,11 @@ export async function proxyReservationFixture(rail='tnk',family='llm') {
     endpoint_contract:f.membership.endpoints.find(e=>e.endpoint===f.offer.endpoint).contract_hash,
     settlement_policy_hash:policyHash,payment_terms_hash:await proxyPaymentTermsDigest(rules,payout),
     max_usage:Object.fromEntries(f.offer.rates.map(r=>[r.unit,10])),prior_spend_au:'0',prior_reserved_au:'0'};
+  if(execution) {
+    terms.request_hash=execution.request_hash;
+    terms.connection_digest=execution.connection_digest;
+    terms.max_usage=Object.fromEntries(f.offer.rates.map(r=>[r.unit,100000]));
+  }
   terms.max_spend_au=proxyOfferCost(terms.offer,terms.max_usage);
   terms.max_total_spend_au=String(BigInt(terms.max_spend_au)+1000n);
   const balanceKey=`bal/${buyer.publicKey}/${rail}`;
@@ -70,9 +75,9 @@ export async function proxyReservationFixture(rail='tnk',family='llm') {
   const apply=async p=>{for(const w of p.writes)if(w.delete)await f.storage.del(w.key);else await f.storage.put(w.key,w.value);};
   return {...f,buyer,ledger,terms,settlementPolicy:policy,authorize,prepare,apply,reads,balance,balanceKey,summaryKey,payout,bindingKey};
 }
-export async function proxyReceiptFixture(rail='tnk',family='llm') {
-  const f=await proxyReservationFixture(rail,family);
-  await f.apply(await f.prepare(f.authorize(f.terms)));
+export async function proxyReceiptFixture(rail='tnk',family='llm',execution=null,deferred=false) {
+  const f=await proxyReservationFixture(rail,family,execution);
+  if(!deferred)await f.apply(await f.prepare(f.authorize(f.terms)));
   const receipt=async({quantity=4,seq=1,final=true,...changes}={})=>{
     const usage=Object.fromEntries(f.terms.offer.rates.map(r=>[r.unit,quantity]));
     const au=proxyOfferCost(f.terms.offer,usage);
