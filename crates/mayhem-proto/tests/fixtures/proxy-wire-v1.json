@@ -1,0 +1,982 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "llm",
+      "market": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "creator_pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "slug": "test-llm",
+        "model": {
+          "family_id": "other",
+          "model_id": "example/Unicode-é-模型-🦉",
+          "revision": "",
+          "quantization": ""
+        },
+        "family": "llm",
+        "endpoints": [
+          {
+            "endpoint": "openai_chat_completions",
+            "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+          },
+          {
+            "endpoint": "openai_completions",
+            "contract_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          {
+            "endpoint": "openai_responses",
+            "contract_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ],
+        "metering": {
+          "policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "units": [
+            "input_token",
+            "output_token"
+          ]
+        },
+        "pricing": "provider_offers"
+      },
+      "membership": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "market_id": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "revision": 1,
+        "endpoints": [
+          {
+            "endpoint": "openai_chat_completions",
+            "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+          },
+          {
+            "endpoint": "openai_completions",
+            "contract_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+          },
+          {
+            "endpoint": "openai_responses",
+            "contract_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+          }
+        ],
+        "served_context": 262144,
+        "max_concurrency": 2,
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_revision": 1,
+        "capacity_group": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "accepted_rails": [
+          "fiat",
+          "tap",
+          "tnk"
+        ]
+      },
+      "offer": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "market_id": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "membership_revision": 1,
+        "revision": 1,
+        "endpoint": "openai_chat_completions",
+        "ctx_bracket": "le256k",
+        "outcome_class": "",
+        "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "rates": [
+          {
+            "unit": "input_token",
+            "per_unit_au": "1000000000000",
+            "granularity": 1000000
+          },
+          {
+            "unit": "output_token",
+            "per_unit_au": "2000000000000",
+            "granularity": 1000000
+          }
+        ],
+        "per_request_au": "0",
+        "min_session_au": "0",
+        "accepted_rails": [
+          "fiat",
+          "tap",
+          "tnk"
+        ]
+      },
+      "digests": {
+        "market": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+        "membership": "104dcc56204ef1df54ebe5cb22bd3cd25f8283986b91029d125ad0f022f3b90b",
+        "offer": "21368eea44c23e217800c58749e5f3a496d84cbac8ec6ca2dc0af1f1a81d3a1d",
+        "permit": "a1828d6f924bd4f6cbc66d5fc147a0d1a10db1d0400d89a384c953846b9ec02e"
+      },
+      "signing_utf8": {
+        "market": "mayhem/proxy/market/v1\u0000{\"creator_pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"openai_chat_completions\"},{\"contract_hash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"endpoint\":\"openai_completions\"},{\"contract_hash\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"endpoint\":\"openai_responses\"}],\"family\":\"llm\",\"lane\":\"proxy\",\"metering\":{\"policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"units\":[\"input_token\",\"output_token\"]},\"model\":{\"family_id\":\"other\",\"model_id\":\"example/Unicode-é-模型-🦉\",\"quantization\":\"\",\"revision\":\"\"},\"pricing\":\"provider_offers\",\"schema_version\":1,\"slug\":\"test-llm\"}",
+        "membership": "mayhem/proxy/membership/v1\u0000{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"capacity_group\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"connection_revision\":1,\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"openai_chat_completions\"},{\"contract_hash\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"endpoint\":\"openai_completions\"},{\"contract_hash\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"endpoint\":\"openai_responses\"}],\"lane\":\"proxy\",\"market_id\":\"e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5\",\"max_concurrency\":2,\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"recipe_hash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"revision\":1,\"schema_version\":1,\"served_context\":262144}",
+        "offer": "mayhem/proxy/offer/v1\u0000{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"ctx_bracket\":\"le256k\",\"endpoint\":\"openai_chat_completions\",\"lane\":\"proxy\",\"market_id\":\"e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5\",\"membership_revision\":1,\"metering_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"min_session_au\":\"0\",\"outcome_class\":\"\",\"per_request_au\":\"0\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"rates\":[{\"granularity\":1000000,\"per_unit_au\":\"1000000000000\",\"unit\":\"input_token\"},{\"granularity\":1000000,\"per_unit_au\":\"2000000000000\",\"unit\":\"output_token\"}],\"revision\":1,\"schema_version\":1}",
+        "permit": "mayhem/proxy/admission/v1\u0000{\"accepted_amount\":\"100000000000000000000\",\"accepted_value_au\":\"10000000000000000000\",\"contract_version\":29,\"entitlement_id\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"evidence_commitment\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"expires_after_epoch\":110,\"fee_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"initial_operation_digest\":\"e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5\",\"invoice_commitment\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"issuance_revision\":1,\"issuer_pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"lane\":\"proxy\",\"network_id\":\"proxy-fixture-network\",\"nonce\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"purpose\":\"proxy_admission_fee\",\"rail\":\"tnk\",\"schema_version\":1,\"valid_from_epoch\":100}"
+      },
+      "permit": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "purpose": "proxy_admission_fee",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "issuer_pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "entitlement_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "fee_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "invoice_commitment": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "evidence_commitment": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "initial_operation_digest": "e33a9b28db796de7976f6e5c30d16b35e7e09bc22b3cafafbca59e1129e735a5",
+        "nonce": "1111111111111111111111111111111111111111111111111111111111111111",
+        "issuance_revision": 1,
+        "rail": "tnk",
+        "accepted_amount": "100000000000000000000",
+        "accepted_value_au": "10000000000000000000",
+        "valid_from_epoch": 100,
+        "expires_after_epoch": 110
+      }
+    },
+    {
+      "name": "decisions",
+      "market": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "creator_pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "slug": "test-decisions",
+        "model": {
+          "family_id": "other",
+          "model_id": "example/Unicode-é-模型-🦉",
+          "revision": "",
+          "quantization": ""
+        },
+        "family": "decisions",
+        "endpoints": [
+          {
+            "endpoint": "mayhem_decisions",
+            "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        ],
+        "metering": {
+          "policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "units": [
+            "decision",
+            "input_character"
+          ]
+        },
+        "pricing": "provider_offers"
+      },
+      "membership": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "market_id": "839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61",
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "revision": 1,
+        "endpoints": [
+          {
+            "endpoint": "mayhem_decisions",
+            "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+          }
+        ],
+        "served_context": 1024,
+        "max_concurrency": 2,
+        "recipe_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "connection_revision": 1,
+        "capacity_group": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "accepted_rails": [
+          "fiat",
+          "tap",
+          "tnk"
+        ]
+      },
+      "offer": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "market_id": "839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61",
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "membership_revision": 1,
+        "revision": 1,
+        "endpoint": "mayhem_decisions",
+        "ctx_bracket": "le8k",
+        "outcome_class": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "metering_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "rates": [
+          {
+            "unit": "decision",
+            "per_unit_au": "1000000000000",
+            "granularity": 1000000
+          },
+          {
+            "unit": "input_character",
+            "per_unit_au": "2000000000000",
+            "granularity": 1000000
+          }
+        ],
+        "per_request_au": "0",
+        "min_session_au": "0",
+        "accepted_rails": [
+          "fiat",
+          "tap",
+          "tnk"
+        ]
+      },
+      "digests": {
+        "market": "839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61",
+        "membership": "e04cf2cb8c33caf549e3a39c9278030e2e9b8b7051d2c6d9999521dcce0dd74a",
+        "offer": "a4932dd1c3c45265c4b772ed6687ef6b5d0fba8f66e87cf228d9667e6a98557c",
+        "permit": "be85273870132903eb6787945252fa906fb05fb16e468e8e324480451e8ae755"
+      },
+      "signing_utf8": {
+        "market": "mayhem/proxy/market/v1\u0000{\"creator_pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"mayhem_decisions\"}],\"family\":\"decisions\",\"lane\":\"proxy\",\"metering\":{\"policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"units\":[\"decision\",\"input_character\"]},\"model\":{\"family_id\":\"other\",\"model_id\":\"example/Unicode-é-模型-🦉\",\"quantization\":\"\",\"revision\":\"\"},\"pricing\":\"provider_offers\",\"schema_version\":1,\"slug\":\"test-decisions\"}",
+        "membership": "mayhem/proxy/membership/v1\u0000{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"capacity_group\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"connection_revision\":1,\"endpoints\":[{\"contract_hash\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"endpoint\":\"mayhem_decisions\"}],\"lane\":\"proxy\",\"market_id\":\"839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61\",\"max_concurrency\":2,\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"recipe_hash\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"revision\":1,\"schema_version\":1,\"served_context\":1024}",
+        "offer": "mayhem/proxy/offer/v1\u0000{\"accepted_rails\":[\"fiat\",\"tap\",\"tnk\"],\"ctx_bracket\":\"le8k\",\"endpoint\":\"mayhem_decisions\",\"lane\":\"proxy\",\"market_id\":\"839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61\",\"membership_revision\":1,\"metering_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"min_session_au\":\"0\",\"outcome_class\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"per_request_au\":\"0\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"rates\":[{\"granularity\":1000000,\"per_unit_au\":\"1000000000000\",\"unit\":\"decision\"},{\"granularity\":1000000,\"per_unit_au\":\"2000000000000\",\"unit\":\"input_character\"}],\"revision\":1,\"schema_version\":1}",
+        "permit": "mayhem/proxy/admission/v1\u0000{\"accepted_amount\":\"100000000000000000000\",\"accepted_value_au\":\"10000000000000000000\",\"contract_version\":29,\"entitlement_id\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"evidence_commitment\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"expires_after_epoch\":110,\"fee_policy_hash\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\",\"initial_operation_digest\":\"839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61\",\"invoice_commitment\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"issuance_revision\":1,\"issuer_pubkey\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"lane\":\"proxy\",\"network_id\":\"proxy-fixture-network\",\"nonce\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"provider_pubkey\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"purpose\":\"proxy_admission_fee\",\"rail\":\"fiat\",\"schema_version\":1,\"valid_from_epoch\":100}"
+      },
+      "permit": {
+        "schema_version": 1,
+        "lane": "proxy",
+        "purpose": "proxy_admission_fee",
+        "network_id": "proxy-fixture-network",
+        "contract_version": 29,
+        "provider_pubkey": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "issuer_pubkey": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "entitlement_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "fee_policy_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "invoice_commitment": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "evidence_commitment": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "initial_operation_digest": "839f6aa9eefe73d861092bd0477e0f16b58e8181fde9a82cbf6cdeaed6eb6f61",
+        "nonce": "1111111111111111111111111111111111111111111111111111111111111111",
+        "issuance_revision": 1,
+        "rail": "fiat",
+        "accepted_amount": "100000000000000000000",
+        "accepted_value_au": "10000000000000000000",
+        "valid_from_epoch": 100,
+        "expires_after_epoch": 110
+      }
+    }
+  ],
+  "invalid": [
+    {
+      "name": "market rejects native lane",
+      "record": "market",
+      "path": "/lane",
+      "value": "native",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "market rejects unknown version",
+      "record": "market",
+      "path": "/schema_version",
+      "value": 2,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "market rejects missing lane",
+      "record": "market",
+      "path": "/lane",
+      "value": null,
+      "op": "remove",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "market rejects secret field",
+      "record": "market",
+      "path": "/upstream_api_key",
+      "value": "test-only-never-a-real-key",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "market rejects fractional version",
+      "record": "market",
+      "path": "/schema_version",
+      "value": 1.5,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "membership rejects native lane",
+      "record": "membership",
+      "path": "/lane",
+      "value": "native",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "membership rejects unknown version",
+      "record": "membership",
+      "path": "/schema_version",
+      "value": 2,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "membership rejects missing lane",
+      "record": "membership",
+      "path": "/lane",
+      "value": null,
+      "op": "remove",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "membership rejects secret field",
+      "record": "membership",
+      "path": "/upstream_api_key",
+      "value": "test-only-never-a-real-key",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "membership rejects fractional version",
+      "record": "membership",
+      "path": "/schema_version",
+      "value": 1.5,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "offer rejects native lane",
+      "record": "offer",
+      "path": "/lane",
+      "value": "native",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "offer rejects unknown version",
+      "record": "offer",
+      "path": "/schema_version",
+      "value": 2,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "offer rejects missing lane",
+      "record": "offer",
+      "path": "/lane",
+      "value": null,
+      "op": "remove",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "offer rejects secret field",
+      "record": "offer",
+      "path": "/upstream_api_key",
+      "value": "test-only-never-a-real-key",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "offer rejects fractional version",
+      "record": "offer",
+      "path": "/schema_version",
+      "value": 1.5,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "embeddings excluded",
+      "record": "market",
+      "path": "/family",
+      "value": "embeddings",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "image endpoint excluded",
+      "record": "market",
+      "path": "/endpoints",
+      "value": [
+        {
+          "endpoint": "openai_image_generations",
+          "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ],
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "decision endpoint cannot masquerade as LLM",
+      "record": "market",
+      "path": "/endpoints",
+      "value": [
+        {
+          "endpoint": "mayhem_decisions",
+          "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ],
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "automatic pricing excluded",
+      "record": "market",
+      "path": "/pricing",
+      "value": "demand",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "rates cannot enter market identity",
+      "record": "market",
+      "path": "/rates",
+      "value": [],
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "model claim cannot contain URL fields",
+      "record": "market",
+      "path": "/model/url",
+      "value": "https://example.invalid/",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "upper-case keys rejected",
+      "record": "market",
+      "path": "/creator_pubkey",
+      "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "empty family identifier rejected",
+      "record": "market",
+      "path": "/model/family_id",
+      "value": "",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "control character rejected",
+      "record": "market",
+      "path": "/model/model_id",
+      "value": "badname",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "UTF8 byte bound enforced",
+      "record": "market",
+      "path": "/model/model_id",
+      "value": "ééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "unit aliases cannot duplicate",
+      "record": "market",
+      "path": "/metering/units",
+      "value": [
+        "input_token",
+        "input_token"
+      ],
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "units must be sorted",
+      "record": "market",
+      "path": "/metering/units",
+      "value": [
+        "output_token",
+        "input_token"
+      ],
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "empty endpoints rejected",
+      "record": "market",
+      "path": "/endpoints",
+      "value": [],
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "duplicate endpoints rejected",
+      "record": "market",
+      "path": "/endpoints",
+      "value": [
+        {
+          "endpoint": "openai_chat_completions",
+          "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+        },
+        {
+          "endpoint": "openai_chat_completions",
+          "contract_hash": "1111111111111111111111111111111111111111111111111111111111111111"
+        }
+      ],
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "invalid membership revision 0",
+      "record": "membership",
+      "path": "/revision",
+      "value": 0,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "invalid membership revision -1",
+      "record": "membership",
+      "path": "/revision",
+      "value": -1,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "invalid membership revision 1.5",
+      "record": "membership",
+      "path": "/revision",
+      "value": 1.5,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "invalid membership revision 9007199254740992",
+      "record": "membership",
+      "path": "/revision",
+      "value": 9007199254740992,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "invalid membership revision '1'",
+      "record": "membership",
+      "path": "/revision",
+      "value": "1",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "oversize context integer rejected",
+      "record": "membership",
+      "path": "/served_context",
+      "value": 4294967296,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "zero concurrency rejected",
+      "record": "membership",
+      "path": "/max_concurrency",
+      "value": 0,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "unknown rail rejected",
+      "record": "membership",
+      "path": "/accepted_rails",
+      "value": [
+        "bitcoin"
+      ],
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "duplicate rail rejected",
+      "record": "membership",
+      "path": "/accepted_rails",
+      "value": [
+        "fiat",
+        "fiat"
+      ],
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "unsorted rails rejected",
+      "record": "membership",
+      "path": "/accepted_rails",
+      "value": [
+        "tnk",
+        "fiat"
+      ],
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "noncanonical money '01'",
+      "record": "offer",
+      "path": "/rates/0/per_unit_au",
+      "value": "01",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "noncanonical money '-1'",
+      "record": "offer",
+      "path": "/rates/0/per_unit_au",
+      "value": "-1",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "noncanonical money '1e3'",
+      "record": "offer",
+      "path": "/rates/0/per_unit_au",
+      "value": "1e3",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "noncanonical money '1.5'",
+      "record": "offer",
+      "path": "/rates/0/per_unit_au",
+      "value": "1.5",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "noncanonical money 1",
+      "record": "offer",
+      "path": "/rates/0/per_unit_au",
+      "value": 1,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "noncanonical money '340282366920938463463374607431768211456'",
+      "record": "offer",
+      "path": "/rates/0/per_unit_au",
+      "value": "340282366920938463463374607431768211456",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "invalid rate granularity 0",
+      "record": "offer",
+      "path": "/rates/0/granularity",
+      "value": 0,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "invalid rate granularity -1",
+      "record": "offer",
+      "path": "/rates/0/granularity",
+      "value": -1,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "invalid rate granularity 1.5",
+      "record": "offer",
+      "path": "/rates/0/granularity",
+      "value": 1.5,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "invalid rate granularity 9007199254740992",
+      "record": "offer",
+      "path": "/rates/0/granularity",
+      "value": 9007199254740992,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "invalid rate granularity '1'",
+      "record": "offer",
+      "path": "/rates/0/granularity",
+      "value": "1",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "hidden rate fee rejected",
+      "record": "offer",
+      "path": "/rates/0/fee",
+      "value": "1",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "all zero price rejected",
+      "record": "offer",
+      "path": "/rates",
+      "value": [
+        {
+          "unit": "input_token",
+          "per_unit_au": "0",
+          "granularity": 1
+        },
+        {
+          "unit": "output_token",
+          "per_unit_au": "0",
+          "granularity": 1
+        }
+      ],
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "chat cannot have decision outcome class",
+      "record": "offer",
+      "path": "/outcome_class",
+      "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "proxy media offer excluded",
+      "record": "offer",
+      "path": "/endpoint",
+      "value": "openai_videos",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "stale market membership",
+      "record": "membership",
+      "path": "/market_id",
+      "value": "0000000000000000000000000000000000000000000000000000000000000000",
+      "op": "set",
+      "base": "llm",
+      "binding": true
+    },
+    {
+      "name": "wrong endpoint contract",
+      "record": "membership",
+      "path": "/endpoints/0/contract_hash",
+      "value": "0000000000000000000000000000000000000000000000000000000000000000",
+      "op": "set",
+      "base": "llm",
+      "binding": true
+    },
+    {
+      "name": "provider substitution",
+      "record": "offer",
+      "path": "/provider_pubkey",
+      "value": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "op": "set",
+      "base": "llm",
+      "binding": true
+    },
+    {
+      "name": "market substitution",
+      "record": "offer",
+      "path": "/market_id",
+      "value": "0000000000000000000000000000000000000000000000000000000000000000",
+      "op": "set",
+      "base": "llm",
+      "binding": true
+    },
+    {
+      "name": "stale membership revision",
+      "record": "offer",
+      "path": "/membership_revision",
+      "value": 2,
+      "op": "set",
+      "base": "llm",
+      "binding": true
+    },
+    {
+      "name": "meter policy substitution",
+      "record": "offer",
+      "path": "/metering_policy_hash",
+      "value": "0000000000000000000000000000000000000000000000000000000000000000",
+      "op": "set",
+      "base": "llm",
+      "binding": true
+    },
+    {
+      "name": "incomplete rate map",
+      "record": "offer",
+      "path": "/rates",
+      "value": [
+        {
+          "unit": "input_token",
+          "per_unit_au": "1",
+          "granularity": 1
+        }
+      ],
+      "op": "set",
+      "base": "llm",
+      "binding": true
+    },
+    {
+      "name": "unadvertised endpoint",
+      "record": "offer",
+      "path": "/endpoint",
+      "value": "mayhem_decisions",
+      "op": "set",
+      "base": "llm",
+      "binding": true
+    },
+    {
+      "name": "permit wrong purpose",
+      "record": "permit",
+      "path": "/purpose",
+      "value": "buyer_credit",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit native lane",
+      "record": "permit",
+      "path": "/lane",
+      "value": "native",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit missing purpose",
+      "record": "permit",
+      "path": "/purpose",
+      "value": null,
+      "op": "remove",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit fee underpayment",
+      "record": "permit",
+      "path": "/accepted_value_au",
+      "value": "9999999999999999999",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit excess cannot create larger admission",
+      "record": "permit",
+      "path": "/accepted_value_au",
+      "value": "10000000000000000001",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit zero amount",
+      "record": "permit",
+      "path": "/accepted_amount",
+      "value": "0",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit bad network",
+      "record": "permit",
+      "path": "/network_id",
+      "value": "https://example.invalid",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit fractional epoch",
+      "record": "permit",
+      "path": "/valid_from_epoch",
+      "value": 100.5,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit backwards window",
+      "record": "permit",
+      "path": "/expires_after_epoch",
+      "value": 99,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit unsafe issuance revision",
+      "record": "permit",
+      "path": "/issuance_revision",
+      "value": 9007199254740992,
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit unknown payment rail",
+      "record": "permit",
+      "path": "/rail",
+      "value": "btc",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit arbitrary issuer bytes",
+      "record": "permit",
+      "path": "/issuer_pubkey",
+      "value": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    },
+    {
+      "name": "permit private invoice data",
+      "record": "permit",
+      "path": "/invoice_email",
+      "value": "fixture@example.invalid",
+      "op": "set",
+      "base": "llm",
+      "binding": false
+    }
+  ]
+}

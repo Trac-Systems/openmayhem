@@ -15,6 +15,7 @@ mod endpoint_contract;
 mod managed_execution_mode;
 pub use managed_execution_mode::managed_execution_mode_binding;
 mod parts_catalog;
+pub mod proxy;
 mod validated_audio;
 mod validated_image;
 pub use validated_image::{image_reference_metadata, ImageReferenceMetadata};
