@@ -70,6 +70,7 @@ impl fmt::Debug for OwnedResult {
 pub struct Recovery {
     pub record: Record,
     pub acceptance: Option<OwnedAcceptance>,
+    pub financial: Option<crate::financial::Retained>,
     pub request: Option<OwnedRequest>,
     pub result: Option<OwnedResult>,
 }
@@ -268,11 +269,13 @@ impl Journal {
         }
         let record = read_record(&records, invocation, attempt)?;
         let acceptance = super::acceptance::read(&tx, &record)?;
+        let financial = super::finance::read(&tx, &record)?;
         let table = storage(tx.open_table(PAYLOADS))?;
         let Some(p) = payload(&table, &record.key())? else {
             return Ok(Recovery {
                 record,
                 acceptance,
+                financial,
                 request: None,
                 result: None,
             });
@@ -305,6 +308,7 @@ impl Journal {
         Ok(Recovery {
             record,
             acceptance,
+            financial,
             request,
             result,
         })
@@ -596,6 +600,7 @@ mod tests {
             INPUT.name(),
             OUTPUT.name(),
             "proxy_accepted_snapshots_v1",
+            "proxy_accepted_finance_v1",
         ] {
             tx.delete_table(TableDefinition::<&str, &[u8]>::new(name))
                 .unwrap();

@@ -347,6 +347,7 @@ mod tests {
         let allocated = j.allocated_payload_bytes().unwrap();
         let tx = j.transaction().unwrap();
         tx.delete_table(ACCEPTANCE).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_accepted_finance_v1")).unwrap();
         let mut meta = metadata(&tx).unwrap();
         meta.schema = 2;
         save_meta(&tx, &meta).unwrap();
@@ -363,6 +364,26 @@ mod tests {
             j.retain_acceptance(&r.invocation, r.attempt, &fixture().1),
             Err(Error::Transition)
         ));
+    }
+
+    #[test]
+    fn schema_three_upgrade_keeps_owned_offer_and_uncertain_dispatch_without_inventing_finance() {
+        let dir=dir();let path=dir.path().join("journal");
+        let j=Journal::open(&path,identity(),limits()).unwrap();
+        let (binding,snapshot)=fixture();
+        let r=j.prepare(d(100),binding,100).unwrap();
+        j.retain_acceptance(&r.invocation,r.attempt,&snapshot).unwrap();
+        j.retain_request(&r.invocation,r.attempt,BODY,4096).unwrap();
+        let r=j.begin_dispatch(&r.invocation,r.generation,101).unwrap().record().clone();
+        let allocated=j.allocated_payload_bytes().unwrap();
+        let tx=j.transaction().unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_accepted_finance_v1")).unwrap();
+        let mut meta=metadata(&tx).unwrap();meta.schema=3;save_meta(&tx,&meta).unwrap();j.commit(tx).unwrap();drop(j);
+        let j=Journal::open(&path,identity(),limits()).unwrap();
+        let saved=j.recover(&r.invocation,r.attempt).unwrap();
+        assert_eq!(saved.record,r);assert!(saved.acceptance.is_some());assert!(saved.financial.is_none());
+        assert_eq!(j.allocated_payload_bytes().unwrap(),allocated);
+        assert!(j.begin_dispatch(&r.invocation,r.generation,102).is_err());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+import {readProxyFinancialState} from '../features/mayhem/proxy-financial-state.js';
 // Run from the checkout root with the release-supported Bare runtime.
 import fs from 'fs';
 import b4a from 'b4a';
@@ -59,6 +60,14 @@ records.set(ledger.receiptBillingKey(t.billing_id),{type:'proxy_billing_anchor',
   created_at:'test/reserve',updated_at:'test/reserve',spent_au:'0',reserved_au:t.max_spend_au});
 records.set(ledger.receiptReservationKey(t.reservation_id),{type:'receipt_reservation_identity',lane:'proxy',accepted_terms:digest,
   ...identity,status:'active',closed_at:null,close_record_key:null});
+const financialContext={...Object.fromEntries(['network_id','msb_bootstrap','subnet_bootstrap','contract_version'].map(k=>[k,t[k]])),epoch:t.billing_epoch-1};
+const readFinancial=()=>readProxyFinancialState({request:{accepted_terms:digest,requester:t.buyer_pubkey,request_nonce:'f'.repeat(64)},verifySignature:verify,
+  withCanonicalSnapshot:async(callback,options)=>{
+    check(options.financial,'financial scope missing');
+    return callback({context:financialContext,proof:{view_key:'a'.repeat(64),fork:0,signed_length:10,tree_hash:'b'.repeat(64)},
+      read:ledger.get,assertCurrent:async()=>{}});
+  }});
+check((await readFinancial()).session.settlement_ready===false,'reserved financial state failed in Bare');
 const body={...r.receipt,accepted_terms:digest,billing_au_owed_cum:r.receipt.au_owed_cum};
 const envelope={op:'proxy_record_usage',provider:t.offer.provider_pubkey,receipt:{body,buyer_sig:sign(buyer,f.proxyBuyerReceiptSigningBytes(body)),
   provider_sig:sign(provider,f.proxyProviderReceiptSigningBytes(body))}};
@@ -67,7 +76,9 @@ check(plan.result.au===body.au_owed_cum&&!plan.duplicate,'receipt plan failed');
 for(const w of plan.writes)if(w.delete)records.delete(w.key);else records.set(w.key,w.value);
 check(records.get(sessionKey).max_spend_au===body.au_owed_cum,'final hold differs from verified charge');
 check((await prepareProxyUsageReceipt(ledger,envelope,t,verify)).duplicate,'receipt replay failed');
+check((await readFinancial()).receipt_head.settlement_ready===true,'final financial state failed in Bare');
 console.log('Bare proxy finance: 12 wire vectors, real signatures, shared hold/index finalization and exact replay passed.');
+console.log('Bare proxy financial state: verified reserved/final records and role-bound exact reads passed.');
 
 const closureCases=JSON.parse(fs.readFileSync('crates/mayhem-proto/tests/fixtures/proxy-closure-v1.json','utf8')).cases;
 for(const row of closureCases) {

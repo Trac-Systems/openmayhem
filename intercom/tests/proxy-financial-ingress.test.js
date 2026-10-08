@@ -1,3 +1,4 @@
+import { PROXY_FINANCIAL_STATE_SERVICE } from '../features/mayhem/proxy-financial-state.js';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -111,6 +112,13 @@ for (const family of ['llm', 'decisions']) for (const rail of ['fiat', 'tnk', 't
     const results = await Promise.all(Array.from({ length: 5 }, () => f.submit(reservation)));
     assert.ok(results.every(result => result.ok), JSON.stringify(results));
     assert.equal(f.appends, 1);
+    const stateQuery={accepted_terms:await proxySpendTermsDigest(f.terms),request_nonce:'c'.repeat(64),requester:f.provider.publicKey};
+    const state=await f.feature._handleService(PROXY_FINANCIAL_STATE_SERVICE,stateQuery,{});
+    assert.equal(state.session.settlement_ready,false);
+    assert.equal(state.receipt_head,null);
+    assert.deepEqual(state.accepted.authorization,reservation.authorization);
+    await assert.rejects(f.feature._handleService(PROXY_FINANCIAL_STATE_SERVICE,{...stateQuery,requester:f.admin.publicKey},{}),/not a party/);
+    assert.equal(f.appends,1,'financial reads never append');
     assert.equal((await f.read('proxy/v1/reservation-budget')).count, 1);
     assert.equal((await f.read(f.summaryKey)).reserved_au, String(50n + BigInt(f.terms.max_spend_au)));
     const receipt = await f.receipt();
@@ -126,6 +134,9 @@ for (const family of ['llm', 'decisions']) for (const rail of ['fiat', 'tnk', 't
     assert.equal(f.journal.list().length, 0);
     assert.equal((await f.submit(reservation)).duplicate, true);
     assert.equal((await f.submit(receipt)).duplicate, true);
+    const recovered=await f.feature._handleService(PROXY_FINANCIAL_STATE_SERVICE,stateQuery,{});
+    assert.deepEqual(recovered.receipt_head.receipt,receipt.receipt);
+    assert.equal(recovered.session.settlement_ready,true);
     assert.equal(f.appends, 2);
     assert.equal((await f.read(f.balanceKey)).au, f.balance.au, 'settlement owns actual debit');
     assert.equal((await f.read(f.summaryKey)).reserved_au, String(50n + BigInt(receipt.receipt.body.au_owed_cum)));
@@ -326,4 +337,27 @@ test('forged closure/expiry and paid aliases fail before canonical append',async
   }
   assert.equal(f.appends,count);
   assert.equal((await f.submit(e)).ok,true);
+});
+
+test('repeated local financial queries use fresh signed challenges and see closure instead of cached admission',async t=>{
+  const f=await fixture(t);await f.submit(f.authorize(f.terms));
+  const requester=f.provider.publicKey;
+  const peer={...f.peer,wallet:{...f.peer.wallet,publicKey:requester,
+    sign:bytes=>sign(f.provider.wallet,b4a.isBuffer(bytes)?bytes:b4a.from(String(bytes)))},base:{writable:false,view:f.base.view}};
+  const participant=new MayhemFeature(peer,{});t.after(()=>participant.stop());
+  const seen=[],cache=new Map();
+  participant.requestService=async(service,request)=>{
+    const authorization=f.feature._verifyServiceRequest(service,request,{admin:f.admin.publicKey,transport:requester});
+    assert.ok(authorization);
+    const key=JSON.stringify(authorization.payload);seen.push(authorization.payload.request_nonce);
+    if(!cache.has(key))cache.set(key,await f.feature._handleService(service,authorization.payload,authorization));
+    return structuredClone(cache.get(key));
+  };
+  const query={accepted_terms:await proxySpendTermsDigest(f.terms),request_nonce:'d'.repeat(64)};
+  const first=await participant.proxyFinancialState(query);assert.equal(first.receipt_head,null);
+  await f.submit(await f.receipt());
+  const second=await participant.proxyFinancialState(query);assert.equal(second.receipt_head.settlement_ready,true);
+  assert.equal(first.request_nonce,query.request_nonce);assert.equal(second.request_nonce,query.request_nonce);
+  assert.equal(new Set(seen).size,2);assert.ok(seen.every(nonce=>nonce!==query.request_nonce));
+  assert.equal(f.appends,2,'queries never append');
 });

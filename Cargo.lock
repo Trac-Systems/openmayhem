@@ -2752,6 +2752,7 @@ dependencies = [
  "blake3",
  "bytes",
  "clap",
+ "getrandom 0.3.4",
  "httpdate",
  "ipnet",
  "jsonschema",

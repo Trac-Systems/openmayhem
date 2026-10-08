@@ -8,6 +8,7 @@
 //! are not diagnostic logs. No credentials or connector-authored monetary values.
 
 mod acceptance;
+mod finance;
 mod payloads;
 pub use acceptance::{AcceptanceSnapshot, OwnedAcceptance};
 pub use payloads::{OwnedRequest, OwnedResult, Recovery};
@@ -476,7 +477,7 @@ impl Journal {
             if meta.identity != identity {
                 return Err(Error::Identity);
             }
-            require(matches!(meta.schema, 1 | 2 | 3))?;
+            require(matches!(meta.schema, 1 | 2 | 3 | 4))?;
             require(
                 [
                     REQUESTS.name(),
@@ -510,11 +511,12 @@ impl Journal {
             )?;
             payloads::initialize(&tx, meta.schema == 1)?;
             acceptance::initialize(&tx, meta.schema < 3)?;
+            finance::initialize(&tx, meta.schema < 4)?;
             if meta.schema == 1 {
                 require(meta.payload_bytes == 0)?;
             }
-            if meta.schema < 3 {
-                meta.schema = 3;
+            if meta.schema < 4 {
+                meta.schema = 4;
                 storage(meta_table.insert("state", encode(&meta)?.as_slice()))?;
             }
         } else {
@@ -525,8 +527,9 @@ impl Journal {
             storage(tx.open_table(EXPIRY))?;
             payloads::initialize(&tx, true)?;
             acceptance::initialize(&tx, true)?;
+            finance::initialize(&tx, true)?;
             let meta = Meta {
-                schema: 3,
+                schema: 4,
                 identity,
                 records: 0,
                 unfinished: 0,
@@ -861,6 +864,7 @@ impl Journal {
                 storage(requests.remove(record.invocation.as_str()))?;
             }
             payloads::prune(&tx, record_key, &mut meta)?;
+            finance::prune(&tx, record_key, &mut meta)?;
             storage(records.remove(record_key.as_str()))?;
             storage(expiry.remove(key.as_str()))?;
             meta.records = meta.records.checked_sub(1).ok_or(Error::Invalid)?;

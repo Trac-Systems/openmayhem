@@ -1,3 +1,5 @@
+import { readProxyFinancialState, validateProxyFinancialStateRequest, PROXY_FINANCIAL_STATE_SERVICE,
+  PROXY_FINANCIAL_STATE_MAX_BYTES, PROXY_FINANCIAL_STATE_MAX_AGE_MS } from './proxy-financial-state.js';
 import { validateProxyPublication, proxyPublicationFeatureKey, proxyPublicationParticipant } from '../../contract/proxy-publication.js';
 import Feature from 'trac-peer/src/artifacts/feature.js';
 import crypto from 'crypto';
@@ -367,7 +369,7 @@ const serviceParticipantFor = (service, value) => {
     return null;
   }
   if (service === 'stripe_checkout') return normalizeKey(value.who);
-  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE) return normalizeKey(value.requester);
+  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE || service === PROXY_FINANCIAL_STATE_SERVICE) return normalizeKey(value.requester);
   if ([
     'provider_payout_context',
     'stripe_connect_adopt',
@@ -683,6 +685,35 @@ class MayhemFeature extends Feature {
     return result;
   }
 
+  async proxyFinancialState(query) {
+    const requester = normalizeKey(this.peer?.wallet?.publicKey);
+    validateProxyFinancialStateRequest({ ...query, requester });
+    if (Object.keys(query).sort().join('|') !== 'accepted_terms|request_nonce') throw new Error('Invalid proxy financial query.');
+    // Caller correlation is not the indexer challenge: even a repeated local
+    // query must fetch fresh state instead of renewing a cached service result.
+    const payload = { accepted_terms: query.accepted_terms, requester,
+      request_nonce: crypto.randomBytes(32).toString('hex') };
+    const admin = await this._adminKey();
+    const identity = { actor: requester, admin, transport: requester, payload };
+    const signature = this.peer.wallet.sign(b4a.from(serviceSigningMessage(PROXY_FINANCIAL_STATE_SERVICE, identity)));
+    const started = Date.now();
+    const result = await this.requestService(PROXY_FINANCIAL_STATE_SERVICE, { ...identity,
+      signing_version: SERVICE_SIGNING_VERSION,
+      signature: b4a.isBuffer(signature) ? b4a.toString(signature, 'hex') : signature });
+    const elapsed = Date.now() - started;
+    if (elapsed < 0 || elapsed > PROXY_FINANCIAL_STATE_MAX_AGE_MS) throw new Error('Proxy financial observation expired; check the same attempt again.');
+    if (result?.ok !== true) throw new Error('Proxy financial state is unavailable.');
+    const context = proxyRuntimeContext(this.peer, CONTRACT_VERSION, result.context?.epoch);
+    if (result.accepted_terms !== payload.accepted_terms || result.request_nonce !== payload.request_nonce
+        || result.requester !== requester || result.lane !== 'proxy' || result.schema_version !== 1
+        || stableJson(result.context) !== stableJson(context)
+        || b4a.byteLength(JSON.stringify(result)) > PROXY_FINANCIAL_STATE_MAX_BYTES) {
+      throw new Error('Proxy financial response does not match this request/network.');
+    }
+    validateProxySnapshotProof(result.proof);
+    return { ...result, request_nonce: query.request_nonce };
+  }
+
   async _requestProxyPreflight(key, value) {
     if (key !== await proxyPublicationFeatureKey(value)) throw new Error('Invalid proxy publication feature key.');
     const requester = normalizeKey(this.peer?.wallet?.publicKey);
@@ -972,6 +1003,9 @@ class MayhemFeature extends Feature {
     if (service === PROXY_PREFLIGHT_SERVICE) {
       try { validateProxyPreflightRequest(payload); } catch { return null; }
     }
+    if (service === PROXY_FINANCIAL_STATE_SERVICE) {
+      try { validateProxyFinancialStateRequest(payload); } catch { return null; }
+    }
     if (service === PROXY_DISCOVERY_SERVICE) {
       try { validateProxyDiscoveryRequest(payload); } catch { return null; }
     }
@@ -1129,6 +1163,11 @@ class MayhemFeature extends Feature {
   }
 
   async _handleService(service, value, authorization) {
+    if (service === PROXY_FINANCIAL_STATE_SERVICE) {
+      return await readProxyFinancialState({ request: value,
+        withCanonicalSnapshot: this.withProxyCanonicalSnapshot,
+        verifySignature: (signature, bytes, signer) => verifyEd25519Hex(this.peer.wallet, signature, bytes, signer) });
+    }
     if (service === PROXY_DISCOVERY_SERVICE) {
       try { return await this.proxyDiscovery(value); }
       catch (error) {

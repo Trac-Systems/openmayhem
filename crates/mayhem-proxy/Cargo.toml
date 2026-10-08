@@ -11,6 +11,7 @@ blake3 = "1"
 clap = { version = "4", features = ["derive"] }
 bytes = "1"
 httpdate = "1"
+getrandom = "0.3"
 ipnet = { version = "2", features = ["serde"] }
 jsonschema = { version = "0.53.0", default-features = false }
 mayhem-proto = { path = "../mayhem-proto" }

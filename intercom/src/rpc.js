@@ -405,6 +405,13 @@ export async function discoverProxyCatalog(peer, body) {
   return await feature.discoverProxyCatalog(body.query);
 }
 
+export async function requestProxyFinancialState(peer, body) {
+  if (!isObject(body) || Object.keys(body).sort().join('|') !== 'accepted_terms|request_nonce') throw new Error('Invalid proxy financial query.');
+  const feature = peer.protocol?.instance?.features?.mayhem;
+  if (typeof feature?.proxyFinancialState !== 'function') throw new Error('Proxy financial relay is not ready.');
+  return await feature.proxyFinancialState(body);
+}
+
 export async function requestStripeCheckout(peer, body) {
   if (!isObject(body)) throw new Error('Missing JSON body.');
   if (!isObject(body.payload) || typeof body.payload.who !== 'string' || !body.payload.who.trim()) {
@@ -543,6 +550,10 @@ export const createServer = (
             })
           );
         }
+      }
+      if (req.method === 'POST' && requestPath === '/v1/proxy/financial-state') {
+        const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 1024) });
+        return respond(200, await requestProxyFinancialState(peer, body));
       }
       if (req.method === 'POST' && requestPath === '/v1/proxy/discovery') {
         const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 10_240) });
