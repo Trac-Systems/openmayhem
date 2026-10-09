@@ -133,7 +133,7 @@ matching configuration hashes cannot reconstruct that identity.
 The optional public `probe` report contains only `state`,
 `for_current_configuration`, `probe_id`, `evidence_hash` and
 `native_throughput`, and `recovery_reason`. `protocol_validated` refers only to that bounded request and
-the retained configuration. Configuration changes yield `recheck_required`;
+the retained configuration. Protocol/resource/capability changes yield `recheck_required`;
 interruption or uncertain work yields `recovery_required`. Requests, replies,
 private paths/fingerprints, resource limits and budget configuration stay private.
 This is a local controller observation, not a conformance certificate for every
@@ -225,10 +225,30 @@ Without `--expected-revision`, `prepare` creates the original draft and refuses
 an existing one. With an exact revision it uses the original update operation,
 preserving its ID and probe scope while invalidating the old structural check.
 Changing rates on that same market retains its market identity and does not
-automatically run a probe. The existing whole-declaration probe binding still
-marks the earlier report as requiring recheck after any draft change; finer
-capability-specific evidence reuse remains unfinished. This does not publish
-those rates or change any accepted purchase.
+automatically run a probe. Saved protocol evidence has a separate versioned
+configuration binding: unchanged protocol/configuration can reuse the original
+probe ID and evidence after changing prices, fixed/minimum fees, publication
+revision/sequence counters, enabled payment rails or settlement policy. The full
+declaration still requires the ordinary structural check before its admission
+handoff is available. No accepted purchase or financial terms are changed.
+
+That configuration binding conservatively includes the exact network/provider,
+full public market, complete adapter/contract/model mapping, connection
+fingerprint/revision, context/concurrency/capacity-group claims, offer
+endpoint/context/outcome/metering slots and pinned probe scope. Any change to
+those facts invalidates the whole protocol observation. This is configuration
+reuse, not independent per-feature conformance reuse, freshness, or proof of
+model identity/readiness. Reordering the same offer slots does not change it.
+Exhaustive typed field matching forces new input fields to be reviewed for this
+binding. Private binding hashes are not included in the public review.
+
+Legacy successful observations can acquire the new binding only during an
+explicit update while their original full declaration binding still matches and
+their connection is unchanged. Already-stale or uncertain legacy observations
+are never promoted from a partial match. Original specifications, evidence
+hashes, probe IDs and reservation intents remain intact. No update/check opens
+the capacity authority, consumes or resets allowance, retries inference, frees
+uncertain occupancy, or changes exact-ID recovery requirements.
 `resume` is an alias of `inspect`, with no network request. Existing create/update,
 check, probe and recover-probe behavior and the actual admission fee gate remain
 unchanged. The complete wizard must still connect the canonical admission/invoice

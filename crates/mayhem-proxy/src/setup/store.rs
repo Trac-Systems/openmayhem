@@ -54,6 +54,7 @@ impl Store {
                 && input.provider_pubkey == record.input.provider_pubkey,
         )?;
         record.next(expected_revision)?;
+        record.retain_probe_configuration()?;
         record.input = input;
         record.connection = connection;
         record.checked = None;

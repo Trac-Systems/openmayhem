@@ -170,8 +170,16 @@ pub enum ProbeState {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct ConfigurationBinding {
+    schema_version: u32,
+    digest: Digest,
+}
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) struct Attempt {
     binding: Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    configuration_binding: Option<ConfigurationBinding>,
     specification: capacity::probes::Specification,
     state: ProbeState,
     probe_id: Option<Digest>,
@@ -181,6 +189,11 @@ pub(super) struct Attempt {
 }
 impl Attempt {
     pub(super) fn validate(&self) -> Result<()> {
+        require(
+            self.configuration_binding
+                .as_ref()
+                .is_none_or(|v| v.schema_version == 1),
+        )?;
         if let Some(intent) = &self.reservation_intent {
             require(intent.expected_used_attempts < u64::MAX && self.probe_id.is_some())?;
         }
@@ -192,11 +205,13 @@ impl Attempt {
     pub(super) fn report(&self, record: &Record) -> Result<ProbeReport> {
         Ok(ProbeReport {
             state: self.state,
-            for_current_configuration: self.binding == record.binding()?
-                && record
-                    .input
-                    .connection()
-                    .is_ok_and(|v| v == record.connection),
+            for_current_configuration: match &self.configuration_binding {
+                Some(binding) => binding.digest == record.probe_configuration_binding()?,
+                None => self.binding == record.binding()?,
+            } && record
+                .input
+                .connection()
+                .is_ok_and(|v| v == record.connection),
             probe_id: self.probe_id.clone(),
             evidence_hash: self.evidence_hash.clone(),
             native_throughput: "not_verified",
@@ -210,6 +225,112 @@ impl Attempt {
                 _ => None,
             },
         })
+    }
+}
+
+impl Record {
+    /// Bind the entire observed protocol/configuration, independently of prices
+    /// and publication counters. Deliberately conservative: any capability
+    /// change invalidates the whole observation, not only a feature subset.
+    fn probe_configuration_binding(&self) -> Result<Digest> {
+        // Exhaustive destructuring makes additions to these input types require
+        // an explicit decision here, rather than silently escaping the binding.
+        let Input {
+            schema_version,
+            network,
+            provider_pubkey,
+            connection_file: _,
+            adapter,
+            market,
+            membership,
+            offers,
+            selection: _,
+            sequence: _,
+            settlement_policy: _,
+        } = &self.input;
+        let mayhem_proto::proxy::ProxyMembership {
+            schema_version: membership_version,
+            lane,
+            market_id,
+            provider_pubkey: member_provider,
+            revision: _,
+            endpoints,
+            served_context,
+            max_concurrency,
+            recipe_hash,
+            connection_revision,
+            capacity_group,
+            accepted_rails: _,
+        } = membership;
+        let mut slots = Vec::with_capacity(offers.len());
+        for offer in offers {
+            let mayhem_proto::proxy::ProxyOffer {
+                schema_version,
+                lane,
+                market_id,
+                provider_pubkey,
+                membership_revision: _,
+                revision: _,
+                endpoint,
+                ctx_bracket,
+                outcome_class,
+                metering_policy_hash,
+                rates: _,
+                per_request_au: _,
+                min_session_au: _,
+                accepted_rails: _,
+            } = offer;
+            slots.push((
+                *endpoint,
+                ctx_bracket,
+                outcome_class,
+                serde_json::json!({
+                    "schema_version":schema_version,"lane":lane,"market_id":market_id,
+                    "provider_pubkey":provider_pubkey,"endpoint":endpoint,"ctx_bracket":ctx_bracket,
+                    "outcome_class":outcome_class,"metering_policy_hash":metering_policy_hash,
+                }),
+            ));
+        }
+        slots.sort_by(|a, b| (a.0, a.1, a.2).cmp(&(b.0, b.1, b.2)));
+        let slots: Vec<_> = slots.into_iter().map(|(_, _, _, slot)| slot).collect();
+        let scope = self.probe_scope.as_ref().ok_or(Error::Invalid)?;
+        let bytes = mayhem_proto::stable_json_bytes(&serde_json::json!({
+            "schema_version":schema_version,"network":network,"provider_pubkey":provider_pubkey,
+            "market":market,"adapter":adapter,"connection":self.connection,
+            "membership":{"schema_version":membership_version,"lane":lane,"market_id":market_id,
+                "provider_pubkey":member_provider,"endpoints":endpoints,"served_context":served_context,
+                "max_concurrency":max_concurrency,"recipe_hash":recipe_hash,
+                "connection_revision":connection_revision,"capacity_group":capacity_group},
+            "offer_slots":slots,"probe_scope":scope,
+        })).map_err(|_| Error::Invalid)?;
+        Ok(Digest::hash(
+            "mayhem/proxy/setup-probe-configuration/v1",
+            &[&bytes],
+        ))
+    }
+
+    /// Upgrade only a still-valid legacy success before changing its original
+    /// declaration. Lost/stale/uncertain evidence cannot acquire a new binding.
+    pub(super) fn retain_probe_configuration(&mut self) -> Result<()> {
+        let Some(attempt) = &self.probe else {
+            return Ok(());
+        };
+        if attempt.configuration_binding.is_some()
+            || attempt.state != ProbeState::Validated
+            || attempt.binding != self.binding()?
+            || !self.input.connection().is_ok_and(|v| v == self.connection)
+        {
+            return Ok(());
+        }
+        let digest = self.probe_configuration_binding()?;
+        self.probe
+            .as_mut()
+            .ok_or(Error::Invalid)?
+            .configuration_binding = Some(ConfigurationBinding {
+            schema_version: 1,
+            digest,
+        });
+        Ok(())
     }
 }
 /// This is a local controller observation, not a public conformance certificate.
@@ -463,6 +584,10 @@ fn prepare(directory: PathBuf, expected: u64, mut plan: ProbePlan) -> Result<Pre
     record.probe_scope = Some(plan.scope);
     record.probe = Some(Attempt {
         binding: record.binding()?,
+        configuration_binding: Some(ConfigurationBinding {
+            schema_version: 1,
+            digest: record.probe_configuration_binding()?,
+        }),
         specification,
         state: ProbeState::Pending,
         probe_id: Some(probe_id),

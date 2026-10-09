@@ -159,6 +159,7 @@ fn redacted(review: &mayhem_proxy::setup::Review) {
         "request_hash",
         "fixture-private-connection",
         "base_url",
+        "configuration_binding",
     ] {
         assert!(!s.contains(private), "private field leaked: {private}");
     }
@@ -226,6 +227,52 @@ async fn four_families_run_real_bounded_decoder_probes_with_redacted_bound_repor
         assert_eq!(a.group_status(&d(2)).unwrap().occupied, 0);
         assert_eq!(a.group_status(&d(51)).unwrap().occupied, 0);
         assert!(!f.dir.path().join("never-read-secret").exists());
+        let mut commercial = f.input.clone();
+        commercial.sequence += 1;
+        commercial.membership.revision += 1;
+        commercial.membership.accepted_rails = vec![ProxyRail::Fiat];
+        commercial.settlement_policy.allow_checkpoints = true;
+        for offer in &mut commercial.offers {
+            offer.revision += 1;
+            offer.membership_revision = commercial.membership.revision;
+            offer.accepted_rails = vec![ProxyRail::Fiat];
+            offer.per_request_au += 3;
+            offer.min_session_au += 4;
+            for rate in &mut offer.rates {
+                rate.per_unit_au += 5;
+            }
+        }
+        let updated = f.store().update(review.revision, commercial).unwrap();
+        assert_eq!(updated.state, State::Unchecked);
+        assert!(updated.admission_handoff.is_none());
+        assert_eq!(updated.probe_status, "protocol_validated");
+        assert_eq!(updated.probe.as_ref().unwrap().probe_id, report.probe_id);
+        assert_eq!(
+            updated.probe.as_ref().unwrap().evidence_hash,
+            report.evidence_hash
+        );
+        let rechecked = f.store().check(updated.revision).unwrap();
+        assert_eq!(rechecked.state, State::StructurallyValid);
+        assert_eq!(rechecked.probe_status, "protocol_validated");
+        assert_ne!(
+            rechecked
+                .admission_handoff
+                .as_ref()
+                .unwrap()
+                .initial_operation_digest,
+            review
+                .admission_handoff
+                .as_ref()
+                .unwrap()
+                .initial_operation_digest
+        );
+        let retained = a.probe_budget(&d(2)).unwrap().unwrap();
+        assert_eq!(
+            (retained.used_attempts, retained.allocated_cost_microusd),
+            (1, 10)
+        );
+        assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+        redacted(&updated);
         reviews.push(serde_json::to_value(&review).unwrap());
     }
     if let Some(path) = std::env::var_os("MAYHEM_TEST_PROXY_SETUP_PROBE_FIXTURE") {
@@ -324,16 +371,31 @@ async fn timeout_and_restart_keep_original_physical_occupancy_and_never_redispat
     assert_eq!(a.probe_budget(&d(2)).unwrap().unwrap().used_attempts, 1);
     drop(a);
     // A draft update keeps its original authority and interrupted probe.
-    let updated = f
-        .store()
-        .update(recovered.revision, f.input.clone())
-        .unwrap();
+    let path = f.store.join("draft.json");
+    let mut legacy: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    legacy["probe"]
+        .as_object_mut()
+        .unwrap()
+        .remove("configuration_binding");
+    private(&path, &serde_json::to_vec(&legacy).unwrap());
+    let mut commercial = f.input.clone();
+    commercial.offers[0].revision += 1;
+    commercial.offers[0].rates[0].per_unit_au += 1;
+    let updated = f.store().update(recovered.revision, commercial).unwrap();
+    assert_eq!(updated.probe_status, "recovery_required");
+    let retained: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    assert!(retained["probe"].get("configuration_binding").is_none());
     let checked = f.store().check(updated.revision).unwrap();
     assert!(matches!(
         f.store().probe(checked.revision, p).await,
         Err(Error::ProbeRecovery)
     ));
     assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+    let budget = authority(&f).probe_budget(&d(2)).unwrap().unwrap();
+    assert_eq!(
+        (budget.used_attempts, budget.allocated_cost_microusd),
+        (1, 10)
+    );
 }
 
 #[tokio::test]
@@ -438,7 +500,7 @@ async fn streaming_uses_real_decoder_and_configuration_update_invalidates_succes
     let review = f.store().probe(rev, p).await.unwrap();
     assert_eq!(review.probe_status, "protocol_validated");
     let mut input = f.input.clone();
-    input.sequence += 1;
+    input.membership.served_context += 1;
     let updated = f.store().update(review.revision, input).unwrap();
     assert_eq!(updated.probe_status, "recheck_required");
     assert!(!updated.probe.as_ref().unwrap().for_current_configuration);
@@ -760,4 +822,296 @@ async fn lost_success_write_recovers_actual_saved_intent_without_inventing_valid
     assert_eq!(a.probe_budget(&d(2)).unwrap().unwrap().used_attempts, 1);
     assert_eq!(a.group_status(&d(51)).unwrap().occupied, 0);
     assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+}
+
+fn rebind_adapter(input: &mut Input) {
+    let adapter = Adapter::restore(input.adapter.clone()).unwrap();
+    input.market.family = adapter.endpoint().family();
+    input.market.endpoints = vec![ProxyEndpointContract {
+        endpoint: adapter.endpoint(),
+        contract_hash: adapter.contract_hash().as_str().into(),
+    }];
+    input.market.metering = Policy::for_endpoint(adapter.endpoint()).contract();
+    input.membership.endpoints = input.market.endpoints.clone();
+    input.membership.market_id = input.market.id().unwrap();
+    input.membership.recipe_hash = adapter.recipe_hash().as_str().into();
+    for offer in &mut input.offers {
+        offer.market_id = input.membership.market_id.clone();
+        offer.endpoint = adapter.endpoint();
+        offer.metering_policy_hash = input.market.metering.policy_hash.clone();
+    }
+    input.validate().unwrap();
+}
+
+#[tokio::test]
+async fn protocol_and_resource_mutation_matrix_invalidates_reuse_without_spending_allowance() {
+    let mut f = Fixture::new(ProxyEndpoint::Chat);
+    let b = backend(
+        &mut f,
+        200,
+        serde_json::to_vec(&answer()).unwrap(),
+        false,
+        Duration::ZERO,
+    );
+    let review = f
+        .store()
+        .probe(checked(&f), plan(&f, chat()))
+        .await
+        .unwrap();
+    let original_probe = review.probe.as_ref().unwrap();
+    let mut revision = review.revision;
+    let mut changes = Vec::new();
+    for name in [
+        "upstream",
+        "request_bytes",
+        "response_bytes",
+        "choices",
+        "tools",
+        "questions",
+        "decision_options",
+        "contract",
+        "endpoint",
+        "context",
+        "concurrency",
+        "capacity_group",
+        "offer_slot",
+        "public_model",
+    ] {
+        let mut input = f.input.clone();
+        match name {
+            "upstream" => input.adapter.upstream_model = "another-private-model".into(),
+            "request_bytes" => input.adapter.limits.request_bytes -= 1,
+            "response_bytes" => input.adapter.limits.response_bytes -= 1,
+            "choices" => input.adapter.limits.choices += 1,
+            "tools" => input.adapter.limits.tools += 1,
+            "questions" => input.adapter.limits.questions += 1,
+            "decision_options" => input.adapter.limits.decision_options += 1,
+            "contract" => {
+                input
+                    .adapter
+                    .contract
+                    .request_attribute_specs
+                    .get_mut("temperature")
+                    .unwrap()
+                    .maximum = Some(0.4)
+            }
+            "endpoint" => {
+                input.adapter.endpoint = ProxyEndpoint::Completions;
+                input.adapter.contract = mayhem_proto::endpoint_family_contract_template(
+                    mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+                )
+                .unwrap();
+            }
+            "context" => input.membership.served_context += 1,
+            "concurrency" => input.membership.max_concurrency += 1,
+            "capacity_group" => input.membership.capacity_group = d(90).as_str().into(),
+            "offer_slot" => input.offers[0].ctx_bracket = "ctx8k".into(),
+            "public_model" => input.market.model.revision = "changed-claim".into(),
+            _ => unreachable!(),
+        }
+        rebind_adapter(&mut input);
+        changes.push((name, input));
+    }
+    let authority = authority(&f); // Updates must not need to reopen this store.
+    for (name, input) in changes {
+        let changed = f.store().update(revision, input).unwrap();
+        revision = changed.revision;
+        assert_eq!(changed.probe_status, "recheck_required", "{name}");
+        let probe = changed.probe.as_ref().unwrap();
+        assert!(!probe.for_current_configuration, "{name}");
+        assert_eq!(probe.probe_id, original_probe.probe_id);
+        assert_eq!(probe.evidence_hash, original_probe.evidence_hash);
+        let checked = f.store().check(revision).unwrap();
+        revision = checked.revision;
+        assert_eq!(checked.probe_status, "recheck_required", "{name}");
+    }
+    let budget = authority.probe_budget(&d(2)).unwrap().unwrap();
+    assert_eq!(
+        (budget.used_attempts, budget.allocated_cost_microusd),
+        (1, 10)
+    );
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn connection_and_pinned_scope_mutations_cannot_reuse_the_old_observation() {
+    let mut f = Fixture::new(ProxyEndpoint::Chat);
+    let b = backend(
+        &mut f,
+        200,
+        serde_json::to_vec(&answer()).unwrap(),
+        false,
+        Duration::ZERO,
+    );
+    let review = f
+        .store()
+        .probe(checked(&f), plan(&f, chat()))
+        .await
+        .unwrap();
+    let mut revision = review.revision;
+    for name in [
+        "revision",
+        "origin",
+        "path",
+        "credentials",
+        "headers",
+        "request_bytes",
+        "response_bytes",
+        "concurrency",
+        "timeout",
+        "network",
+    ] {
+        let mut config = f.connection.clone();
+        let mut input = f.input.clone();
+        match name {
+            "revision" => {
+                config["revision"] = json!(2);
+                input.membership.connection_revision = 2;
+            }
+            "origin" => config["base_url"] = json!("http://127.0.0.1:12345/v1/"),
+            "path" => config["paths"]["chat_completions"] = json!("other-chat"),
+            "credentials" => {
+                config["authentication"] = json!({"type":"bearer","secret":{"source":"file","path":"still-never-read-secret"}})
+            }
+            "headers" => config["headers"] = json!({"x-fixture-config":"changed"}),
+            "request_bytes" => {
+                config["limits"] = json!({"max_request_bytes":8192,"max_response_bytes":65536,"max_in_flight":2,"connect_timeout_ms":10000})
+            }
+            "response_bytes" => {
+                config["limits"] = json!({"max_request_bytes":65536,"max_response_bytes":8192,"max_in_flight":2,"connect_timeout_ms":10000})
+            }
+            "concurrency" => {
+                config["limits"] = json!({"max_request_bytes":65536,"max_response_bytes":65536,"max_in_flight":1,"connect_timeout_ms":10000})
+            }
+            "timeout" => {
+                config["limits"] = json!({"max_request_bytes":65536,"max_response_bytes":65536,"max_in_flight":2,"connect_timeout_ms":5000})
+            }
+            "network" => config["network"]["networks"] = json!(["127.0.0.0/8"]),
+            _ => unreachable!(),
+        }
+        private(
+            &f.input.connection_file,
+            &serde_json::to_vec(&config).unwrap(),
+        );
+        let changed = f.store().update(revision, input).unwrap();
+        revision = changed.revision;
+        assert_eq!(changed.probe_status, "recheck_required", "{name}");
+        assert!(
+            !changed.probe.as_ref().unwrap().for_current_configuration,
+            "{name}"
+        );
+    }
+    private(
+        &f.input.connection_file,
+        &serde_json::to_vec(&f.connection).unwrap(),
+    );
+    let original = f.store().update(revision, f.input.clone()).unwrap();
+    assert_eq!(original.probe_status, "protocol_validated");
+    let path = f.store.join("draft.json");
+    let baseline: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for name in [
+        "capacity_file",
+        "route",
+        "connection_group",
+        "connection_ceiling",
+        "route_ceiling",
+        "constraints",
+    ] {
+        let mut record = baseline.clone();
+        record["probe_scope"][name] = match name {
+            "capacity_file" => json!(f.dir.path().join("another-capacity.redb")),
+            "route" | "connection_group" => json!(d(90)),
+            "connection_ceiling" => json!(3),
+            "route_ceiling" => json!(1),
+            "constraints" => json!([{"id":d(51),"ceiling":3}]),
+            _ => unreachable!(),
+        };
+        private(&path, &serde_json::to_vec(&record).unwrap());
+        assert_eq!(
+            f.store().inspect().unwrap().probe_status,
+            "recheck_required",
+            "{name}"
+        );
+    }
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+    let budget = authority(&f).probe_budget(&d(2)).unwrap().unwrap();
+    assert_eq!(
+        (budget.used_attempts, budget.allocated_cost_microusd),
+        (1, 10)
+    );
+    assert!(!f.dir.path().join("still-never-read-secret").exists());
+}
+
+#[tokio::test]
+async fn only_exact_current_legacy_success_can_gain_a_configuration_binding() {
+    for mode in ["valid", "stale_declaration", "changed_connection"] {
+        let mut f = Fixture::new(ProxyEndpoint::Chat);
+        let b = backend(
+            &mut f,
+            200,
+            serde_json::to_vec(&answer()).unwrap(),
+            false,
+            Duration::ZERO,
+        );
+        let mut review = f
+            .store()
+            .probe(checked(&f), plan(&f, chat()))
+            .await
+            .unwrap();
+        let mut input = f.input.clone();
+        input.offers[0].rates[0].per_unit_au += 1;
+        if mode == "stale_declaration" {
+            // Remove the new binding only after changing the old declaration,
+            // simulating a legacy observation whose exact original input is lost.
+            review = f.store().update(review.revision, input.clone()).unwrap();
+        }
+        let path = f.store.join("draft.json");
+        let mut record: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        let original_attempt = record["probe"].clone();
+        record["probe"]
+            .as_object_mut()
+            .unwrap()
+            .remove("configuration_binding");
+        private(&path, &serde_json::to_vec(&record).unwrap());
+        if mode == "changed_connection" {
+            f.connection["headers"] = json!({"x-fixture":"changed"});
+            private(
+                &f.input.connection_file,
+                &serde_json::to_vec(&f.connection).unwrap(),
+            );
+        }
+        input.offers[0].revision += 1;
+        let updated = f.store().update(review.revision, input).unwrap();
+        assert_eq!(
+            updated.probe_status,
+            if mode == "valid" {
+                "protocol_validated"
+            } else {
+                "recheck_required"
+            }
+        );
+        let stored: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            stored["probe"].get("configuration_binding").is_some(),
+            mode == "valid"
+        );
+        for retained in [
+            "binding",
+            "specification",
+            "probe_id",
+            "evidence_hash",
+            "reservation_intent",
+        ] {
+            assert_eq!(
+                stored["probe"][retained], original_attempt[retained],
+                "original {retained} remains unchanged"
+            );
+        }
+        assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+        let budget = authority(&f).probe_budget(&d(2)).unwrap().unwrap();
+        assert_eq!(
+            (budget.used_attempts, budget.allocated_cost_microusd),
+            (1, 10)
+        );
+    }
 }
