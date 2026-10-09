@@ -6,6 +6,84 @@ fn digest(c: char) -> Digest {
     Digest::new(c.to_string().repeat(64)).unwrap()
 }
 
+#[test]
+fn actual_site_profiles_guard_all_four_endpoint_requests_and_replay_identity() {
+    let fixture: Value = serde_json::from_str(include_str!(
+        "../../../../mayhem-proxy/tests/fixtures/routing-profiles-v1.json"
+    ))
+    .unwrap();
+    for case in fixture["cases"].as_array().unwrap() {
+        let p = &case["publication"];
+        let c = PublishedOffer {
+            id: p["id"].as_str().unwrap().into(),
+            lane: "proxy",
+            market: serde_json::from_value(p["market"].clone()).unwrap(),
+            membership: serde_json::from_value(p["membership"].clone()).unwrap(),
+            offer: serde_json::from_value(p["offer"].clone()).unwrap(),
+            digest: p["digest"].as_str().unwrap().into(),
+            active: true,
+            catalog_eligible: true,
+            catalog_observed_at_ms: Some(1000),
+            operator_verification: "unknown",
+            family_label: None,
+        };
+        let body = case["request"].clone();
+        let request = parse(&c, body.clone());
+        request.check_offer(&c).unwrap();
+        assert_eq!(
+            request.controls.profile.as_ref().unwrap().digest().unwrap(),
+            case["policy_hash"].as_str().unwrap()
+        );
+        let original = request.fingerprint(&digest('a')).unwrap();
+        let mut changed = body.clone();
+        changed["proxy"]["profile"]["max_retail_cost_micro"] = json!("499");
+        assert_ne!(
+            original,
+            parse(&c, changed).fingerprint(&digest('a')).unwrap()
+        );
+        let mut absent = body.clone();
+        absent["proxy"].as_object_mut().unwrap().remove("profile");
+        let legacy = parse(&c, absent);
+        legacy.check_offer(&c).unwrap();
+        assert!(serde_json::to_value(legacy.controls())
+            .unwrap()
+            .get("profile")
+            .is_none());
+        assert_ne!(original, legacy.fingerprint(&digest('a')).unwrap());
+        for field in ["minimum_context", "minimum_tokens_per_second"] {
+            let mut changed = body.clone();
+            changed["proxy"]["profile"]["constraints"][field] = json!(100_000);
+            if field == "minimum_tokens_per_second" && c.offer.endpoint == ProxyEndpoint::Decisions
+            {
+                continue;
+            }
+            assert!(Request::parse(c.offer.endpoint, changed, &policy()).is_err());
+        }
+        let mut changed = body.clone();
+        changed["proxy"]["profile"]["target"] =
+            json!({"kind":"exact_market","market_id":"0".repeat(64)});
+        assert!(matches!(
+            parse(&c, changed).check_offer(&c),
+            Err(Error::Constraints)
+        ));
+        let mut changed = body.clone();
+        changed["proxy"]["profile"]["providers"]["deny"] = json!([c.offer.provider_pubkey]);
+        assert!(matches!(
+            parse(&c, changed).check_offer(&c),
+            Err(Error::Constraints)
+        ));
+        let mut changed = body.clone();
+        changed["proxy"]["profile"]["providers"]["require_verified_operator"] = json!(true);
+        assert!(matches!(
+            parse(&c, changed).check_offer(&c),
+            Err(Error::ProfileEvidence)
+        ));
+        let mut changed = body.clone();
+        changed["proxy"]["profile"]["prices"]["max_total_spend_au"] = json!("1");
+        assert!(Request::parse(c.offer.endpoint, changed, &policy()).is_err());
+    }
+}
+
 fn policy() -> Policy {
     Policy::new(
         digest('1'),
@@ -64,6 +142,7 @@ fn raw(candidate: &PublishedOffer, rail: ProxyRail) -> Value {
         minimum_context: Some(1024),
         minimum_tokens_per_second: None,
         require_verified_operator: false,
+        profile: None,
     };
     let mut body = json!({"model":format!("proxy/offer/{}", candidate.id),"proxy":controls});
     match candidate.offer.endpoint {

@@ -62,6 +62,17 @@ pub struct Specification {
     pub recipe_digest: Digest,
 }
 
+/// Trusted local operator intent, saved by the caller before reservation. The
+/// expected cumulative counter is consumed atomically with the reservation and
+/// never reset by budget reconfiguration. Replaying it never creates a permit,
+/// even after completion evidence has been replaced by a later completion.
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReservationIntent {
+    pub nonce: Digest,
+    pub expected_used_attempts: u64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Probe {
@@ -155,6 +166,30 @@ fn require_index(
 }
 
 impl Authority {
+    /// Pure identity derivation, including every authority/specification field.
+    /// The caller can durably retain the original ID before any reservation.
+    /// This hash is not a Reservation or Dispatch capability.
+    pub fn probe_intent_id(
+        &self,
+        specification: &Specification,
+        intent: &ReservationIntent,
+    ) -> Result<Digest> {
+        if intent.expected_used_attempts == u64::MAX {
+            return Err(Error::ProbeBudget);
+        }
+        require(specification.connection_revision > 0)?;
+        let bytes = mayhem_proto::stable_json_bytes(&serde_json::json!({
+            "schema_version": 1,
+            "authority": self.identity,
+            "specification": specification,
+            "intent": intent,
+        }))
+        .map_err(|_| Error::Invalid)?;
+        Ok(Digest::hash(
+            "mayhem/proxy/probe-reservation-intent/v1",
+            &[&bytes],
+        ))
+    }
     /// Trusted operator configuration only. This cannot credit a customer wallet,
     /// claim a paid receipt, reset spent allowance or release an outstanding probe.
     pub fn configure_probe_budget(&self, group: &Digest, policy: Budget) -> Result<()> {
@@ -197,8 +232,38 @@ impl Authority {
     /// This ignores only health allowance, never physical/configured ceilings or
     /// active/uncertain work. Obtain a due Monitor::observe_recovery first.
     pub fn reserve_probe(&self, specification: Specification) -> Result<Reservation> {
+        self.reserve_probe_inner(specification, None)
+    }
+    /// A single attempt for a previously persisted intent. Duplicate/stale
+    /// callers must recover the original ID; no existing reservation is ever
+    /// turned back into a consumable dispatch capability.
+    pub fn reserve_probe_once(
+        &self,
+        specification: Specification,
+        intent: ReservationIntent,
+    ) -> Result<Reservation> {
+        let id = self.probe_intent_id(&specification, &intent)?;
+        self.reserve_probe_inner(specification, Some((id, intent.expected_used_attempts)))
+    }
+    fn reserve_probe_inner(
+        &self,
+        specification: Specification,
+        intent: Option<(Digest, u64)>,
+    ) -> Result<Reservation> {
         let tx = self.write()?;
         let mut m = meta(&tx)?;
+        // Check the monotonic counter before any occupancy/health decision. A
+        // closed intent remains stale without retaining a per-attempt tombstone.
+        if let Some((_, expected)) = &intent {
+            let budgets = db(tx.open_table(BUDGETS))?;
+            let budget = db(budgets.get(specification.budget_group.as_str()))?
+                .map(|v| decode::<BudgetStatus>(v.value()))
+                .transpose()?
+                .ok_or(Error::ProbeBudget)?;
+            if budget.used_attempts != *expected {
+                return Err(Error::Stale);
+            }
+        }
         if m.leases.saturating_add(m.probes) >= self.limits.max_leases {
             return Err(Error::Quota);
         }
@@ -241,9 +306,14 @@ impl Authority {
         if attempts > budget.policy.max_attempts || cost > budget.policy.max_cost_microusd {
             return Err(Error::ProbeBudget);
         }
-        let mut entropy = [0u8; 32];
-        getrandom::fill(&mut entropy).map_err(|_| Error::Storage)?;
-        let id = Digest::hash("mayhem/proxy/recovery-probe/v1", &[&entropy]);
+        let id = match intent {
+            Some((id, _)) => id,
+            None => {
+                let mut entropy = [0u8; 32];
+                getrandom::fill(&mut entropy).map_err(|_| Error::Storage)?;
+                Digest::hash("mayhem/proxy/recovery-probe/v1", &[&entropy])
+            }
+        };
         let mut probes = db(tx.open_table(PROBES))?;
         if db(probes.get(id.as_str()))?.is_some() {
             return Err(Error::Invalid);

@@ -110,19 +110,29 @@ identical attempts remain occupied. A completion hash without a saved successful
 controller result is not treated as success. There is no automatic resend,
 timeout refund, occupancy expiry or budget reset.
 
-The existing controller reserves internally and returns its ID only on success.
-A crash in the reserve-to-report interval can therefore leave `Prepared` work
-whose original ID was never saved by setup. This entry point deliberately retains
-that occupancy; setup cannot yet recover that pre-dispatch crash automatically.
-Closing this gap requires a stable setup-attempt identity saved before reserve
-and atomically retained/indexed by the capacity reservation, with bounded lookup
-of the original attempt. A callback that merely saves an ID after reserve would
-still leave a reserve-to-save crash window. This shared API extension remains
-unfinished; configuration hashes alone must never stand in for attempt identity.
+Setup saves a stable reservation intent and its derived original probe ID before
+reservation. The ID binds the authority's network/provider identity, the whole
+probe specification, a fresh nonce and the expected cumulative `used_attempts`
+counter. The capacity transaction compares that counter and increments it with
+the reservation. A duplicate or closed intent cannot acquire another reservation
+or dispatch permit, including after restart, allowance renewal or replacement of
+the bounded last-completion record. No per-attempt history or new database table
+is required. A new nonce or expected counter declares a new explicit attempt;
+it does not authorize bypassing existing occupancy.
+
+An interruption before reserve leaves the counter unchanged and no probe to
+release. An interruption after reserve but before dispatch leaves the original
+`Prepared` record, which `recover-probe` can identify and safely cancel without
+refunding consumed allowance. Dispatched work remains uncertain. Losing the
+successful setup report after capacity completion yields `not_validated`, not
+invented protocol evidence or permission to re-execute the original intent.
+Legacy drafts written before stable intents may have retained work with no saved
+original ID. They remain fail-closed with `legacy_probe_identity_unavailable`;
+matching configuration hashes cannot reconstruct that identity.
 
 The optional public `probe` report contains only `state`,
 `for_current_configuration`, `probe_id`, `evidence_hash` and
-`native_throughput`. `protocol_validated` refers only to that bounded request and
+`native_throughput`, and `recovery_reason`. `protocol_validated` refers only to that bounded request and
 the retained configuration. Configuration changes yield `recheck_required`;
 interruption or uncertain work yields `recovery_required`. Requests, replies,
 private paths/fingerprints, resource limits and budget configuration stay private.

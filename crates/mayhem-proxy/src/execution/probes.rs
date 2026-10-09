@@ -4,7 +4,7 @@
 //! cost/attempt allowance and probe-only duration and output limits.
 
 use super::*;
-use capacity::probes::{Probe, Specification, VerifiedCompletion};
+use capacity::probes::{Probe, ReservationIntent, Specification, VerifiedCompletion};
 use std::time::Duration;
 
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +40,7 @@ pub struct Controller {
     streaming: bool,
     storage: Arc<Semaphore>,
     tokenizer: Option<Arc<health::native::Source>>,
+    reservation_intent: Option<ReservationIntent>,
 }
 
 /// Evidence about this probe, never a certification of all advertised contexts,
@@ -124,7 +125,18 @@ impl Controller {
             streaming,
             storage,
             tokenizer: None,
+            reservation_intent: None,
         })
+    }
+    /// The trusted caller must persist this intent and its derived probe ID
+    /// before run(). It grants at most one new reservation and never recreates
+    /// a Dispatch permit for an existing or completed attempt.
+    pub fn with_reservation_intent(mut self, intent: ReservationIntent) -> ProbeResult<Self> {
+        self.authority
+            .probe_intent_id(&self.specification, &intent)
+            .map_err(Error::Capacity)?;
+        self.reservation_intent = Some(intent);
+        Ok(self)
     }
     pub fn with_tokenizer(mut self, source: Arc<health::native::Source>) -> ProbeResult<Self> {
         if self.adapter.endpoint() == mayhem_proto::proxy::ProxyEndpoint::Decisions
@@ -163,8 +175,12 @@ impl Controller {
                 .observe_recovery(&self.specification.route, self.request.health_class)?,
         );
         let specification = self.specification.clone();
+        let intent = self.reservation_intent.clone();
         let reserved = self
-            .storage(move |a| a.reserve_probe(specification))
+            .storage(move |a| match intent {
+                Some(intent) => a.reserve_probe_once(specification, intent),
+                None => a.reserve_probe(specification),
+            })
             .await?;
         let id = reserved.probe().id.clone();
         let init = Init::probe(

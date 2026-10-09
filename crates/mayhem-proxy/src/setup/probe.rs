@@ -176,9 +176,14 @@ pub(super) struct Attempt {
     state: ProbeState,
     probe_id: Option<Digest>,
     evidence_hash: Option<Digest>,
+    #[serde(default)]
+    reservation_intent: Option<capacity::probes::ReservationIntent>,
 }
 impl Attempt {
     pub(super) fn validate(&self) -> Result<()> {
+        if let Some(intent) = &self.reservation_intent {
+            require(intent.expected_used_attempts < u64::MAX && self.probe_id.is_some())?;
+        }
         require(
             self.state != ProbeState::Validated
                 || (self.probe_id.is_some() && self.evidence_hash.is_some()),
@@ -195,6 +200,15 @@ impl Attempt {
             probe_id: self.probe_id.clone(),
             evidence_hash: self.evidence_hash.clone(),
             native_throughput: "not_verified",
+            recovery_reason: match (self.state, self.probe_id.is_some()) {
+                (ProbeState::Pending | ProbeState::Uncertain, false) => {
+                    Some("legacy_probe_identity_unavailable")
+                }
+                (ProbeState::Pending | ProbeState::Uncertain, true) => {
+                    Some("retained_capacity_requires_reconciliation")
+                }
+                _ => None,
+            },
         })
     }
 }
@@ -207,6 +221,7 @@ pub struct ProbeReport {
     pub probe_id: Option<Digest>,
     pub evidence_hash: Option<Digest>,
     pub native_throughput: &'static str,
+    pub recovery_reason: Option<&'static str>,
 }
 impl ProbeReport {
     pub(super) fn status_name(&self) -> &'static str {
@@ -223,11 +238,13 @@ impl ProbeReport {
 }
 
 struct Prepared {
-    guard: store::Guard,
     record: Record,
     authority: Arc<capacity::Authority>,
     controller: probes::Controller,
     deadline: Duration,
+    // Drop the authority/controller before unlocking the draft, so a resumed
+    // command cannot race their ordinary database teardown after cancellation.
+    guard: store::Guard,
 }
 impl Store {
     /// Exactly one explicit attempt, no background polling or automatic retry.
@@ -255,6 +272,12 @@ impl Store {
         let scope = record.probe_scope.as_ref().ok_or(Error::Invalid)?;
         let authority = scope.open(&record, true)?;
         let attempt = record.probe.as_mut().ok_or(Error::Invalid)?;
+        if let Some(intent) = &attempt.reservation_intent {
+            let id = authority
+                .probe_intent_id(&attempt.specification, intent)
+                .map_err(|_| Error::Invalid)?;
+            require(attempt.probe_id.as_ref() == Some(&id))?;
+        }
         if matches!(attempt.state, ProbeState::Pending | ProbeState::Uncertain) {
             if let Some(probe) = scope.retained(&authority)? {
                 // A foreign alias's work is never ours to cancel or adopt.
@@ -401,6 +424,22 @@ fn prepare(directory: PathBuf, expected: u64, mut plan: ProbePlan) -> Result<Pre
         )
         .map_err(|_| Error::ProbeCapacity)?;
     let connection = Arc::new(HttpConnection::new(config).map_err(|_| Error::Protection)?);
+    let budget = authority
+        .probe_budget(&plan.scope.connection_group)
+        .map_err(|_| Error::ProbeCapacity)?
+        .ok_or(Error::ProbeCapacity)?;
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce).map_err(|_| Error::Storage)?;
+    let reservation_intent = capacity::probes::ReservationIntent {
+        nonce: Digest::hash(
+            "mayhem/proxy/setup-probe-nonce/v1",
+            &[record.id.as_str().as_bytes(), &nonce],
+        ),
+        expected_used_attempts: budget.used_attempts,
+    };
+    let probe_id = authority
+        .probe_intent_id(&specification, &reservation_intent)
+        .map_err(|_| Error::ProbeCapacity)?;
     let controller = probes::Controller::new(
         connection,
         adapter,
@@ -419,14 +458,16 @@ fn prepare(directory: PathBuf, expected: u64, mut plan: ProbePlan) -> Result<Pre
             storage_workers: 1,
         },
     )
+    .and_then(|controller| controller.with_reservation_intent(reservation_intent.clone()))
     .map_err(|_| Error::Invalid)?;
     record.probe_scope = Some(plan.scope);
     record.probe = Some(Attempt {
         binding: record.binding()?,
         specification,
         state: ProbeState::Pending,
-        probe_id: None,
+        probe_id: Some(probe_id),
         evidence_hash: None,
+        reservation_intent: Some(reservation_intent),
     });
     guard.write(&record)?;
     Ok(Prepared {
@@ -448,22 +489,22 @@ impl Prepared {
         let attempt = self.record.probe.as_mut().ok_or(Error::Invalid)?;
         match result {
             Ok(Ok(outcome)) => {
+                // The controller may only validate the identity saved before
+                // reserve; never adopt a different result by matching content.
+                require(attempt.probe_id.as_ref() == Some(&outcome.probe))?;
                 attempt.state = ProbeState::Validated;
-                attempt.probe_id = Some(outcome.probe);
                 attempt.evidence_hash = Some(outcome.evidence);
             }
             Ok(Err(_)) => {
-                if let Some(probe) = self
+                if self
                     .record
                     .probe_scope
                     .as_ref()
                     .ok_or(Error::Invalid)?
                     .retained(&self.authority)?
+                    .is_some()
                 {
                     attempt.state = ProbeState::Uncertain;
-                    if probe.specification == attempt.specification {
-                        attempt.probe_id = Some(probe.id);
-                    }
                 } else {
                     attempt.state = ProbeState::NotValidated;
                 }

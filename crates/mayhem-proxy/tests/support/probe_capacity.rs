@@ -1,5 +1,282 @@
 use super::*;
-use capacity::probes::{Budget, ProbePhase, Specification, VerifiedCompletion};
+use capacity::probes::{Budget, ProbePhase, ReservationIntent, Specification, VerifiedCompletion};
+
+fn intent(nonce: u64, expected: u64) -> ReservationIntent {
+    ReservationIntent {
+        nonce: d(nonce),
+        expected_used_attempts: expected,
+    }
+}
+fn probe_identity() -> Identity {
+    Identity {
+        network_id: "918".into(),
+        msb_bootstrap: d(1),
+        subnet_bootstrap: d(2),
+        controller_pubkey: d(3),
+    }
+}
+fn probe_limits() -> capacity::Limits {
+    capacity::Limits {
+        max_groups: 4,
+        max_routes: 8,
+        max_leases: 64,
+        max_evidence_age: Duration::from_secs(60),
+    }
+}
+
+#[test]
+fn stable_probe_identity_binds_every_authority_specification_and_intent_field() {
+    let dir = directory();
+    let a = open(&dir.path().join("capacity"));
+    let original = a.probe_intent_id(&spec(), &intent(200, 0)).unwrap();
+    assert_eq!(
+        a.probe_intent_id(&spec(), &intent(200, 0)).unwrap(),
+        original
+    );
+    for field in [
+        "route",
+        "budget_group",
+        "request_hash",
+        "connection_digest",
+        "connection_revision",
+        "recipe_digest",
+    ] {
+        let mut json = serde_json::to_value(spec()).unwrap();
+        json[field] = if field == "connection_revision" {
+            serde_json::json!(2)
+        } else {
+            serde_json::json!(d(201))
+        };
+        let changed = serde_json::from_value(json).unwrap();
+        assert_ne!(
+            a.probe_intent_id(&changed, &intent(200, 0)).unwrap(),
+            original,
+            "unbound {field}"
+        );
+    }
+    for field in [
+        "network_id",
+        "msb_bootstrap",
+        "subnet_bootstrap",
+        "controller_pubkey",
+    ] {
+        let mut json = serde_json::to_value(probe_identity()).unwrap();
+        json[field] = if field == "network_id" {
+            serde_json::json!("919")
+        } else {
+            serde_json::json!(d(201))
+        };
+        let other = Authority::open(
+            dir.path().join(field),
+            serde_json::from_value(json).unwrap(),
+            probe_limits(),
+        )
+        .unwrap();
+        assert_ne!(
+            other.probe_intent_id(&spec(), &intent(200, 0)).unwrap(),
+            original,
+            "unbound {field}"
+        );
+    }
+    assert_ne!(
+        a.probe_intent_id(&spec(), &intent(201, 0)).unwrap(),
+        original
+    );
+    assert_ne!(
+        a.probe_intent_id(&spec(), &intent(200, 1)).unwrap(),
+        original
+    );
+    assert!(matches!(
+        a.probe_intent_id(&spec(), &intent(200, u64::MAX)),
+        Err(capacity::Error::ProbeBudget)
+    ));
+}
+
+#[test]
+fn duplicate_intents_race_to_exactly_one_reservation_and_never_recreate_a_dispatch_permit() {
+    let dir = directory();
+    let a = open(&dir.path().join("capacity"));
+    layered::layers(&a);
+    a.configure_probe_budget(&d(11), budget()).unwrap();
+    let original = intent(200, 0);
+    let id = a.probe_intent_id(&spec(), &original).unwrap();
+    let barrier = Arc::new(Barrier::new(16));
+    let handles = (0..16)
+        .map(|_| {
+            let a = a.clone();
+            let barrier = barrier.clone();
+            let intent = original.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                a.reserve_probe_once(spec(), intent)
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut winners = Vec::new();
+    for handle in handles {
+        match handle.join().unwrap() {
+            Ok(r) => winners.push(r),
+            Err(capacity::Error::Stale) => {}
+            Err(e) => panic!("{e}"),
+        }
+    }
+    assert_eq!(winners.len(), 1);
+    assert_eq!(winners[0].probe().id, id);
+    counts(&a, 1);
+    let dispatch = a.dispatch_probe(winners.pop().unwrap()).unwrap();
+    assert!(matches!(
+        a.reserve_probe_once(spec(), original.clone()),
+        Err(capacity::Error::Stale)
+    ));
+    assert!(matches!(
+        a.reserve_probe_once(spec(), intent(201, 1)),
+        Err(capacity::Error::InUse)
+    ));
+    let mut substituted = spec();
+    substituted.request_hash = d(205);
+    assert!(matches!(
+        a.reserve_probe_once(substituted, original.clone()),
+        Err(capacity::Error::Stale)
+    ));
+    assert_eq!(a.probe_budget(&d(11)).unwrap().unwrap().used_attempts, 1);
+    a.complete_probe(VerifiedCompletion {
+        probe: dispatch.probe().clone(),
+        evidence: d(210),
+    })
+    .unwrap();
+    assert!(matches!(
+        a.reserve_probe_once(spec(), original),
+        Err(capacity::Error::Stale)
+    ));
+    counts(&a, 0);
+}
+
+#[test]
+fn original_prepared_identity_survives_restart_but_closed_intent_stays_stale_after_later_completion(
+) {
+    let dir = directory();
+    let path = dir.path().join("capacity");
+    let a = open(&path);
+    layered::layers(&a);
+    a.configure_probe_budget(&d(11), budget()).unwrap();
+    let original = intent(220, 0);
+    let id = a.probe_intent_id(&spec(), &original).unwrap();
+    let reserved = a.reserve_probe_once(spec(), original.clone()).unwrap();
+    drop(a);
+    let a = open(&path);
+    assert_eq!(a.probe_intent_id(&spec(), &original).unwrap(), id);
+    let retained = a.probe_for_group(&d(11)).unwrap().unwrap();
+    assert_eq!(retained.id, id);
+    assert_eq!(retained.phase, ProbePhase::Prepared);
+    assert!(matches!(
+        a.dispatch_probe(reserved),
+        Err(capacity::Error::Stale)
+    ));
+    assert!(matches!(
+        a.reserve_probe_once(spec(), original.clone()),
+        Err(capacity::Error::Stale)
+    ));
+    a.cancel_prepared_probe(&id).unwrap();
+    layered::layers(&a);
+    let second = a.reserve_probe_once(spec(), intent(221, 1)).unwrap();
+    a.cancel_prepared_probe(&second.probe().id).unwrap();
+    assert_ne!(
+        a.probe_budget(&d(11))
+            .unwrap()
+            .unwrap()
+            .last_completed
+            .unwrap()
+            .probe,
+        id
+    );
+    let renewed = Budget {
+        max_attempts: 10,
+        max_cost_microusd: 10000,
+        per_attempt_cost_microusd: 0,
+    };
+    a.configure_probe_budget(&d(11), renewed).unwrap();
+    // Even after every route referencing this budget is removed, the retained
+    // cumulative allowance prevents deleting/recreating its group to reset it.
+    a.remove_route(&d(20)).unwrap();
+    a.remove_route(&d(21)).unwrap();
+    assert_eq!(a.group_status(&d(11)).unwrap().routes, 0);
+    assert!(matches!(
+        a.remove_group(&d(11)),
+        Err(capacity::Error::InUse)
+    ));
+    drop(a);
+    let a = open(&path);
+    assert_eq!(a.probe_budget(&d(11)).unwrap().unwrap().used_attempts, 2);
+    assert!(matches!(
+        a.reserve_probe_once(spec(), original),
+        Err(capacity::Error::Stale)
+    ));
+    assert_eq!(a.group_status(&d(10)).unwrap().occupied, 0);
+    assert_eq!(a.group_status(&d(11)).unwrap().occupied, 0);
+}
+
+#[test]
+fn maximum_counter_never_wraps_or_reopens_a_closed_intent() {
+    use redb::{ReadableTable, TableDefinition};
+    let dir = directory();
+    let path = dir.path().join("capacity");
+    let a = open(&path);
+    layered::layers(&a);
+    a.configure_probe_budget(
+        &d(11),
+        Budget {
+            max_attempts: u64::MAX,
+            max_cost_microusd: 0,
+            per_attempt_cost_microusd: 0,
+        },
+    )
+    .unwrap();
+    drop(a);
+    // Seed only the cumulative test counter near its numeric boundary; no
+    // impractical number of operations or unbounded history is needed.
+    let db = redb::Database::open(&path).unwrap();
+    let tx = db.begin_write().unwrap();
+    {
+        let mut table = tx
+            .open_table(TableDefinition::<&str, &[u8]>::new(
+                "capacity_probe_budgets_v1",
+            ))
+            .unwrap();
+        let mut saved: capacity::probes::BudgetStatus =
+            serde_json::from_slice(table.get(d(11).as_str()).unwrap().unwrap().value()).unwrap();
+        saved.used_attempts = u64::MAX - 1;
+        table
+            .insert(
+                d(11).as_str(),
+                serde_json::to_vec(&saved).unwrap().as_slice(),
+            )
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    drop(db);
+    let a = open(&path);
+    layered::layers(&a);
+    let last = intent(230, u64::MAX - 1);
+    let reserved = a.reserve_probe_once(spec(), last.clone()).unwrap();
+    a.cancel_prepared_probe(&reserved.probe().id).unwrap();
+    assert_eq!(
+        a.probe_budget(&d(11)).unwrap().unwrap().used_attempts,
+        u64::MAX
+    );
+    assert!(matches!(
+        a.reserve_probe_once(spec(), last),
+        Err(capacity::Error::Stale)
+    ));
+    assert!(matches!(
+        a.reserve_probe_once(spec(), intent(231, u64::MAX)),
+        Err(capacity::Error::ProbeBudget)
+    ));
+    assert!(matches!(
+        a.reserve_probe(spec()),
+        Err(capacity::Error::ProbeBudget)
+    ));
+    counts(&a, 0);
+}
 
 fn spec() -> Specification {
     Specification {

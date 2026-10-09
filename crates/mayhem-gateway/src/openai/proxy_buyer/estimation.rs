@@ -29,6 +29,7 @@ fn selection_error(error: proxy_request::Error) -> ApiError {
     use proxy_request::Error::*;
     match error {
         SettlementPolicyMismatch => failure("proxy_settlement_policy_mismatch", false),
+        ProfileEvidence => failure("proxy_profile_evidence_unavailable", true),
         Busy => failure("proxy_estimate_busy", true),
         Catalog | Availability(_) => failure("proxy_estimate_unavailable", true),
         _ => failure("proxy_estimate_invalid", false),
@@ -64,7 +65,7 @@ async fn read(state: SharedState, request: HttpRequest) -> Result<Response, ApiE
     let limit = runtime
         .policy
         .request_byte_limit()
-        .saturating_add(17 * 1024);
+        .saturating_add(33 * 1024);
     let bytes = tokio::time::timeout(
         mayhem_proxy::descriptor::DEADLINE,
         to_bytes(request.into_body(), limit),

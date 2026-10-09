@@ -17,7 +17,7 @@ use std::sync::Arc;
 use tokio::sync::Semaphore;
 
 const SELECTOR_PREFIX: &str = "proxy/offer/";
-const MAX_CONTROLS_BYTES: usize = 16 * 1024;
+const MAX_CONTROLS_BYTES: usize = 32 * 1024;
 static READS: Semaphore = Semaphore::const_new(8);
 
 #[derive(Debug, thiserror::Error)]
@@ -34,6 +34,8 @@ pub enum Error {
     Price,
     #[error("proxy operator verification is unavailable")]
     Verification,
+    #[error("routing profile requires authenticated capability or taxonomy evidence that is unavailable")]
+    ProfileEvidence,
     #[error("proxy request metadata reads are busy")]
     Busy,
     #[error("proxy provider is not currently eligible: {0:?}")]
@@ -111,6 +113,10 @@ pub struct Controls {
     pub minimum_tokens_per_second: Option<u32>,
     #[serde(default)]
     pub require_verified_operator: bool,
+    /// Exact retained buyer policy, never metadata copied from the supplier.
+    /// Absence serializes exactly as before, preserving existing replay hashes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<mayhem_proxy::routing::Policy>,
 }
 
 /// The operator's resolved policy is passed separately; it is never read from a
@@ -217,6 +223,31 @@ impl Request {
         } else if controls.output_units.is_none() {
             return Err(Error::Invalid);
         }
+        if let Some(profile) = &controls.profile {
+            profile.validate().map_err(|_| Error::Invalid)?;
+            if profile.endpoint != endpoint
+                || !profile.allowed_rails.contains(&controls.rail)
+                || !profile.settlement_policies.iter().any(|p| {
+                    p.rail == controls.rail
+                        && p.settlement_policy_hash == controls.settlement_policy_hash.as_str()
+                })
+                || controls.prices.max_total_spend_au > profile.prices.max_total_spend_au
+                || profile
+                    .constraints
+                    .minimum_context
+                    .is_some_and(|n| controls.minimum_context.unwrap_or(0) < n)
+                || profile
+                    .constraints
+                    .minimum_tokens_per_second
+                    .is_some_and(|n| controls.minimum_tokens_per_second.unwrap_or(0) < n)
+                || profile
+                    .constraints
+                    .output_units
+                    .is_some_and(|n| controls.output_units.is_none_or(|v| v > n))
+            {
+                return Err(Error::Constraints);
+            }
+        }
         let bytes = serde_json::to_vec(&raw).map_err(|_| Error::Invalid)?;
         if bytes.len() > policy.request_bytes {
             return Err(Error::Invalid);
@@ -303,6 +334,14 @@ impl Request {
             .offer
             .validate_for_membership(&candidate.market, &candidate.membership)
             .map_err(|_| Error::Catalog)?;
+        if let Some(profile) = &self.controls.profile {
+            profile
+                .check_offer(candidate, self.endpoint, self.controls.rail)
+                .map_err(|_| Error::Constraints)?;
+            if profile.requires_evidence_resolution() {
+                return Err(Error::ProfileEvidence);
+            }
+        }
         if candidate.offer.endpoint != self.endpoint
             || !candidate.offer.accepted_rails.contains(&self.controls.rail)
             || self

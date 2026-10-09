@@ -804,6 +804,15 @@ fn selection_error(error: proxy_request::Error) -> ApiError {
             Some("proxy"),
         )
         .with_public_error("proxy_verification_unavailable", "proxy_admission", true),
+        Error::ProfileEvidence => ApiError::service_unavailable(
+            "required proxy routing profile evidence is unavailable",
+            Some("proxy.profile"),
+        )
+        .with_public_error(
+            "proxy_profile_evidence_unavailable",
+            "proxy_admission",
+            true,
+        ),
         Error::Catalog => ApiError::service_unavailable(
             "selected proxy offer has no current catalog evidence",
             Some("model"),

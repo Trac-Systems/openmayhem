@@ -1,0 +1,759 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "publication": {
+        "id": "fa6d281706c8e9ef6e063dbf899656c016c24bc8da061444498084ea7d61a263/099ccdf1fe04baca72af83d099337a312037e637bd313b654f35dbd1894e3e17/c6fb4104d1dd4b741b3be0bd3420947cf9b9f0a5029e3a9744e2752d91f0925b",
+        "lane": "proxy",
+        "market": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "creator_pubkey": "099ccdf1fe04baca72af83d099337a312037e637bd313b654f35dbd1894e3e17",
+          "slug": "test-llm",
+          "model": {
+            "family_id": "other",
+            "model_id": "example/Unicode-é-模型-🦉",
+            "revision": "",
+            "quantization": ""
+          },
+          "family": "llm",
+          "endpoints": [
+            {
+              "endpoint": "openai_chat_completions",
+              "contract_hash": "790f754a670add8d47d9f96cbeee40076f15d674d276a3b5215aea91db8a42df"
+            }
+          ],
+          "metering": {
+            "policy_hash": "6b5c4d375243bbbb2656035608041deac22f7c7edb79e2c4f110e97bcd7076cd",
+            "units": [
+              "input_token",
+              "output_token"
+            ]
+          },
+          "pricing": "provider_offers"
+        },
+        "membership": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "fa6d281706c8e9ef6e063dbf899656c016c24bc8da061444498084ea7d61a263",
+          "provider_pubkey": "099ccdf1fe04baca72af83d099337a312037e637bd313b654f35dbd1894e3e17",
+          "revision": 1,
+          "endpoints": [
+            {
+              "endpoint": "openai_chat_completions",
+              "contract_hash": "790f754a670add8d47d9f96cbeee40076f15d674d276a3b5215aea91db8a42df"
+            }
+          ],
+          "served_context": 262144,
+          "max_concurrency": 2,
+          "recipe_hash": "37e857feedb383215de48cb16dba38fd26890281fe5116d1a6dc573e9db43da1",
+          "connection_revision": 1,
+          "capacity_group": "00000000000000000000000000000000000000000000000000000000000000c8",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "fa6d281706c8e9ef6e063dbf899656c016c24bc8da061444498084ea7d61a263",
+          "provider_pubkey": "099ccdf1fe04baca72af83d099337a312037e637bd313b654f35dbd1894e3e17",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_chat_completions",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "6b5c4d375243bbbb2656035608041deac22f7c7edb79e2c4f110e97bcd7076cd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "1",
+              "granularity": 1
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "1",
+              "granularity": 1
+            }
+          ],
+          "per_request_au": "0",
+          "min_session_au": "0",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "digest": "adb10ff82ef211e6eea8175ce0d61e7eb9ab7719feaa9107bf318a9736ea48de",
+        "active": true,
+        "catalog_eligible": true,
+        "catalog_observed_at_ms": 1791556376275,
+        "operator_verification": "unknown",
+        "family_label": "Other / Undisclosed"
+      },
+      "policy_hash": "0debe5b71649ba7272c9f86798f8958083281fa7dc422b75805d424ee744f0a6",
+      "request": {
+        "messages": [
+          {
+            "role": "user",
+            "content": "Hello"
+          }
+        ],
+        "max_tokens": 128,
+        "model": "proxy/offer/fa6d281706c8e9ef6e063dbf899656c016c24bc8da061444498084ea7d61a263/099ccdf1fe04baca72af83d099337a312037e637bd313b654f35dbd1894e3e17/c6fb4104d1dd4b741b3be0bd3420947cf9b9f0a5029e3a9744e2752d91f0925b",
+        "proxy": {
+          "prices": {
+            "rates": [
+              {
+                "unit": "input_token",
+                "per_unit_au": "1",
+                "granularity": 1
+              },
+              {
+                "unit": "output_token",
+                "per_unit_au": "1",
+                "granularity": 1
+              }
+            ],
+            "per_request_au": "0",
+            "min_session_au": "0",
+            "max_total_spend_au": "1000000000000000000"
+          },
+          "rail": "fiat",
+          "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+          "output_units": 128,
+          "minimum_context": 1024,
+          "minimum_tokens_per_second": null,
+          "require_verified_operator": false,
+          "profile": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "endpoint": "openai_chat_completions",
+            "target": {
+              "kind": "category",
+              "family_ids": [
+                "other"
+              ],
+              "variants": [],
+              "tags": [],
+              "market_allowlist": null
+            },
+            "providers": {
+              "allow": null,
+              "deny": [],
+              "require_verified_operator": false
+            },
+            "allowed_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ],
+            "prices": {
+              "rates": [
+                {
+                  "unit": "input_token",
+                  "per_unit_au": "1",
+                  "granularity": 1
+                },
+                {
+                  "unit": "output_token",
+                  "per_unit_au": "1",
+                  "granularity": 1
+                }
+              ],
+              "per_request_au": "0",
+              "min_session_au": "0",
+              "max_total_spend_au": "1000000000000000000"
+            },
+            "max_retail_cost_micro": "500",
+            "settlement_policies": [
+              {
+                "rail": "fiat",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "rail": "tap",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "rail": "tnk",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            ],
+            "constraints": {
+              "minimum_context": 1024,
+              "minimum_tokens_per_second": null,
+              "output_units": 128,
+              "capabilities": [],
+              "request_controls": [],
+              "data_handling": []
+            },
+            "ranking": "lowest_estimated_cost",
+            "continuity": "retain_compatible"
+          }
+        }
+      }
+    },
+    {
+      "publication": {
+        "id": "3bb10d97553a1f002f384632c9c00190b3a6f7cdf14c751797547595c336de8d/ee29ebd3813b249f9b4fb93d2003b21f62fb6e502cddf9fe9467aa2137166f7f/34c960902d4314d7a8ce38cff7f7e093c6b8cfecfe47e82f1bc2072a50cf08af",
+        "lane": "proxy",
+        "market": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "creator_pubkey": "ee29ebd3813b249f9b4fb93d2003b21f62fb6e502cddf9fe9467aa2137166f7f",
+          "slug": "test-llm",
+          "model": {
+            "family_id": "other",
+            "model_id": "example/Unicode-é-模型-🦉",
+            "revision": "",
+            "quantization": ""
+          },
+          "family": "llm",
+          "endpoints": [
+            {
+              "endpoint": "openai_completions",
+              "contract_hash": "7e55a20ab022e1673ec3ff825bcbb7446062221022ed96d6c2b43440a2d09803"
+            }
+          ],
+          "metering": {
+            "policy_hash": "6b5c4d375243bbbb2656035608041deac22f7c7edb79e2c4f110e97bcd7076cd",
+            "units": [
+              "input_token",
+              "output_token"
+            ]
+          },
+          "pricing": "provider_offers"
+        },
+        "membership": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "3bb10d97553a1f002f384632c9c00190b3a6f7cdf14c751797547595c336de8d",
+          "provider_pubkey": "ee29ebd3813b249f9b4fb93d2003b21f62fb6e502cddf9fe9467aa2137166f7f",
+          "revision": 1,
+          "endpoints": [
+            {
+              "endpoint": "openai_completions",
+              "contract_hash": "7e55a20ab022e1673ec3ff825bcbb7446062221022ed96d6c2b43440a2d09803"
+            }
+          ],
+          "served_context": 262144,
+          "max_concurrency": 2,
+          "recipe_hash": "2e30aabd591d82a14b7de8c8239eff3634b06087f07248ea744e5f5034d31dd4",
+          "connection_revision": 1,
+          "capacity_group": "00000000000000000000000000000000000000000000000000000000000000c8",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "3bb10d97553a1f002f384632c9c00190b3a6f7cdf14c751797547595c336de8d",
+          "provider_pubkey": "ee29ebd3813b249f9b4fb93d2003b21f62fb6e502cddf9fe9467aa2137166f7f",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_completions",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "6b5c4d375243bbbb2656035608041deac22f7c7edb79e2c4f110e97bcd7076cd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "1",
+              "granularity": 1
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "1",
+              "granularity": 1
+            }
+          ],
+          "per_request_au": "0",
+          "min_session_au": "0",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "digest": "b89852709d8140e3c83ec01821452224bb1ca9c0705e6949927081440cb5ec26",
+        "active": true,
+        "catalog_eligible": true,
+        "catalog_observed_at_ms": 1791556377094,
+        "operator_verification": "unknown",
+        "family_label": "Other / Undisclosed"
+      },
+      "policy_hash": "3085605c7c4689fa0306ff6c4e72ff48098036a1eec5faf08cad6d0b54adbbe8",
+      "request": {
+        "prompt": "Hello",
+        "max_tokens": 128,
+        "model": "proxy/offer/3bb10d97553a1f002f384632c9c00190b3a6f7cdf14c751797547595c336de8d/ee29ebd3813b249f9b4fb93d2003b21f62fb6e502cddf9fe9467aa2137166f7f/34c960902d4314d7a8ce38cff7f7e093c6b8cfecfe47e82f1bc2072a50cf08af",
+        "proxy": {
+          "prices": {
+            "rates": [
+              {
+                "unit": "input_token",
+                "per_unit_au": "1",
+                "granularity": 1
+              },
+              {
+                "unit": "output_token",
+                "per_unit_au": "1",
+                "granularity": 1
+              }
+            ],
+            "per_request_au": "0",
+            "min_session_au": "0",
+            "max_total_spend_au": "1000000000000000000"
+          },
+          "rail": "fiat",
+          "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+          "output_units": 128,
+          "minimum_context": 1024,
+          "minimum_tokens_per_second": null,
+          "require_verified_operator": false,
+          "profile": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "endpoint": "openai_completions",
+            "target": {
+              "kind": "category",
+              "family_ids": [
+                "other"
+              ],
+              "variants": [],
+              "tags": [],
+              "market_allowlist": null
+            },
+            "providers": {
+              "allow": null,
+              "deny": [],
+              "require_verified_operator": false
+            },
+            "allowed_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ],
+            "prices": {
+              "rates": [
+                {
+                  "unit": "input_token",
+                  "per_unit_au": "1",
+                  "granularity": 1
+                },
+                {
+                  "unit": "output_token",
+                  "per_unit_au": "1",
+                  "granularity": 1
+                }
+              ],
+              "per_request_au": "0",
+              "min_session_au": "0",
+              "max_total_spend_au": "1000000000000000000"
+            },
+            "max_retail_cost_micro": "500",
+            "settlement_policies": [
+              {
+                "rail": "fiat",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "rail": "tap",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "rail": "tnk",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            ],
+            "constraints": {
+              "minimum_context": 1024,
+              "minimum_tokens_per_second": null,
+              "output_units": 128,
+              "capabilities": [],
+              "request_controls": [],
+              "data_handling": []
+            },
+            "ranking": "lowest_estimated_cost",
+            "continuity": "retain_compatible"
+          }
+        }
+      }
+    },
+    {
+      "publication": {
+        "id": "1ad944083cb1cfe9d57e45f6c6f09da6380f39eaa72f283cb1bb49da1609f878/a059cd227d8e27d603f98134e460a1b2b57ed292253bed09e6a86c44bd228cb2/b98463b6724138bd96b1af4e06fd920cc5bd6b5ccb8406f57c6361f5218a8045",
+        "lane": "proxy",
+        "market": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "creator_pubkey": "a059cd227d8e27d603f98134e460a1b2b57ed292253bed09e6a86c44bd228cb2",
+          "slug": "test-llm",
+          "model": {
+            "family_id": "other",
+            "model_id": "example/Unicode-é-模型-🦉",
+            "revision": "",
+            "quantization": ""
+          },
+          "family": "llm",
+          "endpoints": [
+            {
+              "endpoint": "openai_responses",
+              "contract_hash": "3aa87d98aaa75fea3b15ad8ca1560416798d627bb0955a325038adf7da23e17a"
+            }
+          ],
+          "metering": {
+            "policy_hash": "6b5c4d375243bbbb2656035608041deac22f7c7edb79e2c4f110e97bcd7076cd",
+            "units": [
+              "input_token",
+              "output_token"
+            ]
+          },
+          "pricing": "provider_offers"
+        },
+        "membership": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "1ad944083cb1cfe9d57e45f6c6f09da6380f39eaa72f283cb1bb49da1609f878",
+          "provider_pubkey": "a059cd227d8e27d603f98134e460a1b2b57ed292253bed09e6a86c44bd228cb2",
+          "revision": 1,
+          "endpoints": [
+            {
+              "endpoint": "openai_responses",
+              "contract_hash": "3aa87d98aaa75fea3b15ad8ca1560416798d627bb0955a325038adf7da23e17a"
+            }
+          ],
+          "served_context": 262144,
+          "max_concurrency": 2,
+          "recipe_hash": "d7691622109ad5b7e5bb80de16743326dbfe2a5f354cde8a1a1a219a2b035c88",
+          "connection_revision": 1,
+          "capacity_group": "00000000000000000000000000000000000000000000000000000000000000c8",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "1ad944083cb1cfe9d57e45f6c6f09da6380f39eaa72f283cb1bb49da1609f878",
+          "provider_pubkey": "a059cd227d8e27d603f98134e460a1b2b57ed292253bed09e6a86c44bd228cb2",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "openai_responses",
+          "ctx_bracket": "le256k",
+          "outcome_class": "",
+          "metering_policy_hash": "6b5c4d375243bbbb2656035608041deac22f7c7edb79e2c4f110e97bcd7076cd",
+          "rates": [
+            {
+              "unit": "input_token",
+              "per_unit_au": "1",
+              "granularity": 1
+            },
+            {
+              "unit": "output_token",
+              "per_unit_au": "1",
+              "granularity": 1
+            }
+          ],
+          "per_request_au": "0",
+          "min_session_au": "0",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "digest": "7ceb7a66b7dd3a8e47324c2e9e5e39542efd95dd730e458d322218f9aa55e511",
+        "active": true,
+        "catalog_eligible": true,
+        "catalog_observed_at_ms": 1791556377978,
+        "operator_verification": "unknown",
+        "family_label": "Other / Undisclosed"
+      },
+      "policy_hash": "2caf29e4c3de11cc684676e249f722e7f126bb4fcb5c0231eb7678e97edb0a5e",
+      "request": {
+        "input": "Hello",
+        "max_output_tokens": 128,
+        "model": "proxy/offer/1ad944083cb1cfe9d57e45f6c6f09da6380f39eaa72f283cb1bb49da1609f878/a059cd227d8e27d603f98134e460a1b2b57ed292253bed09e6a86c44bd228cb2/b98463b6724138bd96b1af4e06fd920cc5bd6b5ccb8406f57c6361f5218a8045",
+        "proxy": {
+          "prices": {
+            "rates": [
+              {
+                "unit": "input_token",
+                "per_unit_au": "1",
+                "granularity": 1
+              },
+              {
+                "unit": "output_token",
+                "per_unit_au": "1",
+                "granularity": 1
+              }
+            ],
+            "per_request_au": "0",
+            "min_session_au": "0",
+            "max_total_spend_au": "1000000000000000000"
+          },
+          "rail": "fiat",
+          "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+          "output_units": 128,
+          "minimum_context": 1024,
+          "minimum_tokens_per_second": null,
+          "require_verified_operator": false,
+          "profile": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "endpoint": "openai_responses",
+            "target": {
+              "kind": "category",
+              "family_ids": [
+                "other"
+              ],
+              "variants": [],
+              "tags": [],
+              "market_allowlist": null
+            },
+            "providers": {
+              "allow": null,
+              "deny": [],
+              "require_verified_operator": false
+            },
+            "allowed_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ],
+            "prices": {
+              "rates": [
+                {
+                  "unit": "input_token",
+                  "per_unit_au": "1",
+                  "granularity": 1
+                },
+                {
+                  "unit": "output_token",
+                  "per_unit_au": "1",
+                  "granularity": 1
+                }
+              ],
+              "per_request_au": "0",
+              "min_session_au": "0",
+              "max_total_spend_au": "1000000000000000000"
+            },
+            "max_retail_cost_micro": "500",
+            "settlement_policies": [
+              {
+                "rail": "fiat",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "rail": "tap",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "rail": "tnk",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            ],
+            "constraints": {
+              "minimum_context": 1024,
+              "minimum_tokens_per_second": null,
+              "output_units": 128,
+              "capabilities": [],
+              "request_controls": [],
+              "data_handling": []
+            },
+            "ranking": "lowest_estimated_cost",
+            "continuity": "retain_compatible"
+          }
+        }
+      }
+    },
+    {
+      "publication": {
+        "id": "c3d1e5627e9c849c20aba3a09161e8e6fa471237196b29d611358fbc78e6c4a5/e843cf0d349dfac4639d046a0b0635e2a7d76ff161eb74ee5c7738c0d3365c4a/fa91a29f0fb2d1b2fffb18fa58e676268b39219f1975094740e20102f81a2a26",
+        "lane": "proxy",
+        "market": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "creator_pubkey": "e843cf0d349dfac4639d046a0b0635e2a7d76ff161eb74ee5c7738c0d3365c4a",
+          "slug": "test-decisions",
+          "model": {
+            "family_id": "other",
+            "model_id": "example/Unicode-é-模型-🦉",
+            "revision": "",
+            "quantization": ""
+          },
+          "family": "decisions",
+          "endpoints": [
+            {
+              "endpoint": "mayhem_decisions",
+              "contract_hash": "ff9bedfa09fa0baae332713ec18fb8ad9fba1d5d47f81b9b1e5304fd5bcec777"
+            }
+          ],
+          "metering": {
+            "policy_hash": "83b0b0dd1bc780936deae9d44b3f69469fbb778aaceddf9501d84d751fa01dc0",
+            "units": [
+              "decision"
+            ]
+          },
+          "pricing": "provider_offers"
+        },
+        "membership": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "c3d1e5627e9c849c20aba3a09161e8e6fa471237196b29d611358fbc78e6c4a5",
+          "provider_pubkey": "e843cf0d349dfac4639d046a0b0635e2a7d76ff161eb74ee5c7738c0d3365c4a",
+          "revision": 1,
+          "endpoints": [
+            {
+              "endpoint": "mayhem_decisions",
+              "contract_hash": "ff9bedfa09fa0baae332713ec18fb8ad9fba1d5d47f81b9b1e5304fd5bcec777"
+            }
+          ],
+          "served_context": 1024,
+          "max_concurrency": 2,
+          "recipe_hash": "339d80a8f59642951d501c28f455b2c77bf1e7a7dcc87a8ff8c4a29d4d4305ef",
+          "connection_revision": 1,
+          "capacity_group": "00000000000000000000000000000000000000000000000000000000000000c8",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "offer": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "market_id": "c3d1e5627e9c849c20aba3a09161e8e6fa471237196b29d611358fbc78e6c4a5",
+          "provider_pubkey": "e843cf0d349dfac4639d046a0b0635e2a7d76ff161eb74ee5c7738c0d3365c4a",
+          "membership_revision": 1,
+          "revision": 1,
+          "endpoint": "mayhem_decisions",
+          "ctx_bracket": "le8k",
+          "outcome_class": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "metering_policy_hash": "83b0b0dd1bc780936deae9d44b3f69469fbb778aaceddf9501d84d751fa01dc0",
+          "rates": [
+            {
+              "unit": "decision",
+              "per_unit_au": "1",
+              "granularity": 1
+            }
+          ],
+          "per_request_au": "0",
+          "min_session_au": "0",
+          "accepted_rails": [
+            "fiat",
+            "tap",
+            "tnk"
+          ]
+        },
+        "digest": "4d90051b69714fc8ebd577a4ca40c531c9dc9907bc619a205473b4cc066350a7",
+        "active": true,
+        "catalog_eligible": true,
+        "catalog_observed_at_ms": 1791556378814,
+        "operator_verification": "unknown",
+        "family_label": "Other / Undisclosed"
+      },
+      "policy_hash": "d9baa9c415a34a8ad1be3a421c6442f13b40d78156753ae7437fa4e7897b82e4",
+      "request": {
+        "state": "Hello",
+        "questions": {
+          "label": {
+            "type": "noul",
+            "instructions": "Is this a greeting?"
+          }
+        },
+        "model": "proxy/offer/c3d1e5627e9c849c20aba3a09161e8e6fa471237196b29d611358fbc78e6c4a5/e843cf0d349dfac4639d046a0b0635e2a7d76ff161eb74ee5c7738c0d3365c4a/fa91a29f0fb2d1b2fffb18fa58e676268b39219f1975094740e20102f81a2a26",
+        "proxy": {
+          "prices": {
+            "rates": [
+              {
+                "unit": "decision",
+                "per_unit_au": "1",
+                "granularity": 1
+              }
+            ],
+            "per_request_au": "0",
+            "min_session_au": "0",
+            "max_total_spend_au": "1000000000000000000"
+          },
+          "rail": "fiat",
+          "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+          "output_units": null,
+          "minimum_context": 1024,
+          "minimum_tokens_per_second": null,
+          "require_verified_operator": false,
+          "profile": {
+            "schema_version": 1,
+            "lane": "proxy",
+            "endpoint": "mayhem_decisions",
+            "target": {
+              "kind": "category",
+              "family_ids": [
+                "other"
+              ],
+              "variants": [],
+              "tags": [],
+              "market_allowlist": null
+            },
+            "providers": {
+              "allow": null,
+              "deny": [],
+              "require_verified_operator": false
+            },
+            "allowed_rails": [
+              "fiat",
+              "tap",
+              "tnk"
+            ],
+            "prices": {
+              "rates": [
+                {
+                  "unit": "decision",
+                  "per_unit_au": "1",
+                  "granularity": 1
+                }
+              ],
+              "per_request_au": "0",
+              "min_session_au": "0",
+              "max_total_spend_au": "1000000000000000000"
+            },
+            "max_retail_cost_micro": "500",
+            "settlement_policies": [
+              {
+                "rail": "fiat",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "rail": "tap",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              },
+              {
+                "rail": "tnk",
+                "settlement_policy_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+              }
+            ],
+            "constraints": {
+              "minimum_context": 1024,
+              "minimum_tokens_per_second": null,
+              "output_units": null,
+              "capabilities": [],
+              "request_controls": [],
+              "data_handling": []
+            },
+            "ranking": "lowest_estimated_cost",
+            "continuity": "retain_compatible"
+          }
+        }
+      }
+    }
+  ]
+}

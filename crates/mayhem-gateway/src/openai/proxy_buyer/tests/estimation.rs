@@ -259,6 +259,55 @@ async fn estimate_requires_auth_explicit_policy_prices_and_enabled_buyer() {
 }
 
 #[tokio::test]
+async fn required_profile_evidence_is_unavailable_without_admission_for_all_four_families() {
+    for endpoint in [
+        ProxyEndpoint::Chat,
+        ProxyEndpoint::Completions,
+        ProxyEndpoint::Responses,
+        ProxyEndpoint::Decisions,
+    ] {
+        let mut f = Fixture::start_with(endpoint, ProxyRail::Fiat).await;
+        let mut body = f.body();
+        let controls = body["proxy"].clone();
+        body["proxy"]["profile"] = json!({
+            "schema_version": 1, "lane": "proxy", "endpoint": endpoint,
+            "target": {"kind": "exact_offer", "offer_id": model(&f.harness).strip_prefix("proxy/offer/").unwrap()},
+            "providers": {"allow": null, "deny": [], "require_verified_operator": true},
+            "allowed_rails": [controls["rail"]], "prices": controls["prices"],
+            "max_retail_cost_micro": "1000",
+            "settlement_policies": [{"rail": controls["rail"], "settlement_policy_hash": controls["settlement_policy_hash"]}],
+            "constraints": {"minimum_context": null, "minimum_tokens_per_second": null,
+                "output_units": controls["output_units"], "capabilities": [], "request_controls": [], "data_handling": []},
+            "ranking": "lowest_estimated_cost", "continuity": "retain_compatible"
+        });
+        let (status, headers, error) = estimate(&f, body.clone(), "owner-fixture-key").await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{endpoint:?}: {error}");
+        assert_eq!(error["error"]["code"], "proxy_profile_evidence_unavailable");
+        assert_eq!(error["error"]["category"], "proxy_estimate");
+        assert_eq!(error["error"]["retryable"], true);
+        assert_eq!(headers["cache-control"], "private, no-store");
+        assert!(!headers.contains_key("x-mayhem-job-id"));
+        assert!(f.harness.session_frame_tags().await.is_empty());
+        assert_no_purchase(&mut f).await;
+
+        // Invalid constraints stay a client error even with unresolved evidence.
+        let mut invalid = body.clone();
+        invalid["proxy"]["profile"]["prices"]["max_total_spend_au"] = json!("0");
+        let (status, _, error) = estimate(&f, invalid, "owner-fixture-key").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["error"]["code"], "proxy_estimate_invalid");
+        assert_eq!(error["error"]["retryable"], false);
+
+        // The same otherwise valid profile can be estimated without this requirement.
+        body["proxy"]["profile"]["providers"]["require_verified_operator"] = json!(false);
+        let (status, _, quote) = estimate(&f, body, "owner-fixture-key").await;
+        assert_eq!(status, StatusCode::OK, "{endpoint:?}: {quote}");
+        assert_no_purchase(&mut f).await;
+        f.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn concurrent_estimates_are_bounded_and_never_purchase() {
     let mut f = Fixture::start().await;
     let responses = futures_util::future::join_all(

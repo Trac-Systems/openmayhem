@@ -478,6 +478,10 @@ async fn recovery_never_adopts_or_cancels_a_later_identical_prepared_attempt() {
         record["probe"]["evidence_hash"] = Value::Null;
         if lost_id {
             record["probe"]["probe_id"] = Value::Null;
+            record["probe"]
+                .as_object_mut()
+                .unwrap()
+                .remove("reservation_intent");
         }
         private(&path, &serde_json::to_vec(&record).unwrap());
         let recovered = f.store().recover_probe(review.revision).unwrap();
@@ -485,6 +489,12 @@ async fn recovery_never_adopts_or_cancels_a_later_identical_prepared_attempt() {
             recovered.probe.as_ref().unwrap().state,
             ProbeState::Uncertain
         );
+        if lost_id {
+            assert_eq!(
+                recovered.probe.as_ref().unwrap().recovery_reason,
+                Some("legacy_probe_identity_unavailable")
+            );
+        }
         assert_ne!(
             recovered.probe.as_ref().unwrap().probe_id.as_ref(),
             Some(&foreign_id)
@@ -563,4 +573,191 @@ async fn existing_capacity_owner_and_overlapping_alias_probe_block_new_dispatch(
     let a = authority(&f);
     assert_eq!(a.probe_for_group(&d(51)).unwrap().unwrap().id, foreign_id);
     assert_eq!(a.probe_budget(&d(2)).unwrap().unwrap().used_attempts, 1);
+}
+
+async fn pending_record(f: &Fixture, revision: u64) -> Vec<u8> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let bytes = std::fs::read(f.store.join("draft.json")).unwrap();
+            let record: Value = serde_json::from_slice(&bytes).unwrap();
+            if record["revision"] == json!(revision) && record["probe"]["state"] == json!("pending")
+            {
+                break bytes;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap()
+}
+async fn unlocked(f: &Fixture) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while matches!(Store::open(&f.store), Err(Error::Busy)) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn crash_after_intent_before_reserve_has_original_identity_and_consumes_no_allowance() {
+    let mut f = Fixture::new(ProxyEndpoint::Chat);
+    let b = backend(
+        &mut f,
+        200,
+        serde_json::to_vec(&answer()).unwrap(),
+        false,
+        Duration::ZERO,
+    );
+    let rev = checked(&f);
+    let p = plan(&f, chat());
+    let store = f.store();
+    let mut future = Box::pin(store.probe(rev, p.clone()));
+    // Poll once to launch the actual blocking prepare, then never poll its
+    // completion. Controller::run cannot begin until the caller resumes.
+    {
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(future.as_mut(), &mut context).is_pending());
+    }
+    let saved = pending_record(&f, rev + 1).await;
+    drop(future);
+    unlocked(&f).await;
+    let record: Value = serde_json::from_slice(&saved).unwrap();
+    let specification = serde_json::from_value(record["probe"]["specification"].clone()).unwrap();
+    let intent = serde_json::from_value(record["probe"]["reservation_intent"].clone()).unwrap();
+    let a = authority(&f);
+    assert_eq!(
+        serde_json::to_value(a.probe_intent_id(&specification, &intent).unwrap()).unwrap(),
+        record["probe"]["probe_id"]
+    );
+    assert_eq!(a.probe_budget(&d(2)).unwrap().unwrap().used_attempts, 0);
+    assert!(a.probe_for_group(&d(2)).unwrap().is_none());
+    drop(a);
+    let recovered = f.store().recover_probe(rev + 1).unwrap();
+    assert_eq!(recovered.probe_status, "not_validated");
+    assert_eq!(b.calls.load(Ordering::SeqCst), 0);
+    let next = f.store().probe(recovered.revision, p).await.unwrap();
+    assert_eq!(next.probe_status, "protocol_validated");
+    assert_ne!(
+        next.probe.as_ref().unwrap().probe_id,
+        recovered.probe.as_ref().unwrap().probe_id
+    );
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn crash_after_real_reservation_before_dispatch_recovers_original_prepared_without_refund() {
+    let mut f = Fixture::new(ProxyEndpoint::Chat);
+    let b = backend(
+        &mut f,
+        200,
+        serde_json::to_vec(&answer()).unwrap(),
+        false,
+        Duration::ZERO,
+    );
+    let rev = checked(&f);
+    let original = plan(&f, chat());
+    let mut paused = original.clone();
+    // A bounded ephemeral decoder fixture stalls only the decoder handshake.
+    // exec replaces the shell; kill_on_drop terminates that exact child.
+    paused.worker_program = f.dir.path().join("paused-decoder");
+    private(
+        &paused.worker_program,
+        b"#!/bin/sh\nprintf ready > paused\nexec /bin/sleep 30\n",
+    );
+    std::fs::set_permissions(
+        &paused.worker_program,
+        std::fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let marker = paused.worker_directory.join("paused");
+    let store = f.store();
+    let task = tokio::spawn(async move { store.probe(rev, paused).await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !marker.exists() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let pending = pending_record(&f, rev + 1).await;
+    task.abort();
+    let _ = task.await;
+    unlocked(&f).await;
+    let record: Value = serde_json::from_slice(&pending).unwrap();
+    let specification = serde_json::from_value(record["probe"]["specification"].clone()).unwrap();
+    let intent = serde_json::from_value(record["probe"]["reservation_intent"].clone()).unwrap();
+    let a = authority(&f);
+    let id = a.probe_intent_id(&specification, &intent).unwrap();
+    let retained = a.probe_for_group(&d(2)).unwrap().unwrap();
+    assert_eq!(retained.id, id);
+    assert_eq!(retained.phase, capacity::probes::ProbePhase::Prepared);
+    assert_eq!(a.group_status(&d(51)).unwrap().occupied, 1);
+    drop(a);
+    let recovered = f.store().recover_probe(rev + 1).unwrap();
+    assert_eq!(recovered.probe_status, "not_validated");
+    assert_eq!(recovered.probe.as_ref().unwrap().probe_id, Some(id));
+    assert_eq!(b.calls.load(Ordering::SeqCst), 0);
+    let a = authority(&f);
+    assert_eq!(a.probe_budget(&d(2)).unwrap().unwrap().used_attempts, 1);
+    assert_eq!(a.group_status(&d(51)).unwrap().occupied, 0);
+    assert!(matches!(
+        a.reserve_probe_once(specification, intent),
+        Err(capacity::Error::Stale)
+    ));
+    drop(a);
+    std::fs::remove_file(marker).unwrap();
+    let next = f.store().probe(recovered.revision, original).await.unwrap();
+    assert_eq!(next.probe_status, "protocol_validated");
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        authority(&f)
+            .probe_budget(&d(2))
+            .unwrap()
+            .unwrap()
+            .used_attempts,
+        2
+    );
+}
+
+#[tokio::test]
+async fn lost_success_write_recovers_actual_saved_intent_without_inventing_validation_or_reexecution(
+) {
+    let mut f = Fixture::new(ProxyEndpoint::Chat);
+    let b = backend(
+        &mut f,
+        200,
+        serde_json::to_vec(&answer()).unwrap(),
+        false,
+        Duration::from_millis(200),
+    );
+    let rev = checked(&f);
+    let p = plan(&f, chat());
+    let store = f.store();
+    let task = tokio::spawn(async move { store.probe(rev, p).await });
+    let saved = pending_record(&f, rev + 1).await;
+    let completed = task.await.unwrap().unwrap();
+    assert_eq!(completed.probe_status, "protocol_validated");
+    // Restore the byte-identical durable intent that preceded execution, as if
+    // power loss prevented only the final setup report from becoming durable.
+    private(&f.store.join("draft.json"), &saved);
+    let original: Value = serde_json::from_slice(&saved).unwrap();
+    let specification = serde_json::from_value(original["probe"]["specification"].clone()).unwrap();
+    let intent = serde_json::from_value(original["probe"]["reservation_intent"].clone()).unwrap();
+    let recovered = f.store().recover_probe(rev + 1).unwrap();
+    assert_eq!(recovered.probe_status, "not_validated");
+    assert!(recovered.probe.as_ref().unwrap().evidence_hash.is_none());
+    assert_eq!(
+        recovered.probe.as_ref().unwrap().probe_id,
+        completed.probe.as_ref().unwrap().probe_id
+    );
+    let a = authority(&f);
+    assert!(matches!(
+        a.reserve_probe_once(specification, intent),
+        Err(capacity::Error::Stale)
+    ));
+    assert_eq!(a.probe_budget(&d(2)).unwrap().unwrap().used_attempts, 1);
+    assert_eq!(a.group_status(&d(51)).unwrap().occupied, 0);
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
 }
