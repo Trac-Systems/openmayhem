@@ -1,4 +1,5 @@
 //! Provider startup uses the existing encrypted wallet and protected SC-Bridge.
+mod setup;
 mod supervisor;
 use super::{cached_wallet_signing_key, resolve_wallet_keypair_path, WalletLocatorArgs};
 use anyhow::{Context, Result};
@@ -12,6 +13,11 @@ use tokio::sync::watch;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Prepare and resume a private provider setup without publishing or paying.
+    Setup {
+        #[command(subcommand)]
+        command: setup::Command,
+    },
     /// Refresh or inspect proxy markets without ledger writes.
     Catalog {
         #[command(subcommand)]
@@ -34,6 +40,7 @@ pub struct ServeArgs {
 }
 pub async fn run(command: Command) -> Result<()> {
     let args = match command {
+        Command::Setup { command } => return setup::run(command).await,
         Command::Catalog { command } => {
             return mayhem_proxy::cli::run(mayhem_proxy::cli::Command::Catalog { command })
                 .await
@@ -150,6 +157,61 @@ mod tests {
             panic!("serve required")
         };
         assert!(supervised.supervised);
+    }
+
+    #[test]
+    fn proxy_setup_commands_are_explicit_local_operations_without_wallet_arguments() {
+        for args in [
+            vec![
+                "proxy",
+                "setup",
+                "create",
+                "--directory",
+                "/private/setup",
+                "--input",
+                "/private/declaration.json",
+            ],
+            vec![
+                "proxy",
+                "setup",
+                "update",
+                "--directory",
+                "/private/setup",
+                "--expected-revision",
+                "1",
+                "--input",
+                "/private/declaration.json",
+            ],
+            vec![
+                "proxy",
+                "setup",
+                "check",
+                "--directory",
+                "/private/setup",
+                "--expected-revision",
+                "2",
+            ],
+            vec!["proxy", "setup", "inspect", "--directory", "/private/setup"],
+        ] {
+            assert!(matches!(
+                Cli::try_parse_from(args).unwrap().command,
+                Command::Setup { .. }
+            ));
+        }
+        assert!(
+            Cli::try_parse_from(["proxy", "setup", "check", "--directory", "/private/setup"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "inspect",
+            "--directory",
+            "/private/setup",
+            "--private-key",
+            "rejected"
+        ])
+        .is_err());
     }
 }
 async fn stop_signal() -> Result<()> {

@@ -1,0 +1,490 @@
+{
+  "schema_version": 1,
+  "scope": "Syntactic persisted intent only; valid does not mean registry-approved, resolved or authorized. UTF-8 set ordering; enum scalar count; exact decimal strings.",
+  "values": [
+    {
+      "name": "boolean",
+      "input": {
+        "type": "boolean",
+        "value": false
+      },
+      "valid": true
+    },
+    {
+      "name": "enum-case-spaces",
+      "input": {
+        "type": "enum",
+        "value": "Adaptive High"
+      },
+      "valid": true
+    },
+    {
+      "name": "enum-eighty-emoji",
+      "input": {
+        "type": "enum",
+        "value": "🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠"
+      },
+      "valid": true
+    },
+    {
+      "name": "enum-max-scalars-bytes",
+      "input": {
+        "type": "enum",
+        "value": "🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠"
+      },
+      "valid": true
+    },
+    {
+      "name": "enum-too-many-scalars",
+      "input": {
+        "type": "enum",
+        "value": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      },
+      "valid": false
+    },
+    {
+      "name": "enum-too-many-bytes",
+      "input": {
+        "type": "enum",
+        "value": "🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠"
+      },
+      "valid": false
+    },
+    {
+      "name": "enum-url-like",
+      "input": {
+        "type": "enum",
+        "value": "1://"
+      },
+      "valid": false
+    },
+    {
+      "name": "text-url",
+      "input": {
+        "type": "text",
+        "value": "https://private.invalid"
+      },
+      "valid": false
+    },
+    {
+      "name": "text-unicode",
+      "input": {
+        "type": "text",
+        "value": "多言語 🧠"
+      },
+      "valid": true
+    },
+    {
+      "name": "text-control",
+      "input": {
+        "type": "text",
+        "value": "line\nfeed"
+      },
+      "valid": false
+    },
+    {
+      "name": "set-utf8-order",
+      "input": {
+        "type": "set",
+        "value": [
+          "",
+          "𐀀"
+        ]
+      },
+      "valid": true
+    },
+    {
+      "name": "set-wrong-order",
+      "input": {
+        "type": "set",
+        "value": [
+          "𐀀",
+          ""
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "set-repeated",
+      "input": {
+        "type": "set",
+        "value": [
+          "same",
+          "same"
+        ]
+      },
+      "valid": false
+    },
+    {
+      "name": "set-empty",
+      "input": {
+        "type": "set",
+        "value": []
+      },
+      "valid": false
+    },
+    {
+      "name": "integer-max",
+      "input": {
+        "type": "integer",
+        "value": 9007199254740991
+      },
+      "valid": true
+    },
+    {
+      "name": "integer-min",
+      "input": {
+        "type": "integer",
+        "value": -9007199254740991
+      },
+      "valid": true
+    },
+    {
+      "name": "integer-overflow",
+      "input": {
+        "type": "integer",
+        "value": 9007199254740992
+      },
+      "valid": false
+    },
+    {
+      "name": "integer-fraction",
+      "input": {
+        "type": "integer",
+        "value": 0.5
+      },
+      "valid": false
+    },
+    {
+      "name": "decimal-max",
+      "input": {
+        "type": "decimal",
+        "value": "999999999999999999.999999999999999999"
+      },
+      "valid": true
+    },
+    {
+      "name": "decimal-min",
+      "input": {
+        "type": "decimal",
+        "value": "-999999999999999999.999999999999999999"
+      },
+      "valid": true
+    },
+    {
+      "name": "decimal-smallest",
+      "input": {
+        "type": "decimal",
+        "value": "0.000000000000000001"
+      },
+      "valid": true
+    },
+    {
+      "name": "decimal-zero",
+      "input": {
+        "type": "decimal",
+        "value": "0"
+      },
+      "valid": true
+    },
+    {
+      "name": "decimal-negative-zero",
+      "input": {
+        "type": "decimal",
+        "value": "-0"
+      },
+      "valid": false
+    },
+    {
+      "name": "decimal-trailing-zero",
+      "input": {
+        "type": "decimal",
+        "value": "0.20"
+      },
+      "valid": false
+    },
+    {
+      "name": "decimal-exponent",
+      "input": {
+        "type": "decimal",
+        "value": "1e3"
+      },
+      "valid": false
+    },
+    {
+      "name": "decimal-leading-zero",
+      "input": {
+        "type": "decimal",
+        "value": "01"
+      },
+      "valid": false
+    },
+    {
+      "name": "decimal-too-precise",
+      "input": {
+        "type": "decimal",
+        "value": "0.0000000000000000001"
+      },
+      "valid": false
+    },
+    {
+      "name": "decimal-too-large",
+      "input": {
+        "type": "decimal",
+        "value": "1000000000000000000"
+      },
+      "valid": false
+    },
+    {
+      "name": "unknown-value-field",
+      "input": {
+        "type": "boolean",
+        "value": true,
+        "source": "asserted"
+      },
+      "valid": false
+    }
+  ],
+  "predicates": [
+    {
+      "name": "explicit-null-freshness",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "operator": "eq",
+        "value": {
+          "type": "boolean",
+          "value": true
+        },
+        "evidence": "verified",
+        "max_age_ms": null
+      },
+      "valid": true
+    },
+    {
+      "name": "bounded-freshness",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "operator": "eq",
+        "value": {
+          "type": "boolean",
+          "value": true
+        },
+        "evidence": "declared",
+        "max_age_ms": 4294967295
+      },
+      "valid": true
+    },
+    {
+      "name": "numeric-predicate",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "operator": "gte",
+        "value": {
+          "type": "decimal",
+          "value": "0.0000001"
+        },
+        "evidence": "verified",
+        "max_age_ms": null
+      },
+      "valid": true
+    },
+    {
+      "name": "set-predicate",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "operator": "contains_all",
+        "value": {
+          "type": "set",
+          "value": [
+            "JSON",
+            "Tools"
+          ]
+        },
+        "evidence": "verified",
+        "max_age_ms": null
+      },
+      "valid": true
+    },
+    {
+      "name": "zero-freshness",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "operator": "eq",
+        "value": {
+          "type": "boolean",
+          "value": true
+        },
+        "evidence": "verified",
+        "max_age_ms": 0
+      },
+      "valid": false
+    },
+    {
+      "name": "overflow-freshness",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "operator": "eq",
+        "value": {
+          "type": "boolean",
+          "value": true
+        },
+        "evidence": "verified",
+        "max_age_ms": 4294967296
+      },
+      "valid": false
+    },
+    {
+      "name": "zero-revision",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 0,
+        "operator": "eq",
+        "value": {
+          "type": "boolean",
+          "value": true
+        },
+        "evidence": "verified",
+        "max_age_ms": null
+      },
+      "valid": false
+    },
+    {
+      "name": "overflow-revision",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 2147483648,
+        "operator": "eq",
+        "value": {
+          "type": "boolean",
+          "value": true
+        },
+        "evidence": "verified",
+        "max_age_ms": null
+      },
+      "valid": false
+    },
+    {
+      "name": "invalid-field-id",
+      "input": {
+        "field_id": "Unknown/Field",
+        "schema_revision": 1,
+        "operator": "eq",
+        "value": {
+          "type": "boolean",
+          "value": true
+        },
+        "evidence": "verified",
+        "max_age_ms": null
+      },
+      "valid": false
+    },
+    {
+      "name": "unknown-evidence",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "operator": "eq",
+        "value": {
+          "type": "boolean",
+          "value": true
+        },
+        "evidence": "trusted",
+        "max_age_ms": null
+      },
+      "valid": false
+    },
+    {
+      "name": "enum-ordinal-forbidden",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "operator": "gte",
+        "value": {
+          "type": "enum",
+          "value": "High"
+        },
+        "evidence": "verified",
+        "max_age_ms": null
+      },
+      "valid": false
+    },
+    {
+      "name": "set-operator-type",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "operator": "contains_all",
+        "value": {
+          "type": "boolean",
+          "value": true
+        },
+        "evidence": "verified",
+        "max_age_ms": null
+      },
+      "valid": false
+    },
+    {
+      "name": "unknown-predicate-field",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "operator": "eq",
+        "value": {
+          "type": "boolean",
+          "value": true
+        },
+        "evidence": "verified",
+        "max_age_ms": null,
+        "callback": "forbidden"
+      },
+      "valid": false
+    },
+    {
+      "name": "freshness-key-required",
+      "input": {
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "operator": "eq",
+        "value": {
+          "type": "boolean",
+          "value": true
+        },
+        "evidence": "verified"
+      },
+      "valid": false
+    }
+  ],
+  "controls": [
+    {
+      "name": "unicode-control",
+      "input": {
+        "field_id": "vendor.reasoning.effort",
+        "schema_revision": 3,
+        "value": {
+          "type": "enum",
+          "value": "Adaptive High 🧠"
+        }
+      },
+      "valid": true
+    },
+    {
+      "name": "unknown-runtime-mapping",
+      "input": {
+        "field_id": "vendor.reasoning.effort",
+        "schema_revision": 3,
+        "value": {
+          "type": "enum",
+          "value": "High"
+        },
+        "request_path": "headers.authorization"
+      },
+      "valid": false
+    }
+  ]
+}

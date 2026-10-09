@@ -24,8 +24,10 @@ pub mod metering;
 pub mod negotiation;
 pub mod presence;
 pub mod receipts;
+pub mod registry;
 pub mod semantics;
 pub mod serving;
+pub mod setup;
 pub mod signing;
 pub mod supervisor;
 #[cfg(feature = "test-support")]
