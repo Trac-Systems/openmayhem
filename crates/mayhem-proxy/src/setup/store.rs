@@ -34,6 +34,7 @@ impl Store {
             probe_scope: None,
             probe: None,
             admission: None,
+            publication: None,
         };
         guard.write(&record)?;
         record.review()
@@ -49,6 +50,9 @@ impl Store {
         let connection = input.connection()?;
         let guard = Guard::open(&self.directory)?;
         let mut record = guard.read()?.ok_or(Error::Missing)?;
+        if record.publication.as_ref().is_some_and(|p| !p.complete()) {
+            return Err(Error::PublicationRecovery);
+        }
         // A setup ID cannot be transferred to another wallet or network.
         require(
             input.network == record.input.network
@@ -149,7 +153,14 @@ impl Guard {
         ) {
             Ok(fd) => {
                 let file = File::from(fd);
-                Self::protected(&file, MAX_BYTES)?;
+                Self::protected(
+                    &file,
+                    if matches!(name, "draft.json" | "draft.next") {
+                        MAX_DRAFT_BYTES
+                    } else {
+                        MAX_BYTES
+                    },
+                )?;
                 Ok(Some(file))
             }
             Err(rustix::io::Errno::NOENT) => Ok(None),
@@ -171,10 +182,15 @@ impl Guard {
             return Ok(None);
         };
         let mut bytes = zeroize::Zeroizing::new(Vec::new());
-        file.take(MAX_BYTES as u64 + 1)
+        let maximum = if name == "draft.json" {
+            MAX_DRAFT_BYTES
+        } else {
+            MAX_BYTES
+        };
+        file.take(maximum as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| Error::Storage)?;
-        require(bytes.len() <= MAX_BYTES)?;
+        require(bytes.len() <= maximum)?;
         Ok(Some(
             serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?,
         ))
@@ -192,7 +208,14 @@ impl Guard {
         // Names are fixed by setup callers, never supplied by a declaration.
         let _ = self.file(name)?;
         let bytes = zeroize::Zeroizing::new(serde_json::to_vec(value).map_err(|_| Error::Invalid)?);
-        require(bytes.len() <= MAX_BYTES)?;
+        require(
+            bytes.len()
+                <= if name == "draft.json" {
+                    MAX_DRAFT_BYTES
+                } else {
+                    MAX_BYTES
+                },
+        )?;
         // A crash before rename leaves only an uncommitted temporary file. Never
         // promote it on resume; the original durable draft remains authoritative.
         if self.file(temporary)?.is_some() {

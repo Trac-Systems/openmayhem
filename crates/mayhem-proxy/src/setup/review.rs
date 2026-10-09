@@ -30,6 +30,8 @@ pub struct Review {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub admission: Option<AdmissionReport>,
     pub publication_status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub publication: Option<PublicationReport>,
     pub serving_status: &'static str,
     pub network: Identity,
     pub provider_pubkey: Digest,
@@ -59,7 +61,14 @@ impl Record {
             .as_ref()
             .map(|a| a.report(self))
             .transpose()?;
-        let handoff = if state == State::StructurallyValid {
+        let publication = self
+            .publication
+            .as_ref()
+            .map(|p| p.report(self))
+            .transpose()?;
+        // Once signed publication is retained, its original public plan owns
+        // the initial-operation binding; never offer a replacement invoice intent.
+        let handoff = if state == State::StructurallyValid && self.publication.is_none() {
             Some(AdmissionHandoff {
                 initial_operation_digest: operation.digest().map_err(|_| Error::Invalid)?,
                 initial_operation: operation,
@@ -79,7 +88,14 @@ impl Record {
             probe,
             admission_status: admission.as_ref().map_or("not_checked", |a| a.status),
             admission,
-            publication_status: "not_submitted",
+            publication_status: self.publication.as_ref().map_or("not_submitted", |p| {
+                p.status(
+                    publication
+                        .as_ref()
+                        .is_some_and(|v| v.for_current_configuration),
+                )
+            }),
+            publication,
             serving_status: "not_started",
             network: self.input.network.clone(),
             provider_pubkey: self.input.provider_pubkey.clone(),

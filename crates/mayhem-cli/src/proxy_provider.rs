@@ -13,7 +13,7 @@ use tokio::sync::watch;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// Prepare and resume a private provider setup without publishing or paying.
+    /// Prepare a private setup, explicitly publish admitted declarations, or recover them.
     Setup {
         #[command(subcommand)]
         command: setup::Command,
@@ -329,6 +329,79 @@ mod tests {
             "/private/setup",
             "--peer-rpc",
             "http://127.0.0.1:17800/v1",
+        ])
+        .is_err());
+    }
+    #[test]
+    fn setup_publication_signing_is_explicit_and_recovery_does_not_unlock_a_wallet() {
+        for command in ["publication-plan", "recover-publication"] {
+            let mut args = vec![
+                "proxy",
+                "setup",
+                command,
+                "--directory",
+                "/private/setup",
+                "--expected-revision",
+                "2",
+            ];
+            if command == "recover-publication" {
+                args.extend(["--peer-rpc", "http://127.0.0.1:17800/v1"]);
+            }
+            assert!(Cli::try_parse_from(args.clone()).is_ok());
+            args.extend(["--home", "/private/wallet"]);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "publish",
+            "--directory",
+            "/private/setup",
+            "--expected-revision",
+            "2",
+            "--peer-rpc",
+            "http://127.0.0.1:17800/v1",
+            "--home",
+            "/private/wallet",
+            "--admission-permit",
+            "/private/permit.json"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "publish",
+            "--directory",
+            "/private/setup",
+            "--expected-revision",
+            "2",
+            "--peer-rpc",
+            "http://127.0.0.1:17800/v1",
+            "--offers-only"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "publish",
+            "--directory",
+            "/private/setup",
+            "--expected-revision",
+            "2"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "recover-publication",
+            "--directory",
+            "/private/setup",
+            "--expected-revision",
+            "2",
+            "--peer-rpc",
+            "http://127.0.0.1:17800/v1",
+            "--admission-permit",
+            "/private/replacement.json"
         ])
         .is_err());
     }

@@ -51,8 +51,8 @@ already required by the public membership remain present.
 `unchecked`, `structurally_valid` and `recheck_required` describe local structure
 only. Inspection rechecks the current connection fingerprint; file drift removes
 the unsigned admission handoff until an explicit update and check. The review
-always reports operator-declared claims, publication not submitted and serving
-not started. Admission remains `not_checked` until an explicit canonical read
+always reports operator-declared claims and serving not started. Publication
+remains not submitted until the explicit commands below. Admission remains `not_checked` until an explicit canonical read
 described below; its observations never authorize publication. Without an explicit probe it
 reports `probe_status: not_run` and `probe: null`. The optional handoff is the
 exact unsigned initial `ProxyOperation` and its canonical digest, for the later
@@ -142,10 +142,11 @@ advertised context, performance measurement, admission permit or serving claim.
 
 The state library and unattended CLI are a setup foundation, not the complete
 interactive/dashboard wizard. The explicit canonical read below supplies current
-provider admission and sequence observations. Next wiring must retain the original invoice/evidence,
-verify a permit bound to the exact initial operation, and submit the typed
-provider-signed operation through the existing publication journal/gate. A paid
-or pending invoice cannot be replaced merely because a CLI request was lost.
+provider admission and sequence observations. The explicit publication commands
+below accept an existing verifier-signed permit and use the original operation
+journal/gate. The invoice, collection and permit-issuance service remains
+unimplemented. A paid or pending invoice cannot be replaced merely because a
+CLI request was lost.
 Only confirmed canonical admission/publication can enable subsequent serving.
 Existing `provider proxy add` retains its supervisor-installation meaning;
 these setup commands never invoke it automatically.
@@ -252,8 +253,8 @@ the capacity authority, consumes or resets allowance, retries inference, frees
 uncertain occupancy, or changes exact-ID recovery requirements.
 `resume` is an alias of `inspect`, with no network request. Existing create/update,
 check, probe and recover-probe behavior and the actual admission fee gate remain
-unchanged. The complete wizard must still connect original invoice/permit recovery
-and publication before claiming paid provider readiness.
+unchanged. The complete wizard must still connect original invoice/permit
+recovery and managed serving before claiming paid provider readiness.
 
 ## Canonical provider admission observation
 
@@ -267,7 +268,7 @@ The RPC base must identify an operator-trusted Core peer, using literal loopback
 HTTP or authenticated-by-origin HTTPS. Credentials in URLs, redirects and
 environment proxies are rejected. The peer must already hold the selected
 provider identity and support the new `proxy_provider_state` read service; an old
-peer reports unavailable. Setup never opens a wallet. The peer's existing signed
+peer reports unavailable. This read never opens a wallet. The peer's existing signed
 read transport binds its requester, fresh challenge, network and exact draft
 operation digest to the canonical indexer's reply. It performs no admission or
 financial signature and no transaction append.
@@ -310,3 +311,90 @@ recover the original off-ledger invoice/permit and recheck current canonical
 facts. The publication path must still validate the exact signed operation,
 entitlement and current sequence at its existing gate. No serving readiness,
 paid admission collection or completed provider wizard is claimed here.
+
+
+## Explicit admitted publication and recovery
+
+The shared `Store` now connects a checked draft to the existing canonical writer.
+Review the exact public plan before explicitly signing it with the existing
+provider wallet:
+
+```sh
+mayhem provider proxy setup publication-plan --directory /absolute/private/setup --expected-revision 2
+mayhem provider proxy setup publish --directory /absolute/private/setup --expected-revision 2 --peer-rpc http://127.0.0.1:17800/v1 --home /absolute/private/wallet --admission-permit /absolute/private/permit.json
+mayhem provider proxy setup inspect --directory /absolute/private/setup
+mayhem provider proxy setup recover-publication --directory /absolute/private/setup --expected-revision CURRENT_REVISION --peer-rpc http://127.0.0.1:17800/v1
+```
+
+Only `publish` unlocks a wallet, using the existing wallet locator and protected
+key handling. It signs only the exact reviewed typed registry operations. Other
+setup commands, including recovery, do not unlock it. No command requests a fee,
+creates an invoice, issues a permit, transfers funds, installs serving, invokes a
+model or calibrates a runtime. An imported private permit file contains only the
+existing public permit and issuer signature; cryptographic verification is not a
+claim that its issuer is currently authorized. The canonical gate still checks
+active issuers, the exact initial operation, fee policy, trusted epoch, evidence
+consumption, revocation, quotas and all family/endpoint/membership/offer policies.
+
+A fresh exact provider-state read runs before each operation. An unregistered
+provider without a verified permit reports `admission_required` before any submit.
+That state does not mean unpaid: the original invoice/permit may exist elsewhere.
+An already admitted identity uses no new permit or fee. A present permit cannot
+be replaced in a retained attempt; only an `admission_required` attempt with no
+permit can attach one bound to its original first operation. Issuer rotation,
+permit reissue, invoice recovery and D3 collection/reversal policy require their
+own separately authorized implementation.
+
+One plan contains create/join plus its saved offers (at most 17 operations).
+`publication-plan --offers-only` and `publish --offers-only` instead publish only
+the saved offers on the existing admitted membership. First update/check the
+original draft with explicit next sequence, higher offer revisions and rates;
+keep the market/membership identities unchanged. The existing canonical gate
+validates those references. This changes neither accepted jobs nor their locked
+rates, does not create another market, and reuses the existing entitlement.
+There is no guessed next sequence or silent create-versus-update fallback.
+
+Before network I/O, setup atomically retains the entire original public plan,
+provider signatures, imported permit, trusted peer origin and configuration
+binding in its protected draft. It persists pending state before each submit and
+advances progress only after a fresh signed canonical view confirms that exact
+provider sequence and operation digest. An HTTP success, writer ACK or returned
+error text never substitutes for this confirmation. The existing publication
+journal owns its original writer nonce and performs pre-append admission again.
+A lost response, interrupted caller, malformed response, offline peer or failed
+local write requires inspecting and recovering the same draft, not signing a
+replacement sequence or acquiring another permit. Recovery can confirm an already
+applied operation despite subsequent connection drift, but it cannot dispatch
+new work from changed configuration. Another publication advancing the same
+provider beyond an unconfirmed operation produces an explicit sequence conflict;
+this client does not guess historical success or silently rebase the plan.
+
+The bound origin accepts HTTPS or explicit literal-loopback HTTP, with no URL
+credentials, query, fragment, redirects, environment proxy or transport retries.
+Recovery cannot change that origin. Each call has one 1–15000 ms deadline across
+the whole plan (default 5000), not a fresh deadline per operation. Provider reads
+are bounded to 8 KiB and ignored publication ACKs to 16 KiB; no history/catalog
+scan occurs. At most 17 typed 64 KiB envelopes are retained, alongside the original
+512 KiB input and bounded recovery metadata. Each directory's existing lock and
+CAS revision fence concurrent clients. Updating an unfinished signed plan is
+refused; a completed plan may be superseded only by another explicit checked
+draft update. Revisions advance at durable progress points, so callers must
+inspect after an uncertain result instead of calculating the next revision.
+
+The optional public `publication` report exposes state, plan digest, total and
+confirmed operation counts, pending operation digest, current-configuration flag,
+latest canonical observation, bounded reason and `authorizes_serving: false`.
+It omits signatures, invoice/evidence commitments, peer URL and private input.
+`canonical_operations_confirmed` is a historical publication fact, not live
+capacity or readiness. Once a publication is retained, `publication-plan` is the
+sole original unsigned operation handoff; the older `admission_handoff` is hidden
+to avoid constructing a replacement invoice intent.
+
+The local acceptance fixture uses a real signed Autobase/Hyperbee view, canonical
+contract, pre-append gate and durable publication journal over loopback HTTP.
+Its owned-provider read facade replaces remote service transport, and its issuer
+signs synthetic allocations. It proves create/join, all four endpoint families,
+FIAT/TNK/TAP permit binding, lost-response recovery and same-market price updates.
+It does not prove actual fee collection, production issuer deployment or public
+provider readiness. Interactive/dashboard forms, unattended invoice detection,
+managed serving handoff, Windows protection and full D2–D4 policy remain open.

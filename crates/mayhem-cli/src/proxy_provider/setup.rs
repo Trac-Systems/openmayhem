@@ -1,8 +1,10 @@
 //! Thin CLI over the shared setup state. Public JSON never contains the private
-//! draft, connection reference or loaded credential. No wallet is unlocked.
+//! draft, connection reference or loaded credential. Only explicit Publish
+//! unlocks the existing wallet to sign its exact reviewed registry operations.
+use super::{cached_wallet_signing_key, resolve_wallet_keypair_path, WalletLocatorArgs};
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use mayhem_proxy::setup::{profiles, Input, ProbePlan, ProfileInput, Store};
+use mayhem_proxy::setup::{profiles, AdmissionPermit, Input, ProbePlan, ProfileInput, Store};
 use std::path::PathBuf;
 
 #[derive(Debug, Args)]
@@ -13,6 +15,46 @@ pub struct DraftArgs {
 }
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Review exact public operations without signing, network I/O or fees.
+    PublicationPlan {
+        #[command(flatten)]
+        args: DraftArgs,
+        #[arg(long)]
+        expected_revision: u64,
+        /// Change only saved offers on an existing membership, retaining its identity.
+        #[arg(long)]
+        offers_only: bool,
+    },
+    /// Sign and retain the exact reviewed operations, then request guarded publication.
+    /// Does not collect a fee, issue a permit, install serving or start a model.
+    Publish {
+        #[command(flatten)]
+        args: DraftArgs,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        peer_rpc: String,
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+        #[arg(long)]
+        offers_only: bool,
+        /// Protected verifier-signed permit for the original initial operation.
+        #[arg(long, value_name = "PATH")]
+        admission_permit: Option<PathBuf>,
+        #[command(flatten)]
+        wallet: WalletLocatorArgs,
+    },
+    /// Resume the original signed publication. No wallet unlock or new permit.
+    RecoverPublication {
+        #[command(flatten)]
+        args: DraftArgs,
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        peer_rpc: String,
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+    },
     /// Show local endpoint templates; this never contacts or certifies an upstream.
     Profiles,
     /// Explicit bounded model-list GET; credentials are resolved only for this read.
@@ -103,6 +145,64 @@ pub enum Command {
 }
 pub async fn run(command: Command) -> Result<()> {
     let command = match command {
+        Command::PublicationPlan {
+            args,
+            expected_revision,
+            offers_only,
+        } => {
+            let plan = tokio::task::spawn_blocking(move || {
+                Store::open(args.directory)?.publication_plan(expected_revision, offers_only)
+            })
+            .await??;
+            println!("{}", serde_json::to_string(&plan)?);
+            return Ok(());
+        }
+        Command::Publish {
+            args,
+            expected_revision,
+            peer_rpc,
+            timeout_ms,
+            offers_only,
+            admission_permit,
+            wallet,
+        } => {
+            let (store, plan, permit) = tokio::task::spawn_blocking(move || {
+                let store = Store::open(args.directory)?;
+                let plan = store.publication_plan(expected_revision, offers_only)?;
+                let permit = admission_permit
+                    .as_deref()
+                    .map(AdmissionPermit::load)
+                    .transpose()?;
+                Ok::<_, mayhem_proxy::setup::Error>((store, plan, permit))
+            })
+            .await??;
+            let keypair = resolve_wallet_keypair_path(&wallet)?;
+            let key = cached_wallet_signing_key(
+                &keypair,
+                wallet.wallet_password.as_deref().unwrap_or_default(),
+            )
+            .await?;
+            let authorization = plan.authorize(&key, permit)?;
+            drop(key);
+            let review = store
+                .publish(expected_revision, &peer_rpc, timeout_ms, authorization)
+                .await?;
+            println!("{}", serde_json::to_string(&review)?);
+            return Ok(());
+        }
+        Command::RecoverPublication {
+            args,
+            expected_revision,
+            peer_rpc,
+            timeout_ms,
+        } => {
+            let store = tokio::task::spawn_blocking(move || Store::open(args.directory)).await??;
+            let review = store
+                .recover_publication(expected_revision, &peer_rpc, timeout_ms)
+                .await?;
+            println!("{}", serde_json::to_string(&review)?);
+            return Ok(());
+        }
         Command::AdmissionCheck {
             args,
             expected_revision,
@@ -170,6 +270,9 @@ pub async fn run(command: Command) -> Result<()> {
             | Command::Probe { args, .. }
             | Command::Inspect(args) => args,
             Command::Profiles
+            | Command::PublicationPlan { .. }
+            | Command::Publish { .. }
+            | Command::RecoverPublication { .. }
             | Command::Discover { .. }
             | Command::Inventory { .. }
             | Command::AdmissionCheck { .. } => {
@@ -198,6 +301,9 @@ pub async fn run(command: Command) -> Result<()> {
             Command::Probe { .. } => unreachable!("handled before the blocking operation"),
             Command::Inspect(_) => store.inspect(),
             Command::Profiles
+            | Command::PublicationPlan { .. }
+            | Command::Publish { .. }
+            | Command::RecoverPublication { .. }
             | Command::Discover { .. }
             | Command::Inventory { .. }
             | Command::AdmissionCheck { .. } => {

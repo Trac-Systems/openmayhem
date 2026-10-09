@@ -38,7 +38,7 @@ pub struct AdmissionEvidence {
     pub admission_revoked: bool,
 }
 impl AdmissionEvidence {
-    fn validate(&self) -> Result<()> {
+    pub(super) fn validate(&self) -> Result<()> {
         self.context
             .identity()
             .validate()
@@ -89,6 +89,9 @@ pub(super) struct Attempt {
     evidence: Option<AdmissionEvidence>,
 }
 impl Attempt {
+    pub(super) fn high_water(&self) -> Option<(Proof, u64)> {
+        self.high_water.clone()
+    }
     pub(super) fn validate(&self) -> Result<()> {
         require(
             self.schema_version == 1
@@ -210,30 +213,7 @@ impl Store {
         timeout_ms: u64,
     ) -> Result<Review> {
         require((1..=MAX_AGE_MS).contains(&timeout_ms))?;
-        let base = url::Url::parse(&format!("{}/", peer_rpc.trim_end_matches('/')))
-            .map_err(|_| Error::Invalid)?;
-        require(
-            base.username().is_empty()
-                && base.password().is_none()
-                && base.query().is_none()
-                && base.fragment().is_none()
-                && (base.scheme() == "https"
-                    || base.scheme() == "http"
-                        && match base.host() {
-                            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-                            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-                            _ => false,
-                        }),
-        )?;
-        let endpoint = base
-            .join("proxy/provider-state")
-            .map_err(|_| Error::Invalid)?;
-        let client = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_millis(timeout_ms))
-            .build()
-            .map_err(|_| Error::Invalid)?;
+        let (client, base) = peer(peer_rpc, timeout_ms)?;
         let guard = store::Guard::open(&self.directory)?;
         let mut record = guard.read()?.ok_or(Error::Missing)?;
         let binding = record.binding()?;
@@ -279,29 +259,28 @@ impl Store {
         let nonce = Digest::hash("mayhem/proxy/setup-admission-read/v1", &[&random]);
         let started = Instant::now();
         let result = tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-            let mut response = client.post(endpoint).json(&serde_json::json!({
-                "provider_pubkey":record.input.provider_pubkey,"initial_operation_digest":initial_operation_digest,"request_nonce":nonce,
-            })).send().await.map_err(|_| AdmissionState::Unavailable)?;
-            if !response.status().is_success() { return Err(AdmissionState::Unavailable); }
-            if response.content_length().is_some_and(|v| v > MAX_RESPONSE as u64) { return Err(AdmissionState::InvalidResponse); }
-            let mut bytes = Vec::new();
-            while let Some(chunk) = response.chunk().await.map_err(|_| AdmissionState::Unavailable)? {
-                if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE { return Err(AdmissionState::InvalidResponse); }
-                bytes.extend_from_slice(&chunk);
+            let evidence = observe(
+                &client,
+                &base,
+                &record.input.network,
+                &record.input.provider_pubkey,
+                &initial_operation_digest,
+                &nonce,
+            )
+            .await?;
+            if record
+                .admission
+                .as_ref()
+                .and_then(|a| a.high_water.as_ref())
+                .is_some_and(|(proof, epoch)| {
+                    !evidence.proof.follows(proof) || evidence.context.epoch < *epoch
+                })
+            {
+                return Err(AdmissionState::InvalidResponse);
             }
-            let wire: Wire = serde_json::from_slice(&bytes).map_err(|_| AdmissionState::InvalidResponse)?;
-            if !wire.ok || wire.schema_version != 1 || wire.lane != ProxyLane::Proxy
-                || wire.requester != record.input.provider_pubkey || wire.provider_pubkey != record.input.provider_pubkey
-                || wire.request_nonce != nonce || wire.initial_operation_digest != initial_operation_digest
-                || wire.context.identity() != record.input.network { return Err(AdmissionState::InvalidResponse); }
-            let evidence = AdmissionEvidence { context: wire.context, proof: wire.proof, registry_enabled: wire.registry_enabled,
-                fee_policy_hash: wire.fee_policy_hash, provider: wire.provider, provider_revoked: wire.provider_revoked,
-                admission_revoked: wire.admission_revoked };
-            evidence.validate().map_err(|_| AdmissionState::InvalidResponse)?;
-            if record.admission.as_ref().and_then(|a| a.high_water.as_ref()).is_some_and(|(proof, epoch)|
-                !evidence.proof.follows(proof) || evidence.context.epoch < *epoch) { return Err(AdmissionState::InvalidResponse); }
             Ok(evidence)
-        }).await;
+        })
+        .await;
         let attempt = record.admission.as_mut().ok_or(Error::Invalid)?;
         attempt.state = match result {
             Err(_) => AdmissionState::TimedOut,
@@ -328,4 +307,104 @@ impl Store {
         guard.write(&record)?;
         record.review()
     }
+}
+
+// Shared trusted-origin read used by setup observation and publication recovery.
+pub(super) fn peer(peer_rpc: &str, timeout_ms: u64) -> Result<(reqwest::Client, url::Url)> {
+    require((1..=MAX_AGE_MS).contains(&timeout_ms))?;
+    let base = url::Url::parse(&format!("{}/", peer_rpc.trim_end_matches('/')))
+        .map_err(|_| Error::Invalid)?;
+    require(
+        base.username().is_empty()
+            && base.password().is_none()
+            && base.query().is_none()
+            && base.fragment().is_none()
+            && (base.scheme() == "https"
+                || base.scheme() == "http"
+                    && match base.host() {
+                        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+                        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+                        _ => false,
+                    }),
+    )?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_millis(timeout_ms))
+        .build()
+        .map_err(|_| Error::Invalid)?;
+    Ok((client, base))
+}
+pub(super) async fn observe(
+    client: &reqwest::Client,
+    base: &url::Url,
+    network: &Identity,
+    provider: &Digest,
+    operation: &Digest,
+    nonce: &Digest,
+) -> std::result::Result<AdmissionEvidence, AdmissionState> {
+    let endpoint = base
+        .join("proxy/provider-state")
+        .map_err(|_| AdmissionState::InvalidResponse)?;
+    let response = client
+        .post(endpoint)
+        .json(&serde_json::json!({
+            "provider_pubkey":provider,"initial_operation_digest":operation,"request_nonce":nonce,
+        }))
+        .send()
+        .await
+        .map_err(|_| AdmissionState::Unavailable)?;
+    let bytes = bounded_response(response, MAX_RESPONSE).await?;
+    let wire: Wire = serde_json::from_slice(&bytes).map_err(|_| AdmissionState::InvalidResponse)?;
+    if !wire.ok
+        || wire.schema_version != 1
+        || wire.lane != ProxyLane::Proxy
+        || &wire.requester != provider
+        || &wire.provider_pubkey != provider
+        || &wire.request_nonce != nonce
+        || &wire.initial_operation_digest != operation
+        || &wire.context.identity() != network
+    {
+        return Err(AdmissionState::InvalidResponse);
+    }
+    let evidence = AdmissionEvidence {
+        context: wire.context,
+        proof: wire.proof,
+        registry_enabled: wire.registry_enabled,
+        fee_policy_hash: wire.fee_policy_hash,
+        provider: wire.provider,
+        provider_revoked: wire.provider_revoked,
+        admission_revoked: wire.admission_revoked,
+    };
+    evidence
+        .validate()
+        .map_err(|_| AdmissionState::InvalidResponse)?;
+    Ok(evidence)
+}
+pub(super) async fn bounded_response(
+    mut response: reqwest::Response,
+    maximum: usize,
+) -> std::result::Result<Vec<u8>, AdmissionState> {
+    if !response.status().is_success() {
+        return Err(AdmissionState::Unavailable);
+    }
+    if response
+        .content_length()
+        .is_some_and(|v| v > maximum as u64)
+    {
+        return Err(AdmissionState::InvalidResponse);
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| AdmissionState::Unavailable)?
+    {
+        if bytes.len().saturating_add(chunk.len()) > maximum {
+            return Err(AdmissionState::InvalidResponse);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
 }

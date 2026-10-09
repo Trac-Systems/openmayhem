@@ -5,6 +5,7 @@ mod admission;
 mod connection;
 mod probe;
 mod profile;
+mod publication;
 mod review;
 mod store;
 pub use admission::{AdmissionEvidence, AdmissionReport, AdmissionState, CanonicalProvider};
@@ -13,6 +14,10 @@ pub use probe::{ProbeGroup, ProbePlan, ProbeReport, ProbeScope, ProbeState};
 pub use profile::{
     profiles, EndpointProfile, MembershipInput, OfferInput, ProfileInput, ProfileMarket,
     ProfileReview,
+};
+pub use publication::{
+    AdmissionPermit, PublicationAuthorization, PublicationPlan, PublicationReason,
+    PublicationReport, PublicationState,
 };
 pub use review::{AdmissionHandoff, Review, State};
 pub use store::Store;
@@ -35,6 +40,9 @@ use std::{
 };
 
 pub const MAX_BYTES: usize = 512 * 1024;
+// One original private input plus <=17 immutable public operations, signatures
+// and bounded recovery metadata. Input/discovery limits remain unchanged.
+const MAX_DRAFT_BYTES: usize = MAX_BYTES + 17 * 65536 + 32768;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -60,6 +68,8 @@ pub enum Error {
     ProbeCapacity,
     #[error("provider connection discovery state is missing")]
     DiscoveryMissing,
+    #[error("provider publication requires recovery of its original signed operations")]
+    PublicationRecovery,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 fn require(ok: bool) -> Result<()> {
@@ -200,6 +210,8 @@ struct Record {
     probe: Option<probe::Attempt>,
     #[serde(default)]
     admission: Option<admission::Attempt>,
+    #[serde(default)]
+    publication: Option<publication::Attempt>,
 }
 impl Record {
     fn binding(&self) -> Result<Digest> {
@@ -219,6 +231,10 @@ impl Record {
                 && self.revision <= mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER,
         )?;
         self.input.validate()?;
+        if let Some(publication) = &self.publication {
+            publication.validate()?;
+            publication.check_identity(self)?;
+        }
         if let Some(admission) = &self.admission {
             admission.validate()?;
         }

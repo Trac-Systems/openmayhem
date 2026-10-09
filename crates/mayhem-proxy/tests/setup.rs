@@ -7,6 +7,8 @@ mod connection;
 mod probes;
 #[path = "setup/profile.rs"]
 mod profile;
+#[path = "setup/publication.rs"]
+mod publication;
 use mayhem_proto::proxy::{
     finance::{ProxyReceiptOutcome, ProxySettlementPolicy},
     *,
