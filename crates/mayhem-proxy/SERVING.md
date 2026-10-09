@@ -106,8 +106,11 @@ native-tokenizer observation API preserves tokenizer identity and measurement ag
 connect an operator-approved, digest-pinned local tokenizer to validated streams.
 Buffered or insufficient output remains unknown. See [throughput measurement](THROUGHPUT.md)
 for timing, resource bounds and the distinction between visible-output measurement and
-proof of remote model identity. Managed configuration and public throughput eligibility
-remain separate unfinished integration work.
+proof of remote model identity. `Monitor::register_measured` binds the tokenizer/floor
+requirement to the route's snapshot and actual live capacity source, including fresh
+probe recovery when only speed evidence has expired. Observation-only registrations
+do not imply this requirement. Managed configuration and signed public availability
+remain unfinished integration work.
 
 `capacity::Authority::bind_live` now connects memory-only readiness sources to actual
 proposal reservation, provider signing and dispatch. Sources preserve the observation's

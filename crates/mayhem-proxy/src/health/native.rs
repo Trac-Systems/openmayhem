@@ -30,6 +30,10 @@ pub struct Source {
     workers: Arc<Semaphore>,
 }
 impl Source {
+    /// Identity of approved local data; not attestation of remote model weights.
+    pub fn digest(&self) -> &Digest {
+        &self.digest
+    }
     pub fn from_bytes(
         bytes: &[u8],
         digest: Digest,

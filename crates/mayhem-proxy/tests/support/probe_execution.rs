@@ -7,6 +7,18 @@ use mayhem_proxy::{
 };
 
 pub(super) fn setup(f: &Fixture) -> (Arc<capacity::Authority>, health::Monitor) {
+    setup_policy(f, None)
+}
+pub(super) fn setup_measured(
+    f: &Fixture,
+    tokenizer: Digest,
+) -> (Arc<capacity::Authority>, health::Monitor) {
+    setup_policy(f, Some(tokenizer))
+}
+fn setup_policy(
+    f: &Fixture,
+    tokenizer: Option<Digest>,
+) -> (Arc<capacity::Authority>, health::Monitor) {
     let a = Arc::new(
         capacity::Authority::open(
             f._store.path().join("probe-capacity"),
@@ -69,8 +81,12 @@ pub(super) fn setup(f: &Fixture) -> (Arc<capacity::Authority>, health::Monitor) 
         1,
     )
     .unwrap();
-    m.register(d(20), 2, f.adapter.endpoint() != ProxyEndpoint::Decisions)
-        .unwrap();
+    if let Some(tokenizer) = tokenizer {
+        m.register_measured(d(20), 2, tokenizer).unwrap();
+    } else {
+        m.register(d(20), 2, f.adapter.endpoint() != ProxyEndpoint::Decisions)
+            .unwrap();
+    }
     a.bind_live(capacity::Scope::Group(d(10)), m.connection_source())
         .unwrap();
     a.bind_live(

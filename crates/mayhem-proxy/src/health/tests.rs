@@ -97,6 +97,111 @@ fn class() -> Class {
     Class::new(1024, Thinking::Disabled, true)
 }
 
+fn measured_monitor() -> Monitor {
+    let m = Monitor::new(policy(), 4, 7).unwrap();
+    m.register_measured(d(1), 4, d(9)).unwrap();
+    m
+}
+#[tokio::test(start_paused = true)]
+async fn measured_admission_and_snapshot_share_unknown_fresh_stale_and_recovery_states() {
+    let m = measured_monitor();
+    let source = m.route_source(&d(1)).unwrap();
+    good(&m, &d(1), class(), 1).await;
+    assert_eq!(
+        m.snapshot(&d(1)).unwrap().reason,
+        Reason::UnverifiedThroughput
+    );
+    let evidence = source.evidence().unwrap();
+    assert_eq!(evidence.state, crate::capacity::Readiness::Checking);
+    assert_eq!(evidence.allowance, 0);
+    // Ordinary health is fresh, but a speed-recovery observation is permitted.
+    rate(m.observe_recovery(&d(1), class()).unwrap(), 0, 10, 100).await;
+    assert!(m.snapshot(&d(1)).unwrap().meets_native_floor(5));
+    assert!(!m.snapshot(&d(1)).unwrap().meets_native_floor(200));
+    assert_eq!(
+        source.evidence().unwrap().state,
+        crate::capacity::Readiness::Ready
+    );
+    advance(59_000).await;
+    good(&m, &d(1), class(), 1).await;
+    // Successful short replies do not rejuvenate the last native measurement.
+    assert!(source.evidence().unwrap().age >= Duration::from_millis(59_000));
+    advance(1000).await;
+    let view = m.snapshot(&d(1)).unwrap();
+    assert_eq!(view.reason, Reason::StaleThroughput);
+    assert_eq!(view.allowance, 0);
+    assert_eq!(
+        source.evidence().unwrap().state,
+        crate::capacity::Readiness::Checking
+    );
+    let recovery = m.observe_recovery(&d(1), class()).unwrap();
+    assert!(recovery.recovery_is_current().unwrap());
+    rate(recovery, 0, 10, 100).await;
+    assert!(m.snapshot(&d(1)).unwrap().meets_native_floor(5));
+}
+
+#[tokio::test(start_paused = true)]
+async fn measured_registration_cannot_be_downgraded_or_satisfied_with_another_tokenizer() {
+    let m = measured_monitor();
+    assert!(m.register(d(1), 4, true).is_err());
+    assert!(m.register_measured(d(1), 4, d(8)).is_err());
+    let mut probe = m.observe_recovery(&d(1), class()).unwrap();
+    probe.delta(&delta());
+    probe.native_progress(d(8), 0).unwrap();
+    advance(100).await;
+    probe.native_progress(d(8), 100).unwrap();
+    probe.success(None);
+    let view = m.snapshot(&d(1)).unwrap();
+    assert_eq!(view.reason, Reason::UnverifiedThroughput);
+    assert_eq!(view.allowance, 0);
+    assert!(!view.meets_native_floor(5));
+    assert!(view.recovery_after_ms > 0);
+    assert!(matches!(
+        m.observe_recovery(&d(1), class()),
+        Err(Error::RecoveryBusy)
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn inconclusive_probe_backs_off_without_renewing_speed_or_creating_ready_capacity() {
+    let m = measured_monitor();
+    let probe = m.observe_recovery(&d(1), class()).unwrap();
+    probe.success(Some(999999));
+    let view = m.snapshot(&d(1)).unwrap();
+    assert_eq!(view.reason, Reason::UnverifiedThroughput);
+    assert_eq!(view.allowance, 0);
+    assert_eq!(view.recovery_after_ms, 2000);
+    assert!(matches!(
+        m.observe_recovery(&d(1), class()),
+        Err(Error::RecoveryBusy)
+    ));
+    advance(2000).await;
+    assert_eq!(m.snapshot(&d(1)).unwrap().allowance, 0);
+    rate(m.observe_recovery(&d(1), class()).unwrap(), 0, 10, 100).await;
+    assert!(m.snapshot(&d(1)).unwrap().meets_native_floor(5));
+}
+
+#[tokio::test(start_paused = true)]
+async fn recovery_backoff_starts_after_evaluation_but_evidence_keeps_network_age() {
+    let m = measured_monitor();
+    let mut probe = m.observe_recovery(&d(1), class()).unwrap();
+    probe.delta(&delta());
+    probe.network_complete(Instant::now());
+    let done = probe.prepare_success(Some(5000));
+    advance(20_000).await;
+    done.publish();
+    let view = m.snapshot(&d(1)).unwrap();
+    assert_eq!(view.recovery_after_ms, 2000);
+    assert!(view.evidence_age_ms.unwrap() >= 20_000);
+    assert_eq!(view.allowance, 0);
+    assert!(matches!(
+        m.observe_recovery(&d(1), class()),
+        Err(Error::RecoveryBusy)
+    ));
+    advance(2000).await;
+    assert!(m.observe_recovery(&d(1), class()).is_ok());
+}
+
 #[test]
 fn latency_classes_separate_effort_output_budget_and_schema_without_retaining_prompt_text() {
     let base = json!({"messages":[{"role":"user","content":"private prompt"}],"max_tokens":512,"reasoning_effort":"low"});

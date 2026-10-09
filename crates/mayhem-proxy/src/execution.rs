@@ -220,6 +220,11 @@ impl Executor {
     /// remain the paid controller's responsibility. No additional POST is made.
     pub fn with_observations(mut self, monitor: health::Monitor, route: Digest) -> Result<Self> {
         monitor.snapshot(&route).map_err(|_| Error::Configuration)?;
+        if let Some(source) = &self.tokenizer {
+            monitor
+                .validate_tokenizer(&route, source.digest())
+                .map_err(|_| Error::Configuration)?;
+        }
         self.observations = Some((monitor, route));
         Ok(self)
     }
@@ -228,6 +233,11 @@ impl Executor {
             || !source.matches(self.connection.fingerprint(), self.adapter.recipe_hash())
         {
             return Err(Error::Configuration);
+        }
+        if let Some((monitor, route)) = &self.observations {
+            monitor
+                .validate_tokenizer(route, source.digest())
+                .map_err(|_| Error::Configuration)?;
         }
         self.tokenizer = Some(source);
         Ok(self)

@@ -317,7 +317,7 @@ async fn native_measured_slow_streams_withdraw_then_fresh_budgeted_inference_rec
     .await;
     let mut f = Fixture::new(&b.base, ProxyEndpoint::Chat);
     let source = source(&f);
-    let (a, m) = probe_execution::setup(&f);
+    let (a, m) = probe_execution::setup_measured(&f, source.digest().clone());
     f.executor = f
         .executor
         .with_observations(m.clone(), d(20))
@@ -363,4 +363,46 @@ async fn native_measured_slow_streams_withdraw_then_fresh_budgeted_inference_rec
     assert!(m.snapshot(&d(20)).unwrap().meets_native_floor(5));
     assert_eq!(a.status(&d(20)).unwrap().available, 1);
     assert_eq!(b.calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn native_required_admission_recovers_from_short_probe_without_mistaking_success_for_capacity(
+) {
+    let b = paced_runs(vec![
+        vec![(Duration::ZERO, sse(&[delta("yes", json!("stop"))], true))],
+        chat_pieces(Duration::from_millis(100)),
+    ])
+    .await;
+    let f = Fixture::new(&b.base, ProxyEndpoint::Chat);
+    let source = source(&f);
+    let (a, m) = probe_execution::setup_measured(&f, source.digest().clone());
+    let body = probe_execution::bounded(
+        serde_json::from_slice(&stream_request()).unwrap(),
+        ProxyEndpoint::Chat,
+    );
+    let c = probe_execution::controller(
+        &f,
+        a.clone(),
+        m.clone(),
+        &body,
+        true,
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_tokenizer(source)
+    .unwrap();
+    c.run().await.unwrap();
+    let view = m.snapshot(&d(20)).unwrap();
+    assert_eq!(view.reason, health::Reason::UnverifiedThroughput);
+    assert_eq!(a.status(&d(20)).unwrap().available, 0);
+    assert!(view.recovery_after_ms > 0);
+    assert!(c.run().await.is_err());
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+    tokio::time::sleep(Duration::from_millis(view.recovery_after_ms + 1)).await;
+    c.run().await.unwrap();
+    assert!(m.snapshot(&d(20)).unwrap().meets_native_floor(5));
+    assert_eq!(a.status(&d(20)).unwrap().available, 1);
+    assert_eq!(b.calls.load(Ordering::SeqCst), 2);
+    assert!(c.run().await.is_err());
+    assert_eq!(b.calls.load(Ordering::SeqCst), 2);
 }

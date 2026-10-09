@@ -132,6 +132,8 @@ impl Controller {
         {
             return Err(ProbeError::Configuration);
         }
+        self.monitor
+            .validate_tokenizer(&self.specification.route, source.digest())?;
         self.tokenizer = Some(source);
         Ok(self)
     }

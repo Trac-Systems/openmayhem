@@ -73,14 +73,28 @@ Tokenizer/model matching is an operator claim unless separately verified; T4 ide
 does not turn it into cryptographic model attestation. Native price and billing-unit
 rules are unchanged.
 
-The monitor can compare qualified LLM samples to its floor, withdraw repeated slow
-routes and retain original measurement age. Durable admission separately enforces
-shared allocation ceilings and outstanding work. `Snapshot::meets_native_floor` exposes
-fresh speed eligibility, but no caller may assume every generic Ready signal already
-enforces it. Managed startup, tokenizer provisioning, signed public availability,
-default/explicit floor handling and coordinated recovery must be wired and accepted
-together before public activation. Unknown speed must not be advertised as a measured
-passing rate or converted to zero.
+`Monitor::register_measured` makes the approved tokenizer and policy floor a route's
+immutable admission requirement. Its public snapshot and bound live capacity source
+then share the same qualification: missing/wrong-tokenizer or stale measurements yield
+Checking with zero allowance, and below-floor measurements yield Degraded with zero
+allowance. Fresh short replies do not refresh the old speed sample. Source freshness
+includes the older of health and required speed evidence. Registration cannot silently
+downgrade this policy; executor and probe setup reject conflicting tokenizer data.
+
+Recovery uses this same eligibility even if ordinary HTTP/inference health remains
+fresh. A valid but short/buffered probe can complete without establishing capacity: its
+attempt budget remains spent and it backs off. Timer expiry alone never opens capacity.
+Backoff starts at result evaluation, independently of the original network evidence age,
+so durable publication time cannot consume the recovery delay. No probe bypasses physical
+ceilings, uncertain requests, scope ownership or the operator's cost/attempt budget.
+
+Observation-only `register` remains available for lower-level tests and decision routes;
+it does not establish measured LLM admission. `Snapshot::meets_native_floor` additionally
+checks a stricter buyer requirement without changing the shared operator floor. Durable
+admission separately enforces shared ceilings and outstanding work. Managed startup must
+select the required policy explicitly. Tokenizer provisioning, signed public availability,
+gateway default/explicit floor handling and scheduled recovery integration remain required
+before public activation. Unknown speed is never a measured passing rate or zero.
 
 Local tests cover pinned data, byte offsets across BPE boundaries, UTF-8, multiple
 channels, bounded accumulation, timing/age, slow consumers, real HTTP streaming for

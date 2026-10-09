@@ -147,6 +147,8 @@ pub enum Reason {
     SlowGeneration,
     SlowResponse,
     RecoveryRequired,
+    UnverifiedThroughput,
+    StaleThroughput,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,6 +233,7 @@ impl Gate {
         self.state = match reason {
             Reason::Busy | Reason::RateLimited => State::Busy,
             Reason::SlowGeneration | Reason::SlowResponse => State::Degraded,
+            Reason::UnverifiedThroughput | Reason::StaleThroughput => State::Checking,
             _ => State::Unavailable,
         };
     }
@@ -285,6 +288,7 @@ struct Route {
     classes: BTreeMap<Class, Baseline>,
     last: Option<Measurement>,
     native: Option<(Instant, f64, Digest)>,
+    required_tokenizer: Option<Digest>,
 }
 struct Data {
     routes: BTreeMap<Digest, Route>,
@@ -328,12 +332,30 @@ impl Monitor {
         })
     }
     pub fn register(&self, id: Digest, ceiling: u32, llm: bool) -> Result<()> {
+        self.register_policy(id, ceiling, llm, None)
+    }
+    /// LLM route whose admission/public snapshot requires fresh native speed,
+    /// using this approved tokenizer and the policy's minimum (at least5 tok/s).
+    /// Ordinary register remains an observation-only/decision integration API.
+    pub fn register_measured(&self, id: Digest, ceiling: u32, tokenizer: Digest) -> Result<()> {
+        self.register_policy(id, ceiling, true, Some(tokenizer))
+    }
+    fn register_policy(
+        &self,
+        id: Digest,
+        ceiling: u32,
+        llm: bool,
+        tokenizer: Option<Digest>,
+    ) -> Result<()> {
         if ceiling == 0 || ceiling > self.inner.connection_ceiling {
             return Err(Error::Invalid);
         }
         let mut data = self.inner.data.lock().map_err(|_| Error::Unavailable)?;
         if let Some(route) = data.routes.get(&id) {
-            return if route.ceiling == ceiling && route.llm == llm {
+            return if route.ceiling == ceiling
+                && route.llm == llm
+                && route.required_tokenizer == tokenizer
+            {
                 Ok(())
             } else {
                 Err(Error::Invalid)
@@ -351,6 +373,7 @@ impl Monitor {
                 classes: BTreeMap::new(),
                 last: None,
                 native: None,
+                required_tokenizer: tokenizer,
             },
         );
         data.revision = data.revision.saturating_add(1);
@@ -359,6 +382,19 @@ impl Monitor {
     pub fn snapshot(&self, id: &Digest) -> Result<Snapshot> {
         let data = self.inner.data.lock().map_err(|_| Error::Unavailable)?;
         snapshot(&data, id, &self.inner.policy, Instant::now())
+    }
+    pub(crate) fn validate_tokenizer(&self, id: &Digest, tokenizer: &Digest) -> Result<()> {
+        let data = self.inner.data.lock().map_err(|_| Error::Unavailable)?;
+        let route = data.routes.get(id).ok_or(Error::Invalid)?;
+        if !route.llm
+            || route
+                .required_tokenizer
+                .as_ref()
+                .is_some_and(|v| v != tokenizer)
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(())
     }
     /// Passive observation of an independently admitted request. This cannot
     /// bypass the durable capacity/financial admission checks of its caller.
@@ -436,11 +472,11 @@ fn snapshot(data: &Data, id: &Digest, policy: &Policy, now: Instant) -> Result<S
     let fresh = gate.fresh(now, policy.evidence_ttl_ms);
     let all_fresh =
         group.fresh(now, policy.evidence_ttl_ms) && own.fresh(now, policy.evidence_ttl_ms);
-    let ready = group.state == State::Ready
+    let mut ready = group.state == State::Ready
         && matches!(own.state, State::Ready | State::Degraded)
         && own.allowance > 0
         && all_fresh;
-    let (state, reason) = if ready {
+    let (mut state, mut reason) = if ready {
         (own.state, own.reason)
     } else if gate.state == State::Ready || !fresh {
         (
@@ -454,6 +490,17 @@ fn snapshot(data: &Data, id: &Digest, policy: &Policy, now: Instant) -> Result<S
     } else {
         (gate.state, gate.reason)
     };
+    if ready {
+        if let Some(missing) = native_requirement(route, policy, now) {
+            ready = false;
+            state = if missing == Reason::SlowGeneration {
+                State::Degraded
+            } else {
+                State::Checking
+            };
+            reason = missing;
+        }
+    }
     let retry = group
         .retry_ms
         .saturating_sub(millis(now.saturating_duration_since(group.retry_start)))
@@ -470,7 +517,17 @@ fn snapshot(data: &Data, id: &Digest, policy: &Policy, now: Instant) -> Result<S
             0
         },
         evidence_age_ms: match (group.observed, own.observed) {
-            (Some(a), Some(b)) => Some(millis(now.saturating_duration_since(a.min(b)))),
+            (Some(a), Some(b)) => {
+                let at = if route.required_tokenizer.is_some() && ready {
+                    route
+                        .native
+                        .as_ref()
+                        .map_or(a.min(b), |(at, _, _)| a.min(b).min(*at))
+                } else {
+                    a.min(b)
+                };
+                Some(millis(now.saturating_duration_since(at)))
+            }
             _ => None,
         },
         recovery_after_ms: retry,
@@ -486,6 +543,23 @@ fn snapshot(data: &Data, id: &Digest, policy: &Policy, now: Instant) -> Result<S
                 valid_for_ms: policy.evidence_ttl_ms,
             }),
     })
+}
+
+fn native_requirement(route: &Route, policy: &Policy, now: Instant) -> Option<Reason> {
+    let required = route.required_tokenizer.as_ref()?;
+    match &route.native {
+        None => Some(Reason::UnverifiedThroughput),
+        Some((_, _, tokenizer)) if tokenizer != required => Some(Reason::UnverifiedThroughput),
+        Some((at, _, _))
+            if millis(now.saturating_duration_since(*at)) >= policy.evidence_ttl_ms =>
+        {
+            Some(Reason::StaleThroughput)
+        }
+        Some((_, rate, _)) if *rate < f64::from(policy.min_native_tok_s) => {
+            Some(Reason::SlowGeneration)
+        }
+        _ => None,
+    }
 }
 
 enum Outcome {
@@ -541,6 +615,7 @@ impl Monitor {
             Outcome::Success => {
                 // Tokenization and durable local writes must not renew network
                 // evidence or replace a newer observation with an older result.
+                let evaluated_at = now;
                 let now = measurement.observed_at;
                 data.revision = data.revision.saturating_add(1);
                 let mut slow_reason = None;
@@ -628,6 +703,21 @@ impl Monitor {
                         route.native = Some((at, rate, tokenizer.clone()));
                     }
                 }
+                // A technically valid short/buffered probe may fail to establish
+                // the required speed. Back off instead of repeatedly charging
+                // operator probes or claiming that a timer proves recovery.
+                if sample.recovery {
+                    if let Some(reason) = native_requirement(route, policy, evaluated_at) {
+                        let failures = route.gate.failures.saturating_add(1);
+                        let delay = data.schedule.retry(failures);
+                        let route = data.routes.get_mut(&sample.route).expect("route checked");
+                        route.gate.block(reason, now, delay);
+                        route.gate.retry_start = evaluated_at;
+                        data.connection
+                            .good(now, self.inner.connection_ceiling, policy);
+                        return;
+                    }
+                }
                 if let Some(reason) = slow_reason {
                     if reason == Reason::SlowResponse {
                         route.gate.degrade(now, sample.class);
@@ -639,6 +729,7 @@ impl Monitor {
                     let delay = data.schedule.retry(failures.saturating_add(1));
                     let route = data.routes.get_mut(&sample.route).expect("route checked");
                     route.gate.block(reason, now, delay);
+                    route.gate.retry_start = evaluated_at;
                     route.gate.performance_class = Some(sample.class);
                 } else if recovery_class_matches && (!was_slow || speed_recovery) && !latency_bad {
                     let route = data.routes.get_mut(&sample.route).expect("route checked");
