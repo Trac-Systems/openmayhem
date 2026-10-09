@@ -212,12 +212,12 @@ the pending entry if capacity cleanup fails. Losing a caller's reply does not di
 controller-owned state. The supervisor must invoke the bounded unsigned-expiry method
 even without new incoming inference; this scheduling is not implemented by the library.
 
-Process restart preserves all durable capacity allocations, treating prior-controller
-leases as uncertain. In-memory proposal disappearance is not proof of cancellation.
-Reconciliation of those orphaned leases and partially prepared/signed intentions is
-still required before automatic public startup. Until implemented, this controller is
-local integration work, not production readiness. A single shared runtime authority is
-still required for native/proxy aliases, and opaque outside consumers remain unknown.
+Process restart initially preserves all durable capacity allocations, treating
+prior-controller leases as uncertain. In-memory disappearance is not proof of cancellation.
+The bounded reconciliation below may reclaim explicitly never-signed proposals. Partially
+prepared/signed intentions still require separate recovery before automatic public startup.
+This controller is local integration work, not production readiness. A single shared
+runtime authority is required for native/proxy aliases; outside consumers remain unknown.
 
 Local controller tests negotiate all four JSON endpoints on every rail, reject execution
 before funding, then complete one real loopback HTTP request. They cover all three LLM
@@ -225,3 +225,32 @@ streaming request forms/rails, concurrent proposal replay, per-buyer/byte bounds
 input, operator-policy mismatch, unsigned expiry, signing failure, shared native capacity,
 failed cleanup and restart without a fabricated free slot. Existing receipt/payout and
 streaming executor regression checks remain part of acceptance.
+
+## Restart reconciliation of never-signed proposals
+
+New controller proposals use a durable `Proposed` capacity phase. This phase cannot
+dispatch inference. Before touching the signing journal or wallet, provider acceptance
+atomically commits `Proposed -> Reserved` in the shared capacity store. Both the journal
+and protected wallet signer require that fence. Failed durability cannot return permission
+to sign. Existing `Reserved` records retain their old meaning and are never relabelled as
+never-signed proposals; native allocations are unchanged.
+
+`Controller::reconcile_unsigned(after, limit)` scans one indexed shared-group page of
+at most 64 entries. It releases only this proxy route's prior-controller records whose
+stored phase is still `Proposed`. This proves provider countersigning and dispatch never
+started, independently of a missing journal row, elapsed time or ledger availability.
+It does not release a financial hold, publish a receipt, cancel native work, or report
+fresh serving capacity. Fresh upstream readiness remains independently required.
+
+Current-controller proposals, other routes, native allocations, historical `Reserved`
+records and any signing/dispatch uncertainty remain retained. The per-record transaction
+rechecks the exact lease and old controller fence before removing its indexes/counters.
+Recovery is replay-safe and resumes by seek cursor even when earlier rows were deleted;
+the supervisor must wrap the cursor after each pass. No whole-history rebuild is used.
+
+The tests reopen real stores and demonstrate reclaim followed by a new proposal, bounded
+pagination with native/legacy allocations, refusal to reclaim live proposals, and retention
+of both committed signatures and a signing failure after the durable capacity fence.
+Buyer-signed intentions whose provider never accepted, partially prepared provider records,
+and never-admitted dual signatures still need canonical expiry/absence reconciliation.
+Do not treat this capacity cleanup as proof that those separate records can be erased.

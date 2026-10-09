@@ -20,6 +20,54 @@ struct Controlled {
     buyer_signer: Arc<Authority>,
 }
 impl Controlled {
+    fn restart(self, f: &Fixture, peer: &Peer) -> Self {
+        let policy = self.runtime.approved_policy.clone();
+        let Self {
+            proposals,
+            runtime,
+            journal,
+            provider,
+            buyer,
+            buyer_signer,
+        } = self;
+        drop(proposals);
+        drop(runtime);
+        let capacity = Arc::new(
+            capacity::Authority::open(
+                f._store.path().join("controlled-capacity"),
+                peer.identity.clone(),
+                capacity::Limits {
+                    max_groups: 4,
+                    max_routes: 8,
+                    max_leases: 8,
+                    max_evidence_age: Duration::from_secs(60),
+                },
+            )
+            .unwrap(),
+        );
+        let runtime = Arc::new(Runtime {
+            adapter: f.adapter.clone(),
+            connection: f.connection.clone(),
+            capacity,
+            route: d(201),
+            approved_policy: policy,
+        });
+        let proposals = Proposals::new(
+            runtime.clone(),
+            provider.clone(),
+            peer.client.clone(),
+            limits(),
+        )
+        .unwrap();
+        Self {
+            proposals,
+            runtime,
+            journal,
+            provider,
+            buyer,
+            buyer_signer,
+        }
+    }
     async fn new(f: &Fixture, peer: &mut Peer, limits: ProposalLimits, journal_bytes: u64) -> Self {
         let (buyer_signer, _, provider_key) = signer(peer).await;
         let provider_signer = Arc::new(
@@ -430,18 +478,22 @@ async fn provider_proposals_share_native_capacity_and_failed_cleanup_keeps_recov
     next.billing_id = d(832);
     assert!(s.start(&peer, next, &chat()).await.is_err());
     assert_eq!(cap.status(&d(202)).unwrap().route_occupied, 1);
-    // Simulate a conflicting trusted executor transition. Cleanup must reject
-    // rather than erase its bookkeeping or release possibly executing work.
+    // Dispatch cannot bypass the durable signing fence. Then inject conflicting
+    // trusted cleanup to verify that failed cancellation keeps its diagnostics.
     let lease = cap.lease(&proposal.capacity_lease).unwrap().unwrap();
-    let dispatch = cap
+    assert!(cap
         .dispatch_accepted(&lease.id, &lease.work, &d(201))
-        .unwrap();
+        .is_err());
+    cap.complete(capacity::VerifiedCompletion {
+        lease,
+        evidence: d(888),
+    })
+    .unwrap();
     assert!(s.proposals.cancel_unsigned(ctx).await.is_err());
     assert_eq!(s.proposals.status().await.unwrap().unsigned, 1);
-    assert_eq!(cap.status(&d(201)).unwrap().group_occupied, 2);
-    cap.cancel_reserved(native).unwrap();
     assert_eq!(cap.status(&d(201)).unwrap().group_occupied, 1);
-    cap.uncertain(dispatch).unwrap();
+    cap.cancel_reserved(native).unwrap();
+    assert_eq!(cap.status(&d(201)).unwrap().group_occupied, 0);
     assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
     peer.stop().await;
 }
@@ -530,44 +582,20 @@ async fn provider_controller_restart_cannot_guess_an_orphaned_proposal_was_cance
     let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
     let ctx = context(&peer);
     let (_, proposal) = s.start(&peer, ctx.clone(), &chat()).await.unwrap();
-    let policy = s.runtime.approved_policy.clone();
-    let Controlled {
-        proposals,
-        runtime,
-        journal: _,
-        provider,
-        buyer: _,
-        buyer_signer: _,
-    } = s;
-    drop(proposals);
-    drop(runtime);
-    let cap = Arc::new(
-        capacity::Authority::open(
-            f._store.path().join("controlled-capacity"),
-            peer.identity.clone(),
-            capacity::Limits {
-                max_groups: 4,
-                max_routes: 8,
-                max_leases: 8,
-                max_evidence_age: Duration::from_secs(60),
-            },
-        )
-        .unwrap(),
-    );
+    let s = s.restart(&f, &peer);
+    let cap = &s.runtime.capacity;
+    let control = &s.proposals;
     assert_eq!(
         cap.lease(&proposal.capacity_lease).unwrap().unwrap().phase,
         capacity::Phase::Uncertain
     );
-    capacity_ready(&cap, capacity::Scope::Group(d(200)));
-    capacity_ready(&cap, capacity::Scope::Route(d(201)));
-    let runtime = Arc::new(Runtime {
-        adapter: f.adapter.clone(),
-        connection: f.connection.clone(),
-        capacity: cap.clone(),
-        route: d(201),
-        approved_policy: policy,
-    });
-    let control = Proposals::new(runtime, provider, peer.client.clone(), limits()).unwrap();
+    assert_eq!(
+        cap.status(&d(201)).unwrap().available,
+        0,
+        "restart requires fresh health independently"
+    );
+    capacity_ready(cap, capacity::Scope::Group(d(200)));
+    capacity_ready(cap, capacity::Scope::Route(d(201)));
     assert_eq!(control.expire_unsigned().await.unwrap(), 0);
     let mut pair = open(&peer, ctx.clone(), 1024 * 1024).await;
     let request = transfer(
@@ -578,8 +606,137 @@ async fn provider_controller_restart_cannot_guess_an_orphaned_proposal_was_cance
         },
     )
     .await;
-    assert!(control.propose(ctx, request).await.is_err());
+    assert!(control.propose(ctx.clone(), request).await.is_err());
     assert_eq!(cap.status(&d(201)).unwrap().group_occupied, 1);
+    let proof = control.reconcile_unsigned(None, 1).await.unwrap();
+    assert_eq!((proof.examined, proof.released, proof.retained), (1, 1, 0));
+    assert!(proof.next_after.is_none());
+    assert!(cap.lease(&proposal.capacity_lease).unwrap().is_none());
+    assert_eq!(
+        control.reconcile_unsigned(None, 1).await.unwrap().released,
+        0
+    );
+    let (_, replacement) = s.start(&peer, ctx, &chat()).await.unwrap();
+    assert_ne!(replacement.capacity_lease, proposal.capacity_lease);
+    assert_eq!(peer.command("status").await["publications"], 0);
     assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
     peer.stop().await;
+}
+
+#[tokio::test]
+async fn unsigned_restart_reconciliation_is_paged_and_preserves_native_and_legacy_reservations() {
+    for native in [false, true] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let mut peer = Peer::start(ProxyRail::Fiat, &f, &chat(), false, None).await;
+        let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+        let cap = &s.runtime.capacity;
+        let route = if native {
+            cap.configure_route(capacity::Route {
+                id: d(202),
+                group: d(200),
+                lane: capacity::Lane::Native,
+                max_concurrency: 2,
+            })
+            .unwrap();
+            capacity_ready(cap, capacity::Scope::Route(d(202)));
+            d(202)
+        } else {
+            d(201)
+        };
+        let protected = cap
+            .reserve(
+                &route,
+                capacity::Work {
+                    invocation: d(870),
+                    request_hash: d(871),
+                },
+            )
+            .unwrap();
+        let (_, proposal) = s.start(&peer, context(&peer), &chat()).await.unwrap();
+        assert_eq!(
+            s.proposals
+                .reconcile_unsigned(None, 64)
+                .await
+                .unwrap()
+                .released,
+            0,
+            "live proposals cannot be reclaimed through startup recovery"
+        );
+        let s = s.restart(&f, &peer);
+        let mut cursor = None;
+        let mut released = 0;
+        let mut retained = 0;
+        let mut ended = false;
+        for _ in 0..3 {
+            let page = s.proposals.reconcile_unsigned(cursor, 1).await.unwrap();
+            assert!(page.examined <= 1);
+            released += page.released;
+            retained += page.retained;
+            cursor = page.next_after;
+            if cursor.is_none() {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended);
+        assert_eq!((released, retained), (1, 1));
+        let cap = &s.runtime.capacity;
+        assert!(cap.lease(&proposal.capacity_lease).unwrap().is_none());
+        assert!(cap.lease(&protected.lease().id).unwrap().is_some());
+        assert_eq!(cap.status(&d(201)).unwrap().group_occupied, 1);
+        assert!(s.proposals.reconcile_unsigned(None, 0).await.is_err());
+        assert!(s.proposals.reconcile_unsigned(None, 65).await.is_err());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(peer.command("status").await["publications"], 0);
+        peer.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn restart_reconciliation_preserves_committed_and_uncertain_signing_obligations() {
+    for failed in [false, true] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let mut peer = Peer::start(ProxyRail::Tap, &f, &chat(), false, None).await;
+        let s = Controlled::new(
+            &f,
+            &mut peer,
+            limits(),
+            if failed { 1 } else { 128 * 1024 * 1024 },
+        )
+        .await;
+        let ctx = context(&peer);
+        let (mut pair, proposal) = s.start(&peer, ctx.clone(), &chat()).await.unwrap();
+        let lease = proposal.capacity_lease.clone();
+        assert_eq!(
+            s.runtime.capacity.lease(&lease).unwrap().unwrap().phase,
+            capacity::Phase::Proposed
+        );
+        let (_, offer) = s.offer(&peer, &chat(), &mut pair, proposal).await;
+        let result = s.proposals.accept(ctx.clone(), offer, 1001).await;
+        assert_eq!(result.is_err(), failed);
+        // The capacity fence commits before the journal or signer can fail.
+        assert_eq!(
+            s.runtime.capacity.lease(&lease).unwrap().unwrap().phase,
+            capacity::Phase::Reserved
+        );
+        drop(pair);
+        let s = s.restart(&f, &peer);
+        let page = s.proposals.reconcile_unsigned(None, 64).await.unwrap();
+        assert_eq!((page.released, page.retained), (0, 1));
+        assert_eq!(
+            s.runtime.capacity.status(&d(201)).unwrap().group_occupied,
+            1
+        );
+        let recovered = s.proposals.recover(&ctx).await.unwrap();
+        if let Ok(signed) = result {
+            assert_eq!(recovered.unwrap().authorization, signed.authorization);
+        } else {
+            assert!(recovered.is_none());
+        }
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(peer.command("status").await["publications"], 0);
+        peer.stop().await;
+    }
 }

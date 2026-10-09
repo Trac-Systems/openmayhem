@@ -71,7 +71,7 @@ impl Journal {
         signer: &Authority,
         now_ms: u64,
     ) -> Result<SignedProviderAcceptance> {
-        approval.recheck().map_err(|_| Error::Conflict)?;
+        approval.signing_fenced().map_err(|_| Error::Conflict)?;
         require(
             self.identity()? == *approval.identity() && signer.identity() == approval.identity(),
         )?;

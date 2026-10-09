@@ -225,6 +225,9 @@ pub struct Evidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
+    /// Proxy proposal only: provider signing has not begun and dispatch is forbidden.
+    /// Older Reserved records remain ambiguous and never acquire this phase.
+    Proposed,
     Reserved,
     Dispatched,
     Uncertain,
@@ -604,6 +607,12 @@ impl Authority {
     /// the invocation does, and must be scoped to the authenticated caller. Each
     /// sequential attempt receives a fresh lease only after the previous one closes.
     pub fn reserve(&self, route: &Digest, work: Work) -> Result<Reservation> {
+        self.reserve_phase(route, work, Phase::Reserved)
+    }
+    pub(crate) fn reserve_proposal(&self, route: &Digest, work: Work) -> Result<Reservation> {
+        self.reserve_phase(route, work, Phase::Proposed)
+    }
+    fn reserve_phase(&self, route: &Digest, work: Work, phase: Phase) -> Result<Reservation> {
         let tx = self.write()?;
         let mut m = meta(&tx)?;
         let mut work_index = db(tx.open_table(BY_WORK))?;
@@ -616,6 +625,7 @@ impl Authority {
         let mut groups = db(tx.open_table(GROUPS))?;
         let mut routes = db(tx.open_table(ROUTES))?;
         let mut r: RouteState = read(&routes, route.as_str())?;
+        require(phase != Phase::Proposed || r.config.lane == Lane::Proxy)?;
         let mut g: Group = read(&groups, r.config.group.as_str())?;
         if free(&g, &r, self.fence, self.now()?)? == 0 {
             return Err(Error::Busy);
@@ -634,7 +644,7 @@ impl Authority {
             route: route.clone(),
             work,
             controller_fence: self.fence,
-            phase: Phase::Reserved,
+            phase,
         };
         r.occupied = r.occupied.checked_add(1).ok_or(Error::Invalid)?;
         g.occupied = g.occupied.checked_add(1).ok_or(Error::Invalid)?;
@@ -665,6 +675,59 @@ impl Authority {
         Ok(r.config)
     }
 
+    /// Durable fence BEFORE any provider spend signature can be produced. A
+    /// failed commit never returns permission to sign. Older ordinary reservations
+    /// remain protected; replay returns the same already-fenced allocation.
+    pub(crate) fn begin_signing(&self, expected: &Lease) -> Result<Lease> {
+        let tx = self.write()?;
+        let mut leases = db(tx.open_table(LEASES))?;
+        let mut lease: Lease = read(&leases, expected.id.as_str())?;
+        let r: RouteState = read(&db(tx.open_table(ROUTES))?, lease.route.as_str())?;
+        let g: Group = read(&db(tx.open_table(GROUPS))?, lease.group.as_str())?;
+        ready_reserved(&lease, expected, self.fence, &g, &r, self.now()?)?;
+        require(r.config.lane == Lane::Proxy)?;
+        if lease.phase == Phase::Reserved {
+            return Ok(lease);
+        }
+        lease.phase = Phase::Reserved;
+        db(leases.insert(lease.id.as_str(), encode(&lease)?.as_slice()))?;
+        drop(leases);
+        self.commit(tx)?;
+        Ok(lease)
+    }
+
+    pub(crate) fn route_group(&self, route: &Digest) -> Result<Digest> {
+        self.healthy()?;
+        let tx = db(self.database.begin_read())?;
+        let r: RouteState = read(&db(tx.open_table(ROUTES))?, route.as_str())?;
+        Ok(r.config.group)
+    }
+
+    /// Only a prior-controller Proposed record proves signing and dispatch never
+    /// began. No ledger read, elapsed-time guess or missing journal inference.
+    /// Legacy Reserved, native and dispatched/uncertain records are not reclaimed.
+    pub(crate) fn reclaim_old_proposal(&self, expected: &Lease, route: &Digest) -> Result<bool> {
+        let tx = self.write()?;
+        let leases = db(tx.open_table(LEASES))?;
+        let Some(raw) = db(leases.get(expected.id.as_str()))? else {
+            return Ok(false);
+        };
+        let actual: Lease = decode(raw.value())?;
+        if effective(actual.clone(), self.fence) != *expected || actual.route != *route {
+            return Err(Error::Binding);
+        }
+        if actual.controller_fence >= self.fence || actual.phase != Phase::Proposed {
+            return Ok(false);
+        }
+        let r: RouteState = read(&db(tx.open_table(ROUTES))?, route.as_str())?;
+        require(r.config.lane == Lane::Proxy && r.config.group == actual.group)?;
+        drop(raw);
+        drop(leases);
+        release(&tx, &actual)?;
+        self.commit(tx)?;
+        Ok(true)
+    }
+
     /// Commit BEFORE the executor's own dispatch fence/POST. Failure between those
     /// steps retains an occupied slot for reconciliation; it never admits a duplicate.
     /// Readiness is rechecked to close the observation-to-send race within this authority.
@@ -678,6 +741,7 @@ impl Authority {
         let r: RouteState = read(&db(tx.open_table(ROUTES))?, lease.route.as_str())?;
         let g: Group = read(&db(tx.open_table(GROUPS))?, lease.group.as_str())?;
         ready_reserved(&lease, &reservation.lease, self.fence, &g, &r, self.now()?)?;
+        require(lease.phase == Phase::Reserved)?;
         lease.phase = Phase::Dispatched;
         db(leases.insert(lease.id.as_str(), encode(&lease)?.as_slice()))?;
         drop(leases);
@@ -708,7 +772,8 @@ impl Authority {
         }
         let tx = self.write()?;
         let actual: Lease = read(&db(tx.open_table(LEASES))?, reservation.lease.id.as_str())?;
-        if actual != reservation.lease || actual.phase != Phase::Reserved {
+        if actual != reservation.lease || !matches!(actual.phase, Phase::Reserved | Phase::Proposed)
+        {
             return Err(Error::Binding);
         }
         release(&tx, &actual)?;
@@ -828,8 +893,12 @@ fn ready_reserved(
     if expected.controller_fence != fence {
         return Err(Error::Stale);
     }
-    if lease != expected
-        || lease.phase != Phase::Reserved
+    let mut comparable = expected.clone();
+    if comparable.phase == Phase::Proposed && lease.phase == Phase::Reserved {
+        comparable.phase = Phase::Reserved;
+    }
+    if lease != &comparable
+        || !matches!(lease.phase, Phase::Reserved | Phase::Proposed)
         || lease.group != g.id
         || lease.route != r.config.id
         || r.config.group != g.id

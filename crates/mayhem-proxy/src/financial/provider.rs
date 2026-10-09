@@ -85,6 +85,22 @@ impl Runtime {
     }
 }
 impl Approval {
+    fn begin_signing(&mut self) -> Result<()> {
+        self.recheck()?;
+        self.lease = self
+            .runtime
+            .capacity
+            .begin_signing(&self.lease)
+            .map_err(|_| invalid("provider signing capacity fence failed"))?;
+        self.signing_fenced()
+    }
+    pub(crate) fn signing_fenced(&self) -> Result<()> {
+        require(
+            self.lease.phase == capacity::Phase::Reserved,
+            "provider signing capacity fence is required",
+        )?;
+        self.recheck()
+    }
     pub fn invocation(&self) -> &Digest {
         &self.invocation
     }
@@ -193,7 +209,7 @@ impl ProviderNegotiation {
     }
     pub async fn accept(
         &self,
-        approval: Approval,
+        mut approval: Approval,
         now_ms: u64,
     ) -> Result<crate::attempts::SignedProviderAcceptance> {
         let permit = self
@@ -205,6 +221,7 @@ impl ProviderNegotiation {
         let signer = self.signer.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
+            approval.begin_signing()?;
             journal
                 .sign_provider_acceptance(&approval, &signer, now_ms)
                 .map_err(|_| {

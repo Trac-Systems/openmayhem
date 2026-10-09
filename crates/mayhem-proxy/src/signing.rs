@@ -65,7 +65,7 @@ impl Authority {
         &self,
         approval: &crate::financial::provider::Approval,
     ) -> Result<String> {
-        approval.recheck()?;
+        approval.signing_fenced()?;
         self.party(approval.terms(), false)?;
         let bytes = approval
             .terms()

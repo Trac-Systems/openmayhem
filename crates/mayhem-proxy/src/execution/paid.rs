@@ -486,7 +486,11 @@ impl PaidExecutor {
                 if lease.route != route
                     || lease.work.invocation != r.invocation
                     || lease.work.request_hash != r.binding.request_hash
-                    || (unsent.is_none() && lease.phase == capacity::Phase::Reserved)
+                    || (unsent.is_none()
+                        && matches!(
+                            lease.phase,
+                            capacity::Phase::Reserved | capacity::Phase::Proposed
+                        ))
                 {
                     return Err(Error::Binding);
                 }

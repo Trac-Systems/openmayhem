@@ -55,6 +55,12 @@ pub struct Status {
     pub signing_or_uncertain: usize,
     pub request_bytes: usize,
 }
+pub struct Reconciliation {
+    pub examined: usize,
+    pub released: usize,
+    pub retained: usize,
+    pub next_after: Option<Digest>,
+}
 struct Inner {
     runtime: Arc<Runtime>,
     signer: Arc<ProviderNegotiation>,
@@ -335,6 +341,48 @@ impl Controller {
         .await
         .map_err(|_| Error::Task)?
     }
+    /// One bounded page of this route's prior-controller allocations. Only the
+    /// durable never-signed proposal phase permits release. Protected obligations
+    /// remain available to the separate financial/execution recovery controller.
+    pub async fn reconcile_unsigned(
+        &self,
+        after: Option<Digest>,
+        limit: usize,
+    ) -> Result<Reconciliation> {
+        let permit = self.slot()?;
+        let inner = self.inner.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let cap = &inner.runtime.capacity;
+            let route = &inner.runtime.route;
+            let group = cap
+                .route_group(route)
+                .map_err(|_| invalid("provider recovery group unavailable"))?;
+            let page = cap
+                .recover_group(&group, after.as_ref(), limit)
+                .map_err(|_| invalid("provider recovery page unavailable"))?;
+            let mut result = Reconciliation {
+                examined: page.leases.len(),
+                released: 0,
+                retained: 0,
+                next_after: page.next_after,
+            };
+            for lease in page.leases {
+                if lease.route == *route
+                    && cap
+                        .reclaim_old_proposal(&lease, route)
+                        .map_err(|_| invalid("provider unsigned capacity reconciliation failed"))?
+                {
+                    result.released += 1;
+                } else {
+                    result.retained += 1;
+                }
+            }
+            Ok(result)
+        })
+        .await
+        .map_err(|_| Error::Task)?
+    }
 }
 impl State {
     fn remove(&mut self, invocation: &Digest) -> Result<Pending> {
@@ -413,7 +461,7 @@ impl Inner {
         let reservation = self
             .runtime
             .capacity
-            .reserve(
+            .reserve_proposal(
                 &self.runtime.route,
                 capacity::Work {
                     invocation: invocation.clone(),
