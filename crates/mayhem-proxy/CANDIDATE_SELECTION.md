@@ -4,7 +4,8 @@
 incremental **canonical candidate enumeration** for a saved `routing::Policy`.
 It does not select a winner, execute inference, reserve capacity/credit, publish
 metadata, or turn registry definitions into provider observations. The gateway
-resolver is not connected by this change.
+resolver consumes these pages, validates each actual request and owns the full
+progression before making a ranking claim.
 
 The supplied policy is fully validated and the selected rail must be one of its
 explicit rails. Every returned publication passes its exact offer/market or
@@ -24,13 +25,14 @@ T4 or remote weights. Native models and native indexes are unchanged.
 
 ## Maintained indexes and bounded work
 
-Index version 3 adds row-local entries to the existing transactional derived
+Index version 4 maintains row-local entries to the existing transactional derived
 index. Offer entries cover endpoint/rail, provider, exact unit-set, each rational
 unit price, per-request charge and session minimum. Membership entries cover
-served context; market entries cover claimed family. A price or membership edit
+served context; market entries cover claimed family and the exact canonical
+model tuple (family, model ID, revision, quantization). A price or membership edit
 updates only that canonical row's index keys, without scanning sibling offers.
 There are at most 23 new index entries per active offer (three rails, 16 rates,
-provider, unit-set and two fixed charges), one per active membership and one per
+provider, unit-set and two fixed charges), one per active membership and two per
 market. Withdrawal/deletion removes the prior entries in the same transaction.
 
 Prices use integer-only sortable keys: a u128 whole part and 106 fractional
@@ -41,7 +43,10 @@ still calls the shared `PriceLimits::permits`, checking every unit and fixed
 charge. No decimal display rounding is used for selection.
 
 A bounded planner samples at most eight offers/parents per possible driver and
-selects one deterministic driver. Market/member samples include bounded child
+selects one deterministic driver for ordinary targets. Pinned taxonomy scopes
+prefer their family/model index when sampled cardinalities are unknown; a fully
+exhausted smaller provider/price driver can still win. This prevents repeated
+whole-category scans while retaining selective hard-filter access. Market/member samples include bounded child
 offer reads, so a single large market is not mistaken for a one-offer scope.
 This is a selectivity heuristic, not an optimal query-plan or ranking claim.
 Every page permits at most 256 examined driver/offer rows and 2,048 index seeks,
@@ -70,8 +75,8 @@ The returned `CandidatePage` contains:
 - `next_cursor`, `exhausted`, `scanned_candidates`, `index_reads`;
 - the two pending-validation flags described above.
 
-Begin with no cursor and continue until `exhausted` is true. A future resolver
-can retain a bounded accumulator (best exact quote, its materialized request,
+Begin with no cursor and continue until `exhausted` is true. The connected resolver
+retains a bounded accumulator (best exact quote, its materialized request,
 validation/exclusion state and continuation) instead of storing all candidates.
 Each step can return `continue` and accept another bounded step. This allows a
 large category to finish; broad scope is not permanently rejected merely for
@@ -113,3 +118,16 @@ The rational-key unit test checks equivalent/extreme/adjacent fractions and
 10,000 deterministic pairs against exact cross-products. These tests establish
 local indexing behavior, not a connected gateway/Studio/MCP routing surface or
 production evidence policy.
+
+
+## Published taxonomy scopes
+
+`proxy_candidates_in_scope` accepts one validated administrative family/model
+scope for a `taxonomy_category` policy. Its cursor binds the complete original
+policy, rail and exact source scope. It never expands the category into the
+legacy `family_ids` array. The taxonomy reader and resolver continue across every
+membership page and hold only one bounded scope page at a time. Calling ordinary
+`proxy_candidates` for a taxonomy target fails closed. A manually constructed
+scope can narrow read-only enumeration but cannot satisfy `Policy::check_offer`;
+execution requires an exact reader-created membership proof. See
+[TAXONOMY_ROUTING.md](TAXONOMY_ROUTING.md).

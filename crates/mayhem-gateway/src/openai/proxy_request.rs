@@ -344,6 +344,7 @@ impl Request {
         Digest::new(hash.finalize().to_hex().to_string()).map_err(|_| Error::Invalid)
     }
 
+    #[cfg(test)]
     fn check_candidate(
         &self,
         candidate: &PublishedOffer,
@@ -355,7 +356,15 @@ impl Request {
         }
         Ok(result)
     }
+    #[cfg(test)]
     fn check_offer(&self, candidate: &PublishedOffer) -> Result<Candidate> {
+        self.check_offer_membership(candidate, None)
+    }
+    fn check_offer_membership(
+        &self,
+        candidate: &PublishedOffer,
+        membership: Option<&mayhem_proxy::registry::publication::taxonomy::Membership>,
+    ) -> Result<Candidate> {
         self.check_settlement_policy()?;
         if candidate.id != self.selector.id()
             || candidate.lane != "proxy"
@@ -373,7 +382,7 @@ impl Request {
             .map_err(|_| Error::Catalog)?;
         if let Some(profile) = &self.controls.profile {
             profile
-                .check_offer(candidate, self.endpoint, self.controls.rail)
+                .check_offer_with_taxonomy(candidate, self.endpoint, self.controls.rail, membership)
                 .map_err(|_| Error::Constraints)?;
             if super::proxy_buyer::evidence::unsupported(profile) {
                 return Err(Error::ProfileEvidence);
@@ -425,44 +434,51 @@ pub async fn resolve_estimate(
     request: Arc<Request>,
 ) -> Result<EstimateCandidate> {
     let permit = READS.try_acquire().map_err(|_| Error::Busy)?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let now = super::now_millis_u64();
-        let catalog = control.catalog().read().map_err(|_| Error::Catalog)?;
-        let registered = mayhem_proxy::presence::Registered::read(
-            &catalog,
-            &request.selector.market,
-            &request.selector.provider,
-            &request.selector.slot,
-            now,
-        )
-        .map_err(|_| Error::Catalog)?;
-        let published = catalog
-            .proxy_offer(&request.selector.id(), now)
-            .map_err(|_| Error::Catalog)?
-            .ok_or(Error::Catalog)?;
-        let candidate = request.check_offer(&published)?;
-        let status = catalog.status();
-        let committed = status.committed.as_ref().ok_or(Error::Catalog)?;
-        let network = committed.context.identity();
-        let expires_at_ms = committed
-            .observed_at_ms
-            .ok_or(Error::Catalog)?
-            .saturating_add(mayhem_proxy::presence::CATALOG_AGE_MS);
-        let availability = control
-            .presence()
-            .observe_registered(&registered, request.controls.minimum_tokens_per_second)
+    let read_control = control.clone();
+    let read_request = request.clone();
+    let (published, network, expires_at_ms, availability) =
+        tokio::task::spawn_blocking(move || {
+            let control = read_control;
+            let request = read_request;
+            let _permit = permit;
+            let now = super::now_millis_u64();
+            let catalog = control.catalog().read().map_err(|_| Error::Catalog)?;
+            let registered = mayhem_proxy::presence::Registered::read(
+                &catalog,
+                &request.selector.market,
+                &request.selector.provider,
+                &request.selector.slot,
+                now,
+            )
             .map_err(|_| Error::Catalog)?;
-        Ok(EstimateCandidate {
-            candidate,
-            published,
-            network,
-            expires_at_ms,
-            availability,
+            let published = catalog
+                .proxy_offer(&request.selector.id(), now)
+                .map_err(|_| Error::Catalog)?
+                .ok_or(Error::Catalog)?;
+            let status = catalog.status();
+            let committed = status.committed.as_ref().ok_or(Error::Catalog)?;
+            let network = committed.context.identity();
+            let expires_at_ms = committed
+                .observed_at_ms
+                .ok_or(Error::Catalog)?
+                .saturating_add(mayhem_proxy::presence::CATALOG_AGE_MS);
+            let availability = control
+                .presence()
+                .observe_registered(&registered, request.controls.minimum_tokens_per_second)
+                .map_err(|_| Error::Catalog)?;
+            Ok((published, network, expires_at_ms, availability))
         })
+        .await
+        .map_err(|_| Error::Catalog)??;
+    let membership = taxonomy_membership(&control, &request, &published, &network).await?;
+    let candidate = request.check_offer_membership(&published, membership.as_ref())?;
+    Ok(EstimateCandidate {
+        candidate,
+        published,
+        network,
+        expires_at_ms,
+        availability,
     })
-    .await
-    .map_err(|_| Error::Catalog)?
 }
 
 /// Read-only candidate evidence, not a capacity lease or spending permission.
@@ -476,30 +492,51 @@ pub struct Candidate {
 /// At most eight synchronous bounded selection reads, with no admission queue or
 /// all-market subscription changes. The permit survives HTTP cancellation until
 /// the actual storage task finishes. No per-token reads or historical scans.
+async fn taxonomy_membership(
+    control: &ProxyControl,
+    request: &Request,
+    published: &PublishedOffer,
+    network: &mayhem_proxy::discovery::Identity,
+) -> Result<Option<mayhem_proxy::registry::publication::taxonomy::Membership>> {
+    let Some(mayhem_proxy::routing::Policy {
+        target: mayhem_proxy::routing::Target::TaxonomyCategory { taxonomy, .. },
+        ..
+    }) = &request.controls.profile
+    else {
+        return Ok(None);
+    };
+    let reader = control.registry().ok_or(Error::ProfileEvidence)?;
+    let pin = reader
+        .pin_taxonomy(taxonomy)
+        .await
+        .map_err(|_| Error::ProfileEvidence)?;
+    pin.check_network(network)
+        .map_err(|_| Error::ProfileEvidence)?;
+    let model = mayhem_proxy::registry::publication::taxonomy::Model::from_offer(published);
+    let mut matches = reader
+        .taxonomy_match(&pin, taxonomy, &[model.clone()])
+        .await
+        .map_err(|_| Error::ProfileEvidence)?;
+    let member = matches.pop().ok_or(Error::ProfileEvidence)?;
+    if !member.contains(taxonomy, &model) {
+        return Err(Error::Constraints);
+    }
+    Ok(Some(member))
+}
 pub async fn resolve(control: Arc<ProxyControl>, request: Arc<Request>) -> Result<Candidate> {
-    let permit = READS.try_acquire().map_err(|_| Error::Busy)?;
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        let candidate = control
-            .catalog()
-            .read()
-            .map_err(|_| Error::Catalog)?
-            .proxy_offer(&request.selector.id(), super::now_millis_u64())
-            .map_err(|_| Error::Catalog)?
-            .ok_or(Error::Catalog)?;
-        let status = control
-            .presence()
-            .status(
-                &request.selector.market,
-                &request.selector.provider,
-                &request.selector.slot,
-                request.controls.minimum_tokens_per_second,
-            )
-            .map_err(|_| Error::Catalog)?;
-        request.check_candidate(&candidate, status)
-    })
-    .await
-    .map_err(|_| Error::Catalog)?
+    // Same immutable publication/identity and default presence policy as quotes.
+    // The exact administrative membership check occurs before new admission;
+    // the caller performs retained original-job replay before invoking this.
+    let selected = resolve_estimate(control, request).await?;
+    if selected.availability.status != Eligibility::Available {
+        return Err(Error::Availability(selected.availability.status));
+    }
+    let now = super::now_millis_u64();
+    if now >= selected.expires_at_ms || selected.availability.expires_at_ms.is_none_or(|e| now >= e)
+    {
+        return Err(Error::Catalog);
+    }
+    Ok(selected.candidate)
 }
 
 #[cfg(test)]

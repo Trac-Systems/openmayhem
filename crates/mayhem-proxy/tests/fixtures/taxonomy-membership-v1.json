@@ -1,0 +1,305 @@
+{
+  "test_only": true,
+  "process_id": 28148,
+  "original": {
+    "release": {
+      "object": "proxy.taxonomy_release",
+      "release_id": "d2c69eb8-2649-496c-a5c2-feb60e2a6a13",
+      "revision": "8",
+      "release_hash": "02eed293d429c56783aa8cc72b024f5ac9f5483e96fd302b4c0fca7e58706b77",
+      "manifest": {
+        "schema_version": 1,
+        "parent_release_id": "536fd7f8-c2a7-4342-beb3-cfa9d10cbb5e",
+        "parent_release_hash": "ae167f5c85c0fe2e2cc9ab2612b5b9f36f82e4e97c27ce07c611b884b87515c6",
+        "network": {
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 30
+        },
+        "canonical_families": [
+          {
+            "family_id": "membership_family",
+            "enabled": true,
+            "label": "Synthetic test family"
+          }
+        ],
+        "changes": [
+          {
+            "entry_id": "membership_family",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "fab233c08ad9e7b13a173e829a7cdbfbc0035b022b08a8672c19aa5038219a99"
+          },
+          {
+            "entry_id": "membership_model",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "d521c9e525c9dff93037529494c595d355c2e654e833298ebf1b0ec19b380051"
+          },
+          {
+            "entry_id": "membership_root",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "210934f188c0ca66fee643c77b97280110814fb0484b6a39ba1f0acf0f7796ea"
+          },
+          {
+            "entry_id": "membership_sub",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "2de990c3aa6b1701dfae5022ed94a2b418ff445f3024764d908fad11e6f4fdd2"
+          }
+        ]
+      },
+      "published_at": "2026-10-09T20:59:59.690Z",
+      "publication_state": "published",
+      "canonical_observation": {
+        "schema_version": 1,
+        "network": {
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 30
+        },
+        "snapshot": "fixture:1",
+        "proof": {
+          "view_key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "fork": 0,
+          "signed_length": 1,
+          "tree_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "observed_at_ms": 1791579599684,
+        "expires_at_ms": 1791579659685,
+        "families": [
+          {
+            "family_id": "membership_family",
+            "enabled": true,
+            "label": "Synthetic test family"
+          }
+        ]
+      }
+    },
+    "response": {
+      "object": "proxy.taxonomy_membership_page",
+      "schema_version": 1,
+      "release": {
+        "release_id": "d2c69eb8-2649-496c-a5c2-feb60e2a6a13",
+        "release_hash": "02eed293d429c56783aa8cc72b024f5ac9f5483e96fd302b4c0fca7e58706b77",
+        "revision": "8"
+      },
+      "category": {
+        "entry_id": "membership_root",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "210934f188c0ca66fee643c77b97280110814fb0484b6a39ba1f0acf0f7796ea"
+      },
+      "scopes": [
+        {
+          "source": {
+            "entry_id": "membership_family",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "fab233c08ad9e7b13a173e829a7cdbfbc0035b022b08a8672c19aa5038219a99"
+          },
+          "kind": "family",
+          "family_id": "membership_family"
+        }
+      ],
+      "next_cursor": null,
+      "scanned_entries": 2,
+      "exhausted": true,
+      "capacity_reserved": false,
+      "authorizes_execution": false
+    }
+  },
+  "updated": {
+    "release": {
+      "object": "proxy.taxonomy_release",
+      "release_id": "c1af4a61-e35b-497f-a75f-d8de4b88e9ca",
+      "revision": "9",
+      "release_hash": "0febcb5e9e64a855bd9b03c92798baf39475f86653d01309e24233e8ad3c24ca",
+      "manifest": {
+        "schema_version": 1,
+        "parent_release_id": "d2c69eb8-2649-496c-a5c2-feb60e2a6a13",
+        "parent_release_hash": "02eed293d429c56783aa8cc72b024f5ac9f5483e96fd302b4c0fca7e58706b77",
+        "network": {
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 30
+        },
+        "canonical_families": [],
+        "changes": [
+          {
+            "entry_id": "membership_family",
+            "schema_revision": 2,
+            "version": 2,
+            "document_hash": "b3598e1993ee90fe9bdc75e291bb35fc753959d6e8556a14969e881e58cd190f"
+          }
+        ]
+      },
+      "published_at": "2026-10-09T20:59:59.801Z",
+      "publication_state": "published",
+      "canonical_observation": null
+    },
+    "response": {
+      "object": "proxy.taxonomy_membership_page",
+      "schema_version": 1,
+      "release": {
+        "release_id": "c1af4a61-e35b-497f-a75f-d8de4b88e9ca",
+        "release_hash": "0febcb5e9e64a855bd9b03c92798baf39475f86653d01309e24233e8ad3c24ca",
+        "revision": "9"
+      },
+      "category": {
+        "entry_id": "membership_root",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "210934f188c0ca66fee643c77b97280110814fb0484b6a39ba1f0acf0f7796ea"
+      },
+      "scopes": [
+        {
+          "source": {
+            "entry_id": "membership_model",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "d521c9e525c9dff93037529494c595d355c2e654e833298ebf1b0ec19b380051"
+          },
+          "kind": "model",
+          "family_id": "membership_family",
+          "model_id": "模型 α",
+          "revision": "",
+          "quantization": "Q4"
+        }
+      ],
+      "next_cursor": null,
+      "scanned_entries": 2,
+      "exhausted": true,
+      "capacity_reserved": false,
+      "authorizes_execution": false
+    }
+  },
+  "match_request": {
+    "entry_id": "membership_root",
+    "schema_revision": 1,
+    "models": [
+      {
+        "family_id": "membership_family",
+        "model_id": "模型 α",
+        "revision": "",
+        "quantization": "Q4"
+      },
+      {
+        "family_id": "membership_family",
+        "model_id": "different",
+        "revision": "",
+        "quantization": "Q4"
+      }
+    ]
+  },
+  "original_match": {
+    "object": "proxy.taxonomy_membership_match",
+    "schema_version": 1,
+    "release": {
+      "release_id": "d2c69eb8-2649-496c-a5c2-feb60e2a6a13",
+      "release_hash": "02eed293d429c56783aa8cc72b024f5ac9f5483e96fd302b4c0fca7e58706b77",
+      "revision": "8"
+    },
+    "category": {
+      "entry_id": "membership_root",
+      "schema_revision": 1,
+      "version": 1,
+      "document_hash": "210934f188c0ca66fee643c77b97280110814fb0484b6a39ba1f0acf0f7796ea"
+    },
+    "matches": [
+      {
+        "model": {
+          "family_id": "membership_family",
+          "model_id": "模型 α",
+          "revision": "",
+          "quantization": "Q4"
+        },
+        "source": {
+          "entry_id": "membership_family",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "fab233c08ad9e7b13a173e829a7cdbfbc0035b022b08a8672c19aa5038219a99"
+        },
+        "scope": {
+          "kind": "family",
+          "family_id": "membership_family"
+        }
+      },
+      {
+        "model": {
+          "family_id": "membership_family",
+          "model_id": "different",
+          "revision": "",
+          "quantization": "Q4"
+        },
+        "source": {
+          "entry_id": "membership_family",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "fab233c08ad9e7b13a173e829a7cdbfbc0035b022b08a8672c19aa5038219a99"
+        },
+        "scope": {
+          "kind": "family",
+          "family_id": "membership_family"
+        }
+      }
+    ],
+    "capacity_reserved": false,
+    "authorizes_execution": false
+  },
+  "updated_match": {
+    "object": "proxy.taxonomy_membership_match",
+    "schema_version": 1,
+    "release": {
+      "release_id": "c1af4a61-e35b-497f-a75f-d8de4b88e9ca",
+      "release_hash": "0febcb5e9e64a855bd9b03c92798baf39475f86653d01309e24233e8ad3c24ca",
+      "revision": "9"
+    },
+    "category": {
+      "entry_id": "membership_root",
+      "schema_revision": 1,
+      "version": 1,
+      "document_hash": "210934f188c0ca66fee643c77b97280110814fb0484b6a39ba1f0acf0f7796ea"
+    },
+    "matches": [
+      {
+        "model": {
+          "family_id": "membership_family",
+          "model_id": "模型 α",
+          "revision": "",
+          "quantization": "Q4"
+        },
+        "source": {
+          "entry_id": "membership_model",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "d521c9e525c9dff93037529494c595d355c2e654e833298ebf1b0ec19b380051"
+        },
+        "scope": {
+          "kind": "model",
+          "family_id": "membership_family",
+          "model_id": "模型 α",
+          "revision": "",
+          "quantization": "Q4"
+        }
+      },
+      {
+        "model": {
+          "family_id": "membership_family",
+          "model_id": "different",
+          "revision": "",
+          "quantization": "Q4"
+        },
+        "source": null,
+        "scope": null
+      }
+    ],
+    "capacity_reserved": false,
+    "authorizes_execution": false
+  },
+  "pinned_unchanged": true
+}

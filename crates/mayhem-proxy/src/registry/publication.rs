@@ -1,6 +1,7 @@
 //! Opt-in reader for administrator-published registry semantics. The configured
 //! HTTPS origin is the trust anchor; these hashes are integrity identities, not
 //! signatures or evidence of provider capability. Nothing is activated here.
+pub mod taxonomy;
 mod wire;
 pub use wire::{Document, DocumentReference, Manifest, Reference, Release};
 
@@ -197,10 +198,12 @@ impl Definitions {
 #[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 enum Key {
     Release(String),
+    TaxonomyRelease(String),
     Document(String, String, Reference),
 }
 enum Cached {
     Release(Arc<Release>),
+    TaxonomyRelease(Arc<taxonomy::Release>),
     Document(Arc<Document>),
 }
 struct Cache {
@@ -216,6 +219,7 @@ impl Cache {
         if let Some((old, _)) = self.entries.get(&key) {
             let equal = match (old, &value) {
                 (Cached::Release(a), Cached::Release(b)) => a == b,
+                (Cached::TaxonomyRelease(a), Cached::TaxonomyRelease(b)) => a == b,
                 (Cached::Document(a), Cached::Document(b)) => a == b,
                 _ => false,
             };

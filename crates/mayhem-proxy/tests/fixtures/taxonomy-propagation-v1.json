@@ -1,0 +1,355 @@
+{
+  "test_only": true,
+  "scope": "real Nest HTTP + isolated PostgreSQL + unchanged MCP instance + browser/Studio production clients; canonical gateway is a synthetic family-read double, not Core proof",
+  "taxonomy": {
+    "object": "proxy.taxonomy_release",
+    "release_id": "61278428-60df-4915-b04b-a64fcb06adf3",
+    "revision": "10",
+    "release_hash": "329c629ed419dab64d059dcc4645e9461d163592758fec99c789e0fc5359974c",
+    "manifest": {
+      "schema_version": 1,
+      "parent_release_id": "da8f934c-926a-4413-8455-a9be9a51f5b7",
+      "parent_release_hash": "fd8ee413a282eed182d826436f0df3a4ec9ee779ee5882d70258c14dfcd56c38",
+      "network": {
+        "network_id": "918",
+        "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+        "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+        "contract_version": 30
+      },
+      "canonical_families": [
+        {
+          "family_id": "other",
+          "enabled": true,
+          "label": "Synthetic test family"
+        }
+      ],
+      "changes": [
+        {
+          "entry_id": "runtime_new_category",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "664c9b9f29e11fc8841b9e389346d11913d822c0bdf97fd46471959545ba1725"
+        },
+        {
+          "entry_id": "runtime_other_family",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "b282bfa9aebdc23409103f1bfb01a33615a19bf144d42c0382b88251279143f5"
+        }
+      ]
+    },
+    "published_at": "2026-10-09T21:02:55.487Z",
+    "publication_state": "published",
+    "canonical_observation": {
+      "schema_version": 1,
+      "network": {
+        "network_id": "918",
+        "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+        "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+        "contract_version": 30
+      },
+      "snapshot": "fixture:1",
+      "proof": {
+        "view_key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "fork": 0,
+        "signed_length": 1,
+        "tree_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "observed_at_ms": 1791579775478,
+      "expires_at_ms": 1791579835479,
+      "families": [
+        {
+          "family_id": "other",
+          "enabled": true,
+          "label": "Synthetic test family"
+        }
+      ]
+    }
+  },
+  "registry": {
+    "object": "proxy.registry_release",
+    "release_id": "c7cc06a0-c118-4c48-b9c8-344e57d7cd97",
+    "revision": "1",
+    "release_hash": "f737c95a48f2fa3f2f3a05a90fdb81fdd11a6b271b6403ba3cb7fa2cf9de4871",
+    "manifest": {
+      "schema_version": 1,
+      "parent_release_id": null,
+      "parent_release_hash": null,
+      "changes": [
+        {
+          "field_id": "runtime.temperature",
+          "schema_revision": 1,
+          "version": 1,
+          "definition_hash": "4d45768f941c4461088c9b8bf7a0bdcdb77e470c79b1718b00692373e33d34e0"
+        }
+      ]
+    },
+    "published_at": "2026-10-09T21:02:55.562Z",
+    "publication_state": "published"
+  },
+  "registry_lookup": {
+    "object": "proxy.registry_lookup",
+    "release_id": "c7cc06a0-c118-4c48-b9c8-344e57d7cd97",
+    "release_hash": "f737c95a48f2fa3f2f3a05a90fdb81fdd11a6b271b6403ba3cb7fa2cf9de4871",
+    "definitions": [
+      {
+        "field_id": "runtime.temperature",
+        "schema_revision": 1,
+        "version": 1,
+        "definition_hash": "4d45768f941c4461088c9b8bf7a0bdcdb77e470c79b1718b00692373e33d34e0",
+        "definition": {
+          "schema_version": 1,
+          "field_id": "runtime.temperature",
+          "schema_revision": 1,
+          "labels": {
+            "en": "New typed option 🧠"
+          },
+          "help": {},
+          "units": null,
+          "group": "capabilities",
+          "order": 0,
+          "endpoints": [
+            "openai_chat_completions"
+          ],
+          "value_schema": {
+            "type": "decimal",
+            "minimum": "0",
+            "maximum": "1"
+          },
+          "default": {
+            "type": "decimal",
+            "value": "0.2"
+          },
+          "operators": [
+            "eq"
+          ],
+          "minimum_assurance": "declared",
+          "max_evidence_age_ms": null,
+          "usage": {
+            "kind": "request_control",
+            "request_path": "temperature"
+          },
+          "rules": []
+        }
+      }
+    ]
+  },
+  "members": {
+    "object": "proxy.taxonomy_membership_page",
+    "schema_version": 1,
+    "release": {
+      "release_id": "61278428-60df-4915-b04b-a64fcb06adf3",
+      "release_hash": "329c629ed419dab64d059dcc4645e9461d163592758fec99c789e0fc5359974c",
+      "revision": "10"
+    },
+    "category": {
+      "entry_id": "runtime_new_category",
+      "schema_revision": 1,
+      "version": 1,
+      "document_hash": "664c9b9f29e11fc8841b9e389346d11913d822c0bdf97fd46471959545ba1725"
+    },
+    "scopes": [
+      {
+        "source": {
+          "entry_id": "runtime_other_family",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "b282bfa9aebdc23409103f1bfb01a33615a19bf144d42c0382b88251279143f5"
+        },
+        "kind": "family",
+        "family_id": "other"
+      }
+    ],
+    "next_cursor": null,
+    "scanned_entries": 1,
+    "exhausted": true,
+    "capacity_reserved": false,
+    "authorizes_execution": false
+  },
+  "match_request": {
+    "entry_id": "runtime_new_category",
+    "schema_revision": 1,
+    "models": [
+      {
+        "family_id": "other",
+        "model_id": "example/Unicode-é-模型-🦉",
+        "revision": "",
+        "quantization": ""
+      }
+    ]
+  },
+  "matched": {
+    "object": "proxy.taxonomy_membership_match",
+    "schema_version": 1,
+    "release": {
+      "release_id": "61278428-60df-4915-b04b-a64fcb06adf3",
+      "release_hash": "329c629ed419dab64d059dcc4645e9461d163592758fec99c789e0fc5359974c",
+      "revision": "10"
+    },
+    "category": {
+      "entry_id": "runtime_new_category",
+      "schema_revision": 1,
+      "version": 1,
+      "document_hash": "664c9b9f29e11fc8841b9e389346d11913d822c0bdf97fd46471959545ba1725"
+    },
+    "matches": [
+      {
+        "model": {
+          "family_id": "other",
+          "model_id": "example/Unicode-é-模型-🦉",
+          "revision": "",
+          "quantization": ""
+        },
+        "source": {
+          "entry_id": "runtime_other_family",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "b282bfa9aebdc23409103f1bfb01a33615a19bf144d42c0382b88251279143f5"
+        },
+        "scope": {
+          "kind": "family",
+          "family_id": "other"
+        }
+      }
+    ],
+    "capacity_reserved": false,
+    "authorizes_execution": false
+  },
+  "request_controls": [
+    {
+      "field_id": "runtime.temperature",
+      "schema_revision": 1,
+      "value": {
+        "type": "decimal",
+        "value": "0.2"
+      }
+    }
+  ],
+  "registry_release": {
+    "release_id": "c7cc06a0-c118-4c48-b9c8-344e57d7cd97",
+    "release_hash": "f737c95a48f2fa3f2f3a05a90fdb81fdd11a6b271b6403ba3cb7fa2cf9de4871"
+  },
+  "updated": {
+    "object": "proxy.taxonomy_release",
+    "release_id": "78730715-0921-4d95-838c-2b4f3aa6391a",
+    "revision": "11",
+    "release_hash": "fcdb9b82e500fbe59c7bd1e91df8018947d63154c6b6cb0e5610285eb93262f7",
+    "manifest": {
+      "schema_version": 1,
+      "parent_release_id": "61278428-60df-4915-b04b-a64fcb06adf3",
+      "parent_release_hash": "329c629ed419dab64d059dcc4645e9461d163592758fec99c789e0fc5359974c",
+      "network": {
+        "network_id": "918",
+        "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+        "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+        "contract_version": 30
+      },
+      "canonical_families": [],
+      "changes": [
+        {
+          "entry_id": "runtime_new_category",
+          "schema_revision": 1,
+          "version": 2,
+          "document_hash": "4e4b73258d38d9aaef1bffbb99d1485b059a70727180faa03f51b0d5fb737a40"
+        }
+      ]
+    },
+    "published_at": "2026-10-09T21:02:55.779Z",
+    "publication_state": "published",
+    "canonical_observation": null
+  },
+  "updated_entry": {
+    "object": "proxy.taxonomy_document",
+    "entry_id": "runtime_new_category",
+    "version": 2,
+    "schema_revision": 1,
+    "document": {
+      "schema_version": 1,
+      "entry_id": "runtime_new_category",
+      "schema_revision": 1,
+      "labels": {
+        "en": "Updated at runtime"
+      },
+      "help": {},
+      "order": 0,
+      "visible": true,
+      "lifecycle": "active",
+      "sources": [],
+      "kind": "category",
+      "parents": []
+    },
+    "document_hash": "4e4b73258d38d9aaef1bffbb99d1485b059a70727180faa03f51b0d5fb737a40",
+    "created_at": "2026-10-09T21:02:55.421Z",
+    "updated_at": "2026-10-09T21:02:55.741Z",
+    "routing_state": "metadata_only"
+  },
+  "updated_members": {
+    "object": "proxy.taxonomy_membership_page",
+    "schema_version": 1,
+    "release": {
+      "release_id": "78730715-0921-4d95-838c-2b4f3aa6391a",
+      "release_hash": "fcdb9b82e500fbe59c7bd1e91df8018947d63154c6b6cb0e5610285eb93262f7",
+      "revision": "11"
+    },
+    "category": {
+      "entry_id": "runtime_new_category",
+      "schema_revision": 1,
+      "version": 2,
+      "document_hash": "4e4b73258d38d9aaef1bffbb99d1485b059a70727180faa03f51b0d5fb737a40"
+    },
+    "scopes": [
+      {
+        "source": {
+          "entry_id": "runtime_other_family",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "b282bfa9aebdc23409103f1bfb01a33615a19bf144d42c0382b88251279143f5"
+        },
+        "kind": "family",
+        "family_id": "other"
+      }
+    ],
+    "next_cursor": null,
+    "scanned_entries": 1,
+    "exhausted": true,
+    "capacity_reserved": false,
+    "authorizes_execution": false
+  },
+  "updated_matched": {
+    "object": "proxy.taxonomy_membership_match",
+    "schema_version": 1,
+    "release": {
+      "release_id": "78730715-0921-4d95-838c-2b4f3aa6391a",
+      "release_hash": "fcdb9b82e500fbe59c7bd1e91df8018947d63154c6b6cb0e5610285eb93262f7",
+      "revision": "11"
+    },
+    "category": {
+      "entry_id": "runtime_new_category",
+      "schema_revision": 1,
+      "version": 2,
+      "document_hash": "4e4b73258d38d9aaef1bffbb99d1485b059a70727180faa03f51b0d5fb737a40"
+    },
+    "matches": [
+      {
+        "model": {
+          "family_id": "other",
+          "model_id": "example/Unicode-é-模型-🦉",
+          "revision": "",
+          "quantization": ""
+        },
+        "source": {
+          "entry_id": "runtime_other_family",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "b282bfa9aebdc23409103f1bfb01a33615a19bf144d42c0382b88251279143f5"
+        },
+        "scope": {
+          "kind": "family",
+          "family_id": "other"
+        }
+      }
+    ],
+    "capacity_reserved": false,
+    "authorizes_execution": false
+  }
+}

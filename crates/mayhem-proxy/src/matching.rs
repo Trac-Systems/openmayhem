@@ -24,7 +24,7 @@ pub(crate) const INDEX: TableDefinition<&str, &str> =
     TableDefinition::new("proxy_match_current_v1");
 pub(crate) const STAGED_INDEX: TableDefinition<&str, &str> =
     TableDefinition::new("proxy_match_staged_v1");
-pub(crate) const INDEX_VERSION: u32 = 3;
+pub(crate) const INDEX_VERSION: u32 = 4;
 const MAX_SCAN: usize = 200;
 
 fn digest(value: &impl Serialize) -> Result<String> {

@@ -8,7 +8,8 @@ use mayhem_proxy::{
     directory::PublishedOffer,
     financial::quote::{Maximum, PurchaseRequest},
     presence::Eligibility,
-    routing::{Continuity, Ranking},
+    registry::publication::taxonomy,
+    routing::{Continuity, Ranking, Target},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -156,9 +157,20 @@ struct Session {
     best: Option<Best>,
     page: VecDeque<PublishedOffer>,
     traversal_done: bool,
+    taxonomy: Option<TaxonomyTraversal>,
     waiting: Option<Waiting>,
     lease_until: Option<Instant>,
     pending_reason: Option<&'static str>,
+}
+struct TaxonomyTraversal {
+    pin: taxonomy::Pinned,
+    reference: taxonomy::Reference,
+    category: Option<taxonomy::DocumentReference>,
+    cursor: Option<String>,
+    scopes: VecDeque<taxonomy::Scope>,
+    current: Option<taxonomy::Scope>,
+    query: Option<String>,
+    exhausted: bool,
 }
 struct Waiting {
     model: String,
@@ -532,6 +544,50 @@ async fn start(
     })
     .await
     .map_err(|_| unavailable())??;
+    let taxonomy = if let Target::TaxonomyCategory { taxonomy, .. } =
+        &controls.profile.as_ref().unwrap().target
+    {
+        let control = state.proxy_control().ok_or_else(unavailable)?;
+        let reader = control.registry().ok_or_else(unavailable)?;
+        let pin = reader
+            .pin_taxonomy(taxonomy)
+            .await
+            .map_err(|_| unavailable())?;
+        let network = catalog
+            .status()
+            .committed
+            .ok_or_else(unavailable)?
+            .context
+            .identity();
+        pin.check_network(&network).map_err(|_| invalid())?;
+        Some(TaxonomyTraversal {
+            pin,
+            reference: taxonomy.clone(),
+            category: None,
+            cursor: None,
+            scopes: VecDeque::new(),
+            current: None,
+            query: None,
+            exhausted: false,
+        })
+    } else {
+        None
+    };
+    let query_key = if taxonomy.is_some() {
+        Some(
+            digest(
+                "mayhem/proxy/taxonomy-candidates/v1",
+                &[&mayhem_proto::stable_json_bytes(
+                    &serde_json::json!({"profile":controls.profile,"rail":controls.rail}),
+                )
+                .map_err(|_| invalid())?],
+            )
+            .as_str()
+            .to_owned(),
+        )
+    } else {
+        None
+    };
     let started_at_ms = super::super::now_millis_u64();
     let mut random = [0u8; 32];
     getrandom::fill(&mut random).map_err(|_| unavailable())?;
@@ -556,7 +612,7 @@ async fn start(
         previous,
         previous_checked: false,
         snapshot: catalog.status().content_snapshot,
-        query_key: None,
+        query_key,
         catalog: Some(catalog),
         cursor: None,
         considered: 0,
@@ -567,6 +623,7 @@ async fn start(
         best: None,
         page: VecDeque::new(),
         traversal_done: false,
+        taxonomy,
         waiting: None,
         lease_until: None,
         pending_reason: None,
@@ -716,34 +773,90 @@ async fn advance(
         session.previous_checked = true;
     }
     if session.page.is_empty() && !session.traversal_done {
-        let catalog = session.catalog.as_ref().ok_or_else(unavailable)?.clone();
-        let policy = session.controls.profile.clone().ok_or_else(invalid)?;
-        let rail = session.controls.rail;
-        let cursor = session.cursor.clone();
-        let at = session.started_at_ms;
-        let limit = runtime.resolver.limits.candidates_per_step;
-        let permit = CPU.try_acquire().map_err(|_| busy())?;
-        let page = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            catalog.proxy_candidates(&policy, rail, cursor.as_deref(), limit, at)
-        })
-        .await
-        .map_err(|_| unavailable())?
-        .map_err(|_| unavailable())?;
-        if page.snapshot != session.snapshot
-            || session
-                .query_key
-                .as_ref()
-                .is_some_and(|q| q != &page.query_key)
-        {
-            return Err(unavailable());
+        // At most one administrative page plus one bounded index page per step.
+        // Empty continued membership pages are progress, never exhaustion.
+        if let Some(t) = &mut session.taxonomy {
+            if t.current.is_none() && t.scopes.is_empty() && !t.exhausted {
+                let control = state.proxy_control().ok_or_else(unavailable)?;
+                let page = control
+                    .registry()
+                    .ok_or_else(unavailable)?
+                    .taxonomy_members(&t.pin, &t.reference, t.cursor.as_deref(), 16)
+                    .await
+                    .map_err(|_| unavailable())?;
+                if t.category.as_ref().is_some_and(|c| c != &page.category) {
+                    return Err(unavailable());
+                }
+                t.category = Some(page.category);
+                t.cursor = page.next_cursor;
+                t.exhausted = page.exhausted;
+                t.scopes = page.scopes.into();
+            }
+            if t.current.is_none() {
+                t.current = t.scopes.pop_front();
+                t.query = None;
+                session.cursor = None;
+            }
+            if t.current.is_none() {
+                session.traversal_done = t.exhausted;
+                if !session.traversal_done {
+                    return Ok(pending(session, "scope_remaining"));
+                }
+            }
         }
-        session.query_key = Some(page.query_key);
-        session.scanned += page.scanned_candidates as u64;
-        session.index_reads += page.index_reads as u64;
-        session.page = page.entries.into();
-        session.cursor = page.next_cursor;
-        session.traversal_done = page.exhausted;
+        if !session.traversal_done {
+            let catalog = session.catalog.as_ref().ok_or_else(unavailable)?.clone();
+            let policy = session.controls.profile.clone().ok_or_else(invalid)?;
+            let rail = session.controls.rail;
+            let cursor = session.cursor.clone();
+            let scope = session.taxonomy.as_ref().and_then(|t| t.current.clone());
+            let at = session.started_at_ms;
+            let limit = runtime.resolver.limits.candidates_per_step;
+            let permit = CPU.try_acquire().map_err(|_| busy())?;
+            let page = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                catalog.proxy_candidates_in_scope(
+                    &policy,
+                    rail,
+                    scope.as_ref(),
+                    cursor.as_deref(),
+                    limit,
+                    at,
+                )
+            })
+            .await
+            .map_err(|_| unavailable())?
+            .map_err(|_| unavailable())?;
+            let old_query = session
+                .taxonomy
+                .as_ref()
+                .and_then(|t| t.query.as_ref())
+                .or_else(|| {
+                    if session.taxonomy.is_none() {
+                        session.query_key.as_ref()
+                    } else {
+                        None
+                    }
+                });
+            if page.snapshot != session.snapshot || old_query.is_some_and(|q| q != &page.query_key)
+            {
+                return Err(unavailable());
+            }
+            session.scanned += page.scanned_candidates as u64;
+            session.index_reads += page.index_reads as u64;
+            session.page = page.entries.into();
+            session.cursor = page.next_cursor;
+            if let Some(t) = &mut session.taxonomy {
+                t.query = Some(page.query_key);
+                if page.exhausted {
+                    t.current = None;
+                }
+                session.traversal_done = page.exhausted && t.scopes.is_empty() && t.exhausted;
+            } else {
+                session.query_key = Some(page.query_key);
+                session.traversal_done = page.exhausted;
+            }
+        }
     }
     while let Some(published) = session.page.front().cloned() {
         match check(state, runtime, session, published).await {
@@ -882,9 +995,10 @@ async fn check(
         return Checked::Excluded("key_model_excluded", false);
     }
     let profile = session.controls.profile.clone().unwrap();
-    if profile
-        .check_offer(&published, session.endpoint, session.controls.rail)
-        .is_err()
+    if !matches!(&profile.target, Target::TaxonomyCategory { .. })
+        && profile
+            .check_offer(&published, session.endpoint, session.controls.rail)
+            .is_err()
     {
         return Checked::Excluded("profile_constraints", false);
     }

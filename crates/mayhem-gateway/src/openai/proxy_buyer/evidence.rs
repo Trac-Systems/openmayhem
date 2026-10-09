@@ -13,7 +13,7 @@ static READS: Semaphore = Semaphore::const_new(4);
 pub(crate) fn unsupported(p: &Policy) -> bool {
     p.providers.require_verified_operator
         || !p.constraints.data_handling.is_empty()
-        || matches!(&p.target, Target::Category { variants, tags, .. } if !variants.is_empty() || !tags.is_empty())
+        || matches!(&p.target, Target::Category { variants, tags, .. } | Target::TaxonomyCategory { variants, tags, .. } if !variants.is_empty() || !tags.is_empty())
 }
 pub(super) fn needed(p: &Policy) -> bool {
     !p.constraints.capabilities.is_empty() || matches!(p.ranking, Ranking::PreferredSpeed)

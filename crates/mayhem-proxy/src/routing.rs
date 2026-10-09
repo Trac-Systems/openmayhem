@@ -22,6 +22,13 @@ pub enum Target {
     ExactMarket {
         market_id: String,
     },
+    TaxonomyCategory {
+        taxonomy: crate::registry::publication::taxonomy::Reference,
+        variants: Vec<String>,
+        tags: Vec<String>,
+        #[serde(deserialize_with = "nullable")]
+        market_allowlist: Option<Vec<String>>,
+    },
     Category {
         family_ids: Vec<String>,
         variants: Vec<String>,
@@ -163,6 +170,22 @@ impl Policy {
                 crate::discovery::hex(market_id),
                 "invalid exact routing market",
             )?,
+            Target::TaxonomyCategory {
+                taxonomy,
+                variants,
+                tags,
+                market_allowlist,
+            } => {
+                taxonomy
+                    .validate()
+                    .map_err(|_| crate::invalid("invalid taxonomy routing reference"))?;
+                require(
+                    ids(variants)
+                        && ids(tags)
+                        && market_allowlist.as_ref().is_none_or(|v| hashes(v, 1)),
+                    "invalid taxonomy category restrictions",
+                )?;
+            }
             Target::Category {
                 family_ids,
                 variants,
@@ -286,6 +309,17 @@ impl Policy {
         endpoint: ProxyEndpoint,
         selected_rail: ProxyRail,
     ) -> Result<()> {
+        self.check_offer_with_taxonomy(candidate, endpoint, selected_rail, None)
+    }
+    /// An exact trusted lookup is required for the same pinned category/model;
+    /// candidate enumeration, labels and caller JSON cannot mint this proof.
+    pub fn check_offer_with_taxonomy(
+        &self,
+        candidate: &PublishedOffer,
+        endpoint: ProxyEndpoint,
+        selected_rail: ProxyRail,
+        membership: Option<&crate::registry::publication::taxonomy::Membership>,
+    ) -> Result<()> {
         self.validate()?;
         require(
             candidate.lane == "proxy"
@@ -299,6 +333,20 @@ impl Policy {
             "selected supplier violates routing profile",
         )?;
         let target = match &self.target {
+            Target::TaxonomyCategory {
+                taxonomy,
+                market_allowlist,
+                ..
+            } => {
+                membership.is_some_and(|m| {
+                    m.contains(
+                        taxonomy,
+                        &crate::registry::publication::taxonomy::Model::from_offer(candidate),
+                    )
+                }) && market_allowlist
+                    .as_ref()
+                    .is_none_or(|v| v.contains(&candidate.offer.market_id))
+            }
             Target::ExactOffer { offer_id } => candidate.id == *offer_id,
             Target::ExactMarket { market_id } => candidate.offer.market_id == *market_id,
             Target::Category {
@@ -333,6 +381,6 @@ impl Policy {
         self.providers.require_verified_operator
             || !self.constraints.capabilities.is_empty()
             || !self.constraints.data_handling.is_empty()
-            || matches!(&self.target, Target::Category { variants, tags, .. } if !variants.is_empty() || !tags.is_empty())
+            || matches!(&self.target, Target::Category { variants, tags, .. } | Target::TaxonomyCategory { variants, tags, .. } if !variants.is_empty() || !tags.is_empty())
     }
 }

@@ -5,6 +5,7 @@ mod estimation;
 mod local_lab;
 mod profile;
 mod resolver;
+mod taxonomy;
 mod retail;
 mod streaming;
 use super::*;

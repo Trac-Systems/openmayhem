@@ -1,6 +1,7 @@
 //! Indexed canonical candidate enumeration, not routing or a cost prediction.
 //! Each page has bounded work; callers may continue to exhaust any size scope.
 use super::*;
+use crate::registry::publication::taxonomy::{Model, Scope};
 use crate::routing::{Policy, Target};
 use mayhem_proto::proxy::{ProxyMembership, ProxyRate, PROXY_MAX_SAFE_INTEGER};
 use serde_json::Value;
@@ -56,6 +57,13 @@ fn price_key(amount: u128, granularity: u64) -> Result<String> {
 fn offer_prefix(e: ProxyEndpoint, r: ProxyRail) -> String {
     format!("{ROOT}endpoint/{}/{}/", endpoint(e), rail(r))
 }
+fn model_key(model: &Model) -> Result<String> {
+    Ok(
+        blake3::hash(&stable_json_bytes(&serde_json::to_value(model)?)?)
+            .to_hex()
+            .to_string(),
+    )
+}
 fn keys(key: &str, value: &Value) -> Result<Vec<String>> {
     if value.is_null() {
         return Ok(Vec::new());
@@ -66,6 +74,15 @@ fn keys(key: &str, value: &Value) -> Result<Vec<String>> {
     let mut out = Vec::new();
     if let Some(id) = suffix.strip_prefix("markets/") {
         let m: ProxyMarketDescriptor = serde_json::from_value(value.clone())?;
+        out.push(format!(
+            "{ROOT}model/{}/{id}",
+            model_key(&Model {
+                family_id: m.model.family_id.clone(),
+                model_id: m.model.model_id.clone(),
+                revision: m.model.revision.clone(),
+                quantization: m.model.quantization.clone()
+            })?
+        ));
         out.push(format!(
             "{ROOT}family/{}/{id}",
             family_key(&m.model.family_id)
@@ -151,7 +168,11 @@ struct Driver {
     rows: Rows,
     spans: Vec<Span>,
 }
-fn drivers(policy: &Policy, selected_rail: ProxyRail) -> Result<Vec<Driver>> {
+fn drivers(
+    policy: &Policy,
+    selected_rail: ProxyRail,
+    scope: Option<&Scope>,
+) -> Result<Vec<Driver>> {
     let offers = offer_prefix(policy.endpoint, selected_rail);
     let mut list = vec![Driver {
         name: "endpoint_rail",
@@ -159,6 +180,30 @@ fn drivers(policy: &Policy, selected_rail: ProxyRail) -> Result<Vec<Driver>> {
         spans: vec![Span::prefix(offers.clone())],
     }];
     let (rows, spans) = match &policy.target {
+        Target::TaxonomyCategory { .. } => {
+            let scope = scope.ok_or_else(|| invalid("taxonomy candidates need a pinned scope"))?;
+            let prefix = match scope {
+                Scope::Family { family_id, .. } => {
+                    format!("{ROOT}family/{}/", family_key(family_id))
+                }
+                Scope::Model {
+                    family_id,
+                    model_id,
+                    revision,
+                    quantization,
+                    ..
+                } => format!(
+                    "{ROOT}model/{}/",
+                    model_key(&Model {
+                        family_id: family_id.clone(),
+                        model_id: model_id.clone(),
+                        revision: revision.clone(),
+                        quantization: quantization.clone()
+                    })?
+                ),
+            };
+            (Rows::Markets, vec![Span::prefix(prefix)])
+        }
         Target::ExactOffer { offer_id } => (
             Rows::Offers,
             vec![Span {
@@ -271,8 +316,12 @@ impl Continuation {
         Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(self)?))
     }
 }
-fn query_key(policy: &Policy, selected_rail: ProxyRail) -> Result<String> {
-    let body = stable_json_bytes(&serde_json::json!({"policy":policy,"rail":selected_rail}))?;
+fn query_key(policy: &Policy, selected_rail: ProxyRail, scope: Option<&Scope>) -> Result<String> {
+    let mut value = serde_json::json!({"policy":policy,"rail":selected_rail});
+    if let Some(scope) = scope {
+        value["taxonomy_scope"] = serde_json::to_value(scope)?;
+    }
+    let body = stable_json_bytes(&value)?;
     let mut hash = blake3::Hasher::new_derive_key("mayhem/proxy/candidate-query/v1");
     hash.update(&(body.len() as u64).to_le_bytes());
     hash.update(&body);
@@ -304,6 +353,7 @@ fn choose(
     policy: &Policy,
     selected_rail: ProxyRail,
     reads: &mut usize,
+    prefer_scope: bool,
 ) -> Result<usize> {
     let mut best = (usize::MAX, usize::MAX, 0);
     for (id, driver) in drivers.iter().enumerate() {
@@ -341,7 +391,19 @@ fn choose(
         if parents == PROBE_ROWS {
             count = PROBE_ROWS;
         }
-        let score = (count, usize::from(driver.rows != Rows::Offers), id);
+        // For taxonomy scopes, unknown cardinalities tie at PROBE_ROWS. Prefer
+        // the scope index then, avoiding repeated global scans across scopes.
+        // A fully exhausted smaller provider/price driver still wins, preserving
+        // selective hard-filter access without a catalog-wide planning pass.
+        let score = (
+            count,
+            if prefer_scope {
+                usize::from(id != 1)
+            } else {
+                usize::from(driver.rows != Rows::Offers)
+            },
+            id,
+        );
         if score < best {
             best = score;
         }
@@ -368,8 +430,21 @@ fn child_span(policy: &Policy, selected_rail: ProxyRail, rows: Rows, parent: &st
         offer_prefix(policy.endpoint, selected_rail)
     )))
 }
-fn accepts(policy: &Policy, selected_rail: ProxyRail, p: &PublishedOffer) -> bool {
+fn accepts(
+    policy: &Policy,
+    selected_rail: ProxyRail,
+    p: &PublishedOffer,
+    scope: Option<&Scope>,
+) -> bool {
     let target = match &policy.target {
+        Target::TaxonomyCategory {
+            market_allowlist, ..
+        } => {
+            scope.is_some_and(|s| s.matches(&Model::from_offer(p)))
+                && market_allowlist
+                    .as_ref()
+                    .is_none_or(|v| v.contains(&p.offer.market_id))
+        }
         Target::ExactOffer { offer_id } => p.id == *offer_id,
         Target::ExactMarket { market_id } => p.offer.market_id == *market_id,
         Target::Category {
@@ -434,7 +509,29 @@ impl CatalogRead {
         limit: usize,
         now_ms: u64,
     ) -> Result<CandidatePage> {
+        self.proxy_candidates_in_scope(policy, selected_rail, None, cursor, limit, now_ms)
+    }
+    /// A scope narrows enumeration only. Execution still requires the trusted
+    /// exact membership read, not an arbitrary constructed scope.
+    pub fn proxy_candidates_in_scope(
+        &self,
+        policy: &Policy,
+        selected_rail: ProxyRail,
+        scope: Option<&Scope>,
+        cursor: Option<&str>,
+        limit: usize,
+        now_ms: u64,
+    ) -> Result<CandidatePage> {
         policy.validate()?;
+        require(
+            matches!(&policy.target, Target::TaxonomyCategory { .. }) == scope.is_some(),
+            "taxonomy candidate scope differs",
+        )?;
+        if let Some(scope) = scope {
+            scope
+                .validate()
+                .map_err(|_| invalid("invalid taxonomy scope"))?;
+        }
         require(
             policy.allowed_rails.contains(&selected_rail) && limit > 0 && limit <= MAX_PAGE_ENTRIES,
             "invalid candidate rail or page size",
@@ -445,8 +542,8 @@ impl CatalogRead {
             "proxy directory not hydrated",
         )?;
         let snapshot = status.content_snapshot;
-        let query = query_key(policy, selected_rail)?;
-        let drivers = drivers(policy, selected_rail)?;
+        let query = query_key(policy, selected_rail, scope)?;
+        let drivers = drivers(policy, selected_rail, scope)?;
         let index = db(self.tx.open_table(INDEX))?;
         let mut reads = 0;
         let mut c = if let Some(token) = cursor {
@@ -501,7 +598,14 @@ impl CatalogRead {
                 version: 1,
                 query: query.clone(),
                 snapshot: snapshot.clone(),
-                driver: choose(&index, &drivers, policy, selected_rail, &mut reads)?,
+                driver: choose(
+                    &index,
+                    &drivers,
+                    policy,
+                    selected_rail,
+                    &mut reads,
+                    scope.is_some(),
+                )?,
                 span: 0,
                 after: None,
                 child: None,
@@ -552,7 +656,7 @@ impl CatalogRead {
                 .ok_or_else(|| invalid("candidate index target differs"))?;
             let published = self
                 .proxy_offer(id, now_ms)?
-                .filter(|p| accepts(policy, selected_rail, p));
+                .filter(|p| accepts(policy, selected_rail, p, scope));
             if let Some(p) = published {
                 let size = serde_json::to_vec(&p)?.len() + 1;
                 require(

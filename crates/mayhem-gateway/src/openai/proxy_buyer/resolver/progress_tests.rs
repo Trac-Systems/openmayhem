@@ -86,6 +86,7 @@ fn fixture() -> (Session, Best) {
         best: None,
         page: VecDeque::new(),
         traversal_done: false,
+        taxonomy: None,
         waiting: None,
         lease_until: None,
         pending_reason: None,

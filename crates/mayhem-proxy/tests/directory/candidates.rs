@@ -494,3 +494,124 @@ fn selective_family_driver_preserves_nested_cursor_and_rejects_forged_parent() {
         Err(Error::DirectoryCursorInvalid)
     ));
 }
+
+#[test]
+fn taxonomy_scopes_use_indexed_exact_models_and_bind_all_continuations() {
+    use mayhem_proxy::registry::publication::taxonomy::{DocumentReference, Reference, Scope};
+    let dir = tempfile::tempdir().unwrap();
+    let c = Catalog::open(dir.path().join("taxonomy"), identity()).unwrap();
+    let mut all = Vec::new();
+    for n in 0..96 {
+        all.extend(rows(&format!("model{n}"), "other", 2, false));
+    }
+    let mut p = policy(&all);
+    hydrate(&c, all);
+    p.target = Target::TaxonomyCategory {
+        taxonomy: Reference {
+            release_id: "00000000-0000-4000-8000-000000000001".into(),
+            release_hash: "a".repeat(64),
+            entry_id: "new_category".into(),
+            schema_revision: 1,
+        },
+        variants: vec![],
+        tags: vec![],
+        market_allowlist: None,
+    };
+    let source = DocumentReference {
+        entry_id: "model95".into(),
+        schema_revision: 1,
+        version: 1,
+        document_hash: "b".repeat(64),
+    };
+    let scope = Scope::Model {
+        source,
+        family_id: "other".into(),
+        model_id: "model95".into(),
+        revision: "".into(),
+        quantization: "".into(),
+    };
+    let read = c.read().unwrap();
+    assert!(read
+        .proxy_candidates(&p, ProxyRail::Fiat, None, 1, 10001)
+        .is_err());
+    let first = read
+        .proxy_candidates_in_scope(&p, ProxyRail::Fiat, Some(&scope), None, 1, 10001)
+        .unwrap();
+    assert_eq!(first.entries.len(), 1);
+    assert!(first.index_reads < 100);
+    assert_eq!(first.entries[0].market.model.model_id, "model95");
+    assert!(p
+        .check_offer(&first.entries[0], p.endpoint, ProxyRail::Fiat)
+        .is_err());
+    let cursor = first.next_cursor.unwrap();
+    let second = read
+        .proxy_candidates_in_scope(&p, ProxyRail::Fiat, Some(&scope), Some(&cursor), 10, 10001)
+        .unwrap();
+    assert!(second.exhausted);
+    assert_eq!(second.entries.len(), 1);
+    let mut other = scope.clone();
+    if let Scope::Model { model_id, .. } = &mut other {
+        *model_id = "model94".into();
+    }
+    assert!(matches!(
+        read.proxy_candidates_in_scope(&p, ProxyRail::Fiat, Some(&other), Some(&cursor), 10, 10001),
+        Err(Error::DirectoryCursorInvalid)
+    ));
+    let mut changed = p.clone();
+    changed.prices.rates[0].per_unit_au = 0;
+    assert!(read
+        .proxy_candidates_in_scope(&changed, ProxyRail::Fiat, Some(&scope), None, 10, 10001)
+        .unwrap()
+        .entries
+        .is_empty());
+}
+
+#[test]
+fn taxonomy_scope_planner_keeps_selective_provider_and_price_drivers() {
+    use mayhem_proxy::registry::publication::taxonomy::{DocumentReference, Reference, Scope};
+    let dir = tempfile::tempdir().unwrap();
+    let c = Catalog::open(dir.path().join("scope-selectivity"), identity()).unwrap();
+    let all = rows("large", "other", 1200, false);
+    let mut p = policy(&all);
+    hydrate(&c, all);
+    p.target = Target::TaxonomyCategory {
+        taxonomy: Reference {
+            release_id: "00000000-0000-4000-8000-000000000001".into(),
+            release_hash: "a".repeat(64),
+            entry_id: "category".into(),
+            schema_revision: 1,
+        },
+        variants: vec![],
+        tags: vec![],
+        market_allowlist: None,
+    };
+    let scope = Scope::Family {
+        source: DocumentReference {
+            entry_id: "family".into(),
+            schema_revision: 1,
+            version: 1,
+            document_hash: "b".repeat(64),
+        },
+        family_id: "other".into(),
+    };
+    let read = c.read().unwrap();
+    let broad = read
+        .proxy_candidates_in_scope(&p, ProxyRail::Fiat, Some(&scope), None, 1, 10001)
+        .unwrap();
+    assert_eq!(broad.index_driver, "target");
+    p.providers.allow = Some(vec![format!("{:064x}", 1199)]);
+    let narrow = read
+        .proxy_candidates_in_scope(&p, ProxyRail::Fiat, Some(&scope), None, 10, 10001)
+        .unwrap();
+    assert_eq!(narrow.entries.len(), 1);
+    assert_eq!(narrow.index_driver, "provider");
+    assert!(narrow.index_reads < 100);
+    assert!(narrow.exhausted);
+    p.providers.allow = None;
+    p.prices.rates[0].per_unit_au = 0;
+    let price = read
+        .proxy_candidates_in_scope(&p, ProxyRail::Fiat, Some(&scope), None, 10, 10001)
+        .unwrap();
+    assert_eq!(price.index_driver, "unit_price");
+    assert!(price.exhausted && price.entries.is_empty() && price.index_reads < 100);
+}

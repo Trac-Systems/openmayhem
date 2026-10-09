@@ -297,7 +297,7 @@ pub(crate) fn etag(release: &Release, references: Option<&[Reference]>) -> Resul
         )?
     ))
 }
-fn digest(domain: &str, value: &Value) -> Result<String> {
+pub(super) fn digest(domain: &str, value: &Value) -> Result<String> {
     let canonical =
         stable_json_bytes(value).map_err(|_| Error::Invalid("invalid registry canonical JSON"))?;
     check(
@@ -331,7 +331,7 @@ pub(crate) fn release_id(value: &str) -> bool {
         && matches!(value.as_bytes()[14], b'1'..=b'8')
         && matches!(value.as_bytes()[19], b'8' | b'9' | b'a' | b'b')
 }
-fn timestamp(value: &str) -> bool {
+pub(super) fn timestamp(value: &str) -> bool {
     // SITE emits Date.toISOString: bounded UTC calendar time with milliseconds.
     if value.len() != 24
         || !value.bytes().enumerate().all(|(i, c)| match i {
