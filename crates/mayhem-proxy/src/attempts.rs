@@ -1011,6 +1011,16 @@ fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T> {
 
 #[cfg(unix)]
 pub(crate) fn private_file(path: &Path) -> Result<std::fs::File> {
+    private_file_mode(path, true)
+}
+
+#[cfg(unix)]
+pub(crate) fn existing_private_file(path: &Path) -> Result<std::fs::File> {
+    private_file_mode(path, false)
+}
+
+#[cfg(unix)]
+fn private_file_mode(path: &Path, create: bool) -> Result<std::fs::File> {
     use rustix::fs::{fstat, open, FileType, Mode, OFlags};
     use std::os::unix::fs::MetadataExt;
     let parent = std::fs::metadata(path.parent().ok_or(Error::File)?).map_err(|_| Error::File)?;
@@ -1020,7 +1030,15 @@ pub(crate) fn private_file(path: &Path) -> Result<std::fs::File> {
     }
     let fd = open(
         path,
-        OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        OFlags::RDWR
+            | OFlags::NOFOLLOW
+            | OFlags::NONBLOCK
+            | OFlags::CLOEXEC
+            | if create {
+                OFlags::CREATE
+            } else {
+                OFlags::empty()
+            },
         Mode::RUSR | Mode::WUSR,
     )
     .map_err(|_| Error::File)?;
@@ -1029,6 +1047,7 @@ pub(crate) fn private_file(path: &Path) -> Result<std::fs::File> {
         || s.st_uid != uid
         || s.st_mode & 0o077 != 0
         || s.st_nlink != 1
+        || (!create && s.st_size == 0)
     {
         return Err(Error::File);
     }
@@ -1036,6 +1055,11 @@ pub(crate) fn private_file(path: &Path) -> Result<std::fs::File> {
 }
 #[cfg(not(unix))]
 pub(crate) fn private_file(_: &Path) -> Result<std::fs::File> {
+    Err(Error::UnsupportedFileProtection)
+}
+
+#[cfg(not(unix))]
+pub(crate) fn existing_private_file(_: &Path) -> Result<std::fs::File> {
     Err(Error::UnsupportedFileProtection)
 }
 

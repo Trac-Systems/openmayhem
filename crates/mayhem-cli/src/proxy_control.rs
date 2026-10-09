@@ -25,6 +25,8 @@ use tokio::sync::watch;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Initialize new durable gateway buyer journals and common key budgets; never serves requests.
+    BuyerInit(super::proxy_buyer::InitArgs),
     /// Recover existing proxy buyer holds without dispatching replacement inference.
     BuyerRecovery {
         #[command(subcommand)]
@@ -107,7 +109,10 @@ impl Config {
 }
 
 pub async fn run(command: Command) -> Result<()> {
-    let Command::BuyerRecovery { command } = command;
+    let command = match command {
+        Command::BuyerInit(args) => return super::proxy_buyer::initialize(args).await,
+        Command::BuyerRecovery { command } => command,
+    };
     let once = matches!(&command, RecoveryCommand::Once(_));
     let args = match command {
         RecoveryCommand::Once(v) | RecoveryCommand::Watch(v) => v,

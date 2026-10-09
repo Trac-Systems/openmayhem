@@ -148,3 +148,79 @@ async fn gateway_bind_failure_stops_and_joins_proxy_control() {
     assert!(result.is_err());
     assert!(joined.load(Ordering::SeqCst));
 }
+
+#[tokio::test]
+async fn buyer_failure_leaves_discovery_and_native_serving_until_owner_stop() {
+    let (shutdown, stopped) = watch::channel(false);
+    let (signal, signalled) = tokio::sync::oneshot::channel();
+    let joined = Arc::new(AtomicBool::new(false));
+    let completed = joined.clone();
+    let proxy = async move {
+        join_controls(
+            async move {
+                wait_for_stop(stopped).await;
+                completed.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+            async { Err(anyhow!("fixture buyer failure")) },
+        )
+        .await;
+        Ok(())
+    };
+    let task = tokio::spawn(supervise(
+        std::future::pending(),
+        proxy,
+        async {
+            signalled.await?;
+            Ok(())
+        },
+        shutdown,
+    ));
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert!(!task.is_finished());
+    assert!(!joined.load(Ordering::SeqCst));
+    signal.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(joined.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn stop_joins_buyer_commit_even_after_discovery_failure() {
+    let (shutdown, stopped) = watch::channel(false);
+    let (entered, entry) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let proxy = async move {
+        join_controls(
+            async { Err(anyhow!("fixture discovery failure")) },
+            async move {
+                wait_for_stop(stopped).await;
+                entered.send(()).unwrap();
+                released.await?;
+                Ok(())
+            },
+        )
+        .await;
+        Ok(())
+    };
+    let task = tokio::spawn(supervise(
+        std::future::pending(),
+        proxy,
+        async { Ok(()) },
+        shutdown,
+    ));
+    tokio::time::timeout(Duration::from_secs(1), entry)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!task.is_finished());
+    release.send(()).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

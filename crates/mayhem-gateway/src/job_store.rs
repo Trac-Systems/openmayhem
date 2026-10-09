@@ -12,6 +12,8 @@ use aes_gcm::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub(crate) mod proxy;
+
 const JOB_SCHEMA_VERSION: u32 = 1;
 const JOB_FILE_MAGIC: &[u8; 8] = b"MYHMJOB1";
 const JOB_NONCE_BYTES: usize = 12;
@@ -85,6 +87,8 @@ pub(crate) struct StoredGatewayJob {
     pub(crate) error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) error_info: Option<GatewayJobErrorInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proxy: Option<proxy::ProxyJobState>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -181,6 +185,10 @@ pub(crate) struct GatewayJobStore {
     sealed_sizes: BTreeMap<String, usize>,
     active: BTreeMap<String, ActiveGatewayJob>,
     reconciling: BTreeSet<String>,
+    proxy_pending: BTreeSet<String>,
+    proxy_failed: bool,
+    #[cfg(test)]
+    proxy_lose_write_ack: bool,
     total_bytes: usize,
     max_jobs: usize,
     max_bytes: usize,
@@ -201,6 +209,10 @@ impl GatewayJobStore {
             sealed_sizes: BTreeMap::new(),
             active: BTreeMap::new(),
             reconciling: BTreeSet::new(),
+            proxy_pending: BTreeSet::new(),
+            proxy_failed: false,
+            #[cfg(test)]
+            proxy_lose_write_ack: false,
             total_bytes: 0,
             max_jobs: max_jobs.max(1),
             max_bytes: max_bytes.max(1),
@@ -236,6 +248,7 @@ impl GatewayJobStore {
     ) -> Result<BeginGatewayJob, String> {
         self.purge_expired(now)?;
         if let Some(existing) = self.records.get(&id) {
+            reject_proxy(existing)?;
             validate_job_identity(
                 existing,
                 &endpoint_family,
@@ -302,6 +315,7 @@ impl GatewayJobStore {
                 retryable: false,
                 phase: None,
             }),
+            proxy: None,
         };
         self.persist_active_recovery(recovery)
     }
@@ -360,6 +374,7 @@ impl GatewayJobStore {
                 .records
                 .values()
                 .filter(|job| !self.reconciling.contains(&job.id))
+                .filter(|job| !self.proxy_pending.contains(&job.id))
                 .min_by_key(|job| (job.finished_at, job.id.clone()))
                 .map(|job| job.id.clone())
             else {
@@ -401,6 +416,7 @@ impl GatewayJobStore {
         now: u64,
     ) -> Result<StoredGatewayJob, String> {
         if let Some(existing) = self.records.get(id) {
+            reject_proxy(existing)?;
             if existing.status == status
                 && existing.result == result
                 && existing.artifacts == artifacts
@@ -437,6 +453,7 @@ impl GatewayJobStore {
             receipt,
             error,
             error_info,
+            proxy: None,
         };
         if matches!(
             status,
@@ -496,6 +513,7 @@ impl GatewayJobStore {
             .get(id)
             .cloned()
             .ok_or_else(|| format!("job {id} has no durable reconciliation state"))?;
+        reject_proxy(&existing)?;
         if existing.status == status && existing.error == error {
             self.reconciling.remove(id);
             return Ok(existing);
@@ -547,6 +565,7 @@ impl GatewayJobStore {
             .get(id)
             .cloned()
             .ok_or_else(|| format!("job {id} has no durable reconciliation state"))?;
+        reject_proxy(&existing)?;
         if existing.status != GatewayJobStatus::ReconciliationPending {
             return Err(format!(
                 "job {id} cannot update reconciliation from {}",
@@ -621,6 +640,7 @@ impl GatewayJobStore {
             .records
             .values()
             .filter(|job| job.status == GatewayJobStatus::ReconciliationPending)
+            .filter(|job| job.proxy.is_none())
             .cloned()
             .collect())
     }
@@ -683,7 +703,7 @@ impl GatewayJobStore {
         if job.owner_token_id.as_deref() != owner_token_id {
             return Ok(None);
         }
-        if self.reconciling.contains(id) {
+        if self.reconciling.contains(id) || self.proxy_pending.contains(id) {
             return Err(format!(
                 "job {id} cannot be removed while receipt reconciliation is pending"
             ));
@@ -721,10 +741,17 @@ impl GatewayJobStore {
             if job.schema_version != JOB_SCHEMA_VERSION || job.id != id {
                 return Err(format!("encrypted job {id} has invalid identity or schema"));
             }
+            if let Some(proxy) = &job.proxy {
+                proxy.validate(&job)?;
+                if job.status == GatewayJobStatus::ReconciliationPending {
+                    self.proxy_pending.insert(id.to_owned());
+                }
+            }
             // Older builds marked interrupted checkpoints cancelled before
             // their reservation was closed. Restore those jobs to recovery;
             // never rewrite the signed receipt's finality bit.
-            if job.status != GatewayJobStatus::ReconciliationPending
+            if job.proxy.is_none()
+                && job.status != GatewayJobStatus::ReconciliationPending
                 && job.receipt.as_ref().is_some_and(|receipt| {
                     receipt.pointer("/body/final") == Some(&Value::Bool(false))
                         && receipt.get("canonical_settlement").is_none()
@@ -735,7 +762,7 @@ impl GatewayJobStore {
                 self.persist_replace(id, &repaired)?;
                 sealed = repaired;
             }
-            if job.status == GatewayJobStatus::ReconciliationPending {
+            if job.proxy.is_none() && job.status == GatewayJobStatus::ReconciliationPending {
                 self.reconciling.insert(id.to_owned());
             }
             self.total_bytes = self.total_bytes.saturating_add(sealed.len());
@@ -758,6 +785,7 @@ impl GatewayJobStore {
         for id in expired {
             self.records.remove(&id);
             self.reconciling.remove(&id);
+            self.proxy_pending.remove(&id);
             self.remove_sealed_record(&id)?;
         }
         Ok(())
@@ -772,6 +800,7 @@ impl GatewayJobStore {
                 .values()
                 .filter(|job| Some(job.id.as_str()) != preserve)
                 .filter(|job| !self.reconciling.contains(&job.id))
+                .filter(|job| !self.proxy_pending.contains(&job.id))
                 .min_by_key(|job| (job.finished_at, job.id.clone()))
                 .map(|job| job.id.clone())
             else {
@@ -810,6 +839,7 @@ impl GatewayJobStore {
                 .values()
                 .filter(|job| Some(job.id.as_str()) != replacing)
                 .filter(|job| !self.reconciling.contains(&job.id))
+                .filter(|job| !self.proxy_pending.contains(&job.id))
                 .min_by_key(|job| (job.finished_at, job.id.clone()))
                 .map(|job| job.id.clone())
             else {
@@ -900,6 +930,16 @@ fn summarize_result_metadata(result: Option<&Value>) -> Option<Value> {
         }
     }
     (!metadata.is_empty()).then_some(Value::Object(metadata))
+}
+
+fn reject_proxy(job: &StoredGatewayJob) -> Result<(), String> {
+    if job.proxy.is_some() {
+        return Err(format!(
+            "job {} requires proxy owner reconciliation",
+            job.id
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn gateway_job_id(
@@ -1900,6 +1940,7 @@ mod tests {
             receipt: None,
             error: None,
             error_info: None,
+            proxy: None,
         };
         let key = derive_job_store_key([1_u8; 32]);
         let sealed = seal_job(&key, &job).unwrap();

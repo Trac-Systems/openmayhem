@@ -148,6 +148,10 @@ impl Policy {
     pub fn lifetimes(&self) -> Lifetimes {
         self.lifetimes
     }
+
+    pub fn settlement_policy_hash(&self) -> &Digest {
+        &self.settlement_policy_hash
+    }
 }
 
 /// Owned normalized envelope. Deliberately not Debug/Serialize: ordinary logs

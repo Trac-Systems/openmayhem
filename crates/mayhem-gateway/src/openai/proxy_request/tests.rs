@@ -66,12 +66,24 @@ fn raw(candidate: &PublishedOffer, rail: ProxyRail) -> Value {
         require_verified_operator: false,
     };
     let mut body = json!({"model":format!("proxy/offer/{}", candidate.id),"proxy":controls});
-    if decisions {
-        body["input"] = json!("Choose a label");
-        body["questions"] = json!({"label": ["a","b"]});
-    } else {
-        body["messages"] = json!([{"role":"user","content":"Hello"}]);
-        body["max_tokens"] = json!(128);
+    match candidate.offer.endpoint {
+        ProxyEndpoint::Decisions => {
+            body["state"] = json!("Evaluate this text");
+            body["questions"] =
+                json!({"label":{"type":"noul","instructions":"How relevant is this text?"}});
+        }
+        ProxyEndpoint::Chat => {
+            body["messages"] = json!([{"role":"user","content":"Hello"}]);
+            body["max_tokens"] = json!(128);
+        }
+        ProxyEndpoint::Completions => {
+            body["prompt"] = json!("Hello");
+            body["max_tokens"] = json!(128);
+        }
+        ProxyEndpoint::Responses => {
+            body["input"] = json!("Hello");
+            body["max_output_tokens"] = json!(128);
+        }
     }
     body
 }
@@ -187,6 +199,61 @@ fn decisions_do_not_invent_token_allowances_or_throughput_guarantees() {
         let mut body = raw(&c, ProxyRail::Fiat);
         body["proxy"][field] = json!(5);
         assert!(Request::parse(ProxyEndpoint::Decisions, body, &policy()).is_err());
+    }
+}
+
+#[test]
+fn completion_and_response_controls_preserve_endpoint_schema_and_bind_body_exactly() {
+    for endpoint in [ProxyEndpoint::Completions, ProxyEndpoint::Responses] {
+        let mut c = candidate(false);
+        c.offer.endpoint = endpoint;
+        c.id = format!(
+            "{}/{}/{}",
+            c.offer.market_id,
+            c.offer.provider_pubkey,
+            c.offer.slot_id().unwrap()
+        );
+        let mut body = raw(&c, ProxyRail::Tap);
+        if endpoint == ProxyEndpoint::Completions {
+            body["temperature"] = json!(0.2);
+            body["seed"] = json!(2);
+        } else {
+            body["temperature"] = json!(0.2);
+            body["text"] = json!({"format":{"type":"json_schema","name":"answer","strict":true,
+                "schema":{"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false}}});
+        }
+        let request = parse(&c, body.clone());
+        let fingerprint = request.fingerprint(&digest('a')).unwrap();
+        let mut expected = body.clone();
+        expected.as_object_mut().unwrap().remove("proxy");
+        assert_eq!(
+            serde_json::from_slice::<Value>(request.provider_request()).unwrap(),
+            expected
+        );
+        for field in if endpoint == ProxyEndpoint::Completions {
+            ["prompt", "temperature", "max_tokens"]
+        } else {
+            ["input", "temperature", "max_output_tokens"]
+        } {
+            let mut changed = body.clone();
+            changed[field] = if field.starts_with("max_") {
+                json!(127)
+            } else if field == "temperature" {
+                json!(0.5)
+            } else {
+                json!("changed")
+            };
+            assert_ne!(
+                parse(&c, changed).fingerprint(&digest('a')).unwrap(),
+                fingerprint,
+                "{endpoint:?}/{field}"
+            );
+        }
+        for output in [Value::Null, json!(0), json!(PROXY_MAX_SAFE_INTEGER + 1)] {
+            let mut changed = body.clone();
+            changed["proxy"]["output_units"] = output;
+            assert!(Request::parse(endpoint, changed, &policy()).is_err());
+        }
     }
 }
 

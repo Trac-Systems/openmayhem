@@ -148,7 +148,7 @@ async fn negotiation_canonically_reclaims_never_admitted_buyer_and_dual_signed_p
                 let f = Fixture::new(&backend.base, endpoint);
                 let mut peer = Peer::start(rail, &f, &bytes, false, None).await;
                 let (signer, _, provider_key) = signer(&mut peer).await;
-                let c = controller(&f, &peer, 1);
+                let c = controller(&f, &peer, 2);
                 let (q, p) = prepare(&peer, &f, &bytes, &session(&peer)).await;
                 let saved = c.sign(p, q, signer.clone(), 1000).await.unwrap();
                 let key = saved.key().clone();
@@ -170,7 +170,7 @@ async fn negotiation_canonically_reclaims_never_admitted_buyer_and_dual_signed_p
                 assert_eq!(saved.authorization().is_some(), countersigned);
                 assert!(c.pending(None, 64).await.unwrap().is_empty());
                 drop(c);
-                let c = controller(&f, &peer, 1);
+                let c = controller(&f, &peer, 2);
                 assert!(c.recover(key.clone()).await.unwrap().unwrap().closed());
                 assert!(
                     c.retain_provider_acceptance(auth).await.is_err(),
@@ -184,6 +184,22 @@ async fn negotiation_canonically_reclaims_never_admitted_buyer_and_dual_signed_p
                 assert_eq!(c.prune(3000, 1).await.unwrap(), 1);
                 assert!(c.recover(key).await.unwrap().is_none());
                 let (q, p) = prepare(&peer, &f, &bytes, &session(&peer)).await;
+                assert!(
+                    c.sign(p, q, signer.clone(), 3001).await.is_err(),
+                    "pruning request data must retain the original signing fence"
+                );
+                let mut fresh = query(&peer);
+                fresh.billing_id = d(4242).as_str().into();
+                let q = peer.buyer_client.quote(&fresh).await.unwrap();
+                let intent = PurchaseRequest::new(
+                    f.adapter.public_snapshot(),
+                    bytes.clone(),
+                    prices(&peer),
+                    (f.adapter.endpoint() != ProxyEndpoint::Decisions).then_some(37),
+                    lifetimes(),
+                )
+                .unwrap();
+                let p = q.prepare_purchase(&intent, &session(&peer)).unwrap();
                 let next = c.sign(p, q, signer, 3001).await.unwrap();
                 assert_eq!(
                     next.offer().terms.billing_epoch,
@@ -191,7 +207,7 @@ async fn negotiation_canonically_reclaims_never_admitted_buyer_and_dual_signed_p
                 );
                 assert!(
                     !next.closed(),
-                    "quota recovered for a fresh canonical purchase"
+                    "fresh canonical purchase uses a distinct billing identity"
                 );
                 assert_eq!(peer.command("state").await, before);
                 let status = peer.command("status").await;

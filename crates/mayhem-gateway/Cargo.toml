@@ -37,6 +37,7 @@ mayhem-bridge = { path = "../mayhem-bridge" }
 mayhem-attestation = { path = "../mayhem-attestation" }
 mayhem-proto = { path = "../mayhem-proto" }
 mayhem-proxy = { path = "../mayhem-proxy" }
+redb = "=3.1.3"
 rustfft = "=6.4.1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 semver = "1"
@@ -53,6 +54,7 @@ wait-timeout = "0.2"
 rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
+mayhem-proxy = { path = "../mayhem-proxy", features = ["test-support"] }
 aes = "0.8"
 anyhow = "1"
 cfb-mode = "0.8"

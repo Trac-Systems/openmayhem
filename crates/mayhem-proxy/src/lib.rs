@@ -28,6 +28,9 @@ pub mod serving;
 pub mod signing;
 pub mod supervisor;
 pub mod worker;
+#[cfg(feature = "test-support")]
+#[doc(hidden)]
+pub mod test_support;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

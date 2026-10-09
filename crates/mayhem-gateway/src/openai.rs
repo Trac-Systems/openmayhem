@@ -143,12 +143,18 @@ type SharedState = Arc<GatewayState>;
 
 #[cfg(test)]
 mod durable_streaming_tests;
+#[cfg(test)]
+mod existing_job_access_tests;
 mod failure_recovery;
 mod incremental_output;
-mod response_stream;
+mod key_budget;
+pub mod proxy_buyer;
 pub mod proxy_control;
 mod proxy_directory;
 pub mod proxy_request;
+mod response_stream;
+pub use key_budget::Limits as GatewayKeyBudgetLimits;
+mod proxy_owner;
 
 mod github_update;
 use github_update::{
@@ -291,6 +297,7 @@ const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0
 #[derive(Clone, Debug)]
 pub struct GatewayState {
     proxy_control: Option<Arc<proxy_control::ProxyControl>>,
+    proxy_buyer: Option<Arc<proxy_buyer::Runtime>>,
     catalog_runtime: Arc<Mutex<GatewayCatalogRuntime>>,
     catalog_refresh: Arc<Mutex<GatewayCatalogRefresh>>,
     catalog_refresh_request: Arc<Notify>,
@@ -437,6 +444,35 @@ impl GatewaySpendReservationInner {
         Ok(())
     }
 
+    fn settle_receipt(
+        &self,
+        receipt: &StoredReceipt,
+        legacy_delta: MoneyAu,
+    ) -> Result<(), ApiError> {
+        if receipt.access_token != self.access_token {
+            return Err(GatewayAccessControl::budget_error(
+                key_budget::Error::Conflict,
+            ));
+        }
+        if self.access_control.durable_budget.is_none() || self.access_token.is_none() {
+            return self.settle(legacy_delta, receipt.receipt.body.final_receipt);
+        }
+        let mut remaining = self.remaining_au.lock_recover("gateway spend reservation");
+        let delta = self.access_control.reconcile_native_budget_inner(receipt)?;
+        let mut wallet = self.wallet_spend.lock_recover("gateway wallet spend state");
+        wallet.balance_au = wallet.balance_au.saturating_sub(delta);
+        if receipt.receipt.body.final_receipt {
+            wallet.reservations.remove(&self.id);
+            *remaining = None;
+        } else if let Some(current) = *remaining {
+            let next = current
+                .checked_sub(delta)
+                .ok_or_else(|| GatewayAccessControl::budget_error(key_budget::Error::Conflict))?;
+            wallet.reservations.insert(self.id.clone(), next);
+            *remaining = Some(next);
+        }
+        Ok(())
+    }
     fn release(&self) {
         let mut remaining = self.remaining_au.lock_recover("gateway spend reservation");
         if remaining.take().is_none() {
@@ -465,6 +501,13 @@ impl GatewaySpendReservation {
         self.0.settle(delta_au, terminal)
     }
 
+    fn settle_receipt(
+        &self,
+        receipt: &StoredReceipt,
+        legacy_delta: MoneyAu,
+    ) -> Result<(), ApiError> {
+        self.0.settle_receipt(receipt, legacy_delta)
+    }
     fn release(&self) {
         self.0.release();
     }
@@ -498,7 +541,7 @@ impl GatewayReceiptRecorder {
                 ApiError::conflict("logical billing cumulative amount regressed", None)
             })?;
             self.spend_reservation
-                .settle(spend_delta, receipt.receipt.body.final_receipt)?;
+                .settle_receipt(&receipt, spend_delta)?;
             receipts.push(receipt);
             if let Some(history) = &self.history {
                 if receipts.len() > history.receipt_limit {
@@ -1416,6 +1459,12 @@ impl Default for GatewayTokenStore {
 }
 
 impl GatewayTokenStore {
+    /// Version two delegates all spending counters to the explicitly provisioned
+    /// durable authority. Removing its startup pointer must fail closed.
+    pub fn requires_durable_key_budget(&self) -> bool {
+        self.version >= 2
+    }
+
     pub fn empty() -> Self {
         Self {
             version: default_gateway_token_store_version(),
@@ -1461,6 +1510,7 @@ pub struct GatewayAccessControl {
     store: Arc<Mutex<GatewayTokenStore>>,
     rate_windows: Arc<Mutex<BTreeMap<String, GatewayTokenRateWindow>>>,
     reservations: Arc<Mutex<BTreeMap<(String, String), MoneyAu>>>,
+    durable_budget: Option<Arc<key_budget::Authority>>,
 }
 
 impl GatewayAccessControl {
@@ -1475,9 +1525,294 @@ impl GatewayAccessControl {
             store: Arc::new(Mutex::new(store.normalized())),
             rate_windows: Arc::new(Mutex::new(BTreeMap::new())),
             reservations: Arc::new(Mutex::new(BTreeMap::new())),
+            durable_budget: None,
         }
     }
 
+    /// Call during startup, before any admission. Reopening failure prevents paid
+    /// enablement; token JSON remains configuration, this database owns spending.
+    pub fn with_durable_key_budget(
+        self,
+        path: PathBuf,
+        limits: GatewayKeyBudgetLimits,
+    ) -> Result<Self, String> {
+        self.configure_durable_key_budget(path, limits, false)
+    }
+    /// Explicit one-time provisioning only. Never use as a fallback when reopen
+    /// fails: stale JSON cannot reconstruct committed spending or pending holds.
+    pub fn initialize_durable_key_budget(
+        self,
+        path: PathBuf,
+        limits: GatewayKeyBudgetLimits,
+    ) -> Result<Self, String> {
+        self.configure_durable_key_budget(path, limits, true)
+    }
+    fn configure_durable_key_budget(
+        mut self,
+        path: PathBuf,
+        limits: GatewayKeyBudgetLimits,
+        create: bool,
+    ) -> Result<Self, String> {
+        if !self
+            .reservations
+            .lock_recover("gateway token reservations")
+            .is_empty()
+            || self.durable_budget.is_some()
+        {
+            return Err("gateway key budget must be opened before admission".into());
+        }
+        let authority = {
+            let mut store = self.store.lock_recover("gateway token store");
+            self.reload_store(&mut store)
+                .map_err(|_| "gateway token configuration unavailable".to_owned())?;
+            (if create {
+                key_budget::Authority::create(&path, limits, &store.tokens)
+            } else {
+                key_budget::Authority::open(&path, limits, &store.tokens)
+            })
+            .map_err(|_| "gateway key budget cannot be opened".to_owned())?
+        };
+        self.durable_budget = Some(Arc::new(authority));
+        Ok(self)
+    }
+    fn has_durable_key_budget(&self) -> bool {
+        self.durable_budget.is_some()
+    }
+    fn budget_error(error: key_budget::Error) -> ApiError {
+        match error {
+            key_budget::Error::Cap => {
+                ApiError::payment_required("bearer token budget cap reached", Some("Authorization"))
+            }
+            key_budget::Error::Conflict => ApiError::conflict(
+                "gateway key budget binding or settlement differs",
+                Some("Authorization"),
+            ),
+            key_budget::Error::Invalid => ApiError::bad_request(
+                "invalid gateway key budget operation",
+                Some("Authorization"),
+            ),
+            key_budget::Error::Unavailable | key_budget::Error::Full => {
+                ApiError::service_unavailable(
+                    "gateway key budget unavailable; retained exposure requires recovery",
+                    Some("Authorization"),
+                )
+            }
+        }
+    }
+    fn reserve_proxy_budget(
+        &self,
+        attribution: &GatewayTokenAttribution,
+        request_id: &str,
+        fingerprint: &str,
+        terms: &mayhem_proto::proxy::finance::ProxySpendTerms,
+        model: &str,
+    ) -> Result<(), ApiError> {
+        let budget = self
+            .durable_budget
+            .as_ref()
+            .ok_or_else(|| Self::budget_error(key_budget::Error::Unavailable))?;
+        let mut store = self.store.lock_recover("gateway token store");
+        self.reload_store(&mut store)?;
+        let token = store
+            .tokens
+            .iter()
+            .find(|t| {
+                t.token_id == attribution.token_id
+                    && t.name == attribution.name
+                    && t.is_active(now_secs())
+            })
+            .ok_or_else(|| {
+                ApiError::unauthorized(
+                    "reserved bearer token is unavailable",
+                    Some("Authorization"),
+                )
+            })?;
+        if !token.models.is_empty() && !token.models.iter().any(|allowed| allowed == model) {
+            return Err(ApiError::forbidden(
+                "bearer token is not allowed to use this model",
+                Some("model"),
+            ));
+        }
+        let digest = terms
+            .digest()
+            .map_err(|_| Self::budget_error(key_budget::Error::Invalid))?;
+        budget
+            .reserve(
+                token,
+                key_budget::Lane::Proxy,
+                request_id,
+                fingerprint,
+                &digest,
+                terms.max_spend_au,
+                now_secs(),
+            )
+            .map_err(Self::budget_error)
+    }
+    /// Trusted recovery supplies independently verified canonical closure proof.
+    /// No expiry, cancellation, caller drop or missing journal implies release.
+    fn settle_proxy_budget(
+        &self,
+        attribution: &GatewayTokenAttribution,
+        request_id: &str,
+        fingerprint: &str,
+        terms_digest: &str,
+        cumulative_au: MoneyAu,
+        terminal: bool,
+        proof_digest: &str,
+    ) -> Result<(), ApiError> {
+        let budget = self
+            .durable_budget
+            .as_ref()
+            .ok_or_else(|| Self::budget_error(key_budget::Error::Unavailable))?;
+        self.sync_budget_configuration(&attribution.token_id)?;
+        budget
+            .settle_proxy(
+                &attribution.token_id,
+                request_id,
+                fingerprint,
+                terms_digest,
+                cumulative_au,
+                terminal,
+                proof_digest,
+                now_secs(),
+            )
+            .map(|_| ())
+            .map_err(Self::budget_error)
+    }
+    /// The owner must first retain the controller's opaque signing fence in its
+    /// encrypted job. A missing buyer row or local timeout is never sufficient.
+    fn fence_proxy_budget(
+        &self,
+        attribution: &GatewayTokenAttribution,
+        request_id: &str,
+        fingerprint: &str,
+        terms_digest: &str,
+        maximum: MoneyAu,
+        proof_digest: &str,
+    ) -> Result<(), ApiError> {
+        self.durable_budget
+            .as_ref()
+            .ok_or_else(|| Self::budget_error(key_budget::Error::Unavailable))?
+            .fence_proxy_non_admission(
+                &attribution.token_id,
+                request_id,
+                fingerprint,
+                terms_digest,
+                maximum,
+                proof_digest,
+                now_secs(),
+            )
+            .map_err(Self::budget_error)
+    }
+
+    fn sync_budget_configuration(&self, token_id: &str) -> Result<(), ApiError> {
+        let Some(budget) = &self.durable_budget else {
+            return Ok(());
+        };
+        let mut store = self.store.lock_recover("gateway token store");
+        self.reload_store(&mut store)?;
+        if let Some(token) = store.tokens.iter().find(|t| t.token_id == token_id) {
+            match budget.sync_config(token, now_secs()) {
+                Ok(()) | Err(key_budget::Error::Conflict) => {}
+                Err(error) => return Err(Self::budget_error(error)),
+            }
+        }
+        Ok(())
+    }
+    /// Bounded retained-exposure index for a startup/recovery owner. It never
+    /// scans receipts, tokens or request payload history.
+    fn pending_key_budgets(
+        &self,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<(String, key_budget::Pending)>, ApiError> {
+        self.durable_budget
+            .as_ref()
+            .ok_or_else(|| Self::budget_error(key_budget::Error::Unavailable))?
+            .pending(after, limit)
+            .map_err(Self::budget_error)
+    }
+    /// Replay an original signed native receipt from the bounded durable outbox
+    /// or retained history. Receipt attribution identifies an existing reservation;
+    /// absent pre-migration reservations are not imported as fresh charges.
+    pub fn reconcile_native_budget(&self, receipt: &StoredReceipt) -> Result<MoneyAu, String> {
+        self.reconcile_native_budget_inner(receipt)
+            .map_err(|_| "native key budget reconciliation failed".into())
+    }
+    fn reconcile_native_budget_inner(&self, receipt: &StoredReceipt) -> Result<MoneyAu, ApiError> {
+        let Some(budget) = &self.durable_budget else {
+            return Ok(0);
+        };
+        let Some(attribution) = &receipt.access_token else {
+            return Ok(0);
+        };
+        let body = &receipt.receipt.body;
+        let voucher = &receipt.voucher.body;
+        let invalid = || Self::budget_error(key_budget::Error::Invalid);
+        if body.session_id != voucher.session_id
+            || body.billing_id != voucher.billing_id
+            || body.billing_attempt != voucher.billing_attempt
+            || body.billing_prior_au_owed_cum != voucher.billing_prior_au_owed_cum
+            || body.user != voucher.user
+            || body.provider != voucher.provider
+            || body.reservation_id != voucher.reservation_id
+            || body.rail != voucher.rail
+            || receipt.receipt_ack.session_id != body.session_id
+            || receipt.receipt_ack.seq != body.seq
+            || receipt.receipt_ack.user_sig != receipt.receipt.user_sig
+        {
+            return Err(invalid());
+        }
+        let verify = |key: &str, sig: &str, payload: &[u8]| -> Result<(), ApiError> {
+            let key = decode_hex_array::<32>(key, "key").map_err(|_| invalid())?;
+            let sig = decode_hex_array::<64>(sig, "signature").map_err(|_| invalid())?;
+            VerifyingKey::from_bytes(&key)
+                .map_err(|_| invalid())?
+                .verify_strict(payload, &Signature::from_bytes(&sig))
+                .map_err(|_| invalid())
+        };
+        let payload = receipt_signing_bytes(body).map_err(|_| invalid())?;
+        verify(&body.user, &receipt.receipt.user_sig, &payload)?;
+        verify(
+            &receipt.receipt.enclave_pubkey,
+            &receipt.receipt.enclave_sig,
+            &payload,
+        )?;
+        verify(
+            &voucher.user,
+            &receipt.voucher.user_sig,
+            &spend_voucher_signing_bytes(voucher).map_err(|_| invalid())?,
+        )?;
+        if !budget
+            .contains(
+                &attribution.token_id,
+                key_budget::Lane::Native,
+                &body.session_id,
+            )
+            .map_err(Self::budget_error)?
+        {
+            return Ok(0);
+        }
+        self.sync_budget_configuration(&attribution.token_id)?;
+        let proof = blake3_hex(&serde_json::to_vec(receipt).map_err(|_| invalid())?);
+        budget
+            .settle_native(
+                &attribution.token_id,
+                &body.session_id,
+                key_budget::NativeReceipt {
+                    buyer: &body.user,
+                    maximum: voucher.max_spend_au,
+                    billing_id: &body.billing_id,
+                    prior: body.billing_prior_au_owed_cum,
+                    sequence: body.seq,
+                    cumulative: body.au_owed_cum,
+                    terminal: body.final_receipt,
+                    proof: &proof,
+                },
+                now_secs(),
+            )
+            .map_err(Self::budget_error)
+    }
     pub fn requires_auth(&self) -> bool {
         self.require_auth
     }
@@ -1498,6 +1833,21 @@ impl GatewayAccessControl {
         headers: &HeaderMap,
         model: Option<&str>,
     ) -> Result<Option<GatewayTokenAttribution>, ApiError> {
+        self.authorize_mode(headers, model, true)
+    }
+    fn authorize_existing(
+        &self,
+        headers: &HeaderMap,
+        model: Option<&str>,
+    ) -> Result<Option<GatewayTokenAttribution>, ApiError> {
+        self.authorize_mode(headers, model, false)
+    }
+    fn authorize_mode(
+        &self,
+        headers: &HeaderMap,
+        model: Option<&str>,
+        check_budget: bool,
+    ) -> Result<Option<GatewayTokenAttribution>, ApiError> {
         let Some(raw_token) = gateway_bearer_token(headers)? else {
             if self.require_auth {
                 return Err(ApiError::unauthorized(
@@ -1511,6 +1861,9 @@ impl GatewayAccessControl {
         let now = now_secs();
         let mut store = self.store.lock_recover("gateway token store");
         self.reload_store(&mut store)?;
+        if check_budget && store.requires_durable_key_budget() && self.durable_budget.is_none() {
+            return Err(Self::budget_error(key_budget::Error::Unavailable));
+        }
         let Some(token) = store
             .tokens
             .iter_mut()
@@ -1545,9 +1898,16 @@ impl GatewayAccessControl {
             }
         }
         token.reset_budget_window_if_needed(now);
-        if token
-            .budget_au
-            .is_some_and(|budget_au| token.effective_spent_au() >= budget_au)
+        if check_budget {
+            if let Some(budget) = &self.durable_budget {
+                budget.sync_config(token, now).map_err(Self::budget_error)?;
+                budget.project(token, now).map_err(Self::budget_error)?;
+            }
+        }
+        if check_budget
+            && token
+                .budget_au
+                .is_some_and(|budget_au| token.effective_spent_au() >= budget_au)
         {
             return Err(ApiError::payment_required(
                 "bearer token budget cap reached",
@@ -1565,6 +1925,14 @@ impl GatewayAccessControl {
     }
 
     fn preauthorize_body_headers(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        self.preauthorize_body_headers_mode(headers, true)
+    }
+
+    fn preauthorize_body_headers_mode(
+        &self,
+        headers: &HeaderMap,
+        check_spending: bool,
+    ) -> Result<(), ApiError> {
         let Some(raw_token) = gateway_bearer_token(headers)? else {
             if self.require_auth {
                 return Err(ApiError::unauthorized(
@@ -1578,9 +1946,12 @@ impl GatewayAccessControl {
         let now = now_secs();
         let mut store = self.store.lock_recover("gateway token store");
         self.reload_store(&mut store)?;
+        if store.requires_durable_key_budget() && self.durable_budget.is_none() {
+            return Err(Self::budget_error(key_budget::Error::Unavailable));
+        }
         let Some(token) = store
             .tokens
-            .iter()
+            .iter_mut()
             .find(|token| token.token_hash == token_hash)
         else {
             if self.require_auth {
@@ -1603,9 +1974,13 @@ impl GatewayAccessControl {
                 Some("Authorization"),
             ));
         }
-        if token
-            .budget_au
-            .is_some_and(|budget_au| token.effective_spent_au_at(now) >= budget_au)
+        if let Some(budget) = &self.durable_budget {
+            budget.project(token, now).map_err(Self::budget_error)?;
+        }
+        if check_spending
+            && token
+                .budget_au
+                .is_some_and(|budget_au| token.effective_spent_au_at(now) >= budget_au)
         {
             return Err(ApiError::payment_required(
                 "bearer token budget cap reached",
@@ -1620,18 +1995,42 @@ impl GatewayAccessControl {
         attribution: &Option<GatewayTokenAttribution>,
         reservation_id: &str,
         max_spend_au: MoneyAu,
+        buyer: &str,
     ) -> Result<(), ApiError> {
         let Some(attribution) = attribution else {
             return Ok(());
         };
         let now = now_secs();
         let mut store = self.store.lock_recover("gateway token store");
+        self.reload_store(&mut store)?;
+        if store.requires_durable_key_budget() && self.durable_budget.is_none() {
+            return Err(Self::budget_error(key_budget::Error::Unavailable));
+        }
         let token = store
             .tokens
             .iter_mut()
             .find(|token| token.name == attribution.name && token.token_id == attribution.token_id)
             .ok_or_else(|| ApiError::unauthorized("invalid bearer token", Some("Authorization")))?;
         token.reset_budget_window_if_needed(now);
+        if let Some(budget) = &self.durable_budget {
+            if !token.is_active(now) {
+                return Err(ApiError::unauthorized(
+                    "reserved bearer token is unavailable",
+                    Some("Authorization"),
+                ));
+            }
+            return budget
+                .reserve(
+                    token,
+                    key_budget::Lane::Native,
+                    reservation_id,
+                    buyer,
+                    reservation_id,
+                    max_spend_au,
+                    now,
+                )
+                .map_err(Self::budget_error);
+        }
         let key = (attribution.token_id.clone(), reservation_id.to_owned());
         let mut reservations = self.reservations.lock_recover("gateway token reservations");
         if reservations.contains_key(&key) {
@@ -1672,6 +2071,9 @@ impl GatewayAccessControl {
         let Some(attribution) = attribution else {
             return Ok(());
         };
+        if self.durable_budget.is_some() {
+            return Err(Self::budget_error(key_budget::Error::Invalid));
+        }
         let now = now_secs();
         let mut store = self.store.lock_recover("gateway token store");
         let Some(token_index) = store.tokens.iter().position(|token| {
@@ -1724,6 +2126,10 @@ impl GatewayAccessControl {
         let Some(attribution) = attribution else {
             return;
         };
+        if let Some(budget) = &self.durable_budget {
+            let _ = budget.release_native(&attribution.token_id, reservation_id, now_secs());
+            return;
+        }
         self.reservations
             .lock_recover("gateway token reservations")
             .remove(&(attribution.token_id.clone(), reservation_id.to_owned()));
@@ -1732,14 +2138,19 @@ impl GatewayAccessControl {
     fn summary(&self) -> Value {
         let now = now_secs();
         let mut store = self.store.lock_recover("gateway token store");
-        let reload_error = self
+        let mut reload_error = self
             .reload_store(&mut store)
             .err()
             .map(|error| error.message);
         let tokens = store
             .tokens
-            .iter()
+            .iter_mut()
             .map(|token| {
+                if let Some(budget) = &self.durable_budget {
+                    if budget.project(token, now).is_err() {
+                        reload_error = Some("gateway key budget unavailable".into());
+                    }
+                }
                 let active = token.is_active(now);
                 let spent_period_au = token.current_period_spent_au(now);
                 let effective_spent_au = token.effective_spent_au_at(now);
@@ -1798,6 +2209,9 @@ impl GatewayAccessControl {
     }
 
     fn persist_store(&self, store: &GatewayTokenStore) -> Result<(), ApiError> {
+        if self.durable_budget.is_some() {
+            return Ok(());
+        }
         let Some(path) = self.store_path.as_ref() else {
             return Ok(());
         };
@@ -3971,6 +4385,11 @@ async fn reconcile_pending_gateway_job_once(
     let Some(job) = job else {
         return Ok(());
     };
+    if job.proxy.is_some() {
+        return Err(GatewaySessionError::retryable(
+            "proxy purchase requires its original proxy recovery owner",
+        ));
+    }
     if job.status != GatewayJobStatus::ReconciliationPending {
         return Ok(());
     }
@@ -4826,6 +5245,7 @@ impl GatewayState {
                 attestation_authority: None,
             })),
             proxy_control: None,
+            proxy_buyer: None,
             catalog_refresh: Arc::new(Mutex::new(GatewayCatalogRefresh::default())),
             catalog_refresh_request: Arc::new(Notify::new()),
             catalog_refresh_complete: Arc::new(Notify::new()),
@@ -4906,6 +5326,14 @@ impl GatewayState {
         self.proxy_control.as_ref()
     }
 
+    /// Paid proxy service is opt-in and requires initialized durable ownership.
+    /// The caller must run and join Runtime::run alongside the HTTP server.
+    pub fn with_proxy_buyer(mut self, buyer: Arc<proxy_buyer::Runtime>) -> Result<Self, String> {
+        buyer.validate_owner(&self)?;
+        self.proxy_buyer = Some(buyer);
+        Ok(self)
+    }
+
     pub fn with_receipt_rail(mut self, rail: impl Into<String>) -> Self {
         self.receipt_config.rail = rail.into();
         self
@@ -4932,6 +5360,82 @@ impl GatewayState {
             now_secs(),
         )?));
         Ok(self)
+    }
+
+    /// Startup only, after loading retained receipt history and before exposing
+    /// this gateway to requests. Both native and proxy admissions then share one
+    /// durable key cap. A failed reopen/replay prevents the caller enabling it.
+    pub fn with_durable_key_budget(
+        mut self,
+        path: PathBuf,
+        limits: GatewayKeyBudgetLimits,
+    ) -> Result<Self, String> {
+        if !self
+            .active_job_cancellations
+            .lock_recover("active gateway job cancellations")
+            .is_empty()
+            || !self
+                .wallet_spend
+                .lock_recover("gateway wallet spend state")
+                .reservations
+                .is_empty()
+        {
+            return Err("durable key budgets must be configured before gateway admission".into());
+        }
+        self.access_control = Arc::new(
+            (*self.access_control)
+                .clone()
+                .with_durable_key_budget(path, limits)?,
+        );
+        self.restore_retained_native_key_budgets()?;
+        Ok(self)
+    }
+
+    /// Reconcile only indexed pending native reservations against the existing
+    /// bounded local receipt history. Never reads the network receipt ledger or
+    /// runs on the inference/token path. Missing evidence preserves exposure.
+    pub fn restore_retained_native_key_budgets(&self) -> Result<(), String> {
+        if !self.access_control.has_durable_key_budget() {
+            return Ok(());
+        }
+        let receipts = self.receipts.lock_recover("receipt store");
+        let mut latest = BTreeMap::<(&str, &str), &StoredReceipt>::new();
+        for receipt in receipts.iter().rev().take(self.retention_limits.receipts) {
+            let Some(token) = &receipt.access_token else {
+                continue;
+            };
+            let key = (
+                token.token_id.as_str(),
+                receipt.receipt.body.session_id.as_str(),
+            );
+            if latest
+                .get(&key)
+                .is_none_or(|old| old.receipt.body.seq < receipt.receipt.body.seq)
+            {
+                latest.insert(key, receipt);
+            }
+        }
+        let mut after = None;
+        loop {
+            let page = self
+                .access_control
+                .pending_key_budgets(after.as_deref(), 64)
+                .map_err(|_| "retained key budget index is unavailable".to_owned())?;
+            if page.is_empty() {
+                return Ok(());
+            }
+            after = page.last().map(|(key, _)| key.clone());
+            for (_, pending) in page {
+                if pending.lane != key_budget::Lane::Native {
+                    continue;
+                }
+                if let Some(receipt) =
+                    latest.get(&(pending.token_id.as_str(), pending.request_id.as_str()))
+                {
+                    self.access_control.reconcile_native_budget(receipt)?;
+                }
+            }
+        }
     }
 
     pub fn with_receipt_balance_au(mut self, balance_au: MoneyAu) -> Self {
@@ -4989,8 +5493,12 @@ impl GatewayState {
                 }
             }
         }
-        self.access_control
-            .reserve_budget(access_token, reservation_id, max_spend_au)?;
+        self.access_control.reserve_budget(
+            access_token,
+            reservation_id,
+            max_spend_au,
+            &verifying_key_hex(&self.receipt_config.user_seed),
+        )?;
         let mut wallet = self.wallet_spend.lock_recover("gateway wallet spend state");
         let reserved_au = wallet
             .reservations
@@ -5597,6 +6105,14 @@ impl GatewayState {
         self.access_control.authorize(headers, model)
     }
 
+    fn authorize_existing_gateway_request(
+        &self,
+        headers: &HeaderMap,
+        model: Option<&str>,
+    ) -> Result<Option<GatewayTokenAttribution>, ApiError> {
+        self.access_control.authorize_existing(headers, model)
+    }
+
     fn access_summary(&self) -> Value {
         self.access_control.summary()
     }
@@ -6019,7 +6535,10 @@ pub fn openai_router(state: GatewayState) -> Router {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/proxy/offers", get(proxy_directory::list))
-        .route("/v1/proxy/offers/{market}/{provider}/{slot}", get(proxy_directory::get))
+        .route(
+            "/v1/proxy/offers/{market}/{provider}/{slot}",
+            get(proxy_directory::get),
+        )
         .route("/v1/jobs", get(list_gateway_jobs))
         .route("/v1/jobs/lookup", get(lookup_gateway_job_by_key))
         .route(
@@ -6080,9 +6599,18 @@ async fn preauthorize_gateway_body_request(
     request: Request,
     next: Next,
 ) -> Response {
+    // A paid proxy retry can retrieve a previously charged response. Authenticate
+    // before parsing as usual; the endpoint handler distinguishes replay from
+    // spending and the owner gate atomically authorizes every new reservation.
+    // Native handlers retain their ordinary budget check before inference.
+    let proxy_replay_route = state.proxy_buyer.is_some()
+        && matches!(
+            request.uri().path(),
+            "/v1/chat/completions" | "/v1/completions" | "/v1/responses" | "/v1/decisions"
+        );
     if let Err(error) = state
         .access_control
-        .preauthorize_body_headers(request.headers())
+        .preauthorize_body_headers_mode(request.headers(), !proxy_replay_route)
     {
         return error.into_response();
     }
@@ -9582,7 +10110,7 @@ fn authorize_gateway_job(
     job: &GatewayJobLookup,
 ) -> Result<Option<GatewayTokenAttribution>, ApiError> {
     let access_token =
-        state.authorize_gateway_request(headers, Some(gateway_job_lookup_model(job)))?;
+        state.authorize_existing_gateway_request(headers, Some(gateway_job_lookup_model(job)))?;
     let owner_token_id = access_token
         .as_ref()
         .map(|access_token| access_token.token_id.as_str());
@@ -9600,7 +10128,7 @@ async fn list_gateway_jobs(
     headers: HeaderMap,
     Query(query): Query<VideoListQuery>,
 ) -> Response {
-    let access_token = match state.authorize_gateway_request(&headers, None) {
+    let access_token = match state.authorize_existing_gateway_request(&headers, None) {
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
@@ -9732,7 +10260,7 @@ async fn lookup_gateway_job_by_key(
     headers: HeaderMap,
     Query(query): Query<GatewayJobKeyLookupQuery>,
 ) -> Response {
-    let owner = match state.authorize_gateway_request(&headers, None) {
+    let owner = match state.authorize_existing_gateway_request(&headers, None) {
         Ok(owner) => owner,
         Err(error) => return error.into_response(),
     };
@@ -9905,7 +10433,10 @@ async fn delete_gateway_job(
         Ok(access_token) => access_token,
         Err(err) => return err.into_response(),
     };
-    if matches!(job, GatewayJobLookup::InProgress { .. }) {
+    if matches!(job, GatewayJobLookup::InProgress { .. })
+        || matches!(&job, GatewayJobLookup::Terminal(record)
+            if record.proxy.is_some() && record.status == GatewayJobStatus::ReconciliationPending)
+    {
         if request_gateway_job_cancellation(&state, &job_id) {
             return gateway_job_cancelling_response(&job_id);
         }
@@ -9973,7 +10504,10 @@ async fn cancel_gateway_job(
     if let Err(err) = authorize_gateway_job(&state, &headers, &job) {
         return err.into_response();
     }
-    if matches!(job, GatewayJobLookup::InProgress { .. }) {
+    if matches!(job, GatewayJobLookup::InProgress { .. })
+        || matches!(&job, GatewayJobLookup::Terminal(record)
+            if record.proxy.is_some() && record.status == GatewayJobStatus::ReconciliationPending)
+    {
         if request_gateway_job_cancellation(&state, &job_id) {
             return gateway_job_cancelling_response(&job_id);
         }
@@ -9994,6 +10528,15 @@ async fn create_chat_completion(
     headers: HeaderMap,
     Json(raw_request): Json<Value>,
 ) -> Response {
+    if proxy_buyer::selected(&raw_request) {
+        return proxy_buyer::handle(
+            state,
+            headers,
+            raw_request,
+            mayhem_proto::proxy::ProxyEndpoint::Chat,
+        )
+        .await;
+    }
     let model_id = match endpoint_request_model(&raw_request) {
         Ok(model) => model,
         Err(err) => return err.into_response(),
@@ -10297,6 +10840,15 @@ async fn create_completion(
     headers: HeaderMap,
     Json(raw_request): Json<Value>,
 ) -> Response {
+    if proxy_buyer::selected(&raw_request) {
+        return proxy_buyer::handle(
+            state,
+            headers,
+            raw_request,
+            mayhem_proto::proxy::ProxyEndpoint::Completions,
+        )
+        .await;
+    }
     let model_id = match endpoint_request_model(&raw_request) {
         Ok(model) => model,
         Err(err) => return err.into_response(),
@@ -10376,6 +10928,15 @@ async fn create_response(
     headers: HeaderMap,
     Json(raw_request): Json<Value>,
 ) -> Response {
+    if proxy_buyer::selected(&raw_request) {
+        return proxy_buyer::handle(
+            state,
+            headers,
+            raw_request,
+            mayhem_proto::proxy::ProxyEndpoint::Responses,
+        )
+        .await;
+    }
     let model_id = match endpoint_request_model(&raw_request) {
         Ok(model) => model,
         Err(err) => return err.into_response(),
@@ -10460,6 +11021,15 @@ async fn create_decision(
     headers: HeaderMap,
     Json(raw_request): Json<Value>,
 ) -> Response {
+    if proxy_buyer::selected(&raw_request) {
+        return proxy_buyer::handle(
+            state,
+            headers,
+            raw_request,
+            mayhem_proto::proxy::ProxyEndpoint::Decisions,
+        )
+        .await;
+    }
     let model_id = match endpoint_request_model(&raw_request) {
         Ok(model) => model,
         Err(err) => return err.into_response(),

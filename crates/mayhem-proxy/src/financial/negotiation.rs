@@ -1,7 +1,10 @@
 //! Buyer-owned durable pre-signing negotiation. No signature leaves this parent
 //! until its exact request/terms and signature are committed. No upstream POST.
+mod non_admission;
 use super::*;
 use crate::{attempts, buyer::Snapshot, signing::Authority};
+pub use non_admission::NonAdmission;
+use non_admission::FENCES;
 use quote::{PreparedPurchase, RetainedPurchase};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use std::{
@@ -49,6 +52,10 @@ struct Meta {
     identity: attempts::Identity,
     records: u64,
     bytes: u64,
+    #[serde(default)]
+    fences: u64,
+    #[serde(default)]
+    fence_bytes: u64,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -186,6 +193,23 @@ impl Store {
         identity: attempts::Identity,
         limits: Limits,
     ) -> Result<Self> {
+        Self::open_inner(path.as_ref(), identity, limits, false)
+    }
+    /// Serving must not mistake a lost or uninitialized durable journal for a
+    /// new buyer. Provisioning remains explicit through the original open API.
+    pub fn open_existing(
+        path: impl AsRef<Path>,
+        identity: attempts::Identity,
+        limits: Limits,
+    ) -> Result<Self> {
+        Self::open_inner(path.as_ref(), identity, limits, true)
+    }
+    fn open_inner(
+        path: &Path,
+        identity: attempts::Identity,
+        limits: Limits,
+        existing: bool,
+    ) -> Result<Self> {
         identity
             .validate()
             .map_err(|_| invalid("invalid negotiation identity"))?;
@@ -199,11 +223,32 @@ impl Store {
                 && limits.closed_retention_ms <= PROXY_MAX_SAFE_INTEGER,
             "invalid negotiation limits",
         )?;
-        let file = attempts::private_file(path.as_ref())
-            .map_err(|_| invalid("negotiation needs private supported storage"))?;
+        let file = if existing {
+            attempts::existing_private_file(path)
+        } else {
+            attempts::private_file(path)
+        }
+        .map_err(|_| invalid("negotiation needs private supported storage"))?;
         let mut builder = redb::Database::builder();
         builder.set_cache_size(4 * 1024 * 1024);
         let database = crate::db(builder.create_file(file))?;
+        if existing {
+            let tx = crate::db(database.begin_read())?;
+            let table = crate::db(tx.open_table(META))?;
+            let saved = crate::db(table.get("state"))?
+                .ok_or_else(|| invalid("negotiation metadata missing"))?;
+            let meta = decode_meta(saved.value())?;
+            require(
+                (meta.schema == 1 || meta.schema == 2) && meta.identity == identity,
+                "negotiation identity differs",
+            )?;
+            crate::db(tx.open_table(RECORDS))?;
+            crate::db(tx.open_table(PENDING))?;
+            crate::db(tx.open_table(CLOSED))?;
+            if meta.schema == 2 {
+                crate::db(tx.open_table(FENCES))?;
+            }
+        }
         Self::initialize(database, identity, limits)
     }
     fn initialize(
@@ -220,9 +265,9 @@ impl Store {
         let old = crate::db(meta.get("state"))?
             .map(|v| decode_meta(v.value()))
             .transpose()?;
-        if let Some(m) = old {
+        if let Some(mut m) = old {
             require(
-                m.schema == 1
+                (m.schema == 1 || m.schema == 2)
                     && m.identity == identity
                     && [RECORDS.name(), PENDING.name(), CLOSED.name()]
                         .iter()
@@ -236,19 +281,39 @@ impl Store {
                         == Some(m.records),
                 "negotiation index count differs",
             )?;
+            if m.schema == 1 {
+                require(
+                    m.fences == 0
+                        && m.fence_bytes == 0
+                        && !names.iter().any(|name| name == FENCES.name()),
+                    "legacy signing fence metadata differs",
+                )?;
+                crate::db(tx.open_table(FENCES))?;
+                m.schema = 2;
+                crate::db(meta.insert("state", serde_json::to_vec(&m)?.as_slice()))?;
+            } else {
+                require(
+                    names.iter().any(|name| name == FENCES.name())
+                        && crate::db(crate::db(tx.open_table(FENCES))?.len())? == m.fences,
+                    "buyer signing fence index differs",
+                )?;
+            }
         } else {
             require(names.is_empty(), "unknown negotiation store")?;
             crate::db(tx.open_table(RECORDS))?;
             crate::db(tx.open_table(PENDING))?;
             crate::db(tx.open_table(CLOSED))?;
+            crate::db(tx.open_table(FENCES))?;
             crate::db(
                 meta.insert(
                     "state",
                     serde_json::to_vec(&Meta {
-                        schema: 1,
+                        schema: 2,
                         identity: identity.clone(),
                         records: 0,
                         bytes: 0,
+                        fences: 0,
+                        fence_bytes: 0,
                     })?
                     .as_slice(),
                 ),
@@ -325,7 +390,10 @@ impl Store {
         if previous.is_none() {
             require(
                 meta.records <= self.limits.max_records
-                    && meta.bytes <= self.limits.max_payload_bytes
+                    && meta
+                        .bytes
+                        .checked_add(meta.fence_bytes)
+                        .is_some_and(|n| n <= self.limits.max_payload_bytes)
                     && r.allocated_bytes <= self.limits.max_record_bytes as u64,
                 "negotiation storage quota exhausted",
             )?;
@@ -384,11 +452,13 @@ impl Store {
                 .transpose()?;
             v
         };
+        self.retain_signed_fence(&tx, &k, &purchase.terms, &commitment, old.is_some())?;
         if let Some(record) = old {
             require(
                 record.commitment == commitment,
                 "logical purchase already has different signed terms; recover it",
             )?;
+            self.commit(tx)?;
             return Ok(SavedPurchase { key: k, record });
         }
         let mut record = Record {
@@ -640,6 +710,24 @@ pub struct BuyerNegotiation {
     slots: Arc<tokio::sync::Semaphore>,
 }
 impl BuyerNegotiation {
+    pub(crate) async fn has_signing_fence(&self, billing_id: Digest, attempt: u64) -> Result<bool> {
+        self.run(move |store| store.has_signing_fence(&billing_id, attempt))
+            .await
+    }
+    /// Retain unsigned exact terms before an owner may reserve external exposure.
+    /// Repeated admission is rejected; recover the original identity instead.
+    pub(crate) async fn retain_unsigned(&self, purchase: &PreparedPurchase) -> Result<()> {
+        let retained = purchase.retained()?;
+        let commitment = retained.commitment()?;
+        self.run(move |store| store.retain_unsigned(retained.terms, commitment))
+            .await
+    }
+    pub(crate) async fn fence_unsigned(
+        &self,
+        identity: crate::buyer_controller::RequestIdentity,
+    ) -> Result<Option<NonAdmission>> {
+        self.run(move |store| store.fence_unsigned(&identity)).await
+    }
     /// Startup-only conservative bound for any retained record, including stores
     /// reopened with lower limits. Reads metadata, never request/history rows.
     pub fn max_record_bytes(&self) -> Result<usize> {
@@ -647,7 +735,9 @@ impl BuyerNegotiation {
         let table = crate::db(tx.open_table(META))?;
         let meta = crate::db(table.get("state"))?
             .ok_or_else(|| invalid("negotiation metadata missing"))?;
-        let retained = decode_meta(meta.value())?.bytes.min(MAX_RECORD_BYTES as u64) as usize;
+        let retained = decode_meta(meta.value())?
+            .bytes
+            .min(MAX_RECORD_BYTES as u64) as usize;
         Ok(self.store.limits.max_record_bytes.max(retained))
     }
 
@@ -700,22 +790,7 @@ impl BuyerNegotiation {
     }
     /// Direct lookup after a lost signing reply, before creating another quote.
     pub async fn lookup(&self, billing_id: Digest, attempt: u64) -> Result<Option<SavedPurchase>> {
-        require(
-            attempt > 0 && attempt <= PROXY_MAX_SAFE_INTEGER,
-            "invalid purchase attempt",
-        )?;
-        let id = &self.store.identity;
-        let k = Digest::hash(
-            "mayhem/proxy/buyer-purchase-slot/v1",
-            &[
-                id.network_id.as_bytes(),
-                id.msb_bootstrap.as_str().as_bytes(),
-                id.subnet_bootstrap.as_str().as_bytes(),
-                id.controller_pubkey.as_str().as_bytes(),
-                billing_id.as_str().as_bytes(),
-                &attempt.to_le_bytes(),
-            ],
-        );
+        let k = self.store.slot(&billing_id, attempt)?;
         self.recover(k).await
     }
     pub async fn retain_provider_acceptance(
@@ -876,5 +951,52 @@ mod tests {
             assert!(store.prune(99999, 64).is_err());
             assert!(store.recover(&digest(1)).is_err());
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod strict_reopen_tests {
+    use super::*;
+    #[test]
+    fn buyer_journal_strict_reopen_rejects_missing_zero_and_nonempty_blank_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("buyer.redb");
+        let digest = |n| Digest::new(format!("{n:064x}")).unwrap();
+        let identity = attempts::Identity {
+            network_id: "918".into(),
+            msb_bootstrap: digest(1),
+            subnet_bootstrap: digest(2),
+            controller_pubkey: digest(3),
+        };
+        let limits = Limits {
+            max_records: 2,
+            max_payload_bytes: 131072,
+            max_record_bytes: 65536,
+            closed_retention_ms: 1000,
+        };
+        assert!(Store::open_existing(&path, identity.clone(), limits).is_err());
+        assert!(!path.exists());
+        let file = attempts::private_file(&path).unwrap();
+        assert!(Store::open_existing(&path, identity.clone(), limits).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let database = redb::Database::builder().create_file(file).unwrap();
+        drop(database);
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        assert!(Store::open_existing(&path, identity.clone(), limits).is_err());
+        let database = redb::Database::open(&path).unwrap();
+        assert_eq!(
+            database
+                .begin_read()
+                .unwrap()
+                .list_tables()
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(database);
+        drop(Store::open(&path, identity.clone(), limits).unwrap());
+        assert!(Store::open_existing(&path, identity, limits).is_ok());
     }
 }

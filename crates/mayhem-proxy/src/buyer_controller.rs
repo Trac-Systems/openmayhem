@@ -1,6 +1,7 @@
 //! Owned, bounded JSON buyer sessions. Selection, authenticated HTTP ownership and
 //! account/key budgets belong to the caller. This controller never selects another
 //! offer, changes a rail, retries Execute, or calls a native inference backend.
+pub use crate::financial::negotiation::NonAdmission;
 use crate::{
     attempts::{Digest, Identity},
     buyer::Evidence,
@@ -94,6 +95,12 @@ pub enum GateError {
 /// Implementations must bound their own I/O/work. Cancellation joins an ambiguous
 /// commit instead of dropping it. No default allow implementation exists.
 pub trait AuthorizationGate: Send + Sync {
+    /// Durably close the exact owner intent/budget using the controller's
+    /// permanent signing fence. Missing journal rows are never this proof.
+    fn retain_non_admission<'a>(
+        &'a self,
+        proof: &'a NonAdmission,
+    ) -> Pin<Box<dyn Future<Output = std::result::Result<(), GateError>> + Send + 'a>>;
     fn authorize<'a>(
         &'a self,
         purchase: &'a PreparedPurchase,
@@ -179,6 +186,12 @@ pub struct Error {
 pub type Result<T> = std::result::Result<T, Error>;
 
 pub enum Outcome {
+    /// The exact unsigned intent is durably fenced against all future signing,
+    /// and its owner has retained that proof. This is not an inference result.
+    NotAdmitted {
+        identity: RequestIdentity,
+        proof: NonAdmission,
+    },
     /// Independently verified original output plus canonical signed settlement.
     Completed {
         identity: RequestIdentity,
@@ -202,6 +215,7 @@ pub enum Outcome {
 impl std::fmt::Debug for Outcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (name, identity) = match self {
+            Self::NotAdmitted { identity, .. } => ("NotAdmitted", identity),
             Self::Completed { identity, .. } => ("Completed", identity),
             Self::Closed { identity, .. } => ("Closed", identity),
             Self::Pending { identity, .. } => ("Pending", identity),
@@ -343,6 +357,45 @@ impl Controller {
         self.shared.limits.sessions - self.sessions.available_permits()
     }
 
+    /// Read the original durable purchase from this controller's own journal.
+    /// Absence is not proof that signing or a storage commit never occurred.
+    pub async fn retained_purchase(
+        &self,
+        identity: &RequestIdentity,
+    ) -> crate::Result<Option<SavedPurchase>> {
+        let saved = self
+            .shared
+            .negotiation
+            .lookup(identity.billing_id.clone(), identity.billing_attempt)
+            .await?;
+        if let Some(saved) = &saved {
+            let terms = saved.offer().terms;
+            crate::require(
+                terms.session_id == identity.session_id.as_str()
+                    && terms.request_hash == identity.request_hash.as_str()
+                    && terms.buyer_pubkey == self.identity().controller_pubkey.as_str(),
+                "retained buyer purchase identity differs",
+            )?;
+        }
+        Ok(saved)
+    }
+
+    /// Obtain fresh canonical evidence through the same identity-checked client
+    /// used for purchase. The gateway must persist it before closing exposure.
+    pub async fn observe_purchase(
+        &self,
+        saved: &SavedPurchase,
+    ) -> crate::Result<financial::Observation> {
+        let authorization = saved
+            .authorization()
+            .ok_or_else(|| crate::invalid("buyer acceptance is not retained"))?;
+        crate::require(
+            authorization.terms.buyer_pubkey == self.identity().controller_pubkey.as_str(),
+            "buyer purchase owner differs",
+        )?;
+        self.shared.client.observe(&authorization).await
+    }
+
     pub async fn execute(&self, request: Request, stop: watch::Receiver<bool>) -> Result<Outcome> {
         let identity = request.identity();
         self.launch(Operation::Execute(request), identity, stop)
@@ -482,6 +535,26 @@ impl Progress {
     }
 }
 impl Shared {
+    async fn close_unsigned(
+        &self,
+        p: &mut Progress,
+        gate: &Arc<dyn AuthorizationGate>,
+    ) -> Result<Outcome> {
+        p.stage = Stage::Recovery;
+        let proof = self
+            .negotiation
+            .fence_unsigned(p.identity.clone())
+            .await
+            .map_err(|_| p.error(Code::Storage))?
+            .ok_or_else(|| p.error(Code::RecoveryRequired))?;
+        gate.retain_non_admission(&proof)
+            .await
+            .map_err(|_| p.error(Code::Storage))?;
+        Ok(Outcome::NotAdmitted {
+            identity: p.identity.clone(),
+            proof,
+        })
+    }
     async fn run(
         &self,
         operation: Operation,
@@ -504,7 +577,16 @@ impl Shared {
         p.check(&stop)?;
         match operation {
             Operation::Execute(request) => {
-                if existing.is_some() {
+                if existing.is_some()
+                    || self
+                        .negotiation
+                        .has_signing_fence(
+                            p.identity.billing_id.clone(),
+                            p.identity.billing_attempt,
+                        )
+                        .await
+                        .map_err(|_| p.error(Code::Storage))?
+                {
                     return Err(p.error(Code::RecoveryRequired));
                 }
                 p.retained = false;
@@ -514,13 +596,11 @@ impl Shared {
                 if identity != p.identity {
                     return Err(p.error(Code::Invalid));
                 }
-                self.recover(
-                    existing.ok_or_else(|| p.error(Code::RecoveryRequired))?,
-                    &mut p,
-                    &mut stop,
-                    gate,
-                )
-                .await
+                if let Some(existing) = existing {
+                    self.recover(existing, &mut p, &mut stop, gate).await
+                } else {
+                    self.close_unsigned(&mut p, &gate).await
+                }
             }
         }
     }
@@ -539,7 +619,10 @@ impl Shared {
         if body.len() > self.limits.protocol.request_bytes
             || !matches!(
                 context.offer.endpoint,
-                ProxyEndpoint::Chat | ProxyEndpoint::Decisions
+                ProxyEndpoint::Chat
+                    | ProxyEndpoint::Completions
+                    | ProxyEndpoint::Responses
+                    | ProxyEndpoint::Decisions
             )
             || context.contract_version != mayhem_proto::CONTRACT_VERSION
             || context.validate().is_err()
@@ -622,11 +705,17 @@ impl Shared {
         }
         p.check(stop)?;
         p.stage = Stage::Authorizing;
-        p.retained = true; // The owner may durably retain exposure before replying.
-        gate.authorize(&purchase)
+        // Commit the unsigned signing fence before the owner can retain budget.
+        // A crash after this point can explicitly fence this exact intent closed.
+        p.retained = true; // Any lost durable acknowledgment requires recovery.
+        self.negotiation
+            .retain_unsigned(&purchase)
             .await
-            .map_err(|_| p.error(Code::Refused))?;
-        p.check(stop)?;
+            .map_err(|_| p.error(Code::Storage))?;
+        let authorized = gate.authorize(&purchase).await;
+        if authorized.is_err() || *stop.borrow() {
+            return self.close_unsigned(p, &gate).await;
+        }
         p.stage = Stage::Signing;
         p.retained = true; // Failed/lost fsync acknowledgment is deliberately uncertain.
         let saved = self
@@ -637,8 +726,11 @@ impl Shared {
                 self.signer.clone(),
                 crate::supervisor::unix_ms(),
             )
-            .await
-            .map_err(|_| p.error(Code::Storage))?;
+            .await;
+        let saved = match saved {
+            Ok(saved) => saved,
+            Err(_) => return self.close_unsigned(p, &gate).await,
+        };
         p.check(stop)?;
         channel
             .send(&negotiation::Message::Offer {

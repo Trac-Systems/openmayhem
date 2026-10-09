@@ -15,7 +15,7 @@ pub async fn prepare(
     path: PathBuf,
     home: PathBuf,
     rpc: &PeerRpcClient,
-) -> Result<(Arc<ProxyControl>, ProxyLifecycle)> {
+) -> Result<(Arc<ProxyControl>, ProxyLifecycle, Identity)> {
     // The same trusted RPC already selected for native canonical startup supplies
     // this identity. No network identity is learned from the proxy config itself.
     let status = rpc
@@ -33,7 +33,8 @@ pub async fn prepare(
     tokio::task::spawn_blocking(move || {
         let config = super::read_config_toml_value(&super::config_path_for_home(&home))?;
         let expected = expected_identity(&status, &health, &admin, &config)?;
-        Prepared::load(&path, &expected)?.open().map_err(Into::into)
+        let (control, lifecycle) = Prepared::load(&path, &expected)?.open()?;
+        Ok((control, lifecycle, expected))
     })
     .await
     .context("preparing optional proxy gateway control")?
@@ -118,22 +119,59 @@ fn expected_identity(
     Ok(network)
 }
 
-pub async fn serve(bind: SocketAddr, state: GatewayState, lifecycle: ProxyLifecycle) -> Result<()> {
+pub async fn serve(
+    bind: SocketAddr,
+    state: GatewayState,
+    lifecycle: ProxyLifecycle,
+    buyer: Option<Arc<mayhem_gateway::openai::proxy_buyer::Runtime>>,
+) -> Result<()> {
     let (shutdown, stopped) = watch::channel(false);
+    let buyer_state = state.clone();
     let gateway = serve_with_shutdown(bind, state, wait_for_stop(stopped.clone()));
-    let proxy = tokio::spawn(lifecycle.run(stopped));
+    let proxy = tokio::spawn(async move {
+        let discovery_stop = stopped.clone();
+        let discovery = async move { lifecycle.run(discovery_stop).await.map_err(Into::into) };
+        let paid = async move {
+            if let Some(runtime) = buyer {
+                runtime
+                    .run(buyer_state, stopped)
+                    .await
+                    .map_err(anyhow::Error::msg)?;
+            }
+            Ok(())
+        };
+        join_controls(discovery, paid).await;
+    });
     supervise(
         gateway,
         async move {
-            proxy
-                .await
-                .context("proxy gateway task failed")?
-                .map_err(Into::into)
+            proxy.await.context("proxy gateway task failed")?;
+            Ok(())
         },
         stop_signal(),
         shutdown,
     )
     .await
+}
+
+async fn join_controls<D, B>(discovery: D, buyer: B)
+where
+    D: Future<Output = Result<()>>,
+    B: Future<Output = Result<()>>,
+{
+    let discovery = async {
+        if discovery.await.is_err() {
+            eprintln!("Proxy discovery control stopped.");
+        }
+    };
+    let buyer = async {
+        if buyer.await.is_err() {
+            eprintln!("Proxy buyer control stopped; retained work requires recovery.");
+        }
+    };
+    // Join both owners. Failure of one proxy control does not stop its sibling
+    // or native serving, and process shutdown does not drop durable commits.
+    tokio::join!(discovery, buyer);
 }
 
 async fn supervise<G, P, S>(

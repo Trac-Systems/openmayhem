@@ -6,7 +6,10 @@ use mayhem_bridge::ScBridgeConfig;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Arc, atomic::{AtomicBool,Ordering}},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 use tokio::{
@@ -41,8 +44,8 @@ impl Bridge {
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let attack = Arc::new(Mutex::new(None));
         let frames = Arc::new(Mutex::new(Vec::new()));
-        let reject_presence=Arc::new(AtomicBool::new(false));
-        let rejection=reject_presence.clone();
+        let reject_presence = Arc::new(AtomicBool::new(false));
+        let rejection = reject_presence.clone();
         let mode = attack.clone();
         let capture = frames.clone();
         let identities = Arc::new(HashMap::from([

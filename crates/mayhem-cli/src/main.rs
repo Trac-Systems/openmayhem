@@ -7,6 +7,7 @@ mod intercom_runtime;
 mod managed_openai_compatible;
 mod provider_failure_recovery;
 mod provider_output_stream;
+mod proxy_buyer;
 mod proxy_control;
 mod proxy_gateway;
 mod proxy_provider;
@@ -1594,6 +1595,15 @@ struct UseArgs {
     /// Enable proxy discovery/presence from a protected owner-only configuration.
     #[arg(long, value_name = "PATH", conflicts_with = "dev_embedded_catalog")]
     proxy_config: Option<PathBuf>,
+
+    /// Enable paid proxy requests with protected, explicitly provisioned buyer state.
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "proxy_config",
+        conflicts_with = "dev_embedded_catalog"
+    )]
+    proxy_buyer_config: Option<PathBuf>,
 
     /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
     #[arg(long)]
@@ -45530,6 +45540,7 @@ fn gateway_startup_wallet_report(
 async fn use_gateway(args: UseArgs) -> Result<()> {
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
+    let _budget_owner = proxy_buyer::budget_owner_lock(&home, false)?;
     let config = read_mayhem_config(&home)?;
     let provider_heartbeat_ttl_millis = configured_positive_millis(
         args.provider_heartbeat_ttl_ms,
@@ -45622,6 +45633,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let preferred_providers = preferred_provider_map_from_config(config.as_ref())?;
     let token_store_path = gateway_token_store_path(&home);
     let token_store = read_gateway_token_store(&token_store_path)?;
+    let budget_activation = proxy_buyer::budget_activation(&home, &token_store)?;
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let shared_network_bind = !gateway_bind_is_loopback(bind);
     let require_gateway_auth = args.require_auth || shared_network_bind;
@@ -45644,6 +45656,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let openai_base_url = gateway_v1_url(&gateway_url);
     let mut catalog_watcher: Option<GatewayCatalogWatcherConfig> = None;
     let mut proxy_lifecycle = None;
+    let mut proxy_buyer_prepared = None;
     let (
         state,
         source,
@@ -46035,7 +46048,19 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             state = state.with_hardware_quote_verifier_command(verifier);
         }
         if let Some(path) = args.proxy_config.clone() {
-            let (control, lifecycle) = proxy_gateway::prepare(path, home.clone(), &rpc).await?;
+            let (control, lifecycle, expected) =
+                proxy_gateway::prepare(path, home.clone(), &rpc).await?;
+            if let Some(buyer_path) = args.proxy_buyer_config.clone() {
+                proxy_buyer_prepared = Some(
+                    proxy_buyer::prepare(
+                        buyer_path,
+                        expected,
+                        rpc_url.clone(),
+                        SigningKey::from_bytes(&user_seed),
+                    )
+                    .await?,
+                );
+            }
             state = state.with_proxy_control(control);
             proxy_lifecycle = Some(lifecycle);
         }
@@ -46068,6 +46093,36 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         .with_provider_load_progress_dir(home.join("provider-load-progress"))
         .with_dashboard_history_path(home.join("gateway-dashboard-history.json"))
         .with_access_control(access_control);
+    let state = if let Some(activation) = budget_activation {
+        if let Some(prepared) = &proxy_buyer_prepared {
+            ensure!(
+                activation.matches(prepared),
+                "proxy buyer differs from the activated common key budget"
+            );
+        }
+        tokio::task::spawn_blocking(move || {
+            let limits = activation.limits();
+            state.with_durable_key_budget(activation.path, limits)
+        })
+        .await
+        .context("opening retained common gateway key budgets")?
+        .map_err(anyhow::Error::msg)?
+    } else {
+        ensure!(
+            proxy_buyer_prepared.is_none(),
+            "proxy buyer requires explicit buyer-init provisioning"
+        );
+        state
+    };
+    let (state, proxy_buyer_runtime) = if let Some(prepared) = proxy_buyer_prepared {
+        let runtime = prepared.runtime;
+        let state = state
+            .with_proxy_buyer(runtime.clone())
+            .map_err(anyhow::Error::msg)?;
+        (state, Some(runtime))
+    } else {
+        (state, None)
+    };
     state
         .replace_preferred_providers(preferred_providers.clone())
         .map_err(anyhow::Error::msg)?;
@@ -46202,7 +46257,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     io::stdout().flush()?;
 
     if let Some(lifecycle) = proxy_lifecycle {
-        proxy_gateway::serve(bind, state, lifecycle).await?;
+        proxy_gateway::serve(bind, state, lifecycle, proxy_buyer_runtime).await?;
     } else {
         serve_gateway(bind, state)
             .await

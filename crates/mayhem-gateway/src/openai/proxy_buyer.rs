@@ -1,0 +1,646 @@
+//! Explicit paid proxy HTTP ownership. Discovery alone never enables this lane.
+//! Owned tasks outlive a disconnected HTTP caller; recovery observes the original
+//! purchase and never dispatches Execute again.
+use super::{
+    attach_gateway_job_headers, gateway_existing_job_response, gateway_job_id,
+    gateway_job_pending_response, gateway_prefers_async_response, now_secs,
+    proxy_owner::{Binding, Owner},
+    proxy_request, ApiError, GatewayRequestCancellation, GatewayState, GatewayTokenAttribution,
+    SharedState,
+};
+use crate::job_store::{BeginGatewayJob, GatewayJobStatus, StoredGatewayJob};
+use axum::{
+    http::HeaderMap,
+    response::{IntoResponse, Response},
+    Json,
+};
+use mayhem_proto::proxy::{finance::ProxySettlementPolicy, ProxyEndpoint};
+use mayhem_proxy::{
+    attempts::Digest,
+    buyer_controller::{self, Controller, RequestIdentity},
+    negotiation,
+};
+use serde_json::Value;
+use std::{
+    collections::BTreeSet,
+    fmt,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
+    time::Duration,
+};
+use tokio::{
+    sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore},
+    task::JoinSet,
+};
+
+static STORAGE: Semaphore = Semaphore::const_new(8);
+
+pub struct Runtime {
+    controller: Arc<Controller>,
+    policy: proxy_request::Policy,
+    settlement_policy: ProxySettlementPolicy,
+    slots: Arc<Semaphore>,
+    active: Arc<Mutex<BTreeSet<String>>>,
+    tasks: Mutex<JoinSet<()>>,
+    halt: watch::Sender<bool>,
+    running: AtomicBool,
+}
+impl fmt::Debug for Runtime {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ProxyBuyerRuntime")
+            .field("running", &self.running.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+struct Claim {
+    id: String,
+    active: Arc<Mutex<BTreeSet<String>>>,
+    _permit: OwnedSemaphorePermit,
+}
+struct Running(Arc<Runtime>);
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.running.store(false, Ordering::Release);
+        self.0.halt.send_replace(true);
+    }
+}
+impl Drop for Claim {
+    fn drop(&mut self) {
+        if let Ok(mut active) = self.active.lock() {
+            active.remove(&self.id);
+        }
+    }
+}
+impl Runtime {
+    pub fn new(
+        controller: Arc<Controller>,
+        policy: proxy_request::Policy,
+        settlement_policy: ProxySettlementPolicy,
+        sessions: usize,
+    ) -> Result<Self, String> {
+        settlement_policy.validate()?;
+        if !(1..=64).contains(&sessions)
+            || settlement_policy.digest()? != policy.settlement_policy_hash().as_str()
+        {
+            return Err("invalid proxy buyer policy or session bound".into());
+        }
+        let (halt, _) = watch::channel(false);
+        Ok(Self {
+            controller,
+            policy,
+            settlement_policy,
+            slots: Arc::new(Semaphore::new(sessions)),
+            active: Arc::new(Mutex::new(BTreeSet::new())),
+            tasks: Mutex::new(JoinSet::new()),
+            halt,
+            running: AtomicBool::new(false),
+        })
+    }
+
+    pub(crate) fn validate_owner(&self, state: &GatewayState) -> Result<(), String> {
+        let buyer = hex::encode(
+            ed25519_dalek::SigningKey::from_bytes(&state.receipt_config.user_seed)
+                .verifying_key()
+                .to_bytes(),
+        );
+        if self.controller.identity().controller_pubkey.as_str() != buyer
+            || !state.access_control.has_durable_key_budget()
+            || !state
+                .jobs
+                .lock()
+                .map_err(|_| "gateway job vault unavailable")?
+                .proxy_enabled()
+            || state.proxy_control.is_none()
+        {
+            return Err(
+                "paid proxy requires the same wallet, durable jobs/budgets and discovery".into(),
+            );
+        }
+        Ok(())
+    }
+
+    fn claim(&self, id: &str) -> Result<Claim, ApiError> {
+        if !self.running.load(Ordering::Acquire) || *self.halt.borrow() {
+            return Err(unavailable());
+        }
+        let permit = self.slots.clone().try_acquire_owned().map_err(|_| busy())?;
+        if !self
+            .active
+            .lock()
+            .map_err(|_| unavailable())?
+            .insert(id.to_owned())
+        {
+            return Err(busy());
+        }
+        Ok(Claim {
+            id: id.into(),
+            active: self.active.clone(),
+            _permit: permit,
+        })
+    }
+
+    fn launch(
+        self: &Arc<Self>,
+        state: GatewayState,
+        binding: Binding,
+        request: Option<buyer_controller::Request>,
+        claim: Claim,
+    ) -> Result<oneshot::Receiver<Result<StoredGatewayJob, ApiError>>, ApiError> {
+        let mut tasks = self.tasks.lock().map_err(|_| unavailable())?;
+        while tasks.try_join_next().is_some() {}
+        if *self.halt.borrow() {
+            return Err(unavailable());
+        }
+        let cancellation = GatewayRequestCancellation::new();
+        state
+            .active_job_cancellations
+            .lock()
+            .map_err(|_| unavailable())?
+            .insert(binding.job_id.clone(), cancellation.clone());
+        let runtime = self.clone();
+        let mut halted = self.halt.subscribe();
+        let (reply, receive) = oneshot::channel();
+        tasks.spawn(async move {
+            let _claim = claim;
+            let (stop, stopped) = watch::channel(false);
+            let owner = Arc::new(Owner::new(
+                state.jobs.clone(),
+                state.access_control.clone(),
+                binding.clone(),
+            ));
+            let operation = async {
+                match request {
+                    Some(request) => runtime.controller.execute(request, stopped).await,
+                    None => {
+                        runtime
+                            .controller
+                            .recover(binding.identity.clone(), owner.clone(), stopped)
+                            .await
+                    }
+                }
+            };
+            tokio::pin!(operation);
+            let outcome = tokio::select! {
+                value = &mut operation => value,
+                _ = cancellation.cancelled() => { stop.send_replace(true); operation.await },
+                _ = stop_signal(&mut halted) => { stop.send_replace(true); operation.await },
+            };
+            // No result/error string from an upstream may release money. Exact
+            // canonical closure and durable output are required independently.
+            let mut result = runtime.refresh_owner(&state, &binding, &owner).await;
+            if outcome
+                .as_ref()
+                .is_err_and(|error| !error.recovery_required)
+            {
+                if result.as_ref().is_ok_and(|job| {
+                    job.proxy
+                        .as_ref()
+                        .is_some_and(|p| p.terms().is_none() && p.non_admission().is_none())
+                }) {
+                    result = fail_unsigned(&state, &binding.job_id).await;
+                }
+            }
+            if let Ok(mut active) = state.active_job_cancellations.lock() {
+                if active.get(&binding.job_id) == Some(&cancellation) {
+                    active.remove(&binding.job_id);
+                }
+            }
+            let result = match (result, outcome) {
+                (Ok(job), _) => Ok(job),
+                (Err(_), Err(_)) => Err(unavailable()),
+                (Err(error), Ok(_)) => Err(error),
+            };
+            let _ = reply.send(result);
+        });
+        Ok(receive)
+    }
+
+    async fn refresh_owner(
+        &self,
+        state: &GatewayState,
+        binding: &Binding,
+        owner: &Owner,
+    ) -> Result<StoredGatewayJob, ApiError> {
+        if let Some(saved) = self
+            .controller
+            .retained_purchase(&binding.identity)
+            .await
+            .map_err(|_| unavailable())?
+        {
+            let observation = if saved.authorization().is_some() {
+                Some(
+                    self.controller
+                        .observe_purchase(&saved)
+                        .await
+                        .map_err(|_| unavailable())?,
+                )
+            } else {
+                None
+            };
+            owner
+                .note_purchase(saved)
+                .await
+                .map_err(|_| unavailable())?;
+            if let Some(observation) = observation {
+                if observation
+                    .financial_outcome()
+                    .map_err(|_| unavailable())?
+                    .is_some()
+                {
+                    return owner.close(observation).await.map_err(|_| unavailable());
+                }
+            }
+        }
+        load(state, &binding.job_id).await?.ok_or_else(unavailable)
+    }
+
+    /// Caller owns this lifecycle alongside HTTP serving. Each tick reads only a
+    /// bounded page of pending job IDs. No ledger/history scan or per-token work.
+    pub async fn run(
+        self: Arc<Self>,
+        state: GatewayState,
+        mut stop: watch::Receiver<bool>,
+    ) -> Result<(), String> {
+        self.validate_owner(&state)?;
+        if *self.halt.borrow() || self.running.swap(true, Ordering::AcqRel) {
+            return Err("proxy buyer already running or stopped".into());
+        }
+        let _running = Running(self.clone());
+        let mut cursor: Option<String> = None;
+        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = stop_signal(&mut stop) => break,
+                _ = interval.tick() => {
+                    let jobs = state.jobs.clone();
+                    let after = cursor.clone();
+                    let page = storage(move || jobs.lock().map_err(|_| unavailable())?
+                        .pending_proxy(after.as_deref(), 64).map_err(|_| unavailable())).await;
+                    let Ok(page) = page else { continue };
+                    cursor = if page.len() < 64 { None } else { page.last().cloned() };
+                    for id in page {
+                        let Ok(claim) = self.claim(&id) else { continue };
+                        let Ok(Some(job)) = load(&state, &id).await else { continue };
+                        let Some(proxy) = &job.proxy else { continue };
+                        let Some(owner_id) = &job.owner_token_id else { continue };
+                        if proxy.terms().is_none() && proxy.non_admission().is_none() {
+                            // With no active owner and no durable authorization,
+                            // our mandatory owner gate never permitted signing.
+                            // Do not infer this from a missing buyer journal.
+                            let _ = fail_unsigned(&state, &id).await;
+                            continue;
+                        }
+                        // Recovery cannot grant new authorization: this name is
+                        // only attribution for an already retained obligation.
+                        let binding = Binding { job_id: id, model: job.model.clone(),
+                            fingerprint: job.request_fingerprint.clone(), identity: proxy.identity().clone(),
+                            token: GatewayTokenAttribution { name: String::new(), token_id: owner_id.clone() } };
+                        let _ = self.launch(state.clone(), binding, None, claim);
+                    }
+                }
+            }
+        }
+        self.running.store(false, Ordering::Release);
+        self.halt.send_replace(true);
+        let mut failed = self.controller.shutdown().await.is_err();
+        loop {
+            let joined = std::future::poll_fn(|cx| match self.tasks.lock() {
+                Ok(mut tasks) => tasks.poll_join_next(cx).map(Ok),
+                Err(_) => std::task::Poll::Ready(Err("proxy owner task set unavailable")),
+            })
+            .await?;
+            match joined {
+                None => break,
+                Some(Ok(())) => (),
+                Some(Err(_)) => failed = true,
+            }
+        }
+        if failed {
+            Err("proxy buyer shutdown or owner task failed".into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+async fn stop_signal(stop: &mut watch::Receiver<bool>) {
+    while !*stop.borrow_and_update() {
+        if stop.changed().await.is_err() {
+            break;
+        }
+    }
+}
+async fn storage<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, ApiError> + Send + 'static,
+) -> Result<T, ApiError> {
+    let permit = STORAGE.try_acquire().map_err(|_| busy())?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        f()
+    })
+    .await
+    .map_err(|_| unavailable())?
+}
+async fn load(state: &GatewayState, id: &str) -> Result<Option<StoredGatewayJob>, ApiError> {
+    let jobs = state.jobs.clone();
+    let id = id.to_owned();
+    storage(move || {
+        jobs.lock()
+            .map_err(|_| unavailable())?
+            .get(&id, now_secs())
+            .map_err(|_| unavailable())
+    })
+    .await
+}
+async fn fail_unsigned(state: &GatewayState, id: &str) -> Result<StoredGatewayJob, ApiError> {
+    let jobs = state.jobs.clone();
+    let id = id.to_owned();
+    storage(move || {
+        jobs.lock()
+            .map_err(|_| unavailable())?
+            .fail_proxy_before_authorization(&id, now_secs())
+            .map_err(|_| unavailable())
+    })
+    .await
+}
+fn digest(domain: &str, parts: &[&[u8]]) -> Digest {
+    let mut hash = blake3::Hasher::new_derive_key(domain);
+    for part in parts {
+        hash.update(&(part.len() as u64).to_le_bytes());
+        hash.update(part);
+    }
+    Digest::new(hash.finalize().to_hex().to_string()).expect("digest is hexadecimal")
+}
+fn unavailable() -> ApiError {
+    ApiError::service_unavailable(
+        "proxy purchase is unavailable or awaiting recovery",
+        Some("proxy"),
+    )
+    .with_public_error("proxy_recovery_required", "proxy", true)
+}
+fn busy() -> ApiError {
+    ApiError::service_unavailable("proxy buyer capacity is busy", Some("proxy")).with_public_error(
+        "capacity_unavailable",
+        "proxy",
+        true,
+    )
+}
+fn invalid() -> ApiError {
+    ApiError::bad_request("invalid proxy request or policy", Some("proxy"))
+}
+
+pub(crate) fn selected(raw: &Value) -> bool {
+    raw.get("model")
+        .and_then(Value::as_str)
+        .is_some_and(|m| m.starts_with("proxy/"))
+        || raw.get("proxy").is_some()
+}
+
+fn response(job: StoredGatewayJob) -> Response {
+    if job.status == GatewayJobStatus::Completed {
+        if let Some(result) = job.result {
+            let mut response = Json(result).into_response();
+            attach_gateway_job_headers(&mut response, &job.id);
+            return response;
+        }
+        return unavailable().into_response();
+    }
+    gateway_existing_job_response(job)
+}
+
+pub(crate) async fn handle(
+    state: SharedState,
+    headers: HeaderMap,
+    raw: Value,
+    endpoint: ProxyEndpoint,
+) -> Response {
+    match submit(state, headers, raw, endpoint).await {
+        Ok(response) => response,
+        Err(error) => error.into_response(),
+    }
+}
+async fn submit(
+    state: SharedState,
+    headers: HeaderMap,
+    raw: Value,
+    endpoint: ProxyEndpoint,
+) -> Result<Response, ApiError> {
+    let runtime = state.proxy_buyer.as_ref().ok_or_else(unavailable)?.clone();
+    let request = Arc::new(
+        proxy_request::Request::parse(endpoint, raw, &runtime.policy)
+            .map_err(|_| invalid())?
+            .ok_or_else(invalid)?,
+    );
+    if serde_json::from_slice::<Value>(request.provider_request())
+        .map_err(|_| invalid())?
+        .get("stream")
+        .is_some_and(|v| v != &Value::Bool(false))
+    {
+        return Err(ApiError::bad_request(
+            "this proxy buyer currently supports nonstreaming requests only",
+            Some("stream"),
+        ));
+    }
+    let model = request.selector().model();
+    // Read/replay authorization still enforces revocation, expiry, model scope
+    // and rate limits. New expenditure is checked atomically by the owner gate.
+    let token = state
+        .authorize_existing_gateway_request(&headers, Some(&model))?
+        .ok_or_else(|| {
+            ApiError::unauthorized(
+                "proxy requests require an authenticated key",
+                Some("Authorization"),
+            )
+        })?;
+    let endpoint_name = serde_json::to_value(endpoint)
+        .map_err(|_| invalid())?
+        .as_str()
+        .ok_or_else(invalid)?
+        .to_owned();
+    let key = headers
+        .get("idempotency-key")
+        .map(|v| v.to_str().map_err(|_| invalid()))
+        .transpose()?;
+    let id = gateway_job_id(
+        state.receipt_config.user_seed,
+        Some(&token.token_id),
+        &endpoint_name,
+        key,
+    )
+    .map_err(|e| ApiError::bad_request(e, Some("Idempotency-Key")))?;
+    let owner_digest = digest(
+        "mayhem/proxy/gateway-owner/v1",
+        &[
+            runtime
+                .controller
+                .identity()
+                .controller_pubkey
+                .as_str()
+                .as_bytes(),
+            token.token_id.as_bytes(),
+        ],
+    );
+    let fingerprint = request
+        .fingerprint(&owner_digest)
+        .map_err(|_| invalid())?
+        .as_str()
+        .to_owned();
+    let body: Value = serde_json::from_slice(request.provider_request()).map_err(|_| invalid())?;
+    let identity = RequestIdentity {
+        billing_id: digest("mayhem/proxy/gateway-billing/v1", &[id.as_bytes()]),
+        billing_attempt: 1,
+        session_id: digest(
+            "mayhem/proxy/gateway-session/v1",
+            &[id.as_bytes(), fingerprint.as_bytes()],
+        ),
+        request_hash: Digest::new(mayhem_proto::endpoint_request_fingerprint(&body))
+            .map_err(|_| invalid())?,
+    };
+    if let Some(job) = load(&state, &id).await? {
+        check_replay(&job, &token, &model, &fingerprint, &identity)?;
+        return Ok(response(job));
+    }
+    let candidate = proxy_request::resolve(
+        state
+            .proxy_control
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .clone(),
+        request.clone(),
+    )
+    .await
+    .map_err(selection_error)?;
+    let claim = runtime.claim(&id)?;
+    let binding = Binding {
+        job_id: id.clone(),
+        token: token.clone(),
+        model: model.clone(),
+        fingerprint: fingerprint.clone(),
+        identity: identity.clone(),
+    };
+    let jobs = state.jobs.clone();
+    let begin = binding.clone();
+    let result = storage(move || {
+        jobs.lock()
+            .map_err(|_| unavailable())?
+            .begin_proxy(
+                begin.job_id,
+                endpoint_name,
+                begin.model,
+                Some(begin.token.token_id),
+                begin.fingerprint,
+                begin.identity,
+                now_secs(),
+            )
+            .map_err(|_| {
+                ApiError::conflict(
+                    "proxy idempotency record differs or cannot be retained",
+                    Some("Idempotency-Key"),
+                )
+            })
+    })
+    .await?;
+    if let BeginGatewayJob::Existing(job) = result {
+        return Ok(response(job));
+    }
+    let wallet = runtime.controller.identity();
+    let context = negotiation::Context {
+        schema_version: 1,
+        network_id: wallet.network_id.clone(),
+        msb_bootstrap: wallet.msb_bootstrap.clone(),
+        subnet_bootstrap: wallet.subnet_bootstrap.clone(),
+        contract_version: mayhem_proto::CONTRACT_VERSION,
+        session_id: identity.session_id.clone(),
+        buyer: wallet.controller_pubkey.clone(),
+        billing_id: identity.billing_id.clone(),
+        billing_attempt: identity.billing_attempt,
+        request_hash: identity.request_hash.clone(),
+        offer: candidate.offer,
+        rail: request.controls().rail,
+        settlement_policy_hash: request.controls().settlement_policy_hash.clone(),
+    };
+    let owner = Arc::new(Owner::new(
+        state.jobs.clone(),
+        state.access_control.clone(),
+        binding.clone(),
+    ));
+    let paid = buyer_controller::Request {
+        context,
+        body: request.provider_request().to_vec(),
+        gate: owner,
+        authorization: buyer_controller::Authorization {
+            prices: request.controls().prices.clone(),
+            output_units: request.controls().output_units,
+            lifetimes: request.policy().lifetimes(),
+            settlement_policy: runtime.settlement_policy.clone(),
+            endpoint_contract: candidate.endpoint_contract,
+            recipe_hash: candidate.recipe_hash,
+        },
+    };
+    let receiver = runtime.launch((*state).clone(), binding, Some(paid), claim)?;
+    if gateway_prefers_async_response(&headers) {
+        return Ok(gateway_job_pending_response(&id));
+    }
+    match receiver.await {
+        Ok(Ok(job)) => Ok(response(job)),
+        // The durable owner remains queryable even if its settlement observation
+        // is unavailable. A failed wait never invites a replacement purchase.
+        _ => Ok(gateway_job_pending_response(&id)),
+    }
+}
+
+fn selection_error(error: proxy_request::Error) -> ApiError {
+    use proxy_request::Error;
+    match error {
+        Error::Invalid => invalid(),
+        Error::Constraints => ApiError::bad_request(
+            "selected proxy offer does not satisfy the endpoint, rail or context constraints",
+            Some("proxy"),
+        ),
+        Error::Price => ApiError::payment_required(
+            "selected proxy offer exceeds the authorized price limits",
+            Some("proxy.prices"),
+        ),
+        Error::Verification => ApiError::service_unavailable(
+            "verified operator evidence is unavailable for the selected proxy offer",
+            Some("proxy"),
+        )
+        .with_public_error("proxy_verification_unavailable", "proxy_admission", true),
+        Error::Catalog => ApiError::service_unavailable(
+            "selected proxy offer has no current catalog evidence",
+            Some("model"),
+        )
+        .with_public_error("proxy_catalog_unavailable", "proxy_admission", true),
+        Error::Availability(reason) => ApiError::service_unavailable(
+            format!("selected proxy offer is not eligible: {reason:?}"),
+            Some("model"),
+        )
+        .with_public_error("proxy_provider_unavailable", "proxy_admission", true),
+        Error::Busy => busy(),
+    }
+}
+fn check_replay(
+    job: &StoredGatewayJob,
+    token: &GatewayTokenAttribution,
+    model: &str,
+    fingerprint: &str,
+    identity: &RequestIdentity,
+) -> Result<(), ApiError> {
+    if job.owner_token_id.as_deref() != Some(token.token_id.as_str())
+        || job.model != model
+        || job.request_fingerprint != fingerprint
+        || job.proxy.as_ref().map(|p| p.identity()) != Some(identity)
+    {
+        return Err(ApiError::conflict(
+            "Idempotency-Key belongs to a different request",
+            Some("Idempotency-Key"),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod tests;

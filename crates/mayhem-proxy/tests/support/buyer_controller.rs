@@ -9,6 +9,8 @@ struct Gate {
     reject: bool,
     reject_output: std::sync::atomic::AtomicBool,
     outputs: Mutex<Vec<Value>>,
+    non_admissions: Mutex<Vec<Digest>>,
+    reject_non_admission: std::sync::atomic::AtomicBool,
     entered: Notify,
     release: Option<Arc<Notify>>,
 }
@@ -19,12 +21,38 @@ impl Gate {
             reject: false,
             reject_output: std::sync::atomic::AtomicBool::new(false),
             outputs: Mutex::new(vec![]),
+            non_admissions: Mutex::new(vec![]),
+            reject_non_admission: std::sync::atomic::AtomicBool::new(false),
             entered: Notify::new(),
             release: None,
         })
     }
 }
 impl buyer::AuthorizationGate for Gate {
+    fn retain_non_admission<'a>(
+        &'a self,
+        proof: &'a buyer::NonAdmission,
+    ) -> Pin<Box<dyn Future<Output = Result<(), buyer::GateError>> + Send + 'a>> {
+        Box::pin(async move {
+            assert_eq!(
+                proof.identity().billing_id.as_str(),
+                proof.terms().billing_id
+            );
+            assert_eq!(
+                proof.identity().session_id.as_str(),
+                proof.terms().session_id
+            );
+            if self.reject_non_admission.load(Ordering::SeqCst) {
+                return Err(buyer::GateError::Unavailable);
+            }
+            self.non_admissions
+                .lock()
+                .unwrap()
+                .push(proof.commitment().clone());
+            Ok(())
+        })
+    }
+
     fn retain_verified_output<'a>(
         &'a self,
         output: buyer::VerifiedOutput<'a>,
@@ -152,6 +180,90 @@ fn error(result: buyer::Result<buyer::Outcome>) -> buyer::Error {
         Err(error) => error,
         Ok(_) => panic!("expected buyer failure"),
     }
+}
+
+#[tokio::test]
+async fn buyer_controller_non_admission_hook_failure_reopens_original_fence_without_signing() {
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let bytes = chat();
+    let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let mut peer = Peer::start(ProxyRail::Fiat, &f, &bytes, false, None).await;
+    let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+    let (provider, _) = observed_server(&s, &f, &peer);
+    let ctx = context(&peer);
+    let bridge = Bridge::start(ctx.buyer.as_str(), &ctx.offer.provider_pubkey).await;
+    let (buyer, negotiation, recovery) = buyer_controller(&s, &f, &peer, &bridge, 1);
+    let mut listener = listener(&bridge, &peer).await;
+    let gate = Arc::new(Gate {
+        terms: Mutex::new(vec![]),
+        reject: true,
+        reject_output: std::sync::atomic::AtomicBool::new(false),
+        outputs: Mutex::new(vec![]),
+        non_admissions: Mutex::new(vec![]),
+        reject_non_admission: std::sync::atomic::AtomicBool::new(true),
+        entered: Notify::new(),
+        release: None,
+    });
+    let request = make_request(&s, &f, &peer, &bytes, gate.clone());
+    let identity = request.identity();
+    let (stop, stopped) = watch::channel(false);
+    let (result, handle) = tokio::join!(buyer.execute(request, stopped), async {
+        provider
+            .accept(listener.next(Duration::from_secs(5)).await.unwrap())
+            .unwrap()
+    });
+    assert!(error(result).recovery_required);
+    let _ = handle.wait().await;
+    assert!(negotiation
+        .lookup(identity.billing_id.clone(), identity.billing_attempt)
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(gate.terms.lock().unwrap().len(), 1);
+    assert!(gate.non_admissions.lock().unwrap().is_empty());
+    buyer.shutdown().await.unwrap();
+    drop((buyer, negotiation, recovery));
+    let (buyer, _, _) = buyer_controller(&s, &f, &peer, &bridge, 1);
+    let recovered_gate = Gate::allow();
+    let mut commitment = None;
+    for _ in 0..2 {
+        let buyer::Outcome::NotAdmitted {
+            identity: original,
+            proof,
+        } = buyer
+            .recover(identity.clone(), recovered_gate.clone(), stop.subscribe())
+            .await
+            .unwrap()
+        else {
+            panic!("original unsigned fence must be recoverable")
+        };
+        assert_eq!(original, identity);
+        assert_eq!(proof.terms(), &gate.terms.lock().unwrap()[0]);
+        if let Some(previous) = &commitment {
+            assert_eq!(proof.commitment(), previous);
+        }
+        commitment = Some(proof.commitment().clone());
+    }
+    let failure = error(
+        buyer
+            .execute(
+                make_request(&s, &f, &peer, &bytes, Gate::allow()),
+                stop.subscribe(),
+            )
+            .await,
+    );
+    assert_eq!(failure.code, buyer::Code::RecoveryRequired);
+    let mut wrong = identity.clone();
+    wrong.request_hash = d(9009);
+    assert!(buyer
+        .recover(wrong, recovered_gate.clone(), stop.subscribe())
+        .await
+        .is_err());
+    assert_eq!(recovered_gate.non_admissions.lock().unwrap().len(), 2);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(peer.command("status").await["publications"], 0);
+    buyer.shutdown().await.unwrap();
+    peer.stop().await;
 }
 
 #[tokio::test]
@@ -322,6 +434,8 @@ async fn buyer_controller_rejects_unapproved_prices_hashes_streaming_and_gate_de
             reject: reject == "gate",
             reject_output: std::sync::atomic::AtomicBool::new(false),
             outputs: Mutex::new(vec![]),
+            non_admissions: Mutex::new(vec![]),
+            reject_non_admission: std::sync::atomic::AtomicBool::new(false),
             terms: Mutex::new(vec![]),
             entered: Notify::new(),
             release: None,
@@ -353,8 +467,17 @@ async fn buyer_controller_rejects_unapproved_prices_hashes_streaming_and_gate_de
             let _ = handle.wait().await;
             result
         };
-        let failure = error(result);
-        assert_eq!(failure.recovery_required, reject == "gate", "{reject}");
+        if reject == "gate" {
+            let buyer::Outcome::NotAdmitted { identity, proof } = result.unwrap() else {
+                panic!("gate denial requires non-admission proof")
+            };
+            assert_eq!(identity, id);
+            assert_eq!(proof.identity(), &id);
+            assert_eq!(gate.non_admissions.lock().unwrap().len(), 1);
+        } else {
+            let failure = error(result);
+            assert!(!failure.recovery_required, "{reject}");
+        }
         assert!(negotiation
             .lookup(id.billing_id, id.billing_attempt)
             .await
@@ -389,6 +512,8 @@ async fn buyer_controller_abandoned_gate_keeps_session_permit_until_joined_and_n
         reject: false,
         reject_output: std::sync::atomic::AtomicBool::new(false),
         outputs: Mutex::new(vec![]),
+        non_admissions: Mutex::new(vec![]),
+        reject_non_admission: std::sync::atomic::AtomicBool::new(false),
         entered: Notify::new(),
         release: Some(release.clone()),
     });
@@ -435,6 +560,11 @@ async fn buyer_controller_abandoned_gate_keeps_session_permit_until_joined_and_n
     shutting.await.unwrap();
     let _ = handle.wait().await;
     assert_eq!(buyer.active_sessions(), 0);
+    assert_eq!(
+        gate.non_admissions.lock().unwrap().len(),
+        1,
+        "joined abandoned gate receives durable non-admission proof"
+    );
     assert!(negotiation
         .lookup(id.billing_id, id.billing_attempt)
         .await

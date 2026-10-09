@@ -54,7 +54,9 @@ impl Observation {
             .verify(crate::receipts::verify_signature)
             .map_err(|_| invalid("accepted signatures rejected"))
     }
-    fn financial_outcome(&self) -> Result<Option<FinancialOutcome>> {
+    /// Verify the exact canonical financial closure from this fresh observation.
+    /// This is not proof of stopped execution or permission to retry inference.
+    pub fn financial_outcome(&self) -> Result<Option<FinancialOutcome>> {
         require(
             self.started.elapsed() <= FRESHNESS,
             "financial observation expired",
@@ -341,6 +343,22 @@ impl Store {
         identity: attempts::Identity,
         limits: Limits,
     ) -> Result<Self> {
+        Self::open_inner(path.as_ref(), identity, limits, false)
+    }
+    /// Strict serving reopen: loss of the journal is not first initialization.
+    pub fn open_existing(
+        path: impl AsRef<Path>,
+        identity: attempts::Identity,
+        limits: Limits,
+    ) -> Result<Self> {
+        Self::open_inner(path.as_ref(), identity, limits, true)
+    }
+    fn open_inner(
+        path: &Path,
+        identity: attempts::Identity,
+        limits: Limits,
+        existing: bool,
+    ) -> Result<Self> {
         identity
             .validate()
             .map_err(|_| invalid("invalid recovery identity"))?;
@@ -348,11 +366,29 @@ impl Store {
             limits.max_records > 0 && limits.closed_retention_ms > 0,
             "invalid recovery limits",
         )?;
-        let file = attempts::private_file(path.as_ref())
-            .map_err(|_| invalid("recovery needs a private regular file"))?;
+        let file = if existing {
+            attempts::existing_private_file(path)
+        } else {
+            attempts::private_file(path)
+        }
+        .map_err(|_| invalid("recovery needs a private regular file"))?;
         let mut builder = redb::Database::builder();
         builder.set_cache_size(4 * 1024 * 1024);
         let database = crate::db(builder.create_file(file))?;
+        if existing {
+            let tx = crate::db(database.begin_read())?;
+            let table = crate::db(tx.open_table(META))?;
+            let saved = crate::db(table.get("state"))?
+                .ok_or_else(|| invalid("recovery metadata missing"))?;
+            let meta = decode_meta(saved.value())?;
+            require(
+                meta.schema == 1 && meta.identity == identity,
+                "recovery identity differs",
+            )?;
+            crate::db(tx.open_table(RECORDS))?;
+            crate::db(tx.open_table(PENDING))?;
+            crate::db(tx.open_table(CLOSED))?;
+        }
         Self::initialize(database, identity, limits)
     }
     fn initialize(
@@ -877,5 +913,50 @@ mod tests {
             );
             assert!(store.prune(99999, 64).is_err());
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod strict_reopen_tests {
+    use super::*;
+    #[test]
+    fn buyer_journal_strict_reopen_rejects_missing_zero_and_nonempty_blank_database() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("buyer.redb");
+        let digest = |n| Digest::new(format!("{n:064x}")).unwrap();
+        let identity = attempts::Identity {
+            network_id: "918".into(),
+            msb_bootstrap: digest(1),
+            subnet_bootstrap: digest(2),
+            controller_pubkey: digest(3),
+        };
+        let limits = Limits {
+            max_records: 2,
+            closed_retention_ms: 1000,
+        };
+        assert!(Store::open_existing(&path, identity.clone(), limits).is_err());
+        assert!(!path.exists());
+        let file = attempts::private_file(&path).unwrap();
+        assert!(Store::open_existing(&path, identity.clone(), limits).is_err());
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        let database = redb::Database::builder().create_file(file).unwrap();
+        drop(database);
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        assert!(Store::open_existing(&path, identity.clone(), limits).is_err());
+        let database = redb::Database::open(&path).unwrap();
+        assert_eq!(
+            database
+                .begin_read()
+                .unwrap()
+                .list_tables()
+                .unwrap()
+                .count(),
+            0
+        );
+        drop(database);
+        drop(Store::open(&path, identity.clone(), limits).unwrap());
+        assert!(Store::open_existing(&path, identity, limits).is_ok());
     }
 }
