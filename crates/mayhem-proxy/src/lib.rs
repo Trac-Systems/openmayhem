@@ -19,6 +19,7 @@ pub mod metering;
 pub mod negotiation;
 pub mod receipts;
 pub mod semantics;
+pub mod serving;
 pub mod signing;
 pub mod supervisor;
 pub mod worker;
@@ -27,6 +28,10 @@ pub mod worker;
 pub enum Error {
     #[error("invalid proxy discovery data: {0}")]
     Invalid(String),
+    #[error("proxy provider request validation failed")]
+    ProviderRequest(#[source] endpoint::Error),
+    #[error("proxy provider capacity is unavailable")]
+    ProviderCapacity(#[source] capacity::Error),
     #[error("proxy catalog identity does not match this network/contract")]
     Identity,
     #[error("proxy catalog refresh changed; discard this stale response")]

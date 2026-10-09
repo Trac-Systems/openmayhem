@@ -113,6 +113,13 @@ pub struct Recovery {
     pub request: Option<OwnedRequest>,
     pub result: Option<OwnedResult>,
 }
+/// Bounded control metadata only. `has_result` is a scheduling hint, never proof
+/// authorizing capacity release, billing, or delivery of the retained payload.
+pub(crate) struct RecoveryHeader {
+    pub record: Record,
+    pub financial: Option<crate::financial::Retained>,
+    pub has_result: bool,
+}
 pub(super) fn initialize(tx: &redb::WriteTransaction, create: bool) -> Result<()> {
     let names = storage(tx.list_tables())?
         .map(|n| n.name().to_owned())
@@ -172,6 +179,22 @@ pub(crate) fn result_commitment(
     ))
 }
 impl Journal {
+    pub(crate) fn recovery_header(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+    ) -> Result<RecoveryHeader> {
+        require(attempt > 0)?;
+        let tx = storage(self.database.begin_read())?;
+        let record = read_record(&storage(tx.open_table(RECORDS))?, invocation, attempt)?;
+        let financial = super::finance::read(&tx, &record)?;
+        let saved = payload(&storage(tx.open_table(PAYLOADS))?, &record.key())?;
+        Ok(RecoveryHeader {
+            record,
+            financial,
+            has_result: saved.is_some_and(|p| p.result_digest.is_some()),
+        })
+    }
     /// Called by the trusted parent after endpoint validation, before dispatch.
     /// Reserve worst-case result bytes now; a full logical store cannot strand a
     /// successful paid request merely because unrelated jobs consumed its space.
@@ -689,6 +712,11 @@ mod tests {
                 .insert(r.key().as_str(), b"corrupted".as_slice())
                 .unwrap();
             j.commit(tx).unwrap();
+            // Maintenance sees only a scheduling hint, never validated output.
+            let header = j.recovery_header(&r.invocation, r.attempt).unwrap();
+            assert!(header.has_result);
+            assert!(header.financial.is_none());
+            assert_eq!(header.record.phase, Phase::Dispatched);
             assert!(j.recover(&r.invocation, r.attempt).is_err());
             assert_eq!(
                 j.get(&r.invocation).unwrap().unwrap().phase,

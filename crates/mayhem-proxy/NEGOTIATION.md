@@ -62,9 +62,10 @@ Provider countersigning now uses `financial::provider::ProviderNegotiation`, as 
 below. Authenticated pre-acceptance transport is implemented in `negotiation::Channel`;
 the trusted session dispatcher and automatic supervisor startup are still required.
 Bounded provider proposal orchestration and buyer non-admission recovery are
-described below. Partially prepared/signed provider intentions and their capacity
-leases still need canonical reconciliation before that automatic controller ships.
-Those records remain retained; missing local state alone cannot release them.
+described below. Provider reconciliation of partial signing and capacity retirement
+is implemented; the opt-in session controller and rotating recovery runner are
+described in [SERVING.md](SERVING.md). Missing local state alone cannot release a
+signed or uncertain intention.
 Public API/Studio/MCP serving and production deployment remain separate gates.
 
 ## Provider acceptance
@@ -296,5 +297,6 @@ Local coverage includes all four endpoint families/three rails for buyer-only an
 dual-signed intentions, late-signature refusal, lost ACK after actual admission,
 reopen/prune/reuse, pending publication retirement, role authentication, fresh nonce
 and replay checks, superseded offers/old contracts, corrupt footprints, bounded
-reads and unchanged balances/native holds. Provider-side partial-signing recovery,
-the public dispatcher and automatic serving remain unfinished.
+reads and unchanged balances/native holds. Provider-side partial-signing recovery
+and opt-in session supervision are implemented in [SERVING.md](SERVING.md);
+the public dispatcher and automatic startup remain unfinished.

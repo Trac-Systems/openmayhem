@@ -156,7 +156,10 @@ impl Session {
             _ => Err(Error::Protocol),
         }
     }
-    async fn existing(&self, executor: &PaidExecutor) -> Result<Option<crate::attempts::Recovery>> {
+    pub(crate) async fn existing(
+        &self,
+        executor: &PaidExecutor,
+    ) -> Result<Option<crate::attempts::Recovery>> {
         let saved = executor.recover_current(&self.invocation).await?;
         if let Some(saved) = &saved {
             let matches = if let Some(financial) = &saved.financial {

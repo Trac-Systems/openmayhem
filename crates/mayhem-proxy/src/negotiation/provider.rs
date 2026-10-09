@@ -114,7 +114,7 @@ impl Controller {
             .slots
             .clone()
             .try_acquire_owned()
-            .map_err(|_| invalid("provider proposal control capacity unavailable"))
+            .map_err(|_| Error::ProviderCapacity(capacity::Error::Busy))
     }
     fn authenticate(&self, context: &Context) -> Result<()> {
         context
@@ -298,6 +298,14 @@ impl Controller {
     /// Bounded by configured pending count; no journal/ledger/history scan.
     /// The supervisor must schedule this even when there is no new inference.
     pub async fn expire_unsigned(&self) -> Result<usize> {
+        self.expire_unsigned_bounded(self.inner.limits.pending)
+            .await
+    }
+    pub async fn expire_unsigned_page(&self, limit: usize) -> Result<usize> {
+        require((1..=64).contains(&limit), "invalid unsigned expiry page")?;
+        self.expire_unsigned_bounded(limit).await
+    }
+    async fn expire_unsigned_bounded(&self, limit: usize) -> Result<usize> {
         let permit = self.slot()?;
         let inner = self.inner.clone();
         tokio::task::spawn_blocking(move || {
@@ -311,6 +319,7 @@ impl Controller {
                 .pending
                 .iter()
                 .filter(|(_, p)| p.phase == Phase::Proposed && p.expires <= now)
+                .take(limit)
                 .map(|(id, _)| id.clone())
                 .collect();
             for id in &expired {
@@ -563,7 +572,7 @@ impl Inner {
         } else {
             self.runtime.adapter.prepare_json(&request)
         }
-        .map_err(|_| invalid("invalid provider proposal request"))?;
+        .map_err(Error::ProviderRequest)?;
         require(
             prepared.request_hash() == &context.request_hash,
             "proposal request fingerprint differs",
@@ -596,20 +605,20 @@ impl Inner {
             self.runtime
                 .capacity
                 .check_reserved(old.reservation.lease())
-                .map_err(|_| invalid("proposal capacity no longer ready"))?;
+                .map_err(Error::ProviderCapacity)?;
             return Ok(old.proposal.clone());
         }
-        require(
-            state.pending.len() < self.limits.pending
-                && state
-                    .pending
-                    .values()
-                    .filter(|p| p.context.buyer == context.buyer)
-                    .count()
-                    < self.limits.per_buyer
-                && request.len() <= self.limits.total_request_bytes.saturating_sub(state.bytes),
-            "provider pending proposal quota reached",
-        )?;
+        if !(state.pending.len() < self.limits.pending
+            && state
+                .pending
+                .values()
+                .filter(|p| p.context.buyer == context.buyer)
+                .count()
+                < self.limits.per_buyer
+            && request.len() <= self.limits.total_request_bytes.saturating_sub(state.bytes))
+        {
+            return Err(Error::ProviderCapacity(capacity::Error::Quota));
+        }
         let reservation = self
             .runtime
             .capacity
@@ -620,9 +629,7 @@ impl Inner {
                     request_hash: context.request_hash.clone(),
                 },
             )
-            .map_err(|_| {
-                invalid("provider capacity cannot accept proposal; recover existing work")
-            })?;
+            .map_err(Error::ProviderCapacity)?;
         let route = self.runtime.capacity.check_reserved(reservation.lease());
         if !route.is_ok_and(|r| {
             r.lane == capacity::Lane::Proxy

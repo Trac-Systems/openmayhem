@@ -45,6 +45,61 @@ pub struct PaidExecutor {
     route: Digest,
 }
 impl PaidExecutor {
+    /// One indexed unfinished page; never all receipt/history rows.
+    pub(crate) async fn recovery_page(
+        &self,
+        after: Option<Digest>,
+        limit: usize,
+    ) -> Result<attempts::Page> {
+        self.executor
+            .storage
+            .run(move |journal| journal.recovery_page(after.as_ref(), limit))
+            .await
+    }
+    /// Publish only an already retained, independently countersigned outcome.
+    /// Missing acknowledgments/unknown execution never authorize a waiver or retry.
+    pub(crate) async fn resume_saved(&self, invocation: &Digest, attempt: u64) -> Result<bool> {
+        let saved = self.recovery_header(invocation, attempt).await?;
+        if saved.has_result || saved.record.unsent_cancellation_evidence().is_some() {
+            self.reconcile_capacity(invocation, attempt).await?;
+        }
+        let key = invocation.clone();
+        let outcome = self
+            .executor
+            .storage
+            .run(move |journal| {
+                let receipt = journal.terminal_receipt(&key, attempt)?;
+                let waiver = journal.waiver(&key, attempt)?;
+                if receipt.is_some() && waiver.is_some() {
+                    return Err(attempts::Error::Invalid);
+                }
+                Ok(receipt
+                    .map(Outcome::Receipt)
+                    .or_else(|| waiver.map(Outcome::Waiver)))
+            })
+            .await?;
+        match outcome {
+            Some(outcome) => self.publish_outcome(invocation, attempt, outcome).await,
+            None => Ok(false),
+        }
+    }
+    pub(crate) async fn prune(&self, now: u64, limit: usize) -> Result<usize> {
+        self.executor
+            .storage
+            .run(move |journal| journal.prune_closed(now, limit))
+            .await
+    }
+    async fn recovery_header(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+    ) -> Result<attempts::RecoveryHeader> {
+        let key = invocation.clone();
+        self.executor
+            .storage
+            .run(move |journal| journal.recovery_header(&key, attempt))
+            .await
+    }
     fn check_signer(&self, signer: &crate::signing::Authority) -> Result<()> {
         let actor = signer.identity();
         let network = self.financial.identity();
@@ -205,7 +260,10 @@ impl PaidExecutor {
         attempt: u64,
         outcome: Outcome,
     ) -> Result<bool> {
-        let saved = self.recover(invocation, attempt).await?;
+        // The outcome is already independently signed and retained. Publishing
+        // that envelope needs its original finance binding, not re-reading every
+        // byte of the prompt/result on each background confirmation attempt.
+        let saved = self.recovery_header(invocation, attempt).await?;
         let digest = outcome.digest()?;
         if saved.record.phase == Phase::Closed {
             return if saved.record.closure == Some(digest) {
@@ -464,6 +522,13 @@ impl PaidExecutor {
         self.executor
             .storage
             .run_checked(move |journal| {
+                let header = journal.recovery_header(&key, attempt)?;
+                if authority
+                    .lease(&header.record.binding.capacity_lease)?
+                    .is_none()
+                {
+                    return Ok(false);
+                }
                 let saved = journal.recover(&key, attempt)?;
                 let r = &saved.record;
                 let unsent = r.unsent_cancellation_evidence();

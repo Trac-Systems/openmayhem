@@ -16,6 +16,7 @@ pub(crate) mod retirement;
 pub(crate) use acceptance::validate_offer_binding;
 pub use acceptance::{AcceptanceSnapshot, OwnedAcceptance};
 pub use outcomes::{TerminalDraft, WaiverDraft};
+pub(crate) use payloads::RecoveryHeader;
 pub use payloads::{OwnedRequest, OwnedResult, Recovery, ResultCommitment};
 pub use provider::SignedProviderAcceptance;
 

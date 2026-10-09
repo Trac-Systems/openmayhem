@@ -233,6 +233,13 @@ pub struct Channel {
     control_deadline: Duration,
 }
 impl Channel {
+    pub(crate) fn provider_for(&self, identity: &Identity) -> Result<()> {
+        if self.role != Role::Provider {
+            return Err(Error::Identity);
+        }
+        self.context.link(identity, Role::Provider)?;
+        Ok(())
+    }
     pub async fn connect(
         config: ScBridgeConfig,
         context: Context,

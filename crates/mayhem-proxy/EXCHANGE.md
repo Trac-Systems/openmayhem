@@ -92,15 +92,13 @@ independent acknowledgments, legacy receipt/waiver recovery, cancellation before
 and after dispatch, replay and malformed/foreign fragments. This is not a live
 Noise/relay network proof or an external payout test.
 
-The trusted negotiation session dispatcher, automatic scheduling of the implemented
-orphaned-proposal reconciliation, the supervised full-duplex controller, automatic startup,
+The opt-in supervised controller and bounded periodic reconciliation runner are now
+implemented in [SERVING.md](SERVING.md). They own independent read/write tasks and
+retain in-flight work across connection loss. No blocking receive holds a channel
+lock required for stream delivery. The trusted session dispatcher, automatic startup,
 upstream job polling/cancellation, adaptive health, public API/Studio/MCP and
-end-to-end real-network acceptance remain separate required integration work.
-Do not run a blocking receive while holding a shared channel lock needed by
-stream delivery; the supervised controller must own and schedule that I/O using
-the separate duplex owners. Transport tests exercise incoming cancellation while
-stream delivery is pending, sequence-preserving handoff, bounded queues and malformed
-frames. These are not yet proof of automatic public session supervision.
+end-to-end real-network acceptance remain required integration work. Local controller
+and transport tests do not prove automatic public serving.
 
 [QUOTES.md](QUOTES.md) describes the fresh canonical inputs and request-derived
 purchase builder that precede this already-signed exchange. The components here do not

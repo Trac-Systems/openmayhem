@@ -92,6 +92,7 @@ pub fn error_code(error: &Error) -> &'static str {
         Error::RefreshBusy | Error::StaleRefresh => "catalog_refresh_changed",
         Error::Transport(_) => "discovery_transport_error",
         Error::Invalid(_) | Error::Json(_) => "discovery_invalid_response",
+        Error::ProviderRequest(_) | Error::ProviderCapacity(_) => "provider_control_unavailable",
         Error::Http { code, .. } => match code.as_str() {
             "proxy_discovery_busy" => "proxy_discovery_busy",
             "proxy_discovery_timeout" => "proxy_discovery_timeout",

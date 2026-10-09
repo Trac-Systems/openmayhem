@@ -26,6 +26,10 @@ pub enum Code {
     DestinationRejected,
     RequestTooLarge,
     ResponseTooLarge,
+    AdmissionUnavailable,
+    RecoveryRequired,
+    RequestCancelled,
+    ProviderUnavailable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -113,6 +117,8 @@ impl Failure {
             | Code::UnsupportedControl
             | Code::ContextTooLarge => 400,
             Code::RequestTooLarge => 413,
+            Code::RecoveryRequired | Code::RequestCancelled => 409,
+            Code::AdmissionUnavailable | Code::ProviderUnavailable => 503,
             Code::LocalCapacity
             | Code::UpstreamBusy
             | Code::UpstreamRateLimited
@@ -154,6 +160,10 @@ impl Failure {
             Code::ResponseTooLarge => {
                 "The upstream response exceeds this connection's configured byte limit."
             }
+            Code::AdmissionUnavailable => "The agreed request has no verified financial admission yet. Recover the same request.",
+            Code::RecoveryRequired => "This request requires recovery of its saved state; do not submit a replacement inference.",
+            Code::RequestCancelled => "Cancellation was requested. Upstream execution and payment may still require reconciliation.",
+            Code::ProviderUnavailable => "The provider cannot complete this control operation right now. Recover the same request.",
         }
     }
 }

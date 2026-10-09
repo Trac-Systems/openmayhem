@@ -1,6 +1,9 @@
 use super::*;
 use n::provider::{Controller as Proposals, Limits as ProposalLimits};
 
+#[path = "provider_sessions.rs"]
+mod sessions;
+
 fn limits() -> ProposalLimits {
     ProposalLimits {
         pending: 4,
@@ -18,6 +21,7 @@ struct Controlled {
     provider: Arc<ProviderNegotiation>,
     buyer: BuyerNegotiation,
     buyer_signer: Arc<Authority>,
+    signing: Arc<Authority>,
 }
 impl Controlled {
     fn restart(self, f: &Fixture, peer: &Peer) -> Self {
@@ -29,6 +33,7 @@ impl Controlled {
             provider,
             buyer,
             buyer_signer,
+            signing,
         } = self;
         drop(proposals);
         drop(runtime);
@@ -66,6 +71,7 @@ impl Controlled {
             provider,
             buyer,
             buyer_signer,
+            signing,
         }
     }
     async fn new(f: &Fixture, peer: &mut Peer, limits: ProposalLimits, journal_bytes: u64) -> Self {
@@ -130,8 +136,9 @@ impl Controlled {
             )
             .unwrap(),
         );
-        let provider =
-            Arc::new(ProviderNegotiation::new(journal.clone(), provider_signer, 4).unwrap());
+        let provider = Arc::new(
+            ProviderNegotiation::new(journal.clone(), provider_signer.clone(), 4).unwrap(),
+        );
         let proposals = Proposals::new(
             runtime.clone(),
             provider.clone(),
@@ -146,6 +153,7 @@ impl Controlled {
             provider,
             buyer: controller(f, peer, 8),
             buyer_signer,
+            signing: provider_signer,
         }
     }
     async fn start(
