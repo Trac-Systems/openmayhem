@@ -615,6 +615,25 @@ pub fn draft_terminal_receipt(
     at_ms: u64,
     previous: Option<&mayhem_proto::proxy::finance::ProxyReceiptBody>,
 ) -> Result<mayhem_proto::proxy::finance::ProxyReceiptBody> {
+    draft_terminal_receipt_for(
+        recovery,
+        terms,
+        policy,
+        seq,
+        at_ms,
+        previous,
+        crate::attempts::ResultCommitment::PublicV1,
+    )
+}
+pub(crate) fn draft_terminal_receipt_for(
+    recovery: &Recovery,
+    terms: &mayhem_proto::proxy::finance::ProxySpendTerms,
+    policy: &mayhem_proto::proxy::finance::ProxySettlementPolicy,
+    seq: u64,
+    at_ms: u64,
+    previous: Option<&mayhem_proto::proxy::finance::ProxyReceiptBody>,
+    commitment: crate::attempts::ResultCommitment,
+) -> Result<mayhem_proto::proxy::finance::ProxyReceiptBody> {
     use mayhem_proto::proxy::finance::ProxyReceiptBody;
     let b = &recovery.record.binding;
     if terms.digest().map_err(|_| Error::Offer)? != b.accepted_terms.as_str()
@@ -631,7 +650,15 @@ pub fn draft_terminal_receipt(
     {
         return Err(Error::Offer);
     }
-    let verified = price_terminal(recovery, terms.max_spend_au)?;
+    let mut verified = price_terminal(recovery, terms.max_spend_au)?;
+    verified.result_digest = commitment
+        .compute(
+            &recovery.record.invocation,
+            recovery.record.attempt,
+            b,
+            &recovery.result.as_ref().ok_or(Error::Evidence)?.reply,
+        )
+        .map_err(|_| Error::Evidence)?;
     let outcome = terminal_outcome(
         verified.observation.disposition,
         recovery.record.cancellation_requested,

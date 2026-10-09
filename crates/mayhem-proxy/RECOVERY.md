@@ -2,8 +2,9 @@
 
 This is an explicit control command for an existing buyer recovery database. It
 does not enable proxy serving, negotiate new purchases, dispatch inference, or
-change native provider and payout services. Automatic supervision and the
-authenticated buyer/provider exchange are separate integration work.
+change native provider and payout services. Automatic supervision and negotiation
+remain separate integration work. The post-acceptance authenticated exchange is
+described in [EXCHANGE.md](EXCHANGE.md).
 
 ```sh
 mayhem proxy buyer-recovery once --config buyer-recovery.json --locked

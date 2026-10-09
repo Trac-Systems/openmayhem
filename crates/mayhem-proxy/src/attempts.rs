@@ -13,8 +13,7 @@ mod outcomes;
 mod payloads;
 pub use acceptance::{AcceptanceSnapshot, OwnedAcceptance};
 pub use outcomes::{TerminalDraft, WaiverDraft};
-pub(crate) use payloads::result_commitment;
-pub use payloads::{OwnedRequest, OwnedResult, Recovery};
+pub use payloads::{OwnedRequest, OwnedResult, Recovery, ResultCommitment};
 
 use std::{
     fmt,
@@ -98,7 +97,7 @@ impl Digest {
     pub fn as_str(&self) -> &str {
         &self.0
     }
-    fn hash(domain: &'static str, parts: &[&[u8]]) -> Self {
+    pub(crate) fn hash(domain: &'static str, parts: &[&[u8]]) -> Self {
         let mut h = blake3::Hasher::new_derive_key(domain);
         for p in parts {
             h.update(&(p.len() as u64).to_le_bytes());

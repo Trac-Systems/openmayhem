@@ -11,6 +11,7 @@ pub mod connector;
 pub mod discovery;
 pub mod endpoint;
 pub mod execution;
+pub mod exchange;
 pub mod financial;
 pub mod matching;
 pub mod metering;

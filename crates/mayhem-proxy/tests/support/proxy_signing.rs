@@ -6,12 +6,12 @@ use mayhem_proxy::{
     signing::Authority,
 };
 
-fn buyer_identity(p: &Paid) -> Identity {
+pub(super) fn buyer_identity(p: &Paid) -> Identity {
     let mut id = p.peer.identity.clone();
     id.controller_pubkey = Digest::new(&p.authorization.terms.buyer_pubkey).unwrap();
     id
 }
-fn buyer(p: &Paid) -> BuyerRecovery {
+pub(super) fn buyer(p: &Paid) -> BuyerRecovery {
     BuyerRecovery::new(
         Arc::new(
             Store::open(
@@ -29,10 +29,10 @@ fn buyer(p: &Paid) -> BuyerRecovery {
     )
     .unwrap()
 }
-fn key(p: &Paid) -> Digest {
+pub(super) fn key(p: &Paid) -> Digest {
     Digest::new(p.authorization.terms.digest().unwrap()).unwrap()
 }
-async fn authorities(p: &mut Paid) -> (Authority, Authority) {
+pub(super) async fn authorities(p: &mut Paid) -> (Authority, Authority) {
     let value = p.peer.command("ephemeral_test_wallet_seeds").await;
     let provider: [u8; 32] = serde_json::from_value(value["provider"].clone()).unwrap();
     let buyer_key: [u8; 32] = serde_json::from_value(value["buyer"].clone()).unwrap();
@@ -43,7 +43,7 @@ async fn authorities(p: &mut Paid) -> (Authority, Authority) {
             .unwrap(),
     )
 }
-fn snapshot(p: &Paid) -> AcceptanceSnapshot {
+pub(super) fn snapshot(p: &Paid) -> AcceptanceSnapshot {
     AcceptanceSnapshot {
         adapter: p._fixture.adapter.snapshot(),
         offer: p.authorization.terms.offer.clone(),
@@ -393,12 +393,12 @@ async fn sign_claim(
         .observe(&reply.body)
         .unwrap();
     reply.observed_usage = Some(observation.clone());
-    let mut h = blake3::Hasher::new_derive_key("mayhem/proxy/owned-result/v1");
+    let mut h = blake3::Hasher::new_derive_key("mayhem/proxy/public-result/v1");
     let record_key = format!("{}:{:020}", p.record.invocation.as_str(), p.record.attempt);
     for part in [
         record_key.into_bytes(),
         serde_json::to_vec(&binding).unwrap(),
-        serde_json::to_vec(reply).unwrap(),
+        serde_json::to_vec(&reply.body).unwrap(),
     ] {
         h.update(&(part.len() as u64).to_le_bytes());
         h.update(&part);
@@ -570,5 +570,154 @@ async fn protected_expiry_signature_uses_original_saved_policy_and_survives_rest
         ));
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
         p.peer.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn protected_legacy_private_commitment_drafts_recover_without_rewriting_signatures() {
+    use mayhem_proxy::attempts::{ResultCommitment, TerminalDraft, WaiverDraft};
+    use redb::ReadableTable;
+    for waiver in [false, true] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let p = Paid::start(
+            &backend.base,
+            ProxyEndpoint::Chat,
+            ProxyRail::Tnk,
+            &chat(),
+            false,
+        )
+        .await;
+        p.executor
+            .execute_json(&p.record.invocation, &chat(), &Cancellation::default())
+            .await
+            .unwrap();
+        let saved = p
+            .journal
+            .recover(&p.record.invocation, p.record.attempt)
+            .unwrap();
+        let private_digest = saved.result.as_ref().unwrap().digest.as_str().to_owned();
+        let subtotal =
+            mayhem_proxy::metering::price_terminal(&saved, p.authorization.terms.max_spend_au)
+                .unwrap();
+        let observation = subtotal.digest().unwrap().as_str().to_owned();
+        let draft = if waiver {
+            let mut d = p
+                .executor
+                .prepare_waiver(&p.record.invocation, p.record.attempt)
+                .await
+                .unwrap();
+            d.body.evidence_hash = private_digest;
+            serde_json::to_value(d).unwrap()
+        } else {
+            let mut d = p
+                .executor
+                .prepare_terminal_receipt(&p.record.invocation, p.record.attempt)
+                .await
+                .unwrap();
+            d.body.result_hash = private_digest;
+            d.body.observation_hash = observation.clone();
+            serde_json::to_value(d).unwrap()
+        };
+        let mut draft = draft;
+        draft.as_object_mut().unwrap().remove("result_commitment");
+        let record_key = format!("{}:{:020}", p.record.invocation.as_str(), p.record.attempt);
+        let usage_evidence = if waiver {
+            serde_json::from_value::<WaiverDraft>(draft.clone())
+                .unwrap()
+                .body
+                .digest()
+                .unwrap()
+        } else {
+            observation
+        };
+        let edit_draft = draft.clone();
+        let mut p = p.reopen_edit(false, move |tx| {
+            let mut outcomes = tx
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new(
+                    "proxy_attempt_outcomes_v1",
+                ))
+                .unwrap();
+            let mut slot: Value =
+                serde_json::from_slice(outcomes.get(record_key.as_str()).unwrap().unwrap().value())
+                    .unwrap();
+            slot[if waiver { "waiver" } else { "draft" }] = edit_draft;
+            outcomes
+                .insert(
+                    record_key.as_str(),
+                    serde_json::to_vec(&slot).unwrap().as_slice(),
+                )
+                .unwrap();
+            let mut records = tx
+                .open_table(redb::TableDefinition::<&str, &[u8]>::new(
+                    "proxy_attempt_records_v1",
+                ))
+                .unwrap();
+            let mut record: Value =
+                serde_json::from_slice(records.get(record_key.as_str()).unwrap().unwrap().value())
+                    .unwrap();
+            // All completed variants retain the same private result hash. The
+            // old usage evidence was the old subtotal (or old waiver body).
+            if let Some(verified) = record["resolution"].get_mut("verified") {
+                verified["usage_evidence"] = json!(usage_evidence);
+            }
+            records
+                .insert(
+                    record_key.as_str(),
+                    serde_json::to_vec(&record).unwrap().as_slice(),
+                )
+                .unwrap();
+        });
+        if waiver {
+            let typed: WaiverDraft = serde_json::from_value(draft).unwrap();
+            assert_eq!(typed.result_commitment, ResultCommitment::OwnedV1);
+            assert_eq!(
+                p.executor
+                    .prepare_waiver(&p.record.invocation, p.record.attempt)
+                    .await
+                    .unwrap(),
+                typed
+            );
+            let closure = signed_waiver(&mut p).await;
+            p.executor
+                .retain_waiver(&p.record.invocation, p.record.attempt, &closure)
+                .await
+                .unwrap();
+            let p = p.reopen();
+            assert!(p
+                .executor
+                .publish_waiver(&p.record.invocation, p.record.attempt)
+                .await
+                .unwrap());
+            p.peer.stop().await;
+        } else {
+            let typed: TerminalDraft = serde_json::from_value(draft).unwrap();
+            assert_eq!(typed.result_commitment, ResultCommitment::OwnedV1);
+            assert_eq!(
+                p.executor
+                    .prepare_terminal_receipt(&p.record.invocation, p.record.attempt)
+                    .await
+                    .unwrap(),
+                typed
+            );
+            let receipt = signed_terminal(&mut p).await;
+            p.executor
+                .retain_terminal_receipt(&p.record.invocation, p.record.attempt, &receipt)
+                .await
+                .unwrap();
+            let p = p.reopen();
+            assert!(p
+                .executor
+                .publish_terminal_receipt(&p.record.invocation, p.record.attempt)
+                .await
+                .unwrap());
+            assert_eq!(
+                p.journal
+                    .terminal_receipt(&p.record.invocation, p.record.attempt)
+                    .unwrap(),
+                Some(receipt)
+            );
+            p.peer.stop().await;
+        }
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     }
 }

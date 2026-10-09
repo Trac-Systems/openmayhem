@@ -15,6 +15,8 @@ pub struct TerminalDraft {
     pub attempt: u64,
     pub body: ProxyReceiptBody,
     pub previous: Option<ProxyReceiptBody>,
+    #[serde(default)]
+    pub result_commitment: ResultCommitment,
 }
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -22,6 +24,8 @@ pub struct WaiverDraft {
     pub invocation: Digest,
     pub attempt: u64,
     pub body: ProxyClosureBody,
+    #[serde(default)]
+    pub result_commitment: ResultCommitment,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -54,7 +58,11 @@ pub(super) fn has_intent(tx: &redb::WriteTransaction, key: &str) -> Result<bool>
     let table = storage(tx.open_table(OUTCOMES))?;
     Ok(read_slot(&table, key)?.is_some_and(|s| s.draft.is_some() || s.waiver.is_some()))
 }
-fn known_waiver(recovery: &Recovery, at_ms: u64) -> Result<WaiverDraft> {
+fn known_waiver(
+    recovery: &Recovery,
+    at_ms: u64,
+    commitment: ResultCommitment,
+) -> Result<WaiverDraft> {
     let r = &recovery.record;
     let accepted = recovery.financial.as_ref().ok_or(Error::Invalid)?;
     accepted
@@ -77,7 +85,10 @@ fn known_waiver(recovery: &Recovery, at_ms: u64) -> Result<WaiverDraft> {
         } else {
             ProxyClosureOutcome::CompletedUnbilled
         };
-        (outcome, result.digest.clone())
+        (
+            outcome,
+            commitment.compute(&r.invocation, r.attempt, &r.binding, &result.reply)?,
+        )
     };
     let body = ProxyClosureBody {
         schema_version: 1,
@@ -92,6 +103,7 @@ fn known_waiver(recovery: &Recovery, at_ms: u64) -> Result<WaiverDraft> {
         invocation: r.invocation.clone(),
         attempt: r.attempt,
         body,
+        result_commitment: commitment,
     })
 }
 fn write_slot(table: &mut redb::Table<&str, &[u8]>, key: &str, slot: &Slot) -> Result<()> {
@@ -133,7 +145,7 @@ impl Journal {
         let recovery = self.recover(invocation, attempt)?;
         let r = &recovery.record;
         require(matches!(r.phase, Phase::Dispatched | Phase::Resolved))?;
-        let draft = known_waiver(&recovery, at_ms)?;
+        let draft = known_waiver(&recovery, at_ms, ResultCommitment::PublicV1)?;
         let tx = self.transaction()?;
         let mut current = current(&tx, invocation)?.ok_or(Error::NotFound)?;
         let mut table = storage(tx.open_table(OUTCOMES))?;
@@ -146,7 +158,12 @@ impl Journal {
             return Err(Error::Stale);
         }
         if current.phase == Phase::Dispatched {
-            let evidence = Digest::new(&draft.body.evidence_hash)?;
+            let evidence = recovery
+                .result
+                .as_ref()
+                .ok_or(Error::Transition)?
+                .digest
+                .clone();
             let resolution = match draft.body.outcome {
                 ProxyClosureOutcome::NotExecuted => return Err(Error::Transition),
                 ProxyClosureOutcome::Cancelled => Resolution::Cancelled {
@@ -203,7 +220,10 @@ impl Journal {
             .waiver_draft(invocation, attempt)?
             .ok_or(Error::NotFound)?;
         let recovery = self.recover(invocation, attempt)?;
-        require(draft == known_waiver(&recovery, draft.body.at_ms)? && closure.body == draft.body)?;
+        require(
+            draft == known_waiver(&recovery, draft.body.at_ms, draft.result_commitment)?
+                && closure.body == draft.body,
+        )?;
         let accepted = recovery
             .financial
             .as_ref()
@@ -348,6 +368,7 @@ impl Journal {
             attempt,
             body,
             previous,
+            result_commitment: ResultCommitment::PublicV1,
         };
         let tx = self.transaction()?;
         let mut current = current(&tx, invocation)?.ok_or(Error::NotFound)?;
@@ -361,7 +382,12 @@ impl Journal {
             return Err(Error::Stale);
         }
         let verified = VerifiedResult {
-            result: Digest::new(&draft.body.result_hash)?,
+            result: recovery
+                .result
+                .as_ref()
+                .ok_or(Error::Transition)?
+                .digest
+                .clone(),
             usage_evidence: Digest::new(&draft.body.observation_hash)?,
         };
         let resolution = match draft.body.outcome {
@@ -411,13 +437,14 @@ impl Journal {
             &accepted.settlement_policy,
         )
         .map_err(|_| Error::Conflict)?;
-        let expected = crate::metering::draft_terminal_receipt(
+        let expected = crate::metering::draft_terminal_receipt_for(
             &saved,
             &accepted.authorization.terms,
             &accepted.settlement_policy,
             draft.body.seq,
             draft.body.at_ms,
             draft.previous.as_ref(),
+            draft.result_commitment,
         )
         .map_err(|_| Error::Conflict)?;
         require(expected == receipt.body)?;

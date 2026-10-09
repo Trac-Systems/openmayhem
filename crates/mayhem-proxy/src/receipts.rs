@@ -110,13 +110,15 @@ pub fn approve_waiver(
             Outcome::CompletedUnbilled
         };
         require(body.outcome == outcome, "buyer terminal outcome differs")?;
-        attempts::result_commitment(
-            &draft.invocation,
-            draft.attempt,
-            &financial::terms_binding(t)?,
-            &serde_json::to_vec(received)?,
-        )
-        .map_err(|_| invalid("buyer result commitment differs"))?
+        draft
+            .result_commitment
+            .compute(
+                &draft.invocation,
+                draft.attempt,
+                &financial::terms_binding(t)?,
+                received,
+            )
+            .map_err(|_| invalid("buyer result commitment differs"))?
     };
     require(
         body.evidence_hash == evidence.as_str(),
@@ -238,13 +240,10 @@ pub async fn approve_terminal(
             && received.observed_usage.as_ref() == Some(&observation),
         "buyer result outcome differs",
     )?;
-    let result_digest = attempts::result_commitment(
-        &draft.invocation,
-        draft.attempt,
-        &binding,
-        &serde_json::to_vec(received)?,
-    )
-    .map_err(|_| invalid("buyer result commitment failed"))?;
+    let result_digest = draft
+        .result_commitment
+        .compute(&draft.invocation, draft.attempt, &binding, received)
+        .map_err(|_| invalid("buyer result commitment failed"))?;
     let amount = t
         .offer
         .cost(&observation.units)

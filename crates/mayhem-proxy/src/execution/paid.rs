@@ -500,4 +500,42 @@ impl PaidExecutor {
     pub async fn recover(&self, invocation: &Digest, attempt: u64) -> Result<attempts::Recovery> {
         self.executor.storage.recover(invocation, attempt).await
     }
+    pub(crate) async fn recover_current(
+        &self,
+        invocation: &Digest,
+    ) -> Result<Option<attempts::Recovery>> {
+        let key = invocation.clone();
+        self.executor
+            .storage
+            .run(move |journal| {
+                journal
+                    .get(&key)?
+                    .map(|r| journal.recover(&key, r.attempt))
+                    .transpose()
+            })
+            .await
+    }
+    pub(crate) async fn request_cancel(
+        &self,
+        invocation: &Digest,
+        cancel: &Cancellation,
+    ) -> Result<()> {
+        let key = invocation.clone();
+        let record = self
+            .executor
+            .storage
+            .run(move |journal| {
+                let r = journal.get(&key)?.ok_or(attempts::Error::NotFound)?;
+                if r.phase == Phase::Closed || r.cancellation_requested {
+                    return Ok(r);
+                }
+                journal.advance(&key, r.generation, Event::CancelRequested, now_ms())
+            })
+            .await?;
+        cancel.cancel();
+        if record.unsent_cancellation_evidence().is_some() {
+            self.reconcile_capacity(invocation, record.attempt).await?;
+        }
+        Ok(())
+    }
 }

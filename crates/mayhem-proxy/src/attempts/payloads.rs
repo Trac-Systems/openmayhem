@@ -13,6 +13,45 @@ const OUTPUT: TableDefinition<&str, &[u8]> = TableDefinition::new("proxy_owned_r
 const MAX_BODY: usize = 256 * 1024 * 1024;
 const RESULT_OVERHEAD: usize = 16 * 1024;
 
+/// Existing private journal commitments remain readable. New receipts commit
+/// only to the normalized result the buyer actually receives. The domains are
+/// distinct, so changing this selector cannot reinterpret a signed commitment.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResultCommitment {
+    #[default]
+    OwnedV1,
+    PublicV1,
+}
+impl ResultCommitment {
+    pub(crate) fn compute(
+        self,
+        invocation: &Digest,
+        attempt: u64,
+        binding: &Binding,
+        reply: &ProtocolReply,
+    ) -> Result<Digest> {
+        if self == Self::OwnedV1 {
+            return result_commitment(
+                invocation,
+                attempt,
+                binding,
+                &serde_json::to_vec(reply).map_err(|_| Error::Invalid)?,
+            );
+        }
+        let bytes = serde_json::to_vec(&reply.body).map_err(|_| Error::Invalid)?;
+        require(!bytes.is_empty() && bytes.len() <= MAX_BODY)?;
+        Ok(Digest::hash(
+            "mayhem/proxy/public-result/v1",
+            &[
+                record_key(invocation, attempt).as_bytes(),
+                &encode(binding)?,
+                &bytes,
+            ],
+        ))
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Payload {

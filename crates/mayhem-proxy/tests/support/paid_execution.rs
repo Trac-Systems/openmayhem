@@ -4,6 +4,8 @@ use mayhem_proxy::{capacity, discovery, execution::PaidExecutor, financial};
 use std::{path::Path, process::Stdio};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
+#[path = "authenticated_exchange.rs"]
+mod authenticated_exchange;
 
 struct Peer {
     child: Child,
@@ -12,6 +14,7 @@ struct Peer {
     identity: Identity,
     client: Arc<financial::Client>,
     buyer_client: Arc<financial::Client>,
+    template: ProxySpendAuthorization,
 }
 impl Peer {
     async fn start(
@@ -75,6 +78,7 @@ impl Peer {
             .unwrap(),
         );
         Self {
+            template: serde_json::from_value(v["authorization"].clone()).unwrap(),
             stdin: child.stdin.take().unwrap(),
             child,
             lines,
@@ -147,6 +151,9 @@ impl Paid {
         self.reopen_format(false)
     }
     fn reopen_format(self, schema_five: bool) -> Self {
+        self.reopen_edit(schema_five, |_| {})
+    }
+    fn reopen_edit(self, schema_five: bool, edit: impl FnOnce(&redb::WriteTransaction)) -> Self {
         let Self {
             _fixture: f,
             peer,
@@ -195,6 +202,12 @@ impl Paid {
             }
             tx.commit().unwrap();
             drop(db);
+        }
+        {
+            let db = redb::Database::open(f._store.path().join("paid-journal")).unwrap();
+            let tx = db.begin_write().unwrap();
+            edit(&tx);
+            tx.commit().unwrap();
         }
         let journal = Arc::new(
             Journal::open(
@@ -283,8 +296,28 @@ impl Paid {
         policy: Option<Value>,
         publish: bool,
     ) -> Self {
+        Self::start_scoped(
+            base, endpoint, rail, bytes, streaming, policy, publish, false,
+        )
+        .await
+    }
+    async fn start_scoped(
+        base: &str,
+        endpoint: ProxyEndpoint,
+        rail: ProxyRail,
+        bytes: &[u8],
+        streaming: bool,
+        policy: Option<Value>,
+        publish: bool,
+        scoped: bool,
+    ) -> Self {
         let f = Fixture::new(base, endpoint);
         let mut peer = Peer::start(rail, &f, bytes, streaming, policy).await;
+        let invocation = if scoped {
+            mayhem_proxy::exchange::invocation(&peer.template).unwrap()
+        } else {
+            d(1)
+        };
         let journal = Arc::new(
             Journal::open(
                 f._store.path().join("paid-journal"),
@@ -335,7 +368,7 @@ impl Paid {
             .reserve(
                 &d(201),
                 capacity::Work {
-                    invocation: d(1),
+                    invocation: invocation.clone(),
                     request_hash: request.request_hash().clone(),
                 },
             )
@@ -414,7 +447,7 @@ impl Paid {
         let executor =
             PaidExecutor::new(executor, peer.client.clone(), authority.clone(), d(201)).unwrap();
         let record = executor
-            .prepare_accepted(d(1), &authorization, bytes, streaming)
+            .prepare_accepted(invocation, &authorization, bytes, streaming)
             .await
             .unwrap();
         Self {
