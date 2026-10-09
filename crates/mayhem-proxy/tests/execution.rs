@@ -155,6 +155,15 @@ impl Fixture {
         payload_limit: u64,
         profile: &str,
     ) -> Self {
+        let config = serde_json::from_value::<ConnectionConfig>(json!({"schema_version":1,"id":"fixture","revision":1,"base_url":base,"network":{"mode":"pinned","networks":["127.0.0.1/32"],"allow_http":true},"paths":{"chat_completions":"chat/completions","completions":"completions","responses":"responses","decisions":"decisions"},"error_profile":profile})).unwrap();
+        Self::with_connection(config, endpoint, payload_limit, "upstream-model".into())
+    }
+    fn with_connection(
+        config: ConnectionConfig,
+        endpoint: ProxyEndpoint,
+        payload_limit: u64,
+        upstream_model: String,
+    ) -> Self {
         let store = dir();
         let work = dir();
         let journal = Arc::new(
@@ -175,7 +184,7 @@ impl Fixture {
             )
             .unwrap(),
         );
-        let connection=Arc::new(HttpConnection::new(serde_json::from_value::<ConnectionConfig>(json!({"schema_version":1,"id":"fixture","revision":1,"base_url":base,"network":{"mode":"pinned","networks":["127.0.0.1/32"],"allow_http":true},"paths":{"chat_completions":"chat/completions","completions":"completions","responses":"responses","decisions":"decisions"},"error_profile":profile})).unwrap()).unwrap());
+        let connection = Arc::new(HttpConnection::new(config).unwrap());
         let family = match endpoint {
             ProxyEndpoint::Chat => mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
             ProxyEndpoint::Completions => mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
@@ -186,7 +195,7 @@ impl Fixture {
             Adapter::new(
                 endpoint,
                 endpoint_family_contract_template(family).unwrap(),
-                "upstream-model".into(),
+                upstream_model,
                 Limits {
                     request_bytes: 1024 * 1024,
                     response_bytes: 1024 * 1024,
@@ -1709,12 +1718,15 @@ mod paid_acceptance;
 
 #[path = "support/health_execution.rs"]
 mod health_execution;
+#[path = "support/managed_provider.rs"]
+mod managed_provider;
 #[path = "support/native_execution.rs"]
 mod native_execution;
 #[path = "support/probe_execution.rs"]
 mod probe_execution;
-#[path = "support/managed_provider.rs"]
-mod managed_provider;
 
 #[path = "recipes/execution.rs"]
 mod declarative;
+
+#[path = "support/live_backend.rs"]
+mod live_backend;
