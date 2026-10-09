@@ -1,5 +1,8 @@
 #![forbid(unsafe_code)]
 
+mod session_duplex;
+pub use session_duplex::{ScSessionReceiver, ScSessionSender};
+
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
@@ -169,6 +172,7 @@ pub struct ScBridgeClient {
     max_queued_events: usize,
     max_queued_bytes: usize,
     operation_deadline: Option<Duration>,
+    max_message_bytes: usize,
 }
 
 impl ScBridgeClient {
@@ -194,6 +198,7 @@ impl ScBridgeClient {
             max_queued_events: config.max_queued_events,
             max_queued_bytes: config.max_queued_bytes,
             operation_deadline: config.operation_deadline,
+            max_message_bytes: config.max_message_bytes,
         };
         client
             .request(json!({ "type": "auth", "token": config.token }), "auth_ok")

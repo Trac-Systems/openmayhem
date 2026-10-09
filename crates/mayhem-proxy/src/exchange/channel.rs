@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use mayhem_bridge::{sc_bridge_session_transport, ScBridgeClient, ScBridgeConfig};
 use std::time::{Duration, Instant};
 
-const CHUNK: usize = 32 * 1024;
+pub(super) const CHUNK: usize = 32 * 1024;
 const FRAME_BOUND: usize = 64 * 1024;
 #[derive(Clone, Copy)]
 pub struct Limits {
@@ -13,7 +13,7 @@ pub struct Limits {
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Frame {
+pub(super) struct Frame {
     t: String,
     schema_version: u32,
     session_id: String,
@@ -26,6 +26,104 @@ struct Frame {
     offset: usize,
     digest: Digest,
     data: String,
+}
+impl Frame {
+    pub(super) fn chunk(
+        link: &Link,
+        sequence: u64,
+        bytes: &[u8],
+        digest: &Digest,
+        offset: usize,
+    ) -> Self {
+        let (accepted_terms, negotiation) = link.purpose.bindings();
+        Self {
+            t: link.purpose.tag().into(),
+            schema_version: 1,
+            session_id: link.session_id.clone(),
+            accepted_terms,
+            negotiation,
+            sequence,
+            bytes: bytes.len(),
+            offset,
+            digest: digest.clone(),
+            data: STANDARD.encode(&bytes[offset..(offset + CHUNK).min(bytes.len())]),
+        }
+    }
+}
+pub(super) struct Assembly {
+    sequence: u64,
+    bytes: Vec<u8>,
+    header: Option<(usize, Digest)>,
+}
+impl Assembly {
+    pub(super) fn new(sequence: u64) -> Self {
+        Self {
+            sequence,
+            bytes: Vec::new(),
+            header: None,
+        }
+    }
+    pub(super) fn push<M: WireMessage>(
+        &mut self,
+        link: &Link,
+        limits: Limits,
+        event: Value,
+    ) -> Result<Option<M>> {
+        if event["remote"] != link.remote.as_str() || event["session_id"] != link.session_id {
+            return Err(Error::Identity);
+        }
+        match event["type"].as_str() {
+            Some("session_opened") => return Ok(None),
+            Some("session_frame") => (),
+            _ => return Err(Error::Interrupted),
+        }
+        if sc_bridge_session_transport(&event).is_err() {
+            return Err(Error::Identity);
+        }
+        let encoded = bounded_json(event.get("frame").ok_or(Error::Protocol)?, FRAME_BOUND)?;
+        let frame: Frame = serde_json::from_slice(&encoded).map_err(|_| Error::Protocol)?;
+        let (accepted_terms, negotiation) = link.purpose.bindings();
+        if frame.t != link.purpose.tag()
+            || frame.schema_version != 1
+            || frame.sequence != self.sequence
+            || frame.accepted_terms != accepted_terms
+            || frame.negotiation != negotiation
+            || frame.session_id != link.session_id
+            || frame.bytes == 0
+            || frame.bytes > limits.max_message_bytes
+            || frame.offset != self.bytes.len()
+            || frame.offset >= frame.bytes
+        {
+            return Err(Error::Protocol);
+        }
+        if let Some((total, digest)) = &self.header {
+            if *total != frame.bytes || *digest != frame.digest {
+                return Err(Error::Protocol);
+            }
+        } else {
+            self.header = Some((frame.bytes, frame.digest.clone()));
+        }
+        if frame.data.len() > CHUNK.div_ceil(3) * 4 {
+            return Err(Error::Protocol);
+        }
+        let part = STANDARD.decode(&frame.data).map_err(|_| Error::Protocol)?;
+        if part.len() != CHUNK.min(frame.bytes - frame.offset) {
+            return Err(Error::Protocol);
+        }
+        self.bytes.extend_from_slice(&part);
+        if self.bytes.len() != frame.bytes {
+            return Ok(None);
+        }
+        if Digest::hash(link.purpose.domain(), &[&self.bytes]) != frame.digest {
+            return Err(Error::Protocol);
+        }
+        let message: M = serde_json::from_slice(&self.bytes).map_err(|_| Error::Protocol)?;
+        message.validate()?;
+        if message.sender() != link.role.opposite() {
+            return Err(Error::Identity);
+        }
+        Ok(Some(message))
+    }
 }
 
 pub(crate) trait WireMessage: Serialize + serde::de::DeserializeOwned {
@@ -52,7 +150,7 @@ impl Purpose {
             Self::Negotiation(_) => "p.negotiate",
         }
     }
-    fn domain(&self) -> &'static str {
+    pub(super) fn domain(&self) -> &'static str {
         match self {
             Self::Execution(_) => "mayhem/proxy/exchange-payload/v1",
             Self::Negotiation(_) => "mayhem/proxy/negotiation-payload/v1",
@@ -74,12 +172,12 @@ pub(crate) struct Link {
 }
 /// Common bounded authenticated framing; callers supply only validated links.
 pub(crate) struct Wire {
-    bridge: ScBridgeClient,
-    link: Link,
-    limits: Limits,
-    sent: u64,
-    received: u64,
-    interrupted: bool,
+    pub(super) bridge: ScBridgeClient,
+    pub(super) link: Link,
+    pub(super) limits: Limits,
+    pub(super) sent: u64,
+    pub(super) received: u64,
+    pub(super) interrupted: bool,
 }
 /// One authenticated paid session. Reconnection never resets financial history.
 pub struct Channel {
@@ -115,6 +213,11 @@ impl Channel {
     }
     pub async fn close(self) -> Result<()> {
         self.wire.close().await
+    }
+    /// One socket with independent bounded send/receive ownership. Neither half
+    /// may be cloned or reconnected independently. No second bridge/session owner.
+    pub fn into_duplex(self) -> Result<(super::duplex::Sender, super::duplex::Receiver)> {
+        super::duplex::split(self.wire, self.session)
     }
     pub(crate) fn from_negotiation(mut wire: Wire, session: Session) -> Result<Self> {
         wire.rebind(Link {
@@ -232,8 +335,7 @@ impl Wire {
             .checked_add(1)
             .filter(|v| *v <= mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER)
             .ok_or(Error::Protocol)?;
-        let mut bytes = Vec::new();
-        let mut header: Option<(usize, Digest)> = None;
+        let mut assembly = Assembly::new(sequence);
         loop {
             let remaining = match wait {
                 Some(wait) => Some(
@@ -248,62 +350,9 @@ impl Wire {
                 .next_session_event_for(&self.link.session_id, remaining)
                 .await
                 .map_err(Error::Transport)?;
-            if event["remote"] != self.link.remote.as_str()
-                || event["session_id"] != self.link.session_id
-            {
-                return Err(Error::Identity);
-            }
-            match event["type"].as_str() {
-                Some("session_opened") => continue,
-                Some("session_frame") => {}
-                _ => return Err(Error::Interrupted),
-            }
-            if sc_bridge_session_transport(&event).is_err() {
-                return Err(Error::Identity);
-            }
-            let value = event.get("frame").ok_or(Error::Protocol)?;
-            let encoded = bounded_json(value, FRAME_BOUND)?;
-            let frame: Frame = serde_json::from_slice(&encoded).map_err(|_| Error::Protocol)?;
-            let (accepted_terms, negotiation) = self.link.purpose.bindings();
-            if frame.t != self.link.purpose.tag()
-                || frame.schema_version != 1
-                || frame.sequence != sequence
-                || frame.accepted_terms != accepted_terms
-                || frame.negotiation != negotiation
-                || frame.session_id != self.link.session_id
-                || frame.bytes == 0
-                || frame.bytes > self.limits.max_message_bytes
-                || frame.offset != bytes.len()
-                || frame.offset >= frame.bytes
-            {
-                return Err(Error::Protocol);
-            }
-            if let Some((total, digest)) = &header {
-                if *total != frame.bytes || *digest != frame.digest {
-                    return Err(Error::Protocol);
-                }
-            } else {
-                header = Some((frame.bytes, frame.digest.clone()));
-            }
-            if frame.data.len() > CHUNK.div_ceil(3) * 4 {
-                return Err(Error::Protocol);
-            }
-            let part = STANDARD.decode(&frame.data).map_err(|_| Error::Protocol)?;
-            if part.len() != CHUNK.min(frame.bytes - frame.offset) {
-                return Err(Error::Protocol);
-            }
-            bytes.extend_from_slice(&part);
-            if bytes.len() != frame.bytes {
+            let Some(message) = assembly.push(&self.link, self.limits, event)? else {
                 continue;
-            }
-            if Digest::hash(self.link.purpose.domain(), &[&bytes]) != frame.digest {
-                return Err(Error::Protocol);
-            }
-            let message: M = serde_json::from_slice(&bytes).map_err(|_| Error::Protocol)?;
-            message.validate()?;
-            if message.sender() != self.link.role.opposite() {
-                return Err(Error::Identity);
-            }
+            };
             self.received = sequence;
             self.interrupted = false;
             return Ok(message);

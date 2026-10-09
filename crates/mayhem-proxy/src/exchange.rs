@@ -2,6 +2,7 @@
 //! Peer/session identity comes from the existing protected SC-Bridge, not a body
 //! field. This is not offer negotiation or permission to skip canonical admission.
 pub(crate) mod channel;
+mod duplex;
 use crate::{
     attempts::{Digest, Identity},
     execution::{Cancellation, PaidExecutor, UnsettledReply},
@@ -9,6 +10,7 @@ use crate::{
     signing::{ProviderReceipt, ProviderWaiver},
 };
 pub use channel::{Channel, Limits};
+pub use duplex::{Receiver, Sender};
 use mayhem_proto::proxy::finance::ProxySpendAuthorization;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;

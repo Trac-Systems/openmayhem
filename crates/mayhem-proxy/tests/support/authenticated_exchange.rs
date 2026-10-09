@@ -5,6 +5,9 @@ pub(super) mod exchange_bridge;
 use super::protected_signing::{authorities, buyer as buyer_recovery, key};
 use exchange_bridge::Bridge;
 
+#[path = "duplex_exchange.rs"]
+mod duplex;
+
 fn snapshot(p: &Paid) -> mayhem_proxy::buyer::PublicAcceptanceSnapshot {
     mayhem_proxy::buyer::PublicAcceptanceSnapshot {
         version: 1,

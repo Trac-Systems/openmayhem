@@ -23,6 +23,20 @@ transfer invalidates the channel: reconnect to the same logical request. A
 message-read deadline covers all its fragments and is not a generation timeout.
 There is no unbounded event history or queue.
 
+`Channel::into_duplex` is an explicit opt-in handoff to independent sending and
+receiving owners of that same authenticated socket. It preserves queued events,
+session ownership, accepted terms and both sequence counters; it opens no second
+connection. The bridge actor allows one outstanding send/close RPC while receiving
+events, with configured message, event-count and queued-byte bounds. An overflowing
+queue closes the transport instead of retaining unbounded history. Its finite RPC
+deadline does not limit generation duration or idle time awaiting model output.
+
+Keep a logical `Receiver::receive` future alive while handling other events, or give
+the receiver a dedicated bounded owner. Cancelling it partway through a fragmented
+message invalidates that receiver. Dropping either half closes the transport, without
+asserting that upstream inference stopped or any financial obligation was settled.
+The established synchronous client remains unchanged unless explicitly handed over.
+
 ## Execution and receipts
 
 1. The buyer sends `Execute` with its normalized request. The provider passes
@@ -78,12 +92,15 @@ independent acknowledgments, legacy receipt/waiver recovery, cancellation before
 and after dispatch, replay and malformed/foreign fragments. This is not a live
 Noise/relay network proof or an external payout test.
 
-The trusted negotiation session dispatcher, orphaned-proposal reconciliation,
-the supervised full-duplex controller, automatic startup,
+The trusted negotiation session dispatcher, automatic scheduling of the implemented
+orphaned-proposal reconciliation, the supervised full-duplex controller, automatic startup,
 upstream job polling/cancellation, adaptive health, public API/Studio/MCP and
 end-to-end real-network acceptance remain separate required integration work.
 Do not run a blocking receive while holding a shared channel lock needed by
-stream delivery; the supervised controller must own and schedule that I/O.
+stream delivery; the supervised controller must own and schedule that I/O using
+the separate duplex owners. Transport tests exercise incoming cancellation while
+stream delivery is pending, sequence-preserving handoff, bounded queues and malformed
+frames. These are not yet proof of automatic public session supervision.
 
 [QUOTES.md](QUOTES.md) describes the fresh canonical inputs and request-derived
 purchase builder that precede this already-signed exchange. The components here do not
