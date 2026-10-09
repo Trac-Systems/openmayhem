@@ -4,6 +4,11 @@ This library transports an **already dual-signed** proxy purchase over the
 existing Core SC-Bridge session. It does not negotiate prices, collect the
 admission fee, publish a provider, or replace canonical financial admission.
 
+The preceding authenticated Request/Proposal/Offer/Accepted exchange is implemented
+by `negotiation::Channel`; see [NEGOTIATION.md](NEGOTIATION.md). Successful negotiation
+can promote the same connection into this paid exchange. Promotion verifies the exact
+dual-signed terms but grants neither funding nor permission to dispatch by itself.
+
 Construct `exchange::Session` with the original authorization, the unlocked
 local network/wallet identity and its buyer/provider role. `Channel::connect`
 uses a protected literal-loopback bridge and subscribes to that authorization's
@@ -73,12 +78,13 @@ independent acknowledgments, legacy receipt/waiver recovery, cancellation before
 and after dispatch, replay and malformed/foreign fragments. This is not a live
 Noise/relay network proof or an external payout test.
 
-Offer negotiation, the supervised full-duplex controller, automatic startup,
+Provider proposal/lease orchestration, the trusted negotiation session dispatcher,
+the supervised full-duplex controller, automatic startup,
 upstream job polling/cancellation, adaptive health, public API/Studio/MCP and
 end-to-end real-network acceptance remain separate required integration work.
 Do not run a blocking receive while holding a shared channel lock needed by
 stream delivery; the supervised controller must own and schedule that I/O.
 
 [QUOTES.md](QUOTES.md) describes the fresh canonical inputs and request-derived
-purchase builder that precede this already-signed exchange. Neither component
-replaces durable pre-signing negotiation or financial admission.
+purchase builder that precede this already-signed exchange. The components here do not
+replace durable signing or financial admission.

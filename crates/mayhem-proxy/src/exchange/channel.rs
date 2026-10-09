@@ -17,7 +17,10 @@ struct Frame {
     t: String,
     schema_version: u32,
     session_id: String,
-    accepted_terms: Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    accepted_terms: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    negotiation: Option<Digest>,
     sequence: u64,
     bytes: usize,
     offset: usize,
@@ -25,19 +28,110 @@ struct Frame {
     data: String,
 }
 
-/// One authenticated direct/relayed session over a protected local Core bridge.
-/// An interrupted transfer poisons this channel; reconnect to the same logical
-/// request. It never resets finance, dispatch intent or upstream idempotency.
-pub struct Channel {
+pub(crate) trait WireMessage: Serialize + serde::de::DeserializeOwned {
+    fn sender(&self) -> Role;
+    fn validate(&self) -> Result<()>;
+}
+impl WireMessage for Message {
+    fn sender(&self) -> Role {
+        self.sender()
+    }
+    fn validate(&self) -> Result<()> {
+        self.validate()
+    }
+}
+#[derive(Clone)]
+pub(crate) enum Purpose {
+    Execution(Digest),
+    Negotiation(Digest),
+}
+impl Purpose {
+    fn tag(&self) -> &'static str {
+        match self {
+            Self::Execution(_) => "p.exchange",
+            Self::Negotiation(_) => "p.negotiate",
+        }
+    }
+    fn domain(&self) -> &'static str {
+        match self {
+            Self::Execution(_) => "mayhem/proxy/exchange-payload/v1",
+            Self::Negotiation(_) => "mayhem/proxy/negotiation-payload/v1",
+        }
+    }
+    fn bindings(&self) -> (Option<Digest>, Option<Digest>) {
+        match self {
+            Self::Execution(v) => (Some(v.clone()), None),
+            Self::Negotiation(v) => (None, Some(v.clone())),
+        }
+    }
+}
+#[derive(Clone)]
+pub(crate) struct Link {
+    pub session_id: String,
+    pub remote: Digest,
+    pub role: Role,
+    pub purpose: Purpose,
+}
+/// Common bounded authenticated framing; callers supply only validated links.
+pub(crate) struct Wire {
     bridge: ScBridgeClient,
-    session: Session,
+    link: Link,
     limits: Limits,
     sent: u64,
     received: u64,
     interrupted: bool,
 }
+/// One authenticated paid session. Reconnection never resets financial history.
+pub struct Channel {
+    wire: Wire,
+    session: Session,
+}
 impl Channel {
     pub async fn connect(config: ScBridgeConfig, session: Session, limits: Limits) -> Result<Self> {
+        let link = Link {
+            session_id: session.authorization.terms.session_id.clone(),
+            remote: session.remote.clone(),
+            role: session.role,
+            purpose: Purpose::Execution(session.accepted_terms.clone()),
+        };
+        Ok(Self {
+            wire: Wire::connect(config, link, limits).await?,
+            session,
+        })
+    }
+    pub fn session(&self) -> &Session {
+        &self.session
+    }
+    pub async fn send(&mut self, message: &Message) -> Result<()> {
+        self.wire.send(message).await
+    }
+    pub async fn receive(&mut self, wait: Option<Duration>) -> Result<Received> {
+        let message = self.wire.receive(wait).await?;
+        Ok(Received {
+            accepted_terms: self.session.accepted_terms.clone(),
+            recipient: self.session.role,
+            message,
+        })
+    }
+    pub async fn close(self) -> Result<()> {
+        self.wire.close().await
+    }
+    pub(crate) fn from_negotiation(mut wire: Wire, session: Session) -> Result<Self> {
+        wire.rebind(Link {
+            session_id: session.authorization.terms.session_id.clone(),
+            remote: session.remote.clone(),
+            role: session.role,
+            purpose: Purpose::Execution(session.accepted_terms.clone()),
+        })?;
+        Ok(Self { wire, session })
+    }
+}
+impl Wire {
+    pub(crate) async fn connect(
+        config: ScBridgeConfig,
+        link: Link,
+        limits: Limits,
+    ) -> Result<Self> {
         // The existing local token authenticates a trusted Core process. A
         // remote plaintext bridge must not impersonate Noise peer identities.
         let loopback = match config.url.host() {
@@ -61,18 +155,17 @@ impl Channel {
         let mut bridge = ScBridgeClient::connect(config)
             .await
             .map_err(Error::Transport)?;
-        let t = &session.authorization.terms;
         bridge
-            .session_subscribe([t.session_id.as_str()])
+            .session_subscribe([link.session_id.as_str()])
             .await
             .map_err(Error::Transport)?;
-        if session.role == Role::Buyer {
+        if link.role == Role::Buyer {
             let opened = bridge
-                .session_open(session.remote.as_str(), &t.session_id)
+                .session_open(link.remote.as_str(), &link.session_id)
                 .await
                 .map_err(Error::Transport)?;
-            if opened["remote"] != session.remote.as_str()
-                || opened["session_id"] != t.session_id
+            if opened["remote"] != link.remote.as_str()
+                || opened["session_id"] != link.session_id
                 || sc_bridge_session_transport(&opened).is_err()
             {
                 return Err(Error::Identity);
@@ -80,22 +173,18 @@ impl Channel {
         }
         Ok(Self {
             bridge,
-            session,
+            link,
             limits,
             sent: 0,
             received: 0,
             interrupted: false,
         })
     }
-    pub fn session(&self) -> &Session {
-        &self.session
-    }
-
-    pub async fn send(&mut self, message: &Message) -> Result<()> {
+    pub(crate) async fn send<M: WireMessage>(&mut self, message: &M) -> Result<()> {
         if self.interrupted {
             return Err(Error::Interrupted);
         }
-        if message.sender() != self.session.role {
+        if message.sender() != self.link.role {
             return Err(Error::Identity);
         }
         message.validate()?;
@@ -105,14 +194,16 @@ impl Channel {
             .checked_add(1)
             .filter(|v| *v <= mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER)
             .ok_or(Error::Protocol)?;
-        let digest = Digest::hash("mayhem/proxy/exchange-payload/v1", &[&bytes]);
+        let digest = Digest::hash(self.link.purpose.domain(), &[&bytes]);
         self.interrupted = true;
+        let (accepted_terms, negotiation) = self.link.purpose.bindings();
         for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
             let frame = Frame {
-                t: "p.exchange".into(),
+                t: self.link.purpose.tag().into(),
                 schema_version: 1,
-                session_id: self.session.authorization.terms.session_id.clone(),
-                accepted_terms: self.session.accepted_terms.clone(),
+                session_id: self.link.session_id.clone(),
+                accepted_terms: accepted_terms.clone(),
+                negotiation: negotiation.clone(),
                 sequence,
                 bytes: bytes.len(),
                 offset: index * CHUNK,
@@ -120,7 +211,7 @@ impl Channel {
                 data: STANDARD.encode(chunk),
             };
             self.bridge
-                .session_send(self.session.remote.as_str(), &frame.session_id, &frame)
+                .session_send(self.link.remote.as_str(), &frame.session_id, &frame)
                 .await
                 .map_err(Error::Transport)?;
         }
@@ -130,7 +221,7 @@ impl Channel {
     }
     /// `wait` bounds this control/message read, not total generation duration.
     /// The same deadline spans all fragments; fragments cannot extend it.
-    pub async fn receive(&mut self, wait: Option<Duration>) -> Result<Received> {
+    pub(crate) async fn receive<M: WireMessage>(&mut self, wait: Option<Duration>) -> Result<M> {
         if self.interrupted {
             return Err(Error::Interrupted);
         }
@@ -154,11 +245,11 @@ impl Channel {
             };
             let event = self
                 .bridge
-                .next_session_event_for(&self.session.authorization.terms.session_id, remaining)
+                .next_session_event_for(&self.link.session_id, remaining)
                 .await
                 .map_err(Error::Transport)?;
-            if event["remote"] != self.session.remote.as_str()
-                || event["session_id"] != self.session.authorization.terms.session_id
+            if event["remote"] != self.link.remote.as_str()
+                || event["session_id"] != self.link.session_id
             {
                 return Err(Error::Identity);
             }
@@ -173,11 +264,13 @@ impl Channel {
             let value = event.get("frame").ok_or(Error::Protocol)?;
             let encoded = bounded_json(value, FRAME_BOUND)?;
             let frame: Frame = serde_json::from_slice(&encoded).map_err(|_| Error::Protocol)?;
-            if frame.t != "p.exchange"
+            let (accepted_terms, negotiation) = self.link.purpose.bindings();
+            if frame.t != self.link.purpose.tag()
                 || frame.schema_version != 1
                 || frame.sequence != sequence
-                || frame.accepted_terms != self.session.accepted_terms
-                || frame.session_id != self.session.authorization.terms.session_id
+                || frame.accepted_terms != accepted_terms
+                || frame.negotiation != negotiation
+                || frame.session_id != self.link.session_id
                 || frame.bytes == 0
                 || frame.bytes > self.limits.max_message_bytes
                 || frame.offset != bytes.len()
@@ -203,29 +296,40 @@ impl Channel {
             if bytes.len() != frame.bytes {
                 continue;
             }
-            if Digest::hash("mayhem/proxy/exchange-payload/v1", &[&bytes]) != frame.digest {
+            if Digest::hash(self.link.purpose.domain(), &[&bytes]) != frame.digest {
                 return Err(Error::Protocol);
             }
-            let message: Message = serde_json::from_slice(&bytes).map_err(|_| Error::Protocol)?;
+            let message: M = serde_json::from_slice(&bytes).map_err(|_| Error::Protocol)?;
             message.validate()?;
-            if message.sender() != self.session.role.opposite() {
+            if message.sender() != self.link.role.opposite() {
                 return Err(Error::Identity);
             }
             self.received = sequence;
             self.interrupted = false;
-            return Ok(Received {
-                accepted_terms: self.session.accepted_terms.clone(),
-                recipient: self.session.role,
-                message,
-            });
+            return Ok(message);
         }
     }
-    pub async fn close(mut self) -> Result<()> {
+    pub(crate) fn poison(&mut self) {
+        self.interrupted = true;
+    }
+    fn rebind(&mut self, link: Link) -> Result<()> {
+        if self.interrupted {
+            return Err(Error::Interrupted);
+        }
+        if link.session_id != self.link.session_id
+            || link.remote != self.link.remote
+            || link.role != self.link.role
+        {
+            return Err(Error::Identity);
+        }
+        self.link = link;
+        self.sent = 0;
+        self.received = 0;
+        Ok(())
+    }
+    pub(crate) async fn close(mut self) -> Result<()> {
         self.bridge
-            .session_close(
-                self.session.remote.as_str(),
-                &self.session.authorization.terms.session_id,
-            )
+            .session_close(self.link.remote.as_str(), &self.link.session_id)
             .await
             .map_err(Error::Transport)?;
         Ok(())

@@ -3,6 +3,8 @@ use super::*;
 use financial::negotiation::{BuyerOffer, SavedPurchase};
 use financial::provider::{ProviderNegotiation, Runtime};
 use mayhem_proxy::exchange::{Channel, Message, Role, Session};
+#[path = "negotiation_wire.rs"]
+mod wire;
 
 async fn deliver(
     buyer: &mut Channel,
@@ -53,6 +55,7 @@ struct Setup {
     buyer: BuyerNegotiation,
     saved: SavedPurchase,
     buyer_key: [u8; 32],
+    negotiation: Option<wire::Pair>,
 }
 fn journal_limits(bytes: u64) -> attempts::Limits {
     attempts::Limits {
@@ -109,10 +112,10 @@ impl Setup {
             .unwrap();
         let mut binding = session(peer);
         binding.capacity_lease = lease.lease().id.clone();
-        let (q, purchase) = prepare(peer, f, bytes, &binding).await;
-        let policy = purchase.policy().clone();
         let buyer = controller(f, peer, 8);
-        let saved = buyer.sign(purchase, q, buyer_signer, 1000).await.unwrap();
+        let (saved, negotiation) =
+            wire::begin(peer, f, bytes, &binding, &buyer, buyer_signer).await;
+        let policy = saved.policy().clone();
         let runtime = Arc::new(Runtime {
             adapter: f.adapter.clone(),
             connection: f.connection.clone(),
@@ -139,6 +142,7 @@ impl Setup {
             buyer,
             saved,
             buyer_key,
+            negotiation: Some(negotiation),
         }
     }
     async fn approve(
@@ -329,12 +333,16 @@ async fn provider_countersignature_survives_reopen_and_hands_off_to_one_paid_pos
                 allocated,
                 "duplicate signing does not allocate again"
             );
+            let (_bridge, mut buyer_channel, mut provider_channel, received) = s
+                .negotiation
+                .take()
+                .unwrap()
+                .finish(&peer, signed.clone())
+                .await;
             s.buyer
-                .retain_provider_acceptance(signed.authorization.clone())
+                .retain_provider_acceptance(received.authorization)
                 .await
                 .unwrap();
-            let (_bridge, mut buyer_channel, mut provider_channel) =
-                channels(&peer, &signed.authorization).await;
             let executor = s.executor(&f, &peer);
             let unsent = deliver(&mut buyer_channel, &mut provider_channel, &bytes).await;
             assert!(

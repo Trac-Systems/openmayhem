@@ -1,7 +1,7 @@
 //! Authenticated exchange for an already negotiated proxy spend authorization.
 //! Peer/session identity comes from the existing protected SC-Bridge, not a body
 //! field. This is not offer negotiation or permission to skip canonical admission.
-mod channel;
+pub(crate) mod channel;
 use crate::{
     attempts::{Digest, Identity},
     execution::{Cancellation, PaidExecutor, UnsettledReply},

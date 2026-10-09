@@ -58,8 +58,9 @@ fsync/acknowledgment failure. They use actual local RPC/accounting with ephemera
 test identities. No external payment or real inference is claimed.
 
 Provider countersigning now uses `financial::provider::ProviderNegotiation`, as described
-below. Authenticated pre-acceptance wire exchange, provider proposal orchestration and
-automatic supervisor startup are still required. Never-admitted
+below. Authenticated pre-acceptance transport is implemented in `negotiation::Channel`;
+the trusted session dispatcher, provider proposal orchestration and automatic supervisor
+startup are still required. Never-admitted
 signed intentions also need canonical expiry/requote reconciliation before that
 automatic controller ships. For now they stay retained and count against the
 bounded quota; silently deleting them could enable conflicting authorizations.
@@ -135,5 +136,48 @@ Unsigned drafts and different accepted terms cannot pass that check. The session
 still checks canonical funding and current capacity before the first model POST;
 signatures alone do not suffice. Local four-endpoint/three-rail checks now exercise
 that session handoff and independent public buyer receipt verification. The bridge
-fixture authenticates its loopback participants; real relay/Noise acceptance and the
-pre-acceptance negotiation transport remain separate unfinished requirements.
+fixture authenticates its loopback participants; real relay/Noise acceptance remains
+a separate unfinished requirement.
+
+## Authenticated pre-acceptance transport
+
+`negotiation::Channel` transports Request, Proposal, Offer and Accepted in that order.
+Its immutable Context binds the network, both peers, session, logical buyer attempt,
+exact request fingerprint, offer, rail and settlement policy. Constructing or parsing
+Context does not authenticate a caller: the trusted session dispatcher must supply it
+after admission/identity checks. That dispatcher is not implemented by this transport.
+
+The buyer sends its normalized request. The provider proposes a public adapter plus
+opaque connection, reservation and capacity identifiers. A Proposal is a set of claims,
+not a capacity capability. The buyer independently obtains its canonical quote, applies
+its own resource/spend policy and durably signs the request-derived terms. The provider
+must use its actual Runtime and ProviderNegotiation to check and save its countersignature.
+The wire checks real signatures, the original buyer signature, message order and exact
+context/proposal bindings. It exposes no raw signing service or private upstream mapping.
+
+After Accepted, both parties can promote the same authenticated connection to the paid
+exchange. Negotiation and execution have separate frame purposes and commitment domains;
+stale negotiation fragments cannot become execution commands. Promotion still does not
+reserve money or authorize POST. Canonical financial admission and durable shared capacity
+checks remain mandatory. A sanitized Refused response terminates negotiation without
+creating a paid channel.
+
+Recover starts a separate recovery exchange for the same logical context. The provider
+returns its original durable countersignature; the buyer compares/retains it against its
+original purchase. Lost delivery or acknowledgment must not create another purchase,
+signature, reservation or upstream execution. Older-contract recovery remains possible;
+new Request negotiation requires the current compiled contract. Closing or losing the
+channel does not release a signed obligation or execution capacity.
+
+Transport reuses the bounded SC-Bridge framing described in [EXCHANGE.md](EXCHANGE.md).
+Negotiation sends have a caller-configured total control deadline across all fragments;
+receives require an explicit finite control wait. These are not generation deadlines.
+Timeout, cancellation, malformed framing or invalid received context poisons the channel.
+Reconnect uses durable state, never a guessed successful or cancelled outcome.
+
+Local checks cover the full negotiation-to-paid path on every supported JSON endpoint
+and payment rail, streaming request acceptance, lost acknowledgment after buyer receipt,
+fragmentation, replay, tampered identities/context/request/signatures, control timeout
+and failed promotion before acceptance. They use the loopback SC-Bridge double and local
+canonical accounting fixture. Provider proposal/lease orchestration, resource-budgeted
+session dispatch, full-duplex supervision and real relay/Noise acceptance remain required.

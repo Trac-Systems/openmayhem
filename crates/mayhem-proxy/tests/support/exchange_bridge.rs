@@ -1,5 +1,6 @@
 //! Bounded local SC-Bridge protocol double. Authenticated peer attribution is
 //! supplied by this test transport; it is NOT a real Noise/relay network proof.
+use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
 use mayhem_bridge::ScBridgeConfig;
 use serde_json::{json, Value};
@@ -75,6 +76,20 @@ impl Bridge {
                                     match attack {
                                         Some("remote")=>event["remote"]=json!("f".repeat(64)),
                                         Some("terms")=>event["frame"]["accepted_terms"]=json!("f".repeat(64)),
+                                        Some("negotiation")=>event["frame"]["negotiation"]=json!("f".repeat(64)),
+                                        Some("purpose")=>event["frame"]["t"]=json!("p.exchange"),
+                                        Some("request_payload" | "signature_payload")=>{
+                                            let bytes=STANDARD.decode(event["frame"]["data"].as_str().unwrap()).unwrap();
+                                            let mut payload:Value=serde_json::from_slice(&bytes).unwrap();
+                                            if attack==Some("request_payload") { payload["request"]["model"]=json!("altered-model"); }
+                                            else { payload["value"]["authorization"]["provider_sig"]=json!("0".repeat(128)); }
+                                            let bytes=serde_json::to_vec(&payload).unwrap();
+                                            let mut h=blake3::Hasher::new_derive_key("mayhem/proxy/negotiation-payload/v1");
+                                            h.update(&(bytes.len() as u64).to_le_bytes());h.update(&bytes);
+                                            event["frame"]["bytes"]=json!(bytes.len());
+                                            event["frame"]["data"]=json!(STANDARD.encode(&bytes));
+                                            event["frame"]["digest"]=json!(h.finalize().to_hex().to_string());
+                                        },
                                         Some("offset")=>event["frame"]["offset"]=json!(1),
                                         Some("sequence")=>event["frame"]["sequence"]=json!(2),
                                         Some("size")=>event["frame"]["bytes"]=json!(999_999_999),
@@ -86,6 +101,7 @@ impl Bridge {
                                     {let mut stored=capture.lock().await;if stored.len()<256{stored.push(event.clone());}}
                                     if target.send(event.clone()).await.is_err(){break}
                                     if attack==Some("duplicate") && target.send(event).await.is_err(){break}
+                                    if attack==Some("lost_ack"){break}
                                 }
                                 let typ=match kind {"session_subscribe"=>"session_subscribed","session_open"=>"session_opened",
                                     "session_send"=>"session_sent","session_close"=>"session_closed",_=>panic!("unexpected test command")};
