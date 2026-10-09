@@ -39,7 +39,7 @@ export async function proxyReservationFixture(rail='tnk',family='llm',execution=
     await f.storage.put(f.contract.providerStripePayoutVerificationTargetKey(f.provider.publicKey,payout.target),
       {...verification,record_key:'payout/stripe-verified/fixture'});
   }
-  const policy=row.policy;
+  const policy=execution?.settlement_policy??row.policy;
   const policyHash=await proxySettlementPolicyDigest(policy);
   assert.equal((await f.policy({kind:'set_settlement',policy_hash:policyHash,enabled:true,policy})).ok,true);
   const terms={...row.terms,...f.network,buyer_pubkey:buyer.publicKey,billing_attempt:1,

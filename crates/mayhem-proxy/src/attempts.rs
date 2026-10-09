@@ -12,7 +12,7 @@ mod finance;
 mod outcomes;
 mod payloads;
 pub use acceptance::{AcceptanceSnapshot, OwnedAcceptance};
-pub use outcomes::CompletedDraft;
+pub use outcomes::{TerminalDraft, WaiverDraft};
 pub(crate) use payloads::result_commitment;
 pub use payloads::{OwnedRequest, OwnedResult, Recovery};
 
@@ -329,10 +329,7 @@ impl Record {
         if !self.cancellation_requested || !matches!(self.phase, Phase::Resolved | Phase::Closed) {
             return None;
         }
-        let expected = Digest::hash(
-            "mayhem/proxy/local-cancel-before-dispatch/v1",
-            &[self.invocation.0.as_bytes(), &self.attempt.to_le_bytes()],
-        );
+        let expected = unsent_commitment(&self.invocation, self.attempt);
         match &self.resolution {
             Some(Resolution::NotExecuted { evidence }) if evidence == &expected => Some(expected),
             _ => None,
@@ -379,6 +376,12 @@ impl Record {
 }
 fn record_key(invocation: &Digest, attempt: u64) -> String {
     format!("{}:{attempt:020}", invocation.0)
+}
+pub(crate) fn unsent_commitment(invocation: &Digest, attempt: u64) -> Digest {
+    Digest::hash(
+        "mayhem/proxy/local-cancel-before-dispatch/v1",
+        &[invocation.0.as_bytes(), &attempt.to_le_bytes()],
+    )
 }
 fn expiry_key(record: &Record) -> String {
     format!(
@@ -496,7 +499,7 @@ impl Journal {
             if meta.identity != identity {
                 return Err(Error::Identity);
             }
-            require(matches!(meta.schema, 1 | 2 | 3 | 4 | 5))?;
+            require(matches!(meta.schema, 1 | 2 | 3 | 4 | 5 | 6))?;
             require(
                 [
                     REQUESTS.name(),
@@ -535,8 +538,8 @@ impl Journal {
             if meta.schema == 1 {
                 require(meta.payload_bytes == 0)?;
             }
-            if meta.schema < 5 {
-                meta.schema = 5;
+            if meta.schema < 6 {
+                meta.schema = 6;
                 storage(meta_table.insert("state", encode(&meta)?.as_slice()))?;
             }
         } else {
@@ -550,7 +553,7 @@ impl Journal {
             finance::initialize(&tx, true)?;
             outcomes::initialize(&tx, true)?;
             let meta = Meta {
-                schema: 5,
+                schema: 6,
                 identity,
                 records: 0,
                 unfinished: 0,
@@ -741,6 +744,11 @@ impl Journal {
                 r.output_may_have_been_delivered = true;
             }
             Event::CancelRequested if r.phase != Phase::Closed => {
+                // Once known terminal evidence has fixed the outcome/waiver,
+                // cancellation cannot retroactively relabel finished work.
+                if r.phase == Phase::Resolved && outcomes::has_intent(&tx, &r.key())? {
+                    return Ok(r);
+                }
                 if r.cancellation_requested {
                     return Ok(r);
                 }
@@ -748,10 +756,7 @@ impl Journal {
                 if r.phase == Phase::Prepared {
                     r.phase = Phase::Resolved;
                     r.resolution = Some(Resolution::NotExecuted {
-                        evidence: Digest::hash(
-                            "mayhem/proxy/local-cancel-before-dispatch/v1",
-                            &[r.invocation.0.as_bytes(), &r.attempt.to_le_bytes()],
-                        ),
+                        evidence: unsent_commitment(&r.invocation, r.attempt),
                     });
                 }
             }

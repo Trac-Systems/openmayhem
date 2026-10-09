@@ -97,7 +97,7 @@ fn reserved_receipt_storage_is_bounded_idempotent_and_pruned_with_the_closed_att
     let j = Journal::open(&path, identity(), l).unwrap();
     assert_eq!(j.allocated_payload_bytes().unwrap(), 65536);
     assert!(j
-        .completed_draft(&second.invocation, second.attempt)
+        .terminal_draft(&second.invocation, second.attempt)
         .unwrap()
         .is_none());
 }

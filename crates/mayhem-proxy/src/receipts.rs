@@ -2,7 +2,7 @@
 //! upstream-reported price is accepted from a connector. A buyer must supply its
 //! own retained request and received result, not echo a provider's usage claim.
 use crate::{
-    attempts::{self, AcceptanceSnapshot, CompletedDraft},
+    attempts::{self, AcceptanceSnapshot, TerminalDraft},
     endpoint::ProtocolReply,
     financial, invalid, metering, require, Result,
 };
@@ -41,20 +41,97 @@ pub fn verify_signature(signature: &str, bytes: &[u8], public_key: &str) -> bool
 pub struct BuyerApproval {
     signing_bytes: Vec<u8>,
 }
+/// Explicit buyer consent to a zero-charge closure. For terminal output, verify
+/// the buyer's own received evidence. For unsent cancellation, verify the signed
+/// provider assertion and absence of locally received output. That assertion is
+/// not independent proof of remote non-execution; capacity/retry authorities still
+/// require their own journal/upstream evidence and must not trust this object alone.
+pub fn approve_waiver(
+    draft: &attempts::WaiverDraft,
+    provider_signature: &str,
+    authorization: &ProxySpendAuthorization,
+    own_request: &[u8],
+    received: Option<&ProtocolReply>,
+    cancellation_accepted_before_terminal: bool,
+) -> Result<BuyerApproval> {
+    use mayhem_proto::proxy::finance::ProxyClosureOutcome as Outcome;
+    authorization
+        .verify(verify_signature)
+        .map_err(|_| invalid("accepted signatures rejected"))?;
+    let t = &authorization.terms;
+    let body = &draft.body;
+    body.validate().map_err(|_| invalid("invalid waiver"))?;
+    require(
+        draft.attempt > 0
+            && body.accepted_terms == t.digest().map_err(|_| invalid("invalid accepted terms"))?
+            && verify_signature(
+                provider_signature,
+                &body
+                    .provider_signing_bytes()
+                    .map_err(|_| invalid("invalid waiver"))?,
+                &t.offer.provider_pubkey,
+            ),
+        "provider waiver differs",
+    )?;
+    let request = serde_json::from_slice(own_request)?;
+    require(
+        mayhem_proto::endpoint_request_fingerprint(&request) == t.request_hash,
+        "buyer request differs",
+    )?;
+    let evidence = if body.outcome == Outcome::NotExecuted {
+        require(
+            received.is_none() && cancellation_accepted_before_terminal,
+            "unsent waiver contradicts buyer evidence",
+        )?;
+        attempts::unsent_commitment(&draft.invocation, draft.attempt)
+    } else {
+        let received = received.ok_or_else(|| invalid("buyer terminal result is missing"))?;
+        let disposition = received
+            .observed_usage
+            .as_ref()
+            .ok_or_else(|| invalid("buyer result is unverified"))?
+            .disposition;
+        let outcome = if cancellation_accepted_before_terminal {
+            Outcome::Cancelled
+        } else if disposition == metering::Disposition::Incomplete {
+            Outcome::Failed
+        } else {
+            Outcome::CompletedUnbilled
+        };
+        require(body.outcome == outcome, "buyer terminal outcome differs")?;
+        attempts::result_commitment(
+            &draft.invocation,
+            draft.attempt,
+            &financial::terms_binding(t)?,
+            &serde_json::to_vec(received)?,
+        )
+        .map_err(|_| invalid("buyer result commitment differs"))?
+    };
+    require(
+        body.evidence_hash == evidence.as_str(),
+        "waiver evidence differs",
+    )?;
+    Ok(BuyerApproval {
+        signing_bytes: body
+            .buyer_signing_bytes()
+            .map_err(|_| invalid("invalid waiver"))?,
+    })
+}
 impl BuyerApproval {
     pub fn signing_bytes(&self) -> &[u8] {
         &self.signing_bytes
     }
 }
 
-pub fn approve_completed(
-    draft: &CompletedDraft,
+pub fn approve_terminal(
+    draft: &TerminalDraft,
     provider_signature: &str,
     authorization: &ProxySpendAuthorization,
     policy: &ProxySettlementPolicy,
     snapshot: &AcceptanceSnapshot,
     own_request: &[u8],
     received: &ProtocolReply,
+    cancellation_accepted_before_terminal: bool,
 ) -> Result<BuyerApproval> {
     let t = &authorization.terms;
     authorization
@@ -67,8 +144,8 @@ pub fn approve_completed(
     require(
         draft.attempt > 0
             && draft.body.final_receipt
-            && draft.body.outcome == mayhem_proto::proxy::finance::ProxyReceiptOutcome::Complete,
-        "receipt is not a completed result",
+            && draft.body.outcome != mayhem_proto::proxy::finance::ProxyReceiptOutcome::Running,
+        "receipt is not a terminal result",
     )?;
     require(
         verify_signature(
@@ -97,9 +174,13 @@ pub fn approve_completed(
         .observe(&received.body)
         .map_err(|_| invalid("buyer result cannot be metered"))?;
     require(
-        observation.disposition == metering::Disposition::Complete
+        draft.body.outcome
+            == metering::terminal_outcome(
+                observation.disposition,
+                cancellation_accepted_before_terminal,
+            )
             && received.observed_usage.as_ref() == Some(&observation),
-        "buyer result is not complete",
+        "buyer result outcome differs",
     )?;
     let result_digest = attempts::result_commitment(
         &draft.invocation,
@@ -143,9 +224,9 @@ pub fn approve_completed(
     })
 }
 
-pub fn verify_completed(
+pub fn verify_terminal(
     receipt: &ProxyUsageReceipt,
-    draft: &CompletedDraft,
+    draft: &TerminalDraft,
     authorization: &ProxySpendAuthorization,
     policy: &ProxySettlementPolicy,
 ) -> Result<()> {

@@ -528,6 +528,18 @@ impl VerifiedSubtotal {
 /// `remaining_au` must come from locked parent authorization, never the connector.
 /// This performs no I/O, payout, hold release, receipt lookup or current-offer lookup.
 pub fn price_completed(recovery: &Recovery, remaining_au: MoneyAu) -> Result<VerifiedSubtotal> {
+    let verified = price_terminal(recovery, remaining_au)?;
+    if verified.observation.disposition != Disposition::Complete
+        || recovery.record.cancellation_requested
+    {
+        return Err(Error::OutcomePolicyRequired);
+    }
+    Ok(verified)
+}
+/// Recount a fully validated TERMINAL response, including explicit incomplete or
+/// refusal outcomes. A truncated/unknown stream without a retained terminal result
+/// is not evidence. Charging still requires the original policy to allow its outcome.
+pub fn price_terminal(recovery: &Recovery, remaining_au: MoneyAu) -> Result<VerifiedSubtotal> {
     let r = &recovery.record;
     let b = &r.binding;
     let accepted = recovery.acceptance.as_ref().ok_or(Error::Offer)?;
@@ -544,9 +556,6 @@ pub fn price_completed(recovery: &Recovery, remaining_au: MoneyAu) -> Result<Ver
     let observed = prepared.observe(&output.reply.body)?;
     if output.reply.observed_usage.as_ref() != Some(&observed) {
         return Err(Error::Evidence);
-    }
-    if observed.disposition != Disposition::Complete || r.cancellation_requested {
-        return Err(Error::OutcomePolicyRequired);
     }
     if accepted_offer.digest().map_err(|_| Error::Offer)? != b.offer_digest.as_str()
         || accepted_offer.market_id != b.market_id.as_str()
@@ -578,12 +587,27 @@ pub fn price_completed(recovery: &Recovery, remaining_au: MoneyAu) -> Result<Ver
     })
 }
 
+pub fn terminal_outcome(
+    disposition: Disposition,
+    cancelled: bool,
+) -> mayhem_proto::proxy::finance::ProxyReceiptOutcome {
+    use mayhem_proto::proxy::finance::ProxyReceiptOutcome as Outcome;
+    if cancelled {
+        return Outcome::Cancelled;
+    }
+    match disposition {
+        Disposition::Complete => Outcome::Complete,
+        Disposition::Incomplete => Outcome::Partial,
+        Disposition::Refused => Outcome::Refused,
+    }
+}
+
 /// Prepare an UNSIGNED final receipt from owned, independently recounted output.
 /// The parent supplies retained canonical terms/policy and an exact prior head.
 /// This does not authorize signatures, debit a buyer, release a hold or update a
 /// payout. Current offers, contract version and wall-clock quote expiry are not
 /// consulted when recovering previously accepted work.
-pub fn draft_completed_receipt(
+pub fn draft_terminal_receipt(
     recovery: &Recovery,
     terms: &mayhem_proto::proxy::finance::ProxySpendTerms,
     policy: &mayhem_proto::proxy::finance::ProxySettlementPolicy,
@@ -591,7 +615,7 @@ pub fn draft_completed_receipt(
     at_ms: u64,
     previous: Option<&mayhem_proto::proxy::finance::ProxyReceiptBody>,
 ) -> Result<mayhem_proto::proxy::finance::ProxyReceiptBody> {
-    use mayhem_proto::proxy::finance::{ProxyReceiptBody, ProxyReceiptOutcome};
+    use mayhem_proto::proxy::finance::ProxyReceiptBody;
     let b = &recovery.record.binding;
     if terms.digest().map_err(|_| Error::Offer)? != b.accepted_terms.as_str()
         || terms.request_hash != b.request_hash.as_str()
@@ -607,14 +631,21 @@ pub fn draft_completed_receipt(
     {
         return Err(Error::Offer);
     }
-    let verified = price_completed(recovery, terms.max_spend_au)?;
+    let verified = price_terminal(recovery, terms.max_spend_au)?;
+    let outcome = terminal_outcome(
+        verified.observation.disposition,
+        recovery.record.cancellation_requested,
+    );
+    if !policy.payable_outcomes.contains(&outcome) {
+        return Err(Error::OutcomePolicyRequired);
+    }
     let receipt = ProxyReceiptBody {
         schema_version: 1,
         lane: mayhem_proto::proxy::ProxyLane::Proxy,
         accepted_terms: b.accepted_terms.as_str().into(),
         seq,
         final_receipt: true,
-        outcome: ProxyReceiptOutcome::Complete,
+        outcome,
         result_hash: verified.result_digest.as_str().into(),
         observation_hash: verified.digest()?.as_str().into(),
         usage: verified.observation.units,

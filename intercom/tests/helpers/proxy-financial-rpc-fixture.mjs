@@ -14,8 +14,9 @@ import { CONTRACT_VERSION } from '../../contract/contract.js';
 import { proxyReceiptFixture } from './proxy-finance.js';
 import { closure } from './proxy-closure.js';
 import { prepareProxyClose } from '../../contract/proxy-closure.js';
-import { proxyBuyerReceiptSigningBytes, proxyProviderReceiptSigningBytes } from '../../contract/proxy-finance.js';
+import { proxyBuyerReceiptSigningBytes, proxyProviderReceiptSigningBytes, proxyBuyerClosureSigningBytes, proxyProviderClosureSigningBytes } from '../../contract/proxy-finance.js';
 import { proxyUsageFeatureKey } from '../../contract/proxy-reservations.js';
+import { proxyCloseFeatureKey } from '../../contract/proxy-closure.js';
 const execution=process.argv[4]?JSON.parse(process.argv[4]):null;
 const f=await proxyReceiptFixture(process.argv[2]??'tnk',process.argv[3]??'llm',execution,Boolean(execution));
 let reserved=!execution;
@@ -47,8 +48,9 @@ let submissions=0,publications=0,pending=null,publicationMode=null,publicationTa
 // canonical signed-view service. The remote relay/indexer transport is simulated;
 // its durable append journal has separate real-Autobase integration coverage.
 async function applyReceipt(key,value) {
-  if(key!==await proxyUsageFeatureKey(value))throw new Error('fixture publication key differs');
-  const plan=await f.finalize(value);
+  const waiver=value.op==='proxy_close_reservation';
+  if(key!==await (waiver?proxyCloseFeatureKey(value):proxyUsageFeatureKey(value)))throw new Error('fixture publication key differs');
+  const plan=waiver?await prepareProxyClose(f.ledger,value,f.context,f.peer.wallet.verify):await f.finalize(value);
   if(plan.writes.length) {await f.apply(plan);await sync();publications++;}
   return plan.result;
 }
@@ -85,6 +87,11 @@ try {
     if(command==='stop')break;
     if(command.startsWith('{')) {
       const request=JSON.parse(command);
+      if(request.sign_waiver) {
+        const body=request.sign_waiver;
+        console.log(JSON.stringify({provider_sig:b4a.toString(f.provider.wallet.sign(proxyProviderClosureSigningBytes(body)),'hex'),
+          buyer_sig:b4a.toString(f.buyer.wallet.sign(proxyBuyerClosureSigningBytes(body)),'hex')}));continue;
+      }
       if(request.sign_receipt) {
         const body=request.sign_receipt;
         console.log(JSON.stringify({provider_sig:b4a.toString(f.provider.wallet.sign(proxyProviderReceiptSigningBytes(body)),'hex'),

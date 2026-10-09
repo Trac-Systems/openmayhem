@@ -409,8 +409,8 @@ mod tests {
         let j = Journal::open(&path, identity(), limits()).unwrap();
         assert_eq!(j.get(&r.invocation).unwrap().unwrap(), r);
         assert_eq!(j.allocated_payload_bytes().unwrap(), allocated);
-        assert!(j.completed_draft(&r.invocation, r.attempt).unwrap().is_none());
-        assert!(j.completed_receipt(&r.invocation, r.attempt).unwrap().is_none());
+        assert!(j.terminal_draft(&r.invocation, r.attempt).unwrap().is_none());
+        assert!(j.terminal_receipt(&r.invocation, r.attempt).unwrap().is_none());
         assert!(j.begin_dispatch(&r.invocation, r.generation, 102).is_err());
     }
 

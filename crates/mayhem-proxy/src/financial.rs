@@ -7,7 +7,9 @@ use crate::{
     invalid, require, Error, Result,
 };
 use mayhem_proto::proxy::{
-    finance::{ProxySettlementPolicy, ProxySpendAuthorization, ProxyUsageReceipt},
+    finance::{
+        ProxyReservationClosure, ProxySettlementPolicy, ProxySpendAuthorization, ProxyUsageReceipt,
+    },
     PROXY_MAX_SAFE_INTEGER,
 };
 use serde::{Deserialize, Serialize};
@@ -57,6 +59,49 @@ pub struct Observation {
     started: Instant,
 }
 impl Observation {
+    pub fn confirms_waiver(&self, expected: &ProxyReservationClosure) -> Result<bool> {
+        require(
+            self.started.elapsed() <= FRESHNESS,
+            "canonical financial observation expired",
+        )?;
+        let record = &self.wire.resolution;
+        if record.is_null() {
+            return Ok(false);
+        }
+        let actual: ProxyReservationClosure = serde_json::from_value(record["closure"].clone())?;
+        let t = &self.wire.accepted.authorization.terms;
+        actual
+            .verify(t, crate::receipts::verify_signature)
+            .map_err(|_| invalid("canonical waiver signatures rejected"))?;
+        require(
+            &actual == expected
+                && record["type"] == "proxy_execution_resolution"
+                && record["accepted_terms"] == self.wire.accepted_terms
+                && record["result"]["ok"] == true
+                && record["result"]["retry_safe"] == true
+                && record["result"]["retained_au"] == "0"
+                && record["recorded_at"]
+                    == format!(
+                        "proxy/close/{}",
+                        actual
+                            .body
+                            .digest()
+                            .map_err(|_| invalid("invalid waiver"))?
+                    ),
+            "canonical waiver conflicts with retained outcome",
+        )?;
+        let r = &self.wire.reservation;
+        require(
+            r["status"] == "closed"
+                && r["reservation_id"] == t.reservation_id
+                && r["user"] == t.buyer_pubkey
+                && r["provider"] == t.offer.provider_pubkey
+                && r["rail"] == serde_json::to_value(t.rail)?
+                && !r["closed_at"].is_null(),
+            "canonical waiver reservation differs",
+        )?;
+        Ok(true)
+    }
     pub fn receipt_head(&self) -> Result<Option<ProxyUsageReceipt>> {
         require(
             self.started.elapsed() <= FRESHNESS,
@@ -355,10 +400,6 @@ impl Client {
         policy: &ProxySettlementPolicy,
         receipt: &ProxyUsageReceipt,
     ) -> Result<()> {
-        let _permit = self
-            .slots
-            .try_acquire()
-            .map_err(|_| invalid("financial publication capacity unavailable"))?;
         let t = &authorization.terms;
         require(
             t.network_id == self.identity.network_id
@@ -380,8 +421,50 @@ impl Client {
                 .digest()
                 .map_err(|_| invalid("invalid receipt"))?
         );
-        let bytes = serde_json::to_vec(&json!({"feature":"mayhem","key":key,
-            "value":{"op":"proxy_record_usage","provider":self.requester,"receipt":receipt}}))?;
+        self.submit_feature(
+            key,
+            json!({"op":"proxy_record_usage","provider":self.requester,"receipt":receipt}),
+        )
+        .await
+    }
+    pub async fn submit_waiver(
+        &self,
+        authorization: &ProxySpendAuthorization,
+        closure: &ProxyReservationClosure,
+    ) -> Result<()> {
+        let t = &authorization.terms;
+        require(
+            t.network_id == self.identity.network_id
+                && t.msb_bootstrap == self.identity.msb_bootstrap
+                && t.subnet_bootstrap == self.identity.subnet_bootstrap
+                && t.offer.provider_pubkey == self.requester,
+            "financial publication identity differs",
+        )?;
+        authorization
+            .verify(crate::receipts::verify_signature)
+            .map_err(|_| invalid("accepted signatures rejected"))?;
+        closure
+            .verify(t, crate::receipts::verify_signature)
+            .map_err(|_| invalid("waiver signatures rejected"))?;
+        let key = format!(
+            "proxy/close/{}",
+            closure
+                .body
+                .digest()
+                .map_err(|_| invalid("invalid waiver"))?
+        );
+        self.submit_feature(
+            key,
+            json!({"op":"proxy_close_reservation","provider":self.requester,"closure":closure}),
+        )
+        .await
+    }
+    async fn submit_feature(&self, key: String, value: Value) -> Result<()> {
+        let _permit = self
+            .slots
+            .try_acquire()
+            .map_err(|_| invalid("financial publication capacity unavailable"))?;
+        let bytes = serde_json::to_vec(&json!({"feature":"mayhem","key":key,"value":value}))?;
         require(
             bytes.len() <= MAX_BYTES,
             "financial publication exceeds bound",

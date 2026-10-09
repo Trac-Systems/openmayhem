@@ -559,7 +559,7 @@ async fn owned_usage_prices_the_accepted_offer_once_with_rail_and_budget_binding
                 .max(10);
             assert_eq!(quoted.subtotal_au, expected);
             let receipt =
-                metering::draft_completed_receipt(&saved, &terms, &financial_policy, 1, 2000, None)
+                metering::draft_terminal_receipt(&saved, &terms, &financial_policy, 1, 2000, None)
                     .unwrap();
             assert_eq!(receipt.au_owed_cum, expected);
             assert_eq!(receipt.billing_au_owed_cum, expected + terms.prior_spend_au);
@@ -567,7 +567,7 @@ async fn owned_usage_prices_the_accepted_offer_once_with_rail_and_budget_binding
             let original_digest = receipt.digest().unwrap();
             let reopened = fixture.journal.recover(&r.invocation, r.attempt).unwrap();
             assert_eq!(
-                metering::draft_completed_receipt(
+                metering::draft_terminal_receipt(
                     &reopened,
                     &terms,
                     &financial_policy,
@@ -582,7 +582,7 @@ async fn owned_usage_prices_the_accepted_offer_once_with_rail_and_budget_binding
             );
             let mut repriced = terms.clone();
             repriced.offer.rates[0].per_unit_au += 1;
-            assert!(metering::draft_completed_receipt(
+            assert!(metering::draft_terminal_receipt(
                 &saved,
                 &repriced,
                 &financial_policy,
@@ -591,7 +591,7 @@ async fn owned_usage_prices_the_accepted_offer_once_with_rail_and_budget_binding
                 None
             )
             .is_err());
-            assert!(metering::draft_completed_receipt(
+            assert!(metering::draft_terminal_receipt(
                 &saved,
                 &terms,
                 &financial_policy,

@@ -1,10 +1,42 @@
 //! Paid admission interface: canonical finance, owned acceptance and shared capacity
 //! are mandatory. The caller already obtained buyer/provider signed acceptance through
 //! canonical publication; this component does not invent signatures or create funds.
-//! Public authentication, publication and receipt settlement remain separate concerns.
+//! Public authentication, protected signing and startup integration remain separate.
 use super::*;
 use crate::attempts::AcceptanceSnapshot;
-use mayhem_proto::proxy::finance::ProxySpendAuthorization;
+use mayhem_proto::proxy::finance::{
+    ProxyReservationClosure, ProxySpendAuthorization, ProxyUsageReceipt,
+};
+
+enum Outcome {
+    Receipt(ProxyUsageReceipt),
+    Waiver(ProxyReservationClosure),
+}
+impl Outcome {
+    fn digest(&self) -> Result<Digest> {
+        Digest::new(
+            match self {
+                Self::Receipt(v) => v.body.digest(),
+                Self::Waiver(v) => v.body.digest(),
+            }
+            .map_err(|_| Error::Binding)?,
+        )
+        .map_err(Error::Journal)
+    }
+    fn confirmed(&self, observation: &financial::Observation) -> Result<bool> {
+        match self {
+            Self::Receipt(v) => observation.confirms_receipt(v),
+            Self::Waiver(v) => observation.confirms_waiver(v),
+        }
+        .map_err(Error::Financial)
+    }
+    fn retained(&self, journal: &Journal, invocation: &Digest, attempt: u64) -> Result<bool> {
+        Ok(match self {
+            Self::Receipt(v) => journal.terminal_receipt(invocation, attempt)?.as_ref() == Some(v),
+            Self::Waiver(v) => journal.waiver(invocation, attempt)?.as_ref() == Some(v),
+        })
+    }
+}
 
 pub struct PaidExecutor {
     executor: Executor,
@@ -15,16 +47,16 @@ pub struct PaidExecutor {
 impl PaidExecutor {
     /// Freeze the final body before requesting either signature. Repeated calls
     /// recover its original timestamp/sequence, even after an interrupted signer.
-    pub async fn prepare_completed_receipt(
+    pub async fn prepare_terminal_receipt(
         &self,
         invocation: &Digest,
         attempt: u64,
-    ) -> Result<attempts::CompletedDraft> {
+    ) -> Result<attempts::TerminalDraft> {
         let key = invocation.clone();
         if let Some(draft) = self
             .executor
             .storage
-            .run(move |j| j.completed_draft(&key, attempt))
+            .run(move |j| j.terminal_draft(&key, attempt))
             .await?
         {
             return Ok(draft);
@@ -50,11 +82,11 @@ impl PaidExecutor {
                 // Check freshness again after scheduling bounded storage work.
                 observed.receipt_head().map_err(Error::Financial)?;
                 j.reserve_outcome(&key, attempt)?;
-                Ok(j.prepare_completed_draft(&key, attempt, now_ms(), previous.map(|v| v.body))?)
+                Ok(j.prepare_terminal_draft(&key, attempt, now_ms(), previous.map(|v| v.body))?)
             })
             .await
     }
-    pub async fn retain_completed_receipt(
+    pub async fn retain_terminal_receipt(
         &self,
         invocation: &Digest,
         attempt: u64,
@@ -64,13 +96,13 @@ impl PaidExecutor {
         let receipt = receipt.clone();
         self.executor
             .storage
-            .run(move |j| j.retain_completed_receipt(&key, attempt, &receipt))
+            .run(move |j| j.retain_terminal_receipt(&key, attempt, &receipt))
             .await
     }
     /// Observe -> submit the identical retained envelope if needed -> observe.
     /// No inference retry, timer-based financial release or receipt history scan.
     /// False means the exact receipt is still awaiting canonical confirmation.
-    pub async fn publish_completed_receipt(
+    pub async fn publish_terminal_receipt(
         &self,
         invocation: &Digest,
         attempt: u64,
@@ -79,11 +111,58 @@ impl PaidExecutor {
         let receipt = self
             .executor
             .storage
-            .run(move |j| j.completed_receipt(&key, attempt))
+            .run(move |j| j.terminal_receipt(&key, attempt))
             .await?
             .ok_or(Error::RecoveryRequired)?;
+        self.publish_outcome(invocation, attempt, Outcome::Receipt(receipt))
+            .await
+    }
+    pub async fn prepare_waiver(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+    ) -> Result<attempts::WaiverDraft> {
+        let key = invocation.clone();
+        self.executor
+            .storage
+            .run(move |j| {
+                j.reserve_outcome(&key, attempt)?;
+                j.prepare_waiver(&key, attempt, now_ms())
+            })
+            .await
+    }
+    pub async fn retain_waiver(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+        closure: &ProxyReservationClosure,
+    ) -> Result<()> {
+        let key = invocation.clone();
+        let closure = closure.clone();
+        self.executor
+            .storage
+            .run(move |j| j.retain_waiver(&key, attempt, &closure))
+            .await
+    }
+    pub async fn publish_waiver(&self, invocation: &Digest, attempt: u64) -> Result<bool> {
+        let key = invocation.clone();
+        let closure = self
+            .executor
+            .storage
+            .run(move |j| j.waiver(&key, attempt))
+            .await?
+            .ok_or(Error::RecoveryRequired)?;
+        self.publish_outcome(invocation, attempt, Outcome::Waiver(closure))
+            .await
+    }
+    async fn publish_outcome(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+        outcome: Outcome,
+    ) -> Result<bool> {
         let saved = self.recover(invocation, attempt).await?;
-        let digest = Digest::new(receipt.body.digest().map_err(|_| Error::Binding)?)?;
+        let digest = outcome.digest()?;
         if saved.record.phase == Phase::Closed {
             return if saved.record.closure == Some(digest) {
                 Ok(true)
@@ -97,30 +176,32 @@ impl PaidExecutor {
             .observe(&accepted.authorization)
             .await
             .map_err(Error::Financial)?;
-        if !observation
-            .confirms_receipt(&receipt)
-            .map_err(Error::Financial)?
-        {
-            if observation.is_closed() {
+        if !outcome.confirmed(&observation)? {
+            if observation.is_closed() && matches!(&outcome, Outcome::Receipt(_)) {
                 return Err(Error::RecoveryRequired);
             }
-            let submission = self
-                .financial
-                .submit_receipt(
-                    &accepted.authorization,
-                    &accepted.settlement_policy,
-                    &receipt,
-                )
-                .await;
+            let submission = match &outcome {
+                Outcome::Receipt(receipt) => {
+                    self.financial
+                        .submit_receipt(
+                            &accepted.authorization,
+                            &accepted.settlement_policy,
+                            receipt,
+                        )
+                        .await
+                }
+                Outcome::Waiver(closure) => {
+                    self.financial
+                        .submit_waiver(&accepted.authorization, closure)
+                        .await
+                }
+            };
             observation = self
                 .financial
                 .observe(&accepted.authorization)
                 .await
                 .map_err(Error::Financial)?;
-            if !observation
-                .confirms_receipt(&receipt)
-                .map_err(Error::Financial)?
-            {
+            if !outcome.confirmed(&observation)? {
                 submission.map_err(Error::Financial)?;
                 return Ok(false);
             }
@@ -131,15 +212,12 @@ impl PaidExecutor {
         self.executor
             .storage
             .run_checked(move |j| {
-                if !observation
-                    .confirms_receipt(&receipt)
-                    .map_err(Error::Financial)?
-                {
+                if !outcome.confirmed(&observation)? {
                     return Err(Error::RecoveryRequired);
                 }
                 let r = j.get(&key)?.ok_or(attempts::Error::NotFound)?;
                 if r.attempt != attempt
-                    || j.completed_receipt(&key, attempt)?.as_ref() != Some(&receipt)
+                    || !outcome.retained(j, &key, attempt)?
                     || authority.lease(&r.binding.capacity_lease)?.is_some()
                 {
                     return Err(Error::Binding);
