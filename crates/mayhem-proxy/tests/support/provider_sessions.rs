@@ -199,15 +199,28 @@ fn observed_server(
             .unwrap()
             .success(None);
     }
-    let controller = serving::Controller::new_observed(
-        s.runtime.clone(),
-        s.journal.clone(),
-        s.signing.clone(),
-        peer.client.clone(),
-        pool(f),
-        bounds(),
-        monitor.clone(),
-    )
+    let controller = if f.adapter.endpoint() != ProxyEndpoint::Decisions {
+        serving::Controller::new_measured(
+            s.runtime.clone(),
+            s.journal.clone(),
+            s.signing.clone(),
+            peer.client.clone(),
+            pool(f),
+            bounds(),
+            monitor.clone(),
+            crate::native_execution::source(f),
+        )
+    } else {
+        serving::Controller::new_observed(
+            s.runtime.clone(),
+            s.journal.clone(),
+            s.signing.clone(),
+            peer.client.clone(),
+            pool(f),
+            bounds(),
+            monitor.clone(),
+        )
+    }
     .unwrap();
     (controller, monitor)
 }

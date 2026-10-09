@@ -4,7 +4,7 @@ use mayhem_proxy::{
     supervisor::RefreshPolicy,
 };
 
-fn observe(mut fixture: Fixture) -> (Fixture, Monitor) {
+pub(super) fn observe(mut fixture: Fixture) -> (Fixture, Monitor) {
     let monitor = Monitor::new(
         Policy {
             max_routes: 2,

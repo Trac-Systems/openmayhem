@@ -62,6 +62,30 @@ impl Resolve for SystemDns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test(start_paused = true)]
+    async fn slicing_one_buffered_body_does_not_create_new_timing_evidence() {
+        let at = tokio::time::Instant::now();
+        let mut response = UpstreamResponse {
+            response: None,
+            permit: None,
+            pending: Bytes::from(vec![1; 130_000]),
+            received_at: at,
+            terminal_failure: None,
+            received_bytes: 130_000,
+            max_bytes: 130_000,
+            status: 200,
+            format: WireFormat::Sse,
+            error_profile: ErrorProfile::HttpStatus,
+        };
+        let mut total = 0;
+        while let Some((bytes, observed)) = response.next_timed_chunk().await.unwrap() {
+            assert_eq!(observed, at);
+            assert!(bytes.len() <= 64 * 1024);
+            total += bytes.len();
+            tokio::time::advance(Duration::from_secs(1)).await;
+        }
+        assert_eq!(total, 130_000);
+    }
     #[tokio::test]
     async fn cancelled_dns_keeps_its_permit_until_actual_lookup_finishes() {
         let permits = Arc::new(Semaphore::new(1));
@@ -333,6 +357,7 @@ impl HttpConnection {
             response: Some(response),
             permit: Some(permit),
             pending: Bytes::new(),
+            received_at: tokio::time::Instant::now(),
             terminal_failure: None,
             received_bytes: 0,
             max_bytes: self.limits.max_response_bytes,
@@ -413,6 +438,7 @@ pub struct UpstreamResponse {
     response: Option<Response>,
     permit: Option<OwnedSemaphorePermit>,
     pending: Bytes,
+    received_at: tokio::time::Instant,
     terminal_failure: Option<Failure>,
     received_bytes: usize,
     max_bytes: usize,
@@ -444,20 +470,47 @@ impl UpstreamResponse {
     /// Bounded chunks for the isolated decoder; slow consumers apply backpressure.
     /// EOF is transport EOF only. A protocol decoder must verify its finish marker.
     pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, Failure> {
+        self.next_timed_chunk()
+            .await
+            .map(|v| v.map(|(bytes, _)| bytes))
+    }
+
+    /// Splitting one buffered HTTP chunk must retain one observation timestamp.
+    pub(crate) async fn next_timed_chunk(
+        &mut self,
+    ) -> Result<Option<(Bytes, tokio::time::Instant)>, Failure> {
         if let Some(failure) = &self.terminal_failure {
             return Err(failure.clone());
         }
         loop {
             if !self.pending.is_empty() {
-                return Ok(Some(
+                return Ok(Some((
                     self.pending.split_to(self.pending.len().min(64 * 1024)),
-                ));
+                    self.received_at,
+                )));
             }
             let Some(response) = self.response.as_mut() else {
                 return Ok(None);
             };
-            match response.chunk().await {
+            let mut waited = false;
+            let chunk = {
+                let mut read = std::pin::pin!(response.chunk());
+                std::future::poll_fn(|cx| {
+                    let poll = std::future::Future::poll(read.as_mut(), cx);
+                    waited |= poll.is_pending();
+                    poll
+                })
+                .await
+            };
+            match chunk {
                 Ok(Some(chunk)) => {
+                    // Multiple HTTP frames already buffered when polled belong
+                    // to one observation batch. Splitting them cannot certify a
+                    // generation interval. A bounded reader's stalls invalidate
+                    // measurement independently.
+                    if waited || self.received_bytes == 0 {
+                        self.received_at = tokio::time::Instant::now();
+                    }
                     if chunk.len() > self.max_bytes.saturating_sub(self.received_bytes) {
                         return Err(self.fail(Code::ResponseTooLarge));
                     }

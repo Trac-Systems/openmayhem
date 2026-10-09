@@ -3,16 +3,22 @@ use serde_json::Value;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Measurement {
+    #[serde(skip)]
+    pub(super) observed_at: Instant,
+    #[serde(skip)]
+    pub(super) native_observed_at: Option<Instant>,
     pub headers_ms: Option<u64>,
     pub first_output_ms: Option<u64>,
     pub total_ms: u64,
     pub native_tok_s: Option<f64>,
+    pub native_interval_tokens: Option<u64>,
+    pub native_interval_us: Option<u64>,
     pub tokenizer: Option<Digest>,
     pub reported_output_tokens: Option<u64>,
     pub meaningful_updates: u64,
 }
-/// Local, constant-size timing record. It retains no prompt, model text, tool
-/// arguments, URL or credential, and writes no journal entries on token delivery.
+/// Local timing record. Optional native measurement holds bounded output in
+/// memory until validation/encoding; no prompt, URL, credential or per-token I/O.
 pub struct Sample {
     monitor: Monitor,
     pub(super) route: Digest,
@@ -27,6 +33,8 @@ pub struct Sample {
     tokenizer: Option<Digest>,
     native_first: Option<(Instant, u64)>,
     native_last: Option<(Instant, u64)>,
+    native: Option<native::Capture>,
+    completed: Option<Instant>,
     finished: bool,
 }
 /// Captured network timing, published after any required durable local transition.
@@ -78,6 +86,8 @@ impl Sample {
             tokenizer: None,
             native_first: None,
             native_last: None,
+            native: None,
+            completed: None,
             finished: false,
         }
     }
@@ -87,10 +97,16 @@ impl Sample {
     /// Supply only already validated normalized deltas. Role-only changes,
     /// keepalives, usage counters and finish markers are not model output.
     pub fn delta(&mut self, value: &Value) {
+        self.delta_at(value, Instant::now());
+    }
+    pub(crate) fn delta_at(&mut self, value: &Value, at: Instant) {
+        if let Some(native) = &mut self.native {
+            native.delta(value, at)
+        }
         if !meaningful(value) {
             return;
         }
-        self.first.get_or_insert_with(Instant::now);
+        self.first.get_or_insert(at);
         self.updates = self.updates.saturating_add(1);
     }
     /// Trusted local tokenizer's cumulative count at observed output boundaries.
@@ -98,7 +114,8 @@ impl Sample {
     /// Tokenizer identity must stay fixed; buffered output with one timestamp
     /// cannot establish a generation interval or certify a throughput floor.
     pub fn native_progress(&mut self, tokenizer: Digest, tokens: u64) -> Result<()> {
-        if !self.class.streaming
+        if self.native.is_some()
+            || !self.class.streaming
             || self.first.is_none()
             || tokens > mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER
             || self.tokenizer.as_ref().is_some_and(|old| old != &tokenizer)
@@ -112,8 +129,29 @@ impl Sample {
         self.native_last = Some((now, tokens));
         Ok(())
     }
+    pub(crate) fn use_native(&mut self, source: &native::Source) {
+        if self.class.streaming && self.native_first.is_none() {
+            self.native = source.capture()
+        }
+    }
+    pub(crate) fn backpressure(&self) -> Option<Arc<std::sync::atomic::AtomicBool>> {
+        self.native.as_ref().map(native::Capture::backpressure)
+    }
+    pub(crate) async fn finish_native(&mut self) {
+        self.completed.get_or_insert_with(Instant::now);
+        if let Some(capture) = self.native.take() {
+            if let Some(evidence) = capture.finish().await {
+                self.tokenizer = Some(evidence.digest);
+                self.native_first = Some((evidence.first, 0));
+                self.native_last = Some((evidence.last, evidence.tokens));
+            }
+        }
+    }
+    pub(crate) fn network_complete(&mut self, at: Instant) {
+        self.completed = Some(at);
+    }
     fn measurement(&self, reported_output_tokens: Option<u64>) -> Measurement {
-        let now = Instant::now();
+        let now = self.completed.unwrap_or_else(Instant::now);
         let rate = match (self.native_first, self.native_last) {
             (Some((a, first)), Some((b, last))) if b > a && last > first => {
                 Some((last - first) as f64 / b.duration_since(a).as_secs_f64())
@@ -121,10 +159,24 @@ impl Sample {
             _ => None,
         };
         Measurement {
+            observed_at: now,
+            native_observed_at: self.native_last.map(|(at, _)| at),
             headers_ms: self.headers.map(|t| millis(t.duration_since(self.start))),
             first_output_ms: self.first.map(|t| millis(t.duration_since(self.start))),
             total_ms: millis(now.duration_since(self.start)),
             native_tok_s: rate.filter(|v| v.is_finite()),
+            native_interval_tokens: rate.and_then(|_| {
+                self.native_last
+                    .zip(self.native_first)
+                    .map(|((_, last), (_, first))| last - first)
+            }),
+            native_interval_us: rate.and_then(|_| {
+                self.native_last
+                    .zip(self.native_first)
+                    .map(|((last, _), (first, _))| {
+                        last.duration_since(first).as_micros().min(u64::MAX as u128) as u64
+                    })
+            }),
             tokenizer: self.tokenizer.clone(),
             reported_output_tokens,
             meaningful_updates: self.updates,

@@ -1709,5 +1709,7 @@ mod paid_acceptance;
 
 #[path = "support/health_execution.rs"]
 mod health_execution;
+#[path = "support/native_execution.rs"]
+mod native_execution;
 #[path = "support/probe_execution.rs"]
 mod probe_execution;

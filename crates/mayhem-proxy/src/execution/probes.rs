@@ -39,6 +39,7 @@ pub struct Controller {
     limits: Limits,
     streaming: bool,
     storage: Arc<Semaphore>,
+    tokenizer: Option<Arc<health::native::Source>>,
 }
 
 /// Evidence about this probe, never a certification of all advertised contexts,
@@ -122,7 +123,17 @@ impl Controller {
             limits,
             streaming,
             storage,
+            tokenizer: None,
         })
+    }
+    pub fn with_tokenizer(mut self, source: Arc<health::native::Source>) -> ProbeResult<Self> {
+        if self.adapter.endpoint() == mayhem_proto::proxy::ProxyEndpoint::Decisions
+            || !source.matches(self.connection.fingerprint(), self.adapter.recipe_hash())
+        {
+            return Err(ProbeError::Configuration);
+        }
+        self.tokenizer = Some(source);
+        Ok(self)
     }
     async fn storage<T: Send + 'static>(
         &self,
@@ -213,6 +224,9 @@ impl Controller {
             .as_mut()
             .ok_or(ProbeError::Configuration)?
             .start_execution()?;
+        if let (Some(sample), Some(source)) = (&mut sample, &self.tokenizer) {
+            sample.use_native(source)
+        }
         let transport = transport::Transport {
             connection: &self.connection,
             adapter: &self.adapter,

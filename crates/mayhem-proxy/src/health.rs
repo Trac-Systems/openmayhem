@@ -2,6 +2,7 @@
 //! POST, frees capacity, retries work, signs availability or settles money.
 mod admission;
 mod measurement;
+pub mod native;
 #[cfg(test)]
 mod tests;
 use crate::{
@@ -243,6 +244,10 @@ impl Gate {
         self.performance_class = Some(class);
     }
     fn good(&mut self, now: Instant, ceiling: u32, policy: &Policy) {
+        // A different route may already have refreshed this shared connection.
+        if self.observed.is_some_and(|observed| observed > now) {
+            return;
+        }
         if !self.fresh(now, policy.evidence_ttl_ms) {
             self.allowance = 0;
             self.successes = 0;
@@ -502,7 +507,11 @@ impl Monitor {
             return;
         };
         if matches!(&outcome, Outcome::Success)
-            && sample.generation != (data.connection.generation, route.gate.generation)
+            && (sample.generation != (data.connection.generation, route.gate.generation)
+                || route
+                    .gate
+                    .observed
+                    .is_some_and(|at| at > measurement.observed_at))
         {
             return;
         }
@@ -530,6 +539,9 @@ impl Monitor {
                 }
             }
             Outcome::Success => {
+                // Tokenization and durable local writes must not renew network
+                // evidence or replace a newer observation with an older result.
+                let now = measurement.observed_at;
                 data.revision = data.revision.saturating_add(1);
                 let mut slow_reason = None;
                 let route = data.routes.get_mut(&sample.route).expect("route checked");
@@ -611,7 +623,10 @@ impl Monitor {
                 if let (Some(rate), Some(tokenizer)) =
                     (measurement.native_tok_s, &measurement.tokenizer)
                 {
-                    route.native = Some((now, rate, tokenizer.clone()));
+                    let at = measurement.native_observed_at.unwrap_or(now);
+                    if route.native.as_ref().is_none_or(|(old, _, _)| at >= *old) {
+                        route.native = Some((at, rate, tokenizer.clone()));
+                    }
                 }
                 if let Some(reason) = slow_reason {
                     if reason == Reason::SlowResponse {

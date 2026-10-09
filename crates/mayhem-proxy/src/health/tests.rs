@@ -30,6 +30,69 @@ fn monitor() -> Monitor {
     m.register(d(2), 2, false).unwrap();
     m
 }
+
+#[tokio::test(start_paused = true)]
+async fn native_evidence_age_does_not_restart_after_tokenization_or_durable_publication() {
+    let m = monitor();
+    let mut sample = m.observe_request(&d(1), class()).unwrap();
+    sample.delta(&delta());
+    sample.native_progress(d(9), 0).unwrap();
+    advance(100).await;
+    sample.delta(&delta());
+    sample.native_progress(d(9), 20).unwrap();
+    sample.finish_native().await;
+    let success = sample.prepare_success(Some(999999));
+    advance(60_001).await;
+    success.publish();
+    let view = m.snapshot(&d(1)).unwrap();
+    assert_eq!(view.reason, Reason::Stale);
+    assert_eq!(view.allowance, 0);
+    assert!(!view.meets_native_floor(5));
+    assert_eq!(view.last_measurement.unwrap().total_ms, 100);
+}
+
+#[tokio::test(start_paused = true)]
+async fn delayed_measurements_cannot_replace_newer_route_or_connection_evidence() {
+    let m = monitor();
+    let mut old = m.observe_request(&d(1), class()).unwrap();
+    old.delta(&delta());
+    old.native_progress(d(9), 0).unwrap();
+    advance(100).await;
+    old.native_progress(d(9), 10).unwrap();
+    old.finish_native().await;
+    let old = old.prepare_success(None);
+    advance(10).await;
+    rate(m.observe_request(&d(1), class()).unwrap(), 0, 80, 100).await;
+    let before = m.snapshot(&d(1)).unwrap().native_speed.unwrap();
+    old.publish();
+    let after = m.snapshot(&d(1)).unwrap().native_speed.unwrap();
+    assert_eq!(before.tok_s, after.tok_s);
+    assert_eq!(before.age_ms, after.age_ms);
+    let mut old = m.observe_request(&d(2), class()).unwrap();
+    old.delta(&delta());
+    old.finish_native().await;
+    let old = old.prepare_success(None);
+    advance(20).await;
+    rate(m.observe_request(&d(1), class()).unwrap(), 0, 20, 100).await;
+    let connection = m.inner.data.lock().unwrap().connection.observed;
+    old.publish();
+    assert_eq!(m.inner.data.lock().unwrap().connection.observed, connection);
+}
+
+#[tokio::test(start_paused = true)]
+async fn very_fast_native_progress_is_not_rejected_by_a_minimum_duration() {
+    let m = monitor();
+    let mut sample = m.observe_request(&d(1), class()).unwrap();
+    sample.delta(&delta());
+    sample.native_progress(d(9), 0).unwrap();
+    tokio::time::advance(Duration::from_micros(1)).await;
+    sample.native_progress(d(9), 10).unwrap();
+    sample.success(None);
+    let measurement = m.snapshot(&d(1)).unwrap().last_measurement.unwrap();
+    assert_eq!(measurement.native_interval_tokens, Some(10));
+    assert_eq!(measurement.native_interval_us, Some(1));
+    assert_eq!(measurement.native_tok_s, Some(10_000_000.0));
+}
 fn class() -> Class {
     Class::new(1024, Thinking::Disabled, true)
 }

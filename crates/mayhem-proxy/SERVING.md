@@ -101,9 +101,13 @@ bounded and contains no prompt or output text.
 
 Headers, first meaningful output and completion are timed separately. SSE event counts,
 upstream usage and billable units do not certify native tokens/second. A separate trusted
-native-tokenizer observation API preserves tokenizer identity and measurement age;
-buffered single-timestamp output remains unknown. This tokenizer source is not yet
-connected to execution, so ordinary observations cannot certify the generation floor.
+native-tokenizer observation API preserves tokenizer identity and measurement age.
+`Executor::with_tokenizer`, the equivalent probe option and `Controller::new_measured`
+connect an operator-approved, digest-pinned local tokenizer to validated streams.
+Buffered or insufficient output remains unknown. See [throughput measurement](THROUGHPUT.md)
+for timing, resource bounds and the distinction between visible-output measurement and
+proof of remote model identity. Managed configuration and public throughput eligibility
+remain separate unfinished integration work.
 
 `capacity::Authority::bind_live` now connects memory-only readiness sources to actual
 proposal reservation, provider signing and dispatch. Sources preserve the observation's

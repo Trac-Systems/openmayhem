@@ -150,7 +150,9 @@ impl Controller {
         pool: Arc<Pool>,
         limits: Limits,
     ) -> Result<Self> {
-        Self::build(runtime, journal, signer, financial, pool, limits, None)
+        Self::build(
+            runtime, journal, signer, financial, pool, limits, None, None,
+        )
     }
     /// Use the same monitor bound to this runtime's live capacity sources.
     /// Trusted startup owns source scope/binding and separately funded recovery;
@@ -172,6 +174,28 @@ impl Controller {
             pool,
             limits,
             Some(monitor),
+            None,
+        )
+    }
+    pub fn new_measured(
+        runtime: Arc<Runtime>,
+        journal: Arc<Journal>,
+        signer: Arc<Authority>,
+        financial: Arc<financial::Client>,
+        pool: Arc<Pool>,
+        limits: Limits,
+        monitor: crate::health::Monitor,
+        tokenizer: Arc<crate::health::native::Source>,
+    ) -> Result<Self> {
+        Self::build(
+            runtime,
+            journal,
+            signer,
+            financial,
+            pool,
+            limits,
+            Some(monitor),
+            Some(tokenizer),
         )
     }
     fn build(
@@ -182,6 +206,7 @@ impl Controller {
         pool: Arc<Pool>,
         limits: Limits,
         monitor: Option<crate::health::Monitor>,
+        tokenizer: Option<Arc<crate::health::native::Source>>,
     ) -> Result<Self> {
         if limits.sessions == 0
             || limits.sessions > 4096
@@ -217,6 +242,10 @@ impl Controller {
         )?;
         let executor = match monitor {
             Some(monitor) => executor.with_observations(monitor, runtime.route.clone())?,
+            None => executor,
+        };
+        let executor = match tokenizer {
+            Some(source) => executor.with_tokenizer(source)?,
             None => executor,
         };
         let executor = Arc::new(PaidExecutor::new(

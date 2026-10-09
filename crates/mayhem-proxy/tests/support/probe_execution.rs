@@ -6,7 +6,7 @@ use mayhem_proxy::{
     supervisor::RefreshPolicy,
 };
 
-fn setup(f: &Fixture) -> (Arc<capacity::Authority>, health::Monitor) {
+pub(super) fn setup(f: &Fixture) -> (Arc<capacity::Authority>, health::Monitor) {
     let a = Arc::new(
         capacity::Authority::open(
             f._store.path().join("probe-capacity"),
@@ -80,7 +80,7 @@ fn setup(f: &Fixture) -> (Arc<capacity::Authority>, health::Monitor) {
     .unwrap();
     (a, m)
 }
-fn controller(
+pub(super) fn controller(
     f: &Fixture,
     a: Arc<capacity::Authority>,
     m: health::Monitor,
@@ -120,7 +120,7 @@ fn controller(
         },
     )
 }
-fn bounded(mut body: Value, endpoint: ProxyEndpoint) -> Vec<u8> {
+pub(super) fn bounded(mut body: Value, endpoint: ProxyEndpoint) -> Vec<u8> {
     if endpoint != ProxyEndpoint::Decisions {
         body[if endpoint == ProxyEndpoint::Responses {
             "max_output_tokens"

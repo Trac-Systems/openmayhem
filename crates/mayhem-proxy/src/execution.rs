@@ -8,6 +8,7 @@
 
 mod paid;
 pub mod probes;
+mod timed_reader;
 mod transport;
 pub use paid::PaidExecutor;
 
@@ -42,6 +43,8 @@ pub enum Error {
     StorageCapacity,
     #[error("proxy execution storage worker failed")]
     StorageWorker,
+    #[error("proxy local stream reader failed")]
+    TransportWorker,
     #[error("proxy execution journal: {0}")]
     Journal(#[from] attempts::Error),
     #[error("proxy execution endpoint: {0}")]
@@ -175,6 +178,7 @@ pub struct Executor {
     capacity: Option<(Arc<capacity::Authority>, Digest)>,
     financial: Option<Arc<financial::Client>>,
     observations: Option<(health::Monitor, Digest)>,
+    tokenizer: Option<Arc<health::native::Source>>,
 }
 impl Executor {
     pub fn new(
@@ -197,6 +201,7 @@ impl Executor {
             capacity: None,
             financial: None,
             observations: None,
+            tokenizer: None,
         })
     }
 
@@ -216,6 +221,15 @@ impl Executor {
     pub fn with_observations(mut self, monitor: health::Monitor, route: Digest) -> Result<Self> {
         monitor.snapshot(&route).map_err(|_| Error::Configuration)?;
         self.observations = Some((monitor, route));
+        Ok(self)
+    }
+    pub fn with_tokenizer(mut self, source: Arc<health::native::Source>) -> Result<Self> {
+        if self.adapter.endpoint() == mayhem_proto::proxy::ProxyEndpoint::Decisions
+            || !source.matches(self.connection.fingerprint(), self.adapter.recipe_hash())
+        {
+            return Err(Error::Configuration);
+        }
+        self.tokenizer = Some(source);
         Ok(self)
     }
 
@@ -418,6 +432,9 @@ impl Executor {
             .observations
             .as_ref()
             .and_then(|(monitor, route)| monitor.observe_request(route, request.health_class).ok());
+        if let (Some(sample), Some(source)) = (&mut sample, &self.tokenizer) {
+            sample.use_native(source)
+        }
         let operation = async {
             if streaming {
                 self.transport()
@@ -510,7 +527,10 @@ impl Executor {
                 // manufacture a provider-fault observation or release anything.
                 if matches!(
                     &error,
-                    Error::Journal(_) | Error::StorageCapacity | Error::StorageWorker
+                    Error::Journal(_)
+                        | Error::StorageCapacity
+                        | Error::StorageWorker
+                        | Error::TransportWorker
                 ) {
                     return Err(error);
                 }

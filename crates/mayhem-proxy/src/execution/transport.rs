@@ -56,7 +56,7 @@ impl Transport<'_> {
         F: FnMut(serde_json::Value) -> Fut,
         Fut: Future<Output = std::result::Result<(), ()>>,
     {
-        let mut response = self
+        let response = self
             .connection
             .send(self.adapter.operation(), Some(request.body().to_vec()))
             .await
@@ -72,21 +72,30 @@ impl Transport<'_> {
                 Execution::Unknown,
             )));
         }
+        let mut response = super::timed_reader::Reader::new(
+            response,
+            sample.as_ref().and_then(health::Sample::backpressure),
+        );
         // Persist delivery intent ONCE before calling any consumer. This is
         // conservative even when the upstream fails before its first text byte.
         delivery.first_output().await?;
         let mut stream =
             crate::endpoint::stream::Stream::new(request, public_id, delivery.created())?;
         let mut saved_upstream_id = false;
-        while let Some(chunk) = response.next_chunk().await.map_err(Error::Upstream)? {
+        let mut last_read = tokio::time::Instant::now();
+        while let Some((chunk, at)) = response.next().await? {
+            // One timestamp per network read. Decoding a buffered batch into
+            // many SSE events must not manufacture a generation interval.
+            last_read = at;
+            let blocked = sample.as_ref().and_then(health::Sample::backpressure);
             let mut receive = |frame| {
                 let piece = stream.push(frame).map_err(stream_frame_error);
                 let future = match piece {
                     Ok(Some(value)) => {
                         if let Some(sample) = sample {
-                            sample.delta(&value);
+                            sample.delta_at(&value, at);
                         }
-                        Ok(Some(emit(value)))
+                        Ok(Some(health::native::delivery(emit(value), blocked.clone())))
                     }
                     Ok(None) => Ok(None),
                     Err(e) => Err(e),
@@ -120,14 +129,19 @@ impl Transport<'_> {
         // [DONE] is terminal in this profile. A conforming long-lived SSE HTTP
         // connection need not close before result verification can finish.
         drop(response);
+        if let Some(sample) = sample {
+            sample.network_complete(last_read);
+        }
+        let at = last_read;
+        let blocked = sample.as_ref().and_then(health::Sample::backpressure);
         let mut receive = |frame| {
             let piece = stream.push(frame).map_err(stream_frame_error);
             let future = match piece {
                 Ok(Some(value)) => {
                     if let Some(sample) = sample {
-                        sample.delta(&value);
+                        sample.delta_at(&value, at);
                     }
-                    Ok(Some(emit(value)))
+                    Ok(Some(health::native::delivery(emit(value), blocked.clone())))
                 }
                 Ok(None) => Ok(None),
                 Err(e) => Err(e),
@@ -152,9 +166,13 @@ impl Transport<'_> {
         drop(receive);
         let result = stream.finish()?;
         decoder.verify_stream_result(&result).await?;
-        request
+        let reply = request
             .decode_json(result, public_id, delivery.created())
-            .map_err(Error::Endpoint)
+            .map_err(Error::Endpoint)?;
+        if let Some(sample) = sample {
+            sample.finish_native().await
+        }
+        Ok(reply)
     }
     pub(super) async fn perform(
         &self,
@@ -182,10 +200,15 @@ impl Transport<'_> {
             failure.upstream_status = Some(response.status);
             return Err(Error::Upstream(failure));
         }
-        while let Some(chunk) = response.next_chunk().await.map_err(Error::Upstream)? {
+        let mut last_read = tokio::time::Instant::now();
+        while let Some((chunk, at)) = response.next_timed_chunk().await.map_err(Error::Upstream)? {
+            last_read = at;
             decoder
                 .push(&chunk, |_| async { Err(worker::Error::Protocol) })
                 .await?;
+        }
+        if let Some(sample) = sample {
+            sample.network_complete(last_read);
         }
         let mut value = None;
         decoder
