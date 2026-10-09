@@ -1,6 +1,7 @@
 //! Proxy-only ephemeral availability. No enclave claims, ledger mutation,
 //! purchase authorization or payment-policy changes. Receivers use one shared
 //! eligibility result for discovery and inference; signed presence is not a lease.
+pub mod gateway;
 mod registry;
 mod table;
 mod transport;

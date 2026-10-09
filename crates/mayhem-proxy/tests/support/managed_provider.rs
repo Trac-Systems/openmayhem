@@ -181,8 +181,15 @@ async fn managed_provider_decision_readiness_requires_real_validated_result_with
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     stop.send_replace(true);
     task.await.unwrap().unwrap();
-    assert!(!bridge.frames.lock().await.iter().any(|f|f["type"]=="send"),
-        "healthy local backend must not publish without canonical admission/offer evidence");
+    assert!(
+        !bridge
+            .frames
+            .lock()
+            .await
+            .iter()
+            .any(|f| f["type"] == "send"),
+        "healthy local backend must not publish without canonical admission/offer evidence"
+    );
 }
 
 #[tokio::test]
@@ -256,6 +263,39 @@ async fn managed_provider_rejects_identity_policy_pin_and_scope_errors_before_cr
     let link = root.path().join("link.json");
     std::os::unix::fs::symlink(&path, &link).unwrap();
     assert!(managed::Prepared::load(&link).is_err());
+}
+
+#[test]
+fn managed_supervised_credentials_require_restartable_files_before_opening_stores() {
+    let root = dir();
+    let value = config(
+        root.path(),
+        "http://127.0.0.1:9",
+        "ws://127.0.0.1:9",
+        ProxyEndpoint::Decisions,
+    );
+    let path = save(root.path(), &value);
+    let connection = root.path().join("connection.json");
+    let mut document: Value = serde_json::from_slice(&std::fs::read(&connection).unwrap()).unwrap();
+    managed::Prepared::load_supervised(&path).unwrap();
+    for kind in ["bearer", "header"] {
+        document["authentication"] = json!({"type":kind,"secret":{"source":"environment","name":"PROXY_TEST_INSTALL_SHELL_ONLY"}});
+        if kind == "header" {
+            document["authentication"]["name"] = json!("x-api-key");
+        }
+        private(&connection, &serde_json::to_vec(&document).unwrap());
+        assert!(matches!(
+            managed::Prepared::load_supervised(&path),
+            Err(managed::Error::RestartCredential)
+        ));
+        assert!(!root.path().join("state").exists());
+    }
+    private(&root.path().join("upstream-secret"), b"test-fixture");
+    document["authentication"] =
+        json!({"type":"bearer","secret":{"source":"file","path":"upstream-secret"}});
+    private(&connection, &serde_json::to_vec(&document).unwrap());
+    managed::Prepared::load_supervised(&path).unwrap();
+    assert!(!root.path().join("state").exists());
 }
 
 #[tokio::test]

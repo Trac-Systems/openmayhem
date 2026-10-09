@@ -1,4 +1,5 @@
 //! Provider startup uses the existing encrypted wallet and protected SC-Bridge.
+mod supervisor;
 use super::{cached_wallet_signing_key, resolve_wallet_keypair_path, WalletLocatorArgs};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -19,6 +20,8 @@ pub enum Command {
     /// Serve explicitly configured proxy routes and recover retained sessions.
     /// Does not register markets, pay admission or download/start an upstream model.
     Serve(ServeArgs),
+    /// Install a restartable proxy controller in the existing local mayhemd.
+    Add(supervisor::AddArgs),
 }
 #[derive(Debug, Args)]
 pub struct ServeArgs {
@@ -26,6 +29,8 @@ pub struct ServeArgs {
     config: PathBuf,
     #[command(flatten)]
     wallet: WalletLocatorArgs,
+    #[arg(long, hide = true)]
+    supervised: bool,
 }
 pub async fn run(command: Command) -> Result<()> {
     let args = match command {
@@ -35,11 +40,18 @@ pub async fn run(command: Command) -> Result<()> {
                 .map_err(Into::into)
         }
         Command::Serve(args) => args,
+        Command::Add(args) => return supervisor::add(args).await,
     };
     let config = args.config;
-    let prepared = tokio::task::spawn_blocking(move || Prepared::load(&config))
-        .await
-        .context("preparing proxy provider configuration")??;
+    let prepared = tokio::task::spawn_blocking(move || {
+        if args.supervised {
+            Prepared::load_supervised(&config)
+        } else {
+            Prepared::load(&config)
+        }
+    })
+    .await
+    .context("preparing proxy provider configuration")??;
     let keypair = resolve_wallet_keypair_path(&args.wallet)?;
     let key = cached_wallet_signing_key(
         &keypair,
@@ -112,6 +124,32 @@ mod tests {
                 .command,
             Command::Catalog { .. }
         ));
+        assert!(matches!(
+            Cli::try_parse_from([
+                "proxy",
+                "add",
+                "--config",
+                "provider.json",
+                "--wallet-password-file",
+                "/private/reference-only"
+            ])
+            .unwrap()
+            .command,
+            Command::Add(_)
+        ));
+        let Command::Serve(supervised) = Cli::try_parse_from([
+            "proxy",
+            "serve",
+            "--config",
+            "provider.json",
+            "--supervised",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("serve required")
+        };
+        assert!(supervised.supervised);
     }
 }
 async fn stop_signal() -> Result<()> {

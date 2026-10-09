@@ -2717,6 +2717,7 @@ dependencies = [
  "mayhem-proto",
  "mayhem-proxy",
  "reqwest",
+ "rustix",
  "semver",
  "serde",
  "serde_json",
@@ -2920,6 +2921,8 @@ version = "0.2.271"
 dependencies = [
  "anyhow",
  "clap",
+ "redb",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

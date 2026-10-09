@@ -42,8 +42,9 @@ renews old health or generation-speed evidence. There is no new generation timeo
 
 Heartbeat transport failure reconnects only the availability task, with a bounded
 500 ms exponential backoff capped at 5 seconds. It preserves the publisher's
-sequence and does not cancel paid inference or settlement. Structural local
-storage/signing failures remain fatal rather than being disguised as networking.
+sequence and does not cancel paid inference or settlement. If an individual
+publication cannot read or sign its state, it attempts withdrawal instead of
+claiming availability. Failure of the supervisor task itself remains fatal.
 
 The publisher uses the same shared capacity authority as admission. Advertised
 free slots already subtract active/uncertain work and shared constraints. Buyers
@@ -94,7 +95,26 @@ Publishing itself makes no ledger transactions. Healthy unregistered startup
 publishes nothing.
 
 These are local bridge and canonical RPC fixtures, not real Noise/relay or live
-payment acceptance. The receiver/eligibility components still need automatic
-gateway/catalog supervisor wiring and buyer-surface integration. Automatic
+payment acceptance. `presence::gateway::Gateway` now provides a selected-market
+supervisor component: one receiver at a time, coalesced subscription replacement,
+500 ms exponential reconnect backoff capped at 5 seconds, and the same persistent
+anti-replay Table across reconnects. Empty selection opens no connection. Removed
+markets fail closed immediately; subscription changes drain the old receiver
+before a new one starts. Callers signal its stop watch and await completion;
+bridge setup uses the configured operation deadlines. Health is bounded counters, including generic
+receiver failures because the receiver does not yet expose typed failure causes.
+
+Both routing and catalog consumers can call `Gateway::status`, which resolves
+current canonical registration on every lookup and applies `Table::status` with
+the same optional customer speed floor. Stale/revoked catalog state cannot return
+Available. This is a bounded synchronous control lookup, not per-token work.
+Catalog hydration remains owned by the existing catalog supervisor; its refresh
+policy must keep observations within the 15-second presence freshness bound.
+
+Local tests exercise reconnect with withdrawal/replay preservation, explicit
+market replacement, immediate removal, quota rejection, stale/revoked canonical
+status, backoff, idle selection and cancellation. Actual gateway lifecycle and
+buyer/catalog-surface wiring remain required; this component alone does not
+activate those integrations. Automatic
 mayhemd installation, provider configuration/retirement UX and real-network
 qualification remain. Production activation is gated separately.

@@ -12,6 +12,38 @@ it does not accept a new inline signing key. `provider proxy catalog ...` remain
 read-only and keeps its previous command shape. No native provider is started,
 stopped, reconfigured or moved by this command.
 
+For automatic restart through the existing local supervisor:
+
+```sh
+mayhem provider proxy add --config /absolute/private/provider.json --home /absolute/wallet/home
+```
+
+This requires a running mayhemd advertising persistent-child support. An older
+daemon is rejected; setup must not silently promise persistence it cannot provide.
+Setup validates the protected configuration and normal wallet identity before
+installing a child. It does not open provider stores, start a probe, increment a
+controller fence, register an offer or pay admission. The response means installed
+and starting, not publicly available; normal canonical and health checks still apply.
+
+Each wallet/network gets one local controller name. Aliases belong in that
+controller's configuration rather than competing processes. mayhemd stores its
+full launch specification transactionally in a separate owner-only child registry;
+it restores it after daemon restart and rejects duplicate/static-config collisions.
+No credentials are copied into process arguments, status output or the child
+environment. `--wallet-password-file` (or the existing home secret file) supplies
+encrypted-wallet credentials. Upstream credentials must use protected file
+references for supervised startup, checked again on restart; shell-only secrets
+remain supported by explicit foreground startup. The configured files must remain
+available at their absolute locations. Repeated child crashes use mayhemd's
+existing restart/backoff and crash-loop reporting.
+
+An existing empty, missing, corrupt or unprotected child registry fails closed;
+it is never silently recreated. Diagnostic status-file failure cannot turn an
+already committed installation into a misleading rejection. Authenticated child
+removal commits removal before stopping the child; it does not delete proxy
+capacity, retained requests or financial recovery data. The local process limit
+is 256 persistent children, not a limit on proxy offers or public catalog entries.
+
 ## Configuration and initialization
 
 `managed::Config` defines the version-1 JSON configuration. Files must be regular,
@@ -106,8 +138,8 @@ decision request through reservation/result/receipt/closure on FIAT, TNK and TAP
 The three-rail tests use the canonical isolated ledger RPC fixture and ephemeral
 test wallets; they are **not live payments or real Noise-network acceptance**.
 
-This is explicit command startup. Automatic mayhemd installation/restart policy,
-native/external shared-runtime registration,
+Explicit foreground startup and opt-in persistent mayhemd installation are available.
+Native/external shared-runtime registration,
 provider setup UX, fee collection, gateway/catalog integration and public surfaces
 remain required. The command does not register a market, pay the admission fee
 or establish production activation. Full worker/tokenizer

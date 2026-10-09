@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod persistent;
+
 use std::collections::BTreeMap;
 use std::env;
 use std::fs;
@@ -119,6 +121,7 @@ struct ChildConfig {
 #[derive(Clone, Debug, Serialize)]
 struct SupervisorState {
     ok: bool,
+    capabilities: Vec<&'static str>,
     pid: u32,
     started_at_ms: u64,
     bind: String,
@@ -218,6 +221,7 @@ fn redact_child_args(args: &[String]) -> Vec<String> {
 struct SupervisorRuntime {
     state: Arc<Mutex<SupervisorState>>,
     state_file: PathBuf,
+    persistent: persistent::Shared,
 }
 
 type SupervisorControlReply = oneshot::Sender<std::result::Result<serde_json::Value, String>>;
@@ -226,6 +230,7 @@ type SupervisorControlReply = oneshot::Sender<std::result::Result<serde_json::Va
 enum SupervisorCommand {
     Add {
         child: ChildConfig,
+        persistent: bool,
         reply: SupervisorControlReply,
     },
     Remove {
@@ -260,7 +265,9 @@ async fn main() -> Result<()> {
             let path = home.join(DEFAULT_CONFIG_FILE);
             path.exists().then_some(path)
         });
-    let file_config = read_config(config_path.as_deref())?;
+    let mut file_config = read_config(config_path.as_deref())?;
+    let (persistent, restored_children) = persistent::Store::load(&home)?;
+    file_config.supervisor.children.extend(restored_children);
     let bind = match args.bind {
         Some(bind) => bind,
         None => parse_bind(&file_config.supervisor.bind)?,
@@ -287,6 +294,7 @@ async fn main() -> Result<()> {
     let started_at_ms = unix_epoch_millis()?;
     let state = SupervisorState {
         ok: true,
+        capabilities: persistent::capabilities(),
         pid: std::process::id(),
         started_at_ms,
         bind: bind.to_string(),
@@ -298,6 +306,7 @@ async fn main() -> Result<()> {
     let runtime = SupervisorRuntime {
         state: Arc::new(Mutex::new(state)),
         state_file,
+        persistent,
     };
     runtime.persist_state().await?;
 
@@ -487,16 +496,29 @@ async fn handle_supervisor_command(
     child_shutdowns: &mut BTreeMap<String, watch::Sender<bool>>,
 ) {
     match command {
-        SupervisorCommand::Add { child, reply } => {
+        SupervisorCommand::Add {
+            child,
+            persistent,
+            reply,
+        } => {
             let result = async {
                 validate_children(std::slice::from_ref(&child))?;
                 if child_shutdowns.contains_key(&child.name) {
                     bail!("supervisor child {} already exists", child.name);
                 }
-                runtime.add_child_config(&child).await?;
+                ensure!(!runtime.snapshot().await.children.contains_key(&child.name), "supervisor child {} already exists", child.name);
+                if persistent {
+                    persistent::add(runtime.persistent.clone(), child.clone()).await?;
+                }
+                let state_saved = runtime.add_child_config(&child).await;
+                // A committed durable install is authoritative. A diagnostic
+                // status-file failure must not report a rejected installation
+                // that would nevertheless start on the next daemon restart.
+                let status_snapshot_saved = state_saved.is_ok();
+                if !persistent { state_saved?; }
                 let name = child.name.clone();
                 spawn_supervised_child(child, runtime, tasks, child_shutdowns)?;
-                Ok(json!({ "ok": true, "name": name }))
+                Ok(json!({ "ok": true, "name": name, "persistent": persistent, "status_snapshot_saved": status_snapshot_saved }))
             }
             .await
             .map_err(|err: anyhow::Error| err.to_string());
@@ -504,15 +526,20 @@ async fn handle_supervisor_command(
         }
         SupervisorCommand::Remove { name, reply } => {
             let result = async {
+                // Commit removal before stopping, so a daemon crash cannot
+                // resurrect a child after the caller was told it was removed.
+                let durable_removed = persistent::remove(runtime.persistent.clone(), name.clone()).await?;
                 let stopping = if let Some(shutdown) = child_shutdowns.remove(&name) {
                     let _ = shutdown.send(true);
                     true
                 } else {
                     false
                 };
-                let removed = runtime.remove_child_config(&name).await?;
+                let removed = runtime.remove_child_config(&name).await;
+                let status_snapshot_saved = removed.is_ok();
+                let removed = if durable_removed { true } else { removed? };
                 if stopping || removed {
-                    Ok(json!({ "ok": true, "name": name, "stopping": stopping }))
+                    Ok(json!({ "ok": true, "name": name, "stopping": stopping, "status_snapshot_saved": status_snapshot_saved }))
                 } else {
                     bail!("supervisor child {name} is not running or does not exist");
                 }
@@ -979,20 +1006,32 @@ async fn handle_status_connection(
                 )
                 .await;
             }
-            let child = match serde_json::from_slice::<ChildConfig>(&request.body) {
-                Ok(child) => child,
-                Err(_) => {
-                    return write_http_json(
-                        &mut stream,
-                        400,
-                        &json!({ "ok": false, "error": "malformed JSON body" }),
-                    )
-                    .await;
-                }
-            };
+            #[derive(Deserialize)]
+            struct AddRequest {
+                #[serde(flatten)]
+                child: ChildConfig,
+                #[serde(default)]
+                persistent: bool,
+            }
+            let AddRequest { child, persistent } =
+                match serde_json::from_slice::<AddRequest>(&request.body) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return write_http_json(
+                            &mut stream,
+                            400,
+                            &json!({ "ok": false, "error": "malformed JSON body" }),
+                        )
+                        .await;
+                    }
+                };
             let (reply, response) = oneshot::channel();
             control_tx
-                .send(SupervisorCommand::Add { child, reply })
+                .send(SupervisorCommand::Add {
+                    child,
+                    persistent,
+                    reply,
+                })
                 .await
                 .context("sending child add command")?;
             match response.await.context("waiting for child add response")? {
@@ -1670,6 +1709,7 @@ mod tests {
         SupervisorRuntime {
             state: Arc::new(Mutex::new(SupervisorState {
                 ok: true,
+                capabilities: persistent::capabilities(),
                 pid: std::process::id(),
                 started_at_ms: unix_epoch_millis().unwrap(),
                 bind: "127.0.0.1:0".to_owned(),
@@ -1679,6 +1719,7 @@ mod tests {
                 children: initial_child_states(children),
             })),
             state_file: temp.join("mayhemd-state.json"),
+            persistent: persistent::Store::load(temp).unwrap().0,
         }
     }
 
@@ -1864,7 +1905,7 @@ mod tests {
         ));
         let runtime = test_runtime(&temp, &[]);
         let (control_tx, mut control_rx) = mpsc::channel(1);
-        let body = r#"{"name":"worker","command":"true","restart":false}"#;
+        let body = r#"{"name":"worker","command":"true","restart":false,"persistent":true}"#;
         let headers = format!(
             "POST /children/add HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer test-control-token-0123456789abcdef\r\nContent-Length: {}\r\n\r\n",
             body.len()
@@ -1885,9 +1926,15 @@ mod tests {
             .await
         });
         let command = control_rx.recv().await.expect("authenticated command");
-        let SupervisorCommand::Add { child, reply } = command else {
+        let SupervisorCommand::Add {
+            child,
+            persistent,
+            reply,
+        } = command
+        else {
             panic!("expected child add command");
         };
+        assert!(persistent);
         assert_eq!(child.name, "worker");
         reply
             .send(Ok(json!({ "ok": true, "name": child.name })))
@@ -2175,7 +2222,7 @@ mod tests {
         fs::remove_dir_all(temp).unwrap();
     }
 
-    fn long_running_test_child(name: &str) -> ChildConfig {
+    pub(super) fn long_running_test_child(name: &str) -> ChildConfig {
         #[cfg(windows)]
         {
             ChildConfig {
@@ -2220,6 +2267,7 @@ mod tests {
         handle_supervisor_command(
             SupervisorCommand::Add {
                 child: long_running_test_child("provider-live-test"),
+                persistent: false,
                 reply,
             },
             &runtime,
@@ -2259,6 +2307,69 @@ mod tests {
             .expect("removed child task should stop");
         assert!(joined.expect("child task result").is_ok());
         let _ = fs::remove_dir_all(temp);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn persistent_install_acknowledges_commit_even_if_diagnostic_status_write_fails() {
+        let temp = env::temp_dir().join(format!(
+            "mayhemd-persist-status-{}-{}",
+            std::process::id(),
+            unix_epoch_millis().unwrap()
+        ));
+        fs::create_dir_all(&temp).unwrap();
+        let runtime = test_runtime(&temp, &[]);
+        fs::create_dir(&runtime.state_file).unwrap(); // deterministic status-output fault
+        let mut tasks = JoinSet::new();
+        let mut child_shutdowns = BTreeMap::new();
+        let (reply, response) = oneshot::channel();
+        handle_supervisor_command(
+            SupervisorCommand::Add {
+                child: long_running_test_child("proxy-durable"),
+                persistent: true,
+                reply,
+            },
+            &runtime,
+            &mut tasks,
+            &mut child_shutdowns,
+        )
+        .await;
+        let report = response.await.unwrap().unwrap();
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["persistent"], true);
+        assert_eq!(report["status_snapshot_saved"], false);
+        assert!(child_shutdowns.contains_key("proxy-durable"));
+        child_shutdowns["proxy-durable"].send_replace(true);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while tasks.join_next().await.is_some() {}
+        })
+        .await
+        .unwrap();
+        drop(runtime);
+        let (store, restored) = persistent::Store::load(&temp).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].name, "proxy-durable");
+        drop(store);
+        let runtime = test_runtime(&temp, &restored);
+        let (reply, response) = oneshot::channel();
+        handle_supervisor_command(
+            SupervisorCommand::Remove {
+                name: "proxy-durable".into(),
+                reply,
+            },
+            &runtime,
+            &mut tasks,
+            &mut BTreeMap::new(),
+        )
+        .await;
+        let report = response.await.unwrap().unwrap();
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["status_snapshot_saved"], false);
+        drop(runtime);
+        let (store, restored) = persistent::Store::load(&temp).unwrap();
+        assert!(restored.is_empty());
+        drop(store);
+        fs::remove_dir_all(temp).unwrap();
     }
 
     #[cfg(unix)]

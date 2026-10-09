@@ -117,6 +117,14 @@ impl Prepared {
     /// Missing credentials, mismatched pins or inconsistent groups fail before
     /// a state database, model request, signature or bridge connection exists.
     pub fn load(path: &Path) -> Result<Self> {
+        Self::load_inner(path, false)
+    }
+    /// A daemon cannot inherit secrets that only exist in the installing shell.
+    /// Recheck this on every supervised restart, including after config edits.
+    pub fn load_supervised(path: &Path) -> Result<Self> {
+        Self::load_inner(path, true)
+    }
+    fn load_inner(path: &Path, supervised: bool) -> Result<Self> {
         let bytes = private_file(path, 4 * 1024 * 1024).map_err(|_| Error::Protection)?;
         let mut config: Config =
             serde_json::from_slice(&bytes).map_err(|_| Error::Configuration)?;
@@ -212,6 +220,20 @@ impl Prepared {
             require(c.ceiling > 0 && ids.insert(c.group.clone()))?;
             relative(&mut c.config_file, &parent);
             let private = ConnectionConfig::load(&c.config_file).map_err(|_| Error::Protection)?;
+            if supervised {
+                use crate::connector::config::{Authentication, SecretSource};
+                if matches!(
+                    &private.authentication,
+                    Authentication::Bearer {
+                        secret: SecretSource::Environment { .. }
+                    } | Authentication::Header {
+                        secret: SecretSource::Environment { .. },
+                        ..
+                    }
+                ) {
+                    return Err(Error::RestartCredential);
+                }
+            }
             require(
                 c.ceiling as usize <= private.limits.max_in_flight
                     && connection_names.insert(private.id.clone()),

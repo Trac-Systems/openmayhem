@@ -29,6 +29,8 @@ use tokio::sync::watch;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("supervised proxy credentials must use protected file references, not shell environment variables")]
+    RestartCredential,
     #[error("proxy provider configuration is invalid or exceeds its resource limits")]
     Configuration,
     #[error("proxy provider requires protected local configuration and state files")]

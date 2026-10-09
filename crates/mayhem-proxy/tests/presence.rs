@@ -11,6 +11,8 @@ use std::{
 #[allow(dead_code)]
 #[path = "support/exchange_bridge.rs"]
 mod bridge;
+#[path = "support/presence_gateway.rs"]
+mod gateway;
 fn d(n: u8) -> Digest {
     Digest::new(format!("{n:064x}")).unwrap()
 }
