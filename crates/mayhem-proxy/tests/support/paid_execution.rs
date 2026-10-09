@@ -6,6 +6,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 #[path = "authenticated_exchange.rs"]
 mod authenticated_exchange;
+#[path = "proxy_purchase.rs"]
+mod purchase;
 
 struct Peer {
     child: Child,

@@ -78,3 +78,7 @@ upstream job polling/cancellation, adaptive health, public API/Studio/MCP and
 end-to-end real-network acceptance remain separate required integration work.
 Do not run a blocking receive while holding a shared channel lock needed by
 stream delivery; the supervised controller must own and schedule that I/O.
+
+[QUOTES.md](QUOTES.md) describes the fresh canonical inputs and request-derived
+purchase builder that precede this already-signed exchange. Neither component
+replaces durable pre-signing negotiation or financial admission.

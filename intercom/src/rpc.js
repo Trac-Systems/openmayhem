@@ -405,6 +405,13 @@ export async function discoverProxyCatalog(peer, body) {
   return await feature.discoverProxyCatalog(body.query);
 }
 
+export async function requestProxyQuoteState(peer, body) {
+  if (!isObject(body) || Object.keys(body).sort().join('|') !== 'billing_id|offer|rail|request_nonce|settlement_policy_hash') throw new Error('Invalid proxy quote query.');
+  const feature = peer.protocol?.instance?.features?.mayhem;
+  if (typeof feature?.proxyQuoteState !== 'function') throw new Error('Proxy quote relay is not ready.');
+  return await feature.proxyQuoteState(body);
+}
+
 export async function requestProxyFinancialState(peer, body) {
   if (!isObject(body) || Object.keys(body).sort().join('|') !== 'accepted_terms|request_nonce') throw new Error('Invalid proxy financial query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
@@ -550,6 +557,10 @@ export const createServer = (
             })
           );
         }
+      }
+      if (req.method === 'POST' && requestPath === '/v1/proxy/quote-state') {
+        const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 32768) });
+        return respond(200, await requestProxyQuoteState(peer, body));
       }
       if (req.method === 'POST' && requestPath === '/v1/proxy/financial-state') {
         const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 1024) });

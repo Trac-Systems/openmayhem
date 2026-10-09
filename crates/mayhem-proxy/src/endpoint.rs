@@ -582,6 +582,11 @@ impl Request {
     pub fn metering_policy_hash(&self) -> Digest {
         self.metering.policy_hash()
     }
+    pub fn maximum_usage(&self, output_units: Option<u64>) -> Result<BTreeMap<String, u64>> {
+        self.metering
+            .maximum_usage(output_units)
+            .map_err(|_| Error::Configuration)
+    }
     pub fn endpoint(&self) -> ProxyEndpoint {
         self.endpoint
     }

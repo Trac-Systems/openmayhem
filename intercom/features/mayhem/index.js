@@ -1,3 +1,5 @@
+import { readProxyQuoteState, validateProxyQuoteStateRequest, PROXY_QUOTE_STATE_SERVICE,
+  PROXY_QUOTE_STATE_MAX_BYTES, PROXY_QUOTE_STATE_MAX_AGE_MS } from './proxy-quote-state.js';
 import { readProxyFinancialState, validateProxyFinancialStateRequest, PROXY_FINANCIAL_STATE_SERVICE,
   PROXY_FINANCIAL_STATE_MAX_BYTES, PROXY_FINANCIAL_STATE_MAX_AGE_MS } from './proxy-financial-state.js';
 import { validateProxyPublication, proxyPublicationFeatureKey, proxyPublicationParticipant } from '../../contract/proxy-publication.js';
@@ -369,7 +371,7 @@ const serviceParticipantFor = (service, value) => {
     return null;
   }
   if (service === 'stripe_checkout') return normalizeKey(value.who);
-  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE || service === PROXY_FINANCIAL_STATE_SERVICE) return normalizeKey(value.requester);
+  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE || service === PROXY_FINANCIAL_STATE_SERVICE || service === PROXY_QUOTE_STATE_SERVICE) return normalizeKey(value.requester);
   if ([
     'provider_payout_context',
     'stripe_connect_adopt',
@@ -683,6 +685,34 @@ class MayhemFeature extends Feature {
     }
     validateProxySnapshotProof(result.proof);
     return result;
+  }
+
+  async proxyQuoteState(query) {
+    const requester = normalizeKey(this.peer?.wallet?.publicKey);
+    if (!query || Object.keys(query).sort().join('|') !== 'billing_id|offer|rail|request_nonce|settlement_policy_hash') {
+      throw new Error('Invalid proxy quote query.');
+    }
+    validateProxyQuoteStateRequest({ ...query, requester });
+    const payload = JSON.parse(JSON.stringify({ ...query, requester,
+      request_nonce: crypto.randomBytes(32).toString('hex') }));
+    const admin = await this._adminKey();
+    const identity = { actor: requester, admin, transport: requester, payload };
+    const signature = this.peer.wallet.sign(b4a.from(serviceSigningMessage(PROXY_QUOTE_STATE_SERVICE, identity)));
+    const started = Date.now();
+    const result = await this.requestService(PROXY_QUOTE_STATE_SERVICE, { ...identity,
+      signing_version: SERVICE_SIGNING_VERSION,
+      signature: b4a.isBuffer(signature) ? b4a.toString(signature, 'hex') : signature });
+    const elapsed = Date.now() - started;
+    if (elapsed < 0 || elapsed > PROXY_QUOTE_STATE_MAX_AGE_MS) throw new Error('Proxy quote observation expired; requote.');
+    const context = proxyRuntimeContext(this.peer, CONTRACT_VERSION, result?.context?.epoch);
+    if (result?.ok !== true || result.lane !== 'proxy' || result.schema_version !== 1
+        || stableJson(result.context) !== stableJson(context)
+        || Object.keys(payload).some(key => stableJson(result[key]) !== stableJson(payload[key]))
+        || b4a.byteLength(JSON.stringify(result)) > PROXY_QUOTE_STATE_MAX_BYTES) {
+      throw new Error('Proxy quote response does not match this request/network.');
+    }
+    validateProxySnapshotProof(result.proof);
+    return { ...result, request_nonce: query.request_nonce };
   }
 
   async proxyFinancialState(query) {
@@ -1006,6 +1036,9 @@ class MayhemFeature extends Feature {
     if (service === PROXY_FINANCIAL_STATE_SERVICE) {
       try { validateProxyFinancialStateRequest(payload); } catch { return null; }
     }
+    if (service === PROXY_QUOTE_STATE_SERVICE) {
+      try { validateProxyQuoteStateRequest(payload); } catch { return null; }
+    }
     if (service === PROXY_DISCOVERY_SERVICE) {
       try { validateProxyDiscoveryRequest(payload); } catch { return null; }
     }
@@ -1163,6 +1196,11 @@ class MayhemFeature extends Feature {
   }
 
   async _handleService(service, value, authorization) {
+    if (service === PROXY_QUOTE_STATE_SERVICE) {
+      return await readProxyQuoteState({ request: value,
+        withCanonicalSnapshot: this.withProxyCanonicalSnapshot,
+        verifySignature: (signature, bytes, signer) => verifyEd25519Hex(this.peer.wallet, signature, bytes, signer) });
+    }
     if (service === PROXY_FINANCIAL_STATE_SERVICE) {
       return await readProxyFinancialState({ request: value,
         withCanonicalSnapshot: this.withProxyCanonicalSnapshot,

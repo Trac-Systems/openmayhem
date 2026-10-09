@@ -290,3 +290,6 @@ fn financial_authority_never_travels_over_unprotected_remote_http_or_url_credent
 #[cfg(unix)]
 #[path = "support/buyer_recovery.rs"]
 mod buyer_recovery;
+
+#[path = "support/quote.rs"]
+mod quote;

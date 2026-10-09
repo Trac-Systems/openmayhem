@@ -160,6 +160,35 @@ pub struct Observation {
     pub units: BTreeMap<String, u64>,
 }
 impl Prepared {
+    /// Request-derived reservation quantities. The explicit output allowance is
+    /// in observable billing units, NOT the backend's native max_tokens. A
+    /// decision purchase reserves exactly its validated requested question count.
+    pub fn maximum_usage(&self, output_units: Option<u64>) -> Result<BTreeMap<String, u64>> {
+        use mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER;
+        match self.policy {
+            Policy::ObservableTextV1 => {
+                let output = output_units
+                    .filter(|v| *v > 0 && *v <= PROXY_MAX_SAFE_INTEGER)
+                    .ok_or(Error::Budget)?;
+                if self.input_units > PROXY_MAX_SAFE_INTEGER {
+                    return Err(Error::Overflow);
+                }
+                Ok(BTreeMap::from([
+                    ("input_token".into(), self.input_units),
+                    ("output_token".into(), output),
+                ]))
+            }
+            Policy::CompletedDecisionsV1 => {
+                if output_units.is_some() || self.questions.is_empty() {
+                    return Err(Error::Budget);
+                }
+                Ok(BTreeMap::from([(
+                    "decision".into(),
+                    self.questions.len() as u64,
+                )]))
+            }
+        }
+    }
     pub fn policy_hash(&self) -> Digest {
         self.policy.hash()
     }
