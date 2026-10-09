@@ -13,6 +13,7 @@
 //! files cannot establish a global capacity guarantee.
 
 use crate::attempts::{private_file, Digest, Identity};
+use crate::financial::negotiation::BuyerOffer;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
     TableHandle,
@@ -34,7 +35,9 @@ const ROUTES: TableDefinition<&str, &[u8]> = TableDefinition::new("capacity_rout
 const LEASES: TableDefinition<&str, &[u8]> = TableDefinition::new("capacity_leases_v1");
 const BY_GROUP: TableDefinition<&str, &str> = TableDefinition::new("capacity_group_leases_v1");
 const BY_WORK: TableDefinition<&str, &str> = TableDefinition::new("capacity_work_leases_v1");
+const SIGNING: TableDefinition<&str, &[u8]> = TableDefinition::new("capacity_signing_intents_v1");
 const MAX_RECORD_BYTES: usize = 4096;
+const MAX_SIGNING_BYTES: usize = 32768;
 const MAX_PAGE: usize = 64;
 
 #[derive(Debug, thiserror::Error)]
@@ -258,6 +261,21 @@ pub struct Lease {
 pub struct Reservation {
     lease: Lease,
 }
+/// Original buyer-signed terms retained atomically with the signing fence.
+/// Historical recovery data, never fresh capacity, funding or dispatch authority.
+/// Private construction and no serialization prevent accepting a connector claim.
+pub struct SigningIntent {
+    lease: Lease,
+    buyer: BuyerOffer,
+}
+impl SigningIntent {
+    pub fn lease(&self) -> &Lease {
+        &self.lease
+    }
+    pub fn buyer(&self) -> &BuyerOffer {
+        &self.buyer
+    }
+}
 impl Reservation {
     pub fn lease(&self) -> &Lease {
         &self.lease
@@ -327,12 +345,12 @@ impl Authority {
         let previous = db(t.get("state"))?
             .map(|v| decode::<Meta>(v.value()))
             .transpose()?;
-        let mut m = if let Some(m) = previous {
+        let mut m = if let Some(mut m) = previous {
             if m.identity != identity {
                 return Err(Error::Identity);
             }
             require(
-                m.schema == 1
+                matches!(m.schema, 1 | 2)
                     && [
                         GROUPS.name(),
                         ROUTES.name(),
@@ -343,12 +361,20 @@ impl Authority {
                     .iter()
                     .all(|n| names.iter().any(|s| s == n)),
             )?;
+            if m.schema == 1 {
+                require(!names.iter().any(|n| n == SIGNING.name()))?;
+                db(tx.open_table(SIGNING))?;
+                m.schema = 2;
+            } else {
+                require(names.iter().any(|n| n == SIGNING.name()))?;
+            }
             require(
                 db(db(tx.open_table(GROUPS))?.len())? == m.groups
                     && db(db(tx.open_table(ROUTES))?.len())? == m.routes
                     && db(db(tx.open_table(LEASES))?.len())? == m.leases
                     && db(db(tx.open_table(BY_GROUP))?.len())? == m.leases
-                    && db(db(tx.open_table(BY_WORK))?.len())? == m.leases,
+                    && db(db(tx.open_table(BY_WORK))?.len())? == m.leases
+                    && db(db(tx.open_table(SIGNING))?.len())? <= m.leases,
             )?;
             m
         } else {
@@ -358,8 +384,9 @@ impl Authority {
             db(tx.open_table(LEASES))?;
             db(tx.open_table(BY_GROUP))?;
             db(tx.open_table(BY_WORK))?;
+            db(tx.open_table(SIGNING))?;
             Meta {
-                schema: 1,
+                schema: 2,
                 identity,
                 fence: 0,
                 sequence: 0,
@@ -678,7 +705,7 @@ impl Authority {
     /// Durable fence BEFORE any provider spend signature can be produced. A
     /// failed commit never returns permission to sign. Older ordinary reservations
     /// remain protected; replay returns the same already-fenced allocation.
-    pub(crate) fn begin_signing(&self, expected: &Lease) -> Result<Lease> {
+    pub(crate) fn begin_signing(&self, expected: &Lease, buyer: &BuyerOffer) -> Result<Lease> {
         let tx = self.write()?;
         let mut leases = db(tx.open_table(LEASES))?;
         let mut lease: Lease = read(&leases, expected.id.as_str())?;
@@ -686,14 +713,85 @@ impl Authority {
         let g: Group = read(&db(tx.open_table(GROUPS))?, lease.group.as_str())?;
         ready_reserved(&lease, expected, self.fence, &g, &r, self.now()?)?;
         require(r.config.lane == Lane::Proxy)?;
-        if lease.phase == Phase::Reserved {
+        validate_signing_intent(buyer, &lease, &self.identity)?;
+        let bytes = serde_json::to_vec(buyer).map_err(|_| Error::Invalid)?;
+        require(bytes.len() <= MAX_SIGNING_BYTES)?;
+        let mut signing = db(tx.open_table(SIGNING))?;
+        if let Some(saved) = db(signing.get(lease.id.as_str()))? {
+            require(
+                decode_signing(saved.value(), &lease, &self.identity)? == *buyer
+                    && lease.phase == Phase::Reserved,
+            )?;
             return Ok(lease);
         }
+        db(signing.insert(lease.id.as_str(), bytes.as_slice()))?;
         lease.phase = Phase::Reserved;
         db(leases.insert(lease.id.as_str(), encode(&lease)?.as_slice()))?;
+        drop(signing);
         drop(leases);
         self.commit(tx)?;
         Ok(lease)
+    }
+
+    /// Indexed, durability-fenced read; survives failure before the execution
+    /// journal was prepared. No inference, history read or health renewal.
+    pub fn signing_intent(&self, id: &Digest) -> Result<Option<SigningIntent>> {
+        let _guard = self.writer.lock().map_err(|_| Error::Storage)?;
+        self.healthy()?;
+        let tx = db(self.database.begin_read())?;
+        let table = db(tx.open_table(SIGNING))?;
+        let Some(saved) = db(table.get(id.as_str()))? else {
+            return Ok(None);
+        };
+        let lease: Lease = read(&db(tx.open_table(LEASES))?, id.as_str())?;
+        let route: RouteState = read(&db(tx.open_table(ROUTES))?, lease.route.as_str())?;
+        require(
+            route.config.lane == Lane::Proxy
+                && route.config.group == lease.group
+                && lease.phase != Phase::Proposed,
+        )?;
+        let buyer = decode_signing(saved.value(), &lease, &self.identity)?;
+        Ok(Some(SigningIntent {
+            lease: effective(lease, self.fence),
+            buyer,
+        }))
+    }
+
+    /// The journal has durably forbidden dispatch and retained canonical absence.
+    /// Replays after a crash between release and journal closure are harmless.
+    pub(crate) fn release_retired(
+        &self,
+        retired: &crate::attempts::retirement::Retirement,
+    ) -> Result<bool> {
+        retired
+            .validate(&self.identity)
+            .map_err(|_| Error::Binding)?;
+        let expected = retired.lease();
+        let tx = self.write()?;
+        let leases = db(tx.open_table(LEASES))?;
+        let Some(raw) = db(leases.get(expected.id.as_str()))? else {
+            return Ok(false);
+        };
+        let actual: Lease = decode(raw.value())?;
+        require(
+            actual.id == expected.id
+                && actual.group == expected.group
+                && actual.route == expected.route
+                && actual.work == expected.work
+                && actual.controller_fence == expected.controller_fence,
+        )?;
+        let r: RouteState = read(&db(tx.open_table(ROUTES))?, actual.route.as_str())?;
+        require(r.config.lane == Lane::Proxy && r.config.group == actual.group)?;
+        let signing = db(tx.open_table(SIGNING))?;
+        let saved = db(signing.get(actual.id.as_str()))?.ok_or(Error::Binding)?;
+        require(decode_signing(saved.value(), &actual, &self.identity)? == *retired.buyer())?;
+        drop(saved);
+        drop(signing);
+        drop(raw);
+        drop(leases);
+        release(&tx, &actual)?;
+        self.commit(tx)?;
+        Ok(true)
     }
 
     pub(crate) fn route_group(&self, route: &Digest) -> Result<Digest> {
@@ -759,7 +857,7 @@ impl Authority {
         self.dispatch(&Reservation { lease })
     }
 
-    /// Only the still-held, never-dispatched capability can cancel without external
+    /// Only the still-held, unsigned, never-dispatched capability cancels without external
     /// evidence. Dropping it is intentionally NOT a cancellation or a free slot.
     pub fn cancel_reserved(&self, reservation: Reservation) -> Result<()> {
         self.cancel_reserved_ref(&reservation)
@@ -775,6 +873,9 @@ impl Authority {
         if actual != reservation.lease || !matches!(actual.phase, Phase::Reserved | Phase::Proposed)
         {
             return Err(Error::Binding);
+        }
+        if db(db(tx.open_table(SIGNING))?.get(actual.id.as_str()))?.is_some() {
+            return Err(Error::InUse);
         }
         release(&tx, &actual)?;
         self.commit(tx)
@@ -981,5 +1082,27 @@ fn release(tx: &redb::WriteTransaction, l: &Lease) -> Result<()> {
     db(db(tx.open_table(LEASES))?.remove(l.id.as_str()))?;
     db(db(tx.open_table(BY_GROUP))?.remove(group_key(l).as_str()))?;
     db(db(tx.open_table(BY_WORK))?.remove(l.work.key().as_str()))?;
+    db(db(tx.open_table(SIGNING))?.remove(l.id.as_str()))?;
     save_meta(tx, &m)
+}
+
+fn validate_signing_intent(buyer: &BuyerOffer, lease: &Lease, id: &Identity) -> Result<()> {
+    buyer.verify().map_err(|_| Error::Invalid)?;
+    let t = &buyer.terms;
+    require(
+        t.capacity_lease == lease.id.as_str()
+            && t.request_hash == lease.work.request_hash.as_str()
+            && t.network_id == id.network_id
+            && t.msb_bootstrap == id.msb_bootstrap.as_str()
+            && t.subnet_bootstrap == id.subnet_bootstrap.as_str()
+            && t.offer.provider_pubkey == id.controller_pubkey.as_str()
+            && crate::exchange::invocation_for_terms(t).map_err(|_| Error::Invalid)?
+                == lease.work.invocation,
+    )
+}
+fn decode_signing(bytes: &[u8], lease: &Lease, id: &Identity) -> Result<BuyerOffer> {
+    require(bytes.len() <= MAX_SIGNING_BYTES)?;
+    let buyer: BuyerOffer = serde_json::from_slice(bytes).map_err(|_| Error::Invalid)?;
+    validate_signing_intent(&buyer, lease, id)?;
+    Ok(buyer)
 }

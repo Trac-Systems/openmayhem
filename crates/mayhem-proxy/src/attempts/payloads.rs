@@ -654,6 +654,7 @@ mod tests {
             "proxy_accepted_finance_v1",
             "proxy_attempt_outcomes_v1",
             "proxy_provider_acceptance_v1",
+            "proxy_provider_retirement_v1",
         ] {
             tx.delete_table(TableDefinition::<&str, &[u8]>::new(name))
                 .unwrap();

@@ -677,6 +677,44 @@ async fn competing_provider_acceptances_can_recover_only_one_exact_signed_purcha
 }
 
 #[tokio::test]
+async fn original_reserved_handle_cannot_cancel_after_signing_begins_even_when_signing_fails() {
+    for failed in [false, true] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let mut peer = Peer::start(ProxyRail::Tap, &f, &chat(), false, None).await;
+        let s = Setup::new(&f, &mut peer, &chat()).await;
+        let approval = s.approve(&peer, s.saved.offer(), chat()).await.unwrap();
+        if failed {
+            let journal = Arc::new(
+                Journal::open(
+                    f._store.path().join("failed-signing"),
+                    peer.identity.clone(),
+                    journal_limits(1),
+                )
+                .unwrap(),
+            );
+            let provider = ProviderNegotiation::new(journal, s.provider_signer.clone(), 4).unwrap();
+            assert!(provider.accept(approval, 1001).await.is_err());
+        } else {
+            s.provider.accept(approval, 1001).await.unwrap();
+        }
+        let lease = s.lease.lease().id.clone();
+        assert!(matches!(
+            s.runtime.capacity.cancel_reserved(s.lease),
+            Err(capacity::Error::InUse)
+        ));
+        assert!(s.runtime.capacity.signing_intent(&lease).unwrap().is_some());
+        assert_eq!(
+            s.runtime.capacity.status(&d(201)).unwrap().group_occupied,
+            1
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(peer.command("status").await["publications"], 0);
+        peer.stop().await;
+    }
+}
+
+#[tokio::test]
 #[ignore = "subprocess used by provider_signature_commit_survives_abrupt_process_exit"]
 async fn provider_acceptance_abrupt_exit_child() {
     let output = match std::env::var_os("MAYHEM_TEST_PROVIDER_ACCEPTANCE_CRASH") {

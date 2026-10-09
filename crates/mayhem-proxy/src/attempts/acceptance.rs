@@ -355,6 +355,7 @@ mod tests {
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_accepted_finance_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_outcomes_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
         let mut meta = metadata(&tx).unwrap();
         meta.schema = 2;
         save_meta(&tx, &meta).unwrap();
@@ -387,6 +388,7 @@ mod tests {
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_accepted_finance_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_outcomes_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
         let mut meta=metadata(&tx).unwrap();meta.schema=3;save_meta(&tx,&meta).unwrap();j.commit(tx).unwrap();drop(j);
         let j=Journal::open(&path,identity(),limits()).unwrap();
         let saved=j.recover(&r.invocation,r.attempt).unwrap();
@@ -409,6 +411,7 @@ mod tests {
         let tx = j.transaction().unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_outcomes_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
         let mut meta = metadata(&tx).unwrap();
         meta.schema = 4;
         save_meta(&tx, &meta).unwrap();
@@ -434,6 +437,7 @@ mod tests {
         let allocated = j.allocated_payload_bytes().unwrap();
         let tx = j.transaction().unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
         let mut meta = metadata(&tx).unwrap(); meta.schema = 6; save_meta(&tx, &meta).unwrap();
         j.commit(tx).unwrap(); drop(j);
         let j = Journal::open(&path, identity(), limits()).unwrap();
@@ -445,6 +449,26 @@ mod tests {
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
         j.commit(tx).unwrap(); drop(j);
         assert!(Journal::open(&path, identity(), limits()).is_err(), "current schema must not silently rebuild a missing signature table");
+    }
+
+    #[test]
+    fn schema_seven_upgrade_preserves_dispatch_without_fabricating_retirement() {
+        let dir = dir(); let path = dir.path().join("journal");
+        let j = Journal::open(&path, identity(), limits()).unwrap();
+        let r = j.prepare(d(100), fixture().0, 100).unwrap();
+        let r = j.begin_dispatch(&r.invocation, r.generation, 101).unwrap().record().clone();
+        let tx = j.transaction().unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
+        let mut meta = metadata(&tx).unwrap(); meta.schema = 7; save_meta(&tx, &meta).unwrap();
+        j.commit(tx).unwrap(); drop(j);
+        let j = Journal::open(&path, identity(), limits()).unwrap();
+        assert_eq!(j.get(&r.invocation).unwrap().unwrap(), r);
+        assert!(j.provider_retirement(&r.invocation, r.attempt).unwrap().is_none());
+        assert_eq!(j.recovery_page(None, 64).unwrap().records.len(), 1);
+        let tx = j.transaction().unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
+        j.commit(tx).unwrap(); drop(j);
+        assert!(Journal::open(&path, identity(), limits()).is_err());
     }
 
     #[test]

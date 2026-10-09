@@ -25,6 +25,9 @@ pub(super) fn read(tx: &redb::ReadTransaction, record: &Record) -> Result<Option
         .map(|v| decode_retained(v.value(), record))
         .transpose()
 }
+pub(super) fn has(tx: &redb::WriteTransaction, key: &str) -> Result<bool> {
+    Ok(storage(storage(tx.open_table(FINANCE))?.get(key))?.is_some())
+}
 pub(super) fn prune(tx: &redb::WriteTransaction, key: &str, meta: &mut Meta) -> Result<()> {
     let mut table = storage(tx.open_table(FINANCE))?;
     if let Some(v) = storage(table.remove(key))? {

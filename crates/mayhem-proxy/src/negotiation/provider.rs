@@ -1,5 +1,5 @@
 //! Bounded provider proposal orchestration. No listener, raw signer or model POST.
-//! Unsigned proposals can expire; signing/uncertain obligations cannot expire here.
+//! Unsigned proposals expire locally; signing requires canonical non-admission.
 use super::{Context, Message, Proposal, Received, Role};
 use crate::{
     attempts::{Digest, SignedProviderAcceptance},
@@ -59,6 +59,7 @@ pub struct Reconciliation {
     pub examined: usize,
     pub released: usize,
     pub retained: usize,
+    pub failed: usize,
     pub next_after: Option<Digest>,
 }
 struct Inner {
@@ -67,6 +68,7 @@ struct Inner {
     client: Arc<financial::Client>,
     limits: Limits,
     slots: Arc<Semaphore>,
+    recovery_slots: Arc<Semaphore>,
     state: Mutex<State>,
 }
 #[derive(Clone)]
@@ -102,6 +104,7 @@ impl Controller {
                 client,
                 limits,
                 slots: Arc::new(Semaphore::new(limits.storage_operations)),
+                recovery_slots: Arc::new(Semaphore::new(1)),
                 state: Mutex::new(State::default()),
             }),
         })
@@ -365,6 +368,7 @@ impl Controller {
                 examined: page.leases.len(),
                 released: 0,
                 retained: 0,
+                failed: 0,
                 next_after: page.next_after,
             };
             for lease in page.leases {
@@ -382,6 +386,154 @@ impl Controller {
         })
         .await
         .map_err(|_| Error::Task)?
+    }
+
+    /// Fresh canonical proof is required for each never-admitted signing intent.
+    /// An unavailable proof leaves the slot occupied, and does not starve the page.
+    pub async fn reconcile_signing(
+        &self,
+        after: Option<Digest>,
+        limit: usize,
+        now_ms: u64,
+    ) -> Result<Reconciliation> {
+        let permit = self
+            .inner
+            .recovery_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| invalid("provider recovery already running"))?;
+        let controller = self.clone();
+        // Keep the bounded owner task alive if its RPC caller disconnects. The
+        // durable transition and matching pending-memory cleanup finish together.
+        tokio::spawn(async move {
+            let _permit = permit;
+            controller
+                .reconcile_signing_owned(after, limit, now_ms)
+                .await
+        })
+        .await
+        .map_err(|_| Error::Task)?
+    }
+    async fn reconcile_signing_owned(
+        &self,
+        after: Option<Digest>,
+        limit: usize,
+        now_ms: u64,
+    ) -> Result<Reconciliation> {
+        let inner = self.inner.clone();
+        let page = tokio::task::spawn_blocking(move || {
+            let group = inner
+                .runtime
+                .capacity
+                .route_group(&inner.runtime.route)
+                .map_err(|_| invalid("provider recovery group unavailable"))?;
+            inner
+                .runtime
+                .capacity
+                .recover_group(&group, after.as_ref(), limit)
+                .map_err(|_| invalid("provider recovery page unavailable"))
+        })
+        .await
+        .map_err(|_| Error::Task)??;
+        let mut result = Reconciliation {
+            examined: page.leases.len(),
+            released: 0,
+            retained: 0,
+            failed: 0,
+            next_after: page.next_after,
+        };
+        for lease in page.leases {
+            let released = if lease.route == self.inner.runtime.route {
+                match self
+                    .inner
+                    .signer
+                    .reconcile_signing(
+                        self.inner.runtime.clone(),
+                        lease.id.clone(),
+                        self.inner.client.clone(),
+                        now_ms,
+                    )
+                    .await
+                {
+                    Ok(released) => released,
+                    Err(_) => {
+                        result.failed += 1;
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if released {
+                result.released += 1;
+                let mut state = self
+                    .inner
+                    .state
+                    .lock()
+                    .map_err(|_| invalid("proposal state unavailable"))?;
+                if state
+                    .pending
+                    .get(&lease.work.invocation)
+                    .is_some_and(|p| p.reservation.lease().id == lease.id)
+                {
+                    state.remove(&lease.work.invocation)?;
+                }
+            } else {
+                result.retained += 1;
+            }
+        }
+        Ok(result)
+    }
+    /// Independently sweep unfinished journal entries, including a crash after
+    /// capacity release but before journal closure. No additional financial POST.
+    pub async fn reconcile_retirements(
+        &self,
+        after: Option<Digest>,
+        limit: usize,
+        now_ms: u64,
+    ) -> Result<financial::provider::RetirementPage> {
+        let permit = self
+            .inner
+            .recovery_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| invalid("provider recovery already running"))?;
+        let controller = self.clone();
+        tokio::spawn(async move {
+            let _permit = permit;
+            controller
+                .reconcile_retirements_owned(after, limit, now_ms)
+                .await
+        })
+        .await
+        .map_err(|_| Error::Task)?
+    }
+    async fn reconcile_retirements_owned(
+        &self,
+        after: Option<Digest>,
+        limit: usize,
+        now_ms: u64,
+    ) -> Result<financial::provider::RetirementPage> {
+        let result = self
+            .inner
+            .signer
+            .reconcile_retirements(self.inner.runtime.clone(), after, limit, now_ms)
+            .await?;
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| invalid("proposal state unavailable"))?;
+        for (invocation, lease) in &result.completed {
+            if state
+                .pending
+                .get(invocation)
+                .is_some_and(|p| p.reservation.lease().id == *lease)
+            {
+                state.remove(invocation)?;
+            }
+        }
+        Ok(result)
     }
 }
 impl State {

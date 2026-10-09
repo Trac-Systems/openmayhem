@@ -92,6 +92,7 @@ impl Journal {
         let tx = self.transaction()?;
         let current = current(&tx, &record.invocation)?.ok_or(Error::NotFound)?;
         require(current.attempt == record.attempt && current.binding == record.binding)?;
+        require(current.phase == Phase::Prepared && !current.cancellation_requested)?;
         let mut meta = metadata(&tx)?;
         let mut table = storage(tx.open_table(TABLE))?;
         if let Some(v) = storage(table.get(record.key().as_str()))? {
@@ -103,7 +104,6 @@ impl Journal {
             )?;
             return Ok(saved);
         }
-        require(current.phase == Phase::Prepared && !current.cancellation_requested)?;
         approval.recheck().map_err(|_| Error::Conflict)?;
         let signed = SignedProviderAcceptance {
             authorization: ProxySpendAuthorization {
@@ -147,6 +147,9 @@ impl Journal {
         }
         let tx = storage(self.database.begin_read())?;
         let record = read_record(&storage(tx.open_table(RECORDS))?, invocation, attempt)?;
+        if retirement::has(&tx, &record)? {
+            return Ok(None);
+        }
         let meta: Meta = decode(
             storage(storage(tx.open_table(META))?.get("state"))?
                 .ok_or(Error::Invalid)?

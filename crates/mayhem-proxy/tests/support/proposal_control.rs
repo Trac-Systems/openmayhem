@@ -231,6 +231,15 @@ async fn provider_controller_negotiates_funds_and_dispatches_once_on_every_endpo
             );
             let (saved, offer) = s.offer(&peer, &bytes, &mut pair, proposal).await;
             let signed = s.proposals.accept(ctx.clone(), offer, 1001).await.unwrap();
+            assert!(
+                s.runtime
+                    .capacity
+                    .signing_intent(&lease)
+                    .unwrap()
+                    .unwrap()
+                    .buyer()
+                    == &saved.offer()
+            );
             assert_eq!(s.proposals.status().await.unwrap().request_bytes, 0);
             assert!(!s.proposals.cancel_unsigned(ctx.clone()).await.unwrap());
             assert_eq!(
@@ -278,6 +287,7 @@ async fn provider_controller_negotiates_funds_and_dispatches_once_on_every_endpo
                 .await
                 .unwrap());
             assert_eq!(s.runtime.capacity.status(&d(201)).unwrap().available, 2);
+            assert!(s.runtime.capacity.signing_intent(&lease).unwrap().is_none());
             peer.stop().await;
         }
     }
@@ -713,7 +723,7 @@ async fn restart_reconciliation_preserves_committed_and_uncertain_signing_obliga
             s.runtime.capacity.lease(&lease).unwrap().unwrap().phase,
             capacity::Phase::Proposed
         );
-        let (_, offer) = s.offer(&peer, &chat(), &mut pair, proposal).await;
+        let (saved, offer) = s.offer(&peer, &chat(), &mut pair, proposal).await;
         let result = s.proposals.accept(ctx.clone(), offer, 1001).await;
         assert_eq!(result.is_err(), failed);
         // The capacity fence commits before the journal or signer can fail.
@@ -723,6 +733,15 @@ async fn restart_reconciliation_preserves_committed_and_uncertain_signing_obliga
         );
         drop(pair);
         let s = s.restart(&f, &peer);
+        assert!(
+            s.runtime
+                .capacity
+                .signing_intent(&lease)
+                .unwrap()
+                .unwrap()
+                .buyer()
+                == &saved.offer()
+        );
         let page = s.proposals.reconcile_unsigned(None, 64).await.unwrap();
         assert_eq!((page.released, page.retained), (0, 1));
         assert_eq!(
@@ -739,4 +758,382 @@ async fn restart_reconciliation_preserves_committed_and_uncertain_signing_obliga
         assert_eq!(peer.command("status").await["publications"], 0);
         peer.stop().await;
     }
+}
+
+#[tokio::test]
+async fn canonical_non_admission_releases_signed_and_failed_signing_on_all_endpoints_and_rails() {
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        for (endpoint, bytes, _) in cases() {
+            for failed in [false, true] {
+                let backend = backend(200, answer(), Duration::ZERO).await;
+                let f = Fixture::new(&backend.base, endpoint);
+                let mut peer = Peer::start(rail, &f, &bytes, false, None).await;
+                let s = Controlled::new(
+                    &f,
+                    &mut peer,
+                    limits(),
+                    if failed { 1 } else { 128 * 1024 * 1024 },
+                )
+                .await;
+                let ctx = context(&peer);
+                let (mut pair, proposal) = s.start(&peer, ctx.clone(), &bytes).await.unwrap();
+                let lease = proposal.capacity_lease.clone();
+                let (saved, offer) = s.offer(&peer, &bytes, &mut pair, proposal).await;
+                assert_eq!(
+                    s.proposals.accept(ctx.clone(), offer, 1001).await.is_err(),
+                    failed
+                );
+                let page = s.proposals.reconcile_signing(None, 64, 1002).await.unwrap();
+                assert_eq!((page.released, page.retained, page.failed), (0, 1, 0));
+                peer.command(&json!({"epoch":saved.offer().terms.billing_epoch}).to_string())
+                    .await;
+                // A bad proof cannot release a slot, sign, dispatch or change money.
+                peer.command("nonce").await;
+                let page = s.proposals.reconcile_signing(None, 64, 2000).await.unwrap();
+                assert_eq!((page.released, page.retained, page.failed), (0, 1, 1));
+                peer.command("reset").await;
+                if failed {
+                    let page = s.proposals.reconcile_signing(None, 64, 2000).await.unwrap();
+                    assert_eq!(
+                        (page.released, page.failed),
+                        (0, 1),
+                        "retirement must fit durable storage first"
+                    );
+                }
+                let money = peer.command("state").await;
+                drop(pair);
+                drop(s);
+                // Reopen every store/controller, restoring storage headroom after
+                // the injected signing failure. No old in-memory capability survives.
+                let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+                assert!(
+                    s.runtime
+                        .capacity
+                        .signing_intent(&lease)
+                        .unwrap()
+                        .unwrap()
+                        .buyer()
+                        == &saved.offer()
+                );
+                let page = s.proposals.reconcile_signing(None, 64, 2001).await.unwrap();
+                assert_eq!((page.released, page.retained, page.failed), (1, 0, 0));
+                assert!(s.runtime.capacity.lease(&lease).unwrap().is_none());
+                assert!(s.runtime.capacity.signing_intent(&lease).unwrap().is_none());
+                assert_eq!(s.runtime.capacity.status(&d(201)).unwrap().available, 2);
+                assert!(s.proposals.recover(&ctx).await.unwrap().is_none());
+                assert!(
+                    s.start(&peer, ctx.clone(), &bytes).await.is_err(),
+                    "retired invocation cannot be proposed again"
+                );
+                let record = s.journal.get(&ctx.invocation().unwrap()).unwrap().unwrap();
+                assert_eq!(record.phase, attempts::Phase::Closed);
+                assert!(s
+                    .journal
+                    .begin_dispatch(&record.invocation, record.generation, 2002)
+                    .is_err());
+                assert_eq!(
+                    s.proposals
+                        .reconcile_retirements(None, 64, 2002)
+                        .await
+                        .unwrap()
+                        .examined,
+                    0
+                );
+                assert_eq!(peer.command("state").await, money);
+                assert_eq!(peer.command("status").await["publications"], 0);
+                assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+                assert_eq!(s.journal.prune_closed(3002, 64).unwrap(), 1);
+                assert_eq!(s.journal.allocated_payload_bytes().unwrap(), 0);
+                assert!(s.journal.get(&record.invocation).unwrap().is_none());
+                peer.stop().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn provider_retirement_preserves_admitted_and_possible_execution_on_every_rail() {
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        for admitted in [false, true] {
+            let backend = backend(200, answer(), Duration::ZERO).await;
+            let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+            let mut peer = Peer::start(rail, &f, &chat(), false, None).await;
+            let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+            let ctx = context(&peer);
+            let (mut pair, proposal) = s.start(&peer, ctx.clone(), &chat()).await.unwrap();
+            let lease = proposal.capacity_lease.clone();
+            let (saved, offer) = s.offer(&peer, &chat(), &mut pair, proposal).await;
+            let signed = s.proposals.accept(ctx.clone(), offer, 1001).await.unwrap();
+            if admitted {
+                s.buyer
+                    .retain_provider_acceptance(signed.authorization)
+                    .await
+                    .unwrap();
+                s.buyer
+                    .publish(saved.key().clone(), &recovery(&f, &peer), 1002)
+                    .await
+                    .unwrap();
+            } else {
+                // Even contradictory canonical absence cannot override local
+                // possible-dispatch evidence. This must go to execution recovery.
+                let record = s.journal.get(&ctx.invocation().unwrap()).unwrap().unwrap();
+                s.journal
+                    .begin_dispatch(&record.invocation, record.generation, 1002)
+                    .unwrap();
+            }
+            peer.command(&json!({"epoch":saved.offer().terms.billing_epoch}).to_string())
+                .await;
+            let money = peer.command("state").await;
+            let page = s.proposals.reconcile_signing(None, 64, 2000).await.unwrap();
+            assert_eq!((page.released, page.retained), (0, 1));
+            assert_eq!(page.failed, usize::from(!admitted));
+            assert!(s.runtime.capacity.lease(&lease).unwrap().is_some());
+            assert_eq!(peer.command("state").await, money);
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+            peer.stop().await;
+        }
+    }
+}
+
+// Reconstruct the durable boundary immediately before the final closure commit,
+// retaining the real canonical proof and real signed buyer terms from the test.
+fn reopen_retirement_closure(path: &std::path::Path, record: &attempts::Record) {
+    use redb::{ReadableTable, TableDefinition};
+    let db = redb::Database::open(path).unwrap();
+    let tx = db.begin_write().unwrap();
+    let key = format!("{}:{:020}", record.invocation.as_str(), record.attempt);
+    let mut pending = record.clone();
+    pending.phase = attempts::Phase::Resolved;
+    pending.closure = None;
+    pending.expires_at_ms = None;
+    tx.open_table(TableDefinition::<&str, &[u8]>::new(
+        "proxy_attempt_records_v1",
+    ))
+    .unwrap()
+    .insert(
+        key.as_str(),
+        serde_json::to_vec(&pending).unwrap().as_slice(),
+    )
+    .unwrap();
+    tx.open_table(TableDefinition::<&str, &str>::new(
+        "proxy_attempt_expiry_v1",
+    ))
+    .unwrap()
+    .remove(format!("{:020}:{}", record.expires_at_ms.unwrap(), key).as_str())
+    .unwrap();
+    tx.open_table(TableDefinition::<&str, u64>::new(
+        "proxy_attempt_unfinished_v1",
+    ))
+    .unwrap()
+    .insert(record.invocation.as_str(), record.attempt)
+    .unwrap();
+    {
+        let mut table = tx
+            .open_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_meta_v1"))
+            .unwrap();
+        let mut meta: Value =
+            serde_json::from_slice(table.get("state").unwrap().unwrap().value()).unwrap();
+        meta["unfinished"] = (meta["unfinished"].as_u64().unwrap() + 1).into();
+        table
+            .insert("state", serde_json::to_vec(&meta).unwrap().as_slice())
+            .unwrap();
+    }
+    tx.commit().unwrap();
+}
+
+#[tokio::test]
+async fn provider_retirement_recovers_both_sides_of_capacity_release_without_new_finance() {
+    for restore_capacity in [false, true] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let mut peer = Peer::start(ProxyRail::Tnk, &f, &chat(), false, None).await;
+        let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+        let ctx = context(&peer);
+        let (mut pair, proposal) = s.start(&peer, ctx.clone(), &chat()).await.unwrap();
+        let lease = proposal.capacity_lease.clone();
+        let (saved, offer) = s.offer(&peer, &chat(), &mut pair, proposal).await;
+        s.proposals.accept(ctx.clone(), offer, 1001).await.unwrap();
+        peer.command(&json!({"epoch":saved.offer().terms.billing_epoch}).to_string())
+            .await;
+        drop(pair);
+        drop(s);
+        let path = f._store.path().join("controlled-capacity");
+        let backup = f._store.path().join("capacity-before-retirement");
+        if restore_capacity {
+            std::fs::copy(&path, &backup).unwrap();
+        }
+        let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+        assert_eq!(
+            s.proposals
+                .reconcile_signing(None, 64, 2000)
+                .await
+                .unwrap()
+                .released,
+            1
+        );
+        let record = s.journal.get(&ctx.invocation().unwrap()).unwrap().unwrap();
+        drop(s);
+        reopen_retirement_closure(&f._store.path().join("controlled-journal"), &record);
+        if restore_capacity {
+            std::fs::copy(&backup, &path).unwrap();
+        }
+        let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+        assert_eq!(
+            s.runtime.capacity.lease(&lease).unwrap().is_some(),
+            restore_capacity
+        );
+        // Canonical endpoint deliberately unavailable: historical proof was
+        // committed already. The journal cursor must finish with no fresh I/O.
+        peer.command("nonce").await;
+        let status = peer.command("status").await;
+        let page = s
+            .proposals
+            .reconcile_retirements(None, 1, 2001)
+            .await
+            .unwrap();
+        assert_eq!((page.examined, page.closed, page.failed), (1, 1, 0));
+        assert!(s.runtime.capacity.lease(&lease).unwrap().is_none());
+        assert!(s.proposals.recover(&ctx).await.unwrap().is_none());
+        assert_eq!(
+            s.journal.get(&record.invocation).unwrap().unwrap().phase,
+            attempts::Phase::Closed
+        );
+        assert_eq!(
+            s.proposals
+                .reconcile_retirements(None, 1, 2002)
+                .await
+                .unwrap()
+                .examined,
+            0
+        );
+        assert_eq!(peer.command("status").await, status);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(s.journal.prune_closed(3002, 64).unwrap(), 1);
+        assert_eq!(s.journal.allocated_payload_bytes().unwrap(), 0);
+        peer.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn provider_reconciliation_is_paged_and_never_claims_unsigned_or_native_slots() {
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let mut peer = Peer::start(ProxyRail::Fiat, &f, &chat(), false, None).await;
+    let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+    let ctx = context(&peer);
+    let (mut pair, proposal) = s.start(&peer, ctx.clone(), &chat()).await.unwrap();
+    let lease = proposal.capacity_lease.clone();
+    let (saved, offer) = s.offer(&peer, &chat(), &mut pair, proposal).await;
+    s.proposals.accept(ctx, offer, 1001).await.unwrap();
+    s.runtime
+        .capacity
+        .configure_route(capacity::Route {
+            id: d(202),
+            group: d(200),
+            lane: capacity::Lane::Native,
+            max_concurrency: 2,
+        })
+        .unwrap();
+    capacity_ready(&s.runtime.capacity, capacity::Scope::Route(d(202)));
+    let protected = s
+        .runtime
+        .capacity
+        .reserve(
+            &d(202),
+            capacity::Work {
+                invocation: d(300),
+                request_hash: d(301),
+            },
+        )
+        .unwrap();
+    peer.command(&json!({"epoch":saved.offer().terms.billing_epoch}).to_string())
+        .await;
+    let mut after = None;
+    let mut counts = (0, 0, 0);
+    loop {
+        let page = s.proposals.reconcile_signing(after, 1, 2000).await.unwrap();
+        assert_eq!(page.examined, 1);
+        assert_eq!(page.failed, 0);
+        counts.0 += page.examined;
+        counts.1 += page.released;
+        counts.2 += page.retained;
+        match page.next_after {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(counts, (2, 1, 1));
+    assert!(s.runtime.capacity.lease(&lease).unwrap().is_none());
+    assert!(s
+        .runtime
+        .capacity
+        .lease(&protected.lease().id)
+        .unwrap()
+        .is_some());
+    assert!(s.proposals.reconcile_signing(None, 0, 2000).await.is_err());
+    assert!(s.proposals.reconcile_signing(None, 65, 2000).await.is_err());
+    assert!(s
+        .proposals
+        .reconcile_retirements(None, 65, 2000)
+        .await
+        .is_err());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    peer.stop().await;
+}
+
+#[tokio::test]
+async fn caller_disconnect_does_not_abandon_signing_retirement_owner_task() {
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let mut peer = Peer::start(ProxyRail::Tap, &f, &chat(), false, None).await;
+    let mut bounds = limits();
+    bounds.storage_operations = 1;
+    let s = Controlled::new(&f, &mut peer, bounds, 128 * 1024 * 1024).await;
+    let ctx = context(&peer);
+    let (mut pair, proposal) = s.start(&peer, ctx.clone(), &chat()).await.unwrap();
+    let lease = proposal.capacity_lease.clone();
+    let (saved, offer) = s.offer(&peer, &chat(), &mut pair, proposal).await;
+    s.proposals.accept(ctx.clone(), offer, 1001).await.unwrap();
+    peer.command(&json!({"epoch":saved.offer().terms.billing_epoch}).to_string())
+        .await;
+    peer.command("delay").await;
+    let before = peer.command("status").await["calls"].as_u64().unwrap();
+    let controller = s.proposals.clone();
+    let caller = tokio::spawn(async move { controller.reconcile_signing(None, 64, 2000).await });
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if peer.command("status").await["calls"].as_u64().unwrap() > before {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        s.proposals.reconcile_signing(None, 64, 2000).await.is_err(),
+        "only one recovery owner per route"
+    );
+    caller.abort();
+    assert!(matches!(caller.await, Err(e) if e.is_cancelled()));
+    // Slow canonical recovery cannot occupy the only ordinary admission slot.
+    let mut other = ctx.clone();
+    other.billing_id = d(991);
+    let (_other_pair, _) = s.start(&peer, other.clone(), &chat()).await.unwrap();
+    assert!(s.proposals.cancel_unsigned(other).await.unwrap());
+    loop {
+        let closed = s
+            .journal
+            .get(&ctx.invocation().unwrap())
+            .unwrap()
+            .is_some_and(|r| r.phase == attempts::Phase::Closed);
+        if closed && s.proposals.status().await.unwrap().signing_or_uncertain == 0 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(s.runtime.capacity.lease(&lease).unwrap().is_none());
+    assert_eq!(s.proposals.status().await.unwrap().request_bytes, 0);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(peer.command("status").await["publications"], 0);
+    peer.stop().await;
 }

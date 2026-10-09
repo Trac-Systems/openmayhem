@@ -79,6 +79,55 @@ fn finish(a: &Authority, lease: Lease) -> bool {
 }
 
 #[test]
+fn old_capacity_schema_migrates_without_inventing_signing_or_releasing_native_work() {
+    use redb::{ReadableTable, TableDefinition};
+    let dir = private_dir();
+    let path = dir.path().join("capacity");
+    let a = open(&path);
+    setup(&a, 10, 4, &[(20, Lane::Native), (21, Lane::Proxy)]);
+    let native = a.reserve(&d(20), work(1)).unwrap().lease().clone();
+    let legacy = a.reserve(&d(21), work(2)).unwrap().lease().clone();
+    drop(a);
+    let database = redb::Database::open(&path).unwrap();
+    let tx = database.begin_write().unwrap();
+    tx.delete_table(TableDefinition::<&str, &[u8]>::new(
+        "capacity_signing_intents_v1",
+    ))
+    .unwrap();
+    {
+        let mut table = tx
+            .open_table(TableDefinition::<&str, &[u8]>::new("capacity_meta_v1"))
+            .unwrap();
+        let mut m: serde_json::Value =
+            serde_json::from_slice(table.get("state").unwrap().unwrap().value()).unwrap();
+        m["schema"] = 1.into();
+        table
+            .insert("state", serde_json::to_vec(&m).unwrap().as_slice())
+            .unwrap();
+    }
+    tx.commit().unwrap();
+    drop(database);
+    let a = open(&path);
+    assert_eq!(a.status(&d(21)).unwrap().group_occupied, 2);
+    for lease in [native, legacy] {
+        assert_eq!(a.lease(&lease.id).unwrap().unwrap().phase, Phase::Uncertain);
+        assert!(a.signing_intent(&lease.id).unwrap().is_none());
+    }
+    drop(a);
+    // Missing required storage in the upgraded schema is corruption, not a new
+    // empty table that could make protected signing obligations disappear.
+    let database = redb::Database::open(&path).unwrap();
+    let tx = database.begin_write().unwrap();
+    tx.delete_table(TableDefinition::<&str, &[u8]>::new(
+        "capacity_signing_intents_v1",
+    ))
+    .unwrap();
+    tx.commit().unwrap();
+    drop(database);
+    assert!(Authority::open(&path, identity(), limits()).is_err());
+}
+
+#[test]
 fn native_and_proxy_aliases_share_atomic_capacity_under_concurrency() {
     let dir = private_dir();
     let a = Arc::new(open(&dir.path().join("capacity")));

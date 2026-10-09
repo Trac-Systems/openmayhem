@@ -8,6 +8,8 @@ use crate::{
     endpoint::Adapter,
 };
 use std::sync::Arc;
+mod recovery;
+pub use recovery::RetirementPage;
 
 /// Construct from trusted operator configuration and the actual running objects,
 /// never from a buyer request. Global policy enablement is not operator consent.
@@ -90,7 +92,7 @@ impl Approval {
         self.lease = self
             .runtime
             .capacity
-            .begin_signing(&self.lease)
+            .begin_signing(&self.lease, &self.buyer)
             .map_err(|_| invalid("provider signing capacity fence failed"))?;
         self.signing_fenced()
     }
@@ -98,6 +100,16 @@ impl Approval {
         require(
             self.lease.phase == capacity::Phase::Reserved,
             "provider signing capacity fence is required",
+        )?;
+        let retained = self
+            .runtime
+            .capacity
+            .signing_intent(&self.lease.id)
+            .map_err(|_| invalid("provider signing intention unavailable"))?
+            .ok_or_else(|| invalid("provider signing intention is required"))?;
+        require(
+            retained.lease() == &self.lease && retained.buyer() == &self.buyer,
+            "provider signing intention differs",
         )?;
         self.recheck()
     }

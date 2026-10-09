@@ -12,6 +12,7 @@ mod finance;
 mod outcomes;
 mod payloads;
 mod provider;
+pub(crate) mod retirement;
 pub(crate) use acceptance::validate_offer_binding;
 pub use acceptance::{AcceptanceSnapshot, OwnedAcceptance};
 pub use outcomes::{TerminalDraft, WaiverDraft};
@@ -501,7 +502,7 @@ impl Journal {
             if meta.identity != identity {
                 return Err(Error::Identity);
             }
-            require(matches!(meta.schema, 1 | 2 | 3 | 4 | 5 | 6 | 7))?;
+            require(matches!(meta.schema, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8))?;
             require(
                 [
                     REQUESTS.name(),
@@ -538,11 +539,12 @@ impl Journal {
             finance::initialize(&tx, meta.schema < 4)?;
             outcomes::initialize(&tx, meta.schema < 5)?;
             provider::initialize(&tx, meta.schema < 7)?;
+            retirement::initialize(&tx, meta.schema < 8)?;
             if meta.schema == 1 {
                 require(meta.payload_bytes == 0)?;
             }
-            if meta.schema < 7 {
-                meta.schema = 7;
+            if meta.schema < 8 {
+                meta.schema = 8;
                 storage(meta_table.insert("state", encode(&meta)?.as_slice()))?;
             }
         } else {
@@ -556,8 +558,9 @@ impl Journal {
             finance::initialize(&tx, true)?;
             outcomes::initialize(&tx, true)?;
             provider::initialize(&tx, true)?;
+            retirement::initialize(&tx, true)?;
             let meta = Meta {
-                schema: 7,
+                schema: 8,
                 identity,
                 records: 0,
                 unfinished: 0,
@@ -904,6 +907,7 @@ impl Journal {
             finance::prune(&tx, record_key, &mut meta)?;
             outcomes::prune(&tx, record_key, &mut meta)?;
             provider::prune(&tx, record_key, &mut meta)?;
+            retirement::prune(&tx, record_key, &mut meta)?;
             storage(records.remove(record_key.as_str()))?;
             storage(expiry.remove(key.as_str()))?;
             meta.records = meta.records.checked_sub(1).ok_or(Error::Invalid)?;

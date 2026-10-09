@@ -176,6 +176,7 @@ impl Paid {
             let db = redb::Database::open(f._store.path().join("paid-journal")).unwrap();
             let tx = db.begin_write().unwrap();
             tx.delete_table(redb::TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
+            tx.delete_table(redb::TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
             {
                 let mut meta = tx
                     .open_table(redb::TableDefinition::<&str, &[u8]>::new(
