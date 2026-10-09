@@ -1,6 +1,8 @@
 #![cfg(unix)]
 #[path = "setup/admission.rs"]
 mod admission;
+#[path = "setup/enrollment.rs"]
+mod enrollment;
 #[path = "setup/connection.rs"]
 mod connection;
 #[path = "setup/probe.rs"]

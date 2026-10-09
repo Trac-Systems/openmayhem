@@ -398,3 +398,40 @@ FIAT/TNK/TAP permit binding, lost-response recovery and same-market price update
 It does not prove actual fee collection, production issuer deployment or public
 provider readiness. Interactive/dashboard forms, unattended invoice detection,
 managed serving handoff, Windows protection and full D2–D4 policy remain open.
+
+## Off-ledger fee enrollment
+
+A checked draft can now authenticate to the explicitly selected admission API
+using its existing provider wallet:
+
+```sh
+mayhem provider proxy setup enrollment --directory private-draft \
+  --expected-revision 2 --admission-origin https://api.example.com
+mayhem provider proxy setup enrollment --directory private-draft \
+  --expected-revision 2 --admission-origin https://api.example.com \
+  --action create --rail tnk
+mayhem provider proxy setup enrollment --directory private-draft \
+  --expected-revision 2 --admission-origin https://api.example.com \
+  --action checkout
+```
+
+The default action is `status`; `create` requires exactly one of `fiat`, `tnk`,
+`tap`. `checkout` is for the existing FIAT invoice and returns its original Stripe
+URL. Wallet selection/unlock uses the same options as `publish`. No payment is
+sent, registry operation published, model installed or serving process started.
+
+The client validates the exact network, origin, provider, operation, action,
+request digest, nonce and expiry before signing a short-lived identity challenge.
+Its bearer grant remains in memory for that action. Each operation has a bounded
+network timeout; later status/retry recovers the same provider/network invoice,
+including its original rail and valuation. An unavailable status is not evidence
+that another fee is owed. Invoice issuance or `ready` is not canonical admission;
+the existing protected publication gate independently verifies the signed permit.
+`original_operation_matches` distinguishes retained payment for an earlier draft
+from permission to publish the current one.
+
+Crypto amount fields are exact base units (18 decimals); FIAT USD uses cents.
+The shared client returns structured status for the forthcoming setup dashboard.
+Complete interactive wizard/payment-page delivery, custody provisioning,
+expiry/reissue and release-policy activation are still required. The command is
+not an assertion that public enrollment has been enabled.

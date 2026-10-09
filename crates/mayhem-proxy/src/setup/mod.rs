@@ -3,6 +3,7 @@
 //! the existing bounded upstream controller; setup never opens a wallet.
 mod admission;
 mod connection;
+mod enrollment;
 mod probe;
 mod profile;
 mod publication;
@@ -10,6 +11,7 @@ mod review;
 mod store;
 pub use admission::{AdmissionEvidence, AdmissionReport, AdmissionState, CanonicalProvider};
 pub use connection::{DiscoveryState, InventoryReview};
+pub use enrollment::{EnrollmentAction, EnrollmentClient, EnrollmentInvoice, EnrollmentResult};
 pub use probe::{ProbeGroup, ProbePlan, ProbeReport, ProbeScope, ProbeState};
 pub use profile::{
     profiles, EndpointProfile, MembershipInput, OfferInput, ProfileInput, ProfileMarket,
@@ -70,6 +72,8 @@ pub enum Error {
     DiscoveryMissing,
     #[error("provider publication requires recovery of its original signed operations")]
     PublicationRecovery,
+    #[error("provider admission service is unavailable; resume the original setup, do not send another fee")]
+    EnrollmentUnavailable,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 fn require(ok: bool) -> Result<()> {

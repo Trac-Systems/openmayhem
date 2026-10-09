@@ -1,10 +1,12 @@
 //! Thin CLI over the shared setup state. Public JSON never contains the private
-//! draft, connection reference or loaded credential. Only explicit Publish
-//! unlocks the existing wallet to sign its exact reviewed registry operations.
+//! draft, connection reference or loaded credential. Explicit enrollment signs
+//! scoped identity challenges; Publish signs reviewed registry operations.
 use super::{cached_wallet_signing_key, resolve_wallet_keypair_path, WalletLocatorArgs};
 use anyhow::Result;
 use clap::{Args, Subcommand};
-use mayhem_proxy::setup::{profiles, AdmissionPermit, Input, ProbePlan, ProfileInput, Store};
+use mayhem_proxy::setup::{
+    profiles, AdmissionPermit, EnrollmentAction, Input, ProbePlan, ProfileInput, Store,
+};
 use std::path::PathBuf;
 
 #[derive(Debug, Args)]
@@ -15,6 +17,26 @@ pub struct DraftArgs {
 }
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Recover the original admission invoice, or explicitly open fee checkout.
+    /// No funds are sent and no registration or model serving is started.
+    Enrollment {
+        #[command(flatten)]
+        args: DraftArgs,
+        #[arg(long)]
+        expected_revision: u64,
+        /// Trusted admission API origin, HTTPS or literal loopback for local tests.
+        #[arg(long)]
+        admission_origin: String,
+        #[arg(long, default_value_t = 15000)]
+        timeout_ms: u64,
+        #[arg(long, value_enum, default_value_t = EnrollmentCommand::Status)]
+        action: EnrollmentCommand,
+        /// Required for create, forbidden for status/checkout. Does not send money.
+        #[arg(long, value_enum)]
+        rail: Option<EnrollmentRail>,
+        #[command(flatten)]
+        wallet: WalletLocatorArgs,
+    },
     /// Inspect, preview or export signed data-only connector recipes offline.
     Recipe {
         #[command(subcommand)]
@@ -148,6 +170,18 @@ pub enum Command {
     #[command(alias = "resume")]
     Inspect(DraftArgs),
 }
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum EnrollmentCommand {
+    Create,
+    Status,
+    Checkout,
+}
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum EnrollmentRail {
+    Fiat,
+    Tnk,
+    Tap,
+}
 #[derive(Debug, Subcommand)]
 pub enum RecipeCommand {
     /// Verify signature/mapping fixtures and show public identity, without network I/O.
@@ -170,6 +204,48 @@ pub enum RecipeCommand {
 }
 pub async fn run(command: Command) -> Result<()> {
     let command = match command {
+        Command::Enrollment {
+            args,
+            expected_revision,
+            admission_origin,
+            timeout_ms,
+            action,
+            rail,
+            wallet,
+        } => {
+            anyhow::ensure!(
+                matches!(action, EnrollmentCommand::Create) == rail.is_some(),
+                "--rail is required only for --action create"
+            );
+            let client = tokio::task::spawn_blocking(move || {
+                Store::open(args.directory)?.enrollment_client(
+                    expected_revision,
+                    &admission_origin,
+                    timeout_ms,
+                )
+            })
+            .await??;
+            let keypair = resolve_wallet_keypair_path(&wallet)?;
+            let key = cached_wallet_signing_key(
+                &keypair,
+                wallet.wallet_password.as_deref().unwrap_or_default(),
+            )
+            .await?;
+            let action = match action {
+                EnrollmentCommand::Create => EnrollmentAction::Create,
+                EnrollmentCommand::Status => EnrollmentAction::Status,
+                EnrollmentCommand::Checkout => EnrollmentAction::Checkout,
+            };
+            let rail = rail.map(|r| match r {
+                EnrollmentRail::Fiat => mayhem_proto::proxy::ProxyRail::Fiat,
+                EnrollmentRail::Tnk => mayhem_proto::proxy::ProxyRail::Tnk,
+                EnrollmentRail::Tap => mayhem_proto::proxy::ProxyRail::Tap,
+            });
+            let result = client.execute(&key, action, rail).await?;
+            drop(key);
+            println!("{}", serde_json::to_string(&result)?);
+            return Ok(());
+        }
         Command::Recipe { command } => {
             let result = tokio::task::spawn_blocking(move || -> Result<String> {
                 match command {
@@ -312,7 +388,8 @@ pub async fn run(command: Command) -> Result<()> {
             | Command::RecoverProbe { args, .. }
             | Command::Probe { args, .. }
             | Command::Inspect(args) => args,
-            Command::Recipe { .. }
+            Command::Enrollment { .. }
+            | Command::Recipe { .. }
             | Command::Profiles
             | Command::PublicationPlan { .. }
             | Command::Publish { .. }
@@ -344,7 +421,8 @@ pub async fn run(command: Command) -> Result<()> {
             } => store.recover_probe(expected_revision),
             Command::Probe { .. } => unreachable!("handled before the blocking operation"),
             Command::Inspect(_) => store.inspect(),
-            Command::Recipe { .. }
+            Command::Enrollment { .. }
+            | Command::Recipe { .. }
             | Command::Profiles
             | Command::PublicationPlan { .. }
             | Command::Publish { .. }
@@ -374,6 +452,44 @@ mod recipe_tests {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../mayhem-proxy/tests/fixtures/recipes")
             .join(name)
+    }
+    #[test]
+    fn enrollment_defaults_to_status_and_has_no_transfer_or_publication_option() {
+        let common = [
+            "setup",
+            "enrollment",
+            "--directory",
+            "private-draft",
+            "--expected-revision",
+            "2",
+            "--admission-origin",
+            "https://admission.invalid",
+        ];
+        assert!(matches!(
+            Cli::try_parse_from(common).unwrap().command,
+            Command::Enrollment {
+                action: EnrollmentCommand::Status,
+                rail: None,
+                ..
+            }
+        ));
+        for rail in ["fiat", "tnk", "tap"] {
+            let mut args = common.to_vec();
+            args.extend(["--action", "create", "--rail", rail]);
+            assert!(matches!(
+                Cli::try_parse_from(args).unwrap().command,
+                Command::Enrollment {
+                    action: EnrollmentCommand::Create,
+                    rail: Some(_),
+                    ..
+                }
+            ));
+        }
+        for forbidden in ["--send", "--publish", "--issuer-key", "--amount"] {
+            let mut args = common.to_vec();
+            args.push(forbidden);
+            assert!(Cli::try_parse_from(args).is_err());
+        }
     }
     #[test]
     fn recipe_commands_are_readonly_and_require_explicit_local_inputs() {
