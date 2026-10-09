@@ -358,12 +358,13 @@ impl Request {
     }
     #[cfg(test)]
     fn check_offer(&self, candidate: &PublishedOffer) -> Result<Candidate> {
-        self.check_offer_membership(candidate, None)
+        self.check_offer_membership(candidate, None, None)
     }
     fn check_offer_membership(
         &self,
         candidate: &PublishedOffer,
         membership: Option<&mayhem_proxy::registry::publication::taxonomy::Membership>,
+        operator: Option<&mayhem_proxy::operator::Observation>,
     ) -> Result<Candidate> {
         self.check_settlement_policy()?;
         if candidate.id != self.selector.id()
@@ -397,9 +398,12 @@ impl Request {
         {
             return Err(Error::Constraints);
         }
-        // Public directory currently has no authenticated verification evidence.
-        // Never satisfy a T4 request from a provider label or claimed model name.
-        if self.controls.require_verified_operator {
+        if self.requires_operator()
+            && !operator.is_some_and(|evidence| {
+                Digest::new(&candidate.offer.provider_pubkey)
+                    .is_ok_and(|provider| evidence.permits(&provider))
+            })
+        {
             return Err(Error::Verification);
         }
         self.controls
@@ -419,6 +423,15 @@ impl Request {
                 .map_err(|_| Error::Catalog)?,
         })
     }
+
+    pub(crate) fn requires_operator(&self) -> bool {
+        self.controls.require_verified_operator
+            || self
+                .controls
+                .profile
+                .as_ref()
+                .is_some_and(|p| p.providers.require_verified_operator)
+    }
 }
 
 /// One immutable catalog binding and an independent, truthful availability read.
@@ -436,7 +449,7 @@ pub async fn resolve_estimate(
     let permit = READS.try_acquire().map_err(|_| Error::Busy)?;
     let read_control = control.clone();
     let read_request = request.clone();
-    let (published, network, expires_at_ms, availability) =
+    let (published, network, mut expires_at_ms, availability, proof, epoch) =
         tokio::task::spawn_blocking(move || {
             let control = read_control;
             let request = read_request;
@@ -466,12 +479,32 @@ pub async fn resolve_estimate(
                 .presence()
                 .observe_registered(&registered, request.controls.minimum_tokens_per_second)
                 .map_err(|_| Error::Catalog)?;
-            Ok((published, network, expires_at_ms, availability))
+            Ok((
+                published,
+                network,
+                expires_at_ms,
+                availability,
+                committed.proof.clone(),
+                committed.context.epoch,
+            ))
         })
         .await
         .map_err(|_| Error::Catalog)??;
     let membership = taxonomy_membership(&control, &request, &published, &network).await?;
-    let candidate = request.check_offer_membership(&published, membership.as_ref())?;
+    let operator = if request.requires_operator() {
+        let provider = Digest::new(&published.offer.provider_pubkey).map_err(|_| Error::Catalog)?;
+        let observed = control
+            .operator()
+            .read(&provider, &proof, epoch)
+            .await
+            .map_err(|_| Error::ProfileEvidence)?;
+        expires_at_ms = expires_at_ms.min(observed.expires_at_ms());
+        Some(observed)
+    } else {
+        None
+    };
+    let candidate =
+        request.check_offer_membership(&published, membership.as_ref(), operator.as_ref())?;
     Ok(EstimateCandidate {
         candidate,
         published,

@@ -89,14 +89,15 @@ export function createProxyCanonicalReader(peer, contractVersion) {
 
 export function createProxyCanonicalSnapshot(peer, contractVersion) {
   const { pin } = createProxyCanonicalReader(peer, contractVersion);
-  return async (body, { financial = false } = {}) => {
+  return async (body, { financial = false, operator = false } = {}) => {
     const initial = await pin();
     const observed = new Map();
     let readBytes = 0;
     try {
       const read = async key => {
         if (typeof key !== 'string' || key.length > 256 || !(key.startsWith('proxy/v1/') ||
-            (financial && financialReadKey(key)))) fail('invalid registry read key');
+            (financial && financialReadKey(key)) ||
+            (operator && /^(?:prov|kyb)\/[0-9a-f]{64}$/.test(key)))) fail('invalid registry read key');
         if (observed.has(key)) return clone(observed.get(key));
         if (observed.size >= MAX_KEYS) fail('registry read count exceeds its bound');
         const value = await initial.read(key);

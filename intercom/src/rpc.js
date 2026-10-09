@@ -419,6 +419,13 @@ export async function requestProxyProviderState(peer, body) {
   return await feature.proxyProviderState(body);
 }
 
+export async function requestProxyOperatorState(peer, body) {
+  if (!isObject(body) || Object.keys(body).sort().join('|') !== 'provider_pubkey|request_nonce') throw new Error('Invalid proxy operator query.');
+  const feature = peer.protocol?.instance?.features?.mayhem;
+  if (typeof feature?.proxyOperatorState !== 'function') throw new Error('Proxy operator relay is not ready.');
+  return await feature.proxyOperatorState(body);
+}
+
 export async function requestProxyIntentState(peer, body) {
   if (!isObject(body) || Object.keys(body).sort().join('|') !== 'intent|request_nonce') throw new Error('Invalid proxy intent query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
@@ -594,6 +601,11 @@ export const createServer = (
       if (req.method === 'POST' && requestPath === '/v1/proxy/provider-state') {
         const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 1024) });
         return respond(200, await requestProxyProviderState(peer, body));
+      }
+      if (req.method === 'POST' && requestPath === '/v1/proxy/operator-state') {
+        res.setHeader('Cache-Control', 'no-store');
+        const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 1024) });
+        return respond(200, await requestProxyOperatorState(peer, body));
       }
       if (req.method === 'POST' && requestPath === '/v1/proxy/intent-state') {
         const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 32768) });

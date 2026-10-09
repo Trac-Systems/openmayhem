@@ -23,6 +23,7 @@ pub mod managed;
 pub mod matching;
 pub mod metering;
 pub mod negotiation;
+pub mod operator;
 pub mod presence;
 pub mod receipts;
 pub mod recipe;

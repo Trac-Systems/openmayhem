@@ -17,6 +17,8 @@ import { prepareProxyClose, prepareProxyExpiry } from '../../contract/proxy-clos
 import { proxyBuyerReceiptSigningBytes, proxyProviderReceiptSigningBytes, proxyBuyerClosureSigningBytes, proxyProviderClosureSigningBytes, proxyBuyerExpirySigningBytes } from '../../contract/proxy-finance.js';
 import { proxyUsageFeatureKey, proxyReservationFeatureKey } from '../../contract/proxy-reservations.js';
 import { proxyCloseFeatureKey, proxyExpireFeatureKey } from '../../contract/proxy-closure.js';
+import { execute, signProviderKyb } from './contract.js';
+import { PROXY_OPERATOR_STATE_SERVICE } from '../../features/mayhem/proxy-operator-state.js';
 const execution=process.argv[4]?JSON.parse(process.argv[4]):null;
 const deferred=Boolean(execution)||process.argv[5]==='unreserved';
 const f=await proxyReceiptFixture(process.argv[2]??'tnk',process.argv[3]??'llm',execution,deferred,process.argv[5]==='expiry');
@@ -46,7 +48,7 @@ const buyerLocal={...peer,wallet:wallet(f.buyer)};
 const buyerParticipant=new MayhemFeature(buyerLocal,{});buyerParticipant.key='mayhem';
 buyerParticipant._adminKey=async()=>f.admin.publicKey;
 participant._adminKey=async()=>f.admin.publicKey;
-let mutation=null,calls=0;
+let mutation=null,calls=0,operatorCalls=0,operatorUnavailable=false;
 let submissions=0,publications=0,pending=null,publicationMode=null,publicationTail=Promise.resolve();
 // Test transport uses the actual RPC, receipt validator/accounting planner and
 // canonical signed-view service. The remote relay/indexer transport is simulated;
@@ -71,6 +73,10 @@ participant.relay=buyerParticipant.relay=(key,value)=>{
 };
 function requestsFor(actor) { return async(service,request)=>{
   calls++;
+  if(service===PROXY_OPERATOR_STATE_SERVICE) {
+    operatorCalls++;
+    if(operatorUnavailable)throw new Error('fixture canonical operator service unavailable');
+  }
   if(mutation==='delay')await new Promise(resolve=>setTimeout(resolve,250));
   const verified=admin._verifyServiceRequest(service,request,{admin:f.admin.publicKey,transport:actor.publicKey});
   if(!verified)throw new Error('fixture signature rejected');
@@ -129,6 +135,28 @@ try {
     else if(command==='close') {await f.apply(await prepareProxyClose(f.ledger,await closure(f),f.context,f.peer.wallet.verify));await sync();}
     else if(command==='foreign')participant.peer.wallet=wallet(f.buyer); // Expected local actor/transport remains provider.
     else if(command==='reset')mutation=null;
+    else if(command==='operator_verify'||command==='operator_revoke') {
+      // Explicit test-only native enrollment; the KYB mutation/signature and
+      // canonical read path are real. Never expose synthetic legal fields over
+      // the helper protocol or treat them as inference-integrity evidence.
+      const providerKey=`prov/${f.provider.publicKey}`;
+      await f.storage.put(providerKey,{...await f.read(providerKey),provider:f.provider.publicKey});
+      const value=command==='operator_verify'?{op:'set_provider_kyb',provider:f.provider.publicKey,
+        legal_name:'Local Test Operator',jurisdiction:'DE',proof_hash:'9'.repeat(64),kyb_ref:'LOCAL-TEST-ONLY',
+        verified_at:1788000000,schema_version:1}:{op:'revoke_provider_kyb',provider:f.provider.publicKey};
+      if(command==='operator_verify')value.admin_sig=signProviderKyb(f.admin.wallet,value);
+      const log=console.log;console.log=()=>{};
+      let result;
+      try {result=await execute(f.contract,f.storage,command==='operator_verify'?'setProviderKyb':'revokeProviderKyb',value,f.admin.publicKey,88);}
+      finally {console.log=log;}
+      if(result?.ok!==true)throw new Error(`fixture canonical operator command failed: ${result?.message}`);
+      await sync();
+    }
+    else if(command==='operator_inactive') {await f.storage.put(`prov/${f.provider.publicKey}`,{...await f.read(`prov/${f.provider.publicKey}`),provider:f.provider.publicKey,status:'banned'});await sync();}
+    else if(command==='operator_absent') {await f.storage.del(`kyb/${f.provider.publicKey}`);await sync();}
+    else if(command==='operator_unknown') {await f.storage.put(`kyb/${f.provider.publicKey}`,{provider:f.provider.publicKey,status:'self_reported'});await sync();}
+    else if(command==='operator_unavailable')operatorUnavailable=true;
+    else if(command==='operator_available')operatorUnavailable=false;
     else if(command==='ephemeral_test_wallet_seeds') {
       // Ephemeral fixture process only, through its private test stdin/stdout;
       // never exposed by RPC or a production wallet/signing service.
@@ -142,7 +170,7 @@ try {
     else if(command==='flush_publication') {if(pending){await applyReceipt(pending.key,pending.value);pending=null;}publicationMode=null;}
     else if(['nonce','network','hold','signature','unknown','delay'].includes(command))mutation=command;
     else throw new Error('unknown fixture command');
-    console.log(JSON.stringify({done:command,calls,submissions,publications}));
+    console.log(JSON.stringify({done:command,calls,operator_calls:operatorCalls,submissions,publications}));
   }
 } finally {
   await participant.stop();await buyerParticipant.stop();await admin.stop();server.closeAllConnections();buyerServer.closeAllConnections();

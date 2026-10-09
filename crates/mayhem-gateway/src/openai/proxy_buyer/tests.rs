@@ -2,6 +2,7 @@ mod buyer_policy;
 mod conformance;
 mod contract;
 mod estimation;
+mod operator;
 mod local_lab;
 mod profile;
 mod resolver;

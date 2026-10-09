@@ -2,6 +2,8 @@ import { readProxyAdmissionPolicy, validateProxyAdmissionPolicyRequest, PROXY_AD
   PROXY_ADMISSION_POLICY_MAX_BYTES, PROXY_ADMISSION_POLICY_MAX_AGE_MS } from './proxy-admission-policy.js';
 import { readProxyProviderState, validateProxyProviderStateRequest, PROXY_PROVIDER_STATE_SERVICE,
   PROXY_PROVIDER_STATE_MAX_BYTES, PROXY_PROVIDER_STATE_MAX_AGE_MS } from './proxy-provider-state.js';
+import { readProxyOperatorState, validateProxyOperatorStateRequest, PROXY_OPERATOR_STATE_SERVICE,
+  PROXY_OPERATOR_STATE_MAX_BYTES, PROXY_OPERATOR_STATE_MAX_AGE_MS } from './proxy-operator-state.js';
 import { readProxyIntentState, validateProxyIntentStateRequest, PROXY_INTENT_STATE_SERVICE,
   PROXY_INTENT_STATE_MAX_BYTES, PROXY_INTENT_STATE_MAX_AGE_MS } from './proxy-intent-state.js';
 import { readProxyOfferState, validateProxyOfferStateRequest, PROXY_OFFER_STATE_SERVICE,
@@ -379,7 +381,7 @@ const serviceParticipantFor = (service, value) => {
     return null;
   }
   if (service === 'stripe_checkout') return normalizeKey(value.who);
-  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE || service === PROXY_FINANCIAL_STATE_SERVICE || service === PROXY_QUOTE_STATE_SERVICE || service === PROXY_OFFER_STATE_SERVICE || service === PROXY_INTENT_STATE_SERVICE || service === PROXY_PROVIDER_STATE_SERVICE || service === PROXY_ADMISSION_POLICY_SERVICE) return normalizeKey(value.requester);
+  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE || service === PROXY_FINANCIAL_STATE_SERVICE || service === PROXY_QUOTE_STATE_SERVICE || service === PROXY_OFFER_STATE_SERVICE || service === PROXY_INTENT_STATE_SERVICE || service === PROXY_PROVIDER_STATE_SERVICE || service === PROXY_ADMISSION_POLICY_SERVICE || service === PROXY_OPERATOR_STATE_SERVICE) return normalizeKey(value.requester);
   if ([
     'provider_payout_context',
     'stripe_connect_adopt',
@@ -713,6 +715,30 @@ class MayhemFeature extends Feature {
 
   async proxyProviderState(query) {
     return await this._proxyNegotiationState(query, 'provider');
+  }
+
+  async proxyOperatorState(query) {
+    if (!query || Object.keys(query).sort().join('|') !== 'provider_pubkey|request_nonce') throw new Error('Invalid proxy operator query.');
+    const requester = normalizeKey(this.peer?.wallet?.publicKey);
+    validateProxyOperatorStateRequest({ ...query, requester });
+    const payload = { ...query, requester, request_nonce: crypto.randomBytes(32).toString('hex') };
+    const admin = await this._adminKey();
+    const identity = { actor: requester, admin, transport: requester, payload };
+    const signature = this.peer.wallet.sign(b4a.from(serviceSigningMessage(PROXY_OPERATOR_STATE_SERVICE, identity)));
+    const started = Date.now();
+    const result = await this.requestService(PROXY_OPERATOR_STATE_SERVICE, { ...identity,
+      signing_version: SERVICE_SIGNING_VERSION, signature: b4a.isBuffer(signature) ? b4a.toString(signature, 'hex') : signature });
+    const elapsed = Date.now() - started;
+    if (elapsed < 0 || elapsed > PROXY_OPERATOR_STATE_MAX_AGE_MS) throw new Error('Proxy operator observation expired; refresh.');
+    const context = proxyRuntimeContext(this.peer, CONTRACT_VERSION, result?.context?.epoch);
+    if (result?.ok !== true || result.lane !== 'proxy' || result.schema_version !== 1
+        || stableJson(result.context) !== stableJson(context)
+        || Object.keys(payload).some(key => result[key] !== payload[key])
+        || b4a.byteLength(JSON.stringify(result)) > PROXY_OPERATOR_STATE_MAX_BYTES) {
+      throw new Error('Proxy operator response does not match this request/network.');
+    }
+    validateProxySnapshotProof(result.proof);
+    return { ...result, request_nonce: query.request_nonce };
   }
 
   async _proxyNegotiationState(query, label) {
@@ -1080,6 +1106,9 @@ class MayhemFeature extends Feature {
     if (service === PROXY_PROVIDER_STATE_SERVICE) {
       try { validateProxyProviderStateRequest(payload); } catch { return null; }
     }
+    if (service === PROXY_OPERATOR_STATE_SERVICE) {
+      try { validateProxyOperatorStateRequest(payload); } catch { return null; }
+    }
     if (service === PROXY_OFFER_STATE_SERVICE) {
       try { validateProxyOfferStateRequest(payload); } catch { return null; }
     }
@@ -1248,6 +1277,9 @@ class MayhemFeature extends Feature {
     }
     if (service === PROXY_PROVIDER_STATE_SERVICE) {
       return await readProxyProviderState({ request: value, withCanonicalSnapshot: this.withProxyCanonicalSnapshot });
+    }
+    if (service === PROXY_OPERATOR_STATE_SERVICE) {
+      return await readProxyOperatorState({ request: value, withCanonicalSnapshot: this.withProxyCanonicalSnapshot });
     }
     if (service === PROXY_INTENT_STATE_SERVICE) {
       return await readProxyIntentState({ request: value,

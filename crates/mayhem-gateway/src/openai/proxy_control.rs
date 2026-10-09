@@ -263,6 +263,14 @@ impl Prepared {
             })
             .transpose()?;
         let (failure_updates, failure) = watch::channel(None);
+        let operator = Arc::new(
+            mayhem_proxy::operator::Reader::new(
+                &self.config.peer_rpc_url,
+                self.config.network.clone(),
+                Duration::from_millis(self.config.rpc_timeout_ms),
+            )
+            .map_err(|_| Error::Configuration)?,
+        );
         let control = Arc::new(ProxyControl {
             catalog,
             presence,
@@ -271,6 +279,7 @@ impl Prepared {
             running: Arc::new(AtomicBool::new(false)),
             registry: self.registry,
             conformance,
+            operator,
         });
         let lifecycle = ProxyLifecycle {
             control: control.clone(),
@@ -321,6 +330,7 @@ pub struct ProxyControl {
     running: Arc<AtomicBool>,
     registry: Option<Arc<RegistryReader>>,
     conformance: Option<Arc<mayhem_proxy::conformance::Store>>,
+    operator: Arc<mayhem_proxy::operator::Reader>,
 }
 
 impl fmt::Debug for ProxyControl {
@@ -341,6 +351,9 @@ pub struct Health {
 }
 
 impl ProxyControl {
+    pub(crate) fn operator(&self) -> &Arc<mayhem_proxy::operator::Reader> {
+        &self.operator
+    }
     pub fn conformance(&self) -> Option<&Arc<mayhem_proxy::conformance::Store>> {
         self.conformance.as_ref()
     }

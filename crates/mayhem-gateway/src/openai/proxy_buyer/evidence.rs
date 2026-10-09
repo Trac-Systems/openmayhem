@@ -11,8 +11,7 @@ use std::{future::Future, pin::Pin};
 static READS: Semaphore = Semaphore::const_new(4);
 
 pub(crate) fn unsupported(p: &Policy) -> bool {
-    p.providers.require_verified_operator
-        || !p.constraints.data_handling.is_empty()
+    !p.constraints.data_handling.is_empty()
         || matches!(&p.target, Target::Category { variants, tags, .. } | Target::TaxonomyCategory { variants, tags, .. } if !variants.is_empty() || !tags.is_empty())
 }
 pub(super) fn needed(p: &Policy) -> bool {
@@ -136,6 +135,15 @@ pub(super) async fn gate(
     request: Arc<proxy_request::Request>,
     inner: Arc<dyn buyer_controller::AuthorizationGate>,
 ) -> Result<Arc<dyn buyer_controller::AuthorizationGate>, ApiError> {
+    let inner: Arc<dyn buyer_controller::AuthorizationGate> = if request.requires_operator() {
+        Arc::new(OperatorGate {
+            inner,
+            control: control.clone(),
+            request: request.clone(),
+        })
+    } else {
+        inner
+    };
     if request
         .controls()
         .profile
@@ -158,6 +166,43 @@ pub(super) async fn gate(
             .clone(),
         record,
     }))
+}
+
+/// A previous estimate never grants verification at payment time. Obtain a fresh
+/// canonical observation immediately before the owner can authorize its hold.
+struct OperatorGate {
+    inner: Arc<dyn buyer_controller::AuthorizationGate>,
+    control: Arc<ProxyControl>,
+    request: Arc<proxy_request::Request>,
+}
+impl buyer_controller::AuthorizationGate for OperatorGate {
+    fn retain_non_admission<'a>(
+        &'a self,
+        proof: &'a mayhem_proxy::financial::negotiation::NonAdmission,
+    ) -> Pin<Box<dyn Future<Output = Result<(), buyer_controller::GateError>> + Send + 'a>> {
+        self.inner.retain_non_admission(proof)
+    }
+    fn retain_verified_output<'a>(
+        &'a self,
+        output: buyer_controller::VerifiedOutput<'a>,
+    ) -> Pin<Box<dyn Future<Output = Result<(), buyer_controller::GateError>> + Send + 'a>> {
+        self.inner.retain_verified_output(output)
+    }
+    fn authorize<'a>(
+        &'a self,
+        purchase: &'a mayhem_proxy::financial::quote::PreparedPurchase,
+    ) -> Pin<Box<dyn Future<Output = Result<(), buyer_controller::GateError>> + Send + 'a>> {
+        Box::pin(async move {
+            let selected =
+                proxy_request::resolve_estimate(self.control.clone(), self.request.clone())
+                    .await
+                    .map_err(|_| buyer_controller::GateError::Rejected)?;
+            if selected.candidate.offer.digest().ok() != purchase.terms().offer.digest().ok() {
+                return Err(buyer_controller::GateError::Rejected);
+            }
+            self.inner.authorize(purchase).await
+        })
+    }
 }
 struct Gate {
     inner: Arc<dyn buyer_controller::AuthorizationGate>,

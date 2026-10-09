@@ -76,7 +76,7 @@ fn actual_site_profiles_guard_all_four_endpoint_requests_and_replay_identity() {
         changed["proxy"]["profile"]["providers"]["require_verified_operator"] = json!(true);
         assert!(matches!(
             parse(&c, changed).check_offer(&c),
-            Err(Error::ProfileEvidence)
+            Err(Error::Verification)
         ));
         let mut changed = body.clone();
         changed["proxy"]["profile"]["prices"]["max_total_spend_au"] = json!("1");

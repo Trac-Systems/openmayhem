@@ -226,8 +226,15 @@ async fn restrictive_model_scope_continuity_and_unknown_evidence_never_invent_se
                 value;
         }
         let (status, error) = send(f.router.clone(), changed, "owner-fixture-key").await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(error["error"]["code"], code);
+        if path == "evidence" {
+            assert_eq!(status, StatusCode::OK);
+            assert_eq!(error["status"], "incomplete");
+            assert!(error["selection"].is_null());
+            assert_eq!(error["ranking_claim"], "none");
+        } else {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(error["error"]["code"], code);
+        }
     }
     f.harness.stop_descriptors();
     let (_, unresolved) = send(f.router.clone(), input, "owner-fixture-key").await;

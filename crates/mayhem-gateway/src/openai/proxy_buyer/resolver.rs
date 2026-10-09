@@ -481,7 +481,7 @@ async fn start(
     if controls.settlement_policy_hash != *runtime.policy.settlement_policy_hash() {
         return Err(error("proxy_settlement_policy_mismatch", false));
     }
-    if super::evidence::unsupported(profile) || controls.require_verified_operator {
+    if super::evidence::unsupported(profile) {
         return Err(error("proxy_profile_evidence_unavailable", true));
     }
     if matches!(profile.ranking, Ranking::PreferredSpeed)
@@ -1022,6 +1022,12 @@ async fn check(
         Ok(value) => value,
         Err(proxy_request::Error::Constraints | proxy_request::Error::Price) => {
             return Checked::Excluded("request_constraints", false)
+        }
+        Err(proxy_request::Error::Verification) => {
+            return Checked::Excluded("operator_not_verified", false)
+        }
+        Err(proxy_request::Error::ProfileEvidence) => {
+            return Checked::Excluded("profile_evidence_unavailable", true)
         }
         Err(_) => return Checked::Excluded("catalog_unavailable", true),
     };
