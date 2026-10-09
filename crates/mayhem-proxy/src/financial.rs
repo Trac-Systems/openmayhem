@@ -348,6 +348,22 @@ pub struct Client {
     slots: tokio::sync::Semaphore,
 }
 impl Client {
+    /// Separate bounded control permits for background registration observations.
+    /// These must not consume the permits needed to accept or close paid work.
+    pub(crate) fn presence_reader(&self, max_reads: usize) -> Result<Self> {
+        require(
+            (1..=64).contains(&max_reads),
+            "invalid presence reader capacity",
+        )?;
+        Ok(Self {
+            http: self.http.clone(),
+            endpoint: self.endpoint.clone(),
+            publication_endpoint: self.publication_endpoint.clone(),
+            identity: self.identity.clone(),
+            requester: self.requester.clone(),
+            slots: tokio::sync::Semaphore::new(max_reads),
+        })
+    }
     pub fn new(
         rpc_base: &str,
         identity: Identity,

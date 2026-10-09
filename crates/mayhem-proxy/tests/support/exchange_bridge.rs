@@ -6,7 +6,7 @@ use mayhem_bridge::ScBridgeConfig;
 use serde_json::{json, Value};
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, atomic::{AtomicBool,Ordering}},
     time::Duration,
 };
 use tokio::{
@@ -21,11 +21,13 @@ struct Client {
     tx: mpsc::Sender<Value>,
     sessions: HashSet<String>,
     all: bool,
+    channels: HashSet<String>,
 }
 pub struct Bridge {
     url: String,
     pub attack: Arc<Mutex<Option<&'static str>>>,
     pub frames: Arc<Mutex<Vec<Value>>>,
+    pub reject_presence: Arc<AtomicBool>,
     task: JoinHandle<()>,
 }
 impl Drop for Bridge {
@@ -39,6 +41,8 @@ impl Bridge {
         let url = format!("ws://{}", listener.local_addr().unwrap());
         let attack = Arc::new(Mutex::new(None));
         let frames = Arc::new(Mutex::new(Vec::new()));
+        let reject_presence=Arc::new(AtomicBool::new(false));
+        let rejection=reject_presence.clone();
         let mode = attack.clone();
         let capture = frames.clone();
         let identities = Arc::new(HashMap::from([
@@ -54,7 +58,7 @@ impl Bridge {
                     accepted=listener.accept()=>{
                         let Ok((socket,_))=accepted else {break};
                         client_id+=1;let id=client_id;
-                        let peers=peers.clone();let identities=identities.clone();let mode=mode.clone();let capture=capture.clone();
+                        let peers=peers.clone();let identities=identities.clone();let mode=mode.clone();let capture=capture.clone();let rejection=rejection.clone();
                         tasks.spawn(async move {
                             let ws=accept_async(socket).await.unwrap();let (mut out,mut input)=ws.split();
                             let first=input.next().await.unwrap().unwrap();
@@ -64,7 +68,7 @@ impl Bridge {
                             {
                                 let mut peers=peers.lock().await;
                                 if peers.len()>=64 {return}
-                                peers.insert(id,Client{own:own.clone(),tx:tx.clone(),sessions:HashSet::new(),all:false});
+                                peers.insert(id,Client{own:own.clone(),tx:tx.clone(),sessions:HashSet::new(),all:false,channels:HashSet::new()});
                             }
                             out.send(Message::Text(json!({"type":"auth_ok","id":auth["id"]}).to_string().into())).await.unwrap();
                             loop {
@@ -82,6 +86,21 @@ impl Bridge {
                                     }
                                 };
                                 let kind=request["type"].as_str().unwrap();
+                                if kind=="send" && rejection.load(Ordering::SeqCst) {
+                                    if out.send(Message::Text(json!({"type":"error","id":request["id"],"error":"fixture presence transport unavailable"}).to_string().into())).await.is_err(){break}
+                                    continue;
+                                }
+                                if kind=="subscribe" {
+                                    let mut peers=peers.lock().await;let client=peers.get_mut(&id).unwrap();
+                                    let selected=request["channels"].as_array().unwrap();
+                                    if selected.is_empty(){client.channels.clear();}
+                                    for channel in selected {client.channels.insert(channel.as_str().unwrap().into());}
+                                }
+                                if kind=="send" {
+                                    let channel=request["channel"].as_str().unwrap();
+                                    let targets=peers.lock().await.values().filter(|client|client.channels.contains(channel)).map(|client|client.tx.clone()).collect::<Vec<_>>();
+                                    for target in targets {let _=target.try_send(json!({"type":"sidechannel_message","channel":channel,"message":request["message"]}));}
+                                }
                                 if kind=="session_subscribe" {
                                     let mut peers=peers.lock().await;let client=peers.get_mut(&id).unwrap();
                                     for session in request["session_ids"].as_array().unwrap() {
@@ -130,8 +149,9 @@ impl Bridge {
                                     }
                                     if attack==Some("lost_ack"){break}
                                 }
+                                if kind=="send" {let mut frames=capture.lock().await;if frames.len()<256 {frames.push(request.clone());}}
                                 let typ=match kind {"session_subscribe"=>"session_subscribed","session_open"=>"session_opened",
-                                    "session_send"=>"session_sent","session_close"=>"session_closed",_=>panic!("unexpected test command")};
+                                    "session_send"=>"session_sent","session_close"=>"session_closed","join"=>"joined","send"=>"sent","subscribe"=>"subscribed","clear_filter"=>"filter_set",_=>panic!("unexpected test command")};
                                 if out.send(Message::Text(json!({"type":typ,"id":request["id"],"remote":request["remote"],
                                     "session_id":request["session_id"],"direct":true,"relayed":false}).to_string().into())).await.is_err(){break}
                             }
@@ -146,6 +166,7 @@ impl Bridge {
             url,
             attack,
             frames,
+            reject_presence,
             task,
         }
     }

@@ -90,6 +90,13 @@ shutdown does not convert uncertain work into free slots. Health uses coalesced
 in-memory snapshots; the CLI prints a single final bounded summary, not a growing
 per-request or per-tick log.
 
+Startup also publishes signed proxy availability only after current canonical
+offer/admission observation. It reports the actual remaining shared capacity,
+keeps original health/speed expiry, and attempts withdrawal at shutdown. Its
+control reads have separate permits from paid admission/settlement. See
+[PRESENCE.md](PRESENCE.md) for timing, authentication, replay protection and the
+remaining gateway integration.
+
 ## Evidence and remaining integration
 
 Tests exercise protected configuration/wallet rejection, real local HTTP stream
@@ -100,8 +107,8 @@ The three-rail tests use the canonical isolated ledger RPC fixture and ephemeral
 test wallets; they are **not live payments or real Noise-network acceptance**.
 
 This is explicit command startup. Automatic mayhemd installation/restart policy,
-signed public presence/withdrawal, native/external shared-runtime registration,
+native/external shared-runtime registration,
 provider setup UX, fee collection, gateway/catalog integration and public surfaces
-remain required. The command does not register a market, pay the admission fee,
-publish availability or establish production activation. Full worker/tokenizer
+remain required. The command does not register a market, pay the admission fee
+or establish production activation. Full worker/tokenizer
 OS containment and real-model/network/rail acceptance remain release gates.

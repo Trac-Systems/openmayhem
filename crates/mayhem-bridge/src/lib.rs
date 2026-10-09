@@ -231,6 +231,12 @@ impl ScBridgeClient {
         self.subscribe(std::iter::empty::<&str>()).await
     }
 
+    /// Clear only this connection's optional payload filter. Channel
+    /// subscriptions remain in force; other clients retain their own filters.
+    pub async fn clear_sidechannel_filter(&mut self) -> Result<Value> {
+        self.request(json!({ "type": "clear_filter" }), "filter_set").await
+    }
+
     pub async fn unsubscribe(
         &mut self,
         channels: impl IntoIterator<Item = impl AsRef<str>>,

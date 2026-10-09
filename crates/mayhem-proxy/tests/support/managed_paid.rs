@@ -10,7 +10,7 @@ async fn managed_provider_startup_negotiates_executes_and_closes_paid_decisions_
             .into_iter()
             .find(|(e, _, _)| *e == ProxyEndpoint::Decisions)
             .unwrap();
-        let backend = backend(200, response, Duration::ZERO).await;
+        let backend = backend(200, response, Duration::from_millis(400)).await;
         let f = Fixture::new(&backend.base, endpoint);
         let mut peer = Peer::start(rail, &f, &bytes, false, None).await;
         let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
@@ -57,6 +57,45 @@ async fn managed_provider_startup_negotiates_executes_and_closes_paid_decisions_
         })
         .await
         .unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if bridge
+                    .frames
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|f| f["type"] == "send" && f["message"]["body"]["state"] == "ready")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        {
+            let frames = bridge.frames.lock().await;
+            let frame = frames
+                .iter()
+                .find(|f| f["type"] == "send" && f["message"]["body"]["state"] == "ready")
+                .unwrap();
+            let signed: mayhem_proxy::presence::Signed =
+                serde_json::from_value(frame["message"].clone()).unwrap();
+            signed
+                .verify(&signed.body.network, signed.body.issued_ms)
+                .unwrap();
+            assert_eq!(signed.body.provider.as_str(), context.offer.provider_pubkey);
+            assert_eq!(signed.body.offer.as_str(), context.offer.digest().unwrap());
+            assert_eq!(signed.body.free_slots, 1);
+            assert!(
+                signed.body.speed.is_none(),
+                "decisions must not invent native token rate"
+            );
+            assert!(
+                signed.body.expires_ms - signed.body.issued_ms <= 15_000,
+                "canonical evidence must not be renewed by heartbeat"
+            );
+        }
         assert_eq!(
             backend.calls.load(Ordering::SeqCst),
             1,
@@ -89,8 +128,58 @@ async fn managed_provider_startup_negotiates_executes_and_closes_paid_decisions_
             })
             .await
             .unwrap();
+        if rail == ProxyRail::Fiat {
+            bridge.reject_presence.store(true, Ordering::SeqCst);
+        }
         let result = next(&mut buyer).await;
+        if rail != ProxyRail::Fiat {
+            assert!(
+                bridge
+                    .frames
+                    .lock()
+                    .await
+                    .iter()
+                    .any(|f| f["type"] == "send"
+                        && f["message"]["body"]["state"] == "busy"
+                        && f["message"]["body"]["free_slots"] == 0),
+                "actual occupied paid slot must withdraw new capacity without ending the job"
+            );
+        }
         settle(&s, &f, &peer, &mut buyer, &bytes, result).await;
+        if rail == ProxyRail::Fiat {
+            assert!(
+                health.borrow().presence.reconnects > 0,
+                "test must interrupt the actual heartbeat transport during paid work"
+            );
+            bridge.reject_presence.store(false, Ordering::SeqCst);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let n = bridge
+                        .frames
+                        .lock()
+                        .await
+                        .iter()
+                        .filter(|f| f["type"] == "send" && f["message"]["body"]["state"] == "ready")
+                        .count();
+                    if health.borrow().presence.connected && n >= 2 {
+                        break;
+                    }
+                    health.changed().await.unwrap();
+                }
+            })
+            .await
+            .unwrap();
+            let frames = bridge.frames.lock().await;
+            let sequences = frames
+                .iter()
+                .filter(|f| f["type"] == "send")
+                .map(|f| f["message"]["body"]["sequence"].as_u64().unwrap())
+                .collect::<Vec<_>>();
+            assert!(
+                sequences.windows(2).all(|w| w[0] < w[1]),
+                "reconnection must not reset the signed sequence"
+            );
+        }
         assert_eq!(
             backend.calls.load(Ordering::SeqCst),
             2,
@@ -103,6 +192,14 @@ async fn managed_provider_startup_negotiates_executes_and_closes_paid_decisions_
         );
         stop.send_replace(true);
         task.await.unwrap().unwrap();
+        assert!(bridge
+            .frames
+            .lock()
+            .await
+            .iter()
+            .any(|f| f["type"] == "send"
+                && f["message"]["body"]["state"] == "draining"
+                && f["message"]["body"]["free_slots"] == 0));
         assert_eq!(health.borrow().serving.accepted, 1);
         assert_eq!(health.borrow().serving.failed, 0);
         peer.stop().await;

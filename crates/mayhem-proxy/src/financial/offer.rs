@@ -76,6 +76,18 @@ impl Observation {
         self.fresh()?;
         Ok(&self.wire.membership)
     }
+    pub(crate) fn presence_binding(
+        &self,
+    ) -> Result<(Identity, &ProxyOffer, &ProxyMembership, u64)> {
+        self.fresh()?;
+        let remaining = FRESHNESS.saturating_sub(self.started.elapsed()).as_millis() as u64;
+        Ok((
+            self.wire.context.identity(),
+            &self.wire.offer,
+            &self.wire.membership,
+            remaining,
+        ))
+    }
     pub(crate) fn check_proposal(
         &self,
         context: &crate::negotiation::Context,

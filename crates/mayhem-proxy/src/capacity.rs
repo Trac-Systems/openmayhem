@@ -495,6 +495,13 @@ impl Authority {
         &self.identity
     }
 
+    /// Monotonic across restarts of this locked authority. Presence receivers
+    /// also bind the boot nonce, so a second, freshly created store cannot
+    /// impersonate the same generation or add another allocation for an offer.
+    pub(crate) fn presence_fence(&self) -> (u64, Digest) {
+        (self.fence, self.nonce.clone())
+    }
+
     /// Attach once from trusted startup, after configuring the exact scope.
     /// No model request is issued and no active/uncertain lease is modified.
     /// On restart the saved live requirement stays closed until reattached.

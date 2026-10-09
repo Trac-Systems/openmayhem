@@ -181,6 +181,8 @@ async fn managed_provider_decision_readiness_requires_real_validated_result_with
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     stop.send_replace(true);
     task.await.unwrap().unwrap();
+    assert!(!bridge.frames.lock().await.iter().any(|f|f["type"]=="send"),
+        "healthy local backend must not publish without canonical admission/offer evidence");
 }
 
 #[tokio::test]

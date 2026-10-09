@@ -1,7 +1,9 @@
 //! Explicit opt-in provider startup. Only protected operator files select
 //! connections, runtime groups, adapters, probe spending or tokenizer data.
-//! This does not register offers, pay admission or advertise public presence.
+//! This does not register offers or pay admission. Public presence requires a
+//! current canonical registration observation, independently of local health.
 mod config;
+mod presence;
 mod recovery;
 use crate::{
     attempts::{self, Digest, Journal},
@@ -62,6 +64,7 @@ struct Route {
 pub struct Health {
     pub serving: serving::dispatch::Health,
     pub recovery: recovery::Health,
+    pub presence: presence::Health,
     pub routes: BTreeMap<Digest, health::Snapshot>,
 }
 /// Owns every route and its shared capacity authority. Dropping closes the local
@@ -73,6 +76,7 @@ pub struct Provider {
     registrations: Vec<Registration>,
     limits: config::Limits,
     recovery: recovery::Runner,
+    presence: presence::Runner,
     capacity: Arc<capacity::Authority>,
     monitors: BTreeMap<Digest, Monitor>,
     seed: u64,
@@ -153,6 +157,7 @@ impl Prepared {
         }
         let mut registrations = Vec::new();
         let mut recovery = Vec::new();
+        let mut presence_entries = Vec::new();
         let mut monitors = BTreeMap::new();
         for Route {
             spec,
@@ -186,7 +191,7 @@ impl Prepared {
                 connection: connection.http.clone(),
                 capacity: capacity.clone(),
                 route: spec.id.clone(),
-                approved_policy: spec.settlement_policy,
+                approved_policy: spec.settlement_policy.clone(),
             });
             // Stable route ID, not revision/price, owns retained financial data.
             let journal = Arc::new(
@@ -212,6 +217,18 @@ impl Prepared {
             )
             .map_err(|_| Error::Setup)?;
             for offer in spec.offers {
+                presence_entries.push(presence::Entry {
+                    route: spec.id.clone(),
+                    monitor: connection.monitor.clone(),
+                    query: financial::offer::Query {
+                        rail: *offer.accepted_rails.first().ok_or(Error::Configuration)?,
+                        settlement_policy_hash: spec
+                            .settlement_policy
+                            .digest()
+                            .map_err(|_| Error::Configuration)?,
+                        offer: offer.clone(),
+                    },
+                });
                 registrations
                     .push(Registration::new(&offer, controller.clone()).map_err(|_| Error::Setup)?);
             }
@@ -254,6 +271,22 @@ impl Prepared {
             config.limits.recovery_worker.max_children,
             Duration::from_millis(config.limits.recovery_interval_ms),
         );
+        let presence = presence::Runner {
+            entries: presence_entries,
+            financial: Arc::new(
+                financial
+                    .presence_reader(config.limits.financial_reads)
+                    .map_err(|_| Error::Setup)?,
+            ),
+            publisher: Arc::new(std::sync::Mutex::new(
+                crate::presence::Publisher::new(signer, capacity.clone())
+                    .map_err(|_| Error::Setup)?,
+            )),
+            bridge: bridge.clone(),
+            network: config.network,
+            concurrency: config.limits.financial_reads,
+            health_ttl_ms: config.health.evidence_ttl_ms,
+        };
         Ok(Provider {
             identity,
             bridge,
@@ -263,6 +296,7 @@ impl Prepared {
             registrations,
             limits: config.limits,
             recovery,
+            presence,
             capacity,
             monitors,
             seed,
@@ -311,36 +345,44 @@ impl Provider {
         let (serving_updates, serving_health) =
             watch::channel(serving::dispatch::Health::default());
         let (recovery_updates, recovery_health) = watch::channel(recovery::Health::default());
+        let (presence_updates, presence_health) = watch::channel(presence::Health::default());
         let serving = dispatcher.run(stopping.clone(), serving_updates);
-        let recovery = self.recovery.run(stopping, recovery_updates);
-        tokio::pin!(serving, recovery);
+        let recovery = self.recovery.run(stopping.clone(), recovery_updates);
+        let presence = self.presence.run(stopping, presence_updates);
+        tokio::pin!(serving, recovery, presence);
         let mut sampling = tokio::time::interval(Duration::from_millis(self.limits.observation_ms));
         sampling.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let result = loop {
             tokio::select! {
                 _ = stopped(&mut stop) => {
                     shutdown.send_replace(true);
-                    let (a,b) = tokio::join!(&mut serving, &mut recovery);
-                    break a.map_err(|_| Error::Task).and(b);
+                    let (a,b,c) = tokio::join!(&mut serving, &mut recovery, &mut presence);
+                    break a.map_err(|_| Error::Task).and(b).and(c);
                 },
                 a = &mut serving => {
                     shutdown.send_replace(true);
-                    let b = recovery.await;
-                    break a.map_err(|_| Error::Transport).and(b);
+                    let (b,c) = tokio::join!(&mut recovery,&mut presence);
+                    break a.map_err(|_| Error::Transport).and(b).and(c);
                 },
                 b = &mut recovery => {
                     shutdown.send_replace(true);
-                    let _ = serving.await;
+                    let _ = tokio::join!(&mut serving,&mut presence);
                     break b.and(Err(Error::Task));
                 },
+                c = &mut presence => {
+                    shutdown.send_replace(true);
+                    let _ = tokio::join!(&mut serving,&mut recovery);
+                    break c.and(Err(Error::Transport));
+                },
                 _ = sampling.tick() => {
-                    updates.send_replace(Health { serving: serving_health.borrow().clone(), recovery: recovery_health.borrow().clone(), routes: snapshots(&self.monitors) });
+                    updates.send_replace(Health { serving: serving_health.borrow().clone(), recovery: recovery_health.borrow().clone(), presence:presence_health.borrow().clone(), routes: snapshots(&self.monitors) });
                 }
             }
         };
         updates.send_replace(Health {
             serving: serving_health.borrow().clone(),
             recovery: recovery_health.borrow().clone(),
+            presence: presence_health.borrow().clone(),
             routes: BTreeMap::new(),
         });
         result
