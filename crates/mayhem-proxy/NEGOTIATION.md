@@ -59,8 +59,10 @@ fsync/acknowledgment failure. They use actual local RPC/accounting with ephemera
 test identities. No external payment or real inference is claimed.
 
 Provider countersigning now uses `financial::provider::ProviderNegotiation`, as described
-below. Authenticated pre-acceptance transport is implemented in `negotiation::Channel`;
-the trusted session dispatcher and automatic supervisor startup are still required.
+below. Authenticated pre-acceptance transport is implemented in `negotiation::Channel`.
+`Channel::dial` and `opening::Listener` implement a bounded authenticated open/ready
+handshake. The opt-in registered dispatcher is described in [SERVING.md](SERVING.md);
+automatic supervisor startup remains required.
 Bounded provider proposal orchestration and buyer non-admission recovery are
 described below. Provider reconciliation of partial signing and capacity retirement
 is implemented; the opt-in session controller and rotating recovery runner are
@@ -299,4 +301,5 @@ reopen/prune/reuse, pending publication retirement, role authentication, fresh n
 and replay checks, superseded offers/old contracts, corrupt footprints, bounded
 reads and unchanged balances/native holds. Provider-side partial-signing recovery
 and opt-in session supervision are implemented in [SERVING.md](SERVING.md);
-the public dispatcher and automatic startup remain unfinished.
+the opt-in authenticated dispatcher is also implemented; automatic startup remains
+unfinished.

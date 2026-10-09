@@ -95,7 +95,8 @@ Noise/relay network proof or an external payout test.
 The opt-in supervised controller and bounded periodic reconciliation runner are now
 implemented in [SERVING.md](SERVING.md). They own independent read/write tasks and
 retain in-flight work across connection loss. No blocking receive holds a channel
-lock required for stream delivery. The trusted session dispatcher, automatic startup,
+lock required for stream delivery. The authenticated opening and opt-in registered
+dispatcher are implemented there as well. Automatic startup,
 upstream job polling/cancellation, adaptive health, public API/Studio/MCP and
 end-to-end real-network acceptance remain required integration work. Local controller
 and transport tests do not prove automatic public serving.

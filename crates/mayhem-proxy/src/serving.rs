@@ -2,6 +2,7 @@
 //! an authenticated negotiation channel, never by deserializing a claimed buyer.
 //! No public startup, native provider change or implicit financial waiver.
 mod connection;
+pub mod dispatch;
 pub mod maintenance;
 mod queue;
 
@@ -70,6 +71,7 @@ struct State {
 }
 struct Inner {
     identity: Identity,
+    endpoint: mayhem_proto::proxy::ProxyEndpoint,
     proposals: Proposals,
     executor: Arc<PaidExecutor>,
     signer: Arc<Authority>,
@@ -189,6 +191,7 @@ impl Controller {
         Ok(Self {
             inner: Arc::new(Inner {
                 identity: runtime.capacity.identity().clone(),
+                endpoint: runtime.adapter.endpoint(),
                 proposals,
                 executor,
                 signer,
@@ -207,7 +210,36 @@ impl Controller {
     }
     pub fn start(&self, channel: negotiation::Channel) -> Result<Handle> {
         channel.provider_for(&self.inner.identity)?;
-        let context = channel.context();
+        let guard = self.reserve_connection(channel.context())?;
+        let (stop, stopped) = watch::channel(false);
+        let owner = self.inner.clone();
+        let task =
+            tokio::spawn(async move { connection::run(owner, channel, guard, stopped).await });
+        Ok(Handle {
+            stop,
+            task: Some(task),
+        })
+    }
+    /// Reserve bounded control ownership before opening a dedicated bridge socket
+    /// or telling the buyer it may send. No model/financial admission occurs here.
+    pub fn accept(&self, incoming: negotiation::opening::Incoming) -> Result<Handle> {
+        incoming.check(&self.inner.identity)?;
+        let guard = self.reserve_connection(incoming.context())?;
+        let owner = self.inner.clone();
+        let (stop, mut stopped) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let channel = tokio::select! {
+                result=incoming.accept(&owner.identity)=>result?,
+                _=connection::stopped(&mut stopped)=>return Ok(End::Disconnected),
+            };
+            connection::run(owner, channel, guard, stopped).await
+        });
+        Ok(Handle {
+            stop,
+            task: Some(task),
+        })
+    }
+    fn reserve_connection(&self, context: &negotiation::Context) -> Result<ConnectionGuard> {
         let invocation = context.invocation()?;
         let permit = self
             .inner
@@ -231,19 +263,11 @@ impl Controller {
                 .connections
                 .insert(invocation.clone(), context.buyer.clone());
         }
-        let guard = ConnectionGuard {
+        Ok(ConnectionGuard {
             owner: self.inner.clone(),
             invocation,
             _permit: permit,
             registered: true,
-        };
-        let (stop, stopped) = watch::channel(false);
-        let owner = self.inner.clone();
-        let task =
-            tokio::spawn(async move { connection::run(owner, channel, guard, stopped).await });
-        Ok(Handle {
-            stop,
-            task: Some(task),
         })
     }
 }

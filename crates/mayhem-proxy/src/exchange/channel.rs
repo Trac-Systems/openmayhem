@@ -229,32 +229,37 @@ impl Channel {
         Ok(Self { wire, session })
     }
 }
+pub(crate) fn validate_config(config: &ScBridgeConfig, limits: Limits) -> Result<()> {
+    // The existing local token authenticates a trusted Core process. A
+    // remote plaintext bridge must not impersonate Noise peer identities.
+    let loopback = match config.url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        _ => false,
+    };
+    if !loopback
+        || !matches!(config.url.scheme(), "ws" | "wss")
+        || config.url.query().is_some()
+        || config.url.fragment().is_some()
+        || !config.url.username().is_empty()
+        || config.url.password().is_some()
+        || config.operation_deadline.is_none_or(|d| d.is_zero())
+        || config.max_message_bytes < FRAME_BOUND
+        || limits.max_message_bytes == 0
+        || limits.max_message_bytes > 256 * 1024 * 1024
+    {
+        return Err(Error::Protocol);
+    }
+    Ok(())
+}
+
 impl Wire {
     pub(crate) async fn connect(
         config: ScBridgeConfig,
         link: Link,
         limits: Limits,
     ) -> Result<Self> {
-        // The existing local token authenticates a trusted Core process. A
-        // remote plaintext bridge must not impersonate Noise peer identities.
-        let loopback = match config.url.host() {
-            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
-            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
-            _ => false,
-        };
-        if !loopback
-            || !matches!(config.url.scheme(), "ws" | "wss")
-            || config.url.query().is_some()
-            || config.url.fragment().is_some()
-            || !config.url.username().is_empty()
-            || config.url.password().is_some()
-            || config.operation_deadline.is_none_or(|d| d.is_zero())
-            || config.max_message_bytes < FRAME_BOUND
-            || limits.max_message_bytes == 0
-            || limits.max_message_bytes > 256 * 1024 * 1024
-        {
-            return Err(Error::Protocol);
-        }
+        validate_config(&config, limits)?;
         let mut bridge = ScBridgeClient::connect(config)
             .await
             .map_err(Error::Transport)?;
@@ -282,6 +287,71 @@ impl Wire {
             received: 0,
             interrupted: false,
         })
+    }
+    /// Fixed, bounded opening handshake only; ordinary messages keep their
+    /// purpose/sequence framing. No raw bridge access escapes this module.
+    pub(crate) async fn opening_send(&mut self, frame: Value) -> Result<()> {
+        if self.interrupted
+            || self.sent != 0
+            || self.received != 0
+            || !matches!(self.link.purpose, Purpose::Negotiation(_))
+        {
+            return Err(Error::Protocol);
+        }
+        bounded_json(&frame, 40 * 1024)?;
+        self.interrupted = true;
+        let ack = self
+            .bridge
+            .session_send(self.link.remote.as_str(), &self.link.session_id, frame)
+            .await
+            .map_err(Error::Transport)?;
+        if ack["remote"] != self.link.remote.as_str()
+            || ack["session_id"] != self.link.session_id
+            || sc_bridge_session_transport(&ack).is_err()
+        {
+            return Err(Error::Identity);
+        }
+        self.interrupted = false;
+        Ok(())
+    }
+    pub(crate) async fn opening_receive(&mut self, wait: Duration) -> Result<Value> {
+        if self.interrupted
+            || self.sent != 0
+            || self.received != 0
+            || !matches!(self.link.purpose, Purpose::Negotiation(_))
+            || wait.is_zero()
+        {
+            return Err(Error::Protocol);
+        }
+        self.interrupted = true;
+        let start = Instant::now();
+        loop {
+            let left = wait
+                .checked_sub(start.elapsed())
+                .filter(|v| !v.is_zero())
+                .ok_or(Error::Interrupted)?;
+            let event = self
+                .bridge
+                .next_session_event_for(&self.link.session_id, Some(left))
+                .await
+                .map_err(Error::Transport)?;
+            if event["remote"] != self.link.remote.as_str()
+                || event["session_id"] != self.link.session_id
+                || sc_bridge_session_transport(&event).is_err()
+            {
+                return Err(Error::Identity);
+            }
+            if event["type"] == "session_opened" {
+                continue;
+            }
+            if event["type"] != "session_frame" {
+                return Err(Error::Interrupted);
+            }
+            let frame = event.get("frame").ok_or(Error::Protocol)?;
+            bounded_json(frame, 40 * 1024)?;
+            self.interrupted = false;
+            return Ok(frame.clone());
+        }
     }
     pub(crate) async fn send<M: WireMessage>(&mut self, message: &M) -> Result<()> {
         if self.interrupted {

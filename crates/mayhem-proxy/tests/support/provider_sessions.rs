@@ -1,5 +1,7 @@
 use super::*;
 use mayhem_proxy::{exchange, serving};
+#[path = "provider_opening.rs"]
+mod opening;
 
 fn bounds() -> serving::Limits {
     serving::Limits {
@@ -48,13 +50,39 @@ async fn connect(
     bytes: &[u8],
     controller: &serving::Controller,
 ) -> (Bridge, Channel, serving::Handle, SavedPurchase) {
-    let Pair {
-        bridge,
-        mut buyer,
-        provider,
-        context,
-    } = open(peer, context(peer), 1024 * 1024).await;
-    let handle = controller.start(provider).unwrap();
+    let context = context(peer);
+    let bridge = Bridge::start(context.buyer.as_str(), &context.offer.provider_pubkey).await;
+    let wire_limits = exchange::Limits {
+        max_message_bytes: 1024 * 1024,
+    };
+    let mut listener =
+        n::opening::Listener::connect(bridge.config(false), peer.identity.clone(), wire_limits)
+            .await
+            .unwrap();
+    let buyer_identity = identity(peer);
+    let dialing = n::Channel::dial(
+        bridge.config(true),
+        context.clone(),
+        &buyer_identity,
+        wire_limits,
+    );
+    let accepting = async {
+        let incoming = listener.next(Duration::from_secs(5)).await.unwrap();
+        controller.accept(incoming).unwrap()
+    };
+    let (buyer, handle) = tokio::join!(dialing, accepting);
+    let buyer = buyer.unwrap();
+    drop(listener);
+    let (buyer, saved) = purchase(s, peer, bytes, buyer, &context).await;
+    (bridge, buyer, handle, saved)
+}
+async fn purchase(
+    s: &Controlled,
+    peer: &Peer,
+    bytes: &[u8],
+    mut buyer: n::Channel,
+    context: &n::Context,
+) -> (Channel, SavedPurchase) {
     buyer
         .send(&n::Message::Request {
             request: serde_json::from_slice(bytes).unwrap(),
@@ -107,12 +135,7 @@ async fn connect(
         .retain_provider_acceptance(value.authorization)
         .await
         .unwrap();
-    (
-        bridge,
-        buyer.into_paid(&identity(peer)).unwrap(),
-        handle,
-        saved,
-    )
+    (buyer.into_paid(&identity(peer)).unwrap(), saved)
 }
 async fn next(buyer: &mut Channel) -> exchange::Received {
     buyer.receive(Some(Duration::from_secs(8))).await.unwrap()

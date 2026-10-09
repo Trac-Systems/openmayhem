@@ -4,7 +4,11 @@ use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{SinkExt, StreamExt};
 use mayhem_bridge::ScBridgeConfig;
 use serde_json::{json, Value};
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 use tokio::{
     net::TcpListener,
     sync::{mpsc, Mutex},
@@ -12,6 +16,12 @@ use tokio::{
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+struct Client {
+    own: String,
+    tx: mpsc::Sender<Value>,
+    sessions: HashSet<String>,
+    all: bool,
+}
 pub struct Bridge {
     url: String,
     pub attack: Arc<Mutex<Option<&'static str>>>,
@@ -35,14 +45,15 @@ impl Bridge {
             ("test-buyer".to_owned(), buyer.to_owned()),
             ("test-provider".to_owned(), provider.to_owned()),
         ]));
-        let peers: Arc<Mutex<HashMap<String, mpsc::Sender<Value>>>> =
-            Arc::new(Mutex::new(HashMap::new()));
+        let peers: Arc<Mutex<HashMap<u64, Client>>> = Arc::new(Mutex::new(HashMap::new()));
         let task = tokio::spawn(async move {
             let mut tasks = JoinSet::new();
+            let mut client_id = 0u64;
             loop {
                 tokio::select! {
                     accepted=listener.accept()=>{
                         let Ok((socket,_))=accepted else {break};
+                        client_id+=1;let id=client_id;
                         let peers=peers.clone();let identities=identities.clone();let mode=mode.clone();let capture=capture.clone();
                         tasks.spawn(async move {
                             let ws=accept_async(socket).await.unwrap();let (mut out,mut input)=ws.split();
@@ -50,7 +61,11 @@ impl Bridge {
                             let auth:Value=serde_json::from_str(first.to_text().unwrap()).unwrap();
                             let Some(own)=identities.get(auth["token"].as_str().unwrap_or("")).cloned() else {return};
                             let (tx,mut incoming)=mpsc::channel::<Value>(8);
-                            peers.lock().await.insert(own.clone(),tx.clone());
+                            {
+                                let mut peers=peers.lock().await;
+                                if peers.len()>=64 {return}
+                                peers.insert(id,Client{own:own.clone(),tx:tx.clone(),sessions:HashSet::new(),all:false});
+                            }
                             out.send(Message::Text(json!({"type":"auth_ok","id":auth["id"]}).to_string().into())).await.unwrap();
                             loop {
                                 let request=tokio::select! {
@@ -67,9 +82,18 @@ impl Bridge {
                                     }
                                 };
                                 let kind=request["type"].as_str().unwrap();
+                                if kind=="session_subscribe" {
+                                    let mut peers=peers.lock().await;let client=peers.get_mut(&id).unwrap();
+                                    for session in request["session_ids"].as_array().unwrap() {
+                                        let session=session.as_str().unwrap();
+                                        if session=="*" {client.all=true} else {client.sessions.insert(session.into());}
+                                    }
+                                }
                                 if kind=="session_send" {
-                                    let target=peers.lock().await.get(request["remote"].as_str().unwrap()).cloned();
-                                    let Some(target)=target else {break};
+                                    let targets=peers.lock().await.values().filter(|client|client.own==request["remote"].as_str().unwrap()
+                                        && (client.all || client.sessions.contains(request["session_id"].as_str().unwrap())))
+                                        .map(|client|client.tx.clone()).collect::<Vec<_>>();
+                                    if targets.is_empty(){break}
                                     let mut event=json!({"type":"session_frame","remote":own,"session_id":request["session_id"],
                                         "direct":true,"relayed":false,"frame":request["frame"]});
                                     let attack=mode.lock().await.take();
@@ -95,12 +119,15 @@ impl Bridge {
                                         Some("size")=>event["frame"]["bytes"]=json!(999_999_999),
                                         Some("digest")=>event["frame"]["digest"]=json!("f".repeat(64)),
                                         Some("extra")=>event["frame"]["unexpected"]=json!(true),
+                                        Some("ready_context")=>event["frame"]["context_digest"]=json!("f".repeat(64)),
                                         Some("lineage")=>event["direct"]=json!(false),
                                         _=>{},
                                     }
                                     {let mut stored=capture.lock().await;if stored.len()<256{stored.push(event.clone());}}
-                                    if target.send(event.clone()).await.is_err(){break}
-                                    if attack==Some("duplicate") && target.send(event).await.is_err(){break}
+                                    for target in targets {
+                                        if target.send(event.clone()).await.is_err(){continue}
+                                        if attack==Some("duplicate") {let _=target.send(event.clone()).await;}
+                                    }
                                     if attack==Some("lost_ack"){break}
                                 }
                                 let typ=match kind {"session_subscribe"=>"session_subscribed","session_open"=>"session_opened",
@@ -108,8 +135,7 @@ impl Bridge {
                                 if out.send(Message::Text(json!({"type":typ,"id":request["id"],"remote":request["remote"],
                                     "session_id":request["session_id"],"direct":true,"relayed":false}).to_string().into())).await.is_err(){break}
                             }
-                            let mut peers=peers.lock().await;
-                            if peers.get(&own).is_some_and(|old|old.same_channel(&tx)){peers.remove(&own);}
+                            peers.lock().await.remove(&id);
                         });
                     },
                     Some(_) = tasks.join_next(), if !tasks.is_empty()=>{},
