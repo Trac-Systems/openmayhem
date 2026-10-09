@@ -6,6 +6,11 @@ admin persistence, authenticated publication, candidate observations and routing
 must supply its inputs before it can authorize a real selection. Native routes,
 pricing, settlement and endpoint implementations are not changed by this module.
 
+The opt-in [`publication` reader](REGISTRY_PUBLICATION.md) obtains exact published
+definitions from an operator-configured trusted SITE origin, pins release IDs and
+hashes, and resolves bounded reference closures for these functions. It is a
+separate metadata cache and is not wired into routing or capability evidence.
+
 Definitions carry endpoint scope, typed allowed values, comparison operators,
 localized labels/help, optional units, UI grouping, evidence requirements and
 optional conditional rules. They cannot execute scripts or add new billing or

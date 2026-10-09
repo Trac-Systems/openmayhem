@@ -1,7 +1,9 @@
 //! Revisioned capability/filter/control semantics. This module performs no
-//! discovery, network, inference, finance, or ledger work. Registry data cannot
+//! inference, finance, or ledger work. The opt-in publication reader loads only
+//! administrative definitions from a fixed trusted origin. Registry data cannot
 //! confer operator trust or implement a new endpoint/billing protocol.
 mod controls;
+pub mod publication;
 mod values;
 pub use controls::{apply_controls, Control};
 pub use values::TypedValue;
