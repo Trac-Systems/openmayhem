@@ -14,6 +14,9 @@ use tokio::{
     net::TcpListener,
     sync::Notify,
 };
+#[cfg(unix)]
+#[path = "support/declaration_setup.rs"]
+mod declaration_setup;
 
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/registry-publication-v1.json")).unwrap()
