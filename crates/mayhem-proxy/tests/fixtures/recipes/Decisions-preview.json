@@ -1,0 +1,331 @@
+{
+  "adapter": {
+    "version": 1,
+    "endpoint": "mayhem_decisions",
+    "contract": {
+      "family": "mayhem_decisions",
+      "request_attributes": [
+        "model",
+        "state",
+        "questions",
+        "checkpoint",
+        "task",
+        "lang",
+        "auto_task_detection",
+        "email",
+        "shortlist",
+        "temperature",
+        "limits",
+        "user"
+      ],
+      "required_request_attributes": [
+        "model",
+        "state",
+        "questions"
+      ],
+      "response_attributes": [
+        "id",
+        "object",
+        "created",
+        "model",
+        "answers",
+        "routing",
+        "shortlist",
+        "preprocessing",
+        "usage",
+        "mayhem"
+      ],
+      "required_response_attributes": [
+        "id",
+        "object",
+        "created",
+        "model",
+        "answers",
+        "routing",
+        "usage",
+        "mayhem"
+      ],
+      "request_attribute_specs": {
+        "auto_task_detection": {
+          "value_types": [
+            "boolean"
+          ],
+          "default": false,
+          "calibration_values": [
+            false,
+            true
+          ]
+        },
+        "checkpoint": {
+          "value_types": [
+            "string"
+          ],
+          "enum_values": [
+            "english",
+            "multilingual",
+            "typed-decisions"
+          ],
+          "calibration_values": [
+            "english",
+            "multilingual",
+            "typed-decisions"
+          ]
+        },
+        "email": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {
+              "clean": true,
+              "max_chars": 3000
+            }
+          ]
+        },
+        "lang": {
+          "value_types": [
+            "string"
+          ],
+          "min_length": 1,
+          "max_length": 128,
+          "calibration_values": [
+            "en"
+          ]
+        },
+        "limits": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {
+              "max_len": 1024,
+              "head_max_len": 256
+            }
+          ]
+        },
+        "model": {
+          "value_types": [
+            "string"
+          ],
+          "calibration_values": [
+            "$MODEL"
+          ]
+        },
+        "questions": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {
+              "intent": {
+                "type": "choice",
+                "instructions": "What is the request about?",
+                "criteria": {
+                  "support": "support request",
+                  "other": "another topic"
+                }
+              },
+              "urgent": {
+                "type": "noul",
+                "instructions": "Is the request urgent?"
+              }
+            }
+          ]
+        },
+        "shortlist": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {
+              "k": 20,
+              "max_length": 512,
+              "batch_size": 32
+            }
+          ]
+        },
+        "state": {
+          "value_types": [
+            "string",
+            "object",
+            "array"
+          ],
+          "calibration_values": [
+            "Mayhem calibration state",
+            {
+              "message": "Mayhem calibration state"
+            },
+            [
+              {
+                "role": "user",
+                "content": "Mayhem calibration state"
+              }
+            ]
+          ]
+        },
+        "task": {
+          "value_types": [
+            "string"
+          ],
+          "enum_values": [
+            "typed_decisions"
+          ],
+          "calibration_values": [
+            "typed_decisions"
+          ]
+        },
+        "temperature": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {
+              "choice": 1.0,
+              "score": 1.0,
+              "noul": 1.0
+            }
+          ]
+        },
+        "user": {
+          "value_types": [
+            "string"
+          ],
+          "min_length": 1,
+          "max_length": 512,
+          "calibration_values": [
+            "mayhem-calibration-user"
+          ]
+        }
+      },
+      "response_attribute_specs": {
+        "answers": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {}
+          ]
+        },
+        "created": {
+          "value_types": [
+            "integer"
+          ],
+          "minimum": 0.0,
+          "maximum": 1.8446744073709552e+19,
+          "calibration_values": [
+            1
+          ]
+        },
+        "id": {
+          "value_types": [
+            "string"
+          ],
+          "min_length": 0,
+          "max_length": 536870912,
+          "calibration_values": [
+            "$RESPONSE_VALUE"
+          ]
+        },
+        "mayhem": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {}
+          ]
+        },
+        "model": {
+          "value_types": [
+            "string"
+          ],
+          "min_length": 0,
+          "max_length": 536870912,
+          "calibration_values": [
+            "$RESPONSE_VALUE"
+          ]
+        },
+        "object": {
+          "value_types": [
+            "string"
+          ],
+          "min_length": 0,
+          "max_length": 536870912,
+          "calibration_values": [
+            "$RESPONSE_VALUE"
+          ]
+        },
+        "preprocessing": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {}
+          ]
+        },
+        "routing": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {}
+          ]
+        },
+        "shortlist": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {}
+          ]
+        },
+        "usage": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {}
+          ]
+        }
+      },
+      "interaction_groups": []
+    },
+    "upstream_model": "private-model",
+    "limits": {
+      "request_bytes": 1048576,
+      "response_bytes": 1048576,
+      "choices": 8,
+      "tools": 16,
+      "questions": 16,
+      "decision_options": 32
+    }
+  },
+  "request": {
+    "model": "sample",
+    "state": "classify",
+    "questions": {
+      "q": {
+        "type": "choice",
+        "instructions": "classify",
+        "criteria": {
+          "yes": "Yes",
+          "no": "No"
+        }
+      }
+    }
+  },
+  "response": {
+    "state": "ok",
+    "fault": null,
+    "job": "j2",
+    "labels": {
+      "q": {
+        "type": "choice",
+        "choice": "yes",
+        "probabilities": {
+          "yes": 0.75,
+          "no": 0.25
+        }
+      }
+    }
+  }
+}

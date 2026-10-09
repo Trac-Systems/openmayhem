@@ -31,6 +31,10 @@ pub struct Policy {
     pub request_hash: Digest,
     pub tools: BTreeMap<String, Value>,
     pub output: Output,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<crate::recipe::Signed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe_response_bytes: Option<usize>,
 }
 impl fmt::Debug for Policy {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -124,6 +128,8 @@ impl Policy {
             request_hash,
             tools,
             output,
+            recipe: None,
+            recipe_response_bytes: None,
         };
         policy.bytes()?;
         Ok(policy)
@@ -261,10 +267,24 @@ pub(crate) struct Verifier {
     tools: BTreeMap<String, jsonschema::Validator>,
     output: Option<jsonschema::Validator>,
     json_object: bool,
+    recipe: Option<(crate::recipe::Signed, usize)>,
 }
 impl Verifier {
     pub(crate) fn new(policy: Policy) -> Result<Self, Failure> {
         policy.bytes()?;
+        if policy.recipe.is_some() != policy.recipe_response_bytes.is_some() {
+            return Err(bad_schema("input"));
+        }
+        if let Some(recipe) = &policy.recipe {
+            recipe.validate().map_err(|_| bad_schema("input"))?;
+            if recipe.recipe.endpoint != policy.endpoint
+                || !policy
+                    .recipe_response_bytes
+                    .is_some_and(|v| (1..=256 * 1024 * 1024).contains(&v))
+            {
+                return Err(bad_schema("input"));
+            }
+        }
         let mut budget = Budget::default();
         let mut tools = BTreeMap::new();
         for (name, schema) in policy.tools {
@@ -293,6 +313,7 @@ impl Verifier {
             tools,
             output,
             json_object,
+            recipe: policy.recipe.zip(policy.recipe_response_bytes),
         })
     }
     fn tool(&self, name: &str, args: &str) -> Result<(), Failure> {
@@ -317,6 +338,12 @@ impl Verifier {
             validator.validate(&value).map_err(|_| bad_output())?;
         }
         Ok(())
+    }
+    pub(crate) fn normalize(&self, value: Value) -> Result<Value, Failure> {
+        match &self.recipe {
+            Some((recipe, limit)) => recipe.recipe.map_response(&value, *limit),
+            None => Ok(value),
+        }
     }
     pub(crate) fn verify(&self, value: &Value) -> Result<(), Failure> {
         match self.endpoint {
@@ -435,6 +462,8 @@ mod tests {
             request_hash: Digest::new("1".repeat(64)).unwrap(),
             tools: BTreeMap::new(),
             output: Output::JsonSchema { schema },
+            recipe: None,
+            recipe_response_bytes: None,
         }
     }
     fn reply(content: &str) -> Value {

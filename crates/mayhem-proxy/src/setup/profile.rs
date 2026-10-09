@@ -14,12 +14,20 @@ pub enum EndpointProfile {
         endpoint: ProxyEndpoint,
         contract: EndpointFamilyContract,
     },
+    Declarative {
+        endpoint: ProxyEndpoint,
+        contract: EndpointFamilyContract,
+        recipe: crate::recipe::Signed,
+    },
 }
 impl EndpointProfile {
     fn resolve(&self) -> Result<(ProxyEndpoint, EndpointFamilyContract)> {
         match self {
             Self::Standard { endpoint } => Ok((*endpoint, template(*endpoint)?)),
-            Self::Custom { endpoint, contract } => Ok((*endpoint, contract.clone())),
+            Self::Custom { endpoint, contract }
+            | Self::Declarative {
+                endpoint, contract, ..
+            } => Ok((*endpoint, contract.clone())),
         }
     }
 }
@@ -139,6 +147,12 @@ impl ProfileInput {
         let (endpoint, contract) = self.profile.resolve()?;
         let adapter = Adapter::new(endpoint, contract, self.upstream_model, self.limits)
             .map_err(|_| Error::Invalid)?;
+        let adapter = match self.profile {
+            EndpointProfile::Declarative { recipe, .. } => {
+                adapter.with_recipe(recipe).map_err(|_| Error::Invalid)?
+            }
+            _ => adapter,
+        };
         require(connection.paths.contains_key(&adapter.operation()))?;
         let endpoints = vec![ProxyEndpointContract {
             endpoint,

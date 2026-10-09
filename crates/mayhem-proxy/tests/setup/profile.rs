@@ -147,3 +147,56 @@ fn prepare_load_cas_rates_and_join_preserve_identity_and_reject_mismatched_contr
     );
     f.no_network_or_secret();
 }
+
+#[path = "../support/recipes.rs"]
+mod recipe_fixture;
+#[test]
+fn declarative_profile_import_pins_recipe_and_keeps_private_preview_out_of_public_review() {
+    let f = Fixture::new(ProxyEndpoint::Decisions);
+    let mut input = profile(&f, true);
+    let signed = recipe_fixture::recipe(ProxyEndpoint::Decisions);
+    input.profile = EndpointProfile::Declarative {
+        endpoint: ProxyEndpoint::Decisions,
+        contract: f.input.adapter.contract.clone(),
+        recipe: signed.clone(),
+    };
+    let prepared = input.clone().prepare().unwrap();
+    let adapter = Adapter::restore(prepared.adapter.clone()).unwrap();
+    assert_eq!(
+        prepared.membership.recipe_hash,
+        adapter.recipe_hash().as_str()
+    );
+    assert_eq!(prepared.offers[0].rates, f.input.offers[0].rates);
+    assert_eq!(
+        prepared.membership.capacity_group,
+        f.input.membership.capacity_group
+    );
+    let created = f.store().prepare(input.clone(), None).unwrap();
+    let recipe = created.recipe.unwrap();
+    assert_eq!(recipe.recipe_hash, signed.recipe.digest().unwrap());
+    assert_eq!(
+        recipe.assurance,
+        "signature_and_offline_mapping_fixtures_only"
+    );
+    let checked = f.store().check(created.revision).unwrap();
+    assert_eq!(checked.state, State::StructurallyValid);
+    let public = serde_json::to_string(&checked).unwrap();
+    for hidden in [
+        "private-upstream-model",
+        "upstream_request",
+        "upstream_response",
+        "never-read-secret",
+        "127.0.0.1",
+    ] {
+        assert!(!public.contains(hidden));
+    }
+    let mut broken = signed.recipe;
+    broken.contract_hash = d(70);
+    input.profile = EndpointProfile::Declarative {
+        endpoint: ProxyEndpoint::Decisions,
+        contract: f.input.adapter.contract.clone(),
+        recipe: recipe_fixture::sign(broken),
+    };
+    assert!(input.prepare().is_err());
+    f.no_network_or_secret();
+}

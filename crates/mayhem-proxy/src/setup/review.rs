@@ -39,6 +39,8 @@ pub struct Review {
     pub membership: ProxyMembership,
     pub offers: Vec<ProxyOffer>,
     pub contract: mayhem_proto::EndpointFamilyContract,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<crate::recipe::Review>,
     pub settlement_policy: ProxySettlementPolicy,
     pub settlement_policy_hash: String,
     pub admission_handoff: Option<AdmissionHandoff>,
@@ -103,6 +105,14 @@ impl Record {
             membership: self.input.membership.clone(),
             offers: self.input.offers.clone(),
             contract: self.input.adapter.contract.clone(),
+            recipe: self
+                .input
+                .adapter
+                .recipe
+                .as_ref()
+                .map(|r| r.review())
+                .transpose()
+                .map_err(|_| Error::Invalid)?,
             settlement_policy: self.input.settlement_policy.clone(),
             settlement_policy_hash: self
                 .input

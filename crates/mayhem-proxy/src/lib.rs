@@ -25,6 +25,7 @@ pub mod metering;
 pub mod negotiation;
 pub mod presence;
 pub mod receipts;
+pub mod recipe;
 pub mod registry;
 pub mod routing;
 pub mod semantics;

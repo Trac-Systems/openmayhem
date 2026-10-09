@@ -210,11 +210,12 @@ impl Limits {
     }
 }
 
-/// One same-protocol adapter. Custom recipes will produce this public protocol;
+/// Same-protocol or signed declarative adapter producing this public protocol;
 /// they cannot select network origins, payment terms, or silently drop controls.
 pub struct Adapter {
     protocol: Protocol,
     upstream_model: String,
+    recipe: Option<crate::recipe::Signed>,
 }
 
 /// Shared public request/result rules. Only Adapter has an upstream model mapping
@@ -237,6 +238,8 @@ pub struct AdapterSnapshot {
     pub contract: EndpointFamilyContract,
     pub upstream_model: String,
     pub limits: Limits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipe: Option<crate::recipe::Signed>,
 }
 impl fmt::Debug for AdapterSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -255,24 +258,80 @@ impl fmt::Debug for Adapter {
 impl Adapter {
     pub fn snapshot(&self) -> AdapterSnapshot {
         AdapterSnapshot {
-            version: 1,
+            version: if self.recipe.is_some() { 2 } else { 1 },
             endpoint: self.protocol.endpoint,
             contract: self.protocol.contract.clone(),
             upstream_model: self.upstream_model.clone(),
             limits: self.protocol.limits,
+            recipe: self.recipe.clone(),
         }
     }
     pub fn restore(snapshot: AdapterSnapshot) -> Result<Self> {
-        if snapshot.version != 1 {
+        if !matches!(
+            (snapshot.version, snapshot.recipe.is_some()),
+            (1, false) | (2, true)
+        ) {
             return Err(Error::Configuration);
         }
-        Self::new(
+        let adapter = Self::new(
             snapshot.endpoint,
             snapshot.contract,
             snapshot.upstream_model,
             snapshot.limits,
+        )?;
+        match snapshot.recipe {
+            Some(recipe) => adapter.with_recipe(recipe),
+            None => Ok(adapter),
+        }
+    }
+    /// Import a signed reusable data-only mapping. Offline fixtures are checked
+    /// against the exact public contract; this is not live capability evidence.
+    pub fn with_recipe(mut self, recipe: crate::recipe::Signed) -> Result<Self> {
+        recipe.validate().map_err(|_| Error::Configuration)?;
+        if recipe.recipe.endpoint != self.endpoint()
+            || &recipe.recipe.contract_hash != self.contract_hash()
+        {
+            return Err(Error::Configuration);
+        }
+        for fixture in &recipe.recipe.fixtures {
+            let bytes = serde_json::to_vec(&fixture.request).map_err(|_| Error::Configuration)?;
+            let request = self.protocol.prepare(&bytes, false, None)?;
+            request.decode_json(fixture.normalized_response.clone(), "recipe_fixture", 0)?;
+        }
+        // Bind the reusable recipe AND this private local model/limits/contract
+        // mapping. Existing same-protocol hashes and snapshots are unchanged.
+        self.protocol.recipe_hash = digest(
+            "mayhem/proxy/declarative-adapter/v1",
+            &json!({
+            "version":1,"recipe":recipe.recipe.digest().map_err(|_|Error::Configuration)?,
+            "contract":self.protocol.contract_hash,"endpoint":self.protocol.endpoint,
+            "upstream_model":self.upstream_model,"limits":self.protocol.limits}),
+        )?;
+        self.recipe = Some(recipe);
+        Ok(self)
+    }
+    /// Offline mapping/common-shape preview only. Schema compilation remains in
+    /// the supervised worker during explicit probes/dispatch, never this parent.
+    /// Caller supplies sanitized synthetic examples.
+    pub fn preview(&self, public_request: &Value, upstream_response: &Value) -> Result<Value> {
+        let bytes = serde_json::to_vec(public_request).map_err(|_| Error::Configuration)?;
+        let request = self.prepare_json(&bytes)?;
+        let normalized = match &self.recipe {
+            Some(recipe) => recipe
+                .recipe
+                .map_response(upstream_response, self.limits().response_bytes)
+                .map_err(Error::Request)?,
+            None => upstream_response.clone(),
+        };
+        let reply = request.decode_json(normalized, "recipe_preview", 0)?;
+        Ok(
+            json!({"schema_version":1,"kind":"offline_recipe_preview","assurance":"offline_mapping_and_endpoint_shape_only","semantic_verification":"requires_supervised_probe",
+            "recipe_hash":self.recipe_hash(),"public_request":public_request,
+            "upstream_request":serde_json::from_slice::<Value>(request.body()).map_err(|_|Error::Configuration)?,
+            "normalized_result":reply.body,"observed_usage":reply.observed_usage}),
         )
     }
+
     pub fn new(
         endpoint: ProxyEndpoint,
         contract: EndpointFamilyContract,
@@ -294,6 +353,7 @@ impl Adapter {
                 limits,
             },
             upstream_model,
+            recipe: None,
         })
     }
     pub fn endpoint(&self) -> ProxyEndpoint {
@@ -319,10 +379,28 @@ impl Adapter {
     /// No settings are removed to make a backend accept a request. This adapter
     /// explicitly handles JSON replies; streaming is a separate execution path.
     pub fn prepare_json(&self, bytes: &[u8]) -> Result<Request> {
-        self.protocol
-            .prepare(bytes, false, Some(&self.upstream_model))
+        let mut request = self
+            .protocol
+            .prepare(bytes, false, Some(&self.upstream_model))?;
+        if let Some(recipe) = &self.recipe {
+            let input = serde_json::from_slice(&request.body).map_err(|_| Error::Configuration)?;
+            let body = recipe
+                .recipe
+                .map_request(&input)
+                .map_err(|_| invalid(None, Code::UnsupportedControl))?;
+            request.body = serde_json::to_vec(&body).map_err(|_| Error::Configuration)?;
+            if request.body.len() > self.limits().request_bytes {
+                return Err(invalid(None, Code::RequestTooLarge));
+            }
+            request.semantic_policy.recipe = Some(recipe.clone());
+            request.semantic_policy.recipe_response_bytes = Some(self.limits().response_bytes);
+        }
+        Ok(request)
     }
     pub fn prepare_stream(&self, bytes: &[u8]) -> Result<Request> {
+        if self.recipe.is_some() {
+            return Err(invalid(Some("stream"), Code::UnsupportedControl));
+        }
         self.protocol
             .prepare(bytes, true, Some(&self.upstream_model))
     }

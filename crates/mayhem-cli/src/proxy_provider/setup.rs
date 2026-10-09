@@ -15,6 +15,11 @@ pub struct DraftArgs {
 }
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Inspect, preview or export signed data-only connector recipes offline.
+    Recipe {
+        #[command(subcommand)]
+        command: RecipeCommand,
+    },
     /// Review exact public operations without signing, network I/O or fees.
     PublicationPlan {
         #[command(flatten)]
@@ -143,8 +148,46 @@ pub enum Command {
     #[command(alias = "resume")]
     Inspect(DraftArgs),
 }
+#[derive(Debug, Subcommand)]
+pub enum RecipeCommand {
+    /// Verify signature/mapping fixtures and show public identity, without network I/O.
+    Inspect {
+        #[arg(long, value_name = "PATH")]
+        recipe: PathBuf,
+    },
+    /// Explicit synthetic local sample: show mapping/common shapes; schemas require a probe.
+    Preview {
+        #[arg(long, value_name = "PATH")]
+        recipe: PathBuf,
+        #[arg(long, value_name = "PATH")]
+        sample: PathBuf,
+    },
+    /// Emit only the reusable signed recipe to stdout; no private connection export.
+    Export {
+        #[arg(long, value_name = "PATH")]
+        recipe: PathBuf,
+    },
+}
 pub async fn run(command: Command) -> Result<()> {
     let command = match command {
+        Command::Recipe { command } => {
+            let result = tokio::task::spawn_blocking(move || -> Result<String> {
+                match command {
+                    RecipeCommand::Inspect { recipe } => Ok(serde_json::to_string(
+                        &mayhem_proxy::recipe::Signed::load(&recipe)?.review()?,
+                    )?),
+                    RecipeCommand::Preview { recipe, sample } => Ok(serde_json::to_string(
+                        &mayhem_proxy::recipe::Signed::load(&recipe)?.preview_file(&sample)?,
+                    )?),
+                    RecipeCommand::Export { recipe } => Ok(String::from_utf8(
+                        mayhem_proxy::recipe::Signed::load(&recipe)?.export()?,
+                    )?),
+                }
+            })
+            .await??;
+            println!("{result}");
+            return Ok(());
+        }
         Command::PublicationPlan {
             args,
             expected_revision,
@@ -269,7 +312,8 @@ pub async fn run(command: Command) -> Result<()> {
             | Command::RecoverProbe { args, .. }
             | Command::Probe { args, .. }
             | Command::Inspect(args) => args,
-            Command::Profiles
+            Command::Recipe { .. }
+            | Command::Profiles
             | Command::PublicationPlan { .. }
             | Command::Publish { .. }
             | Command::RecoverPublication { .. }
@@ -300,7 +344,8 @@ pub async fn run(command: Command) -> Result<()> {
             } => store.recover_probe(expected_revision),
             Command::Probe { .. } => unreachable!("handled before the blocking operation"),
             Command::Inspect(_) => store.inspect(),
-            Command::Profiles
+            Command::Recipe { .. }
+            | Command::Profiles
             | Command::PublicationPlan { .. }
             | Command::Publish { .. }
             | Command::RecoverPublication { .. }
@@ -314,4 +359,98 @@ pub async fn run(command: Command) -> Result<()> {
     .await??;
     println!("{}", serde_json::to_string(&review)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod recipe_tests {
+    use super::*;
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+        #[command(subcommand)]
+        command: Command,
+    }
+    fn fixture(name: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../mayhem-proxy/tests/fixtures/recipes")
+            .join(name)
+    }
+    #[test]
+    fn recipe_commands_are_readonly_and_require_explicit_local_inputs() {
+        for args in [
+            vec!["setup", "recipe", "inspect", "--recipe", "sample.json"],
+            vec!["setup", "recipe", "export", "--recipe", "sample.json"],
+            vec![
+                "setup",
+                "recipe",
+                "preview",
+                "--recipe",
+                "sample.json",
+                "--sample",
+                "preview.json",
+            ],
+        ] {
+            assert!(matches!(
+                Cli::try_parse_from(args).unwrap().command,
+                Command::Recipe { .. }
+            ));
+        }
+        for args in [
+            vec!["setup", "recipe", "inspect"],
+            vec!["setup", "recipe", "preview", "--recipe", "a.json"],
+            vec![
+                "setup",
+                "recipe",
+                "inspect",
+                "--recipe",
+                "a.json",
+                "--wallet-password",
+                "no",
+            ],
+            vec![
+                "setup",
+                "recipe",
+                "inspect",
+                "--recipe",
+                "a.json",
+                "--url",
+                "https://forbidden.invalid",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+    }
+    #[tokio::test]
+    async fn recipe_inspect_export_and_preview_use_the_real_offline_handlers() {
+        run(Command::Recipe {
+            command: RecipeCommand::Inspect {
+                recipe: fixture("Chat.json"),
+            },
+        })
+        .await
+        .unwrap();
+        run(Command::Recipe {
+            command: RecipeCommand::Export {
+                recipe: fixture("Decisions.json"),
+            },
+        })
+        .await
+        .unwrap();
+        run(Command::Recipe {
+            command: RecipeCommand::Preview {
+                recipe: fixture("Chat.json"),
+                sample: fixture("Chat-preview.json"),
+            },
+        })
+        .await
+        .unwrap();
+        assert!(run(Command::Recipe {
+            command: RecipeCommand::Preview {
+                recipe: fixture("Decisions.json"),
+                sample: fixture("Chat-preview.json")
+            }
+        })
+        .await
+        .is_err());
+    }
 }

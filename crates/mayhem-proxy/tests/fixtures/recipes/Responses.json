@@ -1,0 +1,198 @@
+{
+  "recipe": {
+    "schema_version": 1,
+    "revision": 1,
+    "abi_min": 1,
+    "abi_max": 1,
+    "publisher": "5e449ad6fa4b2d65746e8cd4f968e38c5a9679f8495db114ee06317f72f717db",
+    "endpoint": "openai_responses",
+    "contract_hash": "3aa87d98aaa75fea3b15ad8ca1560416798d627bb0955a325038adf7da23e17a",
+    "max_json_bytes": 65536,
+    "request": {
+      "kind": "object",
+      "fields": {
+        "input": {
+          "target": [
+            "context"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "max_tokens": {
+          "target": [
+            "options",
+            "limit"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "model": {
+          "target": [
+            "engine"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "n": {
+          "target": [
+            "count"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "response_format": {
+          "target": [
+            "format"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "store": {
+          "target": [
+            "retain"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "stream": {
+          "target": [
+            "options",
+            "stream"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "temperature": {
+          "target": [
+            "options",
+            "heat"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "tool_choice": {
+          "target": [
+            "selection"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "tools": {
+          "target": [
+            "functions"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        }
+      }
+    },
+    "outcome": {
+      "path": [
+        "state"
+      ],
+      "success": "ok",
+      "error_path": [
+        "fault"
+      ],
+      "errors": {
+        "bad": "invalid_request",
+        "busy": "busy",
+        "limited": "rate_limited"
+      }
+    },
+    "response": {
+      "kind": "object",
+      "fields": {
+        "id": {
+          "optional": false,
+          "value": {
+            "kind": "copy",
+            "path": [
+              "job"
+            ]
+          }
+        },
+        "output": {
+          "optional": false,
+          "value": {
+            "kind": "copy",
+            "path": [
+              "result"
+            ]
+          }
+        },
+        "status": {
+          "optional": false,
+          "value": {
+            "kind": "literal",
+            "value": "completed"
+          }
+        }
+      }
+    },
+    "fixtures": [
+      {
+        "request": {
+          "model": "sample",
+          "input": "Hello"
+        },
+        "upstream_request": {
+          "engine": "sample",
+          "context": "Hello"
+        },
+        "upstream_response": {
+          "state": "ok",
+          "fault": null,
+          "job": "j4",
+          "result": [
+            {
+              "id": "m1",
+              "type": "message",
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "output_text",
+                  "text": "Hi",
+                  "annotations": [],
+                  "logprobs": []
+                }
+              ],
+              "status": "completed"
+            }
+          ]
+        },
+        "normalized_response": {
+          "id": "j4",
+          "status": "completed",
+          "output": [
+            {
+              "id": "m1",
+              "type": "message",
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "output_text",
+                  "text": "Hi",
+                  "annotations": [],
+                  "logprobs": []
+                }
+              ],
+              "status": "completed"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "signature": "7cd7ba509e55b090ccf3efdac37de70e206fe65cc3e27c3b0b7352b33c29507099d00b6a4be45400f8b80ca2bc506b4f406d2bcbdbdbe361eb8ef364a1616a0d"
+}

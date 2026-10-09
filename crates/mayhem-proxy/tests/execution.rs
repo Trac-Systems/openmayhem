@@ -1715,3 +1715,6 @@ mod native_execution;
 mod probe_execution;
 #[path = "support/managed_provider.rs"]
 mod managed_provider;
+
+#[path = "recipes/execution.rs"]
+mod declarative;

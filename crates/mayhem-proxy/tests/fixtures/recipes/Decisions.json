@@ -1,0 +1,206 @@
+{
+  "recipe": {
+    "schema_version": 1,
+    "revision": 1,
+    "abi_min": 1,
+    "abi_max": 1,
+    "publisher": "5e449ad6fa4b2d65746e8cd4f968e38c5a9679f8495db114ee06317f72f717db",
+    "endpoint": "mayhem_decisions",
+    "contract_hash": "ff9bedfa09fa0baae332713ec18fb8ad9fba1d5d47f81b9b1e5304fd5bcec777",
+    "max_json_bytes": 65536,
+    "request": {
+      "kind": "object",
+      "fields": {
+        "max_tokens": {
+          "target": [
+            "options",
+            "limit"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "model": {
+          "target": [
+            "engine"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "n": {
+          "target": [
+            "count"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "questions": {
+          "target": [
+            "queries"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "response_format": {
+          "target": [
+            "format"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "state": {
+          "target": [
+            "context"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "store": {
+          "target": [
+            "retain"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "stream": {
+          "target": [
+            "options",
+            "stream"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "temperature": {
+          "target": [
+            "options",
+            "heat"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "tool_choice": {
+          "target": [
+            "selection"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "tools": {
+          "target": [
+            "functions"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        }
+      }
+    },
+    "outcome": {
+      "path": [
+        "state"
+      ],
+      "success": "ok",
+      "error_path": [
+        "fault"
+      ],
+      "errors": {
+        "bad": "invalid_request",
+        "busy": "busy",
+        "limited": "rate_limited"
+      }
+    },
+    "response": {
+      "kind": "object",
+      "fields": {
+        "answers": {
+          "optional": false,
+          "value": {
+            "kind": "copy",
+            "path": [
+              "labels"
+            ]
+          }
+        },
+        "id": {
+          "optional": false,
+          "value": {
+            "kind": "copy",
+            "path": [
+              "job"
+            ]
+          }
+        }
+      }
+    },
+    "fixtures": [
+      {
+        "request": {
+          "model": "sample",
+          "state": "classify",
+          "questions": {
+            "q": {
+              "type": "choice",
+              "instructions": "classify",
+              "criteria": {
+                "yes": "Yes",
+                "no": "No"
+              }
+            }
+          }
+        },
+        "upstream_request": {
+          "engine": "sample",
+          "context": "classify",
+          "queries": {
+            "q": {
+              "type": "choice",
+              "instructions": "classify",
+              "criteria": {
+                "yes": "Yes",
+                "no": "No"
+              }
+            }
+          }
+        },
+        "upstream_response": {
+          "state": "ok",
+          "fault": null,
+          "job": "j2",
+          "labels": {
+            "q": {
+              "type": "choice",
+              "choice": "yes",
+              "probabilities": {
+                "yes": 0.75,
+                "no": 0.25
+              }
+            }
+          }
+        },
+        "normalized_response": {
+          "id": "j2",
+          "answers": {
+            "q": {
+              "type": "choice",
+              "choice": "yes",
+              "probabilities": {
+                "yes": 0.75,
+                "no": 0.25
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "signature": "741f5ea4248553097c997559b45a2b9cdf3798a5669b83829b486b6c6a1a89e4aab3079ba4d293a695c890270fc6b75308f482e23e9d99746de4a5ef5598130c"
+}

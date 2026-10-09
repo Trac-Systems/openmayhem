@@ -1,0 +1,283 @@
+{
+  "adapter": {
+    "version": 1,
+    "endpoint": "openai_completions",
+    "contract": {
+      "family": "openai_completions",
+      "request_attributes": [
+        "model",
+        "prompt",
+        "stream",
+        "max_tokens",
+        "temperature",
+        "top_p",
+        "top_k",
+        "min_p",
+        "seed",
+        "frequency_penalty",
+        "presence_penalty",
+        "stop",
+        "user"
+      ],
+      "required_request_attributes": [
+        "model",
+        "prompt"
+      ],
+      "response_attributes": [
+        "id",
+        "object",
+        "created",
+        "model",
+        "choices",
+        "usage",
+        "mayhem"
+      ],
+      "required_response_attributes": [
+        "id",
+        "object",
+        "created",
+        "model",
+        "choices",
+        "usage",
+        "mayhem"
+      ],
+      "request_attribute_specs": {
+        "frequency_penalty": {
+          "value_types": [
+            "number"
+          ],
+          "minimum": -2.0,
+          "maximum": 2.0,
+          "calibration_values": [
+            0.0
+          ]
+        },
+        "max_tokens": {
+          "value_types": [
+            "integer"
+          ],
+          "minimum": 0.0,
+          "maximum": 262144.0,
+          "calibration_values": [
+            8
+          ]
+        },
+        "min_p": {
+          "value_types": [
+            "number"
+          ],
+          "minimum": 0.0,
+          "maximum": 1.0,
+          "calibration_values": [
+            0.05
+          ]
+        },
+        "model": {
+          "value_types": [
+            "string"
+          ],
+          "calibration_values": [
+            "$MODEL"
+          ]
+        },
+        "presence_penalty": {
+          "value_types": [
+            "number"
+          ],
+          "minimum": -2.0,
+          "maximum": 2.0,
+          "calibration_values": [
+            0.0
+          ]
+        },
+        "prompt": {
+          "value_types": [
+            "string"
+          ],
+          "min_length": 1,
+          "max_length": 32000,
+          "calibration_values": [
+            "Mayhem calibration"
+          ]
+        },
+        "seed": {
+          "value_types": [
+            "integer"
+          ],
+          "minimum": 0.0,
+          "maximum": 4294967295.0,
+          "calibration_values": [
+            7
+          ]
+        },
+        "stop": {
+          "value_types": [
+            "string",
+            "array",
+            "null"
+          ],
+          "calibration_values": [
+            "CALIBRATION_STOP",
+            [
+              "CALIBRATION_STOP",
+              "CALIBRATION_END"
+            ],
+            null
+          ]
+        },
+        "stream": {
+          "value_types": [
+            "boolean"
+          ],
+          "default": false,
+          "calibration_values": [
+            false,
+            true
+          ]
+        },
+        "temperature": {
+          "value_types": [
+            "number"
+          ],
+          "minimum": 0.0,
+          "maximum": 2.0,
+          "calibration_values": [
+            0.6
+          ]
+        },
+        "top_k": {
+          "value_types": [
+            "integer"
+          ],
+          "minimum": 0.0,
+          "maximum": 1000000.0,
+          "calibration_values": [
+            20
+          ]
+        },
+        "top_p": {
+          "value_types": [
+            "number"
+          ],
+          "minimum": 1e-6,
+          "maximum": 1.0,
+          "calibration_values": [
+            0.95
+          ]
+        },
+        "user": {
+          "value_types": [
+            "string"
+          ],
+          "min_length": 1,
+          "max_length": 512,
+          "calibration_values": [
+            "mayhem-calibration-user"
+          ]
+        }
+      },
+      "response_attribute_specs": {
+        "choices": {
+          "value_types": [
+            "array"
+          ],
+          "min_items": 0,
+          "max_items": 1000000,
+          "calibration_values": [
+            []
+          ]
+        },
+        "created": {
+          "value_types": [
+            "integer"
+          ],
+          "minimum": 0.0,
+          "maximum": 1.8446744073709552e+19,
+          "calibration_values": [
+            1
+          ]
+        },
+        "id": {
+          "value_types": [
+            "string"
+          ],
+          "min_length": 0,
+          "max_length": 536870912,
+          "calibration_values": [
+            "$RESPONSE_VALUE"
+          ]
+        },
+        "mayhem": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {}
+          ]
+        },
+        "model": {
+          "value_types": [
+            "string"
+          ],
+          "min_length": 0,
+          "max_length": 536870912,
+          "calibration_values": [
+            "$RESPONSE_VALUE"
+          ]
+        },
+        "object": {
+          "value_types": [
+            "string"
+          ],
+          "min_length": 0,
+          "max_length": 536870912,
+          "calibration_values": [
+            "$RESPONSE_VALUE"
+          ]
+        },
+        "usage": {
+          "value_types": [
+            "object"
+          ],
+          "calibration_values": [
+            {}
+          ]
+        }
+      },
+      "interaction_groups": [
+        [
+          "temperature",
+          "top_p",
+          "top_k",
+          "min_p",
+          "seed"
+        ]
+      ]
+    },
+    "upstream_model": "private-model",
+    "limits": {
+      "request_bytes": 1048576,
+      "response_bytes": 1048576,
+      "choices": 8,
+      "tools": 16,
+      "questions": 16,
+      "decision_options": 32
+    }
+  },
+  "request": {
+    "model": "sample",
+    "prompt": "Hello"
+  },
+  "response": {
+    "state": "ok",
+    "fault": null,
+    "job": "j3",
+    "result": [
+      {
+        "index": 0,
+        "text": "Hi",
+        "finish_reason": "stop"
+      }
+    ]
+  }
+}

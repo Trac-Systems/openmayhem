@@ -1,0 +1,172 @@
+{
+  "recipe": {
+    "schema_version": 1,
+    "revision": 1,
+    "abi_min": 1,
+    "abi_max": 1,
+    "publisher": "5e449ad6fa4b2d65746e8cd4f968e38c5a9679f8495db114ee06317f72f717db",
+    "endpoint": "openai_completions",
+    "contract_hash": "7e55a20ab022e1673ec3ff825bcbb7446062221022ed96d6c2b43440a2d09803",
+    "max_json_bytes": 65536,
+    "request": {
+      "kind": "object",
+      "fields": {
+        "max_tokens": {
+          "target": [
+            "options",
+            "limit"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "model": {
+          "target": [
+            "engine"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "n": {
+          "target": [
+            "count"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "prompt": {
+          "target": [
+            "text"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "response_format": {
+          "target": [
+            "format"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "store": {
+          "target": [
+            "retain"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "stream": {
+          "target": [
+            "options",
+            "stream"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "temperature": {
+          "target": [
+            "options",
+            "heat"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "tool_choice": {
+          "target": [
+            "selection"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "tools": {
+          "target": [
+            "functions"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        }
+      }
+    },
+    "outcome": {
+      "path": [
+        "state"
+      ],
+      "success": "ok",
+      "error_path": [
+        "fault"
+      ],
+      "errors": {
+        "bad": "invalid_request",
+        "busy": "busy",
+        "limited": "rate_limited"
+      }
+    },
+    "response": {
+      "kind": "object",
+      "fields": {
+        "choices": {
+          "optional": false,
+          "value": {
+            "kind": "copy",
+            "path": [
+              "result"
+            ]
+          }
+        },
+        "id": {
+          "optional": false,
+          "value": {
+            "kind": "copy",
+            "path": [
+              "job"
+            ]
+          }
+        }
+      }
+    },
+    "fixtures": [
+      {
+        "request": {
+          "model": "sample",
+          "prompt": "Hello"
+        },
+        "upstream_request": {
+          "engine": "sample",
+          "text": "Hello"
+        },
+        "upstream_response": {
+          "state": "ok",
+          "fault": null,
+          "job": "j3",
+          "result": [
+            {
+              "index": 0,
+              "text": "Hi",
+              "finish_reason": "stop"
+            }
+          ]
+        },
+        "normalized_response": {
+          "id": "j3",
+          "choices": [
+            {
+              "index": 0,
+              "text": "Hi",
+              "finish_reason": "stop"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "signature": "1a736217cffa1630953e1a8e7c7274717998313a943d2dc8af406716dcbfdae7532fabb84a72b52e02c328da9655ca06c067017328ed63983fc0252cef46dc0d"
+}

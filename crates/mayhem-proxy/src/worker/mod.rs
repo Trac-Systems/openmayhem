@@ -256,7 +256,7 @@ fn json<T: Serialize>(value: &T, max: usize) -> Result<Vec<u8>> {
 
 fn emit(
     w: &mut impl Write,
-    event: Decoded,
+    mut event: Decoded,
     init: &Init,
     verifier: Option<&crate::semantics::Verifier>,
 ) -> std::result::Result<(), Failure> {
@@ -286,8 +286,11 @@ fn emit(
         }
     }
     if let Some(verifier) = verifier {
-        match &event {
-            Decoded::Json { value } => verifier.verify(value)?,
+        match &mut event {
+            Decoded::Json { value } => {
+                *value = verifier.normalize(std::mem::take(value))?;
+                verifier.verify(value)?;
+            }
             _ => return Err(protocol()),
         }
     }

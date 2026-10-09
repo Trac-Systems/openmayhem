@@ -1,0 +1,325 @@
+{
+  "recipe": {
+    "schema_version": 1,
+    "revision": 1,
+    "abi_min": 1,
+    "abi_max": 1,
+    "publisher": "5e449ad6fa4b2d65746e8cd4f968e38c5a9679f8495db114ee06317f72f717db",
+    "endpoint": "openai_chat_completions",
+    "contract_hash": "790f754a670add8d47d9f96cbeee40076f15d674d276a3b5215aea91db8a42df",
+    "max_json_bytes": 65536,
+    "request": {
+      "kind": "object",
+      "fields": {
+        "max_tokens": {
+          "target": [
+            "options",
+            "limit"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "messages": {
+          "target": [
+            "dialog"
+          ],
+          "transform": {
+            "kind": "array",
+            "max_items": 64,
+            "item": {
+              "kind": "object",
+              "fields": {
+                "content": {
+                  "target": [
+                    "text"
+                  ],
+                  "transform": {
+                    "kind": "identity"
+                  }
+                },
+                "name": {
+                  "target": [
+                    "name"
+                  ],
+                  "transform": {
+                    "kind": "identity"
+                  }
+                },
+                "role": {
+                  "target": [
+                    "speaker"
+                  ],
+                  "transform": {
+                    "kind": "enum",
+                    "values": {
+                      "assistant": "bot",
+                      "developer": "developer",
+                      "system": "system",
+                      "tool": "tool",
+                      "user": "human"
+                    }
+                  }
+                },
+                "tool_call_id": {
+                  "target": [
+                    "call_ref"
+                  ],
+                  "transform": {
+                    "kind": "identity"
+                  }
+                },
+                "tool_calls": {
+                  "target": [
+                    "calls"
+                  ],
+                  "transform": {
+                    "kind": "identity"
+                  }
+                }
+              }
+            }
+          }
+        },
+        "model": {
+          "target": [
+            "engine"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "n": {
+          "target": [
+            "count"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "response_format": {
+          "target": [
+            "format"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "store": {
+          "target": [
+            "retain"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "stream": {
+          "target": [
+            "options",
+            "stream"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "temperature": {
+          "target": [
+            "options",
+            "heat"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "tool_choice": {
+          "target": [
+            "selection"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        },
+        "tools": {
+          "target": [
+            "functions"
+          ],
+          "transform": {
+            "kind": "identity"
+          }
+        }
+      }
+    },
+    "outcome": {
+      "path": [
+        "state"
+      ],
+      "success": "ok",
+      "error_path": [
+        "fault"
+      ],
+      "errors": {
+        "bad": "invalid_request",
+        "busy": "busy",
+        "limited": "rate_limited"
+      }
+    },
+    "response": {
+      "kind": "object",
+      "fields": {
+        "choices": {
+          "optional": false,
+          "value": {
+            "kind": "array",
+            "path": [
+              "results"
+            ],
+            "max_items": 8,
+            "item": {
+              "kind": "object",
+              "fields": {
+                "finish_reason": {
+                  "optional": false,
+                  "value": {
+                    "kind": "enum",
+                    "path": [
+                      "stop"
+                    ],
+                    "values": {
+                      "done": "stop",
+                      "limit": "length",
+                      "refused": "content_filter",
+                      "tools": "tool_calls"
+                    }
+                  }
+                },
+                "index": {
+                  "optional": false,
+                  "value": {
+                    "kind": "copy",
+                    "path": [
+                      "ordinal"
+                    ]
+                  }
+                },
+                "message": {
+                  "optional": false,
+                  "value": {
+                    "kind": "object",
+                    "fields": {
+                      "content": {
+                        "optional": false,
+                        "value": {
+                          "kind": "copy",
+                          "path": [
+                            "text"
+                          ]
+                        }
+                      },
+                      "reasoning_content": {
+                        "optional": true,
+                        "value": {
+                          "kind": "copy",
+                          "path": [
+                            "reasoning"
+                          ]
+                        }
+                      },
+                      "refusal": {
+                        "optional": true,
+                        "value": {
+                          "kind": "copy",
+                          "path": [
+                            "refusal"
+                          ]
+                        }
+                      },
+                      "role": {
+                        "optional": false,
+                        "value": {
+                          "kind": "enum",
+                          "path": [
+                            "speaker"
+                          ],
+                          "values": {
+                            "bot": "assistant"
+                          }
+                        }
+                      },
+                      "tool_calls": {
+                        "optional": true,
+                        "value": {
+                          "kind": "copy",
+                          "path": [
+                            "calls"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "id": {
+          "optional": false,
+          "value": {
+            "kind": "copy",
+            "path": [
+              "job"
+            ]
+          }
+        }
+      }
+    },
+    "fixtures": [
+      {
+        "request": {
+          "model": "sample",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Hello λ"
+            }
+          ]
+        },
+        "upstream_request": {
+          "engine": "sample",
+          "dialog": [
+            {
+              "speaker": "human",
+              "text": "Hello λ"
+            }
+          ]
+        },
+        "upstream_response": {
+          "state": "ok",
+          "fault": null,
+          "job": "j1",
+          "results": [
+            {
+              "ordinal": 0,
+              "speaker": "bot",
+              "text": "Hi λ",
+              "stop": "done"
+            }
+          ]
+        },
+        "normalized_response": {
+          "id": "j1",
+          "choices": [
+            {
+              "index": 0,
+              "message": {
+                "role": "assistant",
+                "content": "Hi λ"
+              },
+              "finish_reason": "stop"
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "signature": "667afe4474b3ea00c1c3f80f6ae067885ff7fc92e432d058bd85d0f824a197f9d5528530d9adb19527539a6f9d7f99408a03e7155a0bad3a344ef427713d7804"
+}

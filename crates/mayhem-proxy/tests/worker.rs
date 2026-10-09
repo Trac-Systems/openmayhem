@@ -104,6 +104,8 @@ async fn semantic_policy_is_bound_and_must_compile_before_worker_activation() {
         request_hash: record.binding.request_hash.clone(),
         tools: Default::default(),
         output: Output::JsonObject,
+        recipe: None,
+        recipe_response_bytes: None,
     };
     let init = init(&record, WireFormat::Json)
         .with_semantics(&policy)
