@@ -48,6 +48,19 @@ impl Authority {
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
+    /// Trusted negotiation store persists this exact signature before exposure.
+    /// There is intentionally no public arbitrary spend-signing API.
+    pub(crate) fn buyer_spend(
+        &self,
+        purchase: &crate::financial::quote::PreparedPurchase,
+    ) -> Result<String> {
+        self.party(purchase.terms(), true)?;
+        let bytes = purchase
+            .terms()
+            .buyer_signing_bytes()
+            .map_err(|_| invalid("invalid buyer purchase"))?;
+        Ok(hex(&self.key.sign(&bytes).to_bytes()))
+    }
     fn terms(&self, authorization: &ProxySpendAuthorization, buyer: bool) -> Result<()> {
         authorization
             .verify(crate::receipts::verify_signature)

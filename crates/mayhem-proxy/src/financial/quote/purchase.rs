@@ -95,7 +95,61 @@ pub struct PreparedPurchase {
     snapshot: AcceptanceSnapshot,
     request: Vec<u8>,
 }
+/// Private trusted-parent persistence, not an input accepted from connectors.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedPurchase {
+    pub terms: ProxySpendTerms,
+    pub policy: ProxySettlementPolicy,
+    pub prices: PriceLimits,
+    pub snapshot: AcceptanceSnapshot,
+    pub request: String,
+}
+impl RetainedPurchase {
+    pub(crate) fn validate(&self) -> Result<()> {
+        self.terms.validate().map_err(invalid)?;
+        self.prices.permits(&self.terms.offer)?;
+        require(
+            self.terms.max_total_spend_au == self.prices.max_total_spend_au
+                && self.policy.digest().map_err(invalid)? == self.terms.settlement_policy_hash,
+            "retained purchase policy differs",
+        )?;
+        let binding = super::super::terms_binding(&self.terms)?;
+        self.snapshot
+            .validate_for(&binding)
+            .map_err(|_| invalid("retained purchase snapshot differs"))?;
+        let adapter = Adapter::restore(self.snapshot.adapter.clone())
+            .map_err(|_| invalid("invalid retained adapter"))?;
+        let prepared = prepare(&adapter, self.request.as_bytes())?;
+        let output = self.terms.max_usage.get("output_token").copied();
+        require(
+            prepared.matches_binding(&binding)
+                && prepared
+                    .maximum_usage(output)
+                    .map_err(|_| invalid("invalid retained usage"))?
+                    == self.terms.max_usage,
+            "retained purchase request differs",
+        )
+    }
+    pub(crate) fn commitment(&self) -> Result<Digest> {
+        self.validate()?;
+        let bytes = mayhem_proto::stable_json_bytes(&serde_json::to_value(self)?)?;
+        Ok(Digest::hash("mayhem/proxy/purchase-intent/v1", &[&bytes]))
+    }
+}
 impl PreparedPurchase {
+    pub(crate) fn retained(&self) -> Result<RetainedPurchase> {
+        let retained = RetainedPurchase {
+            terms: self.terms.clone(),
+            policy: self.policy.clone(),
+            prices: self.prices.clone(),
+            snapshot: self.snapshot.clone(),
+            request: String::from_utf8(self.request.clone())
+                .map_err(|_| invalid("invalid purchase UTF-8"))?,
+        };
+        retained.validate()?;
+        Ok(retained)
+    }
     pub fn terms(&self) -> &ProxySpendTerms {
         &self.terms
     }

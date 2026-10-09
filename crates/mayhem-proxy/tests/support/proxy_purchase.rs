@@ -1,4 +1,6 @@
 use super::*;
+#[path = "buyer_negotiation.rs"]
+mod negotiation;
 use ed25519_dalek::{Signer, SigningKey};
 use financial::{
     quote::{Lifetimes, PriceLimits, PurchaseRequest, Query, SessionBinding},

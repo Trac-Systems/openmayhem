@@ -55,6 +55,8 @@ They also cover stale offers, changed canonical views, request/signature/replay
 tampering, unready payout bindings, incompatible recipes, price/budget overruns
 and preservation of native holds. No real model or external payment is involved.
 
-Durable pre-signing intentions, authenticated offer negotiation, supervisor
-startup and public API/Studio/MCP integration are still required. Do not expose
-an arbitrary-bytes signing RPC or sign merely because a quote was returned.
+The buyer-side durable signing and reservation handoff is documented in
+[NEGOTIATION.md](NEGOTIATION.md). Provider-side countersigning, authenticated offer
+exchange, supervisor startup and public API/Studio/MCP integration are still
+required. Do not expose an arbitrary-bytes signing RPC or sign merely because a
+quote was returned.

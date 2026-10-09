@@ -685,6 +685,19 @@ impl BuyerRecovery {
         self.run(move |s| Ok(s.observe(&o, false, at_ms)?.confirmed))
             .await
     }
+    /// Adopt already verified canonical history during negotiation recovery,
+    /// including accepted terms from an earlier contract version. No new append.
+    pub(crate) async fn retain_observation(
+        &self,
+        observation: Observation,
+        at_ms: u64,
+    ) -> Result<Observation> {
+        self.run(move |s| {
+            s.observe(&observation, false, at_ms)?;
+            Ok(observation)
+        })
+        .await
+    }
     pub async fn prepare_expiry(
         &self,
         authorization: &ProxySpendAuthorization,
