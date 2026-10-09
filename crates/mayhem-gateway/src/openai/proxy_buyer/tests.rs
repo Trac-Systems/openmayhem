@@ -1,3 +1,5 @@
+mod buyer_policy;
+mod local_lab;
 mod retail;
 mod streaming;
 use super::*;
@@ -36,6 +38,14 @@ impl Fixture {
         endpoint: ProxyEndpoint,
         rail: ProxyRail,
         retail: Option<RetailAuthorizationConfig>,
+    ) -> Self {
+        Self::start_with_retail_key(endpoint, rail, retail, "owner-fixture-key").await
+    }
+    async fn start_with_retail_key(
+        endpoint: ProxyEndpoint,
+        rail: ProxyRail,
+        retail: Option<RetailAuthorizationConfig>,
+        owner_key: &str,
     ) -> Self {
         let harness = Harness::start_with(&support::worker_path(), endpoint, rail).await;
         let control = harness.control().await;
@@ -77,7 +87,7 @@ impl Fixture {
         let tokens = GatewayTokenStore {
             version: 1,
             tokens: vec![
-                token("owner", "owner-fixture-key"),
+                token("owner", owner_key),
                 token("other", "other-fixture-key"),
             ],
         };

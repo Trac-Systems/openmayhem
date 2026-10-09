@@ -25,6 +25,20 @@ release acceptance remain separate requirements.
 
 ## Authenticated financial evidence
 
+`GET /v1/proxy/buyer-policy` requires a current authenticated gateway key and
+returns exactly `schema_version: 1`, `settlement_policy_hash`, and the full public
+`settlement_policy` currently configured on that gateway's buyer runtime. The
+hash uses the existing `mayhem/proxy/settlement-policy/v1` canonical digest.
+An unconfigured buyer returns `503 proxy_buyer_disabled`; no default policy is
+invented. Responses are private and not cacheable. Private configuration,
+credentials and resource limits are never included.
+
+Clients using separate gateways per payment rail must read the policy from the
+same gateway that will execute their request. This read describes approved
+settlement outcomes; it does not promise readiness, funding or provider agreement.
+Admission independently rechecks the explicitly supplied policy hash and frozen
+terms. A later policy change cannot reinterpret an existing purchase.
+
 `GET /v1/jobs/{job_id}/proxy-evidence` returns schema version1,
 `object: "mayhem.proxy.job_evidence"`, for the authenticated key's original
 proxy purchase. Native jobs have no proxy evidence. Current model scope, key

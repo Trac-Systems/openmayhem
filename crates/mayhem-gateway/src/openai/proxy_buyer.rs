@@ -10,6 +10,7 @@ use super::{
 };
 use crate::job_store::{BeginGatewayJob, GatewayJobStatus, StoredGatewayJob};
 use axum::{
+    extract::State,
     http::HeaderMap,
     response::{IntoResponse, Response},
     Json,
@@ -419,6 +420,37 @@ fn busy() -> ApiError {
 }
 fn invalid() -> ApiError {
     ApiError::bad_request("invalid proxy request or policy", Some("proxy"))
+}
+
+/// Current operator-approved settlement facts, not a quote or spending grant.
+/// Callers pin the hash in their explicit request; admission still checks the
+/// runtime policy and the provider/canonical terms independently.
+pub(super) async fn buyer_policy(State(state): State<SharedState>, headers: HeaderMap) -> Response {
+    let result = (|| -> Result<Response, ApiError> {
+        state
+            .authorize_existing_gateway_request(&headers, None)?
+            .ok_or_else(|| {
+                ApiError::unauthorized(
+                    "proxy buyer policy requires an authenticated key",
+                    Some("Authorization"),
+                )
+            })?;
+        let runtime = state.proxy_buyer.as_ref().ok_or_else(|| {
+            ApiError::service_unavailable("proxy buyer is not configured", Some("proxy"))
+                .with_public_error("proxy_buyer_disabled", "proxy_discovery", true)
+        })?;
+        Ok(Json(serde_json::json!({
+            "schema_version": 1,
+            "settlement_policy_hash": runtime.policy.settlement_policy_hash(),
+            "settlement_policy": runtime.settlement_policy,
+        }))
+        .into_response())
+    })();
+    let mut response = result.unwrap_or_else(IntoResponse::into_response);
+    response
+        .headers_mut()
+        .insert("cache-control", "private, no-store".parse().unwrap());
+    response
 }
 
 pub(crate) fn selected(raw: &Value) -> bool {
