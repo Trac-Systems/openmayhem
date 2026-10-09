@@ -1,3 +1,5 @@
+import { readProxyProviderState, validateProxyProviderStateRequest, PROXY_PROVIDER_STATE_SERVICE,
+  PROXY_PROVIDER_STATE_MAX_BYTES, PROXY_PROVIDER_STATE_MAX_AGE_MS } from './proxy-provider-state.js';
 import { readProxyIntentState, validateProxyIntentStateRequest, PROXY_INTENT_STATE_SERVICE,
   PROXY_INTENT_STATE_MAX_BYTES, PROXY_INTENT_STATE_MAX_AGE_MS } from './proxy-intent-state.js';
 import { readProxyOfferState, validateProxyOfferStateRequest, PROXY_OFFER_STATE_SERVICE,
@@ -375,7 +377,7 @@ const serviceParticipantFor = (service, value) => {
     return null;
   }
   if (service === 'stripe_checkout') return normalizeKey(value.who);
-  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE || service === PROXY_FINANCIAL_STATE_SERVICE || service === PROXY_QUOTE_STATE_SERVICE || service === PROXY_OFFER_STATE_SERVICE || service === PROXY_INTENT_STATE_SERVICE) return normalizeKey(value.requester);
+  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE || service === PROXY_FINANCIAL_STATE_SERVICE || service === PROXY_QUOTE_STATE_SERVICE || service === PROXY_OFFER_STATE_SERVICE || service === PROXY_INTENT_STATE_SERVICE || service === PROXY_PROVIDER_STATE_SERVICE) return normalizeKey(value.requester);
   if ([
     'provider_payout_context',
     'stripe_connect_adopt',
@@ -703,14 +705,18 @@ class MayhemFeature extends Feature {
     return await this._proxyNegotiationState(query, 'intent');
   }
 
+  async proxyProviderState(query) {
+    return await this._proxyNegotiationState(query, 'provider');
+  }
+
   async _proxyNegotiationState(query, label) {
-    const provider = label === 'offer', intent = label === 'intent';
-    const service = intent ? PROXY_INTENT_STATE_SERVICE : provider ? PROXY_OFFER_STATE_SERVICE : PROXY_QUOTE_STATE_SERVICE;
-    const keys = intent ? 'intent|request_nonce' : provider ? 'offer|rail|request_nonce|settlement_policy_hash'
+    const provider = label === 'offer', intent = label === 'intent', onboarding = label === 'provider';
+    const service = onboarding ? PROXY_PROVIDER_STATE_SERVICE : intent ? PROXY_INTENT_STATE_SERVICE : provider ? PROXY_OFFER_STATE_SERVICE : PROXY_QUOTE_STATE_SERVICE;
+    const keys = onboarding ? 'initial_operation_digest|provider_pubkey|request_nonce' : intent ? 'intent|request_nonce' : provider ? 'offer|rail|request_nonce|settlement_policy_hash'
       : 'billing_id|offer|rail|request_nonce|settlement_policy_hash';
-    const validate = intent ? validateProxyIntentStateRequest : provider ? validateProxyOfferStateRequest : validateProxyQuoteStateRequest;
-    const maxAge = intent ? PROXY_INTENT_STATE_MAX_AGE_MS : provider ? PROXY_OFFER_STATE_MAX_AGE_MS : PROXY_QUOTE_STATE_MAX_AGE_MS;
-    const maxBytes = intent ? PROXY_INTENT_STATE_MAX_BYTES : provider ? PROXY_OFFER_STATE_MAX_BYTES : PROXY_QUOTE_STATE_MAX_BYTES;
+    const validate = onboarding ? validateProxyProviderStateRequest : intent ? validateProxyIntentStateRequest : provider ? validateProxyOfferStateRequest : validateProxyQuoteStateRequest;
+    const maxAge = onboarding ? PROXY_PROVIDER_STATE_MAX_AGE_MS : intent ? PROXY_INTENT_STATE_MAX_AGE_MS : provider ? PROXY_OFFER_STATE_MAX_AGE_MS : PROXY_QUOTE_STATE_MAX_AGE_MS;
+    const maxBytes = onboarding ? PROXY_PROVIDER_STATE_MAX_BYTES : intent ? PROXY_INTENT_STATE_MAX_BYTES : provider ? PROXY_OFFER_STATE_MAX_BYTES : PROXY_QUOTE_STATE_MAX_BYTES;
     const requester = normalizeKey(this.peer?.wallet?.publicKey);
     if (!query || Object.keys(query).sort().join('|') !== keys) {
       throw new Error(`Invalid proxy ${label} query.`);
@@ -1062,6 +1068,9 @@ class MayhemFeature extends Feature {
     if (service === PROXY_INTENT_STATE_SERVICE) {
       try { validateProxyIntentStateRequest(payload); } catch { return null; }
     }
+    if (service === PROXY_PROVIDER_STATE_SERVICE) {
+      try { validateProxyProviderStateRequest(payload); } catch { return null; }
+    }
     if (service === PROXY_OFFER_STATE_SERVICE) {
       try { validateProxyOfferStateRequest(payload); } catch { return null; }
     }
@@ -1225,6 +1234,9 @@ class MayhemFeature extends Feature {
   }
 
   async _handleService(service, value, authorization) {
+    if (service === PROXY_PROVIDER_STATE_SERVICE) {
+      return await readProxyProviderState({ request: value, withCanonicalSnapshot: this.withProxyCanonicalSnapshot });
+    }
     if (service === PROXY_INTENT_STATE_SERVICE) {
       return await readProxyIntentState({ request: value,
         withCanonicalSnapshot: this.withProxyCanonicalSnapshot,

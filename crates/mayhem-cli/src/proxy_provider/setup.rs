@@ -68,6 +68,18 @@ pub enum Command {
         #[arg(long)]
         expected_revision: u64,
     },
+    /// Read canonical admission/sequence facts; never request payment or publish.
+    AdmissionCheck {
+        #[command(flatten)]
+        args: DraftArgs,
+        #[arg(long)]
+        expected_revision: u64,
+        /// Explicit trusted Core peer RPC base, HTTPS or literal loopback HTTP.
+        #[arg(long)]
+        peer_rpc: String,
+        #[arg(long, default_value_t = 5000)]
+        timeout_ms: u64,
+    },
     /// Run one explicit bounded operator probe; may consume upstream allowance.
     Probe {
         #[command(flatten)]
@@ -91,6 +103,19 @@ pub enum Command {
 }
 pub async fn run(command: Command) -> Result<()> {
     let command = match command {
+        Command::AdmissionCheck {
+            args,
+            expected_revision,
+            peer_rpc,
+            timeout_ms,
+        } => {
+            let store = tokio::task::spawn_blocking(move || Store::open(args.directory)).await??;
+            let review = store
+                .admission_check(expected_revision, &peer_rpc, timeout_ms)
+                .await?;
+            println!("{}", serde_json::to_string(&review)?);
+            return Ok(());
+        }
         Command::Profiles => {
             println!("{}", serde_json::to_string(&profiles()?)?);
             return Ok(());
@@ -144,7 +169,10 @@ pub async fn run(command: Command) -> Result<()> {
             | Command::RecoverProbe { args, .. }
             | Command::Probe { args, .. }
             | Command::Inspect(args) => args,
-            Command::Profiles | Command::Discover { .. } | Command::Inventory { .. } => {
+            Command::Profiles
+            | Command::Discover { .. }
+            | Command::Inventory { .. }
+            | Command::AdmissionCheck { .. } => {
                 unreachable!("handled before the blocking operation")
             }
         };
@@ -169,7 +197,10 @@ pub async fn run(command: Command) -> Result<()> {
             } => store.recover_probe(expected_revision),
             Command::Probe { .. } => unreachable!("handled before the blocking operation"),
             Command::Inspect(_) => store.inspect(),
-            Command::Profiles | Command::Discover { .. } | Command::Inventory { .. } => {
+            Command::Profiles
+            | Command::Discover { .. }
+            | Command::Inventory { .. }
+            | Command::AdmissionCheck { .. } => {
                 unreachable!("handled before the blocking operation")
             }
         }

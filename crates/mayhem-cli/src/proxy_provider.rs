@@ -236,6 +236,17 @@ mod tests {
             vec![
                 "proxy",
                 "setup",
+                "admission-check",
+                "--directory",
+                "/private/setup",
+                "--expected-revision",
+                "2",
+                "--peer-rpc",
+                "http://127.0.0.1:17800/v1",
+            ],
+            vec![
+                "proxy",
+                "setup",
                 "probe",
                 "--directory",
                 "/private/setup",
@@ -308,6 +319,16 @@ mod tests {
             "recover-probe",
             "--directory",
             "/private/setup"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "admission-check",
+            "--directory",
+            "/private/setup",
+            "--peer-rpc",
+            "http://127.0.0.1:17800/v1",
         ])
         .is_err());
     }

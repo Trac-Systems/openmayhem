@@ -1,11 +1,13 @@
 //! Shared local provider setup. Structural validation is not conformance,
 //! admission, publication, or serving authority. Only an explicit probe invokes
 //! the existing bounded upstream controller; setup never opens a wallet.
+mod admission;
 mod connection;
 mod probe;
 mod profile;
 mod review;
 mod store;
+pub use admission::{AdmissionEvidence, AdmissionReport, AdmissionState, CanonicalProvider};
 pub use connection::{DiscoveryState, InventoryReview};
 pub use probe::{ProbeGroup, ProbePlan, ProbeReport, ProbeScope, ProbeState};
 pub use profile::{
@@ -196,6 +198,8 @@ struct Record {
     probe_scope: Option<ProbeScope>,
     #[serde(default)]
     probe: Option<probe::Attempt>,
+    #[serde(default)]
+    admission: Option<admission::Attempt>,
 }
 impl Record {
     fn binding(&self) -> Result<Digest> {
@@ -215,6 +219,9 @@ impl Record {
                 && self.revision <= mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER,
         )?;
         self.input.validate()?;
+        if let Some(admission) = &self.admission {
+            admission.validate()?;
+        }
         if let Some(scope) = &self.probe_scope {
             scope.validate()?;
         }

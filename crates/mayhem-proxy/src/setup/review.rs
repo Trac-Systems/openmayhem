@@ -27,6 +27,8 @@ pub struct Review {
     pub probe_status: &'static str,
     pub probe: Option<ProbeReport>,
     pub admission_status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub admission: Option<AdmissionReport>,
     pub publication_status: &'static str,
     pub serving_status: &'static str,
     pub network: Identity,
@@ -52,6 +54,11 @@ impl Record {
         };
         let operation = self.input.operation();
         let probe = self.probe.as_ref().map(|p| p.report(self)).transpose()?;
+        let admission = self
+            .admission
+            .as_ref()
+            .map(|a| a.report(self))
+            .transpose()?;
         let handoff = if state == State::StructurallyValid {
             Some(AdmissionHandoff {
                 initial_operation_digest: operation.digest().map_err(|_| Error::Invalid)?,
@@ -70,7 +77,8 @@ impl Record {
             claim_status: "operator_declared",
             probe_status: probe.as_ref().map_or("not_run", |p| p.status_name()),
             probe,
-            admission_status: "not_checked",
+            admission_status: admission.as_ref().map_or("not_checked", |a| a.status),
+            admission,
             publication_status: "not_submitted",
             serving_status: "not_started",
             network: self.input.network.clone(),

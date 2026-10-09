@@ -405,6 +405,13 @@ export async function discoverProxyCatalog(peer, body) {
   return await feature.discoverProxyCatalog(body.query);
 }
 
+export async function requestProxyProviderState(peer, body) {
+  if (!isObject(body) || Object.keys(body).sort().join('|') !== 'initial_operation_digest|provider_pubkey|request_nonce') throw new Error('Invalid proxy provider query.');
+  const feature = peer.protocol?.instance?.features?.mayhem;
+  if (typeof feature?.proxyProviderState !== 'function') throw new Error('Proxy provider relay is not ready.');
+  return await feature.proxyProviderState(body);
+}
+
 export async function requestProxyIntentState(peer, body) {
   if (!isObject(body) || Object.keys(body).sort().join('|') !== 'intent|request_nonce') throw new Error('Invalid proxy intent query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
@@ -571,6 +578,10 @@ export const createServer = (
             })
           );
         }
+      }
+      if (req.method === 'POST' && requestPath === '/v1/proxy/provider-state') {
+        const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 1024) });
+        return respond(200, await requestProxyProviderState(peer, body));
       }
       if (req.method === 'POST' && requestPath === '/v1/proxy/intent-state') {
         const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 32768) });

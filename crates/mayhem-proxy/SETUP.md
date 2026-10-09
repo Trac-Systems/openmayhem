@@ -51,8 +51,9 @@ already required by the public membership remain present.
 `unchecked`, `structurally_valid` and `recheck_required` describe local structure
 only. Inspection rechecks the current connection fingerprint; file drift removes
 the unsigned admission handoff until an explicit update and check. The review
-always reports operator-declared claims, admission not checked,
-publication not submitted and serving not started. Without an explicit probe it
+always reports operator-declared claims, publication not submitted and serving
+not started. Admission remains `not_checked` until an explicit canonical read
+described below; its observations never authorize publication. Without an explicit probe it
 reports `probe_status: not_run` and `probe: null`. The optional handoff is the
 exact unsigned initial `ProxyOperation` and its canonical digest, for the later
 identity/invoice workflow to bind. It is not a permit, payment request, proof of
@@ -140,8 +141,8 @@ This is a local controller observation, not a conformance certificate for every
 advertised context, performance measurement, admission permit or serving claim.
 
 The state library and unattended CLI are a setup foundation, not the complete
-interactive/dashboard wizard. Next wiring must read canonical provider admission and
-sequence before requesting an invoice, retain the original invoice/evidence,
+interactive/dashboard wizard. The explicit canonical read below supplies current
+provider admission and sequence observations. Next wiring must retain the original invoice/evidence,
 verify a permit bound to the exact initial operation, and submit the typed
 provider-signed operation through the existing publication journal/gate. A paid
 or pending invoice cannot be replaced merely because a CLI request was lost.
@@ -251,5 +252,61 @@ the capacity authority, consumes or resets allowance, retries inference, frees
 uncertain occupancy, or changes exact-ID recovery requirements.
 `resume` is an alias of `inspect`, with no network request. Existing create/update,
 check, probe and recover-probe behavior and the actual admission fee gate remain
-unchanged. The complete wizard must still connect the canonical admission/invoice
-and publication steps described above before claiming paid provider readiness.
+unchanged. The complete wizard must still connect original invoice/permit recovery
+and publication before claiming paid provider readiness.
+
+## Canonical provider admission observation
+
+After checking a draft, explicitly read its provider's canonical registration:
+
+```sh
+mayhem provider proxy setup admission-check --directory /absolute/private/setup --expected-revision 2 --peer-rpc http://127.0.0.1:17800/v1
+```
+
+The RPC base must identify an operator-trusted Core peer, using literal loopback
+HTTP or authenticated-by-origin HTTPS. Credentials in URLs, redirects and
+environment proxies are rejected. The peer must already hold the selected
+provider identity and support the new `proxy_provider_state` read service; an old
+peer reports unavailable. Setup never opens a wallet. The peer's existing signed
+read transport binds its requester, fresh challenge, network and exact draft
+operation digest to the canonical indexer's reply. It performs no admission or
+financial signature and no transaction append.
+
+The indexer uses its existing verified signed snapshot and rechecks all consulted
+keys before returning. It reads at most five exact registry keys: policy,
+provider, provider revocation, consumed entitlement ownership and entitlement
+revocation. There are no directory/history scans, invoice lookups, balance reads,
+capacity reservations, probes or model calls. Four independent read permits and
+a 15-second deadline bound this service; timed-out work retains its permit until
+its actual snapshot cleanup finishes. `--timeout-ms` accepts 1–15000, defaults to
+5000 and can shorten that bound. Responses have an 8 KiB limit.
+
+The original protected draft receives a pending observation before I/O and a
+final observation afterward, advancing its CAS revision twice. A cancelled read
+may leave only the pending revision. Inspect the same draft and explicitly repeat
+`admission-check` with that revision; `inspect`/`resume` never send a request. A
+repeat reads state only and cannot duplicate payment or publication. The exact
+configuration and connection remain bound. The last accepted proof/epoch floor
+survives unsuccessful reads; regressed or substituted canonical proofs fail
+closed instead of replacing it.
+
+The public optional `admission` report includes the canonical context/proof,
+registry-enabled flag, fee-policy hash, provider sequence, entitlement ID,
+revocation flags, next sequence and whether this exact operation was already
+applied. It includes observation/expiry times and a current-configuration flag.
+Registry configuration has no independent revision counter in the current
+protocol; its policy facts are bound to the same signed snapshot proof instead.
+Sequence exhaustion is explicit as no next sequence. Disabled registry policy
+remains visible even for an already admitted identity. Missing records produce
+`observed_not_registered`, which **never means unpaid**: an off-ledger invoice or
+permit may already exist. The report always says `payment_status: not_checked`
+and `authorizes_publication: false`.
+
+These are historical observations, not reusable admission permits. Fifteen-second
+expiry, a future clock or changed declaration/connection produces
+`refresh_required`; unavailable/malformed peers produce `observation_unavailable`.
+Neither state authorizes another invoice or fee. A future invoice flow must
+recover the original off-ledger invoice/permit and recheck current canonical
+facts. The publication path must still validate the exact signed operation,
+entitlement and current sequence at its existing gate. No serving readiness,
+paid admission collection or completed provider wizard is claimed here.
