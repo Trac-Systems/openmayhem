@@ -1713,3 +1713,5 @@ mod health_execution;
 mod native_execution;
 #[path = "support/probe_execution.rs"]
 mod probe_execution;
+#[path = "support/managed_provider.rs"]
+mod managed_provider;

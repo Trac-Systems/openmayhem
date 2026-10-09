@@ -404,7 +404,8 @@ fn expiry_key(record: &Record) -> String {
     )
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     /// Retained attempts including completed ones, not a lifetime request limit.
     pub max_records: u64,

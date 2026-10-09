@@ -17,7 +17,8 @@ use tokio::{
     sync::{watch, OwnedSemaphorePermit, Semaphore},
 };
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoolLimits {
     pub max_children: usize,
     /// Bounds reserved raw/IPC buffers, not a claim to bound total process RSS.

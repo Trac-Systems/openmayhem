@@ -91,10 +91,11 @@ ceilings, uncertain requests, scope ownership or the operator's cost/attempt bud
 Observation-only `register` remains available for lower-level tests and decision routes;
 it does not establish measured LLM admission. `Snapshot::meets_native_floor` additionally
 checks a stricter buyer requirement without changing the shared operator floor. Durable
-admission separately enforces shared ceilings and outstanding work. Managed startup must
-select the required policy explicitly. Tokenizer provisioning, signed public availability,
-gateway default/explicit floor handling and scheduled recovery integration remain required
-before public activation. Unknown speed is never a measured passing rate or zero.
+admission separately enforces shared ceilings and outstanding work. [Managed startup](MANAGED.md)
+now requires a protected, digest-pinned local tokenizer for each LLM route and assembles
+the measured policy plus budgeted recovery. Wizard provisioning, signed public availability
+and gateway default/explicit floor handling remain required before public activation.
+Unknown speed is never a measured passing rate or zero.
 
 Local tests cover pinned data, byte offsets across BPE boundaries, UTF-8, multiple
 channels, bounded accumulation, timing/age, slow consumers, real HTTP streaming for

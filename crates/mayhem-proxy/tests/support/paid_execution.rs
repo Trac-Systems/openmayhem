@@ -12,6 +12,7 @@ mod purchase;
 mod refusals;
 
 struct Peer {
+    rpc_url: String,
     child: Child,
     stdin: ChildStdin,
     lines: tokio::io::Lines<BufReader<ChildStdout>>,
@@ -82,6 +83,7 @@ impl Peer {
             .unwrap(),
         );
         Self {
+            rpc_url: v["url"].as_str().unwrap().to_owned(),
             template: serde_json::from_value(v["authorization"].clone()).unwrap(),
             stdin: child.stdin.take().unwrap(),
             child,

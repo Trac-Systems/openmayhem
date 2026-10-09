@@ -16,6 +16,7 @@ pub mod execution;
 pub mod financial;
 pub mod health;
 pub mod matching;
+pub mod managed;
 pub mod metering;
 pub mod negotiation;
 pub mod receipts;

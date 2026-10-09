@@ -4,7 +4,8 @@ use super::*;
 use crate::supervisor::{unix_ms, RefreshPolicy, Schedule};
 use serde::Serialize;
 
-#[derive(Clone)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub page_size: usize,
     pub schedule: RefreshPolicy,
@@ -125,7 +126,11 @@ impl Runner {
                 self.cursors[index] = page.next_after;
             }
             Source::Execution => {
-                let page = self.owner.executor.recovery_page(after, limit).await?;
+                let page = self
+                    .owner
+                    .recovery_executor
+                    .recovery_page(after, limit)
+                    .await?;
                 report.examined = page.records.len();
                 for record in page.records {
                     // Live execution owns its state. Maintenance must never race a
@@ -135,7 +140,7 @@ impl Runner {
                     }
                     match self
                         .owner
-                        .executor
+                        .recovery_executor
                         .resume_saved(&record.invocation, record.attempt)
                         .await
                     {
@@ -149,7 +154,7 @@ impl Runner {
         }
         report.more = self.cursors[index].is_some();
         // Indexed expiry touches closed rows only; unknown holds never age out.
-        match self.owner.executor.prune(unix_ms(), limit).await {
+        match self.owner.recovery_executor.prune(unix_ms(), limit).await {
             Ok(pruned) => report.pruned = pruned,
             Err(_) => report.failed += 1,
         }

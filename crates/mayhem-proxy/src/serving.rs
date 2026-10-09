@@ -48,7 +48,8 @@ pub enum Error {
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     pub sessions: usize,
     pub per_buyer: usize,
@@ -74,6 +75,7 @@ struct Inner {
     endpoint: mayhem_proto::proxy::ProxyEndpoint,
     proposals: Proposals,
     executor: Arc<PaidExecutor>,
+    recovery_executor: Arc<PaidExecutor>,
     signer: Arc<Authority>,
     limits: Limits,
     permits: Arc<Semaphore>,
@@ -151,7 +153,7 @@ impl Controller {
         limits: Limits,
     ) -> Result<Self> {
         Self::build(
-            runtime, journal, signer, financial, pool, limits, None, None,
+            runtime, journal, signer, financial, pool, limits, None, None, None,
         )
     }
     /// Use the same monitor bound to this runtime's live capacity sources.
@@ -175,6 +177,7 @@ impl Controller {
             limits,
             Some(monitor),
             None,
+            None,
         )
     }
     pub fn new_measured(
@@ -196,6 +199,32 @@ impl Controller {
             limits,
             Some(monitor),
             Some(tokenizer),
+            None,
+        )
+    }
+    /// Managed startup reserves independent decoder capacity for retained-result
+    /// reconciliation. It never takes decoder permits from active inference.
+    pub fn new_supervised(
+        runtime: Arc<Runtime>,
+        journal: Arc<Journal>,
+        signer: Arc<Authority>,
+        financial: Arc<financial::Client>,
+        pool: Arc<Pool>,
+        recovery_pool: Arc<Pool>,
+        limits: Limits,
+        monitor: crate::health::Monitor,
+        tokenizer: Option<Arc<crate::health::native::Source>>,
+    ) -> Result<Self> {
+        Self::build(
+            runtime,
+            journal,
+            signer,
+            financial,
+            pool,
+            limits,
+            Some(monitor),
+            tokenizer,
+            Some(recovery_pool),
         )
     }
     fn build(
@@ -207,6 +236,7 @@ impl Controller {
         limits: Limits,
         monitor: Option<crate::health::Monitor>,
         tokenizer: Option<Arc<crate::health::native::Source>>,
+        recovery_pool: Option<Arc<Pool>>,
     ) -> Result<Self> {
         if limits.sessions == 0
             || limits.sessions > 4096
@@ -234,32 +264,41 @@ impl Controller {
             financial.clone(),
             limits.proposals,
         )?;
-        let executor = Executor::new(
-            runtime.connection.clone(),
-            runtime.adapter.clone(),
-            pool,
-            Arc::new(Storage::new(journal, limits.proposals.storage_operations)?),
-        )?;
-        let executor = match monitor {
-            Some(monitor) => executor.with_observations(monitor, runtime.route.clone())?,
-            None => executor,
+        let storage = Arc::new(Storage::new(journal, limits.proposals.storage_operations)?);
+        let make_executor = |pool| -> Result<Arc<PaidExecutor>> {
+            let executor = Executor::new(
+                runtime.connection.clone(),
+                runtime.adapter.clone(),
+                pool,
+                storage.clone(),
+            )?;
+            let executor = match monitor.clone() {
+                Some(monitor) => executor.with_observations(monitor, runtime.route.clone())?,
+                None => executor,
+            };
+            let executor = match tokenizer.clone() {
+                Some(source) => executor.with_tokenizer(source)?,
+                None => executor,
+            };
+            Ok(Arc::new(PaidExecutor::new(
+                executor,
+                financial.clone(),
+                runtime.capacity.clone(),
+                runtime.route.clone(),
+            )?))
         };
-        let executor = match tokenizer {
-            Some(source) => executor.with_tokenizer(source)?,
-            None => executor,
+        let executor = make_executor(pool)?;
+        let recovery_executor = match recovery_pool {
+            Some(pool) => make_executor(pool)?,
+            None => executor.clone(),
         };
-        let executor = Arc::new(PaidExecutor::new(
-            executor,
-            financial,
-            runtime.capacity.clone(),
-            runtime.route.clone(),
-        )?);
         Ok(Self {
             inner: Arc::new(Inner {
                 identity: runtime.capacity.identity().clone(),
                 endpoint: runtime.adapter.endpoint(),
                 proposals,
                 executor,
+                recovery_executor,
                 signer,
                 limits,
                 permits: Arc::new(Semaphore::new(limits.sessions)),

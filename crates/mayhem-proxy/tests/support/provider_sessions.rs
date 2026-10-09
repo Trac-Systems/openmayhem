@@ -2,6 +2,8 @@ use super::*;
 use mayhem_proxy::{exchange, serving};
 #[path = "provider_opening.rs"]
 mod opening;
+#[path = "managed_paid.rs"]
+mod managed;
 
 #[tokio::test]
 async fn provider_session_offers_and_recovers_signed_nonexecution_waiver_without_resending() {

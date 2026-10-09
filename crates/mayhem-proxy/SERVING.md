@@ -31,8 +31,10 @@ Several registrations sharing one controller start only one independent maintena
 runner. The dispatcher drains incoming frames while sessions negotiate or execute,
 tracks coalesced control/recovery health and closes connection owners gracefully on
 shutdown or bridge failure. Started JSON executions and recovery pages retain their
-existing durable completion rules. Automatic CLI/mayhemd startup is still required;
-the presence of this library does not publish or activate any provider.
+existing durable completion rules. Explicit `provider proxy serve` startup now
+assembles these components from protected files and the existing wallet; see
+[managed startup](MANAGED.md). Automatic mayhemd installation and signed public
+availability remain required. The library/command does not publish a provider.
 
 ## Ownership and bounded I/O
 

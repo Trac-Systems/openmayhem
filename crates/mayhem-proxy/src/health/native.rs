@@ -10,7 +10,8 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 #[path = "native_tests.rs"]
 mod tests;
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Limits {
     pub artifact_bytes: usize,
     pub output_bytes: usize,

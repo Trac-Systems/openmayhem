@@ -8,6 +8,7 @@ mod managed_openai_compatible;
 mod provider_failure_recovery;
 mod provider_output_stream;
 mod proxy_control;
+mod proxy_provider;
 mod python_runtime;
 mod release_bundle;
 
@@ -520,7 +521,7 @@ enum ProviderCommands {
     /// Configure and inspect the separate proxy lane (LLMs and decisions).
     Proxy {
         #[command(subcommand)]
-        command: mayhem_proxy::cli::Command,
+        command: proxy_provider::Command,
     },
     /// List this provider wallet's active canonical enclaves and rooms.
     List(ProviderListArgs),
@@ -7249,8 +7250,8 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
         ProviderCommands::Proxy { command } => {
             // Proxy errors already have sanitized, actionable Display messages.
             // The native model-setup mapper would discard their actual cause.
-            return mayhem_proxy::cli::run(command).await.map_err(|error| {
-                if verbose { anyhow::Error::new(error) } else { anyhow::anyhow!(error.to_string()) }
+            return proxy_provider::run(command).await.map_err(|error| {
+                if verbose { error } else { anyhow::anyhow!(error.to_string()) }
             });
         }
         ProviderCommands::List(args) => provider_list(args).await,
