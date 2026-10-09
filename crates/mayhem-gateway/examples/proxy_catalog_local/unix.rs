@@ -333,7 +333,7 @@ async fn start(args: &Args) -> Result<Running> {
         let _ = child.kill().await;
         bail!("local catalog helper startup failed; retain original state");
     }
-    let source: Source = serde_json::from_str(&line)?;
+    let source: Source = serde_json::from_str(&line).context("local source metadata")?;
     ensure!(
         source.schema_version == 1
             && source.test_only
@@ -378,7 +378,9 @@ async fn start(args: &Args) -> Result<Running> {
         "operation_timeout_ms":1000,"frame_bytes":65536,"queue_events":8,"queue_bytes":131072},
         "max_markets":1,"max_presence_routes":1,"selected_markets":[]}),
     )?;
-    let (control, unused_lifecycle) = Prepared::load(&config_path, &source.network)?.open()?;
+    let prepared =
+        Prepared::load(&config_path, &source.network).context("local gateway configuration")?;
+    let (control, unused_lifecycle) = prepared.open().context("local gateway stores")?;
     drop(unused_lifecycle);
     let (stop, stopping) = watch::channel(false);
     let (child_stop, child_stopping) = watch::channel(false);
@@ -497,8 +499,19 @@ pub(super) async fn main() {
         }
         running.close().await
     }.await;
-    if result.is_err() {
+    if let Err(error) = result {
         eprintln!("Local test catalog stopped: configuration, startup or state validation failed. Original state retained.");
+        // Static stage names only: never print inner errors, config or credentials.
+        for stage in [
+            "local source metadata",
+            "local gateway configuration",
+            "local gateway stores",
+        ] {
+            if error.chain().any(|cause| cause.to_string() == stage) {
+                eprintln!("Rejected stage: {stage}");
+                break;
+            }
+        }
         std::process::exit(1);
     }
 }
