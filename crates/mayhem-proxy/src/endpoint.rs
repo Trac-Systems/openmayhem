@@ -509,6 +509,7 @@ impl Protocol {
                     Code::UnsupportedControl,
                 )
             })?;
+        let health_class = crate::health::Class::request(&original, bytes.len(), streaming);
         let body = if let Some(model) = upstream_model {
             let mut body = original;
             body["model"] = json!(model);
@@ -544,6 +545,7 @@ impl Protocol {
             semantic_policy,
             metering,
             streaming,
+            health_class,
         })
     }
 }
@@ -573,6 +575,7 @@ pub struct Request {
     semantic_policy: crate::semantics::Policy,
     metering: crate::metering::Prepared,
     streaming: bool,
+    pub(crate) health_class: crate::health::Class,
 }
 impl fmt::Debug for Request {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {

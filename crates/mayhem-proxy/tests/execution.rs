@@ -1693,3 +1693,6 @@ async fn guarded_concurrent_replay_has_one_post_and_two_store_gap_requires_recon
 
 #[path = "support/paid_execution.rs"]
 mod paid_acceptance;
+
+#[path = "support/health_execution.rs"]
+mod health_execution;

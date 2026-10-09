@@ -14,6 +14,7 @@ pub mod endpoint;
 pub mod exchange;
 pub mod execution;
 pub mod financial;
+pub mod health;
 pub mod matching;
 pub mod metering;
 pub mod negotiation;

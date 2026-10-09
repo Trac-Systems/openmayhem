@@ -17,7 +17,7 @@ use crate::{
         http::{HttpConnection, WireFormat},
     },
     endpoint::{Adapter, ProtocolReply, Request},
-    financial,
+    financial, health,
     worker::{self, host::Pool, DecodeLimits, Decoded, Init},
 };
 use std::{
@@ -172,6 +172,7 @@ pub struct Executor {
     storage: Arc<Storage>,
     capacity: Option<(Arc<capacity::Authority>, Digest)>,
     financial: Option<Arc<financial::Client>>,
+    observations: Option<(health::Monitor, Digest)>,
 }
 impl Executor {
     pub fn new(
@@ -193,6 +194,7 @@ impl Executor {
             storage,
             capacity: None,
             financial: None,
+            observations: None,
         })
     }
 
@@ -204,6 +206,15 @@ impl Executor {
     pub fn with_capacity(mut self, authority: Arc<capacity::Authority>, route: Digest) -> Self {
         self.capacity = Some((authority, route));
         self
+    }
+
+    /// Passive evidence for this registered route. This neither admits a request
+    /// nor authorizes a recovery probe; canonical finance and durable capacity
+    /// remain the paid controller's responsibility. No additional POST is made.
+    pub fn with_observations(mut self, monitor: health::Monitor, route: Digest) -> Result<Self> {
+        monitor.snapshot(&route).map_err(|_| Error::Configuration)?;
+        self.observations = Some((monitor, route));
+        Ok(self)
     }
 
     /// `invocation` must already name a durably accepted Core reservation/offer
@@ -245,6 +256,11 @@ impl Executor {
         F: FnMut(serde_json::Value) -> Fut,
         Fut: Future<Output = std::result::Result<(), ()>>,
     {
+        if let (Some((_, observed)), Some((_, admitted))) = (&self.observations, &self.capacity) {
+            if observed != admitted {
+                return Err(Error::Configuration);
+            }
+        }
         let request = if streaming {
             self.adapter.prepare_stream(bytes)?
         } else {
@@ -393,13 +409,33 @@ impl Executor {
             .await?;
         let active = ready.attach(ticket)?;
         let public_id = format!("proxy_{}", record.invocation.as_str());
+        // A broken observer must not turn already admitted work into a failure.
+        // Its admission view remains fail-closed independently. No per-token
+        // locks/storage reads or upstream-reported token-rate certification.
+        let mut sample = self
+            .observations
+            .as_ref()
+            .and_then(|(monitor, route)| monitor.observe_request(route, request.health_class).ok());
         let operation = async {
             if streaming {
-                self.perform_stream(&request, active, &public_id, &record, &mut emit)
-                    .await
+                self.perform_stream(
+                    &request,
+                    active,
+                    &public_id,
+                    &record,
+                    &mut emit,
+                    &mut sample,
+                )
+                .await
             } else {
-                self.perform(&request, active, &public_id, record.created_at_ms / 1000)
-                    .await
+                self.perform(
+                    &request,
+                    active,
+                    &public_id,
+                    record.created_at_ms / 1000,
+                    &mut sample,
+                )
+                .await
             }
         };
         let outcome = tokio::select! {
@@ -407,6 +443,25 @@ impl Executor {
             _=cancel.cancelled() => Err(Error::Cancelled),
             result=operation => result,
         };
+        if let Some(sample) = sample {
+            match &outcome {
+                Ok(reply) => sample.success(reply.reported_usage.as_ref().map(|u| u.output_tokens)),
+                Err(Error::Upstream(f) | Error::Decoder(worker::Error::Upstream(f))) => {
+                    sample.failure(f.clone())
+                }
+                Err(Error::Endpoint(crate::endpoint::Error::Protocol)) => {
+                    sample.failure(Failure::new(
+                        Code::UpstreamProtocol,
+                        Scope::Model,
+                        Stage::ResponseBody,
+                        Execution::Unknown,
+                    ))
+                }
+                // Cancellation, consumer backpressure, decoder containment and
+                // local storage failures do not prove an upstream health fault.
+                _ => drop(sample),
+            }
+        }
         // This is a handful of state writes per attempt, never per-token work or
         // a scan of receipts. On future drop the durable Dispatched record remains.
         match outcome {
@@ -480,6 +535,7 @@ impl Executor {
         public_id: &str,
         record: &Record,
         emit: &mut F,
+        sample: &mut Option<health::Sample>,
     ) -> Result<ProtocolReply>
     where
         F: FnMut(serde_json::Value) -> Fut,
@@ -490,6 +546,9 @@ impl Executor {
             .send(self.adapter.operation(), Some(request.body().to_vec()))
             .await
             .map_err(Error::Upstream)?;
+        if let Some(sample) = sample {
+            sample.headers();
+        }
         if response.status != 200 || response.format != WireFormat::Sse {
             return Err(Error::Upstream(Failure::new(
                 Code::UpstreamProtocol,
@@ -508,9 +567,14 @@ impl Executor {
         let mut saved_upstream_id = false;
         while let Some(chunk) = response.next_chunk().await.map_err(Error::Upstream)? {
             let mut receive = |frame| {
-                let piece = stream.push(frame).map_err(|_| worker::Error::Protocol);
+                let piece = stream.push(frame).map_err(stream_frame_error);
                 let future = match piece {
-                    Ok(Some(value)) => Ok(Some(emit(value))),
+                    Ok(Some(value)) => {
+                        if let Some(sample) = sample {
+                            sample.delta(&value);
+                        }
+                        Ok(Some(emit(value)))
+                    }
                     Ok(None) => Ok(None),
                     Err(e) => Err(e),
                 };
@@ -550,9 +614,14 @@ impl Executor {
         // connection need not close before result verification can finish.
         drop(response);
         let mut receive = |frame| {
-            let piece = stream.push(frame).map_err(|_| worker::Error::Protocol);
+            let piece = stream.push(frame).map_err(stream_frame_error);
             let future = match piece {
-                Ok(Some(value)) => Ok(Some(emit(value))),
+                Ok(Some(value)) => {
+                    if let Some(sample) = sample {
+                        sample.delta(&value);
+                    }
+                    Ok(Some(emit(value)))
+                }
                 Ok(None) => Ok(None),
                 Err(e) => Err(e),
             };
@@ -586,12 +655,16 @@ impl Executor {
         mut decoder: worker::host::Active,
         public_id: &str,
         created: u64,
+        sample: &mut Option<health::Sample>,
     ) -> Result<ProtocolReply> {
         let mut response = self
             .connection
             .send(self.adapter.operation(), Some(request.body().to_vec()))
             .await
             .map_err(Error::Upstream)?;
+        if let Some(sample) = sample {
+            sample.headers();
+        }
         if response.status != 200 || response.format != WireFormat::Json {
             let mut failure = Failure::new(
                 Code::UpstreamProtocol,
@@ -630,6 +703,22 @@ impl Executor {
         request
             .decode_json(value, public_id, created)
             .map_err(Error::Endpoint)
+    }
+}
+
+// This callback has a normalized upstream frame, not a worker IPC envelope.
+// Preserve that provenance so malformed model output is distinguishable from
+// a local worker crash/containment failure without inspecting error text.
+fn stream_frame_error(error: crate::endpoint::Error) -> worker::Error {
+    match error {
+        crate::endpoint::Error::Protocol => worker::Error::Upstream(Failure::new(
+            Code::UpstreamProtocol,
+            Scope::Model,
+            Stage::ResponseBody,
+            Execution::Unknown,
+        )),
+        crate::endpoint::Error::Request(failure) => worker::Error::Upstream(failure),
+        _ => worker::Error::Protocol,
     }
 }
 

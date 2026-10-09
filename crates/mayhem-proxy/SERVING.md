@@ -73,6 +73,43 @@ only an already-retained, independently countersigned receipt or waiver. It does
 not invent an outcome, resend inference or change native provider payout workers.
 Closed-record pruning is indexed and bounded. Unknown work cannot age out.
 
+## Passive health and adaptive allowance
+
+`health::Monitor` observes one declared upstream connection/credential scope and
+its registered routes. The provider declares an allocation ceiling. Fresh validated
+inference starts an allowance of one; configured successful observations increase
+that allowance one at a time, never above the ceiling. This is an adaptive admission
+budget, not proof of the remote scheduler's physical concurrency or a reservation
+against unrelated clients. Durable `capacity::Authority` separately subtracts active
+and uncertain work once across declared shared groups and route aliases.
+
+`Executor::with_observations` opts actual JSON/stream execution into passive timing
+and typed-failure observations. It adds no POST, retries, financial action or per-token
+journal reads. Invalid caller input, client cancellation and local infrastructure
+failures do not become backend health faults. Readiness is recorded only after full
+endpoint/schema verification. A malformed model response and upstream busy/quota/auth
+errors retain their actual scope; a fresh fault remains visible before first success.
+
+Evidence has its own age, independent of heartbeats. Expired evidence allows no new
+work. Recovery is jittered/backed off, respects longer Retry-After values, requires
+fresh inference evidence and never cancels valid ongoing work. An earlier in-flight
+success cannot clear a later failure. Relative latency deterioration for comparable
+request classes reduces allowance without treating one slow request as a dead server.
+Classes separate serialized size, stream mode, thinking/effort, output limits and
+output format; this is not a native input-token estimate. Class/route retention is
+bounded and contains no prompt or output text.
+
+Headers, first meaningful output and completion are timed separately. SSE event counts,
+upstream usage and billable units do not certify native tokens/second. A separate trusted
+native-tokenizer observation API preserves tokenizer identity and measurement age;
+buffered single-timestamp output remains unknown. This tokenizer source is not yet
+connected to execution, so ordinary observations cannot certify the generation floor.
+
+The adaptive allowance is not yet wired into paid admission, signed public presence or
+managed startup. The recovery observer latch is local and is not permission to dispatch
+a paid probe; a durable, funded probe lease and restart reconciliation remain required.
+Numerical public policy and end-to-end freshness/recovery bounds require acceptance.
+
 ## Evidence and remaining integration
 
 Local acceptance covers four JSON endpoints and all three payment rails, all three
