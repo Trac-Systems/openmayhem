@@ -28,6 +28,7 @@ import InferenceRelay from '../features/inference-relay/index.js';
 import ScBridge from '../features/sc-bridge/index.js';
 import { resolveScBridgeToken } from '../features/sc-bridge/token.js';
 import { createInternalStripeAuthHeaders } from './internal-stripe-auth.js';
+import { createFamilyAdminServer, familyAdminListenOptions, readFamilyAdminToken } from './proxy-family-admin-http.js';
 
 const fatalRuntimeError = installFatalRuntimeErrorPolicy(
   typeof Bare !== 'undefined' ? Bare : null
@@ -1670,6 +1671,16 @@ if (scBridge) {
   peer.scBridge = scBridge;
 }
 
+let familyAdminServer = null;
+const familyAdminListen = familyAdminListenOptions(env);
+if (familyAdminListen) {
+  // Explicit operator opt-in; no credential fallback to public gateway/RPC auth.
+  const token = readFamilyAdminToken(env.MAYHEM_PROXY_FAMILY_ADMIN_TOKEN_FILE);
+  familyAdminServer = createFamilyAdminServer(mayhemFeature, { token, contractVersion: releaseIdentity.contractVersion });
+  familyAdminServer.listen(familyAdminListen.port, familyAdminListen.host);
+  familyAdminServer.on('error', error => fatalRuntimeError('Family admin server error', error));
+}
+
 let rpcServer = null;
 if (rpcEnabled) {
   rpcServer = createRpcServer(peer, {
@@ -1747,6 +1758,7 @@ if (keepAlive) {
     if (msbDirectPeerTimer) clearInterval(msbDirectPeerTimer);
     try {
       rpcServer?.close?.();
+      familyAdminServer?.close?.();
     } catch (_e) {}
     try {
       scBridge?.stop?.();

@@ -528,7 +528,7 @@ class MayhemFeature extends Feature {
     }
     if (isProxyPublication(value)) {
       if (!this.proxyPublicationController) throw new Error('Proxy publication recovery is not configured.');
-      return await this.proxyPublicationController.submit(key, value);
+      return await this.proxyPublicationController.submit(key, value, { nonce });
     }
     return await this._submitFeature(key, value, { nonce });
   }

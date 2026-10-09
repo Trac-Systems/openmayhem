@@ -29,6 +29,7 @@ export const CONTRACT_CODE_PATHS = Object.freeze([
   'features/mayhem/proxy-admission.js',
   'features/mayhem/proxy-canonical-view.js',
   'features/mayhem/proxy-discovery.js',
+  'features/mayhem/proxy-family-admin.js',
   'features/mayhem/proxy-financial-state.js',
   'features/mayhem/proxy-publication-journal.js',
   'features/mayhem/proxy-publication-transport.js',

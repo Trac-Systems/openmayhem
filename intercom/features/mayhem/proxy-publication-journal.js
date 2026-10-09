@@ -216,25 +216,26 @@ export class ProxyPublicationController {
       message: 'Proxy publication is retained for canonical recovery; retry this same operation to recover its outcome.' };
   }
 
-  async submit(key, envelope) {
+  async submit(key, envelope, { nonce = null } = {}) {
+    if (nonce !== null && !hex(nonce)) fail('invalid retained nonce');
     if (this.closed) fail('controller is stopping');
     envelope = clone(envelope);
     const previous = this.inFlight.get(key);
     if (previous) {
-      if (stable(previous.envelope) !== stable(envelope)) fail('pending operation envelope differs');
+      if (stable(previous.envelope) !== stable(envelope) || nonce !== null && (previous.nonce ?? this.journal.get(key)?.nonce) !== nonce) fail('pending operation envelope/nonce differs');
       return await previous.promise;
     }
     if (this.inFlight.size >= this.maxInFlight) fail('active publication capacity reached; retry the same operation');
     // Schedule after inserting the entry, before any asynchronous work can yield.
-    const promise = Promise.resolve().then(() => this._submit(key, envelope));
-    this.inFlight.set(key, { envelope, promise });
+    const promise = Promise.resolve().then(() => this._submit(key, envelope, nonce));
+    this.inFlight.set(key, { envelope, nonce, promise });
     try { return await promise; } finally { this.inFlight.delete(key); }
   }
 
-  async _submit(key, envelope) {
+  async _submit(key, envelope, nonce = null) {
     let entry = this.journal.get(key);
     if (entry) {
-      if (stable(entry.envelope) !== stable(envelope)) fail('pending operation envelope differs');
+      if (stable(entry.envelope) !== stable(envelope) || nonce !== null && entry.nonce !== nonce) fail('pending operation envelope/nonce differs');
       const evidence = await this.inspect(entry);
       if (evidence.source) { await this.journal.advance(key, evidence.source); entry = this.journal.get(key); }
       if (evidence.state === 'confirmed') {
@@ -248,7 +249,7 @@ export class ProxyPublicationController {
       const response = await this.admit(key, envelope, async ({ fences } = {}) => {
         if (this.closed) fail('controller is stopping');
         if (!entry) {
-          entry = await this.prepare(key, envelope, { fences });
+          entry = await this.prepare(key, envelope, { fences, nonce });
           await this.journal.put(entry);
         }
         // Durable I/O may yield to a revocation or another registry operation.

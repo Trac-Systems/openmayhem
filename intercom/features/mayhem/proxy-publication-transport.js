@@ -37,10 +37,11 @@ export function createProxyPublicationTransport(peer, contractVersion) {
   const featureKey = proxyPublicationFeatureKey;
   const signedHash = (envelope, nonce) => hex(peer.wallet.sign(`${JSON.stringify(envelope)}${nonce}`));
 
-  const prepare = async (key, envelope, { fences } = {}) => {
+  const prepare = async (key, envelope, { fences, nonce: retainedNonce = null } = {}) => {
+    if (retainedNonce !== null && !/^[0-9a-f]{64}$/.test(retainedNonce)) fail('invalid retained nonce');
     if (key !== await featureKey(envelope)) fail('feature key differs from signed operation');
     const { source } = runtime();
-    const nonce = crypto.randomBytes(32).toString('hex');
+    const nonce = retainedNonce ?? crypto.randomBytes(32).toString('hex');
     const hash = signedHash(envelope, nonce);
     const entry = { key, envelope: JSON.parse(JSON.stringify(envelope)), nonce, hash, result_key: `fr/${hash}`,
       scope: envelope.op === 'proxy_policy' ? 'admin:policy'
