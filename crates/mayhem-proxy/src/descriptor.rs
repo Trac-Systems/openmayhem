@@ -21,7 +21,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::{Duration, Instant};
 
-pub const MAX_BYTES: usize = 192 * 1024;
+// The existing contract allowance is unchanged; the opt-in declaration has its
+// own bound and a small JSON envelope allowance.
+pub const MAX_BYTES: usize = 192 * 1024 + crate::declaration::MAX_BYTES + 64;
 pub const READS: usize = 4;
 pub const DEADLINE: Duration = Duration::from_secs(5);
 pub(crate) const OPEN: &str = "p.describe.open";
@@ -36,6 +38,8 @@ pub struct Context {
     pub offer: ProxyOffer,
     pub rail: ProxyRail,
     pub settlement_policy_hash: Digest,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub data_handling: bool,
 }
 impl Context {
     pub fn new(
@@ -59,6 +63,7 @@ impl Context {
             offer,
             rail,
             settlement_policy_hash: policy,
+            data_handling: false,
         };
         context.link(local, Role::Buyer)?;
         Ok(context)
@@ -119,6 +124,8 @@ pub struct Descriptor {
     pub contract: EndpointFamilyContract,
     pub recipe_hash: Digest,
     pub metering_policy: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_handling: Option<crate::declaration::Signed>,
 }
 impl Descriptor {
     pub(crate) fn from_adapter(adapter: &crate::endpoint::Adapter) -> Self {
@@ -129,6 +136,7 @@ impl Descriptor {
             contract: public.contract,
             recipe_hash: public.recipe_hash,
             metering_policy: Policy::for_endpoint(public.endpoint).definition(),
+            data_handling: None,
         }
     }
     pub fn adapter(

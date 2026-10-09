@@ -232,7 +232,9 @@ impl Request {
         if let Some(pin) = &controls.registry_release {
             pin.validate()?;
             if controls.profile.as_ref().is_none_or(|p| {
-                p.constraints.request_controls.is_empty() && p.constraints.capabilities.is_empty()
+                p.constraints.request_controls.is_empty()
+                    && p.constraints.capabilities.is_empty()
+                    && p.constraints.data_handling.is_empty()
             }) {
                 return Err(Error::Invalid);
             }

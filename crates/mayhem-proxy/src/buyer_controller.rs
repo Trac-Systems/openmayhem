@@ -386,6 +386,39 @@ impl Controller {
         contract: &Digest,
         recipe: &Digest,
     ) -> exchange::Result<endpoint::PublicAdapterSnapshot> {
+        Ok(self
+            .describe_public(offer, rail, policy, contract, recipe, false)
+            .await?
+            .0)
+    }
+    /// Public, provider-attributed promises remain separate from the validated
+    /// request contract and never acquire independent verification assurance.
+    pub async fn describe_with_declaration(
+        &self,
+        offer: mayhem_proto::proxy::ProxyOffer,
+        rail: mayhem_proto::proxy::ProxyRail,
+        policy: Digest,
+        contract: &Digest,
+        recipe: &Digest,
+    ) -> exchange::Result<(
+        endpoint::PublicAdapterSnapshot,
+        Option<crate::declaration::Signed>,
+    )> {
+        self.describe_public(offer, rail, policy, contract, recipe, true)
+            .await
+    }
+    async fn describe_public(
+        &self,
+        offer: mayhem_proto::proxy::ProxyOffer,
+        rail: mayhem_proto::proxy::ProxyRail,
+        policy: Digest,
+        contract: &Digest,
+        recipe: &Digest,
+        data_handling: bool,
+    ) -> exchange::Result<(
+        endpoint::PublicAdapterSnapshot,
+        Option<crate::declaration::Signed>,
+    )> {
         let _permit = self
             .descriptor_reads
             .try_acquire()
@@ -393,10 +426,13 @@ impl Controller {
         if self.stopped.load(Ordering::Acquire) {
             return Err(exchange::Error::Interrupted);
         }
-        let context = crate::descriptor::Context::new(self.identity(), offer, rail, policy)?;
+        let mut context = crate::descriptor::Context::new(self.identity(), offer, rail, policy)?;
+        context.data_handling = data_handling;
         let descriptor =
             crate::descriptor::fetch(self.shared.bridge.clone(), self.identity(), &context).await?;
-        descriptor.adapter(&context, contract, recipe, self.shared.limits.protocol)
+        let adapter =
+            descriptor.adapter(&context, contract, recipe, self.shared.limits.protocol)?;
+        Ok((adapter, descriptor.data_handling))
     }
     /// Maximum normalized response bytes configured by the controller owner.
     /// HTTP observers may impose tighter event/queue limits, never a larger total.

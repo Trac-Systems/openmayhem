@@ -44,6 +44,7 @@ fn fixture() -> (Session, Best) {
     };
     let best = Best {
         evidence: None,
+        declaration: None,
         model: request.selector().model(),
         body: request.provider_value().clone(),
         request,
@@ -101,6 +102,7 @@ fn retained_progress_crosses_one_hundred_thousand_and_never_claims_a_partial_min
         let score = 100_001 - i;
         session.consider(Checked::Ready(Best {
             evidence: None,
+            declaration: None,
             model: template.model.clone(),
             body: template.body.clone(),
             request: template.request.clone(),

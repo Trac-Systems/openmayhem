@@ -422,6 +422,7 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
         }],
         allocations: vec![],
         routes: vec![managed::RouteConfig {
+            data_handling: Vec::new(),
             id: probe.scope.route,
             connection: probe.scope.connection_group,
             ceiling: choices.concurrency,

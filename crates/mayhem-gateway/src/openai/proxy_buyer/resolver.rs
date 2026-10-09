@@ -186,6 +186,7 @@ struct Best {
     score: MoneyAu,
     maximum_retail_cost_micro: Option<MoneyAu>,
     evidence: Option<mayhem_proxy::conformance::Signed>,
+    declaration: Option<super::data_handling::Observation>,
 }
 enum Checked {
     Ready(Best),
@@ -506,6 +507,7 @@ async fn start(
     let control = state.proxy_control().cloned().ok_or_else(unavailable)?;
     if !profile.constraints.request_controls.is_empty()
         || !profile.constraints.capabilities.is_empty()
+        || !profile.constraints.data_handling.is_empty()
     {
         let reader = control
             .registry()
@@ -662,6 +664,9 @@ impl Session {
                         }
                     }
                 }
+                if let Some(record) = &best.declaration {
+                    self.expires_at_ms = self.expires_at_ms.min(record.expires_at_ms);
+                }
                 if let Some(record) = &best.evidence {
                     self.expires_at_ms = self.expires_at_ms.min(record.body.expires_at_ms);
                 }
@@ -743,6 +748,10 @@ async fn advance(
                 if let Some(published) = published {
                     match check(state, runtime, session, published).await {
                         Checked::Ready(best) => {
+                            if let Some(record) = &best.declaration {
+                                session.expires_at_ms =
+                                    session.expires_at_ms.min(record.expires_at_ms);
+                            }
                             if let Some(record) = &best.evidence {
                                 session.expires_at_ms =
                                     session.expires_at_ms.min(record.body.expires_at_ms);
@@ -1128,7 +1137,22 @@ async fn check(
         Ok(value) => value,
         Err(_) => return Checked::Excluded("conformance_evidence_unavailable", true),
     };
+    let declaration = match super::data_handling::check(
+        control,
+        &runtime.controller,
+        request.clone(),
+        &published,
+    )
+    .await
+    {
+        Ok(value) => value,
+        Err(super::data_handling::Failure::Unsatisfied) => {
+            return Checked::Excluded("data_handling_constraints", false)
+        }
+        Err(_) => return Checked::Excluded("data_handling_unavailable", true),
+    };
     Checked::Ready(Best {
+        declaration,
         evidence,
         score: maximum_retail_cost_micro.unwrap_or(maximum.max_spend_au),
         maximum_retail_cost_micro,
@@ -1168,9 +1192,24 @@ async fn finish(state: &SharedState, session: &Session) -> Result<Value, ApiErro
     {
         return Err(unavailable());
     }
+    let runtime = state.proxy_buyer.as_ref().ok_or_else(unavailable)?;
+    let declaration = super::data_handling::check(
+        control,
+        &runtime.controller,
+        best.request.clone(),
+        &latest.published,
+    )
+    .await
+    .map_err(super::data_handling::Failure::api)?;
+    if best.declaration.as_ref().map(|r| r.record.digest().ok())
+        != declaration.as_ref().map(|r| r.record.digest().ok())
+    {
+        return Err(unavailable());
+    }
     let expires = latest
         .expires_at_ms
         .min(session.expires_at_ms)
+        .min(declaration.as_ref().map_or(u64::MAX, |d| d.expires_at_ms))
         .min(latest.availability.expires_at_ms.ok_or_else(unavailable)?);
     if expires <= now {
         return Err(unavailable());

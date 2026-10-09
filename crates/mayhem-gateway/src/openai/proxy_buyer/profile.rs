@@ -32,7 +32,9 @@ fn unavailable_controls() -> ApiError {
 }
 fn has_controls(request: &proxy_request::Request) -> bool {
     request.controls().profile.as_ref().is_some_and(|p| {
-        !p.constraints.request_controls.is_empty() || !p.constraints.capabilities.is_empty()
+        !p.constraints.request_controls.is_empty()
+            || !p.constraints.capabilities.is_empty()
+            || !p.constraints.data_handling.is_empty()
     })
 }
 
@@ -55,7 +57,8 @@ pub(super) async fn materialize(
         .ok_or_else(invalid_controls)?;
     if super::evidence::unsupported(policy)
         || (policy.constraints.request_controls.is_empty()
-            && policy.constraints.capabilities.is_empty())
+            && policy.constraints.capabilities.is_empty()
+            && policy.constraints.data_handling.is_empty())
     {
         return Err(unavailable_controls());
     }
@@ -83,6 +86,10 @@ pub(super) async fn materialize(
             schema_revision: c.schema_revision,
         })
         .chain(policy.constraints.capabilities.iter().map(|p| Reference {
+            field_id: p.field_id.clone(),
+            schema_revision: p.schema_revision,
+        }))
+        .chain(policy.constraints.data_handling.iter().map(|p| Reference {
             field_id: p.field_id.clone(),
             schema_revision: p.schema_revision,
         }))
@@ -140,6 +147,7 @@ pub(super) async fn materialize(
 /// New estimates/admissions must already contain every explicit mapped value.
 /// This never changes the body whose hash the retail owner authorized.
 pub(super) async fn validate(
+    runtime: &Runtime,
     control: Arc<super::super::proxy_control::ProxyControl>,
     request: Arc<proxy_request::Request>,
     adapter: PublicAdapterSnapshot,
@@ -149,6 +157,14 @@ pub(super) async fn validate(
         .await
         .map_err(selection_error)?;
     super::evidence::check(control.clone(), request.clone(), &selected.published).await?;
+    super::data_handling::check(
+        control.clone(),
+        &runtime.controller,
+        request.clone(),
+        &selected.published,
+    )
+    .await
+    .map_err(super::data_handling::Failure::api)?;
     if !has_controls(&request) {
         return Ok(());
     }
@@ -193,6 +209,7 @@ pub(super) async fn validate_admission(
             .await
             .map_err(|_| unavailable_controls())?;
         validate(
+            runtime,
             control.clone(),
             request.clone(),
             adapter,
@@ -317,11 +334,20 @@ async fn read(state: SharedState, http: HttpRequest) -> Result<Response, ApiErro
             .map_err(selection_error)?
             .ok_or_else(invalid_controls)?,
     );
-    if let Some(record) = super::evidence::check(control, prepared, &latest.published).await? {
+    if let Some(record) =
+        super::evidence::check(control.clone(), prepared.clone(), &latest.published).await?
+    {
         expires = expires.min(record.body.expires_at_ms);
         if expires <= now {
             return Err(unavailable_controls());
         }
+    }
+    if let Some(record) =
+        super::data_handling::check(control, &runtime.controller, prepared, &latest.published)
+            .await
+            .map_err(super::data_handling::Failure::api)?
+    {
+        expires = expires.min(record.expires_at_ms);
     }
     let controls_bytes = mayhem_proto::stable_json_bytes(
         &serde_json::to_value(&controls).map_err(|_| invalid_controls())?,

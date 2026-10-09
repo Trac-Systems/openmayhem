@@ -226,6 +226,10 @@ impl Prepared {
                 tokenizer.clone(),
             )
             .map_err(|_| Error::Setup)?;
+            controller
+                .proposals()
+                .install_declarations(spec.data_handling.clone())
+                .map_err(|_| Error::Configuration)?;
             for offer in spec.offers {
                 presence_entries.push(presence::Entry {
                     route: spec.id.clone(),

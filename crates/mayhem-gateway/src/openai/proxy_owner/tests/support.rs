@@ -158,6 +158,7 @@ pub(crate) struct Harness {
     pub(crate) network: discovery::Identity,
     pub(crate) provider_rpc_url: String,
     provider_signer: Arc<Authority>,
+    pub(crate) declarations: negotiation::provider::Controller,
     provider_financial: Arc<financial::Client>,
     capacity: Arc<capacity::Authority>,
     pub(crate) buyer: Arc<buyer::Controller>,
@@ -179,6 +180,12 @@ pub(crate) struct Harness {
     _directory: tempfile::TempDir,
 }
 impl Harness {
+    pub(crate) fn sign_declaration(
+        &self,
+        body: mayhem_proxy::declaration::Body,
+    ) -> mayhem_proxy::declaration::Signed {
+        self.provider_signer.declare_data_handling(body).unwrap()
+    }
     pub(crate) async fn start(worker: &Path) -> Self {
         Self::start_with(worker, ProxyEndpoint::Chat, ProxyRail::Tnk).await
     }
@@ -470,6 +477,7 @@ impl Harness {
         let (ended, provider_ended) = watch::channel(0usize);
         let descriptors_enabled = Arc::new(AtomicBool::new(true));
         let descriptor_mode = descriptors_enabled.clone();
+        let declarations = provider.proposals().clone();
         let provider_task = tokio::spawn(async move {
             let mut sessions = JoinSet::new();
             let mut descriptions = JoinSet::new();
@@ -572,6 +580,7 @@ impl Harness {
             network,
             provider_rpc_url: ready["url"].as_str().unwrap().into(),
             provider_signer,
+            declarations,
             provider_financial: provider_client,
             capacity,
             buyer,

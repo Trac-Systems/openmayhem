@@ -84,6 +84,8 @@ pub struct Route {
     pub settlement_policy: ProxySettlementPolicy,
     pub tokenizer: Option<Tokenizer>,
     pub recovery: Option<Recovery>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_handling: Vec<crate::declaration::Signed>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -292,6 +294,20 @@ impl Prepared {
         let mut tokenizer_bytes = 0usize;
         let mut tokenizer_workers = 0usize;
         for mut spec in std::mem::take(&mut config.routes) {
+            require(spec.data_handling.len() <= crate::declaration::MAX_RECORDS)?;
+            for declaration in &spec.data_handling {
+                declaration.verify().map_err(|_| Error::Configuration)?;
+                require(
+                    declaration.body.subject.network == config.network
+                        && declaration.body.subject.provider == config.provider_pubkey
+                        && spec.offers.iter().any(|o| {
+                            o.market_id == declaration.body.subject.market.as_str()
+                                && o.membership_revision
+                                    == declaration.body.subject.membership_revision
+                                && o.endpoint == declaration.body.subject.endpoint
+                        }),
+                )?;
+            }
             require(
                 spec.ceiling > 0
                     && route_ids.insert(spec.id.clone())
@@ -309,6 +325,21 @@ impl Prepared {
             )?;
             let adapter =
                 Arc::new(Adapter::restore(spec.adapter.clone()).map_err(|_| Error::Configuration)?);
+            let mut declared_subjects = BTreeSet::new();
+            for declaration in &spec.data_handling {
+                let subject = &declaration.body.subject;
+                require(
+                    subject.endpoint == adapter.endpoint()
+                        && subject.endpoint_contract == *adapter.contract_hash()
+                        && subject.recipe_hash == *adapter.recipe_hash()
+                        && subject.connection_revision == connection.http.revision()
+                        && declared_subjects.insert((
+                            subject.market.clone(),
+                            subject.membership_revision,
+                            subject.endpoint,
+                        )),
+                )?;
+            }
             require(
                 operations
                     .get(&spec.connection)

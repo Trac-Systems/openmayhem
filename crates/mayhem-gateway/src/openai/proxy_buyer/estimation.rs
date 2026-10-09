@@ -124,6 +124,7 @@ async fn estimate(
         .await
         .map_err(|_| failure("proxy_estimate_unavailable", true))?;
     super::profile::validate(
+        runtime,
         control.clone(),
         request.clone(),
         adapter.clone(),
@@ -170,9 +171,20 @@ async fn estimate(
     let now = super::super::now_millis_u64();
     let mut expires = selected.expires_at_ms.min(latest.expires_at_ms);
     if let Some(record) =
-        super::evidence::check(control, request.clone(), &latest.published).await?
+        super::evidence::check(control.clone(), request.clone(), &latest.published).await?
     {
         expires = expires.min(record.body.expires_at_ms);
+    }
+    if let Some(record) = super::data_handling::check(
+        control,
+        &runtime.controller,
+        request.clone(),
+        &latest.published,
+    )
+    .await
+    .map_err(super::data_handling::Failure::api)?
+    {
+        expires = expires.min(record.expires_at_ms);
     }
     if latest.availability.status == mayhem_proxy::presence::Eligibility::Available {
         expires = expires.min(

@@ -11,6 +11,7 @@ pub mod catalog;
 pub mod cli;
 pub mod conformance;
 pub mod connector;
+pub mod declaration;
 pub mod descriptor;
 pub mod directory;
 pub mod discovery;

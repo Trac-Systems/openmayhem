@@ -293,6 +293,7 @@ fn build(
             })
             .collect(),
         routes: vec![managed::RouteConfig {
+            data_handling: Vec::new(),
             id: scope.route.clone(),
             connection: scope.connection_group.clone(),
             ceiling: scope.route_ceiling,

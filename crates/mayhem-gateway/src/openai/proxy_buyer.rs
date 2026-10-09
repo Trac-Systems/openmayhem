@@ -37,6 +37,7 @@ use tokio::{
 };
 
 mod contract;
+mod data_handling;
 mod estimation;
 pub(super) mod evidence;
 mod profile;
@@ -693,6 +694,13 @@ async fn submit(
             .as_ref()
             .ok_or_else(unavailable)?
             .clone(),
+        request.clone(),
+        gate,
+    )
+    .await?;
+    let gate = data_handling::gate(
+        state.proxy_control().cloned().ok_or_else(unavailable)?,
+        runtime.controller.clone(),
         request.clone(),
         gate,
     )

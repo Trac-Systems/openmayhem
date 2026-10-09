@@ -48,6 +48,24 @@ impl Authority {
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
+    /// An explicit operator declaration, not a financial signature or evidence
+    /// of remote compliance. No HTTP request can reach this typed signer.
+    pub fn declare_data_handling(
+        &self,
+        body: crate::declaration::Body,
+    ) -> Result<crate::declaration::Signed> {
+        let subject = &body.subject;
+        require(
+            self.identity.controller_pubkey == subject.provider
+                && self.identity.network_id == subject.network.network_id
+                && self.identity.msb_bootstrap.as_str() == subject.network.msb_bootstrap
+                && self.identity.subnet_bootstrap.as_str() == subject.network.subnet_bootstrap
+                && subject.network.contract_version == mayhem_proto::CONTRACT_VERSION,
+            "declaration signing authority differs",
+        )?;
+        let signature = hex(&self.key.sign(&body.signing_bytes()?).to_bytes());
+        Ok(crate::declaration::Signed { body, signature })
+    }
     pub(crate) fn conformance(
         &self,
         body: crate::conformance::Body,

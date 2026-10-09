@@ -13,7 +13,7 @@ use crate::{
 };
 use std::{
     collections::BTreeMap,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
@@ -72,6 +72,7 @@ struct Inner {
     recovery_slots: Arc<Semaphore>,
     descriptor_slots: Arc<Semaphore>,
     state: Mutex<State>,
+    declarations: OnceLock<Vec<crate::declaration::Signed>>,
 }
 #[derive(Clone)]
 pub struct Controller {
@@ -109,8 +110,43 @@ impl Controller {
                 recovery_slots: Arc::new(Semaphore::new(1)),
                 descriptor_slots: Arc::new(Semaphore::new(crate::descriptor::READS)),
                 state: Mutex::new(State::default()),
+                declarations: OnceLock::new(),
             }),
         })
+    }
+    /// Startup-only protected configuration. Reads never sign declarations or
+    /// modify inference/financial state. Updates require a new runtime config.
+    pub fn install_declarations(
+        &self,
+        declarations: Vec<crate::declaration::Signed>,
+    ) -> Result<()> {
+        require(
+            declarations.len() <= crate::declaration::MAX_RECORDS,
+            "too many provider declarations",
+        )?;
+        let identity = self.inner.runtime.capacity.identity();
+        let mut subjects = std::collections::BTreeSet::new();
+        for declaration in &declarations {
+            declaration.verify()?;
+            let s = &declaration.body.subject;
+            require(
+                s.network.network_id == identity.network_id
+                    && s.network.msb_bootstrap == identity.msb_bootstrap.as_str()
+                    && s.network.subnet_bootstrap == identity.subnet_bootstrap.as_str()
+                    && s.network.contract_version == mayhem_proto::CONTRACT_VERSION
+                    && s.provider == identity.controller_pubkey
+                    && s.endpoint == self.inner.runtime.adapter.endpoint()
+                    && s.endpoint_contract == *self.inner.runtime.adapter.contract_hash()
+                    && s.recipe_hash == *self.inner.runtime.adapter.recipe_hash()
+                    && s.connection_revision == self.inner.runtime.connection.revision()
+                    && subjects.insert((s.market.clone(), s.membership_revision, s.endpoint)),
+                "provider declaration runtime differs",
+            )?;
+        }
+        self.inner
+            .declarations
+            .set(declarations)
+            .map_err(|_| invalid("provider declarations already installed"))
     }
     fn slot(&self) -> Result<OwnedSemaphorePermit> {
         self.inner
@@ -153,9 +189,19 @@ impl Controller {
                     }),
                 "descriptor runtime differs from membership",
             )?;
-            Ok::<_, crate::Error>(crate::descriptor::Descriptor::from_adapter(
-                &self.inner.runtime.adapter,
-            ))
+            let mut descriptor =
+                crate::descriptor::Descriptor::from_adapter(&self.inner.runtime.adapter);
+            let subject =
+                crate::declaration::Subject::new(context.network.clone(), &context.offer, &member)?;
+            if context.data_handling {
+                descriptor.data_handling = self
+                    .inner
+                    .declarations
+                    .get()
+                    .and_then(|records| records.iter().find(|d| d.body.subject == subject))
+                    .cloned();
+            }
+            Ok::<_, crate::Error>(descriptor)
         })
         .await;
         incoming
