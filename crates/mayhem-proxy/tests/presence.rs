@@ -196,6 +196,36 @@ impl Fixture {
     }
 }
 #[test]
+fn clock_rollback_cannot_keep_registration_available_after_monotonic_expiry() {
+    let f = Fixture::new();
+    let table = f.table(8);
+    let registered = f.registered(10_000);
+    let mut body = f.body();
+    body.issued_ms = 24_998;
+    body.expires_ms = 34_998;
+    body.evidence_expires_ms = 34_998;
+    let speed = body.speed.as_mut().unwrap();
+    speed.observed_ms = 24_990;
+    speed.expires_ms = 34_998;
+    table
+        .receive(f.sign(body.clone()), &registered, 24_999)
+        .unwrap();
+    std::thread::sleep(Duration::from_millis(3));
+    assert_eq!(
+        eligibility(&body, &f.offer, 25_010, None),
+        Eligibility::Available
+    );
+    let observed = table.observe(&registered, 10_001, None).unwrap();
+    assert_eq!(observed.status, Eligibility::CatalogUnavailable);
+    assert_eq!(observed.observed_at_ms, 10_001);
+    assert_eq!(observed.expires_at_ms, None);
+    assert_eq!(
+        table.status(&registered, 10_001, None).unwrap(),
+        Eligibility::CatalogUnavailable
+    );
+}
+
+#[test]
 fn public_route_checks_signature_network_offer_membership_and_bounds() {
     let f = Fixture::new();
     let t = f.table(10);

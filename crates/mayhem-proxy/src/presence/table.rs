@@ -182,6 +182,11 @@ impl Table {
                 live.received_ms
                     .saturating_add(live.received.elapsed().as_millis() as u64),
             );
+            // A wall-clock rollback cannot extend canonical registration beyond
+            // the monotonic time already established by this received heartbeat.
+            if effective_now >= registered.expires_ms {
+                return Ok(missing(Eligibility::CatalogUnavailable));
+            }
             let status = eligibility(&signed.body, &registered.offer, effective_now, min_tok_s);
             let mut expiry = registered
                 .expires_ms

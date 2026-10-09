@@ -9,13 +9,108 @@ use axum::{
     Json,
 };
 use mayhem_proto::proxy::{ProxyEndpoint, ProxyFamily, ProxyRail};
-use mayhem_proxy::{catalog::CatalogRead, directory, Error};
+use mayhem_proxy::{
+    attempts::Digest,
+    catalog::CatalogRead,
+    directory,
+    presence::{gateway::Gateway, Eligibility, Observation, Registered},
+    Error,
+};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 
 // Bound synchronous database work separately from inference. No waiting queue,
 // no per-card background polling and no unbounded spawn_blocking backlog.
 static READS: Semaphore = Semaphore::const_new(8);
+
+/// Availability is an independent observation, never part of the canonical
+/// publication/digest or a promise that a slot will remain available.
+#[derive(Serialize)]
+struct ObservedOffer {
+    #[serde(flatten)]
+    publication: directory::PublishedOffer,
+    availability: Observation,
+}
+
+#[derive(Serialize)]
+struct ObservedPage {
+    query_key: String,
+    snapshot: String,
+    entries: Vec<ObservedOffer>,
+    previous_cursor: Option<String>,
+    next_cursor: Option<String>,
+    scanned_candidates: usize,
+}
+
+fn observe(
+    catalog: &CatalogRead,
+    presence: &Gateway,
+    publication: directory::PublishedOffer,
+    now: u64,
+) -> Result<ObservedOffer, Error> {
+    let unavailable = || Observation {
+        status: Eligibility::CatalogUnavailable,
+        observed_at_ms: now,
+        expires_at_ms: None,
+    };
+    let [market, provider, slot]: [Digest; 3] = publication
+        .id
+        .split('/')
+        .map(|id| {
+            Digest::new(id).map_err(|_| Error::Invalid("invalid directory offer identity".into()))
+        })
+        .collect::<Result<Vec<_>, _>>()?
+        .try_into()
+        .map_err(|_| Error::Invalid("invalid directory offer identity".into()))?;
+    let registered = Registered::read(catalog, &market, &provider, &slot, now);
+    let availability = match registered {
+        Ok(registered) => {
+            if registered.offer() != &publication.offer
+                || !publication.active
+                || !publication.catalog_eligible
+            {
+                unavailable()
+            } else {
+                // None is the SAME default floor used by admission: 5 tok/s for
+                // LLMs; decisions do not acquire an invented token requirement.
+                presence.observe_registered(&registered, None)?
+            }
+        }
+        Err(Error::Invalid(_) | Error::Identity) => unavailable(),
+        Err(error) => return Err(error),
+    };
+    Ok(ObservedOffer {
+        publication,
+        availability,
+    })
+}
+
+fn observe_page(
+    catalog: &CatalogRead,
+    presence: &Gateway,
+    page: directory::OfferPage,
+    now: u64,
+) -> Result<ObservedPage, Error> {
+    let directory::OfferPage {
+        query_key,
+        snapshot,
+        entries,
+        previous_cursor,
+        next_cursor,
+        scanned_candidates,
+    } = page;
+    Ok(ObservedPage {
+        query_key,
+        snapshot,
+        entries: entries
+            .into_iter()
+            .map(|entry| observe(catalog, presence, entry, now))
+            .collect::<Result<_, _>>()?,
+        previous_cursor,
+        next_cursor,
+        scanned_candidates,
+    })
+}
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -64,7 +159,7 @@ fn invalid_request() -> Response {
 async fn read<T, F>(state: SharedState, headers: HeaderMap, operation: F) -> Response
 where
     T: Serialize + Send + 'static,
-    F: FnOnce(&CatalogRead) -> Result<Option<T>, Error> + Send + 'static,
+    F: FnOnce(&CatalogRead, &Gateway) -> Result<Option<T>, Error> + Send + 'static,
 {
     if let Err(error) = state.authorize_gateway_request(&headers, None) {
         return no_store(error.into_response());
@@ -90,7 +185,7 @@ where
         if snapshot.status().invalidated || snapshot.status().committed.is_none() {
             return Err(Error::Invalid("proxy directory not hydrated".into()));
         }
-        operation(&snapshot)
+        operation(&snapshot, control.presence())
     })
     .await;
     let response = match result {
@@ -140,10 +235,10 @@ pub(super) async fn list(
     {
         return invalid_request();
     }
-    read(state, headers, move |catalog| {
-        catalog
-            .proxy_offers(&query, params.cursor.as_deref(), limit, now_millis_u64())
-            .map(Some)
+    read(state, headers, move |catalog, presence| {
+        let now = now_millis_u64();
+        let page = catalog.proxy_offers(&query, params.cursor.as_deref(), limit, now)?;
+        observe_page(catalog, presence, page, now).map(Some)
     })
     .await
 }
@@ -160,8 +255,12 @@ pub(super) async fn get(
         return invalid_request();
     }
     let id = format!("{market}/{provider}/{slot}");
-    read(state, headers, move |catalog| {
-        catalog.proxy_offer(&id, now_millis_u64())
+    read(state, headers, move |catalog, presence| {
+        let now = now_millis_u64();
+        catalog
+            .proxy_offer(&id, now)?
+            .map(|entry| observe(catalog, presence, entry, now))
+            .transpose()
     })
     .await
 }

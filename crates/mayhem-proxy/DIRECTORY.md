@@ -31,9 +31,30 @@ suppliers are combined. Family labels come from canonical catalog data.
 
 `catalog_eligible` means only that current canonical registration and policy
 validate. It does not mean Available, Verified, reserved capacity or an execution
-quote. Operator verification currently returns `unknown`. A UI must show checking
-until a genuine live presence overlay is connected. Actual admission still needs
-the buyer's constraints, current signed offer, health/capacity and financial gate.
+quote. Operator verification currently returns `unknown`.
+
+Every HTTP list entry and exact detail now adds `availability`, with the existing
+presence `Observation` shape: `{status, observed_at_ms, expires_at_ms}`. This is a
+separate point-in-time observation; it does not change the canonical offer or its
+digest. Status values are `available`, `busy`, `unavailable`, `checking`,
+`draining`, `heartbeat_missing`, `stale_evidence`, `throughput_unverified`,
+`throughput_floor`, `controller_conflict` and `catalog_unavailable`. Expiry is
+nullable and bounds evidence, not a capacity lease. Missing or expired evidence
+cannot be displayed as current availability. Declared membership concurrency is
+not observed free capacity, and no free-slot count is added to this public shape.
+
+The wrapper resolves each exact registration from the same catalog snapshot used
+by its page and calls `Gateway::observe_registered` with the default admission
+policy: LLMs require fresh generation speed of at least 5 tokens/second; decision
+endpoints have no fabricated token-speed requirement. Request-specific higher
+floors and other buyer constraints remain admission checks. No market selection
+or subscription is changed by a directory request. Unselected markets and stopped
+presence report missing evidence. Stale, revoked, disabled or withdrawn canonical
+registration reports `catalog_unavailable`; storage errors retain the existing
+unavailable response. The shared presence table also refuses availability when
+monotonic elapsed time exhausts canonical registration after a wall-clock rollback.
+Actual admission still needs the buyer's constraints, current signed offer,
+health/capacity and financial gate.
 
 ## Paging and resource behavior
 
@@ -42,6 +63,10 @@ Market descriptors are immutable by content identity. Traversal walks indexed
 markets and their provider/slot ranges with at most 256 candidates and 128 KiB of
 entry data per page. There is no total public-offer cap, whole-catalog copy,
 history scan or per-browser snapshot. Reads hold one short MVCC transaction.
+Availability adds at most one bounded exact registration/presence observation per
+returned entry (at most 100). It opens no additional catalog snapshots, makes no
+remote calls, scans no heartbeat history and shares the existing eight-read
+blocking-work limit.
 
 Search is explicitly case-insensitive model-name **prefix** search and name
 ordering. Price/availability sorting and additional taxonomy/trust filters are
@@ -79,7 +104,15 @@ empty-terminal backtracking, direct selection, no-op refresh, repricing,
 withdrawal/deletion and both preceding private-index migrations. These are local
 canonical fixtures, not deployed proxy providers or paid-network acceptance.
 
-The separate website catalog consumes these read shapes. Retail API normalization,
-taxonomy administration, live availability subscriptions, buyer category routing,
-Studio/MCP and paid dispatch remain separate integration work. Their release and
-mainnet gates are unchanged.
+The separate website/API consumers must retain the observation's expiry and
+default-policy meaning. Older metadata snapshots without `availability` remain
+unknown to consumers. New gateway HTTP responses always include it. Tests cover
+real list/detail responses, unchanged canonical digests, signed presence status
+parity with admission, default speed floors, decision exemption, missing selection,
+stopped lifecycle, revocation, stale catalog data and clock rollback. An optional
+`PROXY_DIRECTORY_AVAILABILITY_FIXTURE` path exports the exact wrapper projections
+from synthetic canonical/signed-presence fixtures for cross-language validation;
+it contains no private controller, transport or credential fields.
+
+Taxonomy administration, buyer category routing and broader Studio/MCP workflows
+remain separate integration work. Release and mainnet gates are unchanged.

@@ -19,6 +19,7 @@ use tower::ServiceExt;
 // These tests inspect the handler's shared global read budget. Serialize their
 // local HTTP traffic so another test cannot consume a deliberately held permit.
 static HTTP_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+mod availability;
 const TOKEN: &str = "sk-mayhem-proxy-directory-fixture";
 
 fn identity() -> Identity {
@@ -280,7 +281,9 @@ async fn router_filters_and_pages_public_offers_without_inference_or_rate_projec
             assert_eq!(entry["lane"], "proxy");
             assert_eq!(entry["operator_verification"], "unknown");
             assert_eq!(entry["catalog_eligible"], false);
-            assert!(entry.get("availability").is_none());
+            assert_eq!(entry["availability"]["status"], "catalog_unavailable");
+            assert!(entry["availability"]["observed_at_ms"].is_u64());
+            assert!(entry["availability"]["expires_at_ms"].is_null());
             found.push(entry["id"].as_str().unwrap().to_owned());
         }
         cursor = body["next_cursor"].as_str().map(str::to_owned);
@@ -314,6 +317,7 @@ async fn router_filters_and_pages_public_offers_without_inference_or_rate_projec
     assert_eq!(body["id"], id.as_str());
     assert_eq!(body["offer"], original.value["offer"]);
     assert_eq!(body["digest"], original.value["digest"]);
+    assert_eq!(body["availability"]["status"], "catalog_unavailable");
     assert!(body["offer"]["rates"].as_array().unwrap().len() > 1);
     let missing = format!(
         "/v1/proxy/offers/{}/{}/{}",
@@ -431,7 +435,7 @@ async fn cancelled_http_read_keeps_worker_permit_until_blocking_work_finishes() 
         header::AUTHORIZATION,
         format!("Bearer {TOKEN}").parse().unwrap(),
     );
-    let task = tokio::spawn(read(Arc::new(state.clone()), headers, move |_| {
+    let task = tokio::spawn(read(Arc::new(state.clone()), headers, move |_, _| {
         started.send(()).unwrap();
         let _ = finishing.recv_timeout(Duration::from_secs(3));
         Ok(Some(json!({"fixture":"completed"})))

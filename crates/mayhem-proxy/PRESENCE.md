@@ -136,9 +136,14 @@ market replacement, immediate removal, quota rejection, stale/revoked canonical
 status, backoff, idle selection and cancellation. Gateway/CLI tests also cover
 default-disabled state, protected configuration, canonical identity mismatch,
 local background hydration, shared presence selection and joined shutdown.
-Read-only offer endpoints are described in [DIRECTORY.md](DIRECTORY.md). Buyer
-dispatch, live availability overlays for buyer surfaces, gateway service-installer
-configuration, provider retirement UX and real-network qualification remain.
+Read-only offer endpoints are described in [DIRECTORY.md](DIRECTORY.md). They now
+add default-policy observations through `observe_registered`, reusing their
+single catalog snapshot without changing subscriptions. The shared table checks
+registration expiry against both wall time and the effective monotonic time
+established by received evidence; clock rollback cannot keep an exhausted
+registration available. Request-specific constraints still apply at admission.
+Gateway service-installer configuration, provider retirement UX and real-network
+qualification remain.
 Persistent provider-controller installation is available through the explicit
 `mayhem provider proxy add` command; it is not automatic gateway activation.
 Production activation is gated separately.
