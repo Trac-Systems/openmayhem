@@ -1,8 +1,10 @@
 //! Administrative category membership from the SAME operator-configured trusted
 //! origin as field definitions. Membership never proves a provider capability.
+mod selection;
 mod wire;
 use super::wire::digest;
 use super::{check, response_bytes, transport, Cached, Error, Key, Reader, Result};
+pub use selection::{Filters, Selection, SelectionReference};
 use serde::de::DeserializeOwned;
 use serde_json::{json, Value};
 use std::sync::Arc;

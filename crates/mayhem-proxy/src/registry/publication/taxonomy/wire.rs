@@ -215,7 +215,7 @@ impl Release {
             "taxonomy family publication lacks observation",
         )
     }
-    fn document(&self, d: &DocumentReference) -> Result<()> {
+    pub(super) fn document(&self, d: &DocumentReference) -> Result<()> {
         d.validate()?;
         if let Some(change) = self
             .manifest

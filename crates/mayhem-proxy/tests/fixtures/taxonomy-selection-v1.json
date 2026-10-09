@@ -1,0 +1,446 @@
+{
+  "test_only": true,
+  "scope": "actual local Nest HTTP and PostgreSQL; canonical family observation is synthetic",
+  "request": {
+    "release_hash": "e9334fe0145c37f2519db7c0205cfb271aa66dcc1d405bad75520e80a3fdc116",
+    "variants": [
+      {
+        "entry_id": "selection_a",
+        "schema_revision": 1
+      }
+    ],
+    "tags": [
+      {
+        "entry_id": "selection_coding",
+        "schema_revision": 1
+      },
+      {
+        "entry_id": "selection_research",
+        "schema_revision": 1
+      }
+    ],
+    "models": [
+      {
+        "family_id": "selection_family",
+        "model_id": "vendor/model-a",
+        "revision": "2026-10",
+        "quantization": "q8"
+      },
+      {
+        "family_id": "selection_family",
+        "model_id": "vendor/model-b",
+        "revision": "",
+        "quantization": ""
+      },
+      {
+        "family_id": "selection_family",
+        "model_id": "vendor/model-a",
+        "revision": "2026-10",
+        "quantization": "q4"
+      },
+      {
+        "family_id": "undisclosed",
+        "model_id": "vendor/model-a",
+        "revision": "2026-10",
+        "quantization": "q8"
+      }
+    ]
+  },
+  "original": {
+    "release": {
+      "object": "proxy.taxonomy_release",
+      "release_id": "318c2253-2d66-45d9-b611-141168d8fc8a",
+      "revision": "1",
+      "release_hash": "e9334fe0145c37f2519db7c0205cfb271aa66dcc1d405bad75520e80a3fdc116",
+      "manifest": {
+        "schema_version": 1,
+        "parent_release_id": null,
+        "parent_release_hash": null,
+        "network": {
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 30
+        },
+        "canonical_families": [
+          {
+            "family_id": "selection_family",
+            "enabled": true,
+            "label": "Synthetic test family"
+          }
+        ],
+        "changes": [
+          {
+            "entry_id": "selection_a",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "da0de2399e54b7b1765bf22b4efbd20f434090af6cc1784191b5183fd28a10a7"
+          },
+          {
+            "entry_id": "selection_alias",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "63bd08ec00dd2f7a02acb9804cf2ab58e7ae410992ad302f0a11d0401e789b9a"
+          },
+          {
+            "entry_id": "selection_b",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "94361a120e121612e4b31dc35b8fb5d758e647f7642df2b4e73b321fd522e475"
+          },
+          {
+            "entry_id": "selection_coding",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "125227dbde1809c4533b31d0e8b8bda939db0addacabc77d2e1a256f8092ccef"
+          },
+          {
+            "entry_id": "selection_family",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "d0459005ecc3c7b4032bb486e6502535cebd69e90b7ccad3c09ef8fbd17fa204"
+          },
+          {
+            "entry_id": "selection_research",
+            "schema_revision": 1,
+            "version": 1,
+            "document_hash": "154c26c23b1ce15904fc6ef0ff996895efd400669eb46e3da49ca46945b69eae"
+          }
+        ]
+      },
+      "published_at": "2026-10-09T23:03:39.872Z",
+      "publication_state": "published",
+      "canonical_observation": {
+        "schema_version": 1,
+        "network": {
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 30
+        },
+        "snapshot": "fixture:1",
+        "proof": {
+          "view_key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+          "fork": 0,
+          "signed_length": 1,
+          "tree_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        },
+        "observed_at_ms": 1791587019863,
+        "expires_at_ms": 1791587079864,
+        "families": [
+          {
+            "family_id": "selection_family",
+            "enabled": true,
+            "label": "Synthetic test family"
+          }
+        ]
+      }
+    }
+  },
+  "updated": {
+    "release": {
+      "object": "proxy.taxonomy_release",
+      "release_id": "b1e53fe3-3a12-4a36-9e01-b288e5b6fe6b",
+      "revision": "2",
+      "release_hash": "59c02b9c363e75a615191e864e04f4fa21db4c3c09e2d5acce6a7edd120b6f8b",
+      "manifest": {
+        "schema_version": 1,
+        "parent_release_id": "318c2253-2d66-45d9-b611-141168d8fc8a",
+        "parent_release_hash": "e9334fe0145c37f2519db7c0205cfb271aa66dcc1d405bad75520e80a3fdc116",
+        "network": {
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 30
+        },
+        "canonical_families": [],
+        "changes": [
+          {
+            "entry_id": "selection_a",
+            "schema_revision": 2,
+            "version": 2,
+            "document_hash": "f0ed8a1f1705b5d5b77e94f7629560a0c8cb7a70abeceab99c7ed15a665003b8"
+          }
+        ]
+      },
+      "published_at": "2026-10-09T23:03:40.036Z",
+      "publication_state": "published",
+      "canonical_observation": null
+    }
+  },
+  "original_selection": {
+    "object": "proxy.taxonomy_selection",
+    "schema_version": 1,
+    "release": {
+      "release_id": "318c2253-2d66-45d9-b611-141168d8fc8a",
+      "release_hash": "e9334fe0145c37f2519db7c0205cfb271aa66dcc1d405bad75520e80a3fdc116",
+      "revision": "1"
+    },
+    "variants": [
+      {
+        "entry_id": "selection_a",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "da0de2399e54b7b1765bf22b4efbd20f434090af6cc1784191b5183fd28a10a7"
+      }
+    ],
+    "tags": [
+      {
+        "entry_id": "selection_coding",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "125227dbde1809c4533b31d0e8b8bda939db0addacabc77d2e1a256f8092ccef"
+      },
+      {
+        "entry_id": "selection_research",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "154c26c23b1ce15904fc6ef0ff996895efd400669eb46e3da49ca46945b69eae"
+      }
+    ],
+    "matches": [
+      {
+        "model": {
+          "family_id": "selection_family",
+          "model_id": "vendor/model-a",
+          "revision": "2026-10",
+          "quantization": "q8"
+        },
+        "variant": {
+          "entry_id": "selection_a",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "da0de2399e54b7b1765bf22b4efbd20f434090af6cc1784191b5183fd28a10a7"
+        },
+        "tags": [
+          {
+            "source": {
+              "entry_id": "selection_a",
+              "schema_revision": 1,
+              "version": 1,
+              "document_hash": "da0de2399e54b7b1765bf22b4efbd20f434090af6cc1784191b5183fd28a10a7"
+            },
+            "scope": "model"
+          },
+          {
+            "source": {
+              "entry_id": "selection_a",
+              "schema_revision": 1,
+              "version": 1,
+              "document_hash": "da0de2399e54b7b1765bf22b4efbd20f434090af6cc1784191b5183fd28a10a7"
+            },
+            "scope": "model"
+          }
+        ],
+        "matches": true
+      },
+      {
+        "model": {
+          "family_id": "selection_family",
+          "model_id": "vendor/model-b",
+          "revision": "",
+          "quantization": ""
+        },
+        "variant": null,
+        "tags": [
+          {
+            "source": {
+              "entry_id": "selection_b",
+              "schema_revision": 1,
+              "version": 1,
+              "document_hash": "94361a120e121612e4b31dc35b8fb5d758e647f7642df2b4e73b321fd522e475"
+            },
+            "scope": "model"
+          },
+          {
+            "source": null,
+            "scope": null
+          }
+        ],
+        "matches": false
+      },
+      {
+        "model": {
+          "family_id": "selection_family",
+          "model_id": "vendor/model-a",
+          "revision": "2026-10",
+          "quantization": "q4"
+        },
+        "variant": null,
+        "tags": [
+          {
+            "source": {
+              "entry_id": "selection_family",
+              "schema_revision": 1,
+              "version": 1,
+              "document_hash": "d0459005ecc3c7b4032bb486e6502535cebd69e90b7ccad3c09ef8fbd17fa204"
+            },
+            "scope": "family"
+          },
+          {
+            "source": null,
+            "scope": null
+          }
+        ],
+        "matches": false
+      },
+      {
+        "model": {
+          "family_id": "undisclosed",
+          "model_id": "vendor/model-a",
+          "revision": "2026-10",
+          "quantization": "q8"
+        },
+        "variant": null,
+        "tags": [
+          {
+            "source": null,
+            "scope": null
+          },
+          {
+            "source": null,
+            "scope": null
+          }
+        ],
+        "matches": false
+      }
+    ],
+    "capacity_reserved": false,
+    "authorizes_execution": false
+  },
+  "updated_selection": {
+    "object": "proxy.taxonomy_selection",
+    "schema_version": 1,
+    "release": {
+      "release_id": "b1e53fe3-3a12-4a36-9e01-b288e5b6fe6b",
+      "release_hash": "59c02b9c363e75a615191e864e04f4fa21db4c3c09e2d5acce6a7edd120b6f8b",
+      "revision": "2"
+    },
+    "variants": [
+      {
+        "entry_id": "selection_a",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "da0de2399e54b7b1765bf22b4efbd20f434090af6cc1784191b5183fd28a10a7"
+      }
+    ],
+    "tags": [
+      {
+        "entry_id": "selection_coding",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "125227dbde1809c4533b31d0e8b8bda939db0addacabc77d2e1a256f8092ccef"
+      },
+      {
+        "entry_id": "selection_research",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "154c26c23b1ce15904fc6ef0ff996895efd400669eb46e3da49ca46945b69eae"
+      }
+    ],
+    "matches": [
+      {
+        "model": {
+          "family_id": "selection_family",
+          "model_id": "vendor/model-a",
+          "revision": "2026-10",
+          "quantization": "q8"
+        },
+        "variant": {
+          "entry_id": "selection_a",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "da0de2399e54b7b1765bf22b4efbd20f434090af6cc1784191b5183fd28a10a7"
+        },
+        "tags": [
+          {
+            "source": {
+              "entry_id": "selection_a",
+              "schema_revision": 2,
+              "version": 2,
+              "document_hash": "f0ed8a1f1705b5d5b77e94f7629560a0c8cb7a70abeceab99c7ed15a665003b8"
+            },
+            "scope": "model"
+          },
+          {
+            "source": null,
+            "scope": null
+          }
+        ],
+        "matches": false
+      },
+      {
+        "model": {
+          "family_id": "selection_family",
+          "model_id": "vendor/model-b",
+          "revision": "",
+          "quantization": ""
+        },
+        "variant": null,
+        "tags": [
+          {
+            "source": {
+              "entry_id": "selection_b",
+              "schema_revision": 1,
+              "version": 1,
+              "document_hash": "94361a120e121612e4b31dc35b8fb5d758e647f7642df2b4e73b321fd522e475"
+            },
+            "scope": "model"
+          },
+          {
+            "source": null,
+            "scope": null
+          }
+        ],
+        "matches": false
+      },
+      {
+        "model": {
+          "family_id": "selection_family",
+          "model_id": "vendor/model-a",
+          "revision": "2026-10",
+          "quantization": "q4"
+        },
+        "variant": null,
+        "tags": [
+          {
+            "source": {
+              "entry_id": "selection_family",
+              "schema_revision": 1,
+              "version": 1,
+              "document_hash": "d0459005ecc3c7b4032bb486e6502535cebd69e90b7ccad3c09ef8fbd17fa204"
+            },
+            "scope": "family"
+          },
+          {
+            "source": null,
+            "scope": null
+          }
+        ],
+        "matches": false
+      },
+      {
+        "model": {
+          "family_id": "undisclosed",
+          "model_id": "vendor/model-a",
+          "revision": "2026-10",
+          "quantization": "q8"
+        },
+        "variant": null,
+        "tags": [
+          {
+            "source": null,
+            "scope": null
+          },
+          {
+            "source": null,
+            "scope": null
+          }
+        ],
+        "matches": false
+      }
+    ],
+    "capacity_reserved": false,
+    "authorizes_execution": false
+  }
+}

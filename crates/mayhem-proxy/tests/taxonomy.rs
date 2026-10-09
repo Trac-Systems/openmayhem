@@ -8,6 +8,9 @@ use tokio::{
 fn fixture() -> Value {
     serde_json::from_str(include_str!("fixtures/taxonomy-membership-v1.json")).unwrap()
 }
+fn selection_fixture() -> Value {
+    serde_json::from_str(include_str!("fixtures/taxonomy-selection-v1.json")).unwrap()
+}
 fn hash(domain: &str, v: &Value) -> String {
     let mut bytes = domain.as_bytes().to_vec();
     bytes.push(0);
@@ -29,6 +32,9 @@ impl Drop for Server {
 }
 impl Server {
     async fn start() -> Self {
+        Self::start_fixture(false).await
+    }
+    async fn start_fixture(selection: bool) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let origin = format!("http://{}", listener.local_addr().unwrap());
         let mutate = Arc::new(Mutex::new(None::<fn(&mut Value)>));
@@ -69,7 +75,11 @@ impl Server {
                         .nth(1)
                         .unwrap();
                     let url = url::Url::parse(&format!("http://127.0.0.1{path}")).unwrap();
-                    let f = fixture();
+                    let f = if selection {
+                        selection_fixture()
+                    } else {
+                        fixture()
+                    };
                     let which = if path
                         .contains(f["original"]["release"]["release_id"].as_str().unwrap())
                     {
@@ -85,6 +95,15 @@ impl Server {
                             f[which]["response"].clone(),
                             "members",
                             json!({"entry_id":q["entry_id"],"schema_revision":q["schema_revision"].parse::<u32>().unwrap(),"limit":q["limit"].parse::<usize>().unwrap(),"cursor":q.get("cursor")}),
+                        )
+                    } else if url.path().ends_with("/selection") {
+                        let body: Value =
+                            serde_json::from_slice(&buf[length.0..length.0 + length.1]).unwrap();
+                        let selector = json!({"variants":body["variants"],"tags":body["tags"],"models":body["models"].as_array().unwrap().iter().map(|m|hash("mayhem/proxy/taxonomy-match-model/v1",m)).collect::<Vec<_>>()});
+                        (
+                            f[format!("{which}_selection")].clone(),
+                            "selection",
+                            selector,
                         )
                     } else if url.path().ends_with("/match") {
                         let body: Value =
@@ -120,6 +139,133 @@ impl Server {
         )
         .unwrap()
     }
+}
+
+fn filters(f: &Value, which: &str) -> Filters {
+    serde_json::from_value(json!({"release_id":f[which]["release"]["release_id"],"release_hash":f[which]["release"]["release_hash"],
+        "variants":f["request"]["variants"],"tags":f["request"]["tags"]})).unwrap()
+}
+fn selection_reference(filters: &Filters) -> Reference {
+    Reference {
+        release_id: filters.release_id.clone(),
+        release_hash: filters.release_hash.clone(),
+        entry_id: filters.tags[0].entry_id.clone(),
+        schema_revision: filters.tags[0].schema_revision,
+    }
+}
+#[tokio::test]
+async fn actual_site_selection_preserves_exact_filters_and_old_release() {
+    let f = selection_fixture();
+    let server = Server::start_fixture(true).await;
+    let reader = server.reader();
+    let models: Vec<Model> = serde_json::from_value(f["request"]["models"].clone()).unwrap();
+    for which in ["original", "updated", "original"] {
+        let filters = filters(&f, which);
+        let pin = reader
+            .pin_taxonomy(&selection_reference(&filters))
+            .await
+            .unwrap();
+        let selection = reader
+            .taxonomy_selection(&pin, &filters, &models)
+            .await
+            .unwrap();
+        for (index, model) in models.iter().enumerate() {
+            assert_eq!(
+                selection.allows(&filters, model),
+                f[format!("{which}_selection")]["matches"][index]["matches"]
+                    .as_bool()
+                    .unwrap()
+            );
+        }
+        let mut changed = filters.clone();
+        changed.tags.clear();
+        assert!(!selection.allows(&changed, &models[0]));
+        let mut changed = models[0].clone();
+        changed.quantization.push('x');
+        assert!(!selection.allows(&filters, &changed));
+    }
+}
+#[tokio::test]
+async fn selection_rejects_substitutions_and_malformed_or_partial_evidence() {
+    let f = selection_fixture();
+    let server = Server::start_fixture(true).await;
+    let reader = server.reader();
+    let filters = filters(&f, "original");
+    let pin = reader
+        .pin_taxonomy(&selection_reference(&filters))
+        .await
+        .unwrap();
+    let models: Vec<Model> = serde_json::from_value(f["request"]["models"].clone()).unwrap();
+    for mutation in [
+        (|v: &mut Value| {
+            v["release"]["release_hash"] = json!("f".repeat(64));
+        }) as fn(&mut Value),
+        |v| {
+            v["authorizes_execution"] = json!(true);
+        },
+        |v| {
+            v["capacity_reserved"] = json!(true);
+        },
+        |v| {
+            v["matches"].as_array_mut().unwrap().reverse();
+        },
+        |v| {
+            v["matches"][0]["matches"] = json!(false);
+        },
+        |v| {
+            v["matches"][0]["variant"] = Value::Null;
+        },
+        |v| {
+            v["matches"][0]["variant"]["entry_id"] = json!("different");
+        },
+        |v| {
+            v["tags"][0]["schema_revision"] = json!(2);
+        },
+        |v| {
+            v["matches"][0]["tags"][0]["scope"] = Value::Null;
+        },
+        |v| {
+            v["matches"][0]["tags"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("source");
+        },
+        |v| {
+            v["matches"][0]["tags"].as_array_mut().unwrap().pop();
+        },
+        |v| {
+            v["unknown"] = json!(true);
+        },
+    ] {
+        *server.mutate.lock().unwrap() = Some(mutation);
+        assert!(reader
+            .taxonomy_selection(&pin, &filters, &models)
+            .await
+            .is_err());
+    }
+    *server.mutate.lock().unwrap() = None;
+    let mut duplicate = models.clone();
+    duplicate.push(models[0].clone());
+    assert!(reader
+        .taxonomy_selection(&pin, &filters, &duplicate)
+        .await
+        .is_err());
+    let other = Server::start_fixture(true).await;
+    assert!(other
+        .reader()
+        .taxonomy_selection(&pin, &filters, &models)
+        .await
+        .is_err());
+    let mut empty = filters.clone();
+    empty.tags.clear();
+    empty.variants.clear();
+    assert!(empty.validate().is_err());
+    let mut wrong = filters.clone();
+    wrong.release_hash = "f".repeat(64);
+    assert!(reader
+        .taxonomy_selection(&pin, &wrong, &models)
+        .await
+        .is_err());
 }
 #[tokio::test]
 async fn real_site_release_members_and_exact_lookup_preserve_old_pins() {
