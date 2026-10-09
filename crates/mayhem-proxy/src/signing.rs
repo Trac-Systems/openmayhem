@@ -61,6 +61,18 @@ impl Authority {
             .map_err(|_| invalid("invalid buyer purchase"))?;
         Ok(hex(&self.key.sign(&bytes).to_bytes()))
     }
+    pub(crate) fn provider_spend(
+        &self,
+        approval: &crate::financial::provider::Approval,
+    ) -> Result<String> {
+        approval.recheck()?;
+        self.party(approval.terms(), false)?;
+        let bytes = approval
+            .terms()
+            .provider_signing_bytes()
+            .map_err(|_| invalid("invalid provider acceptance"))?;
+        Ok(hex(&self.key.sign(&bytes).to_bytes()))
+    }
     fn terms(&self, authorization: &ProxySpendAuthorization, buyer: bool) -> Result<()> {
         authorization
             .verify(crate::receipts::verify_signature)

@@ -1,3 +1,4 @@
+import { PROXY_OFFER_STATE_SERVICE } from '../features/mayhem/proxy-offer-state.js';
 import { PROXY_FINANCIAL_STATE_SERVICE } from '../features/mayhem/proxy-financial-state.js';
 import { PROXY_QUOTE_STATE_SERVICE } from '../features/mayhem/proxy-quote-state.js';
 import assert from 'node:assert/strict';
@@ -406,4 +407,48 @@ test('quote service authenticates the buyer and refreshes repeated queries befor
   replay = true;
   await assert.rejects(participant.proxyQuoteState(query), /does not match/);
   assert.equal(f.appends, 1, 'quote reads never publish');
+});
+
+test('offer service binds provider ownership, fresh challenges and canonical payout observation without writes', async t => {
+  const f = await fixture(t);
+  const requester = f.provider.publicKey;
+  const peer = { ...f.peer, wallet: { ...f.peer.wallet, publicKey: requester,
+    sign: bytes => sign(f.provider.wallet, b4a.isBuffer(bytes) ? bytes : b4a.from(String(bytes))) },
+    base: { writable: false, view: f.base.view } };
+  const participant = new MayhemFeature(peer, {});
+  t.after(() => participant.stop());
+  const challenges = [];
+  let previous = null, replay = false;
+  participant.requestService = async (service, request) => {
+    assert.equal(service, PROXY_OFFER_STATE_SERVICE);
+    const authorize = (envelope, transport = requester) => f.feature._verifyServiceRequest(
+      service, envelope, { admin: f.admin.publicKey, transport });
+    assert.equal(authorize(request, f.buyer.publicKey), null);
+    assert.equal(authorize({ ...request, payload: { ...request.payload, requester: f.buyer.publicKey } }), null);
+    assert.equal(authorize({ ...request, payload: { ...request.payload, billing_id: f.terms.billing_id } }), null);
+    const authorization = authorize(request);
+    assert.ok(authorization);
+    challenges.push(authorization.payload.request_nonce);
+    if (replay) return structuredClone(previous);
+    previous = await f.feature._handleService(service, authorization.payload, authorization);
+    return structuredClone(previous);
+  };
+  const query = { offer: f.offer, rail: f.terms.rail, settlement_policy_hash: f.terms.settlement_policy_hash,
+    request_nonce: 'd'.repeat(64) };
+  const before = f.base.local.length;
+  const first = await participant.proxyOfferState(query);
+  const second = await participant.proxyOfferState(query);
+  assert.equal(first.request_nonce, query.request_nonce);
+  assert.equal(second.request_nonce, query.request_nonce);
+  assert.equal(first.payout_revision, f.terms.payout_revision);
+  assert.equal(first.payment_terms_hash, f.terms.payment_terms_hash);
+  assert.equal(first.funding, undefined);
+  assert.equal(first.billing, undefined);
+  assert.equal(new Set(challenges).size, 2);
+  assert.ok(challenges.every(n => n !== query.request_nonce));
+  replay = true;
+  await assert.rejects(participant.proxyOfferState(query), /does not match/);
+  await assert.rejects(participant.proxyOfferState({ ...query, requester }), /Invalid/);
+  assert.equal(f.base.local.length, before);
+  assert.equal(f.appends, 0);
 });

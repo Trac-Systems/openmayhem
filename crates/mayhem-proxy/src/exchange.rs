@@ -316,8 +316,13 @@ impl Session {
 /// Deterministically scoped to buyer/network/logical attempt, never prompt text
 /// or a caller-chosen provider-local ID. Changing terms cannot bypass that journal.
 pub fn invocation(auth: &ProxySpendAuthorization) -> Result<Digest> {
-    auth.terms.validate().map_err(|_| Error::Identity)?;
-    let t = &auth.terms;
+    invocation_for_terms(&auth.terms)
+}
+
+/// Logical key before countersigning; validates shape, never authenticates a
+/// buyer or proves admission. Use only after verifying the buyer's signature.
+pub fn invocation_for_terms(t: &mayhem_proto::proxy::finance::ProxySpendTerms) -> Result<Digest> {
+    t.validate().map_err(|_| Error::Identity)?;
     Ok(Digest::hash(
         "mayhem/proxy/buyer-invocation/v1",
         &[

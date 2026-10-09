@@ -1,3 +1,5 @@
+#[path = "provider_negotiation.rs"]
+mod provider;
 use super::*;
 use financial::negotiation::{
     BuyerNegotiation, Limits as NegotiationLimits, Store as NegotiationStore,

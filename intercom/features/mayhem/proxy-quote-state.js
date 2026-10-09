@@ -1,13 +1,9 @@
 // Fresh buyer-bound inputs to negotiation, never a spend authorization or a
 // reservation. Final publication repeats admission on the canonical writer.
 import b4a from 'b4a';
-import MayhemContract from '../../contract/contract.js';
-import { validateProxyOffer, proxyOfferDigest } from '../../contract/proxy-protocol.js';
-import { readActiveProxyOffer } from '../../contract/proxy-registry.js';
-import { prepareProxyFinancialAdmission } from '../../contract/proxy-finance-policy.js';
-import { proxySettlementPolicyDigest, verifyProxySpendAuthorization } from '../../contract/proxy-finance.js';
-import { acceptedSpend, proxyReservationKeys, proxyPaymentTermsDigest,
-  validateProxyBillingAnchor } from '../../contract/proxy-reservations.js';
+import { validateProxyOfferQuery, readProxyOfferInputs } from './proxy-offer-state.js';
+import { verifyProxySpendAuthorization } from '../../contract/proxy-finance.js';
+import { acceptedSpend, validateProxyBillingAnchor } from '../../contract/proxy-reservations.js';
 
 export const PROXY_QUOTE_STATE_SERVICE = 'proxy_quote_state';
 export const PROXY_QUOTE_STATE_MAX_BYTES = 131072;
@@ -17,13 +13,9 @@ const need = (ok, message) => { if (!ok) throw new Error(`Proxy quote state: ${m
 const checked = v => { if (v instanceof Error) throw v; return v; };
 
 export function validateProxyQuoteStateRequest(value) {
-  need(value && typeof value === 'object' && !Array.isArray(value)
-    && Object.keys(value).sort().join('|') === 'billing_id|offer|rail|request_nonce|requester|settlement_policy_hash'
-    && [value.billing_id, value.request_nonce, value.requester, value.settlement_policy_hash].every(hex)
-    && ['fiat', 'tnk', 'tap'].includes(value.rail)
-    && b4a.byteLength(JSON.stringify(value)) <= 32768, 'invalid request');
-  validateProxyOffer(value.offer);
-  need(value.offer.accepted_rails.includes(value.rail), 'offer does not accept this rail');
+  validateProxyOfferQuery(value);
+  need(Object.keys(value).sort().join('|') === 'billing_id|offer|rail|request_nonce|requester|settlement_policy_hash'
+    && hex(value.billing_id), 'invalid request');
 }
 
 export async function readProxyQuoteState({ request, withCanonicalSnapshot, verifySignature }) {
@@ -32,30 +24,7 @@ export async function readProxyQuoteState({ request, withCanonicalSnapshot, veri
   need(typeof withCanonicalSnapshot === 'function' && typeof verifySignature === 'function', 'service is not configured');
   return withCanonicalSnapshot(async snapshot => {
     await snapshot.assertCurrent();
-    const ledger = Object.create(MayhemContract.prototype);
-    ledger.get = key => snapshot.read(key);
-    ledger.put = ledger.del = () => { throw new Error('Quote observation cannot write.'); };
-    const applied = checked(await ledger.epochApplyStateRecord());
-    const billingEpoch = (applied.pending_epoch ?? applied.updated_epoch) + 1;
-    need(Number.isSafeInteger(billingEpoch) && billingEpoch > 0, 'invalid billing epoch');
-    const selected = await readActiveProxyOffer(request.offer, snapshot.context, key => ledger.get(key));
-    need(selected !== null && selected.offer_digest === await proxyOfferDigest(request.offer), 'offer is no longer active or admitted; requote');
-    // Check quotas without applying the returned counter writes.
-    await prepareProxyFinancialAdmission(key => ledger.get(key), request.offer.provider_pubkey, billingEpoch);
-    const policy = await ledger.get(proxyReservationKeys.settlementPolicy(request.settlement_policy_hash));
-    need(policy?.enabled === true && await proxySettlementPolicyDigest(policy.policy) === request.settlement_policy_hash,
-      'settlement policy is not enabled');
-    const provider = request.offer.provider_pubkey;
-    const registration = await ledger.get(`prov/${provider}`);
-    need(registration?.status === 'active' && registration.accepted_rails?.includes(request.rail), 'provider payment rail is not active');
-    const pointer = await ledger.get(ledger.providerPayoutBindingPointerKey(provider, request.rail));
-    need(pointer?.provider === provider && pointer.rail === request.rail, 'payout pointer is missing');
-    const revision = pointer.pending_revision !== null && pointer.pending_activation_epoch <= billingEpoch
-      ? pointer.pending_revision : pointer.current_revision;
-    const payout = checked(await ledger.providerPayoutBindingForEpoch(provider, request.rail, revision,
-      billingEpoch, { requireCurrentReadiness: true }));
-    const rules = await ledger.currentRules();
-    const paymentTerms = await proxyPaymentTermsDigest(rules, payout);
+    const { ledger, payout, fields } = await readProxyOfferInputs(request, snapshot);
     const balance = checked(await ledger.balanceRecord(request.requester, request.rail));
     checked(ledger.guardianValidateBalanceRecord(balance, request.requester, request.rail));
     if (request.rail === 'tap') need(balance.chain_id === payout.chain_id, 'TAP funding and payout chains differ');
@@ -72,9 +41,7 @@ export async function readProxyQuoteState({ request, withCanonicalSnapshot, veri
     }
     await snapshot.assertCurrent();
     const response = { ok: true, schema_version: 1, lane: 'proxy', ...request,
-      context: snapshot.context, proof: snapshot.proof, billing_epoch: billingEpoch,
-      market: selected.market, membership: selected.membership, settlement_policy: policy.policy,
-      payout_revision: payout.revision, payment_terms_hash: paymentTerms, rules_ver: rules.ver,
+      ...fields,
       funding: { balance_au: balance.au, reserved_au: reserved,
         available_au: checked(ledger.safeSubAu(balance.au, reserved)),
         chain_id: request.rail === 'tap' ? balance.chain_id : null },

@@ -1,3 +1,5 @@
+import { readProxyOfferState, validateProxyOfferStateRequest, PROXY_OFFER_STATE_SERVICE,
+  PROXY_OFFER_STATE_MAX_BYTES, PROXY_OFFER_STATE_MAX_AGE_MS } from './proxy-offer-state.js';
 import { readProxyQuoteState, validateProxyQuoteStateRequest, PROXY_QUOTE_STATE_SERVICE,
   PROXY_QUOTE_STATE_MAX_BYTES, PROXY_QUOTE_STATE_MAX_AGE_MS } from './proxy-quote-state.js';
 import { readProxyFinancialState, validateProxyFinancialStateRequest, PROXY_FINANCIAL_STATE_SERVICE,
@@ -371,7 +373,7 @@ const serviceParticipantFor = (service, value) => {
     return null;
   }
   if (service === 'stripe_checkout') return normalizeKey(value.who);
-  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE || service === PROXY_FINANCIAL_STATE_SERVICE || service === PROXY_QUOTE_STATE_SERVICE) return normalizeKey(value.requester);
+  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE || service === PROXY_FINANCIAL_STATE_SERVICE || service === PROXY_QUOTE_STATE_SERVICE || service === PROXY_OFFER_STATE_SERVICE) return normalizeKey(value.requester);
   if ([
     'provider_payout_context',
     'stripe_connect_adopt',
@@ -687,29 +689,44 @@ class MayhemFeature extends Feature {
     return result;
   }
 
+  async proxyOfferState(query) {
+    return await this._proxyNegotiationState(query, true);
+  }
+
   async proxyQuoteState(query) {
+    return await this._proxyNegotiationState(query, false);
+  }
+
+  async _proxyNegotiationState(query, provider) {
+    const label = provider ? 'offer' : 'quote';
+    const service = provider ? PROXY_OFFER_STATE_SERVICE : PROXY_QUOTE_STATE_SERVICE;
+    const keys = provider ? 'offer|rail|request_nonce|settlement_policy_hash'
+      : 'billing_id|offer|rail|request_nonce|settlement_policy_hash';
+    const validate = provider ? validateProxyOfferStateRequest : validateProxyQuoteStateRequest;
+    const maxAge = provider ? PROXY_OFFER_STATE_MAX_AGE_MS : PROXY_QUOTE_STATE_MAX_AGE_MS;
+    const maxBytes = provider ? PROXY_OFFER_STATE_MAX_BYTES : PROXY_QUOTE_STATE_MAX_BYTES;
     const requester = normalizeKey(this.peer?.wallet?.publicKey);
-    if (!query || Object.keys(query).sort().join('|') !== 'billing_id|offer|rail|request_nonce|settlement_policy_hash') {
-      throw new Error('Invalid proxy quote query.');
+    if (!query || Object.keys(query).sort().join('|') !== keys) {
+      throw new Error(`Invalid proxy ${label} query.`);
     }
-    validateProxyQuoteStateRequest({ ...query, requester });
+    validate({ ...query, requester });
     const payload = JSON.parse(JSON.stringify({ ...query, requester,
       request_nonce: crypto.randomBytes(32).toString('hex') }));
     const admin = await this._adminKey();
     const identity = { actor: requester, admin, transport: requester, payload };
-    const signature = this.peer.wallet.sign(b4a.from(serviceSigningMessage(PROXY_QUOTE_STATE_SERVICE, identity)));
+    const signature = this.peer.wallet.sign(b4a.from(serviceSigningMessage(service, identity)));
     const started = Date.now();
-    const result = await this.requestService(PROXY_QUOTE_STATE_SERVICE, { ...identity,
+    const result = await this.requestService(service, { ...identity,
       signing_version: SERVICE_SIGNING_VERSION,
       signature: b4a.isBuffer(signature) ? b4a.toString(signature, 'hex') : signature });
     const elapsed = Date.now() - started;
-    if (elapsed < 0 || elapsed > PROXY_QUOTE_STATE_MAX_AGE_MS) throw new Error('Proxy quote observation expired; requote.');
+    if (elapsed < 0 || elapsed > maxAge) throw new Error(`Proxy ${label} observation expired; refresh.`);
     const context = proxyRuntimeContext(this.peer, CONTRACT_VERSION, result?.context?.epoch);
     if (result?.ok !== true || result.lane !== 'proxy' || result.schema_version !== 1
         || stableJson(result.context) !== stableJson(context)
         || Object.keys(payload).some(key => stableJson(result[key]) !== stableJson(payload[key]))
-        || b4a.byteLength(JSON.stringify(result)) > PROXY_QUOTE_STATE_MAX_BYTES) {
-      throw new Error('Proxy quote response does not match this request/network.');
+        || b4a.byteLength(JSON.stringify(result)) > maxBytes) {
+      throw new Error(`Proxy ${label} response does not match this request/network.`);
     }
     validateProxySnapshotProof(result.proof);
     return { ...result, request_nonce: query.request_nonce };
@@ -1036,6 +1053,9 @@ class MayhemFeature extends Feature {
     if (service === PROXY_FINANCIAL_STATE_SERVICE) {
       try { validateProxyFinancialStateRequest(payload); } catch { return null; }
     }
+    if (service === PROXY_OFFER_STATE_SERVICE) {
+      try { validateProxyOfferStateRequest(payload); } catch { return null; }
+    }
     if (service === PROXY_QUOTE_STATE_SERVICE) {
       try { validateProxyQuoteStateRequest(payload); } catch { return null; }
     }
@@ -1196,6 +1216,9 @@ class MayhemFeature extends Feature {
   }
 
   async _handleService(service, value, authorization) {
+    if (service === PROXY_OFFER_STATE_SERVICE) {
+      return await readProxyOfferState({ request: value, withCanonicalSnapshot: this.withProxyCanonicalSnapshot });
+    }
     if (service === PROXY_QUOTE_STATE_SERVICE) {
       return await readProxyQuoteState({ request: value,
         withCanonicalSnapshot: this.withProxyCanonicalSnapshot,

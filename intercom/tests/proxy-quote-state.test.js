@@ -3,19 +3,21 @@ import assert from 'node:assert/strict';
 import { proxyReservationFixture } from './helpers/proxy-finance.js';
 import { readProxyQuoteState, validateProxyQuoteStateRequest } from '../features/mayhem/proxy-quote-state.js';
 
+import { readProxyOfferState, validateProxyOfferStateRequest } from '../features/mayhem/proxy-offer-state.js';
+
 const h = n => n.toString(16).padStart(64, '0');
 function query(f) {
   return { requester: f.buyer.publicKey, request_nonce: h(123), billing_id: f.terms.billing_id,
     offer: f.offer, rail: f.terms.rail, settlement_policy_hash: f.terms.settlement_policy_hash };
 }
-async function quote(f, request = query(f), hook = null) {
+async function quote(f, request = query(f), hook = null, reader = readProxyQuoteState, onRead = null) {
   const reads = new Set(); let checks = 0;
-  const result = await readProxyQuoteState({ request, verifySignature: f.peer.wallet.verify,
+  const result = await reader({ request, verifySignature: f.peer.wallet.verify,
     withCanonicalSnapshot: async (body, options) => {
       assert.equal(options.financial, true);
       return body({ context: { ...f.context, epoch: 100 },
         proof: { view_key: h(1), tree_hash: h(2), signed_length: 10, fork: 0 },
-        read: key => { reads.add(key); assert.ok(reads.size <= 128); return f.read(key); },
+        read: key => { if (onRead) onRead(key); reads.add(key); assert.ok(reads.size <= 128); return f.read(key); },
         assertCurrent: async () => { checks++; if (hook) await hook(checks); } });
     } });
   assert.equal(checks, 2);
@@ -59,6 +61,11 @@ test('stale, withdrawn, revoked, incompatible and unready-payout offers cannot q
     if (fault === 'quota') await f.storage.put('proxy/v1/reservation-budget', { epoch: 101, count: 1000 });
     if (fault === 'tap-chain') await f.storage.put(f.balanceKey, { ...f.balance, chain_id: 2 });
     await assert.rejects(quote(f, request), undefined, fault);
+    if (fault !== 'tap-chain') {
+      const { billing_id, ...providerRequest } = request;
+      providerRequest.requester = f.provider.publicKey;
+      await assert.rejects(quote(f, providerRequest, null, readProxyOfferState), undefined, fault);
+    }
   }
 });
 
@@ -70,4 +77,44 @@ test('quote rejects foreign billing and a changing canonical view without return
   for (const extra of [{ buyer: f.buyer.publicKey }, { limits: {} }]) {
     assert.throws(() => validateProxyQuoteStateRequest({ ...query(f), ...extra }));
   }
+});
+
+function offerQuery(f) {
+  const { billing_id, ...request } = query(f);
+  return { ...request, requester: f.provider.publicKey };
+}
+
+test('provider observation works without buyer funding and exposes only owned offer payment inputs', async () => {
+  for (const family of ['llm', 'decisions']) for (const rail of ['fiat', 'tnk', 'tap']) {
+    const f = await proxyReservationFixture(rail, family);
+    const buyer = await quote(f);
+    await f.storage.put(f.balanceKey, { corrupt: true });
+    await f.storage.put(f.summaryKey, { corrupt: true });
+    const before = JSON.stringify([...f.storage.values]);
+    const provider = await quote(f, offerQuery(f), null, readProxyOfferState, key => {
+      assert.notEqual(key, f.balanceKey);
+      assert.notEqual(key, f.summaryKey);
+      assert.notEqual(key, f.ledger.receiptBillingKey(f.terms.billing_id));
+    });
+    for (const field of ['context', 'proof', 'billing_epoch', 'market', 'membership',
+      'settlement_policy', 'payout_revision', 'payment_terms_hash', 'rules_ver']) {
+      assert.deepEqual(provider[field], buyer[field], field);
+    }
+    assert.equal(provider.requester, f.provider.publicKey);
+    assert.equal(provider.funding, undefined);
+    assert.equal(provider.billing, undefined);
+    assert.equal(provider.billing_id, undefined);
+    assert.ok(!JSON.stringify(provider).includes(f.payout.target));
+    assert.equal(JSON.stringify([...f.storage.values]), before);
+  }
+});
+
+test('provider observation rejects foreign identity, extra private fields and canonical changes', async () => {
+  const f = await proxyReservationFixture();
+  const request = offerQuery(f);
+  for (const extra of [{ requester: f.buyer.publicKey }, { billing_id: f.terms.billing_id }, { buyer: f.buyer.publicKey }, { funding: {} }]) {
+    assert.throws(() => validateProxyOfferStateRequest({ ...request, ...extra }));
+  }
+  await assert.rejects(quote(f, request, n => { if (n === 2) throw new Error('canonical fork changed'); },
+    readProxyOfferState), /canonical fork/);
 });

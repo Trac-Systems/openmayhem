@@ -293,3 +293,6 @@ mod buyer_recovery;
 
 #[path = "support/quote.rs"]
 mod quote;
+
+#[path = "support/offer_state.rs"]
+mod offer_state;

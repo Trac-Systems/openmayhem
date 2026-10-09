@@ -331,6 +331,16 @@ impl Store {
         Ok(())
     }
     pub fn recover(&self, k: &Digest) -> Result<Option<SavedPurchase>> {
+        // Signatures cannot escape through a concurrent read before durable
+        // acknowledgment, including the interval before a failed commit latches.
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| invalid("negotiation writer poisoned"))?;
+        require(
+            !self.failed.load(Ordering::Acquire),
+            "negotiation storage needs recovery after failed commit",
+        )?;
         let tx = crate::db(self.database.begin_read())?;
         let table = crate::db(tx.open_table(RECORDS))?;
         let r = crate::db(table.get(k.as_str()))?
@@ -768,6 +778,7 @@ mod tests {
             assert!(store.failed.load(Ordering::Acquire));
             assert!(store.write().is_err());
             assert!(store.prune(99999, 64).is_err());
+            assert!(store.recover(&digest(1)).is_err());
         }
     }
 }

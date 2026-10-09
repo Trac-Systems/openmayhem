@@ -652,6 +652,19 @@ impl Authority {
         self.commit(tx)?;
         Ok(Reservation { lease })
     }
+
+    /// Fresh read for provider countersigning. Does not dispatch or renew a lease;
+    /// actual dispatch repeats the same checks under its write transaction.
+    pub(crate) fn check_reserved(&self, expected: &Lease) -> Result<Route> {
+        self.healthy()?;
+        let tx = db(self.database.begin_read())?;
+        let lease: Lease = read(&db(tx.open_table(LEASES))?, expected.id.as_str())?;
+        let r: RouteState = read(&db(tx.open_table(ROUTES))?, lease.route.as_str())?;
+        let g: Group = read(&db(tx.open_table(GROUPS))?, lease.group.as_str())?;
+        ready_reserved(&lease, expected, self.fence, &g, &r, self.now()?)?;
+        Ok(r.config)
+    }
+
     /// Commit BEFORE the executor's own dispatch fence/POST. Failure between those
     /// steps retains an occupied slot for reconciliation; it never admits a duplicate.
     /// Readiness is rechecked to close the observation-to-send race within this authority.
@@ -662,20 +675,9 @@ impl Authority {
         let tx = self.write()?;
         let mut leases = db(tx.open_table(LEASES))?;
         let mut lease: Lease = read(&leases, reservation.lease.id.as_str())?;
-        if lease != reservation.lease || lease.phase != Phase::Reserved {
-            return Err(Error::Binding);
-        }
         let r: RouteState = read(&db(tx.open_table(ROUTES))?, lease.route.as_str())?;
         let g: Group = read(&db(tx.open_table(GROUPS))?, lease.group.as_str())?;
-        let now = self.now()?;
-        let group_allowance = g.gate.allowance(self.fence, now, g.ceiling)?;
-        let route_allowance = r
-            .gate
-            .allowance(self.fence, now, r.config.max_concurrency)?;
-        // Existing reservations already count. Do not subtract this request twice.
-        if g.occupied > group_allowance || r.occupied > route_allowance {
-            return Err(Error::Busy);
-        }
+        ready_reserved(&lease, &reservation.lease, self.fence, &g, &r, self.now()?)?;
         lease.phase = Phase::Dispatched;
         db(leases.insert(lease.id.as_str(), encode(&lease)?.as_slice()))?;
         drop(leases);
@@ -810,6 +812,34 @@ impl Authority {
         })
     }
 }
+fn ready_reserved(
+    lease: &Lease,
+    expected: &Lease,
+    fence: u64,
+    g: &Group,
+    r: &RouteState,
+    now: u64,
+) -> Result<()> {
+    if expected.controller_fence != fence {
+        return Err(Error::Stale);
+    }
+    if lease != expected
+        || lease.phase != Phase::Reserved
+        || lease.group != g.id
+        || lease.route != r.config.id
+        || r.config.group != g.id
+    {
+        return Err(Error::Binding);
+    }
+    let group_allowance = g.gate.allowance(fence, now, g.ceiling)?;
+    let route_allowance = r.gate.allowance(fence, now, r.config.max_concurrency)?;
+    // Reservations already count. Neither signing nor dispatch subtracts twice.
+    if g.occupied > group_allowance || r.occupied > route_allowance {
+        return Err(Error::Busy);
+    }
+    Ok(())
+}
+
 fn free(g: &Group, r: &RouteState, fence: u64, now: u64) -> Result<u32> {
     let group = g
         .gate

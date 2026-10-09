@@ -349,6 +349,7 @@ mod tests {
         tx.delete_table(ACCEPTANCE).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_accepted_finance_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_outcomes_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
         let mut meta = metadata(&tx).unwrap();
         meta.schema = 2;
         save_meta(&tx, &meta).unwrap();
@@ -380,6 +381,7 @@ mod tests {
         let tx=j.transaction().unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_accepted_finance_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_outcomes_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
         let mut meta=metadata(&tx).unwrap();meta.schema=3;save_meta(&tx,&meta).unwrap();j.commit(tx).unwrap();drop(j);
         let j=Journal::open(&path,identity(),limits()).unwrap();
         let saved=j.recover(&r.invocation,r.attempt).unwrap();
@@ -401,6 +403,7 @@ mod tests {
         let allocated = j.allocated_payload_bytes().unwrap();
         let tx = j.transaction().unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_outcomes_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
         let mut meta = metadata(&tx).unwrap();
         meta.schema = 4;
         save_meta(&tx, &meta).unwrap();
@@ -412,6 +415,31 @@ mod tests {
         assert!(j.terminal_draft(&r.invocation, r.attempt).unwrap().is_none());
         assert!(j.terminal_receipt(&r.invocation, r.attempt).unwrap().is_none());
         assert!(j.begin_dispatch(&r.invocation, r.generation, 102).is_err());
+    }
+
+    #[test]
+    fn schema_six_upgrade_preserves_unknown_execution_without_inventing_provider_acceptance() {
+        let dir = dir(); let path = dir.path().join("journal");
+        let j = Journal::open(&path, identity(), limits()).unwrap();
+        let (binding, snapshot) = fixture();
+        let r = j.prepare(d(100), binding, 100).unwrap();
+        j.retain_acceptance(&r.invocation, r.attempt, &snapshot).unwrap();
+        j.retain_request(&r.invocation, r.attempt, BODY, 4096).unwrap();
+        let r = j.begin_dispatch(&r.invocation, r.generation, 101).unwrap().record().clone();
+        let allocated = j.allocated_payload_bytes().unwrap();
+        let tx = j.transaction().unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
+        let mut meta = metadata(&tx).unwrap(); meta.schema = 6; save_meta(&tx, &meta).unwrap();
+        j.commit(tx).unwrap(); drop(j);
+        let j = Journal::open(&path, identity(), limits()).unwrap();
+        assert_eq!(j.get(&r.invocation).unwrap().unwrap(), r);
+        assert_eq!(j.allocated_payload_bytes().unwrap(), allocated);
+        assert!(j.provider_acceptance(&r.invocation, r.attempt).unwrap().is_none());
+        assert!(j.begin_dispatch(&r.invocation, r.generation, 102).is_err());
+        let tx = j.transaction().unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
+        j.commit(tx).unwrap(); drop(j);
+        assert!(Journal::open(&path, identity(), limits()).is_err(), "current schema must not silently rebuild a missing signature table");
     }
 
     #[test]

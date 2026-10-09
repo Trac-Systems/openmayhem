@@ -11,9 +11,11 @@ mod acceptance;
 mod finance;
 mod outcomes;
 mod payloads;
+mod provider;
 pub use acceptance::{AcceptanceSnapshot, OwnedAcceptance};
 pub use outcomes::{TerminalDraft, WaiverDraft};
 pub use payloads::{OwnedRequest, OwnedResult, Recovery, ResultCommitment};
+pub use provider::SignedProviderAcceptance;
 
 use std::{
     fmt,
@@ -498,7 +500,7 @@ impl Journal {
             if meta.identity != identity {
                 return Err(Error::Identity);
             }
-            require(matches!(meta.schema, 1 | 2 | 3 | 4 | 5 | 6))?;
+            require(matches!(meta.schema, 1 | 2 | 3 | 4 | 5 | 6 | 7))?;
             require(
                 [
                     REQUESTS.name(),
@@ -534,11 +536,12 @@ impl Journal {
             acceptance::initialize(&tx, meta.schema < 3)?;
             finance::initialize(&tx, meta.schema < 4)?;
             outcomes::initialize(&tx, meta.schema < 5)?;
+            provider::initialize(&tx, meta.schema < 7)?;
             if meta.schema == 1 {
                 require(meta.payload_bytes == 0)?;
             }
-            if meta.schema < 6 {
-                meta.schema = 6;
+            if meta.schema < 7 {
+                meta.schema = 7;
                 storage(meta_table.insert("state", encode(&meta)?.as_slice()))?;
             }
         } else {
@@ -551,8 +554,9 @@ impl Journal {
             acceptance::initialize(&tx, true)?;
             finance::initialize(&tx, true)?;
             outcomes::initialize(&tx, true)?;
+            provider::initialize(&tx, true)?;
             let meta = Meta {
-                schema: 6,
+                schema: 7,
                 identity,
                 records: 0,
                 unfinished: 0,
@@ -898,6 +902,7 @@ impl Journal {
             payloads::prune(&tx, record_key, &mut meta)?;
             finance::prune(&tx, record_key, &mut meta)?;
             outcomes::prune(&tx, record_key, &mut meta)?;
+            provider::prune(&tx, record_key, &mut meta)?;
             storage(records.remove(record_key.as_str()))?;
             storage(expiry.remove(key.as_str()))?;
             meta.records = meta.records.checked_sub(1).ok_or(Error::Invalid)?;
@@ -1124,6 +1129,10 @@ mod tests {
             ));
             fault.store(0, Ordering::Release);
             assert!(j.commit_failed.load(Ordering::Acquire));
+            assert!(matches!(
+                j.provider_acceptance(&r.invocation, r.attempt),
+                Err(Error::Storage)
+            ));
             assert!(matches!(
                 j.prepare(d(201), binding(), 102),
                 Err(Error::Storage)

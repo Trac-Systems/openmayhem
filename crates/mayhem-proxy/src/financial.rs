@@ -2,6 +2,8 @@
 //! peer RPC. Its authenticated service verifies the indexer's signed snapshot.
 //! An arbitrary upstream HTTP response is never a financial authority.
 pub mod negotiation;
+pub mod offer;
+pub mod provider;
 pub mod quote;
 pub mod recovery;
 use crate::{
