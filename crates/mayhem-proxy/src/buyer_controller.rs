@@ -355,6 +355,11 @@ impl Controller {
     pub fn identity(&self) -> &Identity {
         self.shared.signer.identity()
     }
+    /// Maximum normalized response bytes configured by the controller owner.
+    /// HTTP observers may impose tighter event/queue limits, never a larger total.
+    pub fn response_byte_limit(&self) -> usize {
+        self.shared.limits.protocol.response_bytes
+    }
     pub fn active_sessions(&self) -> usize {
         self.shared.limits.sessions - self.sessions.available_permits()
     }

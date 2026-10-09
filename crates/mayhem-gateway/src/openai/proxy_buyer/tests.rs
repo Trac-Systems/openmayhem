@@ -1,3 +1,4 @@
+mod streaming;
 use super::*;
 use crate::openai::proxy_owner::tests::support::{self, ControlFixture, Harness};
 use crate::openai::{
@@ -449,17 +450,21 @@ async fn proxy_http_all_four_endpoints_pay_exact_original_once_on_all_three_rail
     ] {
         for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
             let mut f = Fixture::start_with(endpoint, rail).await;
-            let mut streaming = f.body();
-            streaming["stream"] = json!(true);
-            assert_eq!(
-                f.post("stream-rejected", streaming, "owner-fixture-key", false)
-                    .await
-                    .0,
-                StatusCode::BAD_REQUEST,
-                "{endpoint:?}/{rail:?} must reject streaming before signing"
-            );
-            assert_eq!(f.harness.status().await["publications"], 0);
-            assert_eq!(f.harness.backend_calls(), 0);
+            if endpoint == ProxyEndpoint::Decisions {
+                let mut stream = f.body();
+                stream["stream"] = json!(true);
+                let (status, _, _) = f
+                    .post(
+                        "decisions-stream-rejected",
+                        stream,
+                        "owner-fixture-key",
+                        false,
+                    )
+                    .await;
+                assert_eq!(status, StatusCode::BAD_REQUEST);
+                assert_eq!(f.harness.status().await["publications"], 0);
+            }
+
             let (status, headers, response) = f
                 .post(
                     "all-endpoints-original",
@@ -654,12 +659,12 @@ async fn proxy_http_all_four_endpoints_pay_exact_original_once_on_all_three_rail
 }
 
 #[tokio::test]
-async fn proxy_http_async_owner_completes_without_http_wait_and_streaming_stops_before_signing() {
+async fn proxy_http_async_owner_completes_without_http_wait_and_streaming_async_rejected() {
     let mut f = Fixture::start().await;
     let mut stream = f.body();
     stream["stream"] = json!(true);
     let (status, _, _) = f
-        .post("stream-rejected", stream, "owner-fixture-key", false)
+        .post("stream-rejected", stream, "owner-fixture-key", true)
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(f.harness.backend_calls(), 0);

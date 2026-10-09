@@ -2,7 +2,8 @@
 //! encrypted/durable stores supplied by each test, and the existing signed local
 //! canonical ledger fixture. The SC-Bridge transport below is a bounded protocol
 //! double, not evidence of a real Noise relay or production deployment.
-use axum::{routing::post, Json, Router};
+use axum::{response::IntoResponse, routing::post, Json, Router};
+mod streaming;
 use ed25519_dalek::SigningKey;
 use mayhem_proto::{
     endpoint_family_contract_template,
@@ -35,6 +36,7 @@ use std::{
     },
     time::Duration,
 };
+pub(crate) use streaming::StreamBackend;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, ChildStdin, ChildStdout},
@@ -167,6 +169,7 @@ pub(crate) struct Harness {
     pub(crate) template: mayhem_proto::proxy::finance::ProxySpendAuthorization,
     peer: Peer,
     calls: Arc<AtomicUsize>,
+    pub(crate) stream_backend: Arc<StreamBackend>,
     provider_stop: watch::Sender<bool>,
     provider_ended: watch::Receiver<usize>,
     provider_task: JoinHandle<()>,
@@ -186,9 +189,12 @@ impl Harness {
         let directory = private_dir();
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
+        let stream_backend = Arc::new(StreamBackend::default());
+        let backend_stream = stream_backend.clone();
         let path = endpoint_path(endpoint);
         let app = Router::new().route(path, post(move |Json(input): Json<Value>| {
             let count = count.clone();
+            let backend_stream = backend_stream.clone();
             async move {
                 assert_eq!(input["model"], "upstream-model");
                 assert!(input.get("proxy").is_none());
@@ -207,6 +213,9 @@ impl Harness {
                     _ => (),
                 }
                 count.fetch_add(1, Ordering::SeqCst);
+                if input["stream"] == true {
+                    return streaming::response(endpoint, backend_stream);
+                }
                 Json(match endpoint {
                     ProxyEndpoint::Decisions => json!({"id":"private-upstream-id","answers":{"q":{"type":"noul","noul":0.7}}}),
                     ProxyEndpoint::Chat => json!({"id":"private-upstream-id","object":"chat.completion",
@@ -219,7 +228,7 @@ impl Harness {
                         "output":[{"id":"private-output-id","type":"message","role":"assistant",
                             "content":[{"type":"output_text","text":"hello"}]}],
                         "usage":{"input_tokens":2,"output_tokens":1,"total_tokens":3}}),
-                })
+                }).into_response()
             }
         }));
         let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -551,6 +560,7 @@ impl Harness {
             provider_ended,
             provider_task,
             backend_task,
+            stream_backend,
             _bridge: bridge,
             _directory: directory,
         }

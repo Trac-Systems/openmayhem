@@ -11,6 +11,21 @@ pub struct StreamLimits {
     pub total_events: usize,
     pub total_bytes: usize,
 }
+impl StreamLimits {
+    /// An observer that accepts every event fitting the owner's declared response
+    /// bound. Even the smallest encoded event consumes at least one byte, so
+    /// this event-count bound cannot truncate an otherwise byte-valid stream.
+    /// Queue bytes are charged separately against the controller buffer budget.
+    pub fn for_response_bytes(bytes: usize) -> Self {
+        Self {
+            queued_events: 8,
+            queued_bytes: bytes,
+            event_bytes: bytes,
+            total_events: bytes,
+            total_bytes: bytes,
+        }
+    }
+}
 /// Encoded normalized JSON, not SSE framing. No terminal event is emitted here;
 /// consumers await the controller's verified outcome before reporting completion.
 pub struct StreamEvent {
@@ -47,7 +62,9 @@ pub fn stream_channel(limits: StreamLimits) -> crate::Result<(StreamSender, Stre
             && (1..=256 * 1024 * 1024).contains(&limits.total_bytes)
             && (1..=limits.total_bytes).contains(&limits.queued_bytes)
             && (1..=limits.queued_bytes).contains(&limits.event_bytes)
-            && (1..=1_000_000).contains(&limits.total_events),
+            // JSON cannot encode a zero-byte event: the aggregate byte cap
+            // also bounds event count, even if the explicit cap is very large.
+            && limits.total_events > 0,
         "invalid buyer stream bounds",
     )?;
     let (send, receive) = mpsc::channel(limits.queued_events);
@@ -170,5 +187,96 @@ mod tests {
         let mut invalid = limits();
         invalid.queued_bytes = usize::MAX;
         assert!(stream_channel(invalid).is_err());
+    }
+    #[tokio::test]
+    async fn declared_response_bound_accepts_more_than_16384_verified_events_without_history() {
+        use crate::{
+            endpoint::{stream::Stream, Adapter, Limits, PublicAdapter},
+            worker::Decoded,
+        };
+        use mayhem_proto::proxy::ProxyEndpoint;
+        use serde_json::Value;
+        const COUNT: usize = 20_000;
+        const BOUND: usize = 8 * 1024 * 1024;
+        let adapter = Adapter::new(
+            ProxyEndpoint::Chat,
+            mayhem_proto::endpoint_family_contract_template(
+                mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+            )
+            .unwrap(),
+            "upstream".into(),
+            Limits {
+                request_bytes: 4096,
+                response_bytes: BOUND,
+                choices: 1,
+                tools: 1,
+                questions: 1,
+                decision_options: 1,
+            },
+        )
+        .unwrap();
+        let bytes = serde_json::to_vec(
+            &json!({"model":"public","messages":[{"role":"user","content":"hi"}],"stream":true}),
+        )
+        .unwrap();
+        let provider_request = adapter.prepare_stream(&bytes).unwrap();
+        let buyer_request = PublicAdapter::restore(adapter.public_snapshot())
+            .unwrap()
+            .prepare_stream(&bytes)
+            .unwrap();
+        let mut provider = Stream::new(&provider_request, "proxy_fixture", 7).unwrap();
+        let mut buyer = buyer_request.stream("proxy_fixture", 7).unwrap();
+        let (mut sender, mut receiver) =
+            stream_channel(StreamLimits::for_response_bytes(BOUND)).unwrap();
+        let raw = json!({"id":"upstream","choices":[{"index":0,"delta":{"role":"assistant","content":"x"},"finish_reason":null}]}).to_string();
+        for _ in 0..COUNT {
+            let event = provider
+                .push(Decoded::Sse {
+                    event: String::new(),
+                    data: raw.clone(),
+                    id: None,
+                })
+                .unwrap()
+                .unwrap();
+            buyer.push(&event).unwrap();
+            let encoded = sender.encode(&event).unwrap();
+            sender.send(encoded).await.unwrap();
+            let received = receiver.recv().await.unwrap();
+            assert_eq!(
+                serde_json::from_slice::<Value>(received.json_bytes()).unwrap(),
+                event
+            );
+        }
+        for value in [
+            json!({"id":"upstream","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]})
+                .to_string(),
+            "[DONE]".into(),
+        ] {
+            assert!(provider
+                .push(Decoded::Sse {
+                    event: String::new(),
+                    data: value,
+                    id: None
+                })
+                .unwrap()
+                .is_none());
+        }
+        let result = provider_request
+            .decode_json(provider.finish().unwrap(), "proxy_fixture", 7)
+            .unwrap()
+            .body;
+        buyer.verify_final(&result).unwrap();
+        assert_eq!(
+            result["choices"][0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .len(),
+            COUNT
+        );
+        assert_eq!(sender.events, COUNT);
+        assert!(sender.total < BOUND);
+        assert_eq!(sender.bytes.available_permits(), BOUND);
+        drop(sender);
+        assert!(receiver.recv().await.is_none());
     }
 }

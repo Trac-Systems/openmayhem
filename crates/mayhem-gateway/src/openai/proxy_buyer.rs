@@ -35,6 +35,8 @@ use tokio::{
     task::JoinSet,
 };
 
+mod streaming;
+
 static STORAGE: Semaphore = Semaphore::const_new(8);
 
 pub struct Runtime {
@@ -42,6 +44,7 @@ pub struct Runtime {
     policy: proxy_request::Policy,
     settlement_policy: ProxySettlementPolicy,
     slots: Arc<Semaphore>,
+    streams: Arc<Semaphore>,
     active: Arc<Mutex<BTreeSet<String>>>,
     tasks: Mutex<JoinSet<()>>,
     halt: watch::Sender<bool>,
@@ -92,6 +95,7 @@ impl Runtime {
             policy,
             settlement_policy,
             slots: Arc::new(Semaphore::new(sessions)),
+            streams: Arc::new(Semaphore::new(sessions)),
             active: Arc::new(Mutex::new(BTreeSet::new())),
             tasks: Mutex::new(JoinSet::new()),
             halt,
@@ -146,6 +150,7 @@ impl Runtime {
         state: GatewayState,
         binding: Binding,
         request: Option<buyer_controller::Request>,
+        stream: Option<buyer_controller::StreamSender>,
         claim: Claim,
     ) -> Result<oneshot::Receiver<Result<StoredGatewayJob, ApiError>>, ApiError> {
         let mut tasks = self.tasks.lock().map_err(|_| unavailable())?;
@@ -172,7 +177,15 @@ impl Runtime {
             ));
             let operation = async {
                 match request {
-                    Some(request) => runtime.controller.execute(request, stopped).await,
+                    Some(request) => match stream {
+                        Some(stream) => {
+                            runtime
+                                .controller
+                                .execute_stream(request, stream, stopped)
+                                .await
+                        }
+                        None => runtime.controller.execute(request, stopped).await,
+                    },
                     None => {
                         runtime
                             .controller
@@ -298,7 +311,7 @@ impl Runtime {
                         let binding = Binding { job_id: id, model: job.model.clone(),
                             fingerprint: job.request_fingerprint.clone(), identity: proxy.identity().clone(),
                             token: GatewayTokenAttribution { name: String::new(), token_id: owner_id.clone() } };
-                        let _ = self.launch(state.clone(), binding, None, claim);
+                        let _ = self.launch(state.clone(), binding, None, None, claim);
                     }
                 }
             }
@@ -434,14 +447,22 @@ async fn submit(
             .map_err(|_| invalid())?
             .ok_or_else(invalid)?,
     );
-    if serde_json::from_slice::<Value>(request.provider_request())
-        .map_err(|_| invalid())?
-        .get("stream")
-        .is_some_and(|v| v != &Value::Bool(false))
-    {
+    let provider_body: Value =
+        serde_json::from_slice(request.provider_request()).map_err(|_| invalid())?;
+    let streaming = match provider_body.get("stream") {
+        None | Some(Value::Bool(false)) => false,
+        Some(Value::Bool(true)) if endpoint != ProxyEndpoint::Decisions => true,
+        _ => {
+            return Err(ApiError::bad_request(
+                "unsupported proxy stream mode",
+                Some("stream"),
+            ))
+        }
+    };
+    if streaming && gateway_prefers_async_response(&headers) {
         return Err(ApiError::bad_request(
-            "this proxy buyer currently supports nonstreaming requests only",
-            Some("stream"),
+            "proxy streaming requires an attached observer; omit Prefer: respond-async",
+            Some("Prefer"),
         ));
     }
     let model = request.selector().model();
@@ -513,6 +534,11 @@ async fn submit(
     )
     .await
     .map_err(selection_error)?;
+    let stream = if streaming {
+        Some(streaming::channel(&runtime)?)
+    } else {
+        None
+    };
     let claim = runtime.claim(&id)?;
     let binding = Binding {
         job_id: id.clone(),
@@ -580,7 +606,14 @@ async fn submit(
             recipe_hash: candidate.recipe_hash,
         },
     };
-    let receiver = runtime.launch((*state).clone(), binding, Some(paid), claim)?;
+    let (sender, observer) = match stream {
+        Some((sender, receiver, permit)) => (Some(sender), Some((receiver, permit))),
+        None => (None, None),
+    };
+    let receiver = runtime.launch((*state).clone(), binding, Some(paid), sender, claim)?;
+    if let Some((events, permit)) = observer {
+        return Ok(streaming::response(&id, endpoint, events, receiver, permit));
+    }
     if gateway_prefers_async_response(&headers) {
         return Ok(gateway_job_pending_response(&id));
     }

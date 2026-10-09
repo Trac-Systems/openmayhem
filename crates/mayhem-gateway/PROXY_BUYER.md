@@ -60,7 +60,7 @@ Read/verification uses bounded concurrent storage work and a direct job lookup;
 it neither copies the completion body nor scans ledger/receipt history.
 
 This evidence interface is an integration prerequisite. It does not by itself
-activate retail proxy requests, Studio, MCP or public streaming.
+activate retail proxy requests, Studio or MCP.
 
 The gateway owner supplies a separate resolved policy revision and explicit
 epoch lifetimes. Request identity includes the authenticated buyer/key owner,
@@ -113,9 +113,9 @@ or waivers that name a different purchase or invocation.
 
 Nonstreaming Chat, Completions, Responses and Decisions use the common purchase
 path. Endpoint support is conditional on the actual offer/recipe, not the name
-of the model. Streaming remains rejected before spending authorization until its
-full dispatch, cancellation and replay semantics are accepted. Category routing,
-retail accounting and Studio/MCP invocation remain integration work.
+of the model. Streaming Chat, Completions and Responses use the same owned
+purchase path; Decisions streaming is rejected before authorization. Category
+routing, retail accounting and Studio/MCP invocation remain integration work.
 
 These paths preserve the current admitted endpoint contracts, not full upstream
 API compatibility. The default Completions contract accepts `prompt` and its
@@ -127,16 +127,57 @@ vendor-side history, conversation and background execution. Richer fields need
 explicit contract/profile admission, metering review for every prompt-bearing
 field and end-to-end verification before support can be claimed.
 
-Streaming follow-up: the provider already verifies upstream SSE, sends bounded
-provisional `Stream` messages and retains a verified final `Result`. The buyer
-still needs an independent normalized-event verifier with ordering, identity and
-byte bounds, agreement between delivered fragments and the final result, and a
-bounded event channel to HTTP. The current buyer returns only a final outcome;
-its fixed control-message loop cannot consume an arbitrary stream. Provider
-normalization withholds terminal events, so the upstream SSE parser alone is
-not a buyer stream verifier. HTTP completion must wait for verified output
-retention and the original receipt/closure path. Disconnect and reconnect must
-preserve that purchase without replaying or splicing an old fragment history.
+## Public proxy streaming
+
+Send `stream: true` to the explicit proxy Chat, Completions or Responses route.
+The first response has `Content-Type: text/event-stream`, the original
+`x-mayhem-job-id` and `Location`, and `Cache-Control: private, no-store`.
+`Prefer: respond-async` with streaming is rejected before admission; async
+nonstream requests remain supported.
+
+Deltas are provisional. The provider normalizes upstream SSE, and the buyer
+independently checks event identity, ordering, bounded content and agreement
+with the verified final result. The gateway directly polls that bounded channel;
+it does not turn a buffered JSON answer into a pretend live stream. Function
+arguments and other provisional text must not trigger tool execution or be
+interpreted as financial evidence.
+
+The channel permits eight queued events. Its per-event, aggregate queued-byte
+and total provisional-byte bounds equal the controller's configured response
+byte limit; message/frame limits and negotiated output allowance remain enforced
+independently. Event count is bounded by that byte limit (every encoded event
+costs at least one byte), rather than an unrelated fixed count. Queue capacity
+is separately charged against the controller's configured buffer budget. Each
+open observer holds a separate session permit until its body finishes or is
+dropped, including after execution ends.
+Terminal metadata is generated lazily from the bounded retained result; no chunk
+history is stored. These are application buffer bounds, not a total process RSS
+or operating-system socket-buffer guarantee.
+
+Chat/Completions finish chunks and `[DONE]`, and Responses `.done` and
+`response.completed`/`response.incomplete`, are withheld until verified output is
+durable, canonical financial closure is observed and the exact key-budget
+settlement is durable. The terminal response usage is the verified normalized
+usage; model-supplied fields never supply financial closure. On unresolved
+closure the SSE emits an `error` event with `proxy_recovery_required`, the
+original job ID and recovery URL, then ends without a success terminal.
+
+Disconnect, cancellation and shutdown stop delivery and join the owned purchase;
+they do not prove non-execution, refund a hold or dispatch another Execute.
+Use the original job URL or original idempotency key to recover. An identical
+streaming replay returns pending job JSON (202) or the retained endpoint JSON
+(200, `application/json`), with the same job headers. It never restarts SSE,
+replays old fragments or splices recovered content into a previous stream.
+Changing `stream`, body, price, rail or policy under that key conflicts. Historical
+fragments are not journaled, so restart recovery verifies only the original
+retained full result, not a persisted transcript of earlier deltas.
+
+Local acceptance covers all three streaming endpoints on FIAT/TNK/TAP using the
+real gateway router, buyer/provider controllers, isolated decoder and signed
+canonical ledger fixture. It includes a delta delivered before a gated upstream
+tail, delayed receipt publication, original-result recovery, exact replay,
+disconnect and backpressure cancellation/shutdown. These fixtures use a bounded
+bridge double; they are not real Noise-relay, live-model or mainnet evidence.
 
 ## Explicit CLI activation
 
