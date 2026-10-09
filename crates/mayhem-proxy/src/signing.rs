@@ -48,6 +48,23 @@ impl Authority {
     pub fn identity(&self) -> &Identity {
         &self.identity
     }
+    pub(crate) fn conformance(
+        &self,
+        body: crate::conformance::Body,
+    ) -> Result<crate::conformance::Signed> {
+        require(
+            self.identity.controller_pubkey == body.tester
+                && self.identity.network_id == body.network.network_id
+                && self.identity.msb_bootstrap.as_str() == body.network.msb_bootstrap
+                && self.identity.subnet_bootstrap.as_str() == body.network.subnet_bootstrap,
+            "conformance signing authority differs",
+        )?;
+        let bytes = body.signing_bytes()?;
+        Ok(crate::conformance::Signed {
+            body,
+            signature: hex(&self.key.sign(&bytes).to_bytes()),
+        })
+    }
     pub(crate) fn presence(&self, body: crate::presence::Body) -> Result<crate::presence::Signed> {
         require(
             self.identity.network_id == body.network.network_id

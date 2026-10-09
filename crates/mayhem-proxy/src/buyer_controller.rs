@@ -236,6 +236,7 @@ struct Shared {
     verifier: Arc<Pool>,
     bridge: ScBridgeConfig,
     limits: Limits,
+    conformance: std::sync::OnceLock<Arc<crate::conformance::Recorder>>,
 }
 type Slot = (Digest, u64);
 struct Guard {
@@ -342,6 +343,7 @@ impl Controller {
                 verifier,
                 bridge,
                 limits,
+                conformance: std::sync::OnceLock::new(),
             }),
             sessions: Arc::new(Semaphore::new(limits.sessions)),
             descriptor_reads: Semaphore::new(crate::descriptor::READS),
@@ -356,6 +358,24 @@ impl Controller {
     }
     pub fn identity(&self) -> &Identity {
         self.shared.signer.identity()
+    }
+    /// Called by the gateway owner during startup only. Public bodies cannot
+    /// select a store, tokenizer, signing key or observation assertion policy.
+    pub fn enable_conformance(&self, store: Arc<crate::conformance::Store>) -> crate::Result<()> {
+        if let Some(prior) = self.shared.conformance.get() {
+            return crate::require(
+                Arc::ptr_eq(prior.store(), &store),
+                "conformance recorder already configured",
+            );
+        }
+        let recorder = Arc::new(crate::conformance::Recorder::new(
+            store,
+            self.shared.signer.clone(),
+        )?);
+        self.shared
+            .conformance
+            .set(recorder)
+            .map_err(|_| crate::invalid("conformance recorder already configured"))
     }
     /// No buyer session, job, signature, reservation or negotiation is created.
     pub async fn describe(
@@ -851,13 +871,18 @@ impl Shared {
             .into_paid(self.signer.identity())
             .map_err(|_| p.error(Code::Verification))?;
         p.stage = Stage::Executing;
+        let conformance = self.conformance.get().and_then(|r| {
+            saved
+                .authorization()
+                .and_then(|a| r.begin(&a.terms, &value).ok())
+        });
         paid.send(&Message::Execute {
             request: value,
             streaming,
         })
         .await
         .map_err(|_| p.error(Code::Transport))?;
-        self.finish(paid, saved, p, stop, false, &gate, observer)
+        self.finish(paid, saved, p, stop, false, &gate, observer, conformance)
             .await
     }
 
@@ -962,7 +987,8 @@ impl Shared {
         paid.send(&Message::Status)
             .await
             .map_err(|_| p.error(Code::Transport))?;
-        self.finish(paid, saved, p, stop, true, &gate, None).await
+        self.finish(paid, saved, p, stop, true, &gate, None, None)
+            .await
     }
 
     async fn finish(
@@ -974,6 +1000,7 @@ impl Shared {
         recovery: bool,
         gate: &Arc<dyn AuthorizationGate>,
         mut observer: Option<StreamSender>,
+        mut conformance: Option<crate::conformance::capture::Capture>,
     ) -> Result<Outcome> {
         let authorization = saved
             .authorization()
@@ -1055,6 +1082,12 @@ impl Shared {
                         .unwrap()
                         .push(event)
                         .map_err(|_| p.error(Code::Verification))?;
+                    if let Some(capture) = &mut conformance {
+                        capture.delta(event);
+                        if observer.would_wait(bytes.len()) {
+                            capture.backpressure();
+                        }
+                    }
                     streamed = true;
                     tokio::select! {
                         delivered = observer.send(bytes) => { if delivered.is_err() {
@@ -1094,6 +1127,9 @@ impl Shared {
                             .map_err(|_| p.error(Code::Verification))?;
                     }
                     observed = Some(reply);
+                    if let Some(capture) = &mut conformance {
+                        capture.complete_network();
+                    }
                 }
                 Message::Failure { .. } if observed.is_none() && !failed => {
                     failed = true;
@@ -1171,6 +1207,11 @@ impl Shared {
                         .await?;
                     if !matches!(settlement, FinancialOutcome::Paid { .. }) {
                         return Err(p.error(Code::Verification));
+                    }
+                    // Telemetry failure cannot change settlement or authorize a
+                    // retry. The original verified result remains authoritative.
+                    if let Some(capture) = conformance.take() {
+                        let _ = capture.verified(&response).await;
                     }
                     return Ok(Outcome::Completed {
                         identity: p.identity.clone(),

@@ -13,6 +13,8 @@ pub(crate) struct StreamBackend {
     pub pieces: AtomicUsize,
     pub chunk_bytes: AtomicUsize,
     pub emitted: AtomicUsize,
+    pub delay_ms: AtomicUsize,
+    pub words: AtomicBool,
 }
 impl Default for StreamBackend {
     fn default() -> Self {
@@ -22,6 +24,8 @@ impl Default for StreamBackend {
             pieces: AtomicUsize::new(1),
             chunk_bytes: AtomicUsize::new(0),
             emitted: AtomicUsize::new(0),
+            delay_ms: AtomicUsize::new(0),
+            words: AtomicBool::new(false),
         }
     }
 }
@@ -39,6 +43,8 @@ pub(super) fn response(endpoint: ProxyEndpoint, control: Arc<StreamBackend>) -> 
             let terminal = n == count;
             let text = if terminal {
                 ""
+            } else if control.words.load(Ordering::SeqCst) {
+                "one two "
             } else if !large.is_empty() {
                 large.as_str()
             } else if count == 1 {
@@ -61,6 +67,10 @@ pub(super) fn response(endpoint: ProxyEndpoint, control: Arc<StreamBackend>) -> 
             let value = values.next()?;
             if count == 1 && control.paused.load(Ordering::SeqCst) {
                 control.release.acquire().await.unwrap().forget();
+            }
+            let delay = control.delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(Duration::from_millis(delay as u64)).await;
             }
             control.emitted.fetch_add(1, Ordering::SeqCst);
             let event = match value {

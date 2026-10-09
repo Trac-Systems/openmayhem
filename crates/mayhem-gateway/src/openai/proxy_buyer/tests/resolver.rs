@@ -1,7 +1,7 @@
 use super::estimation::{assert_no_purchase, ESTIMATE_CASE};
 use super::*;
 
-fn start(f: &Fixture) -> Value {
+pub(super) fn start(f: &Fixture) -> Value {
     let mut request = f.body();
     request.as_object_mut().unwrap().remove("model");
     let controls = request["proxy"].clone();
@@ -26,7 +26,7 @@ fn start(f: &Fixture) -> Value {
         "ranking":"lowest_estimated_cost","continuity":"retain_compatible"});
     json!({"schema_version":1,"kind":"start","endpoint":f.harness.adapter.endpoint(),"request":request,"previous_model":null})
 }
-async fn send(router: axum::Router, body: Value, token: &str) -> (StatusCode, Value) {
+pub(super) async fn send(router: axum::Router, body: Value, token: &str) -> (StatusCode, Value) {
     let response = router
         .oneshot(
             Request::builder()

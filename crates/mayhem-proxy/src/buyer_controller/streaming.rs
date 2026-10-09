@@ -81,6 +81,9 @@ pub fn stream_channel(limits: StreamLimits) -> crate::Result<(StreamSender, Stre
     ))
 }
 impl StreamSender {
+    pub(super) fn would_wait(&self, bytes: usize) -> bool {
+        self.bytes.available_permits() < bytes || self.send.capacity() == 0
+    }
     pub(super) fn charge(&mut self, permit: OwnedSemaphorePermit) {
         self.accounting = Some(Arc::new(permit));
     }

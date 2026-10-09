@@ -231,11 +231,9 @@ impl Request {
         let controls: Controls = serde_json::from_value(controls).map_err(|_| Error::Invalid)?;
         if let Some(pin) = &controls.registry_release {
             pin.validate()?;
-            if controls
-                .profile
-                .as_ref()
-                .is_none_or(|p| p.constraints.request_controls.is_empty())
-            {
+            if controls.profile.as_ref().is_none_or(|p| {
+                p.constraints.request_controls.is_empty() && p.constraints.capabilities.is_empty()
+            }) {
                 return Err(Error::Invalid);
             }
         }
@@ -377,7 +375,7 @@ impl Request {
             profile
                 .check_offer(candidate, self.endpoint, self.controls.rail)
                 .map_err(|_| Error::Constraints)?;
-            if profile.requires_observation_resolution() {
+            if super::proxy_buyer::evidence::unsupported(profile) {
                 return Err(Error::ProfileEvidence);
             }
         }

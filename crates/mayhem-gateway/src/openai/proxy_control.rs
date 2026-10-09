@@ -58,6 +58,8 @@ pub struct Config {
     /// Administrative semantics only; never provider evidence or a request URL.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registry: Option<RegistryConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conformance: Option<mayhem_proxy::conformance::Config>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -198,6 +200,14 @@ impl Prepared {
             .as_ref()
             .map(RegistryConfig::reader)
             .transpose()?;
+        if let Some(evidence) = &mut config.conformance {
+            evidence.validate().map_err(|_| Error::Configuration)?;
+            if let Some(tokenizer) = &mut evidence.tokenizer {
+                if tokenizer.file.is_relative() {
+                    tokenizer.file = parent.join(&tokenizer.file);
+                }
+            }
+        }
         Ok(Self {
             config,
             bridge,
@@ -239,6 +249,19 @@ impl Prepared {
             .select(self.config.selected_markets)
             .map_err(|_| Error::Configuration)?;
         let (catalog_updates, catalog_health) = watch::channel(supervisor::Health::default());
+        let conformance = self
+            .config
+            .conformance
+            .map(|c| {
+                mayhem_proxy::conformance::Store::open(
+                    &self.config.state_dir.join("proxy-conformance.redb"),
+                    self.config.network.clone(),
+                    c,
+                )
+                .map(Arc::new)
+                .map_err(|_| Error::Configuration)
+            })
+            .transpose()?;
         let (failure_updates, failure) = watch::channel(None);
         let control = Arc::new(ProxyControl {
             catalog,
@@ -247,6 +270,7 @@ impl Prepared {
             failure,
             running: Arc::new(AtomicBool::new(false)),
             registry: self.registry,
+            conformance,
         });
         let lifecycle = ProxyLifecycle {
             control: control.clone(),
@@ -296,6 +320,7 @@ pub struct ProxyControl {
     failure: watch::Receiver<Option<&'static str>>,
     running: Arc<AtomicBool>,
     registry: Option<Arc<RegistryReader>>,
+    conformance: Option<Arc<mayhem_proxy::conformance::Store>>,
 }
 
 impl fmt::Debug for ProxyControl {
@@ -316,6 +341,9 @@ pub struct Health {
 }
 
 impl ProxyControl {
+    pub fn conformance(&self) -> Option<&Arc<mayhem_proxy::conformance::Store>> {
+        self.conformance.as_ref()
+    }
     pub(crate) fn registry(&self) -> Option<&Arc<RegistryReader>> {
         self.registry.as_ref()
     }

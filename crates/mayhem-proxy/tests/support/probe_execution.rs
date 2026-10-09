@@ -7,27 +7,28 @@ use mayhem_proxy::{
 };
 
 pub(super) fn setup(f: &Fixture) -> (Arc<capacity::Authority>, health::Monitor) {
-    setup_policy(f, None)
+    setup_policy(f, None, None)
 }
 pub(super) fn setup_measured(
     f: &Fixture,
     tokenizer: Digest,
 ) -> (Arc<capacity::Authority>, health::Monitor) {
-    setup_policy(f, Some(tokenizer))
+    setup_policy(f, Some(tokenizer), None)
 }
 fn setup_policy(
     f: &Fixture,
     tokenizer: Option<Digest>,
+    identity: Option<Identity>,
 ) -> (Arc<capacity::Authority>, health::Monitor) {
     let a = Arc::new(
         capacity::Authority::open(
             f._store.path().join("probe-capacity"),
-            Identity {
+            identity.unwrap_or_else(|| Identity {
                 network_id: "918".into(),
                 msb_bootstrap: d(1),
                 subnet_bootstrap: d(2),
                 controller_pubkey: d(3),
-            },
+            }),
             capacity::Limits {
                 max_groups: 4,
                 max_routes: 8,
@@ -151,6 +152,115 @@ fn probe_counts(a: &capacity::Authority, expected: u32) {
         assert_eq!(a.group_status(&d(group)).unwrap().occupied, expected);
     }
     assert_eq!(a.status(&d(20)).unwrap().route_occupied, expected);
+}
+
+#[tokio::test]
+async fn actual_probe_completion_can_only_be_retained_for_its_exact_self_test_identity() {
+    use mayhem_proxy::{
+        conformance::{self, Class, Lookup, Provenance, Subject},
+        signing::Authority,
+    };
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let key = ed25519_dalek::SigningKey::from_bytes(&[121; 32]);
+    let public = key
+        .verifying_key()
+        .to_bytes()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>();
+    let identity = Identity {
+        network_id: "918".into(),
+        msb_bootstrap: d(1),
+        subnet_bootstrap: d(2),
+        controller_pubkey: Digest::new(public).unwrap(),
+    };
+    let signer = Arc::new(Authority::from_unlocked_wallet(key, identity.clone()).unwrap());
+    let network = mayhem_proxy::discovery::Identity {
+        network_id: "918".into(),
+        msb_bootstrap: d(1).as_str().into(),
+        subnet_bootstrap: d(2).as_str().into(),
+        contract_version: mayhem_proto::CONTRACT_VERSION,
+    };
+    let store = Arc::new(
+        conformance::Store::open(
+            &f._store.path().join("conformance"),
+            network,
+            conformance::Config {
+                schema_version: 1,
+                tester: identity.controller_pubkey.clone(),
+                ttl_ms: 60000,
+                maximum_records: 8,
+                maximum_bytes: 8 * 16384,
+                minimum_interval_tokens: 2,
+                minimum_interval_us: 1000,
+                mappings: vec![],
+                tokenizer: None,
+            },
+        )
+        .unwrap(),
+    );
+    let recorder = Arc::new(conformance::Recorder::new(store.clone(), signer).unwrap());
+    let (authority, monitor) = setup_policy(&f, None, Some(identity.clone()));
+    let request = bounded(
+        serde_json::from_slice(&chat()).unwrap(),
+        ProxyEndpoint::Chat,
+    );
+    let result = controller(
+        &f,
+        authority.clone(),
+        monitor,
+        &request,
+        false,
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .run()
+    .await
+    .unwrap();
+    let fixture: Value =
+        serde_json::from_str(include_str!("../fixtures/routing-profiles-v1.json")).unwrap();
+    let mut offer: mayhem_proto::proxy::ProxyOffer =
+        serde_json::from_value(fixture["cases"][0]["publication"]["offer"].clone()).unwrap();
+    offer.provider_pubkey = identity.controller_pubkey.as_str().into();
+    let subject = Subject::new(
+        &offer,
+        f.adapter.contract_hash().clone(),
+        f.adapter.recipe_hash().clone(),
+        f.connection.revision(),
+    )
+    .unwrap();
+    recorder
+        .retain_probe(subject.clone(), &result.conformance)
+        .await
+        .unwrap();
+    let Lookup::Present(record) = store
+        .lookup(
+            &subject,
+            &Class::request(&serde_json::from_slice::<Value>(&request).unwrap()).unwrap(),
+        )
+        .unwrap()
+    else {
+        panic!("probe completion missing")
+    };
+    record.verify().unwrap();
+    assert_eq!(record.body.provenance, Provenance::ProviderSelfTest);
+    assert!(record.body.speed.is_none());
+    assert_eq!(record.body.session, result.probe);
+    let mut wrong = subject.clone();
+    wrong.connection_revision += 1;
+    assert!(recorder
+        .retain_probe(wrong, &result.conformance)
+        .await
+        .is_err());
+    let mut wrong = subject;
+    wrong.provider = d(44);
+    assert!(recorder
+        .retain_probe(wrong, &result.conformance)
+        .await
+        .is_err());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    probe_counts(&authority, 0);
 }
 
 pub(super) fn vllm_refusal(prefill: bool) -> Value {

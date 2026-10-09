@@ -173,6 +173,7 @@ struct Best {
     published: PublishedOffer,
     score: MoneyAu,
     maximum_retail_cost_micro: Option<MoneyAu>,
+    evidence: Option<mayhem_proxy::conformance::Signed>,
 }
 enum Checked {
     Ready(Best),
@@ -468,10 +469,17 @@ async fn start(
     if controls.settlement_policy_hash != *runtime.policy.settlement_policy_hash() {
         return Err(error("proxy_settlement_policy_mismatch", false));
     }
-    if profile.requires_observation_resolution() || controls.require_verified_operator {
+    if super::evidence::unsupported(profile) || controls.require_verified_operator {
         return Err(error("proxy_profile_evidence_unavailable", true));
     }
-    if matches!(profile.ranking, Ranking::PreferredSpeed) {
+    if matches!(profile.ranking, Ranking::PreferredSpeed)
+        && (endpoint == ProxyEndpoint::Decisions
+            || body["stream"] != true
+            || state
+                .proxy_control()
+                .and_then(|c| c.conformance())
+                .is_none())
+    {
         return Err(error("proxy_profile_speed_ranking_unavailable", true));
     }
     if let Some(model) = &previous {
@@ -484,7 +492,9 @@ async fn start(
         return Err(invalid());
     }
     let control = state.proxy_control().cloned().ok_or_else(unavailable)?;
-    if !profile.constraints.request_controls.is_empty() {
+    if !profile.constraints.request_controls.is_empty()
+        || !profile.constraints.capabilities.is_empty()
+    {
         let reader = control
             .registry()
             .ok_or_else(|| error("proxy_profile_evidence_unavailable", true))?;
@@ -574,11 +584,49 @@ impl Session {
             Checked::Pending(_) => unreachable!("pending evidence never consumes a candidate"),
             Checked::Excluded(code, unknown) => self.exclude(code, unknown),
             Checked::Ready(best) => {
-                if self
-                    .best
-                    .as_ref()
-                    .is_none_or(|old| better(best.score, &best.model, old.score, &old.model))
-                {
+                if matches!(
+                    self.controls.profile.as_ref().unwrap().ranking,
+                    Ranking::PreferredSpeed
+                ) {
+                    if let (Some(a), Some(b)) = (
+                        best.evidence.as_ref(),
+                        self.best.as_ref().and_then(|b| b.evidence.as_ref()),
+                    ) {
+                        if a.body.class != b.body.class
+                            || !a
+                                .body
+                                .speed
+                                .as_ref()
+                                .unwrap()
+                                .comparable(b.body.speed.as_ref().unwrap())
+                        {
+                            self.exclude("speed_evidence_incomparable", true);
+                            return;
+                        }
+                    }
+                }
+                if let Some(record) = &best.evidence {
+                    self.expires_at_ms = self.expires_at_ms.min(record.body.expires_at_ms);
+                }
+
+                if self.best.as_ref().is_none_or(|old| {
+                    match (
+                        best.evidence.as_ref().and_then(|r| r.body.speed.as_ref()),
+                        old.evidence.as_ref().and_then(|r| r.body.speed.as_ref()),
+                    ) {
+                        (Some(a), Some(b))
+                            if matches!(
+                                self.controls.profile.as_ref().unwrap().ranking,
+                                Ranking::PreferredSpeed
+                            ) =>
+                        {
+                            a.faster_than(b)
+                                || (!b.faster_than(a)
+                                    && better(best.score, &best.model, old.score, &old.model))
+                        }
+                        _ => better(best.score, &best.model, old.score, &old.model),
+                    }
+                }) {
                     self.best = Some(best);
                 }
             }
@@ -600,7 +648,7 @@ fn status(s: &Session, status: &str, exhausted: bool, selection: Option<Value>) 
         "started_at_ms":s.started_at_ms,"retention_expires_at_ms":s.expires_at_ms,
         "scope_exhausted":exhausted,"considered_candidates":s.considered,"scanned_candidates":s.scanned,
         "index_reads":s.index_reads,"exclusions":s.exclusions,"unresolved_candidates":s.unknown,
-        "ranking_basis":if s.retail_ranking.is_some() {"maximum_retail_micro"} else {"maximum_wholesale_au"},"ranking_claim":if status == "selected" {"lowest_maximum_among_validated_candidates"} else if status == "retained_compatible" {"continuity_retention"} else {"none"},
+        "ranking_basis":if matches!(s.controls.profile.as_ref().unwrap().ranking, Ranking::PreferredSpeed) {"locally_tokenized_generation_rate"} else if s.retail_ranking.is_some() {"maximum_retail_micro"} else {"maximum_wholesale_au"},"ranking_claim":if status == "selected" {if matches!(s.controls.profile.as_ref().unwrap().ranking, Ranking::PreferredSpeed) {"highest_observed_comparable_rate"} else {"lowest_maximum_among_validated_candidates"}} else if status == "retained_compatible" {"continuity_retention"} else {"none"},
         "retail_pricing":if s.retail_ranking.is_some() {"applied_projection"} else {"not_applied"},"retail_ranking":s.retail_ranking,"authorizes_execution":false,"selection":selection,
         "pending_reason":if status == "pending" { s.pending_reason } else { None },"retry_after_ms":if status == "pending" {500} else {0}})
 }
@@ -638,6 +686,11 @@ async fn advance(
                 if let Some(published) = published {
                     match check(state, runtime, session, published).await {
                         Checked::Ready(best) => {
+                            if let Some(record) = &best.evidence {
+                                session.expires_at_ms =
+                                    session.expires_at_ms.min(record.body.expires_at_ms);
+                            }
+
                             session.best = Some(best);
                             let selected = finish(state, session).await?;
                             session.complete = true;
@@ -900,7 +953,7 @@ async fn check(
         request.provider_value().clone()
     } else {
         match super::profile::materialize(
-            control,
+            control.clone(),
             request.clone(),
             adapter.clone(),
             selected.candidate.offer.clone(),
@@ -950,7 +1003,13 @@ async fn check(
         },
         None => None,
     };
+    let evidence = match super::evidence::check(control.clone(), request.clone(), &published).await
+    {
+        Ok(value) => value,
+        Err(_) => return Checked::Excluded("conformance_evidence_unavailable", true),
+    };
     Checked::Ready(Best {
+        evidence,
         score: maximum_retail_cost_micro.unwrap_or(maximum.max_spend_au),
         maximum_retail_cost_micro,
         model,
@@ -980,6 +1039,12 @@ async fn finish(state: &SharedState, session: &Session) -> Result<Value, ApiErro
         || latest.availability.status != Eligibility::Available
         || now < session.started_at_ms
         || now >= session.expires_at_ms
+    {
+        return Err(unavailable());
+    }
+    let evidence =
+        super::evidence::check(control.clone(), best.request.clone(), &latest.published).await?;
+    if best.evidence.as_ref().map(|r| r.digest().ok()) != evidence.as_ref().map(|r| r.digest().ok())
     {
         return Err(unavailable());
     }

@@ -10,6 +10,7 @@ use crate::{
     connector::failure::{Code, Failure, Scope},
     supervisor::{RefreshPolicy, Schedule},
 };
+pub(crate) use measurement::meaningful;
 pub use measurement::{Measurement, Sample};
 use serde::{Deserialize, Serialize};
 use std::{

@@ -10,7 +10,7 @@ impl Fixture {
     async fn stream_post(&self, key: &str) -> Response {
         self.stream_post_body(key, self.stream_body()).await
     }
-    async fn stream_post_body(&self, key: &str, body: Value) -> Response {
+    pub(super) async fn stream_post_body(&self, key: &str, body: Value) -> Response {
         self.router
             .clone()
             .oneshot(
@@ -36,7 +36,7 @@ fn payloads(bytes: &[u8]) -> Vec<Value> {
         .map(|line| serde_json::from_str(line).unwrap())
         .collect()
 }
-async fn collect(body: Body) -> Vec<u8> {
+pub(super) async fn collect(body: Body) -> Vec<u8> {
     tokio::time::timeout(Duration::from_secs(20), to_bytes(body, 2 * 1024 * 1024))
         .await
         .unwrap()

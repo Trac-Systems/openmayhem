@@ -6539,6 +6539,7 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/v1/proxy/offers", get(proxy_directory::list))
         .route("/v1/proxy/families/lookup", post(proxy_families::lookup))
         .route("/v1/proxy/buyer-policy", get(proxy_buyer::buyer_policy))
+        .route("/v1/proxy/conformance", get(proxy_buyer::conformance_policy))
         .route("/v1/proxy/estimate", post(proxy_buyer::estimate))
         .route("/v1/proxy/profile/prepare", post(proxy_buyer::prepare_profile))
         .route("/v1/proxy/profile/resolve", post(proxy_buyer::resolve_profile))

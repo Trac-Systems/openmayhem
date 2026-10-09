@@ -1,4 +1,5 @@
 mod buyer_policy;
+mod conformance;
 mod contract;
 mod estimation;
 mod local_lab;
@@ -81,12 +82,34 @@ impl Fixture {
         registry: Option<crate::openai::proxy_control::RegistryConfig>,
         resolution_limits: Option<ProfileResolutionLimits>,
     ) -> Self {
+        Self::start_evidence(
+            endpoint,
+            rail,
+            retail,
+            owner_key,
+            contract,
+            registry,
+            resolution_limits,
+            None,
+        )
+        .await
+    }
+    async fn start_evidence(
+        endpoint: ProxyEndpoint,
+        rail: ProxyRail,
+        retail: Option<RetailAuthorizationConfig>,
+        owner_key: &str,
+        contract: Option<mayhem_proto::EndpointFamilyContract>,
+        registry: Option<crate::openai::proxy_control::RegistryConfig>,
+        resolution_limits: Option<ProfileResolutionLimits>,
+        mut evidence: Option<mayhem_proxy::conformance::Config>,
+    ) -> Self {
         let harness =
             Harness::start_with_contract(&support::worker_path(), endpoint, rail, contract).await;
-        let control = match registry {
-            Some(registry) => harness.control_with_registry(Some(registry)).await,
-            None => harness.control().await,
-        };
+        if let Some(config) = &mut evidence {
+            config.tester = harness.buyer.identity().controller_pubkey.clone();
+        }
+        let control = harness.control_with_evidence(registry, evidence).await;
         let directory = support::private_dir();
         let policy = proxy_request::Policy::new(
             support::digest(1),

@@ -66,7 +66,10 @@ impl Drop for Registry {
 }
 impl Registry {
     pub(super) async fn start() -> Self {
-        let (release, document) = publication(None, temperature(1));
+        Self::with_definition(temperature(1)).await
+    }
+    pub(super) async fn with_definition(definition: Definition) -> Self {
+        let (release, document) = publication(None, definition);
         let state = Arc::new(Mutex::new(RegistryState {
             head: release.clone(),
             releases: BTreeMap::from([(release.release_id.clone(), (release, document))]),
@@ -172,7 +175,7 @@ impl Registry {
             .insert(release.release_id.clone(), (release, document));
     }
 }
-fn body(f: &Fixture) -> Value {
+pub(super) fn body(f: &Fixture) -> Value {
     let mut body = f.body();
     let controls = body["proxy"].clone();
     body["messages"] = json!([{"role":"user","content":"Hello 🧠 𐀀"}]);
@@ -186,7 +189,7 @@ fn body(f: &Fixture) -> Value {
         "ranking":"lowest_estimated_cost","continuity":"retain_compatible"});
     body
 }
-async fn prepare(f: &Fixture, body: Value, token: &str) -> (StatusCode, Value) {
+pub(super) async fn prepare(f: &Fixture, body: Value, token: &str) -> (StatusCode, Value) {
     let response=f.router.clone().oneshot(Request::builder().method("POST").uri("/v1/proxy/profile/prepare")
         .header("content-type","application/json").header("authorization",format!("Bearer {token}"))
         .body(Body::from(serde_json::to_vec(&json!({"schema_version":1,"endpoint":"openai_chat_completions","request":body})).unwrap())).unwrap()).await.unwrap();

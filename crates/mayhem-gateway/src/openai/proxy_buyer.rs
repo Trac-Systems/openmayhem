@@ -38,12 +38,14 @@ use tokio::{
 
 mod contract;
 mod estimation;
+pub(super) mod evidence;
 mod profile;
 mod resolver;
 mod retail;
 mod streaming;
 pub(super) use contract::handle as contract;
 pub(super) use estimation::handle as estimate;
+pub(super) use evidence::policy as conformance_policy;
 pub(super) use profile::handle as prepare_profile;
 pub(super) use resolver::handle as resolve_profile;
 pub use resolver::Limits as ProfileResolutionLimits;
@@ -159,6 +161,11 @@ impl Runtime {
             return Err(
                 "paid proxy requires the same wallet, durable jobs/budgets and discovery".into(),
             );
+        }
+        if let Some(store) = state.proxy_control.as_ref().and_then(|c| c.conformance()) {
+            self.controller
+                .enable_conformance(store.clone())
+                .map_err(|_| "proxy conformance owner differs")?;
         }
         Ok(())
     }
@@ -650,13 +657,46 @@ async fn submit(
     )
     .await
     .map_err(selection_error)?;
-    profile::validate_admission(&runtime, state.proxy_control.as_ref().ok_or_else(unavailable)?.clone(),
-        request.clone(), &candidate).await?;
+    profile::validate_admission(
+        &runtime,
+        state
+            .proxy_control
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .clone(),
+        request.clone(),
+        &candidate,
+    )
+    .await?;
     let stream = if streaming {
         Some(streaming::channel(&runtime)?)
     } else {
         None
     };
+    let owner = Arc::new(Owner::new(
+        state.jobs.clone(),
+        state.access_control.clone(),
+        binding.clone(),
+    ));
+    let gate: Arc<dyn buyer_controller::AuthorizationGate> = match retail {
+        Some(correlation) => Arc::new(retail::Gate {
+            owner,
+            authority: runtime.retail.as_ref().unwrap().clone(),
+            correlation,
+            job: id.clone(),
+        }),
+        None => owner,
+    };
+    let gate = evidence::gate(
+        state
+            .proxy_control
+            .as_ref()
+            .ok_or_else(unavailable)?
+            .clone(),
+        request.clone(),
+        gate,
+    )
+    .await?;
     let claim = runtime.claim(&id)?;
     let jobs = state.jobs.clone();
     let begin = binding.clone();
@@ -698,20 +738,6 @@ async fn submit(
         offer: candidate.offer,
         rail: request.controls().rail,
         settlement_policy_hash: request.controls().settlement_policy_hash.clone(),
-    };
-    let owner = Arc::new(Owner::new(
-        state.jobs.clone(),
-        state.access_control.clone(),
-        binding.clone(),
-    ));
-    let gate: Arc<dyn buyer_controller::AuthorizationGate> = match retail {
-        Some(correlation) => Arc::new(retail::Gate {
-            owner,
-            authority: runtime.retail.as_ref().unwrap().clone(),
-            correlation,
-            job: id.clone(),
-        }),
-        None => owner,
     };
     let paid = buyer_controller::Request {
         context,

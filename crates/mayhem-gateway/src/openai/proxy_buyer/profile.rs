@@ -31,11 +31,9 @@ fn unavailable_controls() -> ApiError {
     selection_error(proxy_request::Error::ProfileEvidence)
 }
 fn has_controls(request: &proxy_request::Request) -> bool {
-    request
-        .controls()
-        .profile
-        .as_ref()
-        .is_some_and(|p| !p.constraints.request_controls.is_empty())
+    request.controls().profile.as_ref().is_some_and(|p| {
+        !p.constraints.request_controls.is_empty() || !p.constraints.capabilities.is_empty()
+    })
 }
 
 /// Resolves one immutable release and exact closure. CPU work retains its permit
@@ -55,7 +53,10 @@ pub(super) async fn materialize(
         .profile
         .as_ref()
         .ok_or_else(invalid_controls)?;
-    if policy.requires_observation_resolution() || policy.constraints.request_controls.is_empty() {
+    if super::evidence::unsupported(policy)
+        || (policy.constraints.request_controls.is_empty()
+            && policy.constraints.capabilities.is_empty())
+    {
         return Err(unavailable_controls());
     }
     let reader = control.registry().ok_or_else(unavailable_controls)?;
@@ -81,6 +82,10 @@ pub(super) async fn materialize(
             field_id: c.field_id.clone(),
             schema_revision: c.schema_revision,
         })
+        .chain(policy.constraints.capabilities.iter().map(|p| Reference {
+            field_id: p.field_id.clone(),
+            schema_revision: p.schema_revision,
+        }))
         .collect::<Vec<_>>();
     let definitions = reader
         .resolve_closure(&pin, &references)
@@ -140,6 +145,10 @@ pub(super) async fn validate(
     adapter: PublicAdapterSnapshot,
     offer: mayhem_proto::proxy::ProxyOffer,
 ) -> Result<(), ApiError> {
+    let selected = proxy_request::resolve_estimate(control.clone(), request.clone())
+        .await
+        .map_err(selection_error)?;
+    super::evidence::check(control.clone(), request.clone(), &selected.published).await?;
     if !has_controls(&request) {
         return Ok(());
     }
@@ -162,7 +171,13 @@ pub(super) async fn validate_admission(
     request: Arc<proxy_request::Request>,
     candidate: &proxy_request::Candidate,
 ) -> Result<(), ApiError> {
-    if !has_controls(&request) {
+    if !has_controls(&request)
+        && request
+            .controls()
+            .profile
+            .as_ref()
+            .is_none_or(|p| !super::evidence::needed(p))
+    {
         return Ok(());
     }
     tokio::time::timeout(DEADLINE, async {
@@ -280,11 +295,11 @@ async fn read(state: SharedState, http: HttpRequest) -> Result<Response, ApiErro
         true,
     )
     .await?;
-    let latest = proxy_request::resolve_estimate(control, request.clone())
+    let latest = proxy_request::resolve_estimate(control.clone(), request.clone())
         .await
         .map_err(selection_error)?;
     let now = super::super::now_millis_u64();
-    let expires = selected.expires_at_ms.min(latest.expires_at_ms);
+    let mut expires = selected.expires_at_ms.min(latest.expires_at_ms);
     if selected.network != latest.network
         || selected.published.digest != latest.published.digest
         || selected.published.membership != latest.published.membership
@@ -295,6 +310,19 @@ async fn read(state: SharedState, http: HttpRequest) -> Result<Response, ApiErro
     let content = retail::request_content_digest(&body).map_err(|_| invalid_controls())?;
     let mut controls = request.controls().clone();
     controls.registry_release = Some(registry_release.clone());
+    let mut prepared = body.clone();
+    prepared["proxy"] = serde_json::to_value(&controls).map_err(|_| invalid_controls())?;
+    let prepared = Arc::new(
+        proxy_request::Request::parse(request.endpoint(), prepared, request.policy())
+            .map_err(selection_error)?
+            .ok_or_else(invalid_controls)?,
+    );
+    if let Some(record) = super::evidence::check(control, prepared, &latest.published).await? {
+        expires = expires.min(record.body.expires_at_ms);
+        if expires <= now {
+            return Err(unavailable_controls());
+        }
+    }
     let controls_bytes = mayhem_proto::stable_json_bytes(
         &serde_json::to_value(&controls).map_err(|_| invalid_controls())?,
     )

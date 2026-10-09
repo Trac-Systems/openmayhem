@@ -51,6 +51,7 @@ fn config(dir: &Path, rpc: String, bridge: String) -> PathBuf {
         refresh: refresh_policy(),
         rpc_timeout_ms: 500,
         registry: None,
+        conformance: None,
     };
     let path = dir.join("gateway.json");
     write(&path, &serde_json::to_vec(&config).unwrap());

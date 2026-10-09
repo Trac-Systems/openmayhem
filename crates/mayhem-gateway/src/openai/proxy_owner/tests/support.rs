@@ -637,6 +637,10 @@ impl Harness {
         }
     }
     pub(crate) async fn prepare(&self) -> PreparedPurchase {
+        self.prepare_connection(Digest::new(&self.template.terms.connection_digest).unwrap())
+            .await
+    }
+    pub(crate) async fn prepare_connection(&self, connection_digest: Digest) -> PreparedPurchase {
         let t = &self.template.terms;
         let quote = self
             .financial
@@ -662,7 +666,7 @@ impl Harness {
                 &SessionBinding {
                     session_id: Digest::new(&t.session_id).unwrap(),
                     reservation_id: Digest::new(&t.reservation_id).unwrap(),
-                    connection_digest: Digest::new(&t.connection_digest).unwrap(),
+                    connection_digest,
                     capacity_lease: Digest::new(&t.capacity_lease).unwrap(),
                 },
             )
@@ -758,7 +762,17 @@ impl Harness {
     pub(crate) async fn control(&self) -> ControlFixture {
         self.control_with_registry(None).await
     }
-    pub(crate) async fn control_with_registry(&self, registry: Option<crate::openai::proxy_control::RegistryConfig>) -> ControlFixture {
+    pub(crate) async fn control_with_registry(
+        &self,
+        registry: Option<crate::openai::proxy_control::RegistryConfig>,
+    ) -> ControlFixture {
+        self.control_with_evidence(registry, None).await
+    }
+    pub(crate) async fn control_with_evidence(
+        &self,
+        registry: Option<crate::openai::proxy_control::RegistryConfig>,
+        conformance: Option<mayhem_proxy::conformance::Config>,
+    ) -> ControlFixture {
         use crate::openai::proxy_control::{self, Prepared};
         use mayhem_proxy::{health, presence, supervisor::RefreshPolicy};
         let directory = private_dir();
@@ -793,6 +807,7 @@ impl Harness {
             refresh: refresh.clone(),
             rpc_timeout_ms: 2000,
             registry,
+            conformance,
         };
         let path = directory.path().join("control.json");
         protected(&path, &serde_json::to_vec(&config).unwrap());

@@ -158,7 +158,7 @@ async fn estimate(
     .map_err(|_| failure("proxy_estimate_unavailable", true))??;
     // Descriptor/network awaits cannot renew catalog freshness or substitute a
     // newer offer, membership, recipe or price into the estimate.
-    let latest = proxy_request::resolve_estimate(control, request.clone())
+    let latest = proxy_request::resolve_estimate(control.clone(), request.clone())
         .await
         .map_err(selection_error)?;
     if latest.network != selected.network
@@ -169,6 +169,11 @@ async fn estimate(
     }
     let now = super::super::now_millis_u64();
     let mut expires = selected.expires_at_ms.min(latest.expires_at_ms);
+    if let Some(record) =
+        super::evidence::check(control, request.clone(), &latest.published).await?
+    {
+        expires = expires.min(record.body.expires_at_ms);
+    }
     if latest.availability.status == mayhem_proxy::presence::Eligibility::Available {
         expires = expires.min(
             latest

@@ -48,6 +48,25 @@ pub struct Controller {
 pub struct Outcome {
     pub probe: Digest,
     pub evidence: Digest,
+    pub conformance: Conformance,
+}
+
+/// Sealed actual decoder result. It is not deserializable and contains no prompt,
+/// credential, upstream URL or generic caller-supplied capability observations.
+pub struct Conformance {
+    pub(crate) network: crate::discovery::Identity,
+    pub(crate) provider: Digest,
+    pub(crate) endpoint: mayhem_proto::proxy::ProxyEndpoint,
+    pub(crate) contract: Digest,
+    pub(crate) recipe: Digest,
+    pub(crate) connection: Digest,
+    pub(crate) connection_revision: u64,
+    pub(crate) request_hash: Digest,
+    pub(crate) probe: Digest,
+    pub(crate) result: Digest,
+    pub(crate) class: crate::conformance::Class,
+    pub(crate) assertions: Vec<crate::conformance::Assertion>,
+    pub(crate) completed: std::time::Instant,
 }
 
 impl Controller {
@@ -301,6 +320,42 @@ impl Controller {
                     observation.publish();
                 }
                 Ok(Outcome {
+                    conformance: Conformance {
+                        network: crate::discovery::Identity {
+                            network_id: self.authority.identity().network_id.clone(),
+                            msb_bootstrap: self.authority.identity().msb_bootstrap.as_str().into(),
+                            subnet_bootstrap: self
+                                .authority
+                                .identity()
+                                .subnet_bootstrap
+                                .as_str()
+                                .into(),
+                            contract_version: mayhem_proto::CONTRACT_VERSION,
+                        },
+                        provider: self.authority.identity().controller_pubkey.clone(),
+                        endpoint: self.adapter.endpoint(),
+                        contract: self.adapter.contract_hash().clone(),
+                        recipe: self.adapter.recipe_hash().clone(),
+                        connection: self.specification.connection_digest.clone(),
+                        connection_revision: self.specification.connection_revision,
+                        request_hash: self.request.request_hash().clone(),
+                        probe: probe.id.clone(),
+                        result: evidence.clone(),
+                        class: crate::conformance::Class::request(
+                            &serde_json::from_slice(self.request.body())
+                                .map_err(|_| ProbeError::Configuration)?,
+                        )
+                        .map_err(|_| ProbeError::Configuration)?,
+                        assertions: crate::conformance::capture::assertions(
+                            self.streaming,
+                            matches!(
+                                self.request.semantic_policy().output,
+                                crate::semantics::Output::JsonSchema { .. }
+                            ),
+                            &reply.body,
+                        ),
+                        completed: std::time::Instant::now(),
+                    },
                     probe: probe.id,
                     evidence,
                 })

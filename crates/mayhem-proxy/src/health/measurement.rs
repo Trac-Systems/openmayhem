@@ -214,7 +214,7 @@ impl Drop for Sample {
 fn text(v: Option<&Value>) -> bool {
     v.and_then(Value::as_str).is_some_and(|s| !s.is_empty())
 }
-fn meaningful(value: &Value) -> bool {
+pub(crate) fn meaningful(value: &Value) -> bool {
     if value
         .get("type")
         .and_then(Value::as_str)
