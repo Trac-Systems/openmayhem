@@ -102,13 +102,16 @@ pub fn error_code(error: &Error) -> &'static str {
     }
 }
 
-struct Schedule {
+pub(crate) struct Schedule {
     policy: RefreshPolicy,
     state: u64,
 }
 
 impl Schedule {
-    fn jitter(&mut self, delay: u64) -> u64 {
+    pub(crate) fn new(policy: RefreshPolicy, state: u64) -> Self {
+        Self { policy, state }
+    }
+    pub(crate) fn jitter(&mut self, delay: u64) -> u64 {
         // Scheduling noise is not a contract input or security randomness. The
         // caller's seed makes tests reproducible and desynchronizes controllers.
         self.state = self
@@ -122,7 +125,7 @@ impl Schedule {
             .max(1)
     }
 
-    fn retry(&mut self, failures: u32) -> u64 {
+    pub(crate) fn retry(&mut self, failures: u32) -> u64 {
         let multiplier = 1u64 << failures.saturating_sub(1).min(32);
         let base = self
             .policy

@@ -3,6 +3,7 @@
 //! free its capacity or make an unknown job safe to repeat.
 mod approvals;
 mod reservations;
+pub mod runner;
 use super::*;
 use crate::attempts;
 use approvals::Acknowledgment;
@@ -134,14 +135,8 @@ impl Observation {
             "financial outcome already resolved",
         )?;
         let a = self.accepted();
-        let t = &a.authorization.terms;
         require(
-            a.settlement_policy.hold_expiry
-                == Some(ProxyHoldExpiry::ReleaseUnfinalizedAndBlockRetry)
-                && self.wire.context.epoch
-                    > t.reservation_expires_after_epoch
-                        .checked_add(t.reservation_receipt_grace_epochs)
-                        .ok_or_else(|| invalid("invalid expiry deadline"))?,
+            self.expiry_eligible()?,
             "accepted expiry policy or canonical deadline not satisfied",
         )?;
         self.reserved_binding()?;
@@ -155,6 +150,16 @@ impl Observation {
         body.validate()
             .map_err(|_| invalid("invalid expiry draft"))?;
         Ok(body)
+    }
+    fn expiry_eligible(&self) -> Result<bool> {
+        let a = self.accepted();
+        let t = &a.authorization.terms;
+        Ok(a.settlement_policy.hold_expiry
+            == Some(ProxyHoldExpiry::ReleaseUnfinalizedAndBlockRetry)
+            && self.wire.context.epoch
+                > t.reservation_expires_after_epoch
+                    .checked_add(t.reservation_receipt_grace_epochs)
+                    .ok_or_else(|| invalid("invalid expiry deadline"))?)
     }
 }
 

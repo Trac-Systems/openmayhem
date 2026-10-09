@@ -7,6 +7,7 @@ mod intercom_runtime;
 mod managed_openai_compatible;
 mod provider_failure_recovery;
 mod provider_output_stream;
+mod proxy_control;
 mod python_runtime;
 mod release_bundle;
 
@@ -386,6 +387,11 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Commands {
+    /// Explicit proxy buyer control and recovery commands.
+    Proxy {
+        #[command(subcommand)]
+        command: proxy_control::Command,
+    },
     /// Choose a role, create or import a wallet, and sign current router rules.
     Setup(SetupArgs),
     /// Inspect, back up, import, and re-encrypt the local Mayhem wallet.
@@ -7157,6 +7163,7 @@ fn main() -> Result<()> {
 async fn mayhem_main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
+        Commands::Proxy { command } => proxy_control::run(command).await,
         Commands::Setup(args) => setup(args).await,
         Commands::Wallet { command } => wallet_command(command).await,
         Commands::Deposit { command } => deposit_command(command).await,
