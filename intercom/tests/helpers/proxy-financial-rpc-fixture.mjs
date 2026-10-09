@@ -13,12 +13,12 @@ import { createServer } from '../../src/rpc.js';
 import { CONTRACT_VERSION } from '../../contract/contract.js';
 import { proxyReceiptFixture } from './proxy-finance.js';
 import { closure } from './proxy-closure.js';
-import { prepareProxyClose } from '../../contract/proxy-closure.js';
-import { proxyBuyerReceiptSigningBytes, proxyProviderReceiptSigningBytes, proxyBuyerClosureSigningBytes, proxyProviderClosureSigningBytes } from '../../contract/proxy-finance.js';
+import { prepareProxyClose, prepareProxyExpiry } from '../../contract/proxy-closure.js';
+import { proxyBuyerReceiptSigningBytes, proxyProviderReceiptSigningBytes, proxyBuyerClosureSigningBytes, proxyProviderClosureSigningBytes, proxyBuyerExpirySigningBytes } from '../../contract/proxy-finance.js';
 import { proxyUsageFeatureKey } from '../../contract/proxy-reservations.js';
-import { proxyCloseFeatureKey } from '../../contract/proxy-closure.js';
+import { proxyCloseFeatureKey, proxyExpireFeatureKey } from '../../contract/proxy-closure.js';
 const execution=process.argv[4]?JSON.parse(process.argv[4]):null;
-const f=await proxyReceiptFixture(process.argv[2]??'tnk',process.argv[3]??'llm',execution,Boolean(execution));
+const f=await proxyReceiptFixture(process.argv[2]??'tnk',process.argv[3]??'llm',execution,Boolean(execution),process.argv[5]==='expiry');
 let reserved=!execution;
 const root=await fs.mkdtemp(path.join(os.tmpdir(),'proxy-finance-rpc-'));
 const store=new Corestore(root);
@@ -41,6 +41,9 @@ const peer={...f.peer,wallet:wallet(f.admin),base:{writable:true,isIndexer:true,
 const admin=new MayhemFeature(peer,{withProxyCanonicalSnapshot:createProxyCanonicalSnapshot(peer,CONTRACT_VERSION)});admin.key='mayhem';
 const local={...peer,wallet:wallet(f.provider)};
 const participant=new MayhemFeature(local,{});participant.key='mayhem';
+const buyerLocal={...peer,wallet:wallet(f.buyer)};
+const buyerParticipant=new MayhemFeature(buyerLocal,{});buyerParticipant.key='mayhem';
+buyerParticipant._adminKey=async()=>f.admin.publicKey;
 participant._adminKey=async()=>f.admin.publicKey;
 let mutation=null,calls=0;
 let submissions=0,publications=0,pending=null,publicationMode=null,publicationTail=Promise.resolve();
@@ -48,13 +51,13 @@ let submissions=0,publications=0,pending=null,publicationMode=null,publicationTa
 // canonical signed-view service. The remote relay/indexer transport is simulated;
 // its durable append journal has separate real-Autobase integration coverage.
 async function applyReceipt(key,value) {
-  const waiver=value.op==='proxy_close_reservation';
-  if(key!==await (waiver?proxyCloseFeatureKey(value):proxyUsageFeatureKey(value)))throw new Error('fixture publication key differs');
-  const plan=waiver?await prepareProxyClose(f.ledger,value,f.context,f.peer.wallet.verify):await f.finalize(value);
+  const waiver=value.op==='proxy_close_reservation',expires=value.op==='proxy_expire_reservation';
+  if(key!==await (expires?proxyExpireFeatureKey(value):waiver?proxyCloseFeatureKey(value):proxyUsageFeatureKey(value)))throw new Error('fixture publication key differs');
+  const plan=expires?await prepareProxyExpiry(f.ledger,value,f.context,f.peer.wallet.verify):waiver?await prepareProxyClose(f.ledger,value,f.context,f.peer.wallet.verify):await f.finalize(value);
   if(plan.writes.length) {await f.apply(plan);await sync();publications++;}
   return plan.result;
 }
-participant.relay=(key,value)=>{
+participant.relay=buyerParticipant.relay=(key,value)=>{
   const job=publicationTail.then(async()=>{
     submissions++;
     if(publicationMode==='pending') {pending={key,value};return {ok:true,pending:true};}
@@ -64,10 +67,10 @@ participant.relay=(key,value)=>{
   });
   publicationTail=job.catch(()=>{});return job;
 };
-participant.requestService=async(service,request)=>{
+function requestsFor(actor) { return async(service,request)=>{
   calls++;
   if(mutation==='delay')await new Promise(resolve=>setTimeout(resolve,250));
-  const verified=admin._verifyServiceRequest(service,request,{admin:f.admin.publicKey,transport:f.provider.publicKey});
+  const verified=admin._verifyServiceRequest(service,request,{admin:f.admin.publicKey,transport:actor.publicKey});
   if(!verified)throw new Error('fixture signature rejected');
   const result=await admin._handleService(service,verified.payload,verified);
   if(mutation==='nonce')result.request_nonce='0'.repeat(64);
@@ -76,17 +79,30 @@ participant.requestService=async(service,request)=>{
   if(mutation==='signature')result.accepted.authorization.buyer_sig='0'.repeat(128);
   if(mutation==='unknown')result.unexpected='invalid';
   return result;
-};
+}; }
+participant.requestService=requestsFor(f.provider);
+buyerParticipant.requestService=requestsFor(f.buyer);
+buyerLocal.protocol={instance:{features:{mayhem:buyerParticipant}}};
 local.protocol={instance:{features:{mayhem:participant}}};
 const server=createServer(local);
 await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
+const buyerServer=createServer(buyerLocal);
+await new Promise(resolve=>buyerServer.listen(0,'127.0.0.1',resolve));
 console.log(JSON.stringify({url:`http://127.0.0.1:${server.address().port}/v1`,identity:f.network,
-  requester:f.provider.publicKey,authorization:f.authorize(f.terms).authorization}));
+  buyer_url:`http://127.0.0.1:${buyerServer.address().port}/v1`,buyer:f.buyer.publicKey,requester:f.provider.publicKey,authorization:f.authorize(f.terms).authorization}));
 try {
   for await(const command of readline.createInterface({input:process.stdin})) {
     if(command==='stop')break;
     if(command.startsWith('{')) {
       const request=JSON.parse(command);
+      if(request.sign_expiry) {
+        console.log(JSON.stringify({buyer_sig:b4a.toString(f.buyer.wallet.sign(proxyBuyerExpirySigningBytes(request.sign_expiry)),'hex')}));continue;
+      }
+      if(Number.isSafeInteger(request.epoch)&&request.epoch>=0) {
+        f.context.epoch=request.epoch;
+        await f.storage.put('epoch/apply/state',{epoch:request.epoch,updated_epoch:request.epoch,pending_epoch:null});await sync();
+        console.log(JSON.stringify({done:'epoch',epoch:request.epoch}));continue;
+      }
       if(request.sign_waiver) {
         const body=request.sign_waiver;
         console.log(JSON.stringify({provider_sig:b4a.toString(f.provider.wallet.sign(proxyProviderClosureSigningBytes(body)),'hex'),
@@ -107,6 +123,7 @@ try {
     else if(command==='foreign')participant.peer.wallet=wallet(f.buyer); // Expected local actor/transport remains provider.
     else if(command==='reset')mutation=null;
     else if(command==='status'){}
+    else if(command==='state') {console.log(JSON.stringify({summary:await f.read(f.summaryKey),balance:await f.read(f.balanceKey),billing:await f.read(f.ledger.receiptBillingKey(f.terms.billing_id))}));continue;}
     else if(command==='publish_pending')publicationMode='pending';
     else if(command==='publish_lost_ack')publicationMode='lost_ack';
     else if(command==='flush_publication') {if(pending){await applyReceipt(pending.key,pending.value);pending=null;}publicationMode=null;}
@@ -115,7 +132,8 @@ try {
     console.log(JSON.stringify({done:command,calls,submissions,publications}));
   }
 } finally {
-  await participant.stop();await admin.stop();server.closeAllConnections();
+  await participant.stop();await buyerParticipant.stop();await admin.stop();server.closeAllConnections();buyerServer.closeAllConnections();
+  await new Promise(resolve=>buyerServer.close(resolve));
   await new Promise(resolve=>server.close(resolve));await view.close();await store.close();
   await fs.rm(root,{recursive:true,force:true});
 }

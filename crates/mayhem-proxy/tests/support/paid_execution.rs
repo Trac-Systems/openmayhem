@@ -11,6 +11,7 @@ struct Peer {
     lines: tokio::io::Lines<BufReader<ChildStdout>>,
     identity: Identity,
     client: Arc<financial::Client>,
+    buyer_client: Arc<financial::Client>,
 }
 impl Peer {
     async fn start(
@@ -65,8 +66,13 @@ impl Peer {
             controller_pubkey: Digest::new(requester).unwrap(),
         };
         let client = Arc::new(
-            financial::Client::new(v["url"].as_str().unwrap(), network, requester.into(), 4)
-                .unwrap(),
+            financial::Client::new(
+                v["url"].as_str().unwrap(),
+                network.clone(),
+                requester.into(),
+                4,
+            )
+            .unwrap(),
         );
         Self {
             stdin: child.stdin.take().unwrap(),
@@ -74,6 +80,15 @@ impl Peer {
             lines,
             identity,
             client,
+            buyer_client: Arc::new(
+                financial::Client::new(
+                    v["buyer_url"].as_str().unwrap(),
+                    network,
+                    v["buyer"].as_str().unwrap().into(),
+                    4,
+                )
+                .unwrap(),
+            ),
         }
     }
     async fn command(&mut self, command: &str) -> Value {
@@ -1863,4 +1878,111 @@ async fn retained_paid_result_reconciles_after_controller_restart_without_new_fi
     );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     peer.stop().await;
+}
+
+#[tokio::test]
+async fn paid_buyer_expiry_of_unknown_stream_never_frees_capacity_or_retries_execution() {
+    use financial::recovery::{BuyerRecovery, FinancialOutcome, Limits, Store};
+    use mayhem_proto::proxy::finance::ProxyReservationExpiry;
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        let backend = backend_raw(
+            200,
+            "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"prefix\"}}]}\n\n".into(),
+            "text/event-stream",
+            Duration::ZERO,
+        )
+        .await;
+        let bytes = stream_request();
+        let policy = json!({"schema_version":1,"lane":"proxy","payable_outcomes":["complete"],
+            "allow_checkpoints":false,"hold_expiry":"release_unfinalized_and_block_retry"});
+        let mut p = Paid::start_with_policy(
+            &backend.base,
+            ProxyEndpoint::Chat,
+            rail,
+            &bytes,
+            true,
+            Some(policy),
+        )
+        .await;
+        let mut buyer_identity = p.peer.identity.clone();
+        buyer_identity.controller_pubkey =
+            Digest::new(&p.authorization.terms.buyer_pubkey).unwrap();
+        let store = Arc::new(
+            Store::open(
+                p._fixture._store.path().join("buyer-recovery"),
+                buyer_identity,
+                Limits {
+                    max_records: 8,
+                    closed_retention_ms: 1000,
+                },
+            )
+            .unwrap(),
+        );
+        let buyer = BuyerRecovery::new(store, p.peer.buyer_client.clone(), 2).unwrap();
+        buyer.refresh(&p.authorization, 1).await.unwrap();
+        assert!(p
+            .executor
+            .execute_stream(
+                &p.record.invocation,
+                &bytes,
+                &Cancellation::default(),
+                |_| async { Ok(()) }
+            )
+            .await
+            .is_err());
+        let deadline = p.authorization.terms.reservation_expires_after_epoch
+            + p.authorization.terms.reservation_receipt_grace_epochs;
+        p.peer
+            .command(&json!({"epoch":deadline+1}).to_string())
+            .await;
+        let body = buyer.prepare_expiry(&p.authorization, 5).await.unwrap();
+        let signature = p
+            .peer
+            .command(&json!({"sign_expiry":body}).to_string())
+            .await;
+        let expiry = ProxyReservationExpiry {
+            body,
+            buyer_sig: signature["buyer_sig"].as_str().unwrap().into(),
+        };
+        let terms = Digest::new(p.authorization.terms.digest().unwrap()).unwrap();
+        buyer.retain_expiry(terms.clone(), expiry).await.unwrap();
+        assert!(matches!(
+            buyer.publish_expiry(terms, 6).await.unwrap(),
+            Some(FinancialOutcome::ExpiredUnknown { .. })
+        ));
+        assert!(p.authority.lease(&p.lease).unwrap().is_some());
+        assert_eq!(
+            p.journal.get(&p.record.invocation).unwrap().unwrap().phase,
+            Phase::Dispatched
+        );
+        assert!(p
+            .executor
+            .reconcile_capacity(&p.record.invocation, p.record.attempt)
+            .await
+            .is_err());
+        assert!(p
+            .executor
+            .prepare_waiver(&p.record.invocation, p.record.attempt)
+            .await
+            .is_err());
+        assert!(p
+            .executor
+            .execute_stream(
+                &p.record.invocation,
+                &bytes,
+                &Cancellation::default(),
+                |_| async { Ok(()) }
+            )
+            .await
+            .is_err());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        let p = p.reopen();
+        assert!(p.authority.lease(&p.lease).unwrap().is_some());
+        assert!(p
+            .executor
+            .reconcile_capacity(&p.record.invocation, p.record.attempt)
+            .await
+            .is_err());
+        p.peer.stop().await;
+    }
 }

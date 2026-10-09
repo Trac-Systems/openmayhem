@@ -12,14 +12,20 @@ struct Fixture {
     lines: tokio::io::Lines<BufReader<ChildStdout>>,
     client: Client,
     auth: ProxySpendAuthorization,
+    buyer_client: std::sync::Arc<Client>,
 }
 impl Fixture {
     async fn new(rail: &str, family: &str) -> Self {
+        Self::new_with_expiry(rail, family, false).await
+    }
+    async fn new_with_expiry(rail: &str, family: &str, expiry: bool) -> Self {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut child = tokio::process::Command::new("node")
             .arg("intercom/tests/helpers/proxy-financial-rpc-fixture.mjs")
             .arg(rail)
             .arg(family)
+            .arg("null")
+            .arg(if expiry { "expiry" } else { "no_expiry" })
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -37,7 +43,7 @@ impl Fixture {
         let identity: Identity = serde_json::from_value(v["identity"].clone()).unwrap();
         let client = Client::new(
             v["url"].as_str().unwrap(),
-            identity,
+            identity.clone(),
             v["requester"].as_str().unwrap().into(),
             2,
         )
@@ -47,10 +53,22 @@ impl Fixture {
             child,
             lines,
             client,
+            buyer_client: std::sync::Arc::new(
+                Client::new(
+                    v["buyer_url"].as_str().unwrap(),
+                    identity,
+                    v["buyer"].as_str().unwrap().into(),
+                    4,
+                )
+                .unwrap(),
+            ),
             auth: serde_json::from_value(v["authorization"].clone()).unwrap(),
         }
     }
     async fn command(&mut self, c: &str) {
+        assert_eq!(self.request(c).await["done"], c);
+    }
+    async fn request(&mut self, c: &str) -> Value {
         self.stdin
             .write_all(format!("{c}\n").as_bytes())
             .await
@@ -64,7 +82,7 @@ impl Fixture {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(v["done"], c);
+        v
     }
     async fn stop(mut self) {
         self.stdin.write_all(b"stop\n").await.unwrap();
@@ -263,3 +281,7 @@ fn financial_authority_never_travels_over_unprotected_remote_http_or_url_credent
     assert!(Client::new("http://127.0.0.1:1/v1", identity.clone(), "c".repeat(64), 2).is_ok());
     assert!(Client::new("https://example.invalid/v1", identity, "c".repeat(64), 2).is_ok());
 }
+
+#[cfg(unix)]
+#[path = "support/buyer_recovery.rs"]
+mod buyer_recovery;

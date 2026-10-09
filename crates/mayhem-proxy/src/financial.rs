@@ -1,6 +1,7 @@
 //! Exact-attempt canonical finance observations from the configured trusted Core
 //! peer RPC. Its authenticated service verifies the indexer's signed snapshot.
 //! An arbitrary upstream HTTP response is never a financial authority.
+pub mod recovery;
 use crate::{
     attempts::{Binding, Digest},
     discovery::{hex, Context, Identity, Proof},
@@ -193,6 +194,11 @@ impl Observation {
             w.context.epoch < t.reservation_expires_after_epoch,
             "reservation no longer admits new execution",
         )?;
+        self.reserved_binding()
+    }
+    fn reserved_binding(&self) -> Result<Binding> {
+        let w = &self.wire;
+        let t = &w.accepted.authorization.terms;
         let s = &w.session;
         let r = &w.reservation;
         let a = &w.billing;
@@ -456,6 +462,48 @@ impl Client {
         self.submit_feature(
             key,
             json!({"op":"proxy_close_reservation","provider":self.requester,"closure":closure}),
+        )
+        .await
+    }
+    /// Buyer-only release under the ORIGINAL opt-in policy and canonical epoch.
+    /// This never proves execution stopped and cannot authorize redispatch.
+    pub async fn submit_expiry(
+        &self,
+        observation: &Observation,
+        expiry: &mayhem_proto::proxy::finance::ProxyReservationExpiry,
+    ) -> Result<()> {
+        let t = &observation.accepted().authorization.terms;
+        require(
+            observation.started.elapsed() <= FRESHNESS
+                && t.network_id == self.identity.network_id
+                && t.msb_bootstrap == self.identity.msb_bootstrap
+                && t.subnet_bootstrap == self.identity.subnet_bootstrap
+                && t.buyer_pubkey == self.requester,
+            "buyer expiry identity or observation differs",
+        )?;
+        observation
+            .accepted()
+            .authorization
+            .verify(crate::receipts::verify_signature)
+            .map_err(|_| invalid("accepted signatures rejected"))?;
+        expiry
+            .verify(
+                t,
+                &observation.accepted().settlement_policy,
+                observation.wire.context.epoch,
+                crate::receipts::verify_signature,
+            )
+            .map_err(|_| invalid("expiry policy, epoch or signature rejected"))?;
+        let key = format!(
+            "proxy/expire/{}",
+            expiry
+                .body
+                .digest()
+                .map_err(|_| invalid("invalid expiry"))?
+        );
+        self.submit_feature(
+            key,
+            json!({"op":"proxy_expire_reservation","buyer":self.requester,"expiry":expiry}),
         )
         .await
     }

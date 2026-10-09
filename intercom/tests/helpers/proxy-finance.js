@@ -13,7 +13,7 @@ const clone=structuredClone;
 const h=n=>n.toString(16).padStart(64,'0');
 const sign=(wallet,bytes)=>b4a.toString(wallet.sign(bytes),'hex');
 
-export async function proxyReservationFixture(rail='tnk',family='llm',execution=null) {
+export async function proxyReservationFixture(rail='tnk',family='llm',execution=null,expiryPolicy=false) {
   const f=await proxyContractFixture(family,rail,execution);
   assert.equal((await f.submit(await f.create())).ok,true);
   assert.equal((await f.submit(await f.envelope({kind:'set_offer',offer:f.offer}))).ok,true);
@@ -40,6 +40,7 @@ export async function proxyReservationFixture(rail='tnk',family='llm',execution=
       {...verification,record_key:'payout/stripe-verified/fixture'});
   }
   const policy=execution?.settlement_policy??row.policy;
+  if(expiryPolicy)policy.hold_expiry='release_unfinalized_and_block_retry';
   const policyHash=await proxySettlementPolicyDigest(policy);
   assert.equal((await f.policy({kind:'set_settlement',policy_hash:policyHash,enabled:true,policy})).ok,true);
   const terms={...row.terms,...f.network,buyer_pubkey:buyer.publicKey,billing_attempt:1,
@@ -75,8 +76,8 @@ export async function proxyReservationFixture(rail='tnk',family='llm',execution=
   const apply=async p=>{for(const w of p.writes)if(w.delete)await f.storage.del(w.key);else await f.storage.put(w.key,w.value);};
   return {...f,buyer,ledger,terms,settlementPolicy:policy,authorize,prepare,apply,reads,balance,balanceKey,summaryKey,payout,bindingKey};
 }
-export async function proxyReceiptFixture(rail='tnk',family='llm',execution=null,deferred=false) {
-  const f=await proxyReservationFixture(rail,family,execution);
+export async function proxyReceiptFixture(rail='tnk',family='llm',execution=null,deferred=false,expiryPolicy=false) {
+  const f=await proxyReservationFixture(rail,family,execution,expiryPolicy);
   if(!deferred)await f.apply(await f.prepare(f.authorize(f.terms)));
   const receipt=async({quantity=4,seq=1,final=true,...changes}={})=>{
     const usage=Object.fromEntries(f.terms.offer.rates.map(r=>[r.unit,quantity]));
