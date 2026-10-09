@@ -3,6 +3,8 @@ use mayhem_proxy::buyer_controller as buyer;
 use mayhem_proxy::financial::recovery::FinancialOutcome;
 use std::{future::Future, pin::Pin};
 use tokio::sync::{watch, Notify};
+#[path = "buyer_streaming.rs"]
+mod streaming;
 
 struct Gate {
     terms: Mutex<Vec<mayhem_proto::proxy::finance::ProxySpendTerms>>,
@@ -106,7 +108,7 @@ fn make_request(
         gate,
         authorization: buyer::Authorization {
             prices: prices(peer),
-            output_units: (f.adapter.endpoint() == ProxyEndpoint::Chat).then_some(37),
+            output_units: (f.adapter.endpoint() != ProxyEndpoint::Decisions).then_some(37),
             lifetimes: lifetimes(),
             settlement_policy: s.runtime.approved_policy.clone(),
             endpoint_contract: f.adapter.contract_hash().clone(),

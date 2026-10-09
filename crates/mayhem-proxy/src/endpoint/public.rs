@@ -102,6 +102,17 @@ impl Adapter {
 /// ```
 pub struct PublicRequest(Request);
 impl PublicRequest {
+    /// Verify normalized provisional provider events without exposing a provider
+    /// dispatch request. Completion still requires independent final verification.
+    pub fn stream(&self, public_id: &str, created: u64) -> Result<PublicStream<'_>> {
+        Ok(PublicStream {
+            inner: stream::Stream::new(&self.0, public_id, created)?,
+            request: self,
+            public_id: public_id.into(),
+            created,
+            failed: false,
+        })
+    }
     pub fn endpoint(&self) -> ProxyEndpoint {
         self.0.endpoint()
     }
@@ -130,5 +141,49 @@ impl PublicRequest {
         created: u64,
     ) -> Result<ProtocolReply> {
         self.0.decode_json(value, public_id, created)
+    }
+}
+
+/// Bounded normalized-event assembly. Holds current text/tools/items, never an
+/// event history. Events are provisional and cannot authorize tools or payment.
+pub struct PublicStream<'a> {
+    inner: stream::Stream<'a>,
+    request: &'a PublicRequest,
+    public_id: String,
+    created: u64,
+    failed: bool,
+}
+impl PublicStream<'_> {
+    pub fn push(&mut self, event: &Value) -> Result<()> {
+        require(!self.failed)?;
+        self.failed = true;
+        let encoded =
+            crate::exchange::channel::bounded_json(event, self.request.response_byte_limit())
+                .map_err(|_| Error::Protocol)?;
+        let frame = crate::worker::Decoded::Sse {
+            event: String::new(),
+            data: String::from_utf8(encoded).map_err(|_| Error::Protocol)?,
+            id: None,
+        };
+        // Provider normalization is canonical: changed identities, unknown
+        // fields, premature terminals and skipped public sequences fail closed.
+        let result = self
+            .inner
+            .push(frame)
+            .and_then(|normalized| require(normalized.as_ref() == Some(event)));
+        self.failed = result.is_err();
+        result
+    }
+    /// A valid terminal result may supply withheld finish/status metadata, never
+    /// replace or extend the observable content already assembled from events.
+    pub fn verify_final(self, response: &Value) -> Result<()> {
+        require(!self.failed)?;
+        crate::exchange::channel::bounded_json(response, self.request.response_byte_limit())
+            .map_err(|_| Error::Protocol)?;
+        let assembled = self.inner.finish_normalized(response)?;
+        let reply = self
+            .request
+            .decode_json(assembled, &self.public_id, self.created)?;
+        require(&reply.body == response)
     }
 }

@@ -501,6 +501,47 @@ async fn proxy_http_all_four_endpoints_pay_exact_original_once_on_all_three_rail
             };
             let paid = paid_receipt.body.au_owed_cum;
             assert_eq!(paid, terms.offer.cost(&paid_receipt.body.usage).unwrap());
+            let evidence_path = format!("/v1/jobs/{id}/proxy-evidence");
+            let (evidence_status, evidence) = f.get(&evidence_path, "owner-fixture-key").await;
+            assert_eq!(evidence_status, StatusCode::OK);
+            assert_eq!(evidence["object"], "mayhem.proxy.job_evidence");
+            assert_eq!(evidence["id"], id);
+            assert_eq!(evidence["model"], model(&f.harness));
+            assert_eq!(
+                evidence["endpoint_family"],
+                serde_json::to_value(endpoint).unwrap()
+            );
+            assert_eq!(evidence["terms"], serde_json::to_value(terms).unwrap());
+            assert_eq!(evidence["financial"]["kind"], "canonical");
+            assert_eq!(evidence["financial"]["outcome"]["kind"], "paid");
+            assert_eq!(
+                evidence["financial"]["outcome"]["receipt"],
+                serde_json::to_value(paid_receipt).unwrap()
+            );
+            assert_eq!(evidence["financial"]["budget_settled"], true);
+            assert_eq!(evidence["terms_hash"], terms.digest().unwrap());
+            assert!(evidence.get("result").is_none());
+            assert_eq!(
+                f.get(&evidence_path, "other-fixture-key").await.0,
+                StatusCode::NOT_FOUND
+            );
+            // Explicit opt-in ABI fixtures for the retail decoder. These are
+            // local synthetic purchases, not production accounts or prompts.
+            if let Some(directory) = std::env::var_os("MAYHEM_TEST_PROXY_EVIDENCE_DIR") {
+                let directory = std::path::PathBuf::from(directory);
+                std::fs::create_dir_all(&directory).unwrap();
+                let endpoint_name = serde_json::to_value(endpoint).unwrap();
+                let rail_name = serde_json::to_value(rail).unwrap();
+                std::fs::write(
+                    directory.join(format!(
+                        "{}_{}.json",
+                        endpoint_name.as_str().unwrap(),
+                        rail_name.as_str().unwrap()
+                    )),
+                    serde_json::to_vec_pretty(&evidence).unwrap(),
+                )
+                .unwrap();
+            }
             if endpoint != ProxyEndpoint::Decisions {
                 assert_eq!(terms.max_usage["output_token"], 37);
                 // Visible "hello" is two normalized billing units, regardless of
@@ -533,6 +574,10 @@ async fn proxy_http_all_four_endpoints_pay_exact_original_once_on_all_three_rail
             assert_eq!(status, StatusCode::OK, "{endpoint:?}/{rail:?}: {replay}");
             assert_eq!(response, replay);
             assert_eq!(replay_headers["x-mayhem-job-id"], id);
+            assert_eq!(
+                f.get(&evidence_path, "owner-fixture-key").await,
+                (StatusCode::OK, evidence)
+            );
             for change in ["body", "price"] {
                 let mut changed = f.body();
                 if change == "price" {
@@ -586,6 +631,10 @@ async fn proxy_http_all_four_endpoints_pay_exact_original_once_on_all_three_rail
                 serde_json::to_vec(&f.tokens).unwrap(),
             )
             .unwrap();
+            assert_eq!(
+                f.get(&evidence_path, "owner-fixture-key").await.0,
+                StatusCode::UNAUTHORIZED
+            );
             assert_eq!(
                 f.post(
                     "all-endpoints-original",
@@ -694,6 +743,16 @@ async fn proxy_http_pending_publication_recovers_original_hold_without_inventing
         .unwrap();
     let terms = job.proxy.as_ref().unwrap().terms().unwrap().clone();
     assert!(job.result.is_none());
+    let (evidence_status, evidence) = f
+        .get(
+            &format!("/v1/jobs/{id}/proxy-evidence"),
+            "owner-fixture-key",
+        )
+        .await;
+    assert_eq!(evidence_status, StatusCode::OK);
+    assert_eq!(evidence["financial"], json!({"kind":"pending"}));
+    assert_eq!(evidence["terms_hash"], terms.digest().unwrap());
+    assert_eq!(evidence["result_verified"], false);
     assert_eq!(f.harness.backend_calls(), 0);
     assert_eq!(f.harness.status().await["publications"], 0);
     assert_eq!(

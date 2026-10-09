@@ -23,6 +23,45 @@ that envelope before passing the owned request to the provider protocol. This
 syntax is a candidate interface; public retail, Studio and MCP integration and
 release acceptance remain separate requirements.
 
+## Authenticated financial evidence
+
+`GET /v1/jobs/{job_id}/proxy-evidence` returns schema version1,
+`object: "mayhem.proxy.job_evidence"`, for the authenticated key's original
+proxy purchase. Native jobs have no proxy evidence. Current model scope, key
+expiry/revocation and owner checks still apply; an exhausted spending cap does
+not hide an already purchased result. The response is private and not cacheable.
+
+The response binds the job/model/endpoint, original request fingerprint and
+billing/session identity, frozen terms and their digest, complete provider rates,
+rail, settlement policy and signed acceptance. Model output, prompts, upstream
+configuration and signing secrets are not included. This route is the evidence
+source: fields named `receipt` or `financial` inside a model answer have no
+financial authority.
+
+The `financial.kind` discriminator deliberately separates:
+
+- `pending`: includes unknown execution and incomplete admission recovery. Keep
+  the original obligation; a missing journal row is not a refund proof.
+- `not_authorized`: the exclusive owner retired the intent before granting
+  authorization. No paid execution was dispatched.
+- `non_admission`: a durable local signing fence, with its commitment and exact
+  terms digest/maximum. It is not a canonical payment receipt. Wait for
+  `budget_settled: true` before treating owner accounting as complete.
+- `canonical`: signed paid receipt, mutual waiver or expired-unknown closure,
+  plus the retained canonical observation identity and budget-completion marker.
+  The observation is retained evidence, not a claim of current network freshness.
+  A zero-charge expired-unknown result does not authorize retrying execution.
+
+Retail consumers must bind the response to their original job, selector, endpoint,
+rail and accepted policy, retain first-observed identity/terms, reject unexpected
+schema or changed bindings, and use decimal integers for money. Missing or
+unavailable evidence cannot justify another purchase or a credit release.
+Read/verification uses bounded concurrent storage work and a direct job lookup;
+it neither copies the completion body nor scans ledger/receipt history.
+
+This evidence interface is an integration prerequisite. It does not by itself
+activate retail proxy requests, Studio, MCP or public streaming.
+
 The gateway owner supplies a separate resolved policy revision and explicit
 epoch lifetimes. Request identity includes the authenticated buyer/key owner,
 endpoint, exact selector, full request, every price/rail/filter control and that

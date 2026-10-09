@@ -6,6 +6,8 @@ use mayhem_proto::proxy::finance::{
 use mayhem_proxy::attempts::{ResultCommitment, TerminalDraft};
 use serde_json::json;
 
+mod evidence;
+
 fn digest(n: u8) -> Digest {
     Digest::new(format!("{n:02x}").repeat(32)).unwrap()
 }
@@ -522,6 +524,11 @@ fn proxy_expiry_finishes_unknown_without_authorizing_retry_or_claiming_output() 
         job.error_info.as_ref().unwrap().category,
         "execution_unknown"
     );
+    let public = serde_json::to_value(super::evidence::project(&job).unwrap()).unwrap();
+    assert_eq!(public["financial"]["kind"], "canonical");
+    assert_eq!(public["financial"]["outcome"]["kind"], "expired_unknown");
+    assert_eq!(public["financial"]["budget_settled"], true);
+    assert_eq!(public["result_verified"], false);
 }
 
 #[test]

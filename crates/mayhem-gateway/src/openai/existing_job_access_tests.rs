@@ -75,6 +75,18 @@ async fn exhausted_key_can_retrieve_its_paid_job_but_cannot_start_more_inference
         .unwrap();
     }
     let app = openai_router(state.clone());
+    assert_eq!(
+        get(
+            &app,
+            &format!("/v1/jobs/{id}/proxy-evidence"),
+            "owner",
+            None
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND,
+        "native jobs have no proxy financial evidence"
+    );
     for uri in [
         format!("/v1/jobs/{id}"),
         format!("/v1/jobs/{id}/result"),

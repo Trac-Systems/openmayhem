@@ -118,12 +118,34 @@ impl Bridge {
                                     if targets.is_empty(){break}
                                     let mut event=json!({"type":"session_frame","remote":own,"session_id":request["session_id"],
                                         "direct":true,"relayed":false,"frame":request["frame"]});
-                                    let attack=mode.lock().await.take();
+                                    let attack={
+                                        let mut mode=mode.lock().await;
+                                        if matches!(*mode,Some("stream_content"|"stream_identity")) {
+                                            let payload=event["frame"]["data"].as_str().and_then(|v|STANDARD.decode(v).ok())
+                                                .and_then(|v|serde_json::from_slice::<Value>(&v).ok());
+                                            if payload.as_ref().is_some_and(|v|v["kind"]=="stream") {mode.take()} else {None}
+                                        } else {mode.take()}
+                                    };
                                     match attack {
                                         Some("remote")=>event["remote"]=json!("f".repeat(64)),
                                         Some("terms")=>event["frame"]["accepted_terms"]=json!("f".repeat(64)),
                                         Some("negotiation")=>event["frame"]["negotiation"]=json!("f".repeat(64)),
                                         Some("purpose")=>event["frame"]["t"]=json!("p.exchange"),
+                                        Some("stream_content"|"stream_identity")=>{
+                                            // Authenticated malicious-provider fixture: recompute
+                                            // transport framing so the buyer's event/final verifier,
+                                            // not a damaged checksum, must detect this mutation.
+                                            let bytes=STANDARD.decode(event["frame"]["data"].as_str().unwrap()).unwrap();
+                                            let mut payload:Value=serde_json::from_slice(&bytes).unwrap();
+                                            if attack==Some("stream_content") {payload["event"]["choices"][0]["delta"]["content"]=json!("different");}
+                                            else {payload["event"]["id"]=json!("foreign-public-id");}
+                                            let bytes=serde_json::to_vec(&payload).unwrap();
+                                            let mut h=blake3::Hasher::new_derive_key("mayhem/proxy/exchange-payload/v1");
+                                            h.update(&(bytes.len() as u64).to_le_bytes());h.update(&bytes);
+                                            event["frame"]["bytes"]=json!(bytes.len());
+                                            event["frame"]["data"]=json!(STANDARD.encode(&bytes));
+                                            event["frame"]["digest"]=json!(h.finalize().to_hex().to_string());
+                                        },
                                         Some("request_payload" | "signature_payload")=>{
                                             let bytes=STANDARD.decode(event["frame"]["data"].as_str().unwrap()).unwrap();
                                             let mut payload:Value=serde_json::from_slice(&bytes).unwrap();

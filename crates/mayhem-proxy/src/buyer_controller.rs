@@ -1,7 +1,8 @@
-//! Owned, bounded JSON buyer sessions. Selection, authenticated HTTP ownership and
+//! Owned, bounded JSON and provisional streaming buyer sessions. Selection, authenticated HTTP ownership and
 //! account/key budgets belong to the caller. This controller never selects another
 //! offer, changes a rail, retries Execute, or calls a native inference backend.
 pub use crate::financial::negotiation::NonAdmission;
+mod streaming;
 use crate::{
     attempts::{Digest, Identity},
     buyer::Evidence,
@@ -34,6 +35,7 @@ use std::{
     },
     time::Duration,
 };
+pub use streaming::{stream_channel, StreamEvent, StreamLimits, StreamReceiver, StreamSender};
 use tokio::{
     sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore},
     task::JoinSet,
@@ -264,7 +266,7 @@ pub struct Controller {
     joining: tokio::sync::Mutex<()>,
 }
 enum Operation {
-    Execute(Request),
+    Execute(Request, Option<StreamSender>),
     Recover(RequestIdentity, Arc<dyn AuthorizationGate>),
 }
 const BUFFER_UNIT: usize = 64 * 1024;
@@ -398,7 +400,20 @@ impl Controller {
 
     pub async fn execute(&self, request: Request, stop: watch::Receiver<bool>) -> Result<Outcome> {
         let identity = request.identity();
-        self.launch(Operation::Execute(request), identity, stop)
+        self.launch(Operation::Execute(request, None), identity, stop)
+            .await
+    }
+    /// Execute a request containing stream:true. Events are bounded provisional
+    /// normalized JSON; only the returned outcome can establish verified closure.
+    /// Dropping the receiver cancels delivery, never erases the original purchase.
+    pub async fn execute_stream(
+        &self,
+        request: Request,
+        observer: StreamSender,
+        stop: watch::Receiver<bool>,
+    ) -> Result<Outcome> {
+        let identity = request.identity();
+        self.launch(Operation::Execute(request, Some(observer)), identity, stop)
             .await
     }
     /// Reconcile the exact original purchase. No new quote, prices, signatures
@@ -414,7 +429,7 @@ impl Controller {
     }
     async fn launch(
         &self,
-        operation: Operation,
+        mut operation: Operation,
         identity: RequestIdentity,
         mut external: watch::Receiver<bool>,
     ) -> Result<Outcome> {
@@ -427,7 +442,7 @@ impl Controller {
         if self.stopped.load(Ordering::Acquire) || *external.borrow() {
             return Err(fail(Code::Stopped));
         }
-        if matches!(&operation, Operation::Execute(request) if request.body.len() > self.shared.limits.protocol.request_bytes)
+        if matches!(&operation, Operation::Execute(request, _) if request.body.len() > self.shared.limits.protocol.request_bytes)
         {
             return Err(fail(Code::Invalid));
         }
@@ -436,11 +451,43 @@ impl Controller {
             .clone()
             .try_acquire_owned()
             .map_err(|_| fail(Code::Busy))?;
+        let extra = match &operation {
+            Operation::Execute(_, Some(observer)) => {
+                if observer.limits.total_bytes > self.shared.limits.protocol.response_bytes {
+                    return Err(fail(Code::Invalid));
+                }
+                // Assembled/normalized content is additional to ordinary JSON
+                // verification/owner buffers. Queue permits outlive this task.
+                u32::try_from(
+                    (self.shared.limits.protocol.response_bytes * 2).div_ceil(BUFFER_UNIT),
+                )
+                .map_err(|_| fail(Code::Invalid))?
+            }
+            _ => 0,
+        };
+        let reservation = self
+            .reservation
+            .checked_add(extra)
+            .ok_or_else(|| fail(Code::Invalid))?;
+        let disconnected: Pin<Box<dyn Future<Output = ()> + Send>> = match &operation {
+            Operation::Execute(_, Some(observer)) => Box::pin(observer.disconnected()),
+            _ => Box::pin(std::future::pending()),
+        };
         let buffers = self
             .buffers
             .clone()
-            .try_acquire_many_owned(self.reservation)
+            .try_acquire_many_owned(reservation)
             .map_err(|_| fail(Code::Busy))?;
+        if let Operation::Execute(_, Some(observer)) = &mut operation {
+            let units = u32::try_from(observer.limits.queued_bytes.div_ceil(BUFFER_UNIT))
+                .map_err(|_| fail(Code::Invalid))?;
+            observer.charge(
+                self.buffers
+                    .clone()
+                    .try_acquire_many_owned(units)
+                    .map_err(|_| fail(Code::Busy))?,
+            );
+        }
         let key = (identity.billing_id.clone(), identity.billing_attempt);
         if !self
             .active
@@ -476,6 +523,7 @@ impl Controller {
                     _ = stopped(&mut external) => { cancel.send_replace(true); work.await },
                     _ = stopped(&mut shutdown) => { cancel.send_replace(true); work.await },
                     _ = result.closed() => { cancel.send_replace(true); work.await },
+                    _ = disconnected => { cancel.send_replace(true); work.await },
                 };
                 let _ = result.send(outcome);
             });
@@ -576,7 +624,7 @@ impl Shared {
             .map_err(|_| p.error(Code::Storage))?;
         p.check(&stop)?;
         match operation {
-            Operation::Execute(request) => {
+            Operation::Execute(request, observer) => {
                 if existing.is_some()
                     || self
                         .negotiation
@@ -590,7 +638,7 @@ impl Shared {
                     return Err(p.error(Code::RecoveryRequired));
                 }
                 p.retained = false;
-                self.execute(request, &mut p, &mut stop).await
+                self.execute(request, observer, &mut p, &mut stop).await
             }
             Operation::Recover(identity, gate) => {
                 if identity != p.identity {
@@ -607,6 +655,7 @@ impl Shared {
     async fn execute(
         &self,
         request: Request,
+        observer: Option<StreamSender>,
         p: &mut Progress,
         stop: &mut watch::Receiver<bool>,
     ) -> Result<Outcome> {
@@ -633,9 +682,14 @@ impl Shared {
             return Err(p.error(Code::Invalid));
         }
         let value: Value = serde_json::from_slice(&body).map_err(|_| p.error(Code::Invalid))?;
-        if value
-            .get("stream")
-            .is_some_and(|v| v != &Value::Bool(false))
+        let streaming = observer.is_some();
+        if (streaming
+            && (context.offer.endpoint == ProxyEndpoint::Decisions
+                || value.get("stream") != Some(&Value::Bool(true))))
+            || (!streaming
+                && value
+                    .get("stream")
+                    .is_some_and(|v| v != &Value::Bool(false)))
             || mayhem_proto::endpoint_request_fingerprint(&value) != context.request_hash.as_str()
         {
             return Err(p.error(Code::Invalid));
@@ -771,11 +825,12 @@ impl Shared {
         p.stage = Stage::Executing;
         paid.send(&Message::Execute {
             request: value,
-            streaming: false,
+            streaming,
         })
         .await
         .map_err(|_| p.error(Code::Transport))?;
-        self.finish(paid, saved, p, stop, false, &gate).await
+        self.finish(paid, saved, p, stop, false, &gate, observer)
+            .await
     }
 
     async fn recover(
@@ -879,7 +934,7 @@ impl Shared {
         paid.send(&Message::Status)
             .await
             .map_err(|_| p.error(Code::Transport))?;
-        self.finish(paid, saved, p, stop, true, &gate).await
+        self.finish(paid, saved, p, stop, true, &gate, None).await
     }
 
     async fn finish(
@@ -890,6 +945,7 @@ impl Shared {
         stop: &mut watch::Receiver<bool>,
         recovery: bool,
         gate: &Arc<dyn AuthorizationGate>,
+        mut observer: Option<StreamSender>,
     ) -> Result<Outcome> {
         let authorization = saved
             .authorization()
@@ -903,11 +959,30 @@ impl Shared {
         .map_err(|_| p.error(Code::Verification))?;
         let (mut sender, mut receiver) =
             paid.into_duplex().map_err(|_| p.error(Code::Transport))?;
+        let public_id = format!("proxy_{}", receiver.session().invocation().as_str());
+        let prepared = if observer.is_some() {
+            let binding = financial::terms_binding(&authorization.terms)
+                .map_err(|_| p.error(Code::Verification))?;
+            Some(
+                saved
+                    .snapshot()
+                    .verify_request(&binding, saved.request())
+                    .map_err(|_| p.error(Code::Verification))?,
+            )
+        } else {
+            None
+        };
+        let mut stream = None;
+        let mut streamed = false;
         let mut observed = None;
         let mut failed = false;
-        // Constant protocol steps. A malicious peer cannot make us collect a
-        // growing message/result history. Generation itself has no total timer.
-        for _ in 0..8 {
+        // Control steps and provisional events have separate bounds; no history
+        // is retained. Generation itself has no total timer.
+        let mut controls = 0;
+        loop {
+            if controls == 8 {
+                return Err(p.error(Code::Verification));
+            }
             let wait =
                 (recovery || observed.is_some() || failed).then_some(self.limits.control_wait);
             let received = tokio::select! {
@@ -919,15 +994,78 @@ impl Shared {
                     return Err(p.error(Code::Stopped));
                 }
             };
+            if !matches!(received.message(), Message::Stream { .. }) {
+                controls += 1;
+            }
             match received.message() {
+                Message::Stream { event }
+                    if observer.is_some() && observed.is_none() && !failed =>
+                {
+                    let observer = observer.as_mut().unwrap();
+                    let bytes = observer
+                        .encode(event)
+                        .map_err(|_| p.error(Code::Verification))?;
+                    if stream.is_none() {
+                        let created =
+                            if authorization.terms.offer.endpoint == ProxyEndpoint::Responses {
+                                event.pointer("/response/created_at")
+                            } else {
+                                event.get("created")
+                            }
+                            .and_then(Value::as_u64)
+                            .ok_or_else(|| p.error(Code::Verification))?;
+                        stream = Some(
+                            prepared
+                                .as_ref()
+                                .unwrap()
+                                .stream(&public_id, created)
+                                .map_err(|_| p.error(Code::Verification))?,
+                        );
+                    }
+                    stream
+                        .as_mut()
+                        .unwrap()
+                        .push(event)
+                        .map_err(|_| p.error(Code::Verification))?;
+                    streamed = true;
+                    tokio::select! {
+                        delivered = observer.send(bytes) => { if delivered.is_err() {
+                            let _ = sender.send(&Message::Cancel).await;
+                            return Err(p.error(Code::Stopped));
+                        } },
+                        _ = stopped(stop) => {
+                            let _ = sender.send(&Message::Cancel).await;
+                            return Err(p.error(Code::Stopped));
+                        }
+                    }
+                }
                 Message::Result { .. } if observed.is_none() && !failed => {
                     p.stage = Stage::Verifying;
-                    observed = Some(
-                        receiver
-                            .session()
-                            .decode_result(received, saved.snapshot(), saved.request())
-                            .map_err(|_| p.error(Code::Verification))?,
-                    );
+                    let reply = receiver
+                        .session()
+                        .decode_result(received, saved.snapshot(), saved.request())
+                        .map_err(|_| p.error(Code::Verification))?;
+                    if let Some(prepared) = &prepared {
+                        let created = reply.body[if authorization.terms.offer.endpoint
+                            == ProxyEndpoint::Responses
+                        {
+                            "created_at"
+                        } else {
+                            "created"
+                        }]
+                        .as_u64()
+                        .ok_or_else(|| p.error(Code::Verification))?;
+                        let stream = match stream.take() {
+                            Some(stream) => stream,
+                            None => prepared
+                                .stream(&public_id, created)
+                                .map_err(|_| p.error(Code::Verification))?,
+                        };
+                        stream
+                            .verify_final(&reply.body)
+                            .map_err(|_| p.error(Code::Verification))?;
+                    }
+                    observed = Some(reply);
                 }
                 Message::Failure { .. } if observed.is_none() && !failed => {
                     failed = true;
@@ -1013,7 +1151,7 @@ impl Shared {
                         settlement,
                     });
                 }
-                Message::Waiver { value } if observed.is_none() => {
+                Message::Waiver { value } if observed.is_none() && !streamed => {
                     p.stage = Stage::Verifying;
                     self.recovery
                         .approve_waiver(
@@ -1047,7 +1185,6 @@ impl Shared {
                 _ => return Err(p.error(Code::Verification)),
             }
         }
-        Err(p.error(Code::Verification))
     }
     async fn acknowledge(
         &self,

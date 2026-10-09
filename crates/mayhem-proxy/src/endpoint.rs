@@ -6,7 +6,9 @@
 mod public;
 mod responses_stream;
 pub mod stream;
-pub use public::{PublicAdapter, PublicAdapterSnapshot, PublicRequest};
+pub use public::{PublicAdapter, PublicAdapterSnapshot, PublicRequest, PublicStream};
+#[cfg(test)]
+mod public_stream_tests;
 
 use crate::{
     attempts::Digest,

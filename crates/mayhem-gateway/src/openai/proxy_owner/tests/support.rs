@@ -455,8 +455,15 @@ impl Harness {
                     _ = stop.changed() => break,
                     channel = listener.next(Duration::from_secs(60)) => {
                         if let Ok(channel) = channel {
-                            let handle = provider.accept(channel).unwrap();
-                            sessions.spawn(async move { let _ = handle.wait().await; });
+                            match provider.accept(channel) {
+                                Ok(handle) => { sessions.spawn(async move { let _ = handle.wait().await; }); },
+                                // The recovery supervisor may reconnect while
+                                // the previous control session is closing. Match
+                                // production dispatch: bounded admission rejects
+                                // this connection, not the entire listener.
+                                Err(serving::Error::Busy) => (),
+                                Err(error) => panic!("provider fixture admission failed: {error}"),
+                            }
                         }
                     },
                     Some(result) = sessions.join_next(), if !sessions.is_empty() => {

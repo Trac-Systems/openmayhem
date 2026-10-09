@@ -154,6 +154,7 @@ mod proxy_directory;
 pub mod proxy_request;
 mod response_stream;
 pub use key_budget::Limits as GatewayKeyBudgetLimits;
+mod proxy_evidence;
 mod proxy_owner;
 
 mod github_update;
@@ -6547,6 +6548,10 @@ pub fn openai_router(state: GatewayState) -> Router {
         )
         .route("/v1/jobs/{job_id}/cancel", post(cancel_gateway_job))
         .route("/v1/jobs/{job_id}/result", get(retrieve_gateway_job_result))
+        .route(
+            "/v1/jobs/{job_id}/proxy-evidence",
+            get(proxy_evidence::retrieve),
+        )
         .route(
             "/v1/jobs/{job_id}/artifacts/{artifact_id}",
             get(retrieve_gateway_job_artifact),

@@ -18,6 +18,8 @@ use std::ops::Bound::{Excluded, Unbounded};
 
 const MAX_PENDING_PAGE: usize = 64;
 
+pub(crate) mod evidence;
+
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct ProxyJobState {
@@ -41,7 +43,8 @@ impl std::fmt::Debug for ProxyJobState {
             .finish_non_exhaustive()
     }
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum ProxyPhase {
     AwaitingAuthorization,
     AwaitingBuyerJournal,
@@ -380,6 +383,16 @@ impl ProxyJobState {
 }
 
 impl GatewayJobStore {
+    /// Indexed read only. Do not clone a possibly large completion or run vault
+    /// expiry maintenance merely to inspect this one purchase's financial state.
+    pub(crate) fn proxy_evidence_record(&self, id: &str, now: u64) -> Option<&StoredGatewayJob> {
+        if self.proxy_failed {
+            return None;
+        }
+        self.records.get(id).filter(|job| job.proxy.is_some()
+            && (job.status == GatewayJobStatus::ReconciliationPending || job.expires_at > now))
+    }
+
     pub(crate) fn proxy_enabled(&self) -> bool {
         self.directory.is_some() && !self.proxy_failed
     }

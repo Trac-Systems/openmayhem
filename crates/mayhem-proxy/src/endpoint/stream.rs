@@ -65,6 +65,12 @@ impl<'a> Stream<'a> {
             Kind::Responses(s) => s.finish(),
         }
     }
+    pub(super) fn finish_normalized(self, result: &Value) -> Result<Value> {
+        match self.kind {
+            Kind::Completion(s) => s.finish_normalized(result),
+            Kind::Responses(s) => s.finish_normalized(result),
+        }
+    }
 }
 struct CompletionStream<'a> {
     request: &'a Request,
@@ -78,6 +84,19 @@ struct CompletionStream<'a> {
     failed: bool,
 }
 impl<'a> CompletionStream<'a> {
+    fn finish_normalized(mut self, result: &Value) -> Result<Value> {
+        require(!self.failed && !self.done)?;
+        let choices = result["choices"].as_array().ok_or(Error::Protocol)?;
+        require(choices.len() == self.request.choices)?;
+        for (index, final_choice) in choices.iter().enumerate() {
+            require(final_choice["index"].as_u64() == Some(index as u64))?;
+            let choice = self.choices.entry(index as u64).or_default();
+            require(choice.finish.is_none())?;
+            choice.finish = Some(string(final_choice, "finish_reason")?.into());
+        }
+        self.done = true;
+        self.finish()
+    }
     pub fn new(request: &'a Request, public_id: &str, created: u64) -> Result<Self> {
         if !request.streaming
             || !identifier(public_id)

@@ -30,6 +30,46 @@ pub(super) struct ResponsesStream<'a> {
     failed: bool,
 }
 impl<'a> ResponsesStream<'a> {
+    pub(super) fn finish_normalized(self, result: &Value) -> Result<Value> {
+        require(!self.failed && self.terminal.is_none())?;
+        let final_items = result["output"].as_array().ok_or(Error::Protocol)?;
+        require(final_items.len() == self.items.len())?;
+        for (item, final_item) in self.items.into_iter().zip(final_items) {
+            let mut expected = item.value;
+            if let Some(status) = final_item.get("status") {
+                expected["status"] = status.clone();
+            }
+            // These fields may occur only in the provider's withheld done
+            // frames. Already-delivered text, arguments, annotations and nonempty
+            // logprobs must remain identical to the final normalized result.
+            if expected["type"] == "reasoning" {
+                expected
+                    .as_object_mut()
+                    .unwrap()
+                    .remove("encrypted_content");
+                if let Some(value) = final_item.get("encrypted_content") {
+                    expected["encrypted_content"] = value.clone();
+                }
+            }
+            if let Some(parts) = expected.get_mut("content").and_then(Value::as_array_mut) {
+                let final_parts = final_item["content"].as_array().ok_or(Error::Protocol)?;
+                require(parts.len() == final_parts.len())?;
+                for (part, final_part) in parts.iter_mut().zip(final_parts) {
+                    if part["type"] == "output_text"
+                        && part
+                            .get("logprobs")
+                            .is_none_or(|v| v.as_array().is_some_and(Vec::is_empty))
+                    {
+                        if let Some(logprobs) = final_part.get("logprobs") {
+                            part["logprobs"] = logprobs.clone();
+                        }
+                    }
+                }
+            }
+            require(&expected == final_item)?;
+        }
+        Ok(result.clone())
+    }
     pub(super) fn new(request: &'a Request, public_id: &str, created: u64) -> Result<Self> {
         if !request.streaming
             || request.endpoint != ProxyEndpoint::Responses
