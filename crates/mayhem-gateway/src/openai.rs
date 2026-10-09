@@ -151,6 +151,7 @@ mod key_budget;
 pub mod proxy_buyer;
 pub mod proxy_control;
 mod proxy_directory;
+mod proxy_families;
 pub mod proxy_request;
 mod response_stream;
 pub use key_budget::Limits as GatewayKeyBudgetLimits;
@@ -6536,9 +6537,11 @@ pub fn openai_router(state: GatewayState) -> Router {
     Router::new()
         .route("/v1/models", get(list_models))
         .route("/v1/proxy/offers", get(proxy_directory::list))
+        .route("/v1/proxy/families/lookup", post(proxy_families::lookup))
         .route("/v1/proxy/buyer-policy", get(proxy_buyer::buyer_policy))
         .route("/v1/proxy/estimate", post(proxy_buyer::estimate))
         .route("/v1/proxy/profile/prepare", post(proxy_buyer::prepare_profile))
+        .route("/v1/proxy/profile/resolve", post(proxy_buyer::resolve_profile))
         .route(
             "/v1/proxy/offers/{market}/{provider}/{slot}/contract",
             get(proxy_buyer::contract),

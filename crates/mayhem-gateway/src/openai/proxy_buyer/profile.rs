@@ -40,7 +40,7 @@ fn has_controls(request: &proxy_request::Request) -> bool {
 
 /// Resolves one immutable release and exact closure. CPU work retains its permit
 /// after caller cancellation; no registry-wide reads or implicit defaults.
-async fn materialize(
+pub(super) async fn materialize(
     control: Arc<super::super::proxy_control::ProxyControl>,
     request: Arc<proxy_request::Request>,
     adapter: PublicAdapterSnapshot,

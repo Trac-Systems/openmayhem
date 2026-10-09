@@ -54,7 +54,7 @@ struct RegistryState {
     reads: usize,
     unavailable: bool,
 }
-struct Registry {
+pub(super) struct Registry {
     origin: String,
     state: Arc<Mutex<RegistryState>>,
     task: tokio::task::JoinHandle<()>,
@@ -65,7 +65,7 @@ impl Drop for Registry {
     }
 }
 impl Registry {
-    async fn start() -> Self {
+    pub(super) async fn start() -> Self {
         let (release, document) = publication(None, temperature(1));
         let state = Arc::new(Mutex::new(RegistryState {
             head: release.clone(),
@@ -157,7 +157,7 @@ impl Registry {
             task,
         }
     }
-    fn config(&self) -> crate::openai::proxy_control::RegistryConfig {
+    pub(super) fn config(&self) -> crate::openai::proxy_control::RegistryConfig {
         crate::openai::proxy_control::RegistryConfig {
             origin: self.origin.clone(),
             allow_loopback_http: true,

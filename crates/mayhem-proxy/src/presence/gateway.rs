@@ -8,10 +8,10 @@ use crate::{catalog::Catalog, require, Error, Result};
 use mayhem_bridge::ScBridgeConfig;
 use serde::Serialize;
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -42,6 +42,47 @@ pub struct Gateway {
     markets: watch::Sender<Arc<BTreeSet<Digest>>>,
     running: Arc<AtomicBool>,
     health: watch::Receiver<Health>,
+    selection: Arc<Mutex<Selection>>,
+}
+
+#[derive(Default)]
+struct Selection {
+    explicit: BTreeSet<Digest>,
+    observations: BTreeMap<Digest, usize>,
+}
+impl Selection {
+    fn union(&self) -> BTreeSet<Digest> {
+        self.explicit
+            .iter()
+            .chain(self.observations.keys())
+            .cloned()
+            .collect()
+    }
+}
+
+/// A bounded interest in authenticated presence, not a capacity reservation.
+/// Dropping one reader cannot remove another reader or explicit selection.
+pub struct ObservationLease {
+    gateway: Gateway,
+    market: Digest,
+}
+impl ObservationLease {
+    pub fn market(&self) -> &Digest {
+        &self.market
+    }
+}
+impl Drop for ObservationLease {
+    fn drop(&mut self) {
+        if let Ok(mut selection) = self.gateway.selection.lock() {
+            if let Some(count) = selection.observations.get_mut(&self.market) {
+                *count -= 1;
+                if *count == 0 {
+                    selection.observations.remove(&self.market);
+                }
+            }
+            self.gateway.publish_selection(&selection);
+        }
+    }
 }
 
 pub struct Supervisor {
@@ -82,6 +123,7 @@ impl Gateway {
                 markets,
                 running: running.clone(),
                 health,
+                selection: Arc::new(Mutex::new(Selection::default())),
             },
             Supervisor {
                 config,
@@ -95,15 +137,64 @@ impl Gateway {
         ))
     }
 
-    /// Atomically replace the desired set. Removed markets fail closed in status
-    /// immediately, even while the old transport finishes its bounded shutdown.
+    /// Atomically replace explicit selections; concurrent observation leases
+    /// retain only their own markets. Unwanted and unleased markets fail closed
+    /// immediately, even while the old transport finishes bounded shutdown.
     /// Repeated identical sets do not reconnect. An empty set opens no connection.
     pub fn select(&self, markets: Vec<Digest>) -> Result<()> {
         require(
             markets.len() <= self.max_markets,
             "presence subscription quota exceeded",
         )?;
-        let markets = Arc::new(markets.into_iter().collect::<BTreeSet<_>>());
+        let mut selection = self
+            .selection
+            .lock()
+            .map_err(|_| crate::invalid("presence selection lock unavailable"))?;
+        let explicit = markets.into_iter().collect::<BTreeSet<_>>();
+        require(
+            explicit
+                .iter()
+                .chain(selection.observations.keys())
+                .collect::<BTreeSet<_>>()
+                .len()
+                <= self.max_markets,
+            "presence subscription quota exceeded",
+        )?;
+        selection.explicit = explicit;
+        self.publish_selection(&selection);
+        Ok(())
+    }
+
+    /// Share the existing authenticated receiver for one current candidate.
+    /// The existing total market quota bounds explicit and temporary demand.
+    pub fn observe_market(&self, market: Digest) -> Result<ObservationLease> {
+        require(
+            self.running.load(Ordering::Acquire),
+            "presence supervisor is stopped",
+        )?;
+        let mut selection = self
+            .selection
+            .lock()
+            .map_err(|_| crate::invalid("presence selection lock unavailable"))?;
+        let mut union = selection.union();
+        union.insert(market.clone());
+        require(
+            union.len() <= self.max_markets,
+            "presence observation quota exceeded",
+        )?;
+        let count = selection.observations.entry(market.clone()).or_default();
+        *count = count
+            .checked_add(1)
+            .ok_or_else(|| crate::invalid("presence observation counter overflow"))?;
+        self.publish_selection(&selection);
+        Ok(ObservationLease {
+            gateway: self.clone(),
+            market,
+        })
+    }
+
+    fn publish_selection(&self, selection: &Selection) {
+        let markets = Arc::new(selection.union());
         self.markets.send_if_modified(|current| {
             if *current == markets {
                 false
@@ -112,7 +203,6 @@ impl Gateway {
                 true
             }
         });
-        Ok(())
     }
 
     pub fn health(&self) -> watch::Receiver<Health> {

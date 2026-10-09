@@ -39,11 +39,14 @@ use tokio::{
 mod contract;
 mod estimation;
 mod profile;
+mod resolver;
 mod retail;
 mod streaming;
 pub(super) use contract::handle as contract;
 pub(super) use estimation::handle as estimate;
 pub(super) use profile::handle as prepare_profile;
+pub(super) use resolver::handle as resolve_profile;
+pub use resolver::Limits as ProfileResolutionLimits;
 pub use retail::{
     request_content_digest as retail_request_content_digest, Config as RetailAuthorizationConfig,
 };
@@ -61,6 +64,7 @@ pub struct Runtime {
     tasks: Mutex<JoinSet<()>>,
     halt: watch::Sender<bool>,
     running: AtomicBool,
+    resolver: resolver::Store,
 }
 impl fmt::Debug for Runtime {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -77,6 +81,7 @@ struct Claim {
 struct Running(Arc<Runtime>);
 impl Drop for Running {
     fn drop(&mut self) {
+        self.0.resolver.clear();
         self.0.running.store(false, Ordering::Release);
         self.0.halt.send_replace(true);
     }
@@ -113,7 +118,17 @@ impl Runtime {
             tasks: Mutex::new(JoinSet::new()),
             halt,
             running: AtomicBool::new(false),
+            resolver: resolver::Store::new(ProfileResolutionLimits::default())?,
         })
+    }
+
+    /// Trusted operator resource budgets for read-only profile resolution.
+    pub fn with_profile_resolution_limits(
+        mut self,
+        limits: ProfileResolutionLimits,
+    ) -> Result<Self, String> {
+        self.resolver = resolver::Store::new(limits)?;
+        Ok(self)
     }
 
     /// Trusted operator configuration only. Matching keys cannot opt out through
@@ -311,6 +326,7 @@ impl Runtime {
             tokio::select! {
                 _ = stop_signal(&mut stop) => break,
                 _ = interval.tick() => {
+                    self.resolver.expire();
                     let jobs = state.jobs.clone();
                     let after = cursor.clone();
                     let page = storage(move || jobs.lock().map_err(|_| unavailable())?

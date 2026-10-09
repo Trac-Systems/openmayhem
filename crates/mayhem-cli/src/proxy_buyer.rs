@@ -187,6 +187,8 @@ struct Config {
     receipt_grace_epochs: u64,
     #[serde(default)]
     retail_authorization: Option<mayhem_gateway::openai::proxy_buyer::RetailAuthorizationConfig>,
+    #[serde(default)]
+    profile_resolution: Option<mayhem_gateway::openai::proxy_buyer::ProfileResolutionLimits>,
 }
 
 impl Config {
@@ -222,6 +224,9 @@ impl Config {
             "invalid proxy buyer resource limits"
         );
         config.policy()?;
+        if let Some(resolution) = &config.profile_resolution {
+            resolution.validate().map_err(anyhow::Error::msg)?;
+        }
         if let Some(retail) = &config.retail_authorization {
             retail.validate().map_err(anyhow::Error::msg)?;
         }
@@ -415,6 +420,8 @@ pub async fn prepare(
             config.settlement_policy.clone(),
             config.sessions,
         )
+        .map_err(anyhow::Error::msg)?
+        .with_profile_resolution_limits(config.profile_resolution.clone().unwrap_or_default())
         .map_err(anyhow::Error::msg)?;
         let budget_limits = config.budget_limits();
         if let Some(retail) = config.retail_authorization {

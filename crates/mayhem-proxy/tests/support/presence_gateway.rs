@@ -1,4 +1,6 @@
 //! Local authenticated protocol fixture only, not a Noise/relay acceptance test.
+#[path = "presence_gateway_leases.rs"]
+mod leases;
 use super::*;
 use futures_util::{SinkExt, StreamExt};
 use mayhem_bridge::ScBridgeConfig;

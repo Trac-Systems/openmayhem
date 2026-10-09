@@ -3,6 +3,7 @@ mod contract;
 mod estimation;
 mod local_lab;
 mod profile;
+mod resolver;
 mod retail;
 mod streaming;
 use super::*;
@@ -69,6 +70,17 @@ impl Fixture {
         contract: Option<mayhem_proto::EndpointFamilyContract>,
         registry: Option<crate::openai::proxy_control::RegistryConfig>,
     ) -> Self {
+        Self::start_configured(endpoint, rail, retail, owner_key, contract, registry, None).await
+    }
+    async fn start_configured(
+        endpoint: ProxyEndpoint,
+        rail: ProxyRail,
+        retail: Option<RetailAuthorizationConfig>,
+        owner_key: &str,
+        contract: Option<mayhem_proto::EndpointFamilyContract>,
+        registry: Option<crate::openai::proxy_control::RegistryConfig>,
+        resolution_limits: Option<ProfileResolutionLimits>,
+    ) -> Self {
         let harness =
             Harness::start_with_contract(&support::worker_path(), endpoint, rail, contract).await;
         let control = match registry {
@@ -89,6 +101,9 @@ impl Fixture {
         .unwrap();
         let mut runtime =
             Runtime::new(harness.buyer.clone(), policy, harness.policy.clone(), 2).unwrap();
+        if let Some(limits) = resolution_limits {
+            runtime = runtime.with_profile_resolution_limits(limits).unwrap();
+        }
         if let Some(config) = retail {
             runtime = runtime.with_retail_authorization(config).unwrap();
         }

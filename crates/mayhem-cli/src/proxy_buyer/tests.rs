@@ -351,3 +351,46 @@ fn buyer_retail_callback_uses_protected_fixed_operator_configuration() {
     write(&path, &serde_json::to_vec(&value).unwrap());
     assert!(Config::load(&path).is_err());
 }
+
+#[test]
+fn buyer_profile_resolution_configuration_preserves_defaults_and_rejects_invalid_budgets_before_startup(
+) {
+    let (dir, path) = fixture();
+    let original = Config::load(&path).unwrap();
+    assert!(original.profile_resolution.is_none());
+    let original_policy = original.settlement_policy.digest().unwrap();
+    let mut value = config();
+    value["profile_resolution"] = json!({"retained_sessions":7,"retained_bytes":67108864,
+        "active_steps":2,"candidates_per_step":3,"ttl_ms":300000,"observation_timeout_ms":10000});
+    write(&path, &serde_json::to_vec(&value).unwrap());
+    let explicit = Config::load(&path).unwrap();
+    assert_eq!(
+        explicit
+            .profile_resolution
+            .as_ref()
+            .unwrap()
+            .retained_sessions,
+        7
+    );
+    assert_eq!(
+        explicit.settlement_policy.digest().unwrap(),
+        original_policy
+    );
+    for (field, invalid) in [
+        ("retained_sessions", 0),
+        ("retained_bytes", 0),
+        ("active_steps", 17),
+        ("candidates_per_step", 17),
+        ("ttl_ms", 0),
+        ("observation_timeout_ms", 60001),
+    ] {
+        let mut bad = value.clone();
+        bad["profile_resolution"][field] = json!(invalid);
+        write(&path, &serde_json::to_vec(&bad).unwrap());
+        assert!(Config::load(&path).is_err(), "{field}");
+        assert!(!dir.0.join("state").exists());
+    }
+    value["profile_resolution"]["per_customer_concurrency"] = json!(2);
+    write(&path, &serde_json::to_vec(&value).unwrap());
+    assert!(Config::load(&path).is_err());
+}
