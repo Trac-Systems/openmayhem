@@ -688,16 +688,22 @@ async fn submit(
 
 fn selection_error(error: proxy_request::Error) -> ApiError {
     use proxy_request::Error;
+    // Only candidate selection, before begin_proxy, can establish these public
+    // non-admission codes. Generic validation and existing-job errors cannot.
     match error {
-        Error::Invalid => invalid(),
+        Error::Invalid => {
+            invalid().with_public_error("proxy_request_invalid", "proxy_admission", false)
+        }
         Error::Constraints => ApiError::bad_request(
             "selected proxy offer does not satisfy the endpoint, rail or context constraints",
             Some("proxy"),
-        ),
+        )
+        .with_public_error("proxy_constraints_not_met", "proxy_admission", false),
         Error::Price => ApiError::payment_required(
             "selected proxy offer exceeds the authorized price limits",
             Some("proxy.prices"),
-        ),
+        )
+        .with_public_error("proxy_price_limit_exceeded", "proxy_admission", false),
         Error::Verification => ApiError::service_unavailable(
             "verified operator evidence is unavailable for the selected proxy offer",
             Some("proxy"),

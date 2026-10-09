@@ -102,6 +102,113 @@ impl Drop for Server {
     }
 }
 
+#[test]
+fn proxy_selection_rejections_have_scoped_non_admission_codes() {
+    for (error, status, code) in [
+        (
+            proxy_request::Error::Price,
+            StatusCode::PAYMENT_REQUIRED,
+            "proxy_price_limit_exceeded",
+        ),
+        (
+            proxy_request::Error::Constraints,
+            StatusCode::BAD_REQUEST,
+            "proxy_constraints_not_met",
+        ),
+        (
+            proxy_request::Error::Invalid,
+            StatusCode::BAD_REQUEST,
+            "proxy_request_invalid",
+        ),
+    ] {
+        let error = selection_error(error);
+        assert_eq!(error.status, status);
+        assert_eq!(error.public_code, code);
+        assert_eq!(error.category, "proxy_admission");
+        assert!(!error.retryable);
+    }
+    // Invalid is defensive in selection_error: the current resolver produces
+    // it only during earlier parsing. Do not broaden that generic error or any
+    // error which can also occur after an owner job exists.
+    assert_eq!(invalid().public_code, "invalid_request");
+    assert_eq!(invalid().category, "request_validation");
+    assert_eq!(
+        selection_error(proxy_request::Error::Busy).category,
+        "proxy"
+    );
+    assert_eq!(unavailable().category, "proxy");
+}
+
+#[tokio::test]
+async fn proxy_http_selection_rejections_create_no_job_spend_or_callback() {
+    let server = Server::start("accept").await;
+    let mut f = server.fixture().await;
+    for (case, status, code, category) in [
+        (
+            "price",
+            StatusCode::PAYMENT_REQUIRED,
+            "proxy_price_limit_exceeded",
+            "proxy_admission",
+        ),
+        (
+            "constraints",
+            StatusCode::BAD_REQUEST,
+            "proxy_constraints_not_met",
+            "proxy_admission",
+        ),
+        (
+            "invalid-parse",
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "request_validation",
+        ),
+    ] {
+        let mut body = f.body();
+        match case {
+            "price" => body["proxy"]["prices"]["rates"][0]["per_unit_au"] = json!("0"),
+            "constraints" => body["proxy"]["minimum_context"] = json!(u32::MAX),
+            "invalid-parse" => body["proxy"]["minimum_context"] = json!(0),
+            _ => unreachable!(),
+        }
+        let (actual_status, headers, response) =
+            f.post(case, body, "owner-fixture-key", false).await;
+        assert_eq!(actual_status, status, "{case}: {response}");
+        assert_eq!(response["error"]["code"], code, "{case}");
+        assert_eq!(response["error"]["category"], category, "{case}");
+        assert_eq!(response["error"]["retryable"], false, "{case}");
+        assert!(headers.get("x-mayhem-job-id").is_none());
+        let id = gateway_job_id(
+            f.harness.buyer_seed,
+            Some("owner"),
+            "openai_chat_completions",
+            Some(case),
+        )
+        .unwrap();
+        assert!(f
+            .state
+            .jobs
+            .lock()
+            .unwrap()
+            .get(&id, now_secs())
+            .unwrap()
+            .is_none());
+        assert!(f
+            .state
+            .access_control
+            .pending_key_budgets(None, 64)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            f.state.access_control.summary()["tokens"][0]["spent_total_au"],
+            "0"
+        );
+        assert_eq!(server.count(), 0);
+        assert_eq!(f.harness.backend_calls(), 0);
+        assert_eq!(f.harness.status().await["publications"], 0);
+    }
+    f.stop().await;
+}
+
 #[tokio::test]
 async fn proxy_http_retail_gate_pins_core_before_callback_and_calls_once_before_execute() {
     let server = Server::start("accept").await;
