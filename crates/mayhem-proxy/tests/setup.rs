@@ -1,6 +1,10 @@
 #![cfg(unix)]
+#[path = "setup/connection.rs"]
+mod connection;
 #[path = "setup/probe.rs"]
 mod probes;
+#[path = "setup/profile.rs"]
+mod profile;
 use mayhem_proto::proxy::{
     finance::{ProxyReceiptOutcome, ProxySettlementPolicy},
     *,

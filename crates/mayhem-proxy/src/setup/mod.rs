@@ -1,10 +1,17 @@
 //! Shared local provider setup. Structural validation is not conformance,
 //! admission, publication, or serving authority. Only an explicit probe invokes
 //! the existing bounded upstream controller; setup never opens a wallet.
+mod connection;
 mod probe;
+mod profile;
 mod review;
 mod store;
+pub use connection::{DiscoveryState, InventoryReview};
 pub use probe::{ProbeGroup, ProbePlan, ProbeReport, ProbeScope, ProbeState};
+pub use profile::{
+    profiles, EndpointProfile, MembershipInput, OfferInput, ProfileInput, ProfileMarket,
+    ProfileReview,
+};
 pub use review::{AdmissionHandoff, Review, State};
 pub use store::Store;
 
@@ -49,6 +56,8 @@ pub enum Error {
     ProbeRecovery,
     #[error("provider setup probe capacity is unavailable or its allowance is exhausted")]
     ProbeCapacity,
+    #[error("provider connection discovery state is missing")]
+    DiscoveryMissing,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 fn require(ok: bool) -> Result<()> {

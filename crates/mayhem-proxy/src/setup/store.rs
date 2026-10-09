@@ -155,7 +155,17 @@ impl Guard {
         }
     }
     pub(super) fn read(&self) -> Result<Option<Record>> {
-        let Some(file) = self.file("draft.json")? else {
+        let record: Option<Record> = self.read_json("draft.json")?;
+        if let Some(record) = &record {
+            record.validate()?;
+        }
+        Ok(record)
+    }
+    pub(super) fn read_json<T: serde::de::DeserializeOwned>(
+        &self,
+        name: &str,
+    ) -> Result<Option<T>> {
+        let Some(file) = self.file(name)? else {
             return Ok(None);
         };
         let mut bytes = zeroize::Zeroizing::new(Vec::new());
@@ -163,25 +173,33 @@ impl Guard {
             .read_to_end(&mut bytes)
             .map_err(|_| Error::Storage)?;
         require(bytes.len() <= MAX_BYTES)?;
-        let record: Record = serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
-        record.validate()?;
-        Ok(Some(record))
+        Ok(Some(
+            serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?,
+        ))
     }
     pub(super) fn write(&self, record: &Record) -> Result<()> {
         record.validate()?;
-        let bytes =
-            zeroize::Zeroizing::new(serde_json::to_vec(record).map_err(|_| Error::Invalid)?);
+        self.write_json("draft.json", "draft.next", record)
+    }
+    pub(super) fn write_json<T: Serialize>(
+        &self,
+        name: &str,
+        temporary: &str,
+        value: &T,
+    ) -> Result<()> {
+        // Names are fixed by setup callers, never supplied by a declaration.
+        let _ = self.file(name)?;
+        let bytes = zeroize::Zeroizing::new(serde_json::to_vec(value).map_err(|_| Error::Invalid)?);
         require(bytes.len() <= MAX_BYTES)?;
         // A crash before rename leaves only an uncommitted temporary file. Never
         // promote it on resume; the original durable draft remains authoritative.
-        if self.file("draft.next")?.is_some() {
-            unlinkat(&self.directory, "draft.next", AtFlags::empty())
-                .map_err(|_| Error::Storage)?;
+        if self.file(temporary)?.is_some() {
+            unlinkat(&self.directory, temporary, AtFlags::empty()).map_err(|_| Error::Storage)?;
         }
         let mut file = File::from(
             openat(
                 &self.directory,
-                "draft.next",
+                temporary,
                 OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::from_raw_mode(0o600),
             )
@@ -189,8 +207,7 @@ impl Guard {
         );
         file.write_all(&bytes).map_err(|_| Error::Storage)?;
         file.sync_all().map_err(|_| Error::Storage)?;
-        renameat(&self.directory, "draft.next", &self.directory, "draft.json")
-            .map_err(|_| Error::Storage)?;
+        renameat(&self.directory, temporary, &self.directory, name).map_err(|_| Error::Storage)?;
         self.directory.sync_all().map_err(|_| Error::CommitUnknown)
     }
 }
@@ -205,6 +222,12 @@ impl Guard {
         Err(Error::Protection)
     }
     pub(super) fn write(&self, _: &Record) -> Result<()> {
+        Err(Error::Protection)
+    }
+    pub(super) fn read_json<T: serde::de::DeserializeOwned>(&self, _: &str) -> Result<Option<T>> {
+        Err(Error::Protection)
+    }
+    pub(super) fn write_json<T: Serialize>(&self, _: &str, _: &str, _: &T) -> Result<()> {
         Err(Error::Protection)
     }
 }

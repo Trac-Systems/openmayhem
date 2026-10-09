@@ -41,7 +41,7 @@ temporary writes never become authoritative on resume. Corrupt current files
 are not silently replaced. An uncertain post-rename result requires inspecting
 the original draft; it is not permission to create another invoice or identity.
 
-`inspect` and every successful mutation return only the public `Review`.
+`inspect` and every successful draft mutation return only the public `Review`.
 It contains public market/membership/offer and endpoint-contract data, policy,
 draft identity/revision and explicit state. Private connection paths and
 fingerprints, upstream model mappings, local resource limits, URLs, credentials
@@ -148,3 +148,88 @@ or pending invoice cannot be replaced merely because a CLI request was lost.
 Only confirmed canonical admission/publication can enable subsequent serving.
 Existing `provider proxy add` retains its supervisor-installation meaning;
 these setup commands never invoke it automatically.
+
+## Connection discovery and profile preparation
+
+The same library now supports an explicit model-list read and offline profile
+preparation before a full declaration exists:
+
+```sh
+mayhem provider proxy setup profiles
+mayhem provider proxy setup discover --directory /absolute/private/setup --connection /absolute/private/connection.json --expected-revision 0
+mayhem provider proxy setup inventory --directory /absolute/private/setup --show-models
+mayhem provider proxy setup prepare --directory /absolute/private/setup --input /absolute/private/profile.json
+mayhem provider proxy setup resume --directory /absolute/private/setup
+mayhem provider proxy setup check --directory /absolute/private/setup --expected-revision 1
+```
+
+`profiles` returns the existing four same-protocol endpoint templates and public
+metering definitions. These are local adapter definitions, not detected upstream
+capabilities. `discover` performs at most one GET through the configured `models`
+operation, with the connector's existing destination checks, no redirects,
+environment proxies or retries. It is the only new command that resolves the
+explicit connection's credential reference. It does not send an inference request,
+launch a decoder, reserve capacity, collect fees, publish or start serving.
+
+Discovery has a 64 KiB response limit, retains at most 128 unique model IDs (256
+UTF-8 bytes each), and has an explicit `--timeout-ms` of 1–10000 milliseconds,
+default 5000. Tighter connection byte/connect/idle limits still apply. Only
+validated IDs are retained; arbitrary model metadata, response headers and vendor
+error text are discarded. Invalid IDs/duplicates fail the observation. A larger
+valid list or explicit upstream `has_more` produces `truncated: true`; this is a
+single-response observation, never a promise to enumerate every upstream model.
+An absent model-list path or unsupported endpoint reports `unsupported`.
+Explicit profiles remain usable without `/models`.
+
+One protected `discovery.json` shares the existing directory lock and atomic
+file writer. It is separate from `draft.json`: discovery cannot modify a checked
+declaration, reset a probe allowance or invalidate retained work. Inventory has
+its own stable ID and CAS revision. Revision 0 creates it; an explicit refresh
+uses its current revision and advances twice, saving `pending` before network
+I/O and the final result afterward. An interruption leaves the original pending
+revision. `inventory` reads it without retrying. A changed connection marks the
+observation as unsuitable for the current configuration; drift during discovery
+discards the returned model IDs. No timer auto-refreshes this file.
+
+Default discovery/inventory output omits private model IDs. `inventory
+--show-models` explicitly includes them for the local operator. Neither form
+contains URLs, connection paths/fingerprints, credentials or arbitrary metadata.
+The public draft review is unchanged. Model identity, capabilities, readiness
+and concurrency always remain `not_verified`; discovery is not conformance or
+serving evidence, and fees remain `not_checked`.
+
+`ProfileInput` is a protected version-1 JSON document containing:
+
+- Explicit `network`, `provider_pubkey`, `connection_file`, `upstream_model`,
+  adapter `limits`, `sequence` and full `settlement_policy`.
+- `profile: {"kind":"standard","endpoint":"chat"}` (also `completions`,
+  `responses`, `decisions`), or `{"kind":"custom","endpoint":"chat",
+  "contract": ...}` with the complete normative endpoint contract.
+- `market: {"action":"create_market","slug": ..., "model": ...}` with an
+  explicit public model claim, or `{"action":"join_market","market": ...}`
+  with the exact existing public market descriptor. No canonical existence or
+  family/model identity is inferred by this offline command.
+- `membership` with `revision`, `served_context`, `max_concurrency`,
+  `capacity_group` and `accepted_rails`.
+- One to 16 `offers`, each containing `revision`, `ctx_bracket`, `outcome_class`,
+  a complete `rates` map, `per_request_au`, `min_session_au` and `accepted_rails`.
+  AU money values retain the protocol's decimal-string encoding.
+
+Preparation derives the adapter, contract/recipe/metering bindings, market ID,
+membership and offer bindings using existing validators. It does not guess model
+family, prices, capabilities, allocation, rail or endpoint. Custom profiles can
+be copied/reused as protected operator input; private model mappings stay private.
+Public recipe import/export and a guided dashboard remain unfinished.
+
+Without `--expected-revision`, `prepare` creates the original draft and refuses
+an existing one. With an exact revision it uses the original update operation,
+preserving its ID and probe scope while invalidating the old structural check.
+Changing rates on that same market retains its market identity and does not
+automatically run a probe. The existing whole-declaration probe binding still
+marks the earlier report as requiring recheck after any draft change; finer
+capability-specific evidence reuse remains unfinished. This does not publish
+those rates or change any accepted purchase.
+`resume` is an alias of `inspect`, with no network request. Existing create/update,
+check, probe and recover-probe behavior and the actual admission fee gate remain
+unchanged. The complete wizard must still connect the canonical admission/invoice
+and publication steps described above before claiming paid provider readiness.

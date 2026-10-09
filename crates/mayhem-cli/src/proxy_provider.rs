@@ -162,6 +162,47 @@ mod tests {
     #[test]
     fn proxy_setup_commands_are_explicit_local_operations_without_wallet_arguments() {
         for args in [
+            vec!["proxy", "setup", "profiles"],
+            vec![
+                "proxy",
+                "setup",
+                "discover",
+                "--directory",
+                "/private/setup",
+                "--connection",
+                "/private/connection.json",
+                "--expected-revision",
+                "0",
+            ],
+            vec![
+                "proxy",
+                "setup",
+                "inventory",
+                "--directory",
+                "/private/setup",
+                "--show-models",
+            ],
+            vec![
+                "proxy",
+                "setup",
+                "prepare",
+                "--directory",
+                "/private/setup",
+                "--input",
+                "/private/profile.json",
+            ],
+            vec![
+                "proxy",
+                "setup",
+                "prepare",
+                "--directory",
+                "/private/setup",
+                "--input",
+                "/private/profile.json",
+                "--expected-revision",
+                "2",
+            ],
+            vec!["proxy", "setup", "resume", "--directory", "/private/setup"],
             vec![
                 "proxy",
                 "setup",
@@ -222,6 +263,25 @@ mod tests {
             Cli::try_parse_from(["proxy", "setup", "check", "--directory", "/private/setup"])
                 .is_err()
         );
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "discover",
+            "--directory",
+            "/private/setup",
+            "--connection",
+            "/private/connection.json"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "inventory",
+            "--directory",
+            "/private/setup",
+            "--auto-refresh"
+        ])
+        .is_err());
         assert!(Cli::try_parse_from([
             "proxy",
             "setup",
