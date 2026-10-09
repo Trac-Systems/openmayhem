@@ -35,11 +35,14 @@ const GROUPS: TableDefinition<&str, &[u8]> = TableDefinition::new("capacity_grou
 const ROUTES: TableDefinition<&str, &[u8]> = TableDefinition::new("capacity_routes_v1");
 const LEASES: TableDefinition<&str, &[u8]> = TableDefinition::new("capacity_leases_v1");
 const BY_GROUP: TableDefinition<&str, &str> = TableDefinition::new("capacity_group_leases_v1");
+const BY_CONSTRAINT: TableDefinition<&str, &str> =
+    TableDefinition::new("capacity_constraint_leases_v1");
 const BY_WORK: TableDefinition<&str, &str> = TableDefinition::new("capacity_work_leases_v1");
 const SIGNING: TableDefinition<&str, &[u8]> = TableDefinition::new("capacity_signing_intents_v1");
 const MAX_RECORD_BYTES: usize = 4096;
 const MAX_SIGNING_BYTES: usize = 32768;
 const MAX_PAGE: usize = 64;
+const MAX_CONSTRAINTS: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -130,6 +133,8 @@ struct Meta {
     groups: u64,
     routes: u64,
     leases: u64,
+    #[serde(default)]
+    constraint_leases: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -194,6 +199,15 @@ impl Gate {
         }
     }
 }
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GroupMode {
+    #[default]
+    Observed,
+    /// A physical/operator allocation ceiling, not model-health evidence.
+    /// Every route still independently requires fresh readiness.
+    Allocation,
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Group {
@@ -202,6 +216,8 @@ struct Group {
     occupied: u32,
     routes: u64,
     gate: Gate,
+    #[serde(default)]
+    mode: GroupMode,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -209,6 +225,8 @@ struct RouteState {
     config: Route,
     occupied: u32,
     gate: Gate,
+    #[serde(default)]
+    constraints: Vec<Digest>,
 }
 
 /// Issued by this authority before starting an asynchronous observation. Newer
@@ -324,6 +342,13 @@ pub struct Status {
     pub available: u32,
     pub state: Readiness,
 }
+#[derive(Clone, Debug)]
+pub struct GroupStatus {
+    pub mode: GroupMode,
+    pub ceiling: u32,
+    pub occupied: u32,
+    pub routes: u64,
+}
 pub struct Page {
     pub leases: Vec<Lease>,
     pub next_after: Option<Digest>,
@@ -372,7 +397,7 @@ impl Authority {
                 return Err(Error::Identity);
             }
             require(
-                matches!(m.schema, 1 | 2 | 3)
+                matches!(m.schema, 1 | 2 | 3 | 4)
                     && [
                         GROUPS.name(),
                         ROUTES.name(),
@@ -390,12 +415,21 @@ impl Authority {
             } else {
                 require(names.iter().any(|n| n == SIGNING.name()))?;
             }
+            if m.schema < 4 {
+                require(
+                    !names.iter().any(|n| n == BY_CONSTRAINT.name()) && m.constraint_leases == 0,
+                )?;
+                db(tx.open_table(BY_CONSTRAINT))?;
+            } else {
+                require(names.iter().any(|n| n == BY_CONSTRAINT.name()))?;
+            }
             require(
                 db(db(tx.open_table(GROUPS))?.len())? == m.groups
                     && db(db(tx.open_table(ROUTES))?.len())? == m.routes
                     && db(db(tx.open_table(LEASES))?.len())? == m.leases
                     && db(db(tx.open_table(BY_GROUP))?.len())? == m.leases
                     && db(db(tx.open_table(BY_WORK))?.len())? == m.leases
+                    && db(db(tx.open_table(BY_CONSTRAINT))?.len())? == m.constraint_leases
                     && db(db(tx.open_table(SIGNING))?.len())? <= m.leases,
             )?;
             m
@@ -405,21 +439,23 @@ impl Authority {
             db(tx.open_table(ROUTES))?;
             db(tx.open_table(LEASES))?;
             db(tx.open_table(BY_GROUP))?;
+            db(tx.open_table(BY_CONSTRAINT))?;
             db(tx.open_table(BY_WORK))?;
             db(tx.open_table(SIGNING))?;
             Meta {
-                schema: 3,
+                schema: 4,
                 identity,
                 fence: 0,
                 sequence: 0,
                 groups: 0,
                 routes: 0,
                 leases: 0,
+                constraint_leases: 0,
             }
         };
-        // Gate.live defaults to None in historical rows; no history rewrite or
-        // lease migration. Older binaries reject this local schema explicitly.
-        m.schema = 3;
+        // Added gate/group/constraint fields default safely in historical rows;
+        // no history rewrite or lease migration. Older binaries reject schema4.
+        m.schema = 4;
         m.fence = m.fence.checked_add(1).ok_or(Error::Invalid)?;
         db(t.insert("state", encode(&m)?.as_slice()))?;
         drop(t);
@@ -513,21 +549,46 @@ impl Authority {
             Readiness::Checking => Err(Error::Checking),
         }
     }
-    fn allowances(&self, group: &Group, route: &RouteState, now: u64) -> Result<(u32, u32)> {
-        let g = self.live_source(Scope::Group(group.id.clone()), &group.gate)?;
-        let r = self.live_source(Scope::Route(route.config.id.clone()), &route.gate)?;
-        let before_g = g.as_ref().map(|s| s.revision()).transpose()?;
-        let before_r = r.as_ref().map(|s| s.revision()).transpose()?;
-        let result = (
-            self.allowance(&group.gate, g.as_deref(), now, group.ceiling)?,
-            self.allowance(&route.gate, r.as_deref(), now, route.config.max_concurrency)?,
-        );
-        if before_g != g.as_ref().map(|s| s.revision()).transpose()?
-            || before_r != r.as_ref().map(|s| s.revision()).transpose()?
-        {
-            return Err(Error::Checking);
+    fn allowances(&self, groups: &[Group], route: &RouteState, now: u64) -> Result<Allowances> {
+        require(!groups.is_empty() && groups.len() <= MAX_CONSTRAINTS + 1)?;
+        let mut sources = Vec::with_capacity(groups.len() + 1);
+        for group in groups {
+            sources.push(if group.mode == GroupMode::Allocation {
+                None
+            } else {
+                self.live_source(Scope::Group(group.id.clone()), &group.gate)?
+            });
         }
-        Ok(result)
+        sources.push(self.live_source(Scope::Route(route.config.id.clone()), &route.gate)?);
+        let revisions = sources
+            .iter()
+            .map(|s| s.as_ref().map(|s| s.revision()).transpose())
+            .collect::<Result<Vec<_>>>()?;
+        let mut free = u32::MAX;
+        let mut fits = true;
+        for (group, source) in groups.iter().zip(&sources) {
+            let allowed = if group.mode == GroupMode::Allocation {
+                group.ceiling
+            } else {
+                self.allowance(&group.gate, source.as_deref(), now, group.ceiling)?
+            };
+            free = free.min(allowed.saturating_sub(group.occupied));
+            fits &= group.occupied <= allowed;
+        }
+        let allowed = self.allowance(
+            &route.gate,
+            sources.last().and_then(|s| s.as_deref()),
+            now,
+            route.config.max_concurrency,
+        )?;
+        free = free.min(allowed.saturating_sub(route.occupied));
+        fits &= route.occupied <= allowed;
+        for (source, before) in sources.iter().zip(revisions) {
+            if before != source.as_ref().map(|s| s.revision()).transpose()? {
+                return Err(Error::Checking);
+            }
+        }
+        Ok(Allowances { free, fits })
     }
     fn now(&self) -> Result<u64> {
         u64::try_from(self.started.elapsed().as_millis()).map_err(|_| Error::Invalid)
@@ -556,6 +617,13 @@ impl Authority {
     }
     /// Changing a ceiling invalidates its health allowance, but NEVER drops work.
     pub fn configure_group(&self, id: Digest, ceiling: u32) -> Result<()> {
+        self.configure_group_mode(id, ceiling, GroupMode::Observed)
+    }
+    /// Physical allocation only. This never supplies Ready evidence for a route.
+    pub fn configure_allocation_group(&self, id: Digest, ceiling: u32) -> Result<()> {
+        self.configure_group_mode(id, ceiling, GroupMode::Allocation)
+    }
+    fn configure_group_mode(&self, id: Digest, ceiling: u32, mode: GroupMode) -> Result<()> {
         require(ceiling > 0)?;
         let tx = self.write()?;
         let mut m = meta(&tx)?;
@@ -563,10 +631,17 @@ impl Authority {
         let old = db(groups.get(id.as_str()))?
             .map(|v| decode::<Group>(v.value()))
             .transpose()?;
-        if old.as_ref().is_some_and(|g| g.ceiling == ceiling) {
+        if old
+            .as_ref()
+            .is_some_and(|g| g.ceiling == ceiling && g.mode == mode)
+        {
             return Ok(());
         }
         let g = if let Some(mut g) = old {
+            if g.mode != mode && (g.occupied > 0 || g.routes > 0) {
+                return Err(Error::InUse);
+            }
+            g.mode = mode;
             g.ceiling = ceiling;
             let revision = sequence(&mut m)?;
             let live = g.gate.live.map(|_| revision);
@@ -584,6 +659,7 @@ impl Authority {
                 occupied: 0,
                 routes: 0,
                 gate: Gate::empty(sequence(&mut m)?),
+                mode,
             }
         };
         db(groups.insert(id.as_str(), encode(&g)?.as_slice()))?;
@@ -598,39 +674,57 @@ impl Authority {
     /// An occupied alias cannot move to another backend or change lane. Existing
     /// allocations survive smaller limits; new admissions wait until they fit.
     pub fn configure_route(&self, route: Route) -> Result<()> {
+        self.configure_route_inner(route, None)
+    }
+    /// Additional overlapping limits (for example a credential pool over a shared
+    /// physical backend). Each relevant group counts this work exactly once.
+    pub fn configure_route_with_constraints(
+        &self,
+        route: Route,
+        constraints: Vec<Digest>,
+    ) -> Result<()> {
+        self.configure_route_inner(route, Some(constraints))
+    }
+    fn configure_route_inner(&self, route: Route, constraints: Option<Vec<Digest>>) -> Result<()> {
         require(route.max_concurrency > 0)?;
         let tx = self.write()?;
         let mut m = meta(&tx)?;
         let mut groups = db(tx.open_table(GROUPS))?;
-        let mut target: Group = read(&groups, route.group.as_str())?;
         let mut routes = db(tx.open_table(ROUTES))?;
         let old = db(routes.get(route.id.as_str()))?
             .map(|v| decode::<RouteState>(v.value()))
             .transpose()?;
-        if old.as_ref().is_some_and(|r| r.config == route) {
+        // Legacy ceiling updates preserve existing constraints, never remove them.
+        let mut constraints = constraints.unwrap_or_else(|| {
+            old.as_ref()
+                .map(|r| r.constraints.clone())
+                .unwrap_or_default()
+        });
+        constraints.sort();
+        validate_constraints(&route, &constraints)?;
+        if old
+            .as_ref()
+            .is_some_and(|r| r.config == route && r.constraints == constraints)
+        {
             return Ok(());
         }
-        let (occupied, required_live) = if let Some(old) = old {
-            if old.occupied > 0
-                && (old.config.group != route.group || old.config.lane != route.lane)
-            {
-                return Err(Error::InUse);
-            }
-            if old.config.group != route.group {
-                let mut previous: Group = read(&groups, old.config.group.as_str())?;
-                previous.routes = previous.routes.checked_sub(1).ok_or(Error::Invalid)?;
-                target.routes = target.routes.checked_add(1).ok_or(Error::Invalid)?;
-                db(groups.insert(previous.id.as_str(), encode(&previous)?.as_slice()))?;
-            }
-            (old.occupied, old.gate.live.is_some())
-        } else {
+        if old.as_ref().is_some_and(|r| {
+            r.occupied > 0
+                && (r.config.group != route.group
+                    || r.config.lane != route.lane
+                    || r.constraints != constraints)
+        }) {
+            return Err(Error::InUse);
+        }
+        let previous = old.as_ref().map(group_ids).transpose()?.unwrap_or_default();
+        let required_live = old.as_ref().is_some_and(|r| r.gate.live.is_some());
+        let occupied = old.as_ref().map(|r| r.occupied).unwrap_or(0);
+        if old.is_none() {
             if m.routes >= self.limits.max_routes {
                 return Err(Error::Quota);
             }
             m.routes += 1;
-            target.routes = target.routes.checked_add(1).ok_or(Error::Invalid)?;
-            (0, false)
-        };
+        }
         let revision = sequence(&mut m)?;
         let mut gate = Gate::empty(revision);
         gate.live = required_live.then_some(revision);
@@ -638,9 +732,24 @@ impl Authority {
             config: route,
             occupied,
             gate,
+            constraints,
         };
+        let current = group_ids(&state)?;
+        for id in &previous {
+            if !current.contains(id) {
+                let mut group: Group = read(&groups, id.as_str())?;
+                group.routes = group.routes.checked_sub(1).ok_or(Error::Invalid)?;
+                db(groups.insert(id.as_str(), encode(&group)?.as_slice()))?;
+            }
+        }
+        for id in &current {
+            let mut group: Group = read(&groups, id.as_str())?;
+            if !previous.contains(id) {
+                group.routes = group.routes.checked_add(1).ok_or(Error::Invalid)?;
+                db(groups.insert(id.as_str(), encode(&group)?.as_slice()))?;
+            }
+        }
         db(routes.insert(state.config.id.as_str(), encode(&state)?.as_slice()))?;
-        db(groups.insert(target.id.as_str(), encode(&target)?.as_slice()))?;
         save_meta(&tx, &m)?;
         drop(routes);
         drop(groups);
@@ -659,10 +768,12 @@ impl Authority {
             return Err(Error::InUse);
         }
         let mut groups = db(tx.open_table(GROUPS))?;
-        let mut g: Group = read(&groups, r.config.group.as_str())?;
-        g.routes = g.routes.checked_sub(1).ok_or(Error::Invalid)?;
+        for id in group_ids(&r)? {
+            let mut g: Group = read(&groups, id.as_str())?;
+            g.routes = g.routes.checked_sub(1).ok_or(Error::Invalid)?;
+            db(groups.insert(g.id.as_str(), encode(&g)?.as_slice()))?;
+        }
         m.routes = m.routes.checked_sub(1).ok_or(Error::Invalid)?;
-        db(groups.insert(g.id.as_str(), encode(&g)?.as_slice()))?;
         db(routes.remove(route.as_str()))?;
         save_meta(&tx, &m)?;
         drop(groups);
@@ -745,7 +856,7 @@ impl Authority {
         self.healthy()?;
         let tx = db(self.database.begin_read())?;
         let r: RouteState = read(&db(tx.open_table(ROUTES))?, route.as_str())?;
-        let g: Group = read(&db(tx.open_table(GROUPS))?, r.config.group.as_str())?;
+        let allocation_groups = load_groups(&db(tx.open_table(GROUPS))?, &r)?;
         let m: Meta = read(&db(tx.open_table(META))?, "state")?;
         let remaining = self
             .limits
@@ -753,9 +864,8 @@ impl Authority {
             .saturating_sub(m.leases)
             .min(u64::from(u32::MAX)) as u32;
         let availability = self
-            .allowances(&g, &r, self.now()?)
-            .and_then(|a| free(&g, &r, a))
-            .map(|n| n.min(remaining));
+            .allowances(&allocation_groups, &r, self.now()?)
+            .map(|a| a.free.min(remaining));
         let (available, state) = match availability {
             Ok(n) if n > 0 => (n, Readiness::Ready),
             Ok(_) | Err(Error::Busy) => (0, Readiness::Busy),
@@ -764,10 +874,22 @@ impl Authority {
             Err(e) => return Err(e),
         };
         Ok(Status {
-            group_occupied: g.occupied,
+            group_occupied: allocation_groups[0].occupied,
             route_occupied: r.occupied,
             available,
             state,
+        })
+    }
+    /// Allocation counters only, never a claim that a model is Ready.
+    pub fn group_status(&self, group: &Digest) -> Result<GroupStatus> {
+        self.healthy()?;
+        let tx = db(self.database.begin_read())?;
+        let g: Group = read(&db(tx.open_table(GROUPS))?, group.as_str())?;
+        Ok(GroupStatus {
+            mode: g.mode,
+            ceiling: g.ceiling,
+            occupied: g.occupied,
+            routes: g.routes,
         })
     }
     /// Atomic shared admission. Request hashes do not form idempotency identities;
@@ -793,8 +915,8 @@ impl Authority {
         let mut routes = db(tx.open_table(ROUTES))?;
         let mut r: RouteState = read(&routes, route.as_str())?;
         require(phase != Phase::Proposed || r.config.lane == Lane::Proxy)?;
-        let mut g: Group = read(&groups, r.config.group.as_str())?;
-        if free(&g, &r, self.allowances(&g, &r, self.now()?)?)? == 0 {
+        let mut allocation_groups = load_groups(&groups, &r)?;
+        if self.allowances(&allocation_groups, &r, self.now()?)?.free == 0 {
             return Err(Error::Busy);
         }
         let mut entropy = [0u8; 32];
@@ -807,20 +929,29 @@ impl Authority {
         }
         let lease = Lease {
             id,
-            group: g.id.clone(),
+            group: allocation_groups[0].id.clone(),
             route: route.clone(),
             work,
             controller_fence: self.fence,
             phase,
         };
         r.occupied = r.occupied.checked_add(1).ok_or(Error::Invalid)?;
-        g.occupied = g.occupied.checked_add(1).ok_or(Error::Invalid)?;
+        for group in &mut allocation_groups {
+            group.occupied = group.occupied.checked_add(1).ok_or(Error::Invalid)?;
+            db(groups.insert(group.id.as_str(), encode(group)?.as_slice()))?;
+        }
         m.leases += 1;
         db(routes.insert(route.as_str(), encode(&r)?.as_slice()))?;
-        db(groups.insert(g.id.as_str(), encode(&g)?.as_slice()))?;
         db(leases.insert(lease.id.as_str(), encode(&lease)?.as_slice()))?;
         db(work_index.insert(lease.work.key().as_str(), lease.id.as_str()))?;
         db(db(tx.open_table(BY_GROUP))?.insert(group_key(&lease).as_str(), lease.id.as_str()))?;
+        {
+            let mut index = db(tx.open_table(BY_CONSTRAINT))?;
+            for group in &r.constraints {
+                db(index.insert(constraint_key(group, &lease.id).as_str(), lease.id.as_str()))?;
+                m.constraint_leases = m.constraint_leases.checked_add(1).ok_or(Error::Invalid)?;
+            }
+        }
         save_meta(&tx, &m)?;
         drop(work_index);
         drop(leases);
@@ -837,14 +968,14 @@ impl Authority {
         let tx = db(self.database.begin_read())?;
         let lease: Lease = read(&db(tx.open_table(LEASES))?, expected.id.as_str())?;
         let r: RouteState = read(&db(tx.open_table(ROUTES))?, lease.route.as_str())?;
-        let g: Group = read(&db(tx.open_table(GROUPS))?, lease.group.as_str())?;
+        let allocation_groups = load_groups(&db(tx.open_table(GROUPS))?, &r)?;
         ready_reserved(
             &lease,
             expected,
             self.fence,
-            &g,
+            &allocation_groups[0],
             &r,
-            self.allowances(&g, &r, self.now()?)?,
+            self.allowances(&allocation_groups, &r, self.now()?)?,
         )?;
         Ok(r.config)
     }
@@ -857,14 +988,14 @@ impl Authority {
         let mut leases = db(tx.open_table(LEASES))?;
         let mut lease: Lease = read(&leases, expected.id.as_str())?;
         let r: RouteState = read(&db(tx.open_table(ROUTES))?, lease.route.as_str())?;
-        let g: Group = read(&db(tx.open_table(GROUPS))?, lease.group.as_str())?;
+        let allocation_groups = load_groups(&db(tx.open_table(GROUPS))?, &r)?;
         ready_reserved(
             &lease,
             expected,
             self.fence,
-            &g,
+            &allocation_groups[0],
             &r,
-            self.allowances(&g, &r, self.now()?)?,
+            self.allowances(&allocation_groups, &r, self.now()?)?,
         )?;
         require(r.config.lane == Lane::Proxy)?;
         validate_signing_intent(buyer, &lease, &self.identity)?;
@@ -991,14 +1122,14 @@ impl Authority {
         let mut leases = db(tx.open_table(LEASES))?;
         let mut lease: Lease = read(&leases, reservation.lease.id.as_str())?;
         let r: RouteState = read(&db(tx.open_table(ROUTES))?, lease.route.as_str())?;
-        let g: Group = read(&db(tx.open_table(GROUPS))?, lease.group.as_str())?;
+        let allocation_groups = load_groups(&db(tx.open_table(GROUPS))?, &r)?;
         ready_reserved(
             &lease,
             &reservation.lease,
             self.fence,
-            &g,
+            &allocation_groups[0],
             &r,
-            self.allowances(&g, &r, self.now()?)?,
+            self.allowances(&allocation_groups, &r, self.now()?)?,
         )?;
         require(lease.phase == Phase::Reserved)?;
         lease.phase = Phase::Dispatched;
@@ -1110,7 +1241,9 @@ impl Authority {
         require(limit > 0 && limit <= MAX_PAGE)?;
         self.healthy()?;
         let tx = db(self.database.begin_read())?;
-        let index = db(tx.open_table(BY_GROUP))?;
+        let primary = db(tx.open_table(BY_GROUP))?;
+        let additional = db(tx.open_table(BY_CONSTRAINT))?;
+        let routes = db(tx.open_table(ROUTES))?;
         let leases = db(tx.open_table(LEASES))?;
         let prefix = format!("{}/", group.as_str());
         let end = format!("{}0", group.as_str());
@@ -1122,15 +1255,37 @@ impl Authority {
         } else {
             Bound::Included(start.as_str())
         };
-        let mut rows = Vec::new();
-        for row in
-            db(index.range::<&str>((start_bound, Bound::Excluded(end.as_str()))))?.take(limit + 1)
-        {
-            let (_, id) = db(row)?;
-            let l: Lease = read(&leases, id.value())?;
-            require(l.group == *group)?;
-            rows.push(effective(l, self.fence));
+        let mut found = BTreeMap::new();
+        for (index, extra) in [(&primary, false), (&additional, true)] {
+            for row in
+                db(index.range::<&str>((start_bound.clone(), Bound::Excluded(end.as_str()))))?
+                    .take(limit + 1)
+            {
+                let (key, id) = db(row)?;
+                let lease: Lease = read(&leases, id.value())?;
+                require(
+                    lease.id.as_str() == id.value()
+                        && key.value() == constraint_key(group, &lease.id),
+                )?;
+                if extra {
+                    let route: RouteState = read(&routes, lease.route.as_str())?;
+                    validate_constraints(&route.config, &route.constraints)?;
+                    require(
+                        route.config.group == lease.group
+                            && lease.group != *group
+                            && route.constraints.contains(group),
+                    )?;
+                } else {
+                    require(lease.group == *group)?;
+                }
+                require(
+                    found
+                        .insert(lease.id.clone(), effective(lease, self.fence))
+                        .is_none(),
+                )?;
+            }
         }
+        let mut rows = found.into_values().collect::<Vec<_>>();
         let more = rows.len() > limit;
         rows.truncate(limit);
         let next_after = if more {
@@ -1150,7 +1305,7 @@ fn ready_reserved(
     fence: u64,
     g: &Group,
     r: &RouteState,
-    allowances: (u32, u32),
+    allowances: Allowances,
 ) -> Result<()> {
     if expected.controller_fence != fence {
         return Err(Error::Stale);
@@ -1167,19 +1322,46 @@ fn ready_reserved(
     {
         return Err(Error::Binding);
     }
-    let (group_allowance, route_allowance) = allowances;
-    // Reservations already count. Neither signing nor dispatch subtracts twice.
-    if g.occupied > group_allowance || r.occupied > route_allowance {
+    // Reservations already count in each applicable constraint exactly once.
+    if !allowances.fits {
         return Err(Error::Busy);
     }
     Ok(())
 }
 
-fn free(g: &Group, r: &RouteState, allowances: (u32, u32)) -> Result<u32> {
-    Ok(allowances
-        .0
-        .saturating_sub(g.occupied)
-        .min(allowances.1.saturating_sub(r.occupied)))
+struct Allowances {
+    free: u32,
+    fits: bool,
+}
+fn validate_constraints(route: &Route, constraints: &[Digest]) -> Result<()> {
+    require(
+        constraints.len() <= MAX_CONSTRAINTS
+            && !constraints.contains(&route.group)
+            && constraints.windows(2).all(|w| w[0] < w[1]),
+    )
+}
+fn group_ids(route: &RouteState) -> Result<Vec<Digest>> {
+    validate_constraints(&route.config, &route.constraints)?;
+    let mut ids = Vec::with_capacity(route.constraints.len() + 1);
+    ids.push(route.config.group.clone());
+    ids.extend(route.constraints.iter().cloned());
+    Ok(ids)
+}
+fn load_groups(
+    table: &impl ReadableTable<&'static str, &'static [u8]>,
+    route: &RouteState,
+) -> Result<Vec<Group>> {
+    group_ids(route)?
+        .iter()
+        .map(|id| {
+            let group: Group = read(table, id.as_str())?;
+            require(group.id == *id)?;
+            Ok(group)
+        })
+        .collect()
+}
+fn constraint_key(group: &Digest, lease: &Digest) -> String {
+    format!("{}/{}", group.as_str(), lease.as_str())
 }
 
 fn effective(mut l: Lease, fence: u64) -> Lease {
@@ -1211,6 +1393,7 @@ fn edit_gate(
         Scope::Group(id) => {
             let mut t = db(tx.open_table(GROUPS))?;
             let mut g: Group = read(&t, id.as_str())?;
+            require(g.mode == GroupMode::Observed)?;
             edit(&mut g.gate)?;
             db(t.insert(id.as_str(), encode(&g)?.as_slice()))?;
         }
@@ -1227,13 +1410,23 @@ fn release(tx: &redb::WriteTransaction, l: &Lease) -> Result<()> {
     let mut m = meta(tx)?;
     let mut groups = db(tx.open_table(GROUPS))?;
     let mut routes = db(tx.open_table(ROUTES))?;
-    let mut g: Group = read(&groups, l.group.as_str())?;
     let mut r: RouteState = read(&routes, l.route.as_str())?;
     require(r.config.group == l.group)?;
-    g.occupied = g.occupied.checked_sub(1).ok_or(Error::Invalid)?;
+    for mut group in load_groups(&groups, &r)? {
+        group.occupied = group.occupied.checked_sub(1).ok_or(Error::Invalid)?;
+        db(groups.insert(group.id.as_str(), encode(&group)?.as_slice()))?;
+    }
+    {
+        let mut index = db(tx.open_table(BY_CONSTRAINT))?;
+        for group in &r.constraints {
+            let key = constraint_key(group, &l.id);
+            require(db(index.get(key.as_str()))?.is_some_and(|v| v.value() == l.id.as_str()))?;
+            db(index.remove(key.as_str()))?;
+            m.constraint_leases = m.constraint_leases.checked_sub(1).ok_or(Error::Invalid)?;
+        }
+    }
     r.occupied = r.occupied.checked_sub(1).ok_or(Error::Invalid)?;
     m.leases = m.leases.checked_sub(1).ok_or(Error::Invalid)?;
-    db(groups.insert(g.id.as_str(), encode(&g)?.as_slice()))?;
     db(routes.insert(r.config.id.as_str(), encode(&r)?.as_slice()))?;
     db(db(tx.open_table(LEASES))?.remove(l.id.as_str()))?;
     db(db(tx.open_table(BY_GROUP))?.remove(group_key(l).as_str()))?;

@@ -110,15 +110,37 @@ proposal reservation, provider signing and dispatch. Sources preserve the observ
 age; reads/heartbeats never renew it. Revision checks reject an inconsistent group/route
 pair without spinning. Restart, missing sources, source errors and expired evidence stay
 closed, and neither configuration changes nor old observation tickets can silently fall
-back to cached Ready. Local capacity schema 3 preserves earlier leases without scanning
+back to cached Ready. Local capacity schema 4 preserves earlier leases without scanning
 or rewriting their history. This is not a ledger-contract version change.
 
 `Controller::new_observed` feeds validated JSON/stream outcomes into the monitor chosen
 by trusted startup. It neither attaches guessed scopes nor manufactures initial health.
 Bind a connection source only to that exact shared API/credential pool. A broader
 physical pool containing independent credentials or native runtimes must not inherit
-one credential's authentication/quota failures; layered physical/credential constraints
-still need integration before advertising that mixed configuration.
+one credential's authentication/quota failures.
+
+`configure_route_with_constraints` adds bounded overlapping groups to the route's
+existing primary group. The primary binding in signed market terms remains unchanged.
+Observed groups require fresh evidence from their exact scope; allocation groups created
+with `configure_allocation_group` supply only a physical/operator ceiling. Allocation
+alone never makes a route Ready. The route's own health and every relevant constraint
+must allow admission. Free capacity is the minimum remaining allowance across them.
+Credential faults therefore stop that credential's routes without withdrawing unrelated
+credentials or native work sharing the physical backend.
+
+One transaction reserves each request once against every relevant group and its route.
+Signing and dispatch recheck those constraints without subtracting the reservation twice.
+Occupied routes cannot move groups or lose constraints. Lower ceilings preserve existing
+work and prevent new admissions until counters fit. The older route configuration method
+preserves additional constraints, so a routine ceiling update cannot erase them.
+
+Verified completion releases all corresponding counters and indexes atomically. Completed
+inference need not retain a physical slot while its payment acknowledgment is pending;
+the durable result and financial obligation remain separately recoverable. A disconnect,
+timeout, cancellation intent or health recovery alone cannot free uncertain execution.
+Restart retains all counters and fences old controllers. Recovery merges bounded indexed
+pages for primary and additional memberships; it never scans whole request histories.
+Missing/mismatched references fail closed without partially decrementing counters.
 
 Signed public presence and managed startup remain unwired. The recovery observer latch
 is local and is not permission to dispatch a paid probe; a durable, funded probe lease
@@ -134,6 +156,10 @@ pending receipt publication without a connected buyer and canonical non-admissio
 retirement. Queue checks cover byte/count pressure, cancellation, disconnect and
 actual writer acknowledgment. Fixtures use the real local signed financial RPC,
 HTTP backend and isolated workers, with a bounded SC-Bridge protocol double.
+Layered allocation is exercised through paid signing/execution/recovery on every supported
+endpoint and rail, plus simultaneous native/proxy/alias admission, independent credential
+failures on the same physical allocation, schema migration and corrupted recovery indexes.
+These are local authority tests; registering actual managed native runtimes is still work.
 
 The opening/dispatcher checks also exercise all four paid JSON endpoints/three
 rails, malformed/foreign/oversized contexts, substituted readiness, finite opening

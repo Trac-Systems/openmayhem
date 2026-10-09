@@ -53,6 +53,9 @@ fn observed_server(
         health::{Class, Monitor, Policy, Thinking},
         supervisor::RefreshPolicy,
     };
+    // Canonical offer terms keep their credential group; the physical backend
+    // allocation is an additional private constraint, not a different market.
+    physical_constraint(s);
     let monitor = Monitor::new(
         Policy {
             max_routes: 8,
@@ -110,6 +113,36 @@ fn observed_server(
     )
     .unwrap();
     (controller, monitor)
+}
+fn physical_constraint(s: &Controlled) {
+    s.runtime
+        .capacity
+        .configure_allocation_group(d(202), 2)
+        .unwrap();
+    s.runtime
+        .capacity
+        .configure_route_with_constraints(
+            capacity::Route {
+                id: d(201),
+                group: d(200),
+                lane: capacity::Lane::Proxy,
+                max_concurrency: 2,
+            },
+            vec![d(202)],
+        )
+        .unwrap();
+}
+fn occupied(s: &Controlled, expected: u32) {
+    for group in [200, 202] {
+        assert_eq!(
+            s.runtime.capacity.group_status(&d(group)).unwrap().occupied,
+            expected
+        );
+    }
+    assert_eq!(
+        s.runtime.capacity.status(&d(201)).unwrap().route_occupied,
+        expected
+    );
 }
 async fn connect(
     s: &Controlled,
@@ -280,6 +313,7 @@ async fn provider_session_negotiates_requires_funding_and_settles_all_json_endpo
             let (controller, monitor) = observed_server(&s, &f, &peer);
             let before = monitor.connection_source().revision().unwrap();
             let (_bridge, mut buyer, handle, saved) = connect(&s, &peer, &bytes, &controller).await;
+            occupied(&s, 1);
             let command = exchange::Message::Execute {
                 request: serde_json::from_slice(&bytes).unwrap(),
                 streaming: false,
@@ -290,6 +324,7 @@ async fn provider_session_negotiates_requires_funding_and_settles_all_json_endpo
                 if failure.code==mayhem_proxy::connector::failure::Code::AdmissionUnavailable)
             );
             assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+            occupied(&s, 1);
             s.buyer
                 .publish(saved.key().clone(), &recovery(&f, &peer), 1002)
                 .await
@@ -304,10 +339,7 @@ async fn provider_session_negotiates_requires_funding_and_settles_all_json_endpo
             assert_eq!(handle.wait().await.unwrap(), serving::End::Settled);
             assert!(monitor.connection_source().revision().unwrap() > before);
             assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
-            assert_eq!(
-                s.runtime.capacity.status(&d(201)).unwrap().group_occupied,
-                0
-            );
+            occupied(&s, 0);
             peer.stop().await;
         }
     }
@@ -351,6 +383,7 @@ async fn provider_session_streams_and_settles_each_supported_stream_endpoint_on_
             let before = monitor.connection_source().revision().unwrap();
             let (_bridge, mut buyer, handle, saved) =
                 connect(&s, &peer, &request, &controller).await;
+            occupied(&s, 1);
             s.buyer
                 .publish(saved.key().clone(), &recovery(&f, &peer), 1002)
                 .await
@@ -372,10 +405,13 @@ async fn provider_session_streams_and_settles_each_supported_stream_endpoint_on_
                 }
             };
             assert!(events > 0);
+            // Durable completed inference frees physical capacity before payment ACK.
+            occupied(&s, 0);
             settle(&s, &f, &peer, &mut buyer, &request, received).await;
             assert_eq!(handle.wait().await.unwrap(), serving::End::Settled);
             assert!(monitor.connection_source().revision().unwrap() > before);
             assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            occupied(&s, 0);
             peer.stop().await;
         }
     }
@@ -398,7 +434,7 @@ async fn provider_session_disconnect_retains_json_result_and_recovers_without_a_
     let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
     let mut peer = Peer::start(ProxyRail::Tap, &f, &bytes, false, None).await;
     let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
-    let controller = server(&s, &f, &peer, bounds());
+    let (controller, _monitor) = observed_server(&s, &f, &peer);
     let (bridge, mut buyer, handle, saved) = connect(&s, &peer, &bytes, &controller).await;
     s.buyer
         .publish(saved.key().clone(), &recovery(&f, &peer), 1002)
@@ -416,6 +452,9 @@ async fn provider_session_disconnect_retains_json_result_and_recovers_without_a_
     drop(buyer);
     drop(bridge);
     assert_eq!(handle.wait().await.unwrap(), serving::End::Disconnected);
+    // The handle waits for the ongoing inference to finish and persist its result.
+    // Lost delivery/ACK retains the result and financial obligation, not a GPU slot.
+    occupied(&s, 0);
     let Pair {
         bridge: _bridge,
         mut buyer,
@@ -443,6 +482,7 @@ async fn provider_session_disconnect_retains_json_result_and_recovers_without_a_
     settle(&s, &f, &peer, &mut buyer, &bytes, result).await;
     assert_eq!(handle.wait().await.unwrap(), serving::End::Settled);
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    occupied(&s, 0);
     peer.stop().await;
 }
 
@@ -457,6 +497,8 @@ async fn provider_session_long_generation_outlives_control_wait_and_explicit_can
         let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
         let mut limits = bounds();
         limits.control_wait = Duration::from_secs(1);
+        physical_constraint(&s);
+        capacity_ready(&s.runtime.capacity, capacity::Scope::Route(d(201)));
         let controller = server(&s, &f, &peer, limits);
         let (_bridge, mut buyer, handle, saved) = connect(&s, &peer, &bytes, &controller).await;
         s.buyer
@@ -496,16 +538,14 @@ async fn provider_session_long_generation_outlives_control_wait_and_explicit_can
                 }
             }
             assert!(cancelled && failed);
-            assert_eq!(
-                s.runtime.capacity.status(&d(201)).unwrap().group_occupied,
-                1
-            );
+            occupied(&s, 1);
             handle.disconnect();
             assert_eq!(handle.wait().await.unwrap(), serving::End::Disconnected);
         } else {
             let result = next(&mut buyer).await;
             settle(&s, &f, &peer, &mut buyer, &bytes, result).await;
             assert_eq!(handle.wait().await.unwrap(), serving::End::Settled);
+            occupied(&s, 0);
         }
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         peer.stop().await;

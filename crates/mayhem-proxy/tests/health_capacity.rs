@@ -1,4 +1,6 @@
 #![cfg(unix)]
+#[path = "support/layered_capacity.rs"]
+mod layered;
 use mayhem_proxy::{
     attempts::{Digest, Identity},
     capacity::{self, Authority, Evidence, Lane, Readiness, ReadinessSource, Route, Scope, Work},
@@ -353,78 +355,100 @@ fn unrelated_credentials_and_replicas_are_not_withdrawn_by_an_authentication_fau
 }
 
 #[test]
-fn legacy_capacity_schema_two_without_live_fields_preserves_inflight_work_during_upgrade() {
+fn legacy_capacity_schemas_preserve_inflight_work_and_live_requirement_during_upgrade() {
     use redb::{ReadableTable, TableDefinition};
-    let dir = directory();
-    let path = dir.path().join("capacity");
-    let a = open(&path);
-    configure(&a);
-    for scope in [
-        Scope::Group(d(10)),
-        Scope::Route(d(20)),
-        Scope::Route(d(21)),
-    ] {
-        let ticket = a.begin_observation(scope).unwrap();
-        a.observe(
-            ticket,
-            Evidence {
-                state: Readiness::Ready,
-                allowance: 4,
-                age: Duration::ZERO,
-                valid_for: Duration::from_secs(60),
-            },
-        )
+    for schema in [2, 3] {
+        let dir = directory();
+        let path = dir.path().join("capacity");
+        let a = open(&path);
+        configure(&a);
+        for scope in [
+            Scope::Group(d(10)),
+            Scope::Route(d(20)),
+            Scope::Route(d(21)),
+        ] {
+            let ticket = a.begin_observation(scope).unwrap();
+            a.observe(
+                ticket,
+                Evidence {
+                    state: Readiness::Ready,
+                    allowance: 4,
+                    age: Duration::ZERO,
+                    valid_for: Duration::from_secs(60),
+                },
+            )
+            .unwrap();
+        }
+        if schema == 3 {
+            let m = monitor();
+            bind(&a, &m);
+            good(&m);
+        }
+        let reserved = a.reserve(&d(20), work(1)).unwrap();
+        a.dispatch(&reserved).unwrap();
+        let id = reserved.lease().id.clone();
+        drop(a);
+        let db = redb::Database::open(&path).unwrap();
+        let tx = db.begin_write().unwrap();
+        tx.delete_table(TableDefinition::<&str, &str>::new(
+            "capacity_constraint_leases_v1",
+        ))
         .unwrap();
-    }
-    let reserved = a.reserve(&d(20), work(1)).unwrap();
-    a.dispatch(&reserved).unwrap();
-    let id = reserved.lease().id.clone();
-    drop(a);
-    let db = redb::Database::open(&path).unwrap();
-    let tx = db.begin_write().unwrap();
-    {
-        let mut meta = tx
-            .open_table(TableDefinition::<&str, &[u8]>::new("capacity_meta_v1"))
-            .unwrap();
-        let mut value: serde_json::Value =
-            serde_json::from_slice(meta.get("state").unwrap().unwrap().value()).unwrap();
-        value["schema"] = 2.into();
-        meta.insert("state", serde_json::to_vec(&value).unwrap().as_slice())
-            .unwrap();
-    }
-    for table in ["capacity_groups_v1", "capacity_routes_v1"] {
-        let mut rows = tx
-            .open_table(TableDefinition::<&str, &[u8]>::new(table))
-            .unwrap();
-        let old = rows
-            .iter()
-            .unwrap()
-            .map(|row| {
-                let (k, v) = row.unwrap();
-                (
-                    k.value().to_owned(),
-                    serde_json::from_slice::<serde_json::Value>(v.value()).unwrap(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (id, mut value) in old {
-            value["gate"].as_object_mut().unwrap().remove("live");
-            rows.insert(id.as_str(), serde_json::to_vec(&value).unwrap().as_slice())
+        {
+            let mut meta = tx
+                .open_table(TableDefinition::<&str, &[u8]>::new("capacity_meta_v1"))
+                .unwrap();
+            let mut value: serde_json::Value =
+                serde_json::from_slice(meta.get("state").unwrap().unwrap().value()).unwrap();
+            value["schema"] = schema.into();
+            value.as_object_mut().unwrap().remove("constraint_leases");
+            meta.insert("state", serde_json::to_vec(&value).unwrap().as_slice())
                 .unwrap();
         }
+        for table in ["capacity_groups_v1", "capacity_routes_v1"] {
+            let mut rows = tx
+                .open_table(TableDefinition::<&str, &[u8]>::new(table))
+                .unwrap();
+            let old = rows
+                .iter()
+                .unwrap()
+                .map(|row| {
+                    let (k, v) = row.unwrap();
+                    (
+                        k.value().to_owned(),
+                        serde_json::from_slice::<serde_json::Value>(v.value()).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            for (id, mut value) in old {
+                if schema == 2 {
+                    value["gate"].as_object_mut().unwrap().remove("live");
+                }
+                value.as_object_mut().unwrap().remove("mode");
+                value.as_object_mut().unwrap().remove("constraints");
+                rows.insert(id.as_str(), serde_json::to_vec(&value).unwrap().as_slice())
+                    .unwrap();
+            }
+        }
+        tx.commit().unwrap();
+        drop(db);
+        let a = open(&path);
+        assert_eq!(a.status(&d(20)).unwrap().state, Readiness::Checking);
+        assert_eq!(a.status(&d(20)).unwrap().group_occupied, 1);
+        assert_eq!(
+            a.lease(&id).unwrap().unwrap().phase,
+            capacity::Phase::Uncertain
+        );
+        if schema == 3 {
+            assert!(matches!(
+                a.begin_observation(Scope::Route(d(20))),
+                Err(capacity::Error::InUse)
+            ));
+        }
+        let m = monitor();
+        bind(&a, &m);
+        good(&m);
+        assert_eq!(a.status(&d(20)).unwrap().available, 3);
+        assert!(matches!(a.dispatch(&reserved), Err(capacity::Error::Stale)));
     }
-    tx.commit().unwrap();
-    drop(db);
-    let a = open(&path);
-    assert_eq!(a.status(&d(20)).unwrap().state, Readiness::Checking);
-    assert_eq!(a.status(&d(20)).unwrap().group_occupied, 1);
-    assert_eq!(
-        a.lease(&id).unwrap().unwrap().phase,
-        capacity::Phase::Uncertain
-    );
-    let m = monitor();
-    bind(&a, &m);
-    good(&m);
-    assert_eq!(a.status(&d(20)).unwrap().available, 3);
-    assert!(matches!(a.dispatch(&reserved), Err(capacity::Error::Stale)));
 }

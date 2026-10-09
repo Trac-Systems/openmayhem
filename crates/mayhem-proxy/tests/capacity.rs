@@ -94,6 +94,10 @@ fn old_capacity_schema_migrates_without_inventing_signing_or_releasing_native_wo
         "capacity_signing_intents_v1",
     ))
     .unwrap();
+    tx.delete_table(TableDefinition::<&str, &str>::new(
+        "capacity_constraint_leases_v1",
+    ))
+    .unwrap();
     {
         let mut table = tx
             .open_table(TableDefinition::<&str, &[u8]>::new("capacity_meta_v1"))
