@@ -25,7 +25,7 @@ test('policy disabled, issuer removal and unavailable canonical source remain ex
  await f.base.append({type:'seed',entries:[['proxy/v1/config',{...f.config,enabled:false,active_issuers:[h(4)]}]]});await f.base.update();
  const response=await readProxyAdmissionPolicy({request,withCanonicalSnapshot:snapshot});
  assert.equal(response.registry_enabled,false);assert.deepEqual(response.active_issuers,[h(4)]);
- for(const bad of [{...request,request_nonce:'bad'},{...request,provider_pubkey:h(1)},{request_nonce:h(1)}]) assert.throws(()=>validateProxyAdmissionPolicyRequest(bad));
+ for(const bad of [{...request,request_nonce:'bad'},{...request,provider_pubkey:'invalid'},{request_nonce:h(1)}]) assert.throws(()=>validateProxyAdmissionPolicyRequest(bad));
  await assert.rejects(readProxyAdmissionPolicy({request,withCanonicalSnapshot:async()=>{throw new Error('unsigned source');}}),/unsigned source/);
 });
 
@@ -60,9 +60,29 @@ test('actual RPC uses authenticated policy relay; altered request, stale nonce a
  const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/proxy/admission-policy`,{method:'POST',body:JSON.stringify(query),headers:{'content-type':'application/json'}});
  assert.equal(response.status,200);const body=await response.json();assert.equal(body.request_nonce,query.request_nonce);assert.deepEqual(body.active_issuers,[f.issuer.publicKey]);
  await requestProxyAdmissionPolicy(peer,query);assert.equal(new Set(nonces).size,2);assert.ok(nonces.every(n=>n!==query.request_nonce));
+ const enrollment=await requestProxyAdmissionPolicy(peer,{...query,provider_pubkey:h(71)});
+ assert.equal(enrollment.provider_pubkey,h(71));assert.equal(enrollment.enrollment.entitlement_id,null);
  mode='replay';await assert.rejects(requestProxyAdmissionPolicy(peer,query),/does not match/);
  mode='network';await assert.rejects(requestProxyAdmissionPolicy(peer,query),/does not match/);
  await assert.rejects(requestProxyAdmissionPolicy({},query),/not ready/);
  await assert.rejects(requestProxyAdmissionPolicy(peer,{...query,issuer:h(1)}),/Invalid/);
  assert.equal(f.base.local.length,before);
+});
+
+
+test('collector can read another public provider admission, never private payment evidence or writes', async t => {
+ const f=await familyAdminFixture(t),snapshot=createProxyCanonicalSnapshot(f.peer,CONTRACT_VERSION);
+ const provider=h(71),entitlement=h(72),request={requester:f.issuer.publicKey,request_nonce:h(73),provider_pubkey:provider};
+ const observed=[];const read=()=>readProxyAdmissionPolicy({request,withCanonicalSnapshot:fn=>snapshot(s=>fn({...s,read:key=>{observed.push(key);return s.read(key);}}))});
+ assert.deepEqual((await read()).enrollment,{provider_pubkey:provider,entitlement_id:null,provider_revoked:false,admission_revoked:false});
+ await f.base.append({type:'seed',entries:[[`proxy/v1/provider/${provider}`,{entitlement:{id:entitlement}}],
+  [`proxy/v1/admission-used/entitlement/${entitlement}`,{provider_pubkey:provider,entitlement_id:entitlement}]]});await f.base.update();
+ const before=f.base.local.length;
+ assert.equal((await read()).enrollment.entitlement_id,entitlement);
+ await f.base.append({type:'seed',entries:[[`proxy/v1/admission-revoked/${entitlement}`,{revoked:true}]]});await f.base.update();
+ const revoked=await read();assert.equal(revoked.enrollment.admission_revoked,true);
+ assert.equal(f.base.local.length,before+1);assert.ok(observed.every(key=>key.startsWith('proxy/v1/')));
+ assert.equal(Object.hasOwn(revoked,'payments'),false);
+ await f.base.append({type:'seed',entries:[[`proxy/v1/admission-used/entitlement/${entitlement}`,{provider_pubkey:h(99),entitlement_id:entitlement}]]});await f.base.update();
+ await assert.rejects(read(),/ownership differs/);
 });

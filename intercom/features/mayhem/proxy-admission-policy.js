@@ -12,7 +12,7 @@ const need = (ok, message) => { if (!ok) throw new Error(`Proxy admission policy
 
 export function validateProxyAdmissionPolicyRequest(value) {
   need(value && typeof value === 'object' && !Array.isArray(value)
-    && Object.keys(value).sort().join('|') === 'request_nonce|requester'
+    && ['request_nonce|requester', 'provider_pubkey|request_nonce|requester'].includes(Object.keys(value).sort().join('|'))
     && Object.values(value).every(hex)
     && b4a.byteLength(JSON.stringify(value)) <= 1024, 'invalid policy query');
 }
@@ -30,11 +30,31 @@ export async function readProxyAdmissionPolicy({ request, withCanonicalSnapshot 
     await snapshot.assertCurrent();
     const config = await snapshot.read(proxyRegistryKeys.config);
     validateProxyRegistryConfig(config, snapshot.context);
+    // Optional public enrollment lookup is for the admission collector. The
+    // provider-owned setup query remains unchanged; neither read can authorize
+    // a fee, countersign a permit or mutate canonical state.
+    let enrollment;
+    if (request.provider_pubkey !== undefined) {
+      const key = request.provider_pubkey;
+      const record = await snapshot.read(proxyRegistryKeys.provider(key));
+      const revoked = await snapshot.read(`proxy/v1/provider-revoked/${key}`);
+      let entitlement = null, admissionRevoked = null;
+      if (record !== null) {
+        need(hex(record.entitlement?.id), 'invalid canonical entitlement');
+        entitlement = record.entitlement.id;
+        const used = await snapshot.read(`proxy/v1/admission-used/entitlement/${entitlement}`);
+        need(used?.provider_pubkey === key && used.entitlement_id === entitlement, 'entitlement ownership differs');
+        admissionRevoked = await snapshot.read(`proxy/v1/admission-revoked/${entitlement}`);
+      }
+      enrollment = { provider_pubkey: key, entitlement_id: entitlement,
+        provider_revoked: revoked !== null, admission_revoked: admissionRevoked !== null };
+    }
     await snapshot.assertCurrent();
     const response = { ok: true, schema_version: 1, lane: 'proxy', ...request,
       context: snapshot.context, proof: snapshot.proof,
       registry_enabled: config.enabled, fee_policy_hash: config.fee_policy_hash,
-      active_issuers: config.active_issuers, max_permit_epochs: config.max_permit_epochs };
+      active_issuers: config.active_issuers, max_permit_epochs: config.max_permit_epochs,
+      ...(enrollment === undefined ? {} : { enrollment }) };
     need(b4a.byteLength(JSON.stringify(response)) <= PROXY_ADMISSION_POLICY_MAX_BYTES, 'response exceeds bound');
     return response;
   })).finally(() => {

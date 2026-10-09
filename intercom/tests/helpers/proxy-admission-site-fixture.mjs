@@ -58,6 +58,9 @@ const coreOrigin=`http://127.0.0.1:${server.address().port}`;
 const nativeBalance=(await f.base.view.get('bal/existing-customer')).value,nativePayout=(await f.base.view.get('payout/epoch/542')).value;
 let configured=null,lastCompletion=null;
 async function run(command){
+ if(command.action==='inspect'){
+  return {policy_reads:policyReads,canonical_appends:f.calls,pending:f.journal.list().length,model_calls:0,live_payments:0};
+ }
  if(command.action==='configure'){
   if(configured)throw new Error('Fixture already configured');
   const siteOrigin=fixedOrigin(command.site_origin,{allowLoopbackHttp:true});
@@ -93,7 +96,7 @@ async function run(command){
  throw new Error('Unknown fixture command');
 }
 const lines=createInterface({input:process.stdin,crlfDelay:Infinity});
-process.stdout.write(JSON.stringify({ready:true,invoice_id:invoiceId,invoice,payment_references:references,reference_assigned_at_ms:observedAt})+'\n');
+process.stdout.write(JSON.stringify({ready:true,core_origin:coreOrigin,core_requester:f.issuer.publicKey,invoice_id:invoiceId,invoice,payment_references:references,reference_assigned_at_ms:observedAt})+'\n');
 try {
  for await(const line of lines){
   if(Buffer.byteLength(line)>32768)throw new Error('Fixture command bound');
