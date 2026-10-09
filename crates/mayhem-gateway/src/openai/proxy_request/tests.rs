@@ -148,7 +148,15 @@ fn envelope_strips_controls_only_and_requires_explicit_limits_and_policy() {
     }
     let mut broken = body.clone();
     broken["proxy"]["settlement_policy_hash"] = json!(digest('3'));
-    assert!(Request::parse(ProxyEndpoint::Chat, broken, &policy()).is_err());
+    let mismatched = parse(&c, broken);
+    assert!(matches!(
+        mismatched.check_settlement_policy(),
+        Err(Error::SettlementPolicyMismatch)
+    ));
+    assert!(matches!(
+        mismatched.check_candidate(&c, Eligibility::Available),
+        Err(Error::SettlementPolicyMismatch)
+    ));
     let mut broken = body.clone();
     broken["proxy"]["fallback_to_native"] = json!(true);
     assert!(Request::parse(ProxyEndpoint::Chat, broken, &policy()).is_err());

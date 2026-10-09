@@ -24,6 +24,8 @@ static READS: Semaphore = Semaphore::const_new(8);
 pub enum Error {
     #[error("invalid explicit proxy request or policy")]
     Invalid,
+    #[error("proxy settlement policy differs from the configured policy")]
+    SettlementPolicyMismatch,
     #[error("proxy catalog or selected offer is unavailable")]
     Catalog,
     #[error("proxy offer does not satisfy the request constraints")]
@@ -168,6 +170,8 @@ pub struct Request {
 impl Request {
     /// Call before native catalog normalization. A native request without proxy
     /// controls returns None unchanged; any malformed proxy selection fails here.
+    /// Settlement policy compatibility is checked separately so the HTTP owner
+    /// can preserve an existing purchase or durably fence a rejected request ID.
     pub fn parse(endpoint: ProxyEndpoint, mut raw: Value, policy: &Policy) -> Result<Option<Self>> {
         let model = raw
             .get("model")
@@ -190,8 +194,7 @@ impl Request {
             return Err(Error::Invalid);
         }
         let controls: Controls = serde_json::from_value(controls).map_err(|_| Error::Invalid)?;
-        if controls.settlement_policy_hash != policy.settlement_policy_hash
-            || controls.prices.max_total_spend_au == 0
+        if controls.prices.max_total_spend_au == 0
             || controls.prices.rates.is_empty()
             || controls.prices.rates.len() > 32
             || controls.minimum_context == Some(0)
@@ -241,6 +244,13 @@ impl Request {
         &self.policy
     }
 
+    pub fn check_settlement_policy(&self) -> Result<()> {
+        if self.controls.settlement_policy_hash != self.policy.settlement_policy_hash {
+            return Err(Error::SettlementPolicyMismatch);
+        }
+        Ok(())
+    }
+
     /// The caller supplies a digest derived from authenticated buyer/key identity,
     /// never from a client body. Semantic JSON ordering is normalized. Every price,
     /// rail, selector, endpoint and policy control participates; changing a cap or
@@ -268,6 +278,7 @@ impl Request {
         candidate: &PublishedOffer,
         status: Eligibility,
     ) -> Result<Candidate> {
+        self.check_settlement_policy()?;
         if candidate.id != self.selector.id()
             || candidate.lane != "proxy"
             || !candidate.active

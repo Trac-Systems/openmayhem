@@ -576,6 +576,16 @@ async fn submit(
         check_replay(&job, &token, &model, &fingerprint, &identity)?;
         return Ok(response(job));
     }
+    let binding = Binding {
+        job_id: id.clone(),
+        token: token.clone(),
+        model: model.clone(),
+        fingerprint: fingerprint.clone(),
+        identity: identity.clone(),
+    };
+    if request.check_settlement_policy().is_err() {
+        return reject_settlement_policy(&state, binding, endpoint_name).await;
+    }
     let candidate = proxy_request::resolve(
         state
             .proxy_control
@@ -592,13 +602,6 @@ async fn submit(
         None
     };
     let claim = runtime.claim(&id)?;
-    let binding = Binding {
-        job_id: id.clone(),
-        token: token.clone(),
-        model: model.clone(),
-        fingerprint: fingerprint.clone(),
-        identity: identity.clone(),
-    };
     let jobs = state.jobs.clone();
     let begin = binding.clone();
     let result = storage(move || {
@@ -686,11 +689,67 @@ async fn submit(
     }
 }
 
+async fn reject_settlement_policy(
+    state: &GatewayState,
+    binding: Binding,
+    endpoint_name: String,
+) -> Result<Response, ApiError> {
+    let jobs = state.jobs.clone();
+    let id = binding.job_id.clone();
+    // An absent read alone cannot prove non-admission: another request may have
+    // begun since load(). Claim and retire this exact ID under the same vault
+    // lock. Only a newly created, durably unsigned intent permits the safe code.
+    // A prior/concurrent purchase, even with identical request fields, is never
+    // overwritten or retired here. Persistence uncertainty remains recoverable.
+    let rejected = storage(move || {
+        let mut jobs = jobs.lock().map_err(|_| unavailable())?;
+        match jobs
+            .begin_proxy(
+                binding.job_id.clone(),
+                endpoint_name,
+                binding.model,
+                Some(binding.token.token_id),
+                binding.fingerprint,
+                binding.identity,
+                now_secs(),
+            )
+            .map_err(|_| {
+                ApiError::conflict(
+                    "proxy idempotency record differs or cannot be retained",
+                    Some("Idempotency-Key"),
+                )
+            })? {
+            BeginGatewayJob::Existing(job) => Ok(Some(job)),
+            BeginGatewayJob::InProgress => Err(unavailable()),
+            BeginGatewayJob::Started => {
+                jobs.fail_proxy_before_authorization(&binding.job_id, now_secs())
+                    .map_err(|_| unavailable())?;
+                Ok(None)
+            }
+        }
+    })
+    .await?;
+    if let Some(job) = rejected {
+        return Ok(response(job));
+    }
+    let mut response = ApiError::bad_request(
+        "requested proxy settlement policy differs from the configured policy",
+        Some("proxy.settlement_policy_hash"),
+    )
+    .with_public_error("proxy_settlement_policy_mismatch", "proxy_admission", false)
+    .into_response();
+    attach_gateway_job_headers(&mut response, &id);
+    Ok(response)
+}
+
 fn selection_error(error: proxy_request::Error) -> ApiError {
     use proxy_request::Error;
     // Only candidate selection, before begin_proxy, can establish these public
     // non-admission codes. Generic validation and existing-job errors cannot.
     match error {
+        // Only reject_settlement_policy can attach a non-admission guarantee to
+        // this error, after retaining the durable original unsigned job.
+        Error::SettlementPolicyMismatch => invalid(),
         Error::Invalid => {
             invalid().with_public_error("proxy_request_invalid", "proxy_admission", false)
         }

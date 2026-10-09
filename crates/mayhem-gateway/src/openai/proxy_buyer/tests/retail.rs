@@ -137,6 +137,218 @@ fn proxy_selection_rejections_have_scoped_non_admission_codes() {
         "proxy"
     );
     assert_eq!(unavailable().category, "proxy");
+    assert_eq!(
+        selection_error(proxy_request::Error::SettlementPolicyMismatch).category,
+        "request_validation",
+        "a policy comparison alone cannot prove original non-admission"
+    );
+}
+
+#[tokio::test]
+async fn proxy_http_policy_mismatch_retains_unsigned_job_without_spend_or_callback() {
+    let server = Server::start("accept").await;
+    let mut f = server.fixture().await;
+    let key = "stale-settlement-policy";
+    let mut stale = f.body();
+    stale["proxy"]["settlement_policy_hash"] = json!(support::digest(91));
+    let (status, _, _) = f
+        .post(key, stale.clone(), "invalid-fixture-key", false)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, headers, error) = f.post(key, stale.clone(), "owner-fixture-key", false).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"]["code"], "proxy_settlement_policy_mismatch");
+    assert_eq!(error["error"]["category"], "proxy_admission");
+    assert_eq!(error["error"]["retryable"], false);
+    let id = headers["x-mayhem-job-id"].to_str().unwrap();
+    assert_eq!(
+        id,
+        gateway_job_id(
+            f.harness.buyer_seed,
+            Some("owner"),
+            "openai_chat_completions",
+            Some(key)
+        )
+        .unwrap()
+    );
+    let path = format!("/v1/jobs/{id}/proxy-evidence");
+    let (status, evidence) = f.get(&path, "owner-fixture-key").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(evidence["phase"], "not_authorized");
+    assert_eq!(evidence["financial"]["kind"], "not_authorized");
+    assert!(evidence["terms"].is_null());
+    assert!(evidence["acceptance"].is_null());
+    if let Some(directory) = std::env::var_os("MAYHEM_TEST_PROXY_EVIDENCE_DIR") {
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("core-proxy-evidence-policy-mismatch.json"),
+            serde_json::to_vec_pretty(&evidence).unwrap(),
+        )
+        .unwrap();
+    }
+    // Losing the first HTTP reply is recoverable from the original encrypted
+    // job after reopen; the new policy cannot later reinterpret this intent.
+    f.router = openai_router(
+        f.state
+            .clone()
+            .with_job_store_dir(f.directory.path().join("jobs"))
+            .unwrap(),
+    );
+    assert_eq!(f.get(&path, "owner-fixture-key").await.1, evidence);
+    for body in [stale, f.body()] {
+        assert_eq!(
+            f.post(key, body, "owner-fixture-key", false).await.0,
+            StatusCode::CONFLICT
+        );
+    }
+    assert_eq!(
+        f.get(&path, "other-fixture-key").await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert!(f
+        .state
+        .access_control
+        .pending_key_budgets(None, 64)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        f.state.access_control.summary()["tokens"][0]["spent_total_au"],
+        "0"
+    );
+    assert_eq!(server.count(), 0);
+    assert_eq!(f.harness.backend_calls(), 0);
+    assert_eq!(f.harness.status().await["publications"], 0);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn proxy_http_policy_mismatch_without_durable_fence_never_claims_non_admission() {
+    let server = Server::start("accept").await;
+    let mut f = server.fixture().await;
+    let mut stale = f.body();
+    stale["proxy"]["settlement_policy_hash"] = json!(support::digest(91));
+    let path = f.directory.path().join("jobs");
+    let offline = f.directory.path().join("jobs-offline");
+    std::fs::rename(&path, &offline).unwrap();
+    let (status, headers, error) = f
+        .post("policy-vault-failure", stale, "owner-fixture-key", false)
+        .await;
+    std::fs::rename(&offline, &path).unwrap();
+    assert_eq!(status, StatusCode::CONFLICT, "{error}");
+    assert_ne!(error["error"]["category"], "proxy_admission");
+    assert_ne!(error["error"]["code"], "proxy_settlement_policy_mismatch");
+    assert!(headers.get("x-mayhem-job-id").is_none());
+    assert!(f
+        .state
+        .access_control
+        .pending_key_budgets(None, 64)
+        .unwrap()
+        .is_empty());
+    assert_eq!(
+        f.state.access_control.summary()["tokens"][0]["spent_total_au"],
+        "0"
+    );
+    assert_eq!(server.count(), 0);
+    assert_eq!(f.harness.backend_calls(), 0);
+    assert_eq!(f.harness.status().await["publications"], 0);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn proxy_http_policy_rollover_preserves_original_paid_and_pending_purchase() {
+    for pending in [false, true] {
+        let server = Server::start("accept").await;
+        let mut f = server.fixture().await;
+        if pending {
+            f.harness.command("publish_pending").await;
+        }
+        let key = "original-policy-purchase";
+        let body = f.body();
+        let expected = if pending {
+            StatusCode::ACCEPTED
+        } else {
+            StatusCode::OK
+        };
+        let (status, headers, original) =
+            f.post(key, body.clone(), "owner-fixture-key", false).await;
+        assert_eq!(status, expected, "{original}");
+        let id = headers["x-mayhem-job-id"].to_str().unwrap();
+        let path = format!("/v1/jobs/{id}/proxy-evidence");
+        let (_, evidence) = f.get(&path, "owner-fixture-key").await;
+        assert!(!evidence["terms"].is_null());
+        assert_eq!(
+            evidence["financial"]["kind"],
+            if pending { "pending" } else { "canonical" }
+        );
+        let spent = f.state.access_control.summary()["tokens"][0]["spent_total_au"].clone();
+        let executions = f.harness.backend_calls();
+        assert_eq!(executions, usize::from(!pending));
+        let mut settlement = f.harness.policy.clone();
+        settlement.allow_checkpoints = !settlement.allow_checkpoints;
+        let policy = proxy_request::Policy::new(
+            support::digest(2),
+            Digest::new(settlement.digest().unwrap()).unwrap(),
+            f.runtime.policy.lifetimes(),
+            512 * 1024,
+        )
+        .unwrap();
+        let changed = Runtime::new(f.harness.buyer.clone(), policy, settlement, 2)
+            .unwrap()
+            .with_retail_authorization(server.config())
+            .unwrap();
+        let original_router = f.router.clone();
+        f.router = openai_router(f.state.clone().with_proxy_buyer(Arc::new(changed)).unwrap());
+        let (status, _, conflict) = f.post(key, body.clone(), "owner-fixture-key", false).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{conflict}");
+        assert_ne!(conflict["error"]["category"], "proxy_admission");
+        assert_eq!(f.get(&path, "owner-fixture-key").await.1, evidence);
+        // Simulate a competing submission winning begin_proxy after the initial
+        // absence check. Even an exact binding must preserve that winner rather
+        // than retire its job or claim a fresh non-admission rejection.
+        let job = f
+            .state
+            .jobs
+            .lock()
+            .unwrap()
+            .get(id, now_secs())
+            .unwrap()
+            .unwrap();
+        let binding = Binding {
+            job_id: id.into(),
+            token: GatewayTokenAttribution {
+                name: "owner".into(),
+                token_id: "owner".into(),
+            },
+            model: job.model.clone(),
+            fingerprint: job.request_fingerprint.clone(),
+            identity: job.proxy.as_ref().unwrap().identity().clone(),
+        };
+        let mut different = binding.clone();
+        different.fingerprint = support::digest(92).as_str().into();
+        let raced = reject_settlement_policy(&f.state, different, job.endpoint_family.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(raced.status, StatusCode::CONFLICT);
+        assert_ne!(raced.category, "proxy_admission");
+        let raced = reject_settlement_policy(&f.state, binding, job.endpoint_family)
+            .await
+            .unwrap();
+        assert_eq!(raced.status(), expected);
+        assert_eq!(f.get(&path, "owner-fixture-key").await.1, evidence);
+        f.router = original_router;
+        assert_eq!(
+            f.post(key, body, "owner-fixture-key", false).await.0,
+            expected
+        );
+        assert_eq!(server.count(), 1);
+        assert_eq!(f.harness.backend_calls(), executions);
+        assert_eq!(
+            f.state.access_control.summary()["tokens"][0]["spent_total_au"],
+            spent
+        );
+        f.stop().await;
+    }
 }
 
 #[tokio::test]
