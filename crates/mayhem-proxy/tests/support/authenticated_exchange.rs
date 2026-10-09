@@ -7,6 +7,8 @@ use exchange_bridge::Bridge;
 
 #[path = "duplex_exchange.rs"]
 mod duplex;
+#[path = "foreign_outcome.rs"]
+mod foreign_outcome;
 
 fn snapshot(p: &Paid) -> mayhem_proxy::buyer::PublicAcceptanceSnapshot {
     mayhem_proxy::buyer::PublicAcceptanceSnapshot {

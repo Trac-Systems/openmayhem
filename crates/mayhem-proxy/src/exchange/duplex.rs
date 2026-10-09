@@ -110,12 +110,9 @@ impl Receiver {
                 .map_err(|_| Error::Interrupted)??,
             None => read.await?,
         };
+        let received = self.session.received(message)?;
         self.received = sequence;
         self.interrupted = false;
-        Ok(Received {
-            accepted_terms: self.session.accepted_terms.clone(),
-            recipient: self.session.role,
-            message,
-        })
+        Ok(received)
     }
 }

@@ -4,6 +4,8 @@ use mayhem_proxy::{exchange, serving};
 mod opening;
 #[path = "managed_paid.rs"]
 mod managed;
+#[path = "buyer_controller.rs"]
+mod buyer_controller;
 
 #[tokio::test]
 async fn provider_session_offers_and_recovers_signed_nonexecution_waiver_without_resending() {

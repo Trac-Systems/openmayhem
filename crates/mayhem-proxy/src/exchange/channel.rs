@@ -205,11 +205,11 @@ impl Channel {
     }
     pub async fn receive(&mut self, wait: Option<Duration>) -> Result<Received> {
         let message = self.wire.receive(wait).await?;
-        Ok(Received {
-            accepted_terms: self.session.accepted_terms.clone(),
-            recipient: self.session.role,
-            message,
-        })
+        let received = self.session.received(message);
+        if received.is_err() {
+            self.wire.interrupted = true;
+        }
+        received
     }
     pub async fn close(self) -> Result<()> {
         self.wire.close().await

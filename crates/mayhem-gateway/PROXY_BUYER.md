@@ -61,6 +61,11 @@ It rechecks the provider proposal and a fresh canonical quote, persists signing
 and acceptance, confirms funding, independently verifies output/receipts, and
 requires explicit owner hooks for budget authorization and result retention.
 Those hooks are integration boundaries, not implementations of HTTP persistence.
+Result retention must precede durable receipt approval as well as signing: a
+separate recovery worker can sign a retained approval. The controller verifies
+without approving, retains the answer through the owner hook, then rechecks
+canonical state before storing approval. Both paid receive paths reject receipts
+or waivers that name a different purchase or invocation.
 
 The first controller increment covers nonstreaming Chat and Decisions. Streaming,
 Completions/Responses execution, category routing, automatic bounded recovery,

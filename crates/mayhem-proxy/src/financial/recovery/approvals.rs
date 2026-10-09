@@ -184,6 +184,15 @@ impl Store {
         Ok(result)
     }
 }
+/// Opaque independent verification, not durable consent and not a signing
+/// capability. Owners can durably retain the verified answer before committing
+/// approval. Retention performs a fresh canonical read and rechecks its head.
+pub struct VerifiedReceipt {
+    observation: Observation,
+    authorization: ProxySpendAuthorization,
+    value: ProviderReceipt,
+    approval: BuyerApproval,
+}
 impl BuyerRecovery {
     /// Already signed evidence remains deliverable while the wallet is locked.
     /// This does not imply that the ledger has applied it.
@@ -210,6 +219,38 @@ impl BuyerRecovery {
         cancelled_before_terminal: bool,
         at_ms: u64,
     ) -> Result<()> {
+        let verified = self
+            .verify_receipt(
+                verifier,
+                value,
+                snapshot,
+                own_request,
+                received,
+                cancelled_before_terminal,
+            )
+            .await?;
+        // Compatibility path has no owner I/O between verification and commit;
+        // preserve its single canonical read and the existing freshness check.
+        let VerifiedReceipt {
+            observation,
+            value,
+            approval,
+            ..
+        } = verified;
+        self.run(move |s| s.approve(&observation, Intent::Receipt { value }, &approval, at_ms))
+            .await
+    }
+    /// Independently verify without storing an approval that another recovery
+    /// owner could sign. The caller must durably retain its output before retain_receipt.
+    pub async fn verify_receipt(
+        &self,
+        verifier: &crate::worker::host::Pool,
+        value: ProviderReceipt,
+        snapshot: impl Evidence,
+        own_request: Vec<u8>,
+        received: ProtocolReply,
+        cancelled_before_terminal: bool,
+    ) -> Result<VerifiedReceipt> {
         let key = Digest::new(&value.draft.body.accepted_terms)
             .map_err(|_| invalid("invalid terms key"))?;
         let saved = self.run(move |s| s.get(key.as_str())).await?;
@@ -231,6 +272,27 @@ impl BuyerRecovery {
             cancelled_before_terminal,
         )
         .await?;
+        Ok(VerifiedReceipt {
+            observation: o,
+            authorization: saved.authorization,
+            value,
+            approval,
+        })
+    }
+    /// Store the exact verified approval only after the owner's output commit.
+    /// Verification does not freeze canonical state while owner I/O is awaited.
+    pub async fn retain_receipt(&self, verified: VerifiedReceipt, at_ms: u64) -> Result<()> {
+        let VerifiedReceipt {
+            authorization,
+            value,
+            approval,
+            ..
+        } = verified;
+        let o = self.client.observe(&authorization).await?;
+        require(
+            value.draft.previous == o.receipt_head()?.map(|r| r.body),
+            "provider draft differs from buyer canonical receipt head",
+        )?;
         self.run(move |s| s.approve(&o, Intent::Receipt { value }, &approval, at_ms))
             .await
     }

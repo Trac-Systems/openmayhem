@@ -5,6 +5,7 @@
 
 pub mod attempts;
 pub mod buyer;
+pub mod buyer_controller;
 pub mod capacity;
 pub mod catalog;
 pub mod cli;

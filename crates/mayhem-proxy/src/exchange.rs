@@ -87,6 +87,29 @@ impl Session {
             invocation,
         })
     }
+    // Authentication of the enclosing frame is insufficient: nested financial
+    // evidence must belong to this exact accepted purchase and invocation.
+    fn received(&self, message: Message) -> Result<Received> {
+        let nested = match &message {
+            Message::Receipt { value } => {
+                Some((&value.draft.body.accepted_terms, &value.draft.invocation))
+            }
+            Message::Waiver { value } => {
+                Some((&value.draft.body.accepted_terms, &value.draft.invocation))
+            }
+            _ => None,
+        };
+        if nested.is_some_and(|(terms, invocation)| {
+            terms != self.accepted_terms.as_str() || invocation != &self.invocation
+        }) {
+            return Err(Error::Identity);
+        }
+        Ok(Received {
+            accepted_terms: self.accepted_terms.clone(),
+            recipient: self.role,
+            message,
+        })
+    }
     pub fn invocation(&self) -> &Digest {
         &self.invocation
     }

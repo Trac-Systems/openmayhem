@@ -7,7 +7,7 @@ pub mod runner;
 use super::*;
 use crate::attempts;
 use approvals::Acknowledgment;
-pub use approvals::SignedAcknowledgment;
+pub use approvals::{SignedAcknowledgment, VerifiedReceipt};
 use mayhem_proto::proxy::finance::{ProxyExpiryBody, ProxyHoldExpiry, ProxyReservationExpiry};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use reservations::ReservationIntent;

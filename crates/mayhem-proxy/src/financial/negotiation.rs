@@ -640,6 +640,17 @@ pub struct BuyerNegotiation {
     slots: Arc<tokio::sync::Semaphore>,
 }
 impl BuyerNegotiation {
+    /// Startup-only conservative bound for any retained record, including stores
+    /// reopened with lower limits. Reads metadata, never request/history rows.
+    pub fn max_record_bytes(&self) -> Result<usize> {
+        let tx = crate::db(self.store.database.begin_read())?;
+        let table = crate::db(tx.open_table(META))?;
+        let meta = crate::db(table.get("state"))?
+            .ok_or_else(|| invalid("negotiation metadata missing"))?;
+        let retained = decode_meta(meta.value())?.bytes.min(MAX_RECORD_BYTES as u64) as usize;
+        Ok(self.store.limits.max_record_bytes.max(retained))
+    }
+
     pub fn new(store: Arc<Store>, client: Arc<Client>, workers: usize) -> Result<Self> {
         let id = client.identity();
         require(
