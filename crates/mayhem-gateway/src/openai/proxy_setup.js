@@ -1,7 +1,7 @@
 'use strict';
 (() => {
   const $ = id => document.getElementById(id);
-  let view, csrf, plan, busy = false;
+  let view, csrf, plan, runPlan, busy = false;
   const text = (id, value) => { $(id).textContent = value; };
   const json = value => JSON.stringify(value, null, 2);
   const field = (parent, label, value, change, numeric = false) => {
@@ -16,7 +16,7 @@
   };
   const integer = value => { const n = Number(value); if (!Number.isSafeInteger(n) || n < 1) throw Error('Enter a positive whole number.'); return n; };
   function render(v) {
-    view = v; plan = null; $('publish').disabled = true;
+    view = v; plan = null; runPlan = null; $('publish').disabled = true; $('start-run').disabled = true;
     text('steps', v.steps.map(s => s.step + ': ' + (s.state || s.structural) + (s.probe ? ' / probe ' + s.probe : '')).join(' → '));
     text('identity', `Connection ${v.connection.id}, revision ${v.connection.revision}; ${v.endpoint}. Draft ${v.review?.draft_id || 'not saved'}, revision ${v.review?.revision || '—'}.`);
     $('model').value = v.selection.upstream_model; $('models').replaceChildren();
@@ -44,8 +44,10 @@
     });
     text('probe', json(v.probe_plan || {state:'No protected probe plan configured'}));
     text('review', json(v.review));
+    text('run',json(v.run || {state:v.capabilities.run ? 'Review Run after the exact publication is confirmed.' : 'A protected runtime template and host lifecycle are required.'}));
     for (const button of document.querySelectorAll('button[data-action]')) {
       const action = button.dataset.action;
+      if (['run_plan','recover_run'].includes(action)) button.disabled = !v.capabilities.run;
       if (action === 'probe') button.disabled = !v.capabilities.probe;
       if (action === 'admission_check') button.disabled = !v.capabilities.canonical_admission;
       if (action.startsWith('invoice_')) button.disabled = !v.capabilities.enrollment;
@@ -83,7 +85,8 @@
     if (name === 'refresh') return request();
     const revision = view.review?.revision;
     let a = {action:name,expected_revision:revision};
-    if (name === 'connect') a = {action:name};
+    if (name === 'recover_run') a = {action:name};
+    else if (name === 'connect') a = {action:name};
     else if (name === 'discover') a = {action:name,expected_inventory_revision:view.inventory?.revision || 0};
     else if (name === 'select') {
       if (document.querySelector('[aria-invalid="true"]')) throw Error('Correct the invalid numeric fields before saving.');
@@ -104,6 +107,9 @@
         const operation = name.slice(8);
         if (operation !== 'status' && !confirm(operation === 'create' ? 'Create or recover the original admission invoice? No funds will be sent.' : 'Request the original FIAT checkout? Opening checkout does not prove payment.')) return;
         a = {action:'enrollment',expected_revision:revision,operation,rail:operation === 'create' ? $('invoice-rail').value : null};
+      } else if (name === 'start_run') {
+        if (!runPlan || !confirm('Install exactly this retained controller? Configured recovery probes may consume the remaining cumulative allowance. Native/model-server configuration is unchanged.')) return;
+        a.plan_digest=runPlan.plan_digest;
       } else if (name === 'publication_plan') a.offers_only = false;
       else if (name === 'publish') {
         if (!plan || !confirm('Sign and submit exactly the reviewed publication? No model server will start.')) return;
@@ -111,6 +117,7 @@
       }
     }
     const result = await request(a);
+    if (name === 'run_plan') { runPlan=result; text('run',json(result)); $('start-run').disabled=false; }
     if (name === 'publication_plan') { plan = result; text('publication',json(result)); $('publish').disabled = false; }
     else if (['publish','recover_publication','admission_check'].includes(name)) text('publication',json(result));
     if (name === 'invoice_checkout') {
@@ -120,6 +127,7 @@
     }
   }
   document.addEventListener('input', () => {
+    if (runPlan) {runPlan=null; $('start-run').disabled=true;}
     if (plan) { plan = null; $('publish').disabled = true; text('message','Save changed selections, then review their exact publication.'); }
   });
   document.addEventListener('click', async event => {

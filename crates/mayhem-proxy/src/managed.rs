@@ -22,7 +22,10 @@ use crate::{
     signing::Authority,
     worker::host::Pool,
 };
-pub use config::{Config, Prepared};
+pub use config::{
+    Bridge, Config, ConnectionSpec, Group, Limits, Prepared, Recovery, Route as RouteConfig,
+    Tokenizer,
+};
 use serde::Serialize;
 use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 use tokio::sync::watch;
@@ -98,6 +101,7 @@ impl Prepared {
             routes,
             financial,
             seed,
+            requires_existing_capacity,
         } = self;
         private_dir(&config.state_dir)?;
         let workdir = config.state_dir.join("decoder-work");
@@ -125,7 +129,11 @@ impl Prepared {
             .map_err(|_| Error::Setup)?,
         );
         let capacity = Arc::new(
-            capacity::Authority::open(
+            (if requires_existing_capacity {
+                capacity::Authority::open_existing
+            } else {
+                capacity::Authority::open
+            })(
                 config.state_dir.join("capacity.redb"),
                 identity.clone(),
                 capacity::Limits {

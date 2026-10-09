@@ -9,6 +9,7 @@ mod probe;
 mod profile;
 mod publication;
 mod review;
+mod run;
 mod store;
 pub use admission::{AdmissionEvidence, AdmissionReport, AdmissionState, CanonicalProvider};
 pub use connection::{DiscoveryState, InventoryReview};
@@ -24,6 +25,10 @@ pub use publication::{
     PublicationReport, PublicationState,
 };
 pub use review::{AdmissionHandoff, Review, State};
+pub use run::{
+    LaunchBinding, LifecycleObservation, ProcessObservation, RunFuture, RunLifecycle, RunPlan,
+    RunReport, RunSettings, RunTemplate,
+};
 pub use store::Store;
 
 use crate::{
@@ -76,6 +81,12 @@ pub enum Error {
     PublicationRecovery,
     #[error("provider admission service is unavailable; resume the original setup, do not send another fee")]
     EnrollmentUnavailable,
+    #[error("managed startup requires the exact current checked and confirmed publication with its original probe scope")]
+    RunPrerequisite,
+    #[error("managed startup conflicts with its retained original configuration or controller; inspect original state")]
+    RunConflict,
+    #[error("managed supervisor is unavailable; recover the original retained startup")]
+    RunUnavailable,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 fn require(ok: bool) -> Result<()> {

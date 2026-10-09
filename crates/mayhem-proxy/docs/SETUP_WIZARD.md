@@ -11,11 +11,12 @@ This checkpoint includes explicit configuration review, one bounded model-list
 read, manual/discovered model selection, full existing price-map editing,
 structural checks, reviewed bounded probes, canonical admission reads,
 provider-key invoice/create/status/checkout, exact publication review/signing,
-and original probe/publication recovery. It does **not** export or install a
-managed serving configuration, start serving, pay a fee, renew a permit, suggest
-markets from a canonical directory, or implement general connection editing in
-the browser. Those remain explicit next steps. Existing native serving is not
-reconfigured. A published offer is not proof of readiness.
+original probe/publication recovery, and reviewed installation/reconciliation of
+one existing managed provider controller. It does **not** pay a fee, renew a permit,
+suggest markets from a canonical directory, or implement general connection
+editing in the browser. Those remain separate work. Existing native serving and
+upstream model servers are not reconfigured. A published offer or running process
+is not proof of readiness.
 
 ## Configuration and identity
 
@@ -32,6 +33,14 @@ reconfigured. A published offer is not proof of readiness.
 - `peer_rpc`: configured trusted Core peer RPC base, or null.
 - `admission_origin`: trusted admission API **origin**, or null. HTTPS is required
   except explicit literal loopback HTTP fixtures.
+- `run`: optional protected runtime handoff settings, absent/null when disabled.
+  `{ "template": "/private/runtime-policy.json", "wallet_password_file": null }`.
+  The password field is a protected **file reference**, using the existing wallet
+  password file; it defaults to `<home>/secrets/wallet-password` when present.
+  The template contains `schema_version:1`, existing managed `bridge`, `health`,
+  `limits`, optional `tokenizer`, and explicit `allow_recovery_probes` fields.
+  No offers, price maps, adapter/recipe snapshots, routes or budgets are entered
+  again: they come from the exact published draft and existing probe plan.
 - `timeout_ms`: 1 through 10000 for discovery/admission reads. Probe execution
   retains its separately bounded existing plan timeout.
 
@@ -98,12 +107,73 @@ work cannot become a successful observation or reset the allowance. Publication
 requires an explicit review and separate confirmation; recovery reconciles the
 original retained operation rather than creating another identity/fee.
 
+
+## Reviewed managed Run
+
+Run requires a current structurally checked draft, an actual protocol-validated
+probe, and the exact publication confirmed by the canonical peer. Its capacity
+file must already be the existing managed `state_dir/capacity.redb`. Preview
+validates the full generated configuration and protected connection/bridge/
+tokenizer references without opening a capacity authority or dispatching work.
+The original connection fingerprint, route, group, physical constraints and
+cumulative probe policy are retained. A template cannot substitute other offers,
+rates or an adapter. Setting `allow_recovery_probes` authorizes only the exact
+existing probe request within the same remaining cumulative allowance.
+
+The CLI has **Review Run**, **Begin Run**, and **Reconcile Run** actions. The
+existing authenticated dashboard has the same controls. Unattended action bodies
+are `{"action":"run_plan","expected_revision":N}`,
+`{"action":"start_run","expected_revision":N,"plan_digest":"…"}`, and
+`{"action":"recover_run"}`. Start requires explicit acknowledgement of the
+reviewed plan. The content-addressed owner-only managed configuration and original
+Run intent are fsynced before any supervisor installation request.
+
+An existing running mayhemd with authenticated exact-child inspection is a Run
+prerequisite; the wizard does not start a second supervisor. The host reuses its
+existing wallet locator, password-file reference, normal
+wallet helper, fixed local mayhemd origin and authenticated control token. The
+stable child name remains one controller per wallet and network, matching
+`provider proxy add`. The generated child command uses hidden supervised config
+pinning; every restart verifies the full canonical config digest and exact
+connection fingerprint before opening any stores. A missing, empty or unrelated
+capacity database is rejected instead of re-created. The original database's
+exclusive lock prevents two controllers, and its used probe counters/retained
+leases are never reset. Fresh health and canonical registration still gate
+presence and admission after restart.
+
+Authenticated `POST /children/inspect` accepts only an exact child name and
+expected canonical full-child-config hash. It returns `missing`, `nonpersistent`,
+`mismatch`, or `matched` plus sanitized process lifecycle. It exports no argv,
+environment, paths, credentials, or actual configuration. Its durable exact-name
+lookup does not scan other children. Config equality includes all daemon defaults,
+fixed binary/wallet/config references and the managed config digest.
+
+A lost installation ACK is reconciled by inspecting that original identity. A
+matched persistent child may be stopped, restarting, or running; none of those
+states attests capacity. Recovery never installs/replaces a child, changes the
+retained plan, reloads the editable runtime template, or creates a new budget.
+A missing child requires another explicit Start of the same acknowledged plan;
+a conflicting child requires operator reconciliation, not automatic removal.
+An edited draft cannot reprice or replace a previously retained Run.
+
+The first Run plan is immutable for this draft directory. Updating an installed
+controller to a later publication remains an explicit operator lifecycle task;
+this wizard does not silently remove/re-add it. Runtime policy/template authoring
+and the current low-level revision/AU controls still need onboarding UI polish.
+
 ## Local validation
 
 ```sh
 cargo test -p mayhem-proxy --test setup flow::
 cargo test -p mayhem-gateway --lib proxy_setup::tests
 cargo check -p mayhem-cli --bin mayhem
+cargo test -p mayhem-proxy --test setup 'run::'
+cargo test -p mayhemd exact_child_inspection_http_auth_lost_ack_and_restart
+# Explicit local binaries, synthetic encrypted wallet and loopback fixtures only:
+cargo build -p mayhem-cli --bin mayhem -p mayhemd --bin mayhemd
+MAYHEM_SETUP_CLI_BINARY="${CARGO_TARGET_DIR:-target}/debug/mayhem" \
+MAYHEM_SETUP_DAEMON_BINARY="${CARGO_TARGET_DIR:-target}/debug/mayhemd" \
+cargo test -p mayhem-proxy --test setup run_cli_real_supervisor_publication_restart -- --ignored
 ```
 
 The focused setup test uses a credential-free loopback model-list endpoint and
@@ -113,3 +183,11 @@ Origin/CSRF, pre-body rejection, private projection, CAS and restart boundaries.
 An ignored, short-lived `local_browser_and_cli_fixture` test is available for a
 local coordinator through `MAYHEM_SETUP_BROWSER_READY`; it has no financial service
 or real upstream configuration and is not a deployment entry point.
+
+The opt-in CLI Run acceptance archives the committed Intercom asset source into
+its disposable directory, seals that fixture using the existing release-identity
+test algorithm, and runs normal startup verification. It does not modify the
+shared release seal or disable verification. The actual encrypted synthetic
+wallet helper, CLI and mayhemd are exercised; canonical publication is the local
+contract fixture and SC-Bridge is a bounded loopback protocol double. This is not
+production relay/fee collection evidence.

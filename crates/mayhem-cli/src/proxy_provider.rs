@@ -1,6 +1,6 @@
 //! Provider startup uses the existing encrypted wallet and protected SC-Bridge.
 mod setup;
-mod supervisor;
+pub(crate) mod supervisor;
 use super::{cached_wallet_signing_key, resolve_wallet_keypair_path, WalletLocatorArgs};
 use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
@@ -37,6 +37,8 @@ pub struct ServeArgs {
     wallet: WalletLocatorArgs,
     #[arg(long, hide = true)]
     supervised: bool,
+    #[arg(long, hide = true, requires = "supervised")]
+    expected_config_digest: Option<String>,
 }
 pub async fn run(command: Command) -> Result<()> {
     let args = match command {
@@ -50,8 +52,14 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Add(args) => return supervisor::add(args).await,
     };
     let config = args.config;
+    let expected_config_digest = args
+        .expected_config_digest
+        .map(mayhem_proxy::attempts::Digest::new)
+        .transpose()?;
     let prepared = tokio::task::spawn_blocking(move || {
-        if args.supervised {
+        if let Some(expected) = expected_config_digest {
+            Prepared::load_supervised_pinned(&config, &expected)
+        } else if args.supervised {
             Prepared::load_supervised(&config)
         } else {
             Prepared::load(&config)

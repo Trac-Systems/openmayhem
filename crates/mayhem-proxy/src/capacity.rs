@@ -14,7 +14,7 @@
 
 pub mod probes;
 
-use crate::attempts::{private_file, Digest, Identity};
+use crate::attempts::{existing_private_file, private_file, Digest, Identity};
 use crate::financial::negotiation::BuyerOffer;
 use redb::{
     Database, Durability, ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition,
@@ -387,9 +387,25 @@ impl std::ops::Deref for Tx<'_> {
 }
 impl Authority {
     pub fn open(path: impl AsRef<Path>, identity: Identity, limits: Limits) -> Result<Self> {
+        Self::open_inner(path.as_ref(), identity, limits, false)
+    }
+    /// Resume an established authority without creating/resetting its accounting store.
+    pub fn open_existing(
+        path: impl AsRef<Path>,
+        identity: Identity,
+        limits: Limits,
+    ) -> Result<Self> {
+        Self::open_inner(path.as_ref(), identity, limits, true)
+    }
+    fn open_inner(path: &Path, identity: Identity, limits: Limits, existing: bool) -> Result<Self> {
         identity.validate().map_err(|_| Error::Invalid)?;
         limits.validate()?;
-        let file = private_file(path.as_ref()).map_err(|_| Error::File)?;
+        let file = (if existing {
+            existing_private_file(path)
+        } else {
+            private_file(path)
+        })
+        .map_err(|_| Error::File)?;
         let mut builder = Database::builder();
         builder.set_cache_size(8 * 1024 * 1024);
         let database = db(builder.create_file(file))?;
@@ -445,7 +461,7 @@ impl Authority {
             )?;
             m
         } else {
-            require(names.is_empty())?;
+            require(!existing && names.is_empty())?;
             db(tx.open_table(GROUPS))?;
             db(tx.open_table(ROUTES))?;
             db(tx.open_table(LEASES))?;

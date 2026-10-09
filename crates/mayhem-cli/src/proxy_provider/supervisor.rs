@@ -1,10 +1,12 @@
 //! Add only the explicitly configured controller to the existing supervisor.
 //! All restart credentials remain protected file references, never process args.
+mod run;
 use crate as cli;
 use crate::WalletLocatorArgs;
 use anyhow::{ensure, Context, Result};
 use clap::Args;
 use mayhem_proxy::{managed::Prepared, signing::Authority};
+pub(crate) use run::Host;
 use serde_json::{json, Value};
 use std::{
     path::{Path, PathBuf},

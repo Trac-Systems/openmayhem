@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 mod persistent;
+#[cfg(all(test, unix))]
+mod inspection;
 
 use std::collections::BTreeMap;
 use std::env;
@@ -997,6 +999,32 @@ async fn handle_status_connection(
             let snapshot = runtime.snapshot().await;
             write_http_json(&mut stream, 200, &snapshot).await
         }
+        ("POST", "/children/inspect") => {
+            if !control_request_authorized(&request.headers, control_token.as_deref()) {
+                return write_http_json(&mut stream, 401, &json!({"ok":false,"error":"unauthorized"})).await;
+            }
+            #[derive(Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Inspect { name: String, expected_config_hash: String }
+            let body = match serde_json::from_slice::<Inspect>(&request.body) {
+                Ok(v) if (1..=128).contains(&v.name.len())
+                    && v.name.bytes().all(|b| b.is_ascii_alphanumeric() || b"._-".contains(&b))
+                    && v.expected_config_hash.len() == 64
+                    && v.expected_config_hash.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)) => v,
+                _ => return write_http_json(&mut stream, 400, &json!({"ok":false,"error":"invalid child selector"})).await,
+            };
+            let matched = match persistent::inspect(runtime.persistent.clone(), body.name.clone(), body.expected_config_hash).await {
+                Ok(v) => v,
+                Err(_) => return write_http_json(&mut stream, 503, &json!({"ok":false,"error":"persistent child inspection unavailable"})).await,
+            };
+            let lifecycle = runtime.state.lock().await.children.get(&body.name).map(|child| json!({
+                "running":child.running,"pid":child.pid,"restart_pending":child.restart_pending,
+                "restarts":child.restarts,"crash_loop":child.crash_loop,
+            }));
+            let state = match matched { Some(true) => "matched", Some(false) => "mismatch", None if lifecycle.is_some() => "nonpersistent", None => "missing" };
+            write_http_json(&mut stream, 200, &json!({"schema_version":1,"name":body.name,"state":state,
+                "persistent":matched.is_some(),"config_matches":matched,"lifecycle":lifecycle})).await
+        }
         ("POST", "/children/add") => {
             if !control_request_authorized(&request.headers, control_token.as_deref()) {
                 return write_http_json(
@@ -1705,7 +1733,7 @@ crash_loop_threshold = 5
 mod tests {
     use super::*;
 
-    fn test_runtime(temp: &Path, children: &[ChildConfig]) -> SupervisorRuntime {
+    pub(super) fn test_runtime(temp: &Path, children: &[ChildConfig]) -> SupervisorRuntime {
         SupervisorRuntime {
             state: Arc::new(Mutex::new(SupervisorState {
                 ok: true,
@@ -1723,7 +1751,7 @@ mod tests {
         }
     }
 
-    async fn wait_for_test_state(
+    pub(super) async fn wait_for_test_state(
         timeout: Duration,
         mut ready: impl FnMut(&SupervisorState) -> bool,
         runtime: &SupervisorRuntime,
@@ -1830,7 +1858,7 @@ mod tests {
         ));
     }
 
-    async fn send_control_request(
+    pub(super) async fn send_control_request(
         runtime: SupervisorRuntime,
         control_tx: mpsc::Sender<SupervisorCommand>,
         control_token: Option<&str>,
@@ -2498,4 +2526,5 @@ while true; do sleep 1; done
             .expect("crash-loop supervisor should finish cleanly");
         let _ = fs::remove_dir_all(temp);
     }
+
 }

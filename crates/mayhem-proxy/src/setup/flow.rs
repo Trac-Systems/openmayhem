@@ -17,6 +17,7 @@ pub struct FlowConfig {
     pub peer_rpc: Option<String>,
     pub admission_origin: Option<String>,
     pub timeout_ms: u64,
+    pub run: Option<RunSettings>,
 }
 impl FlowConfig {
     pub fn load(path: &Path) -> Result<Self> {
@@ -36,6 +37,16 @@ impl FlowConfig {
         if let Some(p) = &mut v.probe_plan {
             if p.is_relative() {
                 *p = base.join(&p);
+            }
+        }
+        if let Some(run) = &mut v.run {
+            if run.template.is_relative() {
+                run.template = base.join(&run.template);
+            }
+            if let Some(path) = &mut run.wallet_password_file {
+                if path.is_relative() {
+                    *path = base.join(&path);
+                }
             }
         }
         v.validate()?;
@@ -60,6 +71,17 @@ impl FlowConfig {
             require(
                 url.path() == "/"
                     && origin.trim_end_matches('/') == url.origin().ascii_serialization(),
+            )?;
+        }
+        if let Some(run) = &self.run {
+            require(
+                run.template.is_absolute()
+                    && run
+                        .wallet_password_file
+                        .as_ref()
+                        .is_none_or(|p| p.is_absolute())
+                    && self.probe_plan.is_some()
+                    && self.peer_rpc.is_some(),
             )?;
         }
         Ok(())
@@ -133,6 +155,14 @@ pub enum FlowAction {
     RecoverPublication {
         expected_revision: u64,
     },
+    RunPlan {
+        expected_revision: u64,
+    },
+    StartRun {
+        expected_revision: u64,
+        plan_digest: Digest,
+    },
+    RecoverRun {},
 }
 #[derive(Serialize)]
 pub struct FlowView {
@@ -146,6 +176,7 @@ pub struct FlowView {
     pub review: Option<Review>,
     pub probe_plan: Option<Value>,
     pub enrollment: Option<Value>,
+    pub run: Option<RunReport>,
     pub steps: Vec<Value>,
     pub capabilities: Value,
 }
@@ -167,6 +198,7 @@ pub struct FlowResult {
 pub struct Flow {
     config: FlowConfig,
     gate: Arc<tokio::sync::Semaphore>,
+    lifecycle: Option<Arc<dyn RunLifecycle>>,
 }
 impl Flow {
     pub fn open(config: FlowConfig) -> Result<Self> {
@@ -175,7 +207,28 @@ impl Flow {
         Ok(Self {
             config,
             gate: Arc::new(tokio::sync::Semaphore::new(1)),
+            lifecycle: None,
         })
+    }
+    pub fn run_settings(&self) -> Option<&RunSettings> {
+        self.config.run.as_ref()
+    }
+    pub fn with_run_lifecycle(mut self, lifecycle: Arc<dyn RunLifecycle>) -> Self {
+        self.lifecycle = Some(lifecycle);
+        self
+    }
+    fn lifecycle(&self) -> Result<&dyn RunLifecycle> {
+        self.lifecycle.as_deref().ok_or(Error::RunUnavailable)
+    }
+    fn run_template(&self) -> Result<RunTemplate> {
+        RunTemplate::load(
+            &self
+                .config
+                .run
+                .as_ref()
+                .ok_or(Error::RunPrerequisite)?
+                .template,
+        )
     }
     pub fn provider(&self) -> &Digest {
         &self.config.profile.provider_pubkey
@@ -296,6 +349,7 @@ impl Flow {
                     |r| e["draft_id"] == json!(r.draft_id) && e["revision"] == r.revision
                 ));
         }
+        let run = store.inspect_run()?;
         let r = review.as_ref();
         let steps = vec![
             json!({"step":"connect","state":"configured_private_reference"}),
@@ -305,7 +359,7 @@ impl Flow {
             json!({"step":"market","state":if r.is_some(){"operator_selected_not_canonical_confirmation"}else{"needs_selection"}}),
             json!({"step":"admission","state":r.map(|r|r.admission_status).unwrap_or("not_checked"),"payment_does_not_enable_serving":true}),
             json!({"step":"review_publish","state":r.map(|r|r.publication_status).unwrap_or("not_submitted"),"explicit_confirmation_required":true}),
-            json!({"step":"run","state":"managed_configuration_handoff_required","automatic_start":false}),
+            json!({"step":"run","state":run.as_ref().map(|r|r.state.as_str()).unwrap_or(if self.config.run.is_some()&&self.lifecycle.is_some(){"not_started"}else{"managed_configuration_handoff_required"}),"automatic_start":false}),
         ];
         Ok(FlowView {
             schema_version: 1,
@@ -324,8 +378,9 @@ impl Flow {
             review,
             probe_plan,
             enrollment,
+            run,
             steps,
-            capabilities: json!({"probe":self.config.probe_plan.is_some(),"canonical_admission":self.config.peer_rpc.is_some(),"enrollment":self.config.admission_origin.is_some(),"publication":self.config.peer_rpc.is_some(),"run":false}),
+            capabilities: json!({"probe":self.config.probe_plan.is_some(),"canonical_admission":self.config.peer_rpc.is_some(),"enrollment":self.config.admission_origin.is_some(),"publication":self.config.peer_rpc.is_some(),"run":self.config.run.is_some()&&self.lifecycle.is_some()}),
         })
     }
     pub async fn execute(
@@ -441,6 +496,29 @@ impl Flow {
                         .await?
                 )
             }
+            FlowAction::RunPlan { expected_revision } => json!(store.run_plan(
+                expected_revision,
+                self.run_template()?,
+                self.probe()?.0,
+                self.peer()?,
+                self.lifecycle()?
+            )?),
+            FlowAction::StartRun {
+                expected_revision,
+                plan_digest,
+            } => json!(
+                store
+                    .start_run(
+                        expected_revision,
+                        self.run_template()?,
+                        self.probe()?.0,
+                        self.peer()?,
+                        &plan_digest,
+                        self.lifecycle()?
+                    )
+                    .await?
+            ),
+            FlowAction::RecoverRun {} => json!(store.recover_run(self.lifecycle()?).await?),
             FlowAction::RecoverPublication { expected_revision } => json!(
                 store
                     .recover_publication(expected_revision, self.peer()?, self.config.timeout_ms)

@@ -2,6 +2,16 @@
 //! fsync + same-directory rename preserves the prior or new complete revision.
 use super::*;
 
+fn file_limit(name: &str) -> usize {
+    if matches!(name, "draft.json" | "draft.next") {
+        MAX_DRAFT_BYTES
+    } else if name.starts_with("wizard-managed-") || name == "wizard-managed.next" {
+        4 * 1024 * 1024
+    } else {
+        MAX_BYTES
+    }
+}
+
 pub struct Store {
     pub(super) directory: PathBuf,
 }
@@ -153,14 +163,7 @@ impl Guard {
         ) {
             Ok(fd) => {
                 let file = File::from(fd);
-                Self::protected(
-                    &file,
-                    if matches!(name, "draft.json" | "draft.next") {
-                        MAX_DRAFT_BYTES
-                    } else {
-                        MAX_BYTES
-                    },
-                )?;
+                Self::protected(&file, file_limit(name))?;
                 Ok(Some(file))
             }
             Err(rustix::io::Errno::NOENT) => Ok(None),
@@ -182,11 +185,7 @@ impl Guard {
             return Ok(None);
         };
         let mut bytes = zeroize::Zeroizing::new(Vec::new());
-        let maximum = if name == "draft.json" {
-            MAX_DRAFT_BYTES
-        } else {
-            MAX_BYTES
-        };
+        let maximum = file_limit(name);
         file.take(maximum as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| Error::Storage)?;
@@ -205,17 +204,10 @@ impl Guard {
         temporary: &str,
         value: &T,
     ) -> Result<()> {
-        // Names are fixed by setup callers, never supplied by a declaration.
+        // Names are fixed or content-addressed by setup callers, never supplied by a declaration.
         let _ = self.file(name)?;
         let bytes = zeroize::Zeroizing::new(serde_json::to_vec(value).map_err(|_| Error::Invalid)?);
-        require(
-            bytes.len()
-                <= if name == "draft.json" {
-                    MAX_DRAFT_BYTES
-                } else {
-                    MAX_BYTES
-                },
-        )?;
+        require(bytes.len() <= file_limit(name))?;
         // A crash before rename leaves only an uncommitted temporary file. Never
         // promote it on resume; the original durable draft remains authoritative.
         if self.file(temporary)?.is_some() {

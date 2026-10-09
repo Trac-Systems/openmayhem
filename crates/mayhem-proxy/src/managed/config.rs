@@ -63,6 +63,8 @@ pub struct ConnectionSpec {
     pub ceiling: u32,
     pub config_file: PathBuf,
     pub probe_budget: capacity::probes::Budget,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_fingerprint: Option<Digest>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -108,6 +110,7 @@ pub struct Prepared {
     pub(super) routes: Vec<super::Route>,
     pub(super) financial: Arc<financial::Client>,
     pub(super) seed: u64,
+    pub(super) requires_existing_capacity: bool,
 }
 impl Prepared {
     pub fn identity(&self) -> &attempts::Identity {
@@ -117,17 +120,43 @@ impl Prepared {
     /// Missing credentials, mismatched pins or inconsistent groups fail before
     /// a state database, model request, signature or bridge connection exists.
     pub fn load(path: &Path) -> Result<Self> {
-        Self::load_inner(path, false)
+        Self::load_inner(path, false, None)
     }
     /// A daemon cannot inherit secrets that only exist in the installing shell.
     /// Recheck this on every supervised restart, including after config edits.
     pub fn load_supervised(path: &Path) -> Result<Self> {
-        Self::load_inner(path, true)
+        Self::load_inner(path, true, None)
     }
-    fn load_inner(path: &Path, supervised: bool) -> Result<Self> {
+    /// Exact wizard-reviewed config; a missing capacity store cannot reset allowances.
+    pub fn load_supervised_pinned(path: &Path, expected: &Digest) -> Result<Self> {
+        Self::load_inner(path, true, Some(expected))
+    }
+    fn load_inner(path: &Path, supervised: bool, expected: Option<&Digest>) -> Result<Self> {
         let bytes = private_file(path, 4 * 1024 * 1024).map_err(|_| Error::Protection)?;
-        let mut config: Config =
-            serde_json::from_slice(&bytes).map_err(|_| Error::Configuration)?;
+        let config: Config = serde_json::from_slice(&bytes).map_err(|_| Error::Configuration)?;
+        Self::prepare(config, path, supervised, expected)
+    }
+    pub(crate) fn check_supervised_config(config: &Config, path: &Path) -> Result<()> {
+        let bytes = serde_json::to_vec(config).map_err(|_| Error::Configuration)?;
+        require(bytes.len() <= 4 * 1024 * 1024)?;
+        let copy = serde_json::from_slice(&bytes).map_err(|_| Error::Configuration)?;
+        Self::prepare(copy, path, true, Some(&config.digest()?)).map(|_| ())
+    }
+    fn prepare(
+        mut config: Config,
+        path: &Path,
+        supervised: bool,
+        expected: Option<&Digest>,
+    ) -> Result<Self> {
+        if let Some(expected) = expected {
+            require(
+                &config.digest()? == expected
+                    && config
+                        .connections
+                        .iter()
+                        .all(|c| c.expected_fingerprint.is_some()),
+            )?;
+        }
         let parent = std::fs::canonicalize(
             path.parent()
                 .filter(|p| !p.as_os_str().is_empty())
@@ -243,6 +272,11 @@ impl Prepared {
                 private.paths.keys().copied().collect::<BTreeSet<_>>(),
             );
             let http = Arc::new(HttpConnection::new(private).map_err(|_| Error::Configuration)?);
+            require(
+                c.expected_fingerprint
+                    .as_ref()
+                    .is_none_or(|pin| pin == http.fingerprint()),
+            )?;
             require(connection_pins.insert(http.fingerprint().clone()))?;
             let monitor = Monitor::new(
                 config.health.clone(),
@@ -384,6 +418,7 @@ impl Prepared {
             routes,
             financial,
             seed,
+            requires_existing_capacity: expected.is_some(),
         })
     }
 }
@@ -445,5 +480,17 @@ impl Limits {
 fn relative(path: &mut PathBuf, parent: &Path) {
     if path.is_relative() {
         *path = parent.join(&*path);
+    }
+}
+
+impl Config {
+    /// Canonical full configuration before relative path resolution; secrets remain references.
+    pub fn digest(&self) -> Result<Digest> {
+        let value = serde_json::to_value(self).map_err(|_| Error::Configuration)?;
+        let bytes = mayhem_proto::stable_json_bytes(&value).map_err(|_| Error::Configuration)?;
+        Ok(Digest::hash(
+            "mayhem/proxy/setup-managed-config/v1",
+            &[&bytes],
+        ))
     }
 }

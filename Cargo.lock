@@ -2923,7 +2923,9 @@ name = "mayhemd"
 version = "0.2.271"
 dependencies = [
  "anyhow",
+ "blake3",
  "clap",
+ "mayhem-proto",
  "redb",
  "rustix",
  "serde",

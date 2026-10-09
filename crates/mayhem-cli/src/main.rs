@@ -46060,6 +46060,17 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 mayhem_proxy::setup::Flow::open(mayhem_proxy::setup::FlowConfig::load(&path)?)
             })
             .await??;
+            let flow = if let Some(settings) = flow.run_settings() {
+                let host = proxy_provider::supervisor::Host::new(
+                    home.clone(),
+                    keypair_path.clone(),
+                    settings.wallet_password_file.clone(),
+                    flow.provider().clone(),
+                )?;
+                flow.with_run_lifecycle(Arc::new(host))
+            } else {
+                flow
+            };
             state = state
                 .with_proxy_setup(flow, &format!("http://{bind}"))
                 .map_err(anyhow::Error::msg)?;

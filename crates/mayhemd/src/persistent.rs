@@ -24,7 +24,7 @@ pub type Shared = Arc<Mutex<Store>>;
 
 pub fn capabilities() -> Vec<&'static str> {
     if cfg!(unix) {
-        vec!["persistent_children_v1"]
+        vec!["persistent_children_v1", "persistent_child_inspect_v1"]
     } else {
         Vec::new()
     }
@@ -125,6 +125,23 @@ impl Store {
         tx.commit()?;
         Ok(())
     }
+    fn inspect(&self, name: &str, expected: &str) -> Result<Option<bool>> {
+        let Some(database) = &self.database else {
+            return Ok(None);
+        };
+        let read = database.begin_read()?;
+        let table = read.open_table(CHILDREN)?;
+        let Some(value) = table.get(name)? else {
+            return Ok(None);
+        };
+        ensure!(
+            value.value().len() <= MAX_CHILD_BYTES,
+            "persistent child is too large"
+        );
+        let child: ChildConfig = serde_json::from_slice(value.value())?;
+        ensure!(child.name == name, "persistent child identity mismatch");
+        Ok(Some(child_config_hash(&child)? == expected))
+    }
     fn remove(&mut self, name: &str) -> Result<bool> {
         let Some(database) = &self.database else {
             return Ok(false);
@@ -147,6 +164,25 @@ pub async fn add(store: Shared, child: ChildConfig) -> Result<()> {
     .await
     .context("persisting supervised child")?
 }
+pub fn child_config_hash(child: &ChildConfig) -> Result<String> {
+    let mut bytes = b"mayhem/supervisor/child-config/v1\0".to_vec();
+    bytes.extend(mayhem_proto::stable_json_bytes(&serde_json::to_value(
+        child,
+    )?)?);
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
+
+pub async fn inspect(store: Shared, name: String, expected: String) -> Result<Option<bool>> {
+    tokio::task::spawn_blocking(move || {
+        store
+            .lock()
+            .map_err(|_| anyhow::anyhow!("persistent child store lock failed"))?
+            .inspect(&name, &expected)
+    })
+    .await
+    .context("inspecting supervised child")?
+}
+
 pub async fn remove(store: Shared, name: String) -> Result<bool> {
     tokio::task::spawn_blocking(move || {
         store

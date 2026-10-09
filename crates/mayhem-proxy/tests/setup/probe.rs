@@ -9,8 +9,8 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-struct Backend {
-    calls: Arc<AtomicUsize>,
+pub(super) struct Backend {
+    pub(super) calls: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
 }
 impl Drop for Backend {
@@ -18,7 +18,7 @@ impl Drop for Backend {
         self.task.abort();
     }
 }
-fn backend(
+pub(super) fn backend(
     f: &mut Fixture,
     status: u16,
     body: Vec<u8>,
@@ -95,7 +95,7 @@ fn chat() -> Value {
 fn answer() -> Value {
     json!({"id":"fixture","choices":[{"index":0,"message":{"role":"assistant","content":"hello"},"finish_reason":"stop"}]})
 }
-fn plan(f: &Fixture, request: Value) -> ProbePlan {
+pub(super) fn plan(f: &Fixture, request: Value) -> ProbePlan {
     let work = f.dir.path().join("worker");
     if !work.exists() {
         std::fs::create_dir(&work).unwrap();

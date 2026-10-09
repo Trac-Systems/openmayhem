@@ -95,7 +95,22 @@ async fn execute(
     }
 }
 pub async fn run(args: WizardArgs) -> Result<()> {
-    let flow = Flow::open(FlowConfig::load(&args.config)?)?;
+    let mut flow = Flow::open(FlowConfig::load(&args.config)?)?;
+    if let Some(settings) = flow.run_settings() {
+        let home = args
+            .wallet
+            .home
+            .clone()
+            .map(Ok)
+            .unwrap_or_else(crate::default_home)?;
+        let host = super::super::supervisor::Host::new(
+            home,
+            resolve_wallet_keypair_path(&args.wallet)?,
+            settings.wallet_password_file.clone(),
+            flow.provider().clone(),
+        )?;
+        flow = flow.with_run_lifecycle(std::sync::Arc::new(host));
+    }
     if args.inspect {
         println!("{}", serde_json::to_string(&flow.view()?)?);
         return Ok(());
@@ -111,7 +126,7 @@ pub async fn run(args: WizardArgs) -> Result<()> {
     loop {
         let view = flow.view()?;
         show(&view)?;
-        println!("c Connect  d Discover  s Select/price  k Check  p Probe  a Admission facts\ni Invoice/create  t Status  f FIAT checkout  v Review publication  u Publish\nr Recover original probe  o Recover original publication  x Exit");
+        println!("c Connect  d Discover  s Select/price  k Check  p Probe  a Admission facts\ni Invoice/create  t Status  f FIAT checkout  v Review publication  u Publish\nr Recover original probe  o Recover original publication  g Review Run  b Begin Run  h Reconcile Run  x Exit");
         let command = prompt("Action", "x")?;
         if command == "x" {
             return Ok(());
@@ -193,6 +208,22 @@ pub async fn run(args: WizardArgs) -> Result<()> {
                     choice,
                 }
             }
+            "g" | "b" => {
+                let expected_revision = needs_revision()?;
+                let plan = flow
+                    .execute(FlowAction::RunPlan { expected_revision }, None)
+                    .await?;
+                println!(
+                    "Managed Run plan: {}",
+                    serde_json::to_string_pretty(&plan.action_result)?
+                );
+                if command=="g" || prompt("Install exactly this persistent controller? Configured recovery probes may consume the existing allowance. Type run","cancel")? != "run" { continue; }
+                FlowAction::StartRun {
+                    expected_revision,
+                    plan_digest: serde_json::from_value(plan.action_result["plan_digest"].clone())?,
+                }
+            }
+            "h" => FlowAction::RecoverRun {},
             "k" => FlowAction::Check {
                 expected_revision: needs_revision()?,
             },

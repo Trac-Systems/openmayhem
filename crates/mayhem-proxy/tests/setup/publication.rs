@@ -4,10 +4,10 @@ use mayhem_proxy::setup::{AdmissionPermit, PublicationReason, PublicationState};
 use std::{process::Stdio, time::Duration};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-fn signer(n: u8) -> SigningKey {
+pub(super) fn signer(n: u8) -> SigningKey {
     SigningKey::from_bytes(&[n; 32])
 }
-fn owned(endpoint: ProxyEndpoint, n: u8) -> Fixture {
+pub(super) fn owned(endpoint: ProxyEndpoint, n: u8) -> Fixture {
     let mut f = Fixture::new(endpoint);
     let key = signer(n);
     let provider = key
@@ -27,14 +27,14 @@ fn owned(endpoint: ProxyEndpoint, n: u8) -> Fixture {
     }
     f
 }
-struct Peer {
+pub(super) struct Peer {
     child: tokio::process::Child,
     url: String,
     network: Identity,
     client: reqwest::Client,
 }
 impl Peer {
-    async fn start(f: &mut Fixture) -> Self {
+    pub(super) async fn start(f: &mut Fixture) -> Self {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut child = tokio::process::Command::new("node")
             .arg("intercom/tests/helpers/proxy-setup-publication-fixture.mjs")
@@ -72,10 +72,10 @@ impl Peer {
         );
         p
     }
-    fn rpc(&self) -> String {
+    pub(super) fn rpc(&self) -> String {
         format!("{}/v1", self.url)
     }
-    async fn call(&self, path: &str, body: Value) -> Value {
+    pub(super) async fn call(&self, path: &str, body: Value) -> Value {
         let response = self
             .client
             .post(format!("{}/fixture/{path}", self.url))
@@ -88,7 +88,7 @@ impl Peer {
         assert!(status.is_success(), "{status}: {body}");
         body
     }
-    async fn permit(
+    pub(super) async fn permit(
         &self,
         plan: &mayhem_proxy::setup::PublicationPlan,
         rail: &str,
@@ -99,7 +99,7 @@ impl Peer {
         )
         .unwrap()
     }
-    async fn close(mut self) {
+    pub(super) async fn close(mut self) {
         self.child
             .stdin
             .take()

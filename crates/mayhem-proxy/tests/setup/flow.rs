@@ -1,7 +1,7 @@
 use super::*;
 use mayhem_proxy::setup::{Flow, FlowAction, FlowConfig, ProfileInput};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-fn config(f: &Fixture) -> FlowConfig {
+pub(super) fn config(f: &Fixture) -> FlowConfig {
     let i = &f.input;
     let profile:ProfileInput=serde_json::from_value(json!({"schema_version":1,"network":i.network,"provider_pubkey":i.provider_pubkey,"connection_file":i.connection_file,
  "profile":{"kind":"custom","endpoint":i.adapter.endpoint,"contract":i.adapter.contract},"upstream_model":i.adapter.upstream_model,"limits":i.adapter.limits,
@@ -17,6 +17,7 @@ fn config(f: &Fixture) -> FlowConfig {
         peer_rpc: None,
         admission_origin: None,
         timeout_ms: 2000,
+        run: None,
     }
 }
 #[tokio::test]
