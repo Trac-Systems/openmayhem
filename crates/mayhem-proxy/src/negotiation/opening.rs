@@ -32,6 +32,11 @@ pub struct Incoming {
     limits: exchange::Limits,
     received: Instant,
 }
+/// Separate control purposes; descriptor traffic never enters paid serving.
+pub enum Opening {
+    Negotiation(Incoming),
+    Descriptor(crate::descriptor::Incoming),
+}
 impl Incoming {
     pub fn context(&self) -> &Context {
         &self.context
@@ -117,6 +122,18 @@ impl Listener {
     /// A finite observation wait, not a model timeout. Malformed/foreign opens
     /// cannot renew it or terminate unrelated serving sessions.
     pub async fn next(&mut self, wait: Duration) -> Result<Incoming> {
+        let started = Instant::now();
+        loop {
+            let left = wait
+                .checked_sub(started.elapsed())
+                .filter(|d| !d.is_zero())
+                .ok_or(Error::Interrupted)?;
+            if let Opening::Negotiation(incoming) = self.next_opening(left).await? {
+                return Ok(incoming);
+            }
+        }
+    }
+    pub async fn next_opening(&mut self, wait: Duration) -> Result<Opening> {
         let start = Instant::now();
         loop {
             let left = wait
@@ -128,25 +145,34 @@ impl Listener {
                 .next_session_frame(left)
                 .await
                 .map_err(Error::Transport)?;
-            if event
+            let tag = event
                 .get("frame")
                 .and_then(|v| v.get("t"))
-                .and_then(Value::as_str)
-                != Some(OPEN)
-            {
+                .and_then(Value::as_str);
+            if tag == Some(crate::descriptor::OPEN) {
+                match crate::descriptor::Incoming::from_event(&event, &self.local, &self.config) {
+                    Ok(incoming) => {
+                        self.counts.accepted = self.counts.accepted.saturating_add(1);
+                        return Ok(Opening::Descriptor(incoming));
+                    }
+                    Err(_) => self.counts.rejected = self.counts.rejected.saturating_add(1),
+                }
+                continue;
+            }
+            if tag != Some(OPEN) {
                 self.counts.unrelated = self.counts.unrelated.saturating_add(1);
                 continue;
             }
             match context_from_event(&event, &self.local) {
                 Ok(context) => {
                     self.counts.accepted = self.counts.accepted.saturating_add(1);
-                    return Ok(Incoming {
+                    return Ok(Opening::Negotiation(Incoming {
                         context,
                         local: self.local.clone(),
                         config: self.config.clone(),
                         limits: self.limits,
                         received: Instant::now(),
-                    });
+                    }));
                 }
                 Err(_) => self.counts.rejected = self.counts.rejected.saturating_add(1),
             }

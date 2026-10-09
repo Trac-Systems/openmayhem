@@ -31,7 +31,7 @@ use std::{
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -171,6 +171,7 @@ pub(crate) struct Harness {
     calls: Arc<AtomicUsize>,
     pub(crate) stream_backend: Arc<StreamBackend>,
     provider_stop: watch::Sender<bool>,
+    descriptors_enabled: Arc<AtomicBool>,
     provider_ended: watch::Receiver<usize>,
     provider_task: JoinHandle<()>,
     backend_task: JoinHandle<()>,
@@ -185,6 +186,14 @@ impl Harness {
         worker: &Path,
         endpoint: ProxyEndpoint,
         rail: ProxyRail,
+    ) -> Self {
+        Self::start_with_contract(worker, endpoint, rail, None).await
+    }
+    pub(crate) async fn start_with_contract(
+        worker: &Path,
+        endpoint: ProxyEndpoint,
+        rail: ProxyRail,
+        contract: Option<mayhem_proto::EndpointFamilyContract>,
     ) -> Self {
         let directory = private_dir();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -237,13 +246,15 @@ impl Harness {
         let adapter = Arc::new(
             Adapter::new(
                 endpoint,
-                endpoint_family_contract_template(match endpoint {
-                    ProxyEndpoint::Chat => mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
-                    ProxyEndpoint::Completions => mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
-                    ProxyEndpoint::Responses => mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
-                    ProxyEndpoint::Decisions => mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
-                })
-                .unwrap(),
+                contract.unwrap_or_else(|| {
+                    endpoint_family_contract_template(match endpoint {
+                        ProxyEndpoint::Chat => mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                        ProxyEndpoint::Completions => mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+                        ProxyEndpoint::Responses => mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+                        ProxyEndpoint::Decisions => mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
+                    })
+                    .unwrap()
+                }),
                 "upstream-model".into(),
                 protocol(),
             )
@@ -457,13 +468,27 @@ impl Harness {
         .unwrap();
         let (provider_stop, mut stop) = watch::channel(false);
         let (ended, provider_ended) = watch::channel(0usize);
+        let descriptors_enabled = Arc::new(AtomicBool::new(true));
+        let descriptor_mode = descriptors_enabled.clone();
         let provider_task = tokio::spawn(async move {
             let mut sessions = JoinSet::new();
+            let mut descriptions = JoinSet::new();
             loop {
                 tokio::select! {
                     _ = stop.changed() => break,
-                    channel = listener.next(Duration::from_secs(60)) => {
+                    channel = listener.next_opening(Duration::from_secs(60)) => {
                         if let Ok(channel) = channel {
+                            let channel = match channel {
+                                negotiation::opening::Opening::Descriptor(incoming) => {
+                                    if descriptor_mode.load(Ordering::Acquire)
+                                        && descriptions.len() < mayhem_proxy::descriptor::READS {
+                                        let reader = provider.proposals().clone();
+                                        descriptions.spawn(async move { let _ = reader.describe(incoming).await; });
+                                    }
+                                    continue;
+                                },
+                                negotiation::opening::Opening::Negotiation(channel) => channel,
+                            };
                             match provider.accept(channel) {
                                 Ok(handle) => { sessions.spawn(async move { let _ = handle.wait().await; }); },
                                 // The recovery supervisor may reconnect while
@@ -475,12 +500,14 @@ impl Harness {
                             }
                         }
                     },
+                    Some(result) = descriptions.join_next(), if !descriptions.is_empty() => { result.unwrap(); },
                     Some(result) = sessions.join_next(), if !sessions.is_empty() => {
                         result.unwrap();
                         ended.send_modify(|count| *count += 1);
                     }
                 }
             }
+            while descriptions.join_next().await.is_some() {}
             sessions.abort_all();
             while sessions.join_next().await.is_some() {}
         });
@@ -557,6 +584,7 @@ impl Harness {
             peer,
             calls,
             provider_stop,
+            descriptors_enabled,
             provider_ended,
             provider_task,
             backend_task,
@@ -648,6 +676,23 @@ impl Harness {
     }
     pub(crate) fn backend_calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
+    }
+    pub(crate) fn capacity_status(&self) -> capacity::Status {
+        self.capacity.status(&digest(201)).unwrap()
+    }
+    pub(crate) fn stop_descriptors(&self) {
+        // Simulate a live older peer that ignores the new opening tag while
+        // continuing to accept the unchanged paid negotiation protocol.
+        self.descriptors_enabled.store(false, Ordering::Release);
+    }
+    pub(crate) async fn session_frame_tags(&self) -> Vec<String> {
+        self._bridge
+            .frames
+            .lock()
+            .await
+            .iter()
+            .filter_map(|frame| frame["frame"]["t"].as_str().map(str::to_owned))
+            .collect()
     }
     pub(crate) async fn wait_provider_ends(&mut self, expected: usize) {
         tokio::time::timeout(Duration::from_secs(10), async {

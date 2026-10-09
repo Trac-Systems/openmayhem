@@ -8,6 +8,51 @@ struct Callback {
     mode: &'static str,
     release: Semaphore,
 }
+
+#[tokio::test]
+async fn retail_estimate_never_calls_authority_or_creates_hold() {
+    let mut server = Server::start("allow").await;
+    let mut f = server.fixture().await;
+    let response = f
+        .router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/proxy/estimate")
+                .header("content-type", "application/json")
+                .header("authorization", "Bearer owner-fixture-key")
+                .body(Body::from(
+                    serde_json::to_vec(&json!({"schema_version":1,
+            "endpoint":ProxyEndpoint::Chat,"request":f.body()}))
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(server.callback.records.lock().unwrap().is_empty());
+    assert_eq!(f.harness.backend_calls(), 0);
+    assert_eq!(f.harness.status().await["publications"], 0);
+    assert!(f
+        .state
+        .access_control
+        .pending_key_budgets(None, 64)
+        .unwrap()
+        .is_empty());
+    assert!(f
+        .state
+        .jobs
+        .lock()
+        .unwrap()
+        .pending_proxy(None, 64)
+        .unwrap()
+        .is_empty());
+    f.stop().await;
+    server.task.abort();
+    let _ = (&mut server.task).await;
+}
 struct Server {
     callback: Arc<Callback>,
     url: String,

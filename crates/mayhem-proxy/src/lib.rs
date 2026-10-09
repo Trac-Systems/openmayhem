@@ -10,27 +10,28 @@ pub mod capacity;
 pub mod catalog;
 pub mod cli;
 pub mod connector;
-pub mod discovery;
+pub mod descriptor;
 pub mod directory;
+pub mod discovery;
 pub mod endpoint;
 pub mod exchange;
 pub mod execution;
 pub mod financial;
 pub mod health;
-pub mod matching;
 pub mod managed;
-pub mod presence;
+pub mod matching;
 pub mod metering;
 pub mod negotiation;
+pub mod presence;
 pub mod receipts;
 pub mod semantics;
 pub mod serving;
 pub mod signing;
 pub mod supervisor;
-pub mod worker;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]
 pub mod test_support;
+pub mod worker;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {

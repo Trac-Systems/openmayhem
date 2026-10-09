@@ -150,6 +150,9 @@ impl Policy {
     pub fn lifetimes(&self) -> Lifetimes {
         self.lifetimes
     }
+    pub(crate) fn request_byte_limit(&self) -> usize {
+        self.request_bytes
+    }
 
     pub fn settlement_policy_hash(&self) -> &Digest {
         &self.settlement_policy_hash
@@ -278,6 +281,13 @@ impl Request {
         candidate: &PublishedOffer,
         status: Eligibility,
     ) -> Result<Candidate> {
+        let result = self.check_offer(candidate)?;
+        if status != Eligibility::Available {
+            return Err(Error::Availability(status));
+        }
+        Ok(result)
+    }
+    fn check_offer(&self, candidate: &PublishedOffer) -> Result<Candidate> {
         self.check_settlement_policy()?;
         if candidate.id != self.selector.id()
             || candidate.lane != "proxy"
@@ -311,9 +321,6 @@ impl Request {
             .prices
             .permits(&candidate.offer)
             .map_err(|_| Error::Price)?;
-        if status != Eligibility::Available {
-            return Err(Error::Availability(status));
-        }
         let contract = candidate
             .membership
             .endpoints
@@ -327,6 +334,59 @@ impl Request {
                 .map_err(|_| Error::Catalog)?,
         })
     }
+}
+
+/// One immutable catalog binding and an independent, truthful availability read.
+pub struct EstimateCandidate {
+    pub candidate: Candidate,
+    pub published: PublishedOffer,
+    pub network: mayhem_proxy::discovery::Identity,
+    pub expires_at_ms: u64,
+    pub availability: mayhem_proxy::presence::Observation,
+}
+pub async fn resolve_estimate(
+    control: Arc<ProxyControl>,
+    request: Arc<Request>,
+) -> Result<EstimateCandidate> {
+    let permit = READS.try_acquire().map_err(|_| Error::Busy)?;
+    tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        let now = super::now_millis_u64();
+        let catalog = control.catalog().read().map_err(|_| Error::Catalog)?;
+        let registered = mayhem_proxy::presence::Registered::read(
+            &catalog,
+            &request.selector.market,
+            &request.selector.provider,
+            &request.selector.slot,
+            now,
+        )
+        .map_err(|_| Error::Catalog)?;
+        let published = catalog
+            .proxy_offer(&request.selector.id(), now)
+            .map_err(|_| Error::Catalog)?
+            .ok_or(Error::Catalog)?;
+        let candidate = request.check_offer(&published)?;
+        let status = catalog.status();
+        let committed = status.committed.as_ref().ok_or(Error::Catalog)?;
+        let network = committed.context.identity();
+        let expires_at_ms = committed
+            .observed_at_ms
+            .ok_or(Error::Catalog)?
+            .saturating_add(mayhem_proxy::presence::CATALOG_AGE_MS);
+        let availability = control
+            .presence()
+            .observe_registered(&registered, request.controls.minimum_tokens_per_second)
+            .map_err(|_| Error::Catalog)?;
+        Ok(EstimateCandidate {
+            candidate,
+            published,
+            network,
+            expires_at_ms,
+            availability,
+        })
+    })
+    .await
+    .map_err(|_| Error::Catalog)?
 }
 
 /// Read-only candidate evidence, not a capacity lease or spending permission.

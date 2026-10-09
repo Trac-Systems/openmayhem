@@ -70,6 +70,7 @@ struct Inner {
     limits: Limits,
     slots: Arc<Semaphore>,
     recovery_slots: Arc<Semaphore>,
+    descriptor_slots: Arc<Semaphore>,
     state: Mutex<State>,
 }
 #[derive(Clone)]
@@ -106,6 +107,7 @@ impl Controller {
                 limits,
                 slots: Arc::new(Semaphore::new(limits.storage_operations)),
                 recovery_slots: Arc::new(Semaphore::new(1)),
+                descriptor_slots: Arc::new(Semaphore::new(crate::descriptor::READS)),
                 state: Mutex::new(State::default()),
             }),
         })
@@ -116,6 +118,50 @@ impl Controller {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::ProviderCapacity(capacity::Error::Busy))
+    }
+    /// Read-only description; separate permits and no proposal/capacity/journal
+    /// operations. Authentication comes from the protected opening listener.
+    pub async fn describe(&self, incoming: crate::descriptor::Incoming) -> Result<()> {
+        let _permit = self
+            .inner
+            .descriptor_slots
+            .try_acquire()
+            .map_err(|_| invalid("descriptor reads busy"))?;
+        incoming
+            .check(self.inner.runtime.capacity.identity())
+            .map_err(|_| invalid("descriptor identity differs"))?;
+        let context = incoming.context();
+        let result = tokio::time::timeout(crate::descriptor::DEADLINE, async {
+            let observed = self
+                .inner
+                .client
+                .offer_state(&financial::offer::Query {
+                    offer: context.offer.clone(),
+                    rail: context.rail,
+                    settlement_policy_hash: context.settlement_policy_hash.as_str().into(),
+                })
+                .await?;
+            observed.check_descriptor(context, &self.inner.runtime.approved_policy)?;
+            let member = observed.membership()?;
+            require(
+                member.recipe_hash == self.inner.runtime.adapter.recipe_hash().as_str()
+                    && member.connection_revision == self.inner.runtime.connection.revision()
+                    && member.endpoints.iter().any(|e| {
+                        e.endpoint == self.inner.runtime.adapter.endpoint()
+                            && e.contract_hash
+                                == self.inner.runtime.adapter.contract_hash().as_str()
+                    }),
+                "descriptor runtime differs from membership",
+            )?;
+            Ok::<_, crate::Error>(crate::descriptor::Descriptor::from_adapter(
+                &self.inner.runtime.adapter,
+            ))
+        })
+        .await;
+        incoming
+            .respond(result.ok().and_then(std::result::Result::ok))
+            .await
+            .map_err(|_| invalid("descriptor transport unavailable"))
     }
     fn authenticate(&self, context: &Context) -> Result<()> {
         context

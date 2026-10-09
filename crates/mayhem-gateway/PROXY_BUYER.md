@@ -23,6 +23,62 @@ that envelope before passing the owned request to the provider protocol. This
 syntax is a candidate interface; public retail, Studio and MCP integration and
 release acceptance remain separate requirements.
 
+## Read-only maximum estimates
+
+`POST /v1/proxy/estimate` requires a current authenticated key with permission for
+the selected model. Its strict body is `{ "schema_version": 1, "endpoint":
+"openai_chat_completions", "request": { ... } }`. `endpoint` also accepts
+`openai_completions`, `openai_responses`, and `mayhem_decisions`. `request` is the
+exact intended inference envelope, including its explicit `proxy` controls.
+The selected execution gateway supplies the configured settlement policy; no
+rail, offer, price ceiling or output allowance is selected automatically.
+
+The response is private and not cacheable. Its fields are `schema_version: 1`,
+`lane: "proxy"`, `kind: "maximum_estimate"`, `network`, `model`, `endpoint`,
+`rail`, `request_hash`, `request_content_digest`, `controls`, the full `offer`,
+`offer_digest`, `membership_digest`, `endpoint_contract`, `recipe_hash`,
+`settlement_policy_hash`, `metering_policy_hash`, `max_usage`, `max_spend_au`,
+`observed_at_ms`, `expires_at_ms`, `availability`, and `estimate_hash`.
+`endpoint_contract` is the canonical contract hash, not a contract body.
+`availability` contains the same routing `status`, its `observed_at_ms`, and
+`expires_at_ms` (null when no current evidence exists). These observations can
+report unavailable capacity alongside a valid arithmetic maximum. Expiry bounds
+the original evidence; availability can change sooner and is never a lease.
+
+`max_usage` and the decimal-string AU maximum use the same preparation and cost
+function as `PreparedPurchase`, including per-unit rounding, one request fee,
+session minimum, and the explicit total cap. Generative input units are exact
+normalized billing quantities, not native tokenizer tokens; output units are
+the explicit maximum allowance, not an estimate of likely model output or the
+upstream `max_tokens`. Decisions reserve the validated question count. Final
+usage, final wholesale cost, retail fees and exchange rates are not predicted.
+
+`request_hash` is the existing provider request fingerprint after removing the
+root `proxy` controls. `request_content_digest` uses the existing retail callback
+typed SHA256 algorithm on that same provider body. `estimate_hash` uses BLAKE3
+derive-key domain `mayhem/proxy/maximum-estimate/v1`, followed by the little-endian
+u64 byte length and `stable_json_bytes` of the entire response excluding
+`estimate_hash`. It binds the explicit controls and all returned facts; it is
+neither a signature nor a payment authorization. Execution still resolves fresh
+canonical state. Clients requiring exact quoted revisions must check the full
+offer digest and all request/policy/usage bindings before granting admission.
+Existing paid requests must recover their original terms before applying a new
+estimate or current-catalog checks.
+
+Custom endpoint contracts are fetched through `p.describe.open` / `p.describe`
+on the existing authenticated peer transport. The reply contains only the public
+contract, opaque recipe hash and supported metering definition, verified against
+canonical membership/offer hashes. Buyer resource limits stay local. Descriptor
+traffic uses separate read permits, a five-second maximum deadline, and bounded
+192 KiB messages; it never enters proposal, capacity, signing or execution paths.
+Older peers that do not support it return an unavailable estimate. No fallback
+creates a proposal. HTTP input is independently bounded before JSON parsing.
+
+Estimate failures use category `proxy_estimate`: `proxy_estimate_invalid` and
+`proxy_settlement_policy_mismatch` are 400; `proxy_buyer_disabled`,
+`proxy_estimate_busy`, and `proxy_estimate_unavailable` are 503. Normal key errors
+retain their existing codes. None creates a job or returns a job ID.
+
 ## Authenticated financial evidence
 
 `GET /v1/proxy/buyer-policy` requires a current authenticated gateway key and

@@ -10,7 +10,7 @@ use mayhem_proto::{
     MoneyAu,
 };
 pub(crate) use purchase::RetainedPurchase;
-pub use purchase::{Lifetimes, PreparedPurchase, PurchaseRequest, SessionBinding};
+pub use purchase::{Lifetimes, Maximum, PreparedPurchase, PurchaseRequest, SessionBinding};
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

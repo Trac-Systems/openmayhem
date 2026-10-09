@@ -83,6 +83,34 @@ async fn provider_opening_dispatcher_keeps_existing_sessions_responsive_at_globa
     .is_err());
     assert_eq!(health.borrow().accepted, 2);
     assert_eq!(health.borrow().rejected, 1);
+    // Public description has separate control headroom even when every paid
+    // serving connection is occupied. It neither allocates a lease nor opens
+    // another paid session, and existing control streams remain responsive.
+    let description = mayhem_proxy::descriptor::Context::new(
+        &identity(&peer),
+        original.offer.clone(),
+        original.rail,
+        original.settlement_policy_hash.clone(),
+    )
+    .unwrap();
+    let described =
+        mayhem_proxy::descriptor::fetch(bridge.config(true), &identity(&peer), &description)
+            .await
+            .unwrap();
+    assert!(described
+        .adapter(
+            &description,
+            f.adapter.contract_hash(),
+            f.adapter.recipe_hash(),
+            f.adapter.limits()
+        )
+        .is_ok());
+    assert_eq!(health.borrow().accepted, 2);
+    assert_eq!(
+        s.runtime.capacity.status(&d(201)).unwrap().group_occupied,
+        0
+    );
+    assert_eq!(peer.command("status").await["submissions"], 0);
     // Existing control streams remain usable when a third opening is refused.
     first.send(&n::Message::Recover).await.unwrap();
     assert!(matches!(

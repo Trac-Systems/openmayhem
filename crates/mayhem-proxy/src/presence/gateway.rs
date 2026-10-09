@@ -148,6 +148,31 @@ impl Gateway {
         }
         self.table.status(&registered, unix_ms()?, min_tok_s)
     }
+    /// The caller just resolved this registration from one fresh catalog read.
+    /// No selection/subscription or durable presence state is changed.
+    pub fn observe_registered(
+        &self,
+        registered: &Registered,
+        min_tok_s: Option<u32>,
+    ) -> Result<super::Observation> {
+        let now = unix_ms()?;
+        let selected = self.markets.borrow();
+        let market = Digest::new(registered.offer.market_id.clone())
+            .map_err(|_| crate::invalid("invalid registered market"))?;
+        if !self.running.load(Ordering::Acquire) || !selected.contains(&market) {
+            return Ok(super::Observation::missing(
+                Eligibility::HeartbeatMissing,
+                now,
+            ));
+        }
+        if &registered.network != self.table.network() {
+            return Ok(super::Observation::missing(
+                Eligibility::CatalogUnavailable,
+                now,
+            ));
+        }
+        self.table.observe(registered, now, min_tok_s)
+    }
 }
 
 impl Supervisor {

@@ -49,6 +49,15 @@ pub struct PurchaseRequest {
     usage: BTreeMap<String, u64>,
     lifetimes: Lifetimes,
 }
+/// Exact request-derived quantities and their offer maximum, never an admission.
+#[derive(Clone, Serialize)]
+pub struct Maximum {
+    pub request_hash: Digest,
+    pub metering_policy_hash: Digest,
+    pub max_usage: BTreeMap<String, u64>,
+    #[serde(with = "mayhem_proto::decimal_u128")]
+    pub max_spend_au: MoneyAu,
+}
 impl PurchaseRequest {
     pub fn new(
         adapter: PublicAdapterSnapshot,
@@ -70,6 +79,30 @@ impl PurchaseRequest {
             prices,
             usage,
             lifetimes,
+        })
+    }
+    /// Shared by estimates and actual purchase preparation. No financial state,
+    /// capacity authority, signer, provider request or persistence is available.
+    pub fn maximum(&self, offer: &ProxyOffer) -> Result<Maximum> {
+        let adapter = PublicAdapter::restore(self.adapter.clone())
+            .map_err(|_| invalid("invalid purchase adapter"))?;
+        let request = prepare(&adapter, &self.request)?;
+        require(
+            request.endpoint() == offer.endpoint
+                && request.metering_policy_hash().as_str() == offer.metering_policy_hash,
+            "purchase request differs from quoted endpoint or metering",
+        )?;
+        self.prices.permits(offer)?;
+        let maximum = offer.cost(&self.usage).map_err(invalid)?;
+        require(
+            maximum > 0 && maximum <= self.prices.max_total_spend_au,
+            "purchase maximum exceeds explicit total limit",
+        )?;
+        Ok(Maximum {
+            request_hash: request.request_hash().clone(),
+            metering_policy_hash: request.metering_policy_hash(),
+            max_usage: self.usage.clone(),
+            max_spend_au: maximum,
         })
     }
 }
@@ -177,6 +210,7 @@ impl Observation {
     ) -> Result<PreparedPurchase> {
         self.fresh()?;
         let w = &self.wire;
+        let maximum = intent.maximum(&w.offer)?;
         let adapter = PublicAdapter::restore(intent.adapter.clone())
             .map_err(|_| invalid("invalid purchase adapter"))?;
         let request = prepare(&adapter, &intent.request)?;
@@ -229,8 +263,8 @@ impl Observation {
             settlement_policy_hash: w.settlement_policy_hash.clone(),
             payment_terms_hash: w.payment_terms_hash.clone(),
             rules_ver: w.rules_ver,
-            max_usage: intent.usage.clone(),
-            max_spend_au: w.offer.cost(&intent.usage).map_err(invalid)?,
+            max_usage: maximum.max_usage,
+            max_spend_au: maximum.max_spend_au,
             prior_spend_au,
             prior_reserved_au: 0,
             max_total_spend_au: intent.prices.max_total_spend_au,

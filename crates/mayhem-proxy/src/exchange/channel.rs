@@ -21,6 +21,8 @@ pub(super) struct Frame {
     accepted_terms: Option<Digest>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     negotiation: Option<Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    descriptor: Option<Digest>,
     sequence: u64,
     bytes: usize,
     offset: usize,
@@ -35,13 +37,14 @@ impl Frame {
         digest: &Digest,
         offset: usize,
     ) -> Self {
-        let (accepted_terms, negotiation) = link.purpose.bindings();
+        let (accepted_terms, negotiation, descriptor) = link.purpose.bindings();
         Self {
             t: link.purpose.tag().into(),
             schema_version: 1,
             session_id: link.session_id.clone(),
             accepted_terms,
             negotiation,
+            descriptor,
             sequence,
             bytes: bytes.len(),
             offset,
@@ -82,12 +85,13 @@ impl Assembly {
         }
         let encoded = bounded_json(event.get("frame").ok_or(Error::Protocol)?, FRAME_BOUND)?;
         let frame: Frame = serde_json::from_slice(&encoded).map_err(|_| Error::Protocol)?;
-        let (accepted_terms, negotiation) = link.purpose.bindings();
+        let (accepted_terms, negotiation, descriptor) = link.purpose.bindings();
         if frame.t != link.purpose.tag()
             || frame.schema_version != 1
             || frame.sequence != self.sequence
             || frame.accepted_terms != accepted_terms
             || frame.negotiation != negotiation
+            || frame.descriptor != descriptor
             || frame.session_id != link.session_id
             || frame.bytes == 0
             || frame.bytes > limits.max_message_bytes
@@ -142,24 +146,28 @@ impl WireMessage for Message {
 pub(crate) enum Purpose {
     Execution(Digest),
     Negotiation(Digest),
+    Descriptor(Digest),
 }
 impl Purpose {
     fn tag(&self) -> &'static str {
         match self {
             Self::Execution(_) => "p.exchange",
             Self::Negotiation(_) => "p.negotiate",
+            Self::Descriptor(_) => "p.describe",
         }
     }
     pub(super) fn domain(&self) -> &'static str {
         match self {
             Self::Execution(_) => "mayhem/proxy/exchange-payload/v1",
             Self::Negotiation(_) => "mayhem/proxy/negotiation-payload/v1",
+            Self::Descriptor(_) => "mayhem/proxy/descriptor-payload/v1",
         }
     }
-    fn bindings(&self) -> (Option<Digest>, Option<Digest>) {
+    fn bindings(&self) -> (Option<Digest>, Option<Digest>, Option<Digest>) {
         match self {
-            Self::Execution(v) => (Some(v.clone()), None),
-            Self::Negotiation(v) => (None, Some(v.clone())),
+            Self::Execution(v) => (Some(v.clone()), None, None),
+            Self::Negotiation(v) => (None, Some(v.clone()), None),
+            Self::Descriptor(v) => (None, None, Some(v.clone())),
         }
     }
 }
@@ -294,7 +302,10 @@ impl Wire {
         if self.interrupted
             || self.sent != 0
             || self.received != 0
-            || !matches!(self.link.purpose, Purpose::Negotiation(_))
+            || !matches!(
+                self.link.purpose,
+                Purpose::Negotiation(_) | Purpose::Descriptor(_)
+            )
         {
             return Err(Error::Protocol);
         }
@@ -318,7 +329,10 @@ impl Wire {
         if self.interrupted
             || self.sent != 0
             || self.received != 0
-            || !matches!(self.link.purpose, Purpose::Negotiation(_))
+            || !matches!(
+                self.link.purpose,
+                Purpose::Negotiation(_) | Purpose::Descriptor(_)
+            )
             || wait.is_zero()
         {
             return Err(Error::Protocol);
@@ -369,7 +383,7 @@ impl Wire {
             .ok_or(Error::Protocol)?;
         let digest = Digest::hash(self.link.purpose.domain(), &[&bytes]);
         self.interrupted = true;
-        let (accepted_terms, negotiation) = self.link.purpose.bindings();
+        let (accepted_terms, negotiation, descriptor) = self.link.purpose.bindings();
         for (index, chunk) in bytes.chunks(CHUNK).enumerate() {
             let frame = Frame {
                 t: self.link.purpose.tag().into(),
@@ -377,6 +391,7 @@ impl Wire {
                 session_id: self.link.session_id.clone(),
                 accepted_terms: accepted_terms.clone(),
                 negotiation: negotiation.clone(),
+                descriptor: descriptor.clone(),
                 sequence,
                 bytes: bytes.len(),
                 offset: index * CHUNK,

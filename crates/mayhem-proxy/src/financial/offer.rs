@@ -55,6 +55,22 @@ pub struct Observation {
     started: Instant,
 }
 impl Observation {
+    pub(crate) fn check_descriptor(
+        &self,
+        context: &crate::descriptor::Context,
+        approved_policy: &ProxySettlementPolicy,
+    ) -> Result<()> {
+        self.fresh()?;
+        let w = &self.wire;
+        require(
+            context.network == w.context.identity()
+                && context.offer == w.offer
+                && context.rail == w.rail
+                && context.settlement_policy_hash.as_str() == w.settlement_policy_hash
+                && approved_policy == &w.settlement_policy,
+            "descriptor differs from canonical offer or approved policy",
+        )
+    }
     fn fresh(&self) -> Result<()> {
         require(
             self.started.elapsed() <= FRESHNESS,

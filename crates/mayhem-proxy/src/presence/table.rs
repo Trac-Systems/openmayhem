@@ -145,11 +145,21 @@ impl Table {
         now_ms: u64,
         min_tok_s: Option<u32>,
     ) -> Result<Eligibility> {
+        self.observe(registered, now_ms, min_tok_s)
+            .map(|v| v.status)
+    }
+    pub fn observe(
+        &self,
+        registered: &Registered,
+        now_ms: u64,
+        min_tok_s: Option<u32>,
+    ) -> Result<Observation> {
+        let missing = |status| Observation::missing(status, now_ms);
         if now_ms < registered.observed_ms
             || now_ms >= registered.expires_ms
             || Instant::now() >= registered.deadline
         {
-            return Ok(Eligibility::CatalogUnavailable);
+            return Ok(missing(Eligibility::CatalogUnavailable));
         }
         let key = format!(
             "{}/{}/{}",
@@ -164,7 +174,7 @@ impl Table {
         if let Some(live) = live.get(&key) {
             let signed = &live.signed;
             if registered.check(&signed.body, now_ms).is_err() {
-                return Ok(Eligibility::CatalogUnavailable);
+                return Ok(missing(Eligibility::CatalogUnavailable));
             }
             // A wall-clock correction must never extend a cached lease. Original
             // signed evidence and elapsed monotonic time both constrain it.
@@ -172,21 +182,30 @@ impl Table {
                 live.received_ms
                     .saturating_add(live.received.elapsed().as_millis() as u64),
             );
-            return Ok(eligibility(
-                &signed.body,
-                &registered.offer,
-                effective_now,
-                min_tok_s,
-            ));
+            let status = eligibility(&signed.body, &registered.offer, effective_now, min_tok_s);
+            let mut expiry = registered
+                .expires_ms
+                .min(signed.body.expires_ms)
+                .min(signed.body.evidence_expires_ms);
+            if registered.offer.endpoint != ProxyEndpoint::Decisions {
+                if let Some(speed) = &signed.body.speed {
+                    expiry = expiry.min(speed.expires_ms);
+                }
+            }
+            return Ok(Observation {
+                status,
+                observed_at_ms: now_ms,
+                expires_at_ms: Some(now_ms.saturating_add(expiry.saturating_sub(effective_now))),
+            });
         }
         let tx = db(self.database.begin_read())?;
         let table = db(tx.open_table(HIGH))?;
         if let Some(mark) = db(table.get(key.as_str()))? {
             let mark: Mark = serde_json::from_slice(mark.value())?;
             if mark.conflict && mark.membership == registered.member.revision {
-                return Ok(Eligibility::ControllerConflict);
+                return Ok(missing(Eligibility::ControllerConflict));
             }
         }
-        Ok(Eligibility::HeartbeatMissing)
+        Ok(missing(Eligibility::HeartbeatMissing))
     }
 }

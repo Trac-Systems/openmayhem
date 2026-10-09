@@ -1,4 +1,5 @@
 mod buyer_policy;
+mod estimation;
 mod local_lab;
 mod retail;
 mod streaming;
@@ -47,7 +48,17 @@ impl Fixture {
         retail: Option<RetailAuthorizationConfig>,
         owner_key: &str,
     ) -> Self {
-        let harness = Harness::start_with(&support::worker_path(), endpoint, rail).await;
+        Self::start_with_contract(endpoint, rail, retail, owner_key, None).await
+    }
+    async fn start_with_contract(
+        endpoint: ProxyEndpoint,
+        rail: ProxyRail,
+        retail: Option<RetailAuthorizationConfig>,
+        owner_key: &str,
+        contract: Option<mayhem_proto::EndpointFamilyContract>,
+    ) -> Self {
+        let harness =
+            Harness::start_with_contract(&support::worker_path(), endpoint, rail, contract).await;
         let control = harness.control().await;
         let directory = support::private_dir();
         let policy = proxy_request::Policy::new(

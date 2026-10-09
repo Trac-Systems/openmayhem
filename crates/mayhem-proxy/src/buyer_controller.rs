@@ -257,6 +257,7 @@ impl Drop for Guard {
 pub struct Controller {
     shared: Arc<Shared>,
     sessions: Arc<Semaphore>,
+    descriptor_reads: Semaphore,
     buffers: Arc<Semaphore>,
     reservation: u32,
     active: Arc<Mutex<BTreeSet<Slot>>>,
@@ -343,6 +344,7 @@ impl Controller {
                 limits,
             }),
             sessions: Arc::new(Semaphore::new(limits.sessions)),
+            descriptor_reads: Semaphore::new(crate::descriptor::READS),
             buffers: Arc::new(Semaphore::new(budget)),
             reservation,
             active: Arc::new(Mutex::new(BTreeSet::new())),
@@ -354,6 +356,27 @@ impl Controller {
     }
     pub fn identity(&self) -> &Identity {
         self.shared.signer.identity()
+    }
+    /// No buyer session, job, signature, reservation or negotiation is created.
+    pub async fn describe(
+        &self,
+        offer: mayhem_proto::proxy::ProxyOffer,
+        rail: mayhem_proto::proxy::ProxyRail,
+        policy: Digest,
+        contract: &Digest,
+        recipe: &Digest,
+    ) -> exchange::Result<endpoint::PublicAdapterSnapshot> {
+        let _permit = self
+            .descriptor_reads
+            .try_acquire()
+            .map_err(|_| exchange::Error::Interrupted)?;
+        if self.stopped.load(Ordering::Acquire) {
+            return Err(exchange::Error::Interrupted);
+        }
+        let context = crate::descriptor::Context::new(self.identity(), offer, rail, policy)?;
+        let descriptor =
+            crate::descriptor::fetch(self.shared.bridge.clone(), self.identity(), &context).await?;
+        descriptor.adapter(&context, contract, recipe, self.shared.limits.protocol)
     }
     /// Maximum normalized response bytes configured by the controller owner.
     /// HTTP observers may impose tighter event/queue limits, never a larger total.

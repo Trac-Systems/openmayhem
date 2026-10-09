@@ -371,6 +371,23 @@ pub enum Eligibility {
     ControllerConflict,
     CatalogUnavailable,
 }
+/// A point-in-time read of the same eligibility decision used by admission.
+/// Expiry is an evidence bound, never a capacity lease or future availability.
+#[derive(Clone, Debug, Serialize)]
+pub struct Observation {
+    pub status: Eligibility,
+    pub observed_at_ms: u64,
+    pub expires_at_ms: Option<u64>,
+}
+impl Observation {
+    pub(crate) fn missing(status: Eligibility, observed_at_ms: u64) -> Self {
+        Self {
+            status,
+            observed_at_ms,
+            expires_at_ms: None,
+        }
+    }
+}
 /// Default and explicit speed floors follow the SAME function used by catalog
 /// consumers. Unknown speed never satisfies an explicit customer requirement.
 pub fn eligibility(

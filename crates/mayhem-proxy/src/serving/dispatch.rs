@@ -135,6 +135,7 @@ impl Dispatcher {
         let mut sampling = tokio::time::interval(limits.observation_wait);
         sampling.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut sessions = JoinSet::new();
+        let mut descriptions = JoinSet::new();
         let mut health = Health {
             running: true,
             ..Health::default()
@@ -156,9 +157,18 @@ impl Dispatcher {
                     health.completed=health.completed.saturating_add(1);
                     if !matches!(result,Ok(Ok(_))) {health.failed=health.failed.saturating_add(1)}
                 },
-                result=listener.next(limits.observation_wait)=>{
+                Some(_)=descriptions.join_next(),if !descriptions.is_empty()=>{},
+                result=listener.next_opening(limits.observation_wait)=>{
                     match result {
-                        Ok(incoming)=>{
+                        Ok(negotiation::opening::Opening::Descriptor(incoming))=>{
+                            if descriptions.len() < crate::descriptor::READS {
+                                if let Some(owner) = routes.get(&Key::of(&incoming.context().offer)) {
+                                    let reader = owner.proposals().clone();
+                                    descriptions.spawn(async move { reader.describe(incoming).await });
+                                }
+                            }
+                        },
+                        Ok(negotiation::opening::Opening::Negotiation(incoming))=>{
                             let owner=routes.get(&Key::of(&incoming.context().offer));
                             let accepted=if sessions.len()<limits.sessions {
                                 owner.map(|owner|owner.accept(incoming))
@@ -192,6 +202,8 @@ impl Dispatcher {
             updates.send_replace(health.clone());
         };
         drop(listener);
+        // Descriptor tasks only read and have a finite total deadline.
+        while descriptions.join_next().await.is_some() {}
         // Withdraw admission first; ask connections to close and allow their
         // durable JSON/result owners and a started recovery page to finish.
         shutdown.send_replace(true);
