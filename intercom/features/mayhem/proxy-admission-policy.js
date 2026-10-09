@@ -12,9 +12,15 @@ const need = (ok, message) => { if (!ok) throw new Error(`Proxy admission policy
 
 export function validateProxyAdmissionPolicyRequest(value) {
   need(value && typeof value === 'object' && !Array.isArray(value)
-    && ['request_nonce|requester', 'provider_pubkey|request_nonce|requester'].includes(Object.keys(value).sort().join('|'))
-    && Object.values(value).every(hex)
+    && ['request_nonce|requester', 'provider_pubkey|request_nonce|requester', 'provider_pubkey|recovery|request_nonce|requester'].includes(Object.keys(value).sort().join('|'))
+    && Object.entries(value).every(([key, v]) => key === 'recovery' || hex(v))
     && b4a.byteLength(JSON.stringify(value)) <= 1024, 'invalid policy query');
+  if (value.recovery !== undefined) {
+    const r = value.recovery;
+    need(r && typeof r === 'object' && !Array.isArray(r)
+      && Object.keys(r).sort().join('|') === 'entitlement_id|evidence_commitment|invoice_commitment'
+      && Object.values(r).every(hex), 'invalid recovery binding');
+  }
 }
 
 export async function readProxyAdmissionPolicy({ request, withCanonicalSnapshot }) {
@@ -28,6 +34,29 @@ export async function readProxyAdmissionPolicy({ request, withCanonicalSnapshot 
   // A timed-out snapshot keeps its read permit until actual cleanup finishes.
   const work = Promise.resolve().then(() => withCanonicalSnapshot(async snapshot => {
     await snapshot.assertCurrent();
+    let recoveryState;
+    if (request.recovery !== undefined) {
+      // Exact keys only. An absent provider alone is insufficient: an unused
+      // entitlement may have been revoked/superseded, or its invoice/evidence
+      // consumed elsewhere. Keep these separate instead of implying authority.
+      const r = request.recovery;
+      const used = async (kind, id) => {
+        const v = await snapshot.read(`proxy/v1/admission-used/${kind}/${id}`);
+        if (v === null) return null;
+        need(hex(v.provider_pubkey) && hex(v.entitlement_id), 'invalid admission consumption');
+        return { provider_pubkey: v.provider_pubkey, entitlement_id: v.entitlement_id };
+      };
+      const generation = await snapshot.read(`proxy/v1/admission-generation/${r.entitlement_id}`);
+      if (generation !== null) need(Number.isSafeInteger(generation.revision) && generation.revision > 0
+        && hex(generation.permit_digest), 'invalid admission generation');
+      recoveryState = {
+        entitlement_used: await used('entitlement', r.entitlement_id),
+        invoice_used: await used('invoice', r.invoice_commitment),
+        evidence_used: await used('evidence', r.evidence_commitment),
+        admission_revoked: await snapshot.read(`proxy/v1/admission-revoked/${r.entitlement_id}`) !== null,
+        generation: generation === null ? null : { revision: generation.revision, permit_digest: generation.permit_digest },
+      };
+    }
     const config = await snapshot.read(proxyRegistryKeys.config);
     validateProxyRegistryConfig(config, snapshot.context);
     // Optional public enrollment lookup is for the admission collector. The
@@ -54,7 +83,8 @@ export async function readProxyAdmissionPolicy({ request, withCanonicalSnapshot 
       context: snapshot.context, proof: snapshot.proof,
       registry_enabled: config.enabled, fee_policy_hash: config.fee_policy_hash,
       active_issuers: config.active_issuers, max_permit_epochs: config.max_permit_epochs,
-      ...(enrollment === undefined ? {} : { enrollment }) };
+      ...(enrollment === undefined ? {} : { enrollment }),
+      ...(recoveryState === undefined ? {} : { recovery_state: recoveryState }) };
     need(b4a.byteLength(JSON.stringify(response)) <= PROXY_ADMISSION_POLICY_MAX_BYTES, 'response exceeds bound');
     return response;
   })).finally(() => {

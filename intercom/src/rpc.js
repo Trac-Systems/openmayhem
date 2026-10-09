@@ -406,7 +406,7 @@ export async function discoverProxyCatalog(peer, body) {
 }
 
 export async function requestProxyAdmissionPolicy(peer, body) {
-  if (!isObject(body) || !['request_nonce', 'provider_pubkey|request_nonce'].includes(Object.keys(body).sort().join('|'))) throw new Error('Invalid proxy admission policy query.');
+  if (!isObject(body) || !['request_nonce', 'provider_pubkey|request_nonce', 'provider_pubkey|recovery|request_nonce'].includes(Object.keys(body).sort().join('|'))) throw new Error('Invalid proxy admission policy query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
   if (typeof feature?.proxyAdmissionPolicy !== 'function') throw new Error('Proxy admission policy relay is not ready.');
   return await feature.proxyAdmissionPolicy(body);

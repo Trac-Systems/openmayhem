@@ -62,11 +62,37 @@ test('actual RPC uses authenticated policy relay; altered request, stale nonce a
  await requestProxyAdmissionPolicy(peer,query);assert.equal(new Set(nonces).size,2);assert.ok(nonces.every(n=>n!==query.request_nonce));
  const enrollment=await requestProxyAdmissionPolicy(peer,{...query,provider_pubkey:h(71)});
  assert.equal(enrollment.provider_pubkey,h(71));assert.equal(enrollment.enrollment.entitlement_id,null);
+ const recovery={entitlement_id:h(72),invoice_commitment:h(73),evidence_commitment:h(74)};
+ const inspection=await requestProxyAdmissionPolicy(peer,{...query,provider_pubkey:h(71),recovery});
+ assert.deepEqual(inspection.recovery,recovery);assert.equal(inspection.recovery_state.entitlement_used,null);
+ assert.equal(inspection.recovery_state.admission_revoked,false);
  mode='replay';await assert.rejects(requestProxyAdmissionPolicy(peer,query),/does not match/);
  mode='network';await assert.rejects(requestProxyAdmissionPolicy(peer,query),/does not match/);
  await assert.rejects(requestProxyAdmissionPolicy({},query),/not ready/);
  await assert.rejects(requestProxyAdmissionPolicy(peer,{...query,issuer:h(1)}),/Invalid/);
  assert.equal(f.base.local.length,before);
+});
+
+test('permit recovery reads exact unused/consumed/revoked/superseded keys on one signed snapshot without writes', async t => {
+ const f=await familyAdminFixture(t),snapshot=createProxyCanonicalSnapshot(f.peer,CONTRACT_VERSION);
+ const recovery={entitlement_id:h(81),invoice_commitment:h(82),evidence_commitment:h(83)};
+ const request={requester:f.issuer.publicKey,request_nonce:h(84),provider_pubkey:h(85),recovery};
+ const keys=[];const read=()=>readProxyAdmissionPolicy({request,withCanonicalSnapshot:fn=>snapshot(s=>fn({...s,read:key=>{keys.push(key);return s.read(key);}}))});
+ const first=await read();assert.deepEqual(first.recovery_state,{entitlement_used:null,invoice_used:null,evidence_used:null,admission_revoked:false,generation:null});
+ assert.equal(keys.length,8);assert.equal(new Set(keys).size,8);assert.equal(first.context.epoch,100);
+ const owner={provider_pubkey:h(91),entitlement_id:h(92)},generation={revision:3,permit_digest:h(93)};
+ await f.base.append({type:'seed',entries:[
+  [`proxy/v1/admission-used/invoice/${recovery.invoice_commitment}`,owner],
+  [`proxy/v1/admission-used/evidence/${recovery.evidence_commitment}`,owner],
+  [`proxy/v1/admission-revoked/${recovery.entitlement_id}`,{revoked:true}],
+  [`proxy/v1/admission-generation/${recovery.entitlement_id}`,generation],
+ ]});await f.base.update();const before=f.base.local.length;
+ const next=await read();assert.equal(next.enrollment.entitlement_id,null);
+ assert.deepEqual(next.recovery_state,{entitlement_used:null,invoice_used:owner,evidence_used:owner,admission_revoked:true,generation});
+ assert.equal(f.base.local.length,before);assert.equal(next.proof.signed_length>first.proof.signed_length,true);
+ for(const bad of [{...request,provider_pubkey:undefined},{...request,recovery:{...recovery,path:'private'}},{...request,recovery:{...recovery,entitlement_id:'invalid'}}]) assert.throws(()=>validateProxyAdmissionPolicyRequest(bad));
+ await f.base.append({type:'seed',entries:[[`proxy/v1/admission-generation/${recovery.entitlement_id}`,{revision:0,permit_digest:h(93)}]]});await f.base.update();
+ await assert.rejects(read(),/invalid admission generation/);
 });
 
 
