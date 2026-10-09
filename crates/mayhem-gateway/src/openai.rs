@@ -165,6 +165,7 @@ use github_update::{
 pub use github_update::{GatewayGithubUpdate, GatewayGithubUpdateStatus};
 
 mod dashboard_ui;
+mod proxy_setup;
 use dashboard_ui::{DASHBOARD_APP_CSS, DASHBOARD_APP_JS};
 
 mod dashboard_brand_assets;
@@ -329,6 +330,7 @@ pub struct GatewayState {
     canary_probe_contract_rpc: Arc<Option<PeerRpcClient>>,
     canary_scheduler: Arc<Mutex<GatewayCanaryScheduler>>,
     dashboard_session: Arc<DashboardSession>,
+    proxy_setup: Arc<Option<proxy_setup::Control>>,
     provider_earnings: Arc<Mutex<GatewayProviderEarningsSnapshot>>,
     local_provider_id: Arc<Option<String>>,
     provider_load_progress_dir: Arc<Option<PathBuf>>,
@@ -5283,6 +5285,7 @@ impl GatewayState {
             canary_probe_contract_rpc: Arc::new(None),
             canary_scheduler: Arc::new(Mutex::new(GatewayCanaryScheduler::default())),
             dashboard_session: Arc::new(DashboardSession::new()),
+            proxy_setup: Arc::new(None),
             provider_earnings: Arc::new(Mutex::new(GatewayProviderEarningsSnapshot::default())),
             local_provider_id: Arc::new(None),
             provider_load_progress_dir: Arc::new(None),
@@ -5339,6 +5342,20 @@ impl GatewayState {
     pub fn with_receipt_rail(mut self, rail: impl Into<String>) -> Self {
         self.receipt_config.rail = rail.into();
         self
+    }
+
+    /// Explicit private setup surface sharing the already loaded wallet and dashboard session.
+    pub fn with_proxy_setup(
+        mut self,
+        flow: mayhem_proxy::setup::Flow,
+        origin: &str,
+    ) -> Result<Self, String> {
+        self.proxy_setup = Arc::new(Some(proxy_setup::Control::new(
+            flow,
+            origin,
+            &self.receipt_config.user_seed,
+        )?));
+        Ok(self)
     }
 
     pub fn with_receipt_user_seed(mut self, seed: [u8; 32]) -> Self {
@@ -6585,6 +6602,10 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/mayhem/dashboard/", get(mayhem_dashboard_root_redirect))
         .route("/mayhem/dashboard/network", get(mayhem_dashboard_network))
         .route("/mayhem/dashboard/provider", get(mayhem_dashboard_provider))
+        .route("/mayhem/dashboard/provider/setup", get(proxy_setup::page))
+        .route("/mayhem/dashboard/provider/setup/state", get(proxy_setup::view))
+        .route("/mayhem/dashboard/provider/setup/action", post(proxy_setup::action))
+        .route("/mayhem/dashboard/assets/proxy-setup.js", get(proxy_setup::script))
         .route("/mayhem/dashboard/evidence", get(mayhem_dashboard_evidence))
         .route("/mayhem/dashboard/session", get(mayhem_dashboard_session))
         .route(
@@ -6691,6 +6712,11 @@ async fn prepare_gateway_listener(
     bind: SocketAddr,
     state: &mut GatewayState,
 ) -> std::io::Result<TcpListener> {
+    if let Some(control) = state.proxy_setup.as_ref() {
+        control
+            .validate_bind(bind)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    }
     validate_gateway_bind_access(
         bind,
         state.access_control.requires_auth(),
@@ -13471,6 +13497,25 @@ fn dashboard_product_response(
     headers: &HeaderMap,
     page: DashboardProductPage,
 ) -> Response {
+    // Bootstrap on the configured host before consuming the one-use session link.
+    // Cookies remain host-scoped; do not weaken setup's exact Host/Origin checks.
+    if matches!(page, DashboardProductPage::Earn) && query.token.is_some() {
+        if let Some(control) = state.proxy_setup.as_ref() {
+            if !control.host(headers) {
+                let target = format!(
+                    "{}{}",
+                    control.origin(),
+                    original_uri.path_and_query().map(|v| v.as_str())
+                        .unwrap_or("/mayhem/dashboard/provider")
+                );
+                if let Ok(location) = HeaderValue::from_str(&target) {
+                    let mut response = StatusCode::SEE_OTHER.into_response();
+                    response.headers_mut().insert(header::LOCATION, location);
+                    return with_dashboard_security_headers(response);
+                }
+            }
+        }
+    }
     let Some(authorization) = dashboard_request_authorized(state, headers, query.token.as_deref())
     else {
         return dashboard_unauthorized_html_response(dashboard_locked_html(), headers);
@@ -13479,9 +13524,21 @@ fn dashboard_product_response(
         return response;
     }
     let origin = dashboard_origin_from_headers(headers);
+    let mut body = render_dashboard_product_page(state, &origin, query, page);
+    if matches!(page, DashboardProductPage::Earn) {
+        if let Some(control) = state.proxy_setup.as_ref() {
+            let context = if control.host(headers) {
+                "Use the configured local connection and wallet. Checks, admission and publication remain explicit."
+            } else {
+                "Setup uses the canonical loopback origin below. Dashboard sessions are host-scoped: use the provider launch link on that origin. If it was already consumed on this alternate host, restart the gateway for a fresh link; your retained draft is preserved."
+            };
+            let panel = format!("<section class=\"panel\"><div class=\"panel-body\"><h2>Proxy provider setup</h2><p>{context}</p><p>Canonical origin: {}</p><a class=\"primary-button\" href=\"{}/mayhem/dashboard/provider/setup\">Open proxy setup wizard</a></div></section></main>", control.origin(), control.origin());
+            body = body.replacen("</main>", &panel, 1);
+        }
+    }
     dashboard_html_response(
         StatusCode::OK,
-        render_dashboard_product_page(state, &origin, query, page),
+        body,
         Some((&authorization.cookie_name, &authorization.browser_token)),
     )
 }

@@ -9,6 +9,8 @@ mod connection;
 mod probes;
 #[path = "setup/profile.rs"]
 mod profile;
+#[path = "setup/flow.rs"]
+mod flow;
 #[path = "setup/publication.rs"]
 mod publication;
 use mayhem_proto::proxy::{

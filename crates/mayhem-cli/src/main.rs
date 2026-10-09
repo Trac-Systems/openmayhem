@@ -1605,6 +1605,10 @@ struct UseArgs {
     )]
     proxy_buyer_config: Option<PathBuf>,
 
+    /// Enable the local provider setup wizard using protected host configuration.
+    #[arg(long, value_name = "PATH", conflicts_with = "dev_embedded_catalog")]
+    proxy_setup_config: Option<PathBuf>,
+
     /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
     #[arg(long)]
     rpc_url: Option<String>,
@@ -45636,6 +45640,10 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let budget_activation = proxy_buyer::budget_activation(&home, &token_store)?;
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let shared_network_bind = !gateway_bind_is_loopback(bind);
+    anyhow::ensure!(
+        args.proxy_setup_config.is_none() || !shared_network_bind,
+        "provider setup requires an explicit loopback gateway bind"
+    );
     let require_gateway_auth = args.require_auth || shared_network_bind;
     let active_token_count = token_store.active_token_count(unix_epoch_seconds()?);
     if let Err(err) =
@@ -46046,6 +46054,15 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         }
         if let Some(verifier) = managed_hardware_quote_verifier {
             state = state.with_hardware_quote_verifier_command(verifier);
+        }
+        if let Some(path) = args.proxy_setup_config.clone() {
+            let flow = tokio::task::spawn_blocking(move || {
+                mayhem_proxy::setup::Flow::open(mayhem_proxy::setup::FlowConfig::load(&path)?)
+            })
+            .await??;
+            state = state
+                .with_proxy_setup(flow, &format!("http://{bind}"))
+                .map_err(anyhow::Error::msg)?;
         }
         if let Some(path) = args.proxy_config.clone() {
             let (control, lifecycle, expected) =

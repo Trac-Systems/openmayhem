@@ -1,0 +1,25 @@
+<style>
+#provider-setup { min-width:0; }
+#provider-setup label { display:block; margin:.65rem 0; }
+#provider-setup input:not([type=checkbox]), #provider-setup select { display:block; max-width:100%; width:28rem; }
+#provider-setup fieldset { min-width:0; margin:1rem 0; }
+#provider-setup pre { white-space:pre-wrap; overflow-wrap:anywhere; max-width:100%; }
+#provider-setup button { margin:.25rem .25rem .25rem 0; }
+#provider-setup #steps, #provider-setup #identity, #provider-setup #message { overflow-wrap:anywhere; }
+#provider-setup #message { position:sticky; top:0; background:var(--bg,#101115); padding:.5rem; z-index:1; }
+</style><main id="provider-setup" class="app-main" style="max-width:1080px;margin:2rem auto;padding:1rem">
+<a href="/mayhem/dashboard/provider">← Provider dashboard</a>
+<h1>Proxy provider setup</h1><p>Connect → Discover → Select → Check → Market → Admission → Review and publish → Run</p>
+<p>Uses this host’s protected connection and loaded wallet. Every network, probe, checkout and publication action is explicit. Your existing model server stays under your control.</p>
+<div id="message" role="status" aria-live="polite"></div><section class="panel"><div class="panel-body"><h2>Progress</h2><div id="steps"></div><p id="identity"></p>
+<button data-action="connect">Check connection configuration</button> <button data-action="discover">Discover upstream models</button> <button data-action="refresh">Refresh retained state</button></div></section>
+<section class="panel"><div class="panel-body"><h2>Select and price</h2><p>Model names and identity are declarations. Discovery does not certify capabilities. Join an existing market through the protected profile; changing a new market’s identity creates a different market.</p>
+<label>Upstream model <input id="model" list="models" maxlength="512"></label><datalist id="models"></datalist>
+<div id="market-fields"><label>Public model label <input id="public-model" maxlength="512"></label><label>Market slug <input id="slug" maxlength="64"></label></div>
+<label>Served context <input id="context" type="number" min="1"></label><label>Shared concurrency <input id="concurrency" type="number" min="1"></label>
+<p>Accepted rails:</p><div id="rails"></div><div id="prices"></div><button data-action="select">Save exact selection</button></div></section>
+<section class="panel"><div class="panel-body"><h2>Check</h2><button data-action="check">Check structure</button> <button data-action="probe">Review and run one probe</button> <button data-action="recover_probe">Recover original probe</button><pre id="probe"></pre><p>Structural checks are not conformance proof. A probe may consume the configured upstream allowance.</p></div></section>
+<section class="panel"><div class="panel-body"><h2>Admission and fee</h2><button data-action="admission_check">Read canonical admission</button> <label>Invoice rail <select id="invoice-rail"><option value="fiat">FIAT</option><option value="tnk">TNK</option><option value="tap">TAP</option></select></label><button data-action="invoice_create">Create or recover invoice</button> <button data-action="invoice_status">Reconcile original invoice status</button> <button data-action="invoice_checkout">Request original FIAT checkout</button><div id="invoice"></div><div id="checkout"></div><p>No payment is sent here. A checkout return is informational; reconcile the invoice before relying on payment status. An invoice or payment never enables serving by itself.</p></div></section>
+<section class="panel"><div class="panel-body"><h2>Review and publish</h2><button data-action="publication_plan">Review exact publication</button> <button data-action="publish" id="publish" disabled>Confirm reviewed publication</button> <button data-action="recover_publication">Recover original publication</button><pre id="publication"></pre><details><summary>Exact retained review</summary><pre id="review"></pre></details></div></section>
+<section class="panel"><div class="panel-body"><h2>Run</h2><p>The existing managed provider runtime must be configured and started separately. This wizard does not export a serving configuration, advertise capacity, restart a model server or change native serving. A published offer alone is not readiness.</p><code>mayhem provider proxy serve --help</code></div></section>
+</main><script src="/mayhem/dashboard/assets/proxy-setup.js" defer></script>

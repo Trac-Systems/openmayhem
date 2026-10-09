@@ -4,6 +4,7 @@
 mod admission;
 mod connection;
 mod enrollment;
+mod flow;
 mod probe;
 mod profile;
 mod publication;
@@ -12,6 +13,7 @@ mod store;
 pub use admission::{AdmissionEvidence, AdmissionReport, AdmissionState, CanonicalProvider};
 pub use connection::{DiscoveryState, InventoryReview};
 pub use enrollment::{EnrollmentAction, EnrollmentClient, EnrollmentInvoice, EnrollmentResult};
+pub use flow::{Flow, FlowAction, FlowChoice, FlowConfig, FlowResult, FlowView};
 pub use probe::{ProbeGroup, ProbePlan, ProbeReport, ProbeScope, ProbeState};
 pub use profile::{
     profiles, EndpointProfile, MembershipInput, OfferInput, ProfileInput, ProfileMarket,
