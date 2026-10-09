@@ -44,6 +44,30 @@ pub enum Error {
 
 type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryRelease {
+    pub release_id: String,
+    pub release_hash: Digest,
+}
+impl RegistryRelease {
+    fn validate(&self) -> Result<()> {
+        let id = self.release_id.as_bytes();
+        if id.len() != 36
+            || !id.iter().enumerate().all(|(i, c)| {
+                if [8, 13, 18, 23].contains(&i) {
+                    *c == b'-'
+                } else {
+                    c.is_ascii_digit() || (b'a'..=b'f').contains(c)
+                }
+            })
+        {
+            return Err(Error::Invalid);
+        }
+        Ok(())
+    }
+}
+
 /// Stable exact-offer selector. A display name can never select the native lane
 /// or a different provider. Revisions change accepted terms, not this identity.
 #[derive(Clone, PartialEq, Eq, Serialize)]
@@ -117,6 +141,8 @@ pub struct Controls {
     /// Absence serializes exactly as before, preserving existing replay hashes.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile: Option<mayhem_proxy::routing::Policy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_release: Option<RegistryRelease>,
 }
 
 /// The operator's resolved policy is passed separately; it is never read from a
@@ -203,6 +229,16 @@ impl Request {
             return Err(Error::Invalid);
         }
         let controls: Controls = serde_json::from_value(controls).map_err(|_| Error::Invalid)?;
+        if let Some(pin) = &controls.registry_release {
+            pin.validate()?;
+            if controls
+                .profile
+                .as_ref()
+                .is_none_or(|p| p.constraints.request_controls.is_empty())
+            {
+                return Err(Error::Invalid);
+            }
+        }
         if controls.prices.max_total_spend_au == 0
             || controls.prices.rates.is_empty()
             || controls.prices.rates.len() > 32
@@ -274,6 +310,9 @@ impl Request {
     pub fn provider_request(&self) -> &[u8] {
         &self.bytes
     }
+    pub(super) fn provider_value(&self) -> &Value {
+        &self.body
+    }
     pub fn policy(&self) -> &Policy {
         &self.policy
     }
@@ -338,7 +377,7 @@ impl Request {
             profile
                 .check_offer(candidate, self.endpoint, self.controls.rail)
                 .map_err(|_| Error::Constraints)?;
-            if profile.requires_evidence_resolution() {
+            if profile.requires_observation_resolution() {
                 return Err(Error::ProfileEvidence);
             }
         }

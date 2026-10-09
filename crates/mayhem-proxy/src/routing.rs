@@ -325,10 +325,14 @@ impl Policy {
     /// Until the authenticated registry/evidence resolver is wired, these
     /// requirements remain explicit errors, never silently ignored constraints.
     pub fn requires_evidence_resolution(&self) -> bool {
+        self.requires_observation_resolution() || !self.constraints.request_controls.is_empty()
+    }
+    /// Registry request controls have a distinct preparation/validation path;
+    /// declarations still cannot satisfy capability, taxonomy or trust evidence.
+    pub fn requires_observation_resolution(&self) -> bool {
         self.providers.require_verified_operator
             || !self.constraints.capabilities.is_empty()
             || !self.constraints.data_handling.is_empty()
-            || !self.constraints.request_controls.is_empty()
             || matches!(&self.target, Target::Category { variants, tags, .. } if !variants.is_empty() || !tags.is_empty())
     }
 }

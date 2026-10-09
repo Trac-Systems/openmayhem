@@ -50,6 +50,7 @@ fn config(dir: &Path, rpc: String, bridge: String) -> PathBuf {
         selected_markets: vec![],
         refresh: refresh_policy(),
         rpc_timeout_ms: 500,
+        registry: None,
     };
     let path = dir.join("gateway.json");
     write(&path, &serde_json::to_vec(&config).unwrap());
@@ -258,6 +259,37 @@ fn existing_empty_or_redirected_proxy_store_is_never_reset() {
                 b"do not modify"
             );
         }
+    }
+}
+
+#[test]
+fn registry_activation_requires_an_explicit_protected_operator_origin() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = config(
+        dir.path(),
+        "http://127.0.0.1:1".into(),
+        "ws://127.0.0.1:2".into(),
+    );
+    let original: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    for (origin, local, valid) in [
+        ("https://registry.invalid", false, true),
+        ("http://127.0.0.1:1234", true, true),
+        ("http://127.0.0.1:1234", false, false),
+        ("http://registry.invalid", true, false),
+        ("https://user:password@registry.invalid", false, false),
+        ("https://registry.invalid/path", false, false),
+        ("https://registry.invalid?target=other", false, false),
+    ] {
+        let mut document = original.clone();
+        document["registry"] = serde_json::json!({"origin":origin,"allow_loopback_http":local});
+        write(&path, &serde_json::to_vec(&document).unwrap());
+        assert_eq!(
+            Prepared::load(&path, &identity()).is_ok(),
+            valid,
+            "{origin}"
+        );
+        assert!(!dir.path().join("proxy-state").exists());
     }
 }
 

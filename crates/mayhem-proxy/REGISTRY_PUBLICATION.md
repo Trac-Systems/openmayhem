@@ -2,9 +2,10 @@
 
 `mayhem_proxy::registry::publication` is an opt-in client for the SITE capability
 registry's published metadata API. It supplies validated, pinned definitions to
-the existing `registry::evaluate` and `registry::apply_controls` functions. It is
-not enabled in buyer routing, admission, payment, provider discovery or connector
-execution. No automatic runtime configuration or registry origin is supplied.
+the existing `registry::evaluate` and `registry::apply_controls` functions. An
+operator can explicitly enable it for saved request-control preparation and
+validation through the gateway proxy-control configuration described below. No
+automatic registry origin, supplier selection or capability evidence is supplied.
 
 The operator constructs `TrustedOrigin::https(origin)` and a `Reader`. The origin
 must contain only a scheme, host and optional port: no credentials, path, query
@@ -112,3 +113,54 @@ server to test exact wire/hash compatibility, origin boundaries, strict rejectio
 monotonic head refresh, retained historical revisions, cache bounds, large valid
 batches, deadlines/concurrency, closure limits and existing control/evidence
 behavior. These tests make no live provider or payment calls.
+
+## Connected saved request controls
+
+The gateway proxy-control configuration accepts optional
+`registry: {origin, allow_loopback_http}`. Omission keeps registry-dependent
+controls unavailable. `origin` is fixed operator input; the HTTP option is only
+for explicit literal-loopback local acceptance. The gateway uses the reader's
+bounded defaults above. No request, profile, offer or provider supplies its URL.
+
+Authenticated `POST /v1/proxy/profile/prepare` accepts exactly
+`{schema_version:1, endpoint, request}`. The existing request must select one exact
+proxy offer and carry a profile with explicit `request_controls`. The route
+resolves the current published release, or the exact
+`request.proxy.registry_release: {release_id, release_hash}` when supplied. It
+loads the referenced semantic revisions and their closure, bounded to 96, then
+applies controls against the selected supplier's actual endpoint descriptor.
+Registry defaults are never inserted. Conflicting explicit values, unsupported
+paths, descriptor limits, request limits and metering/price bounds fail closed.
+Four preparation reads and four retained CPU validation permits bound work;
+preparation and fresh validation have ten-second deadlines.
+
+The response has kind `profile_preparation`, the explicit materialized `request`,
+the pinned release, profile/control/content hashes, canonical offer/membership,
+contract/recipe hashes, and bounded observation/expiry times. `preparation_hash`
+uses domain `mayhem/proxy/profile-preparation/v1` over canonical response metadata,
+excluding `request` and `preparation_hash`; `request_content_digest` and
+`controls_hash` bind the exact body and controls separately. This avoids changing
+request-number canonicalization or any existing retail fingerprint.
+
+Callers must present that materialized request unchanged for their financial
+quote and execution. New estimates and admissions revalidate the exact pinned
+release, controls, descriptor and current offer. They never silently add fields
+to the authorized body. Original-job replay runs before fresh registry reads, so
+later publication changes or a registry outage do not reprice or invalidate an
+accepted job. Preparation does not create a job, reserve credit/capacity or invoke
+inference. Bad mapped values return `proxy_profile_controls_invalid`; missing
+trusted registry/revisions/evidence return `proxy_profile_evidence_unavailable`.
+
+Capability/data-handling predicates, verified-operator requirements and category
+tags/variants still require authoritative observations and remain unavailable
+when those are missing. Published definitions are semantics, not those
+observations. Automatic category enumeration/ranking and native fallback are not
+part of this path.
+
+Gateway tests in `openai/proxy_buyer/tests/profile.rs` exercise real local HTTP
+preparation and the existing quote/bridge/admission/replay machinery, with a
+synthetic published registry and provider/financial doubles. The emitted fixture
+is consumed unchanged by SITE's strict response/hash decoder. SITE separately
+tests saved-profile ownership through real isolated PostgreSQL/Nest and a local
+Core-transport double returning that actual projection. These are local boundary
+checks, not real-provider or mainnet acceptance.

@@ -143,6 +143,7 @@ fn raw(candidate: &PublishedOffer, rail: ProxyRail) -> Value {
         minimum_tokens_per_second: None,
         require_verified_operator: false,
         profile: None,
+        registry_release: None,
     };
     let mut body = json!({"model":format!("proxy/offer/{}", candidate.id),"proxy":controls});
     match candidate.offer.endpoint {

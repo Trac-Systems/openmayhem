@@ -123,6 +123,13 @@ async fn estimate(
         )
         .await
         .map_err(|_| failure("proxy_estimate_unavailable", true))?;
+    super::profile::validate(
+        control.clone(),
+        request.clone(),
+        adapter.clone(),
+        selected.candidate.offer.clone(),
+    )
+    .await?;
     let prepare_request = request.clone();
     let offer = selected.candidate.offer.clone();
     // The read permit survives a disconnected HTTP caller until CPU work ends.

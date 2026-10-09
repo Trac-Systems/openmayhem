@@ -1,6 +1,6 @@
 use super::*;
 
-async fn estimate(
+pub(super) async fn estimate(
     f: &Fixture,
     body: Value,
     token: &str,
@@ -28,7 +28,7 @@ async fn estimate(
     let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
     (status, headers, serde_json::from_slice(&bytes).unwrap())
 }
-async fn assert_no_purchase(f: &mut Fixture) {
+pub(super) async fn assert_no_purchase(f: &mut Fixture) {
     assert_eq!(f.harness.backend_calls(), 0);
     assert!(
         f.harness
@@ -281,7 +281,11 @@ async fn required_profile_evidence_is_unavailable_without_admission_for_all_four
             "ranking": "lowest_estimated_cost", "continuity": "retain_compatible"
         });
         let (status, headers, error) = estimate(&f, body.clone(), "owner-fixture-key").await;
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{endpoint:?}: {error}");
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{endpoint:?}: {error}"
+        );
         assert_eq!(error["error"]["code"], "proxy_profile_evidence_unavailable");
         assert_eq!(error["error"]["category"], "proxy_estimate");
         assert_eq!(error["error"]["retryable"], true);

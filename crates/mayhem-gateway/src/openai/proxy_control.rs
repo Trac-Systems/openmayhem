@@ -9,6 +9,7 @@ use mayhem_proxy::{
     connector::config::private_file,
     discovery::{DiscoveryClient, Identity},
     presence::{self, gateway::Gateway, Table},
+    registry::publication::{Limits as RegistryLimits, Reader as RegistryReader, TrustedOrigin},
     supervisor::{self, RefreshPolicy},
 };
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,30 @@ pub struct Config {
     pub refresh: RefreshPolicy,
     #[serde(default = "rpc_timeout_ms")]
     pub rpc_timeout_ms: u64,
+    /// Administrative semantics only; never provider evidence or a request URL.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry: Option<RegistryConfig>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryConfig {
+    pub origin: String,
+    /// Explicit local acceptance opt-in; HTTPS is otherwise mandatory.
+    pub allow_loopback_http: bool,
+}
+impl RegistryConfig {
+    fn reader(&self) -> Result<Arc<RegistryReader>> {
+        let origin = if self.allow_loopback_http {
+            TrustedOrigin::local_loopback_http(&self.origin)
+        } else {
+            TrustedOrigin::https(&self.origin)
+        }
+        .map_err(|_| Error::Configuration)?;
+        RegistryReader::new(origin, RegistryLimits::default())
+            .map(Arc::new)
+            .map_err(|_| Error::Configuration)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -88,6 +113,7 @@ pub struct Prepared {
     bridge: ScBridgeConfig,
     client: DiscoveryClient,
     seed: u64,
+    registry: Option<Arc<RegistryReader>>,
 }
 
 impl Prepared {
@@ -167,11 +193,17 @@ impl Prepared {
         .map_err(|_| Error::Configuration)?;
         let mut seed = [0; 8];
         getrandom::fill(&mut seed).map_err(|_| Error::Configuration)?;
+        let registry = config
+            .registry
+            .as_ref()
+            .map(RegistryConfig::reader)
+            .transpose()?;
         Ok(Self {
             config,
             bridge,
             client,
             seed: u64::from_le_bytes(seed),
+            registry,
         })
     }
 
@@ -214,6 +246,7 @@ impl Prepared {
             catalog_health,
             failure,
             running: Arc::new(AtomicBool::new(false)),
+            registry: self.registry,
         });
         let lifecycle = ProxyLifecycle {
             control: control.clone(),
@@ -262,6 +295,7 @@ pub struct ProxyControl {
     catalog_health: watch::Receiver<supervisor::Health>,
     failure: watch::Receiver<Option<&'static str>>,
     running: Arc<AtomicBool>,
+    registry: Option<Arc<RegistryReader>>,
 }
 
 impl fmt::Debug for ProxyControl {
@@ -282,6 +316,9 @@ pub struct Health {
 }
 
 impl ProxyControl {
+    pub(crate) fn registry(&self) -> Option<&Arc<RegistryReader>> {
+        self.registry.as_ref()
+    }
     pub fn catalog(&self) -> &Arc<Catalog> {
         &self.catalog
     }

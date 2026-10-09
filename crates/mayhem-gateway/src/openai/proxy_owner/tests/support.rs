@@ -756,6 +756,9 @@ fn protected(path: &Path, bytes: &[u8]) {
 }
 impl Harness {
     pub(crate) async fn control(&self) -> ControlFixture {
+        self.control_with_registry(None).await
+    }
+    pub(crate) async fn control_with_registry(&self, registry: Option<crate::openai::proxy_control::RegistryConfig>) -> ControlFixture {
         use crate::openai::proxy_control::{self, Prepared};
         use mayhem_proxy::{health, presence, supervisor::RefreshPolicy};
         let directory = private_dir();
@@ -789,6 +792,7 @@ impl Harness {
             selected_markets: vec![Digest::new(&self.template.terms.offer.market_id).unwrap()],
             refresh: refresh.clone(),
             rpc_timeout_ms: 2000,
+            registry,
         };
         let path = directory.path().join("control.json");
         protected(&path, &serde_json::to_vec(&config).unwrap());

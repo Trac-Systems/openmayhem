@@ -38,10 +38,12 @@ use tokio::{
 
 mod contract;
 mod estimation;
+mod profile;
 mod retail;
 mod streaming;
 pub(super) use contract::handle as contract;
 pub(super) use estimation::handle as estimate;
+pub(super) use profile::handle as prepare_profile;
 pub use retail::{
     request_content_digest as retail_request_content_digest, Config as RetailAuthorizationConfig,
 };
@@ -632,6 +634,8 @@ async fn submit(
     )
     .await
     .map_err(selection_error)?;
+    profile::validate_admission(&runtime, state.proxy_control.as_ref().ok_or_else(unavailable)?.clone(),
+        request.clone(), &candidate).await?;
     let stream = if streaming {
         Some(streaming::channel(&runtime)?)
     } else {
