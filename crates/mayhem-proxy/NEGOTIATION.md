@@ -111,3 +111,29 @@ wrong wallets, invalid signatures, request/metering/connection/lease mismatches,
 withdrawn or dispatched capacity, storage exhaustion, reopen, abrupt process exit,
 legacy journal migration, and signature-read fencing after failed fsync. These are
 local fixture/accounting proofs, not live model or external payout acceptance.
+
+## Public buyer evidence and execution handoff
+
+New buyer purchases retain `buyer::Snapshot::Public`. They use `PublicAdapter`
+with the public endpoint contract, the recipe digest pinned by canonical membership,
+and their own bounded resource policy. Provider-specific translation remains in the
+provider's private Adapter. The public verifier shares request/result validation and
+metering rules with that adapter but cannot produce a dispatchable Request or upstream
+body. It does not reconstruct or guess the private upstream model mapping. Receipt
+approval and authenticated result delivery accept this buyer-owned public evidence.
+
+Legacy private buyer snapshots deserialize and reserialize with the exact original
+shape, preserving the purchase commitment and signatures. They are converted only
+in memory for verification; recovery does not rewrite a previously signed intent or
+silently renew/reprice it. Unknown or mixed public/private snapshot fields are rejected.
+Provider journal snapshots and recipe hashes are unchanged.
+
+An authenticated session may encounter the Prepared attempt retained during provider
+countersigning, before canonical funding was attached locally. It may hand this into
+paid admission only when the exact durable provider acceptance matches the session.
+Unsigned drafts and different accepted terms cannot pass that check. The session
+still checks canonical funding and current capacity before the first model POST;
+signatures alone do not suffice. Local four-endpoint/three-rail checks now exercise
+that session handoff and independent public buyer receipt verification. The bridge
+fixture authenticates its loopback participants; real relay/Noise acceptance and the
+pre-acceptance negotiation transport remain separate unfinished requirements.

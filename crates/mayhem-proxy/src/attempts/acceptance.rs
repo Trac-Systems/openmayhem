@@ -27,28 +27,33 @@ impl fmt::Debug for AcceptanceSnapshot {
 impl AcceptanceSnapshot {
     pub fn validate_for(&self, binding: &Binding) -> Result<()> {
         let adapter = Adapter::restore(self.adapter.clone()).map_err(|_| Error::Invalid)?;
-        let policy = Policy::resolve(binding.endpoint, &binding.metering_policy)
-            .map_err(|_| Error::Invalid)?;
-        let offer = &self.offer;
         if adapter.endpoint() != binding.endpoint
             || adapter.contract_hash() != &binding.endpoint_contract
             || adapter.recipe_hash() != &binding.recipe_digest
-            || offer.digest().map_err(|_| Error::Invalid)? != binding.offer_digest.as_str()
-            || offer.endpoint != binding.endpoint
-            || offer.market_id != binding.market_id.as_str()
-            || offer.provider_pubkey != binding.provider_pubkey.as_str()
-            || offer.metering_policy_hash != binding.metering_policy.as_str()
-            || !offer.accepted_rails.contains(&binding.rail)
-            || !offer
-                .rates
-                .iter()
-                .map(|r| &r.unit)
-                .eq(policy.contract().units.iter())
         {
             return Err(Error::Conflict);
         }
-        Ok(())
+        validate_offer_binding(&self.offer, binding)
     }
+}
+pub(crate) fn validate_offer_binding(offer: &ProxyOffer, binding: &Binding) -> Result<()> {
+    let policy =
+        Policy::resolve(binding.endpoint, &binding.metering_policy).map_err(|_| Error::Invalid)?;
+    if offer.digest().map_err(|_| Error::Invalid)? != binding.offer_digest.as_str()
+        || offer.endpoint != binding.endpoint
+        || offer.market_id != binding.market_id.as_str()
+        || offer.provider_pubkey != binding.provider_pubkey.as_str()
+        || offer.metering_policy_hash != binding.metering_policy.as_str()
+        || !offer.accepted_rails.contains(&binding.rail)
+        || !offer
+            .rates
+            .iter()
+            .map(|r| &r.unit)
+            .eq(policy.contract().units.iter())
+    {
+        return Err(Error::Conflict);
+    }
+    Ok(())
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

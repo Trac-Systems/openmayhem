@@ -79,7 +79,7 @@ async fn purchase_uses_owned_request_and_explicit_budget_then_reserves_exact_cos
             let q = peer.buyer_client.quote(&query(&peer)).await.unwrap();
             let output = (endpoint != ProxyEndpoint::Decisions).then_some(37);
             let intent = PurchaseRequest::new(
-                f.adapter.snapshot(),
+                f.adapter.public_snapshot(),
                 bytes.clone(),
                 prices(&peer),
                 output,
@@ -187,7 +187,7 @@ async fn purchase_rejects_incompatible_recipe_budget_lifetime_and_oversized_or_i
             vec![None, Some(0), Some(u64::MAX)]
         } {
             assert!(intent(
-                f.adapter.snapshot(),
+                f.adapter.public_snapshot(),
                 bytes.clone(),
                 prices(&peer),
                 budget,
@@ -201,7 +201,7 @@ async fn purchase_rejects_incompatible_recipe_budget_lifetime_and_oversized_or_i
             vec![b' '; f.adapter.limits().request_bytes + 1],
         ] {
             assert!(intent(
-                f.adapter.snapshot(),
+                f.adapter.public_snapshot(),
                 bad,
                 prices(&peer),
                 output,
@@ -210,7 +210,7 @@ async fn purchase_rejects_incompatible_recipe_budget_lifetime_and_oversized_or_i
             .is_err());
         }
         assert!(intent(
-            f.adapter.snapshot(),
+            f.adapter.public_snapshot(),
             bytes.clone(),
             prices(&peer),
             output,
@@ -222,14 +222,14 @@ async fn purchase_rejects_incompatible_recipe_budget_lifetime_and_oversized_or_i
         )
         .is_err());
         for fault in ["price", "budget", "recipe", "expiry", "funding"] {
-            let mut adapter = f.adapter.snapshot();
+            let mut adapter = f.adapter.public_snapshot();
             let mut cap = prices(&peer);
             let mut time = lifetimes();
             let mut allowance = output;
             match fault {
                 "price" => cap.rates[0].per_unit_au = 0,
                 "budget" => cap.max_total_spend_au = 0,
-                "recipe" => adapter.upstream_model = "different-mapping".into(),
+                "recipe" => adapter.recipe_hash = d(211),
                 "expiry" => time.receipt_grace_epochs = mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER,
                 "funding" if endpoint != ProxyEndpoint::Decisions => {
                     allowance = Some(1_000_000);

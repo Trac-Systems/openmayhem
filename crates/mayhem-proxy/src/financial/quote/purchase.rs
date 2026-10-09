@@ -3,8 +3,9 @@
 //! Persistence, authenticated negotiation and dual signatures remain mandatory.
 use super::*;
 use crate::{
-    attempts::{AcceptanceSnapshot, Digest},
-    endpoint::{Adapter, AdapterSnapshot},
+    attempts::Digest,
+    buyer::{Evidence, PublicAcceptanceSnapshot, Snapshot},
+    endpoint::{PublicAdapter, PublicAdapterSnapshot},
 };
 use mayhem_proto::proxy::ProxyLane;
 use std::collections::BTreeMap;
@@ -43,22 +44,22 @@ pub struct SessionBinding {
 /// usage or accidentally dump prompts into ordinary diagnostics.
 pub struct PurchaseRequest {
     request: Vec<u8>,
-    adapter: AdapterSnapshot,
+    adapter: PublicAdapterSnapshot,
     prices: PriceLimits,
     usage: BTreeMap<String, u64>,
     lifetimes: Lifetimes,
 }
 impl PurchaseRequest {
     pub fn new(
-        adapter: AdapterSnapshot,
+        adapter: PublicAdapterSnapshot,
         request: Vec<u8>,
         prices: PriceLimits,
         output_units: Option<u64>,
         lifetimes: Lifetimes,
     ) -> Result<Self> {
         lifetimes.validate()?;
-        let restored =
-            Adapter::restore(adapter.clone()).map_err(|_| invalid("invalid purchase adapter"))?;
+        let restored = PublicAdapter::restore(adapter.clone())
+            .map_err(|_| invalid("invalid purchase adapter"))?;
         let parsed = prepare(&restored, &request)?;
         let usage = parsed
             .maximum_usage(output_units)
@@ -72,7 +73,7 @@ impl PurchaseRequest {
         })
     }
 }
-fn prepare(adapter: &Adapter, request: &[u8]) -> Result<crate::endpoint::Request> {
+fn prepare(adapter: &PublicAdapter, request: &[u8]) -> Result<crate::endpoint::PublicRequest> {
     require(
         request.len() <= adapter.limits().request_bytes,
         "purchase request exceeds bound",
@@ -92,7 +93,7 @@ pub struct PreparedPurchase {
     terms: ProxySpendTerms,
     policy: ProxySettlementPolicy,
     prices: PriceLimits,
-    snapshot: AcceptanceSnapshot,
+    snapshot: Snapshot,
     request: Vec<u8>,
 }
 /// Private trusted-parent persistence, not an input accepted from connectors.
@@ -102,7 +103,7 @@ pub(crate) struct RetainedPurchase {
     pub terms: ProxySpendTerms,
     pub policy: ProxySettlementPolicy,
     pub prices: PriceLimits,
-    pub snapshot: AcceptanceSnapshot,
+    pub snapshot: Snapshot,
     pub request: String,
 }
 impl RetainedPurchase {
@@ -118,9 +119,9 @@ impl RetainedPurchase {
         self.snapshot
             .validate_for(&binding)
             .map_err(|_| invalid("retained purchase snapshot differs"))?;
-        let adapter = Adapter::restore(self.snapshot.adapter.clone())
-            .map_err(|_| invalid("invalid retained adapter"))?;
-        let prepared = prepare(&adapter, self.request.as_bytes())?;
+        let prepared = self
+            .snapshot
+            .verify_request(&binding, self.request.as_bytes())?;
         let output = self.terms.max_usage.get("output_token").copied();
         require(
             prepared.matches_binding(&binding)
@@ -156,7 +157,7 @@ impl PreparedPurchase {
     pub fn policy(&self) -> &ProxySettlementPolicy {
         &self.policy
     }
-    pub fn snapshot(&self) -> &AcceptanceSnapshot {
+    pub fn snapshot(&self) -> &Snapshot {
         &self.snapshot
     }
     pub fn request(&self) -> &[u8] {
@@ -176,7 +177,7 @@ impl Observation {
     ) -> Result<PreparedPurchase> {
         self.fresh()?;
         let w = &self.wire;
-        let adapter = Adapter::restore(intent.adapter.clone())
+        let adapter = PublicAdapter::restore(intent.adapter.clone())
             .map_err(|_| invalid("invalid purchase adapter"))?;
         let request = prepare(&adapter, &intent.request)?;
         require(
@@ -235,10 +236,11 @@ impl Observation {
             max_total_spend_au: intent.prices.max_total_spend_au,
         };
         self.check_terms(&terms, &intent.prices)?;
-        let snapshot = AcceptanceSnapshot {
+        let snapshot = Snapshot::Public(PublicAcceptanceSnapshot {
+            version: 1,
             adapter: intent.adapter.clone(),
             offer: w.offer.clone(),
-        };
+        });
         let binding = super::super::terms_binding(&terms)?;
         snapshot
             .validate_for(&binding)

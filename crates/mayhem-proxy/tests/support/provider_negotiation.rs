@@ -1,6 +1,48 @@
+use super::super::super::authenticated_exchange::exchange_bridge::Bridge;
 use super::*;
 use financial::negotiation::{BuyerOffer, SavedPurchase};
 use financial::provider::{ProviderNegotiation, Runtime};
+use mayhem_proxy::exchange::{Channel, Message, Role, Session};
+
+async fn deliver(
+    buyer: &mut Channel,
+    provider: &mut Channel,
+    request: &[u8],
+) -> mayhem_proxy::exchange::Received {
+    let message = Message::Execute {
+        request: serde_json::from_slice(request).unwrap(),
+        streaming: false,
+    };
+    let (sent, received) = tokio::join!(
+        buyer.send(&message),
+        provider.receive(Some(Duration::from_secs(5)))
+    );
+    sent.unwrap();
+    received.unwrap()
+}
+
+async fn channels(peer: &Peer, auth: &ProxySpendAuthorization) -> (Bridge, Channel, Channel) {
+    let bridge = Bridge::start(&auth.terms.buyer_pubkey, &auth.terms.offer.provider_pubkey).await;
+    let provider = Channel::connect(
+        bridge.config(false),
+        Session::new(auth.clone(), &peer.identity, Role::Provider).unwrap(),
+        mayhem_proxy::exchange::Limits {
+            max_message_bytes: 1024 * 1024,
+        },
+    )
+    .await
+    .unwrap();
+    let buyer = Channel::connect(
+        bridge.config(true),
+        Session::new(auth.clone(), &identity(peer), Role::Buyer).unwrap(),
+        mayhem_proxy::exchange::Limits {
+            max_message_bytes: 1024 * 1024,
+        },
+    )
+    .await
+    .unwrap();
+    (bridge, buyer, provider)
+}
 
 struct Setup {
     runtime: Arc<Runtime>,
@@ -147,6 +189,83 @@ impl Setup {
 }
 
 #[tokio::test]
+async fn negotiated_session_rejects_unsigned_prepared_record_and_different_signed_acceptance() {
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let mut peer = Peer::start(ProxyRail::Fiat, &f, &chat(), false, None).await;
+    let mut s = Setup::new(&f, &mut peer, &chat()).await;
+    let approved = s.approve(&peer, s.saved.offer(), chat()).await.unwrap();
+    let invocation = approved.invocation().clone();
+    let signed = s.provider.accept(approved, 1001).await.unwrap();
+    let record = s.journal.get(&invocation).unwrap().unwrap();
+    let unsigned = Arc::new(
+        Journal::open(
+            f._store.path().join("unsigned-draft"),
+            peer.identity.clone(),
+            journal_limits(128 * 1024 * 1024),
+        )
+        .unwrap(),
+    );
+    let draft = unsigned
+        .prepare(invocation.clone(), record.binding.clone(), 1001)
+        .unwrap();
+    unsigned
+        .retain_acceptance(
+            &invocation,
+            draft.attempt,
+            &attempts::AcceptanceSnapshot {
+                adapter: f.adapter.snapshot(),
+                offer: signed.authorization.terms.offer.clone(),
+            },
+        )
+        .unwrap();
+    unsigned
+        .retain_request(
+            &invocation,
+            draft.attempt,
+            &chat(),
+            f.adapter.limits().response_bytes,
+        )
+        .unwrap();
+    let original = std::mem::replace(&mut s.journal, unsigned);
+    let (_bridge, mut buyer, mut provider) = channels(&peer, &signed.authorization).await;
+    let received = deliver(&mut buyer, &mut provider, &chat()).await;
+    assert!(matches!(
+        provider
+            .session()
+            .execute_json(received, &s.executor(&f, &peer), &Cancellation::default())
+            .await,
+        Err(mayhem_proxy::exchange::Error::Identity)
+    ));
+    s.journal = original;
+
+    let mut changed = signed.authorization;
+    changed.terms.capacity_lease = d(919).as_str().into();
+    let keys = peer.command("ephemeral_test_wallet_seeds").await;
+    let provider_key: [u8; 32] = serde_json::from_value(keys["provider"].clone()).unwrap();
+    changed.buyer_sig = signature(&s.buyer_key, &changed.terms.buyer_signing_bytes().unwrap());
+    changed.provider_sig = signature(
+        &provider_key,
+        &changed.terms.provider_signing_bytes().unwrap(),
+    );
+    changed
+        .verify(mayhem_proxy::receipts::verify_signature)
+        .unwrap();
+    let (_bridge, mut buyer, mut provider) = channels(&peer, &changed).await;
+    let received = deliver(&mut buyer, &mut provider, &chat()).await;
+    assert!(matches!(
+        provider
+            .session()
+            .execute_json(received, &s.executor(&f, &peer), &Cancellation::default())
+            .await,
+        Err(mayhem_proxy::exchange::Error::Identity)
+    ));
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(peer.command("status").await["publications"], 0);
+    peer.stop().await;
+}
+
+#[tokio::test]
 async fn provider_countersignature_survives_reopen_and_hands_off_to_one_paid_post_for_every_endpoint_rail(
 ) {
     for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
@@ -214,22 +333,32 @@ async fn provider_countersignature_survives_reopen_and_hands_off_to_one_paid_pos
                 .retain_provider_acceptance(signed.authorization.clone())
                 .await
                 .unwrap();
+            let (_bridge, mut buyer_channel, mut provider_channel) =
+                channels(&peer, &signed.authorization).await;
+            let executor = s.executor(&f, &peer);
+            let unsent = deliver(&mut buyer_channel, &mut provider_channel, &bytes).await;
+            assert!(
+                provider_channel
+                    .session()
+                    .execute_json(unsent, &executor, &Cancellation::default())
+                    .await
+                    .is_err(),
+                "dual signatures do not replace canonical funding"
+            );
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
             let finance = recovery(&f, &peer);
             s.buyer
                 .publish(s.saved.key().clone(), &finance, 1003)
                 .await
                 .unwrap();
             assert_eq!(peer.command("status").await["publications"], 1);
-            let executor = s.executor(&f, &peer);
-            let accepted = executor
-                .prepare_accepted(invocation.clone(), &signed.authorization, &bytes, false)
+            let request = deliver(&mut buyer_channel, &mut provider_channel, &bytes).await;
+            let delivered = provider_channel
+                .session()
+                .execute_json(request, &executor, &Cancellation::default())
                 .await
                 .unwrap();
-            assert_eq!(accepted.attempt, record.attempt);
-            executor
-                .execute_json(&invocation, &bytes, &Cancellation::default())
-                .await
-                .unwrap();
+            assert_eq!(delivered.attempt.attempt, record.attempt);
             assert!(
                 matches!(
                     executor
@@ -255,9 +384,55 @@ async fn provider_countersignature_survives_reopen_and_hands_off_to_one_paid_pos
                 .sign_terminal_receipt(&s.provider_signer, &invocation, record.attempt)
                 .await
                 .unwrap();
+            // Independently verify delivered output using only buyer-owned public
+            // evidence before the buyer signs the provider's receipt.
+            use mayhem_proxy::buyer::Evidence;
+            let prepared = s
+                .saved
+                .snapshot()
+                .verify_request(&record.binding, &bytes)
+                .unwrap();
+            let created = delivered.reply.body[if endpoint == ProxyEndpoint::Responses {
+                "created_at"
+            } else {
+                "created"
+            }]
+            .as_u64()
+            .unwrap();
+            let received = prepared
+                .decode_json(
+                    delivered.reply.body.clone(),
+                    delivered.reply.body["id"].as_str().unwrap(),
+                    created,
+                )
+                .unwrap();
+            let verifier = Pool::new(
+                env!("CARGO_BIN_EXE_mayhem-proxy-worker"),
+                f._work.path(),
+                PoolLimits {
+                    max_children: 2,
+                    max_buffer_bytes: 64 * 1024 * 1024,
+                    startup_timeout: Duration::from_secs(5),
+                    processing_timeout: Duration::from_secs(3),
+                },
+            )
+            .unwrap();
+            let approval = mayhem_proxy::receipts::approve_terminal(
+                &verifier,
+                &provider_receipt.draft,
+                &provider_receipt.provider_sig,
+                &signed.authorization,
+                s.saved.policy(),
+                s.saved.snapshot(),
+                &bytes,
+                &received,
+                false,
+            )
+            .await
+            .unwrap();
             let body = provider_receipt.draft.body;
             let receipt = mayhem_proto::proxy::finance::ProxyUsageReceipt {
-                buyer_sig: signature(&s.buyer_key, &body.buyer_signing_bytes().unwrap()),
+                buyer_sig: signature(&s.buyer_key, approval.signing_bytes()),
                 provider_sig: provider_receipt.provider_sig,
                 body,
             };

@@ -3,8 +3,10 @@
 //! Full structured-output/tool-argument schema validation belongs to the bounded
 //! semantic verifier before this result may authorize delivery/execution/settlement.
 
+mod public;
 mod responses_stream;
 pub mod stream;
+pub use public::{PublicAdapter, PublicAdapterSnapshot, PublicRequest};
 
 use crate::{
     attempts::Digest,
@@ -209,11 +211,17 @@ impl Limits {
 /// One same-protocol adapter. Custom recipes will produce this public protocol;
 /// they cannot select network origins, payment terms, or silently drop controls.
 pub struct Adapter {
+    protocol: Protocol,
+    upstream_model: String,
+}
+
+/// Shared public request/result rules. Only Adapter has an upstream model mapping
+/// and can produce a dispatchable Request; the buyer exposes a read-only wrapper.
+struct Protocol {
     endpoint: ProxyEndpoint,
     contract: EndpointFamilyContract,
     contract_hash: Digest,
     recipe_hash: Digest,
-    upstream_model: String,
     limits: Limits,
 }
 
@@ -238,7 +246,7 @@ impl fmt::Debug for AdapterSnapshot {
 impl fmt::Debug for Adapter {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Adapter")
-            .field("endpoint", &self.endpoint)
+            .field("endpoint", &self.protocol.endpoint)
             .finish_non_exhaustive()
     }
 }
@@ -246,10 +254,10 @@ impl Adapter {
     pub fn snapshot(&self) -> AdapterSnapshot {
         AdapterSnapshot {
             version: 1,
-            endpoint: self.endpoint,
-            contract: self.contract.clone(),
+            endpoint: self.protocol.endpoint,
+            contract: self.protocol.contract.clone(),
             upstream_model: self.upstream_model.clone(),
-            limits: self.limits,
+            limits: self.protocol.limits,
         }
     }
     pub fn restore(snapshot: AdapterSnapshot) -> Result<Self> {
@@ -269,49 +277,37 @@ impl Adapter {
         upstream_model: String,
         limits: Limits,
     ) -> Result<Self> {
-        limits.validate()?;
-        let family = match endpoint {
-            ProxyEndpoint::Chat => mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
-            ProxyEndpoint::Completions => mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
-            ProxyEndpoint::Responses => mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
-            ProxyEndpoint::Decisions => mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
-        };
-        if contract.family != family
-            || !identifier(&upstream_model)
-            || serde_json::to_vec(&contract)
-                .map_err(|_| Error::Configuration)?
-                .len()
-                > 128 * 1024
-        {
+        if !identifier(&upstream_model) {
             return Err(Error::Configuration);
         }
-        let contract_hash = Digest::new(endpoint_contract_canonical_fingerprint(&contract))
-            .map_err(|_| Error::Configuration)?;
+        let contract_hash = validate_contract(endpoint, &contract, limits)?;
         let recipe = json!({"version":1,"adapter":"same_protocol_json","endpoint":endpoint,"contract":contract_hash,"upstream_model":upstream_model,"limits":limits});
         let recipe_hash = digest("mayhem/proxy/endpoint-adapter/v1", &recipe)?;
         Ok(Self {
-            endpoint,
-            contract,
-            contract_hash,
-            recipe_hash,
+            protocol: Protocol {
+                endpoint,
+                contract,
+                contract_hash,
+                recipe_hash,
+                limits,
+            },
             upstream_model,
-            limits,
         })
     }
     pub fn endpoint(&self) -> ProxyEndpoint {
-        self.endpoint
+        self.protocol.endpoint
     }
     pub fn contract_hash(&self) -> &Digest {
-        &self.contract_hash
+        &self.protocol.contract_hash
     }
     pub fn recipe_hash(&self) -> &Digest {
-        &self.recipe_hash
+        &self.protocol.recipe_hash
     }
     pub fn limits(&self) -> Limits {
-        self.limits
+        self.protocol.limits
     }
     pub fn operation(&self) -> Operation {
-        match self.endpoint {
+        match self.protocol.endpoint {
             ProxyEndpoint::Chat => Operation::ChatCompletions,
             ProxyEndpoint::Completions => Operation::Completions,
             ProxyEndpoint::Responses => Operation::Responses,
@@ -321,18 +317,53 @@ impl Adapter {
     /// No settings are removed to make a backend accept a request. This adapter
     /// explicitly handles JSON replies; streaming is a separate execution path.
     pub fn prepare_json(&self, bytes: &[u8]) -> Result<Request> {
-        self.prepare(bytes, false)
+        self.protocol
+            .prepare(bytes, false, Some(&self.upstream_model))
     }
     pub fn prepare_stream(&self, bytes: &[u8]) -> Result<Request> {
-        if !matches!(
-            self.endpoint,
-            ProxyEndpoint::Chat | ProxyEndpoint::Completions | ProxyEndpoint::Responses
-        ) {
+        self.protocol
+            .prepare(bytes, true, Some(&self.upstream_model))
+    }
+}
+
+fn validate_contract(
+    endpoint: ProxyEndpoint,
+    contract: &EndpointFamilyContract,
+    limits: Limits,
+) -> Result<Digest> {
+    limits.validate()?;
+    let family = match endpoint {
+        ProxyEndpoint::Chat => mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        ProxyEndpoint::Completions => mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+        ProxyEndpoint::Responses => mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+        ProxyEndpoint::Decisions => mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
+    };
+    if contract.family != family
+        || serde_json::to_vec(contract)
+            .map_err(|_| Error::Configuration)?
+            .len()
+            > 128 * 1024
+    {
+        return Err(Error::Configuration);
+    }
+    Digest::new(endpoint_contract_canonical_fingerprint(contract)).map_err(|_| Error::Configuration)
+}
+
+impl Protocol {
+    fn prepare(
+        &self,
+        bytes: &[u8],
+        streaming: bool,
+        upstream_model: Option<&str>,
+    ) -> Result<Request> {
+        if streaming
+            && !matches!(
+                self.endpoint,
+                ProxyEndpoint::Chat | ProxyEndpoint::Completions | ProxyEndpoint::Responses
+            )
+        {
             return Err(invalid(Some("stream"), Code::UnsupportedControl));
         }
-        self.prepare(bytes, true)
-    }
-    fn prepare(&self, bytes: &[u8], streaming: bool) -> Result<Request> {
         if bytes.len() > self.limits.request_bytes {
             return Err(invalid(None, Code::RequestTooLarge));
         }
@@ -478,18 +509,23 @@ impl Adapter {
                     Code::UnsupportedControl,
                 )
             })?;
-        let mut body = original;
-        body["model"] = json!(self.upstream_model);
-        // OpenAI Responses defaults may otherwise retain vendor-side state. This
-        // stateless profile must be probed for store=false support, not silently
-        // omit it when a backend rejects it. Custom profiles need explicit semantics.
-        if self.endpoint == ProxyEndpoint::Responses {
-            body["store"] = json!(false);
-        }
-        let body = serde_json::to_vec(&body).map_err(|_| Error::Configuration)?;
-        if body.len() > self.limits.request_bytes {
-            return Err(invalid(None, Code::RequestTooLarge));
-        }
+        let body = if let Some(model) = upstream_model {
+            let mut body = original;
+            body["model"] = json!(model);
+            // OpenAI Responses defaults may otherwise retain vendor-side state.
+            // This provider profile must be probed for store=false support.
+            if self.endpoint == ProxyEndpoint::Responses {
+                body["store"] = json!(false);
+            }
+            let body = serde_json::to_vec(&body).map_err(|_| Error::Configuration)?;
+            if body.len() > self.limits.request_bytes {
+                return Err(invalid(None, Code::RequestTooLarge));
+            }
+            body
+        } else {
+            // Buyer verification neither translates nor builds an upstream POST.
+            Vec::new()
+        };
         Ok(Request {
             endpoint: self.endpoint,
             request_hash,

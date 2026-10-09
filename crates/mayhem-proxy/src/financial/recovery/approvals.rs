@@ -1,7 +1,7 @@
 //! Durable buyer acknowledgments, separate from mere provider assertions.
 use super::*;
 use crate::{
-    attempts::AcceptanceSnapshot,
+    buyer::Evidence,
     endpoint::ProtocolReply,
     receipts::{self, BuyerApproval},
     signing::{Authority, ProviderReceipt, ProviderWaiver},
@@ -204,7 +204,7 @@ impl BuyerRecovery {
         &self,
         verifier: &crate::worker::host::Pool,
         value: ProviderReceipt,
-        snapshot: AcceptanceSnapshot,
+        snapshot: impl Evidence,
         own_request: Vec<u8>,
         received: ProtocolReply,
         cancelled_before_terminal: bool,

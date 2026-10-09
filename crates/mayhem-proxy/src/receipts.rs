@@ -2,7 +2,8 @@
 //! upstream-reported price is accepted from a connector. A buyer must supply its
 //! own retained request and received result, not echo a provider's usage claim.
 use crate::{
-    attempts::{self, AcceptanceSnapshot, TerminalDraft},
+    attempts::{self, TerminalDraft},
+    buyer::Evidence,
     endpoint::ProtocolReply,
     financial, invalid, metering, require, Result,
 };
@@ -157,7 +158,7 @@ pub async fn approve_terminal(
     provider_signature: &str,
     authorization: &ProxySpendAuthorization,
     policy: &ProxySettlementPolicy,
-    snapshot: &AcceptanceSnapshot,
+    snapshot: &impl Evidence,
     own_request: &[u8],
     received: &ProtocolReply,
     cancellation_accepted_before_terminal: bool,
@@ -188,28 +189,9 @@ pub async fn approve_terminal(
         "provider receipt signature rejected",
     )?;
     let binding = financial::terms_binding(t)?;
-    snapshot
-        .validate_for(&binding)
-        .map_err(|_| invalid("original execution snapshot differs"))?;
-    let value = serde_json::from_slice(own_request)?;
-    require(
-        mayhem_proto::endpoint_request_fingerprint(&value) == t.request_hash,
-        "buyer request differs",
-    )?;
-    // Independently enforce the buyer's original endpoint shape and binding.
-    // Full schema/regex execution below stays in the isolated verifier worker.
-    let adapter = crate::endpoint::Adapter::restore(snapshot.adapter.clone())
-        .map_err(|_| invalid("buyer endpoint snapshot is invalid"))?;
-    let prepared = if value.get("stream") == Some(&serde_json::Value::Bool(true)) {
-        adapter.prepare_stream(own_request)
-    } else {
-        adapter.prepare_json(own_request)
-    }
-    .map_err(|_| invalid("buyer request violates its original contract"))?;
-    require(
-        prepared.matches_binding(&binding),
-        "buyer endpoint binding differs",
-    )?;
+    // The buyer verifies its own request against public contract data. Provider
+    // translation and private model mapping are not needed to approve a receipt.
+    let prepared = snapshot.verify_request(&binding, own_request)?;
     let id = received.body["id"]
         .as_str()
         .ok_or_else(|| invalid("buyer result identity missing"))?;
@@ -278,7 +260,7 @@ pub async fn approve_terminal(
             &subtotal.binding,
             prepared.semantic_policy(),
             &received.body,
-            adapter.limits().response_bytes,
+            prepared.response_byte_limit(),
         )
         .await
         .map_err(|_| invalid("buyer result failed isolated endpoint contract verification"))?;

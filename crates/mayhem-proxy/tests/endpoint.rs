@@ -325,3 +325,29 @@ fn decisions_validate_every_question_type_exact_ids_labels_probabilities_and_sco
     extra["answers"]["extra"] = json!({"type":"noul","noul":0.5});
     assert!(request.decode_json(extra, "p", 0).is_err());
 }
+
+#[test]
+fn buyer_verifier_does_not_apply_provider_translation_or_dispatch_size_to_original_request() {
+    use mayhem_proxy::endpoint::{PublicAdapter, PublicAdapterSnapshot};
+    let provider = adapter(ProxyEndpoint::Responses);
+    let original = br#"{"model":"public-model","input":"hello"}"#;
+    let mut snapshot = provider.public_snapshot();
+    snapshot.limits.request_bytes = original.len();
+    let buyer = PublicAdapter::restore(snapshot.clone()).unwrap();
+    let request = buyer.prepare_json(original).unwrap();
+    assert_eq!(
+        request.request_hash(),
+        provider.prepare_json(original).unwrap().request_hash()
+    );
+    assert_eq!(buyer.recipe_hash(), provider.recipe_hash());
+    let mut too_long = original.to_vec();
+    too_long.push(b' ');
+    assert!(buyer.prepare_json(&too_long).is_err());
+    let mut wrong = serde_json::to_value(snapshot).unwrap();
+    wrong["upstream_model"] = json!("secret-private-mapping");
+    assert!(serde_json::from_value::<PublicAdapterSnapshot>(wrong).is_err());
+    assert!(serde_json::from_value::<PublicAdapterSnapshot>(
+        serde_json::to_value(provider.snapshot()).unwrap()
+    )
+    .is_err());
+}

@@ -4,14 +4,15 @@
 //! capacity evidence nor authorization to accept or settle an inference request.
 
 pub mod attempts;
+pub mod buyer;
 pub mod capacity;
 pub mod catalog;
 pub mod cli;
 pub mod connector;
 pub mod discovery;
 pub mod endpoint;
-pub mod execution;
 pub mod exchange;
+pub mod execution;
 pub mod financial;
 pub mod matching;
 pub mod metering;

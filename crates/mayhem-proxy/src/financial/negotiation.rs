@@ -1,10 +1,7 @@
 //! Buyer-owned durable pre-signing negotiation. No signature leaves this parent
 //! until its exact request/terms and signature are committed. No upstream POST.
 use super::*;
-use crate::{
-    attempts::{self, AcceptanceSnapshot},
-    signing::Authority,
-};
+use crate::{attempts, buyer::Snapshot, signing::Authority};
 use quote::{PreparedPurchase, RetainedPurchase};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use std::{
@@ -151,7 +148,7 @@ impl SavedPurchase {
     pub fn policy(&self) -> &ProxySettlementPolicy {
         &self.record.purchase.policy
     }
-    pub fn snapshot(&self) -> &AcceptanceSnapshot {
+    pub fn snapshot(&self) -> &Snapshot {
         &self.record.purchase.snapshot
     }
     pub fn request(&self) -> &[u8] {

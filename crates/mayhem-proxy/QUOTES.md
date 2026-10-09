@@ -24,10 +24,12 @@ and response bodies and concurrent control requests are bounded.
 1. Resolve `PriceLimits` from the buyer's actual request/project/account policy:
    every unit rate, fixed request charge, session minimum and total logical
    purchase limit. There is no inferred consent from the account balance.
-2. Construct `PurchaseRequest` from the owned outgoing request and selected
-   adapter, plus explicit epoch lifetimes and an output billing-unit allowance
+2. Construct `PurchaseRequest` from the owned outgoing request and public
+   `PublicAdapterSnapshot`, plus explicit epoch lifetimes and an output billing-unit allowance
    for text endpoints. Validation preserves streaming, tools and structured
-   output controls; unsupported requests fail before reservation.
+   output controls; unsupported requests fail before reservation. The snapshot
+   contains the endpoint contract, opaque recipe digest and buyer-local resource
+   limits. It never needs the provider's upstream model mapping or connector.
 3. `Observation::prepare_purchase` computes input units from the actual request.
    Decision requests reserve exactly their validated question count. Text
    requests reserve those input units plus the explicitly authorized output
@@ -50,13 +52,14 @@ funding and a durable capacity lease before sending an upstream request.
 Local tests construct purchases for Chat, Completions, Responses and Decisions
 on FIAT/TNK/TAP, including the three supported streaming forms, and admit their
 exact holds through the existing signed reservation/recovery path. Those tests
-use ephemeral fixture signatures, not a completed production negotiation signer.
+use ephemeral fixture identities and the protected negotiation signing path,
+not a completed public production service.
 They also cover stale offers, changed canonical views, request/signature/replay
 tampering, unready payout bindings, incompatible recipes, price/budget overruns
 and preservation of native holds. No real model or external payment is involved.
 
 The buyer-side durable signing and reservation handoff is documented in
-[NEGOTIATION.md](NEGOTIATION.md). Provider-side countersigning, authenticated offer
-exchange, supervisor startup and public API/Studio/MCP integration are still
+[NEGOTIATION.md](NEGOTIATION.md). Provider-side countersigning is implemented locally;
+authenticated offer exchange, supervisor startup and public API/Studio/MCP integration are still
 required. Do not expose an arbitrary-bytes signing RPC or sign merely because a
 quote was returned.

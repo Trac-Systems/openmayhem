@@ -12,6 +12,7 @@ mod finance;
 mod outcomes;
 mod payloads;
 mod provider;
+pub(crate) use acceptance::validate_offer_binding;
 pub use acceptance::{AcceptanceSnapshot, OwnedAcceptance};
 pub use outcomes::{TerminalDraft, WaiverDraft};
 pub use payloads::{OwnedRequest, OwnedResult, Recovery, ResultCommitment};

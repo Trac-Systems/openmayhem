@@ -1,5 +1,7 @@
 #[path = "provider_negotiation.rs"]
 mod provider;
+#[path = "buyer_public.rs"]
+mod public;
 use super::*;
 use financial::negotiation::{
     BuyerNegotiation, Limits as NegotiationLimits, Store as NegotiationStore,
@@ -45,7 +47,29 @@ async fn prepare(
     let q = peer.buyer_client.quote(&query(peer)).await.unwrap();
     let output = (f.adapter.endpoint() != ProxyEndpoint::Decisions).then_some(37);
     let intent = PurchaseRequest::new(
-        f.adapter.snapshot(),
+        // A buyer receives public contract data and an opaque canonical recipe
+        // digest. It never receives the provider's upstream model translation.
+        mayhem_proxy::endpoint::PublicAdapter::new(
+            f.adapter.endpoint(),
+            endpoint_family_contract_template(match f.adapter.endpoint() {
+                ProxyEndpoint::Chat => mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+                ProxyEndpoint::Completions => mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,
+                ProxyEndpoint::Responses => mayhem_proto::ENDPOINT_OPENAI_RESPONSES,
+                ProxyEndpoint::Decisions => mayhem_proto::ENDPOINT_MAYHEM_DECISIONS,
+            })
+            .unwrap(),
+            f.adapter.recipe_hash().clone(),
+            Limits {
+                request_bytes: 512 * 1024,
+                response_bytes: 512 * 1024,
+                choices: 8,
+                tools: 16,
+                questions: 16,
+                decision_options: 32,
+            },
+        )
+        .unwrap()
+        .snapshot(),
         bytes.to_vec(),
         prices(peer),
         output,
@@ -129,6 +153,10 @@ async fn negotiation_signs_owned_purchases_reopens_and_publishes_once_on_every_e
             let offer = saved.offer();
             offer.verify().unwrap();
             assert_eq!(saved.request(), bytes);
+            let public = serde_json::to_value(saved.snapshot()).unwrap();
+            assert_eq!(public["version"], 1);
+            assert!(public["adapter"].get("upstream_model").is_none());
+            assert_eq!(public["adapter"]["recipe_hash"], offer.terms.recipe_hash);
             assert!(!saved.confirmed());
             assert!(saved.authorization().is_none());
             assert_eq!(
@@ -226,7 +254,7 @@ async fn negotiation_serializes_conflicting_signatures_and_rejects_provider_subs
     another.billing_id = d(2002).as_str().into();
     let q = peer.buyer_client.quote(&another).await.unwrap();
     let intent = PurchaseRequest::new(
-        f.adapter.snapshot(),
+        f.adapter.public_snapshot(),
         bytes.clone(),
         prices(&peer),
         Some(37),
@@ -405,7 +433,7 @@ async fn negotiation_reserved_storage_can_finish_after_limits_are_lowered() {
     other.billing_id = d(4000).as_str().into();
     let q = peer.buyer_client.quote(&other).await.unwrap();
     let intent = PurchaseRequest::new(
-        f.adapter.snapshot(),
+        f.adapter.public_snapshot(),
         bytes.clone(),
         prices(&peer),
         Some(37),

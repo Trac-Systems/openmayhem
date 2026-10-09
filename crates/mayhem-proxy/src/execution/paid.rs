@@ -515,6 +515,25 @@ impl PaidExecutor {
             })
             .await
     }
+    /// Historical countersignature only; never substitutes for canonical funding
+    /// or the current capacity/dispatch checks in prepare_accepted/execute.
+    pub(crate) async fn matches_provider_acceptance(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+        authorization: &ProxySpendAuthorization,
+    ) -> Result<bool> {
+        let key = invocation.clone();
+        let expected = authorization.clone();
+        self.executor
+            .storage
+            .run(move |journal| {
+                Ok(journal
+                    .provider_acceptance(&key, attempt)?
+                    .is_some_and(|saved| saved.authorization == expected))
+            })
+            .await
+    }
     pub(crate) async fn request_cancel(
         &self,
         invocation: &Digest,

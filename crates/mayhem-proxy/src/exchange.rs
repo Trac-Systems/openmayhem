@@ -98,7 +98,7 @@ impl Session {
     pub fn decode_result(
         &self,
         received: Received,
-        snapshot: &crate::attempts::AcceptanceSnapshot,
+        snapshot: &impl crate::buyer::Evidence,
         own_request: &[u8],
     ) -> Result<crate::endpoint::ProtocolReply> {
         if self.role != Role::Buyer
@@ -112,21 +112,9 @@ impl Session {
         };
         let binding = crate::financial::terms_binding(&self.authorization.terms)
             .map_err(|_| Error::Identity)?;
-        snapshot
-            .validate_for(&binding)
+        let prepared = snapshot
+            .verify_request(&binding, own_request)
             .map_err(|_| Error::Identity)?;
-        let adapter = crate::endpoint::Adapter::restore(snapshot.adapter.clone())
-            .map_err(|_| Error::Protocol)?;
-        let request: Value = serde_json::from_slice(own_request).map_err(|_| Error::Protocol)?;
-        let prepared = if request.get("stream") == Some(&Value::Bool(true)) {
-            adapter.prepare_stream(own_request)
-        } else {
-            adapter.prepare_json(own_request)
-        }
-        .map_err(|_| Error::Protocol)?;
-        if !prepared.matches_binding(&binding) {
-            return Err(Error::Identity);
-        }
         let id = format!("proxy_{}", self.invocation.as_str());
         if response["id"].as_str() != Some(id.as_str()) {
             return Err(Error::Identity);
@@ -169,12 +157,24 @@ impl Session {
     async fn existing(&self, executor: &PaidExecutor) -> Result<Option<crate::attempts::Recovery>> {
         let saved = executor.recover_current(&self.invocation).await?;
         if let Some(saved) = &saved {
-            if saved
-                .financial
-                .as_ref()
-                .map(|f| &f.accepted().authorization)
-                != Some(&self.authorization)
-            {
+            let matches = if let Some(financial) = &saved.financial {
+                financial.accepted().authorization == self.authorization
+            } else {
+                // Negotiation saves a Prepared attempt before the buyer can
+                // publish its hold. Only that exact durable countersignature
+                // can bridge into paid admission; no unsigned draft may do so.
+                saved.record.phase == crate::attempts::Phase::Prepared
+                    && saved.acceptance.is_some()
+                    && saved.request.is_some()
+                    && executor
+                        .matches_provider_acceptance(
+                            &self.invocation,
+                            saved.record.attempt,
+                            &self.authorization,
+                        )
+                        .await?
+            };
+            if !matches {
                 return Err(Error::Identity);
             }
         }

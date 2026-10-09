@@ -1,9 +1,17 @@
 use super::*;
 use mayhem_proxy::exchange::{self, Channel, Limits, Message, Role, Session};
 #[path = "exchange_bridge.rs"]
-mod exchange_bridge;
-use super::protected_signing::{authorities, buyer as buyer_recovery, key, snapshot};
+pub(super) mod exchange_bridge;
+use super::protected_signing::{authorities, buyer as buyer_recovery, key};
 use exchange_bridge::Bridge;
+
+fn snapshot(p: &Paid) -> mayhem_proxy::buyer::PublicAcceptanceSnapshot {
+    mayhem_proxy::buyer::PublicAcceptanceSnapshot {
+        version: 1,
+        adapter: p._fixture.adapter.public_snapshot(),
+        offer: p.authorization.terms.offer.clone(),
+    }
+}
 
 async fn channels(p: &Paid, bridge: &Bridge, bound: usize) -> (Channel, Channel) {
     let mut buyer = p.peer.identity.clone();
