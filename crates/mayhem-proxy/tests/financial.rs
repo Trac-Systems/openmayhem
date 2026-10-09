@@ -12,6 +12,7 @@ struct Fixture {
     lines: tokio::io::Lines<BufReader<ChildStdout>>,
     client: Client,
     auth: ProxySpendAuthorization,
+    policy: mayhem_proto::proxy::finance::ProxySettlementPolicy,
     buyer_client: std::sync::Arc<Client>,
 }
 impl Fixture {
@@ -19,13 +20,16 @@ impl Fixture {
         Self::new_with_expiry(rail, family, false).await
     }
     async fn new_with_expiry(rail: &str, family: &str, expiry: bool) -> Self {
+        Self::new_with_mode(rail, family, if expiry { "expiry" } else { "no_expiry" }).await
+    }
+    async fn new_with_mode(rail: &str, family: &str, mode: &str) -> Self {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let mut child = tokio::process::Command::new("node")
             .arg("intercom/tests/helpers/proxy-financial-rpc-fixture.mjs")
             .arg(rail)
             .arg(family)
             .arg("null")
-            .arg(if expiry { "expiry" } else { "no_expiry" })
+            .arg(mode)
             .current_dir(root)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -63,6 +67,7 @@ impl Fixture {
                 .unwrap(),
             ),
             auth: serde_json::from_value(v["authorization"].clone()).unwrap(),
+            policy: serde_json::from_value(v["policy"].clone()).unwrap(),
         }
     }
     async fn command(&mut self, c: &str) {

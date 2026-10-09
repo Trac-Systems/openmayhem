@@ -2,12 +2,15 @@
 //! never provider execution authority. Expiry does NOT close the provider journal,
 //! free its capacity or make an unknown job safe to repeat.
 mod approvals;
+mod reservations;
 use super::*;
 use crate::attempts;
 use approvals::Acknowledgment;
 pub use approvals::SignedAcknowledgment;
 use mayhem_proto::proxy::finance::{ProxyExpiryBody, ProxyHoldExpiry, ProxyReservationExpiry};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
+use reservations::ReservationIntent;
+pub use reservations::ReservationStatus;
 use std::{
     ops::Bound,
     path::Path,
@@ -174,6 +177,7 @@ fn decode_meta(bytes: &[u8]) -> Result<Meta> {
 /// Retained evidence for the authenticated buyer's startup/recovery worker.
 /// Reading it does not renew canonical freshness or authorize publication.
 pub struct RecoveryStatus {
+    pub reservation: Option<ReservationStatus>,
     pub authorization: ProxySpendAuthorization,
     pub policy: ProxySettlementPolicy,
     pub draft: Option<ProxyExpiryBody>,
@@ -196,6 +200,8 @@ struct Record {
     prune_after: Option<u64>,
     #[serde(default)]
     acknowledgment: Option<Acknowledgment>,
+    #[serde(default)]
+    reservation: Option<ReservationIntent>,
 }
 impl Record {
     fn key(&self) -> Result<String> {
@@ -224,6 +230,17 @@ impl Record {
         )?;
         if let Some(a) = &self.acknowledgment {
             a.validate(&self.authorization, &self.policy)?;
+        }
+        if let Some(intent) = &self.reservation {
+            intent.validate()?;
+            require(
+                intent.proof.is_some()
+                    || (self.acknowledgment.is_none()
+                        && self.draft.is_none()
+                        && self.signed.is_none()
+                        && self.confirmed.is_none()),
+                "unconfirmed reservation has a financial outcome intent",
+            )?;
         }
         if let Some(d) = &self.draft {
             d.validate().map_err(|_| invalid("invalid saved expiry"))?;
@@ -442,12 +459,19 @@ impl Store {
             closed_at: None,
             prune_after: None,
             acknowledgment: None,
+            reservation: None,
         });
         require(
             r.authorization == o.accepted().authorization
                 && r.policy == o.accepted().settlement_policy,
             "original recovery terms changed",
         )?;
+        let newly_accepted = r.reservation.as_ref().is_some_and(|v| v.proof.is_none());
+        if let Some(intent) = &mut r.reservation {
+            if intent.proof.is_none() {
+                intent.proof = Some(o.proof().clone());
+            }
+        }
         if let Some(old) = &r.confirmed {
             if outcome.as_ref() == Some(old) {
                 return Ok(r);
@@ -462,7 +486,11 @@ impl Store {
                 ),
                 "canonical recovery outcome regressed or conflicts",
             )?;
-        } else if existing.is_some() && outcome.is_none() && (!prepare || r.draft.is_some()) {
+        } else if existing.is_some()
+            && !newly_accepted
+            && outcome.is_none()
+            && (!prepare || r.draft.is_some())
+        {
             return Ok(r); // Polling an unchanged hold performs no write/fsync.
         }
         if let Some(outcome) = outcome {
@@ -723,6 +751,7 @@ impl BuyerRecovery {
                 .as_ref()
                 .is_some_and(|a| a.buyer_sig.is_some());
             Ok(RecoveryStatus {
+                reservation: r.reservation.as_ref().map(ReservationIntent::status),
                 outcome_approved,
                 outcome_signed,
                 authorization: r.authorization,

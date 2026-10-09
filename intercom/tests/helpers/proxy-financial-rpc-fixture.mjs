@@ -15,11 +15,12 @@ import { proxyReceiptFixture } from './proxy-finance.js';
 import { closure } from './proxy-closure.js';
 import { prepareProxyClose, prepareProxyExpiry } from '../../contract/proxy-closure.js';
 import { proxyBuyerReceiptSigningBytes, proxyProviderReceiptSigningBytes, proxyBuyerClosureSigningBytes, proxyProviderClosureSigningBytes, proxyBuyerExpirySigningBytes } from '../../contract/proxy-finance.js';
-import { proxyUsageFeatureKey } from '../../contract/proxy-reservations.js';
+import { proxyUsageFeatureKey, proxyReservationFeatureKey } from '../../contract/proxy-reservations.js';
 import { proxyCloseFeatureKey, proxyExpireFeatureKey } from '../../contract/proxy-closure.js';
 const execution=process.argv[4]?JSON.parse(process.argv[4]):null;
-const f=await proxyReceiptFixture(process.argv[2]??'tnk',process.argv[3]??'llm',execution,Boolean(execution),process.argv[5]==='expiry');
-let reserved=!execution;
+const deferred=Boolean(execution)||process.argv[5]==='unreserved';
+const f=await proxyReceiptFixture(process.argv[2]??'tnk',process.argv[3]??'llm',execution,deferred,process.argv[5]==='expiry');
+let reserved=!deferred;
 const root=await fs.mkdtemp(path.join(os.tmpdir(),'proxy-finance-rpc-'));
 const store=new Corestore(root);
 const view=new Hyperbee(store.get({name:'financial'}),{keyEncoding:'utf-8',valueEncoding:'json',extension:false});
@@ -51,10 +52,11 @@ let submissions=0,publications=0,pending=null,publicationMode=null,publicationTa
 // canonical signed-view service. The remote relay/indexer transport is simulated;
 // its durable append journal has separate real-Autobase integration coverage.
 async function applyReceipt(key,value) {
-  const waiver=value.op==='proxy_close_reservation',expires=value.op==='proxy_expire_reservation';
-  if(key!==await (expires?proxyExpireFeatureKey(value):waiver?proxyCloseFeatureKey(value):proxyUsageFeatureKey(value)))throw new Error('fixture publication key differs');
-  const plan=expires?await prepareProxyExpiry(f.ledger,value,f.context,f.peer.wallet.verify):waiver?await prepareProxyClose(f.ledger,value,f.context,f.peer.wallet.verify):await f.finalize(value);
+  const reserve=value.op==='proxy_spend_reserve',waiver=value.op==='proxy_close_reservation',expires=value.op==='proxy_expire_reservation';
+  if(key!==await (reserve?proxyReservationFeatureKey(value):expires?proxyExpireFeatureKey(value):waiver?proxyCloseFeatureKey(value):proxyUsageFeatureKey(value)))throw new Error('fixture publication key differs');
+  const plan=reserve?await f.prepare(value):expires?await prepareProxyExpiry(f.ledger,value,f.context,f.peer.wallet.verify):waiver?await prepareProxyClose(f.ledger,value,f.context,f.peer.wallet.verify):await f.finalize(value);
   if(plan.writes.length) {await f.apply(plan);await sync();publications++;}
+  if(reserve)reserved=true;
   return plan.result;
 }
 participant.relay=buyerParticipant.relay=(key,value)=>{
@@ -89,7 +91,8 @@ await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));
 const buyerServer=createServer(buyerLocal);
 await new Promise(resolve=>buyerServer.listen(0,'127.0.0.1',resolve));
 console.log(JSON.stringify({url:`http://127.0.0.1:${server.address().port}/v1`,identity:f.network,
-  buyer_url:`http://127.0.0.1:${buyerServer.address().port}/v1`,buyer:f.buyer.publicKey,requester:f.provider.publicKey,authorization:f.authorize(f.terms).authorization}));
+  buyer_url:`http://127.0.0.1:${buyerServer.address().port}/v1`,buyer:f.buyer.publicKey,requester:f.provider.publicKey,
+  policy:f.settlementPolicy,authorization:f.authorize(f.terms).authorization}));
 try {
   for await(const command of readline.createInterface({input:process.stdin})) {
     if(command==='stop')break;
@@ -112,6 +115,10 @@ try {
         const body=request.sign_receipt;
         console.log(JSON.stringify({provider_sig:b4a.toString(f.provider.wallet.sign(proxyProviderReceiptSigningBytes(body)),'hex'),
           buyer_sig:b4a.toString(f.buyer.wallet.sign(proxyBuyerReceiptSigningBytes(body)),'hex')}));continue;
+      }
+      if(request.bind_lease && !reserved && Object.keys(request).length===1 && /^[0-9a-f]{64}$/.test(request.bind_lease)) {
+        f.terms.capacity_lease=request.bind_lease;
+        console.log(JSON.stringify({done:'bind_lease',policy:f.settlementPolicy,authorization:f.authorize(f.terms).authorization}));continue;
       }
       if(reserved||Object.keys(request).join(',')!=='reserve'||!/^[0-9a-f]{64}$/.test(request.reserve))throw new Error('invalid fixture reservation');
       f.terms.capacity_lease=request.reserve;

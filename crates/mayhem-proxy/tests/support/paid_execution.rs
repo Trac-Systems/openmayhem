@@ -272,6 +272,17 @@ impl Paid {
         streaming: bool,
         policy: Option<Value>,
     ) -> Self {
+        Self::start_configured(base, endpoint, rail, bytes, streaming, policy, false).await
+    }
+    async fn start_configured(
+        base: &str,
+        endpoint: ProxyEndpoint,
+        rail: ProxyRail,
+        bytes: &[u8],
+        streaming: bool,
+        policy: Option<Value>,
+        publish: bool,
+    ) -> Self {
         let f = Fixture::new(base, endpoint);
         let mut peer = Peer::start(rail, &f, bytes, streaming, policy).await;
         let journal = Arc::new(
@@ -330,10 +341,56 @@ impl Paid {
             )
             .unwrap();
         let lease = reservation.lease().id.clone();
-        let v = peer.command(&json!({"reserve":lease}).to_string()).await;
-        assert_eq!(v["done"], "reserve");
+        let operation = if publish { "bind_lease" } else { "reserve" };
+        let v = peer.command(&json!({operation:lease}).to_string()).await;
+        assert_eq!(v["done"], operation);
         let authorization: ProxySpendAuthorization =
             serde_json::from_value(v["authorization"].clone()).unwrap();
+        if publish {
+            use financial::recovery::{BuyerRecovery, Limits, Store};
+            let mut buyer_identity = peer.identity.clone();
+            buyer_identity.controller_pubkey =
+                Digest::new(&authorization.terms.buyer_pubkey).unwrap();
+            let buyer = BuyerRecovery::new(
+                Arc::new(
+                    Store::open(
+                        f._store.path().join("publication-buyer"),
+                        buyer_identity,
+                        Limits {
+                            max_records: 8,
+                            closed_retention_ms: 1000,
+                        },
+                    )
+                    .unwrap(),
+                ),
+                peer.buyer_client.clone(),
+                4,
+            )
+            .unwrap();
+            let key = buyer
+                .retain_reservation(
+                    authorization.clone(),
+                    serde_json::from_value(v["policy"].clone()).unwrap(),
+                    1000,
+                )
+                .await
+                .unwrap();
+            assert!(
+                !buyer
+                    .recover(key.clone())
+                    .await
+                    .unwrap()
+                    .reservation
+                    .unwrap()
+                    .confirmed
+            );
+            buyer
+                .publish_reservation(key, 1001)
+                .await
+                .unwrap()
+                .initial_binding()
+                .unwrap();
+        }
         let pool = Arc::new(
             Pool::new(
                 env!("CARGO_BIN_EXE_mayhem-proxy-worker"),
@@ -369,6 +426,45 @@ impl Paid {
             authorization,
             record,
             lease,
+        }
+    }
+}
+#[tokio::test]
+async fn buyer_published_reservations_enable_exact_paid_execution_and_settlement_on_all_rails() {
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        for (endpoint, bytes, response) in cases() {
+            let backend = backend(200, response, Duration::ZERO).await;
+            let mut p =
+                Paid::start_configured(&backend.base, endpoint, rail, &bytes, false, None, true)
+                    .await;
+            assert_eq!(
+                backend.calls.load(Ordering::SeqCst),
+                0,
+                "reservation publication does not infer"
+            );
+            assert_eq!(p.peer.command("status").await["publications"], 1);
+            p.executor
+                .execute_json(&p.record.invocation, &bytes, &Cancellation::default())
+                .await
+                .unwrap();
+            let receipt = signed_terminal(&mut p).await;
+            p.executor
+                .retain_terminal_receipt(&p.record.invocation, p.record.attempt, &receipt)
+                .await
+                .unwrap();
+            assert!(p
+                .executor
+                .publish_terminal_receipt(&p.record.invocation, p.record.attempt)
+                .await
+                .unwrap());
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(p.peer.command("status").await["publications"], 2);
+            assert_eq!(
+                p.peer.command("state").await["summary"]["reserved_au"],
+                (50 + receipt.body.au_owed_cum).to_string(),
+                "native hold plus verified proxy liability remain until epoch settlement"
+            );
+            p.peer.stop().await;
         }
     }
 }

@@ -6,6 +6,8 @@ use mayhem_proxy::{
 };
 use serde_json::json;
 use std::{os::unix::fs::PermissionsExt, sync::Arc};
+#[path = "reservation_publication.rs"]
+mod reservation_publication;
 fn identity(f: &Fixture) -> attempts::Identity {
     let t = &f.auth.terms;
     attempts::Identity {

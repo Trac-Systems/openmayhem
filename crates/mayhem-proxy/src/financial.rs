@@ -397,6 +397,34 @@ impl Client {
     pub(crate) fn requester(&self) -> &str {
         &self.requester
     }
+    /// Only the buyer's durable recovery controller calls this with its saved
+    /// envelope. Acknowledgment is not canonical reservation confirmation.
+    pub(crate) async fn submit_reservation(
+        &self,
+        authorization: &ProxySpendAuthorization,
+        at: u64,
+    ) -> Result<()> {
+        let t = &authorization.terms;
+        authorization
+            .verify(crate::receipts::verify_signature)
+            .map_err(|_| invalid("reservation signatures rejected"))?;
+        require(
+            at <= PROXY_MAX_SAFE_INTEGER
+                && t.network_id == self.identity.network_id
+                && t.msb_bootstrap == self.identity.msb_bootstrap
+                && t.subnet_bootstrap == self.identity.subnet_bootstrap
+                && t.buyer_pubkey == self.requester,
+            "reservation publication identity differs",
+        )?;
+        let digest = t
+            .digest()
+            .map_err(|_| invalid("invalid reservation terms"))?;
+        self.submit_feature(
+            format!("proxy/spend/{digest}"),
+            json!({"op":"proxy_spend_reserve","authorization":authorization,"at":at}),
+        )
+        .await
+    }
     /// Submit the same durable, dual-signed receipt through the existing canonical
     /// publication journal. HTTP success is NOT settlement confirmation. Ambiguous
     /// submission must be followed by observation of the same accepted terms.
