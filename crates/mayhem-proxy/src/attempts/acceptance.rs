@@ -356,6 +356,7 @@ mod tests {
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_outcomes_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_jobs_v1")).unwrap();
         let mut meta = metadata(&tx).unwrap();
         meta.schema = 2;
         save_meta(&tx, &meta).unwrap();
@@ -389,6 +390,7 @@ mod tests {
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_outcomes_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_jobs_v1")).unwrap();
         let mut meta=metadata(&tx).unwrap();meta.schema=3;save_meta(&tx,&meta).unwrap();j.commit(tx).unwrap();drop(j);
         let j=Journal::open(&path,identity(),limits()).unwrap();
         let saved=j.recover(&r.invocation,r.attempt).unwrap();
@@ -412,6 +414,7 @@ mod tests {
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_outcomes_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_jobs_v1")).unwrap();
         let mut meta = metadata(&tx).unwrap();
         meta.schema = 4;
         save_meta(&tx, &meta).unwrap();
@@ -438,6 +441,7 @@ mod tests {
         let tx = j.transaction().unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_jobs_v1")).unwrap();
         let mut meta = metadata(&tx).unwrap(); meta.schema = 6; save_meta(&tx, &meta).unwrap();
         j.commit(tx).unwrap(); drop(j);
         let j = Journal::open(&path, identity(), limits()).unwrap();
@@ -459,6 +463,7 @@ mod tests {
         let r = j.begin_dispatch(&r.invocation, r.generation, 101).unwrap().record().clone();
         let tx = j.transaction().unwrap();
         tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_jobs_v1")).unwrap();
         let mut meta = metadata(&tx).unwrap(); meta.schema = 7; save_meta(&tx, &meta).unwrap();
         j.commit(tx).unwrap(); drop(j);
         let j = Journal::open(&path, identity(), limits()).unwrap();

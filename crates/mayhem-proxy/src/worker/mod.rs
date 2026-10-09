@@ -180,7 +180,10 @@ impl Init {
     fn validate(&self) -> Result<()> {
         self.limits.validate()?;
         if self.semantic_policy.is_some()
-            && !matches!(self.format, WireFormat::Json | WireFormat::Sse)
+            && !matches!(
+                self.format,
+                WireFormat::Json | WireFormat::Sse | WireFormat::Ndjson
+            )
         {
             return Err(Error::Configuration);
         }
@@ -297,12 +300,23 @@ fn emit(
     let bytes = json(&event, init.limits.ipc_bytes()).map_err(|_| too_large())?;
     write_packet(w, EVENT, &bytes).map_err(|_| protocol())
 }
-fn emit_frame(w: &mut impl Write, frame: Frame, init: &Init) -> std::result::Result<(), Failure> {
-    let event = match frame {
-        Frame::Sse { event, data, id } => Decoded::Sse { event, data, id },
-        Frame::Ndjson(value) => Decoded::Ndjson { value },
+fn emit_frame(
+    w: &mut impl Write,
+    frame: Frame,
+    init: &Init,
+    verifier: Option<&mut crate::semantics::Verifier>,
+) -> std::result::Result<(), Failure> {
+    let event = match verifier {
+        Some(verifier) => verifier.stream_frame(frame)?,
+        None => Some(match frame {
+            Frame::Sse { event, data, id } => Decoded::Sse { event, data, id },
+            Frame::Ndjson(value) => Decoded::Ndjson { value },
+        }),
     };
-    emit(w, event, init, None)
+    if let Some(event) = event {
+        emit(w, event, init, None)?;
+    }
+    Ok(())
 }
 
 /// One attempt, then exit. No shell, network, model execution or filesystem API.
@@ -362,6 +376,19 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> Result<()> {
                     if Some(policy.digest()?) != init.semantic_policy {
                         return Err(crate::semantics::bad_schema("tools"));
                     }
+                    if init.format != WireFormat::Json {
+                        let expected = policy
+                            .recipe
+                            .as_ref()
+                            .and_then(|r| r.recipe.stream.as_ref())
+                            .map(|s| s.format.wire());
+                        if expected.map_or(
+                            init.format != WireFormat::Sse || policy.recipe.is_some(),
+                            |f| f != init.format,
+                        ) {
+                            return Err(crate::semantics::bad_schema("stream"));
+                        }
+                    }
                     crate::semantics::Verifier::new(policy)
                 };
                 match compile() {
@@ -383,7 +410,9 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> Result<()> {
                 } else {
                     received += packet.bytes.len();
                     if let Some(decoder) = &mut decoder {
-                        decoder.push(&packet.bytes, |event| emit_frame(&mut output, event, &init))
+                        decoder.push(&packet.bytes, |event| {
+                            emit_frame(&mut output, event, &init, verifier.as_mut())
+                        })
                     } else if packet.bytes.len()
                         > init.limits.max_event_bytes.saturating_sub(bytes.len())
                     {
@@ -401,7 +430,7 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> Result<()> {
                     && (init.semantic_policy.is_none() || verifier.is_some()) =>
             {
                 if let Some(decoder) = &mut decoder {
-                    decoder.finish(|event| emit_frame(&mut output, event, &init))
+                    decoder.finish(|event| emit_frame(&mut output, event, &init, verifier.as_mut()))
                 } else {
                     serde_json::from_slice(&bytes)
                         .map_err(|_| protocol())
@@ -425,7 +454,8 @@ pub fn run(mut input: impl Read, mut output: impl Write) -> Result<()> {
                 decoder
                     .as_mut()
                     .ok_or(Error::Protocol)?
-                    .finish(|event| emit_frame(&mut output, event, &init))
+                    .finish(|event| emit_frame(&mut output, event, &init, verifier.as_mut()))
+                    .and_then(|_| verifier.as_ref().ok_or_else(protocol)?.finish_frames())
             }
             VERIFY_CHUNK if frames_ended && !packet.bytes.is_empty() => {
                 if packet.bytes.len() > init.limits.max_event_bytes.saturating_sub(bytes.len()) {

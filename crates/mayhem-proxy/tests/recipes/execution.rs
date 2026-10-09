@@ -300,3 +300,9 @@ async fn worker_enforces_adapter_byte_limit_before_emitting_expanded_projection(
         .is_none());
     assert_eq!(server.calls.load(Ordering::SeqCst), 1);
 }
+
+#[path = "streaming.rs"]
+mod streaming;
+
+#[path = "jobs.rs"]
+mod jobs;

@@ -64,7 +64,7 @@ impl Transport<'_> {
         if let Some(sample) = sample {
             sample.headers();
         }
-        if response.status != 200 || response.format != WireFormat::Sse {
+        if response.status != 200 || response.format != self.adapter.stream_format() {
             return Err(Error::Upstream(Failure::new(
                 Code::UpstreamProtocol,
                 Scope::Model,
@@ -177,16 +177,28 @@ impl Transport<'_> {
     pub(super) async fn perform(
         &self,
         request: &Request,
-        mut decoder: worker::host::Active,
+        decoder: worker::host::Active,
         public_id: &str,
         created: u64,
         sample: &mut Option<health::Sample>,
     ) -> Result<ProtocolReply> {
-        let mut response = self
+        let response = self
             .connection
             .send(self.adapter.operation(), Some(request.body().to_vec()))
             .await
             .map_err(Error::Upstream)?;
+        self.receive_json(request, decoder, response, public_id, created, sample)
+            .await
+    }
+    pub(super) async fn receive_json(
+        &self,
+        request: &Request,
+        mut decoder: worker::host::Active,
+        mut response: crate::connector::http::UpstreamResponse,
+        public_id: &str,
+        created: u64,
+        sample: &mut Option<health::Sample>,
+    ) -> Result<ProtocolReply> {
         if let Some(sample) = sample {
             sample.headers();
         }

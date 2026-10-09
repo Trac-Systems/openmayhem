@@ -187,6 +187,10 @@ impl Paid {
                 "proxy_provider_retirement_v1",
             ))
             .unwrap();
+            tx.delete_table(redb::TableDefinition::<&str, &[u8]>::new(
+                "proxy_attempt_jobs_v1",
+            ))
+            .unwrap();
             {
                 let mut meta = tx
                     .open_table(redb::TableDefinition::<&str, &[u8]>::new(
@@ -2165,3 +2169,96 @@ async fn paid_buyer_expiry_of_unknown_stream_never_frees_capacity_or_retries_exe
 
 #[path = "proxy_signing.rs"]
 mod protected_signing;
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn signed_terminal_recovery_skips_job_payloads_and_upstream_after_independent_closure() {
+    use redb::ReadableTable;
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let mut p = Paid::start(
+        &backend.base,
+        ProxyEndpoint::Chat,
+        ProxyRail::Fiat,
+        &chat(),
+        false,
+    )
+    .await;
+    p.executor
+        .execute_json(&p.record.invocation, &chat(), &Cancellation::default())
+        .await
+        .unwrap();
+    let receipt = signed_terminal(&mut p).await;
+    p.executor
+        .retain_terminal_receipt(&p.record.invocation, p.record.attempt, &receipt)
+        .await
+        .unwrap();
+    p.executor
+        .reconcile_capacity(&p.record.invocation, p.record.attempt)
+        .await
+        .unwrap();
+    let key = format!("{}:{:020}", p.record.invocation.as_str(), p.record.attempt);
+    let mut p = p.reopen_edit(false, move |tx| {
+        tx.open_table(redb::TableDefinition::<&str, &[u8]>::new(
+            "proxy_attempt_jobs_v1",
+        ))
+        .unwrap()
+        .insert(
+            key.as_str(),
+            serde_json::to_vec(
+                &json!({"generation":1,"until":0,"next":0,"cancel_sent":false,"stopped":false}),
+            )
+            .unwrap()
+            .as_slice(),
+        )
+        .unwrap();
+        let mut meta = tx
+            .open_table(redb::TableDefinition::<&str, &[u8]>::new(
+                "proxy_attempt_meta_v1",
+            ))
+            .unwrap();
+        let mut value: Value =
+            serde_json::from_slice(meta.get("state").unwrap().unwrap().value()).unwrap();
+        value["payload_bytes"] = json!(value["payload_bytes"].as_u64().unwrap() + 1024);
+        meta.insert("state", serde_json::to_vec(&value).unwrap().as_slice())
+            .unwrap();
+        tx.open_table(redb::TableDefinition::<&str, &[u8]>::new(
+            "proxy_owned_requests_v1",
+        ))
+        .unwrap()
+        .insert(key.as_str(), b"unreadable-owned-input".as_slice())
+        .unwrap();
+    });
+    assert!(p
+        .journal
+        .recover(&p.record.invocation, p.record.attempt)
+        .is_err());
+    let direct = Executor::new(
+        p._fixture.connection.clone(),
+        p._fixture.adapter.clone(),
+        Arc::new(p.verifier()),
+        Arc::new(Storage::new(p.journal.clone(), 8).unwrap()),
+    )
+    .unwrap();
+    assert!(direct
+        .resume_job(&p.record.invocation, p.record.attempt)
+        .await
+        .unwrap());
+    assert!(p
+        .executor
+        .resume_saved_for_test(&p.record.invocation, p.record.attempt)
+        .await
+        .unwrap());
+    assert_eq!(
+        p.journal
+            .terminal_receipt(&p.record.invocation, p.record.attempt)
+            .unwrap(),
+        Some(receipt)
+    );
+    assert_eq!(
+        p.journal.get(&p.record.invocation).unwrap().unwrap().phase,
+        Phase::Closed
+    );
+    assert_eq!(p.peer.command("status").await["publications"], 1);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    p.peer.stop().await;
+}

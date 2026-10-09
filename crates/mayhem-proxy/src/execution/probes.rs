@@ -35,6 +35,7 @@ pub struct Controller {
     authority: Arc<capacity::Authority>,
     monitor: health::Monitor,
     request: Request,
+    request_class: crate::conformance::Class,
     specification: Specification,
     limits: Limits,
     streaming: bool,
@@ -97,6 +98,12 @@ impl Controller {
         {
             return Err(ProbeError::Configuration);
         }
+        if adapter
+            .job()
+            .is_some_and(|job| job.operations().iter().any(|op| !connection.supports(*op)))
+        {
+            return Err(ProbeError::Configuration);
+        }
         let request = if streaming {
             adapter.prepare_stream(body)
         } else {
@@ -123,6 +130,10 @@ impl Controller {
             }
         }
         monitor.snapshot(&route)?;
+        let request_class = crate::conformance::Class::request(
+            &serde_json::from_slice(body).map_err(|_| ProbeError::Configuration)?,
+        )
+        .map_err(|_| ProbeError::Configuration)?;
         let specification = Specification {
             route,
             budget_group,
@@ -139,6 +150,7 @@ impl Controller {
             authority,
             monitor,
             request,
+            request_class,
             specification,
             limits,
             streaming,
@@ -205,7 +217,7 @@ impl Controller {
         let init = Init::probe(
             reserved.probe(),
             if self.streaming {
-                WireFormat::Sse
+                self.adapter.stream_format()
             } else {
                 WireFormat::Json
             },
@@ -270,7 +282,11 @@ impl Controller {
         };
         let public_id = format!("probe_{}", probe.id.as_str());
         let inference = async {
-            if self.streaming {
+            if self.adapter.job().is_some() {
+                transport
+                    .perform_probe_job(&self.request, active, &probe, &public_id, &mut sample)
+                    .await
+            } else if self.streaming {
                 transport
                     .perform_stream(
                         &self.request,
@@ -341,11 +357,7 @@ impl Controller {
                         request_hash: self.request.request_hash().clone(),
                         probe: probe.id.clone(),
                         result: evidence.clone(),
-                        class: crate::conformance::Class::request(
-                            &serde_json::from_slice(self.request.body())
-                                .map_err(|_| ProbeError::Configuration)?,
-                        )
-                        .map_err(|_| ProbeError::Configuration)?,
+                        class: self.request_class.clone(),
                         assertions: crate::conformance::capture::assertions(
                             self.streaming,
                             matches!(

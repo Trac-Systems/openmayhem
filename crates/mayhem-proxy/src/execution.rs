@@ -6,6 +6,7 @@
 //! close holds or sign receipts. The paid wrapper separately reconciles local
 //! capacity from retained terminal output or proven pre-send cancellation.
 
+mod jobs;
 mod paid;
 pub mod probes;
 mod timed_reader;
@@ -193,6 +194,12 @@ impl Executor {
         {
             return Err(Error::Configuration);
         }
+        if adapter
+            .job()
+            .is_some_and(|job| job.operations().iter().any(|op| !connection.supports(*op)))
+        {
+            return Err(Error::Configuration);
+        }
         Ok(Self {
             connection,
             adapter,
@@ -300,6 +307,10 @@ impl Executor {
         {
             return Err(Error::Binding);
         }
+        if let Some(job) = self.adapter.job() {
+            job.submit_body(request.body(), &record, self.adapter.recipe_request_limit())
+                .map_err(|_| Error::Configuration)?;
+        }
         match record.phase {
             Phase::Dispatched => return Err(Error::RecoveryRequired),
             Phase::Resolved | Phase::Closed => return Err(Error::ExistingResult),
@@ -326,7 +337,7 @@ impl Executor {
         let init = Init::new(
             &record,
             if streaming {
-                WireFormat::Sse
+                self.adapter.stream_format()
             } else {
                 WireFormat::Json
             },
@@ -388,6 +399,7 @@ impl Executor {
         } else {
             None
         };
+        let job_lease = self.reserve_job(&record).await?;
         let capacity = self.capacity.clone();
         let ticket = self
             .storage
@@ -446,7 +458,10 @@ impl Executor {
             sample.use_native(source)
         }
         let operation = async {
-            if streaming {
+            if let Some(lease) = job_lease {
+                drop(active);
+                self.submit_job(&record, &request, lease).await
+            } else if streaming {
                 self.transport()
                     .perform_stream(
                         &request,

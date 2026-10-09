@@ -59,8 +59,14 @@ impl PaidExecutor {
     /// Publish only an already retained, independently countersigned outcome.
     /// Missing acknowledgments/unknown execution never authorize a waiver or retry.
     pub(crate) async fn resume_saved(&self, invocation: &Digest, attempt: u64) -> Result<bool> {
+        // Independently retained closure/evidence takes priority over upstream
+        // control availability. Header-only recovery must not reopen payloads.
         self.resolve_saved_non_execution(invocation, attempt)
             .await?;
+        let header = self.recovery_header(invocation, attempt).await?;
+        if header.record.phase == Phase::Dispatched && !header.has_result {
+            self.executor.resume_job(invocation, attempt).await?;
+        }
         let saved = self.recovery_header(invocation, attempt).await?;
         if saved.has_result || saved.record.non_execution_evidence().is_some() {
             self.reconcile_capacity(invocation, attempt).await?;
@@ -84,6 +90,11 @@ impl PaidExecutor {
             Some(outcome) => self.publish_outcome(invocation, attempt, outcome).await,
             None => Ok(false),
         }
+    }
+    #[cfg(feature = "test-support")]
+    #[doc(hidden)]
+    pub async fn resume_saved_for_test(&self, invocation: &Digest, attempt: u64) -> Result<bool> {
+        self.resume_saved(invocation, attempt).await
     }
     pub(crate) async fn prune(&self, now: u64, limit: usize) -> Result<usize> {
         self.executor

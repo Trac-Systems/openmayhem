@@ -268,6 +268,7 @@ pub(crate) struct Verifier {
     output: Option<jsonschema::Validator>,
     json_object: bool,
     recipe: Option<(crate::recipe::Signed, usize)>,
+    stream_state: crate::recipe::stream::State,
 }
 impl Verifier {
     pub(crate) fn new(policy: Policy) -> Result<Self, Failure> {
@@ -314,6 +315,7 @@ impl Verifier {
             output,
             json_object,
             recipe: policy.recipe.zip(policy.recipe_response_bytes),
+            stream_state: Default::default(),
         })
     }
     fn tool(&self, name: &str, args: &str) -> Result<(), Failure> {
@@ -336,6 +338,38 @@ impl Verifier {
         }
         if let Some(validator) = &self.output {
             validator.validate(&value).map_err(|_| bad_output())?;
+        }
+        Ok(())
+    }
+    pub(crate) fn stream_frame(
+        &mut self,
+        frame: crate::connector::framing::Frame,
+    ) -> Result<Option<crate::worker::Decoded>, Failure> {
+        let Some((recipe, limit)) = &self.recipe else {
+            return Ok(Some(match frame {
+                crate::connector::framing::Frame::Sse { event, data, id } => {
+                    crate::worker::Decoded::Sse { event, data, id }
+                }
+                crate::connector::framing::Frame::Ndjson(value) => {
+                    crate::worker::Decoded::Ndjson { value }
+                }
+            }));
+        };
+        let stream = recipe.recipe.stream.as_ref().ok_or_else(bad_output)?;
+        stream.frame(
+            frame,
+            recipe.recipe.max_json_bytes.min(*limit),
+            &mut self.stream_state,
+        )
+    }
+    pub(crate) fn finish_frames(&self) -> Result<(), Failure> {
+        if let Some((recipe, _)) = &self.recipe {
+            recipe
+                .recipe
+                .stream
+                .as_ref()
+                .ok_or_else(bad_output)?
+                .finish(&self.stream_state)?;
         }
         Ok(())
     }

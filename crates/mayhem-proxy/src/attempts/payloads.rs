@@ -268,7 +268,34 @@ impl Journal {
         reply: &ProtocolReply,
         now_ms: u64,
     ) -> Result<OwnedResult> {
+        self.retain_result_checked(invocation, attempt, reply, now_ms, None)
+    }
+    pub(crate) fn retain_job_result(
+        &self,
+        lease: &super::jobs::Lease,
+        reply: &ProtocolReply,
+        now: u64,
+    ) -> Result<OwnedResult> {
+        self.retain_result_checked(
+            &lease.record().invocation,
+            lease.record().attempt,
+            reply,
+            now,
+            Some(lease),
+        )
+    }
+    fn retain_result_checked(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+        reply: &ProtocolReply,
+        now_ms: u64,
+        lease: Option<&super::jobs::Lease>,
+    ) -> Result<OwnedResult> {
         let tx = self.transaction()?;
+        if let Some(lease) = lease {
+            super::jobs::check(&tx, lease, now_ms)?;
+        }
         let mut record = current(&tx, invocation)?.ok_or(Error::NotFound)?;
         if record.attempt != attempt {
             return Err(Error::Stale);
@@ -398,6 +425,7 @@ impl Journal {
 }
 pub(super) fn prune(tx: &redb::WriteTransaction, key: &str, meta: &mut Meta) -> Result<()> {
     super::acceptance::prune(tx, key, meta)?;
+    super::jobs::prune(tx, key, meta)?;
     let mut table = storage(tx.open_table(PAYLOADS))?;
     let Some(p) = payload(&table, key)? else {
         return Ok(());
@@ -658,6 +686,113 @@ mod tests {
         );
     }
     #[test]
+    fn async_job_leases_survive_restart_fence_stale_writers_and_preserve_cancel_intent() {
+        let dir = private_dir();
+        let path = dir.path().join("journal");
+        let j = Journal::open(&path, identity(), limits()).unwrap();
+        let r = j.prepare(d(890), binding(), 100).unwrap();
+        j.retain_request(&r.invocation, r.attempt, BODY, 1024)
+            .unwrap();
+        let before = j.allocated_payload_bytes().unwrap();
+        j.reserve_job(&r.invocation, r.attempt).unwrap();
+        assert_eq!(j.allocated_payload_bytes().unwrap(), before + 1024);
+        j.reserve_job(&r.invocation, r.attempt).unwrap();
+        assert_eq!(j.allocated_payload_bytes().unwrap(), before + 1024);
+        let old = j
+            .claim_job(&r.invocation, r.attempt, 100, 100)
+            .unwrap()
+            .unwrap();
+        assert!(j
+            .claim_job(&r.invocation, r.attempt, 101, 100)
+            .unwrap()
+            .is_none());
+        j.begin_dispatch(&r.invocation, r.generation, 101).unwrap();
+        j.accept_job(&old, RemoteId::new("opaque-upstream-id").unwrap(), 102)
+            .unwrap();
+        j.mark_job_cancel(&old, 103).unwrap();
+        drop(j);
+        let j = Journal::open(&path, identity(), limits()).unwrap();
+        let next = j
+            .claim_job(&r.invocation, r.attempt, 200, 100)
+            .unwrap()
+            .unwrap();
+        assert!(next.cancel_sent);
+        assert!(matches!(
+            j.accept_job(&old, RemoteId::new("changed").unwrap(), 201),
+            Err(Error::Stale)
+        ));
+        assert!(matches!(
+            j.retain_job_result(&old, &reply(&r), 201),
+            Err(Error::Stale)
+        ));
+        assert!(matches!(
+            j.accept_job(&next, RemoteId::new("changed").unwrap(), 201),
+            Err(Error::Conflict)
+        ));
+        let result = j.retain_job_result(&next, &reply(&r), 201).unwrap();
+        assert_eq!(
+            j.recover(&r.invocation, r.attempt)
+                .unwrap()
+                .result
+                .unwrap()
+                .digest,
+            result.digest
+        );
+        assert_eq!(
+            j.get(&r.invocation)
+                .unwrap()
+                .unwrap()
+                .remote_id
+                .unwrap()
+                .as_str(),
+            "opaque-upstream-id"
+        );
+    }
+    #[test]
+    fn async_job_control_reserve_cannot_bypass_payload_quota() {
+        let dir = private_dir();
+        let mut l = limits();
+        l.max_payload_bytes = 1;
+        let j = Journal::open(dir.path().join("journal"), identity(), l).unwrap();
+        let r = j.prepare(d(891), binding(), 100).unwrap();
+        assert!(matches!(
+            j.reserve_job(&r.invocation, r.attempt),
+            Err(Error::Capacity)
+        ));
+        assert_eq!(j.allocated_payload_bytes().unwrap(), 0);
+        assert_eq!(
+            j.get(&r.invocation).unwrap().unwrap().phase,
+            Phase::Prepared
+        );
+    }
+    #[test]
+    fn schema_eight_upgrade_never_creates_a_job_or_redispatch_authority() {
+        let dir = private_dir();
+        let path = dir.path().join("journal");
+        let j = Journal::open(&path, identity(), limits()).unwrap();
+        let r = prepare(&j, 892);
+        let allocated = j.allocated_payload_bytes().unwrap();
+        let tx = j.transaction().unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_jobs_v1"))
+            .unwrap();
+        let mut meta = metadata(&tx).unwrap();
+        meta.schema = 8;
+        save_meta(&tx, &meta).unwrap();
+        j.commit(tx).unwrap();
+        drop(j);
+        let j = Journal::open(&path, identity(), limits()).unwrap();
+        assert_eq!(j.get(&r.invocation).unwrap().unwrap(), r);
+        assert!(!j.has_job(&r.invocation, r.attempt).unwrap());
+        assert_eq!(j.allocated_payload_bytes().unwrap(), allocated);
+        assert!(j.begin_dispatch(&r.invocation, r.generation, 102).is_err());
+        let tx = j.transaction().unwrap();
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new("proxy_attempt_jobs_v1"))
+            .unwrap();
+        j.commit(tx).unwrap();
+        drop(j);
+        assert!(Journal::open(&path, identity(), limits()).is_err());
+    }
+    #[test]
     fn old_record_only_journal_migrates_without_erasing_uncertain_attempts() {
         let dir = private_dir();
         let path = dir.path().join("journal");
@@ -678,6 +813,7 @@ mod tests {
             "proxy_attempt_outcomes_v1",
             "proxy_provider_acceptance_v1",
             "proxy_provider_retirement_v1",
+            "proxy_attempt_jobs_v1",
         ] {
             tx.delete_table(TableDefinition::<&str, &[u8]>::new(name))
                 .unwrap();

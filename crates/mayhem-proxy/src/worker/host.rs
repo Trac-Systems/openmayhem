@@ -269,6 +269,13 @@ pub struct Prepared {
     io: Worker,
 }
 impl Prepared {
+    pub(crate) fn attach_job(self, lease: &crate::attempts::jobs::Lease) -> Result<Active> {
+        if !self.io.semantics_ready || Session::from_record(lease.record())? != self.io.session {
+            return Err(Error::Identity);
+        }
+        Ok(Active { io: self.io })
+    }
+
     pub(crate) fn attach_probe(self, ticket: crate::capacity::probes::Dispatch) -> Result<Active> {
         if self.io.semantic_policy.is_some() && !self.io.semantics_ready {
             return Err(Error::Configuration);
@@ -351,7 +358,10 @@ impl Active {
         F: FnMut(Decoded) -> Fut,
         Fut: Future<Output = Result<()>>,
     {
-        if self.io.format != WireFormat::Sse || !self.io.semantics_ready || self.io.frames_ended {
+        if !matches!(self.io.format, WireFormat::Sse | WireFormat::Ndjson)
+            || !self.io.semantics_ready
+            || self.io.frames_ended
+        {
             return Err(Error::Configuration);
         }
         self.io.exchange(FRAME_END, &[], emit).await?;
@@ -516,7 +526,10 @@ impl Worker {
                         (Decoded::Json { .. }, WireFormat::Json)
                             | (Decoded::Sse { .. }, WireFormat::Sse)
                             | (Decoded::Ndjson { .. }, WireFormat::Ndjson)
-                    ) {
+                    ) && !(self.semantics_ready
+                        && self.format == WireFormat::Ndjson
+                        && matches!(event, Decoded::Sse { .. }))
+                    {
                         return Err(Error::Protocol);
                     }
                     tokio::select! {

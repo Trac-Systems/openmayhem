@@ -32,6 +32,9 @@ pub struct RequestField {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Projection {
+    Tuple {
+        items: Vec<Projection>,
+    },
     Copy {
         path: Vec<String>,
     },
@@ -246,16 +249,33 @@ impl Transform {
     }
 }
 impl Projection {
+    pub(super) fn requires_abi2(&self) -> bool {
+        match self {
+            Self::Tuple { .. } => true,
+            Self::Object { fields } => {
+                fields.is_empty() || fields.values().any(|field| field.value.requires_abi2())
+            }
+            Self::Array { item, .. } => item.requires_abi2(),
+            _ => false,
+        }
+    }
+
     pub(super) fn validate(&self) -> Result<()> {
         self.validate_inner(&mut 0, 0)
     }
     fn validate_inner(&self, n: &mut usize, d: usize) -> Result<()> {
         program(n, d)?;
         match self {
+            Self::Tuple { items } => {
+                check((1..=128).contains(&items.len()))?;
+                for item in items {
+                    item.validate_inner(n, d + 1)?;
+                }
+            }
             Self::Copy { path: p } => path(p)?,
             Self::Literal { value } => check(scalar(value))?,
             Self::Object { fields } => {
-                check(!fields.is_empty() && fields.len() <= 128)?;
+                check(fields.len() <= 128)?;
                 for (k, f) in fields {
                     check(key(k))?;
                     // Optional means exactly a missing copy path, never swallowing type errors.
@@ -292,6 +312,12 @@ impl Projection {
     fn run(&self, input: &Value, b: &mut Budget, d: usize) -> Result<Value> {
         b.step(d)?;
         match self {
+            Self::Tuple { items } => Ok(Value::Array(
+                items
+                    .iter()
+                    .map(|v| v.run(input, b, d + 1))
+                    .collect::<Result<_>>()?,
+            )),
             Self::Copy { path } => b.clone_value(read(input, path).ok_or(Error)?, d),
             Self::Literal { value } => b.clone_value(value, d),
             Self::Object { fields } => {

@@ -356,6 +356,9 @@ impl Adapter {
             recipe: None,
         })
     }
+    pub(crate) fn job(&self) -> Option<&crate::recipe::job::Job> {
+        self.recipe.as_ref().and_then(|r| r.recipe.job.as_ref())
+    }
     pub fn endpoint(&self) -> ProxyEndpoint {
         self.protocol.endpoint
     }
@@ -368,6 +371,13 @@ impl Adapter {
     pub fn limits(&self) -> Limits {
         self.protocol.limits
     }
+    pub(crate) fn recipe_request_limit(&self) -> usize {
+        self.recipe
+            .as_ref()
+            .map_or(self.limits().request_bytes, |r| {
+                r.recipe.max_json_bytes.min(self.limits().request_bytes)
+            })
+    }
     pub fn operation(&self) -> Operation {
         match self.protocol.endpoint {
             ProxyEndpoint::Chat => Operation::ChatCompletions,
@@ -379,9 +389,12 @@ impl Adapter {
     /// No settings are removed to make a backend accept a request. This adapter
     /// explicitly handles JSON replies; streaming is a separate execution path.
     pub fn prepare_json(&self, bytes: &[u8]) -> Result<Request> {
-        let mut request = self
+        let request = self
             .protocol
             .prepare(bytes, false, Some(&self.upstream_model))?;
+        self.translate(request)
+    }
+    fn translate(&self, mut request: Request) -> Result<Request> {
         if let Some(recipe) = &self.recipe {
             let input = serde_json::from_slice(&request.body).map_err(|_| Error::Configuration)?;
             let body = recipe
@@ -397,12 +410,24 @@ impl Adapter {
         }
         Ok(request)
     }
+    pub fn stream_format(&self) -> crate::connector::http::WireFormat {
+        self.recipe
+            .as_ref()
+            .and_then(|r| r.recipe.stream.as_ref())
+            .map_or(crate::connector::http::WireFormat::Sse, |s| s.format.wire())
+    }
     pub fn prepare_stream(&self, bytes: &[u8]) -> Result<Request> {
-        if self.recipe.is_some() {
+        if self
+            .recipe
+            .as_ref()
+            .is_some_and(|r| r.recipe.stream.is_none())
+        {
             return Err(invalid(Some("stream"), Code::UnsupportedControl));
         }
-        self.protocol
-            .prepare(bytes, true, Some(&self.upstream_model))
+        self.translate(
+            self.protocol
+                .prepare(bytes, true, Some(&self.upstream_model))?,
+        )
     }
 }
 

@@ -9,6 +9,7 @@
 
 mod acceptance;
 mod finance;
+pub(crate) mod jobs;
 mod non_execution;
 mod outcomes;
 mod payloads;
@@ -513,7 +514,7 @@ impl Journal {
             if meta.identity != identity {
                 return Err(Error::Identity);
             }
-            require(matches!(meta.schema, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8))?;
+            require(matches!(meta.schema, 1 | 2 | 3 | 4 | 5 | 6 | 7 | 8 | 9))?;
             require(
                 [
                     REQUESTS.name(),
@@ -551,11 +552,12 @@ impl Journal {
             outcomes::initialize(&tx, meta.schema < 5)?;
             provider::initialize(&tx, meta.schema < 7)?;
             retirement::initialize(&tx, meta.schema < 8)?;
+            jobs::initialize(&tx, meta.schema < 9)?;
             if meta.schema == 1 {
                 require(meta.payload_bytes == 0)?;
             }
-            if meta.schema < 8 {
-                meta.schema = 8;
+            if meta.schema < 9 {
+                meta.schema = 9;
                 storage(meta_table.insert("state", encode(&meta)?.as_slice()))?;
             }
         } else {
@@ -570,8 +572,9 @@ impl Journal {
             outcomes::initialize(&tx, true)?;
             provider::initialize(&tx, true)?;
             retirement::initialize(&tx, true)?;
+            jobs::initialize(&tx, true)?;
             let meta = Meta {
-                schema: 8,
+                schema: 9,
                 identity,
                 records: 0,
                 unfinished: 0,

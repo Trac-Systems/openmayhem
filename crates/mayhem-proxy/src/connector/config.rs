@@ -21,6 +21,10 @@ pub enum Operation {
     Completions,
     Responses,
     Decisions,
+    JobPoll,
+    JobResult,
+    JobCancel,
+    JobLookup,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, serde::Serialize)]

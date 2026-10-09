@@ -230,6 +230,9 @@ impl HttpConnection {
         })
     }
 
+    pub(crate) fn supports(&self, operation: Operation) -> bool {
+        self.paths.contains_key(&operation)
+    }
     pub fn fingerprint(&self) -> &crate::attempts::Digest {
         &self.fingerprint
     }

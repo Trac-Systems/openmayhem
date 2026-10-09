@@ -1,5 +1,7 @@
-//! Signed, data-only synchronous JSON connectors. Recipes never own networking,
+//! Signed, data-only JSON, streaming, and asynchronous job connectors. Recipes never own networking,
 //! credentials, executable code, usage policy, retries or payment authority.
+pub mod job;
+pub mod stream;
 mod transform;
 use crate::{
     attempts::Digest,
@@ -11,7 +13,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, io::Read, path::Path};
 pub use transform::{Field, Projection, RequestField, Transform};
 
-pub const ABI: u32 = 1;
+pub const ABI: u32 = 2;
 pub const MAX_RECIPE_BYTES: usize = 64 * 1024;
 pub const SIGNING_DOMAIN: &str = "mayhem/proxy/declarative-recipe/v1";
 #[derive(Debug, thiserror::Error)]
@@ -41,6 +43,10 @@ pub struct Recipe {
     pub outcome: Outcome,
     pub response: Projection,
     pub fixtures: Vec<Fixture>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stream: Option<stream::Stream>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub job: Option<job::Job>,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,15 +96,26 @@ impl Recipe {
         check(
             self.schema_version == 1
                 && self.revision > 0
-                && self.abi_min == ABI
-                && self.abi_max == ABI
+                && (1..=ABI).contains(&self.abi_min)
+                && (self.abi_min..=ABI).contains(&self.abi_max)
                 && (1..=16 * 1024 * 1024).contains(&self.max_json_bytes)
                 && (1..=8).contains(&self.fixtures.len()),
         )?;
         check(serde_json::to_vec(self).map_err(|_| Error)?.len() <= MAX_RECIPE_BYTES)?;
+        if let Some(stream) = &self.stream {
+            check(
+                self.abi_min == 2 && self.abi_max == 2 && self.endpoint != ProxyEndpoint::Decisions,
+            )?;
+            stream.validate(self.max_json_bytes, self.endpoint)?;
+        }
+        if let Some(job) = &self.job {
+            check(self.abi_min == 2 && self.abi_max == 2 && self.stream.is_none())?;
+            job.validate()?;
+        }
         self.request.validate()?;
         check(matches!(self.request, Transform::Object { .. }))?;
         self.response.validate()?;
+        check(!self.response.requires_abi2() || self.abi_min == 2)?;
         // Recipes cannot synthesize or reinterpret billing/usage claims. The
         // endpoint's existing independent meter sees only normalized model output.
         match &self.response {

@@ -1,8 +1,9 @@
-# Synchronous declarative JSON recipes
+# Declarative JSON, streaming and asynchronous recipes
 
 A provider can import a signed JSON connector for a different upstream JSON
 interface while retaining the existing Chat, Completions, stateless Responses
-or DECISIONS contract. This is a data-only synchronous extension. It does not
+or DECISIONS contract. This is a data-only extension with explicit synchronous JSON, streaming, and
+asynchronous job capabilities. It does not
 install code, authorize a destination, certify an upstream, publish an offer or
 change prices, reservation amounts, usage units or settlement.
 
@@ -79,8 +80,8 @@ controls, templates, expression execution or string interpolation. The existing
 private model selection and Responses `store=false` injection precede mapping;
 a recipe must represent those values too.
 
-Response projections are `copy`, scalar `literal`, `object`, bounded `array` and
-`enum`. Paths address object keys only. Optional fields are missing copy paths,
+Response projections are `copy`, scalar `literal`, `object`, bounded `array`,
+`enum`, and ABI-2 fixed `tuple` (up to 128 elements). Paths address object keys only. Optional fields are missing copy paths,
 not a way to suppress type failures. An explicit string outcome discriminator is
 mandatory. Success additionally requires an explicit error path to be present
 and null; missing/unknown outcomes, mixed errors and missing result data fail
@@ -108,13 +109,93 @@ Changing a recipe creates a new identity for new work. Journal acceptance and
 retained results recover the original request without redispatch, repricing,
 changing a receipt or consulting current recipe files.
 
+## ABI-2 streaming
+
+Existing ABI-1 signed recipes retain their exact serialization and digest. A
+recipe using `stream`, `job`, a `tuple`, or an empty output object explicitly
+requires ABI 2. New optional fields are absent in legacy signed serialization.
+
+`stream` declares `format` (`sse` or `ndjson`), exact `event_path`, a bounded
+`events` table, `max_events`, and one to four offline frame fixtures. SSE JSON
+frames become `{event,data,id}`; NDJSON JSON becomes `{event:null,data,id:null}`.
+The signed table maps each discriminator to a common endpoint `data` projection,
+`finish`, explicit sanitized `error`, or explicit `heartbeat`. Unknown events
+fail closed. Chat/Completions use an explicit finish marker; Responses terminate
+only through a verified `response.completed` or `response.incomplete` event.
+No URL, expression, dynamic event name or tool execution is interpreted.
+
+The supervised worker performs normalization with cumulative byte and event
+bounds. The existing common endpoint assembler then checks order, stable IDs,
+choice indices, tool argument fragments and terminals; the worker verifies the
+assembled final result against the original request's schemas before retention.
+Only the existing independent meter determines observable quantities. Stream
+fragments remain provisional, and local cancellation never certifies remote
+nonexecution. Signed examples `Chat-sse.json` and `Chat-ndjson.json` can be
+inspected/exported with the existing CLI. Offline fixtures establish mapping
+consistency, not upstream conformance or financial authority.
+
+## ABI-2 asynchronous jobs and recovery
+
+`job` declares exact submit HTTP status (200/201/202), `job_id_path`, bounded
+`poll_interval_ms` and `control_timeout_ms`, `status_path`, explicit status map,
+`poll`, `result`, and nullable `cancel`/`lookup`. Each control contains a
+`job_id_field` and nullable `response_id_path`. Status values are `pending`,
+`ready`, `cancelled`, `failed`, or `missing`. All required fixed operations must
+exist in the operator's local `ConnectionConfig.paths`: `job_poll`, `job_result`,
+optional `job_cancel`, and optional `job_lookup`. They inherit the same origin,
+credential, network policy, concurrency, and connection fingerprint. Recipes
+cannot add operations to a connection. Control responses are bounded to 16 KiB;
+result bytes retain the configured adapter/worker bound. Poll cadence is at least
+one second; a control step is at most 60 seconds. No total customer generation
+deadline or automatic resubmit is introduced.
+
+Submit crosses the existing durable financial/capacity dispatch fence once.
+A job-ID-only acknowledgment is sufficient for exact authenticated control
+requests. The returned opaque job ID is persisted before polling. If the API
+supports original-key recovery, `lookup` explicitly names `submit_key_field`,
+`lookup_key_field`, and required echoed `response_key_path`; the deterministic
+key binds invocation, attempt, request, recipe and connection. Missing or lost
+acknowledgment without that capability remains unresolved. Even a missing lookup
+result never authorizes resubmitting inference. The `Chat-async.json` example
+illustrates the public signed shape without a real destination or credential.
+
+Journal schema 9 adds one small control record per asynchronous attempt, charged
+1 KiB against the existing payload quota before dispatch. Indexed exact reads,
+durable generation leases, next-poll times, and a commit-before-send cancellation
+flag prevent concurrent/stale recovery and non-idempotent cancel replay. Existing
+unfinished-attempt maintenance calls the same bounded `Executor::resume_job`
+step. Recovery restores the immutable accepted adapter/request and verifies the
+original connection revision/fingerprint; a new recipe, rate, or target never
+replaces them. The completed original result passes the same worker, endpoint
+and meter before a fenced atomic result commit. Existing receipt and buyer
+reconciliation retain monetary authority.
+
+`cancel` explicitly declares whether the per-job operation is idempotent. Its
+ACK alone proves neither stopped execution nor financial closure. A cancelled
+or failed job status without a fully verified endpoint result remains unresolved;
+capacity and charges are not released by a status string or control lease expiry.
+A late verified completed result is retained under the original attempt even
+after cancellation. Verified partial/cancelled settlement remains a separate D2
+acceptance requirement. Exact-result recovery does not mutate settled charges.
+
+Explicit setup probes reuse submit/poll/result, the same supervised verification,
+and their existing timeout/cost/capacity allowance. Interrupted/ambiguous probes
+remain retained and occupied; no replacement probe is started automatically.
+Customer-job restart recovery uses the durable attempt journal. Asynchronous
+probe-job restart lookup/cancellation is not implemented: setup must retain its
+uncertain probe and use existing explicit reconciliation. Probe conformance
+classes bind the original common request before custom field translation.
+
 ## Remaining scope
 
 Dynamic question-key dictionaries can be copied intact; converting arbitrary keys
 into array entries or back requires a future explicitly bounded operation.
-Custom SSE/NDJSON, async submit/poll/result, per-job cancellation, OpenAPI/example
-assisted drafting, and expanded language defaults are unsupported in this phase.
-Custom streaming is rejected before dispatch. Recipes do not prove upstream
+OpenAPI/example assisted drafting and expanded language defaults remain unsupported.
+Streaming and async execution are separate capabilities: an async recipe cannot
+claim that polling a buffered result is streaming. DECISIONS streaming remains
+unsupported. Dynamic per-job URLs, GET query/path interpolation, arbitrary raw
+SSE payloads, and executing upstream-returned links are unsupported; local fixed
+POST control operations carry the opaque ID in a JSON body. Recipes do not prove upstream
 model identity, rights, privacy, tool support or authoritative capabilities.
 Explicit probes and the existing reviewed serving/admission path remain required;
 no automatic paid probes or arbitrary remote code are introduced.
