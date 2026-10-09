@@ -58,6 +58,13 @@ const coreOrigin=`http://127.0.0.1:${server.address().port}`;
 const nativeBalance=(await f.base.view.get('bal/existing-customer')).value,nativePayout=(await f.base.view.get('payout/epoch/542')).value;
 let configured=null,lastCompletion=null;
 async function run(command){
+ if(command.action==='advance_epoch'){
+  const previous=(await f.base.view.get('epoch/apply/state')).value;
+  const current=previous.updated_epoch??previous.epoch;
+  if(!Number.isSafeInteger(command.epoch)||command.epoch<=current)throw new Error('Fixture epoch must advance');
+  await f.base.append({type:'seed',entries:[['epoch/apply/state',{...previous,updated_epoch:command.epoch}]]});await f.base.update();
+  return {epoch:command.epoch};
+ }
  if(command.action==='inspect'){
   return {policy_reads:policyReads,canonical_appends:f.calls,pending:f.journal.list().length,model_calls:0,live_payments:0};
  }

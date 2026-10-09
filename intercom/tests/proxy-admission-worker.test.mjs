@@ -66,6 +66,49 @@ test('fixed sources reject URL credentials/query/redirects and bounded readers r
  await assert.rejects(main({}),/disabled/);
 });
 
+test('renewed permits require independently fresh unused canonical facts and preserve every original fee binding',async()=>{
+ for(const c of fixture.cases){
+  const w=clone(c.issue_work),previous=clone(w.permit),epoch=previous.expires_after_epoch+1;
+  w.previous_permit=previous;w.evidence.canonical_epoch=epoch;
+  Object.assign(w.permit,{issuance_revision:2,nonce:h(91),valid_from_epoch:epoch,expires_after_epoch:epoch+9});
+  let signed=0,mutate=()=>{},seen;
+  const issuer=worker(c,'issue',{signPermit:bytes=>{signed++;return signer(bytes);},fetcher:async(u,o)=>{
+   const q=JSON.parse(o.body);seen=q;const p={...policy(w,q.request_nonce),provider_pubkey:q.provider_pubkey,recovery:q.recovery,
+    enrollment:{provider_pubkey:q.provider_pubkey,entitlement_id:null,provider_revoked:false,admission_revoked:false},
+    recovery_state:{entitlement_used:null,invoice_used:null,evidence_used:null,admission_revoked:false,generation:null}};
+   p.context.epoch=epoch;mutate(p);return Response.json(p);
+  }});
+  assert.equal((await issuer.complete(w,signal())).body.permit.issuance_revision,2);assert.equal(signed,1);
+  assert.deepEqual(seen.recovery,{entitlement_id:previous.entitlement_id,invoice_commitment:previous.invoice_commitment,evidence_commitment:previous.evidence_commitment});
+  for(const change of [p=>p.recovery_state.admission_revoked=true,p=>p.enrollment.provider_revoked=true,
+   p=>p.recovery_state.invoice_used={provider_pubkey:h(72),entitlement_id:h(73)},p=>p.recovery_state.generation={revision:1,permit_digest:h(74)},
+   p=>p.context.epoch=previous.expires_after_epoch,p=>p.recovery.invoice_commitment=h(75),p=>delete p.recovery_state,p=>p.request_nonce=h(76)]){
+   mutate=change;await assert.rejects(issuer.complete(w,signal()));assert.equal(signed,1);
+  }
+  mutate=()=>{};
+  for(const change of [p=>p.previous_permit.accepted_amount='1',p=>p.previous_permit.initial_operation_digest=h(77),
+   p=>p.previous_permit.issuance_revision=9,p=>p.previous_permit.expires_after_epoch=epoch,p=>p.permit.nonce=previous.nonce,
+   p=>delete p.previous_permit]){
+   const altered=clone(w);change(altered);await assert.rejects(issuer.complete(altered,signal()));assert.equal(signed,1);
+  }
+ }
+});
+
+test('expired issuer work requests bounded durable reconciliation; lost recovery ACK retries the same lease',async()=>{
+ const c=fixture.cases[0],w=clone(c.issue_work);let fail=false;const calls=[];
+ const issuer=worker(c,'issue',{timeoutMs:1000,fetcher:async(u,o)=>{const p=policy(w,JSON.parse(o.body).request_nonce);p.context.epoch=w.permit.expires_after_epoch+1;return Response.json(p);},
+  api:{phase:'issue',post:async(action,body)=>{
+   calls.push({action,body});if(action==='pull')return {schema_version:1,purpose:PURPOSE,phase:'issue',work:w};
+   if(action==='reconcile'&&fail)throw new Error('lost response');
+   return {schema_version:1,purpose:PURPOSE,phase:'issue',accepted:true};
+  }},signPermit:()=>{throw new Error('must not sign expired work');}});
+ assert.equal((await issuer.runOnce()).status,'retry');assert.deepEqual(calls.map(x=>x.action),['pull','reconcile']);
+ assert.deepEqual(calls[1].body,base(w));fail=true;calls.length=0;
+ assert.equal((await issuer.runOnce()).status,'retry');assert.deepEqual(calls.map(x=>x.action),['pull','reconcile','retry']);
+ assert.equal(calls[2].body.lease_token,w.lease_token);assert.equal(calls[2].body.code,'canonical_recovery_unavailable');
+ const zero=clone(w);zero.permit.issuance_revision=0;await assert.rejects(worker(c,'issue').complete(zero,signal()),/invalid proxy integer/);
+});
+
 test('TAP exact log observes underpayment, uses finalized head and checks network/block',async()=>{
  const c=fixture.cases[0],w=c.verify_work,p=w.payment_reference,r=c.evidence_completion.receipt;
  let chain=31337,finalized=true,wrongBlock=false;const seen=[];

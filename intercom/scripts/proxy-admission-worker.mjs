@@ -32,15 +32,31 @@ export async function boundedJson(url, { body, headers = {}, signal, fetcher = f
   } } finally { await reader.cancel().catch(() => {}); }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
-export function validatePolicy(v, network, nonce) {
-  shape(v, ['ok','schema_version','lane','requester','request_nonce','context','proof','registry_enabled','fee_policy_hash','active_issuers','max_permit_epochs']);
+export function validatePolicy(v, network, nonce, recovery = null) {
+  shape(v, ['ok','schema_version','lane','requester','request_nonce','context','proof','registry_enabled','fee_policy_hash','active_issuers','max_permit_epochs',
+    ...(recovery?['provider_pubkey','recovery','recovery_state','enrollment']:[])]);
   shape(v.context, [...Object.keys(network),'epoch']);
   need(v.ok === true && v.schema_version === 1 && v.lane === 'proxy' && hex(v.requester)
     && v.request_nonce === nonce && uint(v.context.epoch,1) && Object.keys(network).every(k=>v.context[k]===network[k])
     && typeof v.registry_enabled === 'boolean' && hex(v.fee_policy_hash) && uint(v.max_permit_epochs,1)
     && Array.isArray(v.active_issuers) && v.active_issuers.length > 0 && v.active_issuers.length <= 16
     && v.active_issuers.every((x,i,a)=>hex(x)&&(i===0||a[i-1]<x)), 'canonical policy does not match');
-  validateProxySnapshotProof(v.proof); return v;
+  validateProxySnapshotProof(v.proof);
+  if(recovery) {
+    const {provider_pubkey,...bindings}=recovery;
+    shape(v.recovery,Object.keys(bindings));
+    need(v.provider_pubkey===provider_pubkey&&Object.keys(bindings).every(k=>v.recovery[k]===bindings[k]),'canonical recovery binding differs');
+    shape(v.enrollment,['provider_pubkey','entitlement_id','provider_revoked','admission_revoked']);
+    shape(v.recovery_state,['entitlement_used','invoice_used','evidence_used','admission_revoked','generation']);
+    const e=v.enrollment,r=v.recovery_state;
+    need(e.provider_pubkey===provider_pubkey&&(e.entitlement_id===null||hex(e.entitlement_id))
+      &&typeof e.provider_revoked==='boolean'&&typeof e.admission_revoked==='boolean'&&typeof r.admission_revoked==='boolean','invalid enrollment recovery');
+    for(const used of [r.entitlement_used,r.invoice_used,r.evidence_used]) if(used!==null){shape(used,['provider_pubkey','entitlement_id']);need(hex(used.provider_pubkey)&&hex(used.entitlement_id),'invalid recovery consumption');}
+    if(r.generation!==null){shape(r.generation,['revision','permit_digest']);need(uint(r.generation.revision,1)&&hex(r.generation.permit_digest),'invalid recovery generation');}
+    if(e.entitlement_id!==null||e.provider_revoked||e.admission_revoked||r.admission_revoked
+      ||r.generation!==null||[r.entitlement_used,r.invoice_used,r.evidence_used].some(x=>x!==null)) throw new ReviewWork('reissue_requires_original_canonical_reconciliation');
+  }
+  return v;
 }
 export class AdmissionApi {
   constructor({ origin, credential, phase, allowLoopbackHttp = false, fetcher = fetch }) {
@@ -48,8 +64,8 @@ export class AdmissionApi {
     this.credential=credential; this.phase=phase; this.fetcher=fetcher;
   }
   async post(action, body, signal) {
-    need(['pull','renew','retry','review','evidence','permit'].includes(action), 'unsupported worker action');
-    need(body.phase === this.phase && !(this.phase==='verify'&&action==='permit') && !(this.phase==='issue'&&action==='evidence'), 'worker role mismatch');
+    need(['pull','renew','retry','review','evidence','permit','reconcile'].includes(action), 'unsupported worker action');
+    need(body.phase === this.phase && !(this.phase==='verify'&&['permit','reconcile'].includes(action)) && !(this.phase==='issue'&&action==='evidence'), 'worker role mismatch');
     return await boundedJson(`${this.origin}/internal/proxy-admission-worker/${action}`, {body, signal,
       headers:{authorization:`Bearer ${this.credential}`}, fetcher:this.fetcher});
   }
@@ -64,11 +80,12 @@ export class AdmissionWorker {
     validateNetwork(network); this.options={phase,api,network,feePolicyHash,issuerPubkey,verifyReceipt,signPermit,fetcher,timeoutMs,now,rails};
     this.coreOrigin=fixedOrigin(coreOrigin,{allowLoopbackHttp}); this.active=false;
   }
-  async policy(signal) {
+  async policy(signal, permit = null) {
     const o=this.options, nonce=randomBytes(32).toString('hex'), started=performance.now();
-    const result=await boundedJson(`${this.coreOrigin}/v1/proxy/admission-policy`,{body:{request_nonce:nonce},signal,fetcher:o.fetcher,maxBytes:8192});
+    const recovery=permit?{entitlement_id:permit.entitlement_id,invoice_commitment:permit.invoice_commitment,evidence_commitment:permit.evidence_commitment}:null;
+    const result=await boundedJson(`${this.coreOrigin}/v1/proxy/admission-policy`,{body:{request_nonce:nonce,...(recovery?{provider_pubkey:permit.provider_pubkey,recovery}:{})},signal,fetcher:o.fetcher,maxBytes:8192});
     need(performance.now()-started <= o.timeoutMs, 'canonical policy expired');
-    return validatePolicy(result,o.network,nonce);
+    return validatePolicy(result,o.network,nonce,recovery?{provider_pubkey:permit.provider_pubkey,...recovery}:null);
   }
   async complete(work, signal) {
     const o=this.options; await validateWork(work,o.phase);
@@ -76,7 +93,9 @@ export class AdmissionWorker {
     need(o.rails.includes(i.rail) && work.lease_expires_at_ms > o.now() && Object.keys(o.network).every(k=>i.network[k]===o.network[k])
       && i.fee_policy_hash===o.feePolicyHash && i.issuer_pubkey===o.issuerPubkey, 'invoice differs from configured custody/network');
     if(o.phase==='verify' && (work.reference_assigned_at_ms>i.quote_expires_at_ms || work.reference_assigned_at_ms>o.now())) throw new ReviewWork('late_reference_pending_policy');
-    const policy=await this.policy(signal);
+    const renewal=o.phase==='issue'&&work.permit.issuance_revision>1;
+    if(renewal&&work.previous_permit===undefined) throw new ReviewWork('reissue_requires_original_canonical_reconciliation');
+    const policy=await this.policy(signal,renewal?work.permit:null);
     if(!policy.registry_enabled || policy.fee_policy_hash!==i.fee_policy_hash || !policy.active_issuers.includes(i.issuer_pubkey)) throw new ReviewWork('canonical_policy_changed');
     if(o.phase==='verify') {
       const receipt=await o.verifyReceipt(work,signal);
@@ -93,7 +112,14 @@ export class AdmissionWorker {
     const p=work.permit;
     // SITE stores this exact body before dispatch. The signer cannot choose a
     // new nonce/window/revision after a timeout, expiry, or uncertain append.
-    if(p.issuance_revision!==1) throw new ReviewWork('reissue_requires_original_canonical_reconciliation');
+    if(!renewal&&p.issuance_revision!==1) throw new ReviewWork('reissue_requires_original_canonical_reconciliation');
+    if(renewal) {
+      const previous=work.previous_permit;
+      const mutable=['nonce','issuance_revision','valid_from_epoch','expires_after_epoch'];
+      need(previous.issuance_revision+1===p.issuance_revision&&previous.nonce!==p.nonce
+        &&p.valid_from_epoch>previous.expires_after_epoch&&policy.context.epoch>previous.expires_after_epoch
+        &&Object.keys(previous).filter(k=>!mutable.includes(k)).every(k=>previous[k]===p[k]),'successor does not preserve expired original permit');
+    }
     for(const field of ['provider_pubkey','issuer_pubkey','entitlement_id','fee_policy_hash','invoice_commitment','initial_operation_digest','rail','accepted_value_au']) need(p[field]===i[field], 'permit invoice binding differs');
     need(p.accepted_amount===i.amount_base_units && p.evidence_commitment===work.evidence.evidence_commitment
       && p.valid_from_epoch===work.evidence.canonical_epoch, 'permit evidence binding differs');
@@ -137,6 +163,17 @@ export class AdmissionWorker {
       // An ambiguous completion is retried under SITE's original durable work.
       // Do not return a second signature/permit generation or dump upstream data.
       if(work && !signal.aborted) {
+        if(o.phase==='issue'&&error instanceof ReviewWork&&error.reason==='permit_window_requires_original_reconciliation') {
+          try {
+            const ack=await o.api.post('reconcile',base(work),signal);
+            shape(ack,['schema_version','purpose','phase','accepted']);
+            need(ack.schema_version===1&&ack.purpose===PURPOSE&&ack.phase==='issue'&&ack.accepted===true,'recovery not acknowledged');
+            return {status:'retry',phase:o.phase};
+          } catch {
+            await o.api.post('retry',{...base(work),code:'canonical_recovery_unavailable',delay_seconds:30},signal).catch(()=>{});
+            return {status:'retry',phase:o.phase};
+          }
+        }
         const action=error instanceof ReviewWork?'review':'retry';
         const body=action==='review'?{...base(work),reason:error.reason}:{...base(work),code:error instanceof RetryWork?error.code:'verification_unavailable',delay_seconds:error instanceof RetryWork?error.delaySeconds:30};
         await o.api.post(action,body,signal).catch(()=>{});

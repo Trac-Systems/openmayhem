@@ -25,7 +25,7 @@ fee allocation, `10000000000000000000` AU. No rates, quote lifetime, receiver,
 finality count or permit epoch duration are invented by this worker.
 
 All actions use the fixed configured SITE origin and POST
-`/internal/proxy-admission-worker/{pull,renew,retry,review,evidence,permit}`.
+`/internal/proxy-admission-worker/{pull,renew,retry,review,evidence,permit,reconcile}`.
 Separate verifier/issuer bearer credentials are mandatory at the SITE boundary;
 credential scopes must enforce phase and configured rail access before parsing
 payment work. The verifier process has no issuer key; the issuer has no receipt
@@ -38,6 +38,9 @@ retrieval credential, buyer wallet or bridge configuration.
   invoice_revision,lease_token}`.
 - Renew: base; response `{schema_version,purpose,phase,lease_expires_at_ms}`.
 - Retry: base plus `code,delay_seconds`; review: base plus `reason`.
+- Reconcile: issuer-only base identity. SITE checks fresh canonical facts before
+  renewing an expired permit against the same payment; the callback does not
+  choose a permit body or authorize any ledger write.
 - Evidence/permit: fixture bodies. Success ACK is exactly
   `{schema_version:1,purpose:"proxy_admission_fee",phase,accepted:true}`.
   Retry/review can return this same ACK.
@@ -64,14 +67,18 @@ confirmation counts are excluded from immutable receipt identity.
 
 ## Canonical policy and receipts
 
-`POST /v1/proxy/admission-policy` accepts only `{request_nonce}`. The trusted peer
+`POST /v1/proxy/admission-policy` accepts `{request_nonce}` and, for exact
+recovery, `provider_pubkey` plus `recovery` containing `entitlement_id`,
+`invoice_commitment` and `evidence_commitment`. The trusted peer
 adds its own fresh service nonce, signs the existing authenticated service request,
 and verifies response nonce, requester, network, proof and age. The canonical
-handler reads exactly `proxy/v1/config` in a signed, current snapshot and returns
+handler reads `proxy/v1/config` in a signed, current snapshot and returns
 public enablement, fee-policy hash, active issuers, maximum permit epochs and
 canonical epoch/proof. It uses four bounded read permits; timeout does not release
 a permit before underlying cleanup. No invoice, payment, provider or ledger scan
-is performed. A worker independently re-reads this policy for verification/issuance.
+is performed. Recovery reads a fixed set of exact enrollment, consumption,
+revocation and generation keys from that same snapshot. A worker independently
+re-reads this policy for verification/issuance.
 
 TAP checks chain, token, exact transaction/log index, destination, positive actual
 amount, successful receipt, finalized block and block hash/time. It does not fall
@@ -87,9 +94,20 @@ MSB position hash is presented as an actual block hash.
 `reference_assigned_at_ms` must be the trusted discovery time of an actual payment,
 never the time a user submitted a precomputed transaction hash. This is essential
 for TNK, which supplies no authoritative transfer wall-clock timestamp. Late or
-future references, late observed TAP/Stripe payment times, changed policy, expired
-permits and reissue requests remain review cases. The worker does not reprice,
+future references, late observed TAP/Stripe payment times and changed policy
+remain review cases. The worker does not reprice,
 refund, reverse credit or charge a second admission fee.
+
+For an expired permit, the issuer requests SITE reconciliation of the original
+durable work. SITE may prepare one successor only after the canonical epoch has
+passed the predecessor's expiry and all exact consumption records are absent.
+Revoked admissions and pinned generations cannot be replaced this way. Completed
+canonical enrollment returns the original entitlement rather than another fee.
+The worker receives the successor plus `previous_permit` and independently checks
+the canonical absence/epoch again before signing. All permit fields except nonce,
+issuance revision and validity window must match; payment evidence is unchanged.
+The original invoice revision and completed signatures remain immutable. Lost
+callback acknowledgments recover the same work; no worker chooses a new nonce.
 
 ## Operator configuration (no service enabled by these examples)
 
@@ -125,7 +143,8 @@ payment discovery must be connected and tested. Inline issuer work supports up t
 32 receipts within the unchanged 16 KiB bound; larger lifetime payment sets must
 remain durable and pending an indexed, snapshot-pinned paged issuance transport,
 not be rejected or forgotten. Historical TNK evidence outside the configured
-lookback needs explicit bounded recovery. Expired-permit reissue awaits reconciliation
-of the exact original canonical append before any generation changes. Refunds,
+lookback needs explicit bounded recovery. Same-operation expired-permit recovery
+is covered by actual SITE database/HTTP and canonical worker fixtures; changed
+contract or operation recovery remains separate. Refunds,
 reversals, late valuation, tax/fees and other D3 decisions remain explicit operator
 policy work; no automated default is introduced here.

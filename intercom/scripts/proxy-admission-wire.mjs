@@ -71,7 +71,7 @@ export function base(work) {
 export async function validateWork(v, phase) {
   need(Buffer.byteLength(JSON.stringify(v)) <= MAX_WORK_BYTES, 'work exceeds bound');
   shape(v, ['schema_version','purpose','phase','invoice_id','invoice_revision','lease_token','lease_expires_at_ms',
-    'invoice','payment_reference','reference_assigned_at_ms','permit','evidence']);
+    'invoice','payment_reference','reference_assigned_at_ms','permit','evidence',...(v.previous_permit===undefined?[]:['previous_permit'])]);
   need(v.schema_version === 1 && v.purpose === PURPOSE && v.phase === phase && ['verify','issue'].includes(phase)
     && opaque(v.invoice_id) && uint(v.invoice_revision, 1) && hex(v.lease_token) && uint(v.lease_expires_at_ms, 1), 'invalid work identity or role');
   validateInvoice(v.invoice);
@@ -80,8 +80,14 @@ export async function validateWork(v, phase) {
     need(uint(v.reference_assigned_at_ms, v.invoice.created_at_ms), 'invalid reference observation');
   } else need(v.payment_reference === null && v.reference_assigned_at_ms === null, 'issuer references belong to the evidence set');
   need(await invoiceCommitment(v.invoice_id, v.invoice) === v.invoice.invoice_commitment, 'invoice commitment differs');
-  if (phase === 'verify') need(v.permit === null && v.evidence === null, 'verifier may not issue');
-  else { validateProxyAdmissionPermit(v.permit); await validateEvidenceSet(v.evidence, v); }
+  if (phase === 'verify') need(v.permit === null && v.evidence === null && v.previous_permit===undefined, 'verifier may not issue');
+  else {
+    validateProxyAdmissionPermit(v.permit); await validateEvidenceSet(v.evidence, v);
+    if(v.previous_permit!==undefined) {
+      validateProxyAdmissionPermit(v.previous_permit);
+      need(v.permit.issuance_revision>1,'original issuance cannot claim predecessor');
+    }
+  }
   return v;
 }
 export async function evidenceCommitment(work, receipt) {
