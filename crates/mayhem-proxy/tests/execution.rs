@@ -1249,6 +1249,62 @@ async fn streaming_delivers_only_provisional_chunks_and_preserves_final_shape() 
 }
 
 #[tokio::test]
+async fn nullable_stream_roles_preserve_valid_tool_fragments_but_reject_role_changes() {
+    for (role, valid) in [
+        (Value::Null, true),
+        (json!("assistant"), true),
+        (json!("system"), false),
+        (json!(7), false),
+    ] {
+        let chunks = [
+            json!({"id":"stream_1","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}),
+            json!({"id":"stream_1","choices":[{"index":0,"delta":{"role":role,"content":null,"reasoning_content":null,"tool_calls":[{"id":"call_1","index":0,"type":"function","function":{"name":"lookup_city","arguments":""}}]},"finish_reason":null}]}),
+            json!({"id":"stream_1","choices":[{"index":0,"delta":{"role":null,"tool_calls":[{"id":null,"index":0,"type":"function","function":{"name":null,"arguments":"{\"city\":\""}}]},"finish_reason":null}]}),
+            json!({"id":"stream_1","choices":[{"index":0,"delta":{"role":null,"tool_calls":[{"id":null,"index":0,"type":"function","function":{"name":null,"arguments":"München\"}"}}]},"finish_reason":null}]}),
+            json!({"id":"stream_1","choices":[{"index":0,"delta":{"reasoning_content":null},"finish_reason":"tool_calls"}]}),
+        ];
+        let server =
+            backend_raw(200, sse(&chunks, true), "text/event-stream", Duration::ZERO).await;
+        let f = Fixture::new(&server.base, ProxyEndpoint::Chat);
+        let body = serde_json::to_vec(&json!({"model":"public-model","messages":[{"role":"user","content":"Look up München"}],"stream":true,"tool_choice":"required","tools":[{"type":"function","function":{"name":"lookup_city","parameters":{"type":"object","properties":{"city":{"type":"string","enum":["München"]}},"required":["city"],"additionalProperties":false}}}]})).unwrap();
+        let r = f.prepare_kind(1, &body, ProxyRail::Fiat, true);
+        let mut received = Vec::new();
+        let result = f
+            .executor
+            .execute_stream(&r.invocation, &body, &Cancellation::default(), |v| {
+                received.push(v);
+                async { Ok(()) }
+            })
+            .await;
+        assert_eq!(result.is_ok(), valid, "role {role}: {result:?}");
+        assert_eq!(server.calls.load(Ordering::SeqCst), 1);
+        assert!(received.iter().all(|v| v["choices"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|c| c["finish_reason"].is_null())));
+        if let Ok(result) = result {
+            let call = &result.reply.body["choices"][0]["message"]["tool_calls"][0];
+            assert_eq!(call["function"]["name"], "lookup_city");
+            assert_eq!(call["function"]["arguments"], "{\"city\":\"München\"}");
+            assert!(f
+                .journal
+                .recover(&r.invocation, r.attempt)
+                .unwrap()
+                .result
+                .is_some());
+        } else {
+            assert!(f
+                .journal
+                .recover(&r.invocation, r.attempt)
+                .unwrap()
+                .result
+                .is_none());
+        }
+    }
+}
+
+#[tokio::test]
 async fn streamed_tool_arguments_are_reassembled_exactly_and_schema_checked() {
     for (args, valid) in [
         ("{\"path\":\"src/世界.js\"}", true),

@@ -187,7 +187,10 @@ impl<'a> CompletionStream<'a> {
                     .get("delta")
                     .filter(|v| v.is_object())
                     .ok_or(Error::Protocol)?;
-                if let Some(role) = d.get("role") {
+                // A null optional delta field carries no update, just like
+                // null content or tool-name fragments. An explicit role must
+                // still be assistant; never accept a role change.
+                if let Some(role) = d.get("role").filter(|v| !v.is_null()) {
                     require(role == "assistant")?;
                     delta["role"] = role.clone();
                 }

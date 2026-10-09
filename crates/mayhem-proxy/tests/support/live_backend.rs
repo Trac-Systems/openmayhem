@@ -104,7 +104,17 @@ async fn approved_live_backend_protocol_and_recovery() {
         .expect("real backend did not pass proxy protocol validation");
     let completion = start.elapsed();
     assert_eq!(result.reply.body["model"], "public-model");
-    assert!(result.reply.observed_usage.is_some());
+    assert!(result.reply.observed_usage.as_ref().is_some_and(|usage|
+        usage.disposition == mayhem_proxy::metering::Disposition::Complete),
+        "protocol-valid partial output is not successful complete-call acceptance");
+    if input.endpoint == ProxyEndpoint::Chat && request["tool_choice"] == "required" {
+        assert!(
+            result.reply.body["choices"][0]["message"]["tool_calls"]
+                .as_array()
+                .is_some_and(|calls| !calls.is_empty()),
+            "required-tool acceptance needs a completed tool call"
+        );
+    }
     if streaming {
         assert!(events > 0 && first_output.is_some());
     }
