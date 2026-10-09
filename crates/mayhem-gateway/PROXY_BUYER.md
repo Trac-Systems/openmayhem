@@ -179,6 +179,79 @@ tail, delayed receipt publication, original-result recovery, exact replay,
 disconnect and backpressure cancellation/shutdown. These fixtures use a bounded
 bridge double; they are not real Noise-relay, live-model or mainnet evidence.
 
+## Trusted retail credit admission
+
+An optional `retail_authorization` object in the protected buyer configuration
+contains `url`, `credential`, `owner_token_ids` and `timeout_ms` (1000–5000).
+The URL is fixed by the operator: HTTPS, or HTTP at a literal loopback address;
+userinfo, query strings and fragments are rejected. The client has no redirects,
+retries or system proxy, permits eight concurrent callbacks and reads at most
+8 KiB of response. Credentials are never request fields or diagnostic output.
+Other gateway token owners continue using their ordinary Core authorization.
+Retail dispatch must send `X-Mayhem-Require-Retail-Authorization: 1`. The proxy
+branch rejects any other header value; if the configured hook is missing or the
+key is outside its allowlist, it fails before job creation or spending. An
+allowlisted key always uses the hook even without this additional requirement;
+the header cannot opt out. Native handlers are unchanged.
+
+For an allowlisted token, the original `Idempotency-Key` is mandatory and is the
+retail `request_id`. Callback participation, this reference, the request content
+digest and the fixed authority URL bind the gateway fingerprint. There is no
+public skip/approval flag; credential rotation alone does not alter that binding.
+
+The controller has already computed `max_usage` through its existing endpoint
+and metering implementation and priced it against the exact frozen offer.
+The composite gate first completes normal `Owner.authorize`: durable Core terms
+and common key-budget exposure. It then POSTs exactly:
+
+```json
+{"schema_version":1,"request_id":"original-idempotency-key","job_id":"original-core-job","terms_hash":"hex-digest","request_content_digest":"hex-digest"}
+```
+
+The trusted retail service must authenticate this machine callback, read the
+owner-authenticated `/v1/jobs/{job_id}/proxy-evidence`, bind it to its immutable
+original request/owner and price the exact maximum with its pinned margin and
+rounding policy. It reserves that exact amount at or below the customer's stored
+cap; the cap itself is not a credit hold. Pinning and the credit hold must be
+atomic/idempotent, with no database lock held across the evidence HTTP request.
+Only a committed sufficient hold may return the exact acknowledgment:
+
+```json
+{"schema_version":1,"job_id":"original-core-job","terms_hash":"hex-digest","authorized":true}
+```
+
+The callback does no inference. Only after both gates succeed may the controller
+sign, obtain provider acceptance, publish the canonical reservation and Execute.
+Quote freshness is still checked at signing. This is a bounded machine handshake,
+not a place to wait for human approval or to renew prices/lifetimes. Decline,
+malformed/foreign acknowledgment, disconnect cancellation or timeout fences the
+original unsigned intent; a lost reply may still mean the retailer retained a
+hold. The retailer must reconcile authenticated evidence, never infer release
+from a timeout. If Core rejects before calling retail there may be no retail
+hold at all. Recovery does not call the callback or dispatch Execute again.
+
+`request_content_digest` hashes the provider body after removing only the `proxy`
+envelope; model, streaming and every other provider-request field remain bound.
+It is separate from existing protocol hashes and does not tokenize the request.
+SHA-256 input is the ASCII domain `mayhem/proxy/retail-request-content/v1` followed
+by a zero byte, followed by this typed encoding (root depth zero, maximum 64):
+
+- Null, false and true: the single ASCII bytes `n`, `f` and `t`.
+- Number: `d` and eight big-endian IEEE754 binary64 bytes; normalize negative zero
+  to positive zero. Reject nonfinite values and integer values that cannot be
+  represented exactly as binary64. The Rust integer check uses wider integer
+  round trips so the `u64::MAX` saturation boundary cannot pass.
+- String: `s`, an eight-byte unsigned big-endian UTF-8 byte length, then UTF-8.
+  JavaScript implementations reject unpaired surrogate code units.
+- Array: `a`, an eight-byte unsigned big-endian element count, then each value.
+- Object: `o`, an eight-byte unsigned big-endian entry count, then encoded
+  key-string/value pairs sorted by the keys' UTF-8 bytes. Do not reconstruct a
+  JavaScript object after sorting, which can reorder integer-like keys.
+
+Cross-language golden values are in
+`src/openai/proxy_buyer/retail/retail-content-v1.json`. Ordinary JSON stringification
+is not this encoding: float formatting and UTF16/integer-key ordering differ.
+
 ## Explicit CLI activation
 
 Provisioning and serving are separate operations:

@@ -1,0 +1,44 @@
+[
+  {
+    "name": "null",
+    "value": null,
+    "sha256": "fd13404adb5fca1bcf4bd5c6d9a5f7a0077666468454fc422c52e6fa54e436f5"
+  },
+  {
+    "name": "numbers",
+    "value": [
+      -0.0,
+      1.0,
+      1e-06,
+      1e+20,
+      9007199254740992
+    ],
+    "sha256": "b811737239199374e6bd1f79611a623bb6ca3f24cd2f076515ff9d0b4651c862"
+  },
+  {
+    "name": "unicode_keys",
+    "value": {
+      "10": "ten",
+      "2": "two",
+      "": "bmp",
+      "😀": "astral",
+      "a": "x\n☃"
+    },
+    "sha256": "dab2bdaf7808d300fac568e7fb47fb52b95f9624290029871c84cf9f333bdde7"
+  },
+  {
+    "name": "request",
+    "value": {
+      "model": "proxy/offer/example",
+      "messages": [
+        {
+          "role": "user",
+          "content": "hi"
+        }
+      ],
+      "stream": true,
+      "temperature": 1e-06
+    },
+    "sha256": "fd16174eb62f87dd779b83d086a638e0da6a429c23678484a661fc52c3f00316"
+  }
+]

@@ -35,7 +35,11 @@ use tokio::{
     task::JoinSet,
 };
 
+mod retail;
 mod streaming;
+pub use retail::{
+    request_content_digest as retail_request_content_digest, Config as RetailAuthorizationConfig,
+};
 
 static STORAGE: Semaphore = Semaphore::const_new(8);
 
@@ -45,6 +49,7 @@ pub struct Runtime {
     settlement_policy: ProxySettlementPolicy,
     slots: Arc<Semaphore>,
     streams: Arc<Semaphore>,
+    retail: Option<Arc<retail::Authority>>,
     active: Arc<Mutex<BTreeSet<String>>>,
     tasks: Mutex<JoinSet<()>>,
     halt: watch::Sender<bool>,
@@ -96,11 +101,22 @@ impl Runtime {
             settlement_policy,
             slots: Arc::new(Semaphore::new(sessions)),
             streams: Arc::new(Semaphore::new(sessions)),
+            retail: None,
             active: Arc::new(Mutex::new(BTreeSet::new())),
             tasks: Mutex::new(JoinSet::new()),
             halt,
             running: AtomicBool::new(false),
         })
+    }
+
+    /// Trusted operator configuration only. Matching keys cannot opt out through
+    /// request fields/headers. Other buyers keep their ordinary Core owner gate.
+    pub fn with_retail_authorization(
+        mut self,
+        config: RetailAuthorizationConfig,
+    ) -> Result<Self, String> {
+        self.retail = Some(Arc::new(retail::Authority::new(config)?));
+        Ok(self)
     }
 
     pub(crate) fn validate_owner(&self, state: &GatewayState) -> Result<(), String> {
@@ -442,6 +458,19 @@ async fn submit(
     endpoint: ProxyEndpoint,
 ) -> Result<Response, ApiError> {
     let runtime = state.proxy_buyer.as_ref().ok_or_else(unavailable)?.clone();
+    let mut required_headers = headers
+        .get_all("x-mayhem-require-retail-authorization")
+        .iter();
+    let require_retail = match required_headers.next() {
+        None => false,
+        Some(value) if value.as_bytes() == b"1" && required_headers.next().is_none() => true,
+        _ => {
+            return Err(ApiError::bad_request(
+                "invalid required retail authorization header",
+                Some("X-Mayhem-Require-Retail-Authorization"),
+            ))
+        }
+    };
     let request = Arc::new(
         proxy_request::Request::parse(endpoint, raw, &runtime.policy)
             .map_err(|_| invalid())?
@@ -504,12 +533,35 @@ async fn submit(
             token.token_id.as_bytes(),
         ],
     );
-    let fingerprint = request
-        .fingerprint(&owner_digest)
-        .map_err(|_| invalid())?
-        .as_str()
-        .to_owned();
     let body: Value = serde_json::from_slice(request.provider_request()).map_err(|_| invalid())?;
+    let retail = runtime
+        .retail
+        .as_ref()
+        .map(|authority| authority.correlation(&token.token_id, key, &body))
+        .transpose()?
+        .flatten();
+    if require_retail && retail.is_none() {
+        return Err(ApiError::service_unavailable(
+            "required retail authorization is unavailable",
+            Some("proxy"),
+        )
+        .with_public_error(
+            "proxy_retail_authorization_unavailable",
+            "proxy_admission",
+            true,
+        ));
+    }
+    let base_fingerprint = request.fingerprint(&owner_digest).map_err(|_| invalid())?;
+    let fingerprint = match &retail {
+        Some(correlation) => runtime
+            .retail
+            .as_ref()
+            .unwrap()
+            .fingerprint(&base_fingerprint, correlation),
+        None => base_fingerprint,
+    }
+    .as_str()
+    .to_owned();
     let identity = RequestIdentity {
         billing_id: digest("mayhem/proxy/gateway-billing/v1", &[id.as_bytes()]),
         billing_attempt: 1,
@@ -593,10 +645,19 @@ async fn submit(
         state.access_control.clone(),
         binding.clone(),
     ));
+    let gate: Arc<dyn buyer_controller::AuthorizationGate> = match retail {
+        Some(correlation) => Arc::new(retail::Gate {
+            owner,
+            authority: runtime.retail.as_ref().unwrap().clone(),
+            correlation,
+            job: id.clone(),
+        }),
+        None => owner,
+    };
     let paid = buyer_controller::Request {
         context,
         body: request.provider_request().to_vec(),
-        gate: owner,
+        gate,
         authorization: buyer_controller::Authorization {
             prices: request.controls().prices.clone(),
             output_units: request.controls().output_units,

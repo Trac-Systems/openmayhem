@@ -1,3 +1,4 @@
+mod retail;
 mod streaming;
 use super::*;
 use crate::openai::proxy_owner::tests::support::{self, ControlFixture, Harness};
@@ -29,6 +30,13 @@ impl Fixture {
         Self::start_with(ProxyEndpoint::Chat, ProxyRail::Tnk).await
     }
     async fn start_with(endpoint: ProxyEndpoint, rail: ProxyRail) -> Self {
+        Self::start_with_retail(endpoint, rail, None).await
+    }
+    async fn start_with_retail(
+        endpoint: ProxyEndpoint,
+        rail: ProxyRail,
+        retail: Option<RetailAuthorizationConfig>,
+    ) -> Self {
         let harness = Harness::start_with(&support::worker_path(), endpoint, rail).await;
         let control = harness.control().await;
         let directory = support::private_dir();
@@ -43,9 +51,12 @@ impl Fixture {
             512 * 1024,
         )
         .unwrap();
-        let runtime = Arc::new(
-            Runtime::new(harness.buyer.clone(), policy, harness.policy.clone(), 2).unwrap(),
-        );
+        let mut runtime =
+            Runtime::new(harness.buyer.clone(), policy, harness.policy.clone(), 2).unwrap();
+        if let Some(config) = retail {
+            runtime = runtime.with_retail_authorization(config).unwrap();
+        }
+        let runtime = Arc::new(runtime);
         let model = model(&harness);
         let token = |id: &str, key: &str| GatewayTokenRecord {
             name: id.into(),

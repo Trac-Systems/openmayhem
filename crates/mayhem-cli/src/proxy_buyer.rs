@@ -185,6 +185,8 @@ struct Config {
     acceptance_epochs: u64,
     reservation_epochs: u64,
     receipt_grace_epochs: u64,
+    #[serde(default)]
+    retail_authorization: Option<mayhem_gateway::openai::proxy_buyer::RetailAuthorizationConfig>,
 }
 
 impl Config {
@@ -220,6 +222,9 @@ impl Config {
             "invalid proxy buyer resource limits"
         );
         config.policy()?;
+        if let Some(retail) = &config.retail_authorization {
+            retail.validate().map_err(anyhow::Error::msg)?;
+        }
         let parent = std::fs::canonicalize(
             path.parent()
                 .filter(|p| !p.as_os_str().is_empty())
@@ -404,19 +409,23 @@ pub async fn prepare(
             )
             .map_err(|_| anyhow!("proxy buyer controller limits or identity failed"))?,
         );
-        let runtime = Arc::new(
-            Runtime::new(
-                controller,
-                config.policy()?,
-                config.settlement_policy.clone(),
-                config.sessions,
-            )
-            .map_err(anyhow::Error::msg)?,
-        );
+        let mut runtime = Runtime::new(
+            controller,
+            config.policy()?,
+            config.settlement_policy.clone(),
+            config.sessions,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let budget_limits = config.budget_limits();
+        if let Some(retail) = config.retail_authorization {
+            runtime = runtime
+                .with_retail_authorization(retail)
+                .map_err(anyhow::Error::msg)?;
+        }
         Ok(Prepared {
-            runtime,
+            runtime: Arc::new(runtime),
             budget_path: config.state_dir.join(BUDGET),
-            budget_limits: config.budget_limits(),
+            budget_limits,
         })
     })
     .await

@@ -334,3 +334,20 @@ async fn provisioning_excludes_active_gateway_and_rejects_switched_budget_author
     activation.path = dir.0.join("another-budget.redb");
     assert!(!activation.matches(&prepared));
 }
+
+#[test]
+fn buyer_retail_callback_uses_protected_fixed_operator_configuration() {
+    let (_dir, path) = fixture();
+    let mut value = config();
+    value["retail_authorization"] = json!({"url":"http://127.0.0.1:3010/internal/proxy-hold",
+        "credential":"fixture-only-machine-key","owner_token_ids":["retail-owner"],"timeout_ms":1000});
+    write(&path, &serde_json::to_vec(&value).unwrap());
+    assert!(Config::load(&path).unwrap().retail_authorization.is_some());
+    value["retail_authorization"]["url"] = json!("http://untrusted.example/hold");
+    write(&path, &serde_json::to_vec(&value).unwrap());
+    assert!(Config::load(&path).is_err());
+    value["retail_authorization"]["url"] = json!("https://retail.example/internal/proxy-hold");
+    value["retail_authorization"]["timeout_ms"] = json!(15000);
+    write(&path, &serde_json::to_vec(&value).unwrap());
+    assert!(Config::load(&path).is_err());
+}
