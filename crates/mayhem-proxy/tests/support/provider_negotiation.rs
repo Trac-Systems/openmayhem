@@ -162,34 +162,42 @@ impl Setup {
         self.runtime.approve(offer, state, &self.lease, request)
     }
     fn executor(&self, f: &Fixture, peer: &Peer) -> PaidExecutor {
-        let pool = Arc::new(
-            Pool::new(
-                env!("CARGO_BIN_EXE_mayhem-proxy-worker"),
-                f._work.path(),
-                PoolLimits {
-                    max_children: 2,
-                    max_buffer_bytes: 64 * 1024 * 1024,
-                    startup_timeout: Duration::from_secs(5),
-                    processing_timeout: Duration::from_secs(3),
-                },
-            )
-            .unwrap(),
-        );
-        let executor = Executor::new(
-            f.connection.clone(),
-            f.adapter.clone(),
-            pool,
-            Arc::new(Storage::new(self.journal.clone(), 4).unwrap()),
-        )
-        .unwrap();
-        PaidExecutor::new(
-            executor,
-            peer.client.clone(),
-            self.runtime.capacity.clone(),
-            d(201),
-        )
-        .unwrap()
+        make_executor(f, peer, &self.runtime, &self.journal)
     }
+}
+fn make_executor(
+    f: &Fixture,
+    peer: &Peer,
+    runtime: &Runtime,
+    journal: &Arc<Journal>,
+) -> PaidExecutor {
+    let pool = Arc::new(
+        Pool::new(
+            env!("CARGO_BIN_EXE_mayhem-proxy-worker"),
+            f._work.path(),
+            PoolLimits {
+                max_children: 2,
+                max_buffer_bytes: 64 * 1024 * 1024,
+                startup_timeout: Duration::from_secs(5),
+                processing_timeout: Duration::from_secs(3),
+            },
+        )
+        .unwrap(),
+    );
+    let executor = Executor::new(
+        f.connection.clone(),
+        f.adapter.clone(),
+        pool,
+        Arc::new(Storage::new(journal.clone(), 4).unwrap()),
+    )
+    .unwrap();
+    PaidExecutor::new(
+        executor,
+        peer.client.clone(),
+        runtime.capacity.clone(),
+        d(201),
+    )
+    .unwrap()
 }
 
 #[tokio::test]

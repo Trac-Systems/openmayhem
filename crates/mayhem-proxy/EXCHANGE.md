@@ -78,7 +78,7 @@ independent acknowledgments, legacy receipt/waiver recovery, cancellation before
 and after dispatch, replay and malformed/foreign fragments. This is not a live
 Noise/relay network proof or an external payout test.
 
-Provider proposal/lease orchestration, the trusted negotiation session dispatcher,
+The trusted negotiation session dispatcher, orphaned-proposal reconciliation,
 the supervised full-duplex controller, automatic startup,
 upstream job polling/cancellation, adaptive health, public API/Studio/MCP and
 end-to-end real-network acceptance remain separate required integration work.

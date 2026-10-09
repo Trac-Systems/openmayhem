@@ -1,5 +1,7 @@
 use super::*;
 use mayhem_proxy::negotiation as n;
+#[path = "proposal_control.rs"]
+mod control;
 
 pub(super) fn context(peer: &Peer) -> n::Context {
     let t = &peer.template.terms;

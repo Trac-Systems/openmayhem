@@ -150,6 +150,28 @@ pub struct ProviderNegotiation {
     slots: Arc<tokio::sync::Semaphore>,
 }
 impl ProviderNegotiation {
+    pub(crate) async fn has_intent(&self, invocation: Digest) -> Result<bool> {
+        let permit = self
+            .slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| invalid("provider negotiation storage busy"))?;
+        let journal = self.journal.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            journal
+                .get(&invocation)
+                .map(|v| v.is_some())
+                .map_err(|_| invalid("provider journal unavailable"))
+        })
+        .await
+        .map_err(|_| Error::Task)?
+    }
+    pub(crate) fn identity(&self) -> Result<ProviderIdentity> {
+        self.journal
+            .identity()
+            .map_err(|_| invalid("provider journal unavailable"))
+    }
     pub fn new(
         journal: Arc<crate::attempts::Journal>,
         signer: Arc<crate::signing::Authority>,

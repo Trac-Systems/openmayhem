@@ -59,8 +59,8 @@ test identities. No external payment or real inference is claimed.
 
 Provider countersigning now uses `financial::provider::ProviderNegotiation`, as described
 below. Authenticated pre-acceptance transport is implemented in `negotiation::Channel`;
-the trusted session dispatcher, provider proposal orchestration and automatic supervisor
-startup are still required. Never-admitted
+the trusted session dispatcher and automatic supervisor startup are still required.
+Bounded provider proposal orchestration is described below. Never-admitted
 signed intentions also need canonical expiry/requote reconciliation before that
 automatic controller ships. For now they stay retained and count against the
 bounded quota; silently deleting them could enable conflicting authorizations.
@@ -179,5 +179,49 @@ Local checks cover the full negotiation-to-paid path on every supported JSON end
 and payment rail, streaming request acceptance, lost acknowledgment after buyer receipt,
 fragmentation, replay, tampered identities/context/request/signatures, control timeout
 and failed promotion before acceptance. They use the loopback SC-Bridge double and local
-canonical accounting fixture. Provider proposal/lease orchestration, resource-budgeted
-session dispatch, full-duplex supervision and real relay/Noise acceptance remain required.
+canonical accounting fixture. Resource-budgeted session dispatch, full-duplex supervision
+and real relay/Noise acceptance remain required.
+
+## Provider proposal controller
+
+`negotiation::provider::Controller` accepts an authenticated Request, checks a fresh
+canonical offer against the actual operator-approved adapter/connection/policy, validates
+the request, then reserves one shared capacity lease. Provider/network, recipe, endpoint
+contract, connection revision, capacity group and declared concurrency must agree. It
+creates the public Proposal from those actual objects; caller-supplied slot or connection
+claims cannot substitute for them. No money or inference is executed by this controller.
+
+Identical concurrent or reconnected unsigned negotiations return the same proposal and
+lease. A changed session/context for the same attempt is rejected. Already retained
+execution/signing intentions require recovery instead of a new proposal. Pending count,
+per-buyer count, individual/aggregate request bytes and blocking storage operations have
+explicit operator limits. Request validation precedes capacity allocation. No history or
+receipt scan is needed; existing intention lookup is indexed by logical invocation.
+
+An exact received buyer Offer is checked again against fresh canonical terms and the
+reserved runtime before countersigning starts. From that point, errors or cancellation
+retain the allocation for recovery. Successful signatures remain durable before return;
+only pending protocol memory is freed. Execution capacity remains occupied until the
+existing paid executor reconciles a known outcome. Recover returns the original saved
+signature, without repricing, re-signing or creating another financial reservation.
+
+Before provider countersigning starts, explicit cancellation or the configured unsigned
+proposal lifetime can release its never-dispatched capability. Lifetime never caps
+inference or replaces financial expiry. Cleanup is serialized with acceptance and keeps
+the pending entry if capacity cleanup fails. Losing a caller's reply does not discard
+controller-owned state. The supervisor must invoke the bounded unsigned-expiry method
+even without new incoming inference; this scheduling is not implemented by the library.
+
+Process restart preserves all durable capacity allocations, treating prior-controller
+leases as uncertain. In-memory proposal disappearance is not proof of cancellation.
+Reconciliation of those orphaned leases and partially prepared/signed intentions is
+still required before automatic public startup. Until implemented, this controller is
+local integration work, not production readiness. A single shared runtime authority is
+still required for native/proxy aliases, and opaque outside consumers remain unknown.
+
+Local controller tests negotiate all four JSON endpoints on every rail, reject execution
+before funding, then complete one real loopback HTTP request. They cover all three LLM
+streaming request forms/rails, concurrent proposal replay, per-buyer/byte bounds, malformed
+input, operator-policy mismatch, unsigned expiry, signing failure, shared native capacity,
+failed cleanup and restart without a fabricated free slot. Existing receipt/payout and
+streaming executor regression checks remain part of acceptance.

@@ -337,7 +337,7 @@ impl Wire {
 }
 
 /// Avoid allocating an arbitrarily large serialization before checking its size.
-fn bounded_json(value: &impl Serialize, bound: usize) -> Result<Vec<u8>> {
+pub(crate) fn bounded_json(value: &impl Serialize, bound: usize) -> Result<Vec<u8>> {
     struct Writer {
         bytes: Vec<u8>,
         bound: usize,

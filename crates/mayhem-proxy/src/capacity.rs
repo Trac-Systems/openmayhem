@@ -698,6 +698,11 @@ impl Authority {
     /// Only the still-held, never-dispatched capability can cancel without external
     /// evidence. Dropping it is intentionally NOT a cancellation or a free slot.
     pub fn cancel_reserved(&self, reservation: Reservation) -> Result<()> {
+        self.cancel_reserved_ref(&reservation)
+    }
+    // Controller retains the capability until durability succeeds, so an I/O
+    // error cannot erase its pending cleanup entry. No public forged capability.
+    pub(crate) fn cancel_reserved_ref(&self, reservation: &Reservation) -> Result<()> {
         if reservation.lease.controller_fence != self.fence {
             return Err(Error::Stale);
         }

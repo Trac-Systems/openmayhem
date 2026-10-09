@@ -2,6 +2,7 @@
 //! signing, capacity and financial publication remain mandatory outside transport.
 //! Context is supplied by the trusted session dispatcher, not authenticated merely
 //! because a caller can deserialize it. No raw signer or public RPC lives here.
+pub mod provider;
 use crate::{
     attempts::{Digest, FailureSnapshot, Identity, SignedProviderAcceptance},
     endpoint::{PublicAdapter, PublicAdapterSnapshot},

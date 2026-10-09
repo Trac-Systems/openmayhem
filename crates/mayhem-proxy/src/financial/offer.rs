@@ -76,6 +76,25 @@ impl Observation {
         self.fresh()?;
         Ok(&self.wire.membership)
     }
+    pub(crate) fn check_proposal(
+        &self,
+        context: &crate::negotiation::Context,
+        approved_policy: &ProxySettlementPolicy,
+    ) -> Result<()> {
+        self.fresh()?;
+        let w = &self.wire;
+        require(
+            context.network_id == w.context.network_id
+                && context.msb_bootstrap.as_str() == w.context.msb_bootstrap
+                && context.subnet_bootstrap.as_str() == w.context.subnet_bootstrap
+                && context.contract_version == w.context.contract_version
+                && context.offer == w.offer
+                && context.rail == w.rail
+                && context.settlement_policy_hash.as_str() == w.settlement_policy_hash
+                && approved_policy == &w.settlement_policy,
+            "proposal differs from canonical offer or operator policy",
+        )
+    }
     /// The approved policy MUST come from this provider's trusted configuration,
     /// not the buyer or the list of globally enabled policies. This checks public
     /// offer/payment terms; the writer separately checks the buyer's funding.
