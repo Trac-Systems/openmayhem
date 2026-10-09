@@ -251,3 +251,98 @@ async fn health_malformed_stream_frames_are_backend_faults_not_local_worker_fail
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     }
 }
+
+#[tokio::test]
+async fn health_actual_overload_blocks_another_reserved_json_or_stream_before_post_and_keeps_both_leases(
+) {
+    use mayhem_proxy::{
+        capacity,
+        health::{Class, Thinking},
+    };
+    for streaming in [false, true] {
+        let backend = backend(
+            429,
+            json!({"error":{"code":"rate_limit_exceeded"}}),
+            Duration::ZERO,
+        )
+        .await;
+        let (mut fixture, monitor) = observe(Fixture::new(&backend.base, ProxyEndpoint::Chat));
+        monitor.register(d(201), 2, true).unwrap();
+        let capacity = shared_capacity(&fixture);
+        capacity
+            .bind_live(capacity::Scope::Group(d(200)), monitor.connection_source())
+            .unwrap();
+        capacity
+            .bind_live(
+                capacity::Scope::Route(d(201)),
+                monitor.route_source(&d(201)).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(capacity.status(&d(201)).unwrap().available, 0);
+        // Fixture observation stands for a separately authorized setup probe.
+        for _ in 0..5 {
+            monitor
+                .observe_request(&d(201), Class::new(1024, Thinking::Unknown, streaming))
+                .unwrap()
+                .success(None);
+        }
+        fixture.executor = fixture
+            .executor
+            .with_capacity(capacity.clone(), d(201))
+            .with_observations(monitor.clone(), d(201))
+            .unwrap();
+        let bytes = if streaming { stream_request() } else { chat() };
+        let (first, lease1) = reserve_execution(&fixture, &capacity, 1, &bytes, streaming);
+        let (second, lease2) = reserve_execution(&fixture, &capacity, 2, &bytes, streaming);
+        for (record, first) in [(&first, true), (&second, false)] {
+            let error = if streaming {
+                fixture
+                    .executor
+                    .execute_stream(
+                        &record.invocation,
+                        &bytes,
+                        &Cancellation::default(),
+                        |_| async { Ok(()) },
+                    )
+                    .await
+                    .unwrap_err()
+            } else {
+                fixture
+                    .executor
+                    .execute_json(&record.invocation, &bytes, &Cancellation::default())
+                    .await
+                    .unwrap_err()
+            };
+            if first {
+                assert!(
+                    matches!(error,Error::Upstream(ref f) if f.code==Code::UpstreamRateLimited)
+                );
+            } else {
+                assert!(matches!(error, Error::Capacity(capacity::Error::Busy)));
+            }
+        }
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            capacity.status(&d(201)).unwrap().state,
+            capacity::Readiness::Busy
+        );
+        assert_eq!(capacity.status(&d(201)).unwrap().group_occupied, 2);
+        assert_eq!(
+            capacity.lease(&lease1.lease().id).unwrap().unwrap().phase,
+            capacity::Phase::Dispatched
+        );
+        assert_eq!(
+            capacity.lease(&lease2.lease().id).unwrap().unwrap().phase,
+            capacity::Phase::Reserved
+        );
+        assert_eq!(
+            fixture
+                .journal
+                .get(&second.invocation)
+                .unwrap()
+                .unwrap()
+                .phase,
+            Phase::Prepared
+        );
+    }
+}

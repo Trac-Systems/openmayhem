@@ -1,5 +1,6 @@
 //! Bounded passive upstream evidence. This observes serving, never authorizes a
 //! POST, frees capacity, retries work, signs availability or settles money.
+mod admission;
 mod measurement;
 #[cfg(test)]
 mod tests;
@@ -286,6 +287,7 @@ struct Data {
     schedule: Schedule,
     recovery: Option<u64>,
     sequence: u64,
+    revision: u64,
 }
 struct Inner {
     policy: Policy,
@@ -315,6 +317,7 @@ impl Monitor {
                     schedule,
                     recovery: None,
                     sequence: 0,
+                    revision: 0,
                 }),
             }),
         })
@@ -345,6 +348,7 @@ impl Monitor {
                 native: None,
             },
         );
+        data.revision = data.revision.saturating_add(1);
         Ok(())
     }
     pub fn snapshot(&self, id: &Digest) -> Result<Snapshot> {
@@ -506,6 +510,7 @@ impl Monitor {
                 } else {
                     route.gate.failures
                 };
+                data.revision = data.revision.saturating_add(1);
                 let delay = data
                     .schedule
                     .retry(failures.saturating_add(1))
@@ -517,6 +522,7 @@ impl Monitor {
                 }
             }
             Outcome::Success => {
+                data.revision = data.revision.saturating_add(1);
                 let mut slow_reason = None;
                 let route = data.routes.get_mut(&sample.route).expect("route checked");
                 if route.llm {

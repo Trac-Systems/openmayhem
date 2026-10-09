@@ -44,6 +44,73 @@ fn server(
     )
     .unwrap()
 }
+fn observed_server(
+    s: &Controlled,
+    f: &Fixture,
+    peer: &Peer,
+) -> (serving::Controller, mayhem_proxy::health::Monitor) {
+    use mayhem_proxy::{
+        health::{Class, Monitor, Policy, Thinking},
+        supervisor::RefreshPolicy,
+    };
+    let monitor = Monitor::new(
+        Policy {
+            max_routes: 8,
+            max_classes_per_route: 8,
+            evidence_ttl_ms: 60_000,
+            successes_to_increase: 2,
+            bad_samples_to_reduce: 2,
+            latency_baseline_samples: 3,
+            latency_multiplier: 4,
+            latency_increase_ms: 1000,
+            min_native_tok_s: 5,
+            recovery: RefreshPolicy {
+                interval_ms: 10_000,
+                page_pause_ms: 10,
+                retry_initial_ms: 1000,
+                retry_max_ms: 30_000,
+                jitter_percent: 0,
+            },
+        },
+        2,
+        1,
+    )
+    .unwrap();
+    monitor
+        .register(d(201), 2, f.adapter.endpoint() != ProxyEndpoint::Decisions)
+        .unwrap();
+    s.runtime
+        .capacity
+        .bind_live(capacity::Scope::Group(d(200)), monitor.connection_source())
+        .unwrap();
+    s.runtime
+        .capacity
+        .bind_live(
+            capacity::Scope::Route(d(201)),
+            monitor.route_source(&d(201)).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(s.runtime.capacity.status(&d(201)).unwrap().available, 0);
+    // Fixture bootstrap evidence only; production must earn it through separately
+    // authorized, durably tracked probes. The actual paid requests below refresh it.
+    for _ in 0..3 {
+        monitor
+            .observe_request(&d(201), Class::new(1024, Thinking::Unknown, false))
+            .unwrap()
+            .success(None);
+    }
+    let controller = serving::Controller::new_observed(
+        s.runtime.clone(),
+        s.journal.clone(),
+        s.signing.clone(),
+        peer.client.clone(),
+        pool(f),
+        bounds(),
+        monitor.clone(),
+    )
+    .unwrap();
+    (controller, monitor)
+}
 async fn connect(
     s: &Controlled,
     peer: &Peer,
@@ -210,7 +277,8 @@ async fn provider_session_negotiates_requires_funding_and_settles_all_json_endpo
             let f = Fixture::new(&backend.base, endpoint);
             let mut peer = Peer::start(rail, &f, &bytes, false, None).await;
             let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
-            let controller = server(&s, &f, &peer, bounds());
+            let (controller, monitor) = observed_server(&s, &f, &peer);
+            let before = monitor.connection_source().revision().unwrap();
             let (_bridge, mut buyer, handle, saved) = connect(&s, &peer, &bytes, &controller).await;
             let command = exchange::Message::Execute {
                 request: serde_json::from_slice(&bytes).unwrap(),
@@ -234,6 +302,7 @@ async fn provider_session_negotiates_requires_funding_and_settles_all_json_endpo
             ));
             settle(&s, &f, &peer, &mut buyer, &bytes, received).await;
             assert_eq!(handle.wait().await.unwrap(), serving::End::Settled);
+            assert!(monitor.connection_source().revision().unwrap() > before);
             assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
             assert_eq!(
                 s.runtime.capacity.status(&d(201)).unwrap().group_occupied,
@@ -278,7 +347,8 @@ async fn provider_session_streams_and_settles_each_supported_stream_endpoint_on_
             let f = Fixture::new(&backend.base, endpoint);
             let mut peer = Peer::start(rail, &f, &request, true, None).await;
             let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
-            let controller = server(&s, &f, &peer, bounds());
+            let (controller, monitor) = observed_server(&s, &f, &peer);
+            let before = monitor.connection_source().revision().unwrap();
             let (_bridge, mut buyer, handle, saved) =
                 connect(&s, &peer, &request, &controller).await;
             s.buyer
@@ -304,6 +374,7 @@ async fn provider_session_streams_and_settles_each_supported_stream_endpoint_on_
             assert!(events > 0);
             settle(&s, &f, &peer, &mut buyer, &request, received).await;
             assert_eq!(handle.wait().await.unwrap(), serving::End::Settled);
+            assert!(monitor.connection_source().revision().unwrap() > before);
             assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
             peer.stop().await;
         }

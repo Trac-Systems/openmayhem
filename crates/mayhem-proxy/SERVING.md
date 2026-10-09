@@ -105,10 +105,25 @@ native-tokenizer observation API preserves tokenizer identity and measurement ag
 buffered single-timestamp output remains unknown. This tokenizer source is not yet
 connected to execution, so ordinary observations cannot certify the generation floor.
 
-The adaptive allowance is not yet wired into paid admission, signed public presence or
-managed startup. The recovery observer latch is local and is not permission to dispatch
-a paid probe; a durable, funded probe lease and restart reconciliation remain required.
-Numerical public policy and end-to-end freshness/recovery bounds require acceptance.
+`capacity::Authority::bind_live` now connects memory-only readiness sources to actual
+proposal reservation, provider signing and dispatch. Sources preserve the observation's
+age; reads/heartbeats never renew it. Revision checks reject an inconsistent group/route
+pair without spinning. Restart, missing sources, source errors and expired evidence stay
+closed, and neither configuration changes nor old observation tickets can silently fall
+back to cached Ready. Local capacity schema 3 preserves earlier leases without scanning
+or rewriting their history. This is not a ledger-contract version change.
+
+`Controller::new_observed` feeds validated JSON/stream outcomes into the monitor chosen
+by trusted startup. It neither attaches guessed scopes nor manufactures initial health.
+Bind a connection source only to that exact shared API/credential pool. A broader
+physical pool containing independent credentials or native runtimes must not inherit
+one credential's authentication/quota failures; layered physical/credential constraints
+still need integration before advertising that mixed configuration.
+
+Signed public presence and managed startup remain unwired. The recovery observer latch
+is local and is not permission to dispatch a paid probe; a durable, funded probe lease
+and restart reconciliation remain required. Numerical public policy and end-to-end
+freshness/recovery bounds require acceptance.
 
 ## Evidence and remaining integration
 

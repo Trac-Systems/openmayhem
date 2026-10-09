@@ -150,6 +150,39 @@ impl Controller {
         pool: Arc<Pool>,
         limits: Limits,
     ) -> Result<Self> {
+        Self::build(runtime, journal, signer, financial, pool, limits, None)
+    }
+    /// Use the same monitor bound to this runtime's live capacity sources.
+    /// Trusted startup owns source scope/binding and separately funded recovery;
+    /// this constructor never invents initial Ready evidence or starts probes.
+    pub fn new_observed(
+        runtime: Arc<Runtime>,
+        journal: Arc<Journal>,
+        signer: Arc<Authority>,
+        financial: Arc<financial::Client>,
+        pool: Arc<Pool>,
+        limits: Limits,
+        monitor: crate::health::Monitor,
+    ) -> Result<Self> {
+        Self::build(
+            runtime,
+            journal,
+            signer,
+            financial,
+            pool,
+            limits,
+            Some(monitor),
+        )
+    }
+    fn build(
+        runtime: Arc<Runtime>,
+        journal: Arc<Journal>,
+        signer: Arc<Authority>,
+        financial: Arc<financial::Client>,
+        pool: Arc<Pool>,
+        limits: Limits,
+        monitor: Option<crate::health::Monitor>,
+    ) -> Result<Self> {
         if limits.sessions == 0
             || limits.sessions > 4096
             || limits.per_buyer == 0
@@ -182,6 +215,10 @@ impl Controller {
             pool,
             Arc::new(Storage::new(journal, limits.proposals.storage_operations)?),
         )?;
+        let executor = match monitor {
+            Some(monitor) => executor.with_observations(monitor, runtime.route.clone())?,
+            None => executor,
+        };
         let executor = Arc::new(PaidExecutor::new(
             executor,
             financial,

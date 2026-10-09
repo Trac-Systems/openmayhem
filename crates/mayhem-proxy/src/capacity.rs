@@ -20,11 +20,12 @@ use redb::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     ops::Bound,
     path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Mutex, MutexGuard,
+        Arc, Mutex, MutexGuard,
     },
     time::{Duration, Instant},
 };
@@ -145,7 +146,7 @@ pub struct Route {
     pub lane: Lane,
     pub max_concurrency: u32,
 }
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Scope {
     Group(Digest),
     Route(Digest),
@@ -166,6 +167,9 @@ struct Gate {
     expires_ms: u64,
     allowance: u32,
     state: Readiness,
+    /// A live guard never falls back to a previously persisted Ready observation.
+    #[serde(default)]
+    live: Option<u64>,
 }
 impl Gate {
     fn empty(revision: u64) -> Self {
@@ -175,6 +179,7 @@ impl Gate {
             expires_ms: 0,
             allowance: 0,
             state: Readiness::Checking,
+            live: None,
         }
     }
     fn allowance(&self, fence: u64, now: u64, ceiling: u32) -> Result<u32> {
@@ -223,6 +228,22 @@ pub struct Evidence {
     pub allowance: u32,
     pub age: Duration,
     pub valid_for: Duration,
+}
+
+/// Trusted local observation only. Implementations must perform bounded memory
+/// reads, never network/storage I/O or a scan of request history. The authority
+/// consults this on admission/signing/dispatch, not on generated-token delivery.
+/// Errors and missing/expired observations close admission; no cached fallback.
+pub trait ReadinessSource: Send + Sync {
+    /// Monotonically changes with evidence. Shared sources return the same revision;
+    /// the parent rejects an inconsistent group/route pair without spinning.
+    fn revision(&self) -> Result<u64>;
+    fn evidence(&self) -> Result<Evidence>;
+}
+
+struct LiveSource {
+    generation: u64,
+    source: Arc<dyn ReadinessSource>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -317,6 +338,7 @@ pub struct Authority {
     started: Instant,
     failed: AtomicBool,
     writer: Mutex<()>,
+    live: Mutex<BTreeMap<Scope, LiveSource>>,
 }
 struct Tx<'a> {
     tx: redb::WriteTransaction,
@@ -350,7 +372,7 @@ impl Authority {
                 return Err(Error::Identity);
             }
             require(
-                matches!(m.schema, 1 | 2)
+                matches!(m.schema, 1 | 2 | 3)
                     && [
                         GROUPS.name(),
                         ROUTES.name(),
@@ -386,7 +408,7 @@ impl Authority {
             db(tx.open_table(BY_WORK))?;
             db(tx.open_table(SIGNING))?;
             Meta {
-                schema: 2,
+                schema: 3,
                 identity,
                 fence: 0,
                 sequence: 0,
@@ -395,6 +417,9 @@ impl Authority {
                 leases: 0,
             }
         };
+        // Gate.live defaults to None in historical rows; no history rewrite or
+        // lease migration. Older binaries reject this local schema explicitly.
+        m.schema = 3;
         m.fence = m.fence.checked_add(1).ok_or(Error::Invalid)?;
         db(t.insert("state", encode(&m)?.as_slice()))?;
         drop(t);
@@ -412,10 +437,97 @@ impl Authority {
             started: Instant::now(),
             failed: AtomicBool::new(false),
             writer: Mutex::new(()),
+            live: Mutex::new(BTreeMap::new()),
         })
     }
     pub(crate) fn identity(&self) -> &Identity {
         &self.identity
+    }
+
+    /// Attach once from trusted startup, after configuring the exact scope.
+    /// No model request is issued and no active/uncertain lease is modified.
+    /// On restart the saved live requirement stays closed until reattached.
+    pub fn bind_live(&self, scope: Scope, source: Arc<dyn ReadinessSource>) -> Result<()> {
+        let tx = self.write()?;
+        let mut m = meta(&tx)?;
+        let generation = sequence(&mut m)?;
+        let mut live = self.live.lock().map_err(|_| Error::Storage)?;
+        if let Some(old) = live.get(&scope) {
+            return if Arc::ptr_eq(&old.source, &source) {
+                Ok(())
+            } else {
+                Err(Error::InUse)
+            };
+        }
+        edit_gate(&tx, &scope, |gate| {
+            gate.live = Some(generation);
+            gate.revision = generation;
+            gate.fence = self.fence;
+            gate.expires_ms = 0;
+            gate.allowance = 0;
+            gate.state = Readiness::Checking;
+            Ok(())
+        })?;
+        save_meta(&tx, &m)?;
+        live.insert(scope, LiveSource { generation, source });
+        drop(live);
+        self.commit(tx)
+    }
+
+    fn live_source(&self, scope: Scope, gate: &Gate) -> Result<Option<Arc<dyn ReadinessSource>>> {
+        let Some(generation) = gate.live else {
+            return Ok(None);
+        };
+        if gate.fence != self.fence {
+            return Err(Error::Checking);
+        }
+        let sources = self.live.lock().map_err(|_| Error::Storage)?;
+        let bound = sources.get(&scope).ok_or(Error::Checking)?;
+        if bound.generation != generation {
+            return Err(Error::Checking);
+        }
+        Ok(Some(bound.source.clone()))
+    }
+    fn allowance(
+        &self,
+        gate: &Gate,
+        source: Option<&dyn ReadinessSource>,
+        now: u64,
+        ceiling: u32,
+    ) -> Result<u32> {
+        let Some(source) = source else {
+            return gate.allowance(self.fence, now, ceiling);
+        };
+        let evidence = source.evidence()?;
+        if evidence.valid_for.is_zero() || evidence.valid_for > self.limits.max_evidence_age {
+            return Err(Error::Invalid);
+        }
+        if evidence.age >= evidence.valid_for {
+            return Err(Error::Checking);
+        }
+        match evidence.state {
+            Readiness::Ready if evidence.allowance > 0 => Ok(evidence.allowance.min(ceiling)),
+            Readiness::Ready => Err(Error::Invalid),
+            Readiness::Busy => Err(Error::Busy),
+            Readiness::Unavailable => Err(Error::Unavailable),
+            Readiness::Checking => Err(Error::Checking),
+        }
+    }
+    fn allowances(&self, group: &Group, route: &RouteState, now: u64) -> Result<(u32, u32)> {
+        let g = self.live_source(Scope::Group(group.id.clone()), &group.gate)?;
+        let r = self.live_source(Scope::Route(route.config.id.clone()), &route.gate)?;
+        let before_g = g.as_ref().map(|s| s.revision()).transpose()?;
+        let before_r = r.as_ref().map(|s| s.revision()).transpose()?;
+        let result = (
+            self.allowance(&group.gate, g.as_deref(), now, group.ceiling)?,
+            self.allowance(&route.gate, r.as_deref(), now, route.config.max_concurrency)?,
+        );
+        if before_g != g.as_ref().map(|s| s.revision()).transpose()?
+            || before_r != r.as_ref().map(|s| s.revision()).transpose()?
+        {
+            return Err(Error::Checking);
+        }
+        Ok(result)
     }
     fn now(&self) -> Result<u64> {
         u64::try_from(self.started.elapsed().as_millis()).map_err(|_| Error::Invalid)
@@ -456,7 +568,10 @@ impl Authority {
         }
         let g = if let Some(mut g) = old {
             g.ceiling = ceiling;
-            g.gate = Gate::empty(sequence(&mut m)?);
+            let revision = sequence(&mut m)?;
+            let live = g.gate.live.map(|_| revision);
+            g.gate = Gate::empty(revision);
+            g.gate.live = live;
             g
         } else {
             if m.groups >= self.limits.max_groups {
@@ -474,6 +589,10 @@ impl Authority {
         db(groups.insert(id.as_str(), encode(&g)?.as_slice()))?;
         save_meta(&tx, &m)?;
         drop(groups);
+        self.live
+            .lock()
+            .map_err(|_| Error::Storage)?
+            .remove(&Scope::Group(id));
         self.commit(tx)
     }
     /// An occupied alias cannot move to another backend or change lane. Existing
@@ -491,7 +610,7 @@ impl Authority {
         if old.as_ref().is_some_and(|r| r.config == route) {
             return Ok(());
         }
-        let occupied = if let Some(old) = old {
+        let (occupied, required_live) = if let Some(old) = old {
             if old.occupied > 0
                 && (old.config.group != route.group || old.config.lane != route.lane)
             {
@@ -503,25 +622,32 @@ impl Authority {
                 target.routes = target.routes.checked_add(1).ok_or(Error::Invalid)?;
                 db(groups.insert(previous.id.as_str(), encode(&previous)?.as_slice()))?;
             }
-            old.occupied
+            (old.occupied, old.gate.live.is_some())
         } else {
             if m.routes >= self.limits.max_routes {
                 return Err(Error::Quota);
             }
             m.routes += 1;
             target.routes = target.routes.checked_add(1).ok_or(Error::Invalid)?;
-            0
+            (0, false)
         };
+        let revision = sequence(&mut m)?;
+        let mut gate = Gate::empty(revision);
+        gate.live = required_live.then_some(revision);
         let state = RouteState {
             config: route,
             occupied,
-            gate: Gate::empty(sequence(&mut m)?),
+            gate,
         };
         db(routes.insert(state.config.id.as_str(), encode(&state)?.as_slice()))?;
         db(groups.insert(target.id.as_str(), encode(&target)?.as_slice()))?;
         save_meta(&tx, &m)?;
         drop(routes);
         drop(groups);
+        self.live
+            .lock()
+            .map_err(|_| Error::Storage)?
+            .remove(&Scope::Route(state.config.id));
         self.commit(tx)
     }
     pub fn remove_route(&self, route: &Digest) -> Result<()> {
@@ -541,6 +667,10 @@ impl Authority {
         save_meta(&tx, &m)?;
         drop(groups);
         drop(routes);
+        self.live
+            .lock()
+            .map_err(|_| Error::Storage)?
+            .remove(&Scope::Route(route.clone()));
         self.commit(tx)
     }
     pub fn remove_group(&self, group: &Digest) -> Result<()> {
@@ -555,6 +685,10 @@ impl Authority {
         db(groups.remove(group.as_str()))?;
         save_meta(&tx, &m)?;
         drop(groups);
+        self.live
+            .lock()
+            .map_err(|_| Error::Storage)?
+            .remove(&Scope::Group(group.clone()));
         self.commit(tx)
     }
     pub fn begin_observation(&self, scope: Scope) -> Result<ObservationTicket> {
@@ -562,6 +696,9 @@ impl Authority {
         let mut m = meta(&tx)?;
         let revision = sequence(&mut m)?;
         edit_gate(&tx, &scope, |gate| {
+            if gate.live.is_some() {
+                return Err(Error::InUse);
+            }
             gate.revision = revision;
             Ok(())
         })?;
@@ -590,7 +727,7 @@ impl Authority {
         let expires_ms = self.now()?.checked_add(remaining).ok_or(Error::Invalid)?;
         let tx = self.write()?;
         edit_gate(&tx, &ticket.scope, |gate| {
-            if gate.revision != ticket.revision {
+            if gate.revision != ticket.revision || gate.live.is_some() {
                 return Err(Error::Stale);
             }
             // Consume this ticket even if its value is repeated. Only a new actual
@@ -615,7 +752,10 @@ impl Authority {
             .max_leases
             .saturating_sub(m.leases)
             .min(u64::from(u32::MAX)) as u32;
-        let availability = free(&g, &r, self.fence, self.now()?).map(|n| n.min(remaining));
+        let availability = self
+            .allowances(&g, &r, self.now()?)
+            .and_then(|a| free(&g, &r, a))
+            .map(|n| n.min(remaining));
         let (available, state) = match availability {
             Ok(n) if n > 0 => (n, Readiness::Ready),
             Ok(_) | Err(Error::Busy) => (0, Readiness::Busy),
@@ -654,7 +794,7 @@ impl Authority {
         let mut r: RouteState = read(&routes, route.as_str())?;
         require(phase != Phase::Proposed || r.config.lane == Lane::Proxy)?;
         let mut g: Group = read(&groups, r.config.group.as_str())?;
-        if free(&g, &r, self.fence, self.now()?)? == 0 {
+        if free(&g, &r, self.allowances(&g, &r, self.now()?)?)? == 0 {
             return Err(Error::Busy);
         }
         let mut entropy = [0u8; 32];
@@ -698,7 +838,14 @@ impl Authority {
         let lease: Lease = read(&db(tx.open_table(LEASES))?, expected.id.as_str())?;
         let r: RouteState = read(&db(tx.open_table(ROUTES))?, lease.route.as_str())?;
         let g: Group = read(&db(tx.open_table(GROUPS))?, lease.group.as_str())?;
-        ready_reserved(&lease, expected, self.fence, &g, &r, self.now()?)?;
+        ready_reserved(
+            &lease,
+            expected,
+            self.fence,
+            &g,
+            &r,
+            self.allowances(&g, &r, self.now()?)?,
+        )?;
         Ok(r.config)
     }
 
@@ -711,7 +858,14 @@ impl Authority {
         let mut lease: Lease = read(&leases, expected.id.as_str())?;
         let r: RouteState = read(&db(tx.open_table(ROUTES))?, lease.route.as_str())?;
         let g: Group = read(&db(tx.open_table(GROUPS))?, lease.group.as_str())?;
-        ready_reserved(&lease, expected, self.fence, &g, &r, self.now()?)?;
+        ready_reserved(
+            &lease,
+            expected,
+            self.fence,
+            &g,
+            &r,
+            self.allowances(&g, &r, self.now()?)?,
+        )?;
         require(r.config.lane == Lane::Proxy)?;
         validate_signing_intent(buyer, &lease, &self.identity)?;
         let bytes = serde_json::to_vec(buyer).map_err(|_| Error::Invalid)?;
@@ -838,7 +992,14 @@ impl Authority {
         let mut lease: Lease = read(&leases, reservation.lease.id.as_str())?;
         let r: RouteState = read(&db(tx.open_table(ROUTES))?, lease.route.as_str())?;
         let g: Group = read(&db(tx.open_table(GROUPS))?, lease.group.as_str())?;
-        ready_reserved(&lease, &reservation.lease, self.fence, &g, &r, self.now()?)?;
+        ready_reserved(
+            &lease,
+            &reservation.lease,
+            self.fence,
+            &g,
+            &r,
+            self.allowances(&g, &r, self.now()?)?,
+        )?;
         require(lease.phase == Phase::Reserved)?;
         lease.phase = Phase::Dispatched;
         db(leases.insert(lease.id.as_str(), encode(&lease)?.as_slice()))?;
@@ -989,7 +1150,7 @@ fn ready_reserved(
     fence: u64,
     g: &Group,
     r: &RouteState,
-    now: u64,
+    allowances: (u32, u32),
 ) -> Result<()> {
     if expected.controller_fence != fence {
         return Err(Error::Stale);
@@ -1006,8 +1167,7 @@ fn ready_reserved(
     {
         return Err(Error::Binding);
     }
-    let group_allowance = g.gate.allowance(fence, now, g.ceiling)?;
-    let route_allowance = r.gate.allowance(fence, now, r.config.max_concurrency)?;
+    let (group_allowance, route_allowance) = allowances;
     // Reservations already count. Neither signing nor dispatch subtracts twice.
     if g.occupied > group_allowance || r.occupied > route_allowance {
         return Err(Error::Busy);
@@ -1015,17 +1175,13 @@ fn ready_reserved(
     Ok(())
 }
 
-fn free(g: &Group, r: &RouteState, fence: u64, now: u64) -> Result<u32> {
-    let group = g
-        .gate
-        .allowance(fence, now, g.ceiling)?
-        .saturating_sub(g.occupied);
-    let route = r
-        .gate
-        .allowance(fence, now, r.config.max_concurrency)?
-        .saturating_sub(r.occupied);
-    Ok(group.min(route))
+fn free(g: &Group, r: &RouteState, allowances: (u32, u32)) -> Result<u32> {
+    Ok(allowances
+        .0
+        .saturating_sub(g.occupied)
+        .min(allowances.1.saturating_sub(r.occupied)))
 }
+
 fn effective(mut l: Lease, fence: u64) -> Lease {
     if l.controller_fence != fence {
         l.phase = Phase::Uncertain;
