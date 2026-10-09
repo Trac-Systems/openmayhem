@@ -148,6 +148,7 @@ mod incremental_output;
 mod response_stream;
 pub mod proxy_control;
 mod proxy_directory;
+pub mod proxy_request;
 
 mod github_update;
 use github_update::{
