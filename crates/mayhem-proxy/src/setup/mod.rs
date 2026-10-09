@@ -3,6 +3,7 @@
 //! the existing bounded upstream controller; setup never opens a wallet.
 mod admission;
 pub mod bootstrap;
+pub mod guided;
 mod connection;
 mod enrollment;
 mod flow;
@@ -13,7 +14,7 @@ mod review;
 mod run;
 mod store;
 pub use admission::{AdmissionEvidence, AdmissionReport, AdmissionState, CanonicalProvider};
-pub use connection::{DiscoveryState, InventoryReview};
+pub use connection::{preview_models, DiscoveryState, InventoryReview, ModelsPreview};
 pub use enrollment::{EnrollmentAction, EnrollmentClient, EnrollmentInvoice, EnrollmentResult};
 pub use flow::{Flow, FlowAction, FlowChoice, FlowConfig, FlowResult, FlowView};
 pub use probe::{ProbeGroup, ProbePlan, ProbeReport, ProbeScope, ProbeState};

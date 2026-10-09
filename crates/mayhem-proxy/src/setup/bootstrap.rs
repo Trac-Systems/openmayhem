@@ -443,3 +443,88 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
     managed::Prepared::check_supervised_config(&config, &stage.join("validation.json"))
         .map_err(|_| Error::Bootstrap("managed runtime or protected references"))
 }
+
+/// Build only a bounded GET /models client, using the same destination and
+/// credential restrictions as saved connections. A write-only value lives in an
+/// unpredictable owner-private scratch file only while headers are constructed.
+/// The caller retains its concurrency permit through this blocking operation.
+#[cfg(unix)]
+pub fn models_connection(
+    parent: &Path,
+    base_url: String,
+    network: NetworkPolicy,
+    credential: Credential,
+) -> Result<crate::connector::http::HttpConnection> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.0);
+        }
+    }
+    let mut scratch = None;
+    let mut config = ConnectionConfig {
+        schema_version: 1,
+        id: "setup_preview".into(),
+        revision: 1,
+        base_url,
+        network,
+        paths: BTreeMap::from([(Operation::Models, "models".into())]),
+        authentication: Authentication::None,
+        headers: BTreeMap::new(),
+        error_profile: ErrorProfile::OpenAi,
+        limits: crate::connector::config::Limits {
+            max_in_flight: 1,
+            max_response_bytes: 64 * 1024,
+            connect_timeout_ms: 5_000,
+            read_idle_timeout_ms: Some(5_000),
+            ..Default::default()
+        },
+    };
+    config.validate().map_err(|_| Error::Invalid)?;
+    config.authentication = match credential {
+        Credential::None => Authentication::None,
+        Credential::BearerFile(path) => {
+            require(path.is_absolute())?;
+            Authentication::Bearer {
+                secret: SecretSource::File { path },
+            }
+        }
+        Credential::BearerValue(value) => {
+            secret_valid(&value)?;
+            let meta = fs::symlink_metadata(parent).map_err(|_| Error::Protection)?;
+            require(
+                meta.is_dir()
+                    && !meta.file_type().is_symlink()
+                    && meta.mode() & 0o077 == 0
+                    && meta.uid() == rustix::process::geteuid().as_raw(),
+            )?;
+            let mut nonce = [0u8; 32];
+            getrandom::fill(&mut nonce).map_err(|_| Error::Storage)?;
+            let path = parent.join(format!(".proxy-models-{}", blake3::hash(&nonce).to_hex()));
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&path)
+                .map_err(|_| Error::Storage)?;
+            scratch = Some(Scratch(path.clone()));
+            file.write_all(&value).map_err(|_| Error::Storage)?;
+            Authentication::Bearer {
+                secret: SecretSource::File { path },
+            }
+        }
+    };
+    let result = crate::connector::http::HttpConnection::new(config).map_err(|_| Error::Protection);
+    drop(scratch);
+    result
+}
+#[cfg(not(unix))]
+pub fn models_connection(
+    _: &Path,
+    _: String,
+    _: NetworkPolicy,
+    _: Credential,
+) -> Result<crate::connector::http::HttpConnection> {
+    Err(Error::Protection)
+}

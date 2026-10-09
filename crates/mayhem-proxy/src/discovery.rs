@@ -1,3 +1,4 @@
+pub mod selector;
 use std::{collections::BTreeMap, time::Duration};
 
 use mayhem_proto::proxy::{
@@ -412,6 +413,10 @@ pub struct Page {
 
 impl Page {
     pub fn validate(&self, identity: &Identity) -> Result<()> {
+        self.validate_binding(identity, &QueryBinding::catalog())
+    }
+
+    fn validate_binding(&self, identity: &Identity, binding: &QueryBinding) -> Result<()> {
         identity.validate()?;
         if self.context.identity() != *identity {
             return Err(Error::Identity);
@@ -422,7 +427,7 @@ impl Page {
                 && self.schema_version == 1
                 && hex(&self.request_nonce)
                 && safe_integer(self.context.epoch)
-                && self.query == QueryBinding::catalog(),
+                && self.query == *binding,
             "invalid discovery response binding",
         )?;
         self.proof.validate()?;
@@ -508,6 +513,8 @@ impl DiscoveryClient {
             .join("proxy/discovery")
             .map_err(|_| invalid("invalid peer RPC path"))?;
         let http = reqwest::Client::builder()
+            .no_proxy()
+            .retry(reqwest::retry::never())
             .redirect(reqwest::redirect::Policy::none())
             .timeout(timeout)
             .build()
@@ -521,6 +528,12 @@ impl DiscoveryClient {
 
     pub async fn page(&self, query: &Query) -> Result<Page> {
         query.validate()?;
+        let page = self.fetch(query).await?;
+        page.validate(&self.identity)?;
+        Ok(page)
+    }
+
+    async fn fetch(&self, query: &Query) -> Result<Page> {
         let mut response = self
             .http
             .post(self.endpoint.clone())
@@ -566,7 +579,6 @@ impl DiscoveryClient {
             });
         }
         let page: Page = serde_json::from_slice(&body)?;
-        page.validate(&self.identity)?;
         Ok(page)
     }
 }

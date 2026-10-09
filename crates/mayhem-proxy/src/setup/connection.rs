@@ -162,6 +162,51 @@ fn failure(code: Code) -> DiscoveryState {
         _ => DiscoveryState::Unavailable,
     }
 }
+/// One explicit pre-save read. It is not retained probe or conformance evidence.
+#[derive(Serialize)]
+pub struct ModelsPreview {
+    pub state: DiscoveryState,
+    pub model_ids: Vec<String>,
+    pub truncated: bool,
+    pub observed_at_ms: u64,
+    pub model_identity: &'static str,
+    pub capabilities: &'static str,
+    pub readiness: &'static str,
+}
+pub async fn preview_models(connection: HttpConnection) -> ModelsPreview {
+    let (state, models) = observe(connection, 10_000).await;
+    let (model_ids, truncated) = models.unwrap_or_default();
+    ModelsPreview {
+        state,
+        model_ids,
+        truncated,
+        observed_at_ms: crate::supervisor::unix_ms(),
+        model_identity: "not_verified",
+        capabilities: "not_verified",
+        readiness: "not_verified",
+    }
+}
+async fn observe(
+    connection: HttpConnection,
+    timeout_ms: u64,
+) -> (DiscoveryState, Option<(Vec<String>, bool)>) {
+    match tokio::time::timeout(Duration::from_millis(timeout_ms), async {
+        connection
+            .send(Operation::Models, None)
+            .await?
+            .collect_json()
+            .await
+    })
+    .await
+    {
+        Err(_) => (DiscoveryState::TimedOut, None),
+        Ok(Err(error)) => (failure(error.code), None),
+        Ok(Ok(value)) => match decode(value) {
+            None => (DiscoveryState::InvalidResponse, None),
+            Some(found) => (DiscoveryState::Listed, Some(found)),
+        },
+    }
+}
 impl Store {
     /// Read the original retained observation. This never creates a client,
     /// resolves a credential, retries Pending, or updates a declaration.
@@ -253,25 +298,9 @@ impl Store {
             match HttpConnection::new(config) {
                 Err(_) => DiscoveryState::Unavailable,
                 Ok(connection) => {
-                    match tokio::time::timeout(Duration::from_millis(timeout_ms), async {
-                        connection
-                            .send(Operation::Models, None)
-                            .await?
-                            .collect_json()
-                            .await
-                    })
-                    .await
-                    {
-                        Err(_) => DiscoveryState::TimedOut,
-                        Ok(Err(error)) => failure(error.code),
-                        Ok(Ok(value)) => match decode(value) {
-                            None => DiscoveryState::InvalidResponse,
-                            Some(found) => {
-                                models = Some(found);
-                                DiscoveryState::Listed
-                            }
-                        },
-                    }
+                    let (state, found) = observe(connection, timeout_ms).await;
+                    models = found;
+                    state
                 }
             }
         };

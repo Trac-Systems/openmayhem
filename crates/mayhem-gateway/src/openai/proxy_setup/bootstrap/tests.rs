@@ -1,4 +1,8 @@
 use super::*;
+#[path="../../../../../mayhem-proxy/tests/support/setup_discovery.rs"]
+mod canonical_fixture;
+#[path="guided_tests.rs"]
+mod guided;
 use mayhem_proxy::{
     attempts::{Digest, Identity},
     setup::{self, LaunchBinding, LifecycleObservation, RunFuture},
@@ -35,7 +39,7 @@ fn config(dir: &Path) -> BootstrapConfig {
     BootstrapConfig{destination:dir.join("proxy-setup"),host:Host{
         network:serde_json::from_value(json!({"network_id":"dashboard-fixture","msb_bootstrap":"03".repeat(32),"subnet_bootstrap":"04".repeat(32),"contract_version":mayhem_proto::CONTRACT_VERSION})).unwrap(),
         provider_pubkey:Digest::new(hex::encode(ed25519_dalek::SigningKey::from_bytes(&[201;32]).verifying_key().to_bytes())).unwrap(),
-        peer_rpc:"http://127.0.0.1:9/".into(),bridge_url:"ws://127.0.0.1:9/".into(),bridge_token_file:bridge,
+        peer_rpc:std::fs::read_to_string(dir.join("fixture-peer-url")).unwrap_or_else(|_|"http://127.0.0.1:9/".into()),bridge_url:"ws://127.0.0.1:9/".into(),bridge_token_file:bridge,
         worker_program:std::env::current_exe().unwrap(),wallet_password_file:None,admission_origin:None},
         tokenizers:BTreeMap::from([("approved".into(),Tokenizer{file:token,digest:Digest::new(blake3::hash(&data).to_hex().to_string()).unwrap(),limits:mayhem_proxy::health::native::Limits{artifact_bytes:1024*1024,output_bytes:1024*1024,channels:16,workers:1,minimum_tokens:2}})]),
         credentials:BTreeMap::new(),lifecycle:Arc::new(NoLifecycle)}
@@ -44,6 +48,7 @@ fn input() -> Value {
     json!({"schema_version":1,"base_url":"http://127.0.0.1:9/v1/","network_policy":{"mode":"pinned","networks":["127.0.0.1/32"],"allow_http":true},"credential":{"kind":"bearer_value","value":"synthetic-dashboard-only-key"},"endpoint":"openai_chat_completions","upstream_model":"fixture-model","market":{"action":"create_market","slug":"dashboard-fixture","model":{"family_id":"fixture","model_id":"declared-model","revision":"","quantization":""}},"served_context":4096,"concurrency":2,"accepted_rails":["fiat"],"sequence":1,"offers":[{"revision":1,"ctx_bracket":"ctx4096","outcome_class":"","rates":[{"unit":"input_token","granularity":1000,"per_unit_au":"123"},{"unit":"output_token","granularity":1000,"per_unit_au":"456"}],"per_request_au":"2","min_session_au":"3","accepted_rails":["fiat"]}],"settlement_policy":{"schema_version":1,"lane":"proxy","payable_outcomes":["complete"],"allow_checkpoints":false},"probe_budget":{"max_attempts":2,"max_cost_microusd":20,"per_attempt_cost_microusd":10},"probe_output_limit":32,"probe_timeout_ms":3000,"allow_recovery_probes":false,"tokenizer_id":"approved","closed_retention_ms":86400000})
 }
 struct Server {
+    peer: Option<canonical_fixture::Server>,
     control: Arc<Option<Control>>,
     cookie: std::sync::Mutex<Option<String>>,
     origin: String,
@@ -56,6 +61,10 @@ impl Drop for Server {
     }
 }
 async fn start(dir: &Path) -> Server {
+    let peer=if dir.join("proxy-setup/wizard.json").exists(){None}else{
+        let peer=canonical_fixture::Server::start(serde_json::to_value(config(dir).host.network).unwrap()).await;
+        private(&dir.join("fixture-peer-url"),peer.url.as_bytes());Some(peer)
+    };
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let state = GatewayState::fixture()
@@ -67,6 +76,7 @@ async fn start(dir: &Path) -> Server {
     let task =
         tokio::spawn(async move { axum::serve(listener, openai_router(state)).await.unwrap() });
     Server {
+        peer,
         control,
         cookie: std::sync::Mutex::new(None),
         origin,
@@ -352,7 +362,7 @@ async fn dashboard_bootstrap_browser_fixture() {
         .mode(0o600)
         .open(&ready)
         .unwrap();
-    file.write_all(json!({"url":format!("{}/mayhem/dashboard/provider/setup?token={}",s.origin,s.token),"origin":s.origin}).to_string().as_bytes()).unwrap();
+    file.write_all(json!({"url":format!("{}/mayhem/dashboard/provider/setup?token={}",s.origin,s.token),"origin":s.origin,"upstream_url":format!("{}upstream/",s.peer.as_ref().unwrap().url)}).to_string().as_bytes()).unwrap();
     file.sync_all().unwrap();
     tokio::time::timeout(Duration::from_secs(180), async {
         while !ready.with_extension("done").exists() {

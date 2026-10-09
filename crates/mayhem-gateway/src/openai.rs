@@ -6621,6 +6621,7 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/mayhem/dashboard/provider/setup/state", get(proxy_setup::view))
         .route("/mayhem/dashboard/provider/setup/action", post(proxy_setup::action))
         .route("/mayhem/dashboard/provider/setup/bootstrap", post(proxy_setup::bootstrap::create))
+        .route("/mayhem/dashboard/provider/setup/bootstrap/guide", post(proxy_setup::bootstrap::guided_read))
         .route("/mayhem/dashboard/assets/proxy-setup.js", get(proxy_setup::script))
         .route("/mayhem/dashboard/assets/proxy-setup-bootstrap.js", get(proxy_setup::bootstrap_script))
         .route("/mayhem/dashboard/evidence", get(mayhem_dashboard_evidence))

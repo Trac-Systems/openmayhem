@@ -1,6 +1,7 @@
 //! Host-owned first-create authority. Browser input contains choices, never paths,
 //! wallet material, network identity, signing authority or lifecycle callbacks.
 use super::*;
+mod guide;
 use mayhem_proto::proxy::{finance::ProxySettlementPolicy, ProxyEndpoint, ProxyRail};
 use mayhem_proxy::{
     connector::config::NetworkPolicy,
@@ -69,6 +70,20 @@ impl BootstrapConfig {
             "admission_configured":self.host.admission_origin.is_some(),
             "authorizes_probe":false,"authorizes_publication":false,"authorizes_run":false})
     }
+    fn credential(&self, input: CredentialInput) -> Result<Credential, &'static str> {
+        match input {
+            CredentialInput::None => Ok(Credential::None),
+            CredentialInput::BearerValue { value } => Ok(Credential::BearerValue(Zeroizing::new(
+                value.as_bytes().to_vec(),
+            ))),
+            CredentialInput::Reference { id } => self
+                .credentials
+                .get(&id)
+                .cloned()
+                .map(Credential::BearerFile)
+                .ok_or("setup_unapproved_credential_reference"),
+        }
+    }
     fn choices(&self, input: Input) -> Result<Choices, &'static str> {
         if input.schema_version != 1 || input.offers.len() != 1 || input.offers[0].revision != 1 {
             return Err("setup_invalid_choices");
@@ -86,18 +101,7 @@ impl BootstrapConfig {
                 limits: t.limits.clone(),
             })
         };
-        let credential = match input.credential {
-            CredentialInput::None => Credential::None,
-            CredentialInput::BearerValue { value } => {
-                Credential::BearerValue(Zeroizing::new(value.as_bytes().to_vec()))
-            }
-            CredentialInput::Reference { id } => Credential::BearerFile(
-                self.credentials
-                    .get(&id)
-                    .ok_or("setup_unapproved_credential_reference")?
-                    .clone(),
-            ),
-        };
+        let credential = self.credential(input.credential)?;
         Ok(Choices {
             base_url: input.base_url,
             network_policy: input.network_policy,
@@ -202,20 +206,55 @@ pub(crate) async fn create(State(state): State<SharedState>, request: Request) -
         Ok(v) => v,
         Err(e) => return failure(StatusCode::BAD_REQUEST, e),
     };
-    let result = spawn_creation(permit, move || {
-        // Recover a committed original before attempting a new create. This also
-        // handles a lost HTTP ACK or another process completing the same bundle.
-        if let Some(flow) = config.restore()? {
-            return Ok((flow, false));
-        }
-        bootstrap::create(&config.destination, config.host.clone(), choices)
-            .map_err(|_| "setup_create_failed_inspect_original".to_owned())?;
-        config
-            .restore()?
-            .map(|v| (v, true))
-            .ok_or_else(|| "setup_original_unavailable".to_owned())
+    // Restore the original first; its recovery never depends on fresh discovery.
+    let restore_config = config.clone();
+    let restored = tokio::task::spawn_blocking(move || {
+        let result = restore_config.restore();
+        (permit, result)
     })
     .await;
+    let (permit, original) = match restored {
+        Ok((permit, Ok(original))) => (permit, original),
+        _ => return failure(StatusCode::CONFLICT, "setup_create_failed_inspect_original"),
+    };
+    let result = if let Some(flow) = original {
+        Ok(Ok((flow, false)))
+    } else {
+        let canonical = match mayhem_proxy::setup::guided::Canonical::new(&config.host) {
+            Ok(v) => v,
+            Err(_) => {
+                return failure(
+                    StatusCode::CONFLICT,
+                    "setup_selection_changed_or_unavailable",
+                )
+            }
+        };
+        if let Err(error) = canonical.revalidate(&choices).await {
+            return failure(
+                StatusCode::CONFLICT,
+                match error {
+                    mayhem_proxy::setup::Error::Bootstrap("market already exists; choose join") => {
+                        "setup_market_exists_choose_join"
+                    }
+                    _ => "setup_selection_changed_or_unavailable",
+                },
+            );
+        }
+        spawn_creation(permit, move || {
+            // Another process may have committed while these reads were pending.
+            // Retain the original; never overwrite it with newly selected terms.
+            if let Some(flow) = config.restore()? {
+                return Ok((flow, false));
+            }
+            bootstrap::create(&config.destination, config.host.clone(), choices)
+                .map_err(|_| "setup_create_failed_inspect_original".to_owned())?;
+            config
+                .restore()?
+                .map(|v| (v, true))
+                .ok_or_else(|| "setup_original_unavailable".to_owned())
+        })
+        .await
+    };
     match result {
         Ok(Ok((flow, created))) => {
             let _ = control.flow.set(flow);
@@ -232,3 +271,5 @@ pub(crate) async fn create(State(state): State<SharedState>, request: Request) -
 }
 #[cfg(test)]
 mod tests;
+
+pub(crate) use guide::read as guided_read;

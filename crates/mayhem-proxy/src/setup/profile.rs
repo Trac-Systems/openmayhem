@@ -83,6 +83,26 @@ pub enum ProfileMarket {
     /// local preparation does not attest to its canonical publication.
     JoinMarket { market: ProxyMarketDescriptor },
 }
+/// One descriptor constructor for offline profiles and guided canonical checks.
+pub(super) fn created_market(
+    provider: &Digest,
+    slug: String,
+    model: ProxyModelClaim,
+    endpoint: ProxyEndpoint,
+    endpoints: Vec<ProxyEndpointContract>,
+) -> ProxyMarketDescriptor {
+    ProxyMarketDescriptor {
+        schema_version: 1,
+        lane: ProxyLane::Proxy,
+        creator_pubkey: provider.as_str().into(),
+        slug,
+        model,
+        family: endpoint.family(),
+        endpoints,
+        metering: Policy::for_endpoint(endpoint).contract(),
+        pricing: ProxyPricing::ProviderOffers,
+    }
+}
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MembershipInput {
@@ -161,17 +181,13 @@ impl ProfileInput {
         let (selection, market) = match self.market {
             ProfileMarket::CreateMarket { slug, model } => (
                 Selection::CreateMarket,
-                ProxyMarketDescriptor {
-                    schema_version: 1,
-                    lane: ProxyLane::Proxy,
-                    creator_pubkey: self.provider_pubkey.as_str().into(),
+                created_market(
+                    &self.provider_pubkey,
                     slug,
                     model,
-                    family: endpoint.family(),
-                    endpoints: endpoints.clone(),
-                    metering: Policy::for_endpoint(endpoint).contract(),
-                    pricing: ProxyPricing::ProviderOffers,
-                },
+                    endpoint,
+                    endpoints.clone(),
+                ),
             ),
             ProfileMarket::JoinMarket { market } => (Selection::JoinMarket, market),
         };

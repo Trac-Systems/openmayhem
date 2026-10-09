@@ -1,11 +1,13 @@
 //! Guided first setup. Host authority comes from existing configured Core;
 //! questions collect operator choices, never upstream assertions or secret argv.
 use super::*;
+mod guided;
 use anyhow::{ensure, Context};
 use mayhem_proto::proxy::{
     finance::{ProxyHoldExpiry, ProxyReceiptOutcome, ProxySettlementPolicy},
     *,
 };
+use mayhem_proxy::setup::guided::{usd_to_au, usd_to_microusd, Canonical};
 use mayhem_proxy::{
     attempts::Digest,
     connector::config::{private_file, NetworkPolicy},
@@ -90,7 +92,13 @@ fn path(value: &Path) -> Result<PathBuf> {
     Ok(crate::absolutize(value.to_owned())?)
 }
 
-fn choices(input: &mut impl BufRead, output: &mut impl Write, args: &InitArgs) -> Result<Choices> {
+async fn choices(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    args: &InitArgs,
+    host: &Host,
+    home: &Path,
+) -> Result<Choices> {
     let mut base_url = ask(
         input,
         output,
@@ -157,25 +165,10 @@ fn choices(input: &mut impl BufRead, output: &mut impl Write, args: &InitArgs) -
             Credential::BearerFile(path(Path::new(&value))?)
         }
     };
-    let upstream_model = ask(
-        input,
-        output,
-        "Exact upstream model (manual model IDs are supported)",
-        "",
-    )?;
-    let family_id = ask(
-        input,
-        output,
-        "Existing canonical broad family ID (a name is not canonical registration)",
-        "",
-    )?;
-    let model_id = ask(
-        input,
-        output,
-        "Declared public model label",
-        &upstream_model,
-    )?;
-    let slug = ask(input, output, "New market slug", "")?;
+    let canonical = Canonical::new(host)?;
+    let upstream_model =
+        guided::model(input, output, home, &base_url, &network_policy, &credential).await?;
+    let market = guided::market(input, output, &canonical, endpoint, &upstream_model).await?;
     let served_context: u32 = number(input, output, "Declared served context", "")?;
     let concurrency = number(
         input,
@@ -202,7 +195,7 @@ fn choices(input: &mut impl BufRead, output: &mut impl Write, args: &InitArgs) -
         accepted_rails.windows(2).all(|v| v[0] != v[1]),
         "duplicate rail"
     );
-    writeln!(output, "LLM input/output units are normalized billing units, not upstream tokenizer tokens. Prices below are exact AU; no FX or fee is inferred.")?;
+    writeln!(output, "LLM input/output units are normalized billing units, not upstream tokenizer tokens. Prices are USD-denominated, converted exactly at 1 USD = 10^18 AU; no token FX or fee is inferred.")?;
     let units = mayhem_proxy::metering::Policy::for_endpoint(endpoint)
         .contract()
         .units;
@@ -214,25 +207,30 @@ fn choices(input: &mut impl BufRead, output: &mut impl Write, args: &InitArgs) -
             &format!("{unit}: billing units per price"),
             "",
         )?;
-        let per_unit_au = number(
+        let per_unit_au = usd_to_au(&ask(
             input,
             output,
-            &format!("{unit}: AU for that many units"),
+            &format!("{unit}: USD for that many units (up to 18 decimal places)"),
             "",
-        )?;
+        )?)?;
         rates.push(ProxyRate {
             unit,
             granularity,
             per_unit_au,
         });
     }
-    let per_request_au = number(
+    let per_request_au = usd_to_au(&ask(
         input,
         output,
-        "Additional AU per request (enter 0 if none)",
+        "Additional USD per request (enter 0 if none)",
         "",
-    )?;
-    let min_session_au = number(input, output, "Minimum session AU (enter 0 if none)", "")?;
+    )?)?;
+    let min_session_au = usd_to_au(&ask(
+        input,
+        output,
+        "Minimum session USD (enter 0 if none)",
+        "",
+    )?)?;
     let ctx_bracket = format!("ctx{served_context}");
     let outcome_class = if endpoint == ProxyEndpoint::Decisions {
         let value = ask(
@@ -249,11 +247,10 @@ fn choices(input: &mut impl BufRead, output: &mut impl Write, args: &InitArgs) -
     } else {
         String::new()
     };
-    let sequence = number(
-        input,
+    let sequence = canonical.next_sequence().await?;
+    writeln!(
         output,
-        "Canonical next operation sequence (first admission is 1; rechecked at publication)",
-        "1",
+        "Canonical next operation sequence: {sequence} (rechecked before save and publication)."
     )?;
     let mut payable_outcomes = vec![ProxyReceiptOutcome::Complete];
     for (label, outcome) in [
@@ -295,18 +292,18 @@ fn choices(input: &mut impl BufRead, output: &mut impl Write, args: &InitArgs) -
         _ => anyhow::bail!("unsupported explicit hold-expiry policy"),
     };
     let max_attempts = number(input, output, "Cumulative probe attempt allowance", "")?;
-    let max_cost_microusd = number(
+    let max_cost_microusd = usd_to_microusd(&ask(
         input,
         output,
-        "Cumulative probe allowance in micro-USD (0 only for no-charge backend)",
+        "Cumulative probe allowance in USD (up to 6 decimal places; 0 only for no-charge backend)",
         "",
-    )?;
-    let per_attempt_cost_microusd = number(
+    )?)?;
+    let per_attempt_cost_microusd = usd_to_microusd(&ask(
         input,
         output,
-        "Approved maximum estimated micro-USD per probe",
+        "Approved maximum estimated USD per probe",
         "",
-    )?;
+    )?)?;
     let probe_output_limit = number(
         input,
         output,
@@ -369,15 +366,7 @@ fn choices(input: &mut impl BufRead, output: &mut impl Write, args: &InitArgs) -
         credential,
         endpoint,
         upstream_model,
-        market: ProfileMarket::CreateMarket {
-            slug,
-            model: ProxyModelClaim {
-                family_id,
-                model_id,
-                revision: String::new(),
-                quantization: String::new(),
-            },
-        },
+        market,
         served_context,
         concurrency,
         accepted_rails: accepted_rails.clone(),
@@ -448,22 +437,6 @@ pub async fn run(mut args: InitArgs) -> Result<()> {
         })?;
         args.wallet.wallet_password = Some(std::str::from_utf8(&bytes)?.trim_end().into());
     }
-    let mut output = io::stdout();
-    writeln!(output, "Create one protected standard connection using the existing Core and wallet. No upstream request, paid probe, invoice, publication or service change occurs here.")?;
-    let chosen = choices(&mut io::stdin().lock(), &mut output, &args)?;
-    writeln!(
-        output,
-        "Review exact choices:\n{}",
-        serde_json::to_string_pretty(&chosen.review())?
-    )?;
-    ensure!(
-        yes(
-            &mut io::stdin().lock(),
-            &mut output,
-            "Read configured Core identity and save this private setup? yes/no"
-        )?,
-        "setup cancelled"
-    );
     let rpc = mayhem_bridge::PeerRpcClient::new(&rpc_url)?;
     let (status, health, admin) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
         let status = rpc.status().await?;
@@ -494,8 +467,35 @@ pub async fn run(mut args: InitArgs) -> Result<()> {
             cfg!(windows),
         )),
         wallet_password_file: password.clone(),
-        admission_origin: args.admission_origin,
+        admission_origin: args.admission_origin.clone(),
     };
+    let mut output = io::stdout();
+    writeln!(output,"Choose an existing model server and canonical market. Only explicitly requested discovery reads run here; no probe, payment, publication or service change.")?;
+    let chosen = choices(&mut io::stdin().lock(), &mut output, &args, &host, &home).await?;
+    for r in &chosen.offers[0].rates {
+        writeln!(
+            output,
+            "USD {} = {} AU per {} {} billing units",
+            mayhem_proxy::setup::guided::au_to_usd(r.per_unit_au),
+            r.per_unit_au,
+            r.granularity,
+            r.unit
+        )?;
+    }
+    writeln!(
+        output,
+        "Review exact choices:\n{}",
+        serde_json::to_string_pretty(&chosen.review())?
+    )?;
+    ensure!(
+        yes(
+            &mut io::stdin().lock(),
+            &mut output,
+            "Recheck canonical selection and save this private setup? yes/no"
+        )?,
+        "setup cancelled"
+    );
+    Canonical::new(&host)?.revalidate(&chosen).await?;
     let bundle = tokio::task::spawn_blocking(move || bootstrap::create(&destination, host, chosen))
         .await??;
     let password_arg = password
@@ -577,65 +577,12 @@ mod tests {
             "never-on-argv"
         ])
         .is_err());
-        let args = InitArgs {
-            wallet: WalletLocatorArgs {
-                home: None,
-                keypair: None,
-                peer_store_name: "main".into(),
-                wallet_password: None,
-            },
-            api_key_file: None,
-            tokenizer_file: None,
-            restart_password_file: None,
-            admission_origin: None,
-            rpc_url: None,
-        };
-        let lines = [
-            "https://example.com/v1/",
-            "decisions",
-            "yes",
-            "none",
-            "external",
-            "other",
-            "Public label",
-            "new-market",
-            "4096",
-            "2",
-            "tnk,fiat",
-            "1",
-            "123",
-            "7",
-            "9",
-            "unclassified",
-            "1",
-            "no",
-            "no",
-            "no",
-            "no",
-            "none",
-            "3",
-            "20",
-            "5",
-            "32",
-            "3000",
-            "yes",
-            "7",
-        ]
-        .join("\n")
-            + "\n";
-        let choices = choices(&mut io::Cursor::new(lines), &mut Vec::new(), &args).unwrap();
-        assert_eq!(choices.offers[0].rates[0].per_unit_au, 123);
-        assert_eq!(choices.offers[0].per_request_au, 7);
-        assert_eq!(choices.offers[0].min_session_au, 9);
-        assert_eq!(
-            choices.settlement_policy.payable_outcomes,
-            vec![ProxyReceiptOutcome::Complete]
-        );
-        assert!(!choices.settlement_policy.allow_checkpoints);
-        assert_eq!(choices.settlement_policy.hold_expiry, None);
-        assert_eq!(choices.probe_budget.max_attempts, 3);
-        assert_eq!(choices.probe_budget.per_attempt_cost_microusd, 5);
-        assert!(choices.tokenizer.is_none());
-        assert!(choices.offers[0].outcome_class.is_empty());
+        assert_eq!(usd_to_au("0.000000000000000123").unwrap(), 123);
+        assert_eq!(usd_to_microusd("0.000005").unwrap(), 5);
+        assert!(usd_to_microusd("0.0000005").is_err());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "bootstrap/guided_tests.rs"]
+mod guided_tests;

@@ -21,14 +21,38 @@ Optional host arguments:
 - `--proxy-setup-admission-origin ORIGIN`: explicit trusted admission service.
   Omission leaves enrollment unavailable; no receiver, fee or issuer is inferred.
 
-No Flow, Connection, Probe or runtime-policy JSON is required. The form collects
-endpoint URL, compatible protocol, exact upstream model, explicit destination
-network permission, canonical family/model declaration, context/concurrency,
-accepted rails and full price map, settlement choices, cumulative probe allowance,
-recovery permission and local completed-journal retention. Prices are exact AU;
-no exchange rate or financial policy is filled automatically. The initial form
-creates a new market; joining an exact existing market remains supported by the
-protected profile path. Nonstandard protocols use reviewed custom recipes.
+No Flow, Connection, Probe or runtime-policy JSON is required. The CLI `setup init`
+and first-create dashboard use shared guided reads and the same factory. Enter an
+API URL and a protected credential reference or write-only bearer value, then
+explicitly **Find models on this server**. One guarded GET `/models` returns a
+bounded list (128 IDs / 64 KiB / ten seconds). Unsupported listing remains explicit;
+an exact manual model ID is allowed. Names never certify model identity,
+capabilities or readiness. No generation/probe is sent by this read.
+
+Browse canonical families, then choose **create** or **join**. Family lists are paged;
+markets use the canonical family/endpoint-family indexes. Each page is bounded to
+40 entries and the existing signed cursor, with no total-catalog cutoff. Later
+pages can contain compatible matches even when a current page contains none.
+Joining selects a full canonical descriptor with the exact standard endpoint
+contract and metering policy. This does not promise provider capacity. Creating a
+market declares a model within an enabled existing family; it cannot register a new
+canonical family. The local host owns the trusted peer URL and network identity.
+
+Review reads the next provider operation sequence from authenticated canonical
+state; a genuinely absent provider starts at 1. Errors are never interpreted as an
+empty catalog or absent provider. Final save rechecks the exact market/family and
+sequence; an already-existing exact create descriptor must be joined instead. This
+draft check reserves nothing. Publication independently rechecks canonical
+authority, quota and handle availability. Recovering a previously committed bundle
+precedes fresh reads, including during an outage.
+
+Context, shared concurrency, accepted rails, settlement choices and cumulative
+probe allowance remain explicit operator decisions. Human prices are exact
+USD-denominated decimals (1 USD = 10^18 AU); the chosen unit granularity is retained
+and review displays exact AU. Probe allowances convert to micro-USD with up to six
+decimal places. Excess precision, overflow and exponent notation are rejected,
+never rounded; no token FX or fee is inferred. The same checked Rust conversion
+serves CLI and dashboard. Nonstandard protocols still require reviewed recipes.
 
 The shared factory validates the full generated profile and supervised runtime
 configuration before an atomic private write under `<home>/proxy-setup`. Browser
@@ -66,10 +90,10 @@ private projections, immutable retries, commit-without-ACK recovery, restart and
 handoff to actual Select/Check. They send no upstream, payment or canonical writes.
 The opt-in browser fixture additionally exercises the actual first-create form.
 
-This is the protected first-create connection, not completion of the plan's easy
-onboarding UX. Remaining guided work includes discovering models before requiring
-a model selection, authenticated family/market selection for create **or** join,
-reading the next canonical sequence, human price/allowance entry with explicit
-exact conversions, and approved tokenizer provisioning. The current form honestly
-requires those identifiers, exact units and host-provided tokenizer prerequisite;
-it does not replace them with guessed identities, prices, capacity or evidence.
+The guided flow removes manual canonical family IDs, full market descriptors,
+operation sequences and raw AU/micro-USD price entry. Remaining onboarding
+prerequisites are the trusted existing host, explicit resource/charging/probe
+choices and approved pinned tokenizer provisioning for LLM speed measurement.
+Custom protocols still use reviewed recipes; listing alone is never a conformance
+probe. This does not complete admission collection/permit renewal or claim that
+saving starts serving. Those steps retain their existing separate checks/recovery.
