@@ -8,6 +8,7 @@ mod local_lab;
 mod profile;
 mod resolver;
 mod taxonomy;
+mod taxonomy_filters;
 mod retail;
 mod streaming;
 use super::*;

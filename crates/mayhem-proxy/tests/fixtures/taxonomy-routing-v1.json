@@ -1,0 +1,310 @@
+{
+  "test_only": true,
+  "scope": "Actual isolated Nest/PostgreSQL metadata publication; synthetic canonical family authority",
+  "model": {
+    "family_id": "other",
+    "model_id": "example/Unicode-é-模型-🦉",
+    "revision": "",
+    "quantization": ""
+  },
+  "request": {
+    "release_hash": "59e27011ea70f9b371b6a9ae62180f4802c50112efb1c0d61d48dcd8636c4f4b",
+    "variants": [
+      {
+        "entry_id": "gateway_filter_variant",
+        "schema_revision": 1
+      }
+    ],
+    "tags": [
+      {
+        "entry_id": "gateway_filter_tag",
+        "schema_revision": 1
+      }
+    ],
+    "models": [
+      {
+        "family_id": "other",
+        "model_id": "example/Unicode-é-模型-🦉",
+        "revision": "",
+        "quantization": ""
+      }
+    ]
+  },
+  "original": {
+    "object": "proxy.taxonomy_release",
+    "release_id": "9ed6ec40-bf7b-461b-a6a8-3df3c28d9ffb",
+    "revision": "1",
+    "release_hash": "59e27011ea70f9b371b6a9ae62180f4802c50112efb1c0d61d48dcd8636c4f4b",
+    "manifest": {
+      "schema_version": 1,
+      "parent_release_id": null,
+      "parent_release_hash": null,
+      "network": {
+        "network_id": "918",
+        "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+        "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+        "contract_version": 30
+      },
+      "canonical_families": [
+        {
+          "family_id": "other",
+          "enabled": true,
+          "label": "Synthetic test family"
+        }
+      ],
+      "changes": [
+        {
+          "entry_id": "gateway_filter_family",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "a4c6737d035a6e499318d7897f15e8ac73f486fe7c73be60182ab5ff31d15a83"
+        },
+        {
+          "entry_id": "gateway_filter_tag",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "ca7ab8e6e63c9c363c6ddacc30df45b0d7d3f63f452a91bc8c81681ee9ca3a11"
+        },
+        {
+          "entry_id": "gateway_filter_variant",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "6bb7f3e8866b2f55a61d94350c2d5f44862d5753b3d7bf06529c3908d4d4ffed"
+        }
+      ]
+    },
+    "published_at": "2026-10-09T23:21:49.101Z",
+    "publication_state": "published",
+    "canonical_observation": {
+      "schema_version": 1,
+      "network": {
+        "network_id": "918",
+        "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+        "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+        "contract_version": 30
+      },
+      "snapshot": "fixture:1",
+      "proof": {
+        "view_key": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "fork": 0,
+        "signed_length": 1,
+        "tree_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+      },
+      "observed_at_ms": 1791588109093,
+      "expires_at_ms": 1791588169094,
+      "families": [
+        {
+          "family_id": "other",
+          "enabled": true,
+          "label": "Synthetic test family"
+        }
+      ]
+    }
+  },
+  "updated": {
+    "object": "proxy.taxonomy_release",
+    "release_id": "99776d52-ca9d-4ade-af7e-aa2558ab8f52",
+    "revision": "2",
+    "release_hash": "f85e98493e530dae4b7b011b80a39ed87c79553498e7cd2198b353b7ff42b216",
+    "manifest": {
+      "schema_version": 1,
+      "parent_release_id": "9ed6ec40-bf7b-461b-a6a8-3df3c28d9ffb",
+      "parent_release_hash": "59e27011ea70f9b371b6a9ae62180f4802c50112efb1c0d61d48dcd8636c4f4b",
+      "network": {
+        "network_id": "918",
+        "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+        "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+        "contract_version": 30
+      },
+      "canonical_families": [],
+      "changes": [
+        {
+          "entry_id": "gateway_filter_variant",
+          "schema_revision": 2,
+          "version": 2,
+          "document_hash": "f939cf95be70129d27fac49a45f42ac4706af488d9037020f1bb27de8706b445"
+        }
+      ]
+    },
+    "published_at": "2026-10-09T23:21:49.209Z",
+    "publication_state": "published",
+    "canonical_observation": null
+  },
+  "selected": {
+    "object": "proxy.taxonomy_selection",
+    "schema_version": 1,
+    "release": {
+      "release_id": "9ed6ec40-bf7b-461b-a6a8-3df3c28d9ffb",
+      "release_hash": "59e27011ea70f9b371b6a9ae62180f4802c50112efb1c0d61d48dcd8636c4f4b",
+      "revision": "1"
+    },
+    "variants": [
+      {
+        "entry_id": "gateway_filter_variant",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "6bb7f3e8866b2f55a61d94350c2d5f44862d5753b3d7bf06529c3908d4d4ffed"
+      }
+    ],
+    "tags": [
+      {
+        "entry_id": "gateway_filter_tag",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "ca7ab8e6e63c9c363c6ddacc30df45b0d7d3f63f452a91bc8c81681ee9ca3a11"
+      }
+    ],
+    "matches": [
+      {
+        "model": {
+          "family_id": "other",
+          "model_id": "example/Unicode-é-模型-🦉",
+          "revision": "",
+          "quantization": ""
+        },
+        "variant": {
+          "entry_id": "gateway_filter_variant",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "6bb7f3e8866b2f55a61d94350c2d5f44862d5753b3d7bf06529c3908d4d4ffed"
+        },
+        "tags": [
+          {
+            "source": {
+              "entry_id": "gateway_filter_variant",
+              "schema_revision": 1,
+              "version": 1,
+              "document_hash": "6bb7f3e8866b2f55a61d94350c2d5f44862d5753b3d7bf06529c3908d4d4ffed"
+            },
+            "scope": "model"
+          }
+        ],
+        "matches": true
+      }
+    ],
+    "capacity_reserved": false,
+    "authorizes_execution": false
+  },
+  "excluded": {
+    "object": "proxy.taxonomy_selection",
+    "schema_version": 1,
+    "release": {
+      "release_id": "99776d52-ca9d-4ade-af7e-aa2558ab8f52",
+      "release_hash": "f85e98493e530dae4b7b011b80a39ed87c79553498e7cd2198b353b7ff42b216",
+      "revision": "2"
+    },
+    "variants": [
+      {
+        "entry_id": "gateway_filter_variant",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "6bb7f3e8866b2f55a61d94350c2d5f44862d5753b3d7bf06529c3908d4d4ffed"
+      }
+    ],
+    "tags": [
+      {
+        "entry_id": "gateway_filter_tag",
+        "schema_revision": 1,
+        "version": 1,
+        "document_hash": "ca7ab8e6e63c9c363c6ddacc30df45b0d7d3f63f452a91bc8c81681ee9ca3a11"
+      }
+    ],
+    "matches": [
+      {
+        "model": {
+          "family_id": "other",
+          "model_id": "example/Unicode-é-模型-🦉",
+          "revision": "",
+          "quantization": ""
+        },
+        "variant": {
+          "entry_id": "gateway_filter_variant",
+          "schema_revision": 1,
+          "version": 1,
+          "document_hash": "6bb7f3e8866b2f55a61d94350c2d5f44862d5753b3d7bf06529c3908d4d4ffed"
+        },
+        "tags": [
+          {
+            "source": null,
+            "scope": null
+          }
+        ],
+        "matches": false
+      }
+    ],
+    "capacity_reserved": false,
+    "authorizes_execution": false
+  },
+  "documents": [
+    {
+      "entry_id": "gateway_filter_tag",
+      "schema_revision": 1,
+      "version": 1,
+      "document_hash": "ca7ab8e6e63c9c363c6ddacc30df45b0d7d3f63f452a91bc8c81681ee9ca3a11",
+      "document": {
+        "schema_version": 1,
+        "entry_id": "gateway_filter_tag",
+        "schema_revision": 1,
+        "labels": {
+          "en": "Local research category"
+        },
+        "help": {},
+        "order": 0,
+        "visible": true,
+        "lifecycle": "active",
+        "sources": [],
+        "kind": "category",
+        "parents": []
+      }
+    },
+    {
+      "entry_id": "gateway_filter_variant",
+      "schema_revision": 1,
+      "version": 1,
+      "document_hash": "6bb7f3e8866b2f55a61d94350c2d5f44862d5753b3d7bf06529c3908d4d4ffed",
+      "document": {
+        "schema_version": 1,
+        "entry_id": "gateway_filter_variant",
+        "schema_revision": 1,
+        "labels": {
+          "en": "Local Unicode variant"
+        },
+        "help": {},
+        "order": 0,
+        "visible": true,
+        "lifecycle": "active",
+        "sources": [],
+        "kind": "model",
+        "family": {
+          "entry_id": "gateway_filter_family",
+          "schema_revision": 1
+        },
+        "model_id": "example/Unicode-é-模型-🦉",
+        "revision": "",
+        "quantization": "",
+        "categories": [
+          {
+            "entry_id": "gateway_filter_tag",
+            "schema_revision": 1
+          }
+        ]
+      }
+    }
+  ],
+  "filters": {
+    "release_id": "9ed6ec40-bf7b-461b-a6a8-3df3c28d9ffb",
+    "release_hash": "59e27011ea70f9b371b6a9ae62180f4802c50112efb1c0d61d48dcd8636c4f4b",
+    "variants": [
+      {
+        "entry_id": "gateway_filter_variant",
+        "schema_revision": 1
+      }
+    ],
+    "tags": [
+      {
+        "entry_id": "gateway_filter_tag",
+        "schema_revision": 1
+      }
+    ]
+  }
+}

@@ -83,6 +83,14 @@ pub struct Policy {
     pub lane: ProxyLane,
     pub endpoint: ProxyEndpoint,
     pub target: Target,
+    /// Explicit immutable administrative filters. Legacy target strings are not
+    /// reinterpreted as versioned references. Absence preserves the old hash.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present_filters"
+    )]
+    pub taxonomy_filters: Option<crate::registry::publication::taxonomy::Filters>,
     pub providers: Providers,
     pub allowed_rails: Vec<ProxyRail>,
     pub prices: PriceLimits,
@@ -94,6 +102,11 @@ pub struct Policy {
     pub constraints: Constraints,
     pub ranking: Ranking,
     pub continuity: Continuity,
+}
+fn present_filters<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> std::result::Result<Option<crate::registry::publication::taxonomy::Filters>, D::Error> {
+    crate::registry::publication::taxonomy::Filters::deserialize(d).map(Some)
 }
 fn nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     d: D,
@@ -134,6 +147,11 @@ fn operator(op: registry::Operator) -> &'static str {
 impl Policy {
     pub fn validate(&self) -> Result<()> {
         let c = &self.constraints;
+        if let Some(filters) = &self.taxonomy_filters {
+            filters
+                .validate()
+                .map_err(|_| crate::invalid("invalid routing taxonomy filters"))?;
+        }
         require(
             self.schema_version == 1
                 && self.lane == ProxyLane::Proxy
@@ -320,7 +338,28 @@ impl Policy {
         selected_rail: ProxyRail,
         membership: Option<&crate::registry::publication::taxonomy::Membership>,
     ) -> Result<()> {
+        self.check_offer_with_metadata(candidate, endpoint, selected_rail, membership, None)
+    }
+    pub fn check_offer_with_metadata(
+        &self,
+        candidate: &PublishedOffer,
+        endpoint: ProxyEndpoint,
+        selected_rail: ProxyRail,
+        membership: Option<&crate::registry::publication::taxonomy::Membership>,
+        selection: Option<&crate::registry::publication::taxonomy::Selection>,
+    ) -> Result<()> {
         self.validate()?;
+        if let Some(filters) = &self.taxonomy_filters {
+            require(
+                selection.is_some_and(|proof| {
+                    proof.allows(
+                        filters,
+                        &crate::registry::publication::taxonomy::Model::from_offer(candidate),
+                    )
+                }),
+                "selected model violates taxonomy filters",
+            )?;
+        }
         require(
             candidate.lane == "proxy"
                 && candidate.active
@@ -378,7 +417,8 @@ impl Policy {
     /// Registry request controls have a distinct preparation/validation path;
     /// declarations still cannot satisfy capability, taxonomy or trust evidence.
     pub fn requires_observation_resolution(&self) -> bool {
-        self.providers.require_verified_operator
+        self.taxonomy_filters.is_some()
+            || self.providers.require_verified_operator
             || !self.constraints.capabilities.is_empty()
             || !self.constraints.data_handling.is_empty()
             || matches!(&self.target, Target::Category { variants, tags, .. } | Target::TaxonomyCategory { variants, tags, .. } if !variants.is_empty() || !tags.is_empty())

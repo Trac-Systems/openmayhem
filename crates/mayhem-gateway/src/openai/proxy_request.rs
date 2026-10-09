@@ -360,12 +360,13 @@ impl Request {
     }
     #[cfg(test)]
     fn check_offer(&self, candidate: &PublishedOffer) -> Result<Candidate> {
-        self.check_offer_membership(candidate, None, None)
+        self.check_offer_membership(candidate, None, None, None)
     }
     fn check_offer_membership(
         &self,
         candidate: &PublishedOffer,
         membership: Option<&mayhem_proxy::registry::publication::taxonomy::Membership>,
+        selection: Option<&mayhem_proxy::registry::publication::taxonomy::Selection>,
         operator: Option<&mayhem_proxy::operator::Observation>,
     ) -> Result<Candidate> {
         self.check_settlement_policy()?;
@@ -385,7 +386,13 @@ impl Request {
             .map_err(|_| Error::Catalog)?;
         if let Some(profile) = &self.controls.profile {
             profile
-                .check_offer_with_taxonomy(candidate, self.endpoint, self.controls.rail, membership)
+                .check_offer_with_metadata(
+                    candidate,
+                    self.endpoint,
+                    self.controls.rail,
+                    membership,
+                    selection,
+                )
                 .map_err(|_| Error::Constraints)?;
             if super::proxy_buyer::evidence::unsupported(profile) {
                 return Err(Error::ProfileEvidence);
@@ -493,6 +500,7 @@ pub async fn resolve_estimate(
         .await
         .map_err(|_| Error::Catalog)??;
     let membership = taxonomy_membership(&control, &request, &published, &network).await?;
+    let selection = taxonomy_selection(&control, &request, &published, &network).await?;
     let operator = if request.requires_operator() {
         let provider = Digest::new(&published.offer.provider_pubkey).map_err(|_| Error::Catalog)?;
         let observed = control
@@ -505,8 +513,12 @@ pub async fn resolve_estimate(
     } else {
         None
     };
-    let candidate =
-        request.check_offer_membership(&published, membership.as_ref(), operator.as_ref())?;
+    let candidate = request.check_offer_membership(
+        &published,
+        membership.as_ref(),
+        selection.as_ref(),
+        operator.as_ref(),
+    )?;
     Ok(EstimateCandidate {
         candidate,
         published,
@@ -557,6 +569,37 @@ async fn taxonomy_membership(
         return Err(Error::Constraints);
     }
     Ok(Some(member))
+}
+async fn taxonomy_selection(
+    control: &ProxyControl,
+    request: &Request,
+    published: &PublishedOffer,
+    network: &mayhem_proxy::discovery::Identity,
+) -> Result<Option<mayhem_proxy::registry::publication::taxonomy::Selection>> {
+    let Some(filters) = request
+        .controls
+        .profile
+        .as_ref()
+        .and_then(|p| p.taxonomy_filters.as_ref())
+    else {
+        return Ok(None);
+    };
+    let reader = control.registry().ok_or(Error::ProfileEvidence)?;
+    let pin = reader
+        .pin_taxonomy_filters(filters)
+        .await
+        .map_err(|_| Error::ProfileEvidence)?;
+    pin.check_network(network)
+        .map_err(|_| Error::ProfileEvidence)?;
+    let model = mayhem_proxy::registry::publication::taxonomy::Model::from_offer(published);
+    let selection = reader
+        .taxonomy_selection(&pin, filters, &[model.clone()])
+        .await
+        .map_err(|_| Error::ProfileEvidence)?;
+    if !selection.allows(filters, &model) {
+        return Err(Error::Constraints);
+    }
+    Ok(Some(selection))
 }
 pub async fn resolve(control: Arc<ProxyControl>, request: Arc<Request>) -> Result<Candidate> {
     // Same immutable publication/identity and default presence policy as quotes.

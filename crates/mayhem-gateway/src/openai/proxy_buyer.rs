@@ -44,6 +44,7 @@ mod profile;
 mod resolver;
 mod retail;
 mod streaming;
+mod taxonomy_filters;
 pub(super) use contract::handle as contract;
 pub(super) use estimation::handle as estimate;
 pub(super) use evidence::policy as conformance_policy;
@@ -701,6 +702,12 @@ async fn submit(
     let gate = data_handling::gate(
         state.proxy_control().cloned().ok_or_else(unavailable)?,
         runtime.controller.clone(),
+        request.clone(),
+        gate,
+    )
+    .await?;
+    let gate = taxonomy_filters::gate(
+        state.proxy_control().cloned().ok_or_else(unavailable)?,
         request.clone(),
         gate,
     )

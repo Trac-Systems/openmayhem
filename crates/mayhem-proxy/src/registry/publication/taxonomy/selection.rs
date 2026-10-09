@@ -144,6 +144,23 @@ impl Reply {
     }
 }
 impl Reader {
+    /// Pin using an actual explicit semantic reference, without inventing a
+    /// category or looking up a display alias. Selection validates its kind.
+    pub async fn pin_taxonomy_filters(&self, filters: &Filters) -> Result<Pinned> {
+        filters.validate()?;
+        let first = filters
+            .variants
+            .first()
+            .or_else(|| filters.tags.first())
+            .ok_or(Error::Invalid("empty taxonomy filters"))?;
+        self.pin_taxonomy(&Reference {
+            release_id: filters.release_id.clone(),
+            release_hash: filters.release_hash.clone(),
+            entry_id: first.entry_id.clone(),
+            schema_revision: first.schema_revision,
+        })
+        .await
+    }
     pub async fn taxonomy_selection(
         &self,
         pin: &Pinned,

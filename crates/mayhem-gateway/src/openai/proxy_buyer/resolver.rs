@@ -1004,7 +1004,8 @@ async fn check(
         return Checked::Excluded("key_model_excluded", false);
     }
     let profile = session.controls.profile.clone().unwrap();
-    if !matches!(&profile.target, Target::TaxonomyCategory { .. })
+    if profile.taxonomy_filters.is_none()
+        && !matches!(&profile.target, Target::TaxonomyCategory { .. })
         && profile
             .check_offer(&published, session.endpoint, session.controls.rail)
             .is_err()
