@@ -23,8 +23,7 @@ From the candidate Core worktree, after review:
 
 ```sh
 mkdir -m 700 /absolute/private/local-catalog
-CARGO_TARGET_DIR=/Applications/MAMP/htdocs/operationmayhem/target/proxy-local \
-  cargo run -p mayhem-gateway --example proxy_catalog_local -- \
+cargo run -p mayhem-gateway --example proxy_catalog_local -- \
   --local-test --directory /absolute/private/local-catalog \
   --bind 127.0.0.1:11435 --duration-seconds 1800
 ```
@@ -66,8 +65,7 @@ Focused disposable verification:
 
 ```sh
 node --test intercom/tests/proxy-catalog-local.test.mjs
-CARGO_TARGET_DIR=/Applications/MAMP/htdocs/operationmayhem/target/proxy-local \
-  cargo test -p mayhem-gateway --example proxy_catalog_local -- --test-threads=1
+cargo test -p mayhem-gateway --example proxy_catalog_local -- --test-threads=1
 ```
 
 These tests create and remove their own private directories and loopback
