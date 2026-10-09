@@ -8,6 +8,8 @@ use super::*;
 pub(super) struct ReservationIntent {
     pub(super) at: u64,
     pub(super) proof: Option<Proof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) unadmitted: Option<intent::RetainedAbsence>,
 }
 impl ReservationIntent {
     pub(super) fn validate(&self) -> Result<()> {
@@ -24,6 +26,7 @@ impl ReservationIntent {
         ReservationStatus {
             at: self.at,
             confirmed: self.proof.is_some(),
+            expired_unadmitted: self.unadmitted.is_some(),
         }
     }
 }
@@ -32,6 +35,8 @@ pub struct ReservationStatus {
     pub at: u64,
     /// Historical confirmation only, never fresh dispatch eligibility.
     pub confirmed: bool,
+    /// Canonically never admitted; no buyer hold or backend execution is claimed.
+    pub expired_unadmitted: bool,
 }
 
 impl Store {
@@ -52,7 +57,11 @@ impl Store {
             closed_at: None,
             prune_after: None,
             acknowledgment: None,
-            reservation: Some(ReservationIntent { at, proof: None }),
+            reservation: Some(ReservationIntent {
+                at,
+                proof: None,
+                unadmitted: None,
+            }),
         };
         let key = r.key()?;
         r.validate(&key, &self.identity)?;
@@ -90,6 +99,56 @@ impl Store {
         self.commit(tx)?;
         Digest::new(key).map_err(|_| invalid("invalid terms key"))
     }
+    fn close_unadmitted_reservation(
+        &self,
+        key: &str,
+        o: intent::Observation,
+        at_ms: u64,
+    ) -> Result<()> {
+        let tx = self.transaction()?;
+        let mut table = crate::db(tx.open_table(RECORDS))?;
+        let mut r = self.decode(
+            key,
+            crate::db(table.get(key))?
+                .ok_or_else(|| invalid("unknown reservation intention"))?
+                .value(),
+        )?;
+        let offer = negotiation::BuyerOffer {
+            terms: r.authorization.terms.clone(),
+            buyer_sig: r.authorization.buyer_sig.clone(),
+        };
+        let absent = o.absent(&offer, self.identity.controller_pubkey.as_str())?;
+        let original = r
+            .reservation
+            .as_mut()
+            .ok_or_else(|| invalid("not a reservation intention"))?;
+        require(
+            original.proof.is_none() && r.proof.is_none() && r.confirmed.is_none(),
+            "admitted reservation cannot expire as unadmitted",
+        )?;
+        if original.unadmitted.is_some() {
+            return Ok(());
+        }
+        require(
+            at_ms >= original.at && at_ms <= PROXY_MAX_SAFE_INTEGER,
+            "invalid reservation closure time",
+        )?;
+        let deadline = at_ms
+            .checked_add(self.limits.closed_retention_ms)
+            .filter(|n| *n <= PROXY_MAX_SAFE_INTEGER)
+            .ok_or_else(|| invalid("recovery retention overflow"))?;
+        original.unadmitted = Some(absent);
+        r.closed_at = Some(at_ms);
+        r.prune_after = Some(deadline);
+        self.save(&mut table, key, &r)?;
+        crate::db(crate::db(tx.open_table(PENDING))?.remove(key))?;
+        crate::db(
+            crate::db(tx.open_table(CLOSED))?.insert(format!("{deadline:020}/{key}").as_str(), key),
+        )?;
+        drop(table);
+        o.fresh()?;
+        self.commit(tx)
+    }
 }
 impl BuyerRecovery {
     /// Persist exact buyer/provider signatures, original policy and publication
@@ -109,6 +168,10 @@ impl BuyerRecovery {
     /// publication remains recoverable; callers must not start a replacement hold.
     pub async fn publish_reservation(&self, key: Digest, at_ms: u64) -> Result<Observation> {
         let r = self.run(move |s| s.get(key.as_str())).await?;
+        require(
+            !r.expired_unadmitted(),
+            "reservation intention expired without admission",
+        )?;
         let submission = match r.reservation.as_ref().filter(|v| v.proof.is_none()) {
             Some(intent) => {
                 self.client
@@ -120,6 +183,22 @@ impl BuyerRecovery {
         let observed = match self.client.observe(&r.authorization).await {
             Ok(value) => value,
             Err(error) => {
+                // A missing observation alone proves nothing. Only a fresh
+                // canonical non-admission proof can retire this publication.
+                if r.reservation.as_ref().is_some_and(|v| v.proof.is_none()) {
+                    let offer = negotiation::BuyerOffer {
+                        terms: r.authorization.terms.clone(),
+                        buyer_sig: r.authorization.buyer_sig.clone(),
+                    };
+                    if let Ok(o) = self.client.intent_state(&offer).await {
+                        if o.status()? == intent::Status::Expired {
+                            let key = r.key()?;
+                            self.run(move |s| s.close_unadmitted_reservation(&key, o, at_ms))
+                                .await?;
+                            return Err(invalid("reservation intention expired without admission"));
+                        }
+                    }
+                }
                 submission?;
                 return Err(error);
             }

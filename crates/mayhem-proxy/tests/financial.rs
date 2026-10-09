@@ -103,6 +103,53 @@ impl Fixture {
     }
 }
 #[tokio::test]
+async fn intent_rpc_observes_expired_unadmitted_terms_on_both_roles_and_rejects_corrupt_responses()
+{
+    use mayhem_proxy::financial::{intent::Status, negotiation::BuyerOffer};
+    for family in ["llm", "decisions"] {
+        for rail in ["fiat", "tnk", "tap"] {
+            let mut f = Fixture::new_with_mode(rail, family, "unreserved").await;
+            let offer = BuyerOffer {
+                terms: f.auth.terms.clone(),
+                buyer_sig: f.auth.buyer_sig.clone(),
+            };
+            assert_eq!(
+                f.client
+                    .intent_state(&offer)
+                    .await
+                    .unwrap()
+                    .status()
+                    .unwrap(),
+                Status::Open
+            );
+            assert_eq!(
+                f.buyer_client
+                    .intent_state(&offer)
+                    .await
+                    .unwrap()
+                    .status()
+                    .unwrap(),
+                Status::Open
+            );
+            for fault in ["nonce", "network", "unknown"] {
+                f.command(fault).await;
+                assert!(f.client.intent_state(&offer).await.is_err(), "{fault}");
+                f.command("reset").await;
+            }
+            let before = f.request("state").await;
+            f.request(&serde_json::json!({"epoch":offer.terms.billing_epoch}).to_string())
+                .await;
+            let observed = f.client.intent_state(&offer).await.unwrap();
+            assert_eq!(observed.status().unwrap(), Status::Expired);
+            assert!(observed.authorization().unwrap().is_none());
+            assert_eq!(f.request("state").await, before);
+            assert_eq!(f.request("status").await["publications"], 0);
+            f.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn real_signed_canonical_rpc_binds_six_family_rail_reservations_and_stops_final_redispatch() {
     for family in ["llm", "decisions"] {
         for rail in ["fiat", "tnk", "tap"] {

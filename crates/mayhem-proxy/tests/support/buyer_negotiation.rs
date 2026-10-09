@@ -140,6 +140,102 @@ async fn waive(peer: &mut Peer, auth: &ProxySpendAuthorization) {
     peer.client.submit_waiver(auth, &closure).await.unwrap();
 }
 #[tokio::test]
+async fn negotiation_canonically_reclaims_never_admitted_buyer_and_dual_signed_purchases() {
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        for (endpoint, bytes, _) in cases() {
+            for countersigned in [false, true] {
+                let backend = backend(200, answer(), Duration::ZERO).await;
+                let f = Fixture::new(&backend.base, endpoint);
+                let mut peer = Peer::start(rail, &f, &bytes, false, None).await;
+                let (signer, _, provider_key) = signer(&mut peer).await;
+                let c = controller(&f, &peer, 1);
+                let (q, p) = prepare(&peer, &f, &bytes, &session(&peer)).await;
+                let saved = c.sign(p, q, signer.clone(), 1000).await.unwrap();
+                let key = saved.key().clone();
+                let auth = accepted(saved.offer(), &provider_key);
+                if countersigned {
+                    c.retain_provider_acceptance(auth.clone()).await.unwrap();
+                }
+                assert!(!c.refresh(key.clone(), 1001).await.unwrap().closed());
+                assert_eq!(c.prune(100_000, 64).await.unwrap(), 0);
+                let before = peer.command("state").await;
+                peer.command(&json!({"epoch":auth.terms.billing_epoch}).to_string())
+                    .await;
+                peer.command("nonce").await;
+                assert!(c.refresh(key.clone(), 2000).await.is_err());
+                assert!(!c.recover(key.clone()).await.unwrap().unwrap().closed());
+                peer.command("reset").await;
+                let saved = c.refresh(key.clone(), 2000).await.unwrap();
+                assert!(saved.closed() && !saved.confirmed());
+                assert_eq!(saved.authorization().is_some(), countersigned);
+                assert!(c.pending(None, 64).await.unwrap().is_empty());
+                drop(c);
+                let c = controller(&f, &peer, 1);
+                assert!(c.recover(key.clone()).await.unwrap().unwrap().closed());
+                assert!(
+                    c.retain_provider_acceptance(auth).await.is_err(),
+                    "late signatures cannot reopen closure"
+                );
+                assert!(c
+                    .publish(key.clone(), &recovery(&f, &peer), 2001)
+                    .await
+                    .is_err());
+                assert_eq!(c.prune(2999, 64).await.unwrap(), 0);
+                assert_eq!(c.prune(3000, 1).await.unwrap(), 1);
+                assert!(c.recover(key).await.unwrap().is_none());
+                let (q, p) = prepare(&peer, &f, &bytes, &session(&peer)).await;
+                let next = c.sign(p, q, signer, 3001).await.unwrap();
+                assert_eq!(
+                    next.offer().terms.billing_epoch,
+                    saved.offer().terms.billing_epoch + 1
+                );
+                assert!(
+                    !next.closed(),
+                    "quota recovered for a fresh canonical purchase"
+                );
+                assert_eq!(peer.command("state").await, before);
+                let status = peer.command("status").await;
+                assert_eq!(status["submissions"], 0);
+                assert_eq!(status["publications"], 0);
+                assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+                peer.stop().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn negotiation_recovers_canonical_acceptance_after_lost_ack_instead_of_expiring_it() {
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let mut peer = Peer::start(ProxyRail::Tnk, &f, &chat(), false, None).await;
+    let (signer, _, provider_key) = signer(&mut peer).await;
+    let c = controller(&f, &peer, 1);
+    let (q, p) = prepare(&peer, &f, &chat(), &session(&peer)).await;
+    let saved = c.sign(p, q, signer, 1000).await.unwrap();
+    let key = saved.key().clone();
+    let auth = accepted(saved.offer(), &provider_key);
+    // The countersignature reached the publisher but its ACK never reached this
+    // buyer negotiation store. Canonical observation must recover it exactly.
+    let b = recovery(&f, &peer);
+    let k = b
+        .retain_reservation(auth.clone(), saved.policy().clone(), 1000)
+        .await
+        .unwrap();
+    b.publish_reservation(k, 1001).await.unwrap();
+    peer.command(&json!({"epoch":auth.terms.billing_epoch}).to_string())
+        .await;
+    let recovered = c.refresh(key.clone(), 2000).await.unwrap();
+    assert!(recovered.confirmed() && !recovered.closed());
+    assert_eq!(recovered.authorization().unwrap(), auth);
+    assert_eq!(c.prune(100_000, 64).await.unwrap(), 0);
+    assert_eq!(c.pending(None, 64).await.unwrap(), vec![key]);
+    assert_eq!(peer.command("status").await["publications"], 1);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    peer.stop().await;
+}
+
+#[tokio::test]
 async fn negotiation_signs_owned_purchases_reopens_and_publishes_once_on_every_endpoint_and_rail() {
     for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
         for (endpoint, bytes, _) in cases() {

@@ -24,14 +24,15 @@ component, not an HTTP signing service or permission for a connector to sign.
    or lost acknowledgment leaves the same purchase recoverable. An already
    confirmed purchase, or one from an older contract version, is recovered through
    fresh canonical evidence rather than submitted as a new obsolete reservation.
-6. `refresh` records canonical progress. `confirmed()` is historical evidence,
+6. `refresh` records canonical progress, including exact never-admitted expiry
+   and recovery of a lost countersignature from canonical acceptance. `confirmed()` is historical evidence,
    not a fresh model-dispatch permit. Paid execution must still obtain current
    funding and capacity evidence independently.
 
 The full owned request remains available for independent result verification
-after restart. Only a canonically closed financial outcome enables retention
-pruning. No timer, socket error, quote expiry or process exit removes an unresolved
-signed intention or proves an upstream model stopped.
+after restart. A canonically closed financial outcome or proven never-admitted
+expiry enables retention pruning. No local timer, socket error or process exit
+removes an unresolved signed intention or proves an upstream model stopped.
 
 ## Storage and load bounds
 
@@ -60,10 +61,10 @@ test identities. No external payment or real inference is claimed.
 Provider countersigning now uses `financial::provider::ProviderNegotiation`, as described
 below. Authenticated pre-acceptance transport is implemented in `negotiation::Channel`;
 the trusted session dispatcher and automatic supervisor startup are still required.
-Bounded provider proposal orchestration is described below. Never-admitted
-signed intentions also need canonical expiry/requote reconciliation before that
-automatic controller ships. For now they stay retained and count against the
-bounded quota; silently deleting them could enable conflicting authorizations.
+Bounded provider proposal orchestration and buyer non-admission recovery are
+described below. Partially prepared/signed provider intentions and their capacity
+leases still need canonical reconciliation before that automatic controller ships.
+Those records remain retained; missing local state alone cannot release them.
 Public API/Studio/MCP serving and production deployment remain separate gates.
 
 ## Provider acceptance
@@ -251,6 +252,49 @@ the supervisor must wrap the cursor after each pass. No whole-history rebuild is
 The tests reopen real stores and demonstrate reclaim followed by a new proposal, bounded
 pagination with native/legacy allocations, refusal to reclaim live proposals, and retention
 of both committed signatures and a signing failure after the durable capacity fence.
-Buyer-signed intentions whose provider never accepted, partially prepared provider records,
-and never-admitted dual signatures still need canonical expiry/absence reconciliation.
-Do not treat this capacity cleanup as proof that those separate records can be erased.
+Partially prepared/signed provider records still need integration with canonical
+expiry/absence reconciliation. Do not treat this capacity cleanup as proof that
+those separate records can be erased.
+
+## Canonical non-admission recovery
+
+`/v1/proxy/intent-state` accepts the original buyer-signed terms. Either party may
+query through its own trusted Core peer. Both the signed service envelope and the
+buyer signature are verified; every read generates a new indexer challenge. The
+reply binds the exact terms, requester, network, current canonical view and nonce.
+It uses the same bounded 32 KiB request, 128 KiB response and 15-second control
+freshness as negotiation observations. HTTP errors are not absence evidence.
+
+The canonical service reads the exact permanent accepted-terms key and associated
+financial identifiers. An existing acceptance is returned as admitted, regardless
+of current prices, withdrawal, contract upgrades or elapsed time. Inconsistent
+financial footprints reject the read. No current offer, payout readiness or buyer
+balance is required, and unrelated billing data and payout targets are not exposed.
+
+An absent intention becomes expired only after the COMPLETED canonical epoch
+reaches its billing epoch. This follows the existing reservation rule: new admission
+requires `billing_epoch == (pending_epoch ?? updated_epoch) + 1`. A pending epoch
+alone is insufficient for local retirement. No ledger rule/version changes are
+introduced by this observation. Already admitted work uses the existing financial
+receipt/waiver/expiry path; this proof never refunds or cancels admitted execution.
+
+Buyer negotiation stores retain exact private non-admission evidence, leave
+`confirmed()` false, close their pending index and prune after their configured
+retention. Reopen preserves that distinction; late signatures cannot reopen the
+closed intention. An admitted reply can instead restore a lost countersignature
+before recovering the real financial state. Ordinary confirmed-purchase refresh
+continues to use one financial observation, not an extra intent read per turn.
+
+The reservation-publication recovery queue also handles verified non-admission.
+After an unsuccessful publication/financial observation, it may obtain this fresh
+proof, retire the original publication and expose `expired_unadmitted`. The runner
+counts it resolved and stops retrying that entry, including after restart. Local
+expiry does not fabricate a financial receipt, release a buyer hold, or free a
+provider capacity lease. Publication uncertainty with no such proof stays pending.
+
+Local coverage includes all four endpoint families/three rails for buyer-only and
+dual-signed intentions, late-signature refusal, lost ACK after actual admission,
+reopen/prune/reuse, pending publication retirement, role authentication, fresh nonce
+and replay checks, superseded offers/old contracts, corrupt footprints, bounded
+reads and unchanged balances/native holds. Provider-side partial-signing recovery,
+the public dispatcher and automatic serving remain unfinished.

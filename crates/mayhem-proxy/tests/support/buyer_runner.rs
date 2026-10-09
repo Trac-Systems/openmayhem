@@ -20,6 +20,70 @@ fn runner(r: Arc<BuyerRecovery>, signer: Option<Authority>) -> Runner {
 }
 
 #[tokio::test]
+async fn buyer_runner_retires_never_admitted_publications_without_money_mutation_or_infinite_retry()
+{
+    for family in ["llm", "decisions"] {
+        for rail in ["fiat", "tnk", "tap"] {
+            let mut f = Fixture::new_with_mode(rail, family, "unreserved").await;
+            let d = dir();
+            let r = Arc::new(recovery(&f, &d));
+            r.retain_reservation(f.auth.clone(), f.policy.clone(), 1)
+                .await
+                .unwrap();
+            f.command("publish_pending").await;
+            let mut worker = runner(r.clone(), None);
+            assert!(worker.page().await.unwrap().error_code.is_some());
+            assert!(
+                !r.recover(key(&f))
+                    .await
+                    .unwrap()
+                    .reservation
+                    .unwrap()
+                    .expired_unadmitted
+            );
+            let before = f.request("state").await;
+            f.request(&json!({"epoch":f.auth.terms.billing_epoch}).to_string())
+                .await;
+            f.command("nonce").await;
+            assert!(worker.page().await.unwrap().error_code.is_some());
+            assert_eq!(r.pending(None, 64).await.unwrap(), vec![key(&f)]);
+            f.command("reset").await;
+            let page = worker.page().await.unwrap();
+            assert_eq!(
+                (page.checked, page.resolved, page.awaiting_wallet),
+                (1, 1, 0)
+            );
+            assert!(page.error_code.is_none());
+            let saved = r.recover(key(&f)).await.unwrap();
+            assert!(saved.confirmed.is_none());
+            let reservation = saved.reservation.unwrap();
+            assert!(reservation.expired_unadmitted && !reservation.confirmed);
+            assert!(r.pending(None, 64).await.unwrap().is_empty());
+            assert_eq!(f.request("state").await, before);
+            let status = f.request("status").await;
+            assert_eq!(status["publications"], 0);
+            drop(worker);
+            drop(r);
+            let r = Arc::new(recovery(&f, &d));
+            let mut worker = runner(r.clone(), None);
+            assert_eq!(worker.page().await.unwrap().checked, 0);
+            assert!(r.publish_reservation(key(&f), 10_000).await.is_err());
+            assert_eq!(
+                f.request("status").await["submissions"],
+                status["submissions"]
+            );
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            assert_eq!(r.prune(now + 1001, 64).await.unwrap(), 1);
+            assert!(r.recover(key(&f)).await.is_err());
+            f.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn buyer_runner_all_rails_expire_only_original_opt_in_after_canonical_deadline() {
     for family in ["llm", "decisions"] {
         for rail in ["fiat", "tnk", "tap"] {

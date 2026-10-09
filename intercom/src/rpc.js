@@ -405,6 +405,13 @@ export async function discoverProxyCatalog(peer, body) {
   return await feature.discoverProxyCatalog(body.query);
 }
 
+export async function requestProxyIntentState(peer, body) {
+  if (!isObject(body) || Object.keys(body).sort().join('|') !== 'intent|request_nonce') throw new Error('Invalid proxy intent query.');
+  const feature = peer.protocol?.instance?.features?.mayhem;
+  if (typeof feature?.proxyIntentState !== 'function') throw new Error('Proxy intent relay is not ready.');
+  return await feature.proxyIntentState(body);
+}
+
 export async function requestProxyOfferState(peer, body) {
   if (!isObject(body) || Object.keys(body).sort().join('|') !== 'offer|rail|request_nonce|settlement_policy_hash') throw new Error('Invalid proxy offer query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
@@ -564,6 +571,10 @@ export const createServer = (
             })
           );
         }
+      }
+      if (req.method === 'POST' && requestPath === '/v1/proxy/intent-state') {
+        const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 32768) });
+        return respond(200, await requestProxyIntentState(peer, body));
       }
       if (req.method === 'POST' && requestPath === '/v1/proxy/offer-state') {
         const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 32768) });

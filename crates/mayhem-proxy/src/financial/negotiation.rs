@@ -20,7 +20,7 @@ const CLOSED: TableDefinition<&str, &str> = TableDefinition::new("proxy_negotiat
 const MAX_PAGE: usize = 64;
 const MAX_RECORD_BYTES: usize = 300 * 1024 * 1024;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BuyerOffer {
     pub terms: mayhem_proto::proxy::finance::ProxySpendTerms,
@@ -60,6 +60,8 @@ struct Record {
     provider_sig: Option<String>,
     at_ms: u64,
     proof: Option<Proof>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    unadmitted: Option<intent::RetainedAbsence>,
     closed_at: Option<u64>,
     prune_after: Option<u64>,
 }
@@ -116,9 +118,16 @@ impl Record {
                 "unsigned purchase cannot be confirmed",
             )?;
         }
+        if let Some(absence) = &self.unadmitted {
+            absence.validate_for(t, identity.controller_pubkey.as_str())?;
+            require(
+                self.proof.is_none() && self.closed_at.is_some(),
+                "invalid non-admission closure",
+            )?;
+        }
         if let Some(at) = self.closed_at {
             require(
-                self.proof.is_some()
+                (self.proof.is_some() || self.unadmitted.is_some())
                     && at >= self.at_ms
                     && self
                         .prune_after
@@ -390,6 +399,7 @@ impl Store {
             provider_sig: None,
             at_ms,
             proof: None,
+            unadmitted: None,
             closed_at: None,
             prune_after: None,
         };
@@ -421,7 +431,8 @@ impl Store {
             self.decode(&k, value.value())?
         };
         require(
-            record.purchase.terms == offer.terms
+            record.unadmitted.is_none()
+                && record.purchase.terms == offer.terms
                 && record.buyer_sig == offer.buyer_sig
                 && record
                     .provider_sig
@@ -453,7 +464,8 @@ impl Store {
             self.decode(&k, value.value())?
         };
         require(
-            observation.wire.requester == self.identity.controller_pubkey.as_str()
+            record.unadmitted.is_none()
+                && observation.wire.requester == self.identity.controller_pubkey.as_str()
                 && record.authorization().as_ref() == Some(auth)
                 && record
                     .proof
@@ -489,6 +501,54 @@ impl Store {
             observation.started.elapsed() <= FRESHNESS,
             "negotiation observation expired during storage",
         )?;
+        self.commit(tx)?;
+        Ok(SavedPurchase { key: k, record })
+    }
+    fn expire_unadmitted(
+        &self,
+        k: Digest,
+        observation: intent::Observation,
+        at_ms: u64,
+    ) -> Result<SavedPurchase> {
+        observation.fresh()?;
+        let _guard = self
+            .lock
+            .lock()
+            .map_err(|_| invalid("negotiation writer poisoned"))?;
+        let tx = self.write()?;
+        let mut record = {
+            let table = crate::db(tx.open_table(RECORDS))?;
+            let value =
+                crate::db(table.get(k.as_str()))?.ok_or_else(|| invalid("unknown negotiation"))?;
+            self.decode(&k, value.value())?
+        };
+        require(
+            record.proof.is_none(),
+            "admitted purchase cannot become unadmitted",
+        )?;
+        let absence =
+            observation.absent(&record.offer(), self.identity.controller_pubkey.as_str())?;
+        if record.unadmitted.is_some() {
+            return Ok(SavedPurchase { key: k, record });
+        }
+        require(
+            record.closed_at.is_none() && at_ms >= record.at_ms && at_ms <= PROXY_MAX_SAFE_INTEGER,
+            "invalid non-admission closure time",
+        )?;
+        let deadline = at_ms
+            .checked_add(self.limits.closed_retention_ms)
+            .filter(|n| *n <= PROXY_MAX_SAFE_INTEGER)
+            .ok_or_else(|| invalid("retention overflow"))?;
+        record.unadmitted = Some(absence);
+        record.closed_at = Some(at_ms);
+        record.prune_after = Some(deadline);
+        crate::db(crate::db(tx.open_table(PENDING))?.remove(k.as_str()))?;
+        crate::db(crate::db(tx.open_table(CLOSED))?.insert(
+            format!("{deadline:020}:{}", k.as_str()).as_str(),
+            k.as_str(),
+        ))?;
+        self.replace(&tx, &k, &record)?;
+        observation.fresh()?;
         self.commit(tx)?;
         Ok(SavedPurchase { key: k, record })
     }
@@ -663,6 +723,10 @@ impl BuyerNegotiation {
             .recover(key)
             .await?
             .ok_or_else(|| invalid("negotiation not found"))?;
+        require(
+            saved.record.unadmitted.is_none(),
+            "intention expired without admission; create a fresh purchase",
+        )?;
         let auth = saved
             .authorization()
             .ok_or_else(|| invalid("provider has not accepted purchase"))?;
@@ -682,12 +746,36 @@ impl BuyerNegotiation {
     }
     pub async fn refresh(&self, key: Digest, at_ms: u64) -> Result<SavedPurchase> {
         let saved = self
-            .recover(key)
+            .recover(key.clone())
             .await?
             .ok_or_else(|| invalid("negotiation not found"))?;
-        let auth = saved
-            .authorization()
-            .ok_or_else(|| invalid("provider has not accepted purchase"))?;
+        if saved.record.unadmitted.is_some() {
+            return Ok(saved);
+        }
+        let auth = if saved.confirmed() {
+            saved
+                .authorization()
+                .ok_or_else(|| invalid("confirmed purchase lacks acceptance"))?
+        } else {
+            let observation = self.client.intent_state(&saved.offer()).await?;
+            match observation.status()? {
+                intent::Status::Open => return Ok(saved),
+                intent::Status::Expired => {
+                    return self
+                        .run(move |s| s.expire_unadmitted(key, observation, at_ms))
+                        .await
+                }
+                intent::Status::Admitted => {
+                    let auth = observation
+                        .authorization()?
+                        .ok_or_else(|| invalid("admitted purchase lacks authorization"))?
+                        .clone();
+                    // The canonical copy recovers a lost countersignature ACK.
+                    self.retain_provider_acceptance(auth.clone()).await?;
+                    auth
+                }
+            }
+        };
         let observed = self.client.observe(&auth).await?;
         self.run(move |s| s.observe(observed, at_ms)).await
     }

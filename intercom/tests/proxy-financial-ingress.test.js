@@ -1,3 +1,4 @@
+import { PROXY_INTENT_STATE_SERVICE } from '../features/mayhem/proxy-intent-state.js';
 import { PROXY_OFFER_STATE_SERVICE } from '../features/mayhem/proxy-offer-state.js';
 import { PROXY_FINANCIAL_STATE_SERVICE } from '../features/mayhem/proxy-financial-state.js';
 import { PROXY_QUOTE_STATE_SERVICE } from '../features/mayhem/proxy-quote-state.js';
@@ -362,6 +363,46 @@ test('repeated local financial queries use fresh signed challenges and see closu
   assert.equal(first.request_nonce,query.request_nonce);assert.equal(second.request_nonce,query.request_nonce);
   assert.equal(new Set(seen).size,2);assert.ok(seen.every(nonce=>nonce!==query.request_nonce));
   assert.equal(f.appends,2,'queries never append');
+});
+
+test('intent service authenticates either party, rejects replay and observes admission without appending', async t => {
+  const f = await fixture(t);
+  const { terms, buyer_sig } = f.authorize(f.terms).authorization;
+  const query = { intent: { terms, buyer_sig }, request_nonce: 'd'.repeat(64) };
+  for (const owner of [f.buyer, f.provider]) {
+    const requester = owner.publicKey;
+    const peer = { ...f.peer, wallet: { ...f.peer.wallet, publicKey: requester,
+      sign: bytes => sign(owner.wallet, b4a.isBuffer(bytes) ? bytes : b4a.from(String(bytes))) },
+      base: { writable: false, view: f.base.view } };
+    const participant = new MayhemFeature(peer, {});
+    t.after(() => participant.stop());
+    let previous = null, replay = false;
+    const challenges = [];
+    participant.requestService = async (service, request) => {
+      assert.equal(service, PROXY_INTENT_STATE_SERVICE);
+      const authorize = value => f.feature._verifyServiceRequest(service, value,
+        { admin: f.admin.publicKey, transport: requester });
+      assert.equal(authorize({ ...request, payload: { ...request.payload, requester: f.admin.publicKey } }), null);
+      const wrong = structuredClone(request); wrong.payload.intent.terms.capacity_lease = '0'.repeat(64);
+      assert.equal(authorize(wrong), null, 'signed envelope binds all intention fields');
+      const verified = authorize(request); assert.ok(verified);
+      challenges.push(verified.payload.request_nonce);
+      if (replay) return structuredClone(previous);
+      previous = await f.feature._handleService(service, verified.payload, verified);
+      return structuredClone(previous);
+    };
+    const before = f.base.local.length;
+    await participant.proxyIntentState(query);
+    await participant.proxyIntentState(query);
+    assert.equal(new Set(challenges).size, 2);
+    assert.equal(f.base.local.length, before);
+    replay = true;
+    await assert.rejects(participant.proxyIntentState(query), /does not match/);
+    replay = false;
+    assert.equal((await f.submit(f.authorize(f.terms))).ok, true);
+    assert.equal((await participant.proxyIntentState(query)).status, 'admitted');
+  }
+  assert.equal(f.appends, 1, 'intent reads and repeated acceptance do not append');
 });
 
 test('quote service authenticates the buyer and refreshes repeated queries before negotiation', async t => {

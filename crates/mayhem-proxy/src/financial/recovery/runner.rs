@@ -109,14 +109,32 @@ impl Runner {
     async fn step(&self, key: Digest) -> Result<Step> {
         let r = &self.recovery;
         let saved = r.recover(key.clone()).await?;
-        if saved.confirmed.is_some() {
+        if saved.confirmed.is_some()
+            || saved
+                .reservation
+                .as_ref()
+                .is_some_and(|v| v.expired_unadmitted)
+        {
             return Ok(Step::Resolved);
         }
         // Also handles records whose reservation was already confirmed. The
         // existing journal replays only an unconfirmed original envelope.
-        let o = r
+        let o = match r
             .publish_reservation(key.clone(), crate::supervisor::unix_ms())
-            .await?;
+            .await
+        {
+            Ok(o) => o,
+            Err(error) => {
+                if r.recover(key.clone())
+                    .await?
+                    .reservation
+                    .is_some_and(|v| v.expired_unadmitted)
+                {
+                    return Ok(Step::Resolved);
+                }
+                return Err(error);
+            }
+        };
         if o.financial_outcome()?.is_some() {
             return Ok(Step::Resolved);
         }

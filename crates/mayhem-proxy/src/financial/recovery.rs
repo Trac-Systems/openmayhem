@@ -209,6 +209,11 @@ struct Record {
     reservation: Option<ReservationIntent>,
 }
 impl Record {
+    fn expired_unadmitted(&self) -> bool {
+        self.reservation
+            .as_ref()
+            .is_some_and(|v| v.unadmitted.is_some())
+    }
     fn key(&self) -> Result<String> {
         self.authorization
             .terms
@@ -238,6 +243,13 @@ impl Record {
         }
         if let Some(intent) = &self.reservation {
             intent.validate()?;
+            if let Some(absent) = &intent.unadmitted {
+                absent.validate_for(t, identity.controller_pubkey.as_str())?;
+                require(
+                    intent.proof.is_none() && self.proof.is_none() && self.confirmed.is_none(),
+                    "non-admission conflicts with reserved funds",
+                )?;
+            }
             require(
                 intent.proof.is_some()
                     || (self.acknowledgment.is_none()
@@ -272,7 +284,7 @@ impl Record {
             .map_err(|_| invalid("saved expiry signature rejected"))?;
         }
         require(
-            self.confirmed.is_some() == self.closed_at.is_some()
+            (self.confirmed.is_some() || self.expired_unadmitted()) == self.closed_at.is_some()
                 && self.confirmed.is_some() == self.proof.is_some()
                 && self.confirmed.is_some() == self.confirmed_epoch.is_some()
                 && self.closed_at.is_some() == self.prune_after.is_some()
@@ -280,7 +292,7 @@ impl Record {
                     .closed_at
                     .zip(self.prune_after)
                     .is_some_and(|(at, until)| until > at)
-                    == self.confirmed.is_some(),
+                    == (self.confirmed.is_some() || self.expired_unadmitted()),
             "incomplete recovery confirmation",
         )?;
         if let Some(proof) = &self.proof {
@@ -467,7 +479,8 @@ impl Store {
             reservation: None,
         });
         require(
-            r.authorization == o.accepted().authorization
+            !r.expired_unadmitted()
+                && r.authorization == o.accepted().authorization
                 && r.policy == o.accepted().settlement_policy,
             "original recovery terms changed",
         )?;
@@ -605,7 +618,7 @@ impl Store {
                     .value(),
             )?;
             require(
-                r.confirmed.is_some()
+                (r.confirmed.is_some() || r.expired_unadmitted())
                     && r.prune_after.is_some_and(|deadline| {
                         deadline <= now && index == &format!("{deadline:020}/{key}")
                     })

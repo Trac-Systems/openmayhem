@@ -1,3 +1,5 @@
+import { readProxyIntentState, validateProxyIntentStateRequest, PROXY_INTENT_STATE_SERVICE,
+  PROXY_INTENT_STATE_MAX_BYTES, PROXY_INTENT_STATE_MAX_AGE_MS } from './proxy-intent-state.js';
 import { readProxyOfferState, validateProxyOfferStateRequest, PROXY_OFFER_STATE_SERVICE,
   PROXY_OFFER_STATE_MAX_BYTES, PROXY_OFFER_STATE_MAX_AGE_MS } from './proxy-offer-state.js';
 import { readProxyQuoteState, validateProxyQuoteStateRequest, PROXY_QUOTE_STATE_SERVICE,
@@ -373,7 +375,7 @@ const serviceParticipantFor = (service, value) => {
     return null;
   }
   if (service === 'stripe_checkout') return normalizeKey(value.who);
-  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE || service === PROXY_FINANCIAL_STATE_SERVICE || service === PROXY_QUOTE_STATE_SERVICE || service === PROXY_OFFER_STATE_SERVICE) return normalizeKey(value.requester);
+  if (service === PROXY_PREFLIGHT_SERVICE || service === PROXY_DISCOVERY_SERVICE || service === PROXY_FINANCIAL_STATE_SERVICE || service === PROXY_QUOTE_STATE_SERVICE || service === PROXY_OFFER_STATE_SERVICE || service === PROXY_INTENT_STATE_SERVICE) return normalizeKey(value.requester);
   if ([
     'provider_payout_context',
     'stripe_connect_adopt',
@@ -690,21 +692,25 @@ class MayhemFeature extends Feature {
   }
 
   async proxyOfferState(query) {
-    return await this._proxyNegotiationState(query, true);
+    return await this._proxyNegotiationState(query, 'offer');
   }
 
   async proxyQuoteState(query) {
-    return await this._proxyNegotiationState(query, false);
+    return await this._proxyNegotiationState(query, 'quote');
   }
 
-  async _proxyNegotiationState(query, provider) {
-    const label = provider ? 'offer' : 'quote';
-    const service = provider ? PROXY_OFFER_STATE_SERVICE : PROXY_QUOTE_STATE_SERVICE;
-    const keys = provider ? 'offer|rail|request_nonce|settlement_policy_hash'
+  async proxyIntentState(query) {
+    return await this._proxyNegotiationState(query, 'intent');
+  }
+
+  async _proxyNegotiationState(query, label) {
+    const provider = label === 'offer', intent = label === 'intent';
+    const service = intent ? PROXY_INTENT_STATE_SERVICE : provider ? PROXY_OFFER_STATE_SERVICE : PROXY_QUOTE_STATE_SERVICE;
+    const keys = intent ? 'intent|request_nonce' : provider ? 'offer|rail|request_nonce|settlement_policy_hash'
       : 'billing_id|offer|rail|request_nonce|settlement_policy_hash';
-    const validate = provider ? validateProxyOfferStateRequest : validateProxyQuoteStateRequest;
-    const maxAge = provider ? PROXY_OFFER_STATE_MAX_AGE_MS : PROXY_QUOTE_STATE_MAX_AGE_MS;
-    const maxBytes = provider ? PROXY_OFFER_STATE_MAX_BYTES : PROXY_QUOTE_STATE_MAX_BYTES;
+    const validate = intent ? validateProxyIntentStateRequest : provider ? validateProxyOfferStateRequest : validateProxyQuoteStateRequest;
+    const maxAge = intent ? PROXY_INTENT_STATE_MAX_AGE_MS : provider ? PROXY_OFFER_STATE_MAX_AGE_MS : PROXY_QUOTE_STATE_MAX_AGE_MS;
+    const maxBytes = intent ? PROXY_INTENT_STATE_MAX_BYTES : provider ? PROXY_OFFER_STATE_MAX_BYTES : PROXY_QUOTE_STATE_MAX_BYTES;
     const requester = normalizeKey(this.peer?.wallet?.publicKey);
     if (!query || Object.keys(query).sort().join('|') !== keys) {
       throw new Error(`Invalid proxy ${label} query.`);
@@ -1053,6 +1059,9 @@ class MayhemFeature extends Feature {
     if (service === PROXY_FINANCIAL_STATE_SERVICE) {
       try { validateProxyFinancialStateRequest(payload); } catch { return null; }
     }
+    if (service === PROXY_INTENT_STATE_SERVICE) {
+      try { validateProxyIntentStateRequest(payload); } catch { return null; }
+    }
     if (service === PROXY_OFFER_STATE_SERVICE) {
       try { validateProxyOfferStateRequest(payload); } catch { return null; }
     }
@@ -1216,6 +1225,11 @@ class MayhemFeature extends Feature {
   }
 
   async _handleService(service, value, authorization) {
+    if (service === PROXY_INTENT_STATE_SERVICE) {
+      return await readProxyIntentState({ request: value,
+        withCanonicalSnapshot: this.withProxyCanonicalSnapshot,
+        verifySignature: (signature, bytes, signer) => verifyEd25519Hex(this.peer.wallet, signature, bytes, signer) });
+    }
     if (service === PROXY_OFFER_STATE_SERVICE) {
       return await readProxyOfferState({ request: value, withCanonicalSnapshot: this.withProxyCanonicalSnapshot });
     }
