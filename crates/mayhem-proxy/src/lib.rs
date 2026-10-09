@@ -10,6 +10,7 @@ pub mod catalog;
 pub mod cli;
 pub mod connector;
 pub mod discovery;
+pub mod directory;
 pub mod endpoint;
 pub mod exchange;
 pub mod execution;
@@ -39,6 +40,10 @@ pub enum Error {
     Identity,
     #[error("proxy catalog refresh changed; discard this stale response")]
     StaleRefresh,
+    #[error("proxy catalog cursor expired; restart this query and preserve selection")]
+    DirectoryCursorExpired,
+    #[error("proxy catalog cursor is invalid for this query")]
+    DirectoryCursorInvalid,
     #[error("proxy catalog refresh is already in progress")]
     RefreshBusy,
     #[error("proxy catalog database: {0}")]

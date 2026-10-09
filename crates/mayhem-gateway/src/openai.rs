@@ -146,6 +146,8 @@ mod durable_streaming_tests;
 mod failure_recovery;
 mod incremental_output;
 mod response_stream;
+pub mod proxy_control;
+mod proxy_directory;
 
 mod github_update;
 use github_update::{
@@ -287,6 +289,7 @@ const DASHBOARD_PROVIDER_PROGRESS_ONLY_TTL_MS: u64 = 5 * 60 * 1000;
 const DASHBOARD_CSP: &str = "default-src 'self'; connect-src 'self' http://127.0.0.1:*; img-src 'self' data:; font-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; frame-ancestors 'none'; base-uri 'self'; form-action 'none'";
 #[derive(Clone, Debug)]
 pub struct GatewayState {
+    proxy_control: Option<Arc<proxy_control::ProxyControl>>,
     catalog_runtime: Arc<Mutex<GatewayCatalogRuntime>>,
     catalog_refresh: Arc<Mutex<GatewayCatalogRefresh>>,
     catalog_refresh_request: Arc<Notify>,
@@ -4821,6 +4824,7 @@ impl GatewayState {
                 execution_modes: Arc::new(GatewayExecutionModeRegistry::default()),
                 attestation_authority: None,
             })),
+            proxy_control: None,
             catalog_refresh: Arc::new(Mutex::new(GatewayCatalogRefresh::default())),
             catalog_refresh_request: Arc::new(Notify::new()),
             catalog_refresh_complete: Arc::new(Notify::new()),
@@ -4888,6 +4892,17 @@ impl GatewayState {
     pub fn with_receipt_cosign_enabled(mut self, enabled: bool) -> Self {
         self.receipt_config.cosign_enabled = enabled;
         self
+    }
+
+    /// Explicitly attach proxy discovery control. Its separate lifecycle must be
+    /// run and joined by the caller; native providers remain independently owned.
+    pub fn with_proxy_control(mut self, control: Arc<proxy_control::ProxyControl>) -> Self {
+        self.proxy_control = Some(control);
+        self
+    }
+
+    pub fn proxy_control(&self) -> Option<&Arc<proxy_control::ProxyControl>> {
+        self.proxy_control.as_ref()
     }
 
     pub fn with_receipt_rail(mut self, rail: impl Into<String>) -> Self {
@@ -6002,6 +6017,8 @@ pub fn openai_router(state: GatewayState) -> Router {
 
     Router::new()
         .route("/v1/models", get(list_models))
+        .route("/v1/proxy/offers", get(proxy_directory::list))
+        .route("/v1/proxy/offers/{market}/{provider}/{slot}", get(proxy_directory::get))
         .route("/v1/jobs", get(list_gateway_jobs))
         .route("/v1/jobs/lookup", get(lookup_gateway_job_by_key))
         .route(
@@ -6107,6 +6124,28 @@ fn gateway_request_body_limit(state: &GatewayState) -> usize {
 }
 
 pub async fn serve(bind: SocketAddr, mut state: GatewayState) -> std::io::Result<()> {
+    let listener = prepare_gateway_listener(bind, &mut state).await?;
+    axum::serve(listener, openai_router(state)).await
+}
+
+/// Explicit lifecycle owners may stop listener admission while joining their
+/// control tasks. Dropping the future retains the existing process-stop behavior
+/// for native streams; callers choose whether to await their complete drain.
+pub async fn serve_with_shutdown(
+    bind: SocketAddr,
+    mut state: GatewayState,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()> {
+    let listener = prepare_gateway_listener(bind, &mut state).await?;
+    axum::serve(listener, openai_router(state))
+        .with_graceful_shutdown(shutdown)
+        .await
+}
+
+async fn prepare_gateway_listener(
+    bind: SocketAddr,
+    state: &mut GatewayState,
+) -> std::io::Result<TcpListener> {
     validate_gateway_bind_access(
         bind,
         state.access_control.requires_auth(),
@@ -6122,10 +6161,10 @@ pub async fn serve(bind: SocketAddr, mut state: GatewayState) -> std::io::Result
         state.replace_github_update_status(GatewayGithubUpdateStatus::disabled());
     }
     let listener = TcpListener::bind(bind).await?;
-    spawn_pending_gateway_job_reconciliation(&state)
+    spawn_pending_gateway_job_reconciliation(state)
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-    failure_recovery::spawn_ledger_reservation_sweep(&state);
-    axum::serve(listener, openai_router(state)).await
+    failure_recovery::spawn_ledger_reservation_sweep(state);
+    Ok(listener)
 }
 
 fn spawn_github_update_watcher(state: GatewayState) {

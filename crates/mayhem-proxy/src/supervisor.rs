@@ -90,6 +90,8 @@ pub fn error_code(error: &Error) -> &'static str {
         Error::Database(_) | Error::Io(_) => "catalog_storage_error",
         Error::Task => "catalog_worker_failed",
         Error::RefreshBusy | Error::StaleRefresh => "catalog_refresh_changed",
+        Error::DirectoryCursorExpired => "proxy_directory_cursor_expired",
+        Error::DirectoryCursorInvalid => "proxy_directory_cursor_invalid",
         Error::Transport(_) => "discovery_transport_error",
         Error::Invalid(_) | Error::Json(_) => "discovery_invalid_response",
         Error::ProviderRequest(_) | Error::ProviderCapacity(_) => "provider_control_unavailable",

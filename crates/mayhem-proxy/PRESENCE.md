@@ -108,13 +108,37 @@ Both routing and catalog consumers can call `Gateway::status`, which resolves
 current canonical registration on every lookup and applies `Table::status` with
 the same optional customer speed floor. Stale/revoked catalog state cannot return
 Available. This is a bounded synchronous control lookup, not per-token work.
-Catalog hydration remains owned by the existing catalog supervisor; its refresh
-policy must keep observations within the 15-second presence freshness bound.
+The optional gateway lifecycle owns catalog hydration through the existing catalog
+supervisor. It defaults to a 5-second refresh with at most 20% scheduling jitter,
+and a bounded RPC deadline compatible with the 15-second presence freshness bound.
+Slow pagination or failed refreshes still fail closed when evidence expires.
+
+Canonical CLI startup accepts explicit
+`mayhem use --proxy-config /absolute/private/gateway-proxy.json`. It compares the
+protected configuration with the gateway's existing trusted peer network,
+canonical admin and configured bootstrap pins. Embedded-catalog development mode
+cannot enable this option. No configuration means no proxy stores or control tasks.
+The owner-only version-1 document selects network identity, literal-loopback peer
+RPC and bridge, a bridge token file, private state directory, market/storage quotas
+and the explicit selected markets. Catalog and replay state use separate protected
+files; a missing member of an existing pair is rejected instead of recreating lost
+fences. Unix file protections are required by this implementation.
+
+`GatewayState` holds an optional proxy control handle. Its explicit lifecycle runs
+the two background controls and joins both, including already-started catalog disk
+work, on shutdown. Proxy failure reports degraded state without terminating native
+HTTP service. Ctrl-C/SIGTERM stops new HTTP admission and joins proxy cleanup;
+existing native streams do not add an unbounded shutdown wait. Startup reports
+configuration only, not Ready state or paid-route authorization.
 
 Local tests exercise reconnect with withdrawal/replay preservation, explicit
 market replacement, immediate removal, quota rejection, stale/revoked canonical
-status, backoff, idle selection and cancellation. Actual gateway lifecycle and
-buyer/catalog-surface wiring remain required; this component alone does not
-activate those integrations. Automatic
-mayhemd installation, provider configuration/retirement UX and real-network
-qualification remain. Production activation is gated separately.
+status, backoff, idle selection and cancellation. Gateway/CLI tests also cover
+default-disabled state, protected configuration, canonical identity mismatch,
+local background hydration, shared presence selection and joined shutdown.
+Read-only offer endpoints are described in [DIRECTORY.md](DIRECTORY.md). Buyer
+dispatch, live availability overlays for buyer surfaces, gateway service-installer
+configuration, provider retirement UX and real-network qualification remain.
+Persistent provider-controller installation is available through the explicit
+`mayhem provider proxy add` command; it is not automatic gateway activation.
+Production activation is gated separately.

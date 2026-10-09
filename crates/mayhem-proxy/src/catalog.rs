@@ -19,11 +19,18 @@ use crate::matching::{update_index, INDEX, INDEX_VERSION, STAGED_INDEX};
 use crate::{db, invalid, require, Error, Result};
 
 const META: TableDefinition<&str, &[u8]> = TableDefinition::new("proxy_catalog_metadata_v1");
-const CURRENT: TableDefinition<&str, &[u8]> = TableDefinition::new("proxy_catalog_current_v1");
+pub(crate) const CURRENT: TableDefinition<&str, &[u8]> =
+    TableDefinition::new("proxy_catalog_current_v1");
 const STAGED: TableDefinition<&str, &[u8]> = TableDefinition::new("proxy_catalog_staged_v1");
 const STATE_KEY: &str = "state";
 const CACHE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_STATE_BYTES: usize = 16 * 1024;
+
+fn new_incarnation() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    getrandom::fill(&mut bytes).map_err(|_| invalid("catalog randomness unavailable"))?;
+    Ok(blake3::hash(&bytes).to_hex().to_string())
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +66,12 @@ struct State {
     index_version: u32,
     identity: Identity,
     generation: u64,
+    /// Browsing cursors follow content, not unrelated ledger transactions or
+    /// pagination of an incomplete refresh. The incarnation fences rebuilt DBs.
+    #[serde(default)]
+    incarnation: String,
+    #[serde(default)]
+    content_revision: u64,
     invalidated: bool,
     committed: Option<Committed>,
     pending: Option<Pending>,
@@ -82,6 +95,11 @@ impl State {
         require(
             self.schema_version == 1 && self.index_version <= INDEX_VERSION,
             "unsupported catalog cache schema",
+        )?;
+        require(
+            crate::discovery::hex(&self.incarnation)
+                || (self.index_version < INDEX_VERSION && self.incarnation.is_empty()),
+            "invalid catalog incarnation",
         )?;
         if let Some(c) = &self.committed {
             c.proof.validate()?;
@@ -164,6 +182,7 @@ impl RefreshTicket {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Status {
     pub generation: u64,
+    pub content_snapshot: String,
     pub invalidated: bool,
     pub refresh_in_progress: bool,
     pub committed: Option<Committed>,
@@ -188,6 +207,7 @@ impl From<&State> for Status {
     fn from(state: &State) -> Self {
         Self {
             generation: state.generation,
+            content_snapshot: format!("{}:{}", state.incarnation, state.content_revision),
             invalidated: state.invalidated,
             refresh_in_progress: state.pending.is_some(),
             committed: state.committed.clone(),
@@ -244,14 +264,27 @@ impl Catalog {
             if state.index_version < INDEX_VERSION {
                 // Rebuild derived indexes through bounded background hydration,
                 // never a startup scan of the entire old cache or ledger.
+                let has_index = tables.iter().any(|t| t.name() == INDEX.name());
+                let has_staged_index = tables.iter().any(|t| t.name() == STAGED_INDEX.name());
                 require(
-                    !tables
-                        .iter()
-                        .any(|t| t.name() == INDEX.name() || t.name() == STAGED_INDEX.name()),
-                    "unexpected prior catalog index",
+                    has_index == (state.index_version > 0),
+                    "invalid prior catalog index",
+                )?;
+                require(
+                    has_staged_index
+                        == (state.index_version > 0
+                            && state
+                                .pending
+                                .as_ref()
+                                .is_some_and(|p| p.mode == Mode::Snapshot)),
+                    "invalid prior staged catalog index",
                 )?;
                 db(tx.delete_table(STAGED))?;
+                db(tx.delete_table(STAGED_INDEX))?;
+                db(tx.delete_table(INDEX))?;
                 db(tx.open_table(INDEX))?;
+                state.incarnation = new_incarnation()?;
+                state.content_revision = 0;
                 state.pending = None;
                 state.invalidated = true;
                 state.index_version = INDEX_VERSION;
@@ -287,6 +320,8 @@ impl Catalog {
                     index_version: INDEX_VERSION,
                     identity: identity.clone(),
                     generation: 0,
+                    incarnation: new_incarnation()?,
+                    content_revision: 0,
                     invalidated: true,
                     committed: None,
                     pending: None,
@@ -422,6 +457,7 @@ impl Catalog {
                     .ok_or_else(|| invalid("missing continuation cursor"))?,
             });
         } else {
+            let mut content_changed = page.mode == Mode::Snapshot;
             match page.mode {
                 Mode::Snapshot => {
                     db(tx.delete_table(CURRENT))?;
@@ -442,12 +478,9 @@ impl Catalog {
                                 let old = db(current.get(key.value()))?
                                     .map(|v| serde_json::from_slice::<Value>(v.value()))
                                     .transpose()?;
-                                update_index(
-                                    &mut index,
-                                    key.value(),
-                                    old.as_ref(),
-                                    &serde_json::from_slice(value.value())?,
-                                )?;
+                                let new: Value = serde_json::from_slice(value.value())?;
+                                content_changed |= old.as_ref().unwrap_or(&Value::Null) != &new;
+                                update_index(&mut index, key.value(), old.as_ref(), &new)?;
                                 if value.value() == b"null" {
                                     db(current.remove(key.value()))?;
                                 } else {
@@ -462,6 +495,7 @@ impl Catalog {
                             let old = db(current.get(entry.key.as_str()))?
                                 .map(|v| serde_json::from_slice::<Value>(v.value()))
                                 .transpose()?;
+                            content_changed |= old.as_ref().unwrap_or(&Value::Null) != &entry.value;
                             update_index(&mut index, &entry.key, old.as_ref(), &entry.value)?;
                             if entry.value.is_null() {
                                 db(current.remove(entry.key.as_str()))?;
@@ -486,6 +520,12 @@ impl Catalog {
             });
             state.pending = None;
             state.invalidated = false;
+            if content_changed {
+                state.content_revision = state
+                    .content_revision
+                    .checked_add(1)
+                    .ok_or_else(|| invalid("catalog content revision exhausted"))?;
+            }
         }
         state.advance()?;
         save_state(&tx, &state)?;
@@ -506,6 +546,14 @@ impl Catalog {
         state.advance()?;
         save_state(&tx, &state)?;
         db(tx.commit())
+    }
+
+    /// Join any already-started refresh disk work after stopping and joining the
+    /// refresh supervisor. Cancellation retains this permit inside its blocking
+    /// task, so releasing the last store handle cannot race a detached commit.
+    /// Call only after all refresh producers have been stopped.
+    pub async fn wait_for_refresh_idle(&self) {
+        let _idle = self.refresh_lock.lock().await;
     }
 
     /// One bounded supervisor step. No internal retry loop and no disk work on

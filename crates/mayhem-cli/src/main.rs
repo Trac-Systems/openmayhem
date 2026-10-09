@@ -8,6 +8,7 @@ mod managed_openai_compatible;
 mod provider_failure_recovery;
 mod provider_output_stream;
 mod proxy_control;
+mod proxy_gateway;
 mod proxy_provider;
 mod python_runtime;
 mod release_bundle;
@@ -1589,6 +1590,10 @@ struct UseArgs {
     /// Mayhem home directory. Defaults to MAYHEM_HOME or ~/.mayhem.
     #[arg(long, value_name = "PATH")]
     home: Option<PathBuf>,
+
+    /// Enable proxy discovery/presence from a protected owner-only configuration.
+    #[arg(long, value_name = "PATH", conflicts_with = "dev_embedded_catalog")]
+    proxy_config: Option<PathBuf>,
 
     /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
     #[arg(long)]
@@ -45638,6 +45643,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let gateway_url = gateway_public_url(bind);
     let openai_base_url = gateway_v1_url(&gateway_url);
     let mut catalog_watcher: Option<GatewayCatalogWatcherConfig> = None;
+    let mut proxy_lifecycle = None;
     let (
         state,
         source,
@@ -46028,6 +46034,11 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         if let Some(verifier) = managed_hardware_quote_verifier {
             state = state.with_hardware_quote_verifier_command(verifier);
         }
+        if let Some(path) = args.proxy_config.clone() {
+            let (control, lifecycle) = proxy_gateway::prepare(path, home.clone(), &rpc).await?;
+            state = state.with_proxy_control(control);
+            proxy_lifecycle = Some(lifecycle);
+        }
         (
             state,
             catalog_source,
@@ -46118,6 +46129,10 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         "shared_gateway_notice": shared_gateway_notice,
         "models": model_count,
         "version_gates": &blocked_version_gates,
+        "proxy_control": {
+            "enabled": proxy_lifecycle.is_some(),
+            "state": if proxy_lifecycle.is_some() { "configured" } else { "disabled" },
+        },
     });
 
     if args.json {
@@ -46141,6 +46156,9 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
             println!("{notice}");
         }
         println!("Dashboard access: token required once per gateway run.");
+        if proxy_lifecycle.is_some() {
+            println!("Proxy discovery: configured; canonical refresh and signed presence determine availability.");
+        }
         if args.dev_embedded_catalog {
             println!("Model source: development embedded catalog (non-canonical).");
             println!("Backend: local OpenAI-shape smoke backend (unbillable dev output).");
@@ -46183,9 +46201,13 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     }
     io::stdout().flush()?;
 
-    serve_gateway(bind, state)
-        .await
-        .with_context(|| format!("serving Mayhem gateway on {bind}"))?;
+    if let Some(lifecycle) = proxy_lifecycle {
+        proxy_gateway::serve(bind, state, lifecycle).await?;
+    } else {
+        serve_gateway(bind, state)
+            .await
+            .with_context(|| format!("serving Mayhem gateway on {bind}"))?;
+    }
     Ok(())
 }
 

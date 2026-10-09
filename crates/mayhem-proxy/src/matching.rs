@@ -24,7 +24,7 @@ pub(crate) const INDEX: TableDefinition<&str, &str> =
     TableDefinition::new("proxy_match_current_v1");
 pub(crate) const STAGED_INDEX: TableDefinition<&str, &str> =
     TableDefinition::new("proxy_match_staged_v1");
-pub(crate) const INDEX_VERSION: u32 = 1;
+pub(crate) const INDEX_VERSION: u32 = 2;
 const MAX_SCAN: usize = 200;
 
 fn digest(value: &impl Serialize) -> Result<String> {
@@ -79,6 +79,7 @@ pub(crate) fn index_keys(market: &ProxyMarketDescriptor) -> Result<Vec<String>> 
             name_digest(&market.model)?
         ));
     }
+    keys.extend(crate::directory::market_index_keys(market)?);
     Ok(keys)
 }
 

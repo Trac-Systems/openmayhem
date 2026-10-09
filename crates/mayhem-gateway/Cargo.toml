@@ -36,6 +36,7 @@ jsonschema = { version = "0.53.0", default-features = false }
 mayhem-bridge = { path = "../mayhem-bridge" }
 mayhem-attestation = { path = "../mayhem-attestation" }
 mayhem-proto = { path = "../mayhem-proto" }
+mayhem-proxy = { path = "../mayhem-proxy" }
 rustfft = "=6.4.1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 semver = "1"
@@ -47,6 +48,9 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tower = { version = "0.5", features = ["limit", "util"] }
 url = "2.5"
 wait-timeout = "0.2"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
 
 [dev-dependencies]
 aes = "0.8"
