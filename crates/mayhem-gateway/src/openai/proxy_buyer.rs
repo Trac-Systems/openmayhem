@@ -36,9 +36,11 @@ use tokio::{
     task::JoinSet,
 };
 
+mod contract;
 mod estimation;
 mod retail;
 mod streaming;
+pub(super) use contract::handle as contract;
 pub(super) use estimation::handle as estimate;
 pub use retail::{
     request_content_digest as retail_request_content_digest, Config as RetailAuthorizationConfig,

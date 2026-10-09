@@ -1,4 +1,5 @@
 mod buyer_policy;
+mod contract;
 mod estimation;
 mod local_lab;
 mod retail;

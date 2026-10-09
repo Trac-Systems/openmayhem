@@ -79,6 +79,41 @@ Estimate failures use category `proxy_estimate`: `proxy_estimate_invalid` and
 `proxy_estimate_busy`, and `proxy_estimate_unavailable` are 503. Normal key errors
 retain their existing codes. None creates a job or returns a job ID.
 
+## Public endpoint contracts
+
+`GET /v1/proxy/offers/{market}/{provider}/{slot}/contract?rail=fiat` retrieves
+the exact offer's public normative `EndpointFamilyContract`. The only query
+parameter is the required execution `rail` (`fiat`, `tnk`, or `tap`), and the GET
+body must be empty. It requires a current authenticated key permitted to use
+that exact proxy model; exhausted spending budgets do not prevent this read.
+
+The private, non-cacheable response contains exactly `schema_version: 1`,
+`lane: "proxy"`, `kind: "endpoint_contract"`, `network`, `model`, `rail`,
+`offer_digest`, `membership_digest`, `endpoint`, `endpoint_contract`,
+`recipe_hash`, `settlement_policy_hash`, `contract`, `metering_policy`,
+`observed_at_ms`, and `expires_at_ms`. `contract` is the actual public endpoint
+attribute specification, including request and response attribute specs,
+required attributes and interaction groups. It is not JSON Schema.
+`endpoint_contract` is its existing canonical fingerprint. The selected
+execution gateway supplies `settlement_policy_hash`; no default rail or policy
+is inferred. The metering definition describes billing units, not a price quote.
+
+This route uses the same authenticated descriptor exchange as estimates,
+checks the descriptor against canonical offer and membership hashes, and rechecks
+the exact publication before responding. It refuses a changed offer rather than
+substituting another revision. Original catalog evidence bounds expiry; clients
+must still resolve current terms when estimating or purchasing. Busy capacity
+and missing live presence do not prevent contract inspection. An absent or older
+peer returns unavailable; no template or fabricated request fills the gap.
+
+Separate four-read permits and a five-second HTTP deadline bound this operation.
+It creates no job, budget hold, capacity lease, payment signature or inference
+request. Private upstream addresses, connection settings, model mappings,
+credentials and local limits are omitted. Errors use category `proxy_contract`:
+400 `proxy_contract_invalid`, 404 `proxy_offer_not_found`, or 503
+`proxy_buyer_disabled`, `proxy_contract_busy`, and `proxy_contract_unavailable`.
+Existing authentication errors retain their codes.
+
 ## Authenticated financial evidence
 
 `GET /v1/proxy/buyer-policy` requires a current authenticated gateway key and

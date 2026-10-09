@@ -680,6 +680,20 @@ impl Harness {
     pub(crate) fn capacity_status(&self) -> capacity::Status {
         self.capacity.status(&digest(201)).unwrap()
     }
+    pub(crate) fn reserve_test_capacity(&self, n: u64) -> capacity::Reservation {
+        self.capacity
+            .reserve(
+                &digest(201),
+                capacity::Work {
+                    invocation: digest(n),
+                    request_hash: digest(n + 1),
+                },
+            )
+            .unwrap()
+    }
+    pub(crate) fn release_test_capacity(&self, reservation: capacity::Reservation) {
+        self.capacity.cancel_reserved(reservation).unwrap();
+    }
     pub(crate) fn stop_descriptors(&self) {
         // Simulate a live older peer that ignores the new opening tag while
         // continuing to accept the unchanged paid negotiation protocol.
@@ -719,11 +733,14 @@ pub(crate) struct ControlFixture {
     _directory: tempfile::TempDir,
 }
 impl ControlFixture {
-    pub(crate) async fn stop(self) {
+    pub(crate) async fn pause(&mut self) {
         self.stop.send_replace(true);
-        for task in self.tasks {
+        for task in self.tasks.drain(..) {
             task.await.unwrap();
         }
+    }
+    pub(crate) async fn stop(mut self) {
+        self.pause().await;
     }
 }
 fn protected(path: &Path, bytes: &[u8]) {
