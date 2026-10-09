@@ -1,0 +1,777 @@
+{
+  "schema_version": 1,
+  "description": "Synthetic public fixtures. FIAT amounts are minor units; TAP/TNK are token base units. No private keys or credentials.",
+  "cases": [
+    {
+      "rail": "tap",
+      "verify_work": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "verify",
+        "invoice_id": "fixture_invoice_tap",
+        "invoice_revision": 1,
+        "lease_token": "000000000000000000000000000000000000000000000000000000000000001f",
+        "lease_expires_at_ms": 1700000900000,
+        "invoice": {
+          "network": {
+            "network_id": "918",
+            "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+            "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+            "contract_version": 32
+          },
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000c",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "invoice_commitment": "f3df8cc85fba3d4f043117cc4d153ce112e1e420d1a3c61e64eadecb2a404863",
+          "rail": "tap",
+          "amount_base_units": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "created_at_ms": 1700000000000,
+          "quote_expires_at_ms": 1700000600000,
+          "collection": {
+            "chain_id": 31337,
+            "token_contract": "0x0000000000000000000000000000000000000001",
+            "destination": "0x0000000000000000000000000000000000000002",
+            "allocation_id": "0000000000000000000000000000000000000000000000000000000000000065"
+          }
+        },
+        "payment_reference": {
+          "chain_id": 31337,
+          "token_contract": "0x0000000000000000000000000000000000000001",
+          "transaction_hash": "0x00000000000000000000000000000000000000000000000000000000000000c9",
+          "log_index": 3
+        },
+        "reference_assigned_at_ms": 1700000100000,
+        "permit": null,
+        "evidence": null
+      },
+      "evidence_completion": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "verify",
+        "invoice_id": "fixture_invoice_tap",
+        "invoice_revision": 1,
+        "lease_token": "000000000000000000000000000000000000000000000000000000000000001f",
+        "canonical_epoch": 100,
+        "evidence_commitment": "4e6d62d3378872af1d047920a25105f9bce343ad2d15d903d4f9ec1bb70562dc",
+        "receipt": {
+          "rail": "tap",
+          "physical_key": "tap/31337/0x0000000000000000000000000000000000000001/0x00000000000000000000000000000000000000000000000000000000000000c9/3",
+          "amount_base_units": "1000000000000000000",
+          "finalized": true,
+          "transaction_hash": "0x00000000000000000000000000000000000000000000000000000000000000c9",
+          "log_index": 3,
+          "chain_id": 31337,
+          "token_contract": "0x0000000000000000000000000000000000000001",
+          "from_address": "0x0000000000000000000000000000000000000003",
+          "to_address": "0x0000000000000000000000000000000000000002",
+          "block_number": "100",
+          "block_hash": "0x000000000000000000000000000000000000000000000000000000000000012d",
+          "paid_at_ms": 1700000050000
+        }
+      },
+      "issue_work": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "issue",
+        "invoice_id": "fixture_invoice_tap",
+        "invoice_revision": 1,
+        "lease_token": "0000000000000000000000000000000000000000000000000000000000000020",
+        "lease_expires_at_ms": 1700000900000,
+        "invoice": {
+          "network": {
+            "network_id": "918",
+            "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+            "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+            "contract_version": 32
+          },
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000c",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "invoice_commitment": "f3df8cc85fba3d4f043117cc4d153ce112e1e420d1a3c61e64eadecb2a404863",
+          "rail": "tap",
+          "amount_base_units": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "created_at_ms": 1700000000000,
+          "quote_expires_at_ms": 1700000600000,
+          "collection": {
+            "chain_id": 31337,
+            "token_contract": "0x0000000000000000000000000000000000000001",
+            "destination": "0x0000000000000000000000000000000000000002",
+            "allocation_id": "0000000000000000000000000000000000000000000000000000000000000065"
+          }
+        },
+        "payment_reference": null,
+        "reference_assigned_at_ms": null,
+        "permit": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "purpose": "proxy_admission_fee",
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 32,
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000c",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "invoice_commitment": "f3df8cc85fba3d4f043117cc4d153ce112e1e420d1a3c61e64eadecb2a404863",
+          "evidence_commitment": "eb856795cbef53bd923fa43693c2858863ad06e3ee3f6514bf49bed6063ad8fe",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "nonce": "0000000000000000000000000000000000000000000000000000000000000029",
+          "issuance_revision": 1,
+          "rail": "tap",
+          "accepted_amount": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "valid_from_epoch": 100,
+          "expires_after_epoch": 110
+        },
+        "evidence": {
+          "canonical_epoch": 100,
+          "evidence_commitment": "eb856795cbef53bd923fa43693c2858863ad06e3ee3f6514bf49bed6063ad8fe",
+          "receipts": [
+            {
+              "payment_reference": {
+                "chain_id": 31337,
+                "token_contract": "0x0000000000000000000000000000000000000001",
+                "transaction_hash": "0x00000000000000000000000000000000000000000000000000000000000000c9",
+                "log_index": 3
+              },
+              "reference_assigned_at_ms": 1700000100000,
+              "receipt": {
+                "rail": "tap",
+                "physical_key": "tap/31337/0x0000000000000000000000000000000000000001/0x00000000000000000000000000000000000000000000000000000000000000c9/3",
+                "amount_base_units": "1000000000000000000",
+                "finalized": true,
+                "transaction_hash": "0x00000000000000000000000000000000000000000000000000000000000000c9",
+                "log_index": 3,
+                "chain_id": 31337,
+                "token_contract": "0x0000000000000000000000000000000000000001",
+                "from_address": "0x0000000000000000000000000000000000000003",
+                "to_address": "0x0000000000000000000000000000000000000002",
+                "block_number": "100",
+                "block_hash": "0x000000000000000000000000000000000000000000000000000000000000012d",
+                "paid_at_ms": 1700000050000
+              }
+            }
+          ]
+        }
+      },
+      "permit_completion": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "issue",
+        "invoice_id": "fixture_invoice_tap",
+        "invoice_revision": 1,
+        "lease_token": "0000000000000000000000000000000000000000000000000000000000000020",
+        "permit": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "purpose": "proxy_admission_fee",
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 32,
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000c",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "invoice_commitment": "f3df8cc85fba3d4f043117cc4d153ce112e1e420d1a3c61e64eadecb2a404863",
+          "evidence_commitment": "eb856795cbef53bd923fa43693c2858863ad06e3ee3f6514bf49bed6063ad8fe",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "nonce": "0000000000000000000000000000000000000000000000000000000000000029",
+          "issuance_revision": 1,
+          "rail": "tap",
+          "accepted_amount": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "valid_from_epoch": 100,
+          "expires_after_epoch": 110
+        },
+        "issuer_signature": "34f8f52094de54b0b8ae4a4eb02c04b79c89918408e042e5e41fafa3461208c4bb4a8cbb1a2249059ea32d5a353b9f0f2bf5c7a6fba6acbf8eda04117c2e9000"
+      }
+    },
+    {
+      "rail": "tnk",
+      "verify_work": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "verify",
+        "invoice_id": "fixture_invoice_tnk",
+        "invoice_revision": 1,
+        "lease_token": "000000000000000000000000000000000000000000000000000000000000001f",
+        "lease_expires_at_ms": 1700000900000,
+        "invoice": {
+          "network": {
+            "network_id": "918",
+            "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+            "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+            "contract_version": 32
+          },
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000d",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "invoice_commitment": "f2688015812e675db54d1f7737e4d938dbfefbc8fe53ce28f64be72aff916fed",
+          "rail": "tnk",
+          "amount_base_units": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "created_at_ms": 1700000000000,
+          "quote_expires_at_ms": 1700000600000,
+          "collection": {
+            "network": "testnet1",
+            "destination": "testtrac1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "allocation_id": "0000000000000000000000000000000000000000000000000000000000000066"
+          }
+        },
+        "payment_reference": {
+          "network": "testnet1",
+          "transaction_hash": "00000000000000000000000000000000000000000000000000000000000000ca"
+        },
+        "reference_assigned_at_ms": 1700000100000,
+        "permit": null,
+        "evidence": null
+      },
+      "evidence_completion": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "verify",
+        "invoice_id": "fixture_invoice_tnk",
+        "invoice_revision": 1,
+        "lease_token": "000000000000000000000000000000000000000000000000000000000000001f",
+        "canonical_epoch": 100,
+        "evidence_commitment": "f5cb75fe66c44f7a1c14e42e56246f8a8ac396d961b1f6dfa32e78692adda05f",
+        "receipt": {
+          "rail": "tnk",
+          "physical_key": "tnk/testnet1/00000000000000000000000000000000000000000000000000000000000000ca",
+          "amount_base_units": "1000000000000000000",
+          "finalized": true,
+          "network": "testnet1",
+          "transaction_hash": "00000000000000000000000000000000000000000000000000000000000000ca",
+          "from_address": "testtrac1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "to_address": "testtrac1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "confirmed_signed_length": 100
+        }
+      },
+      "issue_work": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "issue",
+        "invoice_id": "fixture_invoice_tnk",
+        "invoice_revision": 1,
+        "lease_token": "0000000000000000000000000000000000000000000000000000000000000020",
+        "lease_expires_at_ms": 1700000900000,
+        "invoice": {
+          "network": {
+            "network_id": "918",
+            "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+            "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+            "contract_version": 32
+          },
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000d",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "invoice_commitment": "f2688015812e675db54d1f7737e4d938dbfefbc8fe53ce28f64be72aff916fed",
+          "rail": "tnk",
+          "amount_base_units": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "created_at_ms": 1700000000000,
+          "quote_expires_at_ms": 1700000600000,
+          "collection": {
+            "network": "testnet1",
+            "destination": "testtrac1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "allocation_id": "0000000000000000000000000000000000000000000000000000000000000066"
+          }
+        },
+        "payment_reference": null,
+        "reference_assigned_at_ms": null,
+        "permit": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "purpose": "proxy_admission_fee",
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 32,
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000d",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "invoice_commitment": "f2688015812e675db54d1f7737e4d938dbfefbc8fe53ce28f64be72aff916fed",
+          "evidence_commitment": "d17e48cc1978f6978e2f04ee9f1bb59cd0a056bc1c13f39b297d5bdd5d81d465",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "nonce": "000000000000000000000000000000000000000000000000000000000000002a",
+          "issuance_revision": 1,
+          "rail": "tnk",
+          "accepted_amount": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "valid_from_epoch": 100,
+          "expires_after_epoch": 110
+        },
+        "evidence": {
+          "canonical_epoch": 100,
+          "evidence_commitment": "d17e48cc1978f6978e2f04ee9f1bb59cd0a056bc1c13f39b297d5bdd5d81d465",
+          "receipts": [
+            {
+              "payment_reference": {
+                "network": "testnet1",
+                "transaction_hash": "00000000000000000000000000000000000000000000000000000000000000ca"
+              },
+              "reference_assigned_at_ms": 1700000100000,
+              "receipt": {
+                "rail": "tnk",
+                "physical_key": "tnk/testnet1/00000000000000000000000000000000000000000000000000000000000000ca",
+                "amount_base_units": "1000000000000000000",
+                "finalized": true,
+                "network": "testnet1",
+                "transaction_hash": "00000000000000000000000000000000000000000000000000000000000000ca",
+                "from_address": "testtrac1bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "to_address": "testtrac1aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "confirmed_signed_length": 100
+              }
+            }
+          ]
+        }
+      },
+      "permit_completion": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "issue",
+        "invoice_id": "fixture_invoice_tnk",
+        "invoice_revision": 1,
+        "lease_token": "0000000000000000000000000000000000000000000000000000000000000020",
+        "permit": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "purpose": "proxy_admission_fee",
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 32,
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000d",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "invoice_commitment": "f2688015812e675db54d1f7737e4d938dbfefbc8fe53ce28f64be72aff916fed",
+          "evidence_commitment": "d17e48cc1978f6978e2f04ee9f1bb59cd0a056bc1c13f39b297d5bdd5d81d465",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "nonce": "000000000000000000000000000000000000000000000000000000000000002a",
+          "issuance_revision": 1,
+          "rail": "tnk",
+          "accepted_amount": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "valid_from_epoch": 100,
+          "expires_after_epoch": 110
+        },
+        "issuer_signature": "beb067c72747eb060989df887bc0ca38fb1cc2c8addfad59af09189131474c57e74257a84f94273bf9195dbb7298157f0c9d5f96868e86947949c37b2414b60c"
+      }
+    },
+    {
+      "rail": "fiat",
+      "verify_work": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "verify",
+        "invoice_id": "fixture_invoice_fiat",
+        "invoice_revision": 1,
+        "lease_token": "000000000000000000000000000000000000000000000000000000000000001f",
+        "lease_expires_at_ms": 1700000900000,
+        "invoice": {
+          "network": {
+            "network_id": "918",
+            "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+            "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+            "contract_version": 32
+          },
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000e",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "invoice_commitment": "12c669fa3cf1ee65fbea83f7dea6bac00e151e7f132325ff6d7d674bf1b27746",
+          "rail": "fiat",
+          "amount_base_units": "1000",
+          "accepted_value_au": "10000000000000000000",
+          "created_at_ms": 1700000000000,
+          "quote_expires_at_ms": 1700000600000,
+          "collection": {
+            "stripe_account": "acct_localfixture",
+            "livemode": false,
+            "currency": "usd"
+          }
+        },
+        "payment_reference": {
+          "stripe_account": "acct_localfixture",
+          "livemode": false,
+          "payment_intent_id": "pi_localfixture",
+          "verified_webhook_event_id": "evt_localfixture"
+        },
+        "reference_assigned_at_ms": 1700000100000,
+        "permit": null,
+        "evidence": null
+      },
+      "evidence_completion": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "verify",
+        "invoice_id": "fixture_invoice_fiat",
+        "invoice_revision": 1,
+        "lease_token": "000000000000000000000000000000000000000000000000000000000000001f",
+        "canonical_epoch": 100,
+        "evidence_commitment": "027d8f924974690d15f9c8e1bb29b3120a8648f6acaac4762dcddadc36e89052",
+        "receipt": {
+          "rail": "fiat",
+          "physical_key": "fiat/acct_localfixture/test/pi_localfixture",
+          "amount_base_units": "1000",
+          "finalized": true,
+          "stripe_account": "acct_localfixture",
+          "livemode": false,
+          "payment_intent_id": "pi_localfixture",
+          "charge_id": "ch_localfixture",
+          "currency": "usd",
+          "paid_at_ms": 1700000050000
+        }
+      },
+      "issue_work": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "issue",
+        "invoice_id": "fixture_invoice_fiat",
+        "invoice_revision": 1,
+        "lease_token": "0000000000000000000000000000000000000000000000000000000000000020",
+        "lease_expires_at_ms": 1700000900000,
+        "invoice": {
+          "network": {
+            "network_id": "918",
+            "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+            "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+            "contract_version": 32
+          },
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000e",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "invoice_commitment": "12c669fa3cf1ee65fbea83f7dea6bac00e151e7f132325ff6d7d674bf1b27746",
+          "rail": "fiat",
+          "amount_base_units": "1000",
+          "accepted_value_au": "10000000000000000000",
+          "created_at_ms": 1700000000000,
+          "quote_expires_at_ms": 1700000600000,
+          "collection": {
+            "stripe_account": "acct_localfixture",
+            "livemode": false,
+            "currency": "usd"
+          }
+        },
+        "payment_reference": null,
+        "reference_assigned_at_ms": null,
+        "permit": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "purpose": "proxy_admission_fee",
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 32,
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000e",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "invoice_commitment": "12c669fa3cf1ee65fbea83f7dea6bac00e151e7f132325ff6d7d674bf1b27746",
+          "evidence_commitment": "0e885d1567da5e5fd42d6fe27cb37d7405f92dff1c5e1585633331eb08d52b7b",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "nonce": "000000000000000000000000000000000000000000000000000000000000002b",
+          "issuance_revision": 1,
+          "rail": "fiat",
+          "accepted_amount": "1000",
+          "accepted_value_au": "10000000000000000000",
+          "valid_from_epoch": 100,
+          "expires_after_epoch": 110
+        },
+        "evidence": {
+          "canonical_epoch": 100,
+          "evidence_commitment": "0e885d1567da5e5fd42d6fe27cb37d7405f92dff1c5e1585633331eb08d52b7b",
+          "receipts": [
+            {
+              "payment_reference": {
+                "stripe_account": "acct_localfixture",
+                "livemode": false,
+                "payment_intent_id": "pi_localfixture",
+                "verified_webhook_event_id": "evt_localfixture"
+              },
+              "reference_assigned_at_ms": 1700000100000,
+              "receipt": {
+                "rail": "fiat",
+                "physical_key": "fiat/acct_localfixture/test/pi_localfixture",
+                "amount_base_units": "1000",
+                "finalized": true,
+                "stripe_account": "acct_localfixture",
+                "livemode": false,
+                "payment_intent_id": "pi_localfixture",
+                "charge_id": "ch_localfixture",
+                "currency": "usd",
+                "paid_at_ms": 1700000050000
+              }
+            }
+          ]
+        }
+      },
+      "permit_completion": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "issue",
+        "invoice_id": "fixture_invoice_fiat",
+        "invoice_revision": 1,
+        "lease_token": "0000000000000000000000000000000000000000000000000000000000000020",
+        "permit": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "purpose": "proxy_admission_fee",
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 32,
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000e",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "invoice_commitment": "12c669fa3cf1ee65fbea83f7dea6bac00e151e7f132325ff6d7d674bf1b27746",
+          "evidence_commitment": "0e885d1567da5e5fd42d6fe27cb37d7405f92dff1c5e1585633331eb08d52b7b",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "nonce": "000000000000000000000000000000000000000000000000000000000000002b",
+          "issuance_revision": 1,
+          "rail": "fiat",
+          "accepted_amount": "1000",
+          "accepted_value_au": "10000000000000000000",
+          "valid_from_epoch": 100,
+          "expires_after_epoch": 110
+        },
+        "issuer_signature": "7b35cc31e76d0a4b66dfdb8463db72ae3c9a8419f90a2deaa3e5c14cd3469b30c16601f6ae3f030b42eb9a146e7d78d36b87a518cb09b37777bac516f04d5f08"
+      }
+    },
+    {
+      "rail": "tap",
+      "verify_work": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "verify",
+        "invoice_id": "fixture_invoice_tap",
+        "invoice_revision": 1,
+        "lease_token": "000000000000000000000000000000000000000000000000000000000000001f",
+        "lease_expires_at_ms": 1700000900000,
+        "invoice": {
+          "network": {
+            "network_id": "918",
+            "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+            "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+            "contract_version": 32
+          },
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000c",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "invoice_commitment": "f3df8cc85fba3d4f043117cc4d153ce112e1e420d1a3c61e64eadecb2a404863",
+          "rail": "tap",
+          "amount_base_units": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "created_at_ms": 1700000000000,
+          "quote_expires_at_ms": 1700000600000,
+          "collection": {
+            "chain_id": 31337,
+            "token_contract": "0x0000000000000000000000000000000000000001",
+            "destination": "0x0000000000000000000000000000000000000002",
+            "allocation_id": "0000000000000000000000000000000000000000000000000000000000000065"
+          }
+        },
+        "payment_reference": {
+          "chain_id": 31337,
+          "token_contract": "0x0000000000000000000000000000000000000001",
+          "transaction_hash": "0x00000000000000000000000000000000000000000000000000000000000000c9",
+          "log_index": 3
+        },
+        "reference_assigned_at_ms": 1700000100000,
+        "permit": null,
+        "evidence": null
+      },
+      "evidence_completion": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "verify",
+        "invoice_id": "fixture_invoice_tap",
+        "invoice_revision": 1,
+        "lease_token": "000000000000000000000000000000000000000000000000000000000000001f",
+        "canonical_epoch": 100,
+        "evidence_commitment": "73c3d57e788c44e9e7e3b31be96b71003878b45942f0056aa343047f4b37327d",
+        "receipt": {
+          "rail": "tap",
+          "physical_key": "tap/31337/0x0000000000000000000000000000000000000001/0x00000000000000000000000000000000000000000000000000000000000000c9/3",
+          "amount_base_units": "400000000000000000",
+          "finalized": true,
+          "transaction_hash": "0x00000000000000000000000000000000000000000000000000000000000000c9",
+          "log_index": 3,
+          "chain_id": 31337,
+          "token_contract": "0x0000000000000000000000000000000000000001",
+          "from_address": "0x0000000000000000000000000000000000000003",
+          "to_address": "0x0000000000000000000000000000000000000002",
+          "block_number": "100",
+          "block_hash": "0x000000000000000000000000000000000000000000000000000000000000012d",
+          "paid_at_ms": 1700000050000
+        }
+      },
+      "issue_work": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "issue",
+        "invoice_id": "fixture_invoice_tap",
+        "invoice_revision": 1,
+        "lease_token": "0000000000000000000000000000000000000000000000000000000000000020",
+        "lease_expires_at_ms": 1700000900000,
+        "invoice": {
+          "network": {
+            "network_id": "918",
+            "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+            "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+            "contract_version": 32
+          },
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000c",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "invoice_commitment": "f3df8cc85fba3d4f043117cc4d153ce112e1e420d1a3c61e64eadecb2a404863",
+          "rail": "tap",
+          "amount_base_units": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "created_at_ms": 1700000000000,
+          "quote_expires_at_ms": 1700000600000,
+          "collection": {
+            "chain_id": 31337,
+            "token_contract": "0x0000000000000000000000000000000000000001",
+            "destination": "0x0000000000000000000000000000000000000002",
+            "allocation_id": "0000000000000000000000000000000000000000000000000000000000000065"
+          }
+        },
+        "payment_reference": null,
+        "reference_assigned_at_ms": null,
+        "permit": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "purpose": "proxy_admission_fee",
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 32,
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000c",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "invoice_commitment": "f3df8cc85fba3d4f043117cc4d153ce112e1e420d1a3c61e64eadecb2a404863",
+          "evidence_commitment": "908e84c1d053afd00236209293ac6f71a408324c634c39ed7a7eb4cc5bf687c6",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "nonce": "0000000000000000000000000000000000000000000000000000000000000029",
+          "issuance_revision": 1,
+          "rail": "tap",
+          "accepted_amount": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "valid_from_epoch": 100,
+          "expires_after_epoch": 110
+        },
+        "evidence": {
+          "canonical_epoch": 100,
+          "evidence_commitment": "908e84c1d053afd00236209293ac6f71a408324c634c39ed7a7eb4cc5bf687c6",
+          "receipts": [
+            {
+              "payment_reference": {
+                "chain_id": 31337,
+                "token_contract": "0x0000000000000000000000000000000000000001",
+                "transaction_hash": "0x00000000000000000000000000000000000000000000000000000000000000c9",
+                "log_index": 3
+              },
+              "reference_assigned_at_ms": 1700000100000,
+              "receipt": {
+                "rail": "tap",
+                "physical_key": "tap/31337/0x0000000000000000000000000000000000000001/0x00000000000000000000000000000000000000000000000000000000000000c9/3",
+                "amount_base_units": "400000000000000000",
+                "finalized": true,
+                "transaction_hash": "0x00000000000000000000000000000000000000000000000000000000000000c9",
+                "log_index": 3,
+                "chain_id": 31337,
+                "token_contract": "0x0000000000000000000000000000000000000001",
+                "from_address": "0x0000000000000000000000000000000000000003",
+                "to_address": "0x0000000000000000000000000000000000000002",
+                "block_number": "100",
+                "block_hash": "0x000000000000000000000000000000000000000000000000000000000000012d",
+                "paid_at_ms": 1700000050000
+              }
+            },
+            {
+              "payment_reference": {
+                "chain_id": 31337,
+                "token_contract": "0x0000000000000000000000000000000000000001",
+                "transaction_hash": "0x00000000000000000000000000000000000000000000000000000000000000c9",
+                "log_index": 4
+              },
+              "reference_assigned_at_ms": 1700000100000,
+              "receipt": {
+                "rail": "tap",
+                "physical_key": "tap/31337/0x0000000000000000000000000000000000000001/0x00000000000000000000000000000000000000000000000000000000000000c9/4",
+                "amount_base_units": "700000000000000000",
+                "finalized": true,
+                "transaction_hash": "0x00000000000000000000000000000000000000000000000000000000000000c9",
+                "log_index": 4,
+                "chain_id": 31337,
+                "token_contract": "0x0000000000000000000000000000000000000001",
+                "from_address": "0x0000000000000000000000000000000000000003",
+                "to_address": "0x0000000000000000000000000000000000000002",
+                "block_number": "100",
+                "block_hash": "0x000000000000000000000000000000000000000000000000000000000000012d",
+                "paid_at_ms": 1700000050000
+              }
+            }
+          ]
+        }
+      },
+      "permit_completion": {
+        "schema_version": 1,
+        "purpose": "proxy_admission_fee",
+        "phase": "issue",
+        "invoice_id": "fixture_invoice_tap",
+        "invoice_revision": 1,
+        "lease_token": "0000000000000000000000000000000000000000000000000000000000000020",
+        "permit": {
+          "schema_version": 1,
+          "lane": "proxy",
+          "purpose": "proxy_admission_fee",
+          "network_id": "918",
+          "msb_bootstrap": "0000000000000000000000000000000000000000000000000000000000000004",
+          "subnet_bootstrap": "0000000000000000000000000000000000000000000000000000000000000005",
+          "contract_version": 32,
+          "provider_pubkey": "000000000000000000000000000000000000000000000000000000000000000a",
+          "issuer_pubkey": "f80cccdce4ae1c07ae208a2adf99a310ae4207e0306fa0236110b06827bbb8d0",
+          "entitlement_id": "000000000000000000000000000000000000000000000000000000000000000c",
+          "fee_policy_hash": "000000000000000000000000000000000000000000000000000000000000000d",
+          "invoice_commitment": "f3df8cc85fba3d4f043117cc4d153ce112e1e420d1a3c61e64eadecb2a404863",
+          "evidence_commitment": "908e84c1d053afd00236209293ac6f71a408324c634c39ed7a7eb4cc5bf687c6",
+          "initial_operation_digest": "000000000000000000000000000000000000000000000000000000000000000b",
+          "nonce": "0000000000000000000000000000000000000000000000000000000000000029",
+          "issuance_revision": 1,
+          "rail": "tap",
+          "accepted_amount": "1000000000000000000",
+          "accepted_value_au": "10000000000000000000",
+          "valid_from_epoch": 100,
+          "expires_after_epoch": 110
+        },
+        "issuer_signature": "1d111e8c569402d4d35608a1275f1a3d8ec45ade3a7e23fc1a82884796170235ba6d4eb3a0fb1db7aab968bf941a6efb2a9b72d462dd32ba61b7a3a5d4c28c06"
+      },
+      "name": "tap_two_receipt_topup"
+    }
+  ]
+}

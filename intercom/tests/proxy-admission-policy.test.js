@@ -1,0 +1,68 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import b4a from 'b4a';
+import MayhemFeature from '../features/mayhem/index.js';
+import { CONTRACT_VERSION } from '../contract/contract.js';
+import { createProxyCanonicalSnapshot } from '../features/mayhem/proxy-canonical-view.js';
+import { readProxyAdmissionPolicy, validateProxyAdmissionPolicyRequest, PROXY_ADMISSION_POLICY_SERVICE } from '../features/mayhem/proxy-admission-policy.js';
+import { createServer, requestProxyAdmissionPolicy } from '../src/rpc.js';
+import { familyAdminFixture } from './helpers/proxy-family-admin-fixture.mjs';
+const h=n=>n.toString(16).padStart(64,'0');
+const hex=v=>b4a.toString(v,'hex');
+
+test('admission policy reads one real signed canonical key with no ledger writes or private facts',async t=>{
+ const f=await familyAdminFixture(t),snapshot=createProxyCanonicalSnapshot(f.peer,CONTRACT_VERSION),keys=[],before=f.base.local.length;
+ const value=await readProxyAdmissionPolicy({request:{requester:f.issuer.publicKey,request_nonce:h(1)},withCanonicalSnapshot:body=>snapshot(s=>body({...s,read:key=>{keys.push(key);return s.read(key);}}))});
+ assert.deepEqual(keys,['proxy/v1/config']); assert.equal(value.registry_enabled,true);
+ assert.deepEqual(value.active_issuers,[f.issuer.publicKey]); assert.equal(value.max_permit_epochs,20);
+ assert.equal(value.context.epoch,100); assert.ok(value.proof.signed_length>0);
+ assert.equal(f.base.local.length,before);
+ for(const key of ['invoice_commitment','evidence_commitment','accepted_amount','provider_pubkey','balances','private_key']) assert.equal(value[key],undefined);
+});
+
+test('policy disabled, issuer removal and unavailable canonical source remain explicit',async t=>{
+ const f=await familyAdminFixture(t),snapshot=createProxyCanonicalSnapshot(f.peer,CONTRACT_VERSION),request={requester:f.issuer.publicKey,request_nonce:h(2)};
+ await f.base.append({type:'seed',entries:[['proxy/v1/config',{...f.config,enabled:false,active_issuers:[h(4)]}]]});await f.base.update();
+ const response=await readProxyAdmissionPolicy({request,withCanonicalSnapshot:snapshot});
+ assert.equal(response.registry_enabled,false);assert.deepEqual(response.active_issuers,[h(4)]);
+ for(const bad of [{...request,request_nonce:'bad'},{...request,provider_pubkey:h(1)},{request_nonce:h(1)}]) assert.throws(()=>validateProxyAdmissionPolicyRequest(bad));
+ await assert.rejects(readProxyAdmissionPolicy({request,withCanonicalSnapshot:async()=>{throw new Error('unsigned source');}}),/unsigned source/);
+});
+
+test('policy uses four permits and timed out reads keep their permit until cleanup',async t=>{
+ const callbacks=[];t.mock.method(globalThis,'setTimeout',f=>{callbacks.push(f);return 0;});t.mock.method(globalThis,'clearTimeout',()=>{});
+ let release;const wait=new Promise(r=>{release=r;});const blocked=async()=>{await wait;throw new Error('cleaned');};
+ const request={requester:h(1),request_nonce:h(2)},reads=Array.from({length:4},()=>readProxyAdmissionPolicy({request,withCanonicalSnapshot:blocked}));
+ const rejects=Promise.all(reads.map(p=>assert.rejects(p,/expired/)));callbacks.forEach(f=>f());await rejects;
+ await assert.rejects(readProxyAdmissionPolicy({request,withCanonicalSnapshot:blocked}),/capacity/);
+ release();await new Promise(r=>setImmediate(r));
+ await assert.rejects(readProxyAdmissionPolicy({request,withCanonicalSnapshot:blocked}),/cleaned/);
+});
+
+test('actual RPC uses authenticated policy relay; altered request, stale nonce and wrong network fail closed',async t=>{
+ const f=await familyAdminFixture(t),admin=f.feature;
+ const peer={...f.peer,wallet:{...f.peer.wallet,publicKey:f.issuer.publicKey,sign:bytes=>hex(f.issuer.wallet.sign(b4a.from(bytes)))},base:{writable:false,view:f.base.view}};
+ const client=new MayhemFeature(peer,{});t.after(()=>client.stop());
+ let previous,mode='normal';const nonces=[];
+ client.requestService=async(service,envelope)=>{
+  assert.equal(service,PROXY_ADMISSION_POLICY_SERVICE);
+  const check=value=>admin._verifyServiceRequest(service,value,{admin:f.admin.publicKey,transport:f.issuer.publicKey});
+  assert.equal(check({...envelope,payload:{...envelope.payload,request_nonce:h(99)}}),null);
+  const authorization=check(envelope);assert.ok(authorization);nonces.push(authorization.payload.request_nonce);
+  if(mode==='replay')return structuredClone(previous);
+  previous=await admin._handleService(service,authorization.payload,authorization);
+  if(mode==='network')previous.context.network_id='999';
+  return structuredClone(previous);
+ };
+ peer.protocol={instance:{features:{mayhem:client}}};
+ const server=createServer(peer);await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(()=>new Promise(r=>server.close(r)));
+ const query={request_nonce:h(1)},before=f.base.local.length;
+ const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/proxy/admission-policy`,{method:'POST',body:JSON.stringify(query),headers:{'content-type':'application/json'}});
+ assert.equal(response.status,200);const body=await response.json();assert.equal(body.request_nonce,query.request_nonce);assert.deepEqual(body.active_issuers,[f.issuer.publicKey]);
+ await requestProxyAdmissionPolicy(peer,query);assert.equal(new Set(nonces).size,2);assert.ok(nonces.every(n=>n!==query.request_nonce));
+ mode='replay';await assert.rejects(requestProxyAdmissionPolicy(peer,query),/does not match/);
+ mode='network';await assert.rejects(requestProxyAdmissionPolicy(peer,query),/does not match/);
+ await assert.rejects(requestProxyAdmissionPolicy({},query),/not ready/);
+ await assert.rejects(requestProxyAdmissionPolicy(peer,{...query,issuer:h(1)}),/Invalid/);
+ assert.equal(f.base.local.length,before);
+});

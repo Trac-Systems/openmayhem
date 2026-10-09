@@ -405,6 +405,13 @@ export async function discoverProxyCatalog(peer, body) {
   return await feature.discoverProxyCatalog(body.query);
 }
 
+export async function requestProxyAdmissionPolicy(peer, body) {
+  if (!isObject(body) || Object.keys(body).join('|') !== 'request_nonce') throw new Error('Invalid proxy admission policy query.');
+  const feature = peer.protocol?.instance?.features?.mayhem;
+  if (typeof feature?.proxyAdmissionPolicy !== 'function') throw new Error('Proxy admission policy relay is not ready.');
+  return await feature.proxyAdmissionPolicy(body);
+}
+
 export async function requestProxyProviderState(peer, body) {
   if (!isObject(body) || Object.keys(body).sort().join('|') !== 'initial_operation_digest|provider_pubkey|request_nonce') throw new Error('Invalid proxy provider query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
@@ -578,6 +585,11 @@ export const createServer = (
             })
           );
         }
+      }
+      if (req.method === 'POST' && requestPath === '/v1/proxy/admission-policy') {
+        res.setHeader('Cache-Control', 'no-store');
+        const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 1024) });
+        return respond(200, await requestProxyAdmissionPolicy(peer, body));
       }
       if (req.method === 'POST' && requestPath === '/v1/proxy/provider-state') {
         const body = await readJsonBody(req, { maxBytes: Math.min(maxBodyBytes, 1024) });
