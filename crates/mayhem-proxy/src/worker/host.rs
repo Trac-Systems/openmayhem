@@ -268,6 +268,17 @@ pub struct Prepared {
     io: Worker,
 }
 impl Prepared {
+    pub(crate) fn attach_probe(self, ticket: crate::capacity::probes::Dispatch) -> Result<Active> {
+        if self.io.semantic_policy.is_some() && !self.io.semantics_ready {
+            return Err(Error::Configuration);
+        }
+        if ticket.probe().phase != crate::capacity::probes::ProbePhase::Dispatched
+            || Session::from_probe(ticket.probe())? != self.io.session
+        {
+            return Err(Error::Identity);
+        }
+        Ok(Active { io: self.io })
+    }
     pub async fn configure_semantics(mut self, policy: &crate::semantics::Policy) -> Result<Self> {
         if self.io.semantics_ready
             || self.io.semantic_policy.as_ref() != Some(&policy.digest().map_err(Error::Upstream)?)

@@ -110,7 +110,7 @@ proposal reservation, provider signing and dispatch. Sources preserve the observ
 age; reads/heartbeats never renew it. Revision checks reject an inconsistent group/route
 pair without spinning. Restart, missing sources, source errors and expired evidence stay
 closed, and neither configuration changes nor old observation tickets can silently fall
-back to cached Ready. Local capacity schema 4 preserves earlier leases without scanning
+back to cached Ready. Local capacity schema 5 preserves earlier leases without scanning
 or rewriting their history. This is not a ledger-contract version change.
 
 `Controller::new_observed` feeds validated JSON/stream outcomes into the monitor chosen
@@ -142,10 +142,53 @@ Restart retains all counters and fences old controllers. Recovery merges bounded
 pages for primary and additional memberships; it never scans whole request histories.
 Missing/mismatched references fail closed without partially decrementing counters.
 
-Signed public presence and managed startup remain unwired. The recovery observer latch
-is local and is not permission to dispatch a paid probe; a durable, funded probe lease
-and restart reconciliation remain required. Numerical public policy and end-to-end
-freshness/recovery bounds require acceptance.
+Signed public presence and managed startup remain unwired. Numerical public policy and
+end-to-end freshness/recovery bounds require acceptance.
+
+## Operator recovery probes
+
+`execution::probes::Controller` runs an explicitly configured model request only when its
+shared health monitor permits recovery. It uses the same protected HTTP connection,
+isolated decoder, endpoint validation and tool/schema checks as paid JSON and streaming
+execution. A distinct decoder session and consumable probe ticket keep this traffic
+separate from customer purchases. There is no buyer, receipt, demand event or ledger write.
+
+The operator supplies cumulative attempt/cost allowances, a conservative per-attempt cost
+estimate, request/output byte limits, an explicit LLM output-token limit and a probe-only
+duration. These are permissions to use that operator's upstream account, not customer
+credits, proof of an upstream balance or a guaranteed vendor price. Reconfiguration and
+restarts preserve used allowance. Renewal requires an explicit increase. Even a cancelled
+unsent attempt conservatively consumes allowance; no hidden refund or periodic reset.
+Missing/exhausted allowances prevent a POST. There is no automatic idle probing loop.
+
+The capacity database commits budget consumption, one probe per overlapping shared group,
+and all physical/route counters together. Only excluded health gates for the tested route
+and its selected recovery group may be bypassed. Healthy adaptive allowances, unrelated
+failed scopes, configured ceilings and outstanding work remain binding. Health recovered
+by ordinary traffic or a newer fault invalidates a waiting probe before dispatch. All
+blocking storage work has bounded async admission and retains its permit while fsync runs.
+
+Startup failure may cancel a durably Prepared probe. Dispatch commits before POST and
+cannot be replayed by deserializing its status. Drop, timeout or restart preserves unknown
+execution and occupied counters; reads never create a new dispatch permit. A validated
+terminal result or proven pre-dispatch transport refusal closes capacity. The completion
+record retains one bounded evidence digest per allowance, not model output history.
+Network timing excludes decoder startup and local persistence. Health success is published
+only after durable completion; publication delay does not inflate the recorded model latency.
+
+The generic error profile deliberately preserves uncertainty after an arbitrary HTTP
+error. In particular, a 429-shaped body is not independent proof that a vendor executed
+nothing. Connector-specific documented refusal/job-status/cancellation evidence and its
+automatic reconciliation still need integration; an unknown probe cannot simply expire.
+Prepared-probe recovery is available to trusted startup, but managed startup has not yet
+been wired. The monitor and capacity authority must be rebound to their exact scopes.
+The operator can explicitly raise a spent allowance; no implementation may silently reset
+it or delete an unresolved record to keep checking.
+
+These self-tests do not certify global concurrency, all context sizes, upstream model
+identity or native tokens/second. The independent tokenizer/progress source remains
+unconnected, and neither JSON usage fields nor streaming chunk counts certify the 5 tok/s
+floor. Probe recipes must match the condition under review before declaring recovery.
 
 ## Evidence and remaining integration
 

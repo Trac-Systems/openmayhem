@@ -77,6 +77,14 @@ pub struct Session {
     pub binding_hash: Digest,
 }
 impl Session {
+    pub(crate) fn from_probe(probe: &crate::capacity::probes::Probe) -> Result<Self> {
+        let bytes = serde_json::to_vec(&probe.specification).map_err(|_| Error::Configuration)?;
+        Ok(Self {
+            invocation: probe.id.clone(),
+            attempt: 1,
+            binding_hash: Digest::hash("mayhem/proxy/decoder-probe/v1", &[&bytes]),
+        })
+    }
     pub fn from_record(record: &Record) -> Result<Self> {
         let hash = binding_hash(&record.binding)?;
         if record.attempt == 0 {
@@ -128,6 +136,24 @@ pub struct Init {
     pub semantic_policy: Option<Digest>,
 }
 impl Init {
+    pub(crate) fn probe(
+        probe: &crate::capacity::probes::Probe,
+        format: WireFormat,
+        error_profile: ErrorProfile,
+        limits: DecodeLimits,
+    ) -> Result<Self> {
+        let init = Self {
+            abi: ABI,
+            release: RELEASE.into(),
+            session: Session::from_probe(probe)?,
+            format,
+            error_profile,
+            limits,
+            semantic_policy: None,
+        };
+        init.validate()?;
+        Ok(init)
+    }
     pub fn new(
         record: &Record,
         format: WireFormat,

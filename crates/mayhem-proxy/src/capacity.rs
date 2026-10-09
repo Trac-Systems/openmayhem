@@ -12,6 +12,8 @@
 //! Cross-host enforcement requires one shared scheduler/authority; separate database
 //! files cannot establish a global capacity guarantee.
 
+pub mod probes;
+
 use crate::attempts::{private_file, Digest, Identity};
 use crate::financial::negotiation::BuyerOffer;
 use redb::{
@@ -70,6 +72,8 @@ pub enum Error {
     Quota,
     #[error("this work already owns a capacity lease; recover it")]
     ExistingWork,
+    #[error("operator recovery-probe allowance is missing or exhausted")]
+    ProbeBudget,
     #[error("capacity evidence does not match this lease")]
     Binding,
 }
@@ -135,6 +139,12 @@ struct Meta {
     leases: u64,
     #[serde(default)]
     constraint_leases: u64,
+    #[serde(default)]
+    probe_budgets: u64,
+    #[serde(default)]
+    probes: u64,
+    #[serde(default)]
+    probe_groups: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -397,7 +407,7 @@ impl Authority {
                 return Err(Error::Identity);
             }
             require(
-                matches!(m.schema, 1 | 2 | 3 | 4)
+                matches!(m.schema, 1 | 2 | 3 | 4 | 5)
                     && [
                         GROUPS.name(),
                         ROUTES.name(),
@@ -423,6 +433,7 @@ impl Authority {
             } else {
                 require(names.iter().any(|n| n == BY_CONSTRAINT.name()))?;
             }
+            probes::upgrade(&tx, &m, &names)?;
             require(
                 db(db(tx.open_table(GROUPS))?.len())? == m.groups
                     && db(db(tx.open_table(ROUTES))?.len())? == m.routes
@@ -442,8 +453,9 @@ impl Authority {
             db(tx.open_table(BY_CONSTRAINT))?;
             db(tx.open_table(BY_WORK))?;
             db(tx.open_table(SIGNING))?;
+            probes::create_tables(&tx)?;
             Meta {
-                schema: 4,
+                schema: 5,
                 identity,
                 fence: 0,
                 sequence: 0,
@@ -451,11 +463,14 @@ impl Authority {
                 routes: 0,
                 leases: 0,
                 constraint_leases: 0,
+                probe_budgets: 0,
+                probes: 0,
+                probe_groups: 0,
             }
         };
         // Added gate/group/constraint fields default safely in historical rows;
-        // no history rewrite or lease migration. Older binaries reject schema4.
-        m.schema = 4;
+        // no history rewrite or lease migration. Older binaries reject schema5.
+        m.schema = 5;
         m.fence = m.fence.checked_add(1).ok_or(Error::Invalid)?;
         db(t.insert("state", encode(&m)?.as_slice()))?;
         drop(t);
@@ -550,6 +565,15 @@ impl Authority {
         }
     }
     fn allowances(&self, groups: &[Group], route: &RouteState, now: u64) -> Result<Allowances> {
+        self.allowances_with_recovery(groups, route, now, None)
+    }
+    fn allowances_with_recovery(
+        &self,
+        groups: &[Group],
+        route: &RouteState,
+        now: u64,
+        recovery_group: Option<&Digest>,
+    ) -> Result<Allowances> {
         require(!groups.is_empty() && groups.len() <= MAX_CONSTRAINTS + 1)?;
         let mut sources = Vec::with_capacity(groups.len() + 1);
         for group in groups {
@@ -570,15 +594,23 @@ impl Authority {
             let allowed = if group.mode == GroupMode::Allocation {
                 group.ceiling
             } else {
-                self.allowance(&group.gate, source.as_deref(), now, group.ceiling)?
+                recovery_allowance(
+                    self.allowance(&group.gate, source.as_deref(), now, group.ceiling),
+                    recovery_group == Some(&group.id),
+                    group.ceiling,
+                )?
             };
             free = free.min(allowed.saturating_sub(group.occupied));
             fits &= group.occupied <= allowed;
         }
-        let allowed = self.allowance(
-            &route.gate,
-            sources.last().and_then(|s| s.as_deref()),
-            now,
+        let allowed = recovery_allowance(
+            self.allowance(
+                &route.gate,
+                sources.last().and_then(|s| s.as_deref()),
+                now,
+                route.config.max_concurrency,
+            ),
+            recovery_group.is_some(),
             route.config.max_concurrency,
         )?;
         free = free.min(allowed.saturating_sub(route.occupied));
@@ -789,7 +821,7 @@ impl Authority {
         let mut m = meta(&tx)?;
         let mut groups = db(tx.open_table(GROUPS))?;
         let g: Group = read(&groups, group.as_str())?;
-        if g.occupied > 0 || g.routes > 0 {
+        if g.occupied > 0 || g.routes > 0 || probes::has_budget(&tx, group)? {
             return Err(Error::InUse);
         }
         m.groups = m.groups.checked_sub(1).ok_or(Error::Invalid)?;
@@ -862,6 +894,7 @@ impl Authority {
             .limits
             .max_leases
             .saturating_sub(m.leases)
+            .saturating_sub(m.probes)
             .min(u64::from(u32::MAX)) as u32;
         let availability = self
             .allowances(&allocation_groups, &r, self.now()?)
@@ -908,7 +941,7 @@ impl Authority {
         if db(work_index.get(work.key().as_str()))?.is_some() {
             return Err(Error::ExistingWork);
         }
-        if m.leases >= self.limits.max_leases {
+        if m.leases.saturating_add(m.probes) >= self.limits.max_leases {
             return Err(Error::Quota);
         }
         let mut groups = db(tx.open_table(GROUPS))?;
@@ -1332,6 +1365,14 @@ fn ready_reserved(
 struct Allowances {
     free: u32,
     fits: bool,
+}
+fn recovery_allowance(value: Result<u32>, recovering: bool, ceiling: u32) -> Result<u32> {
+    match value {
+        // Only an excluded gate in the explicitly recovered scope is bypassed.
+        // Healthy observed allowances and unrelated failed groups remain binding.
+        Err(Error::Busy | Error::Unavailable | Error::Checking) if recovering => Ok(ceiling),
+        value => value,
+    }
 }
 fn validate_constraints(route: &Route, constraints: &[Digest]) -> Result<()> {
     require(

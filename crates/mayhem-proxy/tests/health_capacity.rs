@@ -1,6 +1,8 @@
 #![cfg(unix)]
 #[path = "support/layered_capacity.rs"]
 mod layered;
+#[path = "support/probe_capacity.rs"]
+mod probes;
 use mayhem_proxy::{
     attempts::{Digest, Identity},
     capacity::{self, Authority, Evidence, Lane, Readiness, ReadinessSource, Route, Scope, Work},
@@ -390,6 +392,14 @@ fn legacy_capacity_schemas_preserve_inflight_work_and_live_requirement_during_up
         drop(a);
         let db = redb::Database::open(&path).unwrap();
         let tx = db.begin_write().unwrap();
+        for table in ["capacity_probe_budgets_v1", "capacity_probes_v1"] {
+            tx.delete_table(TableDefinition::<&str, &[u8]>::new(table))
+                .unwrap();
+        }
+        tx.delete_table(TableDefinition::<&str, &str>::new(
+            "capacity_probe_groups_v1",
+        ))
+        .unwrap();
         tx.delete_table(TableDefinition::<&str, &str>::new(
             "capacity_constraint_leases_v1",
         ))

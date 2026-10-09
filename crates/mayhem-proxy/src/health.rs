@@ -366,6 +366,14 @@ impl Monitor {
     pub fn observe_recovery(&self, id: &Digest, class: Class) -> Result<Sample> {
         self.sample(id, class, true)
     }
+    fn recovery_is_current(&self, sample: &Sample) -> Result<bool> {
+        let data = self.inner.data.lock().map_err(|_| Error::Unavailable)?;
+        let route = data.routes.get(&sample.route).ok_or(Error::Invalid)?;
+        Ok(sample.recovery
+            && data.recovery == Some(sample.sequence)
+            && sample.generation == (data.connection.generation, route.gate.generation)
+            && snapshot(&data, &sample.route, &self.inner.policy, Instant::now())?.allowance == 0)
+    }
     fn sample(&self, id: &Digest, class: Class, recovery: bool) -> Result<Sample> {
         if class.input_bytes_log2 > usize::BITS as u8 {
             return Err(Error::Invalid);

@@ -98,6 +98,14 @@ fn old_capacity_schema_migrates_without_inventing_signing_or_releasing_native_wo
         "capacity_constraint_leases_v1",
     ))
     .unwrap();
+    for table in ["capacity_probe_budgets_v1", "capacity_probes_v1"] {
+        tx.delete_table(TableDefinition::<&str, &[u8]>::new(table))
+            .unwrap();
+    }
+    tx.delete_table(TableDefinition::<&str, &str>::new(
+        "capacity_probe_groups_v1",
+    ))
+    .unwrap();
     {
         let mut table = tx
             .open_table(TableDefinition::<&str, &[u8]>::new("capacity_meta_v1"))

@@ -7,6 +7,8 @@
 //! capacity from retained terminal output or proven pre-send cancellation.
 
 mod paid;
+pub mod probes;
+mod transport;
 pub use paid::PaidExecutor;
 
 use crate::{
@@ -418,24 +420,29 @@ impl Executor {
             .and_then(|(monitor, route)| monitor.observe_request(route, request.health_class).ok());
         let operation = async {
             if streaming {
-                self.perform_stream(
-                    &request,
-                    active,
-                    &public_id,
-                    &record,
-                    &mut emit,
-                    &mut sample,
-                )
-                .await
+                self.transport()
+                    .perform_stream(
+                        &request,
+                        active,
+                        &public_id,
+                        &transport::Delivery::Customer {
+                            storage: &self.storage,
+                            record: &record,
+                        },
+                        &mut emit,
+                        &mut sample,
+                    )
+                    .await
             } else {
-                self.perform(
-                    &request,
-                    active,
-                    &public_id,
-                    record.created_at_ms / 1000,
-                    &mut sample,
-                )
-                .await
+                self.transport()
+                    .perform(
+                        &request,
+                        active,
+                        &public_id,
+                        record.created_at_ms / 1000,
+                        &mut sample,
+                    )
+                    .await
             }
         };
         let outcome = tokio::select! {
@@ -528,181 +535,11 @@ impl Executor {
             }
         }
     }
-    async fn perform_stream<F, Fut>(
-        &self,
-        request: &Request,
-        mut decoder: worker::host::Active,
-        public_id: &str,
-        record: &Record,
-        emit: &mut F,
-        sample: &mut Option<health::Sample>,
-    ) -> Result<ProtocolReply>
-    where
-        F: FnMut(serde_json::Value) -> Fut,
-        Fut: Future<Output = std::result::Result<(), ()>>,
-    {
-        let mut response = self
-            .connection
-            .send(self.adapter.operation(), Some(request.body().to_vec()))
-            .await
-            .map_err(Error::Upstream)?;
-        if let Some(sample) = sample {
-            sample.headers();
+    fn transport(&self) -> transport::Transport<'_> {
+        transport::Transport {
+            connection: &self.connection,
+            adapter: &self.adapter,
         }
-        if response.status != 200 || response.format != WireFormat::Sse {
-            return Err(Error::Upstream(Failure::new(
-                Code::UpstreamProtocol,
-                Scope::Model,
-                Stage::ResponseHeaders,
-                Execution::Unknown,
-            )));
-        }
-        // Persist delivery intent ONCE before calling any consumer. This is
-        // conservative even when the upstream fails before its first text byte.
-        self.storage
-            .event(&record.invocation, record.attempt, Event::FirstOutput)
-            .await?;
-        let mut stream =
-            crate::endpoint::stream::Stream::new(request, public_id, record.created_at_ms / 1000)?;
-        let mut saved_upstream_id = false;
-        while let Some(chunk) = response.next_chunk().await.map_err(Error::Upstream)? {
-            let mut receive = |frame| {
-                let piece = stream.push(frame).map_err(stream_frame_error);
-                let future = match piece {
-                    Ok(Some(value)) => {
-                        if let Some(sample) = sample {
-                            sample.delta(&value);
-                        }
-                        Ok(Some(emit(value)))
-                    }
-                    Ok(None) => Ok(None),
-                    Err(e) => Err(e),
-                };
-                async move {
-                    if let Some(f) = future? {
-                        f.await.map_err(|_| worker::Error::Cancelled)?;
-                    }
-                    Ok(())
-                }
-            };
-            let pushed = decoder.push(&chunk, &mut receive).await;
-            drop(receive);
-            if !saved_upstream_id {
-                if let Some(id) = stream.upstream_id() {
-                    self.storage
-                        .event(
-                            &record.invocation,
-                            record.attempt,
-                            Event::Accepted(attempts::RemoteId::new(id)?),
-                        )
-                        .await?;
-                    saved_upstream_id = true;
-                }
-            }
-            pushed.map_err(|e| {
-                if matches!(e, worker::Error::Cancelled) {
-                    Error::Cancelled
-                } else {
-                    Error::Decoder(e)
-                }
-            })?;
-            if stream.is_done() {
-                break;
-            }
-        }
-        // [DONE] is terminal in this profile. A conforming long-lived SSE HTTP
-        // connection need not close before result verification can finish.
-        drop(response);
-        let mut receive = |frame| {
-            let piece = stream.push(frame).map_err(stream_frame_error);
-            let future = match piece {
-                Ok(Some(value)) => {
-                    if let Some(sample) = sample {
-                        sample.delta(&value);
-                    }
-                    Ok(Some(emit(value)))
-                }
-                Ok(None) => Ok(None),
-                Err(e) => Err(e),
-            };
-            async move {
-                if let Some(f) = future? {
-                    f.await.map_err(|_| worker::Error::Cancelled)?;
-                }
-                Ok(())
-            }
-        };
-        decoder
-            .finish_stream_frames(&mut receive)
-            .await
-            .map_err(|e| {
-                if matches!(e, worker::Error::Cancelled) {
-                    Error::Cancelled
-                } else {
-                    Error::Decoder(e)
-                }
-            })?;
-        drop(receive);
-        let result = stream.finish()?;
-        decoder.verify_stream_result(&result).await?;
-        request
-            .decode_json(result, public_id, record.created_at_ms / 1000)
-            .map_err(Error::Endpoint)
-    }
-    async fn perform(
-        &self,
-        request: &Request,
-        mut decoder: worker::host::Active,
-        public_id: &str,
-        created: u64,
-        sample: &mut Option<health::Sample>,
-    ) -> Result<ProtocolReply> {
-        let mut response = self
-            .connection
-            .send(self.adapter.operation(), Some(request.body().to_vec()))
-            .await
-            .map_err(Error::Upstream)?;
-        if let Some(sample) = sample {
-            sample.headers();
-        }
-        if response.status != 200 || response.format != WireFormat::Json {
-            let mut failure = Failure::new(
-                Code::UpstreamProtocol,
-                Scope::Model,
-                Stage::ResponseHeaders,
-                Execution::Unknown,
-            );
-            failure.upstream_status = Some(response.status);
-            return Err(Error::Upstream(failure));
-        }
-        while let Some(chunk) = response.next_chunk().await.map_err(Error::Upstream)? {
-            decoder
-                .push(&chunk, |_| async { Err(worker::Error::Protocol) })
-                .await?;
-        }
-        let mut value = None;
-        decoder
-            .finish(|decoded| {
-                let accepted = match decoded {
-                    Decoded::Json { value: v } if value.is_none() => {
-                        value = Some(v);
-                        true
-                    }
-                    _ => false,
-                };
-                async move {
-                    if accepted {
-                        Ok(())
-                    } else {
-                        Err(worker::Error::Protocol)
-                    }
-                }
-            })
-            .await?;
-        let value = value.ok_or(Error::Decoder(worker::Error::Protocol))?;
-        request
-            .decode_json(value, public_id, created)
-            .map_err(Error::Endpoint)
     }
 }
 

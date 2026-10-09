@@ -29,7 +29,32 @@ pub struct Sample {
     native_last: Option<(Instant, u64)>,
     finished: bool,
 }
+/// Captured network timing, published after any required durable local transition.
+pub(crate) struct Success {
+    sample: Sample,
+    measurement: Measurement,
+}
+impl Success {
+    pub(crate) fn publish(mut self) {
+        self.sample.finished = true;
+        self.sample
+            .monitor
+            .finish(&self.sample, self.measurement, Outcome::Success);
+    }
+}
 impl Sample {
+    pub(crate) fn recovery_is_current(&self) -> Result<bool> {
+        self.monitor.recovery_is_current(self)
+    }
+    /// Probe admission/decoder startup precedes actual network timing. Keeping its
+    /// recovery latch must not attribute our fsync or process startup to the model.
+    pub(crate) fn start_execution(&mut self) -> Result<()> {
+        if self.headers.is_some() || self.first.is_some() || self.native_first.is_some() {
+            return Err(Error::Invalid);
+        }
+        self.start = Instant::now();
+        Ok(())
+    }
     pub(super) fn new(
         monitor: Monitor,
         route: Digest,
@@ -106,12 +131,17 @@ impl Sample {
         }
     }
     /// Called after complete endpoint/schema verification, not HTTP200 alone.
-    pub fn success(mut self, reported_output_tokens: Option<u64>) {
+    pub fn success(self, reported_output_tokens: Option<u64>) {
+        self.prepare_success(reported_output_tokens).publish();
+    }
+    pub(crate) fn prepare_success(self, reported_output_tokens: Option<u64>) -> Success {
         let observed = self.measurement(
             reported_output_tokens.filter(|v| *v <= mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER),
         );
-        self.finished = true;
-        self.monitor.finish(&self, observed, Outcome::Success);
+        Success {
+            sample: self,
+            measurement: observed,
+        }
     }
     pub fn failure(mut self, failure: Failure) {
         let observed = self.measurement(None);

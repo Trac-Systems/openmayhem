@@ -21,7 +21,7 @@ fn native_ready(a: &Authority) {
     )
     .unwrap();
 }
-fn layers(a: &Authority) -> (Monitor, Monitor) {
+pub(super) fn layers(a: &Authority) -> (Monitor, Monitor) {
     a.configure_allocation_group(d(10), 4).unwrap();
     a.configure_group(d(11), 2).unwrap();
     a.configure_group(d(12), 2).unwrap();
