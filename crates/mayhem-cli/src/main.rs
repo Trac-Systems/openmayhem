@@ -11,6 +11,7 @@ mod proxy_buyer;
 mod proxy_control;
 mod proxy_gateway;
 mod proxy_provider;
+mod proxy_setup;
 mod python_runtime;
 mod release_bundle;
 
@@ -1608,6 +1609,9 @@ struct UseArgs {
     /// Enable the local provider setup wizard using protected host configuration.
     #[arg(long, value_name = "PATH", conflicts_with = "dev_embedded_catalog")]
     proxy_setup_config: Option<PathBuf>,
+
+    #[command(flatten)]
+    setup_bootstrap: proxy_setup::Args,
 
     /// Peer JSON-RPC base URL, including /v1. Defaults to config.toml or local dev-net.
     #[arg(long)]
@@ -45641,7 +45645,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let shared_network_bind = !gateway_bind_is_loopback(bind);
     anyhow::ensure!(
-        args.proxy_setup_config.is_none() || !shared_network_bind,
+        (args.proxy_setup_config.is_none() && !args.setup_bootstrap.proxy_setup) || !shared_network_bind,
         "provider setup requires an explicit loopback gateway bind"
     );
     let require_gateway_auth = args.require_auth || shared_network_bind;
@@ -46054,6 +46058,20 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
         }
         if let Some(verifier) = managed_hardware_quote_verifier {
             state = state.with_hardware_quote_verifier_command(verifier);
+        }
+        if args.setup_bootstrap.proxy_setup {
+            let bootstrap = proxy_setup::prepare(
+                &args.setup_bootstrap,
+                home.clone(),
+                keypair_path.clone(),
+                &user_seed,
+                &rpc,
+                rpc_url.clone(),
+                sc_bridge_url.clone(),
+            ).await?;
+            state = state
+                .with_proxy_setup_bootstrap(bootstrap, &format!("http://{bind}"))
+                .map_err(anyhow::Error::msg)?;
         }
         if let Some(path) = args.proxy_setup_config.clone() {
             let flow = tokio::task::spawn_blocking(move || {

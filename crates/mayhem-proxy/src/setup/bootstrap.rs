@@ -9,6 +9,7 @@ use std::{collections::BTreeMap, fs, io::Write};
 use zeroize::Zeroizing;
 
 /// Supplied by the trusted local host, never by an upstream or public request.
+#[derive(Clone)]
 pub struct Host {
     pub network: Identity,
     pub provider_pubkey: Digest,

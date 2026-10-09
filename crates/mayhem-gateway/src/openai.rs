@@ -166,6 +166,7 @@ pub use github_update::{GatewayGithubUpdate, GatewayGithubUpdateStatus};
 
 mod dashboard_ui;
 mod proxy_setup;
+pub use proxy_setup::bootstrap::BootstrapConfig as GatewayProxySetupBootstrap;
 use dashboard_ui::{DASHBOARD_APP_CSS, DASHBOARD_APP_JS};
 
 mod dashboard_brand_assets;
@@ -5358,6 +5359,20 @@ impl GatewayState {
         Ok(self)
     }
 
+    /// First-time setup uses only this host's protected references and loaded wallet.
+    pub fn with_proxy_setup_bootstrap(
+        mut self,
+        config: GatewayProxySetupBootstrap,
+        origin: &str,
+    ) -> Result<Self, String> {
+        self.proxy_setup = Arc::new(Some(proxy_setup::Control::new_bootstrap(
+            config,
+            origin,
+            &self.receipt_config.user_seed,
+        )?));
+        Ok(self)
+    }
+
     pub fn with_receipt_user_seed(mut self, seed: [u8; 32]) -> Self {
         self.receipt_config.user_seed = seed;
         self.jobs = Arc::new(Mutex::new(GatewayJobStore::in_memory(
@@ -6605,7 +6620,9 @@ pub fn openai_router(state: GatewayState) -> Router {
         .route("/mayhem/dashboard/provider/setup", get(proxy_setup::page))
         .route("/mayhem/dashboard/provider/setup/state", get(proxy_setup::view))
         .route("/mayhem/dashboard/provider/setup/action", post(proxy_setup::action))
+        .route("/mayhem/dashboard/provider/setup/bootstrap", post(proxy_setup::bootstrap::create))
         .route("/mayhem/dashboard/assets/proxy-setup.js", get(proxy_setup::script))
+        .route("/mayhem/dashboard/assets/proxy-setup-bootstrap.js", get(proxy_setup::bootstrap_script))
         .route("/mayhem/dashboard/evidence", get(mayhem_dashboard_evidence))
         .route("/mayhem/dashboard/session", get(mayhem_dashboard_session))
         .route(

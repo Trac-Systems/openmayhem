@@ -49,6 +49,7 @@ tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "signal
 tower = { version = "0.5", features = ["limit", "util"] }
 url = "2.5"
 wait-timeout = "0.2"
+zeroize = "1"
 
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs", "process"] }
