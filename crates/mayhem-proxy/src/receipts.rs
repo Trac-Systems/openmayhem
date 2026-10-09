@@ -40,6 +40,17 @@ pub fn verify_signature(signature: &str, bytes: &[u8], public_key: &str) -> bool
 /// Signing is deliberately separate from accepting arbitrary public RPC bytes.
 pub struct BuyerApproval {
     signing_bytes: Vec<u8>,
+    pub(crate) identity: attempts::Identity,
+}
+fn buyer_identity(t: &mayhem_proto::proxy::finance::ProxySpendTerms) -> Result<attempts::Identity> {
+    let digest =
+        |v: &str| attempts::Digest::new(v).map_err(|_| invalid("invalid signing identity"));
+    Ok(attempts::Identity {
+        network_id: t.network_id.clone(),
+        msb_bootstrap: digest(&t.msb_bootstrap)?,
+        subnet_bootstrap: digest(&t.subnet_bootstrap)?,
+        controller_pubkey: digest(&t.buyer_pubkey)?,
+    })
 }
 /// Explicit buyer consent to a zero-charge closure. For terminal output, verify
 /// the buyer's own received evidence. For unsent cancellation, verify the signed
@@ -112,18 +123,34 @@ pub fn approve_waiver(
         "waiver evidence differs",
     )?;
     Ok(BuyerApproval {
+        identity: buyer_identity(t)?,
         signing_bytes: body
             .buyer_signing_bytes()
             .map_err(|_| invalid("invalid waiver"))?,
     })
 }
 impl BuyerApproval {
+    /// Only trusted private recovery code may reconstruct an approval whose
+    /// exact typed intent was already independently verified and durably saved.
+    pub(crate) fn retained(
+        authorization: &ProxySpendAuthorization,
+        bytes: Vec<u8>,
+    ) -> Result<Self> {
+        authorization
+            .verify(verify_signature)
+            .map_err(|_| invalid("saved authorization rejected"))?;
+        Ok(Self {
+            identity: buyer_identity(&authorization.terms)?,
+            signing_bytes: bytes,
+        })
+    }
     pub fn signing_bytes(&self) -> &[u8] {
         &self.signing_bytes
     }
 }
 
-pub fn approve_terminal(
+pub async fn approve_terminal(
+    verifier: &crate::worker::host::Pool,
     draft: &TerminalDraft,
     provider_signature: &str,
     authorization: &ProxySpendAuthorization,
@@ -167,12 +194,41 @@ pub fn approve_terminal(
         mayhem_proto::endpoint_request_fingerprint(&value) == t.request_hash,
         "buyer request differs",
     )?;
-    let prepared = metering::Policy::resolve(binding.endpoint, &binding.metering_policy)
-        .and_then(|p| p.prepare(binding.endpoint, &value))
-        .map_err(|_| invalid("buyer input cannot be metered"))?;
-    let observation = prepared
-        .observe(&received.body)
-        .map_err(|_| invalid("buyer result cannot be metered"))?;
+    // Independently enforce the buyer's original endpoint shape and binding.
+    // Full schema/regex execution below stays in the isolated verifier worker.
+    let adapter = crate::endpoint::Adapter::restore(snapshot.adapter.clone())
+        .map_err(|_| invalid("buyer endpoint snapshot is invalid"))?;
+    let prepared = if value.get("stream") == Some(&serde_json::Value::Bool(true)) {
+        adapter.prepare_stream(own_request)
+    } else {
+        adapter.prepare_json(own_request)
+    }
+    .map_err(|_| invalid("buyer request violates its original contract"))?;
+    require(
+        prepared.matches_binding(&binding),
+        "buyer endpoint binding differs",
+    )?;
+    let id = received.body["id"]
+        .as_str()
+        .ok_or_else(|| invalid("buyer result identity missing"))?;
+    let created_key = if binding.endpoint == mayhem_proto::proxy::ProxyEndpoint::Responses {
+        "created_at"
+    } else {
+        "created"
+    };
+    let created = received.body[created_key]
+        .as_u64()
+        .ok_or_else(|| invalid("buyer result time missing"))?;
+    let checked = prepared
+        .decode_json(received.body.clone(), id, created)
+        .map_err(|_| invalid("buyer result violates its original endpoint contract"))?;
+    require(
+        checked.body == received.body,
+        "buyer result is not the normalized output",
+    )?;
+    let observation = checked
+        .observed_usage
+        .ok_or_else(|| invalid("buyer result cannot be metered"))?;
     require(
         draft.body.outcome
             == metering::terminal_outcome(
@@ -216,7 +272,19 @@ pub fn approve_terminal(
                     .ok_or_else(|| invalid("buyer total overflow"))?,
         "receipt differs from buyer-observed result",
     )?;
+    verifier
+        .verify_received(
+            &draft.invocation,
+            draft.attempt,
+            &subtotal.binding,
+            prepared.semantic_policy(),
+            &received.body,
+            adapter.limits().response_bytes,
+        )
+        .await
+        .map_err(|_| invalid("buyer result failed isolated endpoint contract verification"))?;
     Ok(BuyerApproval {
+        identity: buyer_identity(t)?,
         signing_bytes: draft
             .body
             .buyer_signing_bytes()

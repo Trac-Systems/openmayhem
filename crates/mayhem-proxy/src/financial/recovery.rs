@@ -1,8 +1,11 @@
 //! Buyer-owned hold recovery. This database contains signed financial intentions,
 //! never provider execution authority. Expiry does NOT close the provider journal,
 //! free its capacity or make an unknown job safe to repeat.
+mod approvals;
 use super::*;
 use crate::attempts;
+use approvals::Acknowledgment;
+pub use approvals::SignedAcknowledgment;
 use mayhem_proto::proxy::finance::{ProxyExpiryBody, ProxyHoldExpiry, ProxyReservationExpiry};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition, TableHandle};
 use std::{
@@ -176,6 +179,8 @@ pub struct RecoveryStatus {
     pub draft: Option<ProxyExpiryBody>,
     pub signed: Option<ProxyReservationExpiry>,
     pub confirmed: Option<FinancialOutcome>,
+    pub outcome_approved: bool,
+    pub outcome_signed: bool,
 }
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -189,6 +194,8 @@ struct Record {
     confirmed_epoch: Option<u64>,
     closed_at: Option<u64>,
     prune_after: Option<u64>,
+    #[serde(default)]
+    acknowledgment: Option<Acknowledgment>,
 }
 impl Record {
     fn key(&self) -> Result<String> {
@@ -215,6 +222,9 @@ impl Record {
                     == t.settlement_policy_hash,
             "recovery authorization differs",
         )?;
+        if let Some(a) = &self.acknowledgment {
+            a.validate(&self.authorization, &self.policy)?;
+        }
         if let Some(d) = &self.draft {
             d.validate().map_err(|_| invalid("invalid saved expiry"))?;
             require(
@@ -431,6 +441,7 @@ impl Store {
             confirmed_epoch: None,
             closed_at: None,
             prune_after: None,
+            acknowledgment: None,
         });
         require(
             r.authorization == o.accepted().authorization
@@ -651,6 +662,24 @@ impl BuyerRecovery {
         require(r.confirmed.is_none(), "financial outcome already resolved")?;
         r.draft.ok_or_else(|| invalid("expiry draft missing"))
     }
+    /// Sign the saved original intent and retain it durably before returning.
+    /// The wallet stays in the trusted parent; no signing request enters RPC/IPC.
+    pub async fn sign_expiry(
+        &self,
+        signer: &crate::signing::Authority,
+        key: Digest,
+    ) -> Result<ProxyReservationExpiry> {
+        let k = key.clone();
+        let saved = self.run(move |s| s.get(k.as_str())).await?;
+        require(
+            saved.confirmed.is_none(),
+            "financial outcome already resolved",
+        )?;
+        let body = saved.draft.ok_or_else(|| invalid("expiry draft missing"))?;
+        let signed = signer.buyer_expiry(&saved.authorization, &saved.policy, body)?;
+        self.retain_expiry(key, signed.clone()).await?;
+        Ok(signed)
+    }
     pub async fn retain_expiry(&self, key: Digest, expiry: ProxyReservationExpiry) -> Result<()> {
         self.run(move |s| s.retain(key.as_str(), expiry)).await
     }
@@ -688,7 +717,14 @@ impl BuyerRecovery {
     pub async fn recover(&self, key: Digest) -> Result<RecoveryStatus> {
         self.run(move |s| {
             let r = s.get(key.as_str())?;
+            let outcome_approved = r.acknowledgment.is_some();
+            let outcome_signed = r
+                .acknowledgment
+                .as_ref()
+                .is_some_and(|a| a.buyer_sig.is_some());
             Ok(RecoveryStatus {
+                outcome_approved,
+                outcome_signed,
                 authorization: r.authorization,
                 policy: r.policy,
                 draft: r.draft,

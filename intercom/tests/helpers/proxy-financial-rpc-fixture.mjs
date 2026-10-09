@@ -122,6 +122,12 @@ try {
     else if(command==='close') {await f.apply(await prepareProxyClose(f.ledger,await closure(f),f.context,f.peer.wallet.verify));await sync();}
     else if(command==='foreign')participant.peer.wallet=wallet(f.buyer); // Expected local actor/transport remains provider.
     else if(command==='reset')mutation=null;
+    else if(command==='ephemeral_test_wallet_seeds') {
+      // Ephemeral fixture process only, through its private test stdin/stdout;
+      // never exposed by RPC or a production wallet/signing service.
+      console.log(JSON.stringify({provider:Array.from(f.provider.wallet.secretKey.subarray(0,32)),
+        buyer:Array.from(f.buyer.wallet.secretKey.subarray(0,32))}));continue;
+    }
     else if(command==='status'){}
     else if(command==='state') {console.log(JSON.stringify({summary:await f.read(f.summaryKey),balance:await f.read(f.balanceKey),billing:await f.read(f.ledger.receiptBillingKey(f.terms.billing_id))}));continue;}
     else if(command==='publish_pending')publicationMode='pending';

@@ -48,6 +48,68 @@ fn units(bytes: usize) -> Result<u32> {
 }
 
 impl Pool {
+    /// Independently check a buyer-received terminal result. This is local-only
+    /// verification, not dispatch authority: no journal ticket, upstream I/O,
+    /// wallet or financial operation is created. Keep untrusted schema/regex
+    /// execution in the same bounded/reaped worker used for provider decoding.
+    pub(crate) async fn verify_received(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+        binding: &Binding,
+        policy: &crate::semantics::Policy,
+        body: &serde_json::Value,
+        max_bytes: usize,
+    ) -> Result<()> {
+        if policy.request_hash != binding.request_hash || policy.endpoint != binding.endpoint {
+            return Err(Error::Identity);
+        }
+        let init = Init {
+            abi: ABI,
+            release: RELEASE.into(),
+            session: Session {
+                invocation: invocation.clone(),
+                attempt,
+                binding_hash: binding_hash(binding)?,
+            },
+            format: WireFormat::Json,
+            error_profile: ErrorProfile::HttpStatus,
+            limits: DecodeLimits {
+                max_total_bytes: max_bytes,
+                max_event_bytes: max_bytes,
+            },
+            semantic_policy: Some(policy.digest().map_err(Error::Upstream)?),
+        };
+        let bytes = json(body, max_bytes)?;
+        let mut prepared = self.start(init).await?.configure_semantics(policy).await?;
+        for chunk in bytes.chunks(CHUNK_BYTES) {
+            prepared
+                .io
+                .exchange(CHUNK, chunk, |_| async { Err(Error::Protocol) })
+                .await?;
+        }
+        let mut seen = false;
+        prepared
+            .io
+            .exchange(FINISH, &[], |decoded| {
+                let valid =
+                    matches!(decoded, Decoded::Json { ref value } if value == body) && !seen;
+                seen = true;
+                async move {
+                    if valid {
+                        Ok(())
+                    } else {
+                        Err(Error::Protocol)
+                    }
+                }
+            })
+            .await?;
+        if !seen {
+            return Err(Error::Protocol);
+        }
+        prepared.stop().await
+    }
+
     /// Only the trusted local launcher chooses this bundled executable and empty
     /// private working directory. Neither is accepted in a public request/recipe.
     /// Package signature verification belongs to the Core installer; this is not

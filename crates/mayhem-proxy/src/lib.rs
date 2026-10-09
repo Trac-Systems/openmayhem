@@ -16,6 +16,7 @@ pub mod matching;
 pub mod metering;
 pub mod receipts;
 pub mod semantics;
+pub mod signing;
 pub mod supervisor;
 pub mod worker;
 

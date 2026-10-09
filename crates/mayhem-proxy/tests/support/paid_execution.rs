@@ -130,6 +130,19 @@ struct Paid {
     lease: Digest,
 }
 impl Paid {
+    fn verifier(&self) -> Pool {
+        Pool::new(
+            env!("CARGO_BIN_EXE_mayhem-proxy-worker"),
+            self._fixture._work.path(),
+            PoolLimits {
+                max_children: 2,
+                max_buffer_bytes: 64 * 1024 * 1024,
+                startup_timeout: Duration::from_secs(5),
+                processing_timeout: Duration::from_secs(3),
+            },
+        )
+        .unwrap()
+    }
     fn reopen(self) -> Self {
         self.reopen_format(false)
     }
@@ -995,6 +1008,7 @@ async fn signed_terminal(p: &mut Paid) -> mayhem_proto::proxy::finance::ProxyUsa
         .unwrap();
     let accepted = saved.financial.as_ref().unwrap().accepted();
     let approval = mayhem_proxy::receipts::approve_terminal(
+        &p.verifier(),
         &draft,
         sigs["provider_sig"].as_str().unwrap(),
         &accepted.authorization,
@@ -1004,6 +1018,7 @@ async fn signed_terminal(p: &mut Paid) -> mayhem_proto::proxy::finance::ProxyUsa
         &saved.result.as_ref().unwrap().reply,
         saved.record.cancellation_requested,
     )
+    .await
     .unwrap();
     assert!(mayhem_proxy::receipts::verify_signature(
         sigs["buyer_sig"].as_str().unwrap(),
@@ -1198,6 +1213,7 @@ async fn paid_receipt_buyer_rejects_altered_output_usage_body_signature_and_iden
         };
         assert!(
             mayhem_proxy::receipts::approve_terminal(
+                &p.verifier(),
                 &d,
                 &signature,
                 &authorization,
@@ -1207,6 +1223,7 @@ async fn paid_receipt_buyer_rejects_altered_output_usage_body_signature_and_iden
                 &reply,
                 false,
             )
+            .await
             .is_err(),
             "{fault}"
         );
@@ -1986,3 +2003,6 @@ async fn paid_buyer_expiry_of_unknown_stream_never_frees_capacity_or_retries_exe
         p.peer.stop().await;
     }
 }
+
+#[path = "proxy_signing.rs"]
+mod protected_signing;

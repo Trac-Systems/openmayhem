@@ -45,6 +45,50 @@ pub struct PaidExecutor {
     route: Digest,
 }
 impl PaidExecutor {
+    fn check_signer(&self, signer: &crate::signing::Authority) -> Result<()> {
+        let actor = signer.identity();
+        let network = self.financial.identity();
+        if actor.network_id != network.network_id
+            || actor.msb_bootstrap.as_str() != network.msb_bootstrap
+            || actor.subnet_bootstrap.as_str() != network.subnet_bootstrap
+            || actor.controller_pubkey.as_str() != self.financial.requester()
+        {
+            return Err(Error::Binding);
+        }
+        Ok(())
+    }
+    /// Signs only the exact durable draft derived from this provider's owned
+    /// request/result and original canonical terms. A connector cannot supply it.
+    pub async fn sign_terminal_receipt(
+        &self,
+        signer: &crate::signing::Authority,
+        invocation: &Digest,
+        attempt: u64,
+    ) -> Result<crate::signing::ProviderReceipt> {
+        self.check_signer(signer)?;
+        let draft = self.prepare_terminal_receipt(invocation, attempt).await?;
+        let saved = self.recover(invocation, attempt).await?;
+        let accepted = saved.financial.as_ref().ok_or(Error::Binding)?.accepted();
+        signer
+            .provider_receipt(draft, accepted)
+            .map_err(Error::Financial)
+    }
+    /// Requesting this is explicit provider consent to a known-outcome waiver.
+    /// This still requires independent buyer approval before canonical closure.
+    pub async fn sign_waiver(
+        &self,
+        signer: &crate::signing::Authority,
+        invocation: &Digest,
+        attempt: u64,
+    ) -> Result<crate::signing::ProviderWaiver> {
+        self.check_signer(signer)?;
+        let draft = self.prepare_waiver(invocation, attempt).await?;
+        let saved = self.recover(invocation, attempt).await?;
+        let accepted = saved.financial.as_ref().ok_or(Error::Binding)?.accepted();
+        signer
+            .provider_waiver(draft, accepted)
+            .map_err(Error::Financial)
+    }
     /// Freeze the final body before requesting either signature. Repeated calls
     /// recover its original timestamp/sequence, even after an interrupted signer.
     pub async fn prepare_terminal_receipt(
