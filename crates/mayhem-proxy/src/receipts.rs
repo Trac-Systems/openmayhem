@@ -54,8 +54,9 @@ fn buyer_identity(t: &mayhem_proto::proxy::finance::ProxySpendTerms) -> Result<a
     })
 }
 /// Explicit buyer consent to a zero-charge closure. For terminal output, verify
-/// the buyer's own received evidence. For unsent cancellation, verify the signed
-/// provider assertion and absence of locally received output. That assertion is
+/// the buyer's own received evidence. For unsent cancellation or a verified broker
+/// refusal, bind the signed provider assertion to the accepted request and require
+/// absence of locally received output. That assertion is
 /// not independent proof of remote non-execution; capacity/retry authorities still
 /// require their own journal/upstream evidence and must not trust this object alone.
 pub fn approve_waiver(
@@ -90,12 +91,32 @@ pub fn approve_waiver(
         mayhem_proto::endpoint_request_fingerprint(&request) == t.request_hash,
         "buyer request differs",
     )?;
+    require(
+        body.outcome == Outcome::NotExecuted || draft.non_execution.is_none(),
+        "non-execution evidence contradicts outcome",
+    )?;
     let evidence = if body.outcome == Outcome::NotExecuted {
         require(
-            received.is_none() && cancellation_accepted_before_terminal,
+            received.is_none(),
             "unsent waiver contradicts buyer evidence",
         )?;
-        attempts::unsent_commitment(&draft.invocation, draft.attempt)
+        if let Some(evidence) = &draft.non_execution {
+            // Signed provider assertion, independently bound to the buyer's exact
+            // accepted terms and request. Zero-charge consent, not replay authority.
+            evidence
+                .commitment(
+                    &draft.invocation,
+                    draft.attempt,
+                    &financial::terms_binding(t)?,
+                )
+                .map_err(|_| invalid("invalid non-execution evidence"))?
+        } else {
+            require(
+                cancellation_accepted_before_terminal,
+                "unsent cancellation was not accepted",
+            )?;
+            attempts::unsent_commitment(&draft.invocation, draft.attempt)
+        }
     } else {
         let received = received.ok_or_else(|| invalid("buyer terminal result is missing"))?;
         let disposition = received

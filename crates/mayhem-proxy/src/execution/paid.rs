@@ -59,8 +59,10 @@ impl PaidExecutor {
     /// Publish only an already retained, independently countersigned outcome.
     /// Missing acknowledgments/unknown execution never authorize a waiver or retry.
     pub(crate) async fn resume_saved(&self, invocation: &Digest, attempt: u64) -> Result<bool> {
+        self.resolve_saved_non_execution(invocation, attempt)
+            .await?;
         let saved = self.recovery_header(invocation, attempt).await?;
-        if saved.has_result || saved.record.unsent_cancellation_evidence().is_some() {
+        if saved.has_result || saved.record.non_execution_evidence().is_some() {
             self.reconcile_capacity(invocation, attempt).await?;
         }
         let key = invocation.clone();
@@ -89,7 +91,7 @@ impl PaidExecutor {
             .run(move |journal| journal.prune_closed(now, limit))
             .await
     }
-    async fn recovery_header(
+    pub(crate) async fn recovery_header(
         &self,
         invocation: &Digest,
         attempt: u64,
@@ -221,6 +223,8 @@ impl PaidExecutor {
         invocation: &Digest,
         attempt: u64,
     ) -> Result<attempts::WaiverDraft> {
+        self.resolve_saved_non_execution(invocation, attempt)
+            .await?;
         let key = invocation.clone();
         self.executor
             .storage
@@ -470,7 +474,9 @@ impl PaidExecutor {
         bytes: &[u8],
         cancel: &Cancellation,
     ) -> Result<UnsettledReply> {
-        self.executor.execute_json(invocation, bytes, cancel).await
+        let result = self.executor.execute_json(invocation, bytes, cancel).await;
+        self.finish_known_failure(invocation, &result).await?;
+        result
     }
     pub async fn execute_stream<F, Fut>(
         &self,
@@ -483,9 +489,42 @@ impl PaidExecutor {
         F: FnMut(serde_json::Value) -> Fut,
         Fut: Future<Output = std::result::Result<(), ()>>,
     {
-        self.executor
+        let result = self
+            .executor
             .execute_stream(invocation, bytes, cancel, emit)
-            .await
+            .await;
+        self.finish_known_failure(invocation, &result).await?;
+        result
+    }
+    async fn finish_known_failure(
+        &self,
+        invocation: &Digest,
+        result: &Result<UnsettledReply>,
+    ) -> Result<()> {
+        if matches!(result, Err(Error::Upstream(f) | Error::Decoder(worker::Error::Upstream(f))) if f.known_non_execution())
+        {
+            let saved = self
+                .recover_current(invocation)
+                .await?
+                .ok_or(Error::Binding)?;
+            if saved.record.non_execution_evidence().is_none() {
+                return Err(Error::RecoveryRequired);
+            }
+            self.reconcile_capacity(invocation, saved.record.attempt)
+                .await?;
+        }
+        Ok(())
+    }
+    async fn resolve_saved_non_execution(&self, invocation: &Digest, attempt: u64) -> Result<()> {
+        let key = invocation.clone();
+        self.executor
+            .storage
+            .run(move |j| {
+                j.resolve_saved_non_execution(&key, attempt, now_ms())?;
+                Ok(())
+            })
+            .await?;
+        Ok(())
     }
     /// Explicit cancellation BEFORE the journal dispatch fence. Commit the
     /// cancellation first so a competing sender cannot run after capacity is freed.
@@ -513,9 +552,11 @@ impl PaidExecutor {
         Ok(())
     }
     /// Release only from retained, validated terminal output or the journal's exact
-    /// pre-send cancellation fence. Capacity and financial closure are independent:
+    /// pre-send cancellation fence or trusted nonexecution evidence. Capacity and financial closure are independent:
     /// this NEVER releases customer funds, publishes a receipt or retries inference.
     pub async fn reconcile_capacity(&self, invocation: &Digest, attempt: u64) -> Result<bool> {
+        self.resolve_saved_non_execution(invocation, attempt)
+            .await?;
         let key = invocation.clone();
         let authority = self.authority.clone();
         let route = self.route.clone();
@@ -532,7 +573,8 @@ impl PaidExecutor {
                 let saved = journal.recover(&key, attempt)?;
                 let r = &saved.record;
                 let unsent = r.unsent_cancellation_evidence();
-                let evidence = if let Some(evidence) = &unsent {
+                let non_execution = r.non_execution_evidence();
+                let evidence = if let Some(evidence) = &non_execution {
                     evidence.clone()
                 } else if let Some(result) = &saved.result {
                     if saved.acceptance.is_none()
@@ -579,7 +621,12 @@ impl PaidExecutor {
             .run(move |journal| {
                 journal
                     .get(&key)?
-                    .map(|r| journal.recover(&key, r.attempt))
+                    .map(|r| {
+                        if r.phase == Phase::Dispatched && r.last_failure.is_some() {
+                            journal.resolve_saved_non_execution(&key, r.attempt, now_ms())?;
+                        }
+                        journal.recover(&key, r.attempt)
+                    })
                     .transpose()
             })
             .await

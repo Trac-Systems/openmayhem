@@ -236,6 +236,7 @@ async fn handle(
                     Err(error) => {
                         let failure = classify(error);
                         output.send(Message::Failure { failure }).await?;
+                        offer_non_execution(&owner, &session, &output).await?;
                     }
                 }
                 Ok(())
@@ -256,6 +257,8 @@ async fn handle(
                     .await?
                     .ok_or(Error::Configuration)?;
                 receipt(owner, session, output, saved.record.attempt).await?;
+            } else if state != PublicState::Settled {
+                offer_non_execution(owner, session, output).await?;
             }
         }
         Message::Cancel => {
@@ -266,6 +269,7 @@ async fn handle(
             output.control(Message::State {
                 state: PublicState::CancelRequested,
             })?;
+            offer_non_execution(owner, session, output).await?;
         }
         Message::Acknowledge { .. } => {
             let saved = session
@@ -310,18 +314,62 @@ async fn receipt(
     output: &queue::Output,
     attempt: u64,
 ) -> Result<()> {
-    match owner
+    // Outcome selection needs only bounded metadata, not another copy of the
+    // prompt and completed response. Signing still verifies retained ownership.
+    let saved = owner
         .executor
-        .sign_terminal_receipt(&owner.signer, session.invocation(), attempt)
-        .await
+        .recovery_header(session.invocation(), attempt)
+        .await?;
+    if saved.record.binding.accepted_terms.as_str()
+        != session
+            .authorization()
+            .terms
+            .digest()
+            .map_err(|_| Error::Configuration)?
     {
-        Ok(value) => output.send(Message::Receipt { value }).await?,
+        return Err(Error::Configuration);
+    }
+    let message = if saved.record.non_execution_evidence().is_some() {
+        owner
+            .executor
+            .reconcile_capacity(session.invocation(), attempt)
+            .await?;
+        owner
+            .executor
+            .sign_waiver(&owner.signer, session.invocation(), attempt)
+            .await
+            .map(|value| Message::Waiver { value })
+    } else {
+        owner
+            .executor
+            .sign_terminal_receipt(&owner.signer, session.invocation(), attempt)
+            .await
+            .map(|value| Message::Receipt { value })
+    };
+    match message {
+        Ok(value) => output.send(value).await?,
         Err(_) => {
             output
                 .send(Message::State {
                     state: PublicState::AwaitingReceipt,
                 })
                 .await?
+        }
+    }
+    Ok(())
+}
+/// A failure is not itself a waiver. Only the exact retained proof may offer a
+/// zero-charge closure for the buyer to independently approve and countersign.
+async fn offer_non_execution(
+    owner: &Inner,
+    session: &Session,
+    output: &queue::Output,
+) -> Result<()> {
+    if let Some(saved) = session.existing(&owner.executor).await? {
+        if saved.record.phase != crate::attempts::Phase::Closed
+            && saved.record.non_execution_evidence().is_some()
+        {
+            receipt(owner, session, output, saved.record.attempt).await?;
         }
     }
     Ok(())

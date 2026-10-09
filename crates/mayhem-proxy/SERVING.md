@@ -180,8 +180,10 @@ The generic error profile deliberately preserves uncertainty after an arbitrary 
 error. In particular, a 429-shaped body is not independent proof that a vendor executed
 nothing. The explicit [vLLM admission profile](REFUSALS.md) now closes operator probes
 for its verified single-request HTTP admission refusals, with backoff and consumed budget
-preserved. Generic errors, started streams, other connectors and paid refusal closure still
-require outcome recovery; an unknown probe cannot simply expire.
+preserved. Paid refusals use the same exact evidence to release physical capacity and offer
+the existing mutually signed zero-charge closure; financial holds remain until canonical
+confirmation. Generic errors, started streams and other connectors still require outcome
+recovery; an unknown attempt cannot simply expire.
 Prepared-probe recovery is available to trusted startup, but managed startup has not yet
 been wired. The monitor and capacity authority must be rebound to their exact scopes.
 The operator can explicitly raise a spent allowance; no implementation may silently reset
@@ -212,7 +214,7 @@ waits, duplicate/global quotas, submarket selection, independent recovery owners
 and graceful stop. The SC-Bridge double now honors multiple clients and per-session
 subscriptions; it still does not prove real Noise/relay behavior.
 
-Automatic CLI/mayhemd startup, adaptive capacity, public availability and real-network/
+Automatic CLI/mayhemd startup, deployment of adaptive capacity, public availability and real-network/
 payment acceptance are still required. Resource sizing must include reconnect and
 recovery control headroom: retained execution owners count against the aggregate
 bound. These library tests are not a deployed serving claim. The Core/site release

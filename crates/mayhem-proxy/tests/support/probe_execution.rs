@@ -137,7 +137,7 @@ fn probe_counts(a: &capacity::Authority, expected: u32) {
     assert_eq!(a.status(&d(20)).unwrap().route_occupied, expected);
 }
 
-fn vllm_refusal(prefill: bool) -> Value {
+pub(super) fn vllm_refusal(prefill: bool) -> Value {
     json!({"error":{"message":if prefill {
         "The engine has reached its prefill token backlog limit. Please try again later or on a different instance."
     } else {
@@ -349,12 +349,17 @@ async fn upstream_refusal_observation_does_not_mint_customer_waivers_or_resubmit
             Err(Error::Upstream(e)) if e.execution == Execution::Rejected)
         );
         let saved = f.journal.recover(&r.invocation, r.attempt).unwrap();
-        assert_eq!(saved.record.phase, Phase::Dispatched);
+        assert_eq!(saved.record.phase, Phase::Resolved);
         assert_eq!(
             saved.record.last_failure.unwrap().execution,
             Execution::Rejected
         );
-        assert!(saved.record.resolution.is_none() && saved.result.is_none());
+        assert!(
+            matches!(
+                saved.record.resolution,
+                Some(attempts::Resolution::NotExecuted { .. })
+            ) && saved.result.is_none()
+        );
         assert!(f
             .journal
             .waiver(&r.invocation, r.attempt)

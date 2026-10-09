@@ -82,6 +82,14 @@ unknown upstream outcome stays occupied and cannot be retried or waived merely
 because the socket closed or a timer elapsed. Closing a channel does not cancel
 or settle its logical request.
 
+A [verified broker refusal](REFUSALS.md) is retained as a terminal nonexecution outcome.
+The provider may send `Failure` followed by a signed `Waiver`; status recovery returns
+`AwaitingReceipt` and that same waiver without re-running inference. This is an offer for
+explicit buyer zero-charge consent, not a refund or another dispatch. Buyer verification
+binds the sanitized evidence to the original request/terms and rejects contradictory
+received output or canonical receipts. Acknowledgment and canonical confirmation use the
+existing closure path on the originally accepted rail. Unknown failures never qualify.
+
 ## Verification and remaining integration
 
 Local tests exercise the real bridge client against a bounded authenticated

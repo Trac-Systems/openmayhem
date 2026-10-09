@@ -1,7 +1,9 @@
 # Upstream refusal evidence
 
 This is an explicit private connector contract. It does not certify a model's identity,
-change the native serving lane, settle money, authorize a retry, or infer free capacity.
+change the native serving lane, settle money or authorize a retry. Verified negative
+execution evidence can release the owning request's capacity; it does not certify
+that the upstream is healthy or has spare capacity for other requests.
 Default `http_status` and `open_ai` connections retain their conservative execution
 uncertainty. No production connection is automatically switched to this profile.
 
@@ -45,11 +47,26 @@ connection Busy. It does not mark Ready. Recovery requires backoff plus a new ex
 budgeted probe or suitable fresh organic evidence. Valid success releases the probe and
 publishes the observed readiness; it still cannot invent native-token speed evidence.
 
-A paid request retains the sanitized observation, but this checkpoint deliberately does
-not manufacture a waiver, release customer money or issue another POST. Its retry advice
-remains `recover_same_attempt`. The paid lifecycle still needs a durable refusal outcome
-and explicit buyer/provider zero-charge closure integration before public serving can
-be activated. Existing pre-dispatch cancellation and receipt recovery rules are unchanged.
+A paid request atomically retains the sanitized failure and a `NotExecuted` outcome
+bound to its original invocation, attempt, request, connection, accepted terms and rail.
+Any retained result, upstream job ID or possible output delivery contradicts that claim
+and prevents this transition. Strictly recognized parent failures before dispatch use
+the same path. Generic HTTP errors and ambiguous execution never qualify.
+
+The paid executor releases that request's physical allocation, independently of financial
+acknowledgment. Managed exchange offers a provider-signed zero-charge waiver and replays
+the same offer on `Status`. The buyer verifies its original request, accepted terms,
+provider signature and evidence commitment, checks for contradictory received output or
+canonical receipts, then explicitly approves and countersigns. Only canonical confirmation
+of that existing mutually signed closure releases the financial hold. This is a signed
+provider assertion, not independent buyer proof of upstream behavior or permission to POST
+again. No new ledger operation is introduced. Retry advice stays `recover_same_attempt`.
+
+Missing acknowledgment, interrupted publication and restart retain the exact original
+intent. An older saved verified failure is reconciled one owned record at a time when
+accessed; there is no history scan or blanket migration. Old cancellation/terminal waiver
+drafts without the new optional evidence field preserve their original semantics and
+signatures. Unknown attempts, raw errors and partial streams do not gain this shortcut.
 
 Other upstream refusal profiles, status/cancellation recovery and already-started stream
 outcomes remain required. An unknown attempt never expires merely because time passed,
@@ -60,5 +77,6 @@ a process restarted, the provider changed settings or a fresh health probe succe
 Real local HTTP fixtures and isolated workers cover JSON/SSE requests refused at HTTP
 admission, refusal followed by successful inference, budget retention, alias scope,
 conflicting/duplicate/truncated/oversized bodies, batches, explicit opt-in, stream errors,
-all three paid rails and refusal replay without another POST. These checks establish the
-local connector behavior; they are not real-engine or live-payment acceptance.
+all three paid rails, signed zero-charge closure, pending acknowledgment/restart recovery,
+contradictory evidence, binding/signature tampering and refusal replay without another POST.
+These checks establish local behavior; they are not real-engine or live-payment acceptance.

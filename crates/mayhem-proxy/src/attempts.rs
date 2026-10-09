@@ -9,12 +9,14 @@
 
 mod acceptance;
 mod finance;
+mod non_execution;
 mod outcomes;
 mod payloads;
 mod provider;
 pub(crate) mod retirement;
 pub(crate) use acceptance::validate_offer_binding;
 pub use acceptance::{AcceptanceSnapshot, OwnedAcceptance};
+pub use non_execution::NonExecutionEvidence;
 pub use outcomes::{TerminalDraft, WaiverDraft};
 pub(crate) use payloads::RecoveryHeader;
 pub use payloads::{OwnedRequest, OwnedResult, Recovery, ResultCommitment};
@@ -250,7 +252,8 @@ pub enum Resolution {
 }
 
 /// Latest bounded diagnostic, attached to the invocation/attempt on disk. No
-/// vendor text. A failure observation cannot resolve money or remote execution.
+/// vendor text. Only strictly validated parent nonexecution evidence can resolve
+/// execution; a failure observation alone never resolves customer money.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FailureSnapshot {
@@ -348,7 +351,11 @@ impl Record {
             self.attempt > 0 && self.generation > 0 && self.created_at_ms <= self.updated_at_ms,
         )?;
         if let Some(f) = &self.last_failure {
-            f.to_failure()?;
+            if f.to_failure()?.known_non_execution()
+                && matches!(self.phase, Phase::Resolved | Phase::Closed)
+            {
+                require(self.failure_non_execution().is_some())?;
+            }
         }
         require(match self.phase {
             Phase::Prepared => {
@@ -727,6 +734,13 @@ impl Journal {
         let tx = self.transaction()?;
         let mut r = checked_current(&tx, invocation, generation, now_ms)?;
         match event {
+            Event::Failure(failure)
+                if r.phase == Phase::Resolved
+                    && r.last_failure.as_ref() == Some(&failure)
+                    && r.failure_non_execution().is_some() =>
+            {
+                return Ok(r)
+            }
             Event::Failure(failure) if r.phase == Phase::Dispatched => {
                 if failure.execution == Execution::NotDispatched
                     && (r.remote_id.is_some() || r.output_may_have_been_delivered)
@@ -736,7 +750,7 @@ impl Journal {
                 if r.last_failure.as_ref() == Some(&failure) {
                     return Ok(r);
                 }
-                r.last_failure = Some(failure);
+                non_execution::resolve_failure(&tx, &mut r, failure)?;
             }
             Event::Accepted(id) if r.phase == Phase::Dispatched => {
                 if r.remote_id.as_ref().is_some_and(|old| old != &id) {

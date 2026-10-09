@@ -8,6 +8,8 @@ use tokio::process::{Child, ChildStdin, ChildStdout};
 mod authenticated_exchange;
 #[path = "proxy_purchase.rs"]
 mod purchase;
+#[path = "paid_refusals.rs"]
+mod refusals;
 
 struct Peer {
     child: Child,
@@ -175,8 +177,14 @@ impl Paid {
             use redb::ReadableTable;
             let db = redb::Database::open(f._store.path().join("paid-journal")).unwrap();
             let tx = db.begin_write().unwrap();
-            tx.delete_table(redb::TableDefinition::<&str, &[u8]>::new("proxy_provider_acceptance_v1")).unwrap();
-            tx.delete_table(redb::TableDefinition::<&str, &[u8]>::new("proxy_provider_retirement_v1")).unwrap();
+            tx.delete_table(redb::TableDefinition::<&str, &[u8]>::new(
+                "proxy_provider_acceptance_v1",
+            ))
+            .unwrap();
+            tx.delete_table(redb::TableDefinition::<&str, &[u8]>::new(
+                "proxy_provider_retirement_v1",
+            ))
+            .unwrap();
             {
                 let mut meta = tx
                     .open_table(redb::TableDefinition::<&str, &[u8]>::new(
@@ -315,7 +323,23 @@ impl Paid {
         publish: bool,
         scoped: bool,
     ) -> Self {
-        let f = Fixture::new(base, endpoint);
+        Self::start_scoped_profile(
+            base, endpoint, rail, bytes, streaming, policy, publish, scoped, "open_ai",
+        )
+        .await
+    }
+    async fn start_scoped_profile(
+        base: &str,
+        endpoint: ProxyEndpoint,
+        rail: ProxyRail,
+        bytes: &[u8],
+        streaming: bool,
+        policy: Option<Value>,
+        publish: bool,
+        scoped: bool,
+        profile: &str,
+    ) -> Self {
+        let f = Fixture::with_profile(base, endpoint, 128 * 1024 * 1024, profile);
         let mut peer = Peer::start(rail, &f, bytes, streaming, policy).await;
         let invocation = if scoped {
             mayhem_proxy::exchange::invocation(&peer.template).unwrap()

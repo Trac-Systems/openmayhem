@@ -26,6 +26,8 @@ pub struct WaiverDraft {
     pub body: ProxyClosureBody,
     #[serde(default)]
     pub result_commitment: ResultCommitment,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub non_execution: Option<NonExecutionEvidence>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -68,7 +70,15 @@ fn known_waiver(
     accepted
         .validate_for(&r.binding)
         .map_err(|_| Error::Conflict)?;
-    let (outcome, evidence) = if let Some(evidence) = r.unsent_cancellation_evidence() {
+    let non_execution = r.failure_non_execution();
+    if non_execution.is_some() {
+        require(
+            recovery.result.is_none()
+                && recovery.request.is_some()
+                && recovery.acceptance.is_some(),
+        )?;
+    }
+    let (outcome, evidence) = if let Some(evidence) = r.non_execution_evidence() {
         (ProxyClosureOutcome::NotExecuted, evidence)
     } else {
         let result = recovery.result.as_ref().ok_or(Error::Transition)?;
@@ -104,6 +114,7 @@ fn known_waiver(
         attempt: r.attempt,
         body,
         result_commitment: commitment,
+        non_execution,
     })
 }
 fn write_slot(table: &mut redb::Table<&str, &[u8]>, key: &str, slot: &Slot) -> Result<()> {
@@ -131,8 +142,9 @@ pub(super) fn prune(tx: &redb::WriteTransaction, key: &str, meta: &mut Meta) -> 
 }
 impl Journal {
     /// Explicit mutual waiver, not an automatic fallback when charging fails.
-    /// Only this journal's unsent cancellation fence or validated terminal result
-    /// can prove the outcome. A timeout or a failed HTTP connection cannot.
+    /// Only this journal's unsent cancellation fence, trusted nonexecution
+    /// evidence or validated terminal result can establish the outcome.
+    /// A timeout or a failed HTTP connection cannot.
     pub fn prepare_waiver(
         &self,
         invocation: &Digest,

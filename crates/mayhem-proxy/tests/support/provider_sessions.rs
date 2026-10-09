@@ -3,6 +3,103 @@ use mayhem_proxy::{exchange, serving};
 #[path = "provider_opening.rs"]
 mod opening;
 
+#[tokio::test]
+async fn provider_session_offers_and_recovers_signed_nonexecution_waiver_without_resending() {
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        for streaming in [false, true] {
+            let backend = backend(
+                503,
+                crate::probe_execution::vllm_refusal(false),
+                Duration::ZERO,
+            )
+            .await;
+            let bytes = if streaming { stream_request() } else { chat() };
+            let f = Fixture::with_profile(
+                &backend.base,
+                ProxyEndpoint::Chat,
+                128 * 1024 * 1024,
+                "vllm_admission_v1",
+            );
+            let mut peer = Peer::start(rail, &f, &bytes, streaming, None).await;
+            let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+            let (controller, monitor) = observed_server(&s, &f, &peer);
+            let (_bridge, mut buyer, handle, saved) = connect(&s, &peer, &bytes, &controller).await;
+            s.buyer
+                .publish(saved.key().clone(), &recovery(&f, &peer), 1002)
+                .await
+                .unwrap();
+            buyer
+                .send(&exchange::Message::Execute {
+                    request: serde_json::from_slice(&bytes).unwrap(),
+                    streaming,
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(next(&mut buyer).await.message(), exchange::Message::Failure {failure} if failure.execution == Execution::Rejected)
+            );
+            let received = next(&mut buyer).await;
+            let exchange::Message::Waiver { value } = received.message() else {
+                panic!("expected zero-charge proposal")
+            };
+            let waiver = value.clone();
+            assert!(waiver.draft.non_execution.is_some());
+            occupied(&s, 0);
+            assert_eq!(monitor.snapshot(&d(201)).unwrap().allowance, 0);
+            assert_eq!(
+                peer.command("status").await["publications"],
+                1,
+                "reservation only"
+            );
+            // A status retry replays this exact signed offer; it cannot infer again.
+            buyer.send(&exchange::Message::Status).await.unwrap();
+            assert!(matches!(
+                next(&mut buyer).await.message(),
+                exchange::Message::State {
+                    state: exchange::PublicState::AwaitingReceipt
+                }
+            ));
+            let again = next(&mut buyer).await;
+            let exchange::Message::Waiver { value: repeated } = again.message() else {
+                panic!("waiver recovery required")
+            };
+            assert_eq!(
+                serde_json::to_value(&waiver).unwrap(),
+                serde_json::to_value(repeated).unwrap()
+            );
+            let recovery = recovery(&f, &peer);
+            recovery
+                .refresh(buyer.session().authorization(), 1003)
+                .await
+                .unwrap();
+            recovery
+                .approve_waiver(waiver, bytes.clone(), None, false, 1004)
+                .await
+                .unwrap();
+            let key = Digest::new(buyer.session().authorization().terms.digest().unwrap()).unwrap();
+            let acknowledgment = recovery.sign_approved(&s.buyer_signer, key).await.unwrap();
+            buyer
+                .send(&exchange::Message::Acknowledge { acknowledgment })
+                .await
+                .unwrap();
+            assert!(matches!(
+                next(&mut buyer).await.message(),
+                exchange::Message::State {
+                    state: exchange::PublicState::Settled
+                }
+            ));
+            assert_eq!(handle.wait().await.unwrap(), serving::End::Settled);
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                peer.command("status").await["publications"],
+                2,
+                "reservation and closure"
+            );
+            peer.stop().await;
+        }
+    }
+}
+
 fn bounds() -> serving::Limits {
     serving::Limits {
         sessions: 4,

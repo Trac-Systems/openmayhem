@@ -294,6 +294,119 @@ fn classified_failure_is_durable_not_execution_or_payment_evidence() {
     assert_eq!(failure.parameter, None);
 }
 
+fn non_execution_failure(refused: bool) -> FailureSnapshot {
+    use mayhem_proxy::connector::failure::{Execution, Failure, Scope, Stage};
+    let mut f = if refused {
+        Failure::new(
+            Code::UpstreamBusy,
+            Scope::Connection,
+            Stage::ResponseHeaders,
+            Execution::Rejected,
+        )
+    } else {
+        Failure::new(
+            Code::InvalidSchema,
+            Scope::Request,
+            Stage::BeforeDispatch,
+            Execution::NotDispatched,
+        )
+    };
+    if refused {
+        f.upstream_status = Some(503);
+        f.upstream_code = Some("vllm_queue_overflow");
+    }
+    (&f).into()
+}
+
+#[test]
+fn trusted_nonexecution_commits_terminal_evidence_atomically_without_financial_closure() {
+    for refused in [false, true] {
+        let dir = private_dir();
+        let path = dir.path().join("journal");
+        let j = open(&path);
+        let r = dispatch(&j, prepared(&j, 1));
+        let failure = non_execution_failure(refused);
+        let proof = NonExecutionEvidence {
+            failure: failure.clone(),
+        };
+        let commitment = proof
+            .commitment(&r.invocation, r.attempt, &r.binding)
+            .unwrap();
+        let resolved = event(&j, r.clone(), Event::Failure(failure.clone()));
+        assert_eq!(resolved.phase, Phase::Resolved);
+        assert_eq!(
+            resolved.resolution,
+            Some(Resolution::NotExecuted {
+                evidence: commitment.clone()
+            })
+        );
+        assert!(resolved.closure.is_none());
+        assert_eq!(
+            event(&j, resolved.clone(), Event::Failure(failure)),
+            resolved
+        );
+        assert!(j
+            .replace_not_executed(&resolved.invocation, resolved.generation, binding(), 1000)
+            .is_err());
+        for e in [
+            Event::FirstOutput,
+            Event::Accepted(RemoteId::new("job").unwrap()),
+            Event::Resolve(Resolution::NotExecuted {
+                evidence: digest(999),
+            }),
+        ] {
+            assert!(j
+                .advance(&resolved.invocation, resolved.generation, e, 1000)
+                .is_err());
+        }
+        let mut changed = r.binding.clone();
+        changed.capacity_lease = digest(999);
+        assert_ne!(
+            proof
+                .commitment(&r.invocation, r.attempt, &changed)
+                .unwrap(),
+            commitment
+        );
+        assert_ne!(
+            proof
+                .commitment(&r.invocation, r.attempt + 1, &r.binding)
+                .unwrap(),
+            commitment
+        );
+        drop(j);
+        assert_eq!(open(&path).get(&r.invocation).unwrap().unwrap(), resolved);
+    }
+}
+
+#[test]
+fn nonexecution_rejects_contradictory_delivery_or_remote_job_evidence() {
+    for refused in [false, true] {
+        for output in [false, true] {
+            let dir = private_dir();
+            let j = open(&dir.path().join("journal"));
+            let r = dispatch(&j, prepared(&j, 1));
+            let r = event(
+                &j,
+                r,
+                if output {
+                    Event::FirstOutput
+                } else {
+                    Event::Accepted(RemoteId::new("job").unwrap())
+                },
+            );
+            assert!(j
+                .advance(
+                    &r.invocation,
+                    r.generation,
+                    Event::Failure(non_execution_failure(refused)),
+                    1000
+                )
+                .is_err());
+            assert_eq!(j.get(&r.invocation).unwrap().unwrap(), r);
+        }
+    }
+}
+
 #[test]
 fn partial_output_cancellation_and_resolution_keep_their_distinct_meanings() {
     let dir = private_dir();

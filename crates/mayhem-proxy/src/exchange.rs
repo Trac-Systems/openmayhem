@@ -226,7 +226,9 @@ impl Session {
             Phase::Closed => PublicState::Settled,
             _ if saved.record.cancellation_requested => PublicState::CancelRequested,
             Phase::Prepared => PublicState::Prepared,
-            Phase::Resolved | Phase::Dispatched if saved.result.is_some() => {
+            Phase::Resolved | Phase::Dispatched
+                if saved.result.is_some() || saved.record.non_execution_evidence().is_some() =>
+            {
                 PublicState::AwaitingReceipt
             }
             Phase::Resolved | Phase::Dispatched => PublicState::OutcomeUnknown,

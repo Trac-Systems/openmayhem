@@ -82,6 +82,23 @@ pub struct Failure {
 }
 
 impl Failure {
+    pub(crate) fn known_non_execution(&self) -> bool {
+        self.verified_rejection()
+            || (self.execution == Execution::NotDispatched
+                && self.stage == Stage::BeforeDispatch
+                && self.upstream_status.is_none()
+                && self.upstream_code.is_none()
+                && matches!(
+                    self.code,
+                    Code::InvalidRequest
+                        | Code::InvalidSchema
+                        | Code::UnsupportedControl
+                        | Code::ContextTooLarge
+                        | Code::RequestTooLarge
+                        | Code::LocalCapacity
+                        | Code::DestinationRejected
+                ))
+    }
     pub(crate) fn verified_rejection(&self) -> bool {
         self.execution == Execution::Rejected
             && self.stage == Stage::ResponseHeaders
