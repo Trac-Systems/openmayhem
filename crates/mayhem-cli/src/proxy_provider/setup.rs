@@ -8,6 +8,7 @@ use mayhem_proxy::setup::{
     profiles, AdmissionPermit, EnrollmentAction, Input, ProbePlan, ProfileInput, Store,
 };
 use std::path::PathBuf;
+mod bootstrap;
 mod wizard;
 
 #[derive(Debug, Args)]
@@ -18,6 +19,8 @@ pub struct DraftArgs {
 }
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Create protected standard-profile setup through explicit prompts; no hand-authored JSON.
+    Init(bootstrap::InitArgs),
     /// Guided local setup using the same retained state as the authenticated dashboard.
     Wizard(wizard::WizardArgs),
     /// Recover the original admission invoice, or explicitly open fee checkout.
@@ -207,6 +210,7 @@ pub enum RecipeCommand {
 }
 pub async fn run(command: Command) -> Result<()> {
     let command = match command {
+        Command::Init(args) => return bootstrap::run(args).await,
         Command::Wizard(args) => return wizard::run(args).await,
         Command::Enrollment {
             args,
@@ -392,7 +396,8 @@ pub async fn run(command: Command) -> Result<()> {
             | Command::RecoverProbe { args, .. }
             | Command::Probe { args, .. }
             | Command::Inspect(args) => args,
-            Command::Wizard(_)
+            Command::Init(_)
+            | Command::Wizard(_)
             | Command::Enrollment { .. }
             | Command::Recipe { .. }
             | Command::Profiles
@@ -426,7 +431,8 @@ pub async fn run(command: Command) -> Result<()> {
             } => store.recover_probe(expected_revision),
             Command::Probe { .. } => unreachable!("handled before the blocking operation"),
             Command::Inspect(_) => store.inspect(),
-            Command::Wizard(_)
+            Command::Init(_)
+            | Command::Wizard(_)
             | Command::Enrollment { .. }
             | Command::Recipe { .. }
             | Command::Profiles

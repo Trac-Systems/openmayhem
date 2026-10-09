@@ -68,6 +68,78 @@ same wallet locator/cache is used by existing CLI commands. Read/check actions d
 not unlock a wallet. Enrollment signs only the existing scoped challenges;
 publication signs only the exact acknowledged `plan_digest`.
 
+## Guided first setup without configuration JSON
+
+`mayhem provider proxy setup init --home <existing-private-home>` creates the
+initial standard-profile bundle under `<home>/proxy-setup`. It reuses the saved
+Core peer/bridge, canonical network checks, existing wallet and installed worker.
+It does not start/reconfigure Core, the supervisor or a model server. The parent
+home must already be owner-only. An existing bundle is always retained: resume
+its `wizard.json` rather than initialize another capacity store.
+
+The prompts collect an API base directory URL, protocol endpoint, protected
+bearer-key reference (or explicit no authentication), upstream model, canonical
+broad family ID, declared label/new-market slug, served context, shared
+concurrency, rails and every exact price unit. This slice creates a new market;
+joining remains supported through the existing explicit profile interface.
+Public HTTPS is the restricted network choice. Local/private endpoints require
+explicit CIDRs and explicit permission for plaintext HTTP; no scanning or
+destination inference occurs. The standard profile does not certify that every
+claimed upstream operation or optional capability works.
+
+Use `--api-key-file` for an existing protected key reference. There is no raw-key
+argument or echoed key prompt. The shared factory additionally accepts a
+nonserializable, zeroizing write-only credential for a future local dashboard
+form. Its output contains only a protected reference. Credentials never enter
+recipes, reviews, ledger declarations or diagnostic errors.
+
+LLM profiles require `--tokenizer-file` or an explicitly selected protected local
+`tokenizer.json`. The factory validates and imports a digest-pinned private copy;
+it never downloads or guesses tokenizer/model identity. The tokenizer measures
+generation speed, not billing. Decisions requires no tokenizer. The guided
+probe is a short streaming greeting for LLMs or one typed decisions question.
+The operator chooses the cumulative attempt/cost allowance, per-attempt upper
+estimate, deadline/output bound and whether targeted recovery may use the same
+allowance. Creation sends no probe; the existing wizard separately requests
+permission for its exact retained probe plan.
+
+Charging outcomes, checkpoints and hold-expiry behavior require explicit choices;
+no financial policy, fee, receiver or FX rate is invented. `--admission-origin`
+selects an explicitly trusted admission service; omission leaves enrollment
+unavailable. `--restart-password-file` retains an existing protected wallet
+password reference (otherwise the existing `<home>/secrets/wallet-password` is
+used when available). No new wallet or payout identity is created.
+
+The `bounded_single_connection_v1` resource preset generates runtime policy:
+1 MiB request/4 MiB response bounds, 16 choices/64 tools/questions/options,
+bounded decoder buffers, one route with the chosen concurrency, a 60-second
+health evidence lifetime, existing refresh scheduling and the existing minimum
+5 native tokens/second for LLM health. These are local resource/monitoring
+settings, not measured upstream capacity or inference-duration limits. The
+operator explicitly chooses local completed-journal retention; this makes no
+claim about upstream data retention. Exact generated runtime configuration is
+reviewed again before Run. Existing expert configuration remains available.
+
+The factory writes a fresh owner-only staging directory, validates the generated
+Flow/Profile/Connection/Probe and complete managed configuration, fsyncs, and
+renames the whole bundle under a stable parent lock. Invalid input leaves no
+published bundle; concurrent creators have at most one winner. It never opens
+a capacity database or alters another setup. The shared wizard then handles
+discovery, checks, admission, publication and Run with their existing revisions
+and explicit confirmations. There is no automatic publication or payment.
+
+This slice adds the shared factory and CLI. The authenticated dashboard still
+opens an existing configuration; connecting its initial form to this same
+factory remains the next UI integration, with the existing exact-origin/session/
+CSRF guards and no path or credential readback exposed to browser actions.
+
+Focused local checks:
+
+```sh
+cargo test -p mayhem-proxy --test setup bootstrap
+cargo test -p mayhem-cli --bin mayhem proxy_provider::setup::bootstrap::tests
+```
+
 ## Existing dashboard integration
 
 ```sh
@@ -158,8 +230,9 @@ An edited draft cannot reprice or replace a previously retained Run.
 
 The first Run plan is immutable for this draft directory. Updating an installed
 controller to a later publication remains an explicit operator lifecycle task;
-this wizard does not silently remove/re-add it. Runtime policy/template authoring
-and the current low-level revision/AU controls still need onboarding UI polish.
+this wizard does not silently remove/re-add it. Guided `setup init` generates the
+first standard runtime policy; the dashboard bootstrap form and current low-level
+revision/AU controls still need onboarding UI work.
 
 ## Local validation
 

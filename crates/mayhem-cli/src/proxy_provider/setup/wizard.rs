@@ -17,6 +17,15 @@ pub struct WizardArgs {
     #[command(flatten)]
     wallet: WalletLocatorArgs,
 }
+pub(super) async fn resume(config: PathBuf, wallet: WalletLocatorArgs) -> Result<()> {
+    run(WizardArgs {
+        config,
+        inspect: false,
+        action_file: None,
+        wallet,
+    })
+    .await
+}
 fn prompt(label: &str, default: &str) -> Result<String> {
     print!("{label} [{default}]: ");
     io::stdout().flush()?;

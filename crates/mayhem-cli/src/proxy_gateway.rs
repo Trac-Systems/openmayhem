@@ -40,7 +40,7 @@ pub async fn prepare(
     .context("preparing optional proxy gateway control")?
 }
 
-fn expected_identity(
+pub(crate) fn expected_identity(
     status: &Value,
     health: &Value,
     canonical_admin: &str,

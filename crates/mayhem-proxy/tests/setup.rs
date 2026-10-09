@@ -1,4 +1,6 @@
 #![cfg(unix)]
+#[path = "setup/bootstrap.rs"]
+mod bootstrap;
 #[path = "setup/admission.rs"]
 mod admission;
 #[path = "setup/enrollment.rs"]

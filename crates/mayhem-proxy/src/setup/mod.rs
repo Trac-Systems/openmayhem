@@ -2,6 +2,7 @@
 //! admission, publication, or serving authority. Only an explicit probe invokes
 //! the existing bounded upstream controller; setup never opens a wallet.
 mod admission;
+pub mod bootstrap;
 mod connection;
 mod enrollment;
 mod flow;
@@ -57,6 +58,8 @@ const MAX_DRAFT_BYTES: usize = MAX_BYTES + 17 * 65536 + 32768;
 pub enum Error {
     #[error("invalid provider setup declaration or binding")]
     Invalid,
+    #[error("provider setup bootstrap validation failed: {0}")]
+    Bootstrap(&'static str),
     #[error("provider setup file protection or access rejected")]
     Protection,
     #[error("provider setup draft is missing")]
