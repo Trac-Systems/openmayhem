@@ -148,10 +148,10 @@ export class AdmissionWorker {
 
 // Independent exact-log TAP verification. No ambiguous same-amount selection,
 // bridge, fallback-finality guess or body-selected RPC endpoint.
-export function tapVerifier({origin,chainId,tokenContract,allowLoopbackHttp=false,fetcher=fetch}) {
-  const rpcOrigin=fixedOrigin(origin,{allowLoopbackHttp}); need(uint(chainId,1)&&/^0x[0-9a-f]{40}$/.test(tokenContract),'invalid TAP asset configuration');
+export function tapVerifier({origin,chainId,tokenContract,allowLoopbackHttp=false,fetcher=fetch,rpc=null}) {
+  const rpcOrigin=rpc?null:fixedOrigin(origin,{allowLoopbackHttp}); need(uint(chainId,1)&&/^0x[0-9a-f]{40}$/.test(tokenContract),'invalid TAP asset configuration');
   let id=0;
-  const call=async(method,params,signal)=>{const requestId=++id;const result=await boundedJson(rpcOrigin,{body:{jsonrpc:'2.0',id:requestId,method,params},signal,fetcher,maxBytes:262144});need(result.jsonrpc==='2.0'&&result.id===requestId&&!result.error,'TAP RPC unavailable');return result.result;};
+  const call=rpc??(async(method,params,signal)=>{const requestId=++id;const result=await boundedJson(rpcOrigin,{body:{jsonrpc:'2.0',id:requestId,method,params},signal,fetcher,maxBytes:262144});need(result.jsonrpc==='2.0'&&result.id===requestId&&!result.error,'TAP RPC unavailable');return result.result;});
   return async(work,signal)=>{
     const i=work.invoice,p=work.payment_reference;
     need(i.rail==='tap'&&i.collection.chain_id===chainId&&i.collection.token_contract===tokenContract,'TAP asset differs');
@@ -248,7 +248,7 @@ export async function main(env=process.env) {
   need(phase==='issue'?!c.verification:!c.issuer_key_file,'credentials must be separated by custody role');
   const credential=fs.readFileSync(c.api_credential_file,'utf8').trim();
   const api=new AdmissionApi({origin:c.api_origin,credential,phase,allowLoopbackHttp:c.allow_loopback_http===true});
-  let verifyReceipt=null,signPermit=null,closeReader=async()=>{};
+  let verifyReceipt=null,signPermit=null,closeReader=async()=>{},discovery=null;
   if(phase==='issue') {
     const key=createPrivateKey(fs.readFileSync(c.issuer_key_file)); need(key.asymmetricKeyType==='ed25519','issuer key must be Ed25519');
     const publicKey=createPublicKey(key).export({format:'der',type:'spki'}).subarray(-32).toString('hex');
@@ -256,7 +256,13 @@ export async function main(env=process.env) {
   } else {
     need(c.verification&&['tap','tnk','fiat'].includes(c.verification.rail),'one explicitly configured verification rail required');
     const v=c.verification;
-    if(v.rail==='tap') verifyReceipt=tapVerifier({origin:v.rpc_origin,chainId:v.chain_id,tokenContract:v.token_contract,allowLoopbackHttp:c.allow_loopback_http===true});
+    if(v.rail==='tap') {
+      const {admissionTapRpc,tapDiscovery,AdmissionDiscoveryWorker}=await import('./proxy-admission-discovery.mjs');
+      const rpc=admissionTapRpc({urls:v.rpc_urls??[v.rpc_origin],chainId:v.chain_id,allowLoopbackHttp:c.allow_loopback_http===true});
+      verifyReceipt=tapVerifier({rpc,chainId:v.chain_id,tokenContract:v.token_contract});
+      if(c.discovery_enabled===true)discovery=new AdmissionDiscoveryWorker({origin:c.api_origin,credential,
+        stream:{rail:'tap',chain_id:v.chain_id,token_contract:v.token_contract},scan:tapDiscovery({rpc,chainId:v.chain_id,tokenContract:v.token_contract}),allowLoopbackHttp:c.allow_loopback_http===true});
+    }
     if(v.rail==='fiat') verifyReceipt=stripeVerifier({account:v.stripe_account,livemode:v.livemode,currency:v.currency,credential:fs.readFileSync(v.credential_file,'utf8').trim()});
     if(v.rail==='tnk') {
       need(['mainnet','testnet1'].includes(v.network)&&uint(v.lookback,1)&&v.lookback<=100000&&uint(v.finality,1)&&uint(v.reader_timeout_seconds,1)&&v.reader_timeout_seconds<=10&&v.state_dir,'explicit bounded TNK reader configuration required');
@@ -269,19 +275,33 @@ export async function main(env=process.env) {
       need(String(config.networkId)===c.network.network_id,'TNK configured network identity differs');
       const msb=new MainSettlementBus(config); let ready=null;
       const origin=fixedOrigin(c.core_origin,{allowLoopbackHttp:c.allow_loopback_http===true});
-      verifyReceipt=tnkVerifier({network:v.network,verifyTransfer:async(intent,signal)=>{
+      const canonicalFrontier=async(signal)=>{
         ready??=msb.ready();
-        await Promise.race([ready,new Promise((_,reject)=>{signal.addEventListener('abort',()=>reject(signal.reason),{once:true});})]);
+        let abort;
+        try { await Promise.race([ready,new Promise((_,reject)=>{abort=()=>reject(signal.reason);signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort();})]); }
+        finally {if(abort)signal.removeEventListener('abort',abort);}
         const status=await boundedJson(`${origin}/status`,{method:'GET',signal,maxBytes:16384});
         const frontier=status?.msb?.signedLength; need(uint(frontier,1)&&String(status.msb.networkId)===c.network.network_id&&status.msb.bootstrapHex===c.network.msb_bootstrap,'TNK canonical frontier unavailable or foreign');
+        return frontier;
+      };
+      verifyReceipt=tnkVerifier({network:v.network,verifyTransfer:async(intent,signal)=>{
+        const frontier=await canonicalFrontier(signal);
         return await verifyTnkObservedTransfer(msb,intent,{frontier,lookback:v.lookback,finality:v.finality,timeoutSeconds:v.reader_timeout_seconds,signal});
       }});
+      if(c.discovery_enabled===true){
+        const {tnkDiscovery,AdmissionDiscoveryWorker}=await import('./proxy-admission-discovery.mjs');
+        discovery=new AdmissionDiscoveryWorker({origin:c.api_origin,credential,stream:{rail:'tnk',network:v.network,msb_bootstrap:v.msb_bootstrap},
+          scan:tnkDiscovery({msb,network:v.network,msbBootstrap:v.msb_bootstrap,frontier:canonicalFrontier}),allowLoopbackHttp:c.allow_loopback_http===true});
+      }
       closeReader=async()=>{await msb.close();};
     }
   }
   const worker=new AdmissionWorker({phase,api,coreOrigin:c.core_origin,network:c.network,feePolicyHash:c.fee_policy_hash,
     issuerPubkey:c.issuer_pubkey,verifyReceipt,signPermit,rails:phase==='verify'?[c.verification.rail]:c.rails,allowLoopbackHttp:c.allow_loopback_http===true});
-  try { do { const result=await worker.runOnce(); process.stdout.write(JSON.stringify({event:'proxy_admission_worker',...result})+'\n');
+  try { do {
+    if(discovery)try{const result=await discovery.runOnce();if(result.status!=='idle')process.stdout.write(JSON.stringify({event:'proxy_admission_discovery',...result})+'\n');}
+      catch{process.stderr.write('{"event":"proxy_admission_discovery","status":"unavailable"}\n');}
+    const result=await worker.runOnce(); process.stdout.write(JSON.stringify({event:'proxy_admission_worker',...result})+'\n');
     if(env.PROXY_ADMISSION_WORKER_ONCE==='1') break;
     await new Promise(resolve=>setTimeout(resolve,1000));
   } while(true); } finally { await closeReader(); }
