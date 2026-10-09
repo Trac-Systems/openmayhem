@@ -370,6 +370,9 @@ fn semantic_changes_need_new_revisions_but_ui_translation_does_not() {
     assert!(def.check_successor(&next).is_err());
     next.schema_revision = 2;
     def.check_successor(&next).unwrap();
+    let mut skipped = next.clone();
+    skipped.schema_revision = 3;
+    assert!(def.check_successor(&skipped).is_err());
     let mut old_pred = predicate(&def.field_id, TypedValue::Enum("High".into()));
     assert!(evaluate(
         &next,
@@ -393,6 +396,54 @@ fn semantic_changes_need_new_revisions_but_ui_translation_does_not() {
         .unwrap(),
         Match::Unknown
     );
+}
+
+#[test]
+fn definition_wire_requires_explicit_nullable_values() {
+    let def = definition("fixture.known", ValueSchema::Boolean);
+    let raw = serde_json::to_value(&def).unwrap();
+    for key in ["units", "default", "max_evidence_age_ms"] {
+        let mut missing = raw.clone();
+        missing.as_object_mut().unwrap().remove(key);
+        assert!(
+            serde_json::from_value::<Definition>(missing).is_err(),
+            "missing {key}"
+        );
+    }
+    let restored: Definition = serde_json::from_value(raw).unwrap();
+    assert_eq!(restored.digest().unwrap(), def.digest().unwrap());
+}
+
+#[test]
+fn actual_site_registry_definitions_preserve_rust_semantics_and_hashes() {
+    let fixture: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/registry-definitions-v1.json")).unwrap();
+    let cases = fixture["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 4);
+    for case in cases {
+        let def: Definition = serde_json::from_value(case["definition"].clone()).unwrap();
+        def.validate().unwrap();
+        assert_eq!(
+            def.digest().unwrap(),
+            case["definition_hash"].as_str().unwrap(),
+            "{}",
+            def.field_id
+        );
+        assert_eq!(serde_json::to_value(&def).unwrap(), case["definition"]);
+    }
+    // Actual authenticated HTTP projection after writing through the API and
+    // PostgreSQL, not just the validator's in-memory serialization.
+    let stored: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/registry-stored-v1.json")).unwrap();
+    let projection = &stored["stored"];
+    let def: Definition = serde_json::from_value(projection["definition"].clone()).unwrap();
+    assert_eq!(
+        def.digest().unwrap(),
+        projection["definition_hash"].as_str().unwrap()
+    );
+    assert_eq!(projection["field_id"], def.field_id);
+    assert_eq!(projection["schema_revision"], def.schema_revision);
+    assert_eq!(projection["execution_state"], "not_activated");
 }
 
 #[test]

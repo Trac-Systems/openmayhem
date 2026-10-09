@@ -72,17 +72,20 @@ pub struct Definition {
     pub schema_revision: u32,
     pub labels: BTreeMap<String, String>,
     pub help: BTreeMap<String, String>,
+    #[serde(deserialize_with = "required_nullable")]
     pub units: Option<String>,
     pub group: String,
     pub order: i32,
     pub endpoints: Vec<ProxyEndpoint>,
     pub value_schema: ValueSchema,
     /// UI advice only; execution never injects defaults or changes user intent.
+    #[serde(deserialize_with = "required_nullable")]
     pub default: Option<TypedValue>,
     pub operators: Vec<Operator>,
     /// Registry requirements are independent hard bounds. A profile may narrow
     /// them but cannot turn fresh/probed evidence into an unlimited claim.
     pub minimum_assurance: Assurance,
+    #[serde(deserialize_with = "required_nullable")]
     pub max_evidence_age_ms: Option<u32>,
     pub usage: Usage,
     pub rules: Vec<Rule>,
@@ -191,7 +194,9 @@ impl Definition {
         self.validate()?;
         next.validate()?;
         require(
-            self.field_id == next.field_id && next.schema_revision >= self.schema_revision,
+            self.field_id == next.field_id
+                && next.schema_revision >= self.schema_revision
+                && next.schema_revision <= self.schema_revision + 1,
             "registry identity or revision changed backwards",
         )?;
         if self.schema_revision == next.schema_revision {
@@ -227,8 +232,11 @@ impl Condition {
         )
     }
     fn check_definition(&self, definition: &Definition, endpoint: ProxyEndpoint) -> Result<()> {
-        self.validate()?;
         definition.validate()?;
+        self.check_reference(definition, endpoint)
+    }
+    fn check_reference(&self, definition: &Definition, endpoint: ProxyEndpoint) -> Result<()> {
+        self.validate()?;
         require(
             self.field_id == definition.field_id
                 && self.schema_revision == definition.schema_revision
@@ -264,14 +272,14 @@ pub struct Predicate {
     pub operator: Operator,
     pub value: TypedValue,
     pub evidence: Assurance,
-    #[serde(deserialize_with = "required_nullable_age")]
+    #[serde(deserialize_with = "required_nullable")]
     pub max_age_ms: Option<u32>,
 }
 
-fn required_nullable_age<'de, D: serde::Deserializer<'de>>(
+fn required_nullable<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
     deserializer: D,
-) -> std::result::Result<Option<u32>, D::Error> {
-    Option::<u32>::deserialize(deserializer)
+) -> std::result::Result<Option<T>, D::Error> {
+    Option::<T>::deserialize(deserializer)
 }
 
 impl Predicate {

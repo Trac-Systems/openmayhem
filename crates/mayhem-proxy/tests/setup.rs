@@ -1,4 +1,6 @@
 #![cfg(unix)]
+#[path = "setup/probe.rs"]
+mod probes;
 use mayhem_proto::proxy::{
     finance::{ProxyReceiptOutcome, ProxySettlementPolicy},
     *,

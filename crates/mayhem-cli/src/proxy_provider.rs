@@ -192,6 +192,26 @@ mod tests {
                 "2",
             ],
             vec!["proxy", "setup", "inspect", "--directory", "/private/setup"],
+            vec![
+                "proxy",
+                "setup",
+                "probe",
+                "--directory",
+                "/private/setup",
+                "--expected-revision",
+                "2",
+                "--plan",
+                "/private/probe.json",
+            ],
+            vec![
+                "proxy",
+                "setup",
+                "recover-probe",
+                "--directory",
+                "/private/setup",
+                "--expected-revision",
+                "3",
+            ],
         ] {
             assert!(matches!(
                 Cli::try_parse_from(args).unwrap().command,
@@ -210,6 +230,24 @@ mod tests {
             "/private/setup",
             "--private-key",
             "rejected"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "probe",
+            "--directory",
+            "/private/setup",
+            "--expected-revision",
+            "2"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "recover-probe",
+            "--directory",
+            "/private/setup"
         ])
         .is_err());
     }

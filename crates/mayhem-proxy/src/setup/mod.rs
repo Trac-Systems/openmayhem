@@ -1,7 +1,10 @@
 //! Shared local provider setup. Structural validation is not conformance,
-//! admission, publication, or serving authority. No network or wallet access.
+//! admission, publication, or serving authority. Only an explicit probe invokes
+//! the existing bounded upstream controller; setup never opens a wallet.
+mod probe;
 mod review;
 mod store;
+pub use probe::{ProbeGroup, ProbePlan, ProbeReport, ProbeScope, ProbeState};
 pub use review::{AdmissionHandoff, Review, State};
 pub use store::Store;
 
@@ -42,6 +45,10 @@ pub enum Error {
     CommitUnknown,
     #[error("provider setup connection changed; update and recheck the draft")]
     ConnectionChanged,
+    #[error("provider setup probe requires recovery of the original retained attempt")]
+    ProbeRecovery,
+    #[error("provider setup probe capacity is unavailable or its allowance is exhausted")]
+    ProbeCapacity,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 fn require(ok: bool) -> Result<()> {
@@ -176,6 +183,10 @@ struct Record {
     input: Input,
     connection: Digest,
     checked: Option<Digest>,
+    #[serde(default)]
+    probe_scope: Option<ProbeScope>,
+    #[serde(default)]
+    probe: Option<probe::Attempt>,
 }
 impl Record {
     fn binding(&self) -> Result<Digest> {
@@ -195,6 +206,13 @@ impl Record {
                 && self.revision <= mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER,
         )?;
         self.input.validate()?;
+        if let Some(scope) = &self.probe_scope {
+            scope.validate()?;
+        }
+        if let Some(probe) = &self.probe {
+            require(self.probe_scope.is_some())?;
+            probe.validate()?;
+        }
         require(
             self.checked
                 .as_ref()

@@ -1,0 +1,187 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "definition": {
+        "schema_version": 1,
+        "field_id": "fixture.tools",
+        "schema_revision": 1,
+        "labels": {
+          "en": "Fixture tools",
+          "de": "Werkzeuge",
+          "ja": "道具 🧠"
+        },
+        "help": {},
+        "units": null,
+        "group": "capabilities",
+        "order": 0,
+        "endpoints": [
+          "openai_chat_completions"
+        ],
+        "value_schema": {
+          "type": "boolean"
+        },
+        "default": null,
+        "operators": [
+          "eq"
+        ],
+        "minimum_assurance": "probed",
+        "max_evidence_age_ms": 60000,
+        "usage": {
+          "kind": "filter_only"
+        },
+        "rules": []
+      },
+      "definition_hash": "5d80e17d1684130c4c417a1d676bb0f46bb2760be8947d163db30e3e83de8bcc"
+    },
+    {
+      "definition": {
+        "schema_version": 1,
+        "field_id": "fixture.reasoning.effort",
+        "schema_revision": 1,
+        "labels": {
+          "en": "Adaptive effort 🧠",
+          "ja": "適応的な思考"
+        },
+        "help": {
+          "en": "Exact model-specific values; never compare vendor ordinals."
+        },
+        "units": null,
+        "group": "reasoning",
+        "order": 7,
+        "endpoints": [
+          "openai_chat_completions"
+        ],
+        "value_schema": {
+          "type": "enum",
+          "values": [
+            "Adaptive High",
+            "Low",
+            "Max"
+          ]
+        },
+        "default": {
+          "type": "enum",
+          "value": "Low"
+        },
+        "operators": [
+          "eq"
+        ],
+        "minimum_assurance": "verified",
+        "max_evidence_age_ms": null,
+        "usage": {
+          "kind": "request_control",
+          "request_path": "reasoning.effort"
+        },
+        "rules": [
+          {
+            "when": [
+              {
+                "field_id": "fixture.reasoning.effort",
+                "schema_revision": 1,
+                "operator": "eq",
+                "value": {
+                  "type": "enum",
+                  "value": "Adaptive High"
+                }
+              }
+            ],
+            "require": [
+              {
+                "field_id": "fixture.reasoning.mode",
+                "schema_revision": 1,
+                "operator": "eq",
+                "value": {
+                  "type": "enum",
+                  "value": "enabled"
+                }
+              }
+            ],
+            "forbid": []
+          }
+        ]
+      },
+      "definition_hash": "eb2bcc6a996b749378cc07ddaf28471355877b1b5e4edced0d5aa59c36c93e69"
+    },
+    {
+      "definition": {
+        "schema_version": 1,
+        "field_id": "fixture.exact_decimal",
+        "schema_revision": 1,
+        "labels": {
+          "en": "Fixture tools",
+          "de": "Werkzeuge",
+          "ja": "道具 🧠"
+        },
+        "help": {},
+        "units": null,
+        "group": "capabilities",
+        "order": 0,
+        "endpoints": [
+          "openai_chat_completions"
+        ],
+        "value_schema": {
+          "type": "decimal",
+          "minimum": "-999999999999999999.999999999999999999",
+          "maximum": "999999999999999999.999999999999999999"
+        },
+        "default": {
+          "type": "decimal",
+          "value": "0.000000000000000001"
+        },
+        "operators": [
+          "eq",
+          "gte",
+          "lte"
+        ],
+        "minimum_assurance": "probed",
+        "max_evidence_age_ms": 60000,
+        "usage": {
+          "kind": "filter_only"
+        },
+        "rules": []
+      },
+      "definition_hash": "81e94e45ac0f4bbe4410c433d2645de8fa6cea16dfc2f9021e043905db028075"
+    },
+    {
+      "definition": {
+        "schema_version": 1,
+        "field_id": "fixture.unicode_values",
+        "schema_revision": 1,
+        "labels": {
+          "en": "Fixture tools",
+          "de": "Werkzeuge",
+          "ja": "道具 🧠"
+        },
+        "help": {},
+        "units": null,
+        "group": "capabilities",
+        "order": 0,
+        "endpoints": [
+          "openai_chat_completions"
+        ],
+        "value_schema": {
+          "type": "set",
+          "values": [
+            "Adaptive High",
+            "",
+            "𐀀",
+            "🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠🧠"
+          ]
+        },
+        "default": null,
+        "operators": [
+          "eq",
+          "contains_all"
+        ],
+        "minimum_assurance": "probed",
+        "max_evidence_age_ms": 60000,
+        "usage": {
+          "kind": "filter_only"
+        },
+        "rules": []
+      },
+      "definition_hash": "19098c871c1c5145ab8234d86626ea5e3e646e3138c1bb57e1064f726da46b52"
+    }
+  ]
+}

@@ -168,6 +168,7 @@ pub fn apply_controls<'a>(
                     )?;
                     let referenced = lookup(&condition.field_id, condition.schema_revision)
                         .ok_or_else(|| invalid("conditional registry field revision is unknown"))?;
+                    referenced.validate()?;
                     require(
                         !definitions.keys().any(|(id, rev)| {
                             id == &condition.field_id && *rev != condition.schema_revision
@@ -177,7 +178,7 @@ pub fn apply_controls<'a>(
                     definitions.insert(key.clone(), referenced);
                     queue.push(key.clone());
                 }
-                condition.check_definition(definitions[&key], endpoint)?;
+                condition.check_reference(definitions[&key], endpoint)?;
                 let referenced = definitions[&key];
                 let Usage::RequestControl { request_path } = &referenced.usage else {
                     return Err(invalid("control conditions require request-control fields"));

@@ -3,7 +3,7 @@
 use super::*;
 
 pub struct Store {
-    directory: PathBuf,
+    pub(super) directory: PathBuf,
 }
 impl Store {
     /// The caller chooses an existing private directory. No other provider,
@@ -31,6 +31,8 @@ impl Store {
             input,
             connection,
             checked: None,
+            probe_scope: None,
+            probe: None,
         };
         guard.write(&record)?;
         record.review()
@@ -82,13 +84,13 @@ use std::{
     os::unix::fs::MetadataExt,
 };
 #[cfg(unix)]
-struct Guard {
+pub(super) struct Guard {
     directory: File,
     _lock: File,
 }
 #[cfg(unix)]
 impl Guard {
-    fn open(path: &Path) -> Result<Self> {
+    pub(super) fn open(path: &Path) -> Result<Self> {
         let directory = File::from(
             open(
                 path,
@@ -152,7 +154,7 @@ impl Guard {
             Err(_) => Err(Error::Protection),
         }
     }
-    fn read(&self) -> Result<Option<Record>> {
+    pub(super) fn read(&self) -> Result<Option<Record>> {
         let Some(file) = self.file("draft.json")? else {
             return Ok(None);
         };
@@ -165,7 +167,7 @@ impl Guard {
         record.validate()?;
         Ok(Some(record))
     }
-    fn write(&self, record: &Record) -> Result<()> {
+    pub(super) fn write(&self, record: &Record) -> Result<()> {
         record.validate()?;
         let bytes =
             zeroize::Zeroizing::new(serde_json::to_vec(record).map_err(|_| Error::Invalid)?);
@@ -193,16 +195,16 @@ impl Guard {
     }
 }
 #[cfg(not(unix))]
-struct Guard;
+pub(super) struct Guard;
 #[cfg(not(unix))]
 impl Guard {
-    fn open(_: &Path) -> Result<Self> {
+    pub(super) fn open(_: &Path) -> Result<Self> {
         Err(Error::Protection)
     }
-    fn read(&self) -> Result<Option<Record>> {
+    pub(super) fn read(&self) -> Result<Option<Record>> {
         Err(Error::Protection)
     }
-    fn write(&self, _: &Record) -> Result<()> {
+    pub(super) fn write(&self, _: &Record) -> Result<()> {
         Err(Error::Protection)
     }
 }

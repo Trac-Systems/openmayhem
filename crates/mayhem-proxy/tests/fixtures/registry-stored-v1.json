@@ -1,0 +1,80 @@
+{
+  "schema_version": 1,
+  "source": "actual authenticated Nest HTTP response after PostgreSQL persistence",
+  "stored": {
+    "object": "proxy.registry_definition",
+    "field_id": "fixture.reasoning.effort",
+    "version": 1,
+    "schema_revision": 1,
+    "definition": {
+      "schema_version": 1,
+      "field_id": "fixture.reasoning.effort",
+      "schema_revision": 1,
+      "labels": {
+        "en": "Adaptive effort 🧠",
+        "ja": "適応的な思考"
+      },
+      "help": {
+        "en": "Exact model-specific values; never compare vendor ordinals."
+      },
+      "units": null,
+      "group": "reasoning",
+      "order": 7,
+      "endpoints": [
+        "openai_chat_completions"
+      ],
+      "value_schema": {
+        "type": "enum",
+        "values": [
+          "Adaptive High",
+          "Low",
+          "Max"
+        ]
+      },
+      "default": {
+        "type": "enum",
+        "value": "Low"
+      },
+      "operators": [
+        "eq"
+      ],
+      "minimum_assurance": "verified",
+      "max_evidence_age_ms": null,
+      "usage": {
+        "kind": "request_control",
+        "request_path": "reasoning.effort"
+      },
+      "rules": [
+        {
+          "when": [
+            {
+              "field_id": "fixture.reasoning.effort",
+              "schema_revision": 1,
+              "value": {
+                "type": "enum",
+                "value": "Adaptive High"
+              },
+              "operator": "eq"
+            }
+          ],
+          "require": [
+            {
+              "field_id": "fixture.reasoning.mode",
+              "schema_revision": 1,
+              "value": {
+                "type": "enum",
+                "value": "enabled"
+              },
+              "operator": "eq"
+            }
+          ],
+          "forbid": []
+        }
+      ]
+    },
+    "definition_hash": "eb2bcc6a996b749378cc07ddaf28471355877b1b5e4edced0d5aa59c36c93e69",
+    "created_at": "2026-10-09T15:12:00.379Z",
+    "updated_at": "2026-10-09T15:12:00.379Z",
+    "execution_state": "not_activated"
+  }
+}

@@ -25,6 +25,7 @@ pub struct Review {
     pub state: State,
     pub claim_status: &'static str,
     pub probe_status: &'static str,
+    pub probe: Option<ProbeReport>,
     pub admission_status: &'static str,
     pub publication_status: &'static str,
     pub serving_status: &'static str,
@@ -50,6 +51,7 @@ impl Record {
             State::Unchecked
         };
         let operation = self.input.operation();
+        let probe = self.probe.as_ref().map(|p| p.report(self)).transpose()?;
         let handoff = if state == State::StructurallyValid {
             Some(AdmissionHandoff {
                 initial_operation_digest: operation.digest().map_err(|_| Error::Invalid)?,
@@ -66,7 +68,8 @@ impl Record {
             revision: self.revision,
             state,
             claim_status: "operator_declared",
-            probe_status: "not_run",
+            probe_status: probe.as_ref().map_or("not_run", |p| p.status_name()),
+            probe,
             admission_status: "not_checked",
             publication_status: "not_submitted",
             serving_status: "not_started",
