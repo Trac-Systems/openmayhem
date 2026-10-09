@@ -43,6 +43,7 @@ fn connection_commitment_binds_dispatch_authority_without_loading_credentials() 
             serde_json::json!({"models":"models","chat_completions":"other"}),
         ),
         ("error_profile", serde_json::json!("http_status")),
+        ("error_profile", serde_json::json!("vllm_admission_v1")),
         (
             "authentication",
             serde_json::json!({"type":"bearer","secret":{"source":"environment","name":"MAYHEM_PROXY_FIXTURE_NOT_LOADED"}}),
@@ -737,4 +738,202 @@ async fn timeout_after_sending_is_not_reported_as_connect_failure_or_safe_replay
     assert_eq!(error.retry_advice(), RetryAdvice::RecoverSameAttempt);
     let _ = release.send(());
     task.await.unwrap();
+}
+
+fn queue_refusal() -> String {
+    json!({"error":{"message":"The engine is currently busy and cannot accept new requests. Please try again later or on a different instance.","type":"Service Unavailable","param":null,"code":503}}).to_string()
+}
+
+#[tokio::test]
+async fn audited_refusal_requires_complete_exact_json_and_explicit_connection_contract() {
+    let body = queue_refusal();
+    let bad_code = body.replace("\"code\":503", "\"code\":500");
+    let duplicate = body.replace("\"code\":503", "\"code\":500,\"code\":503");
+    let mut extra: Value = serde_json::from_str(&body).unwrap();
+    extra["error"]["request_id"] = json!("possibly-executing");
+    let wrong_type = body.replace("Service Unavailable", "ServiceUnavailableError");
+    let wrong_message = body.replace("Please try again later", "Please try again immediately");
+    let mut truncated = response(503, "Content-Type: application/json\r\n", &body);
+    truncated = String::from_utf8(truncated)
+        .unwrap()
+        .replace(
+            &format!("Content-Length: {}", body.len()),
+            &format!("Content-Length: {}", body.len() + 20),
+        )
+        .into_bytes();
+    for (profile, bytes, expected) in [
+        (
+            "vllm_admission_v1",
+            response(
+                503,
+                "Content-Type: application/json\r\nRetry-After: 17\r\n",
+                &body,
+            ),
+            Execution::Rejected,
+        ),
+        (
+            "open_ai",
+            response(503, "Content-Type: application/json\r\n", &body),
+            Execution::Unknown,
+        ),
+        (
+            "http_status",
+            response(503, "Content-Type: application/json\r\n", &body),
+            Execution::Unknown,
+        ),
+        ("vllm_admission_v1", truncated, Execution::Unknown),
+        (
+            "vllm_admission_v1",
+            response(503, "Content-Type: application/json\r\n", &bad_code),
+            Execution::Unknown,
+        ),
+        (
+            "vllm_admission_v1",
+            response(503, "Content-Type: application/json\r\n", &duplicate),
+            Execution::Unknown,
+        ),
+        (
+            "vllm_admission_v1",
+            response(
+                503,
+                "Content-Type: application/json\r\n",
+                &extra.to_string(),
+            ),
+            Execution::Unknown,
+        ),
+        (
+            "vllm_admission_v1",
+            response(503, "Content-Type: application/json\r\n", &wrong_type),
+            Execution::Unknown,
+        ),
+        (
+            "vllm_admission_v1",
+            response(503, "Content-Type: application/json\r\n", &wrong_message),
+            Execution::Unknown,
+        ),
+        (
+            "vllm_admission_v1",
+            response(429, "Content-Type: application/json\r\n", &body),
+            Execution::Unknown,
+        ),
+        (
+            "vllm_admission_v1",
+            response(503, "Content-Type: text/event-stream\r\n", &body),
+            Execution::Unknown,
+        ),
+        (
+            "vllm_admission_v1",
+            response(
+                503,
+                "Content-Type: application/json\r\n",
+                &(body.clone() + &" ".repeat(16 * 1024)),
+            ),
+            Execution::Unknown,
+        ),
+    ] {
+        let f = server(bytes).await;
+        let mut config = configuration(&f.base);
+        config["error_profile"] = json!(profile);
+        let c = HttpConnection::new(configured(config)).unwrap();
+        let failure = send(&c).await.err().unwrap();
+        assert_eq!(failure.execution, expected);
+        assert_eq!(failure.retry_advice(), RetryAdvice::RecoverSameAttempt);
+        assert_eq!(f.hits.load(Ordering::SeqCst), 1);
+        if expected == Execution::Rejected {
+            assert_eq!(failure.retry_after_ms, Some(17_000));
+            assert_eq!(failure.upstream_code, Some("vllm_queue_overflow"));
+            let saved = mayhem_proxy::attempts::FailureSnapshot::from(&failure);
+            assert_eq!(saved.to_failure().unwrap().execution, Execution::Rejected);
+            for field in ["stage", "code", "scope", "upstream_status", "upstream_code"] {
+                let mut corrupt = serde_json::to_value(&saved).unwrap();
+                corrupt[field] = match field {
+                    "stage" => json!("response_body"),
+                    "code" => json!("upstream_protocol"),
+                    "scope" => json!("model"),
+                    "upstream_status" => json!(500),
+                    _ => json!("rate_limit_exceeded"),
+                };
+                let record: mayhem_proxy::attempts::FailureSnapshot =
+                    serde_json::from_value(corrupt).unwrap();
+                assert!(record.to_failure().is_err());
+            }
+            let public = serde_json::to_string(&failure).unwrap();
+            assert!(!public.contains("Please try again later") && !public.contains("engine is"));
+        }
+    }
+}
+
+#[tokio::test]
+async fn vllm_admission_profile_does_not_claim_whole_batch_or_multistep_nonexecution() {
+    let f = server(response(
+        503,
+        "Content-Type: application/json\r\n",
+        &queue_refusal(),
+    ))
+    .await;
+    let mut config = configuration(&f.base);
+    config["error_profile"] = json!("vllm_admission_v1");
+    config["paths"]["completions"] = json!("completions");
+    config["paths"]["responses"] = json!("responses");
+    let c = HttpConnection::new(configured(config)).unwrap();
+    for (operation, body, expected) in [
+        (
+            Operation::Completions,
+            json!({"prompt":"one"}),
+            Execution::Rejected,
+        ),
+        (
+            Operation::Completions,
+            json!({"prompt":[1,2,3]}),
+            Execution::Rejected,
+        ),
+        (
+            Operation::Completions,
+            json!({"prompt":["one","two"]}),
+            Execution::Unknown,
+        ),
+        (
+            Operation::Completions,
+            json!({"prompt":[[1],[2]]}),
+            Execution::Unknown,
+        ),
+        (
+            Operation::Completions,
+            json!({"prompt":"one","best_of":2}),
+            Execution::Unknown,
+        ),
+        (
+            Operation::ChatCompletions,
+            json!({"messages":[],"n":2}),
+            Execution::Unknown,
+        ),
+        (
+            Operation::ChatCompletions,
+            json!({"messages":[],"use_beam_search":true}),
+            Execution::Unknown,
+        ),
+        (
+            Operation::ChatCompletions,
+            json!({"messages":[],"n":1,"best_of":1}),
+            Execution::Rejected,
+        ),
+        (
+            Operation::Responses,
+            json!({"input":"hi"}),
+            Execution::Unknown,
+        ),
+        (
+            Operation::Decisions,
+            json!({"state":"hi","questions":{}}),
+            Execution::Unknown,
+        ),
+    ] {
+        let e = c
+            .send(operation, Some(serde_json::to_vec(&body).unwrap()))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(e.execution, expected);
+    }
+    assert_eq!(f.hits.load(Ordering::SeqCst), 10);
 }

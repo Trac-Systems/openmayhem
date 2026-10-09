@@ -291,7 +291,7 @@ impl FailureSnapshot {
                     .as_deref()
                     .is_none_or(|s| safe_parameter(s).is_some()),
         )?;
-        Ok(Failure {
+        let failure = Failure {
             code: self.code,
             scope: self.scope,
             stage: self.stage,
@@ -300,7 +300,9 @@ impl FailureSnapshot {
             upstream_code: self.upstream_code.as_deref().and_then(safe_upstream_code),
             parameter: self.parameter.as_deref().and_then(safe_parameter),
             retry_after_ms: self.retry_after_ms,
-        })
+        };
+        require(failure.execution != Execution::Rejected || failure.verified_rejection())?;
+        Ok(failure)
     }
 }
 

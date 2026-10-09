@@ -260,7 +260,7 @@ fn emit(
     init: &Init,
     verifier: Option<&crate::semantics::Verifier>,
 ) -> std::result::Result<(), Failure> {
-    if matches!(init.error_profile, ErrorProfile::OpenAi) {
+    if init.error_profile.openai_framing() {
         let body = match &event {
             Decoded::Sse { data, .. } => data.as_bytes().to_vec(),
             Decoded::Json { value } | Decoded::Ndjson { value } => {

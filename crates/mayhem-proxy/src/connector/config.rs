@@ -29,6 +29,15 @@ pub enum ErrorProfile {
     #[default]
     HttpStatus,
     OpenAi,
+    /// OpenAI framing plus the audited single-request vLLM admission refusal
+    /// contract. Explicit private configuration, never inferred from a model name.
+    VllmAdmissionV1,
+}
+
+impl ErrorProfile {
+    pub(crate) fn openai_framing(self) -> bool {
+        matches!(self, Self::OpenAi | Self::VllmAdmissionV1)
+    }
 }
 
 impl Operation {

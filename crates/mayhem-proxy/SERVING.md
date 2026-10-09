@@ -178,8 +178,10 @@ only after durable completion; publication delay does not inflate the recorded m
 
 The generic error profile deliberately preserves uncertainty after an arbitrary HTTP
 error. In particular, a 429-shaped body is not independent proof that a vendor executed
-nothing. Connector-specific documented refusal/job-status/cancellation evidence and its
-automatic reconciliation still need integration; an unknown probe cannot simply expire.
+nothing. The explicit [vLLM admission profile](REFUSALS.md) now closes operator probes
+for its verified single-request HTTP admission refusals, with backoff and consumed budget
+preserved. Generic errors, started streams, other connectors and paid refusal closure still
+require outcome recovery; an unknown probe cannot simply expire.
 Prepared-probe recovery is available to trusted startup, but managed startup has not yet
 been wired. The monitor and capacity authority must be rebound to their exact scopes.
 The operator can explicitly raise a spent allowance; no implementation may silently reset

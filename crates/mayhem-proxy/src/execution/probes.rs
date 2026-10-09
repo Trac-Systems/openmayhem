@@ -287,11 +287,12 @@ impl Controller {
                     _ => None,
                 };
                 if let Some(failure) = failure {
-                    if failure.execution == Execution::NotDispatched {
+                    if failure.execution == Execution::NotDispatched || failure.verified_rejection()
+                    {
                         let bytes =
                             serde_json::to_vec(&failure).map_err(|_| ProbeError::Configuration)?;
                         let evidence = Digest::hash(
-                            "mayhem/proxy/probe-not-dispatched/v1",
+                            "mayhem/proxy/probe-nonexecution/v1",
                             &[probe.id.as_str().as_bytes(), &bytes],
                         );
                         self.complete(probe, evidence).await?;

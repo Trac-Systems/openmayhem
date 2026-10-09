@@ -66,6 +66,10 @@ async fn backend_raw(
     content_type: &'static str,
     delay: Duration,
 ) -> Backend {
+    backend_sequence(vec![(status, body, content_type)], delay).await
+}
+async fn backend_sequence(replies: Vec<(u16, Vec<u8>, &'static str)>, delay: Duration) -> Backend {
+    assert!(!replies.is_empty());
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let base = format!("http://{}/v1/", listener.local_addr().unwrap());
     let calls = Arc::new(AtomicUsize::new(0));
@@ -105,7 +109,8 @@ async fn backend_raw(
                 }
                 bytes.extend_from_slice(&buf[..n]);
             }
-            count.fetch_add(1, Ordering::SeqCst);
+            let index = count.fetch_add(1, Ordering::SeqCst).min(replies.len() - 1);
+            let (status, body, content_type) = &replies[index];
             received
                 .lock()
                 .unwrap()
@@ -142,6 +147,14 @@ impl Fixture {
         Self::with_payload_limit(base, endpoint, 128 * 1024 * 1024)
     }
     fn with_payload_limit(base: &str, endpoint: ProxyEndpoint, payload_limit: u64) -> Self {
+        Self::with_profile(base, endpoint, payload_limit, "open_ai")
+    }
+    fn with_profile(
+        base: &str,
+        endpoint: ProxyEndpoint,
+        payload_limit: u64,
+        profile: &str,
+    ) -> Self {
         let store = dir();
         let work = dir();
         let journal = Arc::new(
@@ -162,7 +175,7 @@ impl Fixture {
             )
             .unwrap(),
         );
-        let connection=Arc::new(HttpConnection::new(serde_json::from_value::<ConnectionConfig>(json!({"schema_version":1,"id":"fixture","revision":1,"base_url":base,"network":{"mode":"pinned","networks":["127.0.0.1/32"],"allow_http":true},"paths":{"chat_completions":"chat/completions","completions":"completions","responses":"responses","decisions":"decisions"},"error_profile":"open_ai"})).unwrap()).unwrap());
+        let connection=Arc::new(HttpConnection::new(serde_json::from_value::<ConnectionConfig>(json!({"schema_version":1,"id":"fixture","revision":1,"base_url":base,"network":{"mode":"pinned","networks":["127.0.0.1/32"],"allow_http":true},"paths":{"chat_completions":"chat/completions","completions":"completions","responses":"responses","decisions":"decisions"},"error_profile":profile})).unwrap()).unwrap());
         let family = match endpoint {
             ProxyEndpoint::Chat => mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
             ProxyEndpoint::Completions => mayhem_proto::ENDPOINT_OPENAI_COMPLETIONS,

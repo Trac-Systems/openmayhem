@@ -256,6 +256,8 @@ impl HttpConnection {
                 Execution::NotDispatched,
             )
         })?;
+        let refusal_eligible =
+            super::refusal::eligible(self.error_profile, operation, body.as_deref());
         let mut request = self
             .client
             .request(operation.method(), url.clone())
@@ -300,7 +302,7 @@ impl HttpConnection {
         })?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
-            return Err(decode_http_failure(response, self.error_profile).await);
+            return Err(decode_http_failure(response, self.error_profile, refusal_eligible).await);
         }
         if response
             .content_length()
@@ -341,7 +343,11 @@ impl HttpConnection {
     }
 }
 
-async fn decode_http_failure(mut response: Response, profile: ErrorProfile) -> Failure {
+async fn decode_http_failure(
+    mut response: Response,
+    profile: ErrorProfile,
+    refusal_eligible: bool,
+) -> Failure {
     let status = response.status().as_u16();
     let retry_after = response
         .headers()
@@ -352,29 +358,46 @@ async fn decode_http_failure(mut response: Response, profile: ErrorProfile) -> F
     if matches!(profile, ErrorProfile::HttpStatus) {
         return failure::openai_error(status, &[], retry_after.as_deref(), SystemTime::now());
     }
+    let json = response
+        .headers()
+        .get(CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
+        .is_some_and(|v| v.trim().eq_ignore_ascii_case("application/json"));
     let mut bytes = Vec::new();
     // Bounded diagnostic error-body read only. Never applies to a generation.
     // An adversarial error stream cannot retain a dispatch slot indefinitely.
-    let _ = tokio::time::timeout(Duration::from_secs(2), async {
-        while let Ok(Some(chunk)) = response.chunk().await {
-            if bytes.len() + chunk.len() > 16 * 1024 {
-                bytes.clear();
-                break;
+    let complete = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            match response.chunk().await {
+                Ok(Some(chunk)) if chunk.len() <= (16 * 1024usize).saturating_sub(bytes.len()) => {
+                    bytes.extend_from_slice(&chunk)
+                }
+                Ok(None) => return true,
+                _ => return false,
             }
-            bytes.extend_from_slice(&chunk);
         }
     })
-    .await;
-    failure::openai_error(
+    .await
+    .unwrap_or(false);
+    // Incomplete diagnostics may not carry a trusted error code or refusal.
+    if !complete {
+        bytes.clear();
+    }
+    let mut failure = failure::openai_error(
         status,
-        if matches!(profile, ErrorProfile::OpenAi) {
+        if profile.openai_framing() {
             &bytes
         } else {
             &[]
         },
         retry_after.as_deref(),
         SystemTime::now(),
-    )
+    );
+    if complete && json && refusal_eligible {
+        super::refusal::recognize(&mut failure, &bytes);
+    }
+    failure
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -464,7 +487,7 @@ impl UpstreamResponse {
         }
         let value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|_| self.fail(Code::UpstreamProtocol))?;
-        if matches!(self.error_profile, ErrorProfile::OpenAi)
+        if self.error_profile.openai_framing()
             && value.get("error").is_some_and(serde_json::Value::is_object)
         {
             let mut error = failure::openai_error(self.status, &bytes, None, SystemTime::now());

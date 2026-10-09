@@ -137,6 +137,238 @@ fn probe_counts(a: &capacity::Authority, expected: u32) {
     assert_eq!(a.status(&d(20)).unwrap().route_occupied, expected);
 }
 
+fn vllm_refusal(prefill: bool) -> Value {
+    json!({"error":{"message":if prefill {
+        "The engine has reached its prefill token backlog limit. Please try again later or on a different instance."
+    } else {
+        "The engine is currently busy and cannot accept new requests. Please try again later or on a different instance."
+    },"type":"Service Unavailable","param":null,"code":503}})
+}
+
+#[tokio::test]
+async fn audited_refusal_releases_probe_allocation_then_recovers_on_json_and_sse() {
+    for streaming in [false, true] {
+        for endpoint in [ProxyEndpoint::Chat, ProxyEndpoint::Completions] {
+            let mut body = if endpoint == ProxyEndpoint::Chat {
+                serde_json::from_slice(&chat()).unwrap()
+            } else {
+                json!({"model":"public-model","prompt":"hello"})
+            };
+            if streaming {
+                body["stream"] = json!(true);
+            }
+            let reply = if endpoint == ProxyEndpoint::Chat {
+                answer()
+            } else {
+                json!({"id":"u","choices":[{"index":0,"text":"hello","finish_reason":"stop"}]})
+            };
+            let output = if streaming {
+                if endpoint == ProxyEndpoint::Chat {
+                    sse(
+                        &[
+                            json!({"id":"u","choices":[{"index":0,"delta":{"content":"hello"},"finish_reason":"stop"}]}),
+                        ],
+                        true,
+                    )
+                } else {
+                    sse(&[reply], true)
+                }
+            } else {
+                serde_json::to_vec(&reply).unwrap()
+            };
+            let b = backend_sequence(
+                vec![
+                    (
+                        503,
+                        serde_json::to_vec(&vllm_refusal(streaming)).unwrap(),
+                        "application/json",
+                    ),
+                    (
+                        200,
+                        output,
+                        if streaming {
+                            "text/event-stream"
+                        } else {
+                            "application/json"
+                        },
+                    ),
+                ],
+                Duration::ZERO,
+            )
+            .await;
+            let f =
+                Fixture::with_profile(&b.base, endpoint, 128 * 1024 * 1024, "vllm_admission_v1");
+            let (a, m) = setup(&f);
+            m.register(d(21), 2, true).unwrap();
+            m.observe_request(
+                &d(21),
+                health::Class::new(16, health::Thinking::Disabled, false),
+            )
+            .unwrap()
+            .success(None);
+            assert_eq!(m.snapshot(&d(21)).unwrap().state, health::State::Ready);
+            let c = controller(
+                &f,
+                a.clone(),
+                m.clone(),
+                &bounded(body, endpoint),
+                streaming,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert!(
+                matches!(c.run().await, Err(probes::ProbeError::Execution(Error::Upstream(e))) if e.execution == Execution::Rejected)
+            );
+            assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+            probe_counts(&a, 0);
+            assert!(a.probe_for_group(&d(10)).unwrap().is_none());
+            assert_eq!(m.snapshot(&d(20)).unwrap().state, health::State::Busy);
+            assert_eq!(m.snapshot(&d(21)).unwrap().state, health::State::Busy);
+            assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 0);
+            let budget = a.probe_budget(&d(10)).unwrap().unwrap();
+            assert_eq!(budget.used_attempts, 1);
+            assert_eq!(budget.allocated_cost_microusd, 10);
+            assert!(budget.last_completed.is_some());
+            // A refused probe is completed, but never an automatic Ready/retry.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            c.run().await.unwrap();
+            assert_eq!(b.calls.load(Ordering::SeqCst), 2);
+            probe_counts(&a, 0);
+            assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 1);
+            assert!(!m.snapshot(&d(20)).unwrap().meets_native_floor(5));
+            assert_eq!(a.probe_budget(&d(10)).unwrap().unwrap().used_attempts, 2);
+            assert!(f
+                .journal
+                .recovery_page(None, 64)
+                .unwrap()
+                .records
+                .is_empty());
+        }
+    }
+}
+
+#[tokio::test]
+async fn refusal_profile_is_explicit_and_cannot_clear_ambiguous_or_batched_probe_work() {
+    let mut partial = vllm_refusal(false);
+    partial["id"] = json!("already-started");
+    for (profile, endpoint, body, reply, content_type) in [
+        (
+            "open_ai",
+            ProxyEndpoint::Chat,
+            serde_json::from_slice(&chat()).unwrap(),
+            vllm_refusal(false),
+            "application/json",
+        ),
+        (
+            "vllm_admission_v1",
+            ProxyEndpoint::Completions,
+            json!({"model":"public-model","prompt":["a","b"]}),
+            vllm_refusal(false),
+            "application/json",
+        ),
+        (
+            "vllm_admission_v1",
+            ProxyEndpoint::Chat,
+            json!({"model":"public-model","messages":[{"role":"user","content":"hi"}],"n":2}),
+            vllm_refusal(false),
+            "application/json",
+        ),
+        (
+            "vllm_admission_v1",
+            ProxyEndpoint::Chat,
+            serde_json::from_slice(&chat()).unwrap(),
+            partial,
+            "application/json",
+        ),
+        (
+            "vllm_admission_v1",
+            ProxyEndpoint::Chat,
+            serde_json::from_slice(&chat()).unwrap(),
+            vllm_refusal(false),
+            "text/html",
+        ),
+    ] {
+        let b = backend_raw(
+            503,
+            serde_json::to_vec(&reply).unwrap(),
+            content_type,
+            Duration::ZERO,
+        )
+        .await;
+        let f = Fixture::with_profile(&b.base, endpoint, 128 * 1024 * 1024, profile);
+        let (a, m) = setup(&f);
+        let invalid_batch = (endpoint == ProxyEndpoint::Completions && body["prompt"].is_array())
+            || body["n"].as_u64() == Some(2);
+        let c = controller(
+            &f,
+            a.clone(),
+            m,
+            &bounded(body, endpoint),
+            false,
+            Duration::from_secs(5),
+        );
+        if invalid_batch {
+            assert!(
+                matches!(c, Err(probes::ProbeError::Execution(Error::Endpoint(mayhem_proxy::endpoint::Error::Request(e)))) if e.execution == Execution::NotDispatched)
+            );
+            probe_counts(&a, 0);
+            assert_eq!(b.calls.load(Ordering::SeqCst), 0);
+            continue;
+        }
+        let c = c.unwrap();
+        assert!(
+            matches!(c.run().await, Err(probes::ProbeError::Execution(Error::Upstream(e))) if e.execution == Execution::Unknown)
+        );
+        probe_counts(&a, 1);
+        assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+        assert!(a
+            .probe_budget(&d(10))
+            .unwrap()
+            .unwrap()
+            .last_completed
+            .is_none());
+    }
+}
+
+#[tokio::test]
+async fn upstream_refusal_observation_does_not_mint_customer_waivers_or_resubmit_paid_work() {
+    let b = backend(503, vllm_refusal(false), Duration::ZERO).await;
+    let f = Fixture::with_profile(
+        &b.base,
+        ProxyEndpoint::Chat,
+        128 * 1024 * 1024,
+        "vllm_admission_v1",
+    );
+    for (i, rail) in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap]
+        .into_iter()
+        .enumerate()
+    {
+        let r = f.prepare(800 + i as u64, &chat(), rail);
+        assert!(
+            matches!(f.executor.execute_json(&r.invocation, &chat(), &Cancellation::default()).await,
+            Err(Error::Upstream(e)) if e.execution == Execution::Rejected)
+        );
+        let saved = f.journal.recover(&r.invocation, r.attempt).unwrap();
+        assert_eq!(saved.record.phase, Phase::Dispatched);
+        assert_eq!(
+            saved.record.last_failure.unwrap().execution,
+            Execution::Rejected
+        );
+        assert!(saved.record.resolution.is_none() && saved.result.is_none());
+        assert!(f
+            .journal
+            .waiver(&r.invocation, r.attempt)
+            .unwrap()
+            .is_none());
+        assert!(f
+            .executor
+            .execute_json(&r.invocation, &chat(), &Cancellation::default())
+            .await
+            .is_err());
+    }
+    assert_eq!(b.calls.load(Ordering::SeqCst), 3);
+}
+
 #[tokio::test]
 async fn real_json_probes_verify_all_endpoints_without_customer_finance_or_invented_speed() {
     for (endpoint, body, response) in [
@@ -398,4 +630,33 @@ async fn concurrent_demand_coalesces_to_one_operator_probe_and_missing_budget_ne
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     assert_eq!(a.probe_budget(&d(10)).unwrap().unwrap().used_attempts, 1);
     assert!(controller(&f, a, m, &chat(), false, Duration::from_secs(5)).is_err());
+}
+
+#[tokio::test]
+async fn vllm_error_inside_a_started_stream_is_not_http_admission_evidence() {
+    let bytes = sse(&[vllm_refusal(false)], true);
+    let b = backend_raw(200, bytes, "text/event-stream", Duration::ZERO).await;
+    let f = Fixture::with_profile(
+        &b.base,
+        ProxyEndpoint::Chat,
+        128 * 1024 * 1024,
+        "vllm_admission_v1",
+    );
+    let (a, m) = setup(&f);
+    let mut body: Value = serde_json::from_slice(&chat()).unwrap();
+    body["stream"] = json!(true);
+    let c = controller(
+        &f,
+        a.clone(),
+        m,
+        &bounded(body, ProxyEndpoint::Chat),
+        true,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(
+        matches!(c.run().await, Err(probes::ProbeError::Execution(Error::Decoder(mayhem_proxy::worker::Error::Upstream(e)))) if e.execution == Execution::Unknown)
+    );
+    probe_counts(&a, 1);
+    assert_eq!(b.calls.load(Ordering::SeqCst), 1);
 }

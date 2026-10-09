@@ -54,6 +54,9 @@ pub enum Stage {
 #[serde(rename_all = "snake_case")]
 pub enum Execution {
     NotDispatched,
+    /// Sent, but rejected before generation under an explicitly selected and
+    /// verified upstream contract. This is NOT a financial closure or retry permit.
+    Rejected,
     Unknown,
 }
 
@@ -79,6 +82,18 @@ pub struct Failure {
 }
 
 impl Failure {
+    pub(crate) fn verified_rejection(&self) -> bool {
+        self.execution == Execution::Rejected
+            && self.stage == Stage::ResponseHeaders
+            && self.code == Code::UpstreamBusy
+            && self.scope == Scope::Connection
+            && self.upstream_status == Some(503)
+            && matches!(
+                self.upstream_code,
+                Some("vllm_queue_overflow" | "vllm_prefill_backlog")
+            )
+            && self.parameter.is_none()
+    }
     pub fn new(code: Code, scope: Scope, stage: Stage, execution: Execution) -> Self {
         Self {
             code,
@@ -252,6 +267,8 @@ pub fn openai_error(
 
 pub(crate) fn safe_upstream_code(value: &str) -> Option<&'static str> {
     match Some(value) {
+        Some("vllm_queue_overflow") => Some("vllm_queue_overflow"),
+        Some("vllm_prefill_backlog") => Some("vllm_prefill_backlog"),
         Some("context_length_exceeded") => Some("context_length_exceeded"),
         Some("unsupported_parameter") => Some("unsupported_parameter"),
         Some("invalid_request_error") => Some("invalid_request_error"),

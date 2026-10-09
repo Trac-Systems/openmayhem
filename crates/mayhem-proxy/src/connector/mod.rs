@@ -6,6 +6,7 @@ pub mod config;
 pub mod failure;
 pub mod framing;
 pub mod http;
+mod refusal;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SetupError {
