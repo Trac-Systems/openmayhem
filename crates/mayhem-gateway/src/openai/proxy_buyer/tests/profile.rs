@@ -226,6 +226,7 @@ async fn fixture(registry: &Registry) -> Fixture {
 
 #[tokio::test]
 async fn published_registry_preparation_estimate_execution_and_original_replay_are_bound() {
+    let _case = estimation::ESTIMATE_CASE.lock().await;
     let registry = Registry::start().await;
     let mut f = fixture(&registry).await;
     let original = body(&f);
@@ -329,6 +330,7 @@ async fn published_registry_preparation_estimate_execution_and_original_replay_a
 
 #[tokio::test]
 async fn preparation_and_new_work_reject_unbound_conflicting_unknown_or_unsupported_controls() {
+    let _case = estimation::ESTIMATE_CASE.lock().await;
     let registry = Registry::start().await;
     let mut f = fixture(&registry).await;
     let original = body(&f);

@@ -1,3 +1,7 @@
+// These acceptance cases share the production process-wide estimate semaphore.
+// Serialize cases, not requests: the saturation case retains its concurrent load.
+pub(super) static ESTIMATE_CASE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 use super::*;
 
 pub(super) async fn estimate(
@@ -85,6 +89,7 @@ fn validate_hash(value: &Value) {
 
 #[tokio::test]
 async fn estimates_match_prepared_purchases_for_all_four_families_without_admission() {
+    let _case = ESTIMATE_CASE.lock().await;
     for endpoint in [
         ProxyEndpoint::Chat,
         ProxyEndpoint::Completions,
@@ -145,6 +150,7 @@ async fn estimates_match_prepared_purchases_for_all_four_families_without_admiss
 
 #[tokio::test]
 async fn estimate_fetches_custom_contract_and_rejects_its_invalid_request() {
+    let _case = ESTIMATE_CASE.lock().await;
     let mut contract = mayhem_proto::endpoint_family_contract_template(
         mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
     )
@@ -205,6 +211,7 @@ async fn estimate_fetches_custom_contract_and_rejects_its_invalid_request() {
 
 #[tokio::test]
 async fn estimate_requires_auth_explicit_policy_prices_and_enabled_buyer() {
+    let _case = ESTIMATE_CASE.lock().await;
     let mut f = Fixture::start().await;
     assert_eq!(
         estimate(&f, f.body(), "wrong-key").await.0,
@@ -260,6 +267,7 @@ async fn estimate_requires_auth_explicit_policy_prices_and_enabled_buyer() {
 
 #[tokio::test]
 async fn required_profile_evidence_is_unavailable_without_admission_for_all_four_families() {
+    let _case = ESTIMATE_CASE.lock().await;
     for endpoint in [
         ProxyEndpoint::Chat,
         ProxyEndpoint::Completions,
@@ -313,6 +321,7 @@ async fn required_profile_evidence_is_unavailable_without_admission_for_all_four
 
 #[tokio::test]
 async fn concurrent_estimates_are_bounded_and_never_purchase() {
+    let _case = ESTIMATE_CASE.lock().await;
     let mut f = Fixture::start().await;
     let responses = futures_util::future::join_all(
         (0..16).map(|_| estimate(&f, f.body(), "owner-fixture-key")),
@@ -335,6 +344,7 @@ async fn concurrent_estimates_are_bounded_and_never_purchase() {
 
 #[tokio::test]
 async fn unavailable_capacity_is_reported_without_inference_or_invented_lease() {
+    let _case = ESTIMATE_CASE.lock().await;
     let mut f = Fixture::start().await;
     f.control.control.select_markets(Vec::new()).unwrap();
     let (status, _, value) = estimate(&f, f.body(), "owner-fixture-key").await;
@@ -347,6 +357,7 @@ async fn unavailable_capacity_is_reported_without_inference_or_invented_lease() 
 
 #[tokio::test]
 async fn descriptors_reject_substituted_contract_recipe_and_unavailable_peer() {
+    let _case = ESTIMATE_CASE.lock().await;
     let mut f = Fixture::start().await;
     let terms = &f.harness.template.terms;
     for (contract, recipe) in [
