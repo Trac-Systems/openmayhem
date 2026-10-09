@@ -2,6 +2,8 @@
 //! derived indexes and bounded keyset walks avoid whole-catalog/history scans.
 //! Published rates are not execution quotes, and registration is not capacity.
 
+pub mod candidates;
+
 use std::ops::Bound::{Excluded, Included};
 
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};

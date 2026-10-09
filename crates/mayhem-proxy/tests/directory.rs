@@ -525,3 +525,6 @@ fn byte_bounded_pages_and_empty_terminal_backtracking_preserve_every_offer() {
         .unwrap();
     assert_eq!(back.entries[0].id, ids(&all).pop().unwrap());
 }
+
+#[path = "directory/candidates.rs"]
+mod candidates;
