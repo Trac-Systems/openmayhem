@@ -23,7 +23,7 @@ invoice.invoice_commitment=await invoiceCommitment(invoiceId,invoice);
 const reference={...baseFixture.verify_work.payment_reference,transaction_hash:'0x'+h()};
 const references=[reference,{...reference,log_index:reference.log_index+1}];
 const observedAt=now-1000,paidAt=Math.floor((now-2000)/1000)*1000,blockHash='0x'+h();
-const amounts=['400000000000000000','700000000000000000'];
+let amounts=['400000000000000000','700000000000000000'];
 const peer={...f.peer,wallet:{...f.peer.wallet,publicKey:f.issuer.publicKey,sign:bytes=>f.issuer.wallet.sign(bytes).toString('hex')},base:{writable:false,view:f.base.view}};
 const client=new MayhemFeature(peer,{});cleanup.push(()=>client.stop());
 let policyReads=0,tapReads=0;
@@ -58,6 +58,13 @@ const coreOrigin=`http://127.0.0.1:${server.address().port}`;
 const nativeBalance=(await f.base.view.get('bal/existing-customer')).value,nativePayout=(await f.base.view.get('payout/epoch/542')).value;
 let configured=null,lastCompletion=null;
 async function run(command){
+ if(command.action==='configure_many_topups'){
+  if(policyReads!==0||tapReads!==0||f.calls!==0)throw new Error('Fixture already used');
+  // 37 partial payments fund one original fee; the 38th is later excess.
+  references.splice(0,references.length,...Array.from({length:38},(_,i)=>({...reference,log_index:100-i})));
+  amounts=Array.from({length:38},(_,i)=>i<36?'10000000000000000':i===36?'640000000000000000':'100000000000000000');
+  return {payment_references:references};
+ }
  if(command.action==='advance_epoch'){
   const previous=(await f.base.view.get('epoch/apply/state')).value;
   const current=previous.updated_epoch??previous.epoch;
@@ -80,7 +87,8 @@ async function run(command){
   const phase=command.phase;let drop=command.drop_ack===true;lastCompletion=null;
   const fetcher=async(url,options)=>{
    const response=await fetch(url,options);
-   if(url===`${configured.siteOrigin}/internal/proxy-admission-worker/${phase==='verify'?'evidence':'permit'}`&&response.ok){
+   if((url===`${configured.siteOrigin}/internal/proxy-admission-worker/${phase==='verify'?'evidence':'permit'}`
+    ||phase==='issue'&&url===`${configured.siteOrigin}/internal/proxy-admission-worker/evidence-progress`)&&response.ok){
     lastCompletion=JSON.parse(options.body);
     if(drop){drop=false;await response.arrayBuffer();throw new Error('Synthetic lost completion ACK after real commit');}
    }

@@ -71,7 +71,7 @@ export function base(work) {
 export async function validateWork(v, phase) {
   need(Buffer.byteLength(JSON.stringify(v)) <= MAX_WORK_BYTES, 'work exceeds bound');
   shape(v, ['schema_version','purpose','phase','invoice_id','invoice_revision','lease_token','lease_expires_at_ms',
-    'invoice','payment_reference','reference_assigned_at_ms','permit','evidence',...(v.previous_permit===undefined?[]:['previous_permit'])]);
+    'invoice','payment_reference','reference_assigned_at_ms','permit','evidence',...(v.previous_permit===undefined?[]:['previous_permit']),...(v.evidence?.format==='paged-v1'?['evidence_progress']:[])]);
   need(v.schema_version === 1 && v.purpose === PURPOSE && v.phase === phase && ['verify','issue'].includes(phase)
     && opaque(v.invoice_id) && uint(v.invoice_revision, 1) && hex(v.lease_token) && uint(v.lease_expires_at_ms, 1), 'invalid work identity or role');
   validateInvoice(v.invoice);
@@ -132,6 +132,7 @@ export async function evidenceSetCommitment(work, receipts) {
     receipts:receipts.map(({payment_reference,receipt})=>({payment_reference,receipt})) });
 }
 export async function validateEvidenceSet(v, work) {
+  if(v?.format==='paged-v1') return validatePagedEvidence(v,work);
   shape(v, ['canonical_epoch','evidence_commitment','receipts']);
   need(uint(v.canonical_epoch,1) && hex(v.evidence_commitment) && Array.isArray(v.receipts)
     && v.receipts.length>0 && v.receipts.length<=32, 'invalid inline evidence set; larger invoices require paged transport');
@@ -145,4 +146,21 @@ export async function validateEvidenceSet(v, work) {
   }
   need(await evidenceSetCommitment(work,v.receipts)===v.evidence_commitment,'evidence set commitment differs');
   return total;
+}
+
+export const EVIDENCE_PROGRESS_DOMAIN = 'mayhem/proxy/admission-evidence-progress/v1';
+export const EVIDENCE_PAGE_SIZE = 4;
+export async function evidenceSeed(work) {
+  return digest('mayhem/proxy/admission-evidence-chain-seed/v1',{invoice_commitment:work.invoice.invoice_commitment});
+}
+export async function evidenceAppend(work,previous,sequence,member) {
+  return digest('mayhem/proxy/admission-evidence-chain-member/v1',{invoice_commitment:work.invoice.invoice_commitment,previous,sequence,member});
+}
+export async function validatePagedEvidence(v,work) {
+  shape(v,['format','canonical_epoch','evidence_commitment','receipt_count','total_amount','root']);
+  need(v.format==='paged-v1'&&uint(v.canonical_epoch,1)&&hex(v.evidence_commitment)&&hex(v.root)
+    &&uint(v.receipt_count,1)&&v.receipt_count<=0x7fffffff&&amount(v.total_amount),'invalid paged evidence');
+  need(await digest('mayhem/proxy/admission-evidence-pages/v1',{invoice_commitment:work.invoice.invoice_commitment,
+    root:v.root,receipt_count:v.receipt_count,total_amount:v.total_amount})===v.evidence_commitment,'paged evidence commitment differs');
+  return BigInt(v.total_amount);
 }

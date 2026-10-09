@@ -6,9 +6,9 @@ import { randomBytes, createPrivateKey, createPublicKey, sign, verify } from 'no
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
-import { proxyAdmissionSigningBytes, verifyProxyAdmissionPermit } from '../contract/proxy-protocol.js';
+import { proxyAdmissionSigningBytes, proxyCanonicalSigningBytes, verifyProxyAdmissionPermit } from '../contract/proxy-protocol.js';
 import { validateProxySnapshotProof } from '../features/mayhem/proxy-canonical-view.js';
-import { PURPOSE, base, need, shape, hex, uint, validateNetwork, validateWork, validateEvidence, validateEvidenceSet, evidenceCommitment } from './proxy-admission-wire.mjs';
+import { PURPOSE, base, need, shape, hex, uint, validateNetwork, validateWork, validateEvidence, validateEvidenceSet, evidenceCommitment, validateReceipt, evidenceSeed, evidenceAppend, EVIDENCE_PROGRESS_DOMAIN, EVIDENCE_PAGE_SIZE, amount } from './proxy-admission-wire.mjs';
 import { RetryWork, ReviewWork, verifyTapTransferReceipt, parseHexInt, tnkVerificationWindow } from './retail-crypto-verification.mjs';
 
 export function fixedOrigin(value, { allowLoopbackHttp = false } = {}) {
@@ -64,8 +64,8 @@ export class AdmissionApi {
     this.credential=credential; this.phase=phase; this.fetcher=fetcher;
   }
   async post(action, body, signal) {
-    need(['pull','renew','retry','review','evidence','permit','reconcile'].includes(action), 'unsupported worker action');
-    need(body.phase === this.phase && !(this.phase==='verify'&&['permit','reconcile'].includes(action)) && !(this.phase==='issue'&&action==='evidence'), 'worker role mismatch');
+    need(['pull','renew','retry','review','evidence','permit','reconcile','evidence-page','evidence-progress'].includes(action), 'unsupported worker action');
+    need(body.phase === this.phase && !(this.phase==='verify'&&['permit','reconcile','evidence-page','evidence-progress'].includes(action)) && !(this.phase==='issue'&&action==='evidence'), 'worker role mismatch');
     return await boundedJson(`${this.origin}/internal/proxy-admission-worker/${action}`, {body, signal,
       headers:{authorization:`Bearer ${this.credential}`}, fetcher:this.fetcher});
   }
@@ -93,6 +93,11 @@ export class AdmissionWorker {
     need(o.rails.includes(i.rail) && work.lease_expires_at_ms > o.now() && Object.keys(o.network).every(k=>i.network[k]===o.network[k])
       && i.fee_policy_hash===o.feePolicyHash && i.issuer_pubkey===o.issuerPubkey, 'invoice differs from configured custody/network');
     if(o.phase==='verify' && (work.reference_assigned_at_ms>i.quote_expires_at_ms || work.reference_assigned_at_ms>o.now())) throw new ReviewWork('late_reference_pending_policy');
+    if(o.phase==='issue'&&work.evidence.format==='paged-v1') {
+      const progress=await this.checkedEvidenceProgress(work);
+      if(progress.count<work.evidence.receipt_count) return this.completeEvidencePage(work,progress,signal);
+      need(progress.root===work.evidence.root&&progress.total===work.evidence.total_amount,'incomplete evidence progress');
+    }
     const renewal=o.phase==='issue'&&work.permit.issuance_revision>1;
     if(renewal&&work.previous_permit===undefined) throw new ReviewWork('reissue_requires_original_canonical_reconciliation');
     const policy=await this.policy(signal,renewal?work.permit:null);
@@ -106,7 +111,7 @@ export class AdmissionWorker {
     }
     const total=await validateEvidenceSet(work.evidence,work);
     if(total<BigInt(i.amount_base_units)) throw new ReviewWork('verified_payment_short');
-    for(const item of work.evidence.receipts) {
+    for(const item of work.evidence.receipts??[]) {
       if(item.reference_assigned_at_ms>i.quote_expires_at_ms || item.reference_assigned_at_ms>o.now() || (item.receipt.paid_at_ms!==undefined && (item.receipt.paid_at_ms>i.quote_expires_at_ms || item.receipt.paid_at_ms>o.now()))) throw new ReviewWork('late_payment_pending_policy');
     }
     const p=work.permit;
@@ -134,6 +139,48 @@ export class AdmissionWorker {
       max_permit_epochs:policy.max_permit_epochs,active_issuers:policy.active_issuers},
       (sig,bytes,key)=>verify(null,bytes,createPublicKey({key:Buffer.concat([Buffer.from('302a300506032b6570032100','hex'),Buffer.from(key,'hex')]),format:'der',type:'spki'}),Buffer.from(sig,'hex')));
     return {action:'permit',body:{...base(work),...envelope}};
+  }
+  async checkedEvidenceProgress(work) {
+    const v=work.evidence_progress;
+    if(v===null) return {invoice_id:work.invoice_id,invoice_commitment:work.invoice.invoice_commitment,
+      evidence_commitment:work.evidence.evidence_commitment,count:0,root:await evidenceSeed(work),total:'0',last_key:''};
+    shape(v,['checkpoint','signature']);
+    const c=v.checkpoint;shape(c,['invoice_id','invoice_commitment','evidence_commitment','count','root','total','last_key']);
+    need(c.invoice_id===work.invoice_id&&c.invoice_commitment===work.invoice.invoice_commitment
+      &&c.evidence_commitment===work.evidence.evidence_commitment&&uint(c.count,1)&&c.count<=work.evidence.receipt_count
+      &&hex(c.root)&&amount(c.total)&&typeof c.last_key==='string'&&c.last_key.length>0&&c.last_key.length<=900
+      &&typeof v.signature==='string'&&/^[0-9a-f]{128}$/.test(v.signature),'invalid evidence progress');
+    const publicKey=createPublicKey({key:Buffer.concat([Buffer.from('302a300506032b6570032100','hex'),Buffer.from(work.invoice.issuer_pubkey,'hex')]),format:'der',type:'spki'});
+    need(verify(null,proxyCanonicalSigningBytes(EVIDENCE_PROGRESS_DOMAIN,c),publicKey,Buffer.from(v.signature,'hex')),'unsigned evidence progress');
+    return c;
+  }
+  async completeEvidencePage(work,progress,signal) {
+    const o=this.options,i=work.invoice;
+    const page=await o.api.post('evidence-page',base(work),signal);
+    shape(page,['schema_version','purpose','phase','evidence_commitment','from_count','members']);
+    need(page.schema_version===1&&page.purpose===PURPOSE&&page.phase==='issue'
+      &&page.evidence_commitment===work.evidence.evidence_commitment&&page.from_count===progress.count
+      &&Array.isArray(page.members)&&page.members.length===Math.min(EVIDENCE_PAGE_SIZE,work.evidence.receipt_count-progress.count),'invalid evidence page');
+    const next={...progress};let total=BigInt(next.total);
+    for(const entry of page.members) {
+      shape(entry,['sequence','member']);const m=entry.member;shape(m,['payment_reference','reference_assigned_at_ms','receipt']);
+      need(entry.sequence===next.count+1,'nonsequential evidence page');
+      const r=validateReceipt(m.receipt,i,m.payment_reference);
+      need(r.physical_key>next.last_key,'duplicate or unsorted evidence page');
+      need(uint(m.reference_assigned_at_ms,i.created_at_ms),'invalid reference observation');
+      if(m.reference_assigned_at_ms>i.quote_expires_at_ms||m.reference_assigned_at_ms>o.now()
+        ||(r.paid_at_ms!==undefined&&(r.paid_at_ms>i.quote_expires_at_ms||r.paid_at_ms>o.now()))) throw new ReviewWork('late_payment_pending_policy');
+      next.root=await evidenceAppend(work,next.root,++next.count,m);next.last_key=r.physical_key;
+      total+=BigInt(r.amount_base_units);need(total<(1n<<128n),'evidence total overflow');
+    }
+    next.total=String(total);
+    if(next.count===work.evidence.receipt_count) need(next.root===work.evidence.root&&next.total===work.evidence.total_amount,'paged evidence differs from retained manifest');
+    need(!signal.aborted&&work.lease_expires_at_ms>o.now(),'lease expired before evidence progress');
+    const signed={checkpoint:next,signature:await o.signPermit(proxyCanonicalSigningBytes(EVIDENCE_PROGRESS_DOMAIN,next))};
+    // The checkpoint certifies immutable evidence only, not a permit or payment.
+    // It remains useful across renewal; the final permit rechecks canonical state.
+    await this.checkedEvidenceProgress({...work,evidence_progress:signed});
+    return {action:'evidence-progress',body:{...base(work),progress:signed}};
   }
   async runOnce() {
     need(!this.active,'worker is busy'); this.active=true;
