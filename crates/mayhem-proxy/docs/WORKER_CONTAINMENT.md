@@ -141,8 +141,13 @@ enforcement and actual decoder acceptance remain release-blocking. Retained v2
 tokenizer initialization additionally verifies its exact 768 MiB Job limit and
 all LPAC controls; legacy one-shot v1 remains refused on Windows. The separate
 Windows tokenizer tests and native enforcement are not yet proved. Protected
-provider setup storage remains Unix-only. Linux/x86_64 native enforcement also
-remains a separate acceptance requirement.
+provider setup storage now has protected NTFS integration; native end-to-end
+acceptance remains separate. Native Linux/x86_64 acceptance passes 22 cases on
+kernel 7.0.0 with the actual current worker: filter enforcement/refusal, streaming
+decoder cancellation/capacity/backpressure, and bounded pinned tokenization.
+The isolated native fixture used the original locked dependency versions and
+checksums, no GPU, no network, and no production service/store access. Its
+ignored filter-child entry is executed by the parent enforcement case.
 
 Primary references: Microsoft's [AppContainer isolation](https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-isolation),
 [LPAC setup](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer),

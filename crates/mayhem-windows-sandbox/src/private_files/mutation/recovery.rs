@@ -14,25 +14,50 @@ pub(super) fn reopen(
 ) -> Outcome<File> {
     let before = information(original, directory).map_err(|_| MutationError::Protection)?;
     acl::validate(original, owner, true).map_err(|_| MutationError::Protection)?;
-    let handle = unsafe {
-        ReOpenFile(
-            original.as_raw_handle(),
+    // An empty relative name reopens the retained object itself, not a path.
+    // Use explicit NT directory/file options: Win32 ReOpenFile rejected these
+    // directory handles with ACCESS_DENIED on native Windows despite the
+    // backup-semantics flag. The surrounding identity/ACL checks still apply.
+    let mut empty = [0u16];
+    let mut name = UNICODE_STRING {
+        Length: 0,
+        MaximumLength: 2,
+        Buffer: empty.as_mut_ptr(),
+    };
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: original.as_raw_handle(),
+        ObjectName: &mut name,
+        Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
+        SecurityDescriptor: null_mut(),
+        SecurityQualityOfService: null_mut(),
+    };
+    let mut io: IO_STATUS_BLOCK = unsafe { zeroed() };
+    let mut handle = null_mut();
+    let status = unsafe {
+        NtOpenFile(
+            &mut handle,
             access | READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE_ACCESS,
+            &attributes,
+            &mut io,
             sharing,
-            FILE_FLAG_OPEN_REPARSE_POINT
+            nt::FILE_OPEN_REPARSE_POINT
+                | nt::FILE_SYNCHRONOUS_IO_NONALERT
                 | if directory {
-                    FILE_FLAG_BACKUP_SEMANTICS
+                    nt::FILE_DIRECTORY_FILE
                 } else {
-                    0
+                    nt::FILE_NON_DIRECTORY_FILE
                 }
                 | if write_through {
-                    FILE_FLAG_WRITE_THROUGH
+                    nt::FILE_WRITE_THROUGH
                 } else {
                     0
                 },
         )
     };
-    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+    if status != 0 || handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        #[cfg(test)]
+        eprintln!("protected reopen refused: directory={directory}, access={access:x}, sharing={sharing:x}, ntstatus={:x}", status as u32);
         return Err(MutationError::Protection);
     }
     let file = unsafe { File::from_raw_handle(handle) };

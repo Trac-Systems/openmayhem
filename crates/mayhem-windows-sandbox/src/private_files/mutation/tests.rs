@@ -247,12 +247,13 @@ fn ntfs_failed_targets_do_not_authorize_replacement_or_unsafe_existing_temps() {
         unsafe { GetSecurityDescriptorDacl(descriptor, &mut present, &mut dacl, &mut defaulted) },
         0
     );
-    // Reopen with explicit WRITE_DAC; owner may alter its own fixture ACL.
+    // Give the fixture the read/modify security rights used by SetSecurityInfo.
+    // This test deliberately makes its own file public, never production data.
     drop(target);
     let handle = unsafe {
         CreateFileW(
             wide(f.0.join("draft.json").to_str().unwrap()).as_ptr(),
-            WRITE_DAC,
+            READ_CONTROL | WRITE_DAC,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             null(),
             OPEN_EXISTING,

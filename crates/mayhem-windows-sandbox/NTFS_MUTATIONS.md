@@ -4,8 +4,9 @@ The API now backs Windows setup JSON storage and first-install bundle
 publication. The separate exclusive database backend is wired into proxy redb
 stores; it retains the database handle for the backend lifetime. This does not
 establish complete Windows onboarding, Run or mayhemd persistence acceptance.
-Native Windows enforcement and crash durability remain unverified and
-release-blocking. Cross compilation is not native proof.
+The storage fixtures pass on native Windows 11 x86_64 (build 26300). Complete
+provider acceptance and actual power-loss durability remain separate requirements.
+Cross compilation alone is not native proof.
 
 `NtfsDirectory::open_existing` retains the existing protected traversal and ACL
 rules, then requires the opened local volume to report NTFS with persistent
@@ -90,8 +91,11 @@ root; it never merges trees, retries the rename, chooses another destination,
 deletes an original, or promotes an abandoned staging tree.
 
 `prepare_for_inspection()` retains the same root object with read-compatible
-access so existing protected loaders can validate a generated bundle. It still
-denies root deletion during inspection. Before publication, the originally
+access so existing protected loaders can validate a generated bundle. It first
+releases the creation handle's delete access through an identity-checked interim
+handle, then denies deletion before reporting successful inspection preparation.
+This respects Windows' sharing rules; it never closes the last object reference
+and reopens a pathname. Before publication, the originally
 declared directories are reopened relative to that root, checked against their
 original identities, and fully flushed bottom-up. This covers the contained
 tokenizer's temporary worker image cleanup without scanning arbitrary paths.
@@ -124,9 +128,13 @@ documents immediate failure on contention and OS release after process exit;
 release can be delayed. The fixed lock prevents overlapping protocol clients,
 not malicious writes by the already-trusted current user/SYSTEM/Administrators.
 
-[ReOpenFile](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-reopenfile)
-reopens the retained object with independently specified access, sharing and
-flags. Every such transition rechecks private ACL, regular/directory identity
+[NtOpenFile](https://learn.microsoft.com/en-us/windows/win32/api/winternl/nf-winternl-ntopenfile)
+reopens the retained object using an empty relative name and explicit directory/
+file options. This handle-relative pattern is also used by
+[Microsoft WSL's ReopenFile helper](https://github.com/microsoft/WSL/blob/master/src/windows/common/filesystem.cpp).
+Native execution showed the Win32 `ReOpenFile` path returning access denied for
+the retained directories. No caller-path or ordinary-I/O fallback is used.
+Every transition rechecks private ACL, regular/directory identity
 and, when required, write-through mode. Exact temporary deletion uses
 [FILE_DISPOSITION_INFORMATION](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_file_disposition_information);
 after setting disposition, only closing that handle is attempted.
@@ -148,7 +156,7 @@ publication and reopening, complete-plan rejection before creation, preserved
 empty/nonempty/file destination conflicts, the same three fault boundaries,
 and an actual no-replace rename collision introduced after the precheck.
 They do not inject write or staging-directory flush failures. These native
-fixtures compile but have not run on Windows.
+fixtures pass on native Windows.
 
 Four integration-adaptation fixtures cover owned-lock lifetime, fixed-slot
 cleanup with original/absence, alias/nonregular/uncertain refusal, read-only
@@ -164,6 +172,9 @@ Run on an isolated native Windows NTFS machine:
 cargo test -p mayhem-windows-sandbox private_files::
 ```
 
-These source fixtures have not been executed on Windows. Native acceptance
-must also distinguish process-failure recovery from actual power-loss testing;
-the latter is not established by a process kill or an injected error.
+All 25 storage cases pass on native Windows 11 x86_64 (build 26300), including
+seven protected-read cases, three database cases, and the mutation/recovery
+cases above. The ignored lock-child helper is invoked by its parent test.
+This proves process-failure recovery and the exercised flush/error behavior,
+not actual power-loss durability; a process kill or injected error cannot prove
+that the physical storage stack honors flushes during power loss.

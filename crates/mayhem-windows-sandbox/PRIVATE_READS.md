@@ -56,8 +56,9 @@ reads, public ACLs, unsafe ancestor grants, writable existing handles, hard
 links, junctions and path replacement while handles are pinned.
 
 This establishes the protected-read boundary on that host, not complete Windows
-provider acceptance. The wider storage suite has five outstanding mutation/
-recovery failures; full proxy setup and contained worker execution remain open.
+provider acceptance. The wider storage suite passes 25 native cases, including
+the corrected handle-reopen and staged-inspection transitions. Full proxy setup
+and contained worker execution remain separate acceptance requirements.
 On an isolated native Windows test machine, the focused command is:
 
 ```powershell

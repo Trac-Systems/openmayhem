@@ -160,6 +160,20 @@ impl PendingDirectory<'_, '_> {
             return Err(MutationError::CommitUnknown);
         }
         let owner = &self.guard.directory.pinned.owner;
+        if !self.readable {
+            // The creation handle has DELETE access. A read-compatible handle
+            // must initially share that access, then replace it before another
+            // reopen can deny deletion. Each step retains the same object.
+            self.root = recovery::reopen(
+                &self.root,
+                owner,
+                true,
+                FILE_TRAVERSE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                false,
+            )?;
+            self.readable = true;
+        }
         self.root = recovery::reopen(
             &self.root,
             owner,
@@ -168,7 +182,6 @@ impl PendingDirectory<'_, '_> {
             FILE_SHARE_READ | FILE_SHARE_WRITE,
             false,
         )?;
-        self.readable = true;
         Ok(())
     }
     pub fn identity(&self) -> DirectoryIdentity {
