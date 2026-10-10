@@ -140251,6 +140251,7 @@ State initialization...
                 "mayhem-enclave",
                 "mayhem-paygate",
                 "mayhem-attestation-verifier",
+                "mayhem-proxy-worker",
             ] {
                 let name = format!("{base_name}{}", if windows { ".exe" } else { "" });
                 let path = format!("bin/{name}");
@@ -140393,6 +140394,7 @@ State initialization...
             "mayhem-enclave",
             "mayhem-paygate",
             "mayhem-attestation-verifier",
+            "mayhem-proxy-worker",
         ];
         let mut binaries = Vec::new();
         let mut assets = Vec::new();

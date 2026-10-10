@@ -36,6 +36,10 @@ const REQUIRED_RELEASE_BINARY_BASE_NAMES: &[&str] = &[
     "mayhem-paygate",
     "mayhem-attestation-verifier",
 ];
+// Signed source inventory identifies proxy-capable bundles without imposing a
+// guessed release cutoff on historical native-only installations.
+const PROXY_RUNTIME_ASSET: &str = "share/mayhem/intercom/contract/proxy-protocol.js";
+const PROXY_WORKER_BINARY_BASE_NAME: &str = "mayhem-proxy-worker";
 const ZIP_END_OF_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0605_4b50;
 const ZIP_CENTRAL_DIRECTORY_SIGNATURE: u32 = 0x0201_4b50;
 const ZIP_LOCAL_FILE_HEADER_SIGNATURE: u32 = 0x0403_4b50;
@@ -387,7 +391,8 @@ impl ReleaseBundleManifest {
         {
             bail!("release bundle does not include primary binary {primary_name}");
         }
-        for required in required_release_binary_names(&self.target) {
+        let proxy_runtime = self.assets.iter().any(|asset| asset.path == PROXY_RUNTIME_ASSET);
+        for required in required_release_binary_names(&self.target, proxy_runtime) {
             if !self.binaries.iter().any(|binary| binary.name == required) {
                 bail!("release bundle does not include required sibling binary {required}");
             }
@@ -3484,7 +3489,7 @@ fn primary_binary_name(target: &str) -> &'static str {
     }
 }
 
-fn required_release_binary_names(target: &str) -> Vec<String> {
+fn required_release_binary_names(target: &str, proxy_runtime: bool) -> Vec<String> {
     let extension = if target.contains("windows") {
         ".exe"
     } else {
@@ -3492,6 +3497,8 @@ fn required_release_binary_names(target: &str) -> Vec<String> {
     };
     REQUIRED_RELEASE_BINARY_BASE_NAMES
         .iter()
+        .copied()
+        .chain(proxy_runtime.then_some(PROXY_WORKER_BINARY_BASE_NAME))
         .map(|name| format!("{name}{extension}"))
         .collect()
 }
@@ -3789,6 +3796,7 @@ mod tests {
             "mayhem-attestation-verifier",
             b"new-mayhem-attestation-verifier",
         ),
+        ("mayhem-proxy-worker", b"new-mayhem-proxy-worker"),
     ];
 
     struct TestDir(PathBuf);
@@ -3971,8 +3979,14 @@ mod tests {
         work_root: &Path,
         seed_byte: u8,
     ) -> (PathBuf, TrustedReleaseKey) {
-        let archive_path = work_root.join(format!("release-{seed_byte}.tar.gz"));
-        write_release_tar(release_root, manifest, &archive_path);
+        let windows = manifest.target.contains("windows");
+        let extension = if windows { "zip" } else { "tar.gz" };
+        let archive_path = work_root.join(format!("release-{seed_byte}.{extension}"));
+        if windows {
+            write_release_zip(release_root, manifest, &archive_path);
+        } else {
+            write_release_tar(release_root, manifest, &archive_path);
+        }
         let (signature_bytes, trusted_key) = sign_test_release(manifest, manifest_bytes, seed_byte);
         let stage_root = work_root.join(format!("staged-{seed_byte}"));
         stage_release_archive(
@@ -4089,10 +4103,7 @@ mod tests {
         archive_path: &Path,
     ) {
         let archive_root = format!("mayhem-{}-{}", manifest.version, manifest.target);
-        let source_parent = archive_path
-            .parent()
-            .expect("test ZIP path parent")
-            .join("script-zip-source");
+        let source_parent = archive_path.with_extension("zip-source");
         fs::create_dir(&source_parent).expect("create script ZIP source parent");
         copy_directory_durable(release_root, &source_parent.join(&archive_root))
             .expect("copy script ZIP source");
@@ -4923,6 +4934,66 @@ mod tests {
             .expect_err("tampered payload must fail")
             .to_string()
             .contains("SHA-256 mismatch"));
+    }
+
+    #[test]
+    fn signed_proxy_worker_requirement_preserves_legacy_bundles() {
+        for target in ["aarch64-apple-darwin", "x86_64-pc-windows-msvc"] {
+            let (release, mut manifest, _) = stage_release_for("v0.2.25", target);
+            let name = if target.contains("windows") {
+                "mayhem-proxy-worker.exe"
+            } else {
+                "mayhem-proxy-worker"
+            };
+            let worker_path = format!("bin/{name}");
+            manifest.binaries.retain(|binary| binary.name != name);
+            manifest.assets.retain(|asset| asset.path != worker_path);
+            fs::remove_file(release.path().join(&worker_path)).expect("remove worker");
+            let legacy_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+            fs::write(release.path().join(RELEASE_MANIFEST_PATH), &legacy_bytes).unwrap();
+            write_test_checksums(release.path());
+            let work = TestDir::new("legacy-proxy-worker");
+            let floor_path = work.path().join("release-floor.json");
+            initialize_release_anti_rollback_floor(&floor_path, "0.2.22").unwrap();
+            let (stage, key) = prepare_signed_test_stage(
+                release.path(), &manifest, &legacy_bytes, work.path(), 71,
+            );
+            let legacy = authenticate_test_stage(&stage, &manifest, &floor_path, &key);
+            assert!(!legacy.verified_release().bin_root().join(name).exists());
+
+            // Both signed inventories commit to the exact runtime marker. The
+            // same historical version now needs a worker because it has proxy
+            // code; no release number or mutable runtime setting is inferred.
+            write_file(release.path(), PROXY_RUNTIME_ASSET, b"proxy protocol");
+            let marker = ReleaseBundleAsset {
+                path: PROXY_RUNTIME_ASSET.into(), sha256: sha256(b"proxy protocol"),
+            };
+            manifest.assets.push(marker.clone());
+            manifest.assets.sort_by(|a, b| a.path.cmp(&b.path));
+            manifest.intercom.assets.push(IntercomBundleAsset {
+                path: marker.path, sha256: marker.sha256,
+            });
+            manifest.intercom.assets.sort_by(|a, b| a.path.cmp(&b.path));
+            assert!(manifest.validate()
+                .expect_err("proxy runtime without worker must be rejected")
+                .to_string().contains(&format!("required sibling binary {name}")));
+
+            write_file(release.path(), &worker_path, b"new-mayhem-proxy-worker");
+            let digest = sha256(b"new-mayhem-proxy-worker");
+            manifest.binaries.push(ReleaseBundleBinary {
+                name: name.into(), path: worker_path.clone(), sha256: digest.clone(),
+            });
+            manifest.assets.push(ReleaseBundleAsset { path: worker_path, sha256: digest });
+            manifest.assets.sort_by(|a, b| a.path.cmp(&b.path));
+            let proxy_bytes = serde_json::to_vec_pretty(&manifest).unwrap();
+            fs::write(release.path().join(RELEASE_MANIFEST_PATH), &proxy_bytes).unwrap();
+            write_test_checksums(release.path());
+            let (stage, key) = prepare_signed_test_stage(
+                release.path(), &manifest, &proxy_bytes, work.path(), 72,
+            );
+            let proxy = authenticate_test_stage(&stage, &manifest, &floor_path, &key);
+            assert!(proxy.verified_release().bin_root().join(name).is_file());
+        }
     }
 
     #[test]

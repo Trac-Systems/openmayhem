@@ -21,6 +21,11 @@ const fs = require('node:fs');
 const path = require('node:path');
 const root = process.argv[2];
 const expected = fs.readFileSync(process.argv[3], 'utf8').trim().split('\n');
+const updater = fs.readFileSync(path.join(root, 'crates/mayhem-cli/src/release_bundle.rs'), 'utf8');
+const requiredBlock = updater.match(/const REQUIRED_RELEASE_BINARY_BASE_NAMES: &\[&str\] = &\[([\s\S]*?)\];/)?.[1];
+const required = [...(requiredBlock ?? '').matchAll(/"([a-z-]+)"/g)].map(x => x[1]);
+required.push(updater.match(/const PROXY_WORKER_BINARY_BASE_NAME: &str = "([a-z-]+)";/)?.[1]);
+if (JSON.stringify(required.sort()) !== JSON.stringify([...expected].sort())) throw new Error('signed updater required binary inventory drift');
 const ps = fs.readFileSync(path.join(root, 'install.ps1'), 'utf8');
 const block = ps.match(/^\$Bins = @\(([\s\S]*?)^\)/m)?.[1];
 const actual = [...(block ?? '').matchAll(/"([a-z-]+)"/g)].map(x => x[1]);
@@ -29,6 +34,12 @@ const ci = fs.readFileSync(path.join(root, '.github/workflows/source-build-evide
 const ciBins = ci.match(/bins=\(([^)]+)\)/)?.[1].trim().split(/\s+/);
 if (JSON.stringify(ciBins) !== JSON.stringify(expected)) throw new Error('native-build evidence inventory drift');
 NODE
+
+# The current source package has the authenticated marker used by the updater.
+# Exercise its real tracked allowlist without dependency hydration/downloads.
+copy_tracked_allowlist "$tmp/runtime" "${INTERCOM_SOURCE_ALLOWLIST[@]}"
+[[ -f "$tmp/runtime/intercom/contract/proxy-protocol.js" ]] || fail 'proxy runtime marker not staged'
+cmp "$ROOT_DIR/intercom/contract/proxy-protocol.js" "$tmp/runtime/intercom/contract/proxy-protocol.js"
 
 VERSION=0.2.999
 BUILT_AT=2026-10-10T00:00:00Z
@@ -44,6 +55,8 @@ for TARGET in aarch64-apple-darwin x86_64-apple-darwin x86_64-unknown-linux-gnu 
   stage_release_binaries "$built" "$stage"
   cmp "$built/mayhem-proxy-worker$BIN_EXT" "$stage/bin/mayhem-proxy-worker$BIN_EXT"
   [[ -x "$stage/bin/mayhem-proxy-worker$BIN_EXT" ]] || fail 'worker is not executable'
+  mkdir -p "$stage/share/mayhem/intercom/contract"
+  cp "$tmp/runtime/intercom/contract/proxy-protocol.js" "$stage/share/mayhem/intercom/contract/proxy-protocol.js"
   write_release_manifest "$stage" "$tmp/intercom.json" "$tmp/$TARGET.json"
   node - "$tmp/$TARGET.json" "$stage" "$BIN_EXT" <<'NODE'
 const fs = require('node:fs');
@@ -52,6 +65,9 @@ const manifest = JSON.parse(fs.readFileSync(process.argv[2], 'utf8'));
 const name = `mayhem-proxy-worker${process.argv[4]}`;
 const binary = manifest.binaries.find(b => b.name === name);
 const hash = crypto.createHash('sha256').update(fs.readFileSync(`${process.argv[3]}/bin/${name}`)).digest('hex');
+const marker = 'share/mayhem/intercom/contract/proxy-protocol.js';
+const markerHash = crypto.createHash('sha256').update(fs.readFileSync(`${process.argv[3]}/${marker}`)).digest('hex');
+if (!manifest.assets.some(a => a.path === marker && a.sha256 === markerHash)) throw new Error('proxy runtime marker missing signed inventory binding');
 if (!binary || binary.path !== `bin/${name}` || binary.sha256 !== hash ||
     !manifest.assets.some(a => a.path === binary.path && a.sha256 === hash)) {
   throw new Error('worker missing exact outer-manifest hash binding');
