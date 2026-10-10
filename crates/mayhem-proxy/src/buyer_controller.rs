@@ -312,6 +312,11 @@ impl Controller {
             limits.protocol,
         )
         .map_err(|_| crate::invalid("invalid buyer protocol bounds"))?;
+        verifier
+            .require_received_limit(limits.protocol.response_bytes)
+            .map_err(|_| {
+                crate::invalid("buyer verifier buffer budget cannot fit its response limit")
+            })?;
         // Existing records can exceed newly lowered admission limits. The
         // metadata accessor includes retained allocations without scanning rows.
         let record = negotiation.max_record_bytes()?;

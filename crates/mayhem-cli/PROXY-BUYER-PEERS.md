@@ -37,3 +37,21 @@ replace existing ledger or purchase stores to repair an identity mismatch. Keep
 native gateway reads on their established peer and reload only the configured
 buyer gateways. Validate a limited paid request and its settlement before widening
 admission.
+
+## Buyer verification buffers
+
+The buyer validates each received terminal result in a bounded decoder process
+before acknowledging its receipt. It enforces the configured response-size
+ceiling, then reserves decoder buffers for the actual encoded result. It does
+not reserve the full response ceiling for every small answer.
+
+Startup also checks that the verifier pool can accommodate at least one result
+at the configured maximum size, including bounded IPC and schema overhead. For
+example, an 8 MiB response ceiling requires slightly over 136 MiB of verifier
+buffer accounting; a 128 MiB pool cannot support it. A 256 MiB pool supports that
+ceiling. The process limit and total buffer limit both remain enforced;
+concurrent verification does not allocate an unbounded pool.
+
+A configuration change preserves retained requests and receipts. Recovery uses
+the original authorization and saved output; it must not resend generation or
+create another charge to repair a local verifier-capacity failure.

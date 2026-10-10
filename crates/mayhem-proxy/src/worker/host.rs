@@ -78,7 +78,42 @@ fn units(bytes: usize) -> Result<u32> {
     u32::try_from(bytes.div_ceil(CHUNK_BYTES)).map_err(|_| Error::Configuration)
 }
 
+fn decoder_buffer_bytes(limits: DecodeLimits, semantic_policy: bool) -> Result<usize> {
+    limits.validate()?;
+    limits
+        .max_total_bytes
+        .checked_add(
+            limits
+                .ipc_bytes()
+                .checked_mul(2)
+                .ok_or(Error::Configuration)?,
+        )
+        .and_then(|n| n.checked_add(CHUNK_BYTES * 2))
+        .and_then(|n| {
+            n.checked_add(if semantic_policy {
+                crate::semantics::MAX_POLICY_BYTES * 2
+            } else {
+                0
+            })
+        })
+        .ok_or(Error::Configuration)
+}
+
 impl Pool {
+    /// Admission must never promise a response size that cannot fit even one
+    /// isolated verifier. Concurrent use may wait for recovery; an impossible
+    /// per-result allocation must instead fail at configuration time.
+    pub(crate) fn require_received_limit(&self, max_bytes: usize) -> Result<()> {
+        let required = decoder_buffer_bytes(
+            DecodeLimits {
+                max_total_bytes: max_bytes,
+                max_event_bytes: max_bytes,
+            },
+            true,
+        )?;
+        config(units(required)? <= units(self.limits.max_buffer_bytes)?)
+    }
+
     /// Independently check a buyer-received terminal result. This is local-only
     /// verification, not dispatch authority: no journal ticket, upstream I/O,
     /// wallet or financial operation is created. Keep untrusted schema/regex
@@ -95,6 +130,13 @@ impl Pool {
         if policy.request_hash != binding.request_hash || policy.endpoint != binding.endpoint {
             return Err(Error::Identity);
         }
+        // This is an already received terminal body, not an open upstream
+        // stream. Enforce the caller's response ceiling, then reserve decoder
+        // buffers for the exact encoded input. Reserving the ceiling here can
+        // reject even a tiny answer when its worst-case IPC expansion exceeds
+        // the pool, permanently preventing receipt recovery.
+        let bytes = json(body, max_bytes)?;
+        let received_bytes = bytes.len();
         let init = Init {
             abi: ABI,
             release: RELEASE.into(),
@@ -106,12 +148,11 @@ impl Pool {
             format: WireFormat::Json,
             error_profile: ErrorProfile::HttpStatus,
             limits: DecodeLimits {
-                max_total_bytes: max_bytes,
-                max_event_bytes: max_bytes,
+                max_total_bytes: received_bytes,
+                max_event_bytes: received_bytes,
             },
             semantic_policy: Some(policy.digest().map_err(Error::Upstream)?),
         };
-        let bytes = json(body, max_bytes)?;
         let mut prepared = self.start(init).await?.configure_semantics(policy).await?;
         for chunk in bytes.chunks(CHUNK_BYTES) {
             prepared
@@ -236,24 +277,7 @@ impl Pool {
             .clone()
             .try_acquire_owned()
             .map_err(|_| Error::Capacity)?;
-        let bytes = init
-            .limits
-            .max_total_bytes
-            .checked_add(
-                init.limits
-                    .ipc_bytes()
-                    .checked_mul(2)
-                    .ok_or(Error::Configuration)?,
-            )
-            .and_then(|n| n.checked_add(CHUNK_BYTES * 2))
-            .and_then(|n| {
-                n.checked_add(if init.semantic_policy.is_some() {
-                    crate::semantics::MAX_POLICY_BYTES * 2
-                } else {
-                    0
-                })
-            })
-            .ok_or(Error::Configuration)?;
+        let bytes = decoder_buffer_bytes(init.limits, init.semantic_policy.is_some())?;
         let buffers = self
             .buffers
             .clone()
@@ -656,5 +680,39 @@ impl Worker {
                 _ => return Err(Error::Protocol),
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod received_limit_tests {
+    use super::*;
+    #[test]
+    fn impossible_received_ceiling_is_rejected_before_paid_admission() {
+        use std::os::unix::fs::PermissionsExt;
+        let work = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(work.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let limits = PoolLimits {
+            max_children: 8,
+            max_buffer_bytes: 128 * 1024 * 1024,
+            startup_timeout: Duration::from_secs(10),
+            processing_timeout: Duration::from_secs(10),
+        };
+        let pool = Pool::new(std::env::current_exe().unwrap(), work.path(), limits).unwrap();
+        assert!(pool.require_received_limit(4 * 1024 * 1024).is_ok());
+        assert!(matches!(
+            pool.require_received_limit(8 * 1024 * 1024),
+            Err(Error::Configuration)
+        ));
+        let larger = pool
+            .with_independent_limits(PoolLimits {
+                max_buffer_bytes: 256 * 1024 * 1024,
+                ..limits
+            })
+            .unwrap();
+        assert!(larger.require_received_limit(8 * 1024 * 1024).is_ok());
+        assert!(larger.require_received_limit(0).is_err());
+        assert!(larger
+            .require_received_limit(256 * 1024 * 1024 + 1)
+            .is_err());
     }
 }

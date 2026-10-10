@@ -146,7 +146,7 @@ impl Paid {
             self._fixture._work.path(),
             PoolLimits {
                 max_children: 2,
-                max_buffer_bytes: 64 * 1024 * 1024,
+                max_buffer_bytes: 128 * 1024 * 1024,
                 startup_timeout: Duration::from_secs(5),
                 processing_timeout: Duration::from_secs(3),
             },
@@ -1170,13 +1170,25 @@ async fn signed_terminal(p: &mut Paid) -> mayhem_proto::proxy::finance::ProxyUsa
         .recover(&p.record.invocation, p.record.attempt)
         .unwrap();
     let accepted = saved.financial.as_ref().unwrap().accepted();
+    // Buyer-local response limits do not adopt the provider's smaller limit.
+    // Exercise the deployed 8 MiB ceiling with a bounded 128 MiB verifier pool;
+    // a small received answer must not reserve the entire ceiling's IPC budget.
+    use mayhem_proxy::buyer::Evidence;
+    let mut buyer_snapshot = saved
+        .acceptance
+        .as_ref()
+        .unwrap()
+        .snapshot
+        .public_snapshot()
+        .unwrap();
+    buyer_snapshot.adapter.limits.response_bytes = 8 * 1024 * 1024;
     let approval = mayhem_proxy::receipts::approve_terminal(
         &p.verifier(),
         &draft,
         sigs["provider_sig"].as_str().unwrap(),
         &accepted.authorization,
         &accepted.settlement_policy,
-        &saved.acceptance.as_ref().unwrap().snapshot,
+        &buyer_snapshot,
         &saved.request.as_ref().unwrap().body,
         &saved.result.as_ref().unwrap().reply,
         saved.record.cancellation_requested,
