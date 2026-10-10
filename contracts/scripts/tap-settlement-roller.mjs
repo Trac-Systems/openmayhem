@@ -524,6 +524,36 @@ function receiptEnvelope(entry) {
   };
 }
 
+async function verifiedSettlementReceipts(bundle, input) {
+  if (!input.some(entry => entry?.lane === 'proxy' || entry?.receipt?.body?.lane === 'proxy')) {
+    return input.map(receiptEnvelope);
+  }
+  // Snapshot caller-owned objects before asynchronous signature verification.
+  // The projection is local accounting data, never a replacement signed body.
+  const frozen = structuredClone({ ...bundle, receipts: input });
+  const { proxyEpochAcceptances, proxyEpochReceipt } = await import('../../intercom/scripts/proxy-epoch.mjs');
+  const accepted = proxyEpochAcceptances(frozen, frozen.receipts), verified = [];
+  for (const entry of frozen.receipts) {
+    if (entry?.lane === 'proxy' || entry?.receipt?.body?.lane === 'proxy') {
+      const value = await proxyEpochReceipt(entry, accepted, frozen.epoch);
+      if (value.body.rail !== 'tap') throw new Error('TAP settlement proxy rail must be tap');
+      for (const field of ['release_epoch', 'receipt_epoch']) {
+        if (entry[field] !== undefined && entry[field] !== entry.settlement_epoch) throw new Error('proxy receipt settlement epoch override');
+      }
+      if (['settle_au', 'au_delta', 'previous_au_owed_cum'].some(field => entry[field] !== undefined)) {
+        throw new Error('proxy settlement amount cannot override the signed receipt');
+      }
+      verified.push(value);
+    } else {
+      if ((entry.lane !== undefined && entry.lane !== 'native') || (entry.receipt?.body?.lane !== undefined && entry.receipt.body.lane !== 'native')) {
+        throw new Error('unsupported receipt lane');
+      }
+      verified.push(receiptEnvelope(entry));
+    }
+  }
+  return verified;
+}
+
 function receiptDeltaAu(entry, body, billingStates) {
   const explicit = entry.settle_au ?? entry.au_delta;
   if (explicit !== undefined) {
@@ -625,7 +655,8 @@ function targetedBindingForReceipt(entry, body, bundleEpoch, targetedSessionBind
     throw new Error(`Missing targeted TAP payout allocation for session ${body.session_id}`);
   }
   if (binding.provider !== body.provider ||
-      !isHexBytes(binding.payout_revision, 32)) {
+      !isHexBytes(binding.payout_revision, 32) ||
+      (body.lane === 'proxy' && binding.payout_revision !== body.payout_revision)) {
     throw new Error('targeted TAP payout allocation does not match receipt provider');
   }
   safeAu(binding.au, 'targeted TAP allocation au');
@@ -1022,7 +1053,19 @@ function validatePriorSettlementState(prior) {
   }
 }
 
-export function buildTapSettlement({
+export function buildTapSettlement(options = {}) {
+  return buildTapSettlementFromEntries(options);
+}
+
+/** Async proxy signature verification feeds the same existing liability/rounding
+ * calculation. The synchronous native API retains its original validation. */
+export async function buildVerifiedTapSettlement(options = {}) {
+  const bundle = options.receipts ? { receipts: options.receipts } : options.bundle;
+  const input = options.receipts ?? normalizedReceipts(bundle);
+  return buildTapSettlementFromEntries(options, await verifiedSettlementReceipts(bundle, input));
+}
+
+function buildTapSettlementFromEntries({
   bundle,
   receipts,
   buyerAccounts = {},
@@ -1035,7 +1078,7 @@ export function buildTapSettlement({
   targetedSessionBindings,
   canonicalLiabilities,
   payoutMinAu,
-} = {}) {
+} = {}, verifiedEntries = null) {
   const inputBundle = receipts ? { receipts } : bundle;
   const input = receipts ?? normalizedReceipts(bundle);
   validatePriorSettlementState(prior);
@@ -1071,17 +1114,26 @@ export function buildTapSettlement({
   const deferredLiabilities = [];
   const aggregatePaidCursors = new Map();
 
-  const sorted = input
-    .map(receiptEnvelope)
+  const sorted = (verifiedEntries ?? input.map(receiptEnvelope))
     .sort((a, b) => (
       String(a.body.billing_id ?? '').localeCompare(String(b.body.billing_id ?? '')) ||
       Number(a.body.billing_attempt ?? 0) - Number(b.body.billing_attempt ?? 0) ||
       Number(a.body.seq ?? 0) - Number(b.body.seq ?? 0)
     ));
 
-  for (const { entry, body, envelope } of sorted) {
-    verifyReceiptEnvelope(envelope);
-    const deltaAu = receiptDeltaAu(entry, body, billingStates);
+  const billingLanes = new Map(), proxyAttempts = new Set();
+  for (const { entry, body, envelope, proxy = false } of sorted) {
+    const lane = proxy ? 'proxy' : 'native';
+    if (billingLanes.has(body.billing_id) && billingLanes.get(body.billing_id) !== lane) throw new Error('logical billing cannot cross native and proxy lanes');
+    billingLanes.set(body.billing_id, lane);
+    if (proxy) {
+      const identity = `${body.billing_id}/${body.billing_attempt}`;
+      if (proxyAttempts.has(identity)) throw new Error('duplicate proxy settlement attempt');
+      proxyAttempts.add(identity);
+    } else verifyReceiptEnvelope(envelope);
+    // Proxy finals price one exact attempt. Their signed cumulative billing can
+    // include earlier epochs and must never be charged again as native usage.
+    const deltaAu = proxy ? safeAu(envelope.body.au_owed_cum, 'proxy attempt amount') : receiptDeltaAu(entry, body, billingStates);
     if (deltaAu === 0n) continue;
     const targetedBinding = targetedBindingForReceipt(
       entry,
@@ -1890,10 +1942,14 @@ export async function rollTapSettlement({
       safeAu(tapUsdAu, 'tap_usd_au').toString() !== tapRateLock.tap_usd_au) {
     throw new Error('TAP settlement rate does not match its canonical rate lock');
   }
-  const requestedEpoch = parseNonNegativeInt(
-    epoch ?? inputBundle?.epoch ?? inputBundle?.settlement_epoch,
-    'TAP settlement epoch'
-  );
+  const bundleEpoch = inputBundle?.epoch ?? inputBundle?.settlement_epoch;
+  const requestedEpoch = parsePositiveInt(epoch ?? bundleEpoch, 'TAP settlement epoch');
+  if (bundleEpoch !== undefined && parsePositiveInt(bundleEpoch, 'TAP bundle epoch') !== requestedEpoch) {
+    throw new Error('explicit TAP settlement epoch conflicts with the canonical bundle');
+  }
+  if (isObject(tapRateLock) && tapRateLock.epoch !== requestedEpoch) {
+    throw new Error('TAP rate lock epoch conflicts with the canonical bundle');
+  }
   const replaySettlement = checkpointReplaySettlement({
     prior,
     epoch: requestedEpoch,
@@ -1901,7 +1957,7 @@ export async function rollTapSettlement({
     tapRateLock,
     canonicalLiabilities,
   });
-  const settlement = replaySettlement ?? buildTapSettlement({
+  const settlement = replaySettlement ?? await buildVerifiedTapSettlement({
       bundle,
       receipts,
       buyerAccounts,
@@ -1938,7 +1994,7 @@ export async function rollTapSettlement({
       chainEpoch > 0
       && chainSpentWei === expectedSpentWei
       && chainRoot === expectedRoot
-      && (epoch === undefined || parseNonNegativeInt(epoch, 'root epoch') === chainEpoch)
+      && requestedEpoch === chainEpoch
     );
   }
 
@@ -1962,7 +2018,7 @@ export async function rollTapSettlement({
       resumed: true,
     };
   } else {
-    screen = await guardianScreenSettlement({ settlement, pool, epoch, previous: prior });
+    screen = await guardianScreenSettlement({ settlement, pool, epoch: requestedEpoch, previous: prior });
   }
   if (!screen.ok) {
     return { ...settlement, posted: false, blocked: true, reasons: screen.reasons, screen };
@@ -2544,9 +2600,9 @@ export async function resolveTargetedTapPayoutsFromLedger({
   const accounts = {};
   const liabilities = new Map();
   const aggregatePaidByProvider = new Map();
-  for (const entry of normalizedReceipts(bundle)) {
-    const { body, envelope } = receiptEnvelope(entry);
-    verifyReceiptEnvelope(envelope);
+  const entries = await verifiedSettlementReceipts(bundle, normalizedReceipts(bundle));
+  for (const { entry, body, envelope, proxy = false } of entries) {
+    if (!proxy) verifyReceiptEnvelope(envelope);
     const epoch = parsePositiveInt(
       entryEpoch(entry, body, bundleEpoch),
       'targeted TAP receipt epoch'
@@ -2569,6 +2625,7 @@ export async function resolveTargetedTapPayoutsFromLedger({
         allocation.rail !== 'tap' ||
         allocation.provider !== body.provider ||
         !isHexBytes(allocation.payout_revision, 32) ||
+        (proxy && allocation.payout_revision !== body.payout_revision) ||
         !String(allocation.feature_key ?? '').startsWith(`epoch/targeted/${epoch}/`)) {
       throw new Error(`confirmed targeted TAP allocation is missing for session ${body.session_id}`);
     }

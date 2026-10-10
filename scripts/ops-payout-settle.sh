@@ -2676,43 +2676,8 @@ PY
   fi
 
   temp_bundle="$work_dir/tap-receipts.json.tmp"
-  if ! receipt_count="$(python3 - "$bundle" "$temp_bundle" "$applied_epoch" "$apply_hash" <<'PY'
-import copy, json, sys
-source, target, expected_epoch, apply_hash = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-bundle = json.load(open(source))
-if bundle.get("epoch") != expected_epoch:
-    raise SystemExit("finalized receipt bundle epoch does not match canonical applied epoch")
-receipts = []
-for entry in bundle.get("receipts", []):
-    if not isinstance(entry, dict):
-        raise SystemExit("receipt entry must be an object")
-    receipt = entry.get("receipt")
-    body = receipt.get("body") if isinstance(receipt, dict) else None
-    if not isinstance(body, dict):
-        raise SystemExit("signed receipt body must be an object")
-    outer = entry.get("rail")
-    inner = body.get("rail")
-    if not isinstance(outer, str) or not isinstance(inner, str):
-        raise SystemExit("receipt outer rail and signed body rail are required")
-    if outer != outer.lower() or inner != inner.lower() or outer != inner:
-        raise SystemExit("receipt outer rail does not match signed receipt rail")
-    rail = inner
-    if rail not in {"fiat", "tap", "tnk"}:
-        raise SystemExit("signed receipt rail is unsupported")
-    if rail == "tap":
-        item = copy.deepcopy(entry)
-        item["receipt_epoch"] = expected_epoch
-        receipts.append(item)
-out = {key: value for key, value in bundle.items() if key != "receipts"}
-out["rail"] = "tap"
-out["epoch_apply_hash"] = apply_hash
-out["receipts"] = receipts
-with open(target, "w") as handle:
-    json.dump(out, handle, indent=2)
-    handle.write("\n")
-print(len(receipts))
-PY
-)"; then
+  if ! receipt_count="$(node "$SOURCE_DIR/intercom/scripts/payout-tap-receipts.mjs" \
+    "$bundle" "$temp_bundle" "$applied_epoch" "$apply_hash")"; then
     rm -f "$temp_bundle"
     echo "tap: failed to derive a rail-isolated spool bundle on attempt $attempt" >&2
     return 1
