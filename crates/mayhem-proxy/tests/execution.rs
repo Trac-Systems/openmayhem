@@ -164,6 +164,28 @@ impl Fixture {
         payload_limit: u64,
         upstream_model: String,
     ) -> Self {
+        Self::with_connection_limits(
+            config,
+            endpoint,
+            payload_limit,
+            upstream_model,
+            Limits {
+                request_bytes: 1024 * 1024,
+                response_bytes: 1024 * 1024,
+                choices: 8,
+                tools: 16,
+                questions: 16,
+                decision_options: 32,
+            },
+        )
+    }
+    fn with_connection_limits(
+        config: ConnectionConfig,
+        endpoint: ProxyEndpoint,
+        payload_limit: u64,
+        upstream_model: String,
+        limits: Limits,
+    ) -> Self {
         let store = dir();
         let work = dir();
         let journal = Arc::new(
@@ -196,14 +218,7 @@ impl Fixture {
                 endpoint,
                 endpoint_family_contract_template(family).unwrap(),
                 upstream_model,
-                Limits {
-                    request_bytes: 1024 * 1024,
-                    response_bytes: 1024 * 1024,
-                    choices: 8,
-                    tools: 16,
-                    questions: 16,
-                    decision_options: 32,
-                },
+                limits,
             )
             .unwrap(),
         );
@@ -1786,3 +1801,6 @@ mod declarative;
 
 #[path = "support/live_backend.rs"]
 mod live_backend;
+
+#[path = "support/performance.rs"]
+mod performance;
