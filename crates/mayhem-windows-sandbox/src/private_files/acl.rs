@@ -69,10 +69,15 @@ pub(super) fn current_user() -> Result<Vec<u8>> {
 pub(super) fn validate(file: &File, current: &[u8], private: bool) -> Result<()> {
     let system = fixed("S-1-5-18")?;
     let admins = fixed("S-1-5-32-544")?;
+    // Windows Resource Protection owns ordinary system ancestors under this
+    // exact service SID. This does not trust arbitrary services or authorize
+    // a service-owned/readable private leaf.
+    let installer = fixed("S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464")?;
     let trusted = |sid: PSID| unsafe {
         EqualSid(sid, current.as_ptr() as _) != 0
             || EqualSid(sid, system.0) != 0
             || EqualSid(sid, admins.0) != 0
+            || (!private && EqualSid(sid, installer.0) != 0)
     };
     let mut owner = null_mut();
     let mut dacl = null_mut();

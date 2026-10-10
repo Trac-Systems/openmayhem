@@ -207,6 +207,43 @@ fn ancestor_read_access_does_not_authorize_mutation_or_private_directory_use() {
 }
 
 #[test]
+fn trusted_installer_ancestor_does_not_trust_other_services_or_expose_private_leaves() {
+    let f = Fixture::new();
+    for (name, sid, allowed) in [
+        (
+            "installer",
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478464",
+            true,
+        ),
+        (
+            "other-service",
+            "S-1-5-80-956008885-3418522649-1831038044-1853292631-2271478465",
+            false,
+        ),
+        ("all-services", "S-1-5-80-0", false),
+    ] {
+        let parent = f.path(name);
+        let descriptor = descriptor_with_grants(&format!("(A;;FA;;;{sid})"));
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor.0,
+            bInheritHandle: 0,
+        };
+        assert_ne!(
+            unsafe { CreateDirectoryW(wide(parent.to_str().unwrap()).as_ptr(), &attributes) },
+            0
+        );
+        file(&parent.join("private"), b"synthetic", false);
+        assert_eq!(
+            read_private_file(&parent.join("private"), 64).is_ok(),
+            allowed,
+            "{name}"
+        );
+        assert!(validate_private_directory(&parent).is_err(), "{name}");
+    }
+}
+
+#[test]
 fn pinned_read_blocks_path_replacement_then_next_read_revalidates_new_authority() {
     let f = Fixture::new();
     let parent = f.path("parent");

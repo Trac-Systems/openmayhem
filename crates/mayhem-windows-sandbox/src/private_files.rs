@@ -32,7 +32,13 @@ const READ_CONTROL: u32 = 0x20000;
 const SYNCHRONIZE_ACCESS: u32 = 0x100000;
 const OBJ_CASE_INSENSITIVE: u32 = 0x40;
 const OBJ_DONT_REPARSE: u32 = 0x1000;
+#[cfg_attr(test, track_caller)]
 fn invalid() -> WindowsSandboxError {
+    #[cfg(test)]
+    eprintln!(
+        "protected local read refused at {}",
+        std::panic::Location::caller()
+    );
     WindowsSandboxError::InvalidConfig("protected local read rejected".into())
 }
 fn wide(value: &str) -> Vec<u16> {
