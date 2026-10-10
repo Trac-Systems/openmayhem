@@ -1,5 +1,6 @@
 //! Guided CLI over the same retained Flow used by the local dashboard.
 use super::*;
+use anyhow::Context;
 use mayhem_proxy::setup::{Flow, FlowAction, FlowConfig, FlowView, ProfileMarket};
 use std::io::{self, Write};
 mod declarations;
@@ -61,6 +62,9 @@ fn show(view: &FlowView) -> Result<()> {
             step["step"],
             step.get("state").unwrap_or(&step["structural"])
         );
+    }
+    if view.review.as_ref().is_some_and(|r| r.publication_status == "canonical_operations_confirmed") {
+        println!("Published offers still need payment registration and verified payout bindings for this exact provider identity. Use provider proxy setup payment-registration to review them; a running controller alone is not readiness.");
     }
     if let Some(saved) = &view.enrollment {
         if saved["state"] == "admitted" {
@@ -146,6 +150,7 @@ pub async fn run(args: WizardArgs) -> Result<()> {
         if let Some(d) = &view.declaration { println!("Data handling: {} (declared, not verified)", d.state); }
         println!("j Review data-handling declarations  y Sign retained declaration review  w Review withdrawal");
         println!("e Review new rates (same market)  z Publish retained rate review");
+        println!("m Review/register shared payment rails after paid admission");
         println!("c Connect  d Discover  s Select/price  k Check  p Probe  a Admission facts\ni Invoice/create  t Status  n Admission returns  f FIAT checkout  q Renew expired unpaid quote  v Review publication  u Publish\nr Recover original probe  o Recover original publication  g Review Run  b Begin Run  h Reconcile Run  x Exit");
         let command = prompt("Action", "x")?;
         if command == "x" {
@@ -154,6 +159,29 @@ pub async fn run(args: WizardArgs) -> Result<()> {
         let revision = view.review.as_ref().map(|r| r.revision);
         let needs_revision =
             || revision.ok_or_else(|| anyhow::anyhow!("save your selection first"));
+        if command == "m" {
+            let review = super::payments::execute(super::payments::Args {
+                config: args.config.clone(), expected_revision: needs_revision()?, submit: false,
+                accept_rules_hash: None, wallet: args.wallet.clone(),
+            }).await;
+            let review = match review {
+                Ok(value) => value,
+                Err(error) => { eprintln!("Payment registration unavailable: {error}. Keep the original invoice."); continue; }
+            };
+            println!("{}", serde_json::to_string_pretty(&review)?);
+            if prompt("Accept these exact rules and register the shown payment rails? Payout targets stay unchanged. (yes/no)", "no")? == "yes" {
+                let result = super::payments::execute(super::payments::Args {
+                    config: args.config.clone(), expected_revision: review["draft_revision"].as_u64().context("missing draft revision")?,
+                    submit: true, accept_rules_hash: Some(review["rules"]["hash"].as_str().context("missing reviewed rules hash")?.into()),
+                    wallet: args.wallet.clone(),
+                }).await;
+                match result {
+                    Ok(value) => println!("{}", serde_json::to_string_pretty(&value)?),
+                    Err(error) => eprintln!("Payment registration incomplete: {error}. Inspect the same identity; do not repay admission."),
+                }
+            }
+            continue;
+        }
         let action = match command.as_str() {
             "e" => rates::review(&view)?,
             "z" => {

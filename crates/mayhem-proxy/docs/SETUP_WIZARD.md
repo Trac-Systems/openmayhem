@@ -206,6 +206,36 @@ The shared wizard then handles
 discovery, checks, admission, publication and Run with their existing revisions
 and explicit confirmations. There is no automatic publication or payment.
 
+### Payment registration after admission
+
+Paying the admission fee and publishing an offer do not themselves create a
+provider payment registration or verify payout destinations. A fresh proxy
+identity needs these even when the same machine already has a different native
+provider wallet. Do not pay a second admission fee or join a native enclave to
+solve this prerequisite.
+
+Use the existing protected wizard configuration and the exact admitted wallet:
+
+```sh
+mayhem provider proxy setup payment-registration --config /absolute/private/wizard.json --expected-revision 13 --keypair /absolute/private/keypair.json
+```
+
+This refreshes authenticated canonical admission and reports the current rules,
+selected rails and payout observations. It writes no ledger transaction. Use the
+returned draft revision for the next action. After reviewing the rules, repeat
+with `--submit --accept-rules-hash <reviewed-hash>` to submit missing consent,
+register the admitted identity and enable its selected rails. Existing accepted
+rails are retained, including rails used by native offers. Unpaid, revoked,
+disabled, mismatched-wallet or stale-configuration requests fail before a ledger
+write. The original invoice, entitlement and publication remain intact.
+
+This command never selects or rotates a payout destination. Use the existing
+`provider payout` and `provider stripe` commands with a home configured for the
+same provider identity to complete or refresh verified payout bindings. Reuse
+existing destinations where intended. A readiness observation is not an inference
+test; the managed controller still checks canonical payment readiness and real
+upstream health before advertising capacity.
+
 On Unix, draft and bundle-creation locks are explicitly released when their
 owning operation ends. Merely closing a descriptor can leave a `flock` held by
 an inherited child descriptor until exec or exit. The protected lock file and

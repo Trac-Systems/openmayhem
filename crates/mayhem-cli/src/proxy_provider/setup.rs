@@ -10,6 +10,7 @@ use mayhem_proxy::setup::{
 use std::path::PathBuf;
 mod bootstrap;
 mod wizard;
+mod payments;
 
 #[derive(Debug, Args)]
 pub struct DraftArgs {
@@ -19,6 +20,8 @@ pub struct DraftArgs {
 }
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Prepare shared payment registration after paid proxy admission. Does not select payout targets.
+    PaymentRegistration(payments::Args),
     /// Create protected standard-profile setup through explicit prompts; no hand-authored JSON.
     Init(bootstrap::InitArgs),
     /// Guided local setup using the same retained state as the authenticated dashboard.
@@ -216,6 +219,7 @@ pub enum RecipeCommand {
 }
 pub async fn run(command: Command) -> Result<()> {
     let command = match command {
+        Command::PaymentRegistration(args) => return payments::run(args).await,
         Command::Init(args) => return bootstrap::run(args).await,
         Command::Wizard(args) => return wizard::run(args).await,
         Command::Enrollment {
@@ -417,6 +421,7 @@ pub async fn run(command: Command) -> Result<()> {
             | Command::Inspect(args) => args,
             Command::Init(_)
             | Command::Wizard(_)
+            | Command::PaymentRegistration(_)
             | Command::Enrollment { .. }
             | Command::Recipe { .. }
             | Command::Profiles
@@ -452,6 +457,7 @@ pub async fn run(command: Command) -> Result<()> {
             Command::Inspect(_) => store.inspect(),
             Command::Init(_)
             | Command::Wizard(_)
+            | Command::PaymentRegistration(_)
             | Command::Enrollment { .. }
             | Command::Recipe { .. }
             | Command::Profiles
