@@ -10,6 +10,54 @@ fn decode<T: DeserializeOwned>(v: &Value) -> T {
 }
 
 #[test]
+fn approved_platform_policy_keeps_rust_and_javascript_receipt_meaning_identical() {
+    let settings: Value = serde_json::from_str(include_str!(
+        "../../../config/proxy/platform-commercial-policy-v1.json"
+    ))
+    .unwrap();
+    let policy: ProxySettlementPolicy = decode(&settings["settlement_policy"]);
+    assert_eq!(policy.digest().unwrap(), settings["settlement_policy_hash"]);
+    for row in fixture()["cases"].as_array().unwrap() {
+        let mut terms: ProxySpendTerms = decode(&row["terms"]);
+        terms.settlement_policy_hash = policy.digest().unwrap();
+        terms.acceptance_expires_after_epoch = terms.billing_epoch
+            + settings["buyer_lifetimes"]["acceptance_epochs"]
+                .as_u64()
+                .unwrap();
+        terms.reservation_expires_after_epoch = terms.billing_epoch
+            + settings["buyer_lifetimes"]["reservation_epochs"]
+                .as_u64()
+                .unwrap();
+        terms.reservation_receipt_grace_epochs = settings["buyer_lifetimes"]
+            ["receipt_grace_epochs"]
+            .as_u64()
+            .unwrap();
+        terms
+            .validate_new_acceptance(
+                &decode(&row["market"]),
+                &decode(&row["membership"]),
+                &terms.offer,
+                &policy,
+                terms.billing_epoch,
+            )
+            .unwrap();
+        let mut receipt: ProxyReceiptBody = decode(&row["receipt"]);
+        receipt.accepted_terms = terms.digest().unwrap();
+        for outcome in &policy.payable_outcomes {
+            receipt.outcome = *outcome;
+            receipt.validate_for(&terms, &policy, None).unwrap();
+        }
+        receipt.final_receipt = false;
+        receipt.outcome = ProxyReceiptOutcome::Running;
+        assert!(receipt.validate_for(&terms, &policy, None).is_err());
+        receipt.final_receipt = true;
+        receipt.outcome = ProxyReceiptOutcome::Complete;
+        receipt.au_owed_cum += 1;
+        assert!(receipt.validate_for(&terms, &policy, None).is_err());
+    }
+}
+
+#[test]
 fn all_endpoint_rail_financial_vectors_match_javascript() {
     for row in fixture()["cases"].as_array().unwrap() {
         let terms: ProxySpendTerms = decode(&row["terms"]);

@@ -1,0 +1,25 @@
+{
+  "schema_version": 1,
+  "settlement_policy": {
+    "schema_version": 1,
+    "lane": "proxy",
+    "payable_outcomes": [
+      "cancelled",
+      "complete",
+      "partial",
+      "refused"
+    ],
+    "allow_checkpoints": false,
+    "hold_expiry": "release_unfinalized_and_block_retry"
+  },
+  "buyer_lifetimes": {
+    "acceptance_epochs": 0,
+    "reservation_epochs": 24,
+    "receipt_grace_epochs": 6
+  },
+  "admission_quote": {
+    "max_rate_age_ms": 300000,
+    "quote_lifetime_ms": 3600000
+  },
+  "settlement_policy_hash": "d562deb003990ad3cb735744a2ba2897c7bf895d064ded5284c4a7603017068a"
+}
