@@ -104,6 +104,12 @@ try {
     if(command==='stop')break;
     if(command.startsWith('{')) {
       const request=JSON.parse(command);
+      if(request.set_offer && Object.keys(request).length===1) {
+        const result=await f.submit(await f.envelope({kind:'set_offer',offer:request.set_offer}));
+        if(result.ok!==true)throw new Error('fixture offer update rejected');
+        await sync();
+        console.log(JSON.stringify({done:'set_offer',offer:request.set_offer}));continue;
+      }
       if(request.sign_expiry) {
         console.log(JSON.stringify({buyer_sig:b4a.toString(f.buyer.wallet.sign(proxyBuyerExpirySigningBytes(request.sign_expiry)),'hex')}));continue;
       }

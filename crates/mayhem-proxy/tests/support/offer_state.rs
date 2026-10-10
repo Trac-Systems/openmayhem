@@ -10,6 +10,42 @@ fn query(f: &Fixture) -> Query {
 }
 
 #[tokio::test]
+async fn availability_follows_rate_revisions_without_repricing_accepted_work() {
+    for family in ["llm", "decisions"] {
+        for rail in ["fiat", "tnk", "tap"] {
+            let mut f = Fixture::new(rail, family).await;
+            let query = query(&f);
+            let before = f.client.current_rate_state(&query).await.unwrap();
+            assert_eq!(before.offer().unwrap(), &query.offer);
+            let mut changed = query.offer.clone();
+            changed.revision += 1;
+            for rate in &mut changed.rates { rate.per_unit_au += 10; }
+            changed.per_request_au += 2;
+            assert_eq!(f.request(&serde_json::json!({"set_offer":changed}).to_string()).await["done"], "set_offer");
+            assert!(f.client.offer_state(&query).await.is_err());
+            let current = f.client.current_rate_state(&query).await.unwrap();
+            assert_eq!(current.offer().unwrap(), &changed);
+            assert!(current.check_terms(&f.auth.terms, &f.policy).is_err(), "new offer cannot reprice original terms");
+            assert!(f.buyer_client.current_rate_state(&query).await.is_err());
+            let mut newer = query.clone();
+            newer.offer = changed;
+            assert_eq!(f.client.offer_state(&newer).await.unwrap().offer().unwrap(), &newer.offer);
+            newer.offer.revision += 1;
+            assert!(f.client.current_rate_state(&newer).await.is_err(), "cannot move a newer observation backwards");
+            f.command("final").await;
+            let state = f.request("state").await;
+            let usage = query.offer.rates.iter().map(|r| (r.unit.clone(), 4)).collect();
+            let original_cost = query.offer.cost(&usage).unwrap();
+            assert_eq!(state["summary"]["reserved_au"], (50 + original_cost).to_string(),
+                "only original payable amount remains reserved for epoch settlement");
+            assert_eq!(state["billing"]["spent_au"], original_cost.to_string());
+            assert!(state["billing"]["active_reservation_id"].is_null());
+            f.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn provider_offer_observation_checks_current_terms_and_operator_policy_across_families_rails()
 {
     for family in ["llm", "decisions"] {

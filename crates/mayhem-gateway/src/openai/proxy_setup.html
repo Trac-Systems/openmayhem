@@ -7,6 +7,7 @@
 #provider-setup button { margin:.25rem .25rem .25rem 0; }
 #provider-setup #steps, #provider-setup #identity, #provider-setup #message { overflow-wrap:anywhere; }
 #provider-setup #message { position:sticky; top:0; background:var(--bg,#101115); padding:.5rem; z-index:1; }
+#provider-setup #message:empty { display:none; }
 </style><main id="provider-setup" class="app-main" style="max-width:1080px;margin:2rem auto;padding:1rem">
 <a href="/mayhem/dashboard/provider">← Provider dashboard</a>
 <h1>Proxy provider setup</h1><p>Connect → Discover → Select → Check → Market → Admission → Review and publish → Run</p>
@@ -28,6 +29,12 @@
 </div></section>
 <section class="panel"><div class="panel-body"><h2>Admission and fee</h2><button data-action="admission_check">Read canonical admission</button> <label>Invoice rail <select id="invoice-rail"><option value="fiat">FIAT</option><option value="tnk">TNK</option><option value="tap">TAP</option></select></label><button data-action="invoice_create">Create or recover invoice</button> <button data-action="invoice_status">Reconcile original invoice status</button> <button data-action="invoice_checkout">Request original FIAT checkout</button><div id="invoice"></div><div id="checkout"></div><p>No payment is sent here. A checkout return is informational; reconcile the invoice before relying on payment status. An invoice or payment never enables serving by itself.</p></div></section>
 <section class="panel"><div class="panel-body"><h2>Review and publish</h2><button data-action="publication_plan">Review exact publication</button> <button data-action="publish" id="publish" disabled>Confirm reviewed publication</button> <button data-action="recover_publication">Recover original publication</button><pre id="publication"></pre><details><summary>Exact retained review</summary><pre id="review"></pre></details></div></section>
+<section class="panel"><div class="panel-body"><h2>Change rates in this market</h2>
+<p>Only prices change. Existing submarkets, accepted rails, membership, model and execution settings stay fixed. The review reads the latest canonical offer revisions and operation sequence automatically. Publishing does not charge another admission fee, probe the model or restart it; already accepted jobs retain their original prices.</p>
+<div id="rate-fields"></div><button data-action="rate_plan">Review new rates</button><button data-action="publish_rates" id="publish-rates" disabled>Publish reviewed rates</button>
+<p id="rate-state"></p><div id="rate-summary"></div><details><summary>Exact rate publication record</summary><pre id="rate-review"></pre></details>
+<p>If publication is uncertain, recover the original publication above. Never create a replacement admission invoice for a rate change.</p>
+</div></section>
 <section class="panel"><div class="panel-body"><h2>Run</h2><p>Review the exact confirmed publication and retained runtime configuration before installing the existing managed controller. Recovery probes use the original cumulative allowance. A running process alone is not readiness; health and canonical admission remain required.</p><button data-action="run_plan">Review Run</button> <button id="start-run" data-action="start_run" disabled>Start reviewed controller</button> <button data-action="recover_run">Reconcile original Run</button><pre id="run"></pre></div></section>
 
 </main><script src="/mayhem/dashboard/assets/proxy-setup.js" defer></script>

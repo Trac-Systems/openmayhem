@@ -1,7 +1,7 @@
 'use strict';
 (() => {
   const $ = id => document.getElementById(id);
-  let view, csrf, plan, runPlan, busy = false, declarationPage;
+  let view, csrf, plan, runPlan, busy = false, declarationPage, rateChoices = [];
   const declarationChoices = new Map();
   const text = (id, value) => { $(id).textContent = value; };
   const json = value => JSON.stringify(value, null, 2);
@@ -16,7 +16,42 @@
     l.append(i); parent.append(l, document.createElement('br')); return i;
   };
   const integer = value => { const n = Number(value); if (!Number.isSafeInteger(n) || n < 1) throw Error('Enter a positive whole number.'); return n; };
+  const auToUsd = raw => {
+    const n = BigInt(raw), scale = 1000000000000000000n;
+    const fraction = (n % scale).toString().padStart(18, '0').replace(/0+$/, '');
+    return (n / scale).toString() + (fraction ? '.' + fraction : '');
+  };
+  const usdToAu = raw => {
+    if (raw.length > 59 || !/^(0|[1-9][0-9]*)(\.[0-9]{1,18})?$/.test(raw)) throw Error('Enter an exact nonnegative USD amount, at most 18 decimal places.');
+    const [whole, fraction = ''] = raw.split('.');
+    const value = BigInt(whole) * 1000000000000000000n + BigInt(fraction.padEnd(18, '0'));
+    if (value > 340282366920938463463374607431768211455n) throw Error('Amount exceeds the supported bound.');
+    return value.toString();
+  };
+  function renderRates(v) {
+    rateChoices = structuredClone(v.rate_choices || []);
+    $('rate-fields').replaceChildren();
+    rateChoices.forEach((choice, index) => {
+      const offer = v.selection.offers[index], group = document.createElement('fieldset'), legend = document.createElement('legend');
+      legend.textContent = `Offer ${index + 1}: ${offer.ctx_bracket}${offer.outcome_class ? ' / ' + offer.outcome_class : ''}`; group.append(legend);
+      const rails = document.createElement('p'); rails.textContent = 'Existing rails: ' + offer.accepted_rails.map(r=>r.toUpperCase()).join(', '); group.append(rails);
+      field(group, 'USD per request', auToUsd(choice.per_request_au), value => choice.per_request_au = usdToAu(value));
+      field(group, 'USD minimum session', auToUsd(choice.min_session_au), value => choice.min_session_au = usdToAu(value));
+      for (const rate of choice.rates) field(group, `USD per ${rate.granularity} ${rate.unit}`, auToUsd(rate.per_unit_au), value => rate.per_unit_au = usdToAu(value));
+      $('rate-fields').append(group);
+    });
+    text('rate-state', v.rates ? v.rates.state : 'Publish the initial configuration before reviewing a rate update.');
+    text('rate-review', json(v.rates || {}));
+    $('rate-summary').replaceChildren();
+    if (v.rates) for (const [index, operation] of v.rates.plan.publication.operations.entries()) {
+      const offer = operation.action.offer, previous = v.rates.plan.previous_offers[index], line = document.createElement('p');
+      line.textContent = `${offer.ctx_bracket}: request USD ${auToUsd(previous.per_request_au)} → ${auToUsd(offer.per_request_au)}; minimum USD ${auToUsd(previous.min_session_au)} → ${auToUsd(offer.min_session_au)}. ` + offer.rates.map(rate => `${rate.unit}: USD ${auToUsd(rate.per_unit_au)} per ${rate.granularity}`).join('; ');
+      $('rate-summary').append(line);
+    }
+    $('publish-rates').disabled = !v.rates || !['needs_confirmation','ready_to_resume_publication','recover_original_publication'].includes(v.rates.state);
+  }
   function render(v) {
+    renderRates(v);
     view = v; plan = null; runPlan = null; $('publish').disabled = true; $('start-run').disabled = true;
     text('declaration-state', v.declaration ? `${v.declaration.state}. Declared, not verified. A running controller configured for these updates reads signed changes automatically; inference and prices are unchanged.` : 'No signed declarations. Missing claims remain unknown.');
     text('declaration-review', json(v.pending_declaration || v.declaration || {}));
@@ -63,6 +98,7 @@
       if (action === 'probe') button.disabled = !v.capabilities.probe;
       if (action === 'admission_check') button.disabled = !v.capabilities.canonical_admission;
       if (action.startsWith('invoice_')) button.disabled = !v.capabilities.enrollment;
+      if (action === 'rate_plan') button.disabled = !v.capabilities.rates || v.review?.publication_status !== 'canonical_operations_confirmed';
       if (action === 'publication_plan' || action === 'recover_publication') button.disabled = !v.capabilities.publication;
       if (['declaration_fields','declaration_plan'].includes(action)) button.disabled = !v.capabilities.declarations;
     }
@@ -99,6 +135,14 @@
   }
   async function perform(name) {
     if (name === 'refresh') return request();
+    if (name === 'rate_plan') {
+      if (document.querySelector('#rate-fields [aria-invalid="true"]')) throw Error('Correct invalid prices before reviewing rates.');
+      return request({action:name,expected_revision:view.review?.revision,choices:rateChoices});
+    }
+    if (name === 'publish_rates') {
+      if (!view.rates || !confirm('Publish exactly these reviewed prices in the same market? Existing accepted jobs retain their original terms. No second admission fee, model restart or new probe.')) return;
+      return request({action:name,expected_revision:view.review.revision,plan_digest:view.rates.plan.plan_digest});
+    }
     if (name.startsWith('declaration_') || name === 'confirm_declaration' || name === 'withdraw_declaration_plan') return declarations(name);
     const revision = view.review?.revision;
     let a = {action:name,expected_revision:revision};

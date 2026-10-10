@@ -170,6 +170,8 @@ pub enum FlowAction {
         operation: EnrollmentAction,
         rail: Option<mayhem_proto::proxy::ProxyRail>,
     },
+    RatePlan { expected_revision: u64, choices: Vec<RateChoice> },
+    PublishRates { expected_revision: u64, plan_digest: Digest },
     PublicationPlan {
         expected_revision: u64,
         offers_only: bool,
@@ -206,6 +208,8 @@ pub struct FlowView {
     pub run: Option<RunReport>,
     pub declaration: Option<DeclarationReport>,
     pub pending_declaration: Option<DeclarationReport>,
+    pub rates: Option<RateReport>,
+    pub rate_choices: Vec<RateChoice>,
     pub steps: Vec<Value>,
     pub capabilities: Value,
 }
@@ -432,6 +436,8 @@ impl Flow {
             endpoint,
             selection: self.choice(review.as_ref().map(|r| (&r.draft_id, r.revision)))?,
             inventory,
+            rate_choices: review.as_ref().map(|r| r.offers.iter().map(RateChoice::from_offer).collect::<Result<Vec<_>>>()).transpose()?.unwrap_or_default(),
+            rates: store.rates()?,
             review,
             probe_plan,
             enrollment,
@@ -439,7 +445,7 @@ impl Flow {
             declaration,
             pending_declaration,
             steps,
-            capabilities: json!({"declarations":self.registry.is_some(),"probe":self.config.probe_plan.is_some(),"canonical_admission":self.config.peer_rpc.is_some(),"enrollment":self.config.admission_origin.is_some(),"publication":self.config.peer_rpc.is_some(),"run":self.config.run.is_some()&&self.lifecycle.is_some()}),
+            capabilities: json!({"declarations":self.registry.is_some(),"probe":self.config.probe_plan.is_some(),"canonical_admission":self.config.peer_rpc.is_some(),"enrollment":self.config.admission_origin.is_some(),"publication":self.config.peer_rpc.is_some(),"rates":self.config.peer_rpc.is_some(),"run":self.config.run.is_some()&&self.lifecycle.is_some()}),
         })
     }
     pub async fn execute(
@@ -559,6 +565,8 @@ impl Flow {
                 }
                 json!(result)
             }
+            FlowAction::RatePlan { expected_revision, choices } => json!(store.plan_rates(expected_revision, choices, self.peer()?, self.config.timeout_ms).await?),
+            FlowAction::PublishRates { expected_revision, plan_digest } => json!(store.publish_rates(expected_revision, &plan_digest, self.peer()?, self.config.timeout_ms, key.ok_or(Error::Invalid)?).await?),
             FlowAction::PublicationPlan {
                 expected_revision,
                 offers_only,
@@ -570,7 +578,7 @@ impl Flow {
             } => {
                 let plan = store.publication_plan(expected_revision, offers_only)?;
                 require(plan.plan_digest == plan_digest)?;
-                let permit = {
+                let permit = if offers_only { None } else {
                     let guard = store::Guard::open(&self.config.directory)?;
                     let retained: Option<Value> = guard.read_json("wizard-enrollment.json")?;
                     retained.and_then(|v|v.get("invoice").and_then(|v|v.get("permit")).cloned()).filter(|v|!v.is_null()).map(|v|serde_json::from_value::<AdmissionPermit>(json!({"permit":v["body"],"issuer_signature":v["issuer_signature"]})).map_err(|_|Error::Invalid)).transpose()?

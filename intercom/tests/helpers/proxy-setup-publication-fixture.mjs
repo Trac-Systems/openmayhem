@@ -6,6 +6,8 @@ import crypto from 'node:crypto';
 import b4a from 'b4a';
 import { familyAdminFixture } from './proxy-family-admin-fixture.mjs';
 import { createProxyCanonicalSnapshot } from '../../features/mayhem/proxy-canonical-view.js';
+import { readProxyOfferState } from '../../features/mayhem/proxy-offer-state.js';
+import { proxySettlementPolicyDigest } from '../../contract/proxy-finance.js';
 import { readProxyProviderState } from '../../features/mayhem/proxy-provider-state.js';
 import { proxyAdmissionSigningBytes, proxyOperationDigest } from '../../contract/proxy-protocol.js';
 import { submitMayhemFeature } from '../../src/rpc.js';
@@ -34,6 +36,36 @@ const server = createServer(async (request, response) => {
       ]) { const result = await f.policy(action); if (result.ok !== true) throw new Error('fixture policy rejected'); }
       await f.base.append({ type: 'seed', entries: [...f.storage.values] }); await f.base.update();
       return reply(200, { configured: true });
+    }
+    if (request.url === '/fixture/rate-readiness') {
+      // Synthetic public payout readiness only: no transfers, buyer funds or invoices.
+      const provider = body.provider, h = n => n.toString(16).padStart(64, '0');
+      const policyHash = await proxySettlementPolicyDigest(body.policy);
+      for (const action of [
+        { kind:'configure_finance', policy:{enabled:true,max_reservations_per_epoch:1000,max_reservations_per_provider_epoch:100,max_checkpoints_per_reservation:8} },
+        { kind:'set_settlement',policy_hash:policyHash,enabled:true,policy:body.policy },
+      ]) { if ((await f.policy(action)).ok !== true) throw Error('fixture finance policy rejected'); }
+      const entries = [...f.storage.values].filter(([key]) => key === 'proxy/v1/config' || key.startsWith('proxy/v1/settlement-policy/') || key.startsWith('proxy/v1/finance'));
+      entries.push(['rules/current',{ver:1,hash:h(800)}],['epoch/apply/state',{epoch:100,updated_epoch:100,pending_epoch:null}],
+        [`prov/${provider}`,{status:'active',accepted_rails:['fiat','tnk','tap']}]);
+      for (const rail of ['fiat','tnk','tap']) {
+        const payout = {type:'provider_payout_binding',provider,rail,revision:h(801),verified:true,activation_epoch:1,
+          target:rail==='fiat'?'acct_setup_fixture':rail==='tap'?'0x'+'2'.repeat(40):'fixture-target',
+          currency:rail==='fiat'?'eur':null,stripe_processor_revision:h(802),chain_id:rail==='tap'?1:null};
+        entries.push([`payout/binding/${rail}/${provider}/${payout.revision}`,payout],
+          [`payout/current/${rail}/${provider}`,{provider,rail,current_revision:payout.revision,pending_revision:null,pending_activation_epoch:null}]);
+        if (rail === 'fiat') {
+          const verification = {type:'stripe_payout_verification',provider,target:payout.target,revision:h(803),processor_revision:payout.stripe_processor_revision,ready:true};
+          const key = `payout/stripe-verified/setup-${provider}`;
+          entries.push([key,verification],[f.contract.providerStripePayoutVerificationTargetKey(provider,payout.target),{...verification,record_key:key}]);
+        }
+      }
+      await f.base.append({type:'seed',entries}); await f.base.update();
+      return reply(200,{ready:true});
+    }
+    if (request.url === '/v1/proxy/offer-state') {
+      if (hidden) return reply(503, {});
+      return reply(200, await readProxyOfferState({request:{...body,requester:body.offer.provider_pubkey},withCanonicalSnapshot:snapshot}));
     }
     if (request.url === '/fixture/permit') {
       permits++;

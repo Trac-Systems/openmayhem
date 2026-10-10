@@ -351,7 +351,14 @@ permit can attach one bound to its original first operation. Issuer rotation,
 permit reissue, invoice recovery and D3 collection/reversal policy require their
 own separately authorized implementation.
 
-One plan contains create/join plus its saved offers (at most 17 operations).
+The guided CLI/dashboard rate editor uses `Store::plan_rates` and
+`Store::publish_rates`. It retains a separate unsigned review, reads fresh
+canonical admission/current-offer state, derives sequences and per-slot revisions,
+and rechecks before signing. Only commercial terms change; probe accounting,
+market/membership/rails and the installed controller remain intact. See
+[guided rate updates](docs/SETUP_WIZARD.md#change-rates-without-changing-the-original-purchase).
+
+One expert plan contains create/join plus its saved offers (at most 17 operations).
 `publication-plan --offers-only` and `publish --offers-only` instead publish only
 the saved offers on the existing admitted membership. First update/check the
 original draft with explicit next sequence, higher offer revisions and rates;

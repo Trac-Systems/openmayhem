@@ -92,6 +92,7 @@ impl Runner {
         let mut last: BTreeMap<usize, (Instant, Signed)> = BTreeMap::new();
         let mut due = vec![Instant::now(); self.entries.len()];
         let mut rails = vec![0usize; self.entries.len()];
+        let mut queries = self.entries.iter().map(|e| e.query.clone()).collect::<Vec<_>>();
         let mut cursor = 0;
         let mut timer = tokio::time::interval(Duration::from_millis(250));
         timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -108,7 +109,10 @@ impl Runner {
                     let Some(Ok((i,r)))=r else {break Err(Error::Task)};
                     active.remove(&i);
                     due[i]=Instant::now()+Duration::from_secs(5);
-                    match r {Ok(view)=>{observed.insert(i,Arc::new(view));},Err(_)=>{
+                    match r.and_then(|view| { let offer=view.offer()?.clone(); Ok((view,offer)) }) {Ok((view,offer))=>{
+                        queries[i].offer=offer;
+                        observed.insert(i,Arc::new(view));
+                    },Err(_)=>{
                         observed.remove(&i);health.canonical_failures=health.canonical_failures.saturating_add(1);
                         rails[i]=(rails[i]+1)%self.entries[i].query.offer.accepted_rails.len();
                         if rails[i]!=0 {due[i]=Instant::now();}
@@ -119,9 +123,9 @@ impl Runner {
                         if pending.len()>=self.concurrency {break}
                         let i=cursor;cursor=(cursor+1)%self.entries.len();
                         if active.contains(&i)||Instant::now()<due[i] {continue}
-                        active.insert(i);let mut query=self.entries[i].query.clone();let client=self.financial.clone();
+                        active.insert(i);let mut query=queries[i].clone();let client=self.financial.clone();
                         query.rail=query.offer.accepted_rails[rails[i]];
-                        pending.spawn(async move{(i,client.offer_state(&query).await)});
+                        pending.spawn(async move{(i,client.current_rate_state(&query).await)});
                     }
                     // Only configured offer slots. Capacity storage and Ed25519
                     // signing run outside the async inference executor.
@@ -142,6 +146,7 @@ impl Runner {
                         let Some(message)=message else {continue};
                         let send=last.get(&i).is_none_or(|(at,old)| at.elapsed()>=Duration::from_millis(presence::HEARTBEAT_MS)
                             || old.body.state!=message.body.state || old.body.reason!=message.body.reason
+                            || old.body.offer!=message.body.offer || old.body.membership!=message.body.membership
                             || old.body.free_slots!=message.body.free_slots || old.body.allowance!=message.body.allowance);
                         if send {
                             let channel=presence::channel(&self.network,&message.body.market).map_err(|_|Error::Configuration)?;

@@ -121,6 +121,17 @@ async fn managed_provider_startup_negotiates_executes_and_closes_paid_decisions_
             .publish(saved.key().clone(), &recovery(&f, &peer), 1002)
             .await
             .unwrap();
+        let updated_offer = if rail == ProxyRail::Tnk {
+            // Publish new rates while the old request owns the paid slot. The
+            // same controller must advertise the new offer without restarting,
+            // yet the retained original purchase must still settle unchanged.
+            let mut offer = context.offer.clone();
+            offer.revision += 1;
+            for rate in &mut offer.rates { rate.per_unit_au += 10; }
+            let digest = offer.digest().unwrap();
+            assert_eq!(peer.command(&json!({"set_offer":offer}).to_string()).await["done"], "set_offer");
+            Some(digest)
+        } else { None };
         buyer
             .send(&exchange::Message::Execute {
                 request: serde_json::from_slice(&bytes).unwrap(),
@@ -146,6 +157,17 @@ async fn managed_provider_startup_negotiates_executes_and_closes_paid_decisions_
             );
         }
         settle(&s, &f, &peer, &mut buyer, &bytes, result).await;
+        if let Some(digest) = updated_offer {
+            // Do not hold the fixture's client idle beyond its own five-second
+            // execution/ACK limit while waiting for the independent heartbeat.
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    if bridge.frames.lock().await.iter().any(|f| f["type"] == "send"
+                        && f["message"]["body"]["offer"] == digest) { break; }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            }).await.expect("same controller advertises the new canonical rates");
+        }
         if rail == ProxyRail::Fiat {
             assert!(
                 health.borrow().presence.reconnects > 0,

@@ -118,3 +118,43 @@ test('provider observation rejects foreign identity, extra private fields and ca
   await assert.rejects(quote(f, request, n => { if (n === 2) throw new Error('canonical fork changed'); },
     readProxyOfferState), /canonical fork/);
 });
+
+test('only provider availability follows signed rate changes; exact buyer and provider quotes remain exact', async () => {
+  for (const family of ['llm', 'decisions']) for (const rail of ['fiat', 'tnk', 'tap']) {
+    const f = await proxyReservationFixture(rail, family);
+    const original = offerQuery(f);
+    const follow = { ...original, follow_rates: true };
+    const first = await quote(f, follow, null, readProxyOfferState);
+    assert.deepEqual(first.current_offer, f.offer);
+    // Actual signed registry publications, including a later price decrease.
+    let previous = f.offer;
+    for (const addition of [10n, 1n]) {
+      const offer = { ...f.offer, revision: previous.revision + 1,
+        rates: f.offer.rates.map(r => ({ ...r, per_unit_au: String(BigInt(r.per_unit_au) + addition) })),
+        per_request_au: String(BigInt(f.offer.per_request_au) + addition) };
+      assert.equal((await f.submit(await f.envelope({ kind: 'set_offer', offer }))).ok, true);
+      const before = JSON.stringify([...f.storage.values]);
+      const read = await quote(f, follow, null, readProxyOfferState);
+      assert.deepEqual(read.offer, f.offer, 'request echo remains bound to original challenge');
+      assert.deepEqual(read.current_offer, offer);
+      assert.equal(JSON.stringify([...f.storage.values]), before, 'observation never writes');
+      await assert.rejects(quote(f, original, null, readProxyOfferState), /no longer active/);
+      await assert.rejects(quote(f), /no longer active/);
+      assert.deepEqual((await quote(f, { ...original, offer }, null, readProxyOfferState)).offer, offer);
+      previous = offer;
+    }
+    assert.throws(() => validateProxyQuoteStateRequest({ ...query(f), follow_rates: true }));
+    assert.throws(() => validateProxyOfferStateRequest({ ...original, follow_rates: false }));
+    assert.throws(() => validateProxyOfferStateRequest({ ...follow, requester: f.buyer.publicKey }));
+    await assert.rejects(quote(f, { ...follow, offer: { ...previous, revision: previous.revision + 1 } },
+      null, readProxyOfferState), /went backwards/);
+    await assert.rejects(quote(f, { ...follow, offer: { ...previous, per_request_au: '99999' } },
+      null, readProxyOfferState), /outside its rates/);
+    await assert.rejects(quote(f, follow, n => { if (n === 2) throw new Error('canonical fork changed'); },
+      readProxyOfferState), /canonical fork/);
+    assert.equal((await f.submit(await f.envelope({ kind: 'withdraw_offer', market_id: previous.market_id,
+      endpoint: previous.endpoint, ctx_bracket: previous.ctx_bracket, outcome_class: previous.outcome_class,
+      revision: previous.revision + 1 }))).ok, true);
+    await assert.rejects(quote(f, follow, null, readProxyOfferState), /no longer active/);
+  }
+});

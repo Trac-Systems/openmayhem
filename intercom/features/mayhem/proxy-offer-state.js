@@ -26,8 +26,23 @@ export function validateProxyOfferQuery(value) {
 }
 export function validateProxyOfferStateRequest(value) {
   validateProxyOfferQuery(value);
-  need(Object.keys(value).sort().join('|') === 'offer|rail|request_nonce|requester|settlement_policy_hash'
+  const fields = value.follow_rates === true ? 'follow_rates|offer|rail|request_nonce|requester|settlement_policy_hash'
+    : 'offer|rail|request_nonce|requester|settlement_policy_hash';
+  need(Object.keys(value).sort().join('|') === fields
     && value.requester === value.offer.provider_pubkey, 'requester does not own this offer');
+}
+
+// Availability may follow the provider's own canonical rate publications. It
+// cannot silently adopt another membership, rail set, endpoint or submarket.
+// Quotes, acceptance and settlement continue to require the exact original offer.
+async function rateSuccessor(original, current) {
+  validateProxyOffer(current);
+  need(current.revision >= original.revision, 'offer revision went backwards');
+  const comparable = current.revision === original.revision ? original : { ...original,
+    revision: current.revision, rates: current.rates, per_request_au: current.per_request_au,
+    min_session_au: current.min_session_au };
+  need(await proxyOfferDigest(comparable) === await proxyOfferDigest(current),
+    'offer changed outside its rates');
 }
 
 // Only called inside a fresh canonical snapshot. The payout target is internal;
@@ -71,9 +86,17 @@ export async function readProxyOfferState({ request, withCanonicalSnapshot }) {
   need(typeof withCanonicalSnapshot === 'function', 'service is not configured');
   return withCanonicalSnapshot(async snapshot => {
     await snapshot.assertCurrent();
-    const { fields } = await readProxyOfferInputs(request, snapshot);
+    let current = request.offer;
+    if (request.follow_rates === true) {
+      const selected = await readActiveProxyOffer(request.offer, snapshot.context, key => snapshot.read(key));
+      need(selected !== null, 'offer is no longer active or admitted; requote');
+      current = selected.offer;
+      await rateSuccessor(request.offer, current);
+    }
+    const { fields } = await readProxyOfferInputs({ ...request, offer: current }, snapshot);
     await snapshot.assertCurrent();
-    const response = { ok: true, schema_version: 1, lane: 'proxy', ...request, ...fields };
+    const response = { ok: true, schema_version: 1, lane: 'proxy', ...request, ...fields,
+      ...(request.follow_rates === true ? { current_offer: current } : {}) };
     need(b4a.byteLength(JSON.stringify(response)) <= PROXY_OFFER_STATE_MAX_BYTES, 'response exceeds bound');
     return response;
   }, { financial: true });

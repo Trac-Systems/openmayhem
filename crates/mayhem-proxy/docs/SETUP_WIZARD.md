@@ -76,6 +76,7 @@ The interactive wizard exposes these explicit steps:
 | `a` Admission facts | Read fresh canonical registration and operation-sequence facts; unavailable is not unpaid. |
 | `i` Invoice/create; `t` Status; `f` FIAT checkout | Create/recover the original invoice, reconcile it, or request checkout. The CLI does not send a transfer. |
 | `v` Review publication; `u` Publish | Review the exact initial create/join and offers, then explicitly sign/submit it. |
+| `e` Review new rates; `z` Publish rate review | Edit USD prices for the existing submarkets, then confirm the retained offer-only plan. Sequence and offer revisions come from fresh canonical reads. |
 | `r` Recover probe; `o` Recover publication | Reconcile the original retained work; no new probe or payment identity. |
 | `g` Review Run; `b` Begin Run; `h` Reconcile Run | Review the generated controller, explicitly install it, or inspect that original child. |
 
@@ -307,66 +308,59 @@ states attests capacity. Recovery never installs/replaces a child, changes the
 retained plan, reloads the editable runtime template, or creates a new budget.
 A missing child requires another explicit Start of the same acknowledged plan;
 a conflicting child requires operator reconciliation, not automatic removal.
-An edited draft cannot reprice or replace a previously retained Run.
+An edited draft cannot replace a previously retained Run. A confirmed commercial-only publication keeps that original child; other execution changes still require explicit lifecycle reconciliation.
 
-The first Run plan is immutable for this draft directory. Updating an installed
-controller to a later publication remains an explicit operator lifecycle task;
-this wizard does not silently remove/re-add it. Guided `setup init` generates the
-first standard runtime policy in both CLI and dashboard. Initial price entry uses
-exact USD decimals; later revision editing still exposes exact AU controls.
+The first Run plan remains immutable for this draft directory. A commercial-only
+publication leaves its controller identity, capacity store and probe allowance
+unchanged. Provider-owned presence reads follow the latest canonical rates for
+that same offer slot; paid requests and accepted jobs retain their exact offer
+bindings. Other runtime reconfiguration is not an automatic remove/re-add.
 
 ## Change rates without changing the original purchase
 
-Saving new prices changes a draft; it does not reprice accepted sessions or a
-running controller. A rate-only edit can reuse a still-valid protocol probe, but
-must pass a new structural check and exact signed publication. Connection,
-upstream, recipe, endpoint/resource or capability changes invalidate the affected
-probe binding. Unknown/uncertain work never becomes successful evidence.
+Use **e Review new rates** in the resumed CLI wizard, or **Change rates in this
+market → Review new rates** in the dashboard. Enter exact USD prices for the
+existing billing units, request fee and minimum session. This path preserves the
+market, membership, rails, endpoint, metering units, model, connection, resource
+limits and settlement policy. It requires the current configuration's completed
+publication. Use the separate reconfiguration path for other changes.
 
-For an already admitted membership, use the explicit offer-only path. Prepare a
-protected `ProfileInput` for that same identity/market/connection, with the new
-offer revisions/prices and the exact next canonical operation sequence. Obtain
-that sequence through Admission facts; do not infer it from the draft revision.
-The examples below use `$SETUP_STATE` for the existing bundle's `state` directory,
-`$PROFILE_INPUT` for that reviewed input, and `$PEER_RPC` for the configured trusted
-peer. Set `$REVISION` to the latest returned draft revision before **each** command.
+Review reads fresh admitted-provider state and the current same-slot offers from
+the configured trusted Core peer. It derives the next canonical operation sequence
+and each slot's next offer revision, including unequal existing revisions. The
+bounded retained proposal shows old and new terms; reviewing it does not alter
+the draft, sign, collect a fee, probe or restart inference.
 
-```sh
-mayhem provider proxy setup prepare --directory "$SETUP_STATE" \
-  --input "$PROFILE_INPUT" --expected-revision "$REVISION"
-mayhem provider proxy setup check --directory "$SETUP_STATE" \
-  --expected-revision "$REVISION"
-mayhem provider proxy setup publication-plan --directory "$SETUP_STATE" \
-  --expected-revision "$REVISION" --offers-only
-```
+Use **z Publish retained rate review** or **Publish reviewed rates** to confirm.
+Before a new submission, setup rechecks the exact sequence and offer baseline. A
+concurrent publication invalidates the review; refresh and review the new facts.
+Only `set_offer` operations are signed. The existing entitlement is reused: no
+replacement market, membership, invoice or permit is created. Original probe
+identity, evidence and cumulative accounting survive the commercial-only update.
+The running controller adopts canonical rates through its existing presence read;
+Run inspection/recovery retains the original immutable installed child.
 
-Review the plan before invoking the signing command:
+Unattended actions use the same strict shared flow:
 
-```sh
-mayhem provider proxy setup publish --directory "$SETUP_STATE" \
-  --expected-revision "$REVISION" --offers-only --peer-rpc "$PEER_RPC" \
-  --home "$MAYHEM_HOME"
-```
+- `rate_plan`: `expected_revision` and `choices` containing each existing `slot_id`,
+  exact `rates`, decimal-string `per_request_au` and `min_session_au`. Obtain
+  current slots from `rate_choices` in `wizard --inspect`; never invent them.
+- `publish_rates`: current `expected_revision` and the retained `plan_digest`.
 
-The simple wizard's `v`/`u` buttons review the initial create/join path; they are
-not an offer-only update shortcut. Advanced Flow actions can select
-`offers_only:true` and bind `publish` to the returned `plan_digest`. A pending
-publication must be recovered before editing. After an uncertain result:
+The action wire uses exact AU strings; the interactive forms convert USD at
+18 decimal places without floats or rounding. Sequence, revisions, membership,
+rails and private paths are not accepted as rate choices. A pending signed
+publication must be recovered before another rate edit. After a lost response,
+refresh the existing wizard and use the retained rate confirmation or **Recover
+original publication**. If the local draft write completed before submission,
+the retained proposal offers the same recovery. Do not create a second invoice,
+controller or allowance. Accepted work keeps its original signed prices; native
+price-floor commands do not change proxy rates.
 
-```sh
-mayhem provider proxy setup inspect --directory "$SETUP_STATE"
-mayhem provider proxy setup recover-publication --directory "$SETUP_STATE" \
-  --expected-revision "$REVISION" --peer-rpc "$PEER_RPC"
-```
-
-The wizard's first Run plan remains immutable. A guided transition from that
-running controller to a later offer publication is not implemented: reviewing
-or starting a different Run plan returns a conflict. The commands above complete
-canonical offer publication, not the full running-provider rate-change workflow.
-An expert lifecycle replacement outside this wizard is still required. Preserve its original capacity/recovery
-stores and wait for original accepted work to reconcile. Never create a second
-controller or new allowance to bypass retained occupancy. Native price-floor
-commands do not alter proxy offer rates.
+The expert `prepare` / `check` / `publication-plan --offers-only` / `publish
+--offers-only` interface remains available for explicitly authored profiles. It
+requires explicit canonical sequence and offer revisions; the guided rate flow
+performs those reads and derivations instead.
 
 ## Read health for the correct controller
 

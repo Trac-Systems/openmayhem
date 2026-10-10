@@ -288,7 +288,7 @@ pub struct PublicationReport {
 }
 
 impl Record {
-    fn publication_plan(&self, offers_only: bool) -> Result<PublicationPlan> {
+    pub(super) fn publication_plan(&self, offers_only: bool) -> Result<PublicationPlan> {
         require(self.checked.as_ref() == Some(&self.binding()?))?;
         if self.input.connection()? != self.connection {
             return Err(Error::ConnectionChanged);

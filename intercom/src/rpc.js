@@ -434,7 +434,9 @@ export async function requestProxyIntentState(peer, body) {
 }
 
 export async function requestProxyOfferState(peer, body) {
-  if (!isObject(body) || Object.keys(body).sort().join('|') !== 'offer|rail|request_nonce|settlement_policy_hash') throw new Error('Invalid proxy offer query.');
+  const fields = body?.follow_rates === true ? 'follow_rates|offer|rail|request_nonce|settlement_policy_hash'
+    : 'offer|rail|request_nonce|settlement_policy_hash';
+  if (!isObject(body) || Object.keys(body).sort().join('|') !== fields) throw new Error('Invalid proxy offer query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
   if (typeof feature?.proxyOfferState !== 'function') throw new Error('Proxy offer relay is not ready.');
   return await feature.proxyOfferState(body);

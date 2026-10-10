@@ -433,12 +433,32 @@ async fn run_exact_canonical_publication_lost_ack_restart_and_spent_budget() {
     );
     private(&f.input.connection_file, &connection_original);
     // Changed editable draft does not relaunch or replace the retained original.
+    let observed = f.store().admission_check(published.revision, &peer.rpc(), 10000).await.unwrap();
     let mut next = f.input.clone();
+    next.sequence = observed.admission.as_ref().unwrap().next_sequence.unwrap();
     next.offers[0].revision += 1;
-    f.store().update(published.revision, next).unwrap();
+    next.offers[0].per_request_au += 1;
+    let edited = f.store().update(observed.revision, next).unwrap();
     let recovered = f.store().recover_run(&host).await.unwrap();
     assert!(!recovered.for_current_configuration);
     assert_eq!(recovered.plan.plan_digest, plan.plan_digest);
+    let checked = f.store().check(edited.revision).unwrap();
+    assert_eq!(checked.probe_status, "protocol_validated", "commercial changes reuse original protocol proof");
+    let prices = f.store().publication_plan(checked.revision, true).unwrap();
+    let repriced = f.store().publish(checked.revision, &peer.rpc(), 10000,
+        prices.authorize(&publication::signer(122), None).unwrap()).await.unwrap();
+    assert_eq!(repriced.publication_status, "canonical_operations_confirmed");
+    let same = f.store().run_plan(repriced.revision, template(&f), probe(), &peer.rpc(), &host).unwrap();
+    assert_eq!(same.plan_digest, plan.plan_digest, "original reviewed process identity remains immutable");
+    assert_eq!(same.config_digest, plan.config_digest);
+    assert!(f.store().inspect_run().unwrap().unwrap().for_current_configuration);
+    let repriced_run = f.store().start_run(repriced.revision, template(&f), probe(), &peer.rpc(), &plan.plan_digest, &host).await.unwrap();
+    assert!(repriced_run.for_current_configuration);
+    let mut different_limits = template(&f);
+    different_limits.limits.sessions += 1;
+    assert!(matches!(f.store().run_plan(repriced.revision, different_limits, probe(), &peer.rpc(), &host), Err(Error::RunConflict)),
+        "commercial update cannot replace execution policy");
+    assert_eq!(std::fs::read(&path).unwrap(), bytes, "installed config remains unchanged");
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     assert_eq!(host.installs.load(Ordering::SeqCst), 1);
     let capacity = f.dir.path().join("capacity.redb");

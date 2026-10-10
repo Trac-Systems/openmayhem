@@ -130,10 +130,12 @@ substitute for the local dashboard session. No endpoint accepts an arbitrary
 host path, process command, wallet key or signing payload.
 
 Proxy prices stay fixed in the signed offer; changing a form does not reprice
-accepted work or replace a running controller. The initial form uses USD decimals;
-the saved-draft editor currently uses AU and revision fields. Its Publish button
-is the initial create/join path. For later offer-only changes and immutable Run
-limitations, follow [Change rates](SETUP_WIZARD.md#change-rates-without-changing-the-original-purchase).
+accepted work or replace a running controller. **Change rates in this market**
+uses exact USD decimals and derives current canonical sequences/revisions.
+**Review new rates** retains an unsigned proposal; **Publish reviewed rates**
+rechecks it and publishes only the same submarket slots, with no second fee or
+model restart. The original Run remains installed. The separate initial Publish
+button still handles create/join. For rate recovery and execution boundaries, follow [Change rates](SETUP_WIZARD.md#change-rates-without-changing-the-original-purchase).
 For lost responses use the retained Status/Recover/Reconcile actions rather than
 creating a new invoice, draft or controller. Reconcile Run reports that exact
 child's lifecycle; it does not attest upstream readiness.

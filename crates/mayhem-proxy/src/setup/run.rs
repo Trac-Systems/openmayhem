@@ -127,6 +127,10 @@ pub struct RunPlan {
     pub probe_budget: crate::capacity::probes::Budget,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_handling: Vec<crate::declaration::Signed>,
+    /// Pinned execution/configuration identity excluding commercial revisions.
+    /// Absent on older retained plans, which keep exact-publication recovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_binding: Option<Digest>,
     pub plan_digest: Digest,
 }
 #[derive(Serialize)]
@@ -174,15 +178,31 @@ fn identity(record: &Record) -> Result<attempts::Identity> {
         controller_pubkey: record.input.provider_pubkey.clone(),
     })
 }
+fn runtime_binding(record: &Record) -> Result<Digest> {
+    let mut input = record.input.clone();
+    // These are the only fields the existing runtime may follow through signed
+    // canonical offer updates. Every endpoint, rail, adapter, capacity and probe
+    // binding stays in this digest. No mutable history is loaded.
+    input.sequence = 1;
+    for offer in &mut input.offers {
+        offer.revision = 1;
+        offer.per_request_au = 0;
+        offer.min_session_au = 0;
+        for rate in &mut offer.rates { rate.per_unit_au = 0; rate.granularity = 1; }
+    }
+    digest("mayhem/proxy/setup-run-execution/v1", &json!({
+        "input": input, "connection":record.connection, "probe_scope":record.probe_scope
+    }))
+}
 fn current(record: &Record, plan: &RunPlan) -> Result<bool> {
     let review = record.review()?;
+    let same_runtime = plan.runtime_binding.as_ref() == Some(&runtime_binding(record)?);
     Ok(record.id == plan.draft_id
-        && record.revision == plan.draft_revision
         && review.state == State::StructurallyValid
         && review.publication.as_ref().is_some_and(|p| {
             p.state == PublicationState::Complete
                 && p.for_current_configuration
-                && p.plan_digest == plan.publication_plan_digest
+                && ((record.revision == plan.draft_revision && p.plan_digest == plan.publication_plan_digest) || same_runtime)
         }))
 }
 impl Retained {
@@ -331,10 +351,40 @@ fn build(
         recovery_probes_enabled: template.allow_recovery_probes,
         probe_budget: budget,
         data_handling,
+        runtime_binding: Some(runtime_binding(record)?),
         plan_digest: Digest::hash("placeholder", &[]),
     };
     plan.plan_digest = plan_digest(&plan)?;
     Ok((config, plan))
+}
+
+/// Prove a revised review still addresses the original installed controller.
+/// Only canonical offer rates can differ; changed templates, paths, recovery
+/// allowances or runtime limits must not silently replace the retained Run.
+fn retained_plan(
+    guard: &store::Guard,
+    record: &Record,
+    mut candidate: managed::Config,
+    saved: &Retained,
+    host: &dyn RunLifecycle,
+    directory: &Path,
+) -> Result<RunPlan> {
+    saved.validate()?;
+    if !current(record, &saved.plan)? { return Err(Error::RunConflict); }
+    let original: managed::Config = guard.read_json(&filename(&saved.plan.config_digest))?
+        .ok_or(Error::RunConflict)?;
+    if digest("mayhem/proxy/setup-managed-config/v1", &original)? != saved.plan.config_digest
+        || candidate.routes.len() != original.routes.len() { return Err(Error::RunConflict); }
+    for (next, old) in candidate.routes.iter_mut().zip(&original.routes) {
+        if next.offers.len() != old.offers.len() || !old.offers.iter().zip(&next.offers)
+            .all(|(a,b)| crate::financial::offer::rate_successor(a,b)) { return Err(Error::RunConflict); }
+        next.offers = old.offers.clone();
+    }
+    if digest("mayhem/proxy/setup-managed-config/v1", &candidate)? != saved.plan.config_digest
+        || host.binding(&identity(record)?, &directory.join(filename(&saved.plan.config_digest)), &saved.plan.config_digest)? != saved.plan.launch {
+        return Err(Error::RunConflict);
+    }
+    Ok(saved.plan.clone())
 }
 // A renewed declaration must not replace the original installed Run identity.
 // Its configured source supplies fresh metadata independently of the retained
@@ -364,7 +414,7 @@ impl Store {
             return Err(Error::Conflict);
         }
         let declarations = run_declarations(&guard, &record)?;
-        let (_, plan) = build(
+        let (config, plan) = build(
             &record,
             declarations,
             template,
@@ -376,7 +426,7 @@ impl Store {
         if let Some(saved) = guard.read_json::<Retained>("wizard-run.json")? {
             saved.validate()?;
             if saved.plan.plan_digest != plan.plan_digest {
-                return Err(Error::RunConflict);
+                return retained_plan(&guard, &record, config, &saved, host, &self.directory);
             }
         }
         Ok(plan)
@@ -413,6 +463,11 @@ impl Store {
             &self.directory,
             host,
         )?;
+        if let Some(mut saved) = guard.read_json::<Retained>("wizard-run.json")? {
+            let original = retained_plan(&guard, &record, config, &saved, host, &self.directory)?;
+            if &original.plan_digest != expected_plan { return Err(Error::RunConflict); }
+            return reconcile(&guard, &record, &self.directory, &mut saved, host, true).await;
+        }
         if &plan.plan_digest != expected_plan {
             return Err(Error::RunConflict);
         }

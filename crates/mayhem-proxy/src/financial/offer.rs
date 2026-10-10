@@ -34,6 +34,10 @@ struct Wire {
     requester: String,
     request_nonce: String,
     offer: ProxyOffer,
+    #[serde(default)]
+    follow_rates: bool,
+    #[serde(default)]
+    current_offer: Option<ProxyOffer>,
     rail: ProxyRail,
     settlement_policy_hash: String,
     context: Context,
@@ -55,6 +59,11 @@ pub struct Observation {
     started: Instant,
 }
 impl Observation {
+    /// Canonically observed effective offer, never a local rate suggestion.
+    pub fn offer(&self) -> Result<&ProxyOffer> {
+        self.fresh()?;
+        Ok(&self.wire.offer)
+    }
     pub(crate) fn check_descriptor(
         &self,
         context: &crate::descriptor::Context,
@@ -159,6 +168,14 @@ impl Observation {
 }
 impl Client {
     pub async fn offer_state(&self, query: &Query) -> Result<Observation> {
+        self.observe_offer(query, false).await
+    }
+    /// Control-plane availability only: follow signed rate publications within
+    /// this exact membership/submarket. Paid negotiation uses `offer_state`.
+    pub async fn current_rate_state(&self, query: &Query) -> Result<Observation> {
+        self.observe_offer(query, true).await
+    }
+    async fn observe_offer(&self, query: &Query, follow_rates: bool) -> Result<Observation> {
         query.validate(&self.requester)?;
         let _permit = self
             .slots
@@ -169,6 +186,9 @@ impl Client {
         let nonce = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let mut body = serde_json::to_value(query)?;
         body["request_nonce"] = json!(nonce);
+        if follow_rates {
+            body["follow_rates"] = json!(true);
+        }
         let started = Instant::now();
         let mut response = self
             .http
@@ -199,7 +219,7 @@ impl Client {
             )?;
             bytes.extend_from_slice(&chunk);
         }
-        let w: Wire = serde_json::from_slice(&bytes)?;
+        let mut w: Wire = serde_json::from_slice(&bytes)?;
         require(
             started.elapsed() <= FRESHNESS
                 && w.ok
@@ -209,12 +229,20 @@ impl Client {
                 && w.request_nonce == nonce
                 && w.context.identity() == self.identity
                 && w.offer == query.offer
+                && w.follow_rates == follow_rates
                 && w.rail == query.rail
                 && w.settlement_policy_hash == query.settlement_policy_hash
                 && w.context.epoch < w.billing_epoch
                 && w.billing_epoch <= PROXY_MAX_SAFE_INTEGER,
             "provider offer response binding differs",
         )?;
+        if follow_rates {
+            let current = w.current_offer.take().ok_or_else(|| invalid("current rate offer missing"))?;
+            require(rate_successor(&query.offer, &current), "current offer changed outside its rates")?;
+            w.offer = current;
+        } else {
+            require(w.current_offer.is_none(), "unexpected current rate offer")?;
+        }
         w.proof.validate()?;
         w.offer
             .validate_for_membership(&w.market, &w.membership)
@@ -228,4 +256,20 @@ impl Client {
         )?;
         Ok(Observation { wire: w, started })
     }
+}
+
+/// A commercial update preserves every execution/rail binding, including the
+/// registered submarket. Same-revision substitutions and rollbacks are refused.
+pub(crate) fn rate_successor(original: &ProxyOffer, current: &ProxyOffer) -> bool {
+    if current.validate().is_err() || current.revision < original.revision {
+        return false;
+    }
+    let mut comparable = original.clone();
+    if current.revision > original.revision {
+        comparable.revision = current.revision;
+        comparable.rates = current.rates.clone();
+        comparable.per_request_au = current.per_request_au;
+        comparable.min_session_au = current.min_session_au;
+    }
+    comparable == *current
 }

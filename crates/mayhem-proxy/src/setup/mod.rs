@@ -11,6 +11,7 @@ mod flow;
 mod probe;
 mod profile;
 mod publication;
+mod rates;
 mod review;
 mod run;
 mod store;
@@ -28,6 +29,7 @@ pub use publication::{
     AdmissionPermit, PublicationAuthorization, PublicationPlan, PublicationReason,
     PublicationReport, PublicationState,
 };
+pub use rates::{RateChoice, RatePlan, RateReport};
 pub use review::{AdmissionHandoff, Review, State};
 pub use run::{
     LaunchBinding, LifecycleObservation, ProcessObservation, RunFuture, RunLifecycle, RunPlan,
@@ -85,6 +87,10 @@ pub enum Error {
     DiscoveryMissing,
     #[error("provider publication requires recovery of its original signed operations")]
     PublicationRecovery,
+    #[error("canonical rate inputs are unavailable; retain this review and retry the read")]
+    RatesUnavailable,
+    #[error("canonical rates or sequence changed; review the new rates before publishing")]
+    RatesChanged,
     #[error("provider admission service is unavailable; resume the original setup, do not send another fee")]
     EnrollmentUnavailable,
     #[error("managed startup requires the exact current checked and confirmed publication with its original probe scope")]

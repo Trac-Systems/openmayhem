@@ -284,9 +284,15 @@ impl Publisher {
         } else {
             view.reason.into()
         };
+        let offer_digest = Digest::new(offer.digest().map_err(invalid)?)
+            .map_err(|_| invalid("invalid presence offer"))?;
+        let membership_digest = Digest::new(member.digest().map_err(invalid)?)
+            .map_err(|_| invalid("invalid presence member"))?;
         if !refresh_due
             && previous.is_some_and(|old| {
                 old.body.state == state
+                    && old.body.offer == offer_digest
+                    && old.body.membership == membership_digest
                     && old.body.reason == reason
                     && old.body.free_slots == free
                     && old.body.allowance == allowance
@@ -309,10 +315,8 @@ impl Publisher {
                     .map_err(|_| invalid("invalid presence market"))?,
                 slot: Digest::new(offer.slot_id().map_err(invalid)?)
                     .map_err(|_| invalid("invalid presence slot"))?,
-                offer: Digest::new(offer.digest().map_err(invalid)?)
-                    .map_err(|_| invalid("invalid presence offer"))?,
-                membership: Digest::new(member.digest().map_err(invalid)?)
-                    .map_err(|_| invalid("invalid presence member"))?,
+                offer: offer_digest,
+                membership: membership_digest,
                 membership_revision: member.revision,
                 offer_revision: offer.revision,
                 fence,

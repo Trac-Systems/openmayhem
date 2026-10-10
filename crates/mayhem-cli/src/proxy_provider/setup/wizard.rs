@@ -3,6 +3,7 @@ use super::*;
 use mayhem_proxy::setup::{Flow, FlowAction, FlowConfig, FlowView, ProfileMarket};
 use std::io::{self, Write};
 mod declarations;
+mod rates;
 
 #[derive(Debug, Args)]
 pub struct WizardArgs {
@@ -97,7 +98,7 @@ async fn execute(
 ) -> Result<mayhem_proxy::setup::FlowResult> {
     if matches!(
         action,
-        FlowAction::Enrollment { .. } | FlowAction::Publish { .. } | FlowAction::ConfirmDeclaration { .. }
+        FlowAction::Enrollment { .. } | FlowAction::Publish { .. } | FlowAction::PublishRates { .. } | FlowAction::ConfirmDeclaration { .. }
     ) {
         let keypair = resolve_wallet_keypair_path(wallet)?;
         let key = cached_wallet_signing_key(
@@ -144,6 +145,7 @@ pub async fn run(args: WizardArgs) -> Result<()> {
         show(&view)?;
         if let Some(d) = &view.declaration { println!("Data handling: {} (declared, not verified)", d.state); }
         println!("j Review data-handling declarations  y Sign retained declaration review  w Review withdrawal");
+        println!("e Review new rates (same market)  z Publish retained rate review");
         println!("c Connect  d Discover  s Select/price  k Check  p Probe  a Admission facts\ni Invoice/create  t Status  f FIAT checkout  v Review publication  u Publish\nr Recover original probe  o Recover original publication  g Review Run  b Begin Run  h Reconcile Run  x Exit");
         let command = prompt("Action", "x")?;
         if command == "x" {
@@ -153,6 +155,13 @@ pub async fn run(args: WizardArgs) -> Result<()> {
         let needs_revision =
             || revision.ok_or_else(|| anyhow::anyhow!("save your selection first"));
         let action = match command.as_str() {
+            "e" => rates::review(&view)?,
+            "z" => {
+                let pending = view.rates.as_ref().ok_or_else(|| anyhow::anyhow!("review rates first"))?;
+                println!("{}", serde_json::to_string_pretty(pending)?);
+                if prompt("Publish exactly these rates? Existing accepted jobs keep their terms; no second fee or inference restart. (yes/no)", "no")? != "yes" { continue; }
+                FlowAction::PublishRates { expected_revision: needs_revision()?, plan_digest: pending.plan.plan_digest.clone() }
+            }
             "j" => declarations::review(&flow, &view).await?,
             "w" => declarations::withdraw(&view)?,
             "y" => {
