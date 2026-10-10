@@ -65,12 +65,12 @@ function privateText(file) { const b=readCustodyFile(file,{max:4096});try{return
 export async function main(env=process.env) {
   need(env.PROXY_ADMISSION_REFUND_WORKER_ENABLED==='1'&&env.PROXY_ADMISSION_REFUND_WORKER_CONFIG,'refund worker disabled');
   const c=privateJson(env.PROXY_ADMISSION_REFUND_WORKER_CONFIG);
-  shape(c,['api_origin','api_credential_file','policy_file','executor_key_file','executor_password_file','journal_root','stripe','timeout_ms','poll_ms','mode','allow_loopback_http',...(Object.hasOwn(c,'tnk')?['tnk']:[])]);
+  shape(c,['api_origin','api_credential_file','policy_file','executor_key_file','executor_password_file','journal_root','stripe','timeout_ms','poll_ms','mode','allow_loopback_http',...['tnk','tap'].filter(r=>Object.hasOwn(c,r))]);
   if(c.stripe!==null)shape(c.stripe,['account','livemode','currency','credential_file','retry_window_ms','max_lookup_pages']);
-  need(c.stripe!==null||c.tnk,'at least one explicit return rail required');
+  need(c.stripe!==null||c.tnk||c.tap,'at least one explicit return rail required');
   need(['once','watch'].includes(c.mode)&&uint(c.poll_ms,1000)&&c.poll_ms<=60000&&typeof c.allow_loopback_http==='boolean','invalid refund worker mode');
   const policy=privateJson(c.policy_file);need(policy.enabled===true&&Array.isArray(policy.rails)
-    &&(c.stripe===null||policy.rails.includes('fiat'))&&(!c.tnk||policy.rails.includes('tnk')),'configured return rails differ from policy');
+    &&(c.stripe===null||policy.rails.includes('fiat'))&&(!c.tnk||policy.rails.includes('tnk'))&&(!c.tap||policy.rails.includes('tap')),'configured return rails differ from policy');
   const password=readCustodyFile(c.executor_password_file,{max:4096}),pem=readCustodyFile(c.executor_key_file,{max:16384});let key;
   try {need(pem.toString('ascii',0,40).startsWith('-----BEGIN ENCRYPTED PRIVATE KEY-----'),'encrypted executor key required');key=createPrivateKey({key:pem,format:'pem',passphrase:password});}
   finally {password.fill(0);pem.fill(0);}
@@ -81,6 +81,10 @@ export async function main(env=process.env) {
   const stop=new AbortController();
   const shutdown=()=>stop.abort();process.once('SIGINT',shutdown);process.once('SIGTERM',shutdown);
   try {
+    if(c.tap){
+      const {openTapRefundRuntime}=await import('./proxy-admission-refund-tap-runtime.mjs');
+      adapters.tap=openTapRefundRuntime(c.tap,{policy,key,journalRoot:c.journal_root,allowLoopbackHttp:c.allow_loopback_http}).adapter;
+    }
     if(c.tnk){
       const {openTnkRefundRuntime}=await import('./proxy-admission-refund-tnk-runtime.mjs');
       tnkRuntime=await openTnkRefundRuntime(c.tnk,{policy,key,journalRoot:c.journal_root,allowLoopbackHttp:c.allow_loopback_http});adapters.tnk=tnkRuntime.adapter;

@@ -40,6 +40,22 @@ NODE
 copy_tracked_allowlist "$tmp/runtime" "${INTERCOM_SOURCE_ALLOWLIST[@]}"
 [[ -f "$tmp/runtime/intercom/contract/proxy-protocol.js" ]] || fail 'proxy runtime marker not staged'
 cmp "$ROOT_DIR/intercom/contract/proxy-protocol.js" "$tmp/runtime/intercom/contract/proxy-protocol.js"
+# TAP returns must load from the installed Intercom layout, without depending
+# on a developer's sibling contracts checkout or its node_modules symlink.
+[[ -f "$tmp/runtime/intercom/scripts/proxy-admission-refund-tap-transaction.mjs" ]] || fail 'TAP return codec omitted'
+ln -s "$ROOT_DIR/intercom/node_modules" "$tmp/runtime/intercom/node_modules"
+node --input-type=module - "$tmp/runtime/intercom" <<'NODE'
+import fs from 'node:fs';
+import path from 'node:path';
+import {pathToFileURL} from 'node:url';
+const root=process.argv[2];
+const pkg=JSON.parse(fs.readFileSync(path.join(root,'package.json'),'utf8'));
+if(pkg.dependencies.ethers!=='6.17.0')throw Error('TAP signing dependency is not pinned');
+await import(pathToFileURL(path.join(root,'scripts/proxy-admission-refund-tap-runtime.mjs')));
+const {main}=await import(pathToFileURL(path.join(root,'scripts/proxy-admission-refund-worker.mjs')));
+let disabled=false;try{await main({});}catch(e){disabled=/disabled/.test(e.message);}
+if(!disabled)throw Error('packaged return worker enabled implicitly');
+NODE
 
 VERSION=0.2.999
 BUILT_AT=2026-10-10T00:00:00Z
