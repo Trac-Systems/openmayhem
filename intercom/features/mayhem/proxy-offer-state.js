@@ -63,6 +63,7 @@ export async function readProxyOfferInputs(request, snapshot) {
     'settlement policy is not enabled');
   const provider = request.offer.provider_pubkey;
   const registration = await ledger.get(`prov/${provider}`);
+  need(registration !== null, 'provider payment registration is missing');
   need(registration?.status === 'active' && registration.accepted_rails?.includes(request.rail),
     'provider payment rail is not active');
   const pointer = await ledger.get(ledger.providerPayoutBindingPointerKey(provider, request.rail));

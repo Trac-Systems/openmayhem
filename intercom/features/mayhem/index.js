@@ -129,6 +129,24 @@ const relayResponseRejected = (response) => (
   response.ok === false
 );
 
+// A failed authenticated service reply has no canonical snapshot. Check it
+// before constructing a context, otherwise its real rejection is replaced by
+// a misleading network-context error. Only fixed public readiness messages may
+// cross this boundary; unexpected exceptions can contain private operator data.
+const proxyReadinessErrors = new Set([
+  'Proxy offer state: provider payment registration is missing.',
+  'Proxy offer state: provider payment rail is not active.',
+  'Proxy offer state: payout pointer is missing.',
+  'Proxy offer state: settlement policy is not enabled.',
+  'Proxy offer state: offer is no longer active or admitted; requote.',
+]);
+const requireProxyObservationSuccess = (result, label) => {
+  if (relayResponseOk(result)) return;
+  const message = relayResponseRejected(result) && proxyReadinessErrors.has(result.message)
+    ? result.message : `Proxy ${label} state is unavailable; refresh the same observation.`;
+  throw new Error(message);
+};
+
 const relayResponseCacheable = (response) => (
   relayResponseOk(response) ||
   (
@@ -731,6 +749,7 @@ class MayhemFeature extends Feature {
       signing_version: SERVICE_SIGNING_VERSION, signature: b4a.isBuffer(signature) ? b4a.toString(signature, 'hex') : signature });
     const elapsed = Date.now() - started;
     if (elapsed < 0 || elapsed > PROXY_OPERATOR_STATE_MAX_AGE_MS) throw new Error('Proxy operator observation expired; refresh.');
+    requireProxyObservationSuccess(result, 'operator');
     const context = proxyRuntimeContext(this.peer, CONTRACT_VERSION, result?.context?.epoch);
     if (result?.ok !== true || result.lane !== 'proxy' || result.schema_version !== 1
         || stableJson(result.context) !== stableJson(context)
@@ -766,6 +785,7 @@ class MayhemFeature extends Feature {
       signature: b4a.isBuffer(signature) ? b4a.toString(signature, 'hex') : signature });
     const elapsed = Date.now() - started;
     if (elapsed < 0 || elapsed > maxAge) throw new Error(`Proxy ${label} observation expired; refresh.`);
+    requireProxyObservationSuccess(result, label);
     const context = proxyRuntimeContext(this.peer, CONTRACT_VERSION, result?.context?.epoch);
     if (result?.ok !== true || result.lane !== 'proxy' || result.schema_version !== 1
         || stableJson(result.context) !== stableJson(context)
