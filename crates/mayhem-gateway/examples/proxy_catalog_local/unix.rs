@@ -158,7 +158,7 @@ fn permitted(method: &Method, path: &str) -> bool {
     if method != Method::GET {
         return false;
     }
-    if path == "/v1/proxy/offers" {
+    if matches!(path, "/v1/proxy/offers" | "/v1/proxy/offers/batch") {
         return true;
     }
     let Some(tail) = path.strip_prefix("/v1/proxy/offers/") else {
@@ -479,7 +479,7 @@ async fn start(args: &Args) -> Result<Running> {
     running.manifest = json!({"schema_version":1,"kind":KIND,"test_only":true,"ready":true,
         "gateway_url":format!("http://{address}"),"token":token,"gateway_pid":std::process::id(),"catalog_pid":child_pid,
         "state_path":args.directory,"network":source.network,"started_at_ms":started,"expires_at_ms":started + args.duration * 1000,
-        "routes":["GET /v1/proxy/offers","GET /v1/proxy/offers/{market}/{provider}/{slot}"],
+        "routes":["GET /v1/proxy/offers","GET /v1/proxy/offers/batch","GET /v1/proxy/offers/{market}/{provider}/{slot}"],
         "paid_execution":false,"admission":"synthetic_local_test_permit"});
     write_private(&running.manifest_path, &running.manifest)?;
     Ok(running)
@@ -541,6 +541,8 @@ mod tests {
             assert!(args(values.into_iter().map(str::to_owned)).is_err());
         }
         assert!(permitted(&Method::GET, "/v1/proxy/offers"));
+        assert!(permitted(&Method::GET, "/v1/proxy/offers/batch"));
+        assert!(!permitted(&Method::POST, "/v1/proxy/offers/batch"));
         assert!(permitted(
             &Method::GET,
             &format!("/v1/proxy/offers/{0}/{0}/{0}", "a".repeat(64))
@@ -618,6 +620,27 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(detail.status(), StatusCode::OK);
+            let batch: Value = client
+                .get(format!(
+                    "{url}/v1/proxy/offers/batch?{}",
+                    url::form_urlencoded::Serializer::new(String::new())
+                        .append_pair("ids", offer["id"].as_str().unwrap())
+                        .finish()
+                ))
+                .bearer_auth(token)
+                .send()
+                .await
+                .unwrap()
+                .error_for_status()
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            assert_eq!(batch["entries"][0]["offer"]["digest"], offer["digest"]);
+            assert_eq!(
+                batch["entries"][0]["offer"]["availability"]["status"],
+                "heartbeat_missing"
+            );
             for path in [
                 "/v1/chat/completions",
                 "/v1/proxy/estimate",

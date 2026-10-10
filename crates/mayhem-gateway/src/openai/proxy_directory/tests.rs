@@ -20,6 +20,7 @@ use tower::ServiceExt;
 // local HTTP traffic so another test cannot consume a deliberately held permit.
 static HTTP_TESTS: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 mod availability;
+mod batch;
 const TOKEN: &str = "sk-mayhem-proxy-directory-fixture";
 
 fn identity() -> Identity {

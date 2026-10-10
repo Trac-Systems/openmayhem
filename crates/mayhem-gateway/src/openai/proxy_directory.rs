@@ -42,6 +42,28 @@ struct ObservedPage {
     scanned_candidates: usize,
 }
 
+// One point-lookup batch for a viewport and its selection. It is deliberately
+// smaller than a catalog page and shares the same bounded reader semaphore.
+const MAX_BATCH_IDS: usize = 16;
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct BatchParams {
+    ids: String,
+}
+
+#[derive(Serialize)]
+struct ObservedBatchEntry {
+    id: String,
+    offer: Option<ObservedOffer>,
+}
+
+#[derive(Serialize)]
+struct ObservedBatch {
+    object: &'static str,
+    observed_at_ms: u64,
+    entries: Vec<ObservedBatchEntry>,
+}
+
 fn observe(
     catalog: &CatalogRead,
     presence: &Gateway,
@@ -261,6 +283,51 @@ pub(super) async fn get(
             .proxy_offer(&id, now)?
             .map(|entry| observe(catalog, presence, entry, now))
             .transpose()
+    })
+    .await
+}
+
+pub(super) async fn batch(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    params: Result<Query<BatchParams>, QueryRejection>,
+) -> Response {
+    let Ok(Query(params)) = params else {
+        return invalid_request();
+    };
+    if params.ids.len() > MAX_BATCH_IDS * 195 - 1 {
+        return invalid_request();
+    }
+    let ids: Vec<String> = params.ids.split(',').map(str::to_owned).collect();
+    let mut unique = std::collections::HashSet::new();
+    if ids.is_empty()
+        || ids.len() > MAX_BATCH_IDS
+        || ids.iter().any(|id| {
+            id.len() != 194
+                || id.split('/').count() != 3
+                || id.split('/').any(|part| Digest::new(part).is_err())
+                || !unique.insert(id.clone())
+        })
+    {
+        return invalid_request();
+    }
+    read(state, headers, move |catalog, presence| {
+        let now = now_millis_u64();
+        let entries = ids
+            .into_iter()
+            .map(|id| {
+                let offer = catalog
+                    .proxy_offer(&id, now)?
+                    .map(|publication| observe(catalog, presence, publication, now))
+                    .transpose()?;
+                Ok(ObservedBatchEntry { id, offer })
+            })
+            .collect::<Result<Vec<_>, Error>>()?;
+        Ok(Some(ObservedBatch {
+            object: "proxy.offer_batch",
+            observed_at_ms: now,
+            entries,
+        }))
     })
     .await
 }

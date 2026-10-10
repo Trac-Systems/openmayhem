@@ -14,8 +14,9 @@ No DHT, MSB client, peer swarm, model backend or financial service starts.
 
 The gateway example opens the existing protected Core catalog stores and runs
 the shared catalog refresh supervisor. It deliberately does not run the presence
-lifecycle or a buyer runtime. Only authenticated `GET /v1/proxy/offers` and exact
-offer detail reads are exposed; all other paths/methods return 404. The protected
+lifecycle or a buyer runtime. Only authenticated `GET /v1/proxy/offers`, exact
+offer detail reads and `GET /v1/proxy/offers/batch?ids=...` (1–16 unique IDs)
+are exposed; all other paths/methods return 404. The protected
 control file's inert presence address/token is never contacted. Source death or
 expired catalog observations fail closed. Freshness constants are unchanged.
 
@@ -44,7 +45,7 @@ directory. It contains:
 - `schema_version: 1`, `kind: "local_test_proxy_catalog"`, `test_only: true`,
   `ready`, `gateway_url`, `token`;
 - `gateway_pid`, `catalog_pid`, `state_path`, `network`, `started_at_ms`,
-  `expires_at_ms`, the two allowed `routes`;
+  `expires_at_ms`, the three allowed `routes`;
 - `paid_execution: false`, `admission: "synthetic_local_test_permit"`.
 
 Shutdown writes `ready: false` and `stopped_at_ms`. A readiness file alone does
