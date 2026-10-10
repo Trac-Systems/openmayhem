@@ -71,8 +71,9 @@ larger 11,201-token jobs took 197–227 ms with observed RSS around 150–167 Mi
 After the one-way allocation-accounting bypass, the existing ordinary decoder
 fixture measured 5.4 ms median startup/handshake and 0.75 ms short JSON
 decode/reap across twelve local processes. These are local macOS debug observations,
-not a model identity, capacity certification or cross-load latency guarantee. Native Windows enforcement remains unverified and release-blocking;
-this change introduces no nonisolated Windows fallback.
+not a model identity, capacity certification or cross-load latency guarantee.
+Native Windows boundary checks are documented below; they are not a Windows
+performance measurement. There is no nonisolated Windows fallback.
 
 Counting semantics stay fixed: one encode per completed visible output field,
 without padding, truncation, stochastic BPE, prefix retokenization or native cache

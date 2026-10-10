@@ -393,7 +393,7 @@ fn generate(
                 )
                 .map_err(|_| Error::Bootstrap("approved tokenizer pin"))?;
                 source
-                    .validate(&pool)
+                    .validate_for_installation(&pool)
                     .map_err(|_| Error::Bootstrap("isolated tokenizer validation"))?;
             }
             put(&stage.join("tokenizer.json"), &bytes)?;
@@ -462,7 +462,7 @@ fn validate_generated(stage: &Path, validation: Validation) -> Result<()> {
         )
         .map_err(|_| Error::Bootstrap("approved tokenizer pin"))?;
         source
-            .validate(&pool)
+            .validate_for_installation(&pool)
             .map_err(|_| Error::Bootstrap("isolated tokenizer validation"))?;
     }
     let config = managed::Config {

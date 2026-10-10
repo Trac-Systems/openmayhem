@@ -23,6 +23,10 @@ fn owned(seed: u8) -> Fixture {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn enrollment_requires_checked_exact_draft_and_trusted_origin_without_upstream_credentials() {
     let f = owned(210);
     f.store().create(f.input.clone()).unwrap();
@@ -56,6 +60,10 @@ fn enrollment_requires_checked_exact_draft_and_trusted_origin_without_upstream_c
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn enrollment_never_signs_a_substituted_or_extended_service_challenge() {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     for mutation in [

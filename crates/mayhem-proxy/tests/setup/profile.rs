@@ -52,6 +52,10 @@ fn profile(f: &Fixture, custom: bool) -> ProfileInput {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn standard_and_custom_profiles_derive_exact_existing_bindings_offline_for_four_families() {
     let templates = profiles().unwrap();
     assert_eq!(templates.len(), 4);
@@ -94,6 +98,10 @@ fn standard_and_custom_profiles_derive_exact_existing_bindings_offline_for_four_
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn prepare_load_cas_rates_and_join_preserve_identity_and_reject_mismatched_contracts() {
     let f = Fixture::new(ProxyEndpoint::Chat);
     let path = f.dir.path().join("profile.json");
@@ -151,6 +159,10 @@ fn prepare_load_cas_rates_and_join_preserve_identity_and_reject_mismatched_contr
 #[path = "../support/recipes.rs"]
 mod recipe_fixture;
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn declarative_profile_import_pins_recipe_and_keeps_private_preview_out_of_public_review() {
     let f = Fixture::new(ProxyEndpoint::Decisions);
     let mut input = profile(&f, true);

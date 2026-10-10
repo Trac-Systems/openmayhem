@@ -1,4 +1,6 @@
 use super::*;
+#[path = "../support/setup_discovery.rs"]
+mod canonical_fixture;
 use mayhem_proxy::{
     connector::config::{Authentication, ConnectionConfig, NetworkPolicy},
     managed,
@@ -8,7 +10,6 @@ use mayhem_proxy::{
     },
 };
 use std::{
-    os::unix::fs::MetadataExt,
     sync::atomic::{AtomicUsize, Ordering},
     time::Duration,
 };
@@ -100,6 +101,10 @@ fn choices(f: &Fixture, endpoint: ProxyEndpoint) -> Choices {
     }
 }
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn bootstrap_generates_all_four_standard_profiles_and_validates_run_without_network_or_capacity(
 ) {
     for endpoint in [
@@ -147,14 +152,20 @@ async fn bootstrap_generates_all_four_standard_profiles_and_validates_run_withou
             "upstream-key",
         ] {
             let p = target.join(filename);
-            assert_eq!(std::fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
+            assert_private_file(&p);
             if filename.ends_with(".json") {
                 assert!(!std::fs::read_to_string(p)
                     .unwrap()
                     .contains(".proxy-bootstrap-"));
             }
         }
-        assert_eq!(std::fs::metadata(&target).unwrap().mode() & 0o777, 0o700);
+        #[cfg(unix)]
+        assert_eq!(
+            std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        #[cfg(windows)]
+        mayhem_windows_sandbox::NtfsDirectory::open_existing(&target).unwrap();
         assert!(!target.join("runtime/capacity.redb").exists());
         assert!(!target.join("state/draft.json").exists());
         assert!(f.listener.accept().is_err());
@@ -169,6 +180,7 @@ async fn bootstrap_generates_all_four_standard_profiles_and_validates_run_withou
         }
     }
 }
+#[cfg(unix)]
 #[tokio::test]
 async fn bootstrap_rejects_invalid_secret_network_policy_tokenizer_and_financial_choices_atomically(
 ) {
@@ -212,6 +224,7 @@ async fn bootstrap_rejects_invalid_secret_network_policy_tokenizer_and_financial
         assert!(f.listener.accept().is_err());
     }
 }
+#[cfg(unix)]
 #[tokio::test]
 async fn bootstrap_never_replaces_existing_or_symlinked_setup_and_preserves_secret_references() {
     let f = Fixture::new(ProxyEndpoint::Decisions);
@@ -243,6 +256,10 @@ async fn bootstrap_never_replaces_existing_or_symlinked_setup_and_preserves_secr
     assert_eq!(std::fs::read(key).unwrap(), b"external-secret-reference\n");
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn bootstrap_concurrent_first_creation_has_one_atomic_winner() {
     let f = Fixture::new(ProxyEndpoint::Decisions);
     let target = f.dir.path().join("bundle");
@@ -267,10 +284,14 @@ async fn bootstrap_concurrent_first_creation_has_one_atomic_winner() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn bootstrap_actual_openai_models_stream_probe_reuses_original_allowance_after_restart() {
     let f = Fixture::new(ProxyEndpoint::Chat);
     let target = f.dir.path().join("bundle");
-    let listener = tokio::net::TcpListener::from_std(f.listener.try_clone().unwrap()).unwrap();
+    let listener = f.async_listener();
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
     let server = tokio::spawn(async move {
@@ -443,8 +464,7 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
     let binary = PathBuf::from(std::env::var_os("MAYHEM_SETUP_CLI_BINARY").expect("CLI binary"));
     let f = publication::owned(ProxyEndpoint::Decisions, 123);
     let home = f.dir.path().join("home");
-    std::fs::create_dir(&home).unwrap();
-    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    private_directory(&home);
     let root = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
     let assets = f.dir.path().join("verified-assets");
     let output = Command::new("node")
@@ -470,38 +490,8 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
         .unwrap()
         .status
         .success());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address = listener.local_addr().unwrap();
-    private(&home.join("config.toml"),format!("[network]\nrpc_url='http://{address}'\nsc_bridge_url='ws://127.0.0.1:1/'\nmsb_bootstrap='{}'\nsubnet_bootstrap='{}'\nadmin_peer_pubkey='{}'\n",d(3).as_str(),d(4).as_str(),d(5).as_str()).as_bytes());
-    let reads = Arc::new(AtomicUsize::new(0));
-    let count = reads.clone();
-    let peer = tokio::spawn(async move {
-        loop {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut bytes = Vec::new();
-            let mut buf = [0; 2048];
-            while !bytes.windows(4).any(|v| v == b"\r\n\r\n") {
-                let n = stream.read(&mut buf).await.unwrap();
-                assert!(n > 0);
-                bytes.extend_from_slice(&buf[..n]);
-                assert!(bytes.len() < 16384);
-            }
-            let request = String::from_utf8(bytes).unwrap();
-            assert!(request.starts_with("GET "));
-            let body = if request.starts_with("GET /status ") {
-                json!({"peer":{"admin":d(5),"subnetBootstrapHex":d(4)},"msb":{"networkId":918,"bootstrapHex":d(3)}})
-            } else if request.starts_with("GET /health ") {
-                json!({"contract_version":mayhem_proto::CONTRACT_VERSION})
-            } else {
-                assert!(request.starts_with("GET /state?"));
-                assert!(request.contains("key=admin"));
-                json!({"value":d(5)})
-            };
-            count.fetch_add(1, Ordering::SeqCst);
-            let body = body.to_string();
-            stream.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
-        }
-    });
+    let peer = canonical_fixture::Server::start(json!({"network_id":"918", "msb_bootstrap":d(3), "subnet_bootstrap":d(4), "contract_version":mayhem_proto::CONTRACT_VERSION})).await;
+    private(&home.join("config.toml"),format!("[network]\nrpc_url='{}'\nsc_bridge_url='ws://127.0.0.1:1/'\nmsb_bootstrap='{}'\nsubnet_bootstrap='{}'\nadmin_peer_pubkey='{}'\n",peer.url,d(3).as_str(),d(4).as_str(),d(5).as_str()).as_bytes());
     let mut command = Command::new(&binary);
     command
         .args(["provider", "proxy", "setup", "init", "--home"])
@@ -526,27 +516,28 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
         "decisions",
         "yes",
         "none",
+        "no", // no upstream discovery
         "external",
-        "other",
-        "Public model",
+        "1",
+        "create",
         "bootstrap-market",
+        "Public model",
         "4096",
         "2",
         "fiat",
         "1",
-        "123",
-        "7",
-        "9",
+        "0.000000000000000123",
+        "0.000000000000000007",
+        "0.000000000000000009",
         "unclassified",
-        "1",
         "no",
         "no",
         "no",
         "no",
         "none",
         "3",
-        "20",
-        "5",
+        "0.000020",
+        "0.000005",
         "32",
         "3000",
         "yes",
@@ -569,8 +560,9 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
         .unwrap();
     assert!(
         output.status.success(),
-        "CLI setup failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "CLI setup failed: {}\n{}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
     );
     let stdout = String::from_utf8(output.stdout).unwrap();
     for hidden in [
@@ -580,7 +572,7 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
     ] {
         assert!(!stdout.contains(hidden));
     }
-    assert_eq!(reads.load(Ordering::SeqCst), 3);
+    assert_eq!(peer.control.identity_reads.load(Ordering::SeqCst), 3);
     let target = home.join("proxy-setup");
     let cfg = FlowConfig::load(&target.join("wizard.json")).unwrap();
     assert_eq!(cfg.profile.provider_pubkey, f.input.provider_pubkey);
@@ -591,13 +583,14 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
     let original = std::fs::read(target.join("wizard.json")).unwrap();
     let retry = command.stdin(Stdio::null()).output().await.unwrap();
     assert!(!retry.status.success());
-    assert_eq!(reads.load(Ordering::SeqCst), 3);
+    assert_eq!(peer.control.identity_reads.load(Ordering::SeqCst), 3);
     assert_eq!(original, std::fs::read(target.join("wizard.json")).unwrap());
     assert!(flow.view().unwrap().review.is_none());
     assert!(!target.join("runtime/capacity.redb").exists());
     if let Some(path) = std::env::var_os("MAYHEM_BOOTSTRAP_CLI_EVIDENCE") {
         std::fs::write(path,serde_json::to_vec_pretty(&json!({"schema_version":1,"fixture":"actual_cli_guided_create_with_normal_synthetic_encrypted_wallet_and_read_only_peer_double","network_identity_reads":3,"upstream_calls":0,"hand_authored_setup_json":false,"same_wallet":true,"retained_after_retry":true,"capacity_created":false,"published":false,"run":false})).unwrap()).unwrap();
     }
-    peer.abort();
-    let _ = peer.await;
+    assert_eq!(peer.control.models_calls.load(Ordering::SeqCst), 0);
+    assert!(!peer.control.queries.lock().unwrap().is_empty());
+    drop(peer);
 }

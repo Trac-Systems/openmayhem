@@ -177,6 +177,10 @@ fn signed_declaration(f: &Fixture) -> mayhem_proxy::declaration::Signed {
     signed
 }
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn run_exact_canonical_publication_lost_ack_restart_and_spent_budget() {
     let mut f = publication::owned(ProxyEndpoint::Decisions, 122);
     let peer = publication::Peer::start(&mut f).await;
@@ -334,17 +338,44 @@ async fn run_exact_canonical_publication_lost_ack_restart_and_spent_budget() {
     );
     assert!(!installed.capacity_advertised_by_setup);
     assert_eq!(host.installs.load(Ordering::SeqCst), 1);
-    assert_eq!(configured["routes"][0]["declaration_source"]["draft_id"], json!(published.draft_id));
+    assert_eq!(
+        configured["routes"][0]["declaration_source"]["draft_id"],
+        json!(published.draft_id)
+    );
     // The same installed process watches new signed metadata; renewal/withdrawal
     // cannot change the immutable configuration or relaunch/reset its budgets.
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-    let withdrawal = f.store().plan_declaration_withdrawal(published.revision, 1, now, now + 120000).unwrap();
-    f.store().confirm_data_handling(published.revision, &withdrawal.plan.plan_digest,
-        &Authority::from_unlocked_wallet(publication::signer(122), identity(&f)).unwrap(), now).unwrap();
-    let recovered_plan = f.store().run_plan(published.revision,template(&f),probe(),&peer.rpc(),&host).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let withdrawal = f
+        .store()
+        .plan_declaration_withdrawal(published.revision, 1, now, now + 120000)
+        .unwrap();
+    f.store()
+        .confirm_data_handling(
+            published.revision,
+            &withdrawal.plan.plan_digest,
+            &Authority::from_unlocked_wallet(publication::signer(122), identity(&f)).unwrap(),
+            now,
+        )
+        .unwrap();
+    let recovered_plan = f
+        .store()
+        .run_plan(
+            published.revision,
+            template(&f),
+            probe(),
+            &peer.rpc(),
+            &host,
+        )
+        .unwrap();
     assert_eq!(recovered_plan.plan_digest, plan.plan_digest);
     assert_eq!(recovered_plan.config_digest, plan.config_digest);
-    assert_eq!(draft_before, std::fs::read(f.store.join("draft.json")).unwrap());
+    assert_eq!(
+        draft_before,
+        std::fs::read(f.store.join("draft.json")).unwrap()
+    );
     let report = f.store().recover_run(&host).await.unwrap();
     assert_eq!(report.plan.plan_digest, plan.plan_digest);
     f.store()
@@ -433,7 +464,11 @@ async fn run_exact_canonical_publication_lost_ack_restart_and_spent_budget() {
     );
     private(&f.input.connection_file, &connection_original);
     // Changed editable draft does not relaunch or replace the retained original.
-    let observed = f.store().admission_check(published.revision, &peer.rpc(), 10000).await.unwrap();
+    let observed = f
+        .store()
+        .admission_check(published.revision, &peer.rpc(), 10000)
+        .await
+        .unwrap();
     let mut next = f.input.clone();
     next.sequence = observed.admission.as_ref().unwrap().next_sequence.unwrap();
     next.offers[0].revision += 1;
@@ -443,22 +478,74 @@ async fn run_exact_canonical_publication_lost_ack_restart_and_spent_budget() {
     assert!(!recovered.for_current_configuration);
     assert_eq!(recovered.plan.plan_digest, plan.plan_digest);
     let checked = f.store().check(edited.revision).unwrap();
-    assert_eq!(checked.probe_status, "protocol_validated", "commercial changes reuse original protocol proof");
+    assert_eq!(
+        checked.probe_status, "protocol_validated",
+        "commercial changes reuse original protocol proof"
+    );
     let prices = f.store().publication_plan(checked.revision, true).unwrap();
-    let repriced = f.store().publish(checked.revision, &peer.rpc(), 10000,
-        prices.authorize(&publication::signer(122), None).unwrap()).await.unwrap();
-    assert_eq!(repriced.publication_status, "canonical_operations_confirmed");
-    let same = f.store().run_plan(repriced.revision, template(&f), probe(), &peer.rpc(), &host).unwrap();
-    assert_eq!(same.plan_digest, plan.plan_digest, "original reviewed process identity remains immutable");
+    let repriced = f
+        .store()
+        .publish(
+            checked.revision,
+            &peer.rpc(),
+            10000,
+            prices.authorize(&publication::signer(122), None).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        repriced.publication_status,
+        "canonical_operations_confirmed"
+    );
+    let same = f
+        .store()
+        .run_plan(repriced.revision, template(&f), probe(), &peer.rpc(), &host)
+        .unwrap();
+    assert_eq!(
+        same.plan_digest, plan.plan_digest,
+        "original reviewed process identity remains immutable"
+    );
     assert_eq!(same.config_digest, plan.config_digest);
-    assert!(f.store().inspect_run().unwrap().unwrap().for_current_configuration);
-    let repriced_run = f.store().start_run(repriced.revision, template(&f), probe(), &peer.rpc(), &plan.plan_digest, &host).await.unwrap();
+    assert!(
+        f.store()
+            .inspect_run()
+            .unwrap()
+            .unwrap()
+            .for_current_configuration
+    );
+    let repriced_run = f
+        .store()
+        .start_run(
+            repriced.revision,
+            template(&f),
+            probe(),
+            &peer.rpc(),
+            &plan.plan_digest,
+            &host,
+        )
+        .await
+        .unwrap();
     assert!(repriced_run.for_current_configuration);
     let mut different_limits = template(&f);
     different_limits.limits.sessions += 1;
-    assert!(matches!(f.store().run_plan(repriced.revision, different_limits, probe(), &peer.rpc(), &host), Err(Error::RunConflict)),
-        "commercial update cannot replace execution policy");
-    assert_eq!(std::fs::read(&path).unwrap(), bytes, "installed config remains unchanged");
+    assert!(
+        matches!(
+            f.store().run_plan(
+                repriced.revision,
+                different_limits,
+                probe(),
+                &peer.rpc(),
+                &host
+            ),
+            Err(Error::RunConflict)
+        ),
+        "commercial update cannot replace execution policy"
+    );
+    assert_eq!(
+        std::fs::read(&path).unwrap(),
+        bytes,
+        "installed config remains unchanged"
+    );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     assert_eq!(host.installs.load(Ordering::SeqCst), 1);
     let capacity = f.dir.path().join("capacity.redb");
@@ -477,6 +564,10 @@ async fn run_exact_canonical_publication_lost_ack_restart_and_spent_budget() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn run_existing_capacity_refuses_missing_empty_or_unrelated_database() {
     let f = Fixture::new(ProxyEndpoint::Decisions);
     let path = f.dir.path().join("capacity.redb");
@@ -488,6 +579,7 @@ fn run_existing_capacity_refuses_missing_empty_or_unrelated_database() {
     std::fs::remove_file(&path).unwrap();
     let db = redb::Database::create(&path).unwrap();
     drop(db);
+    #[cfg(unix)]
     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
     assert!(capacity::Authority::open_existing(&path, identity(&f), limits()).is_err());
 }
@@ -552,8 +644,7 @@ async fn run_cli_real_supervisor_publication_restart() {
     flow.probe_plan = Some(probe_path);
     flow.peer_rpc = Some(peer.rpc());
     let home = f.dir.path().join("home");
-    std::fs::create_dir(&home).unwrap();
-    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700)).unwrap();
+    private_directory(&home);
     let password = home.join("synthetic-password");
     private(&password, b"synthetic-fixture-password\n");
     flow.run = Some(mayhem_proxy::setup::RunSettings {
@@ -617,7 +708,9 @@ async fn run_cli_real_supervisor_publication_restart() {
             .env("MAYHEMD_CONTROL_TOKEN", token)
             .env("MAYHEM_ASSET_DIR", assets)
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            // This daemon and every child use only disposable fixture data.
+            // Retain startup failures instead of reporting an opaque timeout.
+            .stderr(Stdio::inherit())
             .kill_on_drop(true)
             .spawn()
             .unwrap();
@@ -639,16 +732,22 @@ async fn run_cli_real_supervisor_publication_restart() {
         child
     }
     async fn stop(child: &mut tokio::process::Child) {
+        #[cfg(unix)]
         rustix::process::kill_process(
             rustix::process::Pid::from_raw(child.id().unwrap() as i32).unwrap(),
             rustix::process::Signal::TERM,
         )
         .unwrap();
-        assert!(tokio::time::timeout(Duration::from_secs(10), child.wait())
-            .await
-            .unwrap()
-            .unwrap()
-            .success());
+        // Windows uses the fixture daemon's bounded --exit-after-ms shutdown,
+        // which exercises its normal child cleanup without killing foreign processes.
+        let wait = if cfg!(windows) { 70 } else { 10 };
+        assert!(
+            tokio::time::timeout(Duration::from_secs(wait), child.wait())
+                .await
+                .unwrap()
+                .unwrap()
+                .success()
+        );
     }
     async fn action(
         binary: &Path,
@@ -699,13 +798,23 @@ async fn run_cli_real_supervisor_publication_restart() {
     .await;
     let started=action(&binary,&home,&keypair,&flow_path,json!({"action":"start_run","expected_revision":rev,"plan_digest":reviewed["action_result"]["plan_digest"]}),&assets).await;
     assert_eq!(started["action_result"]["state"], "installed");
-    tokio::time::timeout(Duration::from_secs(20), async {
+    let ready = tokio::time::timeout(Duration::from_secs(20), async {
         while backend.calls.load(Ordering::SeqCst) < 2 {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    if ready.is_err() {
+        let state = client
+            .get(format!("http://{address}/status"))
+            .send()
+            .await
+            .unwrap()
+            .json::<Value>()
+            .await
+            .unwrap();
+        panic!("synthetic controller did not probe: {state}");
+    }
     let name = started["action_result"]["plan"]["launch"]["child_name"]
         .as_str()
         .unwrap();

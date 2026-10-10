@@ -86,6 +86,17 @@ impl Source {
             .validate()
             .map_err(|_| Error::Unavailable)
     }
+    /// One-shot installation validation must release retained worker handles
+    /// before the caller atomically publishes the configuration directory.
+    pub(crate) fn validate_for_installation(self, pool: &Pool) -> Result<()> {
+        let result = self.validate(pool);
+        if let Some(tokenizer) = self.pool.into_inner() {
+            tokenizer
+                .finish_installation()
+                .map_err(|_| Error::Unavailable)?;
+        }
+        result
+    }
     pub(crate) fn matches(&self, connection: &Digest, recipe: &Digest) -> bool {
         &self.connection == connection && &self.recipe == recipe
     }

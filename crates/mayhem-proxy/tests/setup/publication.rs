@@ -122,6 +122,10 @@ fn checked(f: &Fixture) {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn real_canonical_publication_retains_lost_ack_and_reuses_admission_for_rates_and_second_provider(
 ) {
     let mut f = owned(ProxyEndpoint::Chat, 121);
@@ -302,6 +306,10 @@ async fn real_canonical_publication_retains_lost_ack_and_reuses_admission_for_ra
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn all_four_endpoint_families_and_three_fee_rails_use_the_real_guarded_writer() {
     for (endpoint, rail, n) in [
         (ProxyEndpoint::Completions, "tnk", 123),
@@ -339,6 +347,10 @@ async fn all_four_endpoint_families_and_three_fee_rails_use_the_real_guarded_wri
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn changed_signatures_permits_origins_and_canonical_reads_never_publish_or_guess_a_new_sequence(
 ) {
     let mut f = owned(ProxyEndpoint::Chat, 126);

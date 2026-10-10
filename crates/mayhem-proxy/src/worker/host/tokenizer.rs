@@ -14,6 +14,7 @@ pub(crate) struct Tokenizer {
     sender: mpsc::Sender<Request>,
     program: PathBuf,
     workdir: PathBuf,
+    stopped: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
 }
 struct Request {
     fields: Vec<Field>,
@@ -92,6 +93,8 @@ impl Pool {
             .enable_all()
             .build()
             .map_err(|_| Error::Start)?;
+        let stopped = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let completed = stopped.clone();
         std::thread::Builder::new().name("proxy-tokenizer".into()).spawn(move || {
             let _actor=actor;
             runtime.block_on(async move {
@@ -119,15 +122,40 @@ impl Pool {
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
             });
+            // Release all launcher/image authority before reporting completion.
+            drop(runtime);
+            if let Ok(mut value) = completed.0.lock() {
+                *value = true;
+                completed.1.notify_all();
+            }
         }).map_err(|_|Error::Start)?;
         Ok(Tokenizer {
             sender,
             program: self.program.clone(),
             workdir: self.workdir.clone(),
+            stopped,
         })
     }
 }
 impl Tokenizer {
+    /// Installation only: consume the source's last sender and await actual
+    /// reaping before moving its staging directory. Never used per inference.
+    pub(crate) fn finish_installation(self) -> Result<()> {
+        let stopped = self.stopped.clone();
+        drop(self);
+        let value = stopped.0.lock().map_err(|_| Error::Stopped)?;
+        let (value, _) = stopped
+            .1
+            .wait_timeout_while(value, Duration::from_secs(engine::WALL_SECONDS * 2), |v| {
+                !*v
+            })
+            .map_err(|_| Error::Stopped)?;
+        if *value {
+            Ok(())
+        } else {
+            Err(Error::ProcessingTimeout)
+        }
+    }
     pub(crate) fn same_launcher(&self, pool: &Pool) -> bool {
         self.program == pool.program && self.workdir == pool.workdir
     }

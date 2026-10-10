@@ -27,7 +27,7 @@ fn backend(f: &mut Fixture, status: u16, body: Vec<u8>, delay: Duration) -> Back
         &f.input.connection_file,
         &serde_json::to_vec(&f.connection).unwrap(),
     );
-    let listener = tokio::net::TcpListener::from_std(f.listener.try_clone().unwrap()).unwrap();
+    let listener = f.async_listener();
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
     let task = tokio::spawn(async move {
@@ -76,6 +76,10 @@ fn list() -> Vec<u8> {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn discovery_is_explicit_private_bounded_and_never_changes_or_certifies_a_draft() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let backend = backend(&mut f, 200, list(), Duration::ZERO);
@@ -148,14 +152,7 @@ async fn discovery_is_explicit_private_bounded_and_never_changes_or_certifies_a_
         std::fs::read(f.store.join("draft.json")).unwrap() == draft,
         "discovery never mutates declarations"
     );
-    assert_eq!(
-        std::fs::metadata(f.store.join("discovery.json"))
-            .unwrap()
-            .permissions()
-            .mode()
-            & 0o777,
-        0o600
-    );
+    assert_private_file(&f.store.join("discovery.json"));
     let names: BTreeSet<_> = std::fs::read_dir(&f.store)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
@@ -171,6 +168,10 @@ async fn discovery_is_explicit_private_bounded_and_never_changes_or_certifies_a_
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn absent_models_is_supported_offline_and_bad_or_oversize_lists_are_not_observations() {
     let f = Fixture::new(ProxyEndpoint::Chat);
     let unsupported = f
@@ -227,6 +228,10 @@ async fn absent_models_is_supported_offline_and_bad_or_oversize_lists_are_not_ob
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn truncation_is_explicit_and_single_response_never_claims_global_completeness() {
     for (count, has_more) in [(140, false), (1, true)] {
         let mut f = Fixture::new(ProxyEndpoint::Chat);
@@ -253,6 +258,10 @@ async fn truncation_is_explicit_and_single_response_never_claims_global_complete
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn interrupted_discovery_remains_pending_and_resume_does_not_dispatch_or_unlock_a_second_owner(
 ) {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
@@ -281,6 +290,10 @@ async fn interrupted_discovery_remains_pending_and_resume_does_not_dispatch_or_u
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn timeout_configuration_drift_and_revision_overflow_never_retain_successful_model_evidence()
 {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
@@ -318,9 +331,12 @@ async fn timeout_configuration_drift_and_revision_overflow_never_retain_successf
         Err(Error::Invalid)
     ));
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(matches!(
-        f.store().inspect_connection(false),
-        Err(Error::Protection)
-    ));
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            f.store().inspect_connection(false),
+            Err(Error::Protection)
+        ));
+    }
 }

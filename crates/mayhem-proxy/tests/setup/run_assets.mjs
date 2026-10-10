@@ -12,7 +12,8 @@ const archive = spawnSync('git', ['archive', '--format=tar', 'HEAD', 'intercom']
 if (archive.status !== 0) throw Error('committed candidate asset snapshot unavailable');
 const extracted = spawnSync('tar', ['-xf', '-', '-C', destination], { input: archive.stdout, maxBuffer: 1024 * 1024 });
 if (extracted.status !== 0) throw Error('candidate fixture extraction failed');
-fs.symlinkSync(path.join(root, 'intercom/node_modules'), path.join(destination, 'intercom/node_modules'), 'dir');
+// Junctions keep Windows fixtures unprivileged; both ends are fixture-owned.
+fs.symlinkSync(path.join(root, 'intercom/node_modules'), path.join(destination, 'intercom/node_modules'), process.platform === 'win32' ? 'junction' : 'dir');
 const { verifyReleaseIdentity, CONTRACT_CODE_PATHS, RELEASE_MANIFEST_PATH } = await import(pathToFileURL(path.join(destination, 'intercom/src/release-identity.js')));
 // Same isolated-fixture sealing algorithm as release-identity.test.js. This
 // manifest never leaves the disposable directory and retains candidate versions.

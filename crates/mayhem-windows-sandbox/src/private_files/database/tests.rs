@@ -3,6 +3,31 @@ use crate::private_files::mutation::tests::Fixture;
 use std::{fs, sync::Arc, thread};
 
 #[test]
+fn private_database_allows_sibling_publication_without_releasing_ancestor_pins() {
+    use crate::private_files::mutation::{LeafName, NtfsDirectory};
+    let fixture = Fixture::new();
+    let leaf = |name: &str| LeafName::new(name).unwrap();
+    let directory = NtfsDirectory::open_existing(&fixture.0).unwrap();
+    let mut guard = directory.try_lock().unwrap();
+    let mut first = guard.stage_directory(leaf("first.next"), &[], 1).unwrap();
+    first.publish(leaf("first")).unwrap();
+    drop(first);
+    let path = fixture.0.join("first").join("database.redb");
+    let database = PrivateDatabaseFile::open(&path, false).unwrap();
+    database.write(0, b"retained").unwrap();
+    database.sync_data().unwrap();
+    let mut sibling = guard.stage_directory(leaf("second.next"), &[], 1).unwrap();
+    sibling.publish(leaf("second")).unwrap();
+    assert!(fs::rename(&fixture.0, fixture.0.with_extension("moved")).is_err());
+    assert!(fs::rename(fixture.0.join("first"), fixture.0.join("replaced")).is_err());
+    assert!(fs::read(&path).is_err());
+    assert!(fs::OpenOptions::new().write(true).open(&path).is_err());
+    let mut bytes = [0u8; 8];
+    database.read(0, &mut bytes).unwrap();
+    assert_eq!(&bytes, b"retained");
+}
+
+#[test]
 fn private_database_holds_exclusive_data_and_parent_handles_until_drop() {
     let fixture = Fixture::new();
     let path = fixture.0.join("database.redb");

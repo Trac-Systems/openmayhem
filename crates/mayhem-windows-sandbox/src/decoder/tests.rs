@@ -23,6 +23,10 @@ pub(super) struct Fixture(pub(super) PathBuf);
 impl Fixture {
     pub(super) fn new() -> Self {
         let path = std::env::temp_dir().join(format!("mayhem-decoder-test-{}", nonce().unwrap()));
+        Self::create_directory(&path);
+        Self(path)
+    }
+    fn create_directory(path: &Path) {
         let user = current_user_sid().unwrap();
         let mut sid_text = null_mut();
         assert_ne!(
@@ -43,7 +47,7 @@ impl Fixture {
         unsafe {
             LocalFree(sid_text as _);
         }
-        let sddl = to_wide_null(format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{user})"));
+        let sddl = to_wide_null(format!("O:{user}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{user})"));
         let mut sd = null_mut();
         assert_ne!(
             unsafe {
@@ -66,11 +70,10 @@ impl Fixture {
             LocalFree(sd);
         }
         assert_ne!(result, 0);
-        Self(path)
     }
     fn launcher(&self) -> DecoderLauncher {
         let work = self.0.join("work");
-        fs::create_dir(&work).unwrap();
+        Self::create_directory(&work);
         DecoderLauncher::new(&std::env::current_exe().unwrap(), &work).unwrap()
     }
 }
@@ -358,6 +361,7 @@ fn contained_probe() {
             assert!(fs::write(&path, b"forbidden").is_err());
             assert!(fs::write(path.with_file_name("new.txt"), b"forbidden").is_err());
             assert!(fs::write(std::env::current_exe().unwrap(), b"forbidden").is_err());
+            assert!(fs::write("mayhem-forbidden-relative-write", b"forbidden").is_err());
             let image = to_wide_null(std::env::current_exe().unwrap().as_os_str());
             // Read-only image access must not permit ACL/owner escalation even
             // though the launcher's normal user owns the staged file.
@@ -464,7 +468,7 @@ pub(super) fn crash_after_creation(child: &DecoderChild, name: &[u16]) {
 fn suspended_startup_parent() {
     let root = PathBuf::from(std::env::var_os("MAYHEM_DECODER_CRASH_ROOT").unwrap());
     let work = root.join("work");
-    fs::create_dir(&work).unwrap();
+    Fixture::create_directory(&work);
     let launcher = DecoderLauncher::new(&std::env::current_exe().unwrap(), &work).unwrap();
     let _child = launcher.spawn(DecoderMode::Decoder).unwrap();
     panic!("creation failpoint was not reached");
@@ -535,10 +539,59 @@ fn parent_death_kills_worker_even_before_resume_or_registration_cleanup() {
         0,
         "suspended worker survived parent death"
     );
-    // The next ordinary launch recovers that parent's exact registration and
-    // starts successfully. This also catches a leaked cross-process lock.
-    let next = Fixture::new();
-    let (code, output) = finish(probe(&next.launcher(), &["memory".into()]));
+    // Restart in the exact same workdir, recovering both the registration and
+    // the staged image. A different directory would hide an image leak.
+    let next =
+        DecoderLauncher::new(&std::env::current_exe().unwrap(), &fixture.0.join("work")).unwrap();
+    let (code, output) = finish(probe(&next, &["memory".into()]));
     assert_eq!(code, 0, "{output}");
     assert!(output.contains("JOB_MEMORY_DENIED"));
+}
+
+#[test]
+fn image_recovery_is_bounded_and_rejects_unknown_files_and_hardlinks() {
+    let fixture = Fixture::new();
+    let work = fixture.0.join("work");
+    Fixture::create_directory(&work);
+    let recorded = "a".repeat(64);
+    let record = work.join(".decoder-image-v1");
+    {
+        let file = crate::private_files::PrivateDatabaseFile::open(&record, false).unwrap();
+        file.write(0, recorded.as_bytes()).unwrap();
+        file.sync_data().unwrap();
+    }
+    let old = work.join(format!("decoder-{recorded}"));
+    fs::create_dir(&old).unwrap();
+    let image = old.join("mayhem-proxy-worker.exe");
+    fs::write(&image, b"interrupted image copy").unwrap();
+    let unrelated = old.join("must-remain");
+    fs::write(&unrelated, b"caller data").unwrap();
+    let program = std::env::current_exe().unwrap();
+    assert!(DecoderLauncher::new(&program, &work).is_err());
+    assert_eq!(fs::read(&unrelated).unwrap(), b"caller data");
+    assert_eq!(fs::read(&record).unwrap(), recorded.as_bytes());
+    fs::remove_file(&unrelated).unwrap();
+    let alias = fixture.0.join("outside-link");
+    fs::hard_link(&image, &alias).unwrap();
+    assert!(DecoderLauncher::new(&program, &work).is_err());
+    assert_eq!(fs::read(&alias).unwrap(), b"interrupted image copy");
+    fs::remove_file(&alias).unwrap();
+    let launcher = DecoderLauncher::new(&program, &work).unwrap();
+    assert!(!old.exists());
+    assert_eq!(fs::read_dir(&work).unwrap().count(), 2);
+    let child = probe(&launcher, &["idle".into()]);
+    drop(launcher);
+    assert!(
+        DecoderLauncher::new(&program, &work).is_err(),
+        "live child retains image ownership"
+    );
+    drop(child);
+    let next = DecoderLauncher::new(&program, &work).unwrap();
+    let (code, output) = finish(probe(&next, &["memory".into()]));
+    assert_eq!(code, 0, "{output}");
+    drop(next);
+    assert_eq!(fs::read_dir(&work).unwrap().count(), 1);
+    fs::write(&record, [b'!'; 64]).unwrap();
+    assert!(DecoderLauncher::new(&program, &work).is_err());
+    assert_eq!(fs::read(&record).unwrap(), [b'!'; 64]);
 }

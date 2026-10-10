@@ -93,11 +93,18 @@ Its identity is registered only for suspended process creation and unregistered
 before resume; no writable AppContainer profile is created. Less Privileged AppContainer mode removes the
 broad `ALL APPLICATION PACKAGES` grant. Its only named capability is a random
 read/execute grant for one private staged bundled executable. The launcher
-copies that image once per Pool, retains it across tokenizer/decoder launches,
+copies that image once per launcher, retains it across tokenizer/decoder launches,
 and denies writes/deletion while children can use it. It accepts only local
 drive paths, rejects reparse points, pins ancestors against rename/deletion,
 and checks source/work-directory ownership and DACLs. The work directory must
-start empty and grant no other user access. Source images may be readable by
+be user-owned private NTFS and initially empty. Thereafter it contains only a
+fixed 64-byte image-intent record and at most one staged image. An exclusive
+record handle lives through every child, including after the owning Pool drops.
+After parent death, recovery checks only that exact recorded directory and worker;
+it rejects active files, hardlinks, reparse points and unknown contents. Malformed
+records fail closed. It never recursively deletes a caller tree or scans image
+history. Inference, recovery and settlement pools share the immutable image but
+retain independent process and buffer budgets. Source images may be readable by
 others but cannot grant them write/delete/ownership rights. Only the current
 user, SYSTEM and local Administrators are trusted for these ACL checks. An
 installation with a different owner/ACL is refused rather than rewritten.
@@ -123,6 +130,12 @@ A failed creation-policy check or resume kills and reaps the child.
 Creation uses a detached process, avoiding a console-helper initialization path;
 stdio remains pipes. Only SystemRoot and LOCALAPPDATA enter the environment,
 without inherited PATH, temporary-directory settings or credentials.
+The stdio-only child uses `GetSystemDirectoryW` for its working directory, without
+adding any file grant or modifying an ACL. Its executable remains the exact pinned
+absolute image. This avoids Windows' documented `CreateProcessW` current-directory
+length restriction when the private configuration lives in a deeply nested path.
+Relative writes remain denied by the LPAC boundary. See Microsoft's
+[current-directory restriction](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-setcurrentdirectory).
 A private NTFS directory under LOCALAPPDATA holds one fixed 64-byte registration
 record. An OS lock serializes only registration/creation/unregistration, never
 inference. Recovery inspects only the exact recorded SID and matching name before
@@ -151,8 +164,12 @@ heap/random/clock compatibility, Job memory refusal, drop/reaping and image
 lifetime. `tests/windows_containment.rs` checks actual worker refusal outside
 the launcher and contained schema/regex preparation through the shared Pool.
 Run both on native Windows; compiling these tests is not enforcement evidence.
-The candidate passes native Windows 11 x86_64 build 26300 acceptance: 44 sandbox
-and protected-storage checks plus six actual decoder/tokenizer integration checks.
+The candidate passes native Windows 11 x86_64 build 26300 acceptance: 46 sandbox
+and protected-storage checks plus six actual decoder/tokenizer integration checks
+and independent inference/recovery/settlement pool-capacity coverage. The worker
+integration tests require `MAYHEM_WINDOWS_SETUP_FIXTURE_PARENT` to point to an
+existing private current-user-owned NTFS directory; they create only disposable
+children under it.
 The four ignored child entry points in the sandbox suite are invoked by parent
 tests, including hard parent termination before resume, abandoned registration
 recovery and concurrent launch serialization. On this host the no-network LPAC

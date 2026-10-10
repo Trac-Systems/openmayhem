@@ -35,7 +35,7 @@ pub(super) fn backend(
         &f.input.connection_file,
         &serde_json::to_vec(&f.connection).unwrap(),
     );
-    let listener = tokio::net::TcpListener::from_std(f.listener.try_clone().unwrap()).unwrap();
+    let listener = f.async_listener();
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
     let task = tokio::spawn(async move {
@@ -98,8 +98,7 @@ fn answer() -> Value {
 pub(super) fn plan(f: &Fixture, request: Value) -> ProbePlan {
     let work = f.dir.path().join("worker");
     if !work.exists() {
-        std::fs::create_dir(&work).unwrap();
-        std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+        private_directory(&work);
     }
     serde_json::from_value(json!({"schema_version":1,
         "scope":{"capacity_file":f.dir.path().join("capacity.redb"),"route":d(50),"connection_group":d(2),"connection_ceiling":2,"route_ceiling":2,"constraints":[{"id":d(51),"ceiling":2}]},
@@ -173,6 +172,10 @@ fn redacted(review: &mayhem_proxy::setup::Review) {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn four_families_run_real_bounded_decoder_probes_with_redacted_bound_reports() {
     let mut reviews = Vec::new();
     for (endpoint, request, reply) in [
@@ -276,24 +279,18 @@ async fn four_families_run_real_bounded_decoder_probes_with_redacted_bound_repor
         reviews.push(serde_json::to_value(&review).unwrap());
     }
     if let Some(path) = std::env::var_os("MAYHEM_TEST_PROXY_SETUP_PROBE_FIXTURE") {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)
-            .unwrap();
-        file.write_all(
-            &serde_json::to_vec_pretty(
-                &json!({"schema_version":1,"test_only":true,"reviews":reviews}),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        file.sync_all().unwrap();
+        write_evidence(
+            Path::new(&path),
+            &json!({"schema_version":1,"test_only":true,"reviews":reviews}),
+        );
     }
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn allowance_is_cumulative_and_scope_cannot_be_replaced_or_recreated() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let b = backend(
@@ -335,6 +332,10 @@ async fn allowance_is_cumulative_and_scope_cannot_be_replaced_or_recreated() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn timeout_and_restart_keep_original_physical_occupancy_and_never_redispatch() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let b = backend(
@@ -399,6 +400,10 @@ async fn timeout_and_restart_keep_original_physical_occupancy_and_never_redispat
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn abort_during_dispatch_keeps_pending_intent_and_draft_lock_blocks_concurrent_mutation() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let b = backend(
@@ -435,6 +440,10 @@ async fn abort_during_dispatch_keeps_pending_intent_and_draft_lock_blocks_concur
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn exact_config_binding_and_bounded_private_plan_reject_before_http() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let b = backend(
@@ -480,11 +489,18 @@ async fn exact_config_binding_and_bounded_private_plan_reject_before_http() {
     let p = plan(&f, chat());
     private(&path, &serde_json::to_vec(&p).unwrap());
     assert!(ProbePlan::load(&path).is_ok());
-    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert!(matches!(ProbePlan::load(&path), Err(Error::Protection)));
+    #[cfg(unix)]
+    {
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(ProbePlan::load(&path), Err(Error::Protection)));
+    }
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn streaming_uses_real_decoder_and_configuration_update_invalidates_success_claim() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let sse = format!(
@@ -509,6 +525,10 @@ async fn streaming_uses_real_decoder_and_configuration_update_invalidates_succes
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn recovery_never_adopts_or_cancels_a_later_identical_prepared_attempt() {
     for lost_id in [false, true] {
         let mut f = Fixture::new(ProxyEndpoint::Chat);
@@ -579,6 +599,10 @@ async fn recovery_never_adopts_or_cancels_a_later_identical_prepared_attempt() {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn existing_capacity_owner_and_overlapping_alias_probe_block_new_dispatch() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let b = backend(
@@ -663,6 +687,10 @@ async fn unlocked(f: &Fixture) {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn crash_after_intent_before_reserve_has_original_identity_and_consumes_no_allowance() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let b = backend(
@@ -708,7 +736,12 @@ async fn crash_after_intent_before_reserve_has_original_identity_and_consumes_no
     assert_eq!(b.calls.load(Ordering::SeqCst), 1);
 }
 
+#[cfg(unix)]
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn crash_after_real_reservation_before_dispatch_recovers_original_prepared_without_refund() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let b = backend(
@@ -784,6 +817,10 @@ async fn crash_after_real_reservation_before_dispatch_recovers_original_prepared
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn lost_success_write_recovers_actual_saved_intent_without_inventing_validation_or_reexecution(
 ) {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
@@ -844,6 +881,10 @@ fn rebind_adapter(input: &mut Input) {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn protocol_and_resource_mutation_matrix_invalidates_reuse_without_spending_allowance() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let b = backend(
@@ -934,6 +975,10 @@ async fn protocol_and_resource_mutation_matrix_invalidates_reuse_without_spendin
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn connection_and_pinned_scope_mutations_cannot_reuse_the_old_observation() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let b = backend(
@@ -1043,6 +1088,10 @@ async fn connection_and_pinned_scope_mutations_cannot_reuse_the_old_observation(
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn only_exact_current_legacy_success_can_gain_a_configuration_binding() {
     for mode in ["valid", "stale_declaration", "changed_connection"] {
         let mut f = Fixture::new(ProxyEndpoint::Chat);

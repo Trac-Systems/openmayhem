@@ -63,14 +63,25 @@ pub fn create(destination: &Path, host: Host, choices: Choices) -> Result<Bundle
         .prepare_for_inspection()
         .map_err(store::windows_error)?;
     validate_generated(&stage, validation)?;
-    // The isolated Windows launcher removes only its exact temporary image.
-    // A failed cleanup must not publish a bundle that cannot start its Pool.
-    require(
-        fs::read_dir(stage.join("worker"))
-            .map_err(|_| Error::Protection)?
-            .next()
-            .is_none(),
-    )?;
+    // Installation validation waits for reaping. Only its bounded recovery
+    // record may remain; never publish a leaked image or an unrelated file.
+    let worker = stage.join("worker");
+    let entries = fs::read_dir(&worker)
+        .map_err(|_| Error::Protection)?
+        .take(2)
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|_| Error::Protection)?;
+    require(entries.len() <= 1)?;
+    if let Some(entry) = entries.first() {
+        require(entry.file_name() == ".decoder-image-v1")?;
+        let bytes = private_file(&entry.path(), 64).map_err(|_| Error::Protection)?;
+        require(
+            bytes.len() == 64
+                && bytes
+                    .iter()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(b)),
+        )?;
+    }
     pending.publish(leaf).map_err(store::windows_error)?;
     // No uncertain-error cleanup or automatic retry. The typed original bundle
     // remains the only source of restart authority, exactly as on Unix.

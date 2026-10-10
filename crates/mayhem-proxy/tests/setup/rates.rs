@@ -37,6 +37,10 @@ async fn published(f: &mut Fixture, seed: u8) -> (Peer, mayhem_proxy::setup::Rev
     (peer, review)
 }
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn guided_rates_all_endpoints_exact_slots_derived_revisions_restart_and_no_second_fee() {
     for (endpoint, seed) in [
         (ProxyEndpoint::Chat, 141),
@@ -195,6 +199,10 @@ async fn guided_rates_all_endpoints_exact_slots_derived_revisions_restart_and_no
     }
 }
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn guided_rates_stale_canonical_review_invalid_choices_and_local_conflicts_fail_closed() {
     let mut f = owned(ProxyEndpoint::Chat, 145);
     let (peer, original) = published(&mut f, 145).await;
@@ -270,8 +278,7 @@ async fn guided_rates_stale_canonical_review_invalid_choices_and_local_conflicts
     assert_eq!(std::fs::read(f.store.join("draft.json")).unwrap(), before);
     // Another owned draft publishes concurrently, changing the same canonical slot.
     let other = f.dir.path().join("other-draft");
-    std::fs::create_dir(&other).unwrap();
-    std::fs::set_permissions(&other, std::fs::Permissions::from_mode(0o700)).unwrap();
+    private_directory(&other);
     let store = Store::open(other).unwrap();
     let mut changed = f.input.clone();
     changed.sequence = 3;
@@ -339,6 +346,10 @@ async fn guided_rates_stale_canonical_review_invalid_choices_and_local_conflicts
     peer.close().await;
 }
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn guided_rate_action_cannot_supply_execution_rails_revision_or_sequence() {
     let f = Fixture::new(ProxyEndpoint::Chat);
     let body =

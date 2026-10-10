@@ -43,6 +43,18 @@ pub struct PoolLimits {
     /// Consumer backpressure is excluded from this clock.
     pub processing_timeout: Duration,
 }
+impl PoolLimits {
+    fn validate(self) -> Result<()> {
+        config(
+            (1..=128).contains(&self.max_children)
+                && self.max_buffer_bytes >= CHUNK_BYTES
+                && !self.startup_timeout.is_zero()
+                && !self.processing_timeout.is_zero(),
+        )?;
+        units(self.max_buffer_bytes)?;
+        Ok(())
+    }
+}
 
 #[derive(Clone)]
 pub struct Pool {
@@ -129,8 +141,9 @@ impl Pool {
         prepared.stop().await
     }
 
-    /// Only the trusted local launcher chooses this bundled executable and empty
-    /// private working directory. Neither is accepted in a public request/recipe.
+    /// Only the trusted local launcher chooses this bundled executable and private
+    /// working directory (empty on Unix; a bounded image journal on Windows).
+    /// Neither is accepted in a public request/recipe.
     /// Package signature verification belongs to the Core installer; this is not
     /// a distribution/install API or an arbitrary executable plugin mechanism.
     pub fn new(
@@ -138,18 +151,14 @@ impl Pool {
         workdir: impl AsRef<Path>,
         limits: PoolLimits,
     ) -> Result<Self> {
-        config(
-            (1..=128).contains(&limits.max_children)
-                && limits.max_buffer_bytes >= CHUNK_BYTES
-                && !limits.startup_timeout.is_zero()
-                && !limits.processing_timeout.is_zero(),
-        )?;
+        limits.validate()?;
         let program = program.as_ref();
         let workdir = workdir.as_ref();
         config(program.is_absolute() && workdir.is_absolute())?;
         let file = std::fs::symlink_metadata(program).map_err(|_| Error::Configuration)?;
         let dir = std::fs::symlink_metadata(workdir).map_err(|_| Error::Configuration)?;
         config(file.is_file() && dir.is_dir())?;
+        #[cfg(not(windows))]
         config(
             std::fs::read_dir(workdir)
                 .map_err(|_| Error::Configuration)?
@@ -182,6 +191,17 @@ impl Pool {
             #[cfg(windows)]
             windows,
         })
+    }
+
+    /// Reuse the exact pinned executable while assigning independent process
+    /// and IPC budgets. No new image staging or executable/path lookup occurs.
+    pub fn with_independent_limits(&self, limits: PoolLimits) -> Result<Self> {
+        limits.validate()?;
+        let mut pool = self.clone();
+        pool.limits = limits;
+        pool.children = Arc::new(Semaphore::new(limits.max_children));
+        pool.buffers = Arc::new(Semaphore::new(units(limits.max_buffer_bytes)? as usize));
+        Ok(pool)
     }
 
     fn spawn_bundled(&self, mode: BundledMode) -> Result<PlatformChild> {

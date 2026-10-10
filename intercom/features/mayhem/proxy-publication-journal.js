@@ -10,6 +10,7 @@ const stable = value => JSON.stringify(value, (_, item) => item && typeof item =
 const fail = message => { throw new Error(`Proxy publication journal: ${message}.`); };
 const hex = value => typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
 const integer = value => Number.isSafeInteger(value) && value >= 0;
+const windows = (globalThis.Bare?.platform ?? globalThis.process?.platform) === 'win32';
 
 // Publication-only bounds, not catalog limits. No completed history is retained:
 // the canonical registry/fr records provide durable completion deduplication.
@@ -83,7 +84,9 @@ export class ProxyPublicationJournal {
 
   async _open() {
     await fs.promises.mkdir(this.directory, { recursive: true, mode: 0o700 });
-    this.lock = await fs.promises.open(path.join(this.directory, 'publication.lock'), 'a', 0o600);
+    // LockFileEx requires read or write access; append-only access is insufficient
+    // on Windows. Keep the lock file non-truncating on every supported runtime.
+    this.lock = await fs.promises.open(path.join(this.directory, 'publication.lock'), 'a+', 0o600);
     if (!nativeFs.tryLock(this.lock.fd)) fail('another process holds the writer lock');
     let file;
     try { file = await fs.promises.open(this.file, 'r'); }
@@ -135,10 +138,19 @@ export class ProxyPublicationJournal {
         offset += bytesWritten;
       }
       await file.sync();
+      await fs.promises.rename(temporary, this.file);
+      if (windows) {
+        // FlushFileBuffers persists file metadata as well as data on NTFS. Flush
+        // the SAME writable handle after rename; Windows cannot fsync a read-only
+        // directory handle. Do not swallow an unsupported/failed flush.
+        // https://learn.microsoft.com/en-us/windows/win32/fileio/file-caching
+        await file.sync();
+      }
     } finally { await file.close(); }
-    await fs.promises.rename(temporary, this.file);
-    const directory = await fs.promises.open(this.directory, 'r');
-    try { await directory.sync(); } finally { await directory.close(); }
+    if (!windows) {
+      const directory = await fs.promises.open(this.directory, 'r');
+      try { await directory.sync(); } finally { await directory.close(); }
+    }
   }
 
   async _mutate(change) {

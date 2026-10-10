@@ -1,6 +1,8 @@
 //! Run on a native supported Windows host. Cross-checking this file does not
 //! establish LPAC enforcement, decoder compatibility, or provider setup support.
 #![cfg(windows)]
+#[path = "support/windows_fixture.rs"]
+mod windows_fixture;
 
 use mayhem_proto::proxy::ProxyEndpoint;
 use mayhem_proxy::{
@@ -50,7 +52,7 @@ fn uncontained_launch_refuses_before_reading_ipc_or_ready() {
 
 #[tokio::test]
 async fn actual_worker_prepares_schema_and_releases_its_process_slot_after_stop() {
-    let work = tempfile::tempdir().unwrap();
+    let work = windows_fixture::PrivateDirectory::new();
     let pool = Pool::new(
         env!("CARGO_BIN_EXE_mayhem-proxy-worker"),
         work.path(),

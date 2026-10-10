@@ -266,6 +266,36 @@ test('storage failure never publishes and leaves native writer available', async
   assert.equal((await f.base.view.get('native/after-disk-failure')).value, true);
 });
 
+test('Windows post-rename flush failure poisons the handle and recovers the retained intent',
+  { skip: process.platform !== 'win32' }, async t => {
+    const f = await fixture(t);
+    const envelope = await f.create(); const key = await proxyRegistryFeatureKey(envelope);
+    const original = fs.promises.open;
+    let syncs = 0;
+    fs.promises.open = async function (name, ...args) {
+      const file = await original.call(this, name, ...args);
+      if (name === path.join(f.directory, 'pending.json.tmp')) {
+        const sync = file.sync.bind(file);
+        file.sync = async () => {
+          if (++syncs === 2) throw new Error('test post-rename flush failure');
+          return await sync();
+        };
+      }
+      return file;
+    };
+    try {
+      await assert.rejects(f.controller.submit(key, envelope), /post-rename flush failure/);
+      assert.equal(syncs, 2);
+      assert.equal(f.calls, 0);
+      await assert.rejects(f.controller.submit(key, envelope), /storage failure/);
+    } finally { fs.promises.open = original; }
+    const saved = JSON.parse(fs.readFileSync(path.join(f.directory, 'pending.json'), 'utf8'));
+    assert.equal(saved.entries.length, 1);
+    await f.reopen();
+    assert.equal((await f.controller.submit(key, envelope)).hash, saved.entries[0].hash);
+    assert.equal(f.calls, 1);
+  });
+
 test('pending entries enforce per-provider and aggregate bounds and isolate returned objects', async t => {
   const f = await fixture(t, { maxEntries: 2 });
   const envelope = await f.create(); const key = await proxyRegistryFeatureKey(envelope);

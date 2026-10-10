@@ -69,7 +69,7 @@ impl Pinned {
             CreateFileW(
                 name.as_ptr(),
                 FILE_READ_ATTRIBUTES | FILE_TRAVERSE | READ_CONTROL,
-                FILE_SHARE_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
                 null(),
                 OPEN_EXISTING,
                 FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
@@ -120,7 +120,14 @@ impl Pinned {
                 handles.last().ok_or_else(invalid)?,
                 part,
                 !last || directory,
-                if last { sharing } else { FILE_SHARE_READ },
+                // Directory write sharing permits trusted sibling publication;
+                // it grants no write access. Denying DELETE keeps every ancestor
+                // pinned against replacement. Private leaf sharing stays strict.
+                if last {
+                    sharing
+                } else {
+                    FILE_SHARE_READ | FILE_SHARE_WRITE
+                },
             )?;
             information(&file, !last || directory)?;
             acl::validate(&file, &owner, last && private_leaf)?;

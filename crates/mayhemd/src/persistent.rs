@@ -12,6 +12,11 @@ use std::{
     sync::{Arc, Mutex},
 };
 
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+use windows::{create_database, file_length, private_file};
+
 const CHILDREN: TableDefinition<&str, &[u8]> = TableDefinition::new("supervised_children_v1");
 const MAX_CHILDREN: u64 = 256; // Local processes, not offers, markets or public list size.
 const MAX_CHILD_BYTES: usize = 64 * 1024;
@@ -23,7 +28,7 @@ pub struct Store {
 pub type Shared = Arc<Mutex<Store>>;
 
 pub fn capabilities() -> Vec<&'static str> {
-    if cfg!(unix) {
+    if cfg!(any(unix, windows)) {
         vec!["persistent_children_v1", "persistent_child_inspect_v1"]
     } else {
         Vec::new()
@@ -79,12 +84,12 @@ impl Store {
             let existing = path_exists(&self.path)?;
             let file = private_file(&self.path, !existing)?;
             ensure!(
-                !existing || file.metadata()?.len() > 0,
+                !existing || file_length(&file)? > 0,
                 "persistent supervisor store is empty; refusing to reset it"
             );
             let mut builder = Database::builder();
             builder.set_cache_size(1024 * 1024);
-            let database = builder.create_file(file)?;
+            let database = create_database(&builder, file)?;
             if existing {
                 let read = database.begin_read()?;
                 read.open_table(CHILDREN)
@@ -240,9 +245,18 @@ fn private_file(path: &Path, create: bool) -> Result<fs::File> {
     );
     Ok(file.into())
 }
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn private_file(_: &Path, _: bool) -> Result<fs::File> {
     anyhow::bail!("persistent child storage requires supported filesystem protection")
+}
+
+#[cfg(not(windows))]
+fn file_length(file: &fs::File) -> std::io::Result<u64> {
+    Ok(file.metadata()?.len())
+}
+#[cfg(not(windows))]
+fn create_database(builder: &redb::Builder, file: fs::File) -> Result<Database> {
+    Ok(builder.create_file(file)?)
 }
 
 #[cfg(all(test, unix))]

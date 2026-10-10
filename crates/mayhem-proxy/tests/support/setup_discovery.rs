@@ -12,6 +12,7 @@ pub struct Control {
     pub fault: Arc<Mutex<Option<&'static str>>>,
     pub queries: Arc<Mutex<Vec<Value>>>,
     pub models_calls: Arc<AtomicU64>,
+    pub identity_reads: Arc<AtomicU64>,
     pub market: Value,
 }
 pub struct Server {
@@ -38,6 +39,7 @@ impl Server {
             fault: Arc::new(Mutex::new(None)),
             queries: Arc::new(Mutex::new(vec![])),
             models_calls: Arc::new(AtomicU64::new(0)),
+            identity_reads: Arc::new(AtomicU64::new(0)),
             market: serde_json::to_value(market).unwrap(),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -84,7 +86,23 @@ impl Server {
                         }
                     }
                     let line = String::from_utf8_lossy(&bytes[..end.unwrap()]);
-                    let (status, value) = if line.starts_with("POST /proxy/discovery ") {
+                    let (status, value) = if line.starts_with("GET /status ") {
+                        c.identity_reads.fetch_add(1, Ordering::SeqCst);
+                        (
+                            200,
+                            json!({"peer":{"admin":format!("{:064x}",5),"subnetBootstrapHex":c.network["subnet_bootstrap"]},"msb":{"networkId":c.network["network_id"].as_str().unwrap().parse::<u64>().unwrap(),"bootstrapHex":c.network["msb_bootstrap"]}}),
+                        )
+                    } else if line.starts_with("GET /health ") {
+                        c.identity_reads.fetch_add(1, Ordering::SeqCst);
+                        (
+                            200,
+                            json!({"contract_version":c.network["contract_version"]}),
+                        )
+                    } else if line.starts_with("GET /state?") {
+                        assert!(line.lines().next().unwrap().contains("key=admin"));
+                        c.identity_reads.fetch_add(1, Ordering::SeqCst);
+                        (200, json!({"value":format!("{:064x}",5)}))
+                    } else if line.starts_with("POST /proxy/discovery ") {
                         let body: Value =
                             serde_json::from_slice(&bytes[end.unwrap()..end.unwrap() + length])
                                 .unwrap();

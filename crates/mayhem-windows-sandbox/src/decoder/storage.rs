@@ -5,10 +5,11 @@ use windows_sys::Win32::Security::Authorization::{
     ConvertStringSidToSidW,
 };
 use windows_sys::Win32::Security::{
-    EqualSid, GetAce, IsValidSid, ACCESS_ALLOWED_ACE, ACE_HEADER, OWNER_SECURITY_INFORMATION,
+    ACCESS_ALLOWED_ACE, ACE_HEADER, EqualSid, GetAce, IsValidSid, OWNER_SECURITY_INFORMATION,
 };
 use windows_sys::Win32::Storage::FileSystem::*;
 use windows_sys::Win32::System::SystemServices::{ACCESS_ALLOWED_ACE_TYPE, ACCESS_DENIED_ACE_TYPE};
+mod recovery;
 
 pub(super) struct Image {
     pub program: PathBuf,
@@ -16,6 +17,7 @@ pub(super) struct Image {
     pub capability: Vec<u8>,
     image_lock: Option<File>,
     _parents: Vec<File>,
+    _recovery: crate::private_files::PrivateDatabaseFile,
 }
 impl Image {
     pub fn new(program: &Path, workdir: &Path) -> Result<Self> {
@@ -34,13 +36,14 @@ impl Image {
         )?;
         validate_acl(&source, &owner, false)?;
         validate_acl(&directory, &owner, true)?;
-        if !directory.metadata()?.is_dir() || fs::read_dir(workdir)?.next().is_some() {
+        if !directory.metadata()?.is_dir() {
             return Err(invalid());
         }
         let length = source.metadata()?.len();
         if length == 0 || length > 256 * 1024 * 1024 || !source.metadata()?.is_file() {
             return Err(invalid());
         }
+        let (recovery, image_nonce) = recovery::prepare(workdir)?;
         let capability = derive_capability_sid(&format!("mayhemProxyDecoderImage{}", nonce()?))?;
         let security = descriptor(&owner, &capability)?;
         let attributes = SECURITY_ATTRIBUTES {
@@ -48,7 +51,7 @@ impl Image {
             lpSecurityDescriptor: security.0,
             bInheritHandle: 0,
         };
-        let path = workdir.join(format!("decoder-{}", nonce()?));
+        let path = workdir.join(format!("decoder-{image_nonce}"));
         let wide = to_wide_null(path.as_os_str());
         if unsafe { CreateDirectoryW(wide.as_ptr(), &attributes) } == 0 {
             return Err(last_error("decoder image directory"));
@@ -60,6 +63,7 @@ impl Image {
             capability,
             image_lock: None,
             _parents: parents,
+            _recovery: recovery,
         };
         let wide = to_wide_null(image.program.as_os_str());
         let handle = unsafe {

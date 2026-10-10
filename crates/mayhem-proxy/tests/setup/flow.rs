@@ -22,6 +22,10 @@ pub(super) fn config(f: &Fixture) -> FlowConfig {
     }
 }
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn shared_flow_retains_exact_choices_across_restart_and_stale_clients_without_private_exports(
 ) {
     let f = Fixture::new(ProxyEndpoint::Chat);
@@ -110,6 +114,10 @@ async fn shared_flow_retains_exact_choices_across_restart_and_stale_clients_with
     f.no_network_or_secret();
 }
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn flow_real_http_discovery_to_explicit_worker_probe_preserves_budget_and_original_revision()
 {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
@@ -123,7 +131,7 @@ async fn flow_real_http_discovery_to_explicit_worker_probe_preserves_budget_and_
         &f.input.connection_file,
         &serde_json::to_vec(&f.connection).unwrap(),
     );
-    let listener = tokio::net::TcpListener::from_std(f.listener.try_clone().unwrap()).unwrap();
+    let listener = f.async_listener();
     let server = tokio::spawn(async move {
         for expected in ["GET /v1/models ", "POST /v1/chat/completions "] {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -160,8 +168,7 @@ async fn flow_real_http_discovery_to_explicit_worker_probe_preserves_budget_and_
         }
     });
     let work = f.dir.path().join("worker");
-    std::fs::create_dir(&work).unwrap();
-    std::fs::set_permissions(&work, std::fs::Permissions::from_mode(0o700)).unwrap();
+    private_directory(&work);
     let path = f.dir.path().join("probe.json");
     private(&path,&serde_json::to_vec(&json!({"schema_version":1,"scope":{"capacity_file":f.dir.path().join("capacity.redb"),"route":d(50),"connection_group":d(2),"connection_ceiling":2,"route_ceiling":2,"constraints":[{"id":d(51),"ceiling":2}]},"budget":{"max_attempts":1,"max_cost_microusd":10,"per_attempt_cost_microusd":10},"worker_program":env!("CARGO_BIN_EXE_mayhem-proxy-worker"),"worker_directory":work,"request":{"model":"public","messages":[{"role":"user","content":"fixture"}],"max_tokens":16},"streaming":false,"max_output_tokens":16,"timeout_ms":2000})).unwrap());
     let mut cfg = config(&f);
@@ -248,6 +255,10 @@ async fn flow_real_http_discovery_to_explicit_worker_probe_preserves_budget_and_
         .unwrap();
 }
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn browser_actions_cannot_choose_private_paths_wallets_origins_or_extend_signing_bodies() {
     for value in [
         json!({"action":"connect","path":"/etc/passwd"}),
@@ -271,6 +282,10 @@ fn browser_actions_cannot_choose_private_paths_wallets_origins_or_extend_signing
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn flow_scoped_signed_enrollment_retains_short_payment_across_checkout_and_reconciles_original(
 ) {
     use ed25519_dalek::{Signature, SigningKey, Verifier};

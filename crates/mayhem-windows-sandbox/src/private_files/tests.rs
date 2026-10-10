@@ -9,8 +9,8 @@ use windows_sys::Win32::{
         SECURITY_ATTRIBUTES,
     },
     System::{
-        Ioctl::FSCTL_SET_REPARSE_POINT, SystemServices::IO_REPARSE_TAG_MOUNT_POINT,
-        IO::DeviceIoControl,
+        IO::DeviceIoControl, Ioctl::FSCTL_SET_REPARSE_POINT,
+        SystemServices::IO_REPARSE_TAG_MOUNT_POINT,
     },
 };
 struct Descriptor(*mut core::ffi::c_void);
@@ -253,11 +253,24 @@ fn pinned_read_blocks_path_replacement_then_next_read_revalidates_new_authority(
     let replacement = f.path("replacement");
     file(&replacement, b"untrusted public", true);
     let pinned = Pinned::open(&path, false).unwrap();
+    // A reader pins this path, not all sibling publication in its parent.
+    let directory = mutation::NtfsDirectory::open_existing(&parent).unwrap();
+    let mut guard = directory.try_lock().unwrap();
+    let mut sibling = guard
+        .stage_directory(mutation::LeafName::new("sibling.next").unwrap(), &[], 0)
+        .unwrap();
+    sibling
+        .publish(mutation::LeafName::new("sibling").unwrap())
+        .unwrap();
+    assert!(fs::OpenOptions::new().write(true).open(&path).is_err());
     assert!(fs::rename(&path, parent.join("moved")).is_err());
     assert!(fs::remove_file(&path).is_err());
     assert!(fs::rename(&replacement, &path).is_err());
     assert!(fs::rename(&parent, f.path("moved-parent")).is_err());
     assert_eq!(&*read(&pinned, 64).unwrap(), b"original");
+    drop(sibling);
+    drop(guard);
+    drop(directory);
     drop(pinned);
     fs::remove_file(&path).unwrap();
     fs::rename(replacement, &path).unwrap();

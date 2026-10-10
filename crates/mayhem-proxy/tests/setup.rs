@@ -1,24 +1,27 @@
-#![cfg(unix)]
-#[path = "setup/bootstrap.rs"]
-mod bootstrap;
+#![cfg(any(unix, windows))]
+#[path = "setup/platform.rs"]
+mod platform;
+use platform::{assert_private_file, private, private_directory, private_tempdir, write_evidence};
 #[path = "setup/admission.rs"]
 mod admission;
-#[path = "setup/enrollment.rs"]
-mod enrollment;
+#[path = "setup/bootstrap.rs"]
+mod bootstrap;
 #[path = "setup/connection.rs"]
 mod connection;
+#[path = "setup/enrollment.rs"]
+mod enrollment;
+#[path = "setup/flow.rs"]
+mod flow;
 #[path = "setup/probe.rs"]
 mod probes;
 #[path = "setup/profile.rs"]
 mod profile;
-#[path = "setup/flow.rs"]
-mod flow;
-#[path = "setup/run.rs"]
-mod run;
-#[path = "setup/rates.rs"]
-mod rates;
 #[path = "setup/publication.rs"]
 mod publication;
+#[path = "setup/rates.rs"]
+mod rates;
+#[path = "setup/run.rs"]
+mod run;
 use mayhem_proto::proxy::{
     finance::{ProxyReceiptOutcome, ProxySettlementPolicy},
     *,
@@ -32,8 +35,6 @@ use mayhem_proxy::{
 };
 use serde_json::{json, Value};
 use std::{
-    io::Write,
-    os::unix::fs::{symlink, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Barrier},
 };
@@ -41,19 +42,11 @@ use std::{
 fn d(n: u8) -> Digest {
     Digest::new(format!("{n:064x}")).unwrap()
 }
-fn private(path: &Path, bytes: &[u8]) {
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(true)
-        .write(true)
-        .mode(0o600)
-        .open(path)
-        .unwrap();
-    f.write_all(bytes).unwrap();
-    f.sync_all().unwrap();
-}
+#[cfg(unix)]
+use std::os::unix::fs::{symlink, PermissionsExt};
+
 struct Fixture {
-    dir: tempfile::TempDir,
+    dir: platform::PrivateDirectory,
     store: PathBuf,
     input: Input,
     connection: Value,
@@ -61,11 +54,9 @@ struct Fixture {
 }
 impl Fixture {
     fn new(endpoint: ProxyEndpoint) -> Self {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let dir = private_tempdir();
         let store = dir.path().join("setup");
-        std::fs::create_dir(&store).unwrap();
-        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+        private_directory(&store);
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let connection = json!({"schema_version":1,"id":"fixture-private-connection","revision":1,
@@ -196,6 +187,13 @@ impl Fixture {
     fn store(&self) -> Store {
         Store::open(&self.store).unwrap()
     }
+    fn async_listener(&self) -> tokio::net::TcpListener {
+        let listener = self.listener.try_clone().unwrap();
+        // Configure the exact socket handed to Tokio. On native Windows the
+        // cloned fixture otherwise blocks accept and the runtime's timers.
+        listener.set_nonblocking(true).unwrap();
+        tokio::net::TcpListener::from_std(listener).unwrap()
+    }
     fn no_network_or_secret(&self) {
         assert_eq!(
             self.listener.accept().unwrap_err().kind(),
@@ -206,6 +204,10 @@ impl Fixture {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn four_endpoint_drafts_resume_public_review_without_claiming_payment_or_probes() {
     let mut public_reviews = Vec::new();
     for endpoint in [
@@ -252,14 +254,7 @@ fn four_endpoint_drafts_resume_public_review_without_claiming_payment_or_probes(
             value
         );
         public_reviews.push(value);
-        assert_eq!(
-            std::fs::metadata(f.store.join("draft.json"))
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
-            0o600
-        );
+        assert_private_file(&f.store.join("draft.json"));
         assert!(matches!(
             store.create(f.input.clone()),
             Err(Error::Conflict)
@@ -267,24 +262,18 @@ fn four_endpoint_drafts_resume_public_review_without_claiming_payment_or_probes(
         f.no_network_or_secret();
     }
     if let Some(path) = std::env::var_os("MAYHEM_TEST_PROXY_SETUP_FIXTURE") {
-        let mut file = std::fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .mode(0o600)
-            .open(path)
-            .unwrap();
-        file.write_all(
-            &serde_json::to_vec_pretty(
-                &json!({"schema_version":1,"test_only":true,"reviews":public_reviews}),
-            )
-            .unwrap(),
-        )
-        .unwrap();
-        file.sync_all().unwrap();
+        write_evidence(
+            Path::new(&path),
+            &json!({"schema_version":1,"test_only":true,"reviews":public_reviews}),
+        );
     }
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn changed_connection_and_revision_require_explicit_update_and_recheck() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     let store = f.store();
@@ -323,6 +312,10 @@ fn changed_connection_and_revision_require_explicit_update_and_recheck() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn concurrent_edits_have_one_cas_winner_and_never_reset_identity() {
     let f = Fixture::new(ProxyEndpoint::Chat);
     let original = f.store().create(f.input.clone()).unwrap();
@@ -357,6 +350,10 @@ fn concurrent_edits_have_one_cas_winner_and_never_reset_identity() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn partial_temp_never_becomes_a_draft_and_corrupt_authority_is_not_recreated() {
     let f = Fixture::new(ProxyEndpoint::Chat);
     let store = f.store();
@@ -374,7 +371,12 @@ fn partial_temp_never_becomes_a_draft_and_corrupt_authority_is_not_recreated() {
     );
 }
 
+#[cfg(unix)]
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn unsafe_permissions_symlinks_hardlinks_and_oversized_files_fail_closed() {
     let f = Fixture::new(ProxyEndpoint::Chat);
     std::fs::set_permissions(&f.store, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -407,6 +409,10 @@ fn unsafe_permissions_symlinks_hardlinks_and_oversized_files_fail_closed() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 fn substituted_identity_contract_recipe_and_unsupported_families_are_rejected() {
     let f = Fixture::new(ProxyEndpoint::Chat);
     let mut input = f.input.clone();

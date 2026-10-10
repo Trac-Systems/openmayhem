@@ -120,20 +120,14 @@ impl Prepared {
         // Recovery has separate decoder headroom. An occupied inference pool
         // cannot consume these operator-approved probe permits.
         let probe_pool = Arc::new(
-            Pool::new(
-                &config.worker_program,
-                &workdir,
-                config.limits.recovery_worker,
-            )
-            .map_err(|_| Error::Setup)?,
+            paid_pool
+                .with_independent_limits(config.limits.recovery_worker)
+                .map_err(|_| Error::Setup)?,
         );
         let settlement_pool = Arc::new(
-            Pool::new(
-                &config.worker_program,
-                &workdir,
-                config.limits.settlement_worker,
-            )
-            .map_err(|_| Error::Setup)?,
+            paid_pool
+                .with_independent_limits(config.limits.settlement_worker)
+                .map_err(|_| Error::Setup)?,
         );
         // Parse approved tokenizer data only in the contained executable, before
         // creating/reconfiguring capacity or enabling presence/admission.
@@ -247,8 +241,16 @@ impl Prepared {
                 .map_err(|_| Error::Configuration)?;
             if let Some(source) = spec.declaration_source {
                 let live = Arc::new(crate::declaration::live::Live::new(source.subject.clone()));
-                controller.proposals().install_live_declarations(live.clone()).map_err(|_| Error::Configuration)?;
-                declaration_entries.push(declarations::Entry { route: spec.id.clone(), source, live, source_status: Arc::new(std::sync::Mutex::new("not_read")) });
+                controller
+                    .proposals()
+                    .install_live_declarations(live.clone())
+                    .map_err(|_| Error::Configuration)?;
+                declaration_entries.push(declarations::Entry {
+                    route: spec.id.clone(),
+                    source,
+                    live,
+                    source_status: Arc::new(std::sync::Mutex::new("not_read")),
+                });
             }
             for offer in spec.offers {
                 presence_entries.push(presence::Entry {
@@ -331,7 +333,9 @@ impl Prepared {
             limits: config.limits,
             recovery,
             presence,
-            declarations: declarations::Runner { entries: declaration_entries },
+            declarations: declarations::Runner {
+                entries: declaration_entries,
+            },
             capacity,
             monitors,
             seed,

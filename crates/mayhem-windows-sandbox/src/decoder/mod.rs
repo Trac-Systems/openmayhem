@@ -249,7 +249,20 @@ fn launch(
     startup.StartupInfo.hStdError = handles[2];
     startup.lpAttributeList = attributes.as_mut_ptr();
     let program = to_wide_null(image.program.as_os_str());
-    let directory = to_wide_null(image.directory.as_os_str());
+    // CreateProcess rejects a current directory above MAX_PATH even when the
+    // executable supports long paths. This stdio-only worker needs no working
+    // files. Use the OS directory already required for its system DLLs, never
+    // an inherited/user-selected directory. No capability or write ACL changes.
+    let mut directory = [0u16; 260];
+    let length = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW(
+            directory.as_mut_ptr(),
+            directory.len() as u32,
+        )
+    } as usize;
+    if length == 0 || length >= directory.len() - 1 {
+        return Err(invalid());
+    }
     let mut command = windows_command_line_os(image.program.as_os_str(), args);
     let environment = identity::environment()?;
     let mut process: PROCESS_INFORMATION = unsafe { zeroed() };

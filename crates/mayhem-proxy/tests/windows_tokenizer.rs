@@ -2,6 +2,8 @@
 //! Uses the actual bundled worker and LPAC/Job launcher with synthetic data;
 //! no provider, upstream, filesystem tokenizer import or payment is involved.
 #![cfg(windows)]
+#[path = "support/windows_fixture.rs"]
+mod windows_fixture;
 
 use mayhem_proxy::{
     attempts::Digest,
@@ -41,11 +43,11 @@ struct Worker {
     child: DecoderChild,
     input: tokio::fs::File,
     output: tokio::fs::File,
-    _directory: tempfile::TempDir,
+    _directory: windows_fixture::PrivateDirectory,
 }
 impl Worker {
     fn new() -> Self {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = windows_fixture::PrivateDirectory::new();
         let launcher = DecoderLauncher::new(
             std::path::Path::new(env!("CARGO_BIN_EXE_mayhem-proxy-worker")),
             directory.path(),
@@ -115,7 +117,7 @@ fn windows_tokenizer_policy_refuses_unrestricted_and_legacy_modes() {
 
 #[test]
 fn windows_source_provisioning_validates_exact_pin_through_the_configured_pool() {
-    let directory = tempfile::tempdir().unwrap();
+    let directory = windows_fixture::PrivateDirectory::new();
     let pool = Pool::new(
         env!("CARGO_BIN_EXE_mayhem-proxy-worker"),
         directory.path(),

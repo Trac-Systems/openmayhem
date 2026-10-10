@@ -98,6 +98,10 @@ fn checked(f: &Fixture) {
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn four_families_retain_explicit_canonical_absence_without_payment_or_upstream_claims() {
     for endpoint in [
         ProxyEndpoint::Chat,
@@ -142,6 +146,10 @@ async fn four_families_retain_explicit_canonical_absence_without_payment_or_upst
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn admitted_revoked_disabled_and_exact_applied_operation_are_observations_not_permissions() {
     let f = Fixture::new(ProxyEndpoint::Chat);
     checked(&f);
@@ -199,6 +207,10 @@ async fn admitted_revoked_disabled_and_exact_applied_operation_are_observations_
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn rejects_substitution_oversize_old_peer_and_regression_without_erasing_the_proof_floor() {
     for fault in [
         "provider",
@@ -275,6 +287,10 @@ async fn rejects_substitution_oversize_old_peer_and_regression_without_erasing_t
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn drift_expiry_and_future_clock_make_retained_evidence_require_refresh() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     checked(&f);
@@ -303,6 +319,10 @@ async fn drift_expiry_and_future_clock_make_retained_evidence_require_refresh() 
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn cancelled_read_retains_pending_original_revision_and_never_retries_on_resume() {
     let f = Fixture::new(ProxyEndpoint::Chat);
     checked(&f);
@@ -326,6 +346,10 @@ async fn cancelled_read_retains_pending_original_revision_and_never_retries_on_r
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn in_flight_connection_drift_and_deadline_failure_never_install_an_observation() {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
     checked(&f);
@@ -364,6 +388,10 @@ async fn in_flight_connection_drift_and_deadline_failure_never_install_an_observ
 }
 
 #[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
 async fn invalid_configuration_and_unchecked_drafts_cannot_contact_peer_or_consume_revision() {
     let f = Fixture::new(ProxyEndpoint::Chat);
     let rpc = peer(&f, |v, _| (200, v), Duration::ZERO);
