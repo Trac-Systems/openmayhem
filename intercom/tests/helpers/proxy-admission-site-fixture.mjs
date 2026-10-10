@@ -5,6 +5,8 @@ import http from 'node:http';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { createInterface } from 'node:readline';
 import { familyAdminFixture } from './proxy-family-admin-fixture.mjs';
+import { createTnkDiscoveryFixture, testTnkAddress } from './proxy-admission-tnk-fixture.mjs';
+import { createAdmissionMsbReader } from '../../features/mayhem/proxy-admission-msb.js';
 import MayhemFeature from '../../features/mayhem/index.js';
 import { requestProxyAdmissionPolicy } from '../../src/rpc.js';
 import { proxyOperationDigest, proxyRegistryFeatureKey } from '../../contract/proxy-protocol.js';
@@ -15,6 +17,10 @@ const cleanup=[];
 const f=await familyAdminFixture({after:fn=>cleanup.push(fn)});
 const baseFixture=JSON.parse(fs.readFileSync(new URL('../fixtures/proxy-admission-worker-v1.json',import.meta.url))).cases[0];
 const h=()=>randomBytes(32).toString('hex'),now=Date.now(),invoiceId=randomUUID();
+const msbFixture=await createTnkDiscoveryFixture({hash:h(),destination:testTnkAddress(h()),
+ networkId:f.network.network_id,msbBootstrap:f.network.msb_bootstrap});
+cleanup.push(()=>msbFixture.close());
+f.peer.proxyAdmissionMsbSnapshot=createAdmissionMsbReader(msbFixture.msb);
 const envelope=await f.create();
 const invoice={...baseFixture.verify_work.invoice,network:f.network,provider_pubkey:f.provider.publicKey,issuer_pubkey:f.issuer.publicKey,
  entitlement_id:h(),initial_operation_digest:await proxyOperationDigest(envelope.intent),fee_policy_hash:f.config.fee_policy_hash,

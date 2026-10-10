@@ -10,10 +10,17 @@ const cursor = value => typeof value === 'string' && /^(0|[1-9][0-9]{0,15})$/.te
 const ethHash = value => typeof value === 'string' && /^0x[0-9a-f]{64}$/.test(value);
 const ethAddress = value => typeof value === 'string' && /^0x[0-9a-f]{40}$/.test(value);
 export function validateDiscoveryWork(w, stream) {
-  shape(w,['schema_version','purpose','phase','stream_id','stream','from_cursor','from_offset','max_positions','lease_token','lease_expires_at_ms']);
+  shape(w,['schema_version','purpose','phase','stream_id','stream','from_cursor','from_offset','max_positions','lease_token','lease_expires_at_ms',
+    ...(Object.hasOwn(w,'previous_snapshot')?['previous_snapshot']:[])]);
   need(w.schema_version===1 && w.purpose===PURPOSE && w.phase==='verify' && hex(w.stream_id) && hex(w.lease_token)
     && cursor(w.from_cursor) && uint(w.from_offset) && w.from_offset<=0x7fffffff && w.max_positions===16 && uint(w.lease_expires_at_ms,1),'invalid discovery work');
   shape(w.stream,Object.keys(stream));
+  if(Object.hasOwn(w,'previous_snapshot')){
+    need(stream.rail==='tnk','unexpected retained MSB snapshot');
+    // Retained history is intentionally older; freshness applies to the NEW
+    // authority response. The scanner verifies this exact old prefix hash.
+    validateAdmissionMsbSnapshot(w.previous_snapshot,{network_id:w.previous_snapshot?.network_id,msb_bootstrap:stream.msb_bootstrap},w.previous_snapshot?.observed_at_ms);
+  }
   need(Object.keys(stream).every(key=>w.stream[key]===stream[key]),'discovery stream differs'); return w;
 }
 export class AdmissionDiscoveryWorker {
@@ -112,10 +119,12 @@ export function tnkDiscovery({msb,network,msbBootstrap,frontier,now=Date.now,add
     const canonicalProof=validateAdmissionMsbSnapshot(await frontier(signal),{
       network_id:String(msb.config?.networkId),msb_bootstrap:msbBootstrap});
     need(msb.state.getSignedLength()>=canonicalProof.signed_length,'TNK canonical reader behind');
-    const page=await scanTnkSignedPage(msb,{from:Number(work.from_cursor),frontier:canonicalProof.signed_length,canonicalProof,signal,addressPrefix});
+    const page=await scanTnkSignedPage(msb,{from:Number(work.from_cursor),frontier:canonicalProof.signed_length,canonicalProof,
+      previousSnapshot:work.previous_snapshot,signal,addressPrefix});
     // Observer time remains explicit. It must not become an invented ledger
     // timestamp or authorize unpaid quote renewal; that needs canonical barriers.
     return {next_cursor:page.next_cursor,next_offset:0,
+      coverage:{kind:'tnk_signed_page',snapshot:canonicalProof,previous:work.previous_snapshot??null},
       observations:page.transfers.map(transfer=>({...transfer,observed_at_ms:now()}))};
   };
 }

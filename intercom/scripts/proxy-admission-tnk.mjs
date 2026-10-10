@@ -29,7 +29,7 @@ function checkCanonicalProof(msb, proof, local) {
  * one immutable checkout. The moving getTxHashes/getTxDetails combination cannot
  * establish a coherent scan boundary. This proof describes ledger sequence, not
  * a payment timestamp or proof that the remote network has caught up to now. */
-export async function scanTnkSignedPage(msb, { from, frontier, signal, addressPrefix, canonicalProof }) {
+export async function scanTnkSignedPage(msb, { from, frontier, signal, addressPrefix, canonicalProof, previousSnapshot }) {
   need(uint(from) && uint(frontier, 1) && from <= frontier && signal
     && typeof addressPrefix === 'string' && /^[a-z0-9]{1,32}$/.test(addressPrefix), 'invalid TNK page bounds');
   const base = msb.state?.base?.view, core = base?.core;
@@ -55,6 +55,15 @@ export async function scanTnkSignedPage(msb, { from, frontier, signal, addressPr
     need(hex(treeHash), 'TNK signed tree hash unavailable'); stable();
     const proof = { view_key: key, fork, signed_length: frontier, tree_hash: treeHash };
     if (canonicalProof !== undefined) checkCanonicalProof(msb, canonicalProof, proof);
+    if (previousSnapshot !== undefined) {
+      need(canonicalProof !== undefined, 'retained TNK history needs canonical authority');
+      validateAdmissionMsbSnapshot(previousSnapshot, canonicalProof, previousSnapshot?.observed_at_ms);
+      need(previousSnapshot.view_key === key && previousSnapshot.fork === fork
+        && previousSnapshot.signed_length <= frontier && previousSnapshot.observed_at_ms <= canonicalProof.observed_at_ms,
+      'TNK retained prefix changed');
+      const previousHash = previousSnapshot.signed_length === frontier ? treeHash : await boundedHash(core, previousSnapshot.signed_length, signal);
+      need(previousHash === previousSnapshot.tree_hash, 'TNK retained prefix hash differs'); stable();
+    }
     const transfers = []; let previous = from - 1, count = 0;
     if (end > from) {
       stream = snapshot.createHistoryStream({ gte: from, lt: end, limit: 16 });

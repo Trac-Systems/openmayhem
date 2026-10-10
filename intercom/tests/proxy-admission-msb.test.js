@@ -105,3 +105,19 @@ test('verification never accepts a changed local fork during its exact-key read'
   } };
   await assert.rejects(verifyTnkObservedTransfer(f.msb, { transaction_hash: hash, destination }, options(proof)), /snapshot changed/);
 });
+
+test('continued discovery verifies the retained Merkle prefix inside the newer canonical view', async t => {
+  const f = await fixture(t), previous = await f.frontier();
+  await f.view.put('later/1', Buffer.from('1')); await f.view.put('later/2', Buffer.from('2'));
+  const current = await f.frontier();
+  const scan = older => scanTnkSignedPage(f.msb, { ...options(current), from: previous.signed_length, previousSnapshot: older });
+  const page = await scan(previous); assert.equal(page.next_cursor, String(current.signed_length));
+  assert.equal(page.transfers.length, 0);
+  for (const change of [{ tree_hash: '01'.repeat(32) }, { view_key: '02'.repeat(32) }, { fork: 1 },
+    { network_id: '2' }, { signed_length: current.signed_length + 1 }]) {
+    await assert.rejects(scan({ ...previous, ...change }));
+  }
+  // Retained evidence may be old; it is the newly authenticated authority
+  // response that must be fresh. Do not strand discovery after downtime.
+  await scan({ ...previous, observed_at_ms: previous.observed_at_ms - 100000 });
+});
