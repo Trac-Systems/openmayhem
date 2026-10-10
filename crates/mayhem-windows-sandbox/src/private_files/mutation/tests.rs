@@ -17,9 +17,9 @@ use windows_sys::Win32::Security::{
 fn leaf(value: &str) -> LeafName {
     LeafName::new(value).unwrap()
 }
-pub(super) struct Fixture(pub(super) PathBuf);
+pub(in crate::private_files) struct Fixture(pub(in crate::private_files) PathBuf);
 impl Fixture {
-    pub(super) fn new() -> Self {
+    pub(in crate::private_files) fn new() -> Self {
         let mut nonce = [0u8; 16];
         getrandom::fill(&mut nonce).unwrap();
         let name = nonce.iter().map(|v| format!("{v:02x}")).collect::<String>();

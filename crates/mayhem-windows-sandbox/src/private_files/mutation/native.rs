@@ -53,7 +53,7 @@ pub(super) fn descriptor(owner: &[u8]) -> Outcome<Descriptor> {
     Ok(Descriptor(result))
 }
 
-pub(super) fn require_ntfs(directory: &File) -> Outcome<()> {
+pub(in crate::private_files) fn require_ntfs(directory: &File) -> Outcome<()> {
     let mut name = [0u16; 32];
     let mut flags = 0;
     if unsafe {
@@ -222,6 +222,23 @@ pub(super) fn create_staged_file(parent: &File, owner: &[u8], name: &LeafName) -
     )?
     .ok_or(MutationError::Protection)
 }
+// An exclusive data handle, not a publishable temporary: no DELETE access and
+// no sharing. The owner must retain the pinned ancestors until it is closed.
+pub(in crate::private_files) fn database_file(
+    pinned: &Pinned,
+    name: &LeafName,
+    existing: bool,
+) -> Outcome<File> {
+    open(
+        pinned,
+        name,
+        if existing { nt::FILE_OPEN } else { nt::FILE_OPEN_IF },
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        true,
+    )?
+    .ok_or(MutationError::Protection)
+}
 pub(super) fn inspect_directory(
     parent: &File,
     owner: &[u8],
@@ -314,7 +331,7 @@ pub(super) fn unlock(file: &File) {
     }
     // Closing the owned handle is the final release even if explicit unlock fails.
 }
-pub(super) fn flush(file: &File) -> Outcome<()> {
+pub(in crate::private_files) fn flush(file: &File) -> Outcome<()> {
     let mut io: IO_STATUS_BLOCK = unsafe { zeroed() };
     // flags=0 includes metadata and the underlying device cache. Never weaken
     // this to DATA_ONLY/NO_SYNC or a successful no-op on unsupported filesystems.

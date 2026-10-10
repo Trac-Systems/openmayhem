@@ -23,6 +23,8 @@ use windows_sys::{
 };
 use zeroize::Zeroizing;
 mod acl;
+mod database;
+pub use database::PrivateDatabaseFile;
 pub(crate) mod mutation;
 #[cfg(test)]
 mod tests;

@@ -408,7 +408,7 @@ impl Authority {
         .map_err(|_| Error::File)?;
         let mut builder = Database::builder();
         builder.set_cache_size(8 * 1024 * 1024);
-        let database = db(builder.create_file(file))?;
+        let database = db(crate::storage::create(&builder, file))?;
         let mut tx = db(database.begin_write())?;
         db(tx.set_durability(Durability::Immediate))?;
         let names = db(tx.list_tables())?

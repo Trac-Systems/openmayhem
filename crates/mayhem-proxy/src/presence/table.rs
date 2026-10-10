@@ -39,7 +39,7 @@ impl Table {
             .map_err(|_| invalid("presence requires protected storage"))?;
         let mut builder = Database::builder();
         builder.set_cache_size(8 * 1024 * 1024);
-        let database = db(builder.create_file(file))?;
+        let database = db(crate::storage::create(&builder, file))?;
         let mut tx = db(database.begin_write())?;
         db(tx.set_durability(Durability::Immediate))?;
         {

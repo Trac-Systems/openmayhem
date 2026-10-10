@@ -231,7 +231,7 @@ impl Store {
         .map_err(|_| invalid("negotiation needs private supported storage"))?;
         let mut builder = redb::Database::builder();
         builder.set_cache_size(4 * 1024 * 1024);
-        let database = crate::db(builder.create_file(file))?;
+        let database = crate::db(crate::storage::create(&builder, file))?;
         if existing {
             let tx = crate::db(database.begin_read())?;
             let table = crate::db(tx.open_table(META))?;

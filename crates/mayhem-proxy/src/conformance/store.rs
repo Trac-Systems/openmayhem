@@ -54,7 +54,7 @@ impl Store {
             .map_err(|_| crate::invalid("conformance store protection failed"))?;
         let mut builder = Database::builder();
         builder.set_cache_size(8 * 1024 * 1024);
-        let database = db(builder.create_file(file))?;
+        let database = db(crate::storage::create(&builder, file))?;
         let tx = db(database.begin_write())?;
         {
             let mut m = db(tx.open_table(META))?;

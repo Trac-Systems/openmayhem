@@ -34,6 +34,7 @@ pub mod semantics;
 pub mod serving;
 pub mod setup;
 pub mod signing;
+mod storage;
 pub mod supervisor;
 #[cfg(feature = "test-support")]
 #[doc(hidden)]

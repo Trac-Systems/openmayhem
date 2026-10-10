@@ -496,7 +496,7 @@ impl Journal {
         let file = private_file(path.as_ref())?;
         let mut builder = Database::builder();
         builder.set_cache_size(8 * 1024 * 1024);
-        let database = storage(builder.create_file(file))?;
+        let database = storage(crate::storage::create(&builder, file))?;
         Self::initialize(database, identity, limits)
     }
 
@@ -1056,12 +1056,22 @@ fn private_file_mode(path: &Path, create: bool) -> Result<std::fs::File> {
     }
     Ok(fd.into())
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+pub(crate) fn private_file(path: &Path) -> Result<crate::storage::PrivateFile> {
+    crate::storage::PrivateFile::open(path, false).map_err(|_| Error::File)
+}
+
+#[cfg(windows)]
+pub(crate) fn existing_private_file(path: &Path) -> Result<crate::storage::PrivateFile> {
+    crate::storage::PrivateFile::open(path, true).map_err(|_| Error::File)
+}
+
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn private_file(_: &Path) -> Result<std::fs::File> {
     Err(Error::UnsupportedFileProtection)
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 pub(crate) fn existing_private_file(_: &Path) -> Result<std::fs::File> {
     Err(Error::UnsupportedFileProtection)
 }

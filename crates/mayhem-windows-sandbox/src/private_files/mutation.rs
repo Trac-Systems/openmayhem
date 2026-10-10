@@ -2,10 +2,10 @@
 use super::*;
 use std::io::Write;
 mod directory;
-mod native;
+pub(super) mod native;
 pub use directory::{DirectoryEntry, DirectoryIdentity, PendingDirectory};
 #[cfg(test)]
-mod tests;
+pub(super) mod tests;
 
 /// Resource bound, not a financial limit. Includes the existing tokenizer cap.
 const MAX_BYTES: usize = 64 * 1024 * 1024;
