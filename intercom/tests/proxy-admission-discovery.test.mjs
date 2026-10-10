@@ -62,6 +62,23 @@ test('TNK observes payload and position from one real signed checkout and requir
     f.msb.state.getSignedLength=()=>9;await assert.rejects(scan(work({stream:s}),AbortSignal.timeout(1000)));
   } finally {await f.close();}
 });
+test('TNK discovery waits for cold-reader catchup without moving its authoritative boundary',async()=>{
+  const s={rail:'tnk',network:'testnet1',msb_bootstrap:h},destination=testTnkAddress('07'.repeat(32));
+  const f=await createTnkDiscoveryFixture({hash:h,destination});
+  try {
+    const proof=await f.frontier(),full=f.msb.state.getSignedLength;
+    let caught=false,reads=0;
+    f.msb.state.getSignedLength=()=>{reads++;return caught?full():0;};
+    const timer=setTimeout(()=>{caught=true;},20);
+    try {
+      const scan=tnkDiscovery({msb:f.msb,network:s.network,msbBootstrap:h,frontier:async()=>proof});
+      const page=await scan(work({stream:s}),AbortSignal.timeout(3000));
+      assert.equal(page.next_cursor,String(proof.signed_length));assert.equal(page.observations.length,1);assert(reads>1);
+      caught=false;
+      await assert.rejects(scan(work({stream:s}),AbortSignal.timeout(20)),error=>error.name==='AbortError'||error.name==='TimeoutError');
+    } finally {clearTimeout(timer);}
+  } finally {await f.close();}
+});
 test('discovery worker idle makes no chain read and a lost completion is never replaced by a guessed cursor',async()=>{
   let calls=0,scanCalls=0,posted;
   const w=new AdmissionDiscoveryWorker({origin:'https://fixture.invalid',credential:'public-fixture-only',stream,

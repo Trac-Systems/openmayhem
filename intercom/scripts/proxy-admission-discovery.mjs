@@ -5,6 +5,8 @@ import { need, shape, hex, uint, PURPOSE } from './proxy-admission-wire.mjs';
 import { ERC20_TRANSFER_TOPIC, parseHexInt } from './retail-crypto-verification.mjs';
 import { scanTnkSignedPage } from './proxy-admission-tnk.mjs';
 import { validateAdmissionMsbSnapshot } from '../features/mayhem/proxy-admission-msb.js';
+import { setTimeout as sleep } from 'node:timers/promises';
+import { waitForMinimumSignedLength } from './msb-reader-catchup.mjs';
 
 const cursor = value => typeof value === 'string' && /^(0|[1-9][0-9]{0,15})$/.test(value) && BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
 const ethHash = value => typeof value === 'string' && /^0x[0-9a-f]{64}$/.test(value);
@@ -118,7 +120,15 @@ export function tnkDiscovery({msb,network,msbBootstrap,frontier,now=Date.now,add
     validateDiscoveryWork(work,{rail:'tnk',network,msb_bootstrap:msbBootstrap});need(work.from_offset===0,'TNK cursor offset differs');
     const canonicalProof=validateAdmissionMsbSnapshot(await frontier(signal),{
       network_id:String(msb.config?.networkId),msb_bootstrap:msbBootstrap});
-    need(msb.state.getSignedLength()>=canonicalProof.signed_length,'TNK canonical reader behind');
+    // ready() opens the store; it does not establish replication progress.
+    // Reuse the bounded catch-up used by receipt verification, honoring the
+    // caller's lease/abort deadline instead of rejecting a healthy cold reader.
+    const signed=await waitForMinimumSignedLength(msb.state,{
+      minimumSignedLength:canonicalProof.signed_length,timeoutSec:10,
+      sleepImpl:ms=>sleep(ms,undefined,{signal}),
+    });
+    signal.throwIfAborted();
+    need(signed>=canonicalProof.signed_length,'TNK canonical reader behind');
     const page=await scanTnkSignedPage(msb,{from:Number(work.from_cursor),frontier:canonicalProof.signed_length,canonicalProof,
       previousSnapshot:work.previous_snapshot,signal,addressPrefix});
     // Observer time remains explicit. It must not become an invented ledger

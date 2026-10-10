@@ -85,13 +85,34 @@ test('discovery and verification match the authoritative prefix, even when local
   await assert.rejects(verifyTnkObservedTransfer(f.msb, { transaction_hash: hash, destination }, options(initial)), /awaiting_finality/);
   const receipt = await verifyTnkObservedTransfer(f.msb, { transaction_hash: hash, destination }, options(current));
   assert.equal(receipt.finalized, true); assert.equal(receipt.tokenAmountBaseUnits, 9n);
-  for (const change of [{ view_key: '01'.repeat(32) }, { fork: current.fork + 1 }, { tree_hash: '02'.repeat(32) },
+  for (const change of [{ view_key: '01'.repeat(32) }, { tree_hash: '02'.repeat(32) },
     { signed_length: current.signed_length + 1 }, { network_id: '2' }, { msb_bootstrap: '03'.repeat(32) },
     { observed_at_ms: Date.now() - 20000 }]) {
     const bad = { ...current, ...change }, opts = { ...options(current), canonicalProof: bad };
     await assert.rejects(scanTnkSignedPage(f.msb, { ...opts, from: 0 }));
     await assert.rejects(verifyTnkObservedTransfer(f.msb, { transaction_hash: hash, destination }, opts));
   }
+});
+
+test('independent reader rebuild counters do not reject the same canonical Merkle prefix', async t => {
+  const f = await fixture(t);
+  await f.view.put('later/1', Buffer.from('1')); await f.view.put('later/2', Buffer.from('2'));
+  const previous = { ...await f.frontier(), fork: 17 };
+  assert.notEqual(f.view.core.fork, previous.fork);
+  const page = await scanTnkSignedPage(f.msb, { ...options(previous), from: 0 });
+  assert.equal(page.transfers.length, 1);
+  const receipt = await verifyTnkObservedTransfer(f.msb, { transaction_hash: hash, destination }, options(previous));
+  assert.equal(receipt.finalized, true); assert.equal(receipt.tokenAmountBaseUnits, 9n);
+  await f.view.put('later/3', Buffer.from('3'));
+  const current = { ...await f.frontier(), fork: 17 };
+  const next = await scanTnkSignedPage(f.msb, { ...options(current), from: previous.signed_length, previousSnapshot: previous });
+  assert.equal(next.next_cursor, String(current.signed_length));
+  await assert.rejects(scanTnkSignedPage(f.msb, { ...options(current), from: previous.signed_length,
+    previousSnapshot: { ...previous, tree_hash: 'ab'.repeat(32) } }), /prefix hash differs/);
+  // A change in the SAME canonical writer's counter still requires explicit
+  // retained-history reconciliation; only cross-reader counter equality changes.
+  await assert.rejects(scanTnkSignedPage(f.msb, { ...options(current), from: previous.signed_length,
+    previousSnapshot: { ...previous, fork: 16 } }), /retained prefix changed/);
 });
 
 test('verification never accepts a changed local fork during its exact-key read', async t => {

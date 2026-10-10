@@ -22,7 +22,12 @@ async function boundedHash(core, length, signal) {
 function checkCanonicalProof(msb, proof, local) {
   validateAdmissionMsbSnapshot(proof, { network_id: String(msb.config?.networkId),
     msb_bootstrap: Buffer.from(msb.config?.bootstrap ?? []).toString('hex') });
-  need(Object.keys(local).every(k => proof[k] === local[k]), 'TNK local reader differs from canonical snapshot');
+  // Autobase's mutable-view fork is a local rebuild counter. Independent
+  // readers can have different counters for the same signed prefix. Identity
+  // is the network, view key, signed length and Merkle hash; callers separately
+  // fence changes to the local counter throughout the read.
+  need(['view_key', 'signed_length', 'tree_hash'].every(k => proof[k] === local[k]),
+    'TNK local reader differs from canonical snapshot');
 }
 
 /** Discover at most sixteen signed ledger positions, payloads included, from
@@ -58,7 +63,7 @@ export async function scanTnkSignedPage(msb, { from, frontier, signal, addressPr
     if (previousSnapshot !== undefined) {
       need(canonicalProof !== undefined, 'retained TNK history needs canonical authority');
       validateAdmissionMsbSnapshot(previousSnapshot, canonicalProof, previousSnapshot?.observed_at_ms);
-      need(previousSnapshot.view_key === key && previousSnapshot.fork === fork
+      need(previousSnapshot.view_key === key && previousSnapshot.fork === canonicalProof.fork
         && previousSnapshot.signed_length <= frontier && previousSnapshot.observed_at_ms <= canonicalProof.observed_at_ms,
       'TNK retained prefix changed');
       const previousHash = previousSnapshot.signed_length === frontier ? treeHash : await boundedHash(core, previousSnapshot.signed_length, signal);

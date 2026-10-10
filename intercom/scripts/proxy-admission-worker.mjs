@@ -378,7 +378,7 @@ export async function main(env=process.env) {
         discovery=new AdmissionDiscoveryWorker({origin:c.api_origin,credential,stream:{rail:'tnk',network:v.network,msb_bootstrap:v.msb_bootstrap},
           scan:tnkDiscovery({msb,network:v.network,msbBootstrap:v.msb_bootstrap,frontier:canonicalFrontier}),allowLoopbackHttp:c.allow_loopback_http===true});
       }
-      closeReader=async()=>{await msb.close();};
+      closeReader=async()=>{if(ready)await msb.close();};
     }
   }
   const worker=new AdmissionWorker({phase,api,coreOrigin:c.core_origin,network:c.network,feePolicyHash:c.fee_policy_hash,
