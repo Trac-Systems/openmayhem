@@ -10,6 +10,7 @@ import {AdmissionRefundWorker} from '../scripts/proxy-admission-refund-worker.mj
 import {digest,invoiceCommitment} from '../scripts/proxy-admission-wire.mjs';
 import {proxyCanonicalSigningBytes} from '../contract/proxy-protocol.js';
 import {testWallet,tnkRefundRuntime} from './helpers/proxy-admission-refund-tnk-runtime.mjs';
+import {checkRecoveredExecution} from './helpers/proxy-admission-refund-recovery.mjs';
 const fixtures=JSON.parse(fs.readFileSync(new URL('./fixtures/proxy-admission-worker-v1.json',import.meta.url)));
 const h=()=>randomBytes(32).toString('hex');
 const key=()=>{const k=generateKeyPairSync('ed25519');return {...k,hex:k.publicKey.export({format:'der',type:'spki'}).subarray(-32).toString('hex')};};
@@ -40,6 +41,9 @@ async function fixture(t){
   resumed:p=>({...work,action:'reconcile',preparation:p,first_dispatch_at_ms:grant.first_dispatch_at_ms})};
 }
 const signal=()=>AbortSignal.timeout(5000);
+test('signed recovery resumes the original TNK payload without a second transfer',async t=>{
+ const f=await fixture(t);await checkRecoveredExecution(f);assert.equal(f.runtime.state.broadcasts.length,1);assert.equal(f.runtime.state.scans,0);
+});
 test('real TNK payload is retained before dispatch and final delivery is canonical, exact and repeatable after ledger growth',async t=>{
  const f=await fixture(t),adapter=f.adapter(),p=await adapter.prepare(f.work,signal());
  const journal=new RefundJournal(f.root,f.work.authorization_digest),stored=journal.get('request');

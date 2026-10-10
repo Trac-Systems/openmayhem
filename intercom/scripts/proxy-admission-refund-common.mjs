@@ -10,6 +10,7 @@ import { ReviewWork } from './retail-crypto-verification.mjs';
 const AUTH = 'mayhem/proxy/admission-refund-authorization/v1';
 export const PREPARE = 'mayhem/proxy/admission-refund-preparation/v1';
 export const DELIVERY = 'mayhem/proxy/admission-refund-delivery/v1';
+export const RECOVERY = 'mayhem/proxy/admission-refund-recovery/v1';
 const opaque = v => typeof v === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(v);
 export const signed = (domain, body, key) => ({ body, signature: sign(null, proxyCanonicalSigningBytes(domain, body), key).toString('hex') });
 function verified(domain, envelope, key) {
@@ -17,6 +18,7 @@ function verified(domain, envelope, key) {
   const publicKey = createPublicKey({ key: Buffer.concat([Buffer.from('302a300506032b6570032100','hex'),Buffer.from(key,'hex')]), format:'der', type:'spki' });
   need(verify(null, proxyCanonicalSigningBytes(domain, envelope.body), publicKey, Buffer.from(envelope.signature,'hex')), 'refund signature differs');
 }
+export { verified as verifyRefundSignature };
 export function same(a,b) { return proxyCanonicalSigningBytes('refund-record',a).equals(proxyCanonicalSigningBytes('refund-record',b)); }
 function fsyncDirectory(dir) { const fd=fs.openSync(dir,fs.constants.O_RDONLY); try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); } }
 
@@ -52,7 +54,7 @@ export class RefundJournal {
 export async function validateRefundWork(work,policy,executorPubkey,rail,now=Date.now()) {
   need(['fiat','tnk','tap'].includes(rail),'invalid refund rail');
   need(Buffer.byteLength(JSON.stringify(work))<=16384,'refund work exceeds bound');
-  shape(work,['refund_id','action','lease_token','lease_expires_at_ms','authorization','authorization_digest','invoice','payment_reference','payment_evidence','preparation','first_dispatch_at_ms']);
+  shape(work,['refund_id','action','lease_token','lease_expires_at_ms','authorization','authorization_digest','invoice','payment_reference','payment_evidence','preparation','first_dispatch_at_ms',...(Object.hasOwn(work,'recovery')?['recovery']:[])]);
   need(opaque(work.refund_id)&&['prepare','reconcile'].includes(work.action)&&hex(work.lease_token)&&uint(work.lease_expires_at_ms,1),'invalid refund work');
   const a=work.authorization,b=a.body;
   shape(b,['schema_version','purpose','refund_id','invoice_id','payment_id','invoice_commitment','evidence_commitment','physical_key','policy_hash','authorizer_pubkey','reason',
@@ -88,6 +90,41 @@ export async function validateRefundWork(work,policy,executorPubkey,rail,now=Dat
   }
   need((work.action==='prepare'&&work.preparation===null&&work.first_dispatch_at_ms===null)
     ||(work.action==='reconcile'&&work.preparation!==null&&uint(work.first_dispatch_at_ms,1)),'refund dispatch state differs');
-  if(work.action==='prepare'&&(now<b.approved_at_ms||now>=b.expires_at_ms)) throw new ReviewWork('refund_authorization_expired');
+  let window=b;
+  if(Object.hasOwn(work,'recovery')) {
+    const recovery=work.recovery,r=recovery?.body;
+    shape(r,['schema_version','purpose','refund_id','authorization_digest','policy_hash','authorizer_pubkey','revision','previous_recovery_digest',
+      'preparation_digest','first_dispatch_at_ms','review_code','review_evidence_hash','approved_at_ms','expires_at_ms']);
+    need(r.schema_version===1&&r.purpose==='proxy_admission_refund_recovery'&&r.refund_id===work.refund_id
+      &&r.authorization_digest===work.authorization_digest&&r.policy_hash===policy.policy_hash&&hex(r.authorizer_pubkey)
+      &&policy.authorizers.includes(r.authorizer_pubkey)&&![executorPubkey,i.issuer_pubkey,i.provider_pubkey].includes(r.authorizer_pubkey)
+      &&uint(r.revision,1)&&r.revision<=2147483647&&(r.revision===1?r.previous_recovery_digest===null:hex(r.previous_recovery_digest))
+      &&hex(r.review_evidence_hash)&&(r.review_code===null||typeof r.review_code==='string'&&/^[a-z0-9_]{1,100}$/.test(r.review_code))
+      &&uint(r.approved_at_ms,1)&&uint(r.expires_at_ms,r.approved_at_ms+1)&&r.approved_at_ms<=now
+      &&r.expires_at_ms-r.approved_at_ms<=policy.max_authorization_ms,'invalid refund recovery');
+    verified(RECOVERY,recovery,r.authorizer_pubkey);
+    if(r.first_dispatch_at_ms===null) need(r.preparation_digest===null,'refund recovery preparation differs');
+    else need(uint(r.first_dispatch_at_ms,b.approved_at_ms)&&r.first_dispatch_at_ms<=r.approved_at_ms
+      &&r.first_dispatch_at_ms===work.first_dispatch_at_ms&&work.preparation!==null&&hex(r.preparation_digest)
+      &&await digest('refund-preparation',work.preparation)===r.preparation_digest,'refund recovery dispatch differs');
+    window=r;
+  }
+  if(work.action==='prepare'&&(now<window.approved_at_ms||now>=window.expires_at_ms)) throw new ReviewWork('refund_authorization_expired');
+  if(work.action==='reconcile') validateRefundDispatch(work,{schema_version:1,purpose:'proxy_admission_refund',refund_id:work.refund_id,
+    action:'reconcile',first_dispatch_at_ms:work.first_dispatch_at_ms});
   return work;
+}
+
+
+// Called after validateRefundWork. A recovery of an already dispatched operation
+// binds its exact preparation/time; it never grants a fresh financial identity.
+export function validateRefundDispatch(work,grant) {
+  shape(grant,['schema_version','purpose','refund_id','action','first_dispatch_at_ms']);
+  const r=work.recovery?.body,b=work.authorization.body,window=r??b;
+  const timestamp=grant.first_dispatch_at_ms;
+  need(grant.schema_version===1&&grant.purpose==='proxy_admission_refund'&&grant.refund_id===work.refund_id
+    &&['dispatch','reconcile'].includes(grant.action)&&uint(timestamp,1)
+    &&(work.first_dispatch_at_ms===null||work.first_dispatch_at_ms===timestamp)
+    &&(r?.first_dispatch_at_ms!=null ? timestamp===r.first_dispatch_at_ms
+      : timestamp>=window.approved_at_ms&&timestamp<window.expires_at_ms),'invalid refund dispatch grant');
 }

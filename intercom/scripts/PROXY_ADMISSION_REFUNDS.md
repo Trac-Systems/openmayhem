@@ -103,8 +103,8 @@ No Stripe TEST/live refund or other money movement is claimed. The TNK adapter
 uses the existing MSB signing/validation format, independently verifies a receipt
 in a signed Hyperbee snapshot, and is exercised through actual SITE HTTP and
 PostgreSQL with a synthetic validator transport. Production MSB opening with the
-operator's stored custody, actual-rail acceptance, public review/status,
-approval renewal and installed-package/release qualification remain.
+operator's stored custody, actual-rail acceptance and installed-package/release
+qualification remain. Local status and signed recovery are described below.
 
 TNK writes a protected exact signed transfer before SITE grants dispatch. Only
 absence at that transaction hash in a fresh canonical snapshot allows broadcast
@@ -185,5 +185,55 @@ to processor confirmation; bank posting may follow. It does not move money,
 change a pending transaction, clear allocations, renew approvals, or overwrite
 saved enrollment state. Its bounded response is authenticated against the exact
 provider/network/page request. New admission collection can be disabled while
-these reads remain available. Operator review/renewal workflows still need their
-separate implementation and acceptance before financial activation.
+these reads remain available.
+
+## Operator review and recovery
+
+`proxy-admission-refund-review.mjs` is separate from the execution worker. It
+supports three explicit commands, with no automatic approval or payment loop:
+
+```sh
+node intercom/scripts/proxy-admission-refund-review.mjs inspect CONFIG REFUND_ID
+node intercom/scripts/proxy-admission-refund-review.mjs prepare CONFIG REFUND_ID EVIDENCE_FILE APPROVAL_FILE
+node intercom/scripts/proxy-admission-refund-review.mjs submit CONFIG APPROVAL_FILE
+```
+
+`CONFIG` is protected JSON with exactly `api_origin`, `api_credential_file`,
+`policy_file`, `review_key_file`, `review_password_file`, `approval_ms` and
+`allow_loopback_http`. All file references are canonical absolute paths with
+owner-only protection. The API credential is the dedicated reviewer credential;
+the key is encrypted Ed25519 PKCS8 for an approved reviewer, separate from the
+execution and custody keys. The selected duration must fit the approved policy.
+HTTPS is required except explicitly configured literal-loopback test fixtures.
+
+Inspect the original amount, destination, failure and retained preparation, and
+record the investigation in `EVIDENCE_FILE`. Preparation hashes that bounded
+protected file, signs the current review revision, and writes a new mode0600
+approval in an existing mode0700 directory. It refuses to overwrite an existing
+file. It does not submit or resume anything. `submit` sends that same saved signed
+approval; retry the same file after a lost acknowledgement. No key, credential,
+evidence contents or custody path goes into the approval. Keep the original
+evidence and approval under the financial retention policy.
+
+SITE requires review state, no active lease, unchanged original authorization,
+matching failure/preparation/first-dispatch and the next approval revision. A
+concurrent stale review is rejected. An identical already-accepted approval only
+returns current state; replay cannot resume a later review or alter completion.
+Approvals form immutable retained history, accessed through one indexed latest
+record rather than an unbounded history scan. Recovery neither creates a new
+allocation nor clears a financial reversal. The original rail, amount, destination,
+Stripe key, signed crypto bytes, nonce and dispatch time stay fixed.
+
+Before first dispatch, recovery renews the short authorization window. After
+dispatch, it permits reconciliation of only the retained operation even after
+that window expires. **It cannot reset Stripe's original retry-retention window**,
+recover a missing signed transaction by inventing another, replace a consumed
+nonce, override contradictory chain evidence or turn a failed processor refund
+into success. Such cases remain actionable review; this command is not a generic
+"force paid" switch. No changes to native payouts or contract writes are involved.
+
+Local acceptance covers all-rail renewal with immutable transactions, post-dispatch
+recovery, races/stale approvals, completion replay, retained Stripe age, role/rail
+boundaries and these commands through real SITE HTTP/PostgreSQL. The database
+migration adds only the immutable recovery table. Financial activation, real-rail
+proof and the release gate remain separate requirements.

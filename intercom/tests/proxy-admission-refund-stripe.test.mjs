@@ -7,6 +7,7 @@ import { generateKeyPairSync,randomBytes,randomUUID,sign,verify } from 'node:cry
 import { StripeAdmissionRefund,RefundJournal } from '../scripts/proxy-admission-refund-stripe.mjs';
 import { digest,invoiceCommitment } from '../scripts/proxy-admission-wire.mjs';
 import { proxyCanonicalSigningBytes } from '../contract/proxy-protocol.js';
+import {checkRecoveredExecution,recoveryFor} from './helpers/proxy-admission-refund-recovery.mjs';
 const fixtures=JSON.parse(fs.readFileSync(new URL('./fixtures/proxy-admission-worker-v1.json',import.meta.url)));
 const h=()=>randomBytes(32).toString('hex');
 const key=()=>{const k=generateKeyPairSync('ed25519');return {...k,hex:k.publicKey.export({format:'der',type:'spki'}).subarray(-32).toString('hex')};};
@@ -55,10 +56,19 @@ async function fixture(t) {
   };
   const options={account:receipt.stripe_account,livemode:receipt.livemode,currency:receipt.currency,credential:'public-test-stripe-refund-fixture-only',policy,key:executor.privateKey,
     journalRoot:root,retryWindowMs:23*3600000,maxLookupPages:2,fetcher,now:()=>now};
-  return {work,grant,state,root,options,executor,first,advance:(ms)=>{now=first+ms;work.lease_expires_at_ms=now+60000;},adapter:()=>new StripeAdmissionRefund(options),
+  return {work,grant,state,root,options,executor,review,first,advance:(ms)=>{now=first+ms;work.lease_expires_at_ms=now+60000;},adapter:()=>new StripeAdmissionRefund(options),
     resumed:(preparation)=>({...work,action:'reconcile',preparation,first_dispatch_at_ms:grant.first_dispatch_at_ms})};
 }
 const signal=()=>new AbortController().signal;
+test('signed recovery resumes the same Stripe return without replacing identity',async t=>{
+ const f=await fixture(t);await checkRecoveredExecution(f);assert.equal(f.state.calls.filter(c=>c.method==='POST').length,1);
+});
+test('signed recovery cannot reset the original Stripe idempotency retention window',async t=>{
+ const f=await fixture(t),p=await f.adapter().prepare(f.work);f.advance(25*3600000);
+ const resumed=f.resumed(p);resumed.recovery=await recoveryFor(f,resumed,f.first+25*3600000);
+ await assert.rejects(f.adapter().execute(resumed,{...f.grant,action:'reconcile'},signal()),e=>e.reason==='refund_idempotency_window_expired');
+ assert.equal(f.state.calls.filter(c=>c.method==='POST').length,0);
+});
 test('retains exact request before sending, independently retrieves succeeded refund and signs delivery',async t=>{
   const f=await fixture(t),adapter=f.adapter(),preparation=await adapter.prepare(f.work);
   assert.equal(f.state.calls.length,0);const journal=new RefundJournal(f.root,f.work.authorization_digest),request=journal.get('request');

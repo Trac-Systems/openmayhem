@@ -1,7 +1,7 @@
 // Original-method FIAT return execution. No retail bridging or contract writes.
 import { createPublicKey } from 'node:crypto';
 import { digest, need, shape, uint } from './proxy-admission-wire.mjs';
-import { RefundJournal, validateRefundWork, signed, same, PREPARE, DELIVERY } from './proxy-admission-refund-common.mjs';
+import { RefundJournal, validateRefundWork, validateRefundDispatch, signed, same, PREPARE, DELIVERY } from './proxy-admission-refund-common.mjs';
 import { RetryWork, ReviewWork } from './retail-crypto-verification.mjs';
 export { RefundJournal } from './proxy-admission-refund-common.mjs';
 export const validateFiatRefundWork=(work,policy,key,now=Date.now())=>validateRefundWork(work,policy,key,'fiat',now);
@@ -78,9 +78,7 @@ export class StripeAdmissionRefund {
   }
   async execute(work,grant,signal) {
     const preparation=await this.prepare(work),journal=await this.checked(work),stored=journal.get('request'),b=work.authorization.body;
-    shape(grant,['schema_version','purpose','refund_id','action','first_dispatch_at_ms']);
-    need(grant.schema_version===1&&grant.purpose==='proxy_admission_refund'&&grant.refund_id===work.refund_id
-      &&['dispatch','reconcile'].includes(grant.action)&&uint(grant.first_dispatch_at_ms,b.approved_at_ms)&&grant.first_dispatch_at_ms<b.expires_at_ms,'invalid refund dispatch grant');
+    validateRefundDispatch(work,grant);
     const pi=await this.stripe('GET',`payment_intents/${b.destination.payment_intent_id}`,undefined,signal);
     need(pi.id===b.destination.payment_intent_id&&pi.status==='succeeded'&&pi.livemode===this.o.livemode&&pi.currency===this.o.currency
       &&uint(pi.amount_received,1)&&String(pi.amount_received)===work.payment_evidence.receipt.amount_base_units

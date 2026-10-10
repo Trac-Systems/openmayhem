@@ -5,7 +5,7 @@ import { prepareSettlementTransferPayload, validatePreparedSettlementTransferPay
 import { validateAdmissionMsbSnapshot } from '../features/mayhem/proxy-admission-msb.js';
 import { verifyTnkObservedTransfer } from './proxy-admission-tnk.mjs';
 import { digest, need, shape, uint, validateNetwork } from './proxy-admission-wire.mjs';
-import { RefundJournal, validateRefundWork, signed, same, PREPARE, DELIVERY } from './proxy-admission-refund-common.mjs';
+import { RefundJournal, validateRefundWork, validateRefundDispatch, signed, same, PREPARE, DELIVERY } from './proxy-admission-refund-common.mjs';
 import { RetryWork, ReviewWork } from './retail-crypto-verification.mjs';
 
 export class TnkAdmissionRefund {
@@ -89,10 +89,7 @@ export class TnkAdmissionRefund {
   }
   async execute(work,grant,signal) {
     const o=this.o,preparation=await this.prepare(work,signal),journal=await this.checked(work),stored=journal.get('request'),b=work.authorization.body;
-    shape(grant,['schema_version','purpose','refund_id','action','first_dispatch_at_ms']);
-    need(grant.schema_version===1&&grant.purpose==='proxy_admission_refund'&&grant.refund_id===work.refund_id
-      &&['dispatch','reconcile'].includes(grant.action)&&uint(grant.first_dispatch_at_ms,b.approved_at_ms)&&grant.first_dispatch_at_ms<b.expires_at_ms,
-    'invalid TNK refund dispatch grant');
+    validateRefundDispatch(work,grant);
     const retained=journal.get('refund');
     let found;
     try {found=await this.observed(work,stored,signal);}

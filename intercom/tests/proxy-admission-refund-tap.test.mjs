@@ -12,6 +12,7 @@ import {admissionTapRpc} from '../scripts/proxy-admission-discovery.mjs';
 import {ERC20_TRANSFER_TOPIC,addressTopic} from '../scripts/retail-crypto-verification.mjs';
 import {proxyCanonicalSigningBytes} from '../contract/proxy-protocol.js';
 import {tapRefundWork} from './helpers/proxy-admission-refund-tap-work.mjs';
+import {checkRecoveredExecution} from './helpers/proxy-admission-refund-recovery.mjs';
 const signal=()=>AbortSignal.timeout(5000),h=()=>`0x${randomBytes(32).toString('hex')}`;
 const q=n=>`0x${BigInt(n).toString(16)}`,word=n=>`0x${BigInt(n).toString(16).padStart(64,'0')}`;
 async function fixture(t,shared={}){
@@ -43,6 +44,9 @@ async function fixture(t,shared={}){
  o.rpc=rpc;
  return {...f,options:o,state,signer,adapter:()=>new TapAdmissionRefund(o)};
 }
+test('signed recovery resumes the original TAP transaction without a new nonce or send',async t=>{
+ const f=await fixture(t);await checkRecoveredExecution(f);assert.equal(f.state.sends.length,1);
+});
 test('signed TAP transaction is durable before dispatch; finalized proof and completion replay never pay twice',async t=>{
  const f=await fixture(t),a=f.adapter(),p=await a.prepare(f.work,signal()),j=new RefundJournal(f.root,f.work.authorization_digest);
  assert.equal(f.state.sends.length,0);assert.equal(j.get('request').transaction_hash,p.body.reference.transaction_hash);

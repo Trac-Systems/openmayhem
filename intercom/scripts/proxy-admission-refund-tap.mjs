@@ -1,7 +1,7 @@
 // Original-asset TAP returns with exact signed bytes and durable nonce claims.
 import {createPublicKey} from 'node:crypto';
 import {tapTransferData,tapBalanceData,inspectTapRefundTransaction} from './proxy-admission-refund-tap-transaction.mjs';
-import {RefundJournal,validateRefundWork,signed,same,PREPARE,DELIVERY} from './proxy-admission-refund-common.mjs';
+import {RefundJournal,validateRefundWork, validateRefundDispatch,signed,same,PREPARE,DELIVERY} from './proxy-admission-refund-common.mjs';
 import {digest,need,shape,uint,amount} from './proxy-admission-wire.mjs';
 import {RetryWork,ReviewWork,verifyTapTransferReceipt,parseHexInt,ERC20_TRANSFER_TOPIC,addressTopic} from './retail-crypto-verification.mjs';
 const eth=v=>typeof v==='string'&&/^0x[0-9a-f]{40}$/.test(v)&&v!==`0x${'0'.repeat(40)}`;
@@ -100,10 +100,7 @@ export class TapAdmissionRefund {
   need(!this.active,'TAP refund execution already active');this.active=true;
   try {
    const o=this.o,p=await this.prepare(work,signal),journal=await this.checked(work),stored=journal.get('request'),b=work.authorization.body;
-   shape(grant,['schema_version','purpose','refund_id','action','first_dispatch_at_ms']);
-   need(grant.schema_version===1&&grant.purpose==='proxy_admission_refund'&&grant.refund_id===work.refund_id&&['dispatch','reconcile'].includes(grant.action)
-    &&uint(grant.first_dispatch_at_ms,b.approved_at_ms)&&grant.first_dispatch_at_ms<b.expires_at_ms
-    &&(work.first_dispatch_at_ms===null||work.first_dispatch_at_ms===grant.first_dispatch_at_ms),'invalid TAP refund dispatch grant');
+   validateRefundDispatch(work,grant);
    const tx=inspectTapRefundTransaction(stored.raw_transaction,this.expected(work)),retained=journal.get('refund');
    let receipt=await this.rpc('eth_getTransactionReceipt',[tx.hash],signal);
    if(!receipt){
