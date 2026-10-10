@@ -7,6 +7,8 @@ mod declarations;
 pub use declarations::Status as DeclarationStatus;
 mod presence;
 mod recovery;
+mod recovery_resolution;
+pub use recovery_resolution::{RecoveryConfirmation, RecoveryResolution, RecoveryStatus};
 #[cfg(windows)]
 mod windows;
 use crate::{

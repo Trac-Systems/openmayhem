@@ -136,7 +136,10 @@ async fn managed_provider_bootstraps_real_stream_then_restart_preserves_spent_bu
     stop.send_replace(true);
     task.await.unwrap().unwrap();
     assert!(!health.borrow().serving.running);
-    assert!(health.borrow().routes.is_empty());
+    assert!(
+        health.borrow().routes.contains_key(&d(20)),
+        "final diagnosis retains the bounded route snapshot"
+    );
     let provider = open(root.path(), &value);
     assert_eq!(provider.route_status(&d(20)).unwrap().1.available, 0);
     let (stop, rx) = watch::channel(false);
@@ -394,4 +397,129 @@ async fn managed_provider_uncertain_probe_retains_capacity_and_does_not_resend_a
         stop.send_replace(true);
         task.await.unwrap().unwrap();
     }
+
+    // Operator resolution is separate from automatic health/restart and never
+    // resets spent budget or manufactures successful model evidence.
+    let path = save(root.path(), &value);
+    let prepared = managed::Prepared::load_supervised(&path).unwrap();
+    let identity = prepared.identity().clone();
+    let signer = Authority::from_unlocked_wallet(key(), identity.clone()).unwrap();
+    let limits = mayhem_proxy::capacity::Limits {
+        max_groups: 8,
+        max_routes: 8,
+        max_leases: 16,
+        max_evidence_age: Duration::from_secs(60),
+    };
+    let capacity_path = root.path().join("state/capacity.redb");
+    let a = mayhem_proxy::capacity::Authority::open_existing(
+        &capacity_path,
+        identity.clone(),
+        limits.clone(),
+    )
+    .unwrap();
+    let probe = a.probe_for_group(&d(10)).unwrap().unwrap();
+    let budget = a.probe_budget(&d(10)).unwrap().unwrap();
+    assert!(
+        managed::Prepared::load_supervised(&path)
+            .unwrap()
+            .recovery_status(&signer)
+            .is_err(),
+        "a running authority cannot be inspected or fenced"
+    );
+    drop(a);
+    let status = managed::Prepared::load_supervised(&path)
+        .unwrap()
+        .recovery_status(&signer)
+        .unwrap();
+    assert_eq!(status.len(), 1);
+    assert_eq!(status[0].probe.as_ref().unwrap().id, probe.id);
+    assert_eq!(status[0].budget.as_ref().unwrap(), &budget);
+    let confirmation = |id, connection, stopped| managed::RecoveryConfirmation {
+        schema_version: 1,
+        probe_id: id,
+        connection_digest: connection,
+        evidence_digest: d(998),
+        upstream_stopped: stopped,
+    };
+    for input in [
+        confirmation(d(999), probe.specification.connection_digest.clone(), true),
+        confirmation(probe.id.clone(), d(999), true),
+        confirmation(
+            probe.id.clone(),
+            probe.specification.connection_digest.clone(),
+            false,
+        ),
+    ] {
+        assert!(managed::Prepared::load_supervised(&path)
+            .unwrap()
+            .resolve_recovery_probe(&signer, input)
+            .is_err());
+    }
+    let a = mayhem_proxy::capacity::Authority::open_existing(
+        &capacity_path,
+        identity.clone(),
+        limits.clone(),
+    )
+    .unwrap();
+    assert!(
+        managed::Prepared::load_supervised(&path)
+            .unwrap()
+            .resolve_recovery_probe(
+                &signer,
+                confirmation(
+                    probe.id.clone(),
+                    probe.specification.connection_digest.clone(),
+                    true
+                )
+            )
+            .is_err(),
+        "resolution cannot fence a live controller"
+    );
+    assert_eq!(a.probe_for_group(&d(10)).unwrap().unwrap().id, probe.id);
+    drop(a);
+    let resolved = managed::Prepared::load_supervised(&path)
+        .unwrap()
+        .resolve_recovery_probe(
+            &signer,
+            confirmation(
+                probe.id.clone(),
+                probe.specification.connection_digest.clone(),
+                true,
+            ),
+        )
+        .unwrap();
+    assert!(resolved.released);
+    let again = managed::Prepared::load_supervised(&path)
+        .unwrap()
+        .resolve_recovery_probe(
+            &signer,
+            confirmation(
+                probe.id.clone(),
+                probe.specification.connection_digest,
+                true,
+            ),
+        )
+        .unwrap();
+    assert!(!again.released);
+    let a =
+        mayhem_proxy::capacity::Authority::open_existing(&capacity_path, identity, limits).unwrap();
+    assert!(a.probe_for_group(&d(10)).unwrap().is_none());
+    let after = a.probe_budget(&d(10)).unwrap().unwrap();
+    assert_eq!(after.used_attempts, budget.used_attempts);
+    assert_eq!(
+        after.allocated_cost_microusd,
+        budget.allocated_cost_microusd
+    );
+    assert_eq!(
+        after.last_completed.unwrap().evidence,
+        resolved.evidence_digest
+    );
+    drop(a);
+    let provider = open(root.path(), &value);
+    let (health, capacity) = provider.route_status(&d(20)).unwrap();
+    assert_eq!(
+        health.allowance, 0,
+        "operator confirmation is not successful inference evidence"
+    );
+    assert_eq!(capacity.group_occupied, 0);
 }

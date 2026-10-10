@@ -1,5 +1,6 @@
 //! Provider startup uses the existing encrypted wallet and protected SC-Bridge.
 mod setup;
+mod recovery;
 pub(crate) mod supervisor;
 use super::{cached_wallet_signing_key, resolve_wallet_keypair_path, WalletLocatorArgs};
 use anyhow::{Context, Result};
@@ -28,6 +29,11 @@ pub enum Command {
     Serve(ServeArgs),
     /// Install a restartable proxy controller in the existing local mayhemd.
     Add(supervisor::AddArgs),
+    /// Resolve one operator monitoring probe after checking the original upstream stopped it.
+    /// Stop this proxy controller first. Never resolves customer requests or refunds probe budget.
+    ResolveRecoveryProbe(recovery::Args),
+    /// Inspect retained monitoring probes and allowance; stop the proxy controller first.
+    RecoveryStatus(recovery::StatusArgs),
 }
 #[derive(Debug, Args)]
 pub struct ServeArgs {
@@ -50,6 +56,8 @@ pub async fn run(command: Command) -> Result<()> {
         }
         Command::Serve(args) => args,
         Command::Add(args) => return supervisor::add(args).await,
+        Command::ResolveRecoveryProbe(args) => return recovery::resolve(args).await,
+        Command::RecoveryStatus(args) => return recovery::status(args).await,
     };
     let config = args.config;
     let expected_config_digest = args
