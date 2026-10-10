@@ -5,12 +5,36 @@
 #[cfg(target_os = "macos")]
 mod macos;
 
+#[cfg(all(
+    target_os = "linux",
+    target_pointer_width = "64",
+    target_endian = "little",
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+mod linux;
+
 pub fn enter() -> Result<(), ()> {
     #[cfg(target_os = "macos")]
     return macos::enter();
+    #[cfg(all(
+        target_os = "linux",
+        target_pointer_width = "64",
+        target_endian = "little",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    return linux::enter();
+    #[cfg(all(
+        target_os = "linux",
+        not(all(
+            target_pointer_width = "64",
+            target_endian = "little",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ))
+    ))]
+    return Err(());
     // Other platforms retain the existing process restrictions until their
     // separately verified containment implementations are integrated. Do not
     // represent this as cross-platform filesystem/network isolation.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     Ok(())
 }

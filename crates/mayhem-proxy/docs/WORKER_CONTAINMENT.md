@@ -31,15 +31,54 @@ remain in the parent. These do not constitute a total RSS or CPU allocation cap.
 The generation/consumer wait remains separate from parser processing time.
 No ledger, receipt-history or per-token health operation is added.
 
-Remaining release requirements include Linux containment, Windows protected
-ACL/JobObject support, tokenizer containment and measured total resource limits.
-Linux currently retains the original process restrictions; it must not be
-advertised as filesystem/network sandboxed by this macOS change. Windows still
-rejects decoder pool creation where its protection is unimplemented. Do not
-declare cross-platform containment acceptance from a macOS test.
+## Linux
 
-For Linux, kernel [seccomp filter documentation](https://kernel.org/doc/html/latest/userspace-api/seccomp_filter.html)
-and [Landlock documentation](https://docs.kernel.org/userspace-api/landlock.html)
-describe different restrictions and limitations. Any implementation must test
-its actual kernel/ABI, inherited handles and permitted system calls; a process
-boundary or a successful filter installation alone is insufficient evidence.
+The dedicated Linux executable supports little-endian 64-bit `x86_64` and
+`aarch64`. Before consuming IPC it enumerates `/proc/self/fd`, closes every
+descriptor above stderr and confirms closure, enables irreversible
+`no_new_privs`, and installs a fixed seccomp allowlist with thread synchronization.
+Missing/inaccessible procfs, denied filter installation, unsupported architecture,
+or a kernel without `SECCOMP_RET_KILL_PROCESS` support causes refusal before READY.
+Linux 4.14 or newer with seccomp filtering enabled is required; a surrounding
+container policy can still make initialization unavailable. No unrestricted retry
+or provider-selected filter is available.
+
+The filter checks the syscall audit architecture and rejects x32 on x86_64.
+It allows input only on stdin, output only on stdout/stderr, limited stdio
+descriptor metadata, private anonymous non-executable allocation, private futexes,
+process-local runtime bookkeeping, clocks, randomness and exit. Open/path access,
+socket or IPC creation/descriptor transfer, process creation/execution/control,
+executable mappings and all unlisted syscalls are denied. New syscall interfaces
+are denied by default. No worker thread may be created after entry. Any fixed
+mode-specific resource limits must be applied by trusted startup before entry;
+the contained process cannot increase its own limits. All provider-controlled
+data parsing remains after entry.
+
+Rust's HashMap seed path uses `getrandom(GRND_INSECURE)` (with a NONBLOCK fallback
+on older kernels); cryptographic `getrandom(0)` remains available. The filter
+allows these three specific forms, never `/dev/urandom` file fallback. On an old
+kernel before its entropy pool is ready, failure remains failure. Private heap
+allocation and clocks do not imply bounded total RSS or CPU, and this filter is
+not an information-flow or remote-provider privacy guarantee. The decoder's
+existing bounded parser deadlines and parent kill/reap behavior remain separate
+from generation waiting time; no overall generation timer is added.
+
+The binary unit tests exercise the actual installed filter in an isolated child,
+with deliberately inherited synthetic file/socket handles and reachable loopback
+listeners. They verify denied external actions, allowed allocation/hash seeding/
+clocks and ABI/argument rules. `tests/linux_containment.rs` adds an outer filter
+that prevents installation: both worker modes must exit with no READY while stdin
+is still open. Existing `tests/worker.rs` exercises the actual production binary's
+JSON, UTF-8 streams, semantic/schema configuration, cancellation and accounting.
+Run these checks on each supported native Linux architecture; success under an
+emulator does not establish guest seccomp enforcement.
+
+Primary references: Linux [seccomp filtering](https://docs.kernel.org/userspace-api/seccomp_filter.html),
+[no_new_privs](https://docs.kernel.org/userspace-api/no_new_privs.html),
+[seccomp ABI and architecture caveats](https://man7.org/linux/man-pages/man2/seccomp.2.html),
+and [Rust's Linux random implementation](https://github.com/rust-lang/rust/blob/master/library/std/src/sys/random/linux.rs).
+
+Windows protected ACL/JobObject support and measured total decoder resource
+limits remain separate release requirements. Windows still rejects decoder pool
+creation where protection is unimplemented. Do not declare cross-platform
+containment acceptance from a single operating-system or architecture test.
