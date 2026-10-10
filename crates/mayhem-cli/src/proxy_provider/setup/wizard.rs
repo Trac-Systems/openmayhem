@@ -137,7 +137,7 @@ pub async fn run(args: WizardArgs) -> Result<()> {
         let view = flow.view()?;
         show(&view)?;
         if let Some(d) = &view.declaration { println!("Data handling: {} (declared, not verified)", d.state); }
-        println!("j Review data-handling declarations  y Sign retained declaration review");
+        println!("j Review data-handling declarations  y Sign retained declaration review  w Review withdrawal");
         println!("c Connect  d Discover  s Select/price  k Check  p Probe  a Admission facts\ni Invoice/create  t Status  f FIAT checkout  v Review publication  u Publish\nr Recover original probe  o Recover original publication  g Review Run  b Begin Run  h Reconcile Run  x Exit");
         let command = prompt("Action", "x")?;
         if command == "x" {
@@ -148,6 +148,7 @@ pub async fn run(args: WizardArgs) -> Result<()> {
             || revision.ok_or_else(|| anyhow::anyhow!("save your selection first"));
         let action = match command.as_str() {
             "j" => declarations::review(&flow, &view).await?,
+            "w" => declarations::withdraw(&view)?,
             "y" => {
                 let pending=view.pending_declaration.as_ref().ok_or_else(|| anyhow::anyhow!("review declarations first"))?;
                 println!("{}",serde_json::to_string_pretty(pending)?);

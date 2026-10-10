@@ -297,6 +297,7 @@ fn build(
             .collect(),
         routes: vec![managed::RouteConfig {
             data_handling: data_handling.clone(),
+            declaration_source: Some(DeclarationSource::from_record(directory, record)?),
             id: scope.route.clone(),
             connection: scope.connection_group.clone(),
             ceiling: scope.route_ceiling,
@@ -335,6 +336,19 @@ fn build(
     plan.plan_digest = plan_digest(&plan)?;
     Ok((config, plan))
 }
+// A renewed declaration must not replace the original installed Run identity.
+// Its configured source supplies fresh metadata independently of the retained
+// financial/runtime binding; other template changes still conflict below.
+fn run_declarations(
+    guard: &store::Guard,
+    record: &Record,
+) -> Result<Vec<crate::declaration::Signed>> {
+    if let Some(saved) = guard.read_json::<Retained>("wizard-run.json")? {
+        saved.validate()?;
+        return Ok(saved.plan.data_handling);
+    }
+    declarations::signed_for_run(guard, record, flow::declarations::now()?)
+}
 impl Store {
     pub fn run_plan(
         &self,
@@ -349,8 +363,7 @@ impl Store {
         if record.revision != expected {
             return Err(Error::Conflict);
         }
-        let declarations =
-            declarations::signed_for_run(&guard, &record, flow::declarations::now()?)?;
+        let declarations = run_declarations(&guard, &record)?;
         let (_, plan) = build(
             &record,
             declarations,
@@ -390,8 +403,7 @@ impl Store {
         if record.revision != expected {
             return Err(Error::Conflict);
         }
-        let declarations =
-            declarations::signed_for_run(&guard, &record, flow::declarations::now()?)?;
+        let declarations = run_declarations(&guard, &record)?;
         let (config, plan) = build(
             &record,
             declarations,

@@ -139,6 +139,11 @@ pub enum FlowAction {
         expected_revision: u64,
         plan_digest: Digest,
     },
+    WithdrawDeclarationPlan {
+        expected_revision: u64,
+        expected_declaration_revision: u64,
+        expires_at_ms: u64,
+    },
     Connect {},
     Discover {
         expected_inventory_revision: u64,
@@ -389,7 +394,7 @@ impl Flow {
                     r.state == "installed"
                         && r.for_current_configuration
                         && declaration.signed.as_ref().is_some_and(|s| {
-                            r.plan
+                            declaration.observed_by_controller || r.plan
                                 .data_handling
                                 .iter()
                                 .any(|d| d.signature == s.signature)
@@ -478,6 +483,9 @@ impl Flow {
                 &plan_digest,
                 key.ok_or(Error::Invalid)?,
             )?,
+            FlowAction::WithdrawDeclarationPlan { expected_revision, expected_declaration_revision, expires_at_ms } => {
+                json!(store.plan_declaration_withdrawal(expected_revision, expected_declaration_revision, declarations::now()?, expires_at_ms)?)
+            },
             FlowAction::Connect {} => {
                 self.config.profile.clone().prepare()?;
                 json!({"configured":true,"network_request":false,"scope":"configuration_only"})

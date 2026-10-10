@@ -73,6 +73,7 @@ struct Inner {
     descriptor_slots: Arc<Semaphore>,
     state: Mutex<State>,
     declarations: OnceLock<Vec<crate::declaration::Signed>>,
+    live_declarations: OnceLock<Arc<crate::declaration::live::Live>>,
 }
 #[derive(Clone)]
 pub struct Controller {
@@ -111,6 +112,7 @@ impl Controller {
                 descriptor_slots: Arc::new(Semaphore::new(crate::descriptor::READS)),
                 state: Mutex::new(State::default()),
                 declarations: OnceLock::new(),
+                live_declarations: OnceLock::new(),
             }),
         })
     }
@@ -147,6 +149,31 @@ impl Controller {
             .declarations
             .set(declarations)
             .map_err(|_| invalid("provider declarations already installed"))
+    }
+    /// Protected managed setup pins the subject before serving. Only this
+    /// metadata source can supply declarations afterwards; never static fallback.
+    pub(crate) fn install_live_declarations(
+        &self,
+        live: Arc<crate::declaration::live::Live>,
+    ) -> Result<()> {
+        let s = &live.subject;
+        let identity = self.inner.runtime.capacity.identity();
+        require(
+            s.network.network_id == identity.network_id
+                && s.network.msb_bootstrap == identity.msb_bootstrap.as_str()
+                && s.network.subnet_bootstrap == identity.subnet_bootstrap.as_str()
+                && s.network.contract_version == mayhem_proto::CONTRACT_VERSION
+                && s.provider == identity.controller_pubkey
+                && s.endpoint == self.inner.runtime.adapter.endpoint()
+                && s.endpoint_contract == *self.inner.runtime.adapter.contract_hash()
+                && s.recipe_hash == *self.inner.runtime.adapter.recipe_hash()
+                && s.connection_revision == self.inner.runtime.connection.revision(),
+            "declaration source runtime differs",
+        )?;
+        self.inner
+            .live_declarations
+            .set(live)
+            .map_err(|_| invalid("declaration source already installed"))
     }
     fn slot(&self) -> Result<OwnedSemaphorePermit> {
         self.inner
@@ -194,12 +221,27 @@ impl Controller {
             let subject =
                 crate::declaration::Subject::new(context.network.clone(), &context.offer, &member)?;
             if context.data_handling {
-                descriptor.data_handling = self
-                    .inner
-                    .declarations
-                    .get()
-                    .and_then(|records| records.iter().find(|d| d.body.subject == subject))
-                    .cloned();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .ok()
+                    .and_then(|d| u64::try_from(d.as_millis()).ok());
+                descriptor.data_handling = if let Some(live) = self.inner.live_declarations.get() {
+                    now.and_then(|now| live.read(now))
+                        .filter(|d| d.body.subject == subject)
+                } else {
+                    self.inner
+                        .declarations
+                        .get()
+                        .and_then(|records| {
+                            records.iter().find(|d| {
+                                d.body.subject == subject
+                                    && now.is_some_and(|now| {
+                                        d.body.issued_at_ms <= now && now < d.body.expires_at_ms
+                                    })
+                            })
+                        })
+                        .cloned()
+                };
             }
             Ok::<_, crate::Error>(descriptor)
         })

@@ -41,6 +41,49 @@ fn choices(value: bool) -> Vec<DeclarationChoice> {
 }
 
 #[tokio::test]
+async fn declaration_withdrawal_is_explicit_signed_unknown_and_preserves_financial_draft() {
+    let (mock, defs) = published().await;
+    let s = setup(ProxyEndpoint::Chat);
+    let initial=s.store.plan_data_handling(1,0,&defs,choices(false),100,1000).unwrap();
+    s.store.confirm_data_handling(1,&initial.plan.plan_digest,&s.authority,101).unwrap();
+    let draft=std::fs::read(s.dir.path().join("draft.json")).unwrap();
+    let original=std::fs::read(s.dir.path().join("wizard-declaration-signed.json")).unwrap();
+    mock.state.lock().unwrap().status=503;
+    let p=s.store.plan_declaration_withdrawal(1,1,200,1200).unwrap();
+    assert_eq!(original,std::fs::read(s.dir.path().join("wizard-declaration-signed.json")).unwrap());
+    assert_eq!(p.plan.body.revision,2);
+    assert!(p.plan.body.claims.iter().all(|c|c.status==Support::Unknown && c.value.is_none()));
+    let signed=s.store.confirm_data_handling(1,&p.plan.plan_digest,&s.authority,201).unwrap();
+    assert_eq!(signed.signed.as_ref().unwrap().body.revision,2);
+    assert_eq!(draft,std::fs::read(s.dir.path().join("draft.json")).unwrap());
+    assert!(s.store.plan_declaration_withdrawal(1,1,300,1300).is_err());
+}
+
+#[tokio::test]
+async fn declaration_authoring_uses_observed_revision_after_old_source_restore() {
+    let (_mock, defs)=published().await;
+    let s=setup(ProxyEndpoint::Chat);
+    let p=s.store.plan_data_handling(1,0,&defs,choices(false),100,1000).unwrap();
+    s.store.confirm_data_handling(1,&p.plan.plan_digest,&s.authority,101).unwrap();
+    let original=std::fs::read(s.dir.path().join("wizard-declaration-signed.json")).unwrap();
+    let p2=s.store.plan_data_handling(1,1,&defs,choices(true),200,1200).unwrap();
+    let second=s.store.confirm_data_handling(1,&p2.plan.plan_digest,&s.authority,201).unwrap();
+    let checkpoint=s.dir.path().join("wizard-declaration-observed.json");
+    std::fs::write(&checkpoint,serde_json::to_vec(&json!({"schema_version":1,"draft_id":second.plan.draft_id,"signed":second.signed,"expired":false})).unwrap()).unwrap();
+    std::fs::set_permissions(&checkpoint,std::fs::Permissions::from_mode(0o600)).unwrap();
+    assert!(s.store.inspect_data_handling(300).unwrap().unwrap().observed_by_controller);
+    assert!(!s.store.inspect_data_handling(1200).unwrap().unwrap().observed_by_controller);
+    std::fs::write(s.dir.path().join("wizard-declaration-signed.json"),original).unwrap();
+    assert_eq!(s.store.inspect_data_handling(300).unwrap().unwrap().latest_revision,2);
+    assert!(!s.store.inspect_data_handling(300).unwrap().unwrap().observed_by_controller);
+    assert!(s.store.confirm_data_handling(1,&p.plan.plan_digest,&s.authority,300).is_err());
+    assert!(s.store.plan_data_handling(1,1,&defs,choices(false),300,1300).is_err());
+    let next=s.store.plan_data_handling(1,2,&defs,choices(false),300,1300).unwrap();
+    assert_eq!(next.plan.body.revision,3);
+    s.store.confirm_data_handling(1,&next.plan.plan_digest,&s.authority,301).unwrap();
+}
+
+#[tokio::test]
 async fn declaration_flow_browses_reviews_signs_recovers_without_endpoint_or_wallet_injection() {
     use mayhem_proxy::setup::{Flow, FlowAction, FlowConfig};
     let (mock, defs) = published().await;

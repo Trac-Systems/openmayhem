@@ -18,7 +18,7 @@
   const integer = value => { const n = Number(value); if (!Number.isSafeInteger(n) || n < 1) throw Error('Enter a positive whole number.'); return n; };
   function render(v) {
     view = v; plan = null; runPlan = null; $('publish').disabled = true; $('start-run').disabled = true;
-    text('declaration-state', v.declaration ? `${v.declaration.state}. Declared, not verified. Runtime activation requires a separately reviewed Run.` : 'No signed declarations. Missing claims remain unknown.');
+    text('declaration-state', v.declaration ? `${v.declaration.state}. Declared, not verified. A running controller configured for these updates reads signed changes automatically; inference and prices are unchanged.` : 'No signed declarations. Missing claims remain unknown.');
     text('declaration-review', json(v.pending_declaration || v.declaration || {}));
     $('declaration-summary').replaceChildren();
     const reviewed = v.pending_declaration || v.declaration;
@@ -96,7 +96,7 @@
   }
   async function perform(name) {
     if (name === 'refresh') return request();
-    if (name.startsWith('declaration_') || name === 'confirm_declaration') return declarations(name);
+    if (name.startsWith('declaration_') || name === 'confirm_declaration' || name === 'withdraw_declaration_plan') return declarations(name);
     const revision = view.review?.revision;
     let a = {action:name,expected_revision:revision};
     if (name === 'recover_run') a = {action:name};
@@ -190,15 +190,20 @@
       }
       return;
     }
+    if (name === 'withdraw_declaration_plan') {
+      const expires = Date.parse($('declaration-expiry').value);
+      if (!view.declaration || !Number.isSafeInteger(expires) || !/Z$/.test($('declaration-expiry').value) || expires <= Date.now()) throw Error('Choose a future UTC expiry for the withdrawal record.');
+      return request({action:name,expected_revision:revision,expected_declaration_revision:view.declaration.latest_revision || view.declaration.plan.body.revision,expires_at_ms:expires});
+    }
     if (name === 'declaration_plan') {
       if (!declarationPage || document.querySelector('#declaration-fields [aria-invalid="true"]')) throw Error('Choose published fields and correct invalid values first.');
       const expires = Date.parse($('declaration-expiry').value);
       if (!Number.isSafeInteger(expires) || !/Z$/.test($('declaration-expiry').value) || expires <= Date.now()) throw Error('Enter a future UTC expiry ending in Z.');
-      return request({action:name,expected_revision:revision,expected_declaration_revision:view.declaration?.plan.body.revision || 0,
+      return request({action:name,expected_revision:revision,expected_declaration_revision:view.declaration?.latest_revision || view.declaration?.plan.body.revision || 0,
         release_id:declarationPage.release_id,release_hash:declarationPage.release_hash,choices:[...declarationChoices.values()].sort((a,b)=>a.field_id<b.field_id?-1:a.field_id>b.field_id?1:0),expires_at_ms:expires});
     }
     const pending = view.pending_declaration;
-    if (!pending || !confirm('Sign exactly the reviewed provider promises until their stated expiry? This does not attest compliance or update a running controller.')) return;
+    if (!pending || !confirm('Sign exactly the reviewed provider promises until their stated expiry? This does not attest compliance. A configured running controller will use the signed changes without restarting inference.')) return;
     return request({action:'confirm_declaration',expected_revision:revision,plan_digest:pending.plan.plan_digest});
   }
   document.addEventListener('input', () => {

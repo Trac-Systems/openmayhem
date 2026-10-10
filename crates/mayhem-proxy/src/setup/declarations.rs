@@ -4,6 +4,8 @@
 use super::*;
 use crate::{declaration, registry, signing::Authority};
 use serde_json::json;
+mod source;
+pub use source::DeclarationSource;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -34,6 +36,8 @@ pub struct DeclarationReport {
     pub signed: Option<declaration::Signed>,
     pub assurance: &'static str,
     pub installed_in_runtime: bool,
+    pub latest_revision: u64,
+    pub observed_by_controller: bool,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -104,6 +108,8 @@ impl Retained {
             signed: self.signed.clone(),
             assurance: "declared_not_verified",
             installed_in_runtime: false,
+            latest_revision: self.plan.body.revision,
+            observed_by_controller: false,
         })
     }
 }
@@ -120,6 +126,62 @@ pub(super) fn signed_for_run(
     Ok(vec![report.signed.ok_or(Error::Invalid)?])
 }
 impl Store {
+    /// Explicit withdrawal keeps the last signed field meanings, sets every
+    /// claim to Unknown, and needs the same separate wallet confirmation. It is
+    /// available even during a registry outage and cannot change financial terms.
+    pub fn plan_declaration_withdrawal(
+        &self,
+        expected_draft: u64,
+        expected_declaration: u64,
+        now: u64,
+        expires_at_ms: u64,
+    ) -> Result<DeclarationReport> {
+        require(now < expires_at_ms)?;
+        let guard = store::Guard::open(&self.directory)?;
+        let record = guard.read()?.ok_or(Error::Missing)?;
+        let previous: Retained = guard
+            .read_json("wizard-declaration-signed.json")?
+            .ok_or(Error::Missing)?;
+        previous.validate()?;
+        require(previous.plan.draft_id == record.id)?;
+        let latest = source::latest_signed(
+            &guard,
+            &record,
+            previous.signed.clone().ok_or(Error::Invalid)?,
+        )?;
+        if record.revision != expected_draft || latest.body.revision != expected_declaration {
+            return Err(Error::Conflict);
+        }
+        require(
+            record.input.connection()? == record.connection
+                && latest.body.subject == subject(&record)?,
+        )?;
+        // If restored source differs from the checkpoint, first explicitly renew
+        // from the current registry; do not attach old release metadata to claims.
+        require(latest.signature == previous.signed.as_ref().ok_or(Error::Invalid)?.signature)?;
+        let mut plan = previous.plan;
+        plan.draft_revision = record.revision;
+        plan.body.revision = latest.body.revision.checked_add(1).ok_or(Error::Invalid)?;
+        plan.body.issued_at_ms = now;
+        plan.body.expires_at_ms = expires_at_ms;
+        for claim in &mut plan.body.claims {
+            claim.status = registry::Support::Unknown;
+            claim.value = None;
+        }
+        plan.plan_digest = digest(&plan)?;
+        let retained = Retained {
+            schema_version: 1,
+            plan,
+            signed: None,
+        };
+        retained.validate()?;
+        guard.write_json(
+            "wizard-declaration-plan.json",
+            "wizard-declaration-plan.next",
+            &retained,
+        )?;
+        retained.report(&record, now)
+    }
     pub fn inspect_pending_data_handling(&self, now: u64) -> Result<Option<DeclarationReport>> {
         let guard = store::Guard::open(&self.directory)?;
         let Some(pending) = guard.read_json::<Retained>("wizard-declaration-plan.json")? else {
@@ -169,10 +231,12 @@ impl Store {
         let revision = if let Some(previous) = &previous {
             previous.validate()?;
             require(previous.plan.draft_id == record.id && previous.signed.is_some())?;
+            source::latest_signed(&guard, &record, previous.signed.clone().ok_or(Error::Invalid)?)?;
             previous.plan.body.revision
         } else {
             0
         };
+        let revision = source::authoring_revision(&guard, &record, revision)?;
         if revision != expected_declaration_revision {
             return Err(Error::Conflict);
         }
@@ -250,7 +314,11 @@ impl Store {
         if let Some(previous) = &previous {
             previous.validate()?;
             require(previous.plan.draft_id == record.id && previous.signed.is_some())?;
-            if &previous.plan.plan_digest == expected_plan {
+            source::latest_signed(&guard, &record, previous.signed.clone().ok_or(Error::Invalid)?)?;
+            if &previous.plan.plan_digest == expected_plan
+                && source::authoring_revision(&guard, &record, previous.plan.body.revision)?
+                    == previous.plan.body.revision
+            {
                 return previous.report(&record, now);
             }
         }
@@ -261,7 +329,11 @@ impl Store {
         if record.input.connection()? != record.connection {
             return Err(Error::ConnectionChanged);
         }
-        let previous_revision = previous.as_ref().map(|p| p.plan.body.revision).unwrap_or(0);
+        let previous_revision = source::authoring_revision(
+            &guard,
+            &record,
+            previous.as_ref().map(|p| p.plan.body.revision).unwrap_or(0),
+        )?;
         if record.revision != expected_draft_revision
             || retained.plan.draft_revision != record.revision
             || &retained.plan.plan_digest != expected_plan
@@ -293,8 +365,16 @@ impl Store {
             return Ok(None);
         };
         require(retained.signed.is_some())?;
-        retained
-            .report(&guard.read()?.ok_or(Error::Missing)?, now)
-            .map(Some)
+        let record = guard.read()?.ok_or(Error::Missing)?;
+        let mut report = retained.report(&record, now)?;
+        if let Some(signed) = &report.signed {
+            report.observed_by_controller = source::observed(&guard, &record, signed, now)?;
+        }
+        report.latest_revision =
+            source::authoring_revision(&guard, &record, report.plan.body.revision)?;
+        if report.latest_revision > report.plan.body.revision {
+            report.state = "superseded_requires_explicit_renewal";
+        }
+        Ok(Some(report))
     }
 }

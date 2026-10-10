@@ -3,6 +3,8 @@
 //! This does not register offers or pay admission. Public presence requires a
 //! current canonical registration observation, independently of local health.
 mod config;
+mod declarations;
+pub use declarations::Status as DeclarationStatus;
 mod presence;
 mod recovery;
 use crate::{
@@ -71,6 +73,7 @@ pub struct Health {
     pub recovery: recovery::Health,
     pub presence: presence::Health,
     pub routes: BTreeMap<Digest, health::Snapshot>,
+    pub declarations: BTreeMap<Digest, DeclarationStatus>,
 }
 /// Owns every route and its shared capacity authority. Dropping closes the local
 /// control scope; no persisted lease or financial hold is silently released.
@@ -82,6 +85,7 @@ pub struct Provider {
     limits: config::Limits,
     recovery: recovery::Runner,
     presence: presence::Runner,
+    declarations: declarations::Runner,
     capacity: Arc<capacity::Authority>,
     monitors: BTreeMap<Digest, Monitor>,
     seed: u64,
@@ -168,6 +172,7 @@ impl Prepared {
         let mut registrations = Vec::new();
         let mut recovery = Vec::new();
         let mut presence_entries = Vec::new();
+        let mut declaration_entries = Vec::new();
         let mut monitors = BTreeMap::new();
         for Route {
             spec,
@@ -230,6 +235,11 @@ impl Prepared {
                 .proposals()
                 .install_declarations(spec.data_handling.clone())
                 .map_err(|_| Error::Configuration)?;
+            if let Some(source) = spec.declaration_source {
+                let live = Arc::new(crate::declaration::live::Live::new(source.subject.clone()));
+                controller.proposals().install_live_declarations(live.clone()).map_err(|_| Error::Configuration)?;
+                declaration_entries.push(declarations::Entry { route: spec.id.clone(), source, live, source_status: Arc::new(std::sync::Mutex::new("not_read")) });
+            }
             for offer in spec.offers {
                 presence_entries.push(presence::Entry {
                     route: spec.id.clone(),
@@ -311,6 +321,7 @@ impl Prepared {
             limits: config.limits,
             recovery,
             presence,
+            declarations: declarations::Runner { entries: declaration_entries },
             capacity,
             monitors,
             seed,
@@ -362,34 +373,48 @@ impl Provider {
         let (presence_updates, presence_health) = watch::channel(presence::Health::default());
         let serving = dispatcher.run(stopping.clone(), serving_updates);
         let recovery = self.recovery.run(stopping.clone(), recovery_updates);
-        let presence = self.presence.run(stopping, presence_updates);
-        tokio::pin!(serving, recovery, presence);
+        let presence = self.presence.run(stopping.clone(), presence_updates);
+        let mut declaration_stop = stopping.clone();
+        let declarations = async {
+            let result = self.declarations.run(stopping).await;
+            self.declarations.clear();
+            // Metadata failure cannot stop accepted inference or settlement.
+            // Keep this branch pending until the actual provider shutdown.
+            stopped(&mut declaration_stop).await;
+            result
+        };
+        tokio::pin!(serving, recovery, presence, declarations);
         let mut sampling = tokio::time::interval(Duration::from_millis(self.limits.observation_ms));
         sampling.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let result = loop {
             tokio::select! {
                 _ = stopped(&mut stop) => {
                     shutdown.send_replace(true);
-                    let (a,b,c) = tokio::join!(&mut serving, &mut recovery, &mut presence);
-                    break a.map_err(|_| Error::Task).and(b).and(c);
+                    let (a,b,c,d) = tokio::join!(&mut serving, &mut recovery, &mut presence, &mut declarations);
+                    break a.map_err(|_| Error::Task).and(b).and(c).and(d);
                 },
                 a = &mut serving => {
                     shutdown.send_replace(true);
-                    let (b,c) = tokio::join!(&mut recovery,&mut presence);
-                    break a.map_err(|_| Error::Transport).and(b).and(c);
+                    let (b,c,d) = tokio::join!(&mut recovery,&mut presence,&mut declarations);
+                    break a.map_err(|_| Error::Transport).and(b).and(c).and(d);
                 },
                 b = &mut recovery => {
                     shutdown.send_replace(true);
-                    let _ = tokio::join!(&mut serving,&mut presence);
+                    let _ = tokio::join!(&mut serving,&mut presence,&mut declarations);
                     break b.and(Err(Error::Task));
                 },
                 c = &mut presence => {
                     shutdown.send_replace(true);
-                    let _ = tokio::join!(&mut serving,&mut recovery);
+                    let _ = tokio::join!(&mut serving,&mut recovery,&mut declarations);
                     break c.and(Err(Error::Transport));
                 },
+                d = &mut declarations => {
+                    shutdown.send_replace(true);
+                    let _ = tokio::join!(&mut serving,&mut recovery,&mut presence);
+                    break d.and(Err(Error::Task));
+                },
                 _ = sampling.tick() => {
-                    updates.send_replace(Health { serving: serving_health.borrow().clone(), recovery: recovery_health.borrow().clone(), presence:presence_health.borrow().clone(), routes: snapshots(&self.monitors) });
+                    updates.send_replace(Health { serving: serving_health.borrow().clone(), recovery: recovery_health.borrow().clone(), presence:presence_health.borrow().clone(), routes: snapshots(&self.monitors), declarations: self.declarations.snapshots() });
                 }
             }
         };
@@ -398,6 +423,7 @@ impl Provider {
             recovery: recovery_health.borrow().clone(),
             presence: presence_health.borrow().clone(),
             routes: BTreeMap::new(),
+            declarations: self.declarations.snapshots(),
         });
         result
     }

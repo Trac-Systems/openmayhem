@@ -173,7 +173,7 @@ pub(super) async fn review(flow: &Flow, view: &FlowView) -> Result<FlowAction> {
         expected_declaration_revision: view
             .declaration
             .as_ref()
-            .map(|d| d.plan.body.revision)
+            .map(|d| d.latest_revision)
             .unwrap_or(0),
         release_id: page["release_id"]
             .as_str()
@@ -186,5 +186,36 @@ pub(super) async fn review(flow: &Flow, view: &FlowView) -> Result<FlowAction> {
         )?,
         choices: choices.into_values().collect(),
         expires_at_ms: expiry,
+    })
+}
+
+pub(super) fn withdraw(view: &FlowView) -> Result<FlowAction> {
+    let declaration = view
+        .declaration
+        .as_ref()
+        .context("no signed declaration to withdraw")?;
+    let hours = prompt(
+        "Withdrawal record validity in hours (no automatic renewal)",
+        "",
+    )?
+    .parse::<u64>()?;
+    anyhow::ensure!(hours > 0, "expiry must be in the future");
+    let now = u64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis(),
+    )?;
+    let expires_at_ms = hours
+        .checked_mul(3600000)
+        .and_then(|n| now.checked_add(n))
+        .context("expiry overflow")?;
+    Ok(FlowAction::WithdrawDeclarationPlan {
+        expected_revision: view
+            .review
+            .as_ref()
+            .context("save your selection first")?
+            .revision,
+        expected_declaration_revision: declaration.latest_revision,
+        expires_at_ms,
     })
 }

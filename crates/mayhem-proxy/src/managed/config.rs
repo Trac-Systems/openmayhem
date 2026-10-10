@@ -86,6 +86,8 @@ pub struct Route {
     pub recovery: Option<Recovery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub data_handling: Vec<crate::declaration::Signed>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration_source: Option<crate::setup::DeclarationSource>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -308,6 +310,18 @@ impl Prepared {
                         }),
                 )?;
             }
+            if let Some(source) = &spec.declaration_source {
+                require(
+                    source.directory.is_absolute()
+                        && source.subject.network == config.network
+                        && source.subject.provider == config.provider_pubkey
+                        && spec.offers.iter().any(|o| {
+                            o.market_id == source.subject.market.as_str()
+                                && o.membership_revision == source.subject.membership_revision
+                                && o.endpoint == source.subject.endpoint
+                        }),
+                )?;
+            }
             require(
                 spec.ceiling > 0
                     && route_ids.insert(spec.id.clone())
@@ -326,6 +340,14 @@ impl Prepared {
             let adapter =
                 Arc::new(Adapter::restore(spec.adapter.clone()).map_err(|_| Error::Configuration)?);
             let mut declared_subjects = BTreeSet::new();
+            if let Some(source) = &spec.declaration_source {
+                require(
+                    source.subject.endpoint == adapter.endpoint()
+                        && source.subject.endpoint_contract == *adapter.contract_hash()
+                        && source.subject.recipe_hash == *adapter.recipe_hash()
+                        && source.subject.connection_revision == connection.http.revision(),
+                )?;
+            }
             for declaration in &spec.data_handling {
                 let subject = &declaration.body.subject;
                 require(

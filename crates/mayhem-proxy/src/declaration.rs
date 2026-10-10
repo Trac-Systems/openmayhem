@@ -3,6 +3,8 @@
 use crate::{attempts::Digest, discovery, registry, require, Result};
 use mayhem_proto::proxy::{ProxyEndpoint, ProxyMembership, ProxyOffer, PROXY_MAX_SAFE_INTEGER};
 use serde::{Deserialize, Serialize};
+pub(crate) mod live;
+pub use live::Inspection;
 
 pub const MAX_BYTES: usize = 16 * 1024;
 pub const MAX_RECORDS: usize = 32;

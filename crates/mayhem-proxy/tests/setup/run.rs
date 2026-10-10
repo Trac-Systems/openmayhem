@@ -334,6 +334,17 @@ async fn run_exact_canonical_publication_lost_ack_restart_and_spent_budget() {
     );
     assert!(!installed.capacity_advertised_by_setup);
     assert_eq!(host.installs.load(Ordering::SeqCst), 1);
+    assert_eq!(configured["routes"][0]["declaration_source"]["draft_id"], json!(published.draft_id));
+    // The same installed process watches new signed metadata; renewal/withdrawal
+    // cannot change the immutable configuration or relaunch/reset its budgets.
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
+    let withdrawal = f.store().plan_declaration_withdrawal(published.revision, 1, now, now + 120000).unwrap();
+    f.store().confirm_data_handling(published.revision, &withdrawal.plan.plan_digest,
+        &Authority::from_unlocked_wallet(publication::signer(122), identity(&f)).unwrap(), now).unwrap();
+    let recovered_plan = f.store().run_plan(published.revision,template(&f),probe(),&peer.rpc(),&host).unwrap();
+    assert_eq!(recovered_plan.plan_digest, plan.plan_digest);
+    assert_eq!(recovered_plan.config_digest, plan.config_digest);
+    assert_eq!(draft_before, std::fs::read(f.store.join("draft.json")).unwrap());
     let report = f.store().recover_run(&host).await.unwrap();
     assert_eq!(report.plan.plan_digest, plan.plan_digest);
     f.store()
