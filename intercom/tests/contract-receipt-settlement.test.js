@@ -217,6 +217,9 @@ function reservationValue(ctx, {
   reservationReceiptGraceEpochs = 6,
   maxSpendAu = '1000',
   workflow = null,
+  at = epoch * 3600,
+  sharedTerms = {},
+  lockedRateMap = LOCKED_RATE_MAP,
 } = {}) {
   const voucherBody = {
     schema_version: SPEND_VOUCHER_SCHEMA_VERSION,
@@ -236,7 +239,7 @@ function reservationValue(ctx, {
     enclave_id: ENCLAVE_ID,
     model_id: MODEL_ID,
     price_ver: 1,
-    locked_rate_map: LOCKED_RATE_MAP,
+    locked_rate_map: lockedRateMap,
     locked_per_req_au: '0',
     locked_min_session_au: '0',
     served_ctx: 8192,
@@ -247,6 +250,7 @@ function reservationValue(ctx, {
     max_spend_au: maxSpendAu,
     checkpoint_every: { tokens: 128, ms: 1000 },
     ...(workflow ? { workflow } : {}),
+    ...sharedTerms,
   };
   const unsigned = {
     op: 'spend_reserve_targeted',
@@ -257,7 +261,7 @@ function reservationValue(ctx, {
     reservation_expires_after_epoch: reservationExpiresAfterEpoch,
     reservation_receipt_grace_epochs: reservationReceiptGraceEpochs,
     epoch,
-    at: epoch * 3600,
+    at,
     rail: 'tnk',
     user: ctx.user.publicKey,
     provider: ctx.provider.publicKey,
@@ -271,6 +275,7 @@ function reservationValue(ctx, {
     ctx_bracket: 'le8k',
     ctx_bracket_table_ver: 1,
     max_spend_au: maxSpendAu,
+    ...sharedTerms,
     voucher: {
       ...voucherBody,
       user_sig: signHex(ctx.user.wallet, spendVoucherMessage(voucherBody)),
@@ -2135,4 +2140,88 @@ test('activity-price fraud proof pins signed canonical work and survives later c
   const challenged = await execute(ctx.contract, ctx.storage, 'fraudProof', proof, ctx.user.publicKey, 98);
   assert.equal(challenged.ok, true, challenged.message);
   assert.equal((await ctx.storage.get('epoch/commit/1')).value.status, 'void');
+});
+
+// These use current signed vouchers. The older ledger vectors stop at missing
+// reservation identity and therefore do not exercise these native guards.
+test('current native reservation enforces the provider speciality, not merely catalog capability', async () => {
+  const ctx = await setupContract();
+  const enclaveKey = `enclave/${ENCLAVE_ID}`;
+  const serveKey = `serve/${ctx.provider.publicKey}/${ENCLAVE_ID}`;
+  const enclave = (await ctx.storage.get(enclaveKey)).value;
+  const serve = (await ctx.storage.get(serveKey)).value;
+  await ctx.storage.put(enclaveKey, { ...enclave, caps: { ...enclave.caps, speciality_levels: { reasoning_effort: ['none', 'high'] } } });
+  await ctx.storage.put(serveKey, { ...serve, served_specialities: { reasoning_effort: ['none'] } });
+  const before = ctx.storage.snapshotBytes();
+  const rejected = await submitReservation(ctx, { sharedTerms: { required_specialities: { reasoning_effort: 'high' } } });
+  assert.ok(rejected.result instanceof Error);
+  assert.match(rejected.result.message, /committed specialities do not cover/i);
+  assert.equal(ctx.storage.snapshotBytes(), before);
+  const accepted = await submitReservation(ctx, { sharedTerms: { required_specialities: { reasoning_effort: 'none' } } });
+  assert.equal(accepted.result.ok, true, accepted.result.message);
+});
+
+test('current native embedding reservation accepts unbracketed context and rejects a text bracket without writes', async () => {
+  const ctx = await setupContract();
+  const enclaveKey = `enclave/${ENCLAVE_ID}`;
+  const serveKey = `serve/${ctx.provider.publicKey}/${ENCLAVE_ID}`;
+  const enclave = (await ctx.storage.get(enclaveKey)).value;
+  const serve = (await ctx.storage.get(serveKey)).value;
+  await ctx.storage.put(enclaveKey, { ...enclave, model_class: 'embedding', caps: { embedding: true, ctx: 512, ctx_max: 512, modality_set: ['embedding'], speciality_levels: {} } });
+  await ctx.storage.put(serveKey, { ...serve, served_ctx: 512, served_modalities: ['embedding'], ctx_bracket: null, ctx_bracket_table_ver: null });
+  await ctx.storage.put(`modelref/${MODEL_ID}`, { id: MODEL_ID, model_class: 'embedding', rate_map: LOCKED_RATE_MAP });
+  await seedCurrentAdminPrice(ctx.storage, { enclaveId: ENCLAVE_ID, modelId: MODEL_ID, admin: ctx.admin.publicKey, txNo: 20,
+    ver: 1, rateMap: LOCKED_RATE_MAP, ctxBracket: null, ctxBracketTableVer: null });
+  const terms = { served_ctx: 512, required_modalities: ['embedding'], ctx_bracket: null, ctx_bracket_table_ver: null };
+  const before = ctx.storage.snapshotBytes();
+  const rejected = await submitReservation(ctx, { sharedTerms: { ...terms, ctx_bracket: 'le8k', ctx_bracket_table_ver: 1 } });
+  assert.ok(rejected.result instanceof Error);
+  assert.match(rejected.result.message, /only valid for text-generation enclaves/i);
+  assert.equal(ctx.storage.snapshotBytes(), before);
+  const accepted = await submitReservation(ctx, { sharedTerms: terms });
+  assert.equal(accepted.result.ok, true, accepted.result.message);
+});
+
+test('current native reservation pins the active context table at its scheduled boundary', async () => {
+  const ctx = await setupContract();
+  const update = { op: 'set_ctx_brackets', submitted_at: 0, effective_at: 86400,
+    brackets: [{ id: 'le16k', max_ctx: 16384 }, { id: 'le64k', max_ctx: 65536 }, { id: 'gt64k', max_ctx: null }] };
+  const before = ctx.storage.snapshotBytes();
+  const denied = await execute(ctx.contract, ctx.storage, 'setCtxBrackets', update, ctx.provider.publicKey, 20);
+  assert.ok(denied instanceof Error); assert.match(denied.message, /Admin required/);
+  assert.equal(ctx.storage.snapshotBytes(), before);
+  const scheduled = await execute(ctx.contract, ctx.storage, 'setCtxBrackets', update, ctx.admin.publicKey, 21);
+  assert.equal(scheduled.ok, true, scheduled.message);
+  const old = await execute(ctx.contract, ctx.storage, 'readCtxBrackets', { op: 'read_ctx_brackets', at: 86399 }, ctx.user.publicKey, 22);
+  const current = await execute(ctx.contract, ctx.storage, 'readCtxBrackets', { op: 'read_ctx_brackets', at: 86400 }, ctx.user.publicKey, 23);
+  assert.equal(old.table.ver, 1); assert.equal(current.table.ver, 2);
+  const snapshot = ctx.storage.snapshotBytes();
+  const rejected = await submitReservation(ctx, { at: 86400 });
+  assert.ok(rejected.result instanceof Error); assert.match(rejected.result.message, /context bracket table is not active/i);
+  assert.equal(ctx.storage.snapshotBytes(), snapshot);
+  const value = reservationValue(ctx, { at: 86400, sharedTerms: { ctx_bracket: 'le16k', ctx_bracket_table_ver: 2 } });
+  const previousStorage = ctx.contract.storage; ctx.contract.storage = ctx.storage;
+  try {
+    const key = await ctx.contract.targetedSpendReservationFeatureKey(value);
+    assert.equal(typeof key, 'string', key?.message);
+    assert.match(key, /^hold\/targeted\/tnk\//);
+  } finally { ctx.contract.storage = previousStorage; }
+});
+
+test('current native reservation keeps accepted rates after a price advance and rejects a forged old rate map', async () => {
+  const ctx = await setupContract();
+  const accepted = await submitReservation(ctx);
+  assert.equal(accepted.result.ok, true, accepted.result.message);
+  const higher = [{ unit: 'input_token', per_unit_au: '20', granularity: 1 }];
+  await seedCurrentAdminPrice(ctx.storage, { enclaveId: ENCLAVE_ID, modelId: MODEL_ID, admin: ctx.admin.publicKey,
+    txNo: 20, ver: 2, rateMap: higher, ctxBracket: 'le8k', ctxBracketTableVer: 1, effectiveAt: 3600 });
+  const replay = await submitReservation(ctx);
+  assert.equal(replay.result.ok, true, replay.result.message); assert.equal(replay.result.idempotent, true);
+  const key = ctx.contract.targetedSpendSessionKey(ctx.user.publicKey, 'tnk', accepted.value.reservation_id);
+  const held = (await ctx.storage.get(key)).value;
+  assert.equal(held.price_ver, 1); assert.deepEqual(held.locked_rate_map, LOCKED_RATE_MAP);
+  const before = ctx.storage.snapshotBytes();
+  const rejected = await submitReservation(ctx, { sessionId: 'f1'.repeat(32), billingId: 'f2'.repeat(32), reservationId: 'f3'.repeat(32), lockedRateMap: higher });
+  assert.ok(rejected.result instanceof Error); assert.match(rejected.result.message, /locked rate_map/i);
+  assert.equal(ctx.storage.snapshotBytes(), before);
 });
