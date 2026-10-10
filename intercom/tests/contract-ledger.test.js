@@ -9,37 +9,17 @@ import {
   executePreparedEpochApplyFeature,
   prepareEpochApplyFeature,
   executeFeature,
-  executeSpendReservationFeature,
   epochApplyFeatureKey,
   makeIdentity,
   makeTxKey,
   makeVerifier,
-  seedCurrentAdminPrice,
   seedSpendHold,
   seedSpendHoldsForApply,
   signConsent,
-  signTargetedSpendReservation,
-  signSpendVoucher,
-  spendReservationFeatureKey,
 } from './helpers/contract.js';
 
 const rulesHash = '7'.repeat(64);
-const TEXT_LOCKED_RATE_MAP = Object.freeze([
-  { unit: 'input_token', per_unit_au: '20', granularity: 1_000 },
-  { unit: 'output_token', per_unit_au: '60', granularity: 1_000 },
-]);
-const EMBEDDING_LOCKED_RATE_MAP = Object.freeze([
-  { unit: 'input_token', per_unit_au: '2', granularity: 1_000 },
-]);
-const CTX_BRACKET_TABLE_VERSION = 1;
 const TEST_STRIPE_PROCESSOR_REVISION = 'c'.repeat(64);
-const ctxBracketForTokens = (tokens) => {
-  if (tokens <= 8_192) return 'le8k';
-  if (tokens <= 32_768) return 'le32k';
-  if (tokens <= 131_072) return 'le128k';
-  if (tokens <= 262_144) return 'le256k';
-  return 'gt256k';
-};
 
 const providerRegistration = {
   op: 'register_provider',
@@ -233,192 +213,6 @@ async function setupLedgerContract(identities = null) {
   );
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 1_000_000));
   return { admin, provider, provider2, user, outsider, storage, contract, payoutRevisions };
-}
-
-async function seedReservationServing(ctx, provider = ctx.provider) {
-  const enclaveId = 'e1'.repeat(32);
-  const modelId = 'test/model@4bit';
-  await ctx.storage.put(`enclave/${enclaveId}`, {
-    enclave_id: enclaveId,
-    model_id: modelId,
-    model_class: 'text-generation',
-    backend: 'llama.cpp',
-    artifact_root: 'a1'.repeat(32),
-    artifact_root_kind: 'blake3_merkle_v1',
-    artifact_source: 'huggingface://trac-network/test/model.gguf',
-    manifest_hash: 'b1'.repeat(32),
-    binary_hash: 'c1'.repeat(32),
-    att_tier: 1,
-    caps: {
-      chat: true,
-      tools: true,
-      json: true,
-      ctx: 8192,
-      ctx_max: 8192,
-      modality_set: ['text'],
-      speciality_levels: {},
-    },
-    status: 'active',
-    created_by: ctx.admin.publicKey,
-    created_by_role: 'admin',
-    created_at: makeTxKey(10),
-    updated_at: makeTxKey(10),
-  });
-  await ctx.storage.put(`serve/${provider.publicKey}/${enclaveId}`, {
-    provider: provider.publicKey,
-    enclave_id: enclaveId,
-    model_id: modelId,
-    status: 'active',
-    served_ctx: 8192,
-    served_modalities: ['text'],
-    served_specialities: {},
-    ctx_bracket: 'le8k',
-    ctx_bracket_table_ver: CTX_BRACKET_TABLE_VERSION,
-    joined_at: makeTxKey(11),
-    updated_at: makeTxKey(11),
-    via: 'feature',
-  });
-  await seedCurrentAdminPrice(ctx.storage, {
-    enclaveId,
-    modelId,
-    admin: ctx.admin.publicKey,
-    txNo: 12,
-    ver: 1,
-    inPer1kAu: 20,
-    outPer1kAu: 60,
-    minSessionAu: 100,
-    effectiveAt: 0,
-  });
-  return { enclaveId, modelId };
-}
-
-async function seedNonTextReservationServing(ctx, provider = ctx.provider) {
-  const enclaveId = 'e2'.repeat(32);
-  const modelId = 'test/embedding@q8';
-  await ctx.storage.put(`enclave/${enclaveId}`, {
-    enclave_id: enclaveId,
-    model_id: modelId,
-    model_class: 'embedding',
-    backend: 'llama.cpp',
-    artifact_root: 'a2'.repeat(32),
-    artifact_root_kind: 'blake3_merkle_v1',
-    artifact_source: 'huggingface://trac-network/test/embedding.gguf',
-    manifest_hash: 'b2'.repeat(32),
-    binary_hash: 'c2'.repeat(32),
-    att_tier: 1,
-    caps: { embedding: true, ctx: 512, ctx_max: 512, modality_set: ['embedding'], speciality_levels: {} },
-    status: 'active',
-    created_by: ctx.admin.publicKey,
-    created_by_role: 'admin',
-    created_at: makeTxKey(20),
-    updated_at: makeTxKey(20),
-  });
-  await ctx.storage.put(`serve/${provider.publicKey}/${enclaveId}`, {
-    provider: provider.publicKey,
-    enclave_id: enclaveId,
-    model_id: modelId,
-    status: 'active',
-    served_ctx: 512,
-    served_modalities: ['embedding'],
-    served_specialities: {},
-    ctx_bracket: null,
-    ctx_bracket_table_ver: null,
-    joined_at: makeTxKey(21),
-    updated_at: makeTxKey(21),
-    via: 'feature',
-  });
-  await seedCurrentAdminPrice(ctx.storage, {
-    enclaveId,
-    modelId,
-    admin: ctx.admin.publicKey,
-    txNo: 22,
-    ver: 1,
-    rateMap: EMBEDDING_LOCKED_RATE_MAP,
-    minSessionAu: 10,
-    effectiveAt: 0,
-    ctxBracket: null,
-  });
-  return { enclaveId, modelId };
-}
-
-function signedSpendReservation(
-  ctx,
-  {
-    provider = ctx.provider,
-    enclaveId,
-    sessionId,
-    maxSpendAu,
-    epoch = 1,
-    priceVer = 1,
-    lockedRateMap = TEXT_LOCKED_RATE_MAP,
-    lockedPerReqAu = 0,
-    lockedMinSessionAu = 100,
-    servedCtx = 8192,
-    requiredModalities = ['text'],
-    requiredSpecialities = {},
-    ctxBracket = ctxBracketForTokens(servedCtx),
-    ctxBracketTableVer = CTX_BRACKET_TABLE_VERSION,
-    at = epoch * 3_600,
-  } = {}
-) {
-  const payoutRevision = ctx.payoutRevisions.get(provider.publicKey);
-  if (!payoutRevision) throw new Error('Missing targeted payout fixture.');
-  const maxSpendAuString = auString(maxSpendAu);
-  const lockedPerReqAuString = auString(lockedPerReqAu);
-  const lockedMinSessionAuString = auString(lockedMinSessionAu);
-  const voucherBody = {
-    session_id: sessionId,
-    billing_id: sessionId,
-    billing_attempt: 0,
-    billing_prior_usage: {},
-    billing_prior_au_owed_cum: '0',
-    rail: 'fiat',
-    enclave_id: enclaveId,
-    price_ver: priceVer,
-    locked_rate_map: lockedRateMap,
-    locked_per_req_au: lockedPerReqAuString,
-    locked_min_session_au: lockedMinSessionAuString,
-    served_ctx: servedCtx,
-    required_modalities: requiredModalities,
-    ...(Object.keys(requiredSpecialities).length > 0
-      ? { required_specialities: requiredSpecialities }
-      : {}),
-    ctx_bracket: ctxBracket,
-    ctx_bracket_table_ver: ctxBracketTableVer,
-    max_spend_au: maxSpendAuString,
-    checkpoint_every: { tokens: 8192, ms: 30_000 },
-  };
-  const unsigned = {
-    op: 'spend_reserve_targeted',
-    payout_revision: payoutRevision,
-    contract_version: CONTRACT_VERSION,
-    session_id: sessionId,
-    epoch,
-    at,
-    rail: 'fiat',
-    user: ctx.user.publicKey,
-    provider: provider.publicKey,
-    enclave_id: enclaveId,
-    price_ver: priceVer,
-    rules_ver: 1,
-    served_ctx: servedCtx,
-    required_modalities: requiredModalities,
-    ...(Object.keys(requiredSpecialities).length > 0
-      ? { required_specialities: requiredSpecialities }
-      : {}),
-    ctx_bracket: ctxBracket,
-    ctx_bracket_table_ver: ctxBracketTableVer,
-    max_spend_au: maxSpendAuString,
-    voucher: {
-      ...voucherBody,
-      user_sig: signSpendVoucher(ctx.user.wallet, voucherBody),
-    },
-    provider_sig: '',
-  };
-  return {
-    ...unsigned,
-    provider_sig: signTargetedSpendReservation(provider.wallet, unsigned),
-  };
 }
 
 test('MayhemProtocol keeps epochApply off the paid tx route', () => {
@@ -708,437 +502,16 @@ test('MayhemProtocol steady-state sponsorship stays at one paid tx per active ep
   }
 });
 
-test('MayhemContract spend reservation enforces active-epoch unreserved user balance', async () => {
-  const ctx = await setupLedgerContract();
-  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
-  await seedReservationServing(ctx, ctx.provider2);
-
-  const first = signedSpendReservation(ctx, {
-    provider: ctx.provider,
-    enclaveId,
-    sessionId: 'a1'.repeat(32),
-    maxSpendAu: 700_000,
-  });
-  const firstKey = await spendReservationFeatureKey(ctx.contract, first, ctx.storage);
-  const firstResult = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    first,
-    ctx.provider.publicKey
-  );
-  assert.equal(firstResult.ok, true, firstResult.message);
-  assert.equal(firstResult.idempotent, false);
-  assert.equal(firstResult.available_au, '300000');
-
-  const hold = (await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value;
-  assert.equal(hold.user, ctx.user.publicKey);
-  assert.equal(hold.rail, 'fiat');
-  assert.equal(hold.epoch, 1);
-  assert.equal(hold.reserved_au, '700000');
-  assert.equal(hold.balance_au_at_last_reserve, '1000000');
-  assert.equal(hold.sessions.length, 1);
-  assert.equal(hold.sessions[0].session_id, 'a1'.repeat(32));
-  assert.equal(hold.sessions[0].provider, ctx.provider.publicKey);
-  assert.equal(hold.sessions[0].feature_key, firstKey);
-  assert.equal(hold.sessions[0].served_ctx, 8192);
-  assert.equal(hold.sessions[0].ctx_bracket, 'le8k');
-  assert.equal(hold.sessions[0].ctx_bracket_table_ver, CTX_BRACKET_TABLE_VERSION);
-  assert.match(hold.sessions[0].voucher_hash, /^[0-9a-f]{64}$/);
-
-  const replay = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    first,
-    ctx.provider.publicKey
-  );
-  assert.equal(replay.ok, true, replay.message);
-  assert.equal(replay.idempotent, true);
-  assert.equal(replay.reserved_au, '700000');
-
-  const second = signedSpendReservation(ctx, {
-    provider: ctx.provider2,
-    enclaveId,
-    sessionId: 'a2'.repeat(32),
-    maxSpendAu: 400_000,
-  });
-  const secondResult = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    second,
-    ctx.provider2.publicKey
-  );
-  assert.match(secondResult.message, /Insufficient unreserved credit balance/);
-  assert.equal((await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value.reserved_au, '700000');
-});
-
-test('MayhemContract spend reservation requires a provider-served speciality level', async () => {
-  const ctx = await setupLedgerContract();
-  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
-  const enclaveKey = `enclave/${enclaveId}`;
-  const serveKey = `serve/${ctx.provider.publicKey}/${enclaveId}`;
-  const enclave = (await ctx.storage.get(enclaveKey)).value;
-  const serve = (await ctx.storage.get(serveKey)).value;
-  await ctx.storage.put(enclaveKey, {
-    ...enclave,
-    caps: {
-      ...enclave.caps,
-      speciality_levels: { reasoning_effort: ['none', 'high'] },
-    },
-  });
-  await ctx.storage.put(serveKey, {
-    ...serve,
-    served_specialities: { reasoning_effort: ['none'] },
-  });
-
-  const unsupported = signedSpendReservation(ctx, {
-    enclaveId,
-    sessionId: 'a3'.repeat(32),
-    maxSpendAu: 100_000,
-    requiredSpecialities: { reasoning_effort: 'high' },
-  });
-  const rejected = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    unsupported,
-    ctx.provider.publicKey
-  );
-  assert.match(rejected.message, /committed specialities do not cover/i);
-  assert.equal(await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`), null);
-
-  const supported = signedSpendReservation(ctx, {
-    enclaveId,
-    sessionId: 'a4'.repeat(32),
-    maxSpendAu: 100_000,
-    requiredSpecialities: { reasoning_effort: 'none' },
-  });
-  const accepted = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    supported,
-    ctx.provider.publicKey
-  );
-  assert.equal(accepted.ok, true, accepted.message);
-  const hold = (await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value;
-  assert.deepEqual(hold.sessions[0].required_specialities, { reasoning_effort: 'none' });
-});
-
-test('MayhemContract spend reservation accepts unbracketed non-text markets only', async () => {
-  const ctx = await setupLedgerContract();
-  const { enclaveId } = await seedNonTextReservationServing(ctx, ctx.provider);
-
-  const accepted = signedSpendReservation(ctx, {
-    provider: ctx.provider,
-    enclaveId,
-    sessionId: 'e3'.repeat(32),
-    maxSpendAu: 100_000,
-    lockedRateMap: EMBEDDING_LOCKED_RATE_MAP,
-    lockedMinSessionAu: 10,
-    servedCtx: 512,
-    requiredModalities: ['embedding'],
-    ctxBracket: null,
-    ctxBracketTableVer: null,
-  });
-  const result = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    accepted,
-    ctx.provider.publicKey
-  );
-  assert.equal(result.ok, true, result.message);
-
-  const hold = (await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value;
-  assert.equal(hold.sessions[0].ctx_bracket, null);
-  assert.equal(hold.sessions[0].ctx_bracket_table_ver, null);
-
-  const rejected = signedSpendReservation(ctx, {
-    provider: ctx.provider,
-    enclaveId,
-    sessionId: 'e4'.repeat(32),
-    maxSpendAu: 100_000,
-    lockedRateMap: EMBEDDING_LOCKED_RATE_MAP,
-    lockedMinSessionAu: 10,
-    servedCtx: 512,
-    requiredModalities: ['embedding'],
-    ctxBracket: 'le8k',
-    ctxBracketTableVer: CTX_BRACKET_TABLE_VERSION,
-  });
-  await assert.rejects(
-    () => spendReservationFeatureKey(ctx.contract, rejected, ctx.storage),
-    /only valid for text-generation enclaves/
-  );
-});
-
-test('MayhemContract spend reservation keeps the locked quote after market price advances', async () => {
-  const ctx = await setupLedgerContract();
-  const { enclaveId, modelId } = await seedReservationServing(ctx, ctx.provider);
-
-  const lockedAtV1 = signedSpendReservation(ctx, {
-    provider: ctx.provider,
-    enclaveId,
-    sessionId: 'f3'.repeat(32),
-    maxSpendAu: 100_000,
-    priceVer: 1,
-    lockedRateMap: TEXT_LOCKED_RATE_MAP,
-  });
-
-  const v2RateMap = [
-    { unit: 'input_token', per_unit_au: '40', granularity: 1_000 },
-    { unit: 'output_token', per_unit_au: '120', granularity: 1_000 },
-  ];
-  await seedCurrentAdminPrice(ctx.storage, {
-    enclaveId,
-    modelId,
-    admin: ctx.admin.publicKey,
-    txNo: 20,
-    ver: 2,
-    inPer1kAu: 40,
-    outPer1kAu: 120,
-    minSessionAu: 100,
-    effectiveAt: 3_600,
-  });
-  assert.equal((await ctx.storage.get(`price/${enclaveId}/le8k`)).value.current.ver, 2);
-
-  const result = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    lockedAtV1,
-    ctx.provider.publicKey
-  );
-  assert.equal(result.ok, true, result.message);
-
-  const hold = (await ctx.storage.get(`hold/fiat/${ctx.user.publicKey}/1`)).value;
-  assert.equal(hold.sessions.length, 1);
-  assert.equal(hold.sessions[0].price_ver, 1);
-  assert.deepEqual(hold.sessions[0].locked_rate_map, TEXT_LOCKED_RATE_MAP);
-  assert.equal(hold.sessions[0].locked_per_req_au, '0');
-  assert.equal(hold.sessions[0].locked_min_session_au, '100');
-  assert.equal(hold.sessions[0].served_ctx, 8192);
-  assert.equal(hold.sessions[0].ctx_bracket, 'le8k');
-  assert.equal(hold.sessions[0].ctx_bracket_table_ver, CTX_BRACKET_TABLE_VERSION);
-
-  const forgedV1Quote = signedSpendReservation(ctx, {
-    provider: ctx.provider,
-    enclaveId,
-    sessionId: 'f4'.repeat(32),
-    maxSpendAu: 100_000,
-    priceVer: 1,
-    lockedRateMap: v2RateMap,
-  });
-  const rejected = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    forgedV1Quote,
-    ctx.provider.publicKey
-  );
-  assert.match(rejected.message, /locked rate_map/i);
-});
-
-test('MayhemContract spend reservation moves to next epoch after epochApply', async () => {
-  const ctx = await setupLedgerContract();
-  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
-
-  const first = signedSpendReservation(ctx, {
-    provider: ctx.provider,
-    enclaveId,
-    sessionId: 'b1'.repeat(32),
-    maxSpendAu: 900_000,
-  });
-  const firstResult = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    first,
-    ctx.provider.publicKey
-  );
-  assert.equal(firstResult.ok, true, firstResult.message);
-
-  const applyValue = makeEpochApply(1, ctx.user.publicKey, ctx.provider.publicKey, 100_000);
-  const applied = await executeEpochApplyFeature(ctx.contract, ctx.storage, applyValue, ctx.admin.publicKey);
-  assert.equal(applied.ok, true, applied.message);
-  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value.au, '900000');
-
-  const nextEpoch = signedSpendReservation(ctx, {
-    provider: ctx.provider,
-    enclaveId,
-    sessionId: 'b2'.repeat(32),
-    maxSpendAu: 900_000,
-    epoch: 2,
-  });
-  const nextResult = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    nextEpoch,
-    ctx.provider.publicKey
-  );
-  assert.equal(nextResult.ok, true, nextResult.message);
-  assert.equal(nextResult.available_au, '0');
-});
-
-test('MayhemContract epochApply refuses debits above reserved spend holds', async () => {
-  const ctx = await setupLedgerContract();
-  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
-
-  const reservation = signedSpendReservation(ctx, {
-    provider: ctx.provider,
-    enclaveId,
-    sessionId: 'd1'.repeat(32),
-    maxSpendAu: 100_000,
-  });
-  const reserved = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    reservation,
-    ctx.provider.publicKey
-  );
-  assert.equal(reserved.ok, true, reserved.message);
-
-  const overCap = await executeEpochApplyFeature(
-    ctx.contract,
-    ctx.storage,
-    makeEpochApply(1, ctx.user.publicKey, ctx.provider.publicKey, 100_001),
-    ctx.admin.publicKey
-  );
-  assert.match(overCap.message, /exceeds reserved spend hold/i);
-  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value.au, '1000000');
-
-  const atCap = await executeEpochApplyFeature(
-    ctx.contract,
-    ctx.storage,
-    makeEpochApply(1, ctx.user.publicKey, ctx.provider.publicKey, 100_000),
-    ctx.admin.publicKey
-  );
-  assert.equal(atCap.ok, true, atCap.message);
-  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/fiat`)).value.au, '900000');
-});
-
-test('MayhemContract paged epochApply accumulates reserved debit checks', async () => {
-  const ctx = await setupLedgerContract();
-  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
-  const reservation = signedSpendReservation(ctx, {
-    provider: ctx.provider,
-    enclaveId,
-    sessionId: 'd2'.repeat(32),
-    maxSpendAu: 150_000,
-  });
-  const reserved = await executeSpendReservationFeature(
-    ctx.contract,
-    ctx.storage,
-    reservation,
-    ctx.provider.publicKey
-  );
-  assert.equal(reserved.ok, true, reserved.message);
-
-  const firstPage = await executeEpochApplyFeature(
-    ctx.contract,
-    ctx.storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 3_600,
-      page: 0,
-      last_page: false,
-      debits: [{ rail: 'fiat', user: ctx.user.publicKey, au: '100000' }],
-      earnings: [{ rail: 'fiat', provider: ctx.provider.publicKey, gross_au: '100000' }],
-    },
-    ctx.admin.publicKey
-  );
-  assert.equal(firstPage.ok, true, firstPage.message);
-  assert.deepEqual((await ctx.storage.get('epoch/apply/state')).value.pending_reserved_debits, [{
-    rail: 'fiat',
-    user: ctx.user.publicKey,
-    au: '100000',
-  }]);
-
-  const overCapSecondPage = await executeEpochApplyFeature(
-    ctx.contract,
-    ctx.storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 3_600,
-      page: 1,
-      last_page: true,
-      debits: [{ rail: 'fiat', user: ctx.user.publicKey, au: '50001' }],
-      earnings: [{ rail: 'fiat', provider: ctx.provider.publicKey, gross_au: '50001' }],
-    },
-    ctx.admin.publicKey
-  );
-  assert.match(overCapSecondPage.message, /exceeds reserved spend hold/i);
-});
-
-test('MayhemContract context bracket tables are admin scheduled and pinned by version', async () => {
-  const ctx = await setupLedgerContract();
-  const { enclaveId } = await seedReservationServing(ctx, ctx.provider);
-
-  const update = {
-    op: 'set_ctx_brackets',
-    submitted_at: 0,
-    effective_at: 86_400,
-    brackets: [
-      { id: 'le16k', max_ctx: 16_384 },
-      { id: 'le64k', max_ctx: 65_536 },
-      { id: 'gt64k', max_ctx: null },
-    ],
-  };
-  const nonAdmin = await execute(ctx.contract, ctx.storage, 'setCtxBrackets', update, ctx.provider.publicKey, 20);
-  assert.match(nonAdmin.message, /Admin required/);
-
-  const scheduled = await execute(ctx.contract, ctx.storage, 'setCtxBrackets', update, ctx.admin.publicKey, 21);
-  assert.equal(scheduled.ok, true, scheduled.message);
-  assert.equal(scheduled.ver, 2);
-
-  const before = await execute(
-    ctx.contract,
-    ctx.storage,
-    'readCtxBrackets',
-    { op: 'read_ctx_brackets', at: 86_399 },
-    ctx.user.publicKey,
-    22
-  );
-  assert.equal(before.table.ver, 1);
-  assert.equal(before.table.brackets[0].id, 'le8k');
-
-  const after = await execute(
-    ctx.contract,
-    ctx.storage,
-    'readCtxBrackets',
-    { op: 'read_ctx_brackets', at: 86_400 },
-    ctx.user.publicKey,
-    23
-  );
-  assert.equal(after.table.ver, 2);
-  assert.equal(after.table.brackets[0].id, 'le16k');
-
-  const oldTableAfterActivation = signedSpendReservation(ctx, {
-    provider: ctx.provider,
-    enclaveId,
-    sessionId: 'c1'.repeat(32),
-    servedCtx: 12_000,
-    ctxBracket: 'le32k',
-    ctxBracketTableVer: 1,
-    maxSpendAu: 100_000,
-    at: 86_400,
-  });
-  await assert.rejects(
-    spendReservationFeatureKey(ctx.contract, oldTableAfterActivation, ctx.storage),
-    /not active/
-  );
-
-  const currentTableAfterActivation = signedSpendReservation(ctx, {
-    provider: ctx.provider,
-    enclaveId,
-    sessionId: 'c2'.repeat(32),
-    servedCtx: 12_000,
-    ctxBracket: 'le16k',
-    ctxBracketTableVer: 2,
-    maxSpendAu: 100_000,
-    at: 86_400,
-  });
-  const key = await spendReservationFeatureKey(ctx.contract, currentTableAfterActivation, ctx.storage);
-  assert.match(key, /^hold\/targeted\/fiat\//);
-});
+// Native spend invariants migrated to contract-receipt-settlement.test.js:
+// signed targeted vouchers replace the retired aggregate reservation shape.
+// The eight current cases cover balance across providers, speciality, non-text
+// brackets, locked rates, scheduled tables, next epochs and receipt-bound caps
+// both within one page and across pages. Keep aggregate API rejection there too.
 
 test('MayhemContract epochApply mutates credit, earning, and fee state in place', async () => {
   const { admin, provider, user, outsider, storage, contract } = await setupLedgerContract();
+  // Invalid trial vectors must not seed the successful epoch's canonical commit.
+  const invalid = await setupLedgerContract({ admin, provider, user, outsider });
 
   const nonAdmin = await execute(
     contract,
@@ -1151,16 +524,16 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
   assert.match(nonAdmin.message, /unknown contract operation type|function not registered/i);
 
   const nonAdminFeature = await executeEpochApplyFeature(
-    contract,
-    storage,
+    invalid.contract,
+    invalid.storage,
     makeEpochApply(1, user.publicKey, provider.publicKey, 1_500),
     outsider.publicKey
   );
   assert.match(nonAdminFeature.message, /admin required/i);
 
   const mismatch = await executeEpochApplyFeature(
-    contract,
-    storage,
+    invalid.contract,
+    invalid.storage,
     {
       op: 'epoch_apply',
       epoch: 1,
@@ -1199,12 +572,8 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
   assert.equal(storage.snapshotBytes(), wrongKeySnapshot);
 
   await seedSpendHoldsForApply(storage, firstApply);
-  const first = await executeEpochApplyFeature(
-    contract,
-    storage,
-    firstApply,
-    admin.publicKey
-  );
+  const prepared = await prepareEpochApplyFeature(contract, storage, firstApply, admin.publicKey);
+  const first = await executePreparedEpochApplyFeature(contract, storage, prepared, admin.publicKey);
   assert.deepEqual(first, {
     ok: true,
     op: 'epochApply',
@@ -1247,10 +616,10 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
   assert.equal(feeAfterFirst.last_apply_hash.length, 64);
 
   const snapshotBeforeReplay = storage.snapshotBytes();
-  const replay = await executeEpochApplyFeature(
+  const replay = await executePreparedEpochApplyFeature(
     contract,
     storage,
-    firstApply,
+    prepared,
     admin.publicKey
   );
   assert.deepEqual(replay, {
@@ -1265,13 +634,14 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
   });
   assert.equal(storage.snapshotBytes(), snapshotBeforeReplay);
 
-  const changedReplay = await executeEpochApplyFeature(
+  const changedReplay = await executePreparedEpochApplyFeature(
     contract,
     storage,
-    makeEpochApply(1, user.publicKey, provider.publicKey, 2_000),
+    { ...prepared, value: { ...prepared.value, ...makeEpochApply(1, user.publicKey, provider.publicKey, 2_000), at: 7200 } },
     admin.publicKey
   );
   assert.match(changedReplay.message, /monotonic/i);
+  assert.equal(storage.snapshotBytes(), snapshotBeforeReplay);
 
   const gap = await executeEpochApplyFeature(
     contract,
@@ -1282,11 +652,13 @@ test('MayhemContract epochApply mutates credit, earning, and fee state in place'
   assert.match(gap.message, /contiguous/i);
 
   await seedSpendHold(storage, { user: user.publicKey, epoch: 2, au: '2000000' });
+  const insufficientPrepared = await prepareEpochApplyFeature(contract, storage,
+    makeEpochApply(2, user.publicKey, provider.publicKey, 2_000_000), admin.publicKey);
   const insufficientSnapshot = storage.snapshotBytes();
-  const insufficient = await executeEpochApplyFeature(
+  const insufficient = await executePreparedEpochApplyFeature(
     contract,
     storage,
-    makeEpochApply(2, user.publicKey, provider.publicKey, 2_000_000),
+    insufficientPrepared,
     admin.publicKey
   );
   assert.match(insufficient.message, /insufficient credit balance/i);
@@ -1441,9 +813,18 @@ test('MayhemContract epochApply replays codepoint-sorted varied keys determinist
     earnings: [...leftApply.earnings].reverse(),
   };
 
+  // Ordering is varied over the SAME receipt identities and epoch commitment.
+  // Independently synthesizing receipts from each input order would create two
+  // economically different canonical epochs, whose hashes must differ.
+  const canonical = await prepareEpochApplyFeature(left.contract, left.storage, leftApply, identities.admin.publicKey);
+  await right.storage.put(right.contract.receiptEpochIndexKey(1), canonical.value.receipt_index);
+  await right.storage.put('epoch/commit/1', (await left.storage.get('epoch/commit/1')).value);
   for (const [ctx, value] of [[left, leftApply], [right, rightApply]]) {
     await seedSpendHoldsForApply(ctx.storage, value);
-    const result = await executeEpochApplyFeature(ctx.contract, ctx.storage, value, identities.admin.publicKey);
+    const input = { ...canonical.value, debits: value.debits, earnings: value.earnings };
+    const result = await executePreparedEpochApplyFeature(ctx.contract, ctx.storage, {
+      key: await epochApplyFeatureKey(ctx.contract, input), value: input, allocations: canonical.allocations,
+    }, identities.admin.publicKey);
     assert.equal(result.ok, true, result.message);
     assert.equal(result.fee_au, '180');
     assert.equal(result.earned_au, '1020');

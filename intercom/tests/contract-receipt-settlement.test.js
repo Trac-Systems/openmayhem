@@ -2225,3 +2225,124 @@ test('current native reservation keeps accepted rates after a price advance and 
   assert.ok(rejected.result instanceof Error); assert.match(rejected.result.message, /locked rate_map/i);
   assert.equal(ctx.storage.snapshotBytes(), before);
 });
+
+test('current native reservations share the unreserved user balance across providers', async () => {
+  const ctx = await setupContract();
+  const provider = await makeIdentity();
+  for (const [index, [method, value]] of [
+    ['consent', { op: 'consent', ver: 1, hash: RULES_HASH,
+      sig: signConsent(provider.wallet, 1, RULES_HASH) }],
+    ['registerProvider', { op: 'register_provider' }],
+    ['setProviderRails', { op: 'set_provider_rails', rails: ['tnk'] }],
+  ].entries()) {
+    const result = await execute(ctx.contract, ctx.storage, method, value, provider.publicKey, 200 + index);
+    assert.equal(result.ok, true, result.message);
+  }
+  for (const [oldKey, newKey] of [
+    [`serve/${ctx.provider.publicKey}/${ENCLAVE_ID}`, `serve/${provider.publicKey}/${ENCLAVE_ID}`],
+    [`payout/binding/tnk/${ctx.provider.publicKey}/${PAYOUT_REVISION}`, `payout/binding/tnk/${provider.publicKey}/${PAYOUT_REVISION}`],
+    [`payout/current/tnk/${ctx.provider.publicKey}`, `payout/current/tnk/${provider.publicKey}`],
+  ]) {
+    await ctx.storage.put(newKey, { ...(await ctx.storage.get(oldKey)).value, provider: provider.publicKey });
+  }
+  const first = await submitReservation(ctx, { maxSpendAu: '70000' });
+  assert.equal(first.result.ok, true, first.result.message);
+  assert.equal(first.result.available_au, '30000');
+  const beforeReplay = ctx.storage.snapshotBytes();
+  const replay = await submitReservation(ctx, { maxSpendAu: '70000' });
+  assert.equal(replay.result.idempotent, true);
+  assert.equal(ctx.storage.snapshotBytes(), beforeReplay);
+  const options = { sessionId: 'd1'.repeat(32), billingId: 'd2'.repeat(32), reservationId: 'd3'.repeat(32) };
+  const second = await submitReservation({ ...ctx, provider }, { ...options, maxSpendAu: '40000' });
+  assert.match(second.result.message, /Insufficient unreserved credit balance/);
+  assert.equal(ctx.storage.snapshotBytes(), beforeReplay);
+  const exact = await submitReservation({ ...ctx, provider }, { ...options, maxSpendAu: '30000' });
+  assert.equal(exact.result.ok, true, exact.result.message);
+  assert.equal(exact.result.available_au, '0');
+});
+
+test('current native settlement releases the original reservation before next-epoch spending', async () => {
+  const ctx = await setupContract();
+  const first = await submitReservation(ctx, { maxSpendAu: '90000' });
+  assert.equal(first.result.ok, true, first.result.message);
+  const recorded = await submitReceipt(ctx, receiptValue(ctx, first, {
+    final: true, usage: { input_token: 1000 }, auOwedCum: '10000',
+  }));
+  assert.equal(recorded.result.ok, true, recorded.result.message);
+  const head = (await ctx.storage.get(`receipt/head/${first.value.voucher.billing_id}/0`)).value;
+  const commit = await commitEpoch(ctx, { count: 1, useAu: '10000' });
+  const applied = await submitTargetedApply(ctx, await targetedApplyValue(ctx, { heads: [head], commitHash: commit.commit_hash }));
+  assert.equal(applied.result.ok, true, applied.result.message);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au, '90000');
+  const next = await submitReservation(ctx, { epoch: 2, maxSpendAu: '90000',
+    sessionId: 'd1'.repeat(32), billingId: 'd2'.repeat(32), reservationId: 'd3'.repeat(32) });
+  assert.equal(next.result.ok, true, next.result.message);
+  assert.equal(next.result.available_au, '0');
+});
+
+test('current native receipts and targeted debits cannot exceed signed reserved spend', async () => {
+  const ctx = await setupContract();
+  const reservation = await submitReservation(ctx, { maxSpendAu: '100' });
+  assert.equal(reservation.result.ok, true, reservation.result.message);
+  const before = ctx.storage.snapshotBytes();
+  const excessive = await submitReceipt(ctx, receiptValue(ctx, reservation, {
+    final: true, usage: { input_token: 11 }, auOwedCum: '110',
+  }));
+  assert.ok(excessive.result instanceof Error);
+  assert.match(excessive.result.message, /exceeds its session reservation/i);
+  assert.equal(ctx.storage.snapshotBytes(), before);
+  const recorded = await submitReceipt(ctx, receiptValue(ctx, reservation, { final: true }));
+  assert.equal(recorded.result.ok, true, recorded.result.message);
+  const head = (await ctx.storage.get(`receipt/head/${reservation.value.voucher.billing_id}/0`)).value;
+  const commit = await commitEpoch(ctx, { count: 1, useAu: '100' });
+  const value = await targetedApplyValue(ctx, { heads: [head], commitHash: commit.commit_hash });
+  const invalid = structuredClone(value);
+  invalid.debits[0].au = invalid.earnings[0].gross_au = invalid.allocations[0].au = '110';
+  const beforeApply = ctx.storage.snapshotBytes();
+  const rejected = await submitTargetedApply(ctx, invalid);
+  assert.match(rejected.result.message, /does not match its canonical receipt head/i);
+  assert.equal(ctx.storage.snapshotBytes(), beforeApply);
+  const accepted = await submitTargetedApply(ctx, value);
+  assert.equal(accepted.result.ok, true, accepted.result.message);
+  assert.equal((await ctx.storage.get(`bal/${ctx.user.publicKey}/tnk`)).value.au, '99900');
+});
+
+test('current native paged settlement retains exact cumulative receipt-backed debits', async () => {
+  const ctx = await setupContract();
+  const balanceKey = `bal/${ctx.user.publicKey}/tnk`;
+  await ctx.storage.put(balanceKey, { ...(await ctx.storage.get(balanceKey)).value, au: '150' });
+  const first = await submitReservation(ctx, { maxSpendAu: '100' });
+  const second = await submitReservation(ctx, { maxSpendAu: '50',
+    sessionId: 'd1'.repeat(32), billingId: 'd2'.repeat(32), reservationId: 'd3'.repeat(32) });
+  assert.equal(first.result.ok, true, first.result.message);
+  assert.equal(second.result.ok, true, second.result.message);
+  assert.equal(second.result.available_au, '0');
+  const heads = [];
+  for (const [reservation, units] of [[first, 10], [second, 5]]) {
+    const recorded = await submitReceipt(ctx, receiptValue(ctx, reservation, {
+      final: true, usage: { input_token: units }, auOwedCum: String(units * 10),
+    }));
+    assert.equal(recorded.result.ok, true, recorded.result.message);
+    heads.push((await ctx.storage.get(`receipt/head/${reservation.value.voucher.billing_id}/0`)).value);
+  }
+  const commit = await commitEpoch(ctx, { count: 2, useAu: '150' });
+  const firstPage = await submitTargetedApply(ctx, await targetedApplyValue(ctx, {
+    heads: [heads[0]], commitHash: commit.commit_hash, page: 0, lastPage: false,
+  }));
+  assert.equal(firstPage.result.ok, true, firstPage.result.message);
+  assert.equal((await ctx.storage.get(balanceKey)).value.au, '50');
+  const page1 = await targetedApplyValue(ctx, { heads: [heads[1]], commitHash: commit.commit_hash, page: 1 });
+  const inflated = structuredClone(page1);
+  inflated.debits[0].au = inflated.earnings[0].gross_au = inflated.allocations[0].au = '60';
+  const before = ctx.storage.snapshotBytes();
+  const rejected = await submitTargetedApply(ctx, inflated);
+  assert.match(rejected.result.message, /does not match its canonical receipt head/i);
+  assert.equal(ctx.storage.snapshotBytes(), before);
+  const finalPage = await submitTargetedApply(ctx, page1);
+  assert.equal(finalPage.result.ok, true, finalPage.result.message);
+  assert.equal((await ctx.storage.get(balanceKey)).value.au, '0');
+  const settled = ctx.storage.snapshotBytes();
+  const replay = await submitTargetedApply(ctx, page1);
+  assert.equal(replay.result.idempotent, true);
+  assert.equal(ctx.storage.snapshotBytes(), settled);
+});
