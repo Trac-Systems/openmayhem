@@ -9,6 +9,35 @@
   const number = id => { const n = Number(value(id)); if (!value(id) || !Number.isSafeInteger(n) || n < 0) throw new Error('Enter a whole number for every allowance and limit.'); return n; };
   const yes = id => { if (!['yes','no'].includes(value(id))) throw new Error('Choose each policy explicitly.'); return value(id) === 'yes'; };
   const option = (select, val, text) => { const o = document.createElement('option'); o.value=val; o.textContent=text; select.append(o); };
+  const steps = [...document.querySelectorAll('[data-setup-step]')];
+  let activeStep = 0;
+  function showStep(index, focus = true) {
+    activeStep = index;
+    steps.forEach((step, i) => { step.hidden = i !== index; });
+    document.querySelectorAll('[data-step]').forEach(button => {
+      if (Number(button.dataset.step) === index) button.setAttribute('aria-current','step');
+      else button.removeAttribute('aria-current');
+    });
+    el('previous-step').hidden = index === 0;
+    el('next-step').hidden = index === steps.length - 1;
+    el('review-button').hidden = index !== steps.length - 1;
+    el('step-status').textContent = `Step ${index + 1} of ${steps.length}`;
+    if (focus) { const heading = steps[index].querySelector('h2'); heading.focus(); heading.scrollIntoView({block:'nearest'}); }
+  }
+  function validateThrough(last) {
+    for (let i = 0; i <= last; i++) {
+      const invalid = [...steps[i].querySelectorAll('input,select,textarea')].find(control => control.willValidate && !control.checkValidity());
+      if (invalid) { showStep(i); invalid.focus(); invalid.reportValidity(); return false; }
+    }
+    return true;
+  }
+  function advance(index) {
+    if (index <= activeStep || validateThrough(index - 1)) showStep(index);
+  }
+  document.querySelectorAll('[data-step]').forEach(button => button.addEventListener('click',()=>advance(Number(button.dataset.step))));
+  el('previous-step').addEventListener('click',()=>showStep(Math.max(0,activeStep - 1)));
+  el('next-step').addEventListener('click',()=>advance(Math.min(steps.length - 1,activeStep + 1)));
+  showStep(0, false);
   document.querySelectorAll('.yes-no').forEach(s => { option(s,'','Choose'); option(s,'no','No'); option(s,'yes','Yes'); });
   const decisions = () => value('endpoint') === 'mayhem_decisions';
   const units = () => decisions() ? ['decision'] : ['input_token','output_token'];
@@ -54,6 +83,8 @@
   el('create-form').addEventListener('input',()=>{el('create-review').hidden=true;ready=false;reviewed=null;});
   el('create-form').addEventListener('submit',async event=>{
     event.preventDefault();
+    if (activeStep < steps.length - 1) { advance(activeStep + 1); return; }
+    if (!validateThrough(steps.length - 1)) return;
     el('create-fields').disabled=true;
     try {
       const amounts=(await guide({kind:'amounts',rates:units().map(unit=>({unit,granularity:number(`${unit}-granularity`),usd:value(`${unit}-rate`)})),per_request_usd:value('per-request'),min_session_usd:value('min-session'),probe_total_usd:value('cost'),probe_per_attempt_usd:value('attempt-cost')})).result;
@@ -70,9 +101,9 @@
     } catch(e){message(e.message);ready=false;reviewed=null;}
     finally{el('create-fields').disabled=false;}
   });
-  el('edit-button').addEventListener('click',()=>{ready=false;reviewed=null;el('create-review').hidden=true;el('base-url').focus();});
+  el('edit-button').addEventListener('click',()=>{ready=false;reviewed=null;el('create-review').hidden=true;showStep(0);el('base-url').focus();});
   el('create-button').addEventListener('click',async()=>{
-    if(!ready||!el('create-form').reportValidity())return;
+    if(!ready||!validateThrough(steps.length - 1))return;
     el('create-button').disabled=true;el('create-fields').disabled=true;
     try {
       const payload=JSON.stringify(reviewed);reviewed=null;el('api-key').value='';

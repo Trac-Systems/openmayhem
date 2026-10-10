@@ -53,6 +53,14 @@ bounded list (128 IDs / 64 KiB / ten seconds). Unsupported listing remains expli
 an exact manual model ID is allowed. Names never certify model identity,
 capabilities or readiness. No generation/probe is sent by this read.
 
+The first-time dashboard presents four steps: connection, model/market, prices,
+and test allowance. Back and the step buttons retain entered choices in the
+current page; moving forward checks required fields before exposing later steps.
+Navigation makes no network request and does not save. Enter advances to the
+next step until the final review. Prices, payment policies and test allowances
+remain explicit choices, followed by the unchanged exact review and save action.
+An unsaved page does not persist a bearer key or draft in browser storage.
+
 Browse canonical families, then choose **create** or **join**. Family lists are paged;
 markets use the canonical family/endpoint-family indexes. Each page is bounded to
 40 entries and the existing signed cursor, with no total-catalog cutoff. Later
@@ -81,8 +89,10 @@ serves CLI and dashboard. Nonstandard protocols still require reviewed recipes.
 The shared factory validates the full generated profile and supervised runtime
 configuration before an atomic private write under `<home>/proxy-setup`. Browser
 requests cannot supply host paths, wallet material, Core identity, worker program,
-bridge/admission origins or lifecycle callbacks. All bundle files are 0600, the
-bundle is 0700. Bearer values are write-only and are not included in state, review,
+bridge/admission origins or lifecycle callbacks. On Unix, bundle files are 0600
+and the bundle is 0700; Windows uses the protected NTFS boundary described in
+[Windows setup storage](WINDOWS_SETUP_STORAGE.md), with native acceptance still
+required before release. Bearer values are write-only and are not included in state, review,
 logs or error responses. Request handling uses the existing dashboard session,
 exact loopback Host/Origin and CSRF secret before a bounded 64 KiB / five-second
 body read. The single creation permit stays with the blocking disk task until it
