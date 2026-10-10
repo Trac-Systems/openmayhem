@@ -83,6 +83,9 @@
       const freshness=document.createElement('p'); freshness.textContent='Last authenticated status snapshot, not live payment confirmation. Reconcile status to refresh payment and permit facts.'; $('invoice').append(freshness);
       const status = document.createElement('p'); status.textContent = `Review: ${invoice.review_code || 'none'}. Permit: ${invoice.permit ? 'retained; canonical validation still required at publication' : 'not available'}.`; $('invoice').append(status);
     }
+    if (!invoice && retained?.review_code) {
+      const review = document.createElement('p'); review.textContent = `Payment requires review: ${retained.review_code}. Admission history is retained; reconcile status for updates.`; $('invoice').append(review);
+    }
   }
   async function request(action) {
     $('checkout').replaceChildren();

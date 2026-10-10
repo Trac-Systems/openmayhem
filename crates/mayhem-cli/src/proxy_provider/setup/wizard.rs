@@ -62,6 +62,12 @@ fn show(view: &FlowView) -> Result<()> {
         );
     }
     if let Some(saved) = &view.enrollment {
+        if saved["state"] == "admitted" {
+            println!("Admission recorded: {}", saved["entitlement_id"]);
+            if let Some(code) = saved["review_code"].as_str() {
+                println!("Payment requires review: {code}. Admission history is retained; reconcile status for updates.");
+            }
+        }
         let invoice = &saved["invoice"];
         if !invoice.is_null() {
             println!(

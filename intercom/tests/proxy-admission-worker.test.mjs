@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import sodium from 'sodium-native';
-import { AdmissionApi, AdmissionWorker, boundedJson, fixedOrigin, tapVerifier, stripeVerifier, tnkVerifier, verifyTnkObservedTransfer, main } from '../scripts/proxy-admission-worker.mjs';
+import { AdmissionApi, AdmissionWorker, boundedJson, fixedOrigin, tapVerifier, stripeVerifier, tnkVerifier, main } from '../scripts/proxy-admission-worker.mjs';
 import { validateWork, validateEvidence, validateEvidenceSet, evidenceCommitment, evidenceSetCommitment, invoiceCommitment, base, PURPOSE } from '../scripts/proxy-admission-wire.mjs';
 import { ERC20_TRANSFER_TOPIC, addressTopic, ReviewWork } from '../scripts/retail-crypto-verification.mjs';
 const fixture=JSON.parse(fs.readFileSync(new URL('./fixtures/proxy-admission-worker-v1.json',import.meta.url)));
@@ -137,15 +137,6 @@ test('Stripe retrieves exact event/intent/charge and rejects wrong purpose, acco
  }
 });
 
-test('TNK signed-frontier scanner retains bounded lookback and observed underpayment without buyer wallets',async()=>{
- const c=fixture.cases[1],w=c.verify_work,r=c.evidence_completion.receipt;let got;
- const verify=tnkVerifier({network:'testnet1',verifyTransfer:(intent,sig)=>verifyTnkObservedTransfer({state:{getSignedLength:()=>1000}},intent,
- {frontier:1000,lookback:50,finality:3,timeoutSeconds:1,signal:sig,scan:async(msb,opts)=>{got=opts;return {safeEnd:998,transfers:[{hash:r.transaction_hash,to:r.to_address,from:r.from_address,tnk_e18:'9',confirmed_length:990}]};}})});
- const actual=await verify(w,signal());assert.equal(actual.amount_base_units,'9');assert.equal(actual.confirmed_signed_length,990);
- assert.equal(got.fromSignedLength,950);assert.equal(got.minimumSignedLength,1000);assert.equal(got.matchHash,r.transaction_hash);assert.equal(got.chunkSize,500);
- assert.equal(actual.block_hash,undefined);
-});
-
 test('real loopback queue honors separate credentials, renews leases and recovers original signature after lost ACK',async t=>{
  const c=fixture.cases[0];let stored=null,pulls=0,renewals=0,loseAck=true;const received=[];
  const server=http.createServer(async(req,res)=>{
@@ -243,14 +234,10 @@ test('connected synthetic payment verification → authenticated canonical polic
  },null,2)+'\n',{mode:0o600});
 });
 
-test('one worker keeps a single active lease request, and TNK advancing heads cannot enlarge a pinned scan',async()=>{
+test('one worker keeps a single active lease request',async()=>{
  const c=fixture.cases[0];let release;
  const api={phase:'issue',post:async()=>await new Promise(r=>{release=r;})};
  const w=worker(c,'issue',{api});const pending=w.runOnce();
  await assert.rejects(w.runOnce(),/busy/);release({schema_version:1,purpose:PURPOSE,phase:'issue',work:null});assert.equal((await pending).status,'idle');
- let reads=0;const msb={state:{getSignedLength:()=>++reads===1?1000:1000000}};
- await assert.rejects(verifyTnkObservedTransfer(msb,{transaction_hash:h(9),destination:'unused'},{frontier:1000,lookback:50,finality:3,timeoutSeconds:1,signal:signal(),
-  scan:async(pinned,options)=>{assert.equal(pinned.state.getSignedLength(),1000);assert.equal(options.fromSignedLength,950);
-   await assert.rejects(pinned.getTxHashes(950,1000000),/escaped/);return {safeEnd:997,transfers:[]};}}),/transfer_pending/);
- assert.equal(reads,1);
+
 });

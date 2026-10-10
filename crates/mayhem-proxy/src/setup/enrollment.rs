@@ -168,6 +168,8 @@ pub struct EnrollmentResult {
     pub invoice: Option<EnrollmentInvoice>,
     pub checkout_url: Option<String>,
     pub entitlement_id: Option<Digest>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_code: Option<String>,
     pub original_operation_matches: bool,
     pub authorizes_publication: bool,
 }
@@ -371,6 +373,7 @@ impl EnrollmentClient {
             invoice: None,
             checkout_url: None,
             entitlement_id: None,
+            review_code: None,
             original_operation_matches: false,
             authorizes_publication: false,
         };
@@ -411,6 +414,7 @@ impl EnrollmentClient {
                 report.original_operation_matches =
                     invoice.initial_operation_digest == self.operation;
                 report.state = invoice.payment_status.clone();
+                report.review_code = invoice.review_code.clone();
                 report.invoice = Some(invoice);
             }
             Some("admitted") => {
@@ -421,11 +425,20 @@ impl EnrollmentClient {
                     purpose: String,
                     state: String,
                     entitlement_id: Digest,
+                    review_code: Option<String>,
                 }
                 let v: Admitted = serde_json::from_value(raw).map_err(|_| Error::Invalid)?;
                 require(v.schema_version == 1 && v.purpose == PURPOSE)?;
+                require(v.review_code.as_ref().is_none_or(|code| {
+                    !code.is_empty()
+                        && code.len() <= 100
+                        && code
+                            .bytes()
+                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                }))?;
                 report.state = v.state;
                 report.entitlement_id = Some(v.entitlement_id);
+                report.review_code = v.review_code;
             }
             Some("no_local_invoice") => {
                 require(
@@ -537,5 +550,73 @@ impl EnrollmentInvoice {
             )?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod admitted_review_tests {
+    use super::*;
+
+    #[test]
+    fn admitted_review_preserves_entitlement_without_authorizing_publication() {
+        let client = EnrollmentClient {
+            client: reqwest::Client::new(),
+            base: url::Url::parse("https://admission.invalid").unwrap(),
+            network: Identity {
+                network_id: "test".into(),
+                msb_bootstrap: "11".repeat(32),
+                subnet_bootstrap: "22".repeat(32),
+                contract_version: 30,
+            },
+            provider: Digest::new("33".repeat(32)).unwrap(),
+            operation: Digest::new("44".repeat(32)).unwrap(),
+            timeout_ms: 1000,
+        };
+        let admitted = json!({"schema_version":1,"purpose":PURPOSE,"state":"admitted","entitlement_id":"55".repeat(32)});
+        for action in [EnrollmentAction::Create, EnrollmentAction::Status] {
+            for review in [None, Some("stripe_reversal_review")] {
+                let mut input = admitted.clone();
+                if let Some(code) = review {
+                    input["review_code"] = json!(code);
+                }
+                let report = client
+                    .result(action, &serde_json::to_vec(&input).unwrap())
+                    .unwrap();
+                assert_eq!(report.state, "admitted");
+                assert_eq!(
+                    report.entitlement_id.as_ref().unwrap().as_str(),
+                    "55".repeat(32)
+                );
+                assert_eq!(report.review_code.as_deref(), review);
+                assert!(report.invoice.is_none() && report.checkout_url.is_none());
+                assert!(!report.authorizes_publication && !report.original_operation_matches);
+                let wire = serde_json::to_value(&report).unwrap();
+                assert_eq!(wire.get("review_code"), input.get("review_code"));
+            }
+        }
+        for code in [
+            json!(""),
+            json!("x".repeat(101)),
+            json!("<script>"),
+            json!("UPPER"),
+            json!(42),
+        ] {
+            let mut input = admitted.clone();
+            input["review_code"] = code;
+            assert!(client
+                .result(
+                    EnrollmentAction::Status,
+                    &serde_json::to_vec(&input).unwrap()
+                )
+                .is_err());
+        }
+        let mut unexpected = admitted;
+        unexpected["extra"] = json!(true);
+        assert!(client
+            .result(
+                EnrollmentAction::Status,
+                &serde_json::to_vec(&unexpected).unwrap()
+            )
+            .is_err());
     }
 }

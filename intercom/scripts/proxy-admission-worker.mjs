@@ -9,7 +9,9 @@ import { performance } from 'node:perf_hooks';
 import { proxyAdmissionSigningBytes, proxyCanonicalSigningBytes, verifyProxyAdmissionPermit } from '../contract/proxy-protocol.js';
 import { validateProxySnapshotProof } from '../features/mayhem/proxy-canonical-view.js';
 import { PURPOSE, base, need, shape, hex, uint, validateNetwork, validateWork, validateEvidence, validateEvidenceSet, evidenceCommitment, validateReceipt, evidenceSeed, evidenceAppend, EVIDENCE_PROGRESS_DOMAIN, EVIDENCE_PAGE_SIZE, amount } from './proxy-admission-wire.mjs';
-import { RetryWork, ReviewWork, verifyTapTransferReceipt, parseHexInt, tnkVerificationWindow } from './retail-crypto-verification.mjs';
+import { verifyTnkObservedTransfer } from './proxy-admission-tnk.mjs';
+export { verifyTnkObservedTransfer } from './proxy-admission-tnk.mjs';
+import { RetryWork, ReviewWork, verifyTapTransferReceipt, parseHexInt } from './retail-crypto-verification.mjs';
 
 export function fixedOrigin(value, { allowLoopbackHttp = false } = {}) {
   const u = new URL(value);
@@ -297,32 +299,6 @@ export function tnkVerifier({network,verifyTransfer}) {
   };
 }
 
-// Existing signed transfer scanner, with explicit bounded frontier and no
-// synthetic block hash presented as evidence. Amount is observed independently.
-export async function verifyTnkObservedTransfer(msb,intent,{frontier,lookback,finality,timeoutSeconds,signal,scan=null}) {
-  need(uint(frontier,1)&&uint(lookback,1)&&lookback<=100000&&uint(finality,1)&&uint(timeoutSeconds,1)&&timeoutSeconds<=10,'invalid TNK observation bounds');
-  const {waitForMinimumSignedLength}=await import('./msb-reader-catchup.mjs');
-  const sleep=ms=>new Promise((resolve,reject)=>{const timer=setTimeout(done,ms);function done(){signal.removeEventListener('abort',abort);resolve();}function abort(){clearTimeout(timer);reject(signal.reason);}signal.addEventListener('abort',abort,{once:true});});
-  const confirmed=await waitForMinimumSignedLength(msb.state,{minimumSignedLength:frontier,timeoutSec:timeoutSeconds,sleepImpl:sleep});
-  if(signal.aborted)throw signal.reason;
-  if(confirmed<frontier)throw new RetryWork('reader_unavailable',30);
-  const {scanMsbTransfers}=scan?{scanMsbTransfers:scan}:await import('./tnk-deposit-watcher.mjs');
-  const window=tnkVerificationWindow(confirmed,lookback);
-  // Freeze the signed frontier for this bounded read. A rapidly advancing
-  // reader cannot expand this request beyond its configured lookback.
-  const pinned={state:{getSignedLength:()=>confirmed},
-    getTxHashes:async(start,end)=>{need(start>=window.fromSignedLength&&end<=confirmed&&end-start<=500,'TNK scan escaped its bound');if(signal.aborted)throw signal.reason;return await msb.getTxHashes(start,end);},
-    getTxDetails:async(hash)=>{need(hash===intent.transaction_hash,'TNK lookup escaped exact reference');if(signal.aborted)throw signal.reason;return await msb.getTxDetails(hash);}};
-  const result=await scanMsbTransfers(pinned,{...window,finalitySignedLengths:finality,chunkSize:500,timeoutSec:timeoutSeconds,matchHash:intent.transaction_hash,sleepImpl:sleep});
-  if(signal.aborted)throw signal.reason;
-  const matches=result.transfers.filter(t=>t.hash===intent.transaction_hash);
-  if(matches.length===0)throw new RetryWork('transfer_pending',20);
-  need(matches.length===1,'TNK transfer identity duplicated');const t=matches[0];
-  if(Number(t.confirmed_length)>result.safeEnd)throw new RetryWork('awaiting_finality',20,true);
-  need(String(t.to)===intent.destination,'TNK destination differs');
-  return {finalized:true,transactionHash:t.hash,tokenAmountBaseUnits:BigInt(t.tnk_e18),fromAddress:String(t.from),toAddress:String(t.to),blockNumber:BigInt(t.confirmed_length)};
-}
-
 export async function main(env=process.env) {
   // Disabled unless an operator explicitly selects a custody role/config.
   if(env.PROXY_ADMISSION_WORKER_ENABLED!=='1') throw new Error('Admission worker disabled');
@@ -370,7 +346,7 @@ export async function main(env=process.env) {
       };
       verifyReceipt=tnkVerifier({network:v.network,verifyTransfer:async(intent,signal)=>{
         const frontier=await canonicalFrontier(signal);
-        return await verifyTnkObservedTransfer(msb,intent,{frontier,lookback:v.lookback,finality:v.finality,timeoutSeconds:v.reader_timeout_seconds,signal});
+        return await verifyTnkObservedTransfer(msb,intent,{frontier,finality:v.finality,timeoutSeconds:v.reader_timeout_seconds,signal,addressPrefix:config.addressPrefix});
       }});
       if(c.discovery_enabled===true){
         const {tnkDiscovery,AdmissionDiscoveryWorker}=await import('./proxy-admission-discovery.mjs');
