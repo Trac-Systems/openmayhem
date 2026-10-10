@@ -61,14 +61,15 @@ test('actual RPC uses authenticated policy relay; altered request, stale nonce a
   if(mode==='network')previous.context.network_id='999';
   if(mode==='msb_network')previous.msb_snapshot.network_id='999';
   if(mode==='msb_stale')previous.msb_snapshot.observed_at_ms-=20000;
-  return structuredClone(previous);
+  return { ...structuredClone(previous), relayed:true, request_id:h(98) };
  };
  peer.protocol={instance:{features:{mayhem:client}}};
  const server=createServer(peer);await new Promise(r=>server.listen(0,'127.0.0.1',r));t.after(()=>new Promise(r=>server.close(r)));
  const query={request_nonce:h(1)},before=f.base.local.length;
  const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/proxy/admission-policy`,{method:'POST',body:JSON.stringify(query),headers:{'content-type':'application/json'}});
  assert.equal(response.status,200);const body=await response.json();assert.equal(body.request_nonce,query.request_nonce);assert.deepEqual(body.active_issuers,[f.issuer.publicKey]);
- assert.equal(msbReads,0);assert.equal(body.msb_snapshot,undefined);
+  assert.equal(msbReads,0);assert.equal(body.msb_snapshot,undefined);
+ assert.equal(Object.hasOwn(body,'relayed'),false);assert.equal(Object.hasOwn(body,'request_id'),false);
  await requestProxyAdmissionPolicy(peer,query);assert.equal(new Set(nonces).size,2);assert.ok(nonces.every(n=>n!==query.request_nonce));
  const readFrontier=canonicalAdmissionMsbReader({coreOrigin:`http://127.0.0.1:${server.address().port}`,network:f.network,
   feePolicyHash:f.config.fee_policy_hash,issuerPubkey:f.issuer.publicKey,allowLoopbackHttp:true});

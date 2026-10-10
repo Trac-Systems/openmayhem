@@ -37,7 +37,8 @@ let policyReads=0,tapReads=0;
 client.requestService=async(service,body)=>{
  const authorization=f.feature._verifyServiceRequest(service,body,{admin:f.admin.publicKey,transport:f.issuer.publicKey});
  if(!authorization)throw new Error('Fixture canonical authentication failed');
- policyReads++;return await f.feature._handleService(service,authorization.payload,authorization);
+ policyReads++;return { ...await f.feature._handleService(service,authorization.payload,authorization),
+   relayed:true,request_id:'a'.repeat(64) };
 };
 peer.protocol={instance:{features:{mayhem:client}}};
 const server=http.createServer(async(req,res)=>{

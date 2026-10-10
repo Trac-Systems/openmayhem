@@ -21,6 +21,7 @@ import { proxyRegistryFeatureKey } from '../contract/proxy-protocol.js';
 import { proxyContractFixture } from './helpers/proxy.js';
 import { createProxyCanonicalSnapshot } from '../features/mayhem/proxy-canonical-view.js';
 import { installProxyPublicationController } from '../features/mayhem/proxy-publication-transport.js';
+import { discoverProxyCatalog } from '../src/rpc.js';
 
 class HexWallet extends PeerWallet {
   get publicKey() {
@@ -565,6 +566,13 @@ test('proxy preflight and publication cross signed Protomux into the actual cano
   assert.equal(discovery.entries.length, 1);
   assert.deepEqual(discovery.entries[0].value, f.market);
   assert.equal(discovery.proof.signed_length, signedLength);
+  assert.equal(discovery.relayed, true, 'actual authenticated remote service response');
+  provider.protocol = { instance: { features: { mayhem: providerFeature } } };
+  const rpcDiscovery = await discoverProxyCatalog(provider, { query: { kind: 'markets', filter: { family_id: 'other' } } });
+  assert.equal(Object.hasOwn(rpcDiscovery, 'relayed'), false);
+  assert.equal(Object.hasOwn(rpcDiscovery, 'request_id'), false);
+  assert.deepEqual(rpcDiscovery.entries, discovery.entries);
+  assert.deepEqual(rpcDiscovery.proof, discovery.proof);
   assert.equal(featureAppends, 1, 'authenticated discovery cannot append a transaction');
   assert.equal(base.view.core.signedLength, signedLength);
   const againDiscovery = await providerFeature.discoverProxyCatalog({ kind: 'markets', filter: { family_id: 'other' }, since: discovery.checkpoint });

@@ -86,7 +86,8 @@ function requestsFor(actor) { return async(service,request)=>{
   if(mutation==='hold')result.session.max_spend_au='0';
   if(mutation==='signature')result.accepted.authorization.buyer_sig='0'.repeat(128);
   if(mutation==='unknown')result.unexpected='invalid';
-  return result;
+  // Match the actual remote service envelope, not only direct admin dispatch.
+  return { ...result, relayed:true, request_id:'a'.repeat(64) };
 }; }
 participant.requestService=requestsFor(f.provider);
 buyerParticipant.requestService=requestsFor(f.buyer);

@@ -398,39 +398,56 @@ export async function submitMayhemFeature(peer, body) {
   return await registered.relay(key, body.value);
 }
 
+// Remote services verify the writer's signature/challenge before attaching
+// local relay diagnostics. Those diagnostics are not fields in the canonical
+// proxy response schema. Keep the RPC payload identical on writers/readers;
+// do not mutate the authenticated response or its relay cache.
+const proxyServicePayload = result => {
+  if (!isObject(result)) throw new Error('Invalid proxy service response.');
+  const hasRelay = Object.hasOwn(result, 'relayed');
+  const hasId = Object.hasOwn(result, 'request_id');
+  if (!hasRelay && !hasId) return result;
+  if (!hasRelay || !hasId || result.relayed !== true ||
+      typeof result.request_id !== 'string' || !/^[0-9a-f]{64}$/.test(result.request_id)) {
+    throw new Error('Invalid proxy relay metadata.');
+  }
+  const { relayed, request_id, ...payload } = result;
+  return payload;
+};
+
 export async function discoverProxyCatalog(peer, body) {
   if (!isObject(body) || Object.keys(body).length !== 1 || !isObject(body.query)) throw new Error('Invalid proxy discovery body.');
   const feature = peer.protocol?.instance?.features?.mayhem;
   if (typeof feature?.discoverProxyCatalog !== 'function') throw new Error('Proxy discovery relay is not ready.');
-  return await feature.discoverProxyCatalog(body.query);
+  return proxyServicePayload(await feature.discoverProxyCatalog(body.query));
 }
 
 export async function requestProxyAdmissionPolicy(peer, body) {
   if (!isObject(body) || !['request_nonce', 'msb_frontier|request_nonce', 'provider_pubkey|request_nonce', 'provider_pubkey|recovery|request_nonce'].includes(Object.keys(body).sort().join('|'))) throw new Error('Invalid proxy admission policy query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
   if (typeof feature?.proxyAdmissionPolicy !== 'function') throw new Error('Proxy admission policy relay is not ready.');
-  return await feature.proxyAdmissionPolicy(body);
+  return proxyServicePayload(await feature.proxyAdmissionPolicy(body));
 }
 
 export async function requestProxyProviderState(peer, body) {
   if (!isObject(body) || Object.keys(body).sort().join('|') !== 'initial_operation_digest|provider_pubkey|request_nonce') throw new Error('Invalid proxy provider query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
   if (typeof feature?.proxyProviderState !== 'function') throw new Error('Proxy provider relay is not ready.');
-  return await feature.proxyProviderState(body);
+  return proxyServicePayload(await feature.proxyProviderState(body));
 }
 
 export async function requestProxyOperatorState(peer, body) {
   if (!isObject(body) || Object.keys(body).sort().join('|') !== 'provider_pubkey|request_nonce') throw new Error('Invalid proxy operator query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
   if (typeof feature?.proxyOperatorState !== 'function') throw new Error('Proxy operator relay is not ready.');
-  return await feature.proxyOperatorState(body);
+  return proxyServicePayload(await feature.proxyOperatorState(body));
 }
 
 export async function requestProxyIntentState(peer, body) {
   if (!isObject(body) || Object.keys(body).sort().join('|') !== 'intent|request_nonce') throw new Error('Invalid proxy intent query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
   if (typeof feature?.proxyIntentState !== 'function') throw new Error('Proxy intent relay is not ready.');
-  return await feature.proxyIntentState(body);
+  return proxyServicePayload(await feature.proxyIntentState(body));
 }
 
 export async function requestProxyOfferState(peer, body) {
@@ -439,21 +456,21 @@ export async function requestProxyOfferState(peer, body) {
   if (!isObject(body) || Object.keys(body).sort().join('|') !== fields) throw new Error('Invalid proxy offer query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
   if (typeof feature?.proxyOfferState !== 'function') throw new Error('Proxy offer relay is not ready.');
-  return await feature.proxyOfferState(body);
+  return proxyServicePayload(await feature.proxyOfferState(body));
 }
 
 export async function requestProxyQuoteState(peer, body) {
   if (!isObject(body) || Object.keys(body).sort().join('|') !== 'billing_id|offer|rail|request_nonce|settlement_policy_hash') throw new Error('Invalid proxy quote query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
   if (typeof feature?.proxyQuoteState !== 'function') throw new Error('Proxy quote relay is not ready.');
-  return await feature.proxyQuoteState(body);
+  return proxyServicePayload(await feature.proxyQuoteState(body));
 }
 
 export async function requestProxyFinancialState(peer, body) {
   if (!isObject(body) || Object.keys(body).sort().join('|') !== 'accepted_terms|request_nonce') throw new Error('Invalid proxy financial query.');
   const feature = peer.protocol?.instance?.features?.mayhem;
   if (typeof feature?.proxyFinancialState !== 'function') throw new Error('Proxy financial relay is not ready.');
-  return await feature.proxyFinancialState(body);
+  return proxyServicePayload(await feature.proxyFinancialState(body));
 }
 
 export async function requestStripeCheckout(peer, body) {
