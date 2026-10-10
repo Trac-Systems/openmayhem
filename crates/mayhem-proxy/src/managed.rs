@@ -436,7 +436,7 @@ impl Provider {
             serving: serving_health.borrow().clone(),
             recovery: recovery_health.borrow().clone(),
             presence: presence_health.borrow().clone(),
-            routes: BTreeMap::new(),
+            routes: snapshots(&self.monitors),
             declarations: self.declarations.snapshots(),
         });
         result
