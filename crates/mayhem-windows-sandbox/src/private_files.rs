@@ -1,4 +1,5 @@
-//! Protected local reads only. No create, write, permission repair or fallback.
+//! Protected local traversal and reads. Read APIs never create, write or repair
+//! permissions. The standalone mutation module requires a separate capability.
 //! The current user, SYSTEM and OS Administrators are the trusted principals;
 //! protection against them or a malicious kernel/filesystem is not claimed.
 use crate::{Result, WindowsSandboxError};
@@ -22,6 +23,7 @@ use windows_sys::{
 };
 use zeroize::Zeroizing;
 mod acl;
+pub(crate) mod mutation;
 #[cfg(test)]
 mod tests;
 const READ_CONTROL: u32 = 0x20000;
@@ -41,6 +43,9 @@ struct Pinned {
 }
 impl Pinned {
     fn open(path: &Path, directory: bool) -> Result<Self> {
+        Self::open_with_final_sharing(path, directory, FILE_SHARE_READ)
+    }
+    fn open_with_final_sharing(path: &Path, directory: bool, sharing: u32) -> Result<Self> {
         let text = path.to_str().ok_or_else(invalid)?;
         let (root, components) = components(text)?;
         let name = wide(&root);
@@ -99,6 +104,7 @@ impl Pinned {
                 handles.last().ok_or_else(invalid)?,
                 part,
                 !last || directory,
+                if last { sharing } else { FILE_SHARE_READ },
             )?;
             information(&file, !last || directory)?;
             acl::validate(&file, &owner, last)?;
@@ -150,7 +156,7 @@ fn components(text: &str) -> Result<(String, Vec<&str>)> {
     }
     Ok((text[..3].to_owned(), parts))
 }
-fn open_child(parent: &File, component: &str, directory: bool) -> Result<File> {
+fn open_child(parent: &File, component: &str, directory: bool, sharing: u32) -> Result<File> {
     let mut name = component.encode_utf16().collect::<Vec<_>>();
     let bytes = u16::try_from(name.len() * 2).map_err(|_| invalid())?;
     let mut name = UNICODE_STRING {
@@ -183,16 +189,7 @@ fn open_child(parent: &File, component: &str, directory: bool) -> Result<File> {
         } else {
             FILE_NON_DIRECTORY_FILE
         };
-    let status = unsafe {
-        NtOpenFile(
-            &mut handle,
-            access,
-            &attributes,
-            &mut io,
-            FILE_SHARE_READ,
-            options,
-        )
-    };
+    let status = unsafe { NtOpenFile(&mut handle, access, &attributes, &mut io, sharing, options) };
     if status < 0 || handle.is_null() || handle == INVALID_HANDLE_VALUE {
         return Err(invalid());
     }
@@ -231,11 +228,14 @@ fn identity(info: &BY_HANDLE_FILE_INFORMATION) -> (u32, u32, u32, u32, u32, u32,
     )
 }
 fn read(pinned: &Pinned, max_bytes: usize) -> Result<Zeroizing<Vec<u8>>> {
+    read_file(pinned.file(), &pinned.owner, max_bytes)
+}
+fn read_file(file: &File, owner: &[u8], max_bytes: usize) -> Result<Zeroizing<Vec<u8>>> {
     let maximum = max_bytes
         .checked_add(1)
         .and_then(|n| u64::try_from(n).ok())
         .ok_or_else(invalid)?;
-    let before = information(pinned.file(), false)?;
+    let before = information(file, false)?;
     let length = (u64::from(before.nFileSizeHigh) << 32) | u64::from(before.nFileSizeLow);
     if length > max_bytes as u64 {
         return Err(invalid());
@@ -244,18 +244,16 @@ fn read(pinned: &Pinned, max_bytes: usize) -> Result<Zeroizing<Vec<u8>>> {
     bytes
         .try_reserve_exact(usize::try_from(length).map_err(|_| invalid())?)
         .map_err(|_| invalid())?;
-    pinned
-        .file()
-        .take(maximum)
+    file.take(maximum)
         .read_to_end(&mut bytes)
         .map_err(|_| invalid())?;
     if bytes.len() as u64 != length
         || bytes.len() > max_bytes
-        || identity(&before) != identity(&information(pinned.file(), false)?)
+        || identity(&before) != identity(&information(file, false)?)
     {
         return Err(invalid());
     }
-    acl::validate(pinned.file(), &pinned.owner, true)?;
+    acl::validate(file, owner, true)?;
     Ok(bytes)
 }
 /// Read an existing private, regular, single-link local file using one stable

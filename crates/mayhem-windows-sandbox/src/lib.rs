@@ -59,6 +59,10 @@ pub type Result<T> = std::result::Result<T, WindowsSandboxError>;
 mod private_files;
 #[cfg(windows)]
 pub use private_files::{read_private_file, validate_private_directory};
+#[cfg(windows)]
+pub use private_files::mutation::{
+    CommitIdentity, LeafName, MutationError, NtfsDirectory, NtfsGuard, PendingFile, PublishMode,
+};
 
 #[cfg(windows)]
 mod platform;
