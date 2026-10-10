@@ -212,6 +212,7 @@ impl Runtime {
             .map_err(|_| unavailable())?
             .insert(binding.job_id.clone(), cancellation.clone());
         let runtime = self.clone();
+        let is_execution = request.is_some();
         let mut halted = self.halt.subscribe();
         let (reply, receive) = oneshot::channel();
         tasks.spawn(async move {
@@ -247,6 +248,20 @@ impl Runtime {
                 _ = cancellation.cancelled() => { stop.send_replace(true); operation.await },
                 _ = stop_signal(&mut halted) => { stop.send_replace(true); operation.await },
             };
+            // One bounded diagnostic per admitted execution, never per recovery
+            // poll. Only local enums and the opaque job ID are logged: no
+            // upstream strings, request contents, credentials or payment terms.
+            if is_execution {
+                if let Err(error) = &outcome {
+                    tracing::warn!(
+                        job_id = %binding.job_id,
+                        code = ?error.code,
+                        stage = ?error.stage,
+                        recovery_required = error.recovery_required,
+                        "proxy execution did not complete"
+                    );
+                }
+            }
             // No result/error string from an upstream may release money. Exact
             // canonical closure and durable output are required independently.
             let mut result = runtime.refresh_owner(&state, &binding, &owner).await;
