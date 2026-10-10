@@ -209,3 +209,56 @@ fn windows_setup_actual_factory_never_overwrites_and_invalid_input_never_publish
     assert!(!f.0.join("unvalidated").exists());
     assert!(!f.0.join("missing-bridge").exists());
 }
+
+#[tokio::test]
+#[ignore = "requires an isolated native Windows private NTFS fixture parent"]
+async fn windows_models_preview_keeps_credentials_private_cleans_before_get_and_preserves_files() {
+    use mayhem_proxy::connector::config::Operation;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let f = Fixture::new();
+    let original = std::fs::read(f.0.join("bridge-token")).unwrap();
+    for mode in 0..3 {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let credential = match mode {
+            0 => Credential::None,
+            1 => Credential::BearerFile(f.0.join("bridge-token")),
+            _ => Credential::BearerValue(zeroize::Zeroizing::new(b"synthetic-preview-key".to_vec())),
+        };
+        let client = bootstrap::models_connection(&f.0,
+            format!("http://{}/v1/", listener.local_addr().unwrap()),
+            f.choices().network_policy, credential).unwrap();
+        assert!(std::fs::read_dir(&f.0).unwrap().all(|entry|
+            !entry.unwrap().file_name().to_string_lossy().starts_with(".proxy-models-")),
+            "credential scratch is removed before any network request");
+        let serving = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut block = [0u8; 1024];
+                let n = socket.read(&mut block).await.unwrap();
+                assert!(n > 0 && request.len() + n <= 16384);
+                request.extend_from_slice(&block[..n]);
+                if request.windows(4).any(|v| v == b"\r\n\r\n") { break; }
+            }
+            let request = String::from_utf8(request).unwrap().to_ascii_lowercase();
+            assert!(request.starts_with("get /v1/models http/1.1\r\n"));
+            match mode {
+                0 => assert!(!request.contains("authorization:")),
+                1 => assert!(request.contains("authorization: bearer synthetic-bridge-token\r\n")),
+                _ => assert!(request.contains("authorization: bearer synthetic-preview-key\r\n")),
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"data\":[]}").await.unwrap();
+        });
+        let response = client.send(Operation::Models, None).await.unwrap();
+        assert_eq!(response.collect_json().await.unwrap(), serde_json::json!({"data":[]}));
+        tokio::time::timeout(std::time::Duration::from_secs(5), serving).await.unwrap().unwrap();
+    }
+    // Leading whitespace passes the existing preliminary trim but is rejected
+    // by the shared connector header validator. Its private scratch still clears.
+    assert!(bootstrap::models_connection(&f.0, "https://example.com/v1/".into(),
+        mayhem_proxy::connector::config::NetworkPolicy::PublicHttps,
+        Credential::BearerValue(zeroize::Zeroizing::new(b" invalid".to_vec()))).is_err());
+    assert!(std::fs::read_dir(&f.0).unwrap().all(|entry|
+        !entry.unwrap().file_name().to_string_lossy().starts_with(".proxy-models-")));
+    assert_eq!(std::fs::read(f.0.join("bridge-token")).unwrap(), original);
+}

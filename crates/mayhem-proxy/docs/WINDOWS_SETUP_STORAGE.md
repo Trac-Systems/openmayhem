@@ -41,10 +41,12 @@ header `windows.h` is unavailable. Native Windows execution is unrun and
 release-blocking, including ACL/sharing/durability, tokenizer containment,
 database locking/restart and actual managed Run acceptance.
 
-`tests/setup_windows.rs` contains two opt-in actual factory/store fixtures:
+`tests/setup_windows.rs` contains opt-in actual factory/store/discovery fixtures:
 restart/CAS/partial-slot recovery, locking, protected reference validation,
 existing-bundle immutability, and no publication of invalid input. They perform
-no network/payment work and have not been built or run on Windows here. On a
+no payment work. Discovery uses only an isolated loopback HTTP fixture to check
+the authenticated GET and credential cleanup. They have not been built or run
+on Windows here. On a
 native Windows host with the required toolchain and a dedicated already-private
 NTFS fixture parent:
 
@@ -52,6 +54,7 @@ NTFS fixture parent:
 $env:MAYHEM_WINDOWS_SETUP_FIXTURE_PARENT = 'C:\private-fixtures'
 cargo test -p mayhem-windows-sandbox private_files::
 cargo test -p mayhem-proxy --test setup_windows -- --ignored --test-threads=1
+cargo test -p mayhem-proxy --lib runtime_directories_create_reopen -- --ignored --test-threads=1
 ```
 
 The fixture creates and removes only a random child under that supplied parent.
@@ -62,8 +65,18 @@ introduced.
 
 The exclusive redb adapter is already integrated separately; native tests must
 still prove competing-open refusal, process-death recovery and original durable
-state reopening. Pre-save credential-backed `/models` preview still has a
-Windows refusal in `bootstrap::models_connection`; it requires a separate
-protected temporary-credential lifecycle. Native Windows mayhemd/Run and fresh
-install/restart proof remain outstanding. This storage slice does not claim
-complete Windows onboarding.
+state reopening. Pre-save credential-backed `/models` preview now uses the
+same protected NTFS creation/publication and exact-file cleanup operations.
+The connector loads a sensitive header and cleanup must succeed before a usable
+client returns; no network is dispatched during credential construction. Existing
+credential files are never removed. A failed or ambiguous storage operation
+can leave a private scratch file and does not trigger deletion retries.
+
+Managed startup now creates missing runtime directories with protected NTFS
+first-create publication, and validates existing directories without permission
+repair, recursive parent creation or replacement. Supervised Windows wallet
+passwords use the same bounded protected-file reader, retaining the existing
+trailing newline handling and never placing the password in child arguments.
+Native Windows mayhemd/Run,
+these directory/credential paths, and fresh install/restart proof remain
+outstanding. Static typechecks do not establish complete Windows onboarding.

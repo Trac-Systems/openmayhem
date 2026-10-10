@@ -229,7 +229,20 @@ fn read_password(path: &Path) -> Result<String> {
     }
     Ok(value)
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn read_password(path: &Path) -> Result<String> {
+    let bytes = mayhem_proxy::connector::config::private_file(path, 8192)
+        .map_err(|_| anyhow::anyhow!("wallet password requires a protected owner-only regular file"))?;
+    let mut value = std::str::from_utf8(&bytes)
+        .map_err(|_| anyhow::anyhow!("wallet password must be UTF-8"))?
+        .to_owned();
+    if value.ends_with('\n') {
+        value.pop();
+        if value.ends_with('\r') { value.pop(); }
+    }
+    Ok(value)
+}
+#[cfg(not(any(unix, windows)))]
 fn read_password(_: &Path) -> Result<String> {
     anyhow::bail!("supervised proxy credentials require supported filesystem protection")
 }

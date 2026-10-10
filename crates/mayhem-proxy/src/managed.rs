@@ -7,6 +7,8 @@ mod declarations;
 pub use declarations::Status as DeclarationStatus;
 mod presence;
 mod recovery;
+#[cfg(windows)]
+mod windows;
 use crate::{
     attempts::{self, Digest, Journal},
     capacity,
@@ -468,7 +470,11 @@ fn private_dir(path: &Path) -> Result<()> {
         }
         Ok(())
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        windows::private_dir(path)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         Err(Error::Protection)

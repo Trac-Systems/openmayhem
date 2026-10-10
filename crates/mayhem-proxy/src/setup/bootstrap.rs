@@ -586,7 +586,11 @@ pub fn models_connection(
     drop(scratch);
     result
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod models_windows;
+#[cfg(windows)]
+pub use models_windows::models_connection;
+#[cfg(not(any(unix, windows)))]
 pub fn models_connection(
     _: &Path,
     _: String,
