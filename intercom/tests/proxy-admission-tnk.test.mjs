@@ -10,6 +10,7 @@ import { safeEncodeApplyOperation } from 'trac-msb/src/utils/protobuf/operationH
 import { bigIntTo16ByteBuffer } from 'trac-msb/src/utils/amountSerialization.js';
 import { OperationType } from 'trac-msb/src/utils/constants.js';
 import { verifyTnkObservedTransfer, tnkVerifier } from '../scripts/proxy-admission-worker.mjs';
+import { scanTnkSignedPage } from '../scripts/proxy-admission-tnk.mjs';
 
 const hash = 'ab'.repeat(32), other = 'cd'.repeat(32), addressPrefix = 'testtrac';
 const destination = PeerWallet.encodeBech32mSafe(addressPrefix, Buffer.alloc(32, 7));
@@ -29,6 +30,75 @@ async function fixture(t) {
   t.after(async () => { await view.close(); await store.close(); await fs.rm(root, { recursive: true, force: true }); });
   return { get view() { return view; }, async reopen() { await view.close(); await store.close(); await open(); } };
 }
+
+test('discovery pages all signed positions without moving reads, skips unrelated entries and excludes unsigned/newer writes', async t => {
+  const f = await fixture(t);
+  const hashes = [];
+  for (let n = 0; n < 38; n++) {
+    const key = n.toString(16).padStart(64, '0'); hashes.push(key);
+    await f.view.put(key, encoded(key));
+    if (n % 5 === 0) await f.view.put(`metadata/${n}`, Buffer.from('not a transfer'));
+  }
+  const frontier = f.view.core.signedLength;
+  await f.view.put(hash, encoded(hash)); // Outside the authoritative boundary.
+  let historyReads = 0, maximum = 0;
+  const base = { core: f.view.core, checkout(length) {
+    assert.equal(length, frontier); const snapshot = f.view.checkout(length);
+    return { createHistoryStream(options) {
+      historyReads++; maximum = Math.max(maximum, options.lt - options.gte);
+      assert.equal(options.limit, 16); return snapshot.createHistoryStream(options);
+    }, close: () => snapshot.close() };
+  } };
+  const msb = { state: { base: { view: base }, getSignedLength: () => f.view.core.signedLength },
+    getTxHashes() { throw Error('moving scan'); }, getTxDetails() { throw Error('moving payload'); } };
+  let from = 0; const found = [];
+  while (from < frontier) {
+    const p = await scanTnkSignedPage(msb, { from, frontier, signal: AbortSignal.timeout(1000), addressPrefix });
+    found.push(...p.transfers.map(x => x.transaction_hash)); from = Number(p.next_cursor);
+    assert.equal(p.proof.signed_length, frontier); assert.equal(p.proof.view_key, f.view.core.key.toString('hex'));
+    assert.equal(p.proof.tree_hash, (await f.view.core.treeHash(frontier)).toString('hex'));
+  }
+  assert.deepEqual(found, hashes); assert.equal(maximum, 16); assert.equal(historyReads, Math.ceil(frontier / 16));
+  const empty = await scanTnkSignedPage(msb, { from: frontier, frontier, signal: AbortSignal.timeout(1000), addressPrefix });
+  assert.equal(empty.transfers.length, 0); assert.equal(historyReads, Math.ceil(frontier / 16));
+});
+
+test('discovery does not advance over corrupt signed payloads or wrong transfer hashes', async t => {
+  const f = await fixture(t);
+  for (const bytes of [Buffer.from([255]), encoded(other), encoded(hash, 0n), encoded(hash, 1n, 'invalid-address'), Buffer.alloc(16385)]) {
+    await f.view.put(hash, bytes); const entry = await f.view.get(hash), frontier = f.view.core.signedLength;
+    const msb = { state: { base: { view: f.view }, getSignedLength: () => frontier } };
+    await assert.rejects(scanTnkSignedPage(msb, { from: entry.seq, frontier, signal: AbortSignal.timeout(1000), addressPrefix }));
+  }
+});
+
+test('discovery aborts a stalled Merkle read before the history stream opens', async () => {
+  const controller = new AbortController(); let started, closed = 0, opens = 0;
+  const ready = new Promise(resolve => { started = resolve; });
+  const core = { key: Buffer.alloc(32, 1), fork: 0, treeHash: () => { started(); return new Promise(() => {}); } };
+  const base = { core, checkout: () => ({ createHistoryStream() { opens++; throw Error('must not open'); }, async close() { closed++; } }) };
+  const msb = { state: { base: { view: base }, getSignedLength: () => 20 } };
+  const pending = scanTnkSignedPage(msb, { from: 1, frontier: 20, signal: controller.signal, addressPrefix });
+  await ready; controller.abort(); await assert.rejects(pending); assert.equal(opens, 0); assert.ok(closed > 0);
+});
+
+test('discovery fences fork/key changes and cancellation, always closing the snapshot', async () => {
+  for (const fault of ['fork', 'key', 'abort', 'order']) {
+    const controller = new AbortController(); let closed = 0;
+    const core = { key: Buffer.alloc(32, 1), fork: 0, treeHash: async () => Buffer.alloc(32, 2) };
+    const base = { core, checkout: () => ({ createHistoryStream() {
+      const stream = (async function* () {
+        if (fault === 'fork') core.fork++;
+        if (fault === 'key') core.key = Buffer.alloc(32, 3);
+        if (fault === 'abort') controller.abort();
+        yield { type: 'put', seq: fault === 'order' ? 100 : 1, key: hash, value: encoded() };
+      })(); stream.destroy = () => {}; return stream;
+    }, async close() { closed++; } }) };
+    const msb = { state: { base: { view: base }, getSignedLength: () => 20 } };
+    await assert.rejects(scanTnkSignedPage(msb, { from: 1, frontier: 20, signal: controller.signal, addressPrefix }));
+    assert.ok(closed > 0);
+  }
+});
 
 test('an old queued TNK payment survives backlog/reopen with one exact signed read and unchanged observed amount', async t => {
   const f = await fixture(t); await f.view.put(hash, encoded());

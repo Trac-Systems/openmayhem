@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import { AdmissionDiscoveryWorker, admissionTapRpc, tapDiscovery, tnkDiscovery } from '../scripts/proxy-admission-discovery.mjs';
 import { ERC20_TRANSFER_TOPIC } from '../scripts/retail-crypto-verification.mjs';
+import { createTnkDiscoveryFixture, testTnkAddress } from './helpers/proxy-admission-tnk-fixture.mjs';
 
 const h='a'.repeat(64),hash='0x'+h,token='0x'+'b'.repeat(40),destination='0x'+'c'.repeat(40);
 const stream={rail:'tap',chain_id:31337,token_contract:token};
@@ -51,14 +52,15 @@ test('TAP empty blocks carry finalized coverage; being ahead of finality cannot 
   const ahead=await scan(work({from_cursor:'11'}),AbortSignal.timeout(1000));
   assert.deepEqual(ahead,{next_cursor:'11',next_offset:0,observations:[]});assert.equal(logReads,1);
 });
-test('TNK shares one bounded signed page, requires canonical catchup and rejects missing transaction records',async()=>{
-  const calls=[],s={rail:'tnk',network:'testnet1',msb_bootstrap:h};
-  const msb={state:{getSignedLength:()=>1000},getTxHashes:async(start,end)=>{calls.push([start,end]);return {hashes:[{hash:h,confirmed_length:12}]};},
-    getTxDetails:async()=>({address:'testtrac1sender',tro:{to:'testtrac1receiver',am:'1000000000000000000'}})};
-  const scan=tnkDiscovery({msb,network:s.network,msbBootstrap:h,frontier:async()=>1000,now:()=>100000});
-  const page=await scan(work({stream:s}),AbortSignal.timeout(1000));assert.deepEqual(calls,[[10,26]]);assert.equal(page.next_cursor,'26');assert.equal(page.observations.length,1);assert.equal(page.observations[0].position,'12');
-  msb.state.getSignedLength=()=>9;await assert.rejects(scan(work({stream:s}),AbortSignal.timeout(1000)));assert.equal(calls.length,1);
-  msb.state.getSignedLength=()=>1000;msb.getTxDetails=async()=>null;await assert.rejects(scan(work({stream:s}),AbortSignal.timeout(1000)));
+test('TNK observes payload and position from one real signed checkout and requires canonical catchup',async()=>{
+  const s={rail:'tnk',network:'testnet1',msb_bootstrap:h},destination=testTnkAddress('07'.repeat(32));
+  const f=await createTnkDiscoveryFixture({hash:h,destination});
+  try {
+    const scan=tnkDiscovery({msb:f.msb,network:s.network,msbBootstrap:h,frontier:async()=>11,now:()=>100000});
+    const page=await scan(work({stream:s}),AbortSignal.timeout(1000));
+    assert.equal(page.next_cursor,'11');assert.deepEqual(page.observations,[{destination,position:'10',transaction_hash:h,observed_at_ms:100000}]);
+    f.msb.state.getSignedLength=()=>9;await assert.rejects(scan(work({stream:s}),AbortSignal.timeout(1000)));
+  } finally {await f.close();}
 });
 test('discovery worker idle makes no chain read and a lost completion is never replaced by a guessed cursor',async()=>{
   let calls=0,scanCalls=0,posted;

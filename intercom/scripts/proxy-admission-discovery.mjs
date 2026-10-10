@@ -3,7 +3,7 @@
 import { boundedJson, fixedOrigin } from './proxy-admission-worker.mjs';
 import { need, shape, hex, uint, PURPOSE } from './proxy-admission-wire.mjs';
 import { ERC20_TRANSFER_TOPIC, parseHexInt } from './retail-crypto-verification.mjs';
-import { transferFromTxDetails } from './tnk-deposit-watcher.mjs';
+import { scanTnkSignedPage } from './proxy-admission-tnk.mjs';
 
 const cursor = value => typeof value === 'string' && /^(0|[1-9][0-9]{0,15})$/.test(value) && BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
 const ethHash = value => typeof value === 'string' && /^0x[0-9a-f]{64}$/.test(value);
@@ -104,24 +104,15 @@ export function tapDiscovery({rpc,chainId,tokenContract}) {
   };
 }
 
-export function tnkDiscovery({msb,network,msbBootstrap,frontier,now=Date.now}) {
+export function tnkDiscovery({msb,network,msbBootstrap,frontier,now=Date.now,addressPrefix=network==='mainnet'?'trac':'testtrac'}) {
   need(['mainnet','testnet1'].includes(network)&&hex(msbBootstrap)&&typeof frontier==='function','TNK discovery configuration required');
   return async(work,signal)=>{
     validateDiscoveryWork(work,{rail:'tnk',network,msb_bootstrap:msbBootstrap});need(work.from_offset===0,'TNK cursor offset differs');
     const current=await frontier(signal);need(uint(current,1)&&msb.state.getSignedLength()>=current,'TNK canonical reader behind');
-    const from=Number(work.from_cursor),end=Math.min(current,from+16);
-    need(from<=current,'TNK canonical frontier regressed');
-    const rows=await msb.getTxHashes(from,end);need(Array.isArray(rows.hashes)&&rows.hashes.length<=16,'TNK hash page exceeds bound');
-    const observations=[];let previous=from-1;
-    for(const entry of rows.hashes){
-      if(signal.aborted)throw signal.reason;
-      need(hex(entry.hash)&&uint(entry.confirmed_length)&&entry.confirmed_length>=from&&entry.confirmed_length<end&&entry.confirmed_length>previous,'TNK signed position differs');previous=entry.confirmed_length;
-      const details=await msb.getTxDetails(entry.hash);need(details,'TNK signed transaction missing');
-      const transfer=transferFromTxDetails(entry,details);
-      if(!transfer)continue;
-      need(typeof transfer.to==='string'&&transfer.to.length<=128,'TNK destination invalid');
-      observations.push({destination:transfer.to,position:String(entry.confirmed_length),observed_at_ms:now(),transaction_hash:entry.hash});
-    }
-    return {next_cursor:String(end),next_offset:0,observations};
+    const page=await scanTnkSignedPage(msb,{from:Number(work.from_cursor),frontier:current,signal,addressPrefix});
+    // Observer time remains explicit. It must not become an invented ledger
+    // timestamp or authorize unpaid quote renewal; that needs canonical barriers.
+    return {next_cursor:page.next_cursor,next_offset:0,
+      observations:page.transfers.map(transfer=>({...transfer,observed_at_ms:now()}))};
   };
 }
