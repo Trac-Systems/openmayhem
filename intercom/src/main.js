@@ -12,6 +12,7 @@ import {
 } from './rpc.js';
 import { hydrateAdminWriterViews, joinCanonicalPeers } from './admin-view-hydration.js';
 import { installFatalRuntimeErrorPolicy } from './runtime-errors.js';
+import { resolvePeerWalletFiles, loadExplicitPeerWallet } from './peer-wallet-files.js';
 import { verifyStartupReleaseIdentity } from './release-identity.js';
 import { MainSettlementBus } from 'trac-msb/src/index.js';
 import { ensureTextCodecs } from 'trac-peer/src/textCodec.js';
@@ -670,7 +671,19 @@ if (flags['wallet-helper']) {
   }
 }
 
+const peerWalletFiles = resolvePeerWalletFiles(flags);
+
 class MayhemWallet extends PeerWallet {
+  explicitWalletReady = false;
+
+  async initKeyPair(filePath, readlineInstance = null) {
+    if (!peerWalletFiles) return super.initKeyPair(filePath, readlineInstance);
+    if (!this.explicitWalletReady) {
+      await loadExplicitPeerWallet(this, peerWalletFiles);
+      this.explicitWalletReady = true;
+    }
+  }
+
   get publicKey() {
     const publicKey = super.publicKey;
     return publicKey ? b4a.toString(publicKey, 'hex') : null;
@@ -1354,7 +1367,11 @@ const peerConfig = createMayhemPeerConfig(contractNetworkEnvironment, {
 if (msbWalletEnabled) {
   await ensureKeypairFile(msbConfig.keyPairPath);
 }
-await ensureKeypairFile(peerConfig.keyPairPath);
+if (!peerWalletFiles) await ensureKeypairFile(peerConfig.keyPairPath);
+const peerWallet = new MayhemWallet({ networkPrefix: msbConfig.addressPrefix });
+// Fail a wrong password/identity before starting either network instance. The
+// default peer/store wallet path retains its existing initialization behavior.
+if (peerWalletFiles) await peerWallet.initKeyPair(peerConfig.keyPairPath);
 
 console.log('=============== STARTING MSB ===============');
 const msbWallet = await loadPeerWallet(msbConfig);
@@ -1396,7 +1413,7 @@ console.log('=============== STARTING MAYHEM PEER ===============');
 const peer = new Peer({
   config: peerConfig,
   msb,
-  wallet: new MayhemWallet({ networkPrefix: msbConfig.addressPrefix }),
+  wallet: peerWallet,
   protocol: MayhemProtocol,
   contract: MayhemContract,
 });

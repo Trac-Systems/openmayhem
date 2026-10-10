@@ -14,6 +14,21 @@ it does not accept a new inline signing key. `provider proxy catalog ...` remain
 read-only and keeps its previous command shape. No native provider is started,
 stopped, reconfigured or moved by this command.
 
+The authenticated SC-Bridge peer identity must match the proxy controller's
+signing wallet. This applies to buyers as well as providers: sharing a bridge
+from a differently identified native peer does not delegate that wallet's
+authority. A mismatch must be corrected before testing paid requests.
+
+For a separate POSIX peer using an existing encrypted wallet, the Intercom
+launcher supports explicit `--peer-wallet-key-file`,
+`--peer-wallet-password-file` and `--peer-wallet-public-key` options together.
+Use absolute protected file references and the expected public key. The peer
+loads that wallet without exporting it into its own store, verifies the identity
+before joining either network, and preserves the original encrypted file.
+Use a separate peer store and loopback bridge port; never change the key inside
+an existing ledger store. These options do not change the default native peer
+wallet path and do not currently accept Windows ACLs as POSIX protection.
+
 For automatic restart through the existing local supervisor:
 
 ```sh
