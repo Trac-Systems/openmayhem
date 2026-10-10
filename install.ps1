@@ -51,7 +51,8 @@ $Bins = @(
     "mayhem-pay",
     "mayhemd",
     "mayhem-enclave",
-    "mayhem-paygate"
+    "mayhem-paygate",
+    "mayhem-proxy-worker"
 )
 
 $script:PathEntries = @()

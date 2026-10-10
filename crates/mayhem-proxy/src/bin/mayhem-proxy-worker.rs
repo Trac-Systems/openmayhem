@@ -7,6 +7,14 @@ static ALLOCATOR: tokenizer_memory::Allocator = tokenizer_memory::Allocator::new
 fn main() {
     // Dedicated stdio executable. No inherited configuration discovery or logs.
     let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if args == ["--help"] || args == ["-h"] {
+        println!("Mayhem's supervised proxy decoder and tokenizer worker.\nManaged by OpenMayhem Core; not an independent inference server.\n\nUsage: mayhem-proxy-worker --stdio-v1 | --tokenizer-stdio-v1 | --tokenizer-stdio-v2");
+        return;
+    }
+    if args == ["--version"] || args == ["-V"] {
+        println!("mayhem-proxy-worker {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     let persistent = args == ["--tokenizer-stdio-v2"];
     let tokenizer = persistent || args == ["--tokenizer-stdio-v1"];
     if args == ["--stdio-v1"] {

@@ -22,6 +22,7 @@ BINS=(
   mayhemd
   mayhem-enclave
   mayhem-paygate
+  mayhem-proxy-worker
 )
 
 MANAGED_VERIFIER_ID="mayhem-attestation-verifier"

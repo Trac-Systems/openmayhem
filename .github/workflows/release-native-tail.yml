@@ -365,6 +365,7 @@ jobs:
           node scripts/tests/release-native-tail-workflow.test.mjs
           bash scripts/tests/attestation-verifier-install-inventory.test.sh
           bash scripts/tests/release-package-capabilities.test.sh
+          bash scripts/tests/proxy-worker-package.test.sh
           if [[ "$RUNNER_OS" == "macOS" ]]; then
             bash scripts/tests/attestation-verifier-package.test.sh
           fi

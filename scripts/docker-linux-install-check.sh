@@ -20,6 +20,7 @@ BINS=(
   mayhemd
   mayhem-enclave
   mayhem-paygate
+  mayhem-proxy-worker
 )
 
 die() {
@@ -188,7 +189,7 @@ docker run --rm \
   bash -s <<'BASH'
     set -euo pipefail
 
-    bins="mayhem mayhem-gateway mayhem-attestation-verifier mayhem-pay mayhemd mayhem-enclave mayhem-paygate"
+    bins="mayhem mayhem-gateway mayhem-attestation-verifier mayhem-pay mayhemd mayhem-enclave mayhem-paygate mayhem-proxy-worker"
 
     hash_file() {
       sha256sum "$1" | awk '{print $1}'

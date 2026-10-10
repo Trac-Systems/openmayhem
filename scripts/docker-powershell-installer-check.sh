@@ -154,10 +154,12 @@ function New-InstallerArtifact {
     $bins = @(
         "mayhem",
         "mayhem-gateway",
+        "mayhem-attestation-verifier",
         "mayhem-pay",
         "mayhemd",
         "mayhem-enclave",
-        "mayhem-paygate"
+        "mayhem-paygate",
+        "mayhem-proxy-worker"
     )
 
     $package = Join-Path $Root "mayhem-pwsh-test-aarch64-pc-windows-msvc"

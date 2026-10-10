@@ -302,7 +302,7 @@ jobs:
         run: |
           set -euo pipefail
           release_dir="target/$TARGET/release"
-          bins=(mayhem mayhem-gateway mayhem-attestation-verifier mayhem-pay mayhemd mayhem-enclave mayhem-paygate)
+          bins=(mayhem mayhem-gateway mayhem-attestation-verifier mayhem-pay mayhemd mayhem-enclave mayhem-paygate mayhem-proxy-worker)
           {
             printf '## `%s`\n\n' "$TARGET"
             printf -- '- Source: `%s`\n' "$SOURCE_SHA"

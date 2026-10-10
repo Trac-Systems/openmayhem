@@ -78,6 +78,7 @@ const bins = [
   'mayhemd',
   'mayhem-enclave',
   'mayhem-paygate',
+  'mayhem-proxy-worker',
 ];
 const sha256 = (file) =>
   crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');

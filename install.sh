@@ -41,6 +41,7 @@ BINS=(
   mayhemd
   mayhem-enclave
   mayhem-paygate
+  mayhem-proxy-worker
 )
 
 PATH_ENTRIES=()
