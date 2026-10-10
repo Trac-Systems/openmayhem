@@ -66,6 +66,56 @@ fn fixture() -> (Directory, PathBuf) {
     (dir, path)
 }
 
+#[tokio::test]
+async fn dedicated_financial_peer_preserves_network_and_wallet_guards() {
+    let (dir, path) = fixture();
+    let original = Config::load(&path).unwrap();
+    assert!(original.financial_rpc_url.is_none());
+    assert!(original.financial_client().is_ok());
+    let mut value = config();
+    value["financial_rpc_url"] = json!("http://127.0.0.1:2/v1");
+    write(&path, &serde_json::to_vec(&value).unwrap());
+    let dedicated = Config::load(&path).unwrap();
+    assert!(dedicated.financial_client().is_ok());
+    assert_eq!(dedicated.identity().unwrap(), original.identity().unwrap());
+    // Selecting a financial peer does not bypass the existing native/discovery
+    // peer binding, network pins, wallet check or journal provisioning fence.
+    assert!(prepare(
+        path.clone(),
+        network(),
+        "http://127.0.0.1:2/v1".into(),
+        key()
+    )
+    .await
+    .is_err());
+    let mut foreign = network();
+    foreign.network_id = "other".into();
+    assert!(
+        prepare(path.clone(), foreign, "http://127.0.0.1:1/v1".into(), key())
+            .await
+            .is_err()
+    );
+    assert!(prepare(
+        path.clone(),
+        network(),
+        "http://127.0.0.1:1/v1".into(),
+        SigningKey::from_bytes(&[74; 32])
+    )
+    .await
+    .is_err());
+    assert!(!dir.0.join("state").exists());
+    for invalid in [
+        "http://example.com/v1",
+        "https://user:pass@example.com/v1",
+        "https://example.com/v1?token=x",
+        "file:///tmp/peer",
+    ] {
+        value["financial_rpc_url"] = json!(invalid);
+        write(&path, &serde_json::to_vec(&value).unwrap());
+        assert!(Config::load(&path).unwrap().financial_client().is_err());
+    }
+}
+
 #[test]
 fn buyer_cli_is_separate_explicit_opt_in_with_explicit_provisioning() {
     assert!(crate::UseArgs::try_parse_from(["use"])

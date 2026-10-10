@@ -163,6 +163,10 @@ struct Config {
     network: discovery::Identity,
     buyer_pubkey: Digest,
     peer_rpc_url: String,
+    /// Optional wallet-owning peer for authenticated proxy finance. The main
+    /// gateway peer remains the canonical discovery/native read source.
+    #[serde(default)]
+    financial_rpc_url: Option<String>,
     state_dir: PathBuf,
     worker_program: PathBuf,
     bridge: mayhem_gateway::openai::proxy_control::Bridge,
@@ -254,6 +258,17 @@ impl Config {
             subnet_bootstrap: Digest::new(&self.network.subnet_bootstrap)?,
             controller_pubkey: self.buyer_pubkey.clone(),
         })
+    }
+    fn financial_client(&self) -> Result<financial::Client> {
+        financial::Client::new(
+            self.financial_rpc_url
+                .as_deref()
+                .unwrap_or(&self.peer_rpc_url),
+            self.network.clone(),
+            self.buyer_pubkey.as_str().to_owned(),
+            self.financial_reads,
+        )
+        .map_err(|_| anyhow!("invalid proxy buyer financial client"))
     }
     fn policy(&self) -> Result<proxy_request::Policy> {
         let hash = self
@@ -369,15 +384,10 @@ pub async fn prepare(
                 .map_err(|_| anyhow!("proxy buyer decoder protection or limits failed"))?,
         );
         let bridge = config.bridge()?;
-        let client = Arc::new(
-            financial::Client::new(
-                &config.peer_rpc_url,
-                config.network.clone(),
-                config.buyer_pubkey.as_str().to_owned(),
-                config.financial_reads,
-            )
-            .map_err(|_| anyhow!("invalid proxy buyer financial client"))?,
-        );
+        // Every financial observation still binds the configured canonical
+        // network and buyer wallet. A separate peer is not a separate ledger,
+        // payment identity, budget, or permission to trust upstream responses.
+        let client = Arc::new(config.financial_client()?);
         let negotiation = Arc::new(BuyerNegotiation::new(
             Arc::new(NegotiationStore::open_existing(
                 config.state_dir.join(NEGOTIATION),
