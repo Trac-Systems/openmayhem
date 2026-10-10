@@ -159,7 +159,15 @@ async fn discovery_is_explicit_private_bounded_and_never_changes_or_certifies_a_
         .collect();
     assert_eq!(
         names,
-        ["draft.json", "draft.lock", "discovery.json"]
+        [
+            "draft.json",
+            if cfg!(windows) {
+                ".mayhem-ntfs.lock"
+            } else {
+                "draft.lock"
+            },
+            "discovery.json",
+        ]
             .into_iter()
             .map(str::to_owned)
             .collect()

@@ -78,7 +78,7 @@ Primary references: Linux [seccomp filtering](https://docs.kernel.org/userspace-
 [seccomp ABI and architecture caveats](https://man7.org/linux/man-pages/man2/seccomp.2.html),
 and [Rust's Linux random implementation](https://github.com/rust-lang/rust/blob/master/library/std/src/sys/random/linux.rs).
 
-## Windows: native worker acceptance; full installation gate remains
+## Windows: native worker and managed restart acceptance
 
 The decoder uses a separate, fixed-policy launcher in `mayhem-windows-sandbox`;
 the native engine's existing configurable launcher is unchanged. Unsafe Win32
@@ -176,8 +176,10 @@ recovery and concurrent launch serialization. On this host the no-network LPAC
 is refused at Winsock initialization; that is denial before connect, not evidence
 that connect itself ran. Retained v2 tokenizer initialization verifies its exact
 768 MiB Job limit and all LPAC controls; legacy one-shot v1 remains refused.
-Full install, mayhemd/Run, other Windows builds and ARM64 acceptance remain
-separate release gates. No unrestricted or weakened launch fallback is allowed.
+Guided CLI creation and actual mayhemd/Run/restart also pass on this host; see
+[Windows setup acceptance](WINDOWS_SETUP_STORAGE.md). Released-bundle installation,
+other Windows builds and ARM64 acceptance remain separate release gates. No
+unrestricted or weakened launch fallback is allowed.
 Native Linux/x86_64 acceptance passes 22 cases on
 kernel 7.0.0 with the actual current worker: filter enforcement/refusal, streaming
 decoder cancellation/capacity/backpressure, and bounded pinned tokenization.

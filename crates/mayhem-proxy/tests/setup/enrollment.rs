@@ -185,7 +185,7 @@ async fn enrollment_never_signs_a_substituted_or_extended_service_challenge() {
 /// Driven by the SITE actual Nest/Redis/PostgreSQL acceptance suite. Explicit
 /// loopback-only input and a public fixed test key; never touches a real wallet.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires SITE-orchestrated PROXY_ENROLLMENT_FIXTURE and isolated API/database"]
 async fn connected_enrollment_driver() {
     let input: Value =
         serde_json::from_str(&std::env::var("PROXY_ENROLLMENT_FIXTURE").unwrap()).unwrap();

@@ -47,8 +47,9 @@ Recovery must inspect the exact original bundle and its typed retained IDs.
 Native Windows 11 x86_64 build 26300 now has passing sandbox, protected storage,
 decoder/tokenizer, setup and conformance-store checks. The full CPU CLI also
 builds natively with MSVC; this supersedes the earlier cross-compilation-only
-evidence and missing local Windows SDK limitation. These proofs do not establish
-other Windows architectures or complete fresh-install/managed Run acceptance.
+evidence and missing local Windows SDK limitation. Guided first-bundle creation
+and actual CLI/supervisor Run/restart also pass on this host. These proofs do not
+establish other Windows architectures or installation from a released bundle.
 
 `tests/setup_windows.rs` contains opt-in actual factory/store/discovery fixtures:
 restart/CAS/partial-slot recovery, locking, protected reference validation,
@@ -88,8 +89,8 @@ passwords use the same bounded protected-file reader, retaining the existing
 trailing newline handling and never placing the password in child arguments.
 The managed-directory create/reopen/refusal test also passes on native Windows
 11 x86_64 build 26300. The seven conformance-store tests pass using private NTFS
-fixtures. Complete mayhemd/Run and fresh-install/restart proof remain separate
-requirements; these component checks do not establish complete onboarding.
+fixtures. Component storage evidence alone does not establish complete onboarding;
+the separate actual CLI/supervisor proof is described below.
 
 The Windows supervisor now implements `persistent_children_v1` using the same
 protected exclusive NTFS database boundary. The first explicit persistent child
@@ -113,3 +114,13 @@ candidate Intercom snapshot. It uses a disposable encrypted wallet and isolated
 canonical ledger/bridge fixtures, not production accounts or payment rails. Its
 Windows daemon shuts down through the fixture's bounded normal exit timer, then
 restarts; it does not terminate any installed supervisor or provider.
+
+Native acceptance now covers 52 shared setup cases: 50 factory/lifecycle cases,
+the actual guided CLI creation and the actual CLI/supervisor Run/restart. The
+separate SITE-orchestrated enrollment driver needs its API/database fixture and
+is not part of this native-only run. Two supervisor persistence tests cover exact
+reopening and refusal of missing, empty, corrupt, foreign and aliased storage.
+The Run proof restores one original child/configuration and preserves both spent
+probe attempts; it does not silently renew the allowance. The same Run test passes
+on macOS. These use synthetic loopback peers/upstreams and prove no real payment,
+external provider capacity or production release.
