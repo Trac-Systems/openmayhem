@@ -555,8 +555,9 @@ offer or running process is not proof of available capacity.
 Follow the [setup and recovery guide](crates/mayhem-proxy/docs/SETUP_WIZARD.md)
 for admission, Run, offer-only rate changes and health from the correct control
 instance, or the [dashboard guide](crates/mayhem-proxy/docs/SETUP_DASHBOARD.md).
-Those guides state the tested OS boundaries: native Windows enforcement and
-complete first-run acceptance remain release gates, not inferred from packaging.
+Those guides state the tested OS boundaries. Native Windows worker enforcement
+is verified on the documented host; complete first-run/managed-service acceptance
+and other OS targets remain release gates, not inferred from packaging.
 
 ### Native providers
 

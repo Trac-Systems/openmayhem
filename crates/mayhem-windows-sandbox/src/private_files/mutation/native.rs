@@ -6,7 +6,7 @@ use windows_sys::{
         Security::Authorization::{
             ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
         },
-        System::{SystemServices::FILE_PERSISTENT_ACLS, IO::OVERLAPPED},
+        System::{IO::OVERLAPPED, SystemServices::FILE_PERSISTENT_ACLS},
     },
 };
 
@@ -105,6 +105,7 @@ fn open(
         sharing,
         write_through,
         false,
+        true,
     )
 }
 fn open_at(
@@ -116,8 +117,9 @@ fn open_at(
     sharing: u32,
     write_through: bool,
     directory: bool,
+    private_parent: bool,
 ) -> Outcome<Option<File>> {
-    acl::validate(parent, owner, true).map_err(|_| MutationError::Protection)?;
+    acl::validate(parent, owner, private_parent).map_err(|_| MutationError::Protection)?;
     let security = descriptor(owner)?;
     let mut wide_name = name.0.encode_utf16().collect::<Vec<_>>();
     let length = u16::try_from(wide_name.len() * 2).map_err(|_| MutationError::Invalid)?;
@@ -206,6 +208,7 @@ pub(super) fn create_directory(parent: &File, owner: &[u8], name: &LeafName) -> 
         FILE_SHARE_READ | FILE_SHARE_WRITE,
         true,
         true,
+        true,
     )?
     .ok_or(MutationError::Protection)
 }
@@ -219,6 +222,7 @@ pub(super) fn create_staged_file(parent: &File, owner: &[u8], name: &LeafName) -
         FILE_SHARE_READ,
         true,
         false,
+        true,
     )?
     .ok_or(MutationError::Protection)
 }
@@ -232,7 +236,11 @@ pub(in crate::private_files) fn database_file(
     open(
         pinned,
         name,
-        if existing { nt::FILE_OPEN } else { nt::FILE_OPEN_IF },
+        if existing {
+            nt::FILE_OPEN
+        } else {
+            nt::FILE_OPEN_IF
+        },
         GENERIC_READ | GENERIC_WRITE,
         0,
         true,
@@ -253,6 +261,7 @@ pub(super) fn inspect_directory(
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
         false,
         true,
+        true,
     )
 }
 pub(super) fn lock_file(pinned: &Pinned, name: &LeafName) -> Outcome<File> {
@@ -269,6 +278,35 @@ pub(super) fn lock_file(pinned: &Pinned, name: &LeafName) -> Outcome<File> {
         return Err(MutationError::Protection);
     }
     Ok(file)
+}
+// LOCALAPPDATA can be administrator-owned. It is a pinned, protected
+// ancestor; only our newly created child must be current-user-owned/private.
+pub(super) fn startup_directory(pinned: &Pinned, name: &LeafName) -> Outcome<File> {
+    let directory = open_at(
+        pinned.file(),
+        &pinned.owner,
+        name,
+        nt::FILE_OPEN_IF,
+        FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_ADD_FILE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        true,
+        true,
+        false,
+    )?
+    .ok_or(MutationError::Protection)?;
+    flush(&directory)?;
+    Ok(directory)
+}
+pub(super) fn startup_file(pinned: &Pinned, name: &LeafName) -> Outcome<File> {
+    open(
+        pinned,
+        name,
+        nt::FILE_OPEN_IF,
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        true,
+    )?
+    .ok_or(MutationError::Protection)
 }
 pub(super) fn create_file(pinned: &Pinned, name: &LeafName) -> Outcome<File> {
     open(

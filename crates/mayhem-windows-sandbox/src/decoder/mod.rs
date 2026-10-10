@@ -10,6 +10,7 @@ use windows_sys::Win32::System::WindowsProgramming::{
     PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT, PROCESS_CREATION_CHILD_PROCESS_RESTRICTED,
 };
 
+mod identity;
 mod storage;
 mod verify;
 pub use verify::{verify_decoder_process, verify_tokenizer_process};
@@ -139,8 +140,11 @@ fn launch(
     mode: DecoderMode,
     args: &[OsString],
 ) -> Result<DecoderChild> {
-    // No profile creation: a unique SID has no writable profile/registry store.
-    let name = to_wide_null(format!("mayhem.proxy.decoder.{}", nonce()?));
+    // Register only the identity required by CreateProcess, never a writable
+    // AppContainer profile. Registration is removed before the child resumes.
+    // Windows limits AppContainer names to 64 characters. The generated
+    // name reserves a fixed prefix and over 200 bits of independent entropy.
+    let name = identity::name()?;
     let mut sid = null_mut();
     let hr = unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) };
     if hr < 0 || sid.is_null() {
@@ -161,7 +165,7 @@ fn launch(
     let output = child_pipe(PipeDirection::ChildWrites)?;
     let stderr = inheritable_null_handle()?;
     let handles = [input.child.handle, output.child.handle, stderr.handle];
-    let mut attributes = AttributeList::new(5)?;
+    let mut attributes = AttributeList::new(6)?;
     attributes.update_security_capabilities(&mut caps)?;
     attributes.update_handle_list(&handles)?;
     let lpac = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
@@ -220,6 +224,23 @@ fn launch(
     {
         return Err(last_error("decoder job limits"));
     }
+    // Assign the kill-on-close Job atomically at creation. Parent death in the
+    // suspended-startup window must not leave an unowned suspended process.
+    let jobs = [job.handle];
+    if unsafe {
+        UpdateProcThreadAttribute(
+            attributes.ptr,
+            0,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST as usize,
+            jobs.as_ptr() as _,
+            size_of_val(&jobs),
+            null_mut(),
+            null(),
+        )
+    } == 0
+    {
+        return Err(last_error("decoder creation job"));
+    }
     let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
     startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
     startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
@@ -230,8 +251,9 @@ fn launch(
     let program = to_wide_null(image.program.as_os_str());
     let directory = to_wide_null(image.directory.as_os_str());
     let mut command = windows_command_line_os(image.program.as_os_str(), args);
-    let environment = [0u16, 0];
+    let environment = identity::environment()?;
     let mut process: PROCESS_INFORMATION = unsafe { zeroed() };
+    let mut registration = identity::Registration::new(&sid, &name)?;
     if unsafe {
         CreateProcessW(
             program.as_ptr(),
@@ -242,7 +264,7 @@ fn launch(
             EXTENDED_STARTUPINFO_PRESENT
                 | CREATE_SUSPENDED
                 | CREATE_UNICODE_ENVIRONMENT
-                | CREATE_NO_WINDOW,
+                | DETACHED_PROCESS,
             environment.as_ptr() as _,
             directory.as_ptr(),
             &startup as *const _ as _,
@@ -261,11 +283,23 @@ fn launch(
         code: None,
         _image: image,
     };
-    if unsafe { AssignProcessToJobObject(child.job.as_raw_handle(), child.process.as_raw_handle()) }
-        == 0
+    let mut in_job = 0;
+    if unsafe {
+        windows_sys::Win32::System::JobObjects::IsProcessInJob(
+            child.process.as_raw_handle(),
+            child.job.as_raw_handle(),
+            &mut in_job,
+        )
+    } == 0
+        || in_job == 0
     {
-        return Err(last_error("decoder job assignment"));
+        return Err(last_error("decoder creation job verification"));
     }
+    #[cfg(test)]
+    tests::crash_after_creation(&child, &name);
+    // Windows has copied the identity into the process token. Retain no
+    // registration or writable profile while processing untrusted bytes.
+    registration.remove()?;
     if unsafe { ResumeThread(thread.handle) } == u32::MAX {
         return Err(last_error("decoder resume"));
     }

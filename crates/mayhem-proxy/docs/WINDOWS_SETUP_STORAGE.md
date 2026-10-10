@@ -45,10 +45,10 @@ database locking/restart and actual managed Run acceptance.
 restart/CAS/partial-slot recovery, locking, protected reference validation,
 existing-bundle immutability, and no publication of invalid input. They perform
 no payment work. Discovery uses only an isolated loopback HTTP fixture to check
-the authenticated GET and credential cleanup. They have not been built or run
-on Windows here. On a
-native Windows host with the required toolchain and a dedicated already-private
-NTFS fixture parent:
+the authenticated GET and credential cleanup. All three pass on native Windows
+11 x86_64 build 26300, alongside the 25 protected-storage cases. On a native
+Windows host with the required toolchain and a dedicated already-private NTFS
+fixture parent:
 
 ```powershell
 $env:MAYHEM_WINDOWS_SETUP_FIXTURE_PARENT = 'C:\private-fixtures'
@@ -63,9 +63,9 @@ remain separate regression evidence. A connected bootstrap case returned Busy
 in the parallel subset and passed when run alone; no production workaround was
 introduced.
 
-The exclusive redb adapter is already integrated separately; native tests must
-still prove competing-open refusal, process-death recovery and original durable
-state reopening. Pre-save credential-backed `/models` preview now uses the
+The native storage and setup tests exercise competing-open refusal, process
+lock release, original durable reopening and restart/CAS recovery with the
+exclusive redb adapter. Pre-save credential-backed `/models` preview now uses the
 same protected NTFS creation/publication and exact-file cleanup operations.
 The connector loads a sensitive header and cleanup must succeed before a usable
 client returns; no network is dispatched during credential construction. Existing
@@ -77,6 +77,7 @@ first-create publication, and validates existing directories without permission
 repair, recursive parent creation or replacement. Supervised Windows wallet
 passwords use the same bounded protected-file reader, retaining the existing
 trailing newline handling and never placing the password in child arguments.
-Native Windows mayhemd/Run,
-these directory/credential paths, and fresh install/restart proof remain
-outstanding. Static typechecks do not establish complete Windows onboarding.
+The managed-directory create/reopen/refusal test also passes on native Windows
+11 x86_64 build 26300. The seven conformance-store tests pass using private NTFS
+fixtures. Complete mayhemd/Run and fresh-install/restart proof remain separate
+requirements; these component checks do not establish complete onboarding.

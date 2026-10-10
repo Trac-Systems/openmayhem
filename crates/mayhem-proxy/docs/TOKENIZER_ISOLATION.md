@@ -97,11 +97,13 @@ ownership; errors cannot fall back to an unrestricted parser. Legacy
 `--tokenizer-stdio-v1` is explicitly refused on Windows because its separate
 one-shot CPU guarantee is not implemented by that launcher.
 
-Windows source and safe-wrapper cross-target checks do not establish native
-enforcement or tokenizer compatibility. Native Windows execution remains unrun;
-the dedicated `windows_tokenizer` and `windows_containment` tests must pass on a
-supported native Windows host before claiming that readiness. This boundary does
-not port the Unix protected setup store or approve a tokenizer identity.
+The candidate's `windows_tokenizer` (four cases) and `windows_containment`
+(two cases) pass with the actual bundled executable on Windows 11 x86_64 build
+26300. This covers retained UTF-8 counts, exact pin rejection, source provisioning,
+heap-limit recovery, unrestricted/legacy refusal and process-slot release.
+Other Windows architectures/builds and complete installation/managed Run remain
+separate acceptance requirements. This does not approve any tokenizer identity.
+See [the containment boundary](WORKER_CONTAINMENT.md) for native security proof.
 
 Focused local checks (build the actual worker before the internal semantic cases):
 

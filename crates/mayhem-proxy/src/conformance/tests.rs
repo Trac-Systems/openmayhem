@@ -1,7 +1,9 @@
 use super::*;
 use ed25519_dalek::SigningKey;
 use serde_json::json;
-use std::{os::unix::fs::PermissionsExt, time::Duration};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+use std::time::Duration;
 fn d(n: u64) -> Digest {
     hash_value(format!("{n:064x}")).unwrap()
 }
@@ -47,10 +49,45 @@ fn config() -> Config {
         tokenizer: None,
     }
 }
+#[cfg(unix)]
 fn directory() -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
     std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     d
+}
+#[cfg(windows)]
+struct PrivateDirectory(std::path::PathBuf);
+#[cfg(windows)]
+impl PrivateDirectory {
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+#[cfg(windows)]
+impl Drop for PrivateDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+#[cfg(windows)]
+fn directory() -> PrivateDirectory {
+    use mayhem_windows_sandbox::{LeafName, NtfsDirectory};
+    let parent = std::path::PathBuf::from(
+        std::env::var_os("MAYHEM_WINDOWS_SETUP_FIXTURE_PARENT")
+            .expect("provide an isolated existing private NTFS test directory"),
+    );
+    let mut guard = NtfsDirectory::open_existing(&parent)
+        .unwrap()
+        .into_lock()
+        .unwrap();
+    let mut random = [0u8; 16];
+    getrandom::fill(&mut random).unwrap();
+    let name = format!("conformance-test-{}", blake3::hash(&random).to_hex());
+    let mut pending = guard
+        .stage_directory(LeafName::new(&format!("{name}.next")).unwrap(), &[], 0)
+        .unwrap();
+    pending.publish(LeafName::new(&name).unwrap()).unwrap();
+    PrivateDirectory(parent.join(name))
 }
 fn body(store: &Store) -> Body {
     let now = store.now_ms();
@@ -92,6 +129,10 @@ fn definition() -> registry::Definition {
     "usage":{"kind":"filter_only"},"rules":[]})).unwrap()
 }
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an isolated native Windows private NTFS fixture parent"
+)]
 fn signed_exact_index_binding_rejects_mutations_unknown_fields_and_request_class_changes() {
     let dir = directory();
     let store = Store::open(&dir.path().join("records"), network(), config()).unwrap();
@@ -144,6 +185,10 @@ fn signed_exact_index_binding_rejects_mutations_unknown_fields_and_request_class
     assert!(serde_json::from_value::<Signed>(missing).is_err());
 }
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an isolated native Windows private NTFS fixture parent"
+)]
 fn restart_and_changed_configuration_never_restore_live_samples_and_replay_does_not_renew() {
     let dir = directory();
     let path = dir.path().join("records");
@@ -181,6 +226,10 @@ fn restart_and_changed_configuration_never_restore_live_samples_and_replay_does_
     assert!(Store::open(&path, wrong, config()).is_err());
 }
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an isolated native Windows private NTFS fixture parent"
+)]
 fn expiry_quotas_and_indexed_pruning_are_bounded() {
     let dir = directory();
     let mut c = config();
@@ -194,9 +243,11 @@ fn expiry_quotas_and_indexed_pruning_are_bounded() {
     let mut second = b.clone();
     second.subject.offer_digest = d(77);
     second.session = d(44);
-    assert!(store
-        .retain(signer().conformance(second.clone()).unwrap())
-        .is_err());
+    assert!(
+        store
+            .retain(signer().conformance(second.clone()).unwrap())
+            .is_err()
+    );
     std::thread::sleep(Duration::from_millis(1100));
     assert!(matches!(
         store.lookup(&b.subject, &b.class).unwrap(),
@@ -211,6 +262,10 @@ fn expiry_quotas_and_indexed_pruning_are_bounded() {
     ));
 }
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an isolated native Windows private NTFS fixture parent"
+)]
 fn exact_mapping_does_not_grant_t4_self_test_assurance_or_unknown_assertions() {
     let dir = directory();
     let def = definition();
@@ -257,19 +312,25 @@ fn exact_mapping_does_not_grant_t4_self_test_assurance_or_unknown_assertions() {
     other
         .help
         .insert("en".into(), "different pinned meaning".into());
-    assert!(store
-        .evaluate(
-            &other,
-            &predicate,
-            &signer().conformance(b.clone()).unwrap()
-        )
-        .is_err());
+    assert!(
+        store
+            .evaluate(
+                &other,
+                &predicate,
+                &signer().conformance(b.clone()).unwrap()
+            )
+            .is_err()
+    );
     b.tester = d(77);
     let mut false_signed = signer().conformance(body(&store)).unwrap();
     false_signed.body = b;
     assert!(store.evaluate(&def, &predicate, &false_signed).is_err());
 }
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an isolated native Windows private NTFS fixture parent"
+)]
 fn speed_ranking_is_exact_rational_comparable_and_never_billing_usage() {
     let mut a = Speed {
         tokenizer: d(1),
@@ -297,6 +358,10 @@ fn speed_ranking_is_exact_rational_comparable_and_never_billing_usage() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an isolated native Windows private NTFS fixture parent"
+)]
 fn request_classes_bind_custom_controls_input_structure_and_full_schema() {
     let plain = json!({"model":"first","messages":[{"role":"user","content":"hello"}],"stream":true,"vendor_mode":"fast"});
     let class = Class::request(&plain).unwrap();
@@ -326,6 +391,10 @@ fn request_classes_bind_custom_controls_input_structure_and_full_schema() {
 }
 
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an isolated native Windows private NTFS fixture parent"
+)]
 fn forward_then_backward_wall_time_cannot_resurrect_or_freeze_a_lease() {
     let dir = directory();
     let store = Store::open(&dir.path().join("records"), network(), config()).unwrap();

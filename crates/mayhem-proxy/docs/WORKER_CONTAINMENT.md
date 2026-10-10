@@ -78,7 +78,7 @@ Primary references: Linux [seccomp filtering](https://docs.kernel.org/userspace-
 [seccomp ABI and architecture caveats](https://man7.org/linux/man-pages/man2/seccomp.2.html),
 and [Rust's Linux random implementation](https://github.com/rust-lang/rust/blob/master/library/std/src/sys/random/linux.rs).
 
-## Windows: implemented boundary, native acceptance outstanding
+## Windows: native worker acceptance; full installation gate remains
 
 The decoder uses a separate, fixed-policy launcher in `mayhem-windows-sandbox`;
 the native engine's existing configurable launcher is unchanged. Unsafe Win32
@@ -88,8 +88,9 @@ architectures refuse initialization. LPAC, child-process restrictions and every
 required mitigation must be available; unsupported systems fail before READY.
 There is no ordinary Windows process-spawn fallback.
 
-Each child receives a fresh derived AppContainer SID and no registered profile
-or writable profile directory. Less Privileged AppContainer mode removes the
+Each child receives a fresh AppContainer SID with over 200 bits of entropy.
+Its identity is registered only for suspended process creation and unregistered
+before resume; no writable AppContainer profile is created. Less Privileged AppContainer mode removes the
 broad `ALL APPLICATION PACKAGES` grant. Its only named capability is a random
 read/execute grant for one private staged bundled executable. The launcher
 copies that image once per Pool, retains it across tokenizer/decoder launches,
@@ -112,12 +113,26 @@ does not protect against that authority or certify remote-provider privacy.
 
 Creation uses an explicit three-handle inheritance list: stdin, stdout and NUL
 stderr. No job, process, image-lock or caller file handle is inherited. The child
-starts suspended, receives an unnamed Job with one active process, no breakaway,
-kill-on-close and fixed process/job committed-memory limits, then resumes.
+starts suspended and belongs to its unnamed Job atomically at creation: one
+active process, no breakaway, kill-on-close and fixed process/job committed-memory
+limits. Parent death before resume therefore kills the suspended worker too.
 The trusted host ceiling is 1 GiB for ordinary decoding and 768 MiB for the
 tokenizer mode (512 MiB counted heap plus 256 MiB for runtime/loader/stacks);
 these are committed-memory limits, not measured RSS or the parent IPC reservation.
-A failed assignment/resume kills and reaps the child.
+A failed creation-policy check or resume kills and reaps the child.
+Creation uses a detached process, avoiding a console-helper initialization path;
+stdio remains pipes. Only SystemRoot and LOCALAPPDATA enter the environment,
+without inherited PATH, temporary-directory settings or credentials.
+A private NTFS directory under LOCALAPPDATA holds one fixed 64-byte registration
+record. An OS lock serializes only registration/creation/unregistration, never
+inference. Recovery inspects only the exact recorded SID and matching name before
+replacement. It never enumerates profiles, scans history or clears an uncertain
+record. Complete malformed records fail closed; incomplete first writes cannot
+have authorized registration. No child has access to this journal.
+The child verifies effective LPAC access rather than relying on an information
+class rejected by GetTokenInformation on the native acceptance host. Extra
+OS-enforced denial of Fsctl system calls is accepted without dropping any
+required mitigation.
 Dynamic executable memory, Win32k calls, extension points, remote/low-integrity
 image loads and child creation are restricted at creation. Before parsing any
 IPC, the child checks LPAC/capability shape, stdio, Job limits and mitigations.
@@ -136,13 +151,17 @@ heap/random/clock compatibility, Job memory refusal, drop/reaping and image
 lifetime. `tests/windows_containment.rs` checks actual worker refusal outside
 the launcher and contained schema/regex preparation through the shared Pool.
 Run both on native Windows; compiling these tests is not enforcement evidence.
-No Windows runtime was available for this implementation slice, so native
-enforcement and actual decoder acceptance remain release-blocking. Retained v2
-tokenizer initialization additionally verifies its exact 768 MiB Job limit and
-all LPAC controls; legacy one-shot v1 remains refused on Windows. The separate
-Windows tokenizer tests and native enforcement are not yet proved. Protected
-provider setup storage now has protected NTFS integration; native end-to-end
-acceptance remains separate. Native Linux/x86_64 acceptance passes 22 cases on
+The candidate passes native Windows 11 x86_64 build 26300 acceptance: 44 sandbox
+and protected-storage checks plus six actual decoder/tokenizer integration checks.
+The four ignored child entry points in the sandbox suite are invoked by parent
+tests, including hard parent termination before resume, abandoned registration
+recovery and concurrent launch serialization. On this host the no-network LPAC
+is refused at Winsock initialization; that is denial before connect, not evidence
+that connect itself ran. Retained v2 tokenizer initialization verifies its exact
+768 MiB Job limit and all LPAC controls; legacy one-shot v1 remains refused.
+Full install, mayhemd/Run, other Windows builds and ARM64 acceptance remain
+separate release gates. No unrestricted or weakened launch fallback is allowed.
+Native Linux/x86_64 acceptance passes 22 cases on
 kernel 7.0.0 with the actual current worker: filter enforcement/refusal, streaming
 decoder cancellation/capacity/backpressure, and bounded pinned tokenization.
 The isolated native fixture used the original locked dependency versions and

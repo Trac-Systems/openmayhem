@@ -15,8 +15,8 @@ use windows_sys::{
     Wdk::{
         Foundation::OBJECT_ATTRIBUTES,
         Storage::FileSystem::{
-            NtOpenFile, FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
-            FILE_SYNCHRONOUS_IO_NONALERT,
+            FILE_DIRECTORY_FILE, FILE_NON_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT,
+            FILE_SYNCHRONOUS_IO_NONALERT, NtOpenFile,
         },
     },
     Win32::{Foundation::*, Storage::FileSystem::*, System::IO::IO_STATUS_BLOCK},
@@ -54,6 +54,14 @@ impl Pinned {
         Self::open_with_final_sharing(path, directory, FILE_SHARE_READ)
     }
     fn open_with_final_sharing(path: &Path, directory: bool, sharing: u32) -> Result<Self> {
+        Self::open_with_final_policy(path, directory, sharing, true)
+    }
+    fn open_with_final_policy(
+        path: &Path,
+        directory: bool,
+        sharing: u32,
+        private_leaf: bool,
+    ) -> Result<Self> {
         let text = path.to_str().ok_or_else(invalid)?;
         let (root, components) = components(text)?;
         let name = wide(&root);
@@ -115,7 +123,7 @@ impl Pinned {
                 if last { sharing } else { FILE_SHARE_READ },
             )?;
             information(&file, !last || directory)?;
-            acl::validate(&file, &owner, last)?;
+            acl::validate(&file, &owner, last && private_leaf)?;
             handles.push(file);
         }
         Ok(Self { handles, owner })

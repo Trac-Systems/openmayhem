@@ -1,6 +1,6 @@
 use super::*;
 use windows_sys::Win32::Security::*;
-use windows_sys::Win32::Storage::FileSystem::{GetFileType, FILE_TYPE_CHAR, FILE_TYPE_PIPE};
+use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_CHAR, FILE_TYPE_PIPE, GetFileType};
 use windows_sys::Win32::System::Console::{STD_INPUT_HANDLE, STD_OUTPUT_HANDLE};
 use windows_sys::Win32::System::JobObjects::*;
 
@@ -25,13 +25,18 @@ fn verify_process(exact_memory: Option<usize>) -> Result<()> {
         return Err(invalid());
     }
     let mut token = null_mut();
-    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &mut token,
+        )
+    } == 0
+    {
         return Err(invalid());
     }
     let token = HandleGuard::new(token);
-    if token_u32(token.handle, TokenIsAppContainer)? != 1
-        || token_u32(token.handle, TokenIsLessPrivilegedAppContainer)? != 1
-    {
+    if token_u32(token.handle, TokenIsAppContainer)? != 1 || !is_lpac(token.handle)? {
         return Err(invalid());
     }
     let caps = information(token.handle, TokenCapabilities)?;
@@ -100,12 +105,14 @@ fn verify_process(exact_memory: Option<usize>) -> Result<()> {
     }
     // Verify the immutable creation policies, before reading caller bytes. DWORD
     // flag layouts are defined by the matching Windows mitigation structures.
-    for (policy, flags) in [
-        (ProcessDynamicCodePolicy, 1u32),
-        (ProcessSystemCallDisablePolicy, 1u32),
-        (ProcessStrictHandleCheckPolicy, 3u32),
-        (ProcessExtensionPointDisablePolicy, 1u32),
-        (ProcessImageLoadPolicy, 7u32),
+    for (policy, flags, extra_restrictions) in [
+        (ProcessDynamicCodePolicy, 1u32, 0),
+        // Recent Windows also sets DisallowFsctlSystemCalls. This additional
+        // denial must not make an otherwise valid Win32k restriction fail.
+        (ProcessSystemCallDisablePolicy, 1u32, 4),
+        (ProcessStrictHandleCheckPolicy, 3u32, 0),
+        (ProcessExtensionPointDisablePolicy, 1u32, 0),
+        (ProcessImageLoadPolicy, 7u32, 0),
     ] {
         let mut observed = 0u32;
         if unsafe {
@@ -116,7 +123,7 @@ fn verify_process(exact_memory: Option<usize>) -> Result<()> {
                 size_of_val(&observed),
             )
         } == 0
-            || observed != flags
+            || observed & !extra_restrictions != flags
         {
             return Err(invalid());
         }
@@ -150,6 +157,58 @@ fn information(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Result<Vec<usiz
         return Err(invalid());
     }
     Ok(bytes)
+}
+
+/// Test effective access rather than relying on TokenIsLessPrivilegedAppContainer,
+/// which GetTokenInformation rejects on the native acceptance host.
+/// The ordinary identity may access both bits; the restricted identity must
+/// receive only the ALL RESTRICTED APPLICATION PACKAGES bit, never the broad
+/// ALL APPLICATION PACKAGES bit. No actual OS object is created or opened.
+pub(super) fn is_lpac(token: HANDLE) -> Result<bool> {
+    use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
+    use windows_sys::Win32::System::SystemServices::MAXIMUM_ALLOWED;
+    let mut duplicate = null_mut();
+    if unsafe { DuplicateToken(token, SecurityImpersonation, &mut duplicate) } == 0 {
+        return Err(invalid());
+    }
+    let duplicate = HandleGuard::new(duplicate);
+    let sddl = to_wide_null("O:SYG:SYD:(A;;0x3;;;WD)(A;;0x1;;;AC)(A;;0x2;;;S-1-15-2-2)");
+    let mut descriptor = null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            null_mut(),
+        )
+    } == 0
+    {
+        return Err(invalid());
+    }
+    let mut mapping: GENERIC_MAPPING = unsafe { zeroed() };
+    let mut privileges = [0usize; 32];
+    let mut bytes = size_of_val(&privileges) as u32;
+    let mut granted = 0u32;
+    let mut access = 0;
+    let result = unsafe {
+        AccessCheck(
+            descriptor,
+            duplicate.handle,
+            MAXIMUM_ALLOWED,
+            &mut mapping,
+            privileges.as_mut_ptr() as _,
+            &mut bytes,
+            &mut granted,
+            &mut access,
+        )
+    };
+    unsafe {
+        LocalFree(descriptor);
+    }
+    if result == 0 {
+        return Err(invalid());
+    }
+    Ok(access != 0 && granted == 2)
 }
 fn token_u32(token: HANDLE, class: TOKEN_INFORMATION_CLASS) -> Result<u32> {
     let value = information(token, class)?;

@@ -391,17 +391,17 @@ also insufficient proof of proxy readiness.
 ## Platform and acceptance limits
 
 Protected setup and managed configuration use platform filesystem checks, not a
-permission override. The exercised guided CLI/dashboard/Run path is macOS. Linux
-has the Unix setup path; native ARM decoder/tokenizer isolation checks do not by
-themselves prove a complete fresh installation and managed Run. Linux x86_64 also
-requires native containment acceptance; emulation is not proof. Linux worker
-startup needs supported seccomp and procfs and fails closed when containment
-cannot be installed.
+permission override. The exercised complete guided CLI/dashboard/Run path is
+macOS. Native Linux ARM and x86_64 worker/tokenizer isolation have separate
+acceptance evidence; that does not prove complete fresh installation and managed
+Run. Linux startup needs supported seccomp and procfs and fails closed when
+containment cannot be installed. Emulation alone is not proof.
 
-Windows containment and protected-storage integration are separate acceptance
-work. Native Windows decoder/tokenizer enforcement and complete first setup/Run
-remain unproven; packaging `.exe` files or cross-compiling does not establish
-support. Do not fall back to an uncontained worker or weaken file protection.
+On Windows 11 x86_64 build 26300, native protected storage and actual bundled
+decoder/tokenizer checks pass. Complete installation, mayhemd/Run, other Windows
+versions and ARM64 remain separate acceptance requirements. Packaging executable
+files or cross-compiling cannot establish those claims. Never fall back to an
+uncontained worker or weaken file protection.
 See [WORKER_CONTAINMENT.md](WORKER_CONTAINMENT.md) and
 [TOKENIZER_ISOLATION.md](TOKENIZER_ISOLATION.md) for the exact boundaries.
 

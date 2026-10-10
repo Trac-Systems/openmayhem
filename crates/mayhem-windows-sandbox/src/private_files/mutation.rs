@@ -4,6 +4,7 @@ use std::io::Write;
 mod directory;
 pub(super) mod native;
 mod recovery;
+pub(crate) mod startup;
 pub use directory::{DirectoryEntry, DirectoryIdentity, PendingDirectory};
 #[cfg(test)]
 pub(super) mod tests;

@@ -7,9 +7,21 @@ use windows_sys::Win32::Foundation::GetHandleInformation;
 use windows_sys::Win32::Security::Authorization::ConvertStringSecurityDescriptorToSecurityDescriptorW;
 use windows_sys::Win32::Storage::FileSystem::CreateDirectoryW;
 
-struct Fixture(PathBuf);
+fn file_identity(handle: HANDLE) -> Option<(u32, u32, u32)> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
+    (unsafe { GetFileInformationByHandle(handle, &mut info) } != 0).then_some((
+        info.dwVolumeSerialNumber,
+        info.nFileIndexHigh,
+        info.nFileIndexLow,
+    ))
+}
+
+pub(super) struct Fixture(pub(super) PathBuf);
 impl Fixture {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let path = std::env::temp_dir().join(format!("mayhem-decoder-test-{}", nonce().unwrap()));
         let user = current_user_sid().unwrap();
         let mut sid_text = null_mut();
@@ -115,6 +127,67 @@ fn unrestricted_process_cannot_pass_decoder_verification() {
 }
 
 #[test]
+fn effective_lpac_check_rejects_an_ordinary_appcontainer_token() {
+    use windows_sys::Win32::Security::*;
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
+    let name = to_wide_null(nonce().unwrap());
+    let mut sid = null_mut();
+    assert_eq!(
+        unsafe { DeriveAppContainerSidFromAppContainerName(name.as_ptr(), &mut sid) },
+        0
+    );
+    let sid = SidGuard::new(sid);
+    let mut parent = null_mut();
+    assert_ne!(
+        unsafe {
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_QUERY | TOKEN_DUPLICATE,
+                &mut parent,
+            )
+        },
+        0
+    );
+    let parent = HandleGuard::new(parent);
+    let module = unsafe { GetModuleHandleW(to_wide_null("kernelbase.dll").as_ptr()) };
+    let function =
+        unsafe { GetProcAddress(module, c"CreateAppContainerToken".as_ptr() as _) }.unwrap();
+    let create: unsafe extern "system" fn(
+        HANDLE,
+        *const SECURITY_CAPABILITIES,
+        *mut HANDLE,
+    ) -> i32 = unsafe { std::mem::transmute(function) };
+    let capabilities = SECURITY_CAPABILITIES {
+        AppContainerSid: sid.as_ptr(),
+        Capabilities: null_mut(),
+        CapabilityCount: 0,
+        Reserved: 0,
+    };
+    let mut token = null_mut();
+    assert_ne!(
+        unsafe { create(parent.handle, &capabilities, &mut token) },
+        0
+    );
+    let token = HandleGuard::new(token);
+    let mut is_container = 0u32;
+    let mut bytes = 0u32;
+    assert_ne!(
+        unsafe {
+            GetTokenInformation(
+                token.handle,
+                TokenIsAppContainer,
+                &mut is_container as *mut _ as _,
+                size_of_val(&is_container) as u32,
+                &mut bytes,
+            )
+        },
+        0
+    );
+    assert_eq!(is_container, 1);
+    assert!(!verify::is_lpac(token.handle).unwrap());
+}
+
+#[test]
 fn tokenizer_verifier_requires_its_exact_job_and_preserves_decoder_verification() {
     let fixture = Fixture::new();
     let launcher = fixture.launcher();
@@ -148,6 +221,7 @@ fn lpac_denies_private_files_network_processes_and_unlisted_handles() {
     let private = fixture.0.join("private.txt");
     fs::write(&private, b"synthetic canary").unwrap();
     let canary = File::open(&private).unwrap();
+    let (volume, index_high, index_low) = file_identity(canary.as_raw_handle()).unwrap();
     assert_ne!(
         unsafe {
             SetHandleInformation(
@@ -161,13 +235,27 @@ fn lpac_denies_private_files_network_processes_and_unlisted_handles() {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     listener.set_nonblocking(true).unwrap();
     let launcher = fixture.launcher();
+    // Strict-handle mitigation may terminate the process for querying an
+    // excluded handle. Isolate that check so the other authority checks run.
+    let (code, output) = finish(probe(
+        &launcher,
+        &[
+            "unlisted_handle".into(),
+            (canary.as_raw_handle() as usize).to_string(),
+            format!("{volume} {index_high} {index_low}"),
+        ],
+    ));
+    assert!(output.contains("CHECK_UNLISTED_HANDLE"), "{output}");
+    assert!(
+        code == 0xc0000008 || (code == 0 && output.contains("UNLISTED_HANDLE_DENIED")),
+        "unexpected unlisted-handle result {code:#x}: {output}"
+    );
     let child = probe(
         &launcher,
         &[
             "authority".into(),
             private.to_str().unwrap().into(),
             listener.local_addr().unwrap().to_string(),
-            (canary.as_raw_handle() as usize).to_string(),
             std::process::id().to_string(),
         ],
     );
@@ -228,6 +316,11 @@ fn image_is_immutable_shared_and_cleaned_without_workspace_grants() {
 #[test]
 #[ignore = "only entered through the real restricted launcher"]
 fn contained_probe() {
+    // Production stderr is deliberately NUL. Only this synthetic test child
+    // sends assertion diagnostics over its already captured stdout pipe.
+    std::panic::set_hook(Box::new(|info| {
+        println!("CONTAINED_TEST_FAILURE: {info}");
+    }));
     verify_decoder_process().expect("LPAC/Job/stdio/mitigation verification");
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();
@@ -250,22 +343,17 @@ fn contained_probe() {
         "authority" => {
             let path = PathBuf::from(lines.next().unwrap().unwrap());
             let address = lines.next().unwrap().unwrap().parse().unwrap();
-            let handle: usize = lines.next().unwrap().unwrap().parse().unwrap();
             let parent: u32 = lines.next().unwrap().unwrap().parse().unwrap();
-            let mut flags = 0;
-            assert_eq!(
-                unsafe { GetHandleInformation(handle as HANDLE, &mut flags) },
-                0,
-                "unlisted inheritable handle reached child"
+            assert!(
+                unsafe {
+                    OpenProcess(
+                        PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_CREATE_PROCESS,
+                        0,
+                        parent,
+                    )
+                }
+                .is_null()
             );
-            assert!(unsafe {
-                OpenProcess(
-                    PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_CREATE_PROCESS,
-                    0,
-                    parent,
-                )
-            }
-            .is_null());
             assert!(fs::read(&path).is_err());
             assert!(fs::write(&path, b"forbidden").is_err());
             assert!(fs::write(path.with_file_name("new.txt"), b"forbidden").is_err());
@@ -287,13 +375,33 @@ fn contained_probe() {
                 },
                 INVALID_HANDLE_VALUE
             );
-            assert!(TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_err());
-            assert!(TcpListener::bind("127.0.0.1:0").is_err());
-            assert!(UdpSocket::bind("127.0.0.1:0").is_err());
-            assert!(std::process::Command::new(std::env::current_exe().unwrap())
-                .arg("--list")
-                .spawn()
-                .is_err());
+            // std::net panics when Windows refuses Winsock initialization.
+            // Observe that refusal directly, instead of treating the Rust
+            // initialization assertion as a sandbox/decoder failure. The
+            // unrestricted parent already proved its loopback listener works.
+            use windows_sys::Win32::Networking::WinSock::*;
+            let mut wsa: WSADATA = unsafe { zeroed() };
+            let initialized = unsafe { WSAStartup(0x0202, &mut wsa) };
+            if initialized == 0 {
+                assert!(TcpStream::connect_timeout(&address, Duration::from_millis(300)).is_err());
+                assert!(TcpListener::bind("127.0.0.1:0").is_err());
+                assert!(UdpSocket::bind("127.0.0.1:0").is_err());
+                unsafe {
+                    WSACleanup();
+                }
+            } else {
+                assert!(
+                    matches!(initialized, WSASYSCALLFAILURE | WSAEACCES),
+                    "unexpected Winsock initialization error: {initialized}"
+                );
+                println!("WINSOCK_INITIALIZATION_DENIED");
+            }
+            assert!(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .arg("--list")
+                    .spawn()
+                    .is_err()
+            );
             let mut map = std::collections::HashMap::new();
             map.insert("clock", Instant::now());
             let mut bytes = vec![0u8; 1024 * 1024];
@@ -301,6 +409,28 @@ fn contained_probe() {
             assert!(map.contains_key("clock"));
             assert!(SystemTime::now().duration_since(UNIX_EPOCH).is_ok());
             println!("LPAC_AUTHORITY_DENIED");
+        }
+        "unlisted_handle" => {
+            let handle: usize = lines.next().unwrap().unwrap().parse().unwrap();
+            let identity = lines.next().unwrap().unwrap();
+            let parts = identity
+                .split_whitespace()
+                .map(|part| part.parse::<u32>().unwrap())
+                .collect::<Vec<_>>();
+            let expected = (parts[0], parts[1], parts[2]);
+            println!("CHECK_UNLISTED_HANDLE");
+            std::io::stdout().flush().unwrap();
+            let mut flags = 0;
+            if unsafe { GetHandleInformation(handle as HANDLE, &mut flags) } != 0 {
+                // Handle numbers can be reused by the child's own loader.
+                // Reject the inherited object, not an unrelated equal number.
+                assert_ne!(
+                    file_identity(handle as HANDLE),
+                    Some(expected),
+                    "unlisted inheritable file reached child"
+                );
+            }
+            println!("UNLISTED_HANDLE_DENIED");
         }
         "memory" => {
             let mut bytes = Vec::<u8>::new();
@@ -312,4 +442,103 @@ fn contained_probe() {
         },
         _ => panic!("unexpected fixture command"),
     }
+}
+
+pub(super) fn crash_after_creation(child: &DecoderChild, name: &[u16]) {
+    if std::env::var_os("MAYHEM_DECODER_CRASH_AT_CREATE").is_none() {
+        return;
+    }
+    println!(
+        "\nSUSPENDED {} {}",
+        unsafe { GetProcessId(child.process.as_raw_handle()) },
+        String::from_utf16(&name[..64]).unwrap()
+    );
+    std::io::stdout().flush().unwrap();
+    loop {
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+#[test]
+#[ignore = "parent invokes and kills this bounded startup fixture"]
+fn suspended_startup_parent() {
+    let root = PathBuf::from(std::env::var_os("MAYHEM_DECODER_CRASH_ROOT").unwrap());
+    let work = root.join("work");
+    fs::create_dir(&work).unwrap();
+    let launcher = DecoderLauncher::new(&std::env::current_exe().unwrap(), &work).unwrap();
+    let _child = launcher.spawn(DecoderMode::Decoder).unwrap();
+    panic!("creation failpoint was not reached");
+}
+
+#[test]
+fn parent_death_kills_worker_even_before_resume_or_registration_cleanup() {
+    use std::process::{Command, Stdio};
+    struct Parent(std::process::Child);
+    impl Drop for Parent {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let fixture = Fixture::new();
+    let mut parent = Parent(
+        Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::decoder::tests::suspended_startup_parent",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("MAYHEM_DECODER_CRASH_AT_CREATE", "1")
+            .env("MAYHEM_DECODER_CRASH_ROOT", &fixture.0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let stdout = parent.0.stdout.take().unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(std::result::Result::ok)
+        {
+            if let Some(value) = line.strip_prefix("SUSPENDED ") {
+                let _ = sender.send(value.to_owned());
+            }
+        }
+    });
+    let ready = receiver.recv_timeout(Duration::from_secs(10)).unwrap();
+    let pid = ready
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .parse::<u32>()
+        .unwrap();
+    let handle = unsafe {
+        OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_SYNCHRONIZE,
+            0,
+            pid,
+        )
+    };
+    assert!(!handle.is_null());
+    let handle = HandleGuard::new(handle);
+    assert_eq!(
+        unsafe { WaitForSingleObject(handle.handle, 0) },
+        WAIT_TIMEOUT
+    );
+    parent.0.kill().unwrap();
+    parent.0.wait().unwrap();
+    assert_eq!(
+        unsafe { WaitForSingleObject(handle.handle, 5000) },
+        0,
+        "suspended worker survived parent death"
+    );
+    // The next ordinary launch recovers that parent's exact registration and
+    // starts successfully. This also catches a leaked cross-process lock.
+    let next = Fixture::new();
+    let (code, output) = finish(probe(&next.launcher(), &["memory".into()]));
+    assert_eq!(code, 0, "{output}");
+    assert!(output.contains("JOB_MEMORY_DENIED"));
 }
