@@ -5,6 +5,8 @@ import {
   MemoryStorage,
   execute,
   executeEpochApplyFeature,
+  executePreparedEpochApplyFeature,
+  prepareEpochApplyFeature,
   makeIdentity,
   makeVerifier,
   seedSpendHold,
@@ -113,14 +115,16 @@ test('MayhemContract guardian halts epochApply on conservation failure', async (
   });
   const applyValue = epochApply(1, user.publicKey, provider.publicKey);
   await seedSpendHoldsForApply(storage, applyValue);
+  const prepared = await prepareEpochApplyFeature(contract, storage, applyValue, admin.publicKey);
   const before = storage.snapshotBytes();
 
-  const result = await executeEpochApplyFeature(
+  const result = await executePreparedEpochApplyFeature(
     contract,
     storage,
-    applyValue,
+    prepared,
     admin.publicKey
   );
+  assert.ok(result instanceof Error);
   assert.match(result.message, /guardian conservation/i);
   assert.equal(storage.snapshotBytes(), before);
 });
@@ -135,14 +139,25 @@ test('MayhemContract guardian halts epochApply on non-monotonic epochs', async (
     admin.publicKey
   );
   assert.equal(first.ok, true, first.message);
+  const prepared = await prepareEpochApplyFeature(
+    contract, storage, {
+      ...epochApply(1, user.publicKey, provider.publicKey, 2_000),
+      // Let the cadence mature so the epoch-order guard, rather than the time
+      // guard, rejects this later attempt to change an already applied epoch.
+      at: 7_200,
+      // Keep the accepted receipt snapshot instead of inventing a new index.
+      receipt_index: (await storage.get(contract.receiptEpochIndexKey(1))).value,
+    }, admin.publicKey
+  );
   const before = storage.snapshotBytes();
 
-  const replayWithChangedDelta = await executeEpochApplyFeature(
+  const replayWithChangedDelta = await executePreparedEpochApplyFeature(
     contract,
     storage,
-    epochApply(1, user.publicKey, provider.publicKey, 2_000),
+    prepared,
     admin.publicKey
   );
+  assert.ok(replayWithChangedDelta instanceof Error);
   assert.match(replayWithChangedDelta.message, /guardian monotonic epoch/i);
   assert.equal(storage.snapshotBytes(), before);
 });
@@ -152,14 +167,16 @@ test('MayhemContract guardian halts epochApply on negative balances', async () =
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, -1));
   const applyValue = epochApply(1, user.publicKey, provider.publicKey);
   await seedSpendHoldsForApply(storage, applyValue);
+  const prepared = await prepareEpochApplyFeature(contract, storage, applyValue, admin.publicKey);
   const before = storage.snapshotBytes();
 
-  const result = await executeEpochApplyFeature(
+  const result = await executePreparedEpochApplyFeature(
     contract,
     storage,
-    applyValue,
+    prepared,
     admin.publicKey
   );
+  assert.ok(result instanceof Error);
   assert.match(result.message, /guardian non-negative balance/i);
   assert.equal(storage.snapshotBytes(), before);
 });

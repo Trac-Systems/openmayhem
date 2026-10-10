@@ -11,7 +11,8 @@ import {
   MemoryStorage,
   execute,
   executeDepositFeature,
-  executeEpochApplyFeature,
+  epochApplyFeatureKey,
+  executePreparedEpochApplyFeature,
   executeRateFeature,
   makeIdentity,
   makeTxKey,
@@ -377,19 +378,20 @@ test('MayhemContract rejects admin ops before genesis admin is present', async (
     txNo += 1;
   }
 
+  const featureValue = {
+    op: 'epoch_apply', epoch: 1, at: 3_600, debits: [],
+    earnings: [{ rail: 'fiat', provider: outsider.publicKey, gross_au: '1000' }],
+  };
+  // The unauthorized call must not seed a commit/index into the empty store.
+  const prepared = { key: await epochApplyFeatureKey(contract, featureValue), value: featureValue, allocations: [] };
   const beforeFeature = storage.snapshotBytes();
-  const featureResult = await executeEpochApplyFeature(
+  const featureResult = await executePreparedEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 3_600,
-      debits: [],
-      earnings: [{ rail: 'fiat', provider: outsider.publicKey, gross_au: '1000' }],
-    },
+    prepared,
     outsider.publicKey
   );
+  assert.ok(featureResult instanceof Error);
   assert.match(featureResult.message, /admin required/i, 'epochApply feature should require genesis admin');
   assert.equal(storage.snapshotBytes(), beforeFeature, 'epochApply feature must not mutate before genesis admin');
 
@@ -450,19 +452,19 @@ test('MayhemContract keeps providers out of canonical economy and control-plane 
     txNo += 1;
   }
 
+  const featureValue = {
+    op: 'epoch_apply', epoch: 1, at: 3_600, debits: [],
+    earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '1000' }],
+  };
+  const prepared = { key: await epochApplyFeatureKey(contract, featureValue), value: featureValue, allocations: [] };
   const beforeFeature = storage.snapshotBytes();
-  const featureResult = await executeEpochApplyFeature(
+  const featureResult = await executePreparedEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      at: 3_600,
-      debits: [],
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '1000' }],
-    },
+    prepared,
     providerSender
   );
+  assert.ok(featureResult instanceof Error);
   assert.match(featureResult.message, /admin required/i, 'epochApply feature should be admin-only');
   assert.equal(storage.snapshotBytes(), beforeFeature, 'epochApply feature must not mutate state');
 

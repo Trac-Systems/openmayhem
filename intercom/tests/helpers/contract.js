@@ -375,7 +375,7 @@ async function legacyReceiptIndex(value, allocations) {
   };
 }
 
-async function legacyEpochCommit(storage, contract, value, sender, allocations) {
+async function legacyEpochCommit(storage, featureKey, value, sender, allocations) {
   const existing = await storage.get(`epoch/commit/${value.epoch}`);
   if (existing?.value?.commit_hash) return existing.value.commit_hash;
   if (value.epoch_commit_hash) return value.epoch_commit_hash;
@@ -402,17 +402,17 @@ async function legacyEpochCommit(storage, contract, value, sender, allocations) 
     provisional_until_epoch: value.epoch + 6,
     commit_hash: commitHash,
     submitted_by: sender,
-    submitted_at: contract.tx,
+    submitted_at: featureKey,
     at: value.at,
   });
   return commitHash;
 }
 
-async function legacyTargetedEpochValue(storage, contract, value, sender) {
+async function legacyTargetedEpochValue(storage, contract, value, sender, featureKey) {
   const allocations = await legacyEpochAllocations(value);
   const receiptIndex = await legacyReceiptIndex(value, allocations);
   await storage.put(contract.receiptEpochIndexKey(value.epoch), receiptIndex);
-  const epochCommitHash = await legacyEpochCommit(storage, contract, value, sender, allocations);
+  const epochCommitHash = await legacyEpochCommit(storage, featureKey, value, sender, allocations);
   return {
     value: {
       ...value,
@@ -423,26 +423,37 @@ async function legacyTargetedEpochValue(storage, contract, value, sender) {
   };
 }
 
-export async function executeEpochApplyFeature(contract, storage, value, sender) {
+// Fixture seeding is distinct from execution: no-mutation checks must snapshot
+// after preparation and exercise only the actual accounting operation.
+export async function prepareEpochApplyFeature(contract, storage, value, sender) {
+  const key = await epochApplyFeatureKey(contract, value);
+  const targeted = await legacyTargetedEpochValue(storage, contract, value, sender, key);
+  return { key, ...targeted };
+}
+
+export async function executePreparedEpochApplyFeature(contract, storage, prepared, sender) {
   const previousStorage = contract.storage;
   const previousAddress = contract.address;
   const previousValue = contract.value;
   const previousTx = contract.tx;
   contract.storage = storage;
   contract.address = sender;
-  contract.value = value;
-  contract.tx = await epochApplyFeatureKey(contract, value);
+  contract.value = prepared.value;
+  contract.tx = prepared.key;
   try {
     // Legacy-shaped vectors exercise the accounting core used by apply_targeted_epoch.
-    const targeted = await legacyTargetedEpochValue(storage, contract, value, sender);
-    contract.value = targeted.value;
-    return await contract.targetedEpochApply(targeted.value, [], targeted.allocations);
+    return await contract.targetedEpochApply(prepared.value, [], prepared.allocations);
   } finally {
     contract.storage = previousStorage;
     contract.address = previousAddress;
     contract.value = previousValue;
     contract.tx = previousTx;
   }
+}
+
+export async function executeEpochApplyFeature(contract, storage, value, sender) {
+  const prepared = await prepareEpochApplyFeature(contract, storage, value, sender);
+  return executePreparedEpochApplyFeature(contract, storage, prepared, sender);
 }
 
 export async function depositFeatureKey(contract, value) {
