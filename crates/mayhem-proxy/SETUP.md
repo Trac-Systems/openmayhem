@@ -1,11 +1,17 @@
 # Local provider setup drafts
 
+For first setup without hand-authored configuration, use the
+[guided CLI/dashboard workflow](docs/SETUP_WIZARD.md). This document describes the
+advanced draft commands used by the same workflow.
+
 The shared `mayhem_proxy::setup` library saves and reviews an explicit provider
 declaration before any wallet, upstream connection, payment or publication is
 opened. The CLI is a thin client of this same state implementation:
 
-Private file verification and locking are currently implemented for Unix.
-Other platforms fail closed; Windows permissions and setup remain unfinished.
+Private file verification and locking must succeed on the actual host. Windows
+protected-storage integration and native first-install/restart/Run acceptance
+remain separately gated; compiled code is not operational proof. See the
+[current platform limits](docs/SETUP_WIZARD.md#platform-and-acceptance-limits).
 
 ```sh
 mayhem provider proxy setup create --directory /absolute/private/setup --input /absolute/private/declaration.json

@@ -1,6 +1,8 @@
 # Explicit provider startup
 
-The candidate Core CLI supports:
+The [guided setup workflow](docs/SETUP_WIZARD.md) generates and reviews the first
+managed configuration before its explicit Run action. For an existing reviewed
+configuration, the Core CLI supports:
 
 ```sh
 mayhem provider proxy serve --config /absolute/private/provider.json --home /absolute/wallet/home
@@ -51,8 +53,9 @@ owner-only files, not symlinks or hard links. The control document is bounded to
 4 MiB; referenced connection documents to 32 KiB; bridge credentials to 8 KiB.
 Relative references resolve against the file which owns them. Errors do not echo
 credentials, upstream URLs, prompts or private paths. Filesystem protection
-currently requires Unix; Windows ACL support remains a release prerequisite for
-that platform.
+must be validated on the target platform. Windows protected-storage integration
+and complete native first-install/restart/Run acceptance remain separate release
+prerequisites; do not infer support from a successful build.
 
 The explicit configuration contains:
 
@@ -80,8 +83,8 @@ The explicit configuration contains:
 
 Duration fields inherited from the internal limit types use JSON objects such as
 `{"secs":5,"nanos":0}`; fields explicitly named `_ms` use integer milliseconds.
-The provider wizard will produce this configuration; hand-authoring every field
-is not the intended final onboarding experience.
+The guided CLI and dashboard produce this configuration and review it before
+Run. The low-level commands remain available for explicit operator configuration.
 
 The loader checks files, identities, scoped groups, offer uniqueness, supported
 operations, adapter contracts, health policy and tokenizer pins before opening
@@ -126,8 +129,8 @@ Startup also publishes signed proxy availability only after current canonical
 offer/admission observation. It reports the actual remaining shared capacity,
 keeps original health/speed expiry, and attempts withdrawal at shutdown. Its
 control reads have separate permits from paid admission/settlement. See
-[PRESENCE.md](PRESENCE.md) for timing, authentication, replay protection and the
-remaining gateway integration.
+[PRESENCE.md](PRESENCE.md) for timing, authentication, replay protection and
+gateway observations.
 
 ## Evidence and remaining integration
 
@@ -138,9 +141,11 @@ decision request through reservation/result/receipt/closure on FIAT, TNK and TAP
 The three-rail tests use the canonical isolated ledger RPC fixture and ephemeral
 test wallets; they are **not live payments or real Noise-network acceptance**.
 
-Explicit foreground startup and opt-in persistent mayhemd installation are available.
-Native/external shared-runtime registration,
-provider setup UX, fee collection, gateway/catalog integration and public surfaces
-remain required. The command does not register a market, pay the admission fee
-or establish production activation. Full worker/tokenizer
-OS containment and real-model/network/rail acceptance remain release gates.
+Explicit foreground startup, guided setup and opt-in persistent mayhemd
+installation are available. The separate setup workflow handles admission
+status and exact reviewed publication; `serve`/`add` do not register a market,
+pay the admission fee or establish production activation. A retained Run does
+not automatically adopt a later price publication. Native/external shared-runtime
+registration and complete real-model/network/rail acceptance remain separate
+requirements. Worker/tokenizer containment and full setup/Run must be proved on
+each supported OS; native Windows acceptance remains outstanding.

@@ -206,10 +206,11 @@ No GPU? CPU-only machines still serve. Embeddings, small text models, and speech
 
 ### What you need installed first
 
-Every release install builds locally from source. Set up Node.js 20+ with npm,
-Rust, and the native compiler toolchain before running the installer. The source
-build compiles llama.cpp through cmake and Rust bindings through bindgen;
-missing `libclang` is the single most common source-build failure.
+The documented `--from-source` installation needs Node.js 20+ with npm, Rust
+and the native compiler toolchain. An explicitly selected authenticated binary
+release uses its packaged runtime assets instead of rebuilding locally; Node.js
+remains a runtime prerequisite. The source build compiles llama.cpp through cmake
+and Rust bindings through bindgen; missing `libclang` is the single most common source-build failure.
 
 **Every OS for a source build:**
 - Rust (stable, via [rustup](https://rustup.rs)) — `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
@@ -508,7 +509,59 @@ mayhem tokens revoke laptop      # immediate
 
 ## Providing to the network
 
-The same software and the same market serve four fairly different kinds of operation. Pick your lane; the knobs match it:
+### Proxy providers: connect an existing model server
+
+Use the explicit proxy lane for a model server you already operate or are
+permitted to use. It supports compatible chat, completions, responses and
+Decisions endpoints, plus reviewed declarative recipes. Proxy offers publish
+fixed provider prices, including per-unit rates, request fees, minimum session
+amounts and accepted payment rails. Native market-clearing prices and native
+model/media defaults remain separate.
+
+Install the complete Core package, including the sibling `mayhem-proxy-worker`.
+Use an existing private Core home/wallet, running trusted peer/SC-Bridge and,
+for persistent Run, the existing mayhemd. For LLM speed measurement supply an
+approved protected local tokenizer file; setup pins its bytes and never guesses
+or downloads it. It does not prove the remote model's identity. Decisions needs
+no tokenizer. Upstream credentials remain protected file references or write-only
+local dashboard input; never put their values in command arguments.
+
+With `MAYHEM_HOME`, `TOKENIZER_FILE` and `ADMISSION_ORIGIN` set to your chosen
+home, protected file and trusted admission service:
+
+```sh
+mayhem provider proxy setup init --home "$MAYHEM_HOME" \
+  --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
+# Resume the original saved setup:
+mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
+  --config "$MAYHEM_HOME/proxy-setup/wizard.json"
+```
+
+Alternatively use the existing local gateway's authenticated provider dashboard:
+
+```sh
+mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 --proxy-setup \
+  --proxy-setup-tokenizer-file "$TOKENIZER_FILE" \
+  --proxy-setup-admission-origin "$ADMISSION_ORIGIN"
+```
+
+Omit the tokenizer option for Decisions. Open the session URL printed by Core.
+Guided setup browses canonical families and exact create/join markets, collects
+explicit price/probe limits, and saves a private bundle. Probe, fee checkout,
+publication and Run each remain separate explicit actions. A buyer deposit does
+not pay the provider admission fee. A saved draft, payment return page, published
+offer or running process is not proof of available capacity.
+
+Follow the [setup and recovery guide](crates/mayhem-proxy/docs/SETUP_WIZARD.md)
+for admission, Run, offer-only rate changes and health from the correct control
+instance, or the [dashboard guide](crates/mayhem-proxy/docs/SETUP_DASHBOARD.md).
+Those guides state the tested OS boundaries: native Windows enforcement and
+complete first-run acceptance remain release gates, not inferred from packaging.
+
+### Native providers
+
+The native lane serves four fairly different kinds of operation. Pick your
+operating model; the knobs match it:
 
 | You are | Typical setup | How you run it |
 |---|---|---|

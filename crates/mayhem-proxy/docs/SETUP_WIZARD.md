@@ -7,25 +7,94 @@ calculate their own recipe, endpoint-contract and metering hashes. They do not
 require the operator to hand-author a recipe. Discovery lists upstream model IDs;
 it never certifies model identity, concurrency, capabilities or readiness.
 
-This checkpoint includes explicit configuration review, one bounded model-list
-read, manual/discovered model selection, full existing price-map editing,
-structural checks, reviewed bounded probes, canonical admission reads,
-provider-key invoice/create/status/checkout, exact publication review/signing,
-original probe/publication recovery, and reviewed installation/reconciliation of
-one existing managed provider controller. It does **not** pay a fee, renew a permit,
-suggest markets from a canonical directory, or implement general connection
-editing in the browser. Those remain separate work. Existing native serving and
-upstream model servers are not reconfigured. A published offer or running process
-is not proof of readiness.
+The current CLI and dashboard support guided first creation, bounded model
+listing, canonical family/market browsing, exact create or join selection,
+structural checks, explicit bounded probes, admission invoice/status/checkout,
+reviewed publication, and persistent Run/recovery. Each external action is
+separate. Saving configuration does not pay, publish, start a model server or
+establish live availability. The admission service controls fee collection and
+permit issuance; the wizard does not invent a fee or issue a permit itself.
+
+Proxy offers have provider-set prices: every unit rate, request fee, minimum
+session amount and accepted rail belongs to the exact signed offer. They do not
+use the native lane's market-clearing price. Native model startup, defaults and
+attestation remain separate. A provider declaration, model-list response, KYB
+identity or published offer does not prove the remote model's identity or privacy.
+
+## Before first setup
+
+Install one complete matching Core build, including `mayhem`, `mayhemd`,
+`mayhem-gateway`, `mayhem-proxy-worker` and its authenticated Intercom assets.
+The worker must remain beside `mayhem`; copying the CLI alone is insufficient.
+Standard recipes and dashboard pages are compiled in. Node.js 20+ is an existing
+Core runtime prerequisite; source builds also need the toolchain described in the
+[root README](../../../README.md#what-you-need-installed-first). No development
+checkout or Node development dependencies are needed by an installed wizard.
+
+Use an existing private Core home, encrypted wallet, configured trusted peer and
+SC-Bridge. Persistent Run also needs the existing running mayhemd with persistent
+child support. Setup does not create a second wallet, peer or supervisor. Have
+these operator inputs ready:
+
+- A working upstream API and permission to use it, with an exact model ID or an
+  explicitly requested model-list read. Setup does not install or restart it.
+- A protected upstream credential file, or an explicit no-authentication choice.
+  The local dashboard can instead accept a write-only bearer value.
+- For LLM endpoints, approved protected local `tokenizer.json` data. Its exact
+  bytes are imported and pinned; the tokenizer is used for speed measurement,
+  not billing or verification of the remote model. Decisions needs no tokenizer.
+- Your concurrency, price, rail, settlement and probe allowance choices. A trusted
+  admission origin is needed for enrollment; its current response supplies the
+  actual fee and collection instructions. Never substitute a buyer deposit.
+- An existing protected wallet password file for unattended restarts, if needed.
+
+The examples use `$MAYHEM_HOME` for that existing home and `$TOKENIZER_FILE` and
+`$ADMISSION_ORIGIN` for inputs you have selected. Omit the tokenizer option for
+Decisions. Add `--api-key-file PATH` for a protected upstream key reference.
+
+```sh
+mayhem provider proxy setup init --home "$MAYHEM_HOME" \
+  --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
+mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
+  --config "$MAYHEM_HOME/proxy-setup/wizard.json" --inspect
+mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
+  --config "$MAYHEM_HOME/proxy-setup/wizard.json"
+```
+
+`init` opens the wizard after saving the new bundle. Resume its existing
+`wizard.json` after interruption; do not initialize a replacement capacity store.
+`--inspect` is a local read and performs no upstream request. Use the current
+revision returned by each action, rather than assuming how far a lost response
+advanced the draft.
+
+The interactive wizard exposes these explicit steps:
+
+| Action | Meaning |
+|---|---|
+| `c` Connect; `d` Discover; `s` Select/price | Review the saved connection, request bounded listing, or save exact choices. Listing is not a probe. |
+| `k` Check; `p` Probe | Check local structure, then separately review and authorize one request within the retained cumulative allowance. |
+| `a` Admission facts | Read fresh canonical registration and operation-sequence facts; unavailable is not unpaid. |
+| `i` Invoice/create; `t` Status; `f` FIAT checkout | Create/recover the original invoice, reconcile it, or request checkout. The CLI does not send a transfer. |
+| `v` Review publication; `u` Publish | Review the exact initial create/join and offers, then explicitly sign/submit it. |
+| `r` Recover probe; `o` Recover publication | Reconcile the original retained work; no new probe or payment identity. |
+| `g` Review Run; `b` Begin Run; `h` Reconcile Run | Review the generated controller, explicitly install it, or inspect that original child. |
+
+Payment instructions and a checkout return are not payment confirmation. Status
+must reconcile the same invoice, and canonical publication must confirm the exact
+operation before Run. An admitted result with a separate financial `review_code`
+retains its admission history while exposing the review; do not erase that history
+or treat the flag as a new fee or automatic revocation.
 
 ## Configuration and identity
 
 `FlowConfig` is an owner-only JSON file (0600, no symlink). Its fields are:
 
 - `schema_version: 1`, `directory`: existing owner-only setup directory (0700).
-- `profile`: existing `ProfileInput` from `setup prepare`; normally
-  `profile: {"kind":"standard","endpoint":"openai_chat_completions"}` (or `openai_completions`,
-  `openai_responses`, `mayhem_decisions`). Network, provider public key, connection reference,
+- `profile`: the full `ProfileInput` accepted by `setup prepare`. Inside that
+  object, its own `profile` field is normally
+  `{"kind":"standard","endpoint":"openai_chat_completions"}` (or
+  `openai_completions`, `openai_responses`, `mayhem_decisions`).
+  Network, provider public key, connection reference,
   limits, exact create/join market declaration, capacity group, rails, all prices,
   sequence and settlement policy remain explicit operator choices.
 - `probe_plan`: protected existing `ProbePlan` path, or null. It binds the request,
@@ -41,6 +110,8 @@ is not proof of readiness.
   `limits`, optional `tokenizer`, and explicit `allow_recovery_probes` fields.
   No offers, price maps, adapter/recipe snapshots, routes or budgets are entered
   again: they come from the exact published draft and existing probe plan.
+- `declaration_registry`: optional trusted registry origin/settings for signed
+  data-handling declarations; see [DATA_HANDLING_SETUP.md](DATA_HANDLING_SETUP.md).
 - `timeout_ms`: 1 through 10000 for discovery/admission reads. Probe execution
   retains its separately bounded existing plan timeout.
 
@@ -59,9 +130,10 @@ mayhem provider proxy setup wizard --config /private/wizard.json --action-file /
 
 The interactive path prompts for model, new-market display label/slug, context,
 concurrency, membership/offer revisions, accepted rails and every signed price
-unit. The simple rail editor narrows each offer's existing rails. Exact market
-joining and changes to protected endpoint/identity configuration use the existing
-profile interface; neither aliases nor discovered labels become canonical proof.
+unit. The simple rail editor narrows each offer's existing rails. First-time
+create/join selection is guided as described below. Later changes to
+protected endpoint/identity configuration use the explicit profile interface;
+neither aliases nor discovered labels become canonical proof.
 Unattended actions use strict `FlowAction` JSON in an owner-only bounded file.
 Each mutation carries the current retained revision; a stale client fails. The
 same wallet locator/cache is used by existing CLI commands. Read/check actions do
@@ -78,10 +150,13 @@ home must already be owner-only. An existing bundle is always retained: resume
 its `wizard.json` rather than initialize another capacity store.
 
 The prompts collect an API base directory URL, protocol endpoint, protected
-bearer-key reference (or explicit no authentication), upstream model, canonical
-broad family ID, declared label/new-market slug, served context, shared
-concurrency, rails and every exact price unit. This slice creates a new market;
-joining remains supported through the existing explicit profile interface.
+bearer-key reference (or explicit no authentication), upstream model, served
+context, shared concurrency, rails and every exact price unit. Canonical family
+and compatible market pages support either creating a new market in an enabled
+family or joining an exact existing market. Review reads the provider operation
+sequence; final save rechecks it and the selected canonical descriptor. A failed
+read never becomes an empty catalog. Creating an already-existing exact descriptor
+is refused; select that market through join instead.
 Public HTTPS is the restricted network choice. Local/private endpoints require
 explicit CIDRs and explicit permission for plaintext HTTP; no scanning or
 destination inference occurs. The standard profile does not certify that every
@@ -89,7 +164,7 @@ claimed upstream operation or optional capability works.
 
 Use `--api-key-file` for an existing protected key reference. There is no raw-key
 argument or echoed key prompt. The shared factory additionally accepts a
-nonserializable, zeroizing write-only credential for a future local dashboard
+nonserializable, zeroizing write-only credential from the local dashboard
 form. Its output contains only a protected reference. Credentials never enter
 recipes, reviews, ledger declarations or diagnostic errors.
 
@@ -124,14 +199,17 @@ The factory writes a fresh owner-only staging directory, validates the generated
 Flow/Profile/Connection/Probe and complete managed configuration, fsyncs, and
 renames the whole bundle under a stable parent lock. Invalid input leaves no
 published bundle; concurrent creators have at most one winner. It never opens
-a capacity database or alters another setup. The shared wizard then handles
+a capacity database or alters another setup. Tokenizer validation may launch the
+contained local worker; this is not an upstream probe or a serving controller.
+The shared wizard then handles
 discovery, checks, admission, publication and Run with their existing revisions
 and explicit confirmations. There is no automatic publication or payment.
 
-This slice adds the shared factory and CLI. The authenticated dashboard still
-opens an existing configuration; connecting its initial form to this same
-factory remains the next UI integration, with the existing exact-origin/session/
-CSRF guards and no path or credential readback exposed to browser actions.
+The authenticated dashboard connects its initial form to this same factory.
+Start it with `mayhem use --proxy-setup` and the host-only options described in
+[SETUP_DASHBOARD.md](SETUP_DASHBOARD.md). Its existing exact-origin/session/CSRF
+guards expose no path or credential readback. `--proxy-setup-config` resumes an
+existing bundle and is mutually exclusive with first-time `--proxy-setup`.
 
 Focused local checks:
 
@@ -168,10 +246,13 @@ network/chain/token and quote expiry. It is a **last authenticated snapshot**, n
 live confirmation. Explicit status reconciliation recovers the same invoice.
 Checkout URLs are returned only to the requesting session and removed from the
 retained projection. Browser checkout return never marks a payment successful.
-No fee transfer, issuance, native registration or ledger append is performed by
-the flow itself. Existing service/canonical policy remains authoritative. Cached
+Enrollment actions do not send a fee transfer, issue a permit, register a native
+provider or append a ledger operation. The separate Publish action submits only
+the exact reviewed proxy registry operations. Existing service/canonical policy remains authoritative. Cached
 permits still undergo the original exact provider/network/operation and canonical
-validation before publication; an expired permit is not renewed by this wizard.
+validation before publication. Reconcile the original invoice with the admission
+service for an expired permit; never create another invoice merely to retry.
+Renewal and collection remain service/canonical decisions.
 
 A changed probe file invalidates the reviewed probe-plan digest. The probe always
 uses existing shared capacity and cumulative allowance. Exhaustion or uncertain
@@ -231,8 +312,108 @@ An edited draft cannot reprice or replace a previously retained Run.
 The first Run plan is immutable for this draft directory. Updating an installed
 controller to a later publication remains an explicit operator lifecycle task;
 this wizard does not silently remove/re-add it. Guided `setup init` generates the
-first standard runtime policy; the dashboard bootstrap form and current low-level
-revision/AU controls still need onboarding UI work.
+first standard runtime policy in both CLI and dashboard. Initial price entry uses
+exact USD decimals; later revision editing still exposes exact AU controls.
+
+## Change rates without changing the original purchase
+
+Saving new prices changes a draft; it does not reprice accepted sessions or a
+running controller. A rate-only edit can reuse a still-valid protocol probe, but
+must pass a new structural check and exact signed publication. Connection,
+upstream, recipe, endpoint/resource or capability changes invalidate the affected
+probe binding. Unknown/uncertain work never becomes successful evidence.
+
+For an already admitted membership, use the explicit offer-only path. Prepare a
+protected `ProfileInput` for that same identity/market/connection, with the new
+offer revisions/prices and the exact next canonical operation sequence. Obtain
+that sequence through Admission facts; do not infer it from the draft revision.
+The examples below use `$SETUP_STATE` for the existing bundle's `state` directory,
+`$PROFILE_INPUT` for that reviewed input, and `$PEER_RPC` for the configured trusted
+peer. Set `$REVISION` to the latest returned draft revision before **each** command.
+
+```sh
+mayhem provider proxy setup prepare --directory "$SETUP_STATE" \
+  --input "$PROFILE_INPUT" --expected-revision "$REVISION"
+mayhem provider proxy setup check --directory "$SETUP_STATE" \
+  --expected-revision "$REVISION"
+mayhem provider proxy setup publication-plan --directory "$SETUP_STATE" \
+  --expected-revision "$REVISION" --offers-only
+```
+
+Review the plan before invoking the signing command:
+
+```sh
+mayhem provider proxy setup publish --directory "$SETUP_STATE" \
+  --expected-revision "$REVISION" --offers-only --peer-rpc "$PEER_RPC" \
+  --home "$MAYHEM_HOME"
+```
+
+The simple wizard's `v`/`u` buttons review the initial create/join path; they are
+not an offer-only update shortcut. Advanced Flow actions can select
+`offers_only:true` and bind `publish` to the returned `plan_digest`. A pending
+publication must be recovered before editing. After an uncertain result:
+
+```sh
+mayhem provider proxy setup inspect --directory "$SETUP_STATE"
+mayhem provider proxy setup recover-publication --directory "$SETUP_STATE" \
+  --expected-revision "$REVISION" --peer-rpc "$PEER_RPC"
+```
+
+The wizard's first Run plan remains immutable. A guided transition from that
+running controller to a later offer publication is not implemented: reviewing
+or starting a different Run plan returns a conflict. The commands above complete
+canonical offer publication, not the full running-provider rate-change workflow.
+An expert lifecycle replacement outside this wizard is still required. Preserve its original capacity/recovery
+stores and wait for original accepted work to reconcile. Never create a second
+controller or new allowance to bypass retained occupancy. Native price-floor
+commands do not alter proxy offer rates.
+
+## Read health for the correct controller
+
+**Reconcile Run** reports the exact persistent child and its running/restarting/
+stopped state. It does not establish fresh upstream readiness or capacity. The
+provider controller starts with unknown health and needs current canonical
+registration plus fresh route evidence. LLM speed uses the approved tokenizer;
+a successful short probe can still have insufficient speed evidence. Only an
+explicitly enabled recovery-probe policy can spend more of the existing probe
+allowance when evidence expires.
+
+`mayhem provider health` describes the native lane. There is no `provider proxy
+health` subcommand or public `/v1/proxy/health` endpoint. The foreground proxy
+controller prints one final bounded health summary on exit. In a separately
+configured proxy gateway, authenticated `GET /v1/proxy/offers` and exact offer
+details expose `availability: {status, observed_at_ms, expires_at_ms}` for that
+gateway's own control instance. Another process's catalog or heartbeat does not
+make this one ready. A directory read does not subscribe unobserved markets or
+reserve capacity; `checking`, `heartbeat_missing`, `stale_evidence` and
+`controller_conflict` must remain visible. See [DIRECTORY.md](../DIRECTORY.md)
+and [PRESENCE.md](../PRESENCE.md).
+
+`mayhem provider proxy catalog status --config PATH` reads a stopped controller's
+cache; it is not live health. Do not open a second owner against the running
+controller's database. Native `/v1/models` visibility and a running process are
+also insufficient proof of proxy readiness.
+
+## Platform and acceptance limits
+
+Protected setup and managed configuration use platform filesystem checks, not a
+permission override. The exercised guided CLI/dashboard/Run path is macOS. Linux
+has the Unix setup path; native ARM decoder/tokenizer isolation checks do not by
+themselves prove a complete fresh installation and managed Run. Linux x86_64 also
+requires native containment acceptance; emulation is not proof. Linux worker
+startup needs supported seccomp and procfs and fails closed when containment
+cannot be installed.
+
+Windows containment and protected-storage integration are separate acceptance
+work. Native Windows decoder/tokenizer enforcement and complete first setup/Run
+remain unproven; packaging `.exe` files or cross-compiling does not establish
+support. Do not fall back to an uncontained worker or weaken file protection.
+See [WORKER_CONTAINMENT.md](WORKER_CONTAINMENT.md) and
+[TOKENIZER_ISOLATION.md](TOKENIZER_ISOLATION.md) for the exact boundaries.
+
+Local fixture tests establish the documented state/recovery behavior. They do
+not establish live payment collection, issuer activation, production networking,
+remote model identity or OS support beyond the host actually tested.
 
 ## Local validation
 

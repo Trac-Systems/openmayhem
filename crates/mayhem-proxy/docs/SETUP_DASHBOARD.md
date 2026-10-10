@@ -4,7 +4,28 @@ Start the existing wallet-backed gateway with explicit `mayhem use --proxy-setup
 activation. It remains bound to a literal loopback address. Open the authenticated
 provider dashboard URL printed by Core, then **Open proxy setup wizard**. Alternate
 hostnames redirect to the configured origin through the existing session bootstrap;
-Host/Origin validation is not relaxed.
+Host/Origin validation is not relaxed. Use the existing private Core home,
+wallet, trusted peer and SC-Bridge; persistent Run also requires the existing
+mayhemd. Install the complete matching Core package with `mayhem-proxy-worker`
+beside `mayhem`. See [setup prerequisites and OS limits](SETUP_WIZARD.md#before-first-setup).
+
+For the first bundle, with the named variables set to operator-selected inputs:
+
+```sh
+mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 --proxy-setup \
+  --proxy-setup-tokenizer-file "$TOKENIZER_FILE" \
+  --proxy-setup-admission-origin "$ADMISSION_ORIGIN"
+```
+
+For a retained bundle use `--proxy-setup-config` instead of `--proxy-setup`:
+
+```sh
+mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 \
+  --proxy-setup-config "$MAYHEM_HOME/proxy-setup/wizard.json"
+```
+
+The existing gateway must be configured by its owner; these examples are not a
+request to start a second listener. Both modes use its normal wallet/session.
 
 For LLM profiles, provision approved protected local tokenizer data and pass
 `--proxy-setup-tokenizer-file /absolute/protected/tokenizer.json`. The CLI pins its
@@ -20,6 +41,9 @@ Optional host arguments:
   reference, otherwise the existing host reference is reused when present.
 - `--proxy-setup-admission-origin ORIGIN`: explicit trusted admission service.
   Omission leaves enrollment unavailable; no receiver, fee or issuer is inferred.
+- `--proxy-setup-declaration-registry-file PATH`: protected host-selected trust
+  configuration for [declared data-handling fields](DATA_HANDLING_SETUP.md).
+  Signing a promise does not upgrade it to verified privacy or model evidence.
 
 No Flow, Connection, Probe or runtime-policy JSON is required. The CLI `setup init`
 and first-create dashboard use shared guided reads and the same factory. Enter an
@@ -73,7 +97,8 @@ Successful creation opens the existing shared wizard: Connect → Discover → S
 → Check → Market → Admission → Review/publish → Run. Each upstream request,
 probe, invoice/checkout, publication and managed start still requires its existing
 explicit action. Saving does not reserve capacity, consume probe allowance, create
-an invoice, publish, pay or start a process. Existing native services are unchanged.
+an invoice, publish, pay or start a serving controller. Local tokenizer validation
+may launch the contained worker. Existing native services are unchanged.
 
 First creation never overwrites a destination. Reload after a lost response: the
 same running host and a restarted host recover the original protected bundle. A
@@ -90,10 +115,35 @@ private projections, immutable retries, commit-without-ACK recovery, restart and
 handoff to actual Select/Check. They send no upstream, payment or canonical writes.
 The opt-in browser fixture additionally exercises the actual first-create form.
 
+The HTTP routes are on the existing loopback gateway:
+
+| Method/path | Schema and authority |
+|---|---|
+| `GET /mayhem/dashboard/provider/setup` | Session-authenticated wizard or first-create page. |
+| `GET /mayhem/dashboard/provider/setup/state` | Private retained projection; does not run a model probe. |
+| `POST /mayhem/dashboard/provider/setup/bootstrap/guide` | Typed guided read for models/catalog/sequence or exact amount conversion; no saved bundle or payment. |
+| `POST /mayhem/dashboard/provider/setup/bootstrap` | Typed first-create choices using host-approved opaque asset IDs. |
+| `POST /mayhem/dashboard/provider/setup/action` | One typed `FlowAction`, matching draft revision and returned plan digest where required. |
+
+Use the UI for session/Origin/CSRF handling. A gateway inference API key is not a
+substitute for the local dashboard session. No endpoint accepts an arbitrary
+host path, process command, wallet key or signing payload.
+
+Proxy prices stay fixed in the signed offer; changing a form does not reprice
+accepted work or replace a running controller. The initial form uses USD decimals;
+the saved-draft editor currently uses AU and revision fields. Its Publish button
+is the initial create/join path. For later offer-only changes and immutable Run
+limitations, follow [Change rates](SETUP_WIZARD.md#change-rates-without-changing-the-original-purchase).
+For lost responses use the retained Status/Recover/Reconcile actions rather than
+creating a new invoice, draft or controller. Reconcile Run reports that exact
+child's lifecycle; it does not attest upstream readiness.
+
 The guided flow removes manual canonical family IDs, full market descriptors,
 operation sequences and raw AU/micro-USD price entry. Remaining onboarding
 prerequisites are the trusted existing host, explicit resource/charging/probe
 choices and approved pinned tokenizer provisioning for LLM speed measurement.
 Custom protocols still use reviewed recipes; listing alone is never a conformance
-probe. This does not complete admission collection/permit renewal or claim that
-saving starts serving. Those steps retain their existing separate checks/recovery.
+probe. The admission service remains responsible for actual collection and permit
+issuance/renewal; status reconciles its result for the same original operation.
+Saving never starts serving. Fixture UI checks are not live payment or native
+Windows acceptance; see the [platform limits](SETUP_WIZARD.md#platform-and-acceptance-limits).
