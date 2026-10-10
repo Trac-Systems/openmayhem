@@ -8,7 +8,7 @@ const h='a'.repeat(64),hash='0x'+h,token='0x'+'b'.repeat(40),destination='0x'+'c
 const stream={rail:'tap',chain_id:31337,token_contract:token};
 const work=(extra={})=>({schema_version:1,purpose:'proxy_admission_fee',phase:'verify',stream_id:h,stream,
   from_cursor:'10',from_offset:0,max_positions:16,lease_token:'d'.repeat(64),lease_expires_at_ms:Date.now()+60000,...extra});
-const block={number:'0xa',hash,timestamp:'0x64'};
+const block={number:'0xa',hash,parentHash:'0x'+'9'.repeat(64),timestamp:'0x64'};
 const logs=Array.from({length:21},(_,i)=>({address:token,blockHash:hash,blockNumber:'0xa',removed:false,
   topics:[ERC20_TRANSFER_TOPIC,'0x'+'0'.repeat(64),'0x'+'0'.repeat(24)+destination.slice(2)],transactionHash:'0x'+i.toString(16).padStart(64,'0'),logIndex:'0x'+i.toString(16)}));
 
@@ -25,6 +25,8 @@ test('TAP uses operator credential paths, explicit fallback and finalized block-
     const first=await scan(work(),AbortSignal.timeout(3000));assert.equal(first.next_cursor,'10');assert.equal(first.next_offset,16);assert.equal(first.observations.length,16);
     const second=await scan(work({from_offset:16}),AbortSignal.timeout(3000));assert.equal(second.next_cursor,'11');assert.equal(second.next_offset,0);assert.equal(second.observations.length,5);
     assert.equal(new Set([...first.observations,...second.observations].map(x=>x.transaction_hash)).size,21);
+    assert.equal(first.coverage.block_hash,hash);assert.equal(first.coverage.log_count,21);
+    assert.equal(second.coverage.block_time_ms,100000);assert.equal(second.coverage.block_number,'10');
     assert.equal(first.observations[0].observed_at_ms,100000);assert.equal(first.observations[0].destination,destination);
     assert(requests.some(r=>r.path==='/operator-credential-path/'));await assert.rejects(rpc('eth_sendRawTransaction',[],AbortSignal.timeout(1000)));
   }finally{await new Promise(r=>server.close(r));}
@@ -37,6 +39,17 @@ test('TAP rejects wrong chain, non-canonical logs and missing finality without a
   }
   const scan=tapDiscovery({rpc:async(method)=>method==='eth_getLogs'?[{...logs[0],removed:true}]:block,chainId:31337,tokenContract:token});
   await assert.rejects(scan(work(),AbortSignal.timeout(1000)));
+  const missingParent=tapDiscovery({rpc:async()=>({...block,parentHash:undefined}),chainId:31337,tokenContract:token});
+  await assert.rejects(missingParent(work(),AbortSignal.timeout(1000)));
+});
+test('TAP empty blocks carry finalized coverage; being ahead of finality cannot fabricate coverage',async()=>{
+  let logReads=0;
+  const scan=tapDiscovery({rpc:async(method)=>{if(method==='eth_getLogs'){logReads++;return [];}return block;},chainId:31337,tokenContract:token});
+  const empty=await scan(work(),AbortSignal.timeout(1000));
+  assert.equal(empty.coverage.log_count,0);assert.equal(empty.coverage.parent_hash,block.parentHash);
+  assert.equal(empty.next_cursor,'11');assert.equal(empty.next_offset,0);
+  const ahead=await scan(work({from_cursor:'11'}),AbortSignal.timeout(1000));
+  assert.deepEqual(ahead,{next_cursor:'11',next_offset:0,observations:[]});assert.equal(logReads,1);
 });
 test('TNK shares one bounded signed page, requires canonical catchup and rejects missing transaction records',async()=>{
   const calls=[],s={rail:'tnk',network:'testnet1',msb_bootstrap:h};

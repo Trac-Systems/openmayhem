@@ -38,7 +38,7 @@ export class AdmissionDiscoveryWorker {
       // lease must remain usable, with all work bounded by the time left.
       const leasedSignal=AbortSignal.any([signal,AbortSignal.timeout(remaining)]);
       const page=await o.scan(work,leasedSignal);
-      shape(page,['next_cursor','next_offset','observations']);
+      shape(page,['next_cursor','next_offset','observations',...(Object.hasOwn(page,'coverage')?['coverage']:[])]);
       need(cursor(page.next_cursor)&&uint(page.next_offset)&&Array.isArray(page.observations)&&page.observations.length<=16,'invalid discovery page');
       const completed=await this.post('complete',{...envelope,stream_id:work.stream_id,lease_token:work.lease_token,
         from_cursor:work.from_cursor,from_offset:work.from_offset,...page},leasedSignal);
@@ -83,7 +83,7 @@ export function tapDiscovery({rpc,chainId,tokenContract}) {
     // blocks without discarding later events or a fixed total recipient cap.
     const number=`0x${from.toString(16)}`;
     const block=from===tip?finalized:await rpc('eth_getBlockByNumber',[number,false],signal);
-    need(block?.number===number&&ethHash(block.hash),'TAP canonical block differs');
+    need(block?.number===number&&ethHash(block.hash)&&ethHash(block.parentHash),'TAP canonical block differs');
     const observed=Number(parseHexInt(block.timestamp,'block time'))*1000;need(uint(observed,1),'TAP block time invalid');
     const logs=await rpc('eth_getLogs',[{blockHash:block.hash,address:tokenContract,topics:[ERC20_TRANSFER_TOPIC]}],signal);
     need(Array.isArray(logs),'TAP transfer logs missing');
@@ -97,6 +97,8 @@ export function tapDiscovery({rpc,chainId,tokenContract}) {
     need(offset<=logs.length,'TAP retained offset differs');
     const selected=logs.slice(offset,offset+16),nextOffset=offset+selected.length;
     return {next_cursor:nextOffset===logs.length?String(from+1n):String(from),next_offset:nextOffset===logs.length?0:nextOffset,
+      coverage:{kind:'tap_finalized_block',block_number:String(from),block_hash:block.hash,parent_hash:block.parentHash,
+        block_time_ms:observed,finalized_number:String(tip),finalized_hash:finalized.hash,log_count:logs.length},
       observations:selected.map(log=>({destination:`0x${log.topics[2].slice(26)}`,position:String(from),observed_at_ms:observed,
         transaction_hash:log.transactionHash,log_index:Number(parseHexInt(log.logIndex,'log index'))}))};
   };
