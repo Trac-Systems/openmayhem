@@ -167,3 +167,23 @@ Acceptance includes a real ERC-20 transfer on an ephemeral local EVM through the
 actual worker, SITE HTTP and PostgreSQL, checking token balances, gas and completion
 replay. Local EVM finality does not prove Ethereum mainnet confirmation timing.
 No real TAP/TNK or Stripe funds were moved by these checks.
+
+
+## Provider status access
+
+Providers read approved return progress through their existing wallet-authenticated
+setup flow; execution and reviewer credentials are never required. The guided CLI
+has `n Admission returns`. Noninteractive callers use the existing wizard action
+file with `{"action":"admission_returns","expected_revision":2,"after":null}`,
+then the returned `return_page.next_cursor` as `after` for another page. Use the
+current checked draft revision in place of the example revision.
+
+The local provider dashboard exposes the same view under Admission fee returns.
+It shows exact original-rail amounts, reviewed destinations, pending confirmation,
+operator/funding/approval problems and completed returns. FIAT completion refers
+to processor confirmation; bank posting may follow. It does not move money,
+change a pending transaction, clear allocations, renew approvals, or overwrite
+saved enrollment state. Its bounded response is authenticated against the exact
+provider/network/page request. New admission collection can be disabled while
+these reads remain available. Operator review/renewal workflows still need their
+separate implementation and acceptance before financial activation.

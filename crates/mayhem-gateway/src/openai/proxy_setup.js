@@ -1,7 +1,7 @@
 'use strict';
 (() => {
   const $ = id => document.getElementById(id);
-  let view, csrf, plan, runPlan, busy = false, declarationPage, rateChoices = [];
+  let view, csrf, plan, runPlan, busy = false, declarationPage, rateChoices = [], returnCursor = null;
   const declarationChoices = new Map();
   const text = (id, value) => { $(id).textContent = value; };
   const json = value => JSON.stringify(value, null, 2);
@@ -98,6 +98,7 @@
       if (action === 'probe') button.disabled = !v.capabilities.probe;
       if (action === 'admission_check') button.disabled = !v.capabilities.canonical_admission;
       if (action.startsWith('invoice_')) button.disabled = !v.capabilities.enrollment;
+      if (action.startsWith('returns_')) button.disabled = !v.capabilities.enrollment || !v.review?.revision || (action === 'returns_next' && !returnCursor);
       if (action === 'invoice_refresh') {
         const i = v.enrollment?.invoice;
         button.disabled ||= !v.enrollment?.for_current_revision || !i?.invoice_commitment || !i.quote_expired || i.payment_status !== 'awaiting_payment' || i.received_amount_base_units !== '0' || Boolean(i.review_code);
@@ -139,6 +140,28 @@
   }
   async function perform(name) {
     if (name === 'refresh') return request();
+    if (name === 'returns_refresh' || name === 'returns_next') {
+      const revision = view.review?.revision;
+      if (!revision) throw Error('Save and check your selection first.');
+      const result = await request({action:'admission_returns',expected_revision:revision,after:name === 'returns_next' ? returnCursor : null});
+      const page = result.return_page; returnCursor = page.next_cursor;
+      $('returns-next').disabled = !returnCursor; $('returns').replaceChildren();
+      const observed=document.createElement('p'); observed.textContent=`Checked ${new Date(page.observed_at_ms).toLocaleString()}. ${page.entries.length ? '' : 'No recorded admission returns.'}`; $('returns').append(observed);
+      const messages={queued:'Queued for processing',confirming:'Checking the original transfer',returned:'Return confirmed',review_required:'Operator review required',funding_required:'Platform funding required',gas_funding_required:'Platform gas funding required',fee_limit:'Waiting for fees within the approved limit',approval_expired:'Operator approval must be renewed',verification_unavailable:'Verification is temporarily unavailable'};
+      for (const entry of page.entries) {
+        const item=document.createElement('article'), title=document.createElement('p'), detail=document.createElement('p');
+        const units=entry.rail==='fiat' ? `${entry.destination.currency.toUpperCase()} minor units` : `${entry.rail.toUpperCase()} base units`;
+        title.textContent=`${entry.amount_base_units} ${units} — ${messages[entry.reason] || 'Review required'}`;
+        detail.textContent=`${entry.action_required==='operator' ? 'OpenMayhem must take the next action. Do not send another payment to resolve this return. ' : ''}${entry.next_attempt_at_ms ? 'Next check scheduled: '+new Date(entry.next_attempt_at_ms).toLocaleString()+'. ' : ''}${entry.completed_at_ms ? 'Confirmed: '+new Date(entry.completed_at_ms).toLocaleString()+'. ' : ''}`;
+        detail.style.overflowWrap='anywhere'; item.append(title,detail);
+        const destination=document.createElement('p'); destination.textContent=entry.destination.kind==='original_payment_method' ? 'Returns to the original payment method. Bank posting may take longer.' : `Reviewed return address: ${entry.destination.address}`;
+        destination.style.overflowWrap='anywhere';item.append(destination);
+        const references=document.createElement('details'), summary=document.createElement('summary'), ids=document.createElement('p');
+        summary.textContent='Return references';ids.textContent=`Return: ${entry.refund_id}. Invoice: ${entry.invoice_id}.`;ids.style.overflowWrap='anywhere';
+        references.append(summary,ids);item.append(references);$('returns').append(item);
+      }
+      return result;
+    }
     if (name === 'rate_plan') {
       if (document.querySelector('#rate-fields [aria-invalid="true"]')) throw Error('Correct invalid prices before reviewing rates.');
       return request({action:name,expected_revision:view.review?.revision,choices:rateChoices});

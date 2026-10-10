@@ -16,7 +16,7 @@ const view = { endpoint:'openai_chat_completions', connection:{id:'fixture',revi
 const original = { invoice_id:id,invoice_commitment:commitment,payment_status:'awaiting_payment',rail:'fiat',fee_usd:'10.00',
   amount_base_units:'1000',received_amount_base_units:'0',missing_amount_base_units:'1000',excess_amount_base_units:'0',
   quote_expired:true,quote_expires_at_ms:Date.now()-60000,review_code:null,collection:{currency:'usd'},permit:null };
-const actions=[],errors=[];
+const actions=[],errors=[]; let returnError=false;
 const browser=await chromium.launch({headless:true}),page=await browser.newPage({viewport:{width:1280,height:900}});
 page.on('pageerror',e=>errors.push(e.message));page.on('dialog',d=>d.accept());
 await page.route('**/*',async route=>{
@@ -26,6 +26,17 @@ await page.route('**/*',async route=>{
   if(url.pathname==='/mayhem/dashboard/provider/setup/action'){
     assert.equal(request.headers()['x-mayhem-setup-csrf'],'fixture-csrf');
     const a=request.postDataJSON();actions.push(a);
+    if(a.action==='admission_returns') {
+      assert.equal(a.expected_revision,2);assert([null,'last_return'].includes(a.after));
+      if(returnError)return route.fulfill({status:503,json:{error:'Return status temporarily unavailable'}});
+      const entries=a.after ? [] : [
+        {rail:'fiat',amount_base_units:'125',state:'returned',reason:'returned',destination:{kind:'original_payment_method',currency:'eur'},completed_at_ms:Date.now(),action_required:'none'},
+        {rail:'tnk',amount_base_units:'10000000',state:'queued',reason:'funding_required',destination:{kind:'crypto_address',address:'testtrac1'+'a'.repeat(60)},next_attempt_at_ms:Date.now()+30000,action_required:'operator'},
+        {rail:'tap',amount_base_units:'10000000000000000000',state:'review',reason:'approval_expired',destination:{kind:'crypto_address',address:'0x'+'b'.repeat(40)},action_required:'operator'},
+        {rail:'tap',amount_base_units:'1000000',state:'confirming',reason:'confirming',destination:{kind:'crypto_address',address:'0x'+'c'.repeat(40)},action_required:'none'}
+      ].map((e,n)=>({...e,refund_id:'return_'+n+'a'.repeat(100),invoice_id:'invoice_'+'b'.repeat(100)}));
+      return route.fulfill({json:{view,action_result:{state:'returns',authorizes_publication:false,return_page:{entries,next_cursor:a.after?null:'last_return',observed_at_ms:Date.now()}}}});
+    }
     assert.deepEqual(a,{action:'enrollment',expected_revision:2,operation:'refresh',rail:null,quote:{invoice_id:id,invoice_commitment:commitment}});
     view.enrollment.invoice={...view.enrollment.invoice,invoice_id:'33'.repeat(32),invoice_commitment:'44'.repeat(32),quote_expired:false};
     return route.fulfill({json:{view,action_result:{state:'awaiting_payment',invoice:view.enrollment.invoice,authorizes_publication:false}}});
@@ -53,8 +64,27 @@ try {
   await page.setViewportSize({width:390,height:844});await button.scrollIntoViewIfNeeded();
   assert(!(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1)));
   await page.screenshot({path:path.join(output,'mobile.png')});
-  assert.equal(actions.length,3);assert.deepEqual(errors,[]);
+  assert.equal(actions.length,3);
+  await page.setViewportSize({width:1280,height:900});
+  await page.getByText('Admission fee returns',{exact:true}).click();
+  await page.getByRole('button',{name:'Check returns',exact:true}).click();
+  await page.locator('#returns').filter({hasText:'Platform funding required'}).waitFor();
+  assert.match(await page.locator('#returns').textContent(),/Operator approval must be renewed/);
+  assert.match(await page.locator('#returns').textContent(),/Return confirmed/);
+  assert.match(await page.locator('#returns').textContent(),/Checking the original transfer/);
+  assert.match(await page.locator('#returns').textContent(),/Bank posting may take longer/);
+  assert(!(await page.getByRole('button',{name:'More returns',exact:true}).isDisabled()));
+  await page.locator('#returns').scrollIntoViewIfNeeded();await page.screenshot({path:path.join(output,'returns-desktop.png')});
+  await page.setViewportSize({width:390,height:844});await page.locator('#returns').scrollIntoViewIfNeeded();
+  assert(!(await page.evaluate(()=>document.documentElement.scrollWidth>innerWidth+1)));
+  await page.screenshot({path:path.join(output,'returns-mobile.png')});
+  const saved=await page.locator('#returns').textContent();returnError=true;
+  await page.getByRole('button',{name:'Check returns',exact:true}).click();await page.locator('#message').filter({hasText:'temporarily unavailable'}).waitFor();
+  assert.equal(await page.locator('#returns').textContent(),saved);returnError=false;
+  await page.getByRole('button',{name:'More returns',exact:true}).click();await page.locator('#returns').filter({hasText:'No recorded admission returns'}).waitFor();
+  assert(await page.getByRole('button',{name:'More returns',exact:true}).isDisabled());
+  assert.equal(actions.filter(a=>a.action==='admission_returns').length,3);assert.deepEqual(errors,[]);
   const result={scope:'actual dashboard HTML/JS with controlled HTTP state/actions; no real payment, wallet signature or ledger write',
-    rails:['fiat','tnk','tap'],exact_quote_binding:true,unsafe_renewal_disabled:true,reload_readonly:true,mobile_no_overflow:true,errors};
+    rails:['fiat','tnk','tap'],exact_quote_binding:true,unsafe_renewal_disabled:true,reload_readonly:true,returns_all_rails:true,returns_paged:true,returns_error_retains_view:true,mobile_no_overflow:true,errors};
   await writeFile(path.join(output,'result.json'),JSON.stringify(result,null,2)+'\n');console.log(JSON.stringify(result));
 } finally {await browser.close();}

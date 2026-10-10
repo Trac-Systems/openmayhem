@@ -165,6 +165,10 @@ pub enum FlowAction {
     AdmissionCheck {
         expected_revision: u64,
     },
+    AdmissionReturns {
+        expected_revision: u64,
+        after: Option<String>,
+    },
     Enrollment {
         expected_revision: u64,
         operation: EnrollmentAction,
@@ -553,7 +557,7 @@ impl Flow {
                     .await?;
                 // Checkout is an ephemeral link, not a fresh invoice/permit observation.
                 // Retain the last reconciled invoice rather than replacing it with null.
-                if !matches!(operation, EnrollmentAction::Checkout) {
+                if !matches!(operation, EnrollmentAction::Checkout | EnrollmentAction::Returns) {
                     let mut retained = serde_json::to_value(&result).map_err(|_| Error::Invalid)?;
                     retained["checkout_url"] = Value::Null;
                     retained["source"] = json!("last_authenticated_response_not_live_status");
@@ -566,6 +570,10 @@ impl Flow {
                     )?;
                 }
                 json!(result)
+            }
+            FlowAction::AdmissionReturns {expected_revision,after} => {
+                let client=store.enrollment_client(expected_revision,self.config.admission_origin.as_deref().ok_or(Error::Invalid)?,self.config.timeout_ms)?;
+                json!(client.returns(key.ok_or(Error::Invalid)?,after).await?)
             }
             FlowAction::RatePlan { expected_revision, choices } => json!(store.plan_rates(expected_revision, choices, self.peer()?, self.config.timeout_ms).await?),
             FlowAction::PublishRates { expected_revision, plan_digest } => json!(store.publish_rates(expected_revision, &plan_digest, self.peer()?, self.config.timeout_ms, key.ok_or(Error::Invalid)?).await?),

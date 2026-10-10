@@ -351,7 +351,7 @@ async fn flow_scoped_signed_enrollment_retains_short_payment_across_checkout_and
             socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).as_bytes()).await.unwrap();
         }
         let mut retained_operation = None;
-        for action in ["invoice_create", "invoice_checkout", "invoice_status"] {
+        for action in ["invoice_create", "invoice_checkout", "invoice_status", "invoice_returns", "invoice_returns"] {
             let (socket, header, request) = read(&listener).await;
             assert!(header.starts_with("POST /v1/proxy/admission/auth/challenge "));
             assert_eq!(request["action"], action);
@@ -410,7 +410,10 @@ async fn flow_scoped_signed_enrollment_retains_short_payment_across_checkout_and
                 ),
                 request["request_digest"]
             );
-            let response = if action == "invoice_checkout" {
+            let response = if action == "invoice_returns" {
+                assert!(invoice_request["request"] == json!({}) || invoice_request["request"] == json!({"after":"return_001"}));
+                json!({"schema_version":1,"purpose":"proxy_admission_fee","state":"returns","provider_pubkey":request["provider_pubkey"],"entries":[{"refund_id":"return_001","invoice_id":"old_invoice","rail":"fiat","amount_base_units":"125","state":"queued","reason":"funding_required","destination":{"kind":"original_payment_method","currency":"usd"},"created_at_ms":now-1000,"completed_at_ms":null,"next_attempt_at_ms":now+30000,"action_required":"operator"}],"next_cursor":null,"observed_at_ms":now})
+            } else if action == "invoice_checkout" {
                 json!({"state":"checkout","url":"https://checkout.stripe.com/c/pay/synthetic-local-only"})
             } else {
                 json!({"schema_version":1,"purpose":"proxy_admission_fee","state":"invoice","invoice_id":"same_invoice","provider_pubkey":request["provider_pubkey"],"initial_operation_digest":operation,"rail":"fiat","payment_status":if action=="invoice_create"{"short_payment"}else{"issuing"},"quote_expires_at_ms":now+30000,"quote_expired":false,"fee_usd":"10.00","amount_base_units":"1000","received_amount_base_units":if action=="invoice_create"{"250"}else{"1000"},"missing_amount_base_units":if action=="invoice_create"{"750"}else{"0"},"excess_amount_base_units":"0","collection":{"currency":"usd"},"review_code":null,"permit":null,"publication_status":"not_checked","replayed":true})
@@ -499,6 +502,14 @@ async fn flow_scoped_signed_enrollment_retains_short_payment_across_checkout_and
         status.view.enrollment.unwrap()["authorizes_publication"],
         false
     );
+    let retained_before_returns = std::fs::read(f.store.join("wizard-enrollment.json")).unwrap();
+    for after in [None, Some("return_001".to_owned())] {
+        let returns = restarted.execute(FlowAction::AdmissionReturns { expected_revision: 2, after }, Some(&key)).await.unwrap();
+        assert_eq!(returns.action_result["return_page"]["entries"][0]["reason"], "funding_required");
+        assert_eq!(returns.action_result["authorizes_publication"], false);
+        assert_eq!(returns.view.enrollment.as_ref().unwrap()["invoice"]["invoice_id"], "same_invoice");
+        assert_eq!(std::fs::read(f.store.join("wizard-enrollment.json")).unwrap(), retained_before_returns);
+    }
     let retained = std::fs::read_to_string(f.store.join("wizard-enrollment.json")).unwrap();
     for secret in [
         d(93).as_str(),

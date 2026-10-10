@@ -202,6 +202,12 @@ async fn connected_enrollment_driver() {
     f.store().check(1).unwrap();
     let client = f.store().enrollment_client(2, origin, 15000).unwrap();
     let key = SigningKey::from_bytes(&[seed; 32]);
+    for cursor in [None, Some("previous_return".to_owned())] {
+        let returns = client.returns(&key, cursor).await.unwrap();
+        assert_eq!(returns.state, "returns");
+        assert!(!returns.authorizes_publication && returns.invoice.is_none());
+        assert!(returns.return_page.unwrap().entries.is_empty());
+    }
     if input.get("quote").is_some() {
         let quote: EnrollmentQuote = serde_json::from_value(input["quote"].clone()).unwrap();
         assert!(client.execute(&key, EnrollmentAction::Refresh, None).await.is_err());

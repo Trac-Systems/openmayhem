@@ -98,7 +98,7 @@ async fn execute(
 ) -> Result<mayhem_proxy::setup::FlowResult> {
     if matches!(
         action,
-        FlowAction::Enrollment { .. } | FlowAction::Publish { .. } | FlowAction::PublishRates { .. } | FlowAction::ConfirmDeclaration { .. }
+        FlowAction::Enrollment { .. } | FlowAction::AdmissionReturns { .. } | FlowAction::Publish { .. } | FlowAction::PublishRates { .. } | FlowAction::ConfirmDeclaration { .. }
     ) {
         let keypair = resolve_wallet_keypair_path(wallet)?;
         let key = cached_wallet_signing_key(
@@ -146,7 +146,7 @@ pub async fn run(args: WizardArgs) -> Result<()> {
         if let Some(d) = &view.declaration { println!("Data handling: {} (declared, not verified)", d.state); }
         println!("j Review data-handling declarations  y Sign retained declaration review  w Review withdrawal");
         println!("e Review new rates (same market)  z Publish retained rate review");
-        println!("c Connect  d Discover  s Select/price  k Check  p Probe  a Admission facts\ni Invoice/create  t Status  f FIAT checkout  q Renew expired unpaid quote  v Review publication  u Publish\nr Recover original probe  o Recover original publication  g Review Run  b Begin Run  h Reconcile Run  x Exit");
+        println!("c Connect  d Discover  s Select/price  k Check  p Probe  a Admission facts\ni Invoice/create  t Status  n Admission returns  f FIAT checkout  q Renew expired unpaid quote  v Review publication  u Publish\nr Recover original probe  o Recover original publication  g Review Run  b Begin Run  h Reconcile Run  x Exit");
         let command = prompt("Action", "x")?;
         if command == "x" {
             return Ok(());
@@ -289,6 +289,10 @@ pub async fn run(args: WizardArgs) -> Result<()> {
             "a" => FlowAction::AdmissionCheck {
                 expected_revision: needs_revision()?,
             },
+            "n" => {
+                let cursor = prompt("Next cursor from the previous return page (blank for first page)", "")?;
+                FlowAction::AdmissionReturns { expected_revision: needs_revision()?, after: if cursor.is_empty() { None } else { Some(cursor) } }
+            }
             "i" | "t" | "f" | "q" => {
                 let operation = match command.as_str() {
                     "i" => EnrollmentAction::Create,

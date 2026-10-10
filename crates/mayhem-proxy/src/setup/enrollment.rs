@@ -19,6 +19,7 @@ pub enum EnrollmentAction {
     Status,
     Checkout,
     Refresh,
+    Returns,
 }
 impl EnrollmentAction {
     fn wire(self) -> &'static str {
@@ -27,6 +28,7 @@ impl EnrollmentAction {
             Self::Status => "invoice_status",
             Self::Checkout => "invoice_checkout",
             Self::Refresh => "invoice_refresh",
+            Self::Returns => "invoice_returns",
         }
     }
     fn path(self) -> &'static str {
@@ -35,6 +37,7 @@ impl EnrollmentAction {
             Self::Status => "status",
             Self::Checkout => "checkout",
             Self::Refresh => "refresh",
+            Self::Returns => "returns",
         }
     }
 }
@@ -185,6 +188,83 @@ pub struct EnrollmentResult {
     pub review_code: Option<String>,
     pub original_operation_matches: bool,
     pub authorizes_publication: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub return_page: Option<EnrollmentReturns>,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentReturns {
+    pub schema_version: u32,
+    pub purpose: String,
+    pub state: String,
+    pub provider_pubkey: Digest,
+    pub entries: Vec<EnrollmentReturn>,
+    pub next_cursor: Option<String>,
+    pub observed_at_ms: u64,
+}
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentReturn {
+    pub refund_id: String,
+    pub invoice_id: String,
+    pub rail: mayhem_proto::proxy::ProxyRail,
+    pub amount_base_units: String,
+    pub state: String,
+    pub reason: String,
+    pub destination: Value,
+    pub created_at_ms: u64,
+    pub completed_at_ms: Option<u64>,
+    pub next_attempt_at_ms: Option<u64>,
+    pub action_required: String,
+}
+impl EnrollmentReturns {
+    fn validate(&self, provider: &Digest) -> Result<()> {
+        require(self.schema_version == 1 && self.purpose == PURPOSE && self.state == "returns"
+            && &self.provider_pubkey == provider && self.entries.len() <= 16
+            && self.observed_at_ms > 0 && self.observed_at_ms <= MAX_SAFE)?;
+        if let Some(cursor) = &self.next_cursor {
+            require(self.entries.len() == 16 && self.entries.last().is_some_and(|r| &r.refund_id == cursor))?;
+        }
+        let mut seen = std::collections::HashSet::new();
+        for r in &self.entries {
+            require(safe_id(&r.refund_id,128) && safe_id(&r.invoice_id,128)
+                && seen.insert(&r.refund_id) && amount(&r.amount_base_units)? > 0
+                && r.created_at_ms > 0 && r.created_at_ms <= MAX_SAFE
+                && r.completed_at_ms.is_none_or(|v| v > 0 && v <= MAX_SAFE)
+                && r.next_attempt_at_ms.is_none_or(|v| v > 0 && v <= MAX_SAFE)
+                && matches!(r.state.as_str(),"queued"|"confirming"|"review"|"returned")
+                && matches!(r.reason.as_str(),"queued"|"confirming"|"review_required"|"returned"|"funding_required"|"gas_funding_required"|"fee_limit"|"approval_expired"|"verification_unavailable")
+                && matches!(r.action_required.as_str(),"operator"|"none")
+                && (r.state == "returned") == r.completed_at_ms.is_some()
+                && (!matches!(r.state.as_str(),"returned"|"review") || r.next_attempt_at_ms.is_none()))?;
+            let expected_action = if r.state == "review" || matches!(r.reason.as_str(), "funding_required"|"gas_funding_required"|"fee_limit"|"approval_expired") { "operator" } else { "none" };
+            require(r.action_required == expected_action
+                && (r.state == "returned") == (r.reason == "returned")
+                && (!matches!(r.reason.as_str(), "queued"|"confirming") || r.reason == r.state)
+                && (r.reason != "review_required" || r.state == "review"))?;
+            match r.rail {
+                mayhem_proto::proxy::ProxyRail::Fiat => {
+                    #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct D { kind:String, currency:String }
+                    let d:D=serde_json::from_value(r.destination.clone()).map_err(|_|Error::Invalid)?;
+                    require(d.kind=="original_payment_method" && d.currency.len()==3 && d.currency.bytes().all(|b|b.is_ascii_lowercase()))?;
+                }
+                mayhem_proto::proxy::ProxyRail::Tnk => {
+                    #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct D { kind:String, network:String, address:String }
+                    let d:D=serde_json::from_value(r.destination.clone()).map_err(|_|Error::Invalid)?;
+                    require(d.kind=="crypto_address" && matches!(d.network.as_str(),"mainnet"|"testnet1") && safe_id(&d.address,128)
+                        && d.address.starts_with(if d.network=="mainnet" {"trac1"} else {"testtrac1"}))?;
+                }
+                mayhem_proto::proxy::ProxyRail::Tap => {
+                    #[derive(Deserialize)] #[serde(deny_unknown_fields)] struct D {kind:String,chain_id:u64,token_contract:String,address:String}
+                    let d:D=serde_json::from_value(r.destination.clone()).map_err(|_|Error::Invalid)?;
+                    let eth=|v:&str| v.len()==42 && v.starts_with("0x") && v[2..].bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+                    require(d.kind=="crypto_address" && d.chain_id>0 && d.chain_id<=MAX_SAFE && eth(&d.token_contract) && eth(&d.address))?;
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 fn signing_bytes<T: Serialize>(domain: &str, value: &T) -> Result<Vec<u8>> {
@@ -244,6 +324,12 @@ fn safe_id(value: &str, max: usize) -> bool {
 }
 
 impl EnrollmentClient {
+    pub async fn returns(&self,key:&SigningKey,after:Option<String>) -> Result<EnrollmentResult> {
+        require(hex(&key.verifying_key().to_bytes())==self.provider.as_str())?;
+        let request=if let Some(after)=after { require(safe_id(&after,128))?;json!({"after":after}) } else {json!({})};
+        tokio::time::timeout(Duration::from_millis(self.timeout_ms), self.perform(key,EnrollmentAction::Returns,request))
+            .await.map_err(|_|Error::EnrollmentUnavailable)?
+    }
     pub async fn execute(
         &self,
         key: &SigningKey,
@@ -266,7 +352,7 @@ impl EnrollmentClient {
                 json!({"rail":"fiat","currency":"usd"})
             }
             (EnrollmentAction::Create, Some(rail)) => json!({"rail":rail}),
-            (EnrollmentAction::Status | EnrollmentAction::Checkout, None) => json!({}),
+            (EnrollmentAction::Status | EnrollmentAction::Checkout | EnrollmentAction::Returns, None) => json!({}),
             (EnrollmentAction::Refresh, None) => {
                 serde_json::to_value(quote.ok_or(Error::Invalid)?).map_err(|_| Error::Invalid)?
             }
@@ -402,7 +488,13 @@ impl EnrollmentClient {
             review_code: None,
             original_operation_matches: false,
             authorizes_publication: false,
+            return_page: None,
         };
+        if matches!(action,EnrollmentAction::Returns) {
+            let page:EnrollmentReturns=serde_json::from_value(raw).map_err(|_|Error::Invalid)?;
+            page.validate(&self.provider)?;
+            report.state="returns".into();report.return_page=Some(page);return Ok(report);
+        }
         if matches!(action, EnrollmentAction::Checkout) {
             #[derive(Deserialize)]
             #[serde(deny_unknown_fields)]
@@ -582,6 +674,41 @@ impl EnrollmentInvoice {
 #[cfg(test)]
 mod admitted_review_tests {
     use super::*;
+
+    #[test]
+    fn return_pages_reject_inconsistent_or_private_payloads_and_fit_response_budget() {
+        let provider = Digest::new("33".repeat(32)).unwrap();
+        let base = json!({"schema_version":1,"purpose":PURPOSE,"state":"returns","provider_pubkey":provider,
+            "entries":[{"refund_id":"r1","invoice_id":"i1","rail":"fiat","amount_base_units":"125","state":"queued","reason":"funding_required",
+            "destination":{"kind":"original_payment_method","currency":"usd"},"created_at_ms":100,"completed_at_ms":null,"next_attempt_at_ms":1000,"action_required":"operator"}],
+            "next_cursor":null,"observed_at_ms":1000});
+        let validate = |value:Value| serde_json::from_value::<EnrollmentReturns>(value).map_err(|_|Error::Invalid).and_then(|p|p.validate(&provider));
+        assert!(validate(base.clone()).is_ok());
+        for (rail,destination) in [
+            ("fiat", json!({"kind":"original_payment_method","currency":"eur"})),
+            ("tnk", json!({"kind":"crypto_address","network":"testnet1","address":format!("testtrac1{}","a".repeat(60))})),
+            ("tap", json!({"kind":"crypto_address","chain_id":1,"token_contract":format!("0x{}","a".repeat(40)),"address":format!("0x{}","b".repeat(40))})),
+        ] {
+            let mut p=base.clone(); p["entries"][0]["rail"]=json!(rail);p["entries"][0]["destination"]=destination;
+            for (state,reason,action) in [("queued","queued","none"),("confirming","confirming","none"),("review","review_required","operator"),("returned","returned","none")] {
+                p["entries"][0]["state"]=json!(state);p["entries"][0]["reason"]=json!(reason);p["entries"][0]["action_required"]=json!(action);
+                p["entries"][0]["completed_at_ms"]=if state=="returned" {json!(1000)} else {Value::Null};
+                p["entries"][0]["next_attempt_at_ms"]=if matches!(state,"review"|"returned") {Value::Null} else {json!(1000)};
+                assert!(validate(p.clone()).is_ok());
+            }
+            p["entries"][0]["destination"]["private_signature"]=json!("must not escape");assert!(validate(p).is_err());
+        }
+        for (field,value) in [("state",json!("delivered")),("amount_base_units",json!("0")),("amount_base_units",json!("1.5")),("refund_id",json!("../escape")),("reason",json!("raw_processor_error")),("reason",json!("returned")),("action_required",json!("none")),("completed_at_ms",json!(10)),("created_at_ms",json!(MAX_SAFE+1))] {
+            let mut p=base.clone();p["entries"][0][field]=value;assert!(validate(p).is_err(),"{field}");
+        }
+        let mut p=base.clone();p["provider_pubkey"]=json!("44".repeat(32));assert!(validate(p).is_err());
+        let mut p=base.clone();p["next_cursor"]=json!("r1");assert!(validate(p).is_err());
+        let mut p=base.clone();p["entries"]=json!([base["entries"][0],base["entries"][0]]);assert!(validate(p).is_err());
+        let mut p=base.clone();p["entries"]=json!((0..16).map(|n|{let mut e=base["entries"][0].clone();e["refund_id"]=json!(format!("{:0>128}",n));e["invoice_id"]=json!("i".repeat(128));e["amount_base_units"]=json!(u128::MAX.to_string());e["rail"]=json!("tnk");e["destination"]=json!({"kind":"crypto_address","network":"testnet1","address":format!("testtrac1{}","a".repeat(119))});e}).collect::<Vec<_>>());
+        p["next_cursor"]=p["entries"][15]["refund_id"].clone();assert!(validate(p.clone()).is_ok());
+        assert!(serde_json::to_vec(&p).unwrap().len()<16*1024);
+        p["entries"].as_array_mut().unwrap().push(base["entries"][0].clone());assert!(validate(p).is_err());
+    }
 
     #[test]
     fn admitted_review_preserves_entitlement_without_authorizing_publication() {
