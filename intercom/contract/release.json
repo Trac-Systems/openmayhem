@@ -2,7 +2,7 @@
   "schema": 1,
   "release_version": "0.2.272",
   "contract_version": 30,
-  "contract_code_sha256": "872880023f6f8c0d7abf2ba375b96a41623587251437f58bc12c6d834286fe0f",
+  "contract_code_sha256": "a53d00a96534e0f0a637dc697a2ac2ab6c6a9911db8bb66db1b66162f69a43d6",
   "files": [
     {
       "path": "contract/contract.js",
@@ -86,7 +86,7 @@
     },
     {
       "path": "features/mayhem/index.js",
-      "sha256": "ad9d09812fd3eddc76cd1c0bccb30a06bb338e66c9cc1313f66d27151c938500"
+      "sha256": "62a07c9eee17c755d6447a454ec558cbdad7c7910793c0c34b4b87f99747c804"
     },
     {
       "path": "features/mayhem/proxy-admission.js",
