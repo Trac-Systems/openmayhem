@@ -104,15 +104,16 @@ test('independent reader rebuild counters do not reject the same canonical Merkl
   const receipt = await verifyTnkObservedTransfer(f.msb, { transaction_hash: hash, destination }, options(previous));
   assert.equal(receipt.finalized, true); assert.equal(receipt.tokenAmountBaseUnits, 9n);
   await f.view.put('later/3', Buffer.from('3'));
-  const current = { ...await f.frontier(), fork: 17 };
+  const current = { ...await f.frontier(), fork: 18 };
   const next = await scanTnkSignedPage(f.msb, { ...options(current), from: previous.signed_length, previousSnapshot: previous });
   assert.equal(next.next_cursor, String(current.signed_length));
   await assert.rejects(scanTnkSignedPage(f.msb, { ...options(current), from: previous.signed_length,
     previousSnapshot: { ...previous, tree_hash: 'ab'.repeat(32) } }), /prefix hash differs/);
-  // A change in the SAME canonical writer's counter still requires explicit
-  // retained-history reconciliation; only cross-reader counter equality changes.
-  await assert.rejects(scanTnkSignedPage(f.msb, { ...options(current), from: previous.signed_length,
-    previousSnapshot: { ...previous, fork: 16 } }), /retained prefix changed/);
+  // An authority rebuild is safe only when its new view still proves the exact
+  // retained signed prefix. A changed counter alone must not strand discovery.
+  const rebuilt = await scanTnkSignedPage(f.msb, { ...options(current), from: previous.signed_length,
+    previousSnapshot: { ...previous, fork: 16 } });
+  assert.equal(rebuilt.next_cursor, String(current.signed_length));
 });
 
 test('verification never accepts a changed local fork during its exact-key read', async t => {
@@ -134,7 +135,7 @@ test('continued discovery verifies the retained Merkle prefix inside the newer c
   const scan = older => scanTnkSignedPage(f.msb, { ...options(current), from: previous.signed_length, previousSnapshot: older });
   const page = await scan(previous); assert.equal(page.next_cursor, String(current.signed_length));
   assert.equal(page.transfers.length, 0);
-  for (const change of [{ tree_hash: '01'.repeat(32) }, { view_key: '02'.repeat(32) }, { fork: 1 },
+  for (const change of [{ tree_hash: '01'.repeat(32) }, { view_key: '02'.repeat(32) },
     { network_id: '2' }, { signed_length: current.signed_length + 1 }]) {
     await assert.rejects(scan({ ...previous, ...change }));
   }

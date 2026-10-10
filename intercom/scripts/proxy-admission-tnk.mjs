@@ -63,7 +63,10 @@ export async function scanTnkSignedPage(msb, { from, frontier, signal, addressPr
     if (previousSnapshot !== undefined) {
       need(canonicalProof !== undefined, 'retained TNK history needs canonical authority');
       validateAdmissionMsbSnapshot(previousSnapshot, canonicalProof, previousSnapshot?.observed_at_ms);
-      need(previousSnapshot.view_key === key && previousSnapshot.fork === canonicalProof.fork
+      // A new authority observation can follow a local view rebuild without
+      // changing signed history. Verify its exact retained Merkle prefix below;
+      // the mutable rebuild counter is not the identity of that prefix.
+      need(previousSnapshot.view_key === key
         && previousSnapshot.signed_length <= frontier && previousSnapshot.observed_at_ms <= canonicalProof.observed_at_ms,
       'TNK retained prefix changed');
       const previousHash = previousSnapshot.signed_length === frontier ? treeHash : await boundedHash(core, previousSnapshot.signed_length, signal);
