@@ -5,7 +5,7 @@ use super::{cached_wallet_signing_key, resolve_wallet_keypair_path, WalletLocato
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use mayhem_proxy::setup::{
-    profiles, AdmissionPermit, EnrollmentAction, Input, ProbePlan, ProfileInput, Store,
+    profiles, AdmissionPermit, EnrollmentAction, EnrollmentQuote, Input, ProbePlan, ProfileInput, Store,
 };
 use std::path::PathBuf;
 mod bootstrap;
@@ -37,9 +37,14 @@ pub enum Command {
         timeout_ms: u64,
         #[arg(long, value_enum, default_value_t = EnrollmentCommand::Status)]
         action: EnrollmentCommand,
-        /// Required for create, forbidden for status/checkout. Does not send money.
+        /// Required for create, forbidden for status/checkout/refresh. Does not send money.
         #[arg(long, value_enum)]
         rail: Option<EnrollmentRail>,
+        /// Exact old quote from status; both fields are required only for refresh.
+        #[arg(long, requires = "invoice_commitment")]
+        invoice_id: Option<String>,
+        #[arg(long, requires = "invoice_id")]
+        invoice_commitment: Option<String>,
         #[command(flatten)]
         wallet: WalletLocatorArgs,
     },
@@ -181,6 +186,7 @@ pub enum EnrollmentCommand {
     Create,
     Status,
     Checkout,
+    Refresh,
 }
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
 pub enum EnrollmentRail {
@@ -219,12 +225,24 @@ pub async fn run(command: Command) -> Result<()> {
             timeout_ms,
             action,
             rail,
+            invoice_id,
+            invoice_commitment,
             wallet,
         } => {
             anyhow::ensure!(
                 matches!(action, EnrollmentCommand::Create) == rail.is_some(),
                 "--rail is required only for --action create"
             );
+            anyhow::ensure!(
+                matches!(action, EnrollmentCommand::Refresh) == invoice_id.is_some()
+                    && invoice_id.is_some() == invoice_commitment.is_some(),
+                "--invoice-id and --invoice-commitment are required only for --action refresh"
+            );
+            let quote = invoice_id.zip(invoice_commitment).map(|(invoice_id, invoice_commitment)| {
+                serde_json::from_value::<EnrollmentQuote>(serde_json::json!({
+                    "invoice_id": invoice_id, "invoice_commitment": invoice_commitment
+                }))
+            }).transpose()?;
             let client = tokio::task::spawn_blocking(move || {
                 Store::open(args.directory)?.enrollment_client(
                     expected_revision,
@@ -243,13 +261,14 @@ pub async fn run(command: Command) -> Result<()> {
                 EnrollmentCommand::Create => EnrollmentAction::Create,
                 EnrollmentCommand::Status => EnrollmentAction::Status,
                 EnrollmentCommand::Checkout => EnrollmentAction::Checkout,
+                EnrollmentCommand::Refresh => EnrollmentAction::Refresh,
             };
             let rail = rail.map(|r| match r {
                 EnrollmentRail::Fiat => mayhem_proto::proxy::ProxyRail::Fiat,
                 EnrollmentRail::Tnk => mayhem_proto::proxy::ProxyRail::Tnk,
                 EnrollmentRail::Tap => mayhem_proto::proxy::ProxyRail::Tap,
             });
-            let result = client.execute(&key, action, rail).await?;
+            let result = client.execute_with_quote(&key, action, rail, quote).await?;
             drop(key);
             println!("{}", serde_json::to_string(&result)?);
             return Ok(());
@@ -502,6 +521,19 @@ mod recipe_tests {
             args.push(forbidden);
             assert!(Cli::try_parse_from(args).is_err());
         }
+        let id = "11".repeat(32);
+        let commitment = "22".repeat(32);
+        let mut args = common.to_vec();
+        args.extend(["--action", "refresh", "--invoice-id", &id]);
+        assert!(Cli::try_parse_from(args.clone()).is_err());
+        args.extend(["--invoice-commitment", &commitment]);
+        assert!(matches!(
+            Cli::try_parse_from(args).unwrap().command,
+            Command::Enrollment {
+                action: EnrollmentCommand::Refresh, rail: None,
+                invoice_id: Some(_), invoice_commitment: Some(_), ..
+            }
+        ));
     }
     #[test]
     fn recipe_commands_are_readonly_and_require_explicit_local_inputs() {

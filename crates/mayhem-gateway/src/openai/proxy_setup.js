@@ -98,6 +98,10 @@
       if (action === 'probe') button.disabled = !v.capabilities.probe;
       if (action === 'admission_check') button.disabled = !v.capabilities.canonical_admission;
       if (action.startsWith('invoice_')) button.disabled = !v.capabilities.enrollment;
+      if (action === 'invoice_refresh') {
+        const i = v.enrollment?.invoice;
+        button.disabled ||= !v.enrollment?.for_current_revision || !i?.invoice_commitment || !i.quote_expired || i.payment_status !== 'awaiting_payment' || i.received_amount_base_units !== '0' || Boolean(i.review_code);
+      }
       if (action === 'rate_plan') button.disabled = !v.capabilities.rates || v.review?.publication_status !== 'canonical_operations_confirmed';
       if (action === 'publication_plan' || action === 'recover_publication') button.disabled = !v.capabilities.publication;
       if (['declaration_fields','declaration_plan'].includes(action)) button.disabled = !v.capabilities.declarations;
@@ -166,8 +170,8 @@
         a.probe_plan_digest = view.probe_plan.digest;
       } else if (name.startsWith('invoice_')) {
         const operation = name.slice(8);
-        if (operation !== 'status' && !confirm(operation === 'create' ? 'Create or recover the original admission invoice? No funds will be sent.' : 'Request the original FIAT checkout? Opening checkout does not prove payment.')) return;
-        a = {action:'enrollment',expected_revision:revision,operation,rail:operation === 'create' ? $('invoice-rail').value : null};
+        if (operation !== 'status' && !confirm(operation === 'create' ? 'Create or recover the original admission invoice? No funds will be sent.' : operation === 'refresh' ? 'Reconcile this expired quote and request a new one only if it is still unpaid? If a transfer is pending, wait for status instead. No funds will be sent.' : 'Request the original FIAT checkout? Opening checkout does not prove payment.')) return;
+        a = {action:'enrollment',expected_revision:revision,operation,rail:operation === 'create' ? $('invoice-rail').value : null,quote:operation === 'refresh' ? {invoice_id:view.enrollment?.invoice?.invoice_id,invoice_commitment:view.enrollment?.invoice?.invoice_commitment} : null};
       } else if (name === 'start_run') {
         if (!runPlan || !confirm('Install exactly this retained controller? Configured recovery probes may consume the remaining cumulative allowance. Native/model-server configuration is unchanged.')) return;
         a.plan_digest=runPlan.plan_digest;

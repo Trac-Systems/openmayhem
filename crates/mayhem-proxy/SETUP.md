@@ -448,3 +448,47 @@ The shared client returns structured status for the forthcoming setup dashboard.
 Complete interactive wizard/payment-page delivery, custody provisioning,
 expiry/reissue and release-policy activation are still required. The command is
 not an assertion that public enrollment has been enabled.
+
+
+### Renew an expired unpaid admission quote
+
+Create/status recover the same enrollment; they do not silently replace an
+expired amount. Read `invoice.invoice_id` and `invoice.invoice_commitment` from
+status, then explicitly request renewal:
+
+```sh
+mayhem provider proxy setup enrollment --directory private-draft \
+  --expected-revision 2 --admission-origin https://api.example.com \
+  --action refresh --invoice-id <old-invoice-id> \
+  --invoice-commitment <old-invoice-commitment>
+```
+
+Use the actual checked draft revision and the operator-configured admission
+origin. This signs an identity/action challenge; it does not pay or publish.
+The guided wizard offers `q Renew expired unpaid quote`; the local dashboard
+uses the same retained flow and shows a renewal button for an expired, empty,
+not-reviewed quote. Reconcile status first if its saved snapshot is old. A
+missing commitment from an older API does not permit automatic renewal.
+
+The typed unattended action is `enrollment`, `operation: "refresh"`, `rail: null`,
+with `quote: {"invoice_id": "...", "invoice_commitment": "..."}` and the checked
+`expected_revision`. Other enrollment actions must omit `quote` or use null.
+The exact original quote is authenticated. Concurrent retries return its single
+successor; they do not target a later quote automatically. The original receiver
+is permanently retained. Arriving, short, uncertain or reviewed payments prevent
+renewal until reconciled; a pending network transfer is not proof of nonpayment.
+Wait for its status instead of sending another fee. Late/excess/refund completion
+and real-rail activation remain separately gated.
+
+The public API route is `POST /v1/proxy/admission/invoice/refresh`, using the same
+4096-byte pre-body authentication and private/no-store policy as create/status.
+The signed action is `invoice_refresh`, with a request containing only the two
+old quote fields. It needs fresh terminal FIAT evidence or retained complete
+crypto coverage before returning a successor. An unavailable reconciler retains
+the old invoice. Renewing an unpaid quote is distinct from reissuing an expired
+permit after verified payment. Neither operation grants publication by itself.
+
+Ship the API, Core client and collection worker changes together: old strict
+clients reject the newly exposed commitment field. This is an off-ledger setup
+API change, not a new ledger contract operation. The current project release and
+financial-activation gates still apply.

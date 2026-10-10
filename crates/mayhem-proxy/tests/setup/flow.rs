@@ -93,7 +93,8 @@ async fn shared_flow_retains_exact_choices_across_restart_and_stale_clients_with
             FlowAction::Enrollment {
                 expected_revision: 2,
                 operation: mayhem_proxy::setup::EnrollmentAction::Create,
-                rail: Some(ProxyRail::Fiat)
+                rail: Some(ProxyRail::Fiat),
+                quote: None,
             },
             None
         )
@@ -442,6 +443,7 @@ async fn flow_scoped_signed_enrollment_retains_short_payment_across_checkout_and
                 expected_revision: 2,
                 operation: mayhem_proxy::setup::EnrollmentAction::Create,
                 rail: Some(ProxyRail::Fiat),
+                quote: None,
             },
             Some(&key),
         )
@@ -458,6 +460,7 @@ async fn flow_scoped_signed_enrollment_retains_short_payment_across_checkout_and
                 expected_revision: 2,
                 operation: mayhem_proxy::setup::EnrollmentAction::Checkout,
                 rail: None,
+                quote: None,
             },
             Some(&key),
         )
@@ -482,6 +485,7 @@ async fn flow_scoped_signed_enrollment_retains_short_payment_across_checkout_and
                 expected_revision: 2,
                 operation: mayhem_proxy::setup::EnrollmentAction::Status,
                 rail: None,
+                quote: None,
             },
             Some(&key),
         )

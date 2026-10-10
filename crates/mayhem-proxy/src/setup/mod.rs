@@ -18,7 +18,7 @@ mod store;
 pub use admission::{AdmissionEvidence, AdmissionReport, AdmissionState, CanonicalProvider};
 pub use connection::{preview_models, DiscoveryState, InventoryReview, ModelsPreview};
 pub use declarations::{DeclarationChoice, DeclarationPlan, DeclarationReport, DeclarationSource};
-pub use enrollment::{EnrollmentAction, EnrollmentClient, EnrollmentInvoice, EnrollmentResult};
+pub use enrollment::{EnrollmentAction, EnrollmentClient, EnrollmentInvoice, EnrollmentQuote, EnrollmentResult};
 pub use flow::{DeclarationRegistry, Flow, FlowAction, FlowChoice, FlowConfig, FlowResult, FlowView};
 pub use probe::{ProbeGroup, ProbePlan, ProbeReport, ProbeScope, ProbeState};
 pub use profile::{

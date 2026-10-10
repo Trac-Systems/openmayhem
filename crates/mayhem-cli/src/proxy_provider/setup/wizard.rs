@@ -146,7 +146,7 @@ pub async fn run(args: WizardArgs) -> Result<()> {
         if let Some(d) = &view.declaration { println!("Data handling: {} (declared, not verified)", d.state); }
         println!("j Review data-handling declarations  y Sign retained declaration review  w Review withdrawal");
         println!("e Review new rates (same market)  z Publish retained rate review");
-        println!("c Connect  d Discover  s Select/price  k Check  p Probe  a Admission facts\ni Invoice/create  t Status  f FIAT checkout  v Review publication  u Publish\nr Recover original probe  o Recover original publication  g Review Run  b Begin Run  h Reconcile Run  x Exit");
+        println!("c Connect  d Discover  s Select/price  k Check  p Probe  a Admission facts\ni Invoice/create  t Status  f FIAT checkout  q Renew expired unpaid quote  v Review publication  u Publish\nr Recover original probe  o Recover original publication  g Review Run  b Begin Run  h Reconcile Run  x Exit");
         let command = prompt("Action", "x")?;
         if command == "x" {
             return Ok(());
@@ -289,10 +289,11 @@ pub async fn run(args: WizardArgs) -> Result<()> {
             "a" => FlowAction::AdmissionCheck {
                 expected_revision: needs_revision()?,
             },
-            "i" | "t" | "f" => {
+            "i" | "t" | "f" | "q" => {
                 let operation = match command.as_str() {
                     "i" => EnrollmentAction::Create,
                     "t" => EnrollmentAction::Status,
+                    "q" => EnrollmentAction::Refresh,
                     _ => EnrollmentAction::Checkout,
                 };
                 let rail = if command == "i" {
@@ -305,7 +306,7 @@ pub async fn run(args: WizardArgs) -> Result<()> {
                 };
                 if command != "t"
                     && prompt(
-                        "Create/recover original invoice or checkout; no funds sent. Type continue",
+                        "Create/recover invoice, request checkout or reconcile the expired unpaid quote; no funds sent. Type continue",
                         "cancel",
                     )? != "continue"
                 {
@@ -315,6 +316,11 @@ pub async fn run(args: WizardArgs) -> Result<()> {
                     expected_revision: needs_revision()?,
                     operation,
                     rail,
+                    quote: if command == "q" {
+                        let saved = view.enrollment.as_ref().ok_or_else(|| anyhow::anyhow!("Reconcile invoice status first"))?;
+                        let invoice = &saved["invoice"];
+                        Some(serde_json::from_value(serde_json::json!({"invoice_id":invoice["invoice_id"],"invoice_commitment":invoice["invoice_commitment"]}))?)
+                    } else { None },
                 }
             }
             "v" | "u" => {

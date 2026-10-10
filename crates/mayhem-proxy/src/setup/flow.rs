@@ -169,6 +169,7 @@ pub enum FlowAction {
         expected_revision: u64,
         operation: EnrollmentAction,
         rail: Option<mayhem_proto::proxy::ProxyRail>,
+        quote: Option<EnrollmentQuote>,
     },
     RatePlan { expected_revision: u64, choices: Vec<RateChoice> },
     PublishRates { expected_revision: u64, plan_digest: Digest },
@@ -534,6 +535,7 @@ impl Flow {
                 expected_revision,
                 operation,
                 rail,
+                quote,
             } => {
                 let client = store.enrollment_client(
                     expected_revision,
@@ -547,7 +549,7 @@ impl Flow {
                 let record = guard.read()?.ok_or(Error::Missing)?;
                 require(record.revision == expected_revision)?;
                 let result = client
-                    .execute(key.ok_or(Error::Invalid)?, operation, rail)
+                    .execute_with_quote(key.ok_or(Error::Invalid)?, operation, rail, quote)
                     .await?;
                 // Checkout is an ephemeral link, not a fresh invoice/permit observation.
                 // Retain the last reconciled invoice rather than replacing it with null.

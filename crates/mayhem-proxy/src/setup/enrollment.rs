@@ -18,6 +18,7 @@ pub enum EnrollmentAction {
     Create,
     Status,
     Checkout,
+    Refresh,
 }
 impl EnrollmentAction {
     fn wire(self) -> &'static str {
@@ -25,6 +26,7 @@ impl EnrollmentAction {
             Self::Create => "invoice_create",
             Self::Status => "invoice_status",
             Self::Checkout => "invoice_checkout",
+            Self::Refresh => "invoice_refresh",
         }
     }
     fn path(self) -> &'static str {
@@ -32,6 +34,7 @@ impl EnrollmentAction {
             Self::Create => "create",
             Self::Status => "status",
             Self::Checkout => "checkout",
+            Self::Refresh => "refresh",
         }
     }
 }
@@ -135,6 +138,8 @@ pub struct EnrollmentInvoice {
     pub purpose: String,
     pub state: String,
     pub invoice_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invoice_commitment: Option<Digest>,
     pub provider_pubkey: Digest,
     pub initial_operation_digest: Digest,
     pub rail: mayhem_proto::proxy::ProxyRail,
@@ -152,6 +157,14 @@ pub struct EnrollmentInvoice {
     pub publication_status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub replayed: Option<bool>,
+}
+/// The operator's exact observed quote. Refresh never silently switches its
+/// target to whatever another client most recently created.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrollmentQuote {
+    pub invoice_id: Digest,
+    pub invoice_commitment: Digest,
 }
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -237,13 +250,26 @@ impl EnrollmentClient {
         action: EnrollmentAction,
         rail: Option<mayhem_proto::proxy::ProxyRail>,
     ) -> Result<EnrollmentResult> {
+        self.execute_with_quote(key, action, rail, None).await
+    }
+    pub async fn execute_with_quote(
+        &self,
+        key: &SigningKey,
+        action: EnrollmentAction,
+        rail: Option<mayhem_proto::proxy::ProxyRail>,
+        quote: Option<EnrollmentQuote>,
+    ) -> Result<EnrollmentResult> {
         require(hex(&key.verifying_key().to_bytes()) == self.provider.as_str())?;
+        require(matches!(action, EnrollmentAction::Refresh) == quote.is_some())?;
         let request = match (action, rail) {
             (EnrollmentAction::Create, Some(mayhem_proto::proxy::ProxyRail::Fiat)) => {
                 json!({"rail":"fiat","currency":"usd"})
             }
             (EnrollmentAction::Create, Some(rail)) => json!({"rail":rail}),
             (EnrollmentAction::Status | EnrollmentAction::Checkout, None) => json!({}),
+            (EnrollmentAction::Refresh, None) => {
+                serde_json::to_value(quote.ok_or(Error::Invalid)?).map_err(|_| Error::Invalid)?
+            }
             _ => return Err(Error::Invalid),
         };
         // One bounded operation, including challenge, exchange and invoice I/O.

@@ -1,6 +1,6 @@
 use super::*;
 use ed25519_dalek::SigningKey;
-use mayhem_proxy::setup::{EnrollmentAction, EnrollmentResult};
+use mayhem_proxy::setup::{EnrollmentAction, EnrollmentQuote, EnrollmentResult};
 
 fn owned(seed: u8) -> Fixture {
     let mut f = Fixture::new(ProxyEndpoint::Chat);
@@ -194,7 +194,7 @@ async fn connected_enrollment_driver() {
     assert_eq!(url.scheme(), "http");
     assert_eq!(url.host_str(), Some("127.0.0.1"));
     let seed: u8 = input["seed"].as_u64().unwrap().try_into().unwrap();
-    assert!((210..=212).contains(&seed));
+    assert!((210..=215).contains(&seed));
     let rail: ProxyRail = serde_json::from_value(input["rail"].clone()).unwrap();
     let mut f = owned(seed);
     f.input.network = serde_json::from_value(input["network"].clone()).unwrap();
@@ -202,6 +202,24 @@ async fn connected_enrollment_driver() {
     f.store().check(1).unwrap();
     let client = f.store().enrollment_client(2, origin, 15000).unwrap();
     let key = SigningKey::from_bytes(&[seed; 32]);
+    if input.get("quote").is_some() {
+        let quote: EnrollmentQuote = serde_json::from_value(input["quote"].clone()).unwrap();
+        assert!(client.execute(&key, EnrollmentAction::Refresh, None).await.is_err());
+        assert!(client.execute_with_quote(&key, EnrollmentAction::Status, None, Some(quote.clone())).await.is_err());
+        assert!(client.execute_with_quote(&key, EnrollmentAction::Refresh, Some(rail), Some(quote.clone())).await.is_err());
+        let result = client.execute_with_quote(&key, EnrollmentAction::Refresh, None, Some(quote.clone())).await.unwrap();
+        let invoice = result.invoice.as_ref().unwrap();
+        assert_ne!(invoice.invoice_id, quote.invoice_id.as_str());
+        assert!(invoice.invoice_commitment.is_some());
+        assert_eq!(invoice.rail, rail);
+        let replay = client.execute_with_quote(&key, EnrollmentAction::Refresh, None, Some(quote)).await.unwrap();
+        assert_eq!(replay.invoice.as_ref().unwrap().invoice_id, invoice.invoice_id);
+        assert_eq!(replay.invoice.as_ref().unwrap().replayed, Some(true));
+        assert!(!replay.authorizes_publication);
+        println!("ENROLLMENT_RESULT {}", serde_json::to_string(&replay).unwrap());
+        f.no_network_or_secret();
+        return;
+    }
     let missing = client
         .execute(&key, EnrollmentAction::Status, None)
         .await
