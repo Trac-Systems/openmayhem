@@ -37,6 +37,9 @@ pub struct InitArgs {
     /// Explicit trusted admission API origin; omission keeps enrollment unavailable.
     #[arg(long)]
     admission_origin: Option<String>,
+    /// Protected registry trust configuration for optional provider declarations.
+    #[arg(long, value_name = "PATH")]
+    declaration_registry_file: Option<PathBuf>,
     /// Existing trusted peer. Defaults to the saved Core configuration.
     #[arg(long)]
     rpc_url: Option<String>,
@@ -468,6 +471,7 @@ pub async fn run(mut args: InitArgs) -> Result<()> {
         )),
         wallet_password_file: password.clone(),
         admission_origin: args.admission_origin.clone(),
+        declaration_registry: args.declaration_registry_file.as_deref().map(mayhem_proxy::setup::DeclarationRegistry::load).transpose()?,
     };
     let mut output = io::stdout();
     writeln!(output,"Choose an existing model server and canonical market. Only explicitly requested discovery reads run here; no probe, payment, publication or service change.")?;

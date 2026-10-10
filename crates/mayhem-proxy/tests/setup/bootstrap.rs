@@ -26,6 +26,7 @@ fn host(f: &Fixture) -> Host {
         worker_program: PathBuf::from(env!("CARGO_BIN_EXE_mayhem-proxy-worker")),
         wallet_password_file: None,
         admission_origin: None,
+        declaration_registry: None,
     }
 }
 fn choices(f: &Fixture, endpoint: ProxyEndpoint) -> Choices {

@@ -39,6 +39,139 @@ fn choices(value: bool) -> Vec<DeclarationChoice> {
         value: Some(TypedValue::Boolean(value)),
     }]
 }
+
+#[tokio::test]
+async fn declaration_flow_browses_reviews_signs_recovers_without_endpoint_or_wallet_injection() {
+    use mayhem_proxy::setup::{Flow, FlowAction, FlowConfig};
+    let (mock, defs) = published().await;
+    for endpoint in [
+        ProxyEndpoint::Chat,
+        ProxyEndpoint::Completions,
+        ProxyEndpoint::Responses,
+        ProxyEndpoint::Decisions,
+    ] {
+        let s = setup(endpoint);
+        let config: FlowConfig = serde_json::from_value(
+            json!({"schema_version":1,"directory":s.dir.path(),"profile":s.profile,
+            "probe_plan":null,"peer_rpc":null,"admission_origin":null,"timeout_ms":1000,"run":null,
+            "declaration_registry":{"origin":mock.origin,"local_loopback_http":true}}),
+        )
+        .unwrap();
+        let flow = Flow::open(config.clone()).unwrap();
+        let before = std::fs::read(s.dir.path().join("draft.json")).unwrap();
+        let fields = flow
+            .execute(
+                FlowAction::DeclarationFields {
+                    release_id: None,
+                    cursor: None,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            fields.action_result["data"][0]["field_id"],
+            "privacy.training"
+        );
+        let meta = defs.release().metadata();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let plan = flow
+            .execute(
+                FlowAction::DeclarationPlan {
+                    expected_revision: 1,
+                    expected_declaration_revision: 0,
+                    release_id: meta.release_id.clone(),
+                    release_hash: Digest::new(meta.release_hash.clone()).unwrap(),
+                    choices: choices(false),
+                    expires_at_ms: now + 60000,
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        let pending = plan.view.pending_declaration.unwrap();
+        assert_eq!(pending.state, "needs_confirmation");
+        assert!(plan.view.declaration.is_none());
+        let action = || FlowAction::ConfirmDeclaration {
+            expected_revision: 1,
+            plan_digest: pending.plan.plan_digest.clone(),
+        };
+        assert!(flow.execute(action(), None).await.is_err());
+        assert!(flow
+            .execute(action(), Some(&SigningKey::from_bytes(&[76; 32])))
+            .await
+            .is_err());
+        let signed = flow
+            .execute(action(), Some(&SigningKey::from_bytes(&[77; 32])))
+            .await
+            .unwrap();
+        assert!(signed.view.pending_declaration.is_none());
+        assert_eq!(
+            signed.view.declaration.as_ref().unwrap().state,
+            "signed_not_installed"
+        );
+        mock.state.lock().unwrap().status = 503;
+        let recovered = Flow::open(config)
+            .unwrap()
+            .execute(action(), Some(&SigningKey::from_bytes(&[77; 32])))
+            .await
+            .unwrap();
+        assert_eq!(
+            signed.action_result["signed"],
+            recovered.action_result["signed"]
+        );
+        assert_eq!(
+            before,
+            std::fs::read(s.dir.path().join("draft.json")).unwrap()
+        );
+        assert!(serde_json::from_value::<FlowAction>(json!({"action":"declaration_fields","release_id":null,"cursor":null,"origin":"http://untrusted.invalid"})).is_err());
+        assert!(serde_json::from_value::<FlowAction>(json!({"action":"confirm_declaration","expected_revision":1,"plan_digest":pending.plan.plan_digest,"body":{"claims":[]}})).is_err());
+        mock.state.lock().unwrap().status = 200;
+    }
+}
+
+#[tokio::test]
+async fn declaration_fields_page_is_pinned_bounded_and_checks_immutable_identity() {
+    let (mock, _) = published().await;
+    let reader = Reader::new(
+        TrustedOrigin::local_loopback_http(&mock.origin).unwrap(),
+        Limits::default(),
+    )
+    .unwrap();
+    let pin = reader.current().await.unwrap();
+    assert_eq!(reader.fields_page(&pin, None).await.unwrap().data.len(), 1);
+    assert!(reader
+        .fields_page(&pin, Some(&"x".repeat(513)))
+        .await
+        .is_err());
+    assert!(reader.fields_page(&pin, Some("\n")).await.is_err());
+    mock.state.lock().unwrap().mutate = Some(|body| body["release_hash"] = json!("00".repeat(32)));
+    assert!(reader.fields_page(&pin, None).await.is_err());
+    mock.state.lock().unwrap().mutate =
+        Some(|body| body["data"] = json!(vec![body["data"][0].clone(); 33]));
+    assert!(reader.fields_page(&pin, None).await.is_err());
+    mock.state.lock().unwrap().mutate = Some(|body| {
+        body["data"][0]["definition"]["labels"]["en"] = json!("changed without digest")
+    });
+    assert!(reader.fields_page(&pin, None).await.is_err());
+    // A valid new self-hash still cannot change a definition under the same
+    // already observed immutable release/reference.
+    mock.state.lock().unwrap().mutate = Some(|body| {
+        let mut doc: Document = serde_json::from_value(body["data"][0].clone()).unwrap();
+        doc.definition
+            .labels
+            .insert("en".into(), "Changed immutable meaning".into());
+        doc.definition_hash = doc.definition.digest().unwrap();
+        body["data"][0] = json!(doc);
+    });
+    assert!(matches!(
+        reader.fields_page(&pin, None).await,
+        Err(mayhem_proxy::registry::publication::Error::Equivocation)
+    ));
+}
 struct Setup {
     dir: tempfile::TempDir,
     store: Store,

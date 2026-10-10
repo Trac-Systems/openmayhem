@@ -107,7 +107,37 @@ impl Retained {
         })
     }
 }
+pub(super) fn signed_for_run(
+    guard: &store::Guard,
+    record: &Record,
+    now: u64,
+) -> Result<Vec<declaration::Signed>> {
+    let Some(retained) = guard.read_json::<Retained>("wizard-declaration-signed.json")? else {
+        return Ok(Vec::new());
+    };
+    let report = retained.report(record, now)?;
+    require(report.for_current_configuration && report.state == "signed_not_installed")?;
+    Ok(vec![report.signed.ok_or(Error::Invalid)?])
+}
 impl Store {
+    pub fn inspect_pending_data_handling(&self, now: u64) -> Result<Option<DeclarationReport>> {
+        let guard = store::Guard::open(&self.directory)?;
+        let Some(pending) = guard.read_json::<Retained>("wizard-declaration-plan.json")? else {
+            return Ok(None);
+        };
+        pending.validate()?;
+        if let Some(signed) = guard.read_json::<Retained>("wizard-declaration-signed.json")? {
+            signed.validate()?;
+            if signed.plan.plan_digest == pending.plan.plan_digest
+                || signed.plan.body.revision >= pending.plan.body.revision
+            {
+                return Ok(None);
+            }
+        }
+        pending
+            .report(&guard.read()?.ok_or(Error::Missing)?, now)
+            .map(Some)
+    }
     /// The caller resolves these exact definitions through the fixed trusted
     /// registry reader. Browser-supplied definitions cannot construct this type.
     /// A new plan replaces only a pending plan; the last signed original remains

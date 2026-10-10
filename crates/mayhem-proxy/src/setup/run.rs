@@ -125,6 +125,8 @@ pub struct RunPlan {
     pub launch: LaunchBinding,
     pub recovery_probes_enabled: bool,
     pub probe_budget: crate::capacity::probes::Budget,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub data_handling: Vec<crate::declaration::Signed>,
     pub plan_digest: Digest,
 }
 #[derive(Serialize)]
@@ -217,6 +219,7 @@ impl Retained {
 }
 fn build(
     record: &Record,
+    data_handling: Vec<crate::declaration::Signed>,
     template: RunTemplate,
     mut probe: ProbePlan,
     peer: &str,
@@ -293,7 +296,7 @@ fn build(
             })
             .collect(),
         routes: vec![managed::RouteConfig {
-            data_handling: Vec::new(),
+            data_handling: data_handling.clone(),
             id: scope.route.clone(),
             connection: scope.connection_group.clone(),
             ceiling: scope.route_ceiling,
@@ -326,6 +329,7 @@ fn build(
         launch,
         recovery_probes_enabled: template.allow_recovery_probes,
         probe_budget: budget,
+        data_handling,
         plan_digest: Digest::hash("placeholder", &[]),
     };
     plan.plan_digest = plan_digest(&plan)?;
@@ -345,7 +349,17 @@ impl Store {
         if record.revision != expected {
             return Err(Error::Conflict);
         }
-        let (_, plan) = build(&record, template, probe, peer, &self.directory, host)?;
+        let declarations =
+            declarations::signed_for_run(&guard, &record, flow::declarations::now()?)?;
+        let (_, plan) = build(
+            &record,
+            declarations,
+            template,
+            probe,
+            peer,
+            &self.directory,
+            host,
+        )?;
         if let Some(saved) = guard.read_json::<Retained>("wizard-run.json")? {
             saved.validate()?;
             if saved.plan.plan_digest != plan.plan_digest {
@@ -376,7 +390,17 @@ impl Store {
         if record.revision != expected {
             return Err(Error::Conflict);
         }
-        let (config, plan) = build(&record, template, probe, peer, &self.directory, host)?;
+        let declarations =
+            declarations::signed_for_run(&guard, &record, flow::declarations::now()?)?;
+        let (config, plan) = build(
+            &record,
+            declarations,
+            template,
+            probe,
+            peer,
+            &self.directory,
+            host,
+        )?;
         if &plan.plan_digest != expected_plan {
             return Err(Error::RunConflict);
         }

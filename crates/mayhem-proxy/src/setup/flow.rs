@@ -6,6 +6,8 @@ use ed25519_dalek::SigningKey;
 use mayhem_proto::proxy::ProxyEndpoint;
 use serde_json::{json, Value};
 use std::sync::Arc;
+pub(super) mod declarations;
+pub use declarations::DeclarationRegistry;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -16,6 +18,7 @@ pub struct FlowConfig {
     pub probe_plan: Option<PathBuf>,
     pub peer_rpc: Option<String>,
     pub admission_origin: Option<String>,
+    pub declaration_registry: Option<DeclarationRegistry>,
     pub timeout_ms: u64,
     pub run: Option<RunSettings>,
 }
@@ -59,6 +62,9 @@ impl FlowConfig {
                 && (1..=10_000).contains(&self.timeout_ms),
         )?;
         self.profile.clone().prepare()?;
+        if let Some(registry) = &self.declaration_registry {
+            registry.reader()?;
+        }
         if let Some(path) = &self.probe_plan {
             require(path.is_absolute())?;
             ProbePlan::load(path)?;
@@ -117,6 +123,22 @@ impl FlowChoice {
 #[derive(Deserialize, Serialize)]
 #[serde(tag = "action", rename_all = "snake_case", deny_unknown_fields)]
 pub enum FlowAction {
+    DeclarationFields {
+        release_id: Option<String>,
+        cursor: Option<String>,
+    },
+    DeclarationPlan {
+        expected_revision: u64,
+        expected_declaration_revision: u64,
+        release_id: String,
+        release_hash: Digest,
+        choices: Vec<DeclarationChoice>,
+        expires_at_ms: u64,
+    },
+    ConfirmDeclaration {
+        expected_revision: u64,
+        plan_digest: Digest,
+    },
     Connect {},
     Discover {
         expected_inventory_revision: u64,
@@ -177,6 +199,8 @@ pub struct FlowView {
     pub probe_plan: Option<Value>,
     pub enrollment: Option<Value>,
     pub run: Option<RunReport>,
+    pub declaration: Option<DeclarationReport>,
+    pub pending_declaration: Option<DeclarationReport>,
     pub steps: Vec<Value>,
     pub capabilities: Value,
 }
@@ -199,15 +223,22 @@ pub struct Flow {
     config: FlowConfig,
     gate: Arc<tokio::sync::Semaphore>,
     lifecycle: Option<Arc<dyn RunLifecycle>>,
+    registry: Option<crate::registry::publication::Reader>,
 }
 impl Flow {
     pub fn open(config: FlowConfig) -> Result<Self> {
         config.validate()?;
         Store::open(&config.directory)?;
+        let registry = config
+            .declaration_registry
+            .as_ref()
+            .map(DeclarationRegistry::reader)
+            .transpose()?;
         Ok(Self {
             config,
             gate: Arc::new(tokio::sync::Semaphore::new(1)),
             lifecycle: None,
+            registry,
         })
     }
     pub fn run_settings(&self) -> Option<&RunSettings> {
@@ -350,6 +381,26 @@ impl Flow {
                 ));
         }
         let run = store.inspect_run()?;
+        let now = declarations::now()?;
+        let mut declaration = store.inspect_data_handling(now)?;
+        if let Some(declaration) = &mut declaration {
+            if declaration.state == "signed_not_installed"
+                && run.as_ref().is_some_and(|r| {
+                    r.state == "installed"
+                        && r.for_current_configuration
+                        && declaration.signed.as_ref().is_some_and(|s| {
+                            r.plan
+                                .data_handling
+                                .iter()
+                                .any(|d| d.signature == s.signature)
+                        })
+                })
+            {
+                declaration.state = "configured_in_controller";
+                declaration.installed_in_runtime = true;
+            }
+        }
+        let pending_declaration = store.inspect_pending_data_handling(now)?;
         let r = review.as_ref();
         let steps = vec![
             json!({"step":"connect","state":"configured_private_reference"}),
@@ -357,6 +408,7 @@ impl Flow {
             json!({"step":"select","state":if r.is_some(){"retained"}else{"needs_selection"}}),
             json!({"step":"check","structural":r.map(|r|json!(r.state)).unwrap_or(json!("not_run")),"probe":r.map(|r|r.probe_status).unwrap_or("not_run")}),
             json!({"step":"market","state":if r.is_some(){"operator_selected_not_canonical_confirmation"}else{"needs_selection"}}),
+            json!({"step":"data_handling","state":declaration.as_ref().map(|d|d.state).unwrap_or("not_declared"),"assurance":"declared_not_verified"}),
             json!({"step":"admission","state":r.map(|r|r.admission_status).unwrap_or("not_checked"),"payment_does_not_enable_serving":true}),
             json!({"step":"review_publish","state":r.map(|r|r.publication_status).unwrap_or("not_submitted"),"explicit_confirmation_required":true}),
             json!({"step":"run","state":run.as_ref().map(|r|r.state.as_str()).unwrap_or(if self.config.run.is_some()&&self.lifecycle.is_some(){"not_started"}else{"managed_configuration_handoff_required"}),"automatic_start":false}),
@@ -379,8 +431,10 @@ impl Flow {
             probe_plan,
             enrollment,
             run,
+            declaration,
+            pending_declaration,
             steps,
-            capabilities: json!({"probe":self.config.probe_plan.is_some(),"canonical_admission":self.config.peer_rpc.is_some(),"enrollment":self.config.admission_origin.is_some(),"publication":self.config.peer_rpc.is_some(),"run":self.config.run.is_some()&&self.lifecycle.is_some()}),
+            capabilities: json!({"declarations":self.registry.is_some(),"probe":self.config.probe_plan.is_some(),"canonical_admission":self.config.peer_rpc.is_some(),"enrollment":self.config.admission_origin.is_some(),"publication":self.config.peer_rpc.is_some(),"run":self.config.run.is_some()&&self.lifecycle.is_some()}),
         })
     }
     pub async fn execute(
@@ -395,6 +449,35 @@ impl Flow {
             .map_err(|_| Error::Busy)?;
         let store = self.store()?;
         let result = match action {
+            FlowAction::DeclarationFields { release_id, cursor } => {
+                self.declaration_fields(release_id, cursor).await?
+            }
+            FlowAction::DeclarationPlan {
+                expected_revision,
+                expected_declaration_revision,
+                release_id,
+                release_hash,
+                choices,
+                expires_at_ms,
+            } => {
+                self.declaration_plan(
+                    expected_revision,
+                    expected_declaration_revision,
+                    &release_id,
+                    &release_hash,
+                    choices,
+                    expires_at_ms,
+                )
+                .await?
+            }
+            FlowAction::ConfirmDeclaration {
+                expected_revision,
+                plan_digest,
+            } => self.confirm_declaration(
+                expected_revision,
+                &plan_digest,
+                key.ok_or(Error::Invalid)?,
+            )?,
             FlowAction::Connect {} => {
                 self.config.profile.clone().prepare()?;
                 json!({"configured":true,"network_request":false,"scope":"configuration_only"})

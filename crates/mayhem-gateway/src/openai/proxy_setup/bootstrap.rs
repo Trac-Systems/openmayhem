@@ -54,6 +54,7 @@ impl BootstrapConfig {
             || config.profile.network != self.host.network
             || config.peer_rpc.as_deref() != Some(self.host.peer_rpc.as_str())
             || config.admission_origin != self.host.admission_origin
+            || config.declaration_registry != self.host.declaration_registry
         {
             return Err("setup original host binding mismatch".into());
         }

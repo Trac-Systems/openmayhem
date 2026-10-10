@@ -2,6 +2,7 @@
 use super::*;
 use mayhem_proxy::setup::{Flow, FlowAction, FlowConfig, FlowView, ProfileMarket};
 use std::io::{self, Write};
+mod declarations;
 
 #[derive(Debug, Args)]
 pub struct WizardArgs {
@@ -90,7 +91,7 @@ async fn execute(
 ) -> Result<mayhem_proxy::setup::FlowResult> {
     if matches!(
         action,
-        FlowAction::Enrollment { .. } | FlowAction::Publish { .. }
+        FlowAction::Enrollment { .. } | FlowAction::Publish { .. } | FlowAction::ConfirmDeclaration { .. }
     ) {
         let keypair = resolve_wallet_keypair_path(wallet)?;
         let key = cached_wallet_signing_key(
@@ -135,6 +136,8 @@ pub async fn run(args: WizardArgs) -> Result<()> {
     loop {
         let view = flow.view()?;
         show(&view)?;
+        if let Some(d) = &view.declaration { println!("Data handling: {} (declared, not verified)", d.state); }
+        println!("j Review data-handling declarations  y Sign retained declaration review");
         println!("c Connect  d Discover  s Select/price  k Check  p Probe  a Admission facts\ni Invoice/create  t Status  f FIAT checkout  v Review publication  u Publish\nr Recover original probe  o Recover original publication  g Review Run  b Begin Run  h Reconcile Run  x Exit");
         let command = prompt("Action", "x")?;
         if command == "x" {
@@ -144,6 +147,13 @@ pub async fn run(args: WizardArgs) -> Result<()> {
         let needs_revision =
             || revision.ok_or_else(|| anyhow::anyhow!("save your selection first"));
         let action = match command.as_str() {
+            "j" => declarations::review(&flow, &view).await?,
+            "y" => {
+                let pending=view.pending_declaration.as_ref().ok_or_else(|| anyhow::anyhow!("review declarations first"))?;
+                println!("{}",serde_json::to_string_pretty(pending)?);
+                if prompt("Sign exactly these promises until their stated expiry? (yes/no)","no")? != "yes" { continue; }
+                FlowAction::ConfirmDeclaration { expected_revision:needs_revision()?, plan_digest:pending.plan.plan_digest.clone() }
+            }
             "c" => FlowAction::Connect {},
             "d" => FlowAction::Discover {
                 expected_inventory_revision: view

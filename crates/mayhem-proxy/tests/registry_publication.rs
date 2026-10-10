@@ -210,7 +210,15 @@ impl Mock {
                             .strip_prefix("/v1/proxy/registry/releases/")
                             .unwrap();
                         let mut status = s.status;
-                        let (mut body, default_etag) = if call.method == "GET" {
+                        let (mut body, default_etag) = if call.method == "GET" && suffix.contains("/fields?") {
+                            let (id, query) = suffix.split_once("/fields?").unwrap();
+                            let query = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect::<BTreeMap<_,_>>();
+                            assert_eq!(query.get("limit").map(String::as_str), Some("32"));
+                            let release = s.releases.get(id).unwrap();
+                            let data = s.documents.iter().filter(|((release,_,_),_)| release == id).map(|(_,d)|d.clone()).take(32).collect::<Vec<_>>();
+                            let tag = format!("\"{}\"",hash("mayhem/proxy/registry-representation/v1",&json!({"release_id":id,"release_hash":release["release_hash"],"kind":"fields","selector":{"limit":32,"cursor":query.get("cursor")}})));
+                            (json!({"object":"list","release_id":id,"release_hash":release["release_hash"],"data":data,"next_cursor":null}),tag)
+                        } else if call.method == "GET" {
                             let body = if suffix == "current" {
                                 s.head.clone()
                             } else {

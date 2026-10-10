@@ -19,6 +19,7 @@ pub struct Host {
     pub worker_program: PathBuf,
     pub wallet_password_file: Option<PathBuf>,
     pub admission_origin: Option<String>,
+    pub declaration_registry: Option<DeclarationRegistry>,
 }
 /// Deliberately neither Serialize nor Debug: frontends may accept a secret once,
 /// but only a protected reference is written into configuration/review.
@@ -373,6 +374,7 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
         probe_plan: Some("probe.json".into()),
         peer_rpc: Some(host.peer_rpc.clone()),
         admission_origin: host.admission_origin,
+        declaration_registry: host.declaration_registry,
         timeout_ms: 5000,
         run: Some(RunSettings {
             template: "runtime-policy.json".into(),

@@ -2,6 +2,8 @@
 //! HTTPS origin is the trust anchor; these hashes are integrity identities, not
 //! signatures or evidence of provider capability. Nothing is activated here.
 pub mod taxonomy;
+mod fields;
+pub use fields::FieldsPage;
 mod wire;
 pub use wire::{Document, DocumentReference, Manifest, Reference, Release};
 

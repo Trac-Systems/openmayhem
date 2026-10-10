@@ -16,6 +16,7 @@ pub(super) fn config(f: &Fixture) -> FlowConfig {
         probe_plan: None,
         peer_rpc: None,
         admission_origin: None,
+        declaration_registry: None,
         timeout_ms: 2000,
         run: None,
     }

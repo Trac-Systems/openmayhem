@@ -22,6 +22,9 @@ pub struct Args {
     /// Trusted admission API origin. Omission leaves enrollment unavailable.
     #[arg(long, requires = "proxy_setup")]
     pub proxy_setup_admission_origin: Option<String>,
+    /// Protected registry trust configuration for optional provider declarations.
+    #[arg(long, value_name = "PATH", requires = "proxy_setup")]
+    pub proxy_setup_declaration_registry_file: Option<PathBuf>,
 }
 
 pub async fn prepare(
@@ -108,6 +111,7 @@ pub async fn prepare(
             ),
             wallet_password_file: password,
             admission_origin: args.proxy_setup_admission_origin.clone(),
+            declaration_registry: args.proxy_setup_declaration_registry_file.as_deref().map(mayhem_proxy::setup::DeclarationRegistry::load).transpose()?,
         },
         tokenizers,
         credentials,

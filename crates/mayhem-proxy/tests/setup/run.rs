@@ -132,6 +132,50 @@ fn limits() -> capacity::Limits {
         max_evidence_age: Duration::from_secs(60),
     }
 }
+// Fixture for a declaration already authored by the separately tested Store flow.
+// Exercise the actual managed-loader/run boundary without a second registry server.
+fn signed_declaration(f: &Fixture) -> mayhem_proxy::declaration::Signed {
+    use mayhem_proxy::{declaration, registry::Support};
+    let review = f.store().inspect().unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let signed = Authority::from_unlocked_wallet(publication::signer(122), identity(f))
+        .unwrap()
+        .declare_data_handling(declaration::Body {
+            schema_version: 1,
+            subject: declaration::Subject::new(
+                review.network.clone(),
+                &review.offers[0],
+                &review.membership,
+            )
+            .unwrap(),
+            revision: 1,
+            issued_at_ms: now,
+            expires_at_ms: now + 60000,
+            claims: vec![declaration::Claim {
+                field_id: "privacy.training".into(),
+                schema_revision: 1,
+                definition_digest: d(9),
+                status: Support::Unknown,
+                value: None,
+            }],
+        })
+        .unwrap();
+    let mut plan = json!({"schema_version":1,"draft_id":review.draft_id,"draft_revision":review.revision,
+        "registry_release_id":"11111111-1111-4111-8111-111111111111","registry_release_hash":d(8),"body":signed.body});
+    let bytes = mayhem_proto::stable_json_bytes(&plan).unwrap();
+    let mut digest = blake3::Hasher::new_derive_key("mayhem/proxy/setup-data-handling-plan/v1");
+    digest.update(&(bytes.len() as u64).to_le_bytes());
+    digest.update(&bytes);
+    plan["plan_digest"] = json!(digest.finalize().to_hex().to_string());
+    private(
+        &f.store.join("wizard-declaration-signed.json"),
+        &serde_json::to_vec(&json!({"schema_version":1,"plan":plan,"signed":signed})).unwrap(),
+    );
+    signed
+}
 #[tokio::test]
 async fn run_exact_canonical_publication_lost_ack_restart_and_spent_budget() {
     let mut f = publication::owned(ProxyEndpoint::Decisions, 122);
@@ -188,6 +232,39 @@ async fn run_exact_canonical_publication_lost_ack_restart_and_spent_budget() {
         )
         .unwrap();
     assert_eq!(plan.probe_budget, probe().budget);
+    let original_plan = plan;
+    let draft_before = std::fs::read(f.store.join("draft.json")).unwrap();
+    let declaration = signed_declaration(&f);
+    let plan = f
+        .store()
+        .run_plan(
+            published.revision,
+            template(&f),
+            probe(),
+            &peer.rpc(),
+            &host,
+        )
+        .unwrap();
+    assert_ne!(plan.config_digest, original_plan.config_digest);
+    assert_eq!(plan.data_handling.len(), 1);
+    assert_eq!(plan.data_handling[0].signature, declaration.signature);
+    assert!(matches!(
+        f.store()
+            .start_run(
+                published.revision,
+                template(&f),
+                probe(),
+                &peer.rpc(),
+                &original_plan.plan_digest,
+                &host
+            )
+            .await,
+        Err(Error::RunConflict)
+    ));
+    assert_eq!(
+        draft_before,
+        std::fs::read(f.store.join("draft.json")).unwrap()
+    );
     assert!(!f.store.join("wizard-run.json").exists());
     let before = capacity::Authority::open_existing(
         f.dir.path().join("capacity.redb"),
@@ -243,6 +320,18 @@ async fn run_exact_canonical_publication_lost_ack_restart_and_spent_budget() {
         .await
         .unwrap();
     assert_eq!(installed.state, "installed");
+    let configured: Value = serde_json::from_slice(
+        &std::fs::read(f.store.join(format!(
+            "wizard-managed-{}.json",
+            plan.config_digest.as_str()
+        )))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        configured["routes"][0]["data_handling"][0]["signature"],
+        declaration.signature
+    );
     assert!(!installed.capacity_advertised_by_setup);
     assert_eq!(host.installs.load(Ordering::SeqCst), 1);
     let report = f.store().recover_run(&host).await.unwrap();

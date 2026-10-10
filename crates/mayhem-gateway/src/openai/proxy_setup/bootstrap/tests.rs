@@ -40,7 +40,7 @@ fn config(dir: &Path) -> BootstrapConfig {
         network:serde_json::from_value(json!({"network_id":"dashboard-fixture","msb_bootstrap":"03".repeat(32),"subnet_bootstrap":"04".repeat(32),"contract_version":mayhem_proto::CONTRACT_VERSION})).unwrap(),
         provider_pubkey:Digest::new(hex::encode(ed25519_dalek::SigningKey::from_bytes(&[201;32]).verifying_key().to_bytes())).unwrap(),
         peer_rpc:std::fs::read_to_string(dir.join("fixture-peer-url")).unwrap_or_else(|_|"http://127.0.0.1:9/".into()),bridge_url:"ws://127.0.0.1:9/".into(),bridge_token_file:bridge,
-        worker_program:std::env::current_exe().unwrap(),wallet_password_file:None,admission_origin:None},
+        worker_program:std::env::current_exe().unwrap(),wallet_password_file:None,admission_origin:None,declaration_registry:None},
         tokenizers:BTreeMap::from([("approved".into(),Tokenizer{file:token,digest:Digest::new(blake3::hash(&data).to_hex().to_string()).unwrap(),limits:mayhem_proxy::health::native::Limits{artifact_bytes:1024*1024,output_bytes:1024*1024,channels:16,workers:1,minimum_tokens:2}})]),
         credentials:BTreeMap::new(),lifecycle:Arc::new(NoLifecycle)}
 }

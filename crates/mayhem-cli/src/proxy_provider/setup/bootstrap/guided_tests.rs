@@ -50,6 +50,7 @@ async fn guided_cli_prompts_discover_choose_create_or_join_and_convert_exact_pri
         worker_program: std::env::current_exe().unwrap(),
         wallet_password_file: None,
         admission_origin: None,
+        declaration_registry: None,
     };
     let args = InitArgs {
         wallet: WalletLocatorArgs {
@@ -62,6 +63,7 @@ async fn guided_cli_prompts_discover_choose_create_or_join_and_convert_exact_pri
         tokenizer_file: Some(token),
         restart_password_file: None,
         admission_origin: None,
+        declaration_registry_file: None,
         rpc_url: None,
     };
     for join in [false, true] {

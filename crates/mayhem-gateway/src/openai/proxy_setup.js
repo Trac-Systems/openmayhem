@@ -1,7 +1,8 @@
 'use strict';
 (() => {
   const $ = id => document.getElementById(id);
-  let view, csrf, plan, runPlan, busy = false;
+  let view, csrf, plan, runPlan, busy = false, declarationPage;
+  const declarationChoices = new Map();
   const text = (id, value) => { $(id).textContent = value; };
   const json = value => JSON.stringify(value, null, 2);
   const field = (parent, label, value, change, numeric = false) => {
@@ -17,6 +18,17 @@
   const integer = value => { const n = Number(value); if (!Number.isSafeInteger(n) || n < 1) throw Error('Enter a positive whole number.'); return n; };
   function render(v) {
     view = v; plan = null; runPlan = null; $('publish').disabled = true; $('start-run').disabled = true;
+    text('declaration-state', v.declaration ? `${v.declaration.state}. Declared, not verified. Runtime activation requires a separately reviewed Run.` : 'No signed declarations. Missing claims remain unknown.');
+    text('declaration-review', json(v.pending_declaration || v.declaration || {}));
+    $('declaration-summary').replaceChildren();
+    const reviewed = v.pending_declaration || v.declaration;
+    if (reviewed) {
+      const expiry = document.createElement('p'); expiry.textContent = `Valid until ${new Date(reviewed.plan.body.expires_at_ms).toISOString()}. No automatic renewal.`; $('declaration-summary').append(expiry);
+      const list = document.createElement('ul');
+      for (const claim of reviewed.plan.body.claims) { const item=document.createElement('li'); item.textContent=`${claim.field_id}: ${claim.status === 'supported' ? JSON.stringify(claim.value.value) : claim.status}`; list.append(item); }
+      $('declaration-summary').append(list);
+    }
+    $('confirm-declaration').disabled = !v.pending_declaration || v.pending_declaration.state !== 'needs_confirmation';
     text('steps', v.steps.map(s => s.step + ': ' + (s.state || s.structural) + (s.probe ? ' / probe ' + s.probe : '')).join(' → '));
     text('identity', `Connection ${v.connection.id}, revision ${v.connection.revision}; ${v.endpoint}. Draft ${v.review?.draft_id || 'not saved'}, revision ${v.review?.revision || '—'}.`);
     $('model').value = v.selection.upstream_model; $('models').replaceChildren();
@@ -52,6 +64,7 @@
       if (action === 'admission_check') button.disabled = !v.capabilities.canonical_admission;
       if (action.startsWith('invoice_')) button.disabled = !v.capabilities.enrollment;
       if (action === 'publication_plan' || action === 'recover_publication') button.disabled = !v.capabilities.publication;
+      if (['declaration_fields','declaration_plan'].includes(action)) button.disabled = !v.capabilities.declarations;
     }
     const retained = v.enrollment, invoice = retained?.invoice;
     $('invoice').replaceChildren();
@@ -83,6 +96,7 @@
   }
   async function perform(name) {
     if (name === 'refresh') return request();
+    if (name.startsWith('declaration_') || name === 'confirm_declaration') return declarations(name);
     const revision = view.review?.revision;
     let a = {action:name,expected_revision:revision};
     if (name === 'recover_run') a = {action:name};
@@ -125,6 +139,67 @@
       if (result.checkout_url) { const url = new URL(result.checkout_url); if (url.protocol !== 'https:') throw Error('Checkout requires HTTPS.');
         const link=document.createElement('a'); link.href=url.href; link.target='_blank'; link.rel='noopener noreferrer'; link.textContent='Open original invoice checkout'; $('checkout').append(link); }
     }
+  }
+  async function declarations(name) {
+    const revision = view.review?.revision;
+    if (!revision) throw Error('Save your selection first.');
+    if (name === 'declaration_fields' || name === 'declaration_next') {
+      if (name === 'declaration_next' && document.querySelector('#declaration-fields [aria-invalid="true"]')) throw Error('Correct the invalid field before changing pages.');
+      if (name === 'declaration_next' && !declarationPage?.next_cursor) return;
+      const next = name === 'declaration_next';
+      const page = await request({action:'declaration_fields', release_id:next ? declarationPage.release_id : null, cursor:next ? declarationPage.next_cursor : null});
+      if (!next) {
+        declarationChoices.clear();
+        for (const c of view.declaration?.plan.body.claims || []) declarationChoices.set(c.field_id, {field_id:c.field_id,schema_revision:c.schema_revision,status:c.status,value:c.value});
+      }
+      declarationPage = page; $('declaration-next').disabled = !page.next_cursor;
+      $('declaration-fields').replaceChildren();
+      for (const doc of page.data) {
+        const d = doc.definition, saved = declarationChoices.get(d.field_id), box = document.createElement('fieldset');
+        const title = document.createElement('legend'); title.textContent = d.labels.en || Object.values(d.labels)[0] || d.field_id; box.append(title);
+        const help = document.createElement('p'); help.textContent = d.help.en || Object.values(d.help)[0] || d.field_id; box.append(help);
+        const status = document.createElement('select'); status.setAttribute('aria-label', `${title.textContent}: declaration`);
+        for (const [value,label] of [['omit','Do not declare'],['supported','Declare a value'],['unknown','Explicitly unknown'],['unsupported','Unsupported']]) { const option=document.createElement('option'); option.value=value; option.textContent=label; status.append(option); }
+        status.value = saved?.status || 'omit'; box.append(status);
+        const schema = d.value_schema, value = ['boolean','enum','set'].includes(schema.type) ? document.createElement('select') : document.createElement('input');
+        value.setAttribute('aria-label', `${title.textContent}: value`);
+        if (value.tagName === 'SELECT') {
+          value.multiple = schema.type === 'set';
+          const values = schema.type === 'boolean' ? ['false','true'] : schema.values;
+          for (const item of values) { const o=document.createElement('option'); o.value=item; o.textContent=item; value.append(o); }
+          if (schema.type === 'set') for (const o of value.options) o.selected = saved?.value?.value?.includes(o.value) || false;
+          else if (saved?.value) value.value = String(saved.value.value);
+        } else { value.value = saved?.value?.value ?? ''; value.maxLength = schema.max_length || 512; }
+        value.disabled = status.value !== 'supported'; box.append(value);
+        const update = () => {
+          value.disabled = status.value !== 'supported';
+          if (status.value === 'omit') { declarationChoices.delete(d.field_id); return; }
+          if (!declarationChoices.has(d.field_id) && declarationChoices.size >= 32) throw Error('A declaration can contain up to 32 selected fields.');
+          let typed = null;
+          if (status.value === 'supported') {
+            let v = value.value;
+            if (schema.type === 'boolean') v = v === 'true';
+            if (schema.type === 'set') v = [...value.selectedOptions].map(o=>o.value).sort();
+            if (schema.type === 'integer') { v = Number(v); if (!value.value.trim() || !Number.isSafeInteger(v)) throw Error('Enter an exact whole number.'); }
+            typed = {type:schema.type,value:v};
+          }
+          declarationChoices.set(d.field_id,{field_id:d.field_id,schema_revision:d.schema_revision,status:status.value,value:typed});
+        };
+        for (const control of [status,value]) control.addEventListener('change',()=>{ try { update(); box.removeAttribute('aria-invalid'); } catch(e) { box.setAttribute('aria-invalid','true'); text('message',e.message); } });
+        $('declaration-fields').append(box);
+      }
+      return;
+    }
+    if (name === 'declaration_plan') {
+      if (!declarationPage || document.querySelector('#declaration-fields [aria-invalid="true"]')) throw Error('Choose published fields and correct invalid values first.');
+      const expires = Date.parse($('declaration-expiry').value);
+      if (!Number.isSafeInteger(expires) || !/Z$/.test($('declaration-expiry').value) || expires <= Date.now()) throw Error('Enter a future UTC expiry ending in Z.');
+      return request({action:name,expected_revision:revision,expected_declaration_revision:view.declaration?.plan.body.revision || 0,
+        release_id:declarationPage.release_id,release_hash:declarationPage.release_hash,choices:[...declarationChoices.values()].sort((a,b)=>a.field_id<b.field_id?-1:a.field_id>b.field_id?1:0),expires_at_ms:expires});
+    }
+    const pending = view.pending_declaration;
+    if (!pending || !confirm('Sign exactly the reviewed provider promises until their stated expiry? This does not attest compliance or update a running controller.')) return;
+    return request({action:'confirm_declaration',expected_revision:revision,plan_digest:pending.plan.plan_digest});
   }
   document.addEventListener('input', () => {
     if (runPlan) {runPlan=null; $('start-run').disabled=true;}

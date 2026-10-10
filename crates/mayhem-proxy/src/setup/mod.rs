@@ -18,7 +18,7 @@ pub use admission::{AdmissionEvidence, AdmissionReport, AdmissionState, Canonica
 pub use connection::{preview_models, DiscoveryState, InventoryReview, ModelsPreview};
 pub use declarations::{DeclarationChoice, DeclarationPlan, DeclarationReport};
 pub use enrollment::{EnrollmentAction, EnrollmentClient, EnrollmentInvoice, EnrollmentResult};
-pub use flow::{Flow, FlowAction, FlowChoice, FlowConfig, FlowResult, FlowView};
+pub use flow::{DeclarationRegistry, Flow, FlowAction, FlowChoice, FlowConfig, FlowResult, FlowView};
 pub use probe::{ProbeGroup, ProbePlan, ProbeReport, ProbeScope, ProbeState};
 pub use profile::{
     profiles, EndpointProfile, MembershipInput, OfferInput, ProfileInput, ProfileMarket,
