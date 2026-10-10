@@ -106,10 +106,21 @@ impl Fixture {
         contract: Option<mayhem_proto::EndpointFamilyContract>,
         registry: Option<crate::openai::proxy_control::RegistryConfig>,
         resolution_limits: Option<ProfileResolutionLimits>,
-        mut evidence: Option<mayhem_proxy::conformance::Config>,
+        evidence: Option<mayhem_proxy::conformance::Config>,
     ) -> Self {
         let harness =
             Harness::start_with_contract(&support::worker_path(), endpoint, rail, contract).await;
+        Self::from_harness(harness, rail, retail, owner_key, registry, resolution_limits, evidence).await
+    }
+    async fn from_harness(
+        harness: Harness,
+        rail: ProxyRail,
+        retail: Option<RetailAuthorizationConfig>,
+        owner_key: &str,
+        registry: Option<crate::openai::proxy_control::RegistryConfig>,
+        resolution_limits: Option<ProfileResolutionLimits>,
+        mut evidence: Option<mayhem_proxy::conformance::Config>,
+    ) -> Self {
         if let Some(config) = &mut evidence {
             config.tester = harness.buyer.identity().controller_pubkey.clone();
         }

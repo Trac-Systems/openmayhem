@@ -170,6 +170,10 @@ pub(crate) struct Harness {
     pub(crate) template: mayhem_proto::proxy::finance::ProxySpendAuthorization,
     peer: Peer,
     calls: Arc<AtomicUsize>,
+    pub(crate) backend_status: Arc<AtomicUsize>,
+    observed: Option<mayhem_proxy::health::Monitor>,
+    connection: Arc<HttpConnection>,
+    pool: Arc<Pool>,
     pub(crate) stream_backend: Arc<StreamBackend>,
     provider_stop: watch::Sender<bool>,
     descriptors_enabled: Arc<AtomicBool>,
@@ -202,14 +206,29 @@ impl Harness {
         rail: ProxyRail,
         contract: Option<mayhem_proto::EndpointFamilyContract>,
     ) -> Self {
+        Self::start_configured(worker, endpoint, rail, contract, false).await
+    }
+    pub(crate) async fn start_observed(worker: &Path) -> Self {
+        Self::start_configured(worker, ProxyEndpoint::Decisions, ProxyRail::Fiat, None, true).await
+    }
+    async fn start_configured(
+        worker: &Path,
+        endpoint: ProxyEndpoint,
+        rail: ProxyRail,
+        contract: Option<mayhem_proto::EndpointFamilyContract>,
+        observe: bool,
+    ) -> Self {
         let directory = private_dir();
         let calls = Arc::new(AtomicUsize::new(0));
         let count = calls.clone();
+        let backend_status = Arc::new(AtomicUsize::new(200));
+        let status = backend_status.clone();
         let stream_backend = Arc::new(StreamBackend::default());
         let backend_stream = stream_backend.clone();
         let path = endpoint_path(endpoint);
         let app = Router::new().route(path, post(move |Json(input): Json<Value>| {
             let count = count.clone();
+            let status = status.clone();
             let backend_stream = backend_stream.clone();
             async move {
                 assert_eq!(input["model"], "upstream-model");
@@ -229,6 +248,11 @@ impl Harness {
                     _ => (),
                 }
                 count.fetch_add(1, Ordering::SeqCst);
+                let status = status.load(Ordering::SeqCst);
+                if status != 200 {
+                    return (axum::http::StatusCode::from_u16(status as u16).unwrap(),
+                        Json(json!({"error":{"code":"rate_limit_exceeded","message":"fixture backend busy"}}))).into_response();
+                }
                 if input["stream"] == true {
                     return streaming::response(endpoint, backend_stream);
                 }
@@ -402,7 +426,7 @@ impl Harness {
         }
         let runtime = Arc::new(financial::provider::Runtime {
             adapter: adapter.clone(),
-            connection,
+            connection: connection.clone(),
             capacity: capacity.clone(),
             route: digest(201),
             approved_policy: policy.clone(),
@@ -436,13 +460,7 @@ impl Harness {
             )
             .unwrap(),
         );
-        let provider = serving::Controller::new(
-            runtime,
-            journal,
-            provider_signer.clone(),
-            provider_client.clone(),
-            pool.clone(),
-            serving::Limits {
+        let serving_limits = serving::Limits {
                 sessions: 4,
                 per_buyer: 2,
                 outbound_messages: 16,
@@ -456,9 +474,20 @@ impl Harness {
                     storage_operations: 4,
                     unsigned_lifetime: Duration::from_secs(30),
                 },
-            },
-        )
-        .unwrap();
+            };
+        let observed = observe.then(|| fixture_monitor(endpoint));
+        if observe {
+            capacity.configure_probe_budget(&digest(200), capacity::probes::Budget {
+                max_attempts: 2, max_cost_microusd: 20, per_attempt_cost_microusd: 10,
+            }).unwrap();
+        }
+        let provider = if let Some(monitor) = &observed {
+            serving::Controller::new_observed(runtime, journal, provider_signer.clone(),
+                provider_client.clone(), pool.clone(), serving_limits, monitor.clone())
+        } else {
+            serving::Controller::new(runtime, journal, provider_signer.clone(),
+                provider_client.clone(), pool.clone(), serving_limits)
+        }.unwrap();
         let bridge = Bridge::start(
             &template.terms.buyer_pubkey,
             &template.terms.offer.provider_pubkey,
@@ -563,7 +592,7 @@ impl Harness {
                 recovery.clone(),
                 financial.clone(),
                 buyer_signer,
-                pool,
+                pool.clone(),
                 bridge.config(true),
                 buyer::Limits {
                     sessions: 2,
@@ -592,6 +621,10 @@ impl Harness {
             template,
             peer,
             calls,
+            backend_status,
+            observed,
+            connection,
+            pool,
             provider_stop,
             descriptors_enabled,
             provider_ended,
@@ -737,6 +770,53 @@ impl Harness {
         self.backend_task.abort();
         self.peer.stop().await;
     }
+    pub(crate) async fn recover_observed_backend(&self) {
+        let monitor = self.observed.as_ref().unwrap().clone();
+        let view = monitor.snapshot(&digest(201)).unwrap();
+        assert_eq!(view.allowance, 0, "recovery must not probe an available provider");
+        assert!(view.recovery_after_ms <= 2000);
+        tokio::time::sleep(Duration::from_millis(view.recovery_after_ms + 1)).await;
+        mayhem_proxy::execution::probes::Controller::new(
+            self.connection.clone(), self.adapter.clone(), self.pool.clone(), self.capacity.clone(),
+            monitor, digest(201), digest(200), &request_body(ProxyEndpoint::Decisions), false,
+            mayhem_proxy::execution::probes::Limits {
+                max_request_bytes: 16 * 1024, max_response_bytes: 32 * 1024,
+                max_output_tokens: 128, timeout: Duration::from_secs(5), storage_workers: 2,
+            },
+        ).unwrap().run().await.unwrap();
+    }
+    pub(crate) fn withdraw_observed_backend(&self) {
+        use mayhem_proxy::{connector::failure::{Code, Execution, Failure, Scope, Stage}, health};
+        // Inject only the controller's loss signal. The signed publisher,
+        // receiving admission checks and subsequent HTTP probe remain real.
+        self.observed.as_ref().unwrap().observe_request(&digest(201),
+            health::Class::new(16, health::Thinking::Unknown, false)).unwrap()
+            .failure(Failure::new(Code::UpstreamUnavailable, Scope::Connection,
+                Stage::Connecting, Execution::NotDispatched));
+    }
+    pub(crate) fn observed_status(&self) -> Value {
+        let capacity = self.capacity_status();
+        json!({"health":self.observed.as_ref().unwrap().snapshot(&digest(201)).unwrap(),
+            "capacity":{"available":capacity.available,"occupied":capacity.group_occupied,"state":capacity.state}})
+    }
+}
+
+fn fixture_monitor(endpoint: ProxyEndpoint) -> mayhem_proxy::health::Monitor {
+    use mayhem_proxy::{health, supervisor::RefreshPolicy};
+    let monitor = health::Monitor::new(health::Policy {
+        max_routes: 8, max_classes_per_route: 8, evidence_ttl_ms: 60_000,
+        successes_to_increase: 2, bad_samples_to_reduce: 2,
+        latency_baseline_samples: 3, latency_multiplier: 4, latency_increase_ms: 1000,
+        min_native_tok_s: 5,
+        recovery: RefreshPolicy { interval_ms: 2000, page_pause_ms: 10,
+            retry_initial_ms: 100, retry_max_ms: 1000, jitter_percent: 0 },
+    }, 2, 1).unwrap();
+    if endpoint == ProxyEndpoint::Decisions {
+        monitor.register(digest(201), 2, false).unwrap();
+    } else {
+        monitor.register_measured(digest(201), 2, digest(801)).unwrap();
+    }
+    monitor
 }
 
 pub(crate) struct ControlFixture {
@@ -845,31 +925,8 @@ impl Harness {
         .await
         .expect("real local discovery and selected presence subscription");
         let tokenizer = digest(801);
-        let monitor = health::Monitor::new(
-            health::Policy {
-                max_routes: 8,
-                max_classes_per_route: 8,
-                evidence_ttl_ms: 60_000,
-                successes_to_increase: 2,
-                bad_samples_to_reduce: 2,
-                latency_baseline_samples: 3,
-                latency_multiplier: 4,
-                latency_increase_ms: 1000,
-                min_native_tok_s: 5,
-                recovery: refresh,
-            },
-            2,
-            1,
-        )
-        .unwrap();
+        let monitor = self.observed.clone().unwrap_or_else(|| fixture_monitor(self.adapter.endpoint()));
         let measured = self.adapter.endpoint() != ProxyEndpoint::Decisions;
-        if measured {
-            monitor
-                .register_measured(digest(201), 2, tokenizer.clone())
-                .unwrap();
-        } else {
-            monitor.register(digest(201), 2, false).unwrap();
-        }
         // Deterministic local tokenizer-count/timestamp fixture evidence. This
         // tests publishing/receiving evidence, not tokenizer model accuracy.
         for _ in 0..3 {

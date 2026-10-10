@@ -164,3 +164,84 @@ async fn serve_proxy_loopback_lab() {
         .unwrap();
     write_private(&result_file, &summary);
 }
+
+/// Finite, opt-in presence propagation lab. The only upstream is a disposable
+/// loopback decision backend. No external API, money, store or service is used.
+#[tokio::test]
+#[ignore = "manual signed-presence integration; loopback and private fixture manifests only"]
+async fn serve_proxy_presence_lab() {
+    let manifest_path = PathBuf::from(std::env::var_os("MAYHEM_TEST_PROXY_PRESENCE_MANIFEST")
+        .expect("explicit private output manifest required"));
+    assert!(manifest_path.is_absolute() && !manifest_path.exists());
+    let parent = std::fs::symlink_metadata(manifest_path.parent().unwrap()).unwrap();
+    assert!(parent.is_dir() && !parent.file_type().is_symlink() && parent.permissions().mode() & 0o077 == 0);
+    let stop_file = manifest_path.with_extension("stop");
+    assert!(!stop_file.exists());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gateway_url = format!("http://{}", listener.local_addr().unwrap());
+    let mut random = [0u8; 32];
+    getrandom::fill(&mut random).unwrap();
+    let key = format!("presence-lab-{}", hex::encode(random));
+    let harness = Harness::start_observed(&support::worker_path()).await;
+    let f = Fixture::from_harness(harness, ProxyRail::Fiat, None, &key, None, None, None).await;
+    let (status, offers) = f.get("/v1/proxy/offers?rail=fiat", &key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(offers["entries"].as_array().unwrap().len(), 1);
+    let (shutdown, stopped) = oneshot::channel::<()>();
+    let router = f.router.clone();
+    let serving = tokio::spawn(async move {
+        axum::serve(listener, router).with_graceful_shutdown(async { let _ = stopped.await; }).await.unwrap();
+    });
+    write_private(&manifest_path, &json!({"schema_version":1,"test_only":true,"ready":true,
+        "gateway_url":gateway_url,"gateway_token":key,"offer_id":offers["entries"][0]["id"],
+        "expires_at_ms":crate::openai::now_millis_u64()+90_000,"stop_file":stop_file,
+        "test_doubles":["loopback decision backend","initial healthy evidence","controller connection-loss signal","SC-Bridge peer transport attribution","synthetic ledger funding"]}));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let commands = ["occupy", "release", "withdraw", "recover", "upstream_busy", "recover_uncertain"];
+    let mut next = 0;
+    let mut reservations = Vec::new();
+    while tokio::time::Instant::now() < deadline && !stop_file.exists() {
+        let command = manifest_path.with_extension(format!("command.{next}.json"));
+        if next < commands.len() && command.exists() {
+            let input: Value = serde_json::from_slice(
+                &mayhem_proxy::connector::config::private_file(&command, 512).unwrap()).unwrap();
+            assert_eq!(input, json!({"command":commands[next]}));
+            let started = crate::openai::now_millis_u64();
+            let mut extra = Value::Null;
+            match commands[next] {
+                "occupy" => { reservations.push(f.harness.reserve_test_capacity(901)); reservations.push(f.harness.reserve_test_capacity(902)); }
+                "release" => { for reservation in reservations.drain(..) { f.harness.release_test_capacity(reservation); } }
+                "withdraw" => f.harness.withdraw_observed_backend(),
+                "upstream_busy" => {
+                    f.harness.backend_status.store(429, Ordering::SeqCst);
+                    let (status, _, body) = f.post("presence-failure", f.body(), &key, false).await;
+                    // A dispatched upstream refusal may remain a recoverable
+                    // 202 while canonical settlement catches up; never call it
+                    // a successful decision or fabricate financial closure.
+                    assert_ne!(status, StatusCode::OK);
+                    assert_eq!(f.harness.backend_calls(), 2);
+                    extra = json!({"http_status":status.as_u16(),"error_code":body["error"]["code"]});
+                }
+                "recover" | "recover_uncertain" => {
+                    f.harness.backend_status.store(200, Ordering::SeqCst);
+                    f.harness.recover_observed_backend().await;
+                    assert_eq!(f.harness.backend_calls(), if commands[next] == "recover" { 1 } else { 3 });
+                }
+                _ => unreachable!(),
+            }
+            write_private(&manifest_path.with_extension(format!("ack.{next}.json")),
+                &json!({"command":commands[next],"started_at_ms":started,
+                    "finished_at_ms":crate::openai::now_millis_u64(),"backend_calls":f.harness.backend_calls(),"result":extra,
+                    "provider":f.harness.observed_status()}));
+            next += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let calls = f.harness.backend_calls();
+    let _ = shutdown.send(());
+    f.stop().await;
+    tokio::time::timeout(Duration::from_secs(10), serving).await.unwrap().unwrap();
+    write_private(&manifest_path.with_extension("result.json"),
+        &json!({"commands_completed":next,"backend_calls":calls,"production_changed":false}));
+    assert_eq!(next, commands.len(), "all externally observed phases must complete");
+}
