@@ -1,7 +1,9 @@
 //! Standalone NTFS namespace commits. No setup, database or financial callers.
 use super::*;
 use std::io::Write;
+mod directory;
 mod native;
+pub use directory::{DirectoryEntry, DirectoryIdentity, PendingDirectory};
 #[cfg(test)]
 mod tests;
 

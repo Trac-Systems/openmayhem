@@ -50,9 +50,40 @@ object closes handles only and never promotes or deletes a temporary.
 Crash recovery must continue using the existing typed application records and
 their original operation IDs/digests. This primitive deliberately does not
 introduce a redo log that treats leftover temporary files as authorization.
-Temporary cleanup, first-install staged-directory publication and an exclusive
-redb file backend are not implemented. They remain separate integration work.
-No raw writable handle is exported.
+Temporary cleanup, an exclusive redb file backend and application-store wiring
+are not implemented. No raw writable handle is exported.
+
+## First-install directory publication
+
+`guard.stage_directory(temporary, entries, maximum)` accepts an explicit tree
+of `DirectoryEntry::Directory` and `DirectoryEntry::File` records. Every path is
+a nonempty sequence of validated `LeafName` components; directory parents must
+be declared, and duplicate paths, file parents and reserved lock names fail
+before any staging mutation. Input order does not matter. The plan is bounded
+to 128 entries, depth 8, and 64 MiB aggregate file bytes, or a smaller caller
+maximum. An empty private directory is also a valid plan.
+
+Creation is relative to retained parent handles, with explicit owner/private
+DACL and write-through mode for every directory and file. Files are fully
+flushed and closed. Directories are then fully flushed and closed from leaves
+to root. Only the staged root handle and original parent guard survive into
+`PendingDirectory`; no descendant handle or writable path is exposed.
+
+`PendingDirectory::publish(destination)` has no replace option. An existing
+directory, even an empty one, is a conflict. Other target types are rejected.
+The implementation attempts one handle-relative no-replace directory rename,
+fully flushes the retained root, and checks the target's volume/file identity.
+Before the attempt, failures leave the destination unchanged. A concurrent
+target creation or any other error after the attempted rename returns
+`CommitUnknown`. Reconciliation only flushes and checks that exact original
+root; it never merges trees, retries the rename, chooses another destination,
+deletes an original, or promotes an abandoned staging tree.
+
+This is a standalone first-install primitive, not provider setup integration.
+There is no reboot recovery object or new journal format: callers must use
+their existing typed retained operation/digest records for restart decisions.
+Normal full flush is requested on directory handles as well as files; an
+unsupported or failed flush is an error, never a successful no-op.
 
 ## Documented authority
 
@@ -74,8 +105,8 @@ not malicious writes by the already-trusted current user/SYSTEM/Administrators.
 
 ## Focused verification
 
-Six native fixture cases plus one explicitly ignored subprocess helper compile
-for `x86_64-pc-windows-msvc`. They cover create/replace/reopen, bounded and reserved
+Six file/lock native fixture cases plus one explicitly ignored subprocess helper
+compile for `x86_64-pc-windows-msvc`. They cover create/replace/reopen, bounded and reserved
 names, injected failures before rename/after rename/after final flush, actual
 sharing-induced rename failure, hard-linked/public targets, and two-process
 locking with owner termination. The helper is invoked by the bounded parent
@@ -83,6 +114,13 @@ test, not counted as independent enforcement proof. Existing protected-reader
 fixtures still cover junctions and ancestor ACL/path replacement.
 There is no injected prepare-write or pre-rename-flush failure test in this
 slice; the before-rename hook runs after preparation and its flush succeeded.
+
+Five additional native directory cases cover full nested/empty-directory
+publication and reopening, complete-plan rejection before creation, preserved
+empty/nonempty/file destination conflicts, the same three fault boundaries,
+and an actual no-replace rename collision introduced after the precheck.
+They do not inject write or staging-directory flush failures. These native
+fixtures compile but have not run on Windows.
 
 Run on an isolated native Windows NTFS machine:
 

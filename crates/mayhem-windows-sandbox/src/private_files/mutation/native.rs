@@ -96,8 +96,29 @@ fn open(
     sharing: u32,
     write_through: bool,
 ) -> Outcome<Option<File>> {
-    acl::validate(pinned.file(), &pinned.owner, true).map_err(|_| MutationError::Protection)?;
-    let security = descriptor(&pinned.owner)?;
+    open_at(
+        pinned.file(),
+        &pinned.owner,
+        name,
+        disposition,
+        access,
+        sharing,
+        write_through,
+        false,
+    )
+}
+fn open_at(
+    parent: &File,
+    owner: &[u8],
+    name: &LeafName,
+    disposition: u32,
+    access: u32,
+    sharing: u32,
+    write_through: bool,
+    directory: bool,
+) -> Outcome<Option<File>> {
+    acl::validate(parent, owner, true).map_err(|_| MutationError::Protection)?;
+    let security = descriptor(owner)?;
     let mut wide_name = name.0.encode_utf16().collect::<Vec<_>>();
     let length = u16::try_from(wide_name.len() * 2).map_err(|_| MutationError::Invalid)?;
     let mut unicode = UNICODE_STRING {
@@ -107,7 +128,7 @@ fn open(
     };
     let object = OBJECT_ATTRIBUTES {
         Length: size_of::<OBJECT_ATTRIBUTES>() as u32,
-        RootDirectory: pinned.file().as_raw_handle(),
+        RootDirectory: parent.as_raw_handle(),
         ObjectName: &mut unicode,
         Attributes: OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE,
         SecurityDescriptor: security.0.cast(),
@@ -116,7 +137,11 @@ fn open(
     let mut io: IO_STATUS_BLOCK = unsafe { zeroed() };
     let mut handle = null_mut();
     let options = nt::FILE_SYNCHRONOUS_IO_NONALERT
-        | nt::FILE_NON_DIRECTORY_FILE
+        | if directory {
+            nt::FILE_DIRECTORY_FILE
+        } else {
+            nt::FILE_NON_DIRECTORY_FILE
+        }
         | nt::FILE_OPEN_REPARSE_POINT
         | if write_through {
             nt::FILE_WRITE_THROUGH
@@ -130,7 +155,11 @@ fn open(
             &object,
             &mut io,
             null(),
-            FILE_ATTRIBUTE_NORMAL,
+            if directory {
+                FILE_ATTRIBUTE_DIRECTORY
+            } else {
+                FILE_ATTRIBUTE_NORMAL
+            },
             sharing,
             disposition,
             options,
@@ -148,7 +177,8 @@ fn open(
         return Err(MutationError::Protection);
     }
     let file = unsafe { File::from_raw_handle(handle) };
-    validate_file(&file, &pinned.owner)?;
+    information(&file, directory).map_err(|_| MutationError::Protection)?;
+    acl::validate(&file, owner, true).map_err(|_| MutationError::Protection)?;
     if write_through {
         let mut mode: nt::FILE_MODE_INFORMATION = unsafe { zeroed() };
         let status = unsafe {
@@ -165,6 +195,48 @@ fn open(
         }
     }
     Ok(Some(file))
+}
+pub(super) fn create_directory(parent: &File, owner: &[u8], name: &LeafName) -> Outcome<File> {
+    open_at(
+        parent,
+        owner,
+        name,
+        nt::FILE_CREATE,
+        FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | DELETE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        true,
+        true,
+    )?
+    .ok_or(MutationError::Protection)
+}
+pub(super) fn create_staged_file(parent: &File, owner: &[u8], name: &LeafName) -> Outcome<File> {
+    open_at(
+        parent,
+        owner,
+        name,
+        nt::FILE_CREATE,
+        GENERIC_READ | GENERIC_WRITE | DELETE,
+        FILE_SHARE_READ,
+        true,
+        false,
+    )?
+    .ok_or(MutationError::Protection)
+}
+pub(super) fn inspect_directory(
+    parent: &File,
+    owner: &[u8],
+    name: &LeafName,
+) -> Outcome<Option<File>> {
+    open_at(
+        parent,
+        owner,
+        name,
+        nt::FILE_OPEN,
+        FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        false,
+        true,
+    )
 }
 pub(super) fn lock_file(pinned: &Pinned, name: &LeafName) -> Outcome<File> {
     let file = open(

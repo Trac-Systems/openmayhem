@@ -61,7 +61,8 @@ mod private_files;
 pub use private_files::{read_private_file, validate_private_directory};
 #[cfg(windows)]
 pub use private_files::mutation::{
-    CommitIdentity, LeafName, MutationError, NtfsDirectory, NtfsGuard, PendingFile, PublishMode,
+    CommitIdentity, DirectoryEntry, DirectoryIdentity, LeafName, MutationError, NtfsDirectory,
+    NtfsGuard, PendingDirectory, PendingFile, PublishMode,
 };
 
 #[cfg(windows)]
