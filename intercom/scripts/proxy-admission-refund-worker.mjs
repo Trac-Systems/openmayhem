@@ -35,11 +35,13 @@ export class AdmissionRefundWorker {
       const deadline=AbortSignal.any([signal,AbortSignal.timeout(this.timeoutMs)]);
       const result=await this.api.post('pull',{rails:Object.keys(this.adapters).sort()},deadline),work=result.work;
       if(work===null)return {outcome:'idle'};
+      need(typeof work.refund_id==='string'&&/^[A-Za-z0-9_-]{1,128}$/.test(work.refund_id)
+        &&typeof work.lease_token==='string'&&/^[0-9a-f]{64}$/.test(work.lease_token),'invalid refund lease identity');
+      identity={refund_id:work.refund_id,lease_token:work.lease_token};
       const adapter=this.adapters[work?.authorization?.body?.destination?.rail];need(adapter,'refund rail has no configured custody');
       // Adapter validates signatures and immutable evidence before local state
       // or any payment request. No generic arbitrary-URL execution is accepted.
-      const preparation=await adapter.prepare(work);
-      identity={refund_id:work.refund_id,lease_token:work.lease_token};
+      const preparation=await adapter.prepare(work,deadline);
       const grant=await this.api.post('dispatch',{...identity,preparation},deadline);
       const delivery=await adapter.execute(work,grant,deadline);
       const completed=await this.api.post('delivered',{...identity,delivery},deadline);
@@ -63,24 +65,33 @@ function privateText(file) { const b=readCustodyFile(file,{max:4096});try{return
 export async function main(env=process.env) {
   need(env.PROXY_ADMISSION_REFUND_WORKER_ENABLED==='1'&&env.PROXY_ADMISSION_REFUND_WORKER_CONFIG,'refund worker disabled');
   const c=privateJson(env.PROXY_ADMISSION_REFUND_WORKER_CONFIG);
-  shape(c,['api_origin','api_credential_file','policy_file','executor_key_file','executor_password_file','journal_root','stripe','timeout_ms','poll_ms','mode','allow_loopback_http']);
-  shape(c.stripe,['account','livemode','currency','credential_file','retry_window_ms','max_lookup_pages']);
+  shape(c,['api_origin','api_credential_file','policy_file','executor_key_file','executor_password_file','journal_root','stripe','timeout_ms','poll_ms','mode','allow_loopback_http',...(Object.hasOwn(c,'tnk')?['tnk']:[])]);
+  if(c.stripe!==null)shape(c.stripe,['account','livemode','currency','credential_file','retry_window_ms','max_lookup_pages']);
+  need(c.stripe!==null||c.tnk,'at least one explicit return rail required');
   need(['once','watch'].includes(c.mode)&&uint(c.poll_ms,1000)&&c.poll_ms<=60000&&typeof c.allow_loopback_http==='boolean','invalid refund worker mode');
-  const policy=privateJson(c.policy_file);need(policy.enabled===true&&Array.isArray(policy.rails)&&policy.rails.includes('fiat'),'this entry point currently supports FIAT returns only');
+  const policy=privateJson(c.policy_file);need(policy.enabled===true&&Array.isArray(policy.rails)
+    &&(c.stripe===null||policy.rails.includes('fiat'))&&(!c.tnk||policy.rails.includes('tnk')),'configured return rails differ from policy');
   const password=readCustodyFile(c.executor_password_file,{max:4096}),pem=readCustodyFile(c.executor_key_file,{max:16384});let key;
   try {need(pem.toString('ascii',0,40).startsWith('-----BEGIN ENCRYPTED PRIVATE KEY-----'),'encrypted executor key required');key=createPrivateKey({key:pem,format:'pem',passphrase:password});}
   finally {password.fill(0);pem.fill(0);}
   const api=new RefundApi({origin:c.api_origin,credential:privateText(c.api_credential_file),allowLoopbackHttp:c.allow_loopback_http});
-  const adapter=new StripeAdmissionRefund({account:c.stripe.account,livemode:c.stripe.livemode,currency:c.stripe.currency,credential:privateText(c.stripe.credential_file),
+  const adapters={};let tnkRuntime;
+  if(c.stripe!==null)adapters.fiat=new StripeAdmissionRefund({account:c.stripe.account,livemode:c.stripe.livemode,currency:c.stripe.currency,credential:privateText(c.stripe.credential_file),
     policy,key,journalRoot:c.journal_root,retryWindowMs:c.stripe.retry_window_ms,maxLookupPages:c.stripe.max_lookup_pages});
-  const worker=new AdmissionRefundWorker({api,adapters:{fiat:adapter},timeoutMs:c.timeout_ms}),stop=new AbortController();
+  const stop=new AbortController();
   const shutdown=()=>stop.abort();process.once('SIGINT',shutdown);process.once('SIGTERM',shutdown);
-  try {do {
+  try {
+    if(c.tnk){
+      const {openTnkRefundRuntime}=await import('./proxy-admission-refund-tnk-runtime.mjs');
+      tnkRuntime=await openTnkRefundRuntime(c.tnk,{policy,key,journalRoot:c.journal_root,allowLoopbackHttp:c.allow_loopback_http});adapters.tnk=tnkRuntime.adapter;
+    }
+    const worker=new AdmissionRefundWorker({api,adapters,timeoutMs:c.timeout_ms});
+    do {
     try { process.stdout.write(JSON.stringify(await worker.once(stop.signal))+'\n'); }
     catch {if(stop.signal.aborted)break;process.stdout.write(JSON.stringify({outcome:'retry',code:'refund_worker_unavailable'})+'\n');}
     if(c.mode==='once')break;
     await sleep(c.poll_ms,undefined,{signal:stop.signal}).catch(()=>{});
-  } while(!stop.signal.aborted);}finally{process.removeListener('SIGINT',shutdown);process.removeListener('SIGTERM',shutdown);}
+  } while(!stop.signal.aborted);}finally{try{await tnkRuntime?.close();}finally{process.removeListener('SIGINT',shutdown);process.removeListener('SIGTERM',shutdown);}}
 }
 if(process.argv[1]&&path.resolve(process.argv[1])===fileURLToPath(import.meta.url)) {
   main().catch(()=>{process.stderr.write('Admission refund worker configuration rejected; inspect protected local configuration.\n');process.exitCode=1;});
