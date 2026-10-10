@@ -96,7 +96,7 @@ fn secret_valid(bytes: &[u8]) -> Result<()> {
 /// directory. An existing bundle is always a conflict, never an overwrite/reset.
 #[cfg(unix)]
 pub fn create(destination: &Path, host: Host, choices: Choices) -> Result<Bundle> {
-    use rustix::fs::{flock, open, openat, FlockOperation, Mode, OFlags};
+    use rustix::fs::{open, openat, Mode, OFlags};
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
     require(destination.is_absolute())?;
     let name = destination
@@ -137,7 +137,7 @@ pub fn create(destination: &Path, host: Host, choices: Choices) -> Result<Bundle
             && meta.mode() & 0o077 == 0
             && meta.uid() == rustix::process::geteuid().as_raw(),
     )?;
-    flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|_| Error::Busy)?;
+    let _lock = store::ExclusiveLock::acquire(lock)?;
     let parent = fs::canonicalize(parent).map_err(|_| Error::Protection)?;
     let destination = parent.join(name);
     if fs::symlink_metadata(&destination).is_ok() {

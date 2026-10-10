@@ -102,7 +102,28 @@ use std::{
 #[cfg(unix)]
 pub(super) struct Guard {
     directory: File,
-    _lock: File,
+    _lock: ExclusiveLock,
+}
+
+/// The parent operation owns this lock, not decoder children launched on other
+/// threads. CLOEXEC closes an inherited descriptor only once the child execs;
+/// closing the parent's descriptor alone can leave its lock held until then.
+#[cfg(unix)]
+pub(super) struct ExclusiveLock(File);
+#[cfg(unix)]
+impl ExclusiveLock {
+    pub(super) fn acquire(file: File) -> Result<Self> {
+        flock(&file, FlockOperation::NonBlockingLockExclusive).map_err(|_| Error::Busy)?;
+        Ok(Self(file))
+    }
+}
+#[cfg(unix)]
+impl Drop for ExclusiveLock {
+    fn drop(&mut self) {
+        // Only unlock the open description acquired by this guard. Other
+        // owners open independently and retain their own exclusion afterward.
+        let _ = flock(&self.0, FlockOperation::Unlock);
+    }
 }
 #[cfg(unix)]
 impl Guard {
@@ -136,7 +157,7 @@ impl Guard {
             .map_err(|_| Error::Protection)?,
         );
         Self::protected(&lock, 0)?;
-        flock(&lock, FlockOperation::NonBlockingLockExclusive).map_err(|_| Error::Busy)?;
+        let lock = ExclusiveLock::acquire(lock)?;
         Ok(Self {
             directory,
             _lock: lock,
@@ -228,6 +249,49 @@ impl Guard {
         self.directory.sync_all().map_err(|_| Error::CommitUnknown)
     }
 }
+
+#[cfg(all(test, unix))]
+mod lock_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::{Command, Stdio};
+
+    #[test]
+    fn finished_draft_lock_is_not_retained_by_a_child_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let guard = Guard::open(directory.path()).unwrap();
+        // A duplicate shares the same kernel lock as a descriptor inherited at
+        // fork. Hold it deliberately past exec to make that otherwise brief
+        // scheduling window deterministic, without unsafe fork hooks.
+        let inherited = guard._lock.0.try_clone().unwrap();
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "read -r release"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(inherited))
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let original_still_held = matches!(Store::open(directory.path()), Err(Error::Busy));
+        drop(guard);
+        let reopened = Guard::open(directory.path());
+        // Reap before assertions, including on the expected failing baseline.
+        let released = child.stdin.take().unwrap().write_all(b"done\n");
+        let exited = child.wait();
+        released.unwrap();
+        assert!(exited.unwrap().success());
+        assert!(original_still_held);
+        assert!(
+            reopened.is_ok(),
+            "completed draft stayed busy while the child held its inherited descriptor"
+        );
+        // Child exit must not release the replacement owner's independent lock.
+        assert!(matches!(Store::open(directory.path()), Err(Error::Busy)));
+        drop(reopened);
+        Store::open(directory.path()).unwrap();
+    }
+}
+
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]

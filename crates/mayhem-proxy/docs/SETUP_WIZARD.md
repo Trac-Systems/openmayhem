@@ -206,6 +206,15 @@ The shared wizard then handles
 discovery, checks, admission, publication and Run with their existing revisions
 and explicit confirmations. There is no automatic publication or payment.
 
+On Unix, draft and bundle-creation locks are explicitly released when their
+owning operation ends. Merely closing a descriptor can leave a `flock` held by
+an inherited child descriptor until exec or exit. The protected lock file and
+nonblocking mutual exclusion remain; another active owner still returns Busy.
+This release does not add waiting, retries or changes to capacity databases.
+The regression test retains a duplicate in a real child, verifies reopening
+before that child exits, and checks that the replacement owner stays exclusive.
+See the [flock descriptor and release semantics](https://man7.org/linux/man-pages/man2/flock.2.html).
+
 The authenticated dashboard connects its initial form to this same factory.
 Start it with `mayhem use --proxy-setup` and the host-only options described in
 [SETUP_DASHBOARD.md](SETUP_DASHBOARD.md). Its existing exact-origin/session/CSRF
