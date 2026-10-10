@@ -690,7 +690,11 @@ fn protected_directory(path: &Path) -> Result<()> {
         Err(Error::Protection)
     }
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn protected_directory(path: &Path) -> Result<()> {
+    mayhem_windows_sandbox::validate_private_directory(path).map_err(|_| Error::Protection)
+}
+#[cfg(not(any(unix, windows)))]
 fn protected_directory(_: &Path) -> Result<()> {
     Err(Error::Protection)
 }

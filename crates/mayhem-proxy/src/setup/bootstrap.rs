@@ -194,7 +194,11 @@ pub fn create(destination: &Path, host: Host, choices: Choices) -> Result<Bundle
     }
     result
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub use windows::create;
+#[cfg(not(any(unix, windows)))]
 pub fn create(_: &Path, _: Host, _: Choices) -> Result<Bundle> {
     Err(Error::Protection)
 }
@@ -212,12 +216,23 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
         .and_then(|_| file.sync_all())
         .map_err(|_| Error::Storage)
 }
-#[cfg(not(unix))]
-fn write(_: &Path, _: &[u8]) -> Result<()> {
-    Err(Error::Protection)
-}
 
+#[cfg(unix)]
 fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
+    let validation = generate(stage, host, choices, write)?;
+    validate_generated(stage, validation)
+}
+struct Validation {
+    peer_rpc: String,
+    concurrency: u32,
+    streaming: bool,
+}
+fn generate(
+    stage: &Path,
+    host: Host,
+    choices: Choices,
+    mut put: impl FnMut(&Path, &[u8]) -> Result<()>,
+) -> Result<Validation> {
     require(
         (1..=1024).contains(&choices.concurrency)
             && choices.served_context > 0
@@ -252,7 +267,7 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
         }
         Credential::BearerValue(value) => {
             secret_valid(&value)?;
-            write(&stage.join("upstream-key"), &value)?;
+            put(&stage.join("upstream-key"), &value)?;
             Authentication::Bearer {
                 secret: SecretSource::File {
                     path: "upstream-key".into(),
@@ -289,7 +304,7 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
     connection
         .fingerprint()
         .map_err(|_| Error::Bootstrap("connection policy"))?;
-    write(&stage.join("connection.json"), &serialize(&connection)?)?;
+    put(&stage.join("connection.json"), &serialize(&connection)?)?;
     let scope_bytes = serialize(&(host.network.clone(), host.provider_pubkey.clone()))?;
     let connection_group = Digest::hash("mayhem/proxy/bootstrap-connection/v1", &[&scope_bytes]);
     let profile = ProfileInput {
@@ -332,7 +347,7 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
     let probe = ProbePlan {
         schema_version: 1,
         scope: ProbeScope {
-            capacity_file: "runtime/capacity.redb".into(),
+            capacity_file: Path::new("runtime").join("capacity.redb"),
             route: Digest::hash("mayhem/proxy/bootstrap-route/v1", &[&scope_bytes]),
             connection_group,
             connection_ceiling: choices.concurrency,
@@ -347,7 +362,7 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
         max_output_tokens: choices.probe_output_limit,
         timeout_ms: choices.probe_timeout_ms,
     };
-    write(&stage.join("probe.json"), &serialize(&probe)?)?;
+    put(&stage.join("probe.json"), &serialize(&probe)?)?;
     let mut template = runtime::template(
         &host,
         choices.tokenizer,
@@ -361,17 +376,32 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
             require(pin.file.is_absolute())?;
             let bytes = private_file(&pin.file, 64 * 1024 * 1024).map_err(|_| Error::Protection)?;
             require(blake3::hash(&bytes).to_hex().as_str() == pin.digest.as_str())?;
-            let pool = crate::worker::host::Pool::new(&host.worker_program, stage.join("worker"), template.limits.worker)
+            #[cfg(unix)]
+            {
+                let pool = crate::worker::host::Pool::new(
+                    &host.worker_program,
+                    stage.join("worker"),
+                    template.limits.worker,
+                )
                 .map_err(|_| Error::Bootstrap("isolated tokenizer launcher"))?;
-            let source = crate::health::native::Source::from_bytes(&bytes, pin.digest.clone(), pin.digest.clone(), pin.digest.clone(), pin.limits)
+                let source = crate::health::native::Source::from_bytes(
+                    &bytes,
+                    pin.digest.clone(),
+                    pin.digest.clone(),
+                    pin.digest.clone(),
+                    pin.limits,
+                )
                 .map_err(|_| Error::Bootstrap("approved tokenizer pin"))?;
-            source.validate(&pool).map_err(|_| Error::Bootstrap("isolated tokenizer validation"))?;
-            write(&stage.join("tokenizer.json"), &bytes)?;
+                source
+                    .validate(&pool)
+                    .map_err(|_| Error::Bootstrap("isolated tokenizer validation"))?;
+            }
+            put(&stage.join("tokenizer.json"), &bytes)?;
             pin.file = "tokenizer.json".into();
         }
         _ => return Err(Error::Invalid),
     }
-    write(&stage.join("runtime-policy.json"), &serialize(&template)?)?;
+    put(&stage.join("runtime-policy.json"), &serialize(&template)?)?;
     let flow = FlowConfig {
         schema_version: 1,
         directory: "state".into(),
@@ -386,7 +416,14 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
             wallet_password_file: host.wallet_password_file,
         }),
     };
-    write(&stage.join("wizard.json"), &serialize(&flow)?)?;
+    put(&stage.join("wizard.json"), &serialize(&flow)?)?;
+    Ok(Validation {
+        peer_rpc: host.peer_rpc,
+        concurrency: choices.concurrency,
+        streaming,
+    })
+}
+fn validate_generated(stage: &Path, validation: Validation) -> Result<()> {
     // Validate the complete generated cross-component configuration before its
     // atomic publication; this parses local secrets/tokenizer, never dispatches.
     let flow = FlowConfig::load(&stage.join("wizard.json"))
@@ -399,18 +436,40 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
         ProbePlan::load(&stage.join("probe.json")).map_err(|_| Error::Bootstrap("probe plan"))?;
     let adapter = Adapter::restore(input.adapter.clone()).map_err(|_| Error::Invalid)?;
     let request = serialize(&probe.request)?;
-    if streaming {
+    if validation.streaming {
         adapter.prepare_stream(&request)
     } else {
         adapter.prepare_json(&request)
     }
     .map_err(|_| Error::Bootstrap("probe request"))?;
     let template = RunTemplate::load(&stage.join("runtime-policy.json"))?;
+    #[cfg(windows)]
+    if let Some(pin) = &template.tokenizer {
+        let bytes =
+            private_file(&pin.file, pin.limits.artifact_bytes).map_err(|_| Error::Protection)?;
+        let pool = crate::worker::host::Pool::new(
+            &probe.worker_program,
+            &probe.worker_directory,
+            template.limits.worker,
+        )
+        .map_err(|_| Error::Bootstrap("isolated tokenizer launcher"))?;
+        let source = crate::health::native::Source::from_bytes(
+            &bytes,
+            pin.digest.clone(),
+            pin.digest.clone(),
+            pin.digest.clone(),
+            pin.limits,
+        )
+        .map_err(|_| Error::Bootstrap("approved tokenizer pin"))?;
+        source
+            .validate(&pool)
+            .map_err(|_| Error::Bootstrap("isolated tokenizer validation"))?;
+    }
     let config = managed::Config {
         schema_version: 1,
         network: input.network,
         provider_pubkey: input.provider_pubkey,
-        peer_rpc_url: host.peer_rpc,
+        peer_rpc_url: validation.peer_rpc,
         bridge: template.bridge,
         state_dir: stage.join("runtime"),
         worker_program: probe.worker_program,
@@ -418,7 +477,7 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
         limits: template.limits,
         connections: vec![managed::ConnectionSpec {
             group: probe.scope.connection_group.clone(),
-            ceiling: choices.concurrency,
+            ceiling: validation.concurrency,
             config_file: input.connection_file.clone(),
             probe_budget: probe.budget,
             expected_fingerprint: Some(
@@ -434,7 +493,7 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
             declaration_source: None,
             id: probe.scope.route,
             connection: probe.scope.connection_group,
-            ceiling: choices.concurrency,
+            ceiling: validation.concurrency,
             constraints: vec![],
             adapter: input.adapter,
             offers: input.offers,
@@ -442,7 +501,7 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
             tokenizer: template.tokenizer,
             recovery: template.allow_recovery_probes.then_some(managed::Recovery {
                 request: probe.request,
-                streaming,
+                streaming: validation.streaming,
                 max_output_tokens: probe.max_output_tokens,
                 timeout_ms: probe.timeout_ms,
             }),

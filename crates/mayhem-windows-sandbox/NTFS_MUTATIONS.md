@@ -1,8 +1,11 @@
-# Standalone protected NTFS mutations
+# Protected NTFS mutations
 
-This API is not wired to provider setup, Run, capacity, financial stores or
-mayhemd persistence. Native Windows enforcement and crash durability remain
-unverified and release-blocking. Cross compilation is not native proof.
+The API now backs Windows setup JSON storage and first-install bundle
+publication. The separate exclusive database backend is wired into proxy redb
+stores; it retains the database handle for the backend lifetime. This does not
+establish complete Windows onboarding, Run or mayhemd persistence acceptance.
+Native Windows enforcement and crash durability remain unverified and
+release-blocking. Cross compilation is not native proof.
 
 `NtfsDirectory::open_existing` retains the existing protected traversal and ACL
 rules, then requires the opened local volume to report NTFS with persistent
@@ -11,7 +14,8 @@ opens, while denying delete sharing; ancestors retain their existing sharing.
 The read-only API is unchanged. No new trusted principals or permission repair
 are introduced.
 
-`try_lock()` uses one fixed private `.mayhem-ntfs.lock` per directory. Its
+`try_lock()` or ownership-transferring `into_lock()` uses one fixed private
+`.mayhem-ntfs.lock` per directory. Its
 nonblocking exclusive byte lock lives with `NtfsGuard`, which all readers and
 writers of this namespace must use. The lock file remains on disk; it is never
 unlinked/replaced on release. Unsupported locking is an error, and no named
@@ -50,8 +54,14 @@ object closes handles only and never promotes or deletes a temporary.
 Crash recovery must continue using the existing typed application records and
 their original operation IDs/digests. This primitive deliberately does not
 introduce a redo log that treats leftover temporary files as authorization.
-Temporary cleanup, an exclusive redb file backend and application-store wiring
-are not implemented. No raw writable handle is exported.
+`discard_uncommitted(original, temporary)` supports the existing setup store's
+fixed temporary slot. It independently retains the original or proves absence,
+requires a private regular single-link temporary with a distinct identity, and
+deletes only that exact handle under the guard before a full parent flush.
+Malformed originals fail closed. An ambiguous delete/rename poisons that guard
+against later cleanup or mutation; dropping an uncertain pending object does
+not erase this latch. A new operation still uses its typed original record,
+never the temporary, as authority. No raw writable handle is exported.
 
 ## First-install directory publication
 
@@ -79,7 +89,18 @@ target creation or any other error after the attempted rename returns
 root; it never merges trees, retries the rename, chooses another destination,
 deletes an original, or promotes an abandoned staging tree.
 
-This is a standalone first-install primitive, not provider setup integration.
+`prepare_for_inspection()` retains the same root object with read-compatible
+access so existing protected loaders can validate a generated bundle. It still
+denies root deletion during inspection. Before publication, the originally
+declared directories are reopened relative to that root, checked against their
+original identities, and fully flushed bottom-up. This covers the contained
+tokenizer's temporary worker image cleanup without scanning arbitrary paths.
+The root is then reopened by retained handle with write-through/delete access,
+without a caller-path lookup. The setup caller rejects a nonempty worker
+directory after validation.
+
+Windows setup invokes this primitive after generating the same typed bundle as
+Unix and validating its configuration, references and pinned tokenizer.
 There is no reboot recovery object or new journal format: callers must use
 their existing typed retained operation/digest records for restart decisions.
 Normal full flush is requested on directory handles as well as files; an
@@ -103,6 +124,13 @@ documents immediate failure on contention and OS release after process exit;
 release can be delayed. The fixed lock prevents overlapping protocol clients,
 not malicious writes by the already-trusted current user/SYSTEM/Administrators.
 
+[ReOpenFile](https://learn.microsoft.com/en-us/windows/win32/api/winbase/nf-winbase-reopenfile)
+reopens the retained object with independently specified access, sharing and
+flags. Every such transition rechecks private ACL, regular/directory identity
+and, when required, write-through mode. Exact temporary deletion uses
+[FILE_DISPOSITION_INFORMATION](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntddk/ns-ntddk-_file_disposition_information);
+after setting disposition, only closing that handle is attempted.
+
 ## Focused verification
 
 Six file/lock native fixture cases plus one explicitly ignored subprocess helper
@@ -121,6 +149,14 @@ empty/nonempty/file destination conflicts, the same three fault boundaries,
 and an actual no-replace rename collision introduced after the precheck.
 They do not inject write or staging-directory flush failures. These native
 fixtures compile but have not run on Windows.
+
+Four integration-adaptation fixtures cover owned-lock lifetime, fixed-slot
+cleanup with original/absence, alias/nonregular/uncertain refusal, read-only
+inspection followed by publication, and replaced declared-directory refusal.
+They include transient worker-file creation/removal but do not simulate power
+loss during its final directory flush. Actual setup fixtures and remaining
+toolchain limits are documented in
+[WINDOWS_SETUP_STORAGE.md](../mayhem-proxy/docs/WINDOWS_SETUP_STORAGE.md).
 
 Run on an isolated native Windows NTFS machine:
 

@@ -228,9 +228,13 @@ impl Guard {
         self.directory.sync_all().map_err(|_| Error::CommitUnknown)
     }
 }
-#[cfg(not(unix))]
+#[cfg(windows)]
+mod windows;
+#[cfg(windows)]
+pub(super) use windows::{error as windows_error, Guard};
+#[cfg(not(any(unix, windows)))]
 pub(super) struct Guard;
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 impl Guard {
     pub(super) fn open(_: &Path) -> Result<Self> {
         Err(Error::Protection)

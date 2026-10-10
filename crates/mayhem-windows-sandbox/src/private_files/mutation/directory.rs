@@ -80,6 +80,9 @@ impl<'d> NtfsGuard<'d> {
         entries: &[DirectoryEntry<'_>],
         maximum: usize,
     ) -> Outcome<PendingDirectory<'g, 'd>> {
+        if self.uncertain {
+            return Err(MutationError::CommitUnknown);
+        }
         if temporary == self.name {
             return Err(MutationError::Invalid);
         }
@@ -88,6 +91,7 @@ impl<'d> NtfsGuard<'d> {
         let root = native::create_directory(pinned.file(), &pinned.owner, &temporary)?;
         let original = identity(&root, &pinned.owner)?;
         let mut directories = BTreeMap::<Vec<String>, File>::new();
+        let mut inspected_directories = Vec::new();
         directories.insert(Vec::new(), root);
         // Lexicographic order places every proper prefix before its children.
         // All handles are derived from this newly-created root, never paths.
@@ -106,6 +110,7 @@ impl<'d> NtfsGuard<'d> {
                 // All descendant file handles close before publication.
             } else {
                 let directory = native::create_directory(parent, &pinned.owner, &leaf)?;
+                inspected_directories.push((path.clone(), identity(&directory, &pinned.owner)?));
                 directories.insert(path.clone(), directory);
             }
         }
@@ -128,6 +133,8 @@ impl<'d> NtfsGuard<'d> {
             original,
             attempted: None,
             committed: false,
+            readable: false,
+            inspected_directories,
         })
     }
 }
@@ -141,8 +148,29 @@ pub struct PendingDirectory<'g, 'd> {
     original: DirectoryIdentity,
     attempted: Option<LeafName>,
     committed: bool,
+    readable: bool,
+    inspected_directories: Vec<(Vec<String>, DirectoryIdentity)>,
 }
 impl PendingDirectory<'_, '_> {
+    /// Permit ordinary protected loaders to inspect the complete staged tree.
+    /// Keeps the exact root object open; publication upgrades that same object,
+    /// never reopens a caller path. No file mutation API becomes available.
+    pub fn prepare_for_inspection(&mut self) -> Outcome<()> {
+        if self.attempted.is_some() {
+            return Err(MutationError::CommitUnknown);
+        }
+        let owner = &self.guard.directory.pinned.owner;
+        self.root = recovery::reopen(
+            &self.root,
+            owner,
+            true,
+            FILE_TRAVERSE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            false,
+        )?;
+        self.readable = true;
+        Ok(())
+    }
     pub fn identity(&self) -> DirectoryIdentity {
         self.original
     }
@@ -179,7 +207,32 @@ impl PendingDirectory<'_, '_> {
             return Err(MutationError::Conflict);
         }
         checkpoint(Stage::BeforeRename)?;
+        if self.readable {
+            // Inspection can run a contained tokenizer which creates/removes its
+            // temporary image in an originally empty worker directory. Re-flush
+            // every declared directory bottom-up, checking its original identity;
+            // never discover or authorize arbitrary added paths by scanning.
+            self.flush_inspected_directories()?;
+            self.root = recovery::reopen(
+                &self.root,
+                &pinned.owner,
+                true,
+                FILE_TRAVERSE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                false,
+            )?;
+            self.root = recovery::reopen(
+                &self.root,
+                &pinned.owner,
+                true,
+                FILE_TRAVERSE | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                true,
+            )?;
+            self.readable = false;
+        }
         self.attempted = Some(destination.clone());
+        self.guard.uncertain = true;
         native::rename(
             &self.root,
             pinned.file(),
@@ -191,7 +244,41 @@ impl PendingDirectory<'_, '_> {
         self.finish()?;
         checkpoint(Stage::AfterFlush).map_err(|_| MutationError::CommitUnknown)?;
         self.committed = true;
+        self.guard.uncertain = false;
         Ok(self.original)
+    }
+    fn flush_inspected_directories(&self) -> Outcome<()> {
+        let owner = &self.guard.directory.pinned.owner;
+        let mut directories = BTreeMap::new();
+        directories.insert(
+            Vec::<String>::new(),
+            self.root.try_clone().map_err(|_| MutationError::Storage)?,
+        );
+        for (path, expected) in &self.inspected_directories {
+            let parent = directories
+                .get(&path[..path.len() - 1])
+                .ok_or(MutationError::Protection)?;
+            let leaf = LeafName::new(path.last().ok_or(MutationError::Protection)?)?;
+            let directory = native::inspect_directory(parent, owner, &leaf)?
+                .ok_or(MutationError::Protection)?;
+            if identity(&directory, owner)? != *expected {
+                return Err(MutationError::Protection);
+            }
+            let directory = recovery::reopen(
+                &directory,
+                owner,
+                true,
+                FILE_TRAVERSE | FILE_ADD_FILE | FILE_ADD_SUBDIRECTORY,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                true,
+            )?;
+            directories.insert(path.clone(), directory);
+        }
+        while directories.len() > 1 {
+            let (_, directory) = directories.pop_last().ok_or(MutationError::Storage)?;
+            native::flush(&directory)?;
+        }
+        Ok(())
     }
     fn finish(&self) -> Outcome<()> {
         let destination = self.attempted.as_ref().ok_or(MutationError::Invalid)?;
@@ -213,6 +300,7 @@ impl PendingDirectory<'_, '_> {
     pub fn reconcile(&mut self) -> Outcome<DirectoryIdentity> {
         self.finish()?;
         self.committed = true;
+        self.guard.uncertain = false;
         Ok(self.original)
     }
 }

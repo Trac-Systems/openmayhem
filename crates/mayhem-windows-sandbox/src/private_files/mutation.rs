@@ -3,6 +3,7 @@ use super::*;
 use std::io::Write;
 mod directory;
 pub(super) mod native;
+mod recovery;
 pub use directory::{DirectoryEntry, DirectoryIdentity, PendingDirectory};
 #[cfg(test)]
 pub(super) mod tests;
@@ -79,6 +80,26 @@ impl NtfsDirectory {
         Ok(Self { pinned })
     }
     pub fn try_lock(&self) -> Outcome<NtfsGuard<'_>> {
+        let (file, name) = self.lock_parts()?;
+        Ok(NtfsGuard {
+            directory: DirectoryAuthority::Borrowed(self),
+            file,
+            name,
+            uncertain: false,
+        })
+    }
+    /// Owned lock authority for a caller guard spanning several operations.
+    /// No self-references, leaked handles or lifetime extension are involved.
+    pub fn into_lock(self) -> Outcome<NtfsGuard<'static>> {
+        let (file, name) = self.lock_parts()?;
+        Ok(NtfsGuard {
+            directory: DirectoryAuthority::Owned(self),
+            file,
+            name,
+            uncertain: false,
+        })
+    }
+    fn lock_parts(&self) -> Outcome<(File, LeafName)> {
         let name = LeafName::new(".mayhem-ntfs.lock")?;
         acl::validate(self.pinned.file(), &self.pinned.owner, true)
             .map_err(|_| MutationError::Protection)?;
@@ -90,18 +111,28 @@ impl NtfsDirectory {
             native::unlock(&file);
             return Err(error);
         }
-        Ok(NtfsGuard {
-            directory: self,
-            file,
-            name,
-        })
+        Ok((file, name))
     }
 }
 
+enum DirectoryAuthority<'a> {
+    Borrowed(&'a NtfsDirectory),
+    Owned(NtfsDirectory),
+}
+impl std::ops::Deref for DirectoryAuthority<'_> {
+    type Target = NtfsDirectory;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(directory) => directory,
+            Self::Owned(directory) => directory,
+        }
+    }
+}
 pub struct NtfsGuard<'a> {
-    directory: &'a NtfsDirectory,
+    directory: DirectoryAuthority<'a>,
     file: File,
     name: LeafName,
+    uncertain: bool,
 }
 impl Drop for NtfsGuard<'_> {
     fn drop(&mut self) {
@@ -129,6 +160,9 @@ impl<'d> NtfsGuard<'d> {
         bytes: &[u8],
         maximum: usize,
     ) -> Outcome<PendingFile<'g, 'd>> {
+        if self.uncertain {
+            return Err(MutationError::CommitUnknown);
+        }
         if temporary == self.name || maximum > MAX_BYTES || bytes.len() > maximum {
             return Err(MutationError::Invalid);
         }
@@ -210,12 +244,14 @@ impl PendingFile<'_, '_> {
         checkpoint(Stage::BeforeRename)?;
         // From this point even a syscall failure is conservatively uncertain.
         self.attempted = Some(destination.clone());
+        self.guard.uncertain = true;
         native::rename(&self.file, pinned.file(), &destination, mode)
             .map_err(|_| MutationError::CommitUnknown)?;
         checkpoint(Stage::AfterRename).map_err(|_| MutationError::CommitUnknown)?;
         self.finish()?;
         checkpoint(Stage::AfterFlush).map_err(|_| MutationError::CommitUnknown)?;
         self.committed = true;
+        self.guard.uncertain = false;
         Ok(self.identity)
     }
     fn finish(&self) -> Outcome<()> {
@@ -240,6 +276,7 @@ impl PendingFile<'_, '_> {
     pub fn reconcile(&mut self) -> Outcome<CommitIdentity> {
         self.finish()?;
         self.committed = true;
+        self.guard.uncertain = false;
         Ok(self.identity)
     }
     pub fn is_committed(&self) -> bool {
