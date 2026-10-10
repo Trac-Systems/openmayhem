@@ -144,6 +144,8 @@ pub(super) struct Params {
     endpoint: Option<ProxyEndpoint>,
     minimum_context: Option<u32>,
     rail: Option<ProxyRail>,
+    model: Option<String>,
+    from_end: Option<bool>,
     cursor: Option<String>,
     limit: Option<usize>,
 }
@@ -241,6 +243,14 @@ pub(super) async fn list(
     let Ok(Query(params)) = params else {
         return invalid_request();
     };
+    let model = match params.model {
+        Some(raw) if raw.len() <= 4096 => match serde_json::from_str(&raw) {
+            Ok(model) => Some(model),
+            Err(_) => return invalid_request(),
+        },
+        Some(_) => return invalid_request(),
+        None => None,
+    };
     let query = directory::Query {
         kind: params.kind,
         family_id: params.family_id,
@@ -248,18 +258,24 @@ pub(super) async fn list(
         endpoint: params.endpoint,
         minimum_context: params.minimum_context,
         rail: params.rail,
+        model,
     };
     let limit = params.limit.unwrap_or(50);
     if query.key().is_err()
         || limit == 0
         || limit > 100
         || params.cursor.as_ref().is_some_and(|c| c.len() > 8192)
+        || params.from_end.unwrap_or(false) && params.cursor.is_some()
     {
         return invalid_request();
     }
     read(state, headers, move |catalog, presence| {
         let now = now_millis_u64();
-        let page = catalog.proxy_offers(&query, params.cursor.as_deref(), limit, now)?;
+        let page = if params.from_end.unwrap_or(false) {
+            catalog.proxy_offers_from_end(&query, limit, now)?
+        } else {
+            catalog.proxy_offers(&query, params.cursor.as_deref(), limit, now)?
+        };
         observe_page(catalog, presence, page, now).map(Some)
     })
     .await

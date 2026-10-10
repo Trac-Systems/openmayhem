@@ -23,6 +23,7 @@ use crate::{
     invalid,
     matching::INDEX,
     presence::Registered,
+    registry::publication::taxonomy::Model,
     require, Error, Result,
 };
 
@@ -76,10 +77,25 @@ pub struct Query {
     pub endpoint: Option<ProxyEndpoint>,
     pub minimum_context: Option<u32>,
     pub rail: Option<ProxyRail>,
+    /// Exact declared identity, never a capability or verified-weights claim.
+    /// Omitted from ordinary query hashes for existing cursor compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<Model>,
 }
 
 impl Query {
     fn validate(&self) -> Result<()> {
+        if let Some(model) = &self.model {
+            model
+                .validate()
+                .map_err(|error| invalid(error.to_string()))?;
+            require(
+                self.family_id
+                    .as_ref()
+                    .is_none_or(|f| f == &model.family_id),
+                "proxy model and family filters differ",
+            )?;
+        }
         require(
             self.name_prefix.len() <= 512 && !self.name_prefix.chars().any(char::is_control),
             "invalid proxy name prefix",
@@ -103,15 +119,21 @@ impl Query {
 
     fn prefix(&self) -> String {
         let family = self
-            .family_id
-            .as_deref()
+            .model
+            .as_ref()
+            .map(|m| &m.family_id)
+            .or(self.family_id.as_ref())
+            .map(String::as_str)
             .map(family_key)
             .unwrap_or("all".into());
         format!(
             "browse/{}/{}/{}",
             self.kind.map(kind).unwrap_or("all"),
             family,
-            text_key(&self.name_prefix)
+            self.model
+                .as_ref()
+                .map(|m| format!("{}/", text_key(&m.model_id)))
+                .unwrap_or_else(|| text_key(&self.name_prefix))
         )
     }
 
@@ -124,6 +146,7 @@ impl Query {
 
     fn accepts(&self, value: &PublishedOffer) -> bool {
         value.active
+            && self.accepts_model(&value.market)
             && self.endpoint.is_none_or(|e| e == value.offer.endpoint)
             && self
                 .minimum_context
@@ -131,6 +154,18 @@ impl Query {
             && self
                 .rail
                 .is_none_or(|r| value.offer.accepted_rails.contains(&r))
+    }
+
+    fn accepts_model(&self, market: &ProxyMarketDescriptor) -> bool {
+        self.model.as_ref().is_none_or(|m| {
+            m.family_id == market.model.family_id
+                && m.model_id == market.model.model_id
+                && m.revision == market.model.revision
+                && m.quantization == market.model.quantization
+                && m.model_id
+                    .to_lowercase()
+                    .starts_with(&self.name_prefix.to_lowercase())
+        })
     }
 }
 
@@ -324,6 +359,28 @@ impl CatalogRead {
         limit: usize,
         now_ms: u64,
     ) -> Result<OfferPage> {
+        self.proxy_offers_page(query, cursor, limit, now_ms, false)
+    }
+
+    /// Start at the final bounded page of a scope. Reverse continuation remains
+    /// encoded in the normal query/snapshot-bound cursor, not a retained history.
+    pub fn proxy_offers_from_end(
+        &self,
+        query: &Query,
+        limit: usize,
+        now_ms: u64,
+    ) -> Result<OfferPage> {
+        self.proxy_offers_page(query, None, limit, now_ms, true)
+    }
+
+    fn proxy_offers_page(
+        &self,
+        query: &Query,
+        cursor: Option<&str>,
+        limit: usize,
+        now_ms: u64,
+        from_end: bool,
+    ) -> Result<OfferPage> {
         let query_key = query.key()?;
         require(
             limit > 0 && limit <= MAX_PAGE_ENTRIES,
@@ -339,7 +396,7 @@ impl CatalogRead {
         let cursor = cursor
             .map(|c| decode(c, &query_key, &snapshot, &prefix))
             .transpose()?;
-        let reverse = cursor.as_ref().is_some_and(|c| c.reverse);
+        let reverse = cursor.as_ref().map_or(from_end, |c| c.reverse);
         let inclusive = cursor.as_ref().is_some_and(|c| c.inclusive);
         let anchor = cursor.as_ref().map(|c| &c.position);
         let upper = format!("{prefix}\u{7f}");
@@ -384,6 +441,19 @@ impl CatalogRead {
             let market_key = market_key.value();
             let market = market_value.value().rsplit('/').next().unwrap_or("");
             require(hex(market), "invalid stored proxy directory market")?;
+            if query.model.is_some() {
+                let descriptor: ProxyMarketDescriptor = serde_json::from_value(
+                    self.get(market_value.value())?
+                        .ok_or_else(|| invalid("proxy directory market is missing"))?,
+                )?;
+                if !query.accepts_model(&descriptor) {
+                    last = Some(Position {
+                        market_key: market_key.into(),
+                        offer_key: None,
+                    });
+                    continue;
+                }
+            }
             let offer_prefix = format!("{CATALOG_PREFIX}offers/{market}/");
             let offer_upper = format!("{offer_prefix}\u{7f}");
             let offer_anchor = anchor

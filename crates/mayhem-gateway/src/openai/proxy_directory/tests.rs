@@ -382,6 +382,9 @@ async fn malformed_http_queries_cursors_and_ids_are_bounded_bad_requests() {
         vec![("limit", "101")],
         vec![("minimum_context", "-1")],
         vec![("kind", "native")],
+        vec![("model", "[]")],
+        vec![("model", "null")],
+        vec![("from_end", "true"), ("cursor", "opaque")],
         vec![("cursor", "!!!")],
         vec![("kind", "llm"), ("endpoint", "mayhem_decisions")],
     ] {
@@ -413,6 +416,60 @@ async fn malformed_http_queries_cursors_and_ids_are_bounded_bad_requests() {
         request(
             &state,
             "/v1/proxy/offers/not-a-market/provider/slot",
+            Some(TOKEN)
+        )
+        .await
+        .0,
+        StatusCode::BAD_REQUEST
+    );
+}
+
+#[tokio::test]
+async fn exact_model_query_and_last_page_preserve_the_same_publication_identity() {
+    let _serial = HTTP_TESTS.lock().await;
+    let dir = tempfile::tempdir().unwrap();
+    let control = protected_control(dir.path());
+    let mut all = rows("Vendor/Model", "qwen", 5, false);
+    let descriptor: ProxyMarketDescriptor = serde_json::from_value(all[0].value.clone()).unwrap();
+    all.extend(rows("Vendor/Model-longer", "qwen", 3, false));
+    apply(&control, all);
+    let state = state(Some(control));
+    let selected = serde_json::to_string(&json!({"family_id":descriptor.model.family_id,
+        "model_id":descriptor.model.model_id, "revision":descriptor.model.revision, "quantization":descriptor.model.quantization})).unwrap();
+    let (status, _, tail) = request(
+        &state,
+        &uri(&[("model", &selected), ("limit", "2"), ("from_end", "true")]),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{tail}");
+    assert_eq!(tail["entries"].as_array().unwrap().len(), 2);
+    assert!(tail["next_cursor"].is_null());
+    for entry in tail["entries"].as_array().unwrap() {
+        assert_eq!(entry["market"], json!(descriptor));
+    }
+    let cursor = tail["previous_cursor"].as_str().unwrap();
+    let (status, _, previous) = request(
+        &state,
+        &uri(&[("model", &selected), ("limit", "2"), ("cursor", cursor)]),
+        Some(TOKEN),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{previous}");
+    assert_eq!(previous["entries"].as_array().unwrap().len(), 2);
+    assert!(previous["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|p| !tail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| p["id"] == t["id"])));
+    assert_eq!(
+        request(
+            &state,
+            &uri(&[("model", &selected), ("family_id", "other")]),
             Some(TOKEN)
         )
         .await

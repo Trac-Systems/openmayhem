@@ -79,6 +79,16 @@ fn hydrate(c: &Catalog, mut rows: Vec<Entry>) {
 }
 
 fn rows(name: &str, family: &str, count: usize, decision: bool) -> Vec<Entry> {
+    variant_rows(name, family, count, decision, None)
+}
+
+fn variant_rows(
+    name: &str,
+    family: &str,
+    count: usize,
+    decision: bool,
+    variant: Option<(&str, &str)>,
+) -> Vec<Entry> {
     let v: Value = serde_json::from_str(include_str!(
         "../../mayhem-proto/tests/fixtures/proxy-wire-v1.json"
     ))
@@ -88,6 +98,10 @@ fn rows(name: &str, family: &str, count: usize, decision: bool) -> Vec<Entry> {
         serde_json::from_value(fixture["market"].clone()).unwrap();
     market.model.model_id = name.into();
     market.model.family_id = family.into();
+    if let Some((revision, quantization)) = variant {
+        market.model.revision = revision.into();
+        market.model.quantization = quantization.into();
+    }
     let id = market.id().unwrap();
     let mut result = vec![Entry {
         key: format!("{CATALOG_PREFIX}markets/{id}"),
@@ -116,6 +130,102 @@ fn ids(rows: &[Entry]) -> Vec<String> {
         .collect();
     result.sort();
     result
+}
+
+#[test]
+fn exact_model_scope_preserves_revision_quantization_case_and_reverse_navigation() {
+    use mayhem_proxy::registry::publication::taxonomy::Model;
+    let dir = tempfile::tempdir().unwrap();
+    let c = Catalog::open(dir.path().join("catalog"), identity()).unwrap();
+    let wanted = variant_rows("Vendor/Model", "qwen", 11, false, Some(("r1", "fp4")));
+    let mut all = wanted.clone();
+    for (name, family, revision, quant) in [
+        ("Vendor/Model", "qwen", "r2", "fp4"),
+        ("Vendor/Model", "qwen", "r1", "fp8"),
+        ("Vendor/Model", "other", "r1", "fp4"),
+        ("vendor/model", "qwen", "r1", "fp4"),
+        ("Vendor/Model-longer", "qwen", "r1", "fp4"),
+    ] {
+        all.extend(variant_rows(
+            name,
+            family,
+            35,
+            false,
+            Some((revision, quant)),
+        ));
+    }
+    hydrate(&c, all);
+    let query = Browse {
+        name_prefix: "VENDOR/M".into(),
+        model: Some(Model {
+            family_id: "qwen".into(),
+            model_id: "Vendor/Model".into(),
+            revision: "r1".into(),
+            quantization: "fp4".into(),
+        }),
+        ..Default::default()
+    };
+    let read = c.read().unwrap();
+    let forward = read.proxy_offers(&query, None, 100, 10001).unwrap();
+    assert_eq!(
+        forward
+            .entries
+            .iter()
+            .map(|e| e.id.clone())
+            .collect::<Vec<_>>(),
+        ids(&wanted)
+    );
+    // Other variants cost a market index step, not 35 provider reads each.
+    assert!(forward.scanned_candidates < 20);
+    let tail = read.proxy_offers_from_end(&query, 4, 10001).unwrap();
+    assert_eq!(
+        tail.entries
+            .iter()
+            .map(|e| e.id.clone())
+            .collect::<Vec<_>>(),
+        ids(&wanted)[7..]
+    );
+    assert!(tail.next_cursor.is_none());
+    let previous = read
+        .proxy_offers(&query, tail.previous_cursor.as_deref(), 4, 10001)
+        .unwrap();
+    assert_eq!(
+        previous
+            .entries
+            .iter()
+            .map(|e| e.id.clone())
+            .collect::<Vec<_>>(),
+        ids(&wanted)[3..7]
+    );
+    let returned = read
+        .proxy_offers(&query, previous.next_cursor.as_deref(), 4, 10001)
+        .unwrap();
+    assert_eq!(
+        returned
+            .entries
+            .iter()
+            .map(|e| e.id.clone())
+            .collect::<Vec<_>>(),
+        ids(&wanted)[7..]
+    );
+    let mut wrong = query.clone();
+    wrong.model.as_mut().unwrap().revision = "r2".into();
+    assert!(matches!(
+        read.proxy_offers(&wrong, tail.previous_cursor.as_deref(), 4, 10001),
+        Err(Error::DirectoryCursorInvalid)
+    ));
+    wrong.family_id = Some("other".into());
+    assert!(wrong.key().is_err());
+    wrong = query.clone();
+    wrong.name_prefix = "unrelated".into();
+    assert!(read
+        .proxy_offers(&wrong, None, 100, 10001)
+        .unwrap()
+        .entries
+        .is_empty());
+    let default = Browse::default();
+    let old_wire = json!({"kind":null,"family_id":null,"name_prefix":"","endpoint":null,"minimum_context":null,"rail":null});
+    assert_eq!(serde_json::to_value(&default).unwrap(), old_wire);
 }
 
 #[test]
