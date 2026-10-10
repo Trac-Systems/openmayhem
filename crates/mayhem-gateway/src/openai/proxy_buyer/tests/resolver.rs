@@ -238,7 +238,10 @@ async fn restrictive_model_scope_continuity_and_unknown_evidence_never_invent_se
     }
     f.harness.stop_descriptors();
     let (_, unresolved) = send(f.router.clone(), input, "owner-fixture-key").await;
-    assert_eq!(unresolved["status"], "incomplete", "{unresolved}");
+    // The only supplier stopped its descriptor service. The complete catalog
+    // has no usable offer; this is not missing catalog or trust evidence.
+    assert_eq!(unresolved["status"], "no_match", "{unresolved}");
+    assert_eq!(unresolved["unresolved_candidates"], 0);
     assert!(unresolved["selection"].is_null());
     assert_eq!(unresolved["ranking_claim"], "none");
     assert_eq!(unresolved["exclusions"]["descriptor_unavailable"], 1);
@@ -595,6 +598,36 @@ async fn candidate_observation_deadline_is_unresolved_and_does_not_claim_empty_o
     assert_eq!(incomplete["scope_exhausted"], true);
     assert!(incomplete["selection"].is_null());
     assert_eq!(incomplete["ranking_claim"], "none");
+    assert_no_purchase(&mut f).await;
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn slow_continuation_uses_current_healthy_evidence_after_observation_deadline() {
+    let _case = ESTIMATE_CASE.lock().await;
+    let mut f = configured(ProfileResolutionLimits {
+        observation_timeout_ms: 50,
+        ..Default::default()
+    })
+    .await;
+    f.control
+        .control
+        .select_markets(vec![support::digest(901), support::digest(902)])
+        .unwrap();
+    let (_, pending) = send(f.router.clone(), start(&f), "owner-fixture-key").await;
+    assert_eq!(pending["pending_reason"], "observation_budget");
+    tokio::time::sleep(Duration::from_millis(60)).await;
+    let market = Digest::new(&f.harness.template.terms.offer.market_id).unwrap();
+    f.control.control.select_markets(vec![market]).unwrap();
+    let (_, selected) = send(
+        f.router.clone(),
+        pending["continuation"].clone(),
+        "owner-fixture-key",
+    )
+    .await;
+    assert_eq!(selected["status"], "selected", "{selected}");
+    assert_eq!(selected["selection"]["model"], model(&f.harness));
+    assert_eq!(selected["unresolved_candidates"], 0);
     assert_no_purchase(&mut f).await;
     f.stop().await;
 }

@@ -916,11 +916,14 @@ async fn advance(
     )
     .await
     .map_err(|_| unavailable())?;
-    if current.availability.status != Eligibility::Available {
-        if observation_pending(current.availability.status) {
-            return Ok(pending(session, "presence_pending"));
-        }
-        return Err(unavailable());
+    if let Some(outcome) = candidate_availability(
+        current.availability.status,
+        observation_expired(runtime, session),
+    ) {
+        return match outcome {
+            Checked::Pending(reason) => Ok(pending(session, reason)),
+            _ => Err(unavailable()),
+        };
     }
     let selected = finish(state, session).await?;
     session.complete = true;
@@ -953,6 +956,39 @@ fn observation_pending(status: Eligibility) -> bool {
             | Eligibility::ThroughputUnverified
     )
 }
+fn observation_expired(runtime: &Runtime, session: &Session) -> bool {
+    session.waiting.as_ref().is_some_and(|waiting| {
+        waiting.started.elapsed()
+            >= Duration::from_millis(runtime.resolver.limits.observation_timeout_ms)
+    })
+}
+
+// A complete catalog with an unusable supplier is not an incomplete catalog.
+// Never dispatch to that supplier, but do not let it veto healthy alternatives.
+// Only failure to establish the catalog/observation itself remains unresolved.
+fn candidate_availability(status: Eligibility, expired: bool) -> Option<Checked> {
+    if status == Eligibility::Available {
+        return None;
+    }
+    if observation_pending(status) {
+        return Some(if expired {
+            Checked::Excluded("provider_presence_timeout", false)
+        } else {
+            Checked::Pending("presence_pending")
+        });
+    }
+    Some(Checked::Excluded(
+        match status {
+            Eligibility::Busy => "provider_busy",
+            Eligibility::Draining => "provider_draining",
+            Eligibility::ThroughputFloor => "throughput_floor",
+            Eligibility::ControllerConflict => "controller_conflict",
+            Eligibility::CatalogUnavailable => "catalog_unavailable",
+            _ => "availability_unavailable",
+        },
+        status == Eligibility::CatalogUnavailable,
+    ))
+}
 fn observe_market(
     state: &SharedState,
     runtime: &Arc<Runtime>,
@@ -967,11 +1003,6 @@ fn observe_market(
         });
     }
     let waiting = session.waiting.as_mut().unwrap();
-    if waiting.started.elapsed()
-        >= Duration::from_millis(runtime.resolver.limits.observation_timeout_ms)
-    {
-        return Some(Checked::Excluded("observation_deadline", true));
-    }
     if waiting.lease.is_none() {
         let Some(control) = state.proxy_control() else {
             return Some(Checked::Excluded("catalog_unavailable", true));
@@ -982,7 +1013,13 @@ fn observe_market(
         };
         match control.presence().observe_market(market) {
             Ok(lease) => waiting.lease = Some(lease),
-            Err(_) => return Some(Checked::Pending("observation_budget")),
+            Err(_) => {
+                return Some(if observation_expired(runtime, session) {
+                    Checked::Excluded("observation_deadline", true)
+                } else {
+                    Checked::Pending("observation_budget")
+                });
+            }
         }
     }
     None
@@ -1047,23 +1084,13 @@ async fn check(
     {
         return Checked::Excluded("publication_changed", true);
     }
-    if selected.availability.status != Eligibility::Available {
-        if observation_pending(selected.availability.status) {
-            return Checked::Pending("presence_pending");
-        }
-        return Checked::Excluded(
-            match selected.availability.status {
-                Eligibility::Busy => "provider_busy",
-                Eligibility::Draining => "provider_draining",
-                Eligibility::ThroughputFloor => "throughput_floor",
-                Eligibility::ThroughputUnverified => "throughput_unverified",
-                _ => "availability_unavailable",
-            },
-            !matches!(
-                selected.availability.status,
-                Eligibility::Busy | Eligibility::Draining | Eligibility::ThroughputFloor
-            ),
-        );
+    // Read current evidence before expiring a wait: a slow polling client may
+    // resume after the deadline even though a fresh heartbeat is already here.
+    if let Some(outcome) = candidate_availability(
+        selected.availability.status,
+        observation_expired(runtime, session),
+    ) {
+        return outcome;
     }
     let adapter = match runtime
         .controller
@@ -1077,7 +1104,10 @@ async fn check(
         .await
     {
         Ok(value) => value,
-        Err(_) => return Checked::Excluded("descriptor_unavailable", true),
+        // Describing this supplier performs no inference or purchase. If its
+        // controller cannot supply the authenticated descriptor, this offer is
+        // unusable now; another fully checked offer can still be selected.
+        Err(_) => return Checked::Excluded("descriptor_unavailable", false),
     };
     let body = if profile.constraints.request_controls.is_empty() {
         request.provider_value().clone()

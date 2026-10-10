@@ -127,10 +127,48 @@ fn retained_progress_crosses_one_hundred_thousand_and_never_claims_a_partial_min
         u128::MAX,
         "retail score never rewrites wholesale terms"
     );
-    session.consider(Checked::Excluded("descriptor_unavailable", true));
+    session.consider(Checked::Excluded("catalog_unavailable", true));
     assert_eq!(session.unknown, 1);
     assert!(status(&session, "incomplete", true, None)["selection"].is_null());
     assert!(better(u128::MAX - 1, "z", u128::MAX, "a"));
     assert!(better(1, "a", 1, "b"));
     assert!(!better(1, "b", 1, "a"));
+}
+
+#[test]
+fn unavailable_suppliers_do_not_veto_a_validated_alternative() {
+    for state in [
+        Eligibility::Busy,
+        Eligibility::Unavailable,
+        Eligibility::Checking,
+        Eligibility::Draining,
+        Eligibility::HeartbeatMissing,
+        Eligibility::StaleEvidence,
+        Eligibility::ThroughputUnverified,
+        Eligibility::ThroughputFloor,
+        Eligibility::ControllerConflict,
+    ] {
+        let (mut session, healthy) = fixture();
+        session.consider(Checked::Ready(healthy));
+        session.consider(candidate_availability(state, true).unwrap());
+        assert_eq!(session.considered, 2, "{state:?}");
+        assert_eq!(session.unknown, 0, "{state:?}");
+        assert!(session.best.is_some(), "{state:?}");
+    }
+    for state in [
+        Eligibility::HeartbeatMissing,
+        Eligibility::Checking,
+        Eligibility::StaleEvidence,
+        Eligibility::ThroughputUnverified,
+    ] {
+        assert!(matches!(
+            candidate_availability(state, false),
+            Some(Checked::Pending(_))
+        ));
+    }
+    assert!(candidate_availability(Eligibility::Available, true).is_none());
+    assert!(matches!(
+        candidate_availability(Eligibility::CatalogUnavailable, true),
+        Some(Checked::Excluded("catalog_unavailable", true))
+    ));
 }
