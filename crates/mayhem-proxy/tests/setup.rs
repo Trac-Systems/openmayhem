@@ -1,6 +1,8 @@
 #![cfg(any(unix, windows))]
 #[path = "setup/platform.rs"]
 mod platform;
+#[path = "setup/cli_assets.rs"]
+mod cli_assets;
 use platform::{assert_private_file, private, private_directory, private_tempdir, write_evidence};
 #[path = "setup/admission.rs"]
 mod admission;

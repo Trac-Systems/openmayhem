@@ -465,16 +465,7 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
     let f = publication::owned(ProxyEndpoint::Decisions, 123);
     let home = f.dir.path().join("home");
     private_directory(&home);
-    let root = std::fs::canonicalize(Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")).unwrap();
-    let assets = f.dir.path().join("verified-assets");
-    let output = Command::new("node")
-        .arg(root.join("crates/mayhem-proxy/tests/setup/run_assets.mjs"))
-        .arg(&root)
-        .arg(&assets)
-        .output()
-        .await
-        .unwrap();
-    assert!(output.status.success(), "isolated fixture assets failed");
+    let assets = cli_assets::prepare(&binary, f.dir.path()).await;
     let password = home.join("fixture-password");
     private(&password, b"synthetic-fixture-password\n");
     private(&home.join("sc-bridge-token"), b"synthetic-bridge-token\n");
@@ -484,7 +475,7 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
         .args(["--input-type=module", "-e", wallet_script])
         .arg(&keypair)
         .arg(f.input.provider_pubkey.as_str())
-        .current_dir(root.join("intercom"))
+        .current_dir(assets.join("intercom"))
         .output()
         .await
         .unwrap()
@@ -500,7 +491,6 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
         .arg(&keypair)
         .arg("--restart-password-file")
         .arg(&password)
-        .env("MAYHEM_ASSET_DIR", &assets)
         .env_remove("MAYHEM_WALLET_PASSWORD")
         .env_remove("MAYHEM_HOME")
         .env_remove("HTTP_PROXY")
@@ -510,6 +500,7 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    cli_assets::configure(&mut command, &assets, &home);
     let mut child = command.spawn().unwrap();
     let lines = [
         "https://example.invalid/v1/",

@@ -607,10 +607,18 @@ async fn run_cli_real_supervisor_publication_restart() {
         Duration::ZERO,
     );
     let bridge = bridge::Bridge::start(d(71).as_str(), f.input.provider_pubkey.as_str()).await;
-    let probe = probes::plan(
+    let mut probe = probes::plan(
         &f,
         json!({"model":"public-model","state":"synthetic","questions":{"q":{"type":"noul","instructions":"hello?"}}}),
     );
+    if let Some(install) = cli_assets::installed_root() {
+        assert_eq!(std::fs::canonicalize(daemon.parent().unwrap()).unwrap(), install.join("bin"));
+        probe.worker_program = install.join("bin").join(if cfg!(windows) {
+            "mayhem-proxy-worker.exe"
+        } else {
+            "mayhem-proxy-worker"
+        });
+    }
     let rev = f.store().create(f.input.clone()).unwrap().revision;
     let rev = f.store().check(rev).unwrap().revision;
     let rev = f
@@ -656,26 +664,13 @@ async fn run_cli_real_supervisor_publication_restart() {
     let keypair = home.join("fixture-wallet.json");
     // Use the wallet library's actual encrypted storage format, with only a
     // deterministic disposable fixture key. The normal CLI wallet helper reads it.
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let assets = f.dir.path().join("verified-assets");
-    let assets_output = Command::new("node")
-        .arg(root.join("crates/mayhem-proxy/tests/setup/run_assets.mjs"))
-        .arg(std::fs::canonicalize(&root).unwrap())
-        .arg(&assets)
-        .output()
-        .await
-        .unwrap();
-    assert!(
-        assets_output.status.success(),
-        "isolated candidate release verification: {}",
-        String::from_utf8_lossy(&assets_output.stderr)
-    );
+    let assets = cli_assets::prepare(&binary, f.dir.path()).await;
     let wallet_script = r#"import fs from 'node:fs';import crypto from 'trac-crypto-api';const publicKey=process.argv[2];const data={publicKey,secretKey:'7b'.repeat(32)+publicKey,mnemonic:null,derivationPath:null};const e=crypto.data.encrypt(Buffer.from(JSON.stringify(data)),Buffer.from('synthetic-fixture-password'));fs.writeFileSync(process.argv[1],JSON.stringify({nonce:e.nonce.toString('hex'),salt:e.salt.toString('hex'),ciphertext:e.ciphertext.toString('hex')}),{mode:0o600});"#;
     let made = Command::new("node")
         .args(["--input-type=module", "-e", wallet_script])
         .arg(&keypair)
         .arg(f.input.provider_pubkey.as_str())
-        .current_dir(root.join("intercom"))
+        .current_dir(assets.join("intercom"))
         .output()
         .await
         .unwrap();
@@ -698,7 +693,9 @@ async fn run_cli_real_supervisor_publication_restart() {
         client: &reqwest::Client,
         assets: &Path,
     ) -> tokio::process::Child {
-        let child = Command::new(binary)
+        let mut command = Command::new(binary);
+        cli_assets::configure(&mut command, assets, home);
+        let child = command
             .arg("--home")
             .arg(home)
             .arg("--bind")
@@ -706,7 +703,6 @@ async fn run_cli_real_supervisor_publication_restart() {
             .arg("--exit-after-ms")
             .arg("60000")
             .env("MAYHEMD_CONTROL_TOKEN", token)
-            .env("MAYHEM_ASSET_DIR", assets)
             .stdout(Stdio::null())
             // This daemon and every child use only disposable fixture data.
             // Retain startup failures instead of reporting an opaque timeout.
@@ -759,9 +755,11 @@ async fn run_cli_real_supervisor_publication_restart() {
     ) -> Value {
         let path = home.join("action.json");
         private(&path, &serde_json::to_vec(&action).unwrap());
+        let mut command = Command::new(binary);
+        cli_assets::configure(&mut command, assets, home);
         let output = tokio::time::timeout(
             Duration::from_secs(30),
-            Command::new(binary)
+            command
                 .args(["provider", "proxy", "setup", "wizard", "--config"])
                 .arg(flow)
                 .arg("--home")
@@ -770,7 +768,6 @@ async fn run_cli_real_supervisor_publication_restart() {
                 .arg(keypair)
                 .arg("--action-file")
                 .arg(path)
-                .env("MAYHEM_ASSET_DIR", assets)
                 .env_remove("MAYHEM_WALLET_PASSWORD")
                 .env_remove("MAYHEM_HOME")
                 .output(),
