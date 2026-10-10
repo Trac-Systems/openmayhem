@@ -266,6 +266,45 @@ fn key_budget_native_cumulative_receipts_deduplicate_across_restart_and_failover
     assert!(store.pending(None, 64).unwrap().is_empty());
 }
 #[test]
+fn key_budget_native_older_history_after_restart_preserves_charge_and_exposure() {
+    let dir = private_dir();
+    let mut t = token();
+    t.budget_au = Some(100);
+    let store = open(&dir, &t);
+    store.reserve(&t, Lane::Native, "session", "buyer", "session", 100, 2).unwrap();
+    assert_eq!(store.settle_native(&t.token_id, "session", native(387, 40, false, "newer"), 3).unwrap(), 40);
+    drop(store);
+    let store = open(&dir, &t);
+    for _ in 0..2 {
+        assert_eq!(store.settle_native(&t.token_id, "session", native(386, 39, false, "older"), 4).unwrap(), 0);
+        let pending = store.pending(None, 64).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].1.charged, 40);
+        assert_eq!(pending[0].1.maximum, 100);
+        assert_eq!(store.reserve(&t, Lane::Proxy, "other", "fp", "terms", 1, 4), Err(Error::Cap));
+    }
+    let mut wrong_identity = native(386, 39, false, "wrong");
+    wrong_identity.buyer = "other";
+    assert_eq!(store.settle_native(&t.token_id, "session", wrong_identity, 4), Err(Error::Conflict));
+    let mut wrong_maximum = native(386, 39, false, "wrong");
+    wrong_maximum.maximum = 99;
+    assert_eq!(store.settle_native(&t.token_id, "session", wrong_maximum, 4), Err(Error::Conflict));
+    let mut wrong_billing = native(386, 39, false, "wrong");
+    wrong_billing.billing_id = "other";
+    assert_eq!(store.settle_native(&t.token_id, "session", wrong_billing, 4), Err(Error::Conflict));
+    for bad in [native(386, 41, false, "increased"), native(386, 39, true, "premature-final"), native(387, 40, false, "changed-proof")] {
+        assert_eq!(store.settle_native(&t.token_id, "session", bad, 4), Err(Error::Conflict));
+    }
+    assert_eq!(store.settle_native(&t.token_id, "session", native(388, 45, true, "final"), 5).unwrap(), 5);
+    assert!(store.pending(None, 64).unwrap().is_empty());
+    assert_eq!(store.settle_native(&t.token_id, "session", native(386, 39, false, "older"), 6).unwrap(), 0);
+    assert_eq!(store.settle_native(&t.token_id, "session", native(388, 45, true, "final"), 6).unwrap(), 0);
+    store.project(&mut t, 6).unwrap();
+    assert_eq!(t.spent_total_au, 45);
+    store.reserve(&t, Lane::Proxy, "other", "fp", "terms", 55, 6).unwrap();
+}
+
+#[test]
 fn key_budget_proxy_exact_bindings_retention_and_terminal_replay() {
     let dir = private_dir();
     let mut t = token();
@@ -530,6 +569,66 @@ fn key_budget_closed_capacity_fences_new_work_without_preventing_recovery() {
     assert!(store
         .settle_proxy(&t.token_id, "job", "fp", "terms", 10, true, "proof", 4)
         .is_ok());
+}
+
+#[test]
+fn key_budget_gateway_startup_accepts_older_signed_dashboard_checkpoint() {
+    use crate::openai::tests::{test_chat_output, test_chat_request, test_invocation, test_model};
+    use crate::openai::{sign_hex, GatewayState};
+    let dir = private_dir();
+    let model = test_model();
+    let mut invocation = test_invocation();
+    invocation.spend_voucher.user_sig = sign_hex(
+        &invocation.receipt_user_seed,
+        &mayhem_proto::spend_voucher_signing_bytes(&invocation.spend_voucher.body).unwrap(),
+    );
+    let fixture = GatewayState::from_models(vec![model.clone()])
+        .with_receipt_user_seed(invocation.receipt_user_seed);
+    let mut receipt = fixture.meter_chat_session(
+        &model, &test_chat_request(&model.id), &test_chat_output(), &invocation, None,
+    ).unwrap();
+    let mut t = token();
+    t.budget_au = Some(2000);
+    receipt.access_token = Some(GatewayTokenAttribution { name: t.name.clone(), token_id: t.token_id.clone() });
+    let sign = |r: &mut crate::openai::StoredReceipt, seq, amount, terminal| {
+        r.receipt.body.seq = seq;
+        r.receipt.body.au_owed_cum = amount;
+        r.receipt.body.final_receipt = terminal;
+        let bytes = mayhem_proto::receipt_signing_bytes(&r.receipt.body).unwrap();
+        r.receipt.user_sig = sign_hex(&invocation.receipt_user_seed, &bytes);
+        r.receipt.enclave_sig = sign_hex(&fixture.receipt_config.enclave_seed, &bytes);
+        r.receipt_ack.seq = seq;
+        r.receipt_ack.user_sig = r.receipt.user_sig.clone();
+    };
+    sign(&mut receipt, 387, 200, false);
+    let config = GatewayTokenStore { version: 1, tokens: vec![t] };
+    let path = dir.path().join("startup.redb");
+    let access = GatewayAccessControl::new(true, config.clone(), None)
+        .initialize_durable_key_budget(path.clone(), limits()).unwrap();
+    access.reserve_budget(&receipt.access_token, &receipt.receipt.body.session_id,
+        receipt.voucher.body.max_spend_au, &receipt.receipt.body.user).unwrap();
+    assert_eq!(access.reconcile_native_budget(&receipt).unwrap(), 200);
+    drop(access); // durable accounting committed, dashboard checkpoint still older
+    let mut older = receipt.clone();
+    sign(&mut older, 386, 199, false);
+    let history = dir.path().join("dashboard.json");
+    std::fs::write(&history, serde_json::to_vec(&serde_json::json!({
+        "version": 1, "receipts": [older], "paused_sessions": []
+    })).unwrap()).unwrap();
+    let state = GatewayState::from_models(vec![model])
+        .with_dashboard_history_path(history)
+        .with_access_control(GatewayAccessControl::new(true, config, None))
+        .with_durable_key_budget(path, limits()).unwrap();
+    state.restore_retained_native_key_budgets().unwrap();
+    assert_eq!(state.access_summary()["tokens"][0]["spent_total_au"], "200");
+    assert_eq!(state.access_control.pending_key_budgets(None, 64).unwrap().len(), 1);
+    let mut tampered = older;
+    tampered.receipt.body.au_owed_cum += 1;
+    assert!(state.access_control.reconcile_native_budget(&tampered).is_err());
+    sign(&mut receipt, 388, 250, true);
+    assert_eq!(state.access_control.reconcile_native_budget(&receipt).unwrap(), 50);
+    assert!(state.access_control.pending_key_budgets(None, 64).unwrap().is_empty());
+    assert_eq!(state.access_summary()["tokens"][0]["spent_total_au"], "250");
 }
 
 #[test]

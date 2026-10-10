@@ -443,6 +443,19 @@ impl Authority {
             if let Some(old) = &r.billing {
                 require(old == value.billing_id, Error::Conflict)?;
             }
+            // The durable budget commits before dashboard history is persisted.
+            // A restart can therefore replay a verified older checkpoint. Keep
+            // the newer charge, proof and retained exposure; never infer release
+            // or accept contradictory final/cumulative evidence from that replay.
+            if r.proof.is_some() && value.sequence < r.sequence {
+                require(
+                    !value.terminal
+                        && value.prior <= value.cumulative
+                        && value.cumulative <= r.cumulative,
+                    Error::Conflict,
+                )?;
+                return Ok((0, r.closed));
+            }
             if r.proof.is_some() && value.sequence == r.sequence {
                 require(
                     r.proof.as_deref() == Some(value.proof)
