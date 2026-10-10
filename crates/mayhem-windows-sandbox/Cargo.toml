@@ -13,7 +13,10 @@ thiserror = "2"
 
 [target.'cfg(windows)'.dependencies]
 getrandom = "0.3"
+zeroize = "1"
 windows-sys = { version = "0.60", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
     "Win32_Security",
@@ -22,6 +25,8 @@ windows-sys = { version = "0.60", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_JobObjects",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
     "Win32_System_Pipes",
     "Win32_System_StationsAndDesktops",
     "Win32_System_SystemServices",

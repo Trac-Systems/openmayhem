@@ -537,7 +537,12 @@ pub fn private_file(path: &Path, max_bytes: usize) -> SetupResult<Zeroizing<Vec<
         require(bytes.len() <= max_bytes, "private file exceeds byte limit")?;
         Ok(bytes)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        mayhem_windows_sandbox::read_private_file(path, max_bytes)
+            .map_err(|_| SetupError::FilePermissions)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = (path, max_bytes);
         Err(SetupError::UnsupportedFilePermissions)

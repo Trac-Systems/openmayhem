@@ -56,6 +56,11 @@ pub enum WindowsSandboxError {
 pub type Result<T> = std::result::Result<T, WindowsSandboxError>;
 
 #[cfg(windows)]
+mod private_files;
+#[cfg(windows)]
+pub use private_files::{read_private_file, validate_private_directory};
+
+#[cfg(windows)]
 mod platform;
 
 #[cfg(windows)]
