@@ -253,12 +253,9 @@ impl Runtime {
             // upstream strings, request contents, credentials or payment terms.
             if is_execution {
                 if let Err(error) = &outcome {
-                    tracing::warn!(
-                        job_id = %binding.job_id,
-                        code = ?error.code,
-                        stage = ?error.stage,
-                        recovery_required = error.recovery_required,
-                        "proxy execution did not complete"
+                    eprintln!(
+                        "Proxy execution did not complete: job_id={} code={:?} stage={:?} recovery_required={}",
+                        binding.job_id, error.code, error.stage, error.recovery_required
                     );
                 }
             }
