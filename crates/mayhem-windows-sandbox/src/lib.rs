@@ -61,6 +61,11 @@ mod platform;
 #[cfg(windows)]
 pub use platform::{run_appcontainer, spawn_appcontainer, WindowsSandboxChild};
 
+#[cfg(windows)]
+pub use platform::decoder::{
+    verify_decoder_process, verify_tokenizer_process, DecoderChild, DecoderLauncher, DecoderMode,
+};
+
 #[cfg(not(windows))]
 pub struct WindowsSandboxChild {
     pub stdin: Option<std::fs::File>,

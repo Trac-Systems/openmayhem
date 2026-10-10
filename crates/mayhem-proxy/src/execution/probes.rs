@@ -177,6 +177,7 @@ impl Controller {
         }
         self.monitor
             .validate_tokenizer(&self.specification.route, source.digest())?;
+        source.bind_pool(&self.pool).map_err(|_| ProbeError::Configuration)?;
         self.tokenizer = Some(source);
         Ok(self)
     }

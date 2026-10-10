@@ -2,11 +2,13 @@
 //! code or reported usage. One encode per output field after validated completion;
 //! no prefix retokenization, network calls or per-token database operations.
 use super::*;
+use crate::worker::host::Pool;
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
-use tokenizers::Tokenizer;
+use std::sync::OnceLock;
+pub mod engine;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
-#[cfg(test)]
+#[cfg(all(test, unix))]
 #[path = "native_tests.rs"]
 mod tests;
 
@@ -23,7 +25,8 @@ pub struct Limits {
 /// Construct only from operator-approved, digest-pinned local data. No path or
 /// URL is interpreted by this component; no remote code or Hub feature is enabled.
 pub struct Source {
-    tokenizer: Arc<Tokenizer>,
+    bytes: Arc<[u8]>,
+    pool: OnceLock<crate::worker::host::Tokenizer>,
     digest: Digest,
     connection: Digest,
     recipe: Digest,
@@ -42,34 +45,12 @@ impl Source {
         recipe: Digest,
         limits: Limits,
     ) -> Result<Self> {
-        if !(1..=64 * 1024 * 1024).contains(&limits.artifact_bytes)
-            || bytes.len() > limits.artifact_bytes
-            || !(1..=4 * 1024 * 1024).contains(&limits.output_bytes)
-            || !(1..=1024).contains(&limits.channels)
-            || !(1..=16).contains(&limits.workers)
-            || !(2..=1_000_000).contains(&limits.minimum_tokens)
-            || blake3::hash(bytes).to_hex().as_str() != digest.as_str()
-        {
-            return Err(Error::Invalid);
-        }
-        // Counts may not include artificial padding, truncation or stochastic BPE.
-        let spec: Value = serde_json::from_slice(bytes).map_err(|_| Error::Invalid)?;
-        if !spec["padding"].is_null()
-            || !spec["truncation"].is_null()
-            || spec["model"]["dropout"].as_f64().is_some_and(|v| v != 0.0)
-        {
-            return Err(Error::Invalid);
-        }
-        let mut tokenizer = Tokenizer::from_bytes(bytes).map_err(|_| Error::Invalid)?;
-        let mut model = tokenizer.get_model().clone();
-        match &mut model {
-            tokenizers::models::ModelWrapper::BPE(model) => model.resize_cache(0),
-            tokenizers::models::ModelWrapper::Unigram(model) => model.resize_cache(0),
-            _ => (),
-        }
-        tokenizer.with_model(model);
+        // This checks the pin and resource policy only. Validation/activation
+        // uses an explicit isolated launcher; construction never parses models.
+        check(bytes, &digest, limits)?;
         Ok(Self {
-            tokenizer: Arc::new(tokenizer),
+            bytes: Arc::from(bytes),
+            pool: OnceLock::new(),
             digest,
             connection,
             recipe,
@@ -77,15 +58,43 @@ impl Source {
             workers: Arc::new(Semaphore::new(limits.workers)),
         })
     }
+    /// Explicit trusted launcher supplied by the existing host. No PATH search,
+    /// artifact-provided executable, or in-process parser fallback.
+    pub fn bind_pool(&self, pool: &Pool) -> Result<()> {
+        if let Some(prior) = self.pool.get() {
+            return if prior.same_launcher(pool) {
+                Ok(())
+            } else {
+                Err(Error::Invalid)
+            };
+        }
+        let bounded = pool
+            .tokenizer(self.bytes.clone(), self.digest.clone(), self.limits)
+            .map_err(|_| Error::Invalid)?;
+        if self.pool.set(bounded).is_err() {
+            return self.bind_pool(pool);
+        }
+        Ok(())
+    }
+    /// Startup/provisioning validation. The owner must call this in its bounded
+    /// blocking scope before activating the source or atomically saving a bundle.
+    pub fn validate(&self, pool: &Pool) -> Result<()> {
+        self.bind_pool(pool)?;
+        self.pool
+            .get()
+            .ok_or(Error::Unavailable)?
+            .validate()
+            .map_err(|_| Error::Unavailable)
+    }
     pub(crate) fn matches(&self, connection: &Digest, recipe: &Digest) -> bool {
         &self.connection == connection && &self.recipe == recipe
     }
     pub(crate) fn capture(&self) -> Option<Capture> {
         // Reserve before retaining any output. No waiting task queue. The permit
-        // survives caller cancellation until any blocking encode actually exits.
+        // survives caller cancellation until any spawned child is reaped.
         let permit = self.workers.clone().try_acquire_owned().ok()?;
         Some(Capture {
-            source: self.tokenizer.clone(),
+            pool: self.pool.get()?.clone(),
             digest: self.digest.clone(),
             limits: self.limits,
             permit,
@@ -101,12 +110,12 @@ impl Source {
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct Channel(u64, u64, u8);
-struct Field {
-    text: String,
-    first_bytes: usize,
+pub(crate) struct Field {
+    pub(crate) text: String,
+    pub(crate) first_bytes: usize,
 }
 pub(crate) struct Capture {
-    source: Arc<Tokenizer>,
+    pool: crate::worker::host::Tokenizer,
     digest: Digest,
     limits: Limits,
     permit: OwnedSemaphorePermit,
@@ -237,35 +246,17 @@ impl Capture {
         if last <= first {
             return None;
         }
-        tokio::task::spawn_blocking(move || {
-            let _permit = self.permit;
-            let mut count = 0usize;
-            for (_, field) in self.fields {
-                let encoded = self.source.encode(field.text.as_str(), false).ok()?;
-                for &(start, end) in encoded.get_offsets() {
-                    if start > end || end > field.text.len() {
-                        return None;
-                    }
-                    // A token spanning the first observed boundary is excluded.
-                    // Encoding only the completed text avoids BPE seam inflation.
-                    if start >= field.first_bytes && end > start {
-                        count = count.checked_add(1)?
-                    }
-                }
-            }
-            if count < self.limits.minimum_tokens {
-                return None;
-            }
-            Some(Evidence {
-                digest: self.digest,
-                tokens: count as u64,
-                first,
-                last,
-            })
+        let fields = self.fields.into_values().collect();
+        let count = self.pool.count(fields, self.permit).await.ok()?;
+        if count < self.limits.minimum_tokens as u64 {
+            return None;
+        }
+        Some(Evidence {
+            digest: self.digest,
+            tokens: count,
+            first,
+            last,
         })
-        .await
-        .ok()
-        .flatten()
     }
 }
 fn contains_text(v: &Value) -> bool {
@@ -297,4 +288,27 @@ pub(crate) async fn delivery<F: std::future::Future>(
         poll
     })
     .await
+}
+
+// These checks deliberately do not instantiate a tokenizer or execute patterns.
+pub(crate) fn check_limits(limits: Limits) -> Result<()> {
+    if !(1..=engine::MAX_ARTIFACT).contains(&limits.artifact_bytes)
+        || !(1..=engine::MAX_OUTPUT).contains(&limits.output_bytes)
+        || !(1..=1024).contains(&limits.channels)
+        || !(1..=16).contains(&limits.workers)
+        || !(2..=1_000_000).contains(&limits.minimum_tokens)
+    {
+        return Err(Error::Invalid);
+    }
+    Ok(())
+}
+pub(crate) fn check(bytes: &[u8], digest: &Digest, limits: Limits) -> Result<()> {
+    check_limits(limits)?;
+    if bytes.is_empty()
+        || bytes.len() > limits.artifact_bytes
+        || blake3::hash(bytes).to_hex().as_str() != digest.as_str()
+    {
+        return Err(Error::Invalid);
+    }
+    Ok(())
 }

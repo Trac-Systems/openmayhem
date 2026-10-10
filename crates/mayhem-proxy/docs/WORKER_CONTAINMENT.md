@@ -78,7 +78,74 @@ Primary references: Linux [seccomp filtering](https://docs.kernel.org/userspace-
 [seccomp ABI and architecture caveats](https://man7.org/linux/man-pages/man2/seccomp.2.html),
 and [Rust's Linux random implementation](https://github.com/rust-lang/rust/blob/master/library/std/src/sys/random/linux.rs).
 
-Windows protected ACL/JobObject support and measured total decoder resource
-limits remain separate release requirements. Windows still rejects decoder pool
-creation where protection is unimplemented. Do not declare cross-platform
-containment acceptance from a single operating-system or architecture test.
+## Windows: implemented boundary, native acceptance outstanding
+
+The decoder uses a separate, fixed-policy launcher in `mayhem-windows-sandbox`;
+the native engine's existing configurable launcher is unchanged. Unsafe Win32
+calls stay in that FFI crate, while the protocol/financial crate still forbids
+unsafe code. The intended targets are 64-bit x86_64 and aarch64. Other Windows
+architectures refuse initialization. LPAC, child-process restrictions and every
+required mitigation must be available; unsupported systems fail before READY.
+There is no ordinary Windows process-spawn fallback.
+
+Each child receives a fresh derived AppContainer SID and no registered profile
+or writable profile directory. Less Privileged AppContainer mode removes the
+broad `ALL APPLICATION PACKAGES` grant. Its only named capability is a random
+read/execute grant for one private staged bundled executable. The launcher
+copies that image once per Pool, retains it across tokenizer/decoder launches,
+and denies writes/deletion while children can use it. It accepts only local
+drive paths, rejects reparse points, pins ancestors against rename/deletion,
+and checks source/work-directory ownership and DACLs. The work directory must
+start empty and grant no other user access. Source images may be readable by
+others but cannot grant them write/delete/ownership rights. Only the current
+user, SYSTEM and local Administrators are trusted for these ACL checks. An
+installation with a different owner/ACL is refused rather than rewritten.
+
+No artifact/model/workspace path, network, device or registry capability is
+granted. Model output and pinned tokenizer bytes travel through bounded pipes.
+Windows still provides the minimal LPAC system resources required to load/run
+an executable; this is not a literal denial of every operating-system file.
+The intended denial is access to ambient user/workspace data and external
+effects, and must be verified on each supported Windows release. A privileged
+administrator or kernel can change OS security/reporting policy; this boundary
+does not protect against that authority or certify remote-provider privacy.
+
+Creation uses an explicit three-handle inheritance list: stdin, stdout and NUL
+stderr. No job, process, image-lock or caller file handle is inherited. The child
+starts suspended, receives an unnamed Job with one active process, no breakaway,
+kill-on-close and fixed process/job committed-memory limits, then resumes.
+The trusted host ceiling is 1 GiB for ordinary decoding and 768 MiB for the
+tokenizer mode (512 MiB counted heap plus 256 MiB for runtime/loader/stacks);
+these are committed-memory limits, not measured RSS or the parent IPC reservation.
+A failed assignment/resume kills and reaps the child.
+Dynamic executable memory, Win32k calls, extension points, remote/low-integrity
+image loads and child creation are restricted at creation. Before parsing any
+IPC, the child checks LPAC/capability shape, stdio, Job limits and mitigations.
+It never emits READY after a failed check.
+
+The parent retains existing process/IPC permits through kill/reap and pipe
+draining. Windows pipe adapters use bounded 64 KiB asynchronous file buffers;
+a supervisor polls one process handle per acquired slot. No per-token, history,
+financial or remote-provider operation is added, and there is no overall model
+generation or retained-tokenizer lifetime timer. This does not establish a
+total CPU allocation guarantee.
+
+Native tests in the sandbox crate exercise private read/write denial, reachable
+loopback denial, process creation/access denial, excluded inheritable handles,
+heap/random/clock compatibility, Job memory refusal, drop/reaping and image
+lifetime. `tests/windows_containment.rs` checks actual worker refusal outside
+the launcher and contained schema/regex preparation through the shared Pool.
+Run both on native Windows; compiling these tests is not enforcement evidence.
+No Windows runtime was available for this implementation slice, so native
+enforcement and actual decoder acceptance remain release-blocking. Retained v2
+tokenizer initialization additionally verifies its exact 768 MiB Job limit and
+all LPAC controls; legacy one-shot v1 remains refused on Windows. The separate
+Windows tokenizer tests and native enforcement are not yet proved. Protected
+provider setup storage remains Unix-only. Linux/x86_64 native enforcement also
+remains a separate acceptance requirement.
+
+Primary references: Microsoft's [AppContainer isolation](https://learn.microsoft.com/en-us/windows/win32/secauthz/appcontainer-isolation),
+[LPAC setup](https://learn.microsoft.com/en-us/windows/win32/secauthz/implementing-an-appcontainer),
+[creation attributes and mitigation masks](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute),
+[Job objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects),
+and Chromium's [derived versus registered AppContainer identities](https://github.com/chromium/chromium/blob/main/sandbox/win/src/app_container_base.cc).

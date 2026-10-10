@@ -17,16 +17,58 @@ fn limits() -> Limits {
         minimum_tokens: 2,
     }
 }
-fn source() -> Source {
-    let b = bytes();
-    Source::from_bytes(
-        &b,
-        Digest::new(blake3::hash(&b).to_hex().as_str()).unwrap(),
-        d(1),
-        d(2),
-        limits(),
+struct FixtureSource {
+    source: Source,
+    _directory: tempfile::TempDir,
+}
+impl std::ops::Deref for FixtureSource {
+    type Target = Source;
+    fn deref(&self) -> &Source {
+        &self.source
+    }
+}
+fn isolate(source: Source) -> FixtureSource {
+    // Unit semantic cases use the same real contained binary as the integration
+    // tests. Cargo's package tests build it; focused --lib runs build it first.
+    let executable = std::env::current_exe().unwrap();
+    let program = executable
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("mayhem-proxy-worker");
+    let directory = tempfile::tempdir().unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let pool = Pool::new(
+        program,
+        directory.path(),
+        crate::worker::host::PoolLimits {
+            max_children: 1,
+            max_buffer_bytes: 8 * 1024 * 1024,
+            startup_timeout: Duration::from_secs(5),
+            processing_timeout: Duration::from_secs(5),
+        },
     )
-    .unwrap()
+    .unwrap();
+    source.validate(&pool).unwrap();
+    FixtureSource {
+        source,
+        _directory: directory,
+    }
+}
+fn source() -> FixtureSource {
+    let b = bytes();
+    isolate(
+        Source::from_bytes(
+            &b,
+            Digest::new(blake3::hash(&b).to_hex().as_str()).unwrap(),
+            d(1),
+            d(2),
+            limits(),
+        )
+        .unwrap(),
+    )
 }
 fn delta(text: &str) -> Value {
     json!({"choices":[{"index":0,"delta":{"content":text}}]})
@@ -46,7 +88,7 @@ fn pinned_tokenizer_rejects_wrong_data_padding_truncation_dropout_and_unbounded_
         }
         let changed = serde_json::to_vec(&v).unwrap();
         let hash = Digest::new(blake3::hash(&changed).to_hex().as_str()).unwrap();
-        assert!(Source::from_bytes(&changed, hash, d(1), d(2), limits()).is_err());
+        assert!(engine::load(&changed, &hash, limits()).is_err());
     }
     let mut bad = limits();
     bad.output_bytes = usize::MAX;
@@ -111,14 +153,16 @@ async fn bpe_merge_crossing_first_boundary_is_not_counted_twice_or_as_new_work()
         "normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,
         "model":{"type":"BPE","dropout":null,"unk_token":null,"continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":false,"byte_fallback":false,
             "vocab":{"a":0,"b":1,"ab":2,"c":3,"d":4,"cd":5,"e":6,"f":7,"ef":8," ":9},"merges":[["a","b"],["c","d"],["e","f"]]}})).unwrap();
-    let s = Source::from_bytes(
-        &b,
-        Digest::new(blake3::hash(&b).to_hex().as_str()).unwrap(),
-        d(1),
-        d(2),
-        limits(),
-    )
-    .unwrap();
+    let s = isolate(
+        Source::from_bytes(
+            &b,
+            Digest::new(blake3::hash(&b).to_hex().as_str()).unwrap(),
+            d(1),
+            d(2),
+            limits(),
+        )
+        .unwrap(),
+    );
     let mut c = s.capture().unwrap();
     let first = Instant::now();
     c.delta(&delta("a"), first);

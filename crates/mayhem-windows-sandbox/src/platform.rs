@@ -68,6 +68,11 @@ use crate::{
     WindowsSandboxRunReport, WindowsSandboxStderr,
 };
 
+// A stricter, separate launcher for the bundled proxy parser. The native-engine
+// AppContainer APIs and their filesystem grants are deliberately unchanged.
+#[path = "decoder/mod.rs"]
+pub mod decoder;
+
 const READ_CONTROL_ACCESS: u32 = 0x0002_0000;
 const WINDOW_STATION_CHILD_ACCESS: u32 = READ_CONTROL_ACCESS
     | WINSTA_ACCESSCLIPBOARD as u32

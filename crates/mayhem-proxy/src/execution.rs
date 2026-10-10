@@ -246,6 +246,7 @@ impl Executor {
                 .validate_tokenizer(route, source.digest())
                 .map_err(|_| Error::Configuration)?;
         }
+        source.bind_pool(&self.pool).map_err(|_| Error::Configuration)?;
         self.tokenizer = Some(source);
         Ok(self)
     }

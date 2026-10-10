@@ -2898,6 +2898,7 @@ dependencies = [
  "libc",
  "mayhem-bridge",
  "mayhem-proto",
+ "mayhem-windows-sandbox",
  "redb",
  "reqwest",
  "rustix",
@@ -2916,6 +2917,7 @@ dependencies = [
 name = "mayhem-windows-sandbox"
 version = "0.2.271"
 dependencies = [
+ "getrandom 0.3.4",
  "thiserror 2.0.18",
  "windows-sys 0.60.2",
 ]

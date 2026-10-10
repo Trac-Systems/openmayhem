@@ -13,9 +13,24 @@ use std::{
 };
 use tokio::{
     io::AsyncWriteExt,
-    process::{ChildStdin, ChildStdout, Command},
+    process::Command,
     sync::{watch, OwnedSemaphorePermit, Semaphore},
 };
+mod tokenizer;
+pub(crate) use tokenizer::Tokenizer;
+
+#[cfg(windows)]
+mod windows;
+#[cfg(not(windows))]
+use tokio::process::{Child as PlatformChild, ChildStdin, ChildStdout};
+#[cfg(windows)]
+use windows::{Child as PlatformChild, ChildStdin, ChildStdout};
+
+#[derive(Clone, Copy)]
+enum BundledMode {
+    Decoder,
+    Tokenizer,
+}
 
 #[derive(Clone, Copy, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -29,12 +44,15 @@ pub struct PoolLimits {
     pub processing_timeout: Duration,
 }
 
+#[derive(Clone)]
 pub struct Pool {
     program: PathBuf,
     workdir: PathBuf,
     limits: PoolLimits,
     children: Arc<Semaphore>,
     buffers: Arc<Semaphore>,
+    #[cfg(windows)]
+    windows: windows::Launcher,
 }
 
 fn config(ok: bool) -> Result<()> {
@@ -150,8 +168,10 @@ impl Pool {
                     && dir.mode() & 0o077 == 0,
             )?;
         }
-        #[cfg(not(unix))]
-        return Err(Error::Configuration); // Windows ACL + JobObject integration required.
+        #[cfg(not(any(unix, windows)))]
+        return Err(Error::Configuration);
+        #[cfg(windows)]
+        let windows = windows::Launcher::new(program, workdir).map_err(|_| Error::Configuration)?;
         #[allow(unreachable_code)]
         Ok(Self {
             program: program.into(),
@@ -159,7 +179,32 @@ impl Pool {
             limits,
             children: Arc::new(Semaphore::new(limits.max_children)),
             buffers: Arc::new(Semaphore::new(units(limits.max_buffer_bytes)? as usize)),
+            #[cfg(windows)]
+            windows,
         })
+    }
+
+    fn spawn_bundled(&self, mode: BundledMode) -> Result<PlatformChild> {
+        #[cfg(windows)]
+        return windows::spawn(&self.windows, mode);
+        #[cfg(not(windows))]
+        {
+            let mut command = Command::new(&self.program);
+            command
+                .arg(match mode {
+                    BundledMode::Decoder => "--stdio-v1",
+                    BundledMode::Tokenizer => "--tokenizer-stdio-v2",
+                })
+                .env_clear()
+                .current_dir(&self.workdir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            #[cfg(unix)]
+            command.process_group(0);
+            command.spawn().map_err(|_| Error::Start)
+        }
     }
 
     /// Spawn before dispatch when practical. No upstream call occurs here. A
@@ -194,18 +239,7 @@ impl Pool {
             .clone()
             .try_acquire_many_owned(units(bytes)?)
             .map_err(|_| Error::Capacity)?;
-        let mut command = Command::new(&self.program);
-        command
-            .arg("--stdio-v1")
-            .env_clear()
-            .current_dir(&self.workdir)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        #[cfg(unix)]
-        command.process_group(0);
-        let mut child = command.spawn().map_err(|_| Error::Start)?;
+        let mut child = self.spawn_bundled(BundledMode::Decoder)?;
         let input = child.stdin.take().ok_or(Error::Start)?;
         let output = child.stdout.take().ok_or(Error::Start)?;
         let (stop, mut stop_rx) = watch::channel(false);

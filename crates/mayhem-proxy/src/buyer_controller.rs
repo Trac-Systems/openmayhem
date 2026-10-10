@@ -368,6 +368,7 @@ impl Controller {
                 "conformance recorder already configured",
             );
         }
+        store.prepare_tokenizer(&self.shared.verifier)?;
         let recorder = Arc::new(crate::conformance::Recorder::new(
             store,
             self.shared.signer.clone(),

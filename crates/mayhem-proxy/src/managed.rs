@@ -92,7 +92,8 @@ pub struct Provider {
 }
 impl Prepared {
     /// Unlock/verify the normal Core wallet before creating any provider stores.
-    /// No inference, ledger write or worker process is started during preparation.
+    /// No inference or ledger write is started. Approved tokenizer validation
+    /// uses the contained local worker before capacity configuration/serving.
     pub fn open(self, signer: Arc<Authority>) -> Result<Provider> {
         if signer.identity() != &self.identity {
             return Err(Error::Identity);
@@ -132,6 +133,13 @@ impl Prepared {
             )
             .map_err(|_| Error::Setup)?,
         );
+        // Parse approved tokenizer data only in the contained executable, before
+        // creating/reconfiguring capacity or enabling presence/admission.
+        for route in &routes {
+            if let Some(source) = &route.tokenizer {
+                source.validate(&paid_pool).map_err(|_| Error::Setup)?;
+            }
+        }
         let capacity = Arc::new(
             (if requires_existing_capacity {
                 capacity::Authority::open_existing

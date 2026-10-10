@@ -47,7 +47,7 @@ async fn guided_cli_prompts_discover_choose_create_or_join_and_convert_exact_pri
         peer_rpc: peer.url.clone(),
         bridge_url: "ws://127.0.0.1:9/".into(),
         bridge_token_file: home.path().join("bridge"),
-        worker_program: std::env::current_exe().unwrap(),
+        worker_program: std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("mayhem-proxy-worker"),
         wallet_password_file: None,
         admission_origin: None,
         declaration_registry: None,

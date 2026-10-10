@@ -89,6 +89,13 @@ impl Store {
             tokenizer,
         })
     }
+    /// Host startup supplies the already authenticated local worker launcher.
+    pub fn prepare_tokenizer(&self, pool: &crate::worker::host::Pool) -> Result<()> {
+        if let Some(source) = &self.tokenizer {
+            source.validate(pool).map_err(|_| crate::invalid("isolated conformance tokenizer unavailable"))?;
+        }
+        Ok(())
+    }
     pub fn network(&self) -> &discovery::Identity {
         &self.network
     }

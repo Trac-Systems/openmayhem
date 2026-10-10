@@ -361,6 +361,11 @@ fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
             require(pin.file.is_absolute())?;
             let bytes = private_file(&pin.file, 64 * 1024 * 1024).map_err(|_| Error::Protection)?;
             require(blake3::hash(&bytes).to_hex().as_str() == pin.digest.as_str())?;
+            let pool = crate::worker::host::Pool::new(&host.worker_program, stage.join("worker"), template.limits.worker)
+                .map_err(|_| Error::Bootstrap("isolated tokenizer launcher"))?;
+            let source = crate::health::native::Source::from_bytes(&bytes, pin.digest.clone(), pin.digest.clone(), pin.digest.clone(), pin.limits)
+                .map_err(|_| Error::Bootstrap("approved tokenizer pin"))?;
+            source.validate(&pool).map_err(|_| Error::Bootstrap("isolated tokenizer validation"))?;
             write(&stage.join("tokenizer.json"), &bytes)?;
             pin.file = "tokenizer.json".into();
         }
