@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "release_version": "0.2.271",
+  "release_version": "0.2.272",
   "contract_version": 30,
-  "contract_code_sha256": "e8fa65295afce4f9f2d181ad568f985a06f999c3c458b44b15df1228d2f7e30c",
+  "contract_code_sha256": "872880023f6f8c0d7abf2ba375b96a41623587251437f58bc12c6d834286fe0f",
   "files": [
     {
       "path": "contract/contract.js",
@@ -86,7 +86,7 @@
     },
     {
       "path": "features/mayhem/index.js",
-      "sha256": "cb05503b29fe8cdae866495a754137071aa2c1568275a45d25de3a27380245ff"
+      "sha256": "ad9d09812fd3eddc76cd1c0bccb30a06bb338e66c9cc1313f66d27151c938500"
     },
     {
       "path": "features/mayhem/proxy-admission.js",
@@ -94,7 +94,7 @@
     },
     {
       "path": "features/mayhem/proxy-canonical-view.js",
-      "sha256": "241e35911a62807c2aa6140505aba67a8b442c860714b257ea95e10f371abeaa"
+      "sha256": "daff27eb022d0650b46b454ba71996e84b2234ddc2f284781cc71e0ba809f300"
     },
     {
       "path": "features/mayhem/proxy-discovery.js",
@@ -110,7 +110,7 @@
     },
     {
       "path": "features/mayhem/proxy-publication-journal.js",
-      "sha256": "987d052b2c062c73447798e02d20b380267dc030ea31573c51670ac578b8e1c3"
+      "sha256": "329df689804cb81cc2e0b61be7e08be6fed02bd1d321ac98b417ad46befc1078"
     },
     {
       "path": "features/mayhem/proxy-publication-transport.js",
