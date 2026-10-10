@@ -93,10 +93,21 @@ MSB position hash is presented as an actual block hash.
 
 `reference_assigned_at_ms` must be the trusted discovery time of an actual payment,
 never the time a user submitted a precomputed transaction hash. This is essential
-for TNK, which supplies no authoritative transfer wall-clock timestamp. Late or
-future references, late observed TAP/Stripe payment times and changed policy
-remain review cases. The worker does not reprice,
-refund, reverse credit or charge a second admission fee.
+for TNK, which supplies no authoritative transfer wall-clock timestamp. Independent
+verification now records early/late physical payments; admission eligibility is
+checked separately. TAP/Stripe payments made within the original quote may qualify
+when discovered late. A late TNK observation is `payment_time_unproven`, not proof
+of an actual late transfer. Future timestamps are rejected. Early/genuinely late
+funds and changed policy remain review cases, not automatic permits. Both inline
+and paged issuers enforce timing. The worker does not reprice, refund, reverse
+credit or charge a second admission fee.
+
+The matching SITE migration requeues only unfinished verification paused for
+listed timing/retired-quote reasons. Financial review flags, paid history,
+original references and completed callbacks remain intact. Reviewed invoices can
+continue recording independent receipts, while queued/leased issuance is fenced.
+Deploy the matching API, verifier and issuer together under the release gate;
+these local changes require no ledger-contract operation.
 
 For an expired permit, the issuer requests SITE reconciliation of the original
 durable work. SITE may prepare one successor only after the canonical epoch has
@@ -137,12 +148,13 @@ underpayment/top-up/excess, resource bounds, and actual canonical publication
 with no duplicate append or native fund changes. The local HTTP SITE queue in
 this test is a fixture; real SITE persistence/ownership acceptance is separate.
 
-This worker alone does not complete P3 or public onboarding. SITE collection
-initiation, signed-wallet challenge/status recovery, real receiver allocation and
-payment discovery must be connected and tested. Inline issuer work supports up to
-32 receipts within the unchanged 16 KiB bound; larger lifetime payment sets must
-remain durable and pending an indexed, snapshot-pinned paged issuance transport,
-not be rejected or forgotten. Historical TNK evidence outside the configured
+This worker alone does not complete P3 or public onboarding. SITE initiation,
+signed-wallet challenges, exclusive receivers, discovery and quote renewal have
+local connected proof; authorized real-rail acceptance remains required. Inline
+issuer work supports up to 32 receipts within the unchanged 16 KiB bound; larger
+sets use indexed, snapshot-pinned pages of four, with immutable signed progress.
+The evidence-pages tests and actual SITE/Core worker fixtures cover restart,
+delayed discovery and both issuer transports. Historical TNK evidence outside the configured
 lookback needs explicit bounded recovery. Same-operation expired-permit recovery
 is covered by actual SITE database/HTTP and canonical worker fixtures; changed
 contract or operation recovery remains separate. Refunds,

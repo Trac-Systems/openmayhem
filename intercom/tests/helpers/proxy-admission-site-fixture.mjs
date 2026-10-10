@@ -17,6 +17,7 @@ const cleanup=[];
 const f=await familyAdminFixture({after:fn=>cleanup.push(fn)});
 const baseFixture=JSON.parse(fs.readFileSync(new URL('../fixtures/proxy-admission-worker-v1.json',import.meta.url))).cases[0];
 const h=()=>randomBytes(32).toString('hex'),now=Date.now(),invoiceId=randomUUID();
+const delayed=process.env.PROXY_ADMISSION_DELAYED_FIXTURE==='1';
 const msbFixture=await createTnkDiscoveryFixture({hash:h(),destination:testTnkAddress(h()),
  networkId:f.network.network_id,msbBootstrap:f.network.msb_bootstrap});
 cleanup.push(()=>msbFixture.close());
@@ -24,11 +25,11 @@ f.peer.proxyAdmissionMsbSnapshot=createAdmissionMsbReader(msbFixture.msb);
 const envelope=await f.create();
 const invoice={...baseFixture.verify_work.invoice,network:f.network,provider_pubkey:f.provider.publicKey,issuer_pubkey:f.issuer.publicKey,
  entitlement_id:h(),initial_operation_digest:await proxyOperationDigest(envelope.intent),fee_policy_hash:f.config.fee_policy_hash,
- created_at_ms:now-10000,quote_expires_at_ms:now+120000,collection:{...baseFixture.verify_work.invoice.collection,allocation_id:h()}};
+ created_at_ms:now-120000,quote_expires_at_ms:delayed?now-10000:now+120000,collection:{...baseFixture.verify_work.invoice.collection,allocation_id:h()}};
 invoice.invoice_commitment=await invoiceCommitment(invoiceId,invoice);
 const reference={...baseFixture.verify_work.payment_reference,transaction_hash:'0x'+h()};
 const references=[reference,{...reference,log_index:reference.log_index+1}];
-const observedAt=now-1000,paidAt=Math.floor((now-2000)/1000)*1000,blockHash='0x'+h();
+const observedAt=now-1000,paidAt=Math.floor((now-(delayed?20000:2000))/1000)*1000,blockHash='0x'+h();
 let amounts=['400000000000000000','700000000000000000'];
 const peer={...f.peer,wallet:{...f.peer.wallet,publicKey:f.issuer.publicKey,sign:bytes=>f.issuer.wallet.sign(bytes).toString('hex')},base:{writable:false,view:f.base.view}};
 const client=new MayhemFeature(peer,{});cleanup.push(()=>client.stop());

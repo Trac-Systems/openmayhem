@@ -80,7 +80,7 @@ test('canonical disablement, issuer removal, stale nonce, wrong network, expiry/
   const w=worker(c,'issue',{signPermit:()=>{signed++;throw new Error('must not sign');},fetcher:async(u,o)=>{const p=policy(c.issue_work,JSON.parse(o.body).request_nonce);mutate(p);return Response.json(p);}});
   await assert.rejects(w.complete(c.issue_work,signal()));
  }assert.equal(signed,0);
- for(const mutate of [x=>x.permit.issuance_revision=2,x=>x.evidence.receipts[0].reference_assigned_at_ms=x.invoice.quote_expires_at_ms+1]){
+ for(const mutate of [x=>x.permit.issuance_revision=2,x=>x.evidence.receipts[0].reference_assigned_at_ms=now()+1]){
   const w=clone(c.issue_work);mutate(w);await assert.rejects(worker(c,'issue').complete(w,signal()),ReviewWork);
  }
 });
@@ -266,4 +266,39 @@ test('one worker keeps a single active lease request',async()=>{
  const w=worker(c,'issue',{api});const pending=w.runOnce();
  await assert.rejects(w.runOnce(),/busy/);release({schema_version:1,purpose:PURPOSE,phase:'issue',work:null});assert.equal((await pending).status,'idle');
 
+});
+
+
+test('verification retains early/late physical funds; issuance uses actual paid time and fails closed for unknown TNK timing',async()=>{
+ for(const original of fixture.cases.slice(0,3)) {
+  const c=clone(original), expiry=c.verify_work.invoice.quote_expires_at_ms, time=expiry+1000;
+  c.verify_work.lease_expires_at_ms=time+60000;c.issue_work.lease_expires_at_ms=time+60000;
+  c.verify_work.reference_assigned_at_ms=expiry+100;
+  c.issue_work.evidence.receipts[0].reference_assigned_at_ms=expiry+100;
+  const verified=await worker(c,'verify',{now:()=>time}).complete(c.verify_work,signal());
+  assert.equal(verified.action,'evidence');assert.deepEqual(verified.body.receipt,c.evidence_completion.receipt);
+  if(c.rail==='tnk') await assert.rejects(worker(c,'issue',{now:()=>time}).complete(c.issue_work,signal()),/payment_time_unproven/);
+  else assert.equal((await worker(c,'issue',{now:()=>time}).complete(c.issue_work,signal())).action,'permit');
+  for(const paidAt of [c.verify_work.invoice.created_at_ms-1,expiry+1]) {
+   const late=clone(c);
+   if(late.rail==='tnk') {
+    late.verify_work.reference_assigned_at_ms=paidAt;late.issue_work.evidence.receipts[0].reference_assigned_at_ms=paidAt;
+   } else {
+    late.evidence_completion.receipt.paid_at_ms=paidAt;late.issue_work.evidence.receipts[0].receipt.paid_at_ms=paidAt;
+   }
+   const facts=await worker(late,'verify',{now:()=>time}).complete(late.verify_work,signal());
+   await validateEvidence(facts.body && {canonical_epoch:facts.body.canonical_epoch,evidence_commitment:facts.body.evidence_commitment,receipt:facts.body.receipt},late.verify_work);
+   late.issue_work.evidence.evidence_commitment=await evidenceSetCommitment(late.issue_work,late.issue_work.evidence.receipts);
+   late.issue_work.permit.evidence_commitment=late.issue_work.evidence.evidence_commitment;
+   let signed=0;
+   await assert.rejects(worker(late,'issue',{now:()=>time,signPermit:()=>{signed++;throw new Error('unexpected signature');}}).complete(late.issue_work,signal()));
+   assert.equal(signed,0);
+  }
+  const future=clone(c);future.verify_work.reference_assigned_at_ms=time+1;
+  await assert.rejects(worker(future,'verify',{now:()=>time}).complete(future.verify_work,signal()),/future_payment_evidence/);
+  if(c.rail!=='tnk') {
+   c.evidence_completion.receipt.paid_at_ms=time+1;
+   await assert.rejects(worker(c,'verify',{now:()=>time}).complete(c.verify_work,signal()),/future_payment_evidence/);
+  }
+ }
 });

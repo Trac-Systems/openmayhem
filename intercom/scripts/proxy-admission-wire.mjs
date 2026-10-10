@@ -77,7 +77,7 @@ export async function validateWork(v, phase) {
   validateInvoice(v.invoice);
   if (phase === 'verify') {
     validateReference(v.payment_reference, v.invoice);
-    need(uint(v.reference_assigned_at_ms, v.invoice.created_at_ms), 'invalid reference observation');
+    need(uint(v.reference_assigned_at_ms), 'invalid reference observation');
   } else need(v.payment_reference === null && v.reference_assigned_at_ms === null, 'issuer references belong to the evidence set');
   need(await invoiceCommitment(v.invoice_id, v.invoice) === v.invoice.invoice_commitment, 'invoice commitment differs');
   if (phase === 'verify') need(v.permit === null && v.evidence === null && v.previous_permit===undefined, 'verifier may not issue');
@@ -110,7 +110,7 @@ export function validateReceipt(r, i, p) {
     shape(r, [...shared,'transaction_hash','log_index','chain_id','token_contract','from_address','to_address','block_number','block_hash','paid_at_ms']);
     need(r.chain_id === p.chain_id && r.token_contract === p.token_contract && r.transaction_hash === p.transaction_hash
       && r.log_index === p.log_index && address(r.from_address) && r.to_address === i.collection.destination
-      && amount(r.block_number) && tx(r.block_hash) && uint(r.paid_at_ms, i.created_at_ms)
+      && amount(r.block_number) && tx(r.block_hash) && uint(r.paid_at_ms)
       && r.physical_key === `tap/${p.chain_id}/${p.token_contract}/${p.transaction_hash}/${p.log_index}`, 'invalid TAP receipt');
   } else if (i.rail === 'tnk') {
     shape(r, [...shared,'network','transaction_hash','from_address','to_address','confirmed_signed_length']);
@@ -120,13 +120,22 @@ export function validateReceipt(r, i, p) {
   } else {
     shape(r, [...shared,'stripe_account','livemode','payment_intent_id','charge_id','currency','paid_at_ms']);
     need(r.stripe_account === p.stripe_account && r.livemode === p.livemode && r.payment_intent_id === p.payment_intent_id
-      && /^ch_[A-Za-z0-9]{1,100}$/.test(r.charge_id) && r.currency === i.collection.currency && uint(r.paid_at_ms, i.created_at_ms)
+      && /^ch_[A-Za-z0-9]{1,100}$/.test(r.charge_id) && r.currency === i.collection.currency && uint(r.paid_at_ms)
       && r.physical_key === `fiat/${p.stripe_account}/${p.livemode ? 'live' : 'test'}/${p.payment_intent_id}`, 'invalid FIAT receipt');
   }
   need(r.rail === i.rail && r.finalized === true && amount(r.amount_base_units) && BigInt(r.amount_base_units) > 0n, 'unverified fee amount');
   return r;
 }
 
+// Facts are retained even when money cannot automatically qualify for admission.
+// TNK supplies no authoritative payment time; late observation is ambiguous.
+export function paymentTiming(invoice, receipt, assignedAt) {
+  need(uint(assignedAt), 'invalid reference observation');
+  const paidAt=receipt.rail==='tnk'?assignedAt:receipt.paid_at_ms;
+  if(assignedAt<invoice.created_at_ms || paidAt<invoice.created_at_ms) return 'transfer_before_invoice';
+  if(paidAt>invoice.quote_expires_at_ms) return receipt.rail==='tnk'?'payment_time_unproven':'late_transfer';
+  return 'within_quote';
+}
 export async function evidenceSetCommitment(work, receipts) {
   return await digest('mayhem/proxy/admission-evidence-set/v1', { invoice_commitment:work.invoice.invoice_commitment,
     receipts:receipts.map(({payment_reference,receipt})=>({payment_reference,receipt})) });

@@ -9,7 +9,7 @@ import { performance } from 'node:perf_hooks';
 import { proxyAdmissionSigningBytes, proxyCanonicalSigningBytes, verifyProxyAdmissionPermit } from '../contract/proxy-protocol.js';
 import { validateProxySnapshotProof } from '../features/mayhem/proxy-canonical-view.js';
 import { validateAdmissionMsbSnapshot } from '../features/mayhem/proxy-admission-msb.js';
-import { PURPOSE, base, need, shape, hex, uint, validateNetwork, validateWork, validateEvidence, validateEvidenceSet, evidenceCommitment, validateReceipt, evidenceSeed, evidenceAppend, EVIDENCE_PROGRESS_DOMAIN, EVIDENCE_PAGE_SIZE, amount } from './proxy-admission-wire.mjs';
+import { PURPOSE, base, need, shape, hex, uint, validateNetwork, validateWork, validateEvidence, validateEvidenceSet, evidenceCommitment, validateReceipt, paymentTiming, evidenceSeed, evidenceAppend, EVIDENCE_PROGRESS_DOMAIN, EVIDENCE_PAGE_SIZE, amount } from './proxy-admission-wire.mjs';
 import { verifyTnkObservedTransfer } from './proxy-admission-tnk.mjs';
 export { verifyTnkObservedTransfer } from './proxy-admission-tnk.mjs';
 import { RetryWork, ReviewWork, verifyTapTransferReceipt, parseHexInt } from './retail-crypto-verification.mjs';
@@ -116,7 +116,7 @@ export class AdmissionWorker {
     const i=work.invoice;
     need(o.rails.includes(i.rail) && work.lease_expires_at_ms > o.now() && Object.keys(o.network).every(k=>i.network[k]===o.network[k])
       && i.fee_policy_hash===o.feePolicyHash && i.issuer_pubkey===o.issuerPubkey, 'invoice differs from configured custody/network');
-    if(o.phase==='verify' && (work.reference_assigned_at_ms>i.quote_expires_at_ms || work.reference_assigned_at_ms>o.now())) throw new ReviewWork('late_reference_pending_policy');
+    if(o.phase==='verify' && work.reference_assigned_at_ms>o.now()) throw new ReviewWork('future_payment_evidence');
     if(o.phase==='issue'&&work.evidence.format==='paged-v1') {
       const progress=await this.checkedEvidenceProgress(work);
       if(progress.count<work.evidence.receipt_count) return this.completeEvidencePage(work,progress,signal);
@@ -128,7 +128,7 @@ export class AdmissionWorker {
     if(!policy.registry_enabled || policy.fee_policy_hash!==i.fee_policy_hash || !policy.active_issuers.includes(i.issuer_pubkey)) throw new ReviewWork('canonical_policy_changed');
     if(o.phase==='verify') {
       const receipt=await o.verifyReceipt(work,signal);
-      if(receipt.paid_at_ms!==undefined && (receipt.paid_at_ms>i.quote_expires_at_ms || receipt.paid_at_ms>o.now())) throw new ReviewWork('late_payment_pending_policy');
+      if(receipt.paid_at_ms!==undefined && receipt.paid_at_ms>o.now()) throw new ReviewWork('future_payment_evidence');
       const evidence={canonical_epoch:policy.context.epoch,evidence_commitment:await evidenceCommitment(work,receipt),receipt};
       await validateEvidence(evidence,work);
       return {action:'evidence',body:{...base(work),...evidence}};
@@ -136,7 +136,9 @@ export class AdmissionWorker {
     const total=await validateEvidenceSet(work.evidence,work);
     if(total<BigInt(i.amount_base_units)) throw new ReviewWork('verified_payment_short');
     for(const item of work.evidence.receipts??[]) {
-      if(item.reference_assigned_at_ms>i.quote_expires_at_ms || item.reference_assigned_at_ms>o.now() || (item.receipt.paid_at_ms!==undefined && (item.receipt.paid_at_ms>i.quote_expires_at_ms || item.receipt.paid_at_ms>o.now()))) throw new ReviewWork('late_payment_pending_policy');
+      if(item.reference_assigned_at_ms>o.now() || (item.receipt.paid_at_ms!==undefined && item.receipt.paid_at_ms>o.now())) throw new ReviewWork('future_payment_evidence');
+      const timing=paymentTiming(i,item.receipt,item.reference_assigned_at_ms);
+      if(timing!=='within_quote') throw new ReviewWork(timing);
     }
     const p=work.permit;
     // SITE stores this exact body before dispatch. The signer cannot choose a
@@ -191,9 +193,10 @@ export class AdmissionWorker {
       need(entry.sequence===next.count+1,'nonsequential evidence page');
       const r=validateReceipt(m.receipt,i,m.payment_reference);
       need(r.physical_key>next.last_key,'duplicate or unsorted evidence page');
-      need(uint(m.reference_assigned_at_ms,i.created_at_ms),'invalid reference observation');
-      if(m.reference_assigned_at_ms>i.quote_expires_at_ms||m.reference_assigned_at_ms>o.now()
-        ||(r.paid_at_ms!==undefined&&(r.paid_at_ms>i.quote_expires_at_ms||r.paid_at_ms>o.now()))) throw new ReviewWork('late_payment_pending_policy');
+      need(uint(m.reference_assigned_at_ms),'invalid reference observation');
+      if(m.reference_assigned_at_ms>o.now() || (r.paid_at_ms!==undefined && r.paid_at_ms>o.now())) throw new ReviewWork('future_payment_evidence');
+      const timing=paymentTiming(i,r,m.reference_assigned_at_ms);
+      if(timing!=='within_quote') throw new ReviewWork(timing);
       next.root=await evidenceAppend(work,next.root,++next.count,m);next.last_key=r.physical_key;
       total+=BigInt(r.amount_base_units);need(total<(1n<<128n),'evidence total overflow');
     }

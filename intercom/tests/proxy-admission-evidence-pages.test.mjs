@@ -175,7 +175,6 @@ test('page sums, assignment/payment time, lease and abort bounds are checked bef
   const changes = [
     p => { p.members[0].member.receipt.amount_base_units = String((1n << 128n) - 1n); },
     (p, f) => { p.members[0].member.reference_assigned_at_ms = f.work.invoice.created_at_ms - 1; },
-    (p, f) => { p.members[0].member.reference_assigned_at_ms = f.work.invoice.quote_expires_at_ms + 1; },
     p => { p.members[0].member.reference_assigned_at_ms = fixedNow + 1; },
     (p, f) => { p.members[0].member.receipt.paid_at_ms = f.work.invoice.created_at_ms - 1; },
     (p, f) => { p.members[0].member.receipt.paid_at_ms = f.work.invoice.quote_expires_at_ms + 1; },
@@ -239,4 +238,22 @@ test('lost progress ACK resumes the persisted checkpoint on the next lease inste
   const restarted = issuer(f, { api }); assert.equal((await restarted.worker.runOnce()).status, 'accepted');
   assert.equal(persisted.checkpoint.count, 8); assert.equal(completions, 2); assert.equal(restarted.state.reads.length, 0);
   assert.deepEqual(calls, ['pull', 'evidence-page', 'evidence-progress', 'retry', 'pull', 'evidence-page', 'evidence-progress']);
+});
+
+
+test('paged issuance accepts timely TAP/FIAT found late but never invents a TNK payment timestamp',async()=>{
+ for(const rail of ['tap','fiat','tnk']) {
+  const f=await fixture(rail,9),time=f.work.invoice.quote_expires_at_ms+1000;
+  f.work.lease_expires_at_ms=time+60000;
+  for(const m of f.members)m.reference_assigned_at_ms=time-100;
+  let root=await evidenceSeed(f.work);
+  for(let n=0;n<f.members.length;n++)root=await evidenceAppend(f.work,root,n+1,f.members[n]);
+  f.work.evidence.root=root;await commitManifest(f.work);
+  const w=issuer(f,{now:()=>time});
+  if(rail==='tnk') { await assert.rejects(w.worker.complete(f.work,signal()),/payment_time_unproven/);assert.equal(w.state.signatures.length,0); }
+  else {
+   while((f.work.evidence_progress?.checkpoint.count??0)<f.members.length)await advance(f,w.worker);
+   assert.equal((await w.worker.complete(f.work,signal())).action,'permit');
+  }
+ }
 });
