@@ -6,6 +6,8 @@ import {
   MemoryStorage,
   execute,
   executeEpochApplyFeature,
+  executePreparedEpochApplyFeature,
+  prepareEpochApplyFeature,
   executeFeature,
   executeSpendReservationFeature,
   epochApplyFeatureKey,
@@ -1546,13 +1548,12 @@ test('MayhemContract au helpers reject numeric money inputs', async () => {
 
 test('MayhemContract epochApply enforces max_apply_batch before writing', async () => {
   const { admin, provider, storage, contract } = await setupLedgerContract();
-  const before = storage.snapshotBytes();
   const tooManyDebits = Array.from({ length: 2_001 }, (_, i) => ({
     rail: 'fiat',
     user: `user-${i}`,
     au: '1',
   }));
-  const tooLarge = await executeEpochApplyFeature(
+  const prepared = await prepareEpochApplyFeature(
     contract,
     storage,
     {
@@ -1564,6 +1565,8 @@ test('MayhemContract epochApply enforces max_apply_batch before writing', async 
     },
     admin.publicKey
   );
+  const before = storage.snapshotBytes();
+  const tooLarge = await executePreparedEpochApplyFeature(contract, storage, prepared, admin.publicKey);
   assert.match(tooLarge.message, /max_apply_batch/i);
   assert.equal(storage.snapshotBytes(), before);
 });
@@ -1585,8 +1588,7 @@ test('MayhemContract epochApply uses the active admin max_apply_batch param', as
   );
   assert.equal(tuned.ok, true, tuned.message);
 
-  const before = storage.snapshotBytes();
-  const tunedTooLarge = await executeEpochApplyFeature(
+  const prepared = await prepareEpochApplyFeature(
     contract,
     storage,
     {
@@ -1602,6 +1604,8 @@ test('MayhemContract epochApply uses the active admin max_apply_batch param', as
     },
     admin.publicKey
   );
+  const before = storage.snapshotBytes();
+  const tunedTooLarge = await executePreparedEpochApplyFeature(contract, storage, prepared, admin.publicKey);
   assert.match(tunedTooLarge.message, /max_apply_batch/i);
   assert.equal(storage.snapshotBytes(), before);
 });
@@ -1617,7 +1621,8 @@ test('MayhemContract epochApply accepts admin-raised max_apply_batch above defau
       op: 'set_params',
       submitted_at: 0,
       effective_at: 86_400,
-      values: { max_apply_batch: 5_501 },
+      // Debits, earnings and canonical allocations all count toward this bound.
+      values: { max_apply_batch: 5_502 },
     },
     admin.publicKey,
     4
@@ -1665,8 +1670,7 @@ test('MayhemContract epochApply uses the active admin max_market_usage_entries p
   );
   assert.equal(tuned.ok, true, tuned.message);
 
-  const before = storage.snapshotBytes();
-  const tooManyMarketEntries = await executeEpochApplyFeature(
+  const prepared = await prepareEpochApplyFeature(
     contract,
     storage,
     {
@@ -1679,6 +1683,8 @@ test('MayhemContract epochApply uses the active admin max_market_usage_entries p
     },
     admin.publicKey
   );
+  const before = storage.snapshotBytes();
+  const tooManyMarketEntries = await executePreparedEpochApplyFeature(contract, storage, prepared, admin.publicKey);
   assert.match(tooManyMarketEntries.message, /max_market_usage_entries/i);
   assert.equal(storage.snapshotBytes(), before);
 });
@@ -1686,59 +1692,63 @@ test('MayhemContract epochApply uses the active admin max_market_usage_entries p
 test('MayhemContract epochApply paginates settlement entries across free pages', async () => {
   const { admin, provider, user, storage, contract } = await setupLedgerContract();
   await storage.put(`bal/${user.publicKey}/fiat`, seededBalance(user.publicKey, 10_000));
-  const firstDebits = Array.from({ length: 1_999 }, () => ({
+  // Leave two entries for the earning and its canonical allocation (2,000 total).
+  const firstDebits = Array.from({ length: 1_998 }, () => ({
     rail: 'fiat',
     user: user.publicKey,
     au: '1',
   }));
-  const secondDebits = Array.from({ length: 501 }, () => ({
+  const secondDebits = Array.from({ length: 502 }, () => ({
     rail: 'fiat',
     user: user.publicKey,
     au: '1',
   }));
   await seedSpendHold(storage, { user: user.publicKey, epoch: 1, au: '2500' });
+  // Prepare the complete index/commit once. Each page consumes a disjoint part
+  // of that same canonical snapshot; a page-local index would falsely claim
+  // that page zero has already consumed every receipt.
+  const prepared = await prepareEpochApplyFeature(contract, storage, {
+    op: 'epoch_apply', epoch: 1, at: 3600,
+    debits: [...firstDebits, ...secondDebits],
+    earnings: [
+      { rail: 'fiat', provider: provider.publicKey, gross_au: '1998' },
+      { rail: 'fiat', provider: provider.publicKey, gross_au: '502' },
+    ],
+  }, admin.publicKey);
+  assert.equal(prepared.value.receipt_index.count, 2);
+  const pageInput = async (page, debits) => {
+    const value = { ...prepared.value, page, last_page: page === 1,
+      debits, earnings: [prepared.value.earnings[page]] };
+    const allocations = [prepared.allocations[page]];
+    assert.ok(debits.length + value.earnings.length + allocations.length <= 2000);
+    return { key: await epochApplyFeatureKey(contract, value), value, allocations };
+  };
 
-  const firstPage = await executeEpochApplyFeature(
+  const firstPage = await executePreparedEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      page: 0,
-      last_page: false,
-      at: 3600,
-      debits: firstDebits,
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '1999' }],
-    },
+    await pageInput(0, firstDebits),
     admin.publicKey
   );
   assert.equal(firstPage.ok, true, firstPage.message);
   assert.equal(firstPage.page, 0);
   assert.equal(firstPage.last_page, false);
-  assert.equal(firstPage.debited_au, '1999');
+  assert.equal(firstPage.debited_au, '1998');
   let applyState = (await storage.get('epoch/apply/state')).value;
   assert.equal(applyState.updated_epoch, 0);
   assert.equal(applyState.pending_epoch, 1);
   assert.equal(applyState.pending_next_page, 1);
 
-  const secondPage = await executeEpochApplyFeature(
+  const secondPage = await executePreparedEpochApplyFeature(
     contract,
     storage,
-    {
-      op: 'epoch_apply',
-      epoch: 1,
-      page: 1,
-      last_page: true,
-      at: 3600,
-      debits: secondDebits,
-      earnings: [{ rail: 'fiat', provider: provider.publicKey, gross_au: '501' }],
-    },
+    await pageInput(1, secondDebits),
     admin.publicKey
   );
   assert.equal(secondPage.ok, true, secondPage.message);
   assert.equal(secondPage.page, 1);
   assert.equal(secondPage.last_page, true);
-  assert.equal(secondPage.debited_au, '501');
+  assert.equal(secondPage.debited_au, '502');
   applyState = (await storage.get('epoch/apply/state')).value;
   assert.equal(applyState.updated_epoch, 1);
   assert.equal(applyState.pending_epoch, null);
