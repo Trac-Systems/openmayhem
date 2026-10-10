@@ -29,6 +29,7 @@ import ScBridge from '../features/sc-bridge/index.js';
 import { resolveScBridgeToken } from '../features/sc-bridge/token.js';
 import { createInternalStripeAuthHeaders } from './internal-stripe-auth.js';
 import { createFamilyAdminServer, familyAdminListenOptions, readFamilyAdminToken } from './proxy-family-admin-http.js';
+import { createAdmissionMsbReader } from '../features/mayhem/proxy-admission-msb.js';
 
 const fatalRuntimeError = installFatalRuntimeErrorPolicy(
   typeof Bare !== 'undefined' ? Bare : null
@@ -1399,6 +1400,7 @@ const peer = new Peer({
   protocol: MayhemProtocol,
   contract: MayhemContract,
 });
+peer.proxyAdmissionMsbSnapshot = createAdmissionMsbReader(msb);
 await peer.ready();
 joinCanonicalPeers(peer, peerDirectPeers);
 await hydrateAdminWriterViews(peer);

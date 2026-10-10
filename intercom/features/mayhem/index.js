@@ -1,3 +1,4 @@
+import { validateAdmissionMsbSnapshot } from './proxy-admission-msb.js';
 import { readProxyAdmissionPolicy, validateProxyAdmissionPolicyRequest, PROXY_ADMISSION_POLICY_SERVICE,
   PROXY_ADMISSION_POLICY_MAX_BYTES, PROXY_ADMISSION_POLICY_MAX_AGE_MS } from './proxy-admission-policy.js';
 import { readProxyProviderState, validateProxyProviderStateRequest, PROXY_PROVIDER_STATE_SERVICE,
@@ -744,7 +745,7 @@ class MayhemFeature extends Feature {
   async _proxyNegotiationState(query, label) {
     const provider = label === 'offer', intent = label === 'intent', onboarding = label === 'provider', admission = label === 'admission_policy';
     const service = admission ? PROXY_ADMISSION_POLICY_SERVICE : onboarding ? PROXY_PROVIDER_STATE_SERVICE : intent ? PROXY_INTENT_STATE_SERVICE : provider ? PROXY_OFFER_STATE_SERVICE : PROXY_QUOTE_STATE_SERVICE;
-    const keys = admission ? (query?.recovery !== undefined ? 'provider_pubkey|recovery|request_nonce' : query?.provider_pubkey === undefined ? 'request_nonce' : 'provider_pubkey|request_nonce') : onboarding ? 'initial_operation_digest|provider_pubkey|request_nonce' : intent ? 'intent|request_nonce' : provider ? (query?.follow_rates === true ? 'follow_rates|offer|rail|request_nonce|settlement_policy_hash' : 'offer|rail|request_nonce|settlement_policy_hash')
+    const keys = admission ? (query?.msb_frontier === true ? 'msb_frontier|request_nonce' : query?.recovery !== undefined ? 'provider_pubkey|recovery|request_nonce' : query?.provider_pubkey === undefined ? 'request_nonce' : 'provider_pubkey|request_nonce') : onboarding ? 'initial_operation_digest|provider_pubkey|request_nonce' : intent ? 'intent|request_nonce' : provider ? (query?.follow_rates === true ? 'follow_rates|offer|rail|request_nonce|settlement_policy_hash' : 'offer|rail|request_nonce|settlement_policy_hash')
       : 'billing_id|offer|rail|request_nonce|settlement_policy_hash';
     const validate = admission ? validateProxyAdmissionPolicyRequest : onboarding ? validateProxyProviderStateRequest : intent ? validateProxyIntentStateRequest : provider ? validateProxyOfferStateRequest : validateProxyQuoteStateRequest;
     const maxAge = admission ? PROXY_ADMISSION_POLICY_MAX_AGE_MS : onboarding ? PROXY_PROVIDER_STATE_MAX_AGE_MS : intent ? PROXY_INTENT_STATE_MAX_AGE_MS : provider ? PROXY_OFFER_STATE_MAX_AGE_MS : PROXY_QUOTE_STATE_MAX_AGE_MS;
@@ -773,6 +774,8 @@ class MayhemFeature extends Feature {
       throw new Error(`Proxy ${label} response does not match this request/network.`);
     }
     validateProxySnapshotProof(result.proof);
+    if (admission && query.msb_frontier === true) validateAdmissionMsbSnapshot(result.msb_snapshot, context);
+    else if (admission && (result.msb_snapshot !== undefined || result.msb_frontier !== undefined)) throw new Error('Unrequested admission MSB snapshot.');
     return { ...result, request_nonce: query.request_nonce };
   }
 
@@ -1273,7 +1276,8 @@ class MayhemFeature extends Feature {
 
   async _handleService(service, value, authorization) {
     if (service === PROXY_ADMISSION_POLICY_SERVICE) {
-      return await readProxyAdmissionPolicy({ request: value, withCanonicalSnapshot: this.withProxyCanonicalSnapshot });
+      return await readProxyAdmissionPolicy({ request: value, withCanonicalSnapshot: this.withProxyCanonicalSnapshot,
+        readMsbSnapshot: this.peer.proxyAdmissionMsbSnapshot });
     }
     if (service === PROXY_PROVIDER_STATE_SERVICE) {
       return await readProxyProviderState({ request: value, withCanonicalSnapshot: this.withProxyCanonicalSnapshot });

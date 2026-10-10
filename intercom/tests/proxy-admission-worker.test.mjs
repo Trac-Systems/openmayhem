@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import http from 'node:http';
 import sodium from 'sodium-native';
-import { AdmissionApi, AdmissionWorker, boundedJson, fixedOrigin, tapVerifier, stripeVerifier, tnkVerifier, main } from '../scripts/proxy-admission-worker.mjs';
+import { AdmissionApi, AdmissionWorker, boundedJson, fixedOrigin, tapVerifier, stripeVerifier, tnkVerifier, main, canonicalAdmissionMsbReader } from '../scripts/proxy-admission-worker.mjs';
 import { validateWork, validateEvidence, validateEvidenceSet, evidenceCommitment, evidenceSetCommitment, invoiceCommitment, base, PURPOSE } from '../scripts/proxy-admission-wire.mjs';
 import { ERC20_TRANSFER_TOPIC, addressTopic, ReviewWork } from '../scripts/retail-crypto-verification.mjs';
 const fixture=JSON.parse(fs.readFileSync(new URL('./fixtures/proxy-admission-worker-v1.json',import.meta.url)));
@@ -17,6 +17,32 @@ function worker(c,phase,extra={}){const work=c[phase+'_work'];return new Admissi
  verifyReceipt:phase==='verify'?async()=>clone(c.evidence_completion.receipt):null,signPermit:phase==='issue'?signer:null,
  fetcher:async(url,o)=>Response.json(policy(work,JSON.parse(o.body).request_nonce)),...extra});}
 const signal=()=>AbortSignal.timeout(10000);
+
+test('worker MSB reads are fresh nonce-bound canonical-policy requests, with no numeric-status fallback', async () => {
+ const work=fixture.cases[0].verify_work, nonces=[];
+ let mutate=()=>{}, replay=null, mode='normal';
+ const read=canonicalAdmissionMsbReader({coreOrigin:'https://fixture.invalid',network:work.invoice.network,
+  feePolicyHash:work.invoice.fee_policy_hash,issuerPubkey:work.invoice.issuer_pubkey,
+  fetcher:async(url,options)=>{
+   assert.equal(url,'https://fixture.invalid/v1/proxy/admission-policy');assert.equal(options.method,'POST');
+   assert.equal(options.redirect,'error');const body=JSON.parse(options.body);assert.equal(body.msb_frontier,true);
+   assert.deepEqual(Object.keys(body).sort(),['msb_frontier','request_nonce']);nonces.push(body.request_nonce);
+   if(mode==='replay') return Response.json(replay);
+   const response={...policy(work,body.request_nonce),msb_frontier:true,
+    msb_snapshot:{network_id:work.invoice.network.network_id,msb_bootstrap:work.invoice.network.msb_bootstrap,
+     view_key:h(20),fork:0,signed_length:100,tree_hash:h(21),observed_at_ms:Date.now()}};
+   mutate(response);replay=response;return Response.json(response);
+  }});
+ assert.equal((await read(signal())).signed_length,100);
+ mode='replay';await assert.rejects(read(signal()),/does not match/);mode='normal';
+ for(const change of [v=>delete v.msb_snapshot,v=>v.msb_frontier=false,v=>v.extra=true,
+  v=>v.msb_snapshot.observed_at_ms-=20000,v=>v.msb_snapshot.network_id='999',
+  v=>v.registry_enabled=false,v=>v.active_issuers=[h(1)],v=>v.fee_policy_hash=h(90)]){
+  mutate=change;await assert.rejects(read(signal()));
+ }
+ assert.equal(new Set(nonces).size,nonces.length);
+ const before=nonces.length;await assert.rejects(read(AbortSignal.abort()));assert.equal(nonces.length,before);
+});
 
 test('four shared fixtures validate hashes, actual positive amounts, sorted topups and original signatures',async()=>{
  for(const c of fixture.cases){await validateWork(c.verify_work,'verify');await validateWork(c.issue_work,'issue');

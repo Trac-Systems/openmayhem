@@ -8,6 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { performance } from 'node:perf_hooks';
 import { proxyAdmissionSigningBytes, proxyCanonicalSigningBytes, verifyProxyAdmissionPermit } from '../contract/proxy-protocol.js';
 import { validateProxySnapshotProof } from '../features/mayhem/proxy-canonical-view.js';
+import { validateAdmissionMsbSnapshot } from '../features/mayhem/proxy-admission-msb.js';
 import { PURPOSE, base, need, shape, hex, uint, validateNetwork, validateWork, validateEvidence, validateEvidenceSet, evidenceCommitment, validateReceipt, evidenceSeed, evidenceAppend, EVIDENCE_PROGRESS_DOMAIN, EVIDENCE_PAGE_SIZE, amount } from './proxy-admission-wire.mjs';
 import { verifyTnkObservedTransfer } from './proxy-admission-tnk.mjs';
 export { verifyTnkObservedTransfer } from './proxy-admission-tnk.mjs';
@@ -34,10 +35,11 @@ export async function boundedJson(url, { body, headers = {}, signal, fetcher = f
   } } finally { await reader.cancel().catch(() => {}); }
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
-export function validatePolicy(v, network, nonce, recovery = null) {
+export function validatePolicy(v, network, nonce, recovery = null, msbFrontier = false) {
   shape(v, ['ok','schema_version','lane','requester','request_nonce','context','proof','registry_enabled','fee_policy_hash','active_issuers','max_permit_epochs',
-    ...(recovery?['provider_pubkey','recovery','recovery_state','enrollment']:[])]);
+    ...(recovery?['provider_pubkey','recovery','recovery_state','enrollment']:[]),...(msbFrontier?['msb_frontier','msb_snapshot']:[])]);
   shape(v.context, [...Object.keys(network),'epoch']);
+  if(msbFrontier){need(v.msb_frontier===true,'MSB frontier binding differs');validateAdmissionMsbSnapshot(v.msb_snapshot,network);}
   need(v.ok === true && v.schema_version === 1 && v.lane === 'proxy' && hex(v.requester)
     && v.request_nonce === nonce && uint(v.context.epoch,1) && Object.keys(network).every(k=>v.context[k]===network[k])
     && typeof v.registry_enabled === 'boolean' && hex(v.fee_policy_hash) && uint(v.max_permit_epochs,1)
@@ -59,6 +61,26 @@ export function validatePolicy(v, network, nonce, recovery = null) {
       ||r.generation!==null||[r.entitlement_used,r.invoice_used,r.evidence_used].some(x=>x!==null)) throw new ReviewWork('reissue_requires_original_canonical_reconciliation');
   }
   return v;
+}
+export function canonicalAdmissionMsbReader({ coreOrigin, network, feePolicyHash, issuerPubkey, allowLoopbackHttp = false, fetcher = fetch }) {
+  validateNetwork(network);
+  need(hex(feePolicyHash) && hex(issuerPubkey), 'canonical MSB policy binding required');
+  const origin = fixedOrigin(coreOrigin, { allowLoopbackHttp });
+  return async signal => {
+    const nonce = randomBytes(32).toString('hex'), started = performance.now();
+    const deadline = AbortSignal.any([signal, AbortSignal.timeout(15000)]);
+    deadline.throwIfAborted();
+    const response = await boundedJson(`${origin}/v1/proxy/admission-policy`, {
+      body: { request_nonce: nonce, msb_frontier: true }, signal: deadline, fetcher, maxBytes: 8192,
+    });
+    deadline.throwIfAborted();
+    need(performance.now() - started <= 15000, 'canonical MSB observation expired');
+    const policy = validatePolicy(response, network, nonce, null, true);
+    if (!policy.registry_enabled || policy.fee_policy_hash !== feePolicyHash || !policy.active_issuers.includes(issuerPubkey)) {
+      throw new ReviewWork('canonical_policy_changed');
+    }
+    return policy.msb_snapshot;
+  };
 }
 export class AdmissionApi {
   constructor({ origin, credential, phase, allowLoopbackHttp = false, fetcher = fetch }) {
@@ -334,19 +356,19 @@ export async function main(env=process.env) {
         channel:v.channel,bootstrap:v.msb_bootstrap,dhtBootstrap:v.dht_bootstrap,enableWallet:false});
       need(String(config.networkId)===c.network.network_id,'TNK configured network identity differs');
       const msb=new MainSettlementBus(config); let ready=null;
-      const origin=fixedOrigin(c.core_origin,{allowLoopbackHttp:c.allow_loopback_http===true});
+      const readFrontier=canonicalAdmissionMsbReader({coreOrigin:c.core_origin,network:c.network,
+        feePolicyHash:c.fee_policy_hash,issuerPubkey:c.issuer_pubkey,allowLoopbackHttp:c.allow_loopback_http===true});
       const canonicalFrontier=async(signal)=>{
         ready??=msb.ready();
         let abort;
         try { await Promise.race([ready,new Promise((_,reject)=>{abort=()=>reject(signal.reason);signal.addEventListener('abort',abort,{once:true});if(signal.aborted)abort();})]); }
         finally {if(abort)signal.removeEventListener('abort',abort);}
-        const status=await boundedJson(`${origin}/status`,{method:'GET',signal,maxBytes:16384});
-        const frontier=status?.msb?.signedLength; need(uint(frontier,1)&&String(status.msb.networkId)===c.network.network_id&&status.msb.bootstrapHex===c.network.msb_bootstrap,'TNK canonical frontier unavailable or foreign');
-        return frontier;
+        return await readFrontier(signal);
       };
       verifyReceipt=tnkVerifier({network:v.network,verifyTransfer:async(intent,signal)=>{
-        const frontier=await canonicalFrontier(signal);
-        return await verifyTnkObservedTransfer(msb,intent,{frontier,finality:v.finality,timeoutSeconds:v.reader_timeout_seconds,signal,addressPrefix:config.addressPrefix});
+        const canonicalProof=await canonicalFrontier(signal);
+        return await verifyTnkObservedTransfer(msb,intent,{frontier:canonicalProof.signed_length,canonicalProof,
+          finality:v.finality,timeoutSeconds:v.reader_timeout_seconds,signal,addressPrefix:config.addressPrefix});
       }});
       if(c.discovery_enabled===true){
         const {tnkDiscovery,AdmissionDiscoveryWorker}=await import('./proxy-admission-discovery.mjs');

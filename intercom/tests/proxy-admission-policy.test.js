@@ -7,6 +7,9 @@ import { createProxyCanonicalSnapshot } from '../features/mayhem/proxy-canonical
 import { readProxyAdmissionPolicy, validateProxyAdmissionPolicyRequest, PROXY_ADMISSION_POLICY_SERVICE } from '../features/mayhem/proxy-admission-policy.js';
 import { createServer, requestProxyAdmissionPolicy } from '../src/rpc.js';
 import { familyAdminFixture } from './helpers/proxy-family-admin-fixture.mjs';
+import { createTnkDiscoveryFixture, testTnkAddress } from './helpers/proxy-admission-tnk-fixture.mjs';
+import { createAdmissionMsbReader } from '../features/mayhem/proxy-admission-msb.js';
+import { canonicalAdmissionMsbReader } from '../scripts/proxy-admission-worker.mjs';
 const h=n=>n.toString(16).padStart(64,'0');
 const hex=v=>b4a.toString(v,'hex');
 
@@ -41,6 +44,10 @@ test('policy uses four permits and timed out reads keep their permit until clean
 
 test('actual RPC uses authenticated policy relay; altered request, stale nonce and wrong network fail closed',async t=>{
  const f=await familyAdminFixture(t),admin=f.feature;
+ const msb=await createTnkDiscoveryFixture({hash:h(91),destination:testTnkAddress(h(92)),networkId:f.network.network_id,msbBootstrap:f.network.msb_bootstrap});
+ t.after(()=>msb.close());let msbReads=0;
+ const readMsb=createAdmissionMsbReader(msb.msb);
+ f.peer.proxyAdmissionMsbSnapshot=async context=>{msbReads++;return readMsb(context);};
  const peer={...f.peer,wallet:{...f.peer.wallet,publicKey:f.issuer.publicKey,sign:bytes=>hex(f.issuer.wallet.sign(b4a.from(bytes)))},base:{writable:false,view:f.base.view}};
  const client=new MayhemFeature(peer,{});t.after(()=>client.stop());
  let previous,mode='normal';const nonces=[];
@@ -52,6 +59,8 @@ test('actual RPC uses authenticated policy relay; altered request, stale nonce a
   if(mode==='replay')return structuredClone(previous);
   previous=await admin._handleService(service,authorization.payload,authorization);
   if(mode==='network')previous.context.network_id='999';
+  if(mode==='msb_network')previous.msb_snapshot.network_id='999';
+  if(mode==='msb_stale')previous.msb_snapshot.observed_at_ms-=20000;
   return structuredClone(previous);
  };
  peer.protocol={instance:{features:{mayhem:client}}};
@@ -59,7 +68,17 @@ test('actual RPC uses authenticated policy relay; altered request, stale nonce a
  const query={request_nonce:h(1)},before=f.base.local.length;
  const response=await fetch(`http://127.0.0.1:${server.address().port}/v1/proxy/admission-policy`,{method:'POST',body:JSON.stringify(query),headers:{'content-type':'application/json'}});
  assert.equal(response.status,200);const body=await response.json();assert.equal(body.request_nonce,query.request_nonce);assert.deepEqual(body.active_issuers,[f.issuer.publicKey]);
+ assert.equal(msbReads,0);assert.equal(body.msb_snapshot,undefined);
  await requestProxyAdmissionPolicy(peer,query);assert.equal(new Set(nonces).size,2);assert.ok(nonces.every(n=>n!==query.request_nonce));
+ const readFrontier=canonicalAdmissionMsbReader({coreOrigin:`http://127.0.0.1:${server.address().port}`,network:f.network,
+  feePolicyHash:f.config.fee_policy_hash,issuerPubkey:f.issuer.publicKey,allowLoopbackHttp:true});
+ const proof=await readFrontier(AbortSignal.timeout(3000));
+ assert.equal(proof.view_key,msb.view.core.key.toString('hex'));assert.equal(msbReads,1);
+ const frontierQuery={...query,msb_frontier:true};
+ mode='replay';await assert.rejects(requestProxyAdmissionPolicy(peer,frontierQuery),/does not match/);
+ mode='msb_network';await assert.rejects(requestProxyAdmissionPolicy(peer,frontierQuery),/foreign/);
+ mode='msb_stale';await assert.rejects(requestProxyAdmissionPolicy(peer,frontierQuery),/stale/);
+ mode='normal';
  const enrollment=await requestProxyAdmissionPolicy(peer,{...query,provider_pubkey:h(71)});
  assert.equal(enrollment.provider_pubkey,h(71));assert.equal(enrollment.enrollment.entitlement_id,null);
  const recovery={entitlement_id:h(72),invoice_commitment:h(73),evidence_commitment:h(74)};
@@ -70,7 +89,10 @@ test('actual RPC uses authenticated policy relay; altered request, stale nonce a
  mode='network';await assert.rejects(requestProxyAdmissionPolicy(peer,query),/does not match/);
  await assert.rejects(requestProxyAdmissionPolicy({},query),/not ready/);
  await assert.rejects(requestProxyAdmissionPolicy(peer,{...query,issuer:h(1)}),/Invalid/);
+ await assert.rejects(requestProxyAdmissionPolicy(peer,{...query,msb_frontier:false}),/Invalid/);
+ await assert.rejects(requestProxyAdmissionPolicy(peer,{...frontierQuery,provider_pubkey:h(71)}),/Invalid/);
  assert.equal(f.base.local.length,before);
+ assert.equal(msb.view.core.length,11);
 });
 
 test('permit recovery reads exact unused/consumed/revoked/superseded keys on one signed snapshot without writes', async t => {

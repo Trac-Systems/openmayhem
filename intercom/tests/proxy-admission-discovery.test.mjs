@@ -56,7 +56,7 @@ test('TNK observes payload and position from one real signed checkout and requir
   const s={rail:'tnk',network:'testnet1',msb_bootstrap:h},destination=testTnkAddress('07'.repeat(32));
   const f=await createTnkDiscoveryFixture({hash:h,destination});
   try {
-    const scan=tnkDiscovery({msb:f.msb,network:s.network,msbBootstrap:h,frontier:async()=>11,now:()=>100000});
+    const scan=tnkDiscovery({msb:f.msb,network:s.network,msbBootstrap:h,frontier:f.frontier,now:()=>100000});
     const page=await scan(work({stream:s}),AbortSignal.timeout(1000));
     assert.equal(page.next_cursor,'11');assert.deepEqual(page.observations,[{destination,position:'10',transaction_hash:h,observed_at_ms:100000}]);
     f.msb.state.getSignedLength=()=>9;await assert.rejects(scan(work({stream:s}),AbortSignal.timeout(1000)));

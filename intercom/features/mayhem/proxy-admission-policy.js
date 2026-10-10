@@ -2,6 +2,7 @@
 // No provider ownership, payment evidence, ledger scans or writes.
 import b4a from 'b4a';
 import { proxyRegistryKeys, validateProxyRegistryConfig } from '../../contract/proxy-registry.js';
+import { validateAdmissionMsbSnapshot } from './proxy-admission-msb.js';
 
 export const PROXY_ADMISSION_POLICY_SERVICE = 'proxy_admission_policy';
 export const PROXY_ADMISSION_POLICY_MAX_BYTES = 8192;
@@ -12,8 +13,8 @@ const need = (ok, message) => { if (!ok) throw new Error(`Proxy admission policy
 
 export function validateProxyAdmissionPolicyRequest(value) {
   need(value && typeof value === 'object' && !Array.isArray(value)
-    && ['request_nonce|requester', 'provider_pubkey|request_nonce|requester', 'provider_pubkey|recovery|request_nonce|requester'].includes(Object.keys(value).sort().join('|'))
-    && Object.entries(value).every(([key, v]) => key === 'recovery' || hex(v))
+    && ['request_nonce|requester', 'msb_frontier|request_nonce|requester', 'provider_pubkey|request_nonce|requester', 'provider_pubkey|recovery|request_nonce|requester'].includes(Object.keys(value).sort().join('|'))
+    && Object.entries(value).every(([key, v]) => key === 'recovery' || (key === 'msb_frontier' ? v === true : hex(v)))
     && b4a.byteLength(JSON.stringify(value)) <= 1024, 'invalid policy query');
   if (value.recovery !== undefined) {
     const r = value.recovery;
@@ -23,7 +24,7 @@ export function validateProxyAdmissionPolicyRequest(value) {
   }
 }
 
-export async function readProxyAdmissionPolicy({ request, withCanonicalSnapshot }) {
+export async function readProxyAdmissionPolicy({ request, withCanonicalSnapshot, readMsbSnapshot }) {
   validateProxyAdmissionPolicyRequest(request);
   request = JSON.parse(JSON.stringify(request));
   need(typeof withCanonicalSnapshot === 'function', 'canonical service is unavailable');
@@ -78,6 +79,11 @@ export async function readProxyAdmissionPolicy({ request, withCanonicalSnapshot 
       enrollment = { provider_pubkey: key, entitlement_id: entitlement,
         provider_revoked: revoked !== null, admission_revoked: admissionRevoked !== null };
     }
+    let msbSnapshot;
+    if (request.msb_frontier === true) {
+      need(typeof readMsbSnapshot === 'function', 'signed MSB source unavailable');
+      msbSnapshot = validateAdmissionMsbSnapshot(await readMsbSnapshot(snapshot.context), snapshot.context);
+    }
     await snapshot.assertCurrent();
     const response = { ok: true, schema_version: 1, lane: 'proxy', ...request,
       context: snapshot.context, proof: snapshot.proof,
@@ -85,6 +91,7 @@ export async function readProxyAdmissionPolicy({ request, withCanonicalSnapshot 
       active_issuers: config.active_issuers, max_permit_epochs: config.max_permit_epochs,
       ...(enrollment === undefined ? {} : { enrollment }),
       ...(recoveryState === undefined ? {} : { recovery_state: recoveryState }) };
+    if (msbSnapshot) response.msb_snapshot = msbSnapshot;
     need(b4a.byteLength(JSON.stringify(response)) <= PROXY_ADMISSION_POLICY_MAX_BYTES, 'response exceeds bound');
     return response;
   })).finally(() => {

@@ -4,6 +4,7 @@ import { boundedJson, fixedOrigin } from './proxy-admission-worker.mjs';
 import { need, shape, hex, uint, PURPOSE } from './proxy-admission-wire.mjs';
 import { ERC20_TRANSFER_TOPIC, parseHexInt } from './retail-crypto-verification.mjs';
 import { scanTnkSignedPage } from './proxy-admission-tnk.mjs';
+import { validateAdmissionMsbSnapshot } from '../features/mayhem/proxy-admission-msb.js';
 
 const cursor = value => typeof value === 'string' && /^(0|[1-9][0-9]{0,15})$/.test(value) && BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
 const ethHash = value => typeof value === 'string' && /^0x[0-9a-f]{64}$/.test(value);
@@ -108,8 +109,10 @@ export function tnkDiscovery({msb,network,msbBootstrap,frontier,now=Date.now,add
   need(['mainnet','testnet1'].includes(network)&&hex(msbBootstrap)&&typeof frontier==='function','TNK discovery configuration required');
   return async(work,signal)=>{
     validateDiscoveryWork(work,{rail:'tnk',network,msb_bootstrap:msbBootstrap});need(work.from_offset===0,'TNK cursor offset differs');
-    const current=await frontier(signal);need(uint(current,1)&&msb.state.getSignedLength()>=current,'TNK canonical reader behind');
-    const page=await scanTnkSignedPage(msb,{from:Number(work.from_cursor),frontier:current,signal,addressPrefix});
+    const canonicalProof=validateAdmissionMsbSnapshot(await frontier(signal),{
+      network_id:String(msb.config?.networkId),msb_bootstrap:msbBootstrap});
+    need(msb.state.getSignedLength()>=canonicalProof.signed_length,'TNK canonical reader behind');
+    const page=await scanTnkSignedPage(msb,{from:Number(work.from_cursor),frontier:canonicalProof.signed_length,canonicalProof,signal,addressPrefix});
     // Observer time remains explicit. It must not become an invented ledger
     // timestamp or authorize unpaid quote renewal; that needs canonical barriers.
     return {next_cursor:page.next_cursor,next_offset:0,
