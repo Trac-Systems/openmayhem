@@ -38,6 +38,7 @@ pub(super) fn backend(
     let listener = f.async_listener();
     let calls = Arc::new(AtomicUsize::new(0));
     let count = calls.clone();
+    let expected_model = f.input.adapter.upstream_model.clone();
     let task = tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -70,7 +71,7 @@ pub(super) fn backend(
             }
             let request: Value =
                 serde_json::from_slice(&bytes[boundary..boundary + length]).unwrap();
-            assert_eq!(request["model"], "private-upstream-model");
+            assert_eq!(request["model"], expected_model);
             assert!(!String::from_utf8_lossy(&bytes[..boundary])
                 .to_lowercase()
                 .contains("authorization:"));

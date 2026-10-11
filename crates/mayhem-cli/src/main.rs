@@ -1607,8 +1607,8 @@ struct UseArgs {
     proxy_buyer_config: Option<PathBuf>,
 
     /// Enable the local provider setup wizard using protected host configuration.
-    #[arg(long, value_name = "PATH", conflicts_with = "dev_embedded_catalog")]
-    proxy_setup_config: Option<PathBuf>,
+    #[arg(long, value_name = "PATH", num_args = 0..=1, conflicts_with = "dev_embedded_catalog")]
+    proxy_setup_config: Option<Option<PathBuf>>,
 
     #[command(flatten)]
     setup_bootstrap: proxy_setup::Args,
@@ -7274,7 +7274,11 @@ async fn provider_command(command: ProviderCommands, verbose: bool) -> Result<()
             // Proxy errors already have sanitized, actionable Display messages.
             // The native model-setup mapper would discard their actual cause.
             return proxy_provider::run(command).await.map_err(|error| {
-                if verbose { error } else { anyhow::anyhow!(error.to_string()) }
+                if verbose {
+                    error
+                } else {
+                    anyhow::anyhow!(error.to_string())
+                }
             });
         }
         ProviderCommands::List(args) => provider_list(args).await,
@@ -37820,23 +37824,26 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                         .await?
                         .context("canonical fiat attempt tail points to a missing record")?
                     } else {
-                        let quote = if output.get("role").and_then(Value::as_str) == Some("operator_fee") {
-                            None
-                        } else if let Some(quote) = initial_attempt_quotes.get(index).cloned().flatten() {
-                            ensure_canonical_fiat_quote_matches_output(output, Some(&quote))?;
-                            Some(quote)
-                        } else {
-                            create_targeted_fiat_quote(
-                                client,
-                                api_base_url,
-                                secret_key,
-                                output,
-                                1,
-                                args.stripe_transfer_max_attempts,
-                                args.stripe_transfer_retry_ms,
-                            )
-                            .await?
-                        };
+                        let quote =
+                            if output.get("role").and_then(Value::as_str) == Some("operator_fee") {
+                                None
+                            } else if let Some(quote) =
+                                initial_attempt_quotes.get(index).cloned().flatten()
+                            {
+                                ensure_canonical_fiat_quote_matches_output(output, Some(&quote))?;
+                                Some(quote)
+                            } else {
+                                create_targeted_fiat_quote(
+                                    client,
+                                    api_base_url,
+                                    secret_key,
+                                    output,
+                                    1,
+                                    args.stripe_transfer_max_attempts,
+                                    args.stripe_transfer_retry_ms,
+                                )
+                                .await?
+                            };
                         prepare_targeted_fiat_attempt(
                             &rpc,
                             signer,
@@ -37969,7 +37976,11 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         }
     }
 
-    if plan.already_settled.is_none() && args.tx.submit && !args.tx.sim && pending_outputs.is_empty() {
+    if plan.already_settled.is_none()
+        && args.tx.submit
+        && !args.tx.sim
+        && pending_outputs.is_empty()
+    {
         let signer = signer
             .as_ref()
             .context("fiat settlement requires its canonical admin signer")?;
@@ -45546,6 +45557,12 @@ fn gateway_startup_wallet_report(
 }
 
 async fn use_gateway(args: UseArgs) -> Result<()> {
+    ensure!(
+        args.setup_bootstrap.name.is_none()
+            || args.setup_bootstrap.proxy_setup
+            || args.proxy_setup_config.is_some(),
+        "A setup name requires --proxy-setup or --proxy-setup-config."
+    );
     let home = args.home.clone().map(Ok).unwrap_or_else(default_home)?;
     let home = absolutize(home)?;
     let _budget_owner = proxy_buyer::budget_owner_lock(&home, false)?;
@@ -45645,7 +45662,8 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
     let bind = gateway_bind_addr(config.as_ref(), args.bind.as_deref(), args.port)?;
     let shared_network_bind = !gateway_bind_is_loopback(bind);
     anyhow::ensure!(
-        (args.proxy_setup_config.is_none() && !args.setup_bootstrap.proxy_setup) || !shared_network_bind,
+        (args.proxy_setup_config.is_none() && !args.setup_bootstrap.proxy_setup)
+            || !shared_network_bind,
         "provider setup requires an explicit loopback gateway bind"
     );
     let require_gateway_auth = args.require_auth || shared_network_bind;
@@ -46068,12 +46086,18 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 &rpc,
                 rpc_url.clone(),
                 sc_bridge_url.clone(),
-            ).await?;
+            )
+            .await?;
             state = state
                 .with_proxy_setup_bootstrap(bootstrap, &format!("http://{bind}"))
                 .map_err(anyhow::Error::msg)?;
         }
         if let Some(path) = args.proxy_setup_config.clone() {
+            let path = proxy_provider::setup::config_path(
+                Some(&home),
+                args.setup_bootstrap.name.as_ref(),
+                path.as_ref(),
+            )?;
             let flow = tokio::task::spawn_blocking(move || {
                 mayhem_proxy::setup::Flow::open(mayhem_proxy::setup::FlowConfig::load(&path)?)
             })
@@ -57428,7 +57452,11 @@ mod payout_recovery_tests;
 
 impl std::fmt::Display for FiatFundingWait {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Stripe payout is waiting for available funds: {}", self.0)
+        write!(
+            f,
+            "Stripe payout is waiting for available funds: {}",
+            self.0
+        )
     }
 }
 
@@ -57746,9 +57774,13 @@ async fn execute_canonical_stripe_attempt(
                 retry_ms,
             )
             .await?;
-            Some(canonical_fiat_quote_snapshot(quote,
-                request.get("fx_quote_hash").and_then(Value::as_str)
-                    .context("canonical fiat attempt is missing FX quote hash")?)?)
+            Some(canonical_fiat_quote_snapshot(
+                quote,
+                request
+                    .get("fx_quote_hash")
+                    .and_then(Value::as_str)
+                    .context("canonical fiat attempt is missing FX quote hash")?,
+            )?)
         }
         None => None,
     };
@@ -57774,7 +57806,15 @@ async fn execute_canonical_stripe_attempt(
     if transfer.is_none() {
         // A prior successful transfer can be reconciled with an empty balance.
         // Only a genuinely new external transfer requires available funding.
-        require_fiat_output_funding(client, api_base_url, secret_key, output, max_attempts, retry_ms).await?;
+        require_fiat_output_funding(
+            client,
+            api_base_url,
+            secret_key,
+            output,
+            max_attempts,
+            retry_ms,
+        )
+        .await?;
         let idempotency_key = targeted_fiat_attempt_idempotency_key(attempt_id);
         let quote_identity = quote
             .as_ref()
@@ -57846,10 +57886,21 @@ async fn execute_canonical_stripe_attempt(
                     stripe_retry_sleep(retry_ms, attempt).await;
                     continue;
                 }
-                if matches!(stripe_api_error_code(&body).as_deref(), Some("balance_insufficient" | "insufficient_funds")) {
+                if matches!(
+                    stripe_api_error_code(&body).as_deref(),
+                    Some("balance_insufficient" | "insufficient_funds")
+                ) {
                     // Another debit can consume balance after the preflight. Keep
                     // the canonical attempt intact for idempotent reconciliation.
-                    let mut funding = fiat_output_funding_status(client, api_base_url, secret_key, output, max_attempts, retry_ms).await?;
+                    let mut funding = fiat_output_funding_status(
+                        client,
+                        api_base_url,
+                        secret_key,
+                        output,
+                        max_attempts,
+                        retry_ms,
+                    )
+                    .await?;
                     funding["processor_rejected"] = json!(true);
                     return Err(FiatFundingWait(funding).into());
                 }
@@ -116012,7 +116063,10 @@ esac
             record["value"]["rail"] = json!(rail);
             for version in 27..=u64::from(CONTRACT_VERSION) {
                 record["value"]["contract_version"] = json!(version);
-                assert_eq!(canonical_targeted_payout_plan(&record, rail, 508).unwrap(), record["value"]);
+                assert_eq!(
+                    canonical_targeted_payout_plan(&record, rail, 508).unwrap(),
+                    record["value"]
+                );
                 assert!(canonical_targeted_payout_plan(&record, rail, 509).is_err());
                 assert!(canonical_targeted_payout_plan(&record, "tap", 508).is_err());
             }

@@ -35,7 +35,7 @@ pub fn create(destination: &Path, host: Host, choices: Choices) -> Result<Bundle
     .map_err(store::windows_error)?;
     let stage = parent.join(temporary.as_str());
     let mut files = Vec::<(Vec<LeafName>, Zeroizing<Vec<u8>>)>::new();
-    let validation = generate(&stage, host, choices, |path, bytes| {
+    let validation = generate(&stage, &destination, host, choices, |path, bytes| {
         let relative = path.strip_prefix(&stage).map_err(|_| Error::Protection)?;
         require(relative.components().count() == 1)?;
         let name = relative.to_str().ok_or(Error::Protection)?;

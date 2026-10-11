@@ -203,6 +203,58 @@ fn now_ms() -> Result<u64> {
 }
 
 impl Store {
+    /// Read admission by provider identity for a new model without changing the
+    /// draft revision or transferring an invoice from a different setup.
+    pub async fn admitted_provider(
+        &self,
+        expected_revision: u64,
+        peer_rpc: &str,
+        timeout_ms: u64,
+    ) -> Result<Option<CanonicalProvider>> {
+        let guard = store::Guard::open(&self.directory)?;
+        let record = guard.read()?.ok_or(Error::Missing)?;
+        if record.revision != expected_revision {
+            return Err(Error::Conflict);
+        }
+        require(record.checked.as_ref() == Some(&record.binding()?))?;
+        if record.input.connection()? != record.connection {
+            return Err(Error::ConnectionChanged);
+        }
+        let (client, base) = peer(peer_rpc, timeout_ms)?;
+        let operation = Digest::new(
+            record
+                .input
+                .operation()
+                .digest()
+                .map_err(|_| Error::Invalid)?,
+        )
+        .map_err(|_| Error::Invalid)?;
+        let mut random = [0u8; 32];
+        getrandom::fill(&mut random).map_err(|_| Error::Storage)?;
+        let nonce = Digest::hash("mayhem/proxy/setup-admission-read/v1", &[&random]);
+        let evidence = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            observe(
+                &client,
+                &base,
+                &record.input.network,
+                &record.input.provider_pubkey,
+                &operation,
+                &nonce,
+            ),
+        )
+        .await
+        .map_err(|_| Error::EnrollmentUnavailable)?
+        .map_err(|_| Error::EnrollmentUnavailable)?;
+        require(
+            evidence.registry_enabled && !evidence.provider_revoked && !evidence.admission_revoked,
+        )?;
+        if let Some((proof, epoch)) = record.admission.as_ref().and_then(|a| a.high_water()) {
+            require(evidence.proof.follows(&proof) && evidence.context.epoch >= epoch)?;
+        }
+        Ok(evidence.provider)
+    }
+
     /// A trusted local peer authenticates this read with its existing identity.
     /// HTTPS remote peers must be explicitly trusted by the operator. No wallet
     /// or inference connection credentials are read by this command.

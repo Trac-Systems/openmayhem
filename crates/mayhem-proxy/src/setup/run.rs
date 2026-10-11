@@ -188,11 +188,17 @@ fn runtime_binding(record: &Record) -> Result<Digest> {
         offer.revision = 1;
         offer.per_request_au = 0;
         offer.min_session_au = 0;
-        for rate in &mut offer.rates { rate.per_unit_au = 0; rate.granularity = 1; }
+        for rate in &mut offer.rates {
+            rate.per_unit_au = 0;
+            rate.granularity = 1;
+        }
     }
-    digest("mayhem/proxy/setup-run-execution/v1", &json!({
-        "input": input, "connection":record.connection, "probe_scope":record.probe_scope
-    }))
+    digest(
+        "mayhem/proxy/setup-run-execution/v1",
+        &json!({
+            "input": input, "connection":record.connection, "probe_scope":record.probe_scope
+        }),
+    )
 }
 fn current(record: &Record, plan: &RunPlan) -> Result<bool> {
     let review = record.review()?;
@@ -202,7 +208,9 @@ fn current(record: &Record, plan: &RunPlan) -> Result<bool> {
         && review.publication.as_ref().is_some_and(|p| {
             p.state == PublicationState::Complete
                 && p.for_current_configuration
-                && ((record.revision == plan.draft_revision && p.plan_digest == plan.publication_plan_digest) || same_runtime)
+                && ((record.revision == plan.draft_revision
+                    && p.plan_digest == plan.publication_plan_digest)
+                    || same_runtime)
         }))
 }
 impl Retained {
@@ -370,18 +378,36 @@ fn retained_plan(
     directory: &Path,
 ) -> Result<RunPlan> {
     saved.validate()?;
-    if !current(record, &saved.plan)? { return Err(Error::RunConflict); }
-    let original: managed::Config = guard.read_json(&filename(&saved.plan.config_digest))?
+    if !current(record, &saved.plan)? {
+        return Err(Error::RunConflict);
+    }
+    let original: managed::Config = guard
+        .read_json(&filename(&saved.plan.config_digest))?
         .ok_or(Error::RunConflict)?;
     if digest("mayhem/proxy/setup-managed-config/v1", &original)? != saved.plan.config_digest
-        || candidate.routes.len() != original.routes.len() { return Err(Error::RunConflict); }
+        || candidate.routes.len() != original.routes.len()
+    {
+        return Err(Error::RunConflict);
+    }
     for (next, old) in candidate.routes.iter_mut().zip(&original.routes) {
-        if next.offers.len() != old.offers.len() || !old.offers.iter().zip(&next.offers)
-            .all(|(a,b)| crate::financial::offer::rate_successor(a,b)) { return Err(Error::RunConflict); }
+        if next.offers.len() != old.offers.len()
+            || !old
+                .offers
+                .iter()
+                .zip(&next.offers)
+                .all(|(a, b)| crate::financial::offer::rate_successor(a, b))
+        {
+            return Err(Error::RunConflict);
+        }
         next.offers = old.offers.clone();
     }
     if digest("mayhem/proxy/setup-managed-config/v1", &candidate)? != saved.plan.config_digest
-        || host.binding(&identity(record)?, &directory.join(filename(&saved.plan.config_digest)), &saved.plan.config_digest)? != saved.plan.launch {
+        || host.binding(
+            &identity(record)?,
+            &directory.join(filename(&saved.plan.config_digest)),
+            &saved.plan.config_digest,
+        )? != saved.plan.launch
+    {
         return Err(Error::RunConflict);
     }
     Ok(saved.plan.clone())
@@ -465,7 +491,9 @@ impl Store {
         )?;
         if let Some(mut saved) = guard.read_json::<Retained>("wizard-run.json")? {
             let original = retained_plan(&guard, &record, config, &saved, host, &self.directory)?;
-            if &original.plan_digest != expected_plan { return Err(Error::RunConflict); }
+            if &original.plan_digest != expected_plan {
+                return Err(Error::RunConflict);
+            }
             return reconcile(&guard, &record, &self.directory, &mut saved, host, true).await;
         }
         if &plan.plan_digest != expected_plan {
@@ -578,4 +606,18 @@ fn update(saved: &mut Retained, v: LifecycleObservation) {
     }
     .into();
     saved.observation = Some(v)
+}
+
+// Listing observes complete atomic snapshots without creating a draft lock.
+pub(super) fn retained_state(directory: &Path) -> Result<String> {
+    let path = directory.join("wizard-run.json");
+    match std::fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok("not_started".into()),
+        Err(_) => return Err(Error::Protection),
+        Ok(_) => (),
+    }
+    let bytes = private_file(&path, MAX_BYTES).map_err(|_| Error::Protection)?;
+    let retained: Retained = serde_json::from_slice(&bytes).map_err(|_| Error::Invalid)?;
+    retained.validate()?;
+    Ok(retained.state)
 }

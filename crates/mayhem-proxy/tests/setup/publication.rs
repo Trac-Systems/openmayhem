@@ -121,6 +121,122 @@ fn checked(f: &Fixture) {
     f.store().check(1).unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn second_model_for_the_same_provider_skips_invoice_and_publishes_without_a_permit() {
+    use mayhem_proxy::setup::{EnrollmentAction, Flow, FlowAction, ProfileMarket};
+    let mut first = owned(ProxyEndpoint::Chat, 121);
+    let home = first.dir.path().to_owned();
+    private_directory(&home.join("proxy-setup"));
+    private_directory(&home.join("proxy-setup/alpha"));
+    first.store = home.join("proxy-setup/alpha/state");
+    private_directory(&first.store);
+    let peer = Peer::start(&mut first).await;
+    checked(&first);
+    let plan = first.store().publication_plan(2, false).unwrap();
+    let permit = peer.permit(&plan, "fiat").await;
+    let published = first
+        .store()
+        .publish(
+            2,
+            &peer.rpc(),
+            5000,
+            plan.authorize(&signer(121), Some(permit)).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        published.publication_status,
+        "canonical_operations_confirmed"
+    );
+
+    let mut second = owned(ProxyEndpoint::Chat, 121);
+    second.input.network = first.input.network.clone();
+    private_directory(&home.join("proxy-setup/beta"));
+    second.store = home.join("proxy-setup/beta/state");
+    private_directory(&second.store);
+    let mut config = super::flow::config(&second);
+    config.profile.sequence = 3;
+    config.profile.upstream_model = "second-model".into();
+    if let ProfileMarket::CreateMarket { slug, model } = &mut config.profile.market {
+        *slug = "second-model-market".into();
+        model.model_id = "second-model".into();
+    }
+    config.peer_rpc = Some(peer.rpc());
+    // Successful enrollment must not contact this deliberately unavailable origin.
+    config.admission_origin = Some("http://127.0.0.1:1".into());
+    let flow = Flow::open(config.clone()).unwrap();
+    let choice = flow.view().unwrap().selection;
+    flow.execute(
+        FlowAction::Select {
+            expected_revision: None,
+            choice,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    flow.execute(
+        FlowAction::Check {
+            expected_revision: 1,
+        },
+        None,
+    )
+    .await
+    .unwrap();
+    let before = std::fs::read(second.store.join("draft.json")).unwrap();
+    assert!(flow.provider_is_admitted(2).await.unwrap());
+    assert_eq!(
+        std::fs::read(second.store.join("draft.json")).unwrap(),
+        before
+    );
+    let enrolled = flow
+        .execute(
+            FlowAction::Enrollment {
+                expected_revision: 2,
+                operation: EnrollmentAction::Create,
+                rail: Some(ProxyRail::Fiat),
+                quote: None,
+            },
+            Some(&signer(121)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(enrolled.action_result["state"], "admitted");
+    assert!(enrolled.action_result["invoice"].is_null());
+    assert!(enrolled.action_result["checkout_url"].is_null());
+    assert_eq!(enrolled.view.review.unwrap().revision, 2);
+    let restarted = Flow::open(config).unwrap();
+    assert_eq!(
+        restarted.view().unwrap().enrollment.unwrap()["source"],
+        "canonical_provider_admission"
+    );
+    let plan = second.store().publication_plan(2, false).unwrap();
+    let result = restarted
+        .execute(
+            FlowAction::Publish {
+                expected_revision: 2,
+                offers_only: false,
+                plan_digest: plan.plan_digest,
+            },
+            Some(&signer(121)),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        result.view.review.unwrap().publication_status,
+        "canonical_operations_confirmed"
+    );
+    let retained: Value =
+        serde_json::from_slice(&std::fs::read(second.store.join("draft.json")).unwrap()).unwrap();
+    assert!(retained["publication"]["authorization"].is_object());
+    assert!(retained["publication"]["authorization"]["admission"].is_null());
+    let status = peer.call("status", json!({})).await;
+    assert_eq!(status["permits"], 1);
+    assert_eq!(status["submissions"], 4);
+    peer.close().await;
+}
+
 #[tokio::test]
 #[cfg_attr(
     windows,

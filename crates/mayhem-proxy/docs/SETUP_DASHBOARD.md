@@ -12,7 +12,7 @@ beside `mayhem`. See [setup prerequisites and OS limits](SETUP_WIZARD.md#before-
 For the first bundle, with the named variables set to operator-selected inputs:
 
 ```sh
-mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 --proxy-setup \
+mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 --proxy-setup --name llama \
   --proxy-setup-tokenizer-file "$TOKENIZER_FILE" \
   --proxy-setup-admission-origin "$ADMISSION_ORIGIN"
 ```
@@ -21,8 +21,13 @@ For a retained bundle use `--proxy-setup-config` instead of `--proxy-setup`:
 
 ```sh
 mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 \
-  --proxy-setup-config "$MAYHEM_HOME/proxy-setup/wizard.json"
+  --proxy-setup-config --name llama
 ```
+
+Both modes select the same named bundle as the CLI. Names default to `default`.
+An existing root `proxy-setup/wizard.json` remains the default bundle in place.
+Use `mayhem provider proxy setup list --home "$MAYHEM_HOME"` to read a page of
+saved setup names and their retained publication and Run states.
 
 The existing gateway must be configured by its owner; these examples are not a
 request to start a second listener. Both modes use its normal wallet/session.
@@ -87,7 +92,7 @@ never rounded; no token FX or fee is inferred. The same checked Rust conversion
 serves CLI and dashboard. Nonstandard protocols still require reviewed recipes.
 
 The shared factory validates the full generated profile and supervised runtime
-configuration before an atomic private write under `<home>/proxy-setup`. Browser
+configuration before an atomic private write under `<home>/proxy-setup/<name>`. Browser
 requests cannot supply host paths, wallet material, Core identity, worker program,
 bridge/admission origins or lifecycle callbacks. On Unix, bundle files are 0600
 and the bundle is 0700; Windows uses the protected NTFS boundary described in

@@ -175,8 +175,14 @@ pub enum FlowAction {
         rail: Option<mayhem_proto::proxy::ProxyRail>,
         quote: Option<EnrollmentQuote>,
     },
-    RatePlan { expected_revision: u64, choices: Vec<RateChoice> },
-    PublishRates { expected_revision: u64, plan_digest: Digest },
+    RatePlan {
+        expected_revision: u64,
+        choices: Vec<RateChoice>,
+    },
+    PublishRates {
+        expected_revision: u64,
+        plan_digest: Digest,
+    },
     PublicationPlan {
         expected_revision: u64,
         offers_only: bool,
@@ -240,6 +246,17 @@ pub struct Flow {
     registry: Option<crate::registry::publication::Reader>,
 }
 impl Flow {
+    /// Check the configured canonical peer before asking for a fee rail.
+    pub async fn provider_is_admitted(&self, expected_revision: u64) -> Result<bool> {
+        let Some(peer) = self.config.peer_rpc.as_deref() else {
+            return Ok(false);
+        };
+        Ok(Store::open(&self.config.directory)?
+            .admitted_provider(expected_revision, peer, self.config.timeout_ms)
+            .await?
+            .is_some())
+    }
+
     pub fn open(config: FlowConfig) -> Result<Self> {
         config.validate()?;
         Store::open(&config.directory)?;
@@ -403,10 +420,11 @@ impl Flow {
                     r.state == "installed"
                         && r.for_current_configuration
                         && declaration.signed.as_ref().is_some_and(|s| {
-                            declaration.observed_by_controller || r.plan
-                                .data_handling
-                                .iter()
-                                .any(|d| d.signature == s.signature)
+                            declaration.observed_by_controller
+                                || r.plan
+                                    .data_handling
+                                    .iter()
+                                    .any(|d| d.signature == s.signature)
                         })
                 })
             {
@@ -441,7 +459,16 @@ impl Flow {
             endpoint,
             selection: self.choice(review.as_ref().map(|r| (&r.draft_id, r.revision)))?,
             inventory,
-            rate_choices: review.as_ref().map(|r| r.offers.iter().map(RateChoice::from_offer).collect::<Result<Vec<_>>>()).transpose()?.unwrap_or_default(),
+            rate_choices: review
+                .as_ref()
+                .map(|r| {
+                    r.offers
+                        .iter()
+                        .map(RateChoice::from_offer)
+                        .collect::<Result<Vec<_>>>()
+                })
+                .transpose()?
+                .unwrap_or_default(),
             rates: store.rates()?,
             review,
             probe_plan,
@@ -494,9 +521,18 @@ impl Flow {
                 &plan_digest,
                 key.ok_or(Error::Invalid)?,
             )?,
-            FlowAction::WithdrawDeclarationPlan { expected_revision, expected_declaration_revision, expires_at_ms } => {
-                json!(store.plan_declaration_withdrawal(expected_revision, expected_declaration_revision, declarations::now()?, expires_at_ms)?)
-            },
+            FlowAction::WithdrawDeclarationPlan {
+                expected_revision,
+                expected_declaration_revision,
+                expires_at_ms,
+            } => {
+                json!(store.plan_declaration_withdrawal(
+                    expected_revision,
+                    expected_declaration_revision,
+                    declarations::now()?,
+                    expires_at_ms
+                )?)
+            }
             FlowAction::Connect {} => {
                 self.config.profile.clone().prepare()?;
                 json!({"configured":true,"network_request":false,"scope":"configuration_only"})
@@ -541,26 +577,64 @@ impl Flow {
                 rail,
                 quote,
             } => {
-                let client = store.enrollment_client(
-                    expected_revision,
-                    self.config
-                        .admission_origin
-                        .as_deref()
-                        .ok_or(Error::Invalid)?,
-                    self.config.timeout_ms,
-                )?;
+                let admitted = if matches!(
+                    operation,
+                    EnrollmentAction::Create
+                        | EnrollmentAction::Refresh
+                        | EnrollmentAction::Checkout
+                ) {
+                    match self.config.peer_rpc.as_deref() {
+                        Some(peer) => {
+                            store
+                                .admitted_provider(expected_revision, peer, self.config.timeout_ms)
+                                .await?
+                        }
+                        None => None,
+                    }
+                } else {
+                    None
+                };
+                let skipped = admitted.is_some();
+                let client = if skipped {
+                    None
+                } else {
+                    Some(
+                        store.enrollment_client(
+                            expected_revision,
+                            self.config
+                                .admission_origin
+                                .as_deref()
+                                .ok_or(Error::Invalid)?,
+                            self.config.timeout_ms,
+                        )?,
+                    )
+                };
                 let guard = store::Guard::open(&self.config.directory)?;
                 let record = guard.read()?.ok_or(Error::Missing)?;
                 require(record.revision == expected_revision)?;
-                let result = client
-                    .execute_with_quote(key.ok_or(Error::Invalid)?, operation, rail, quote)
-                    .await?;
+                let result = if let Some(provider) = admitted {
+                    EnrollmentResult::already_admitted(provider)
+                } else {
+                    client
+                        .ok_or(Error::Invalid)?
+                        .execute_with_quote(key.ok_or(Error::Invalid)?, operation, rail, quote)
+                        .await?
+                };
                 // Checkout is an ephemeral link, not a fresh invoice/permit observation.
                 // Retain the last reconciled invoice rather than replacing it with null.
-                if !matches!(operation, EnrollmentAction::Checkout | EnrollmentAction::Returns) {
+                if skipped
+                    || !matches!(
+                        operation,
+                        EnrollmentAction::Checkout | EnrollmentAction::Returns
+                    )
+                {
                     let mut retained = serde_json::to_value(&result).map_err(|_| Error::Invalid)?;
                     retained["checkout_url"] = Value::Null;
-                    retained["source"] = json!("last_authenticated_response_not_live_status");
+                    retained["source"] = json!(if skipped {
+                        "canonical_provider_admission"
+                    } else {
+                        "last_authenticated_response_not_live_status"
+                    });
                     retained["draft_id"] = json!(record.id);
                     retained["revision"] = json!(record.revision);
                     guard.write_json(
@@ -571,12 +645,47 @@ impl Flow {
                 }
                 json!(result)
             }
-            FlowAction::AdmissionReturns {expected_revision,after} => {
-                let client=store.enrollment_client(expected_revision,self.config.admission_origin.as_deref().ok_or(Error::Invalid)?,self.config.timeout_ms)?;
-                json!(client.returns(key.ok_or(Error::Invalid)?,after).await?)
+            FlowAction::AdmissionReturns {
+                expected_revision,
+                after,
+            } => {
+                let client = store.enrollment_client(
+                    expected_revision,
+                    self.config
+                        .admission_origin
+                        .as_deref()
+                        .ok_or(Error::Invalid)?,
+                    self.config.timeout_ms,
+                )?;
+                json!(client.returns(key.ok_or(Error::Invalid)?, after).await?)
             }
-            FlowAction::RatePlan { expected_revision, choices } => json!(store.plan_rates(expected_revision, choices, self.peer()?, self.config.timeout_ms).await?),
-            FlowAction::PublishRates { expected_revision, plan_digest } => json!(store.publish_rates(expected_revision, &plan_digest, self.peer()?, self.config.timeout_ms, key.ok_or(Error::Invalid)?).await?),
+            FlowAction::RatePlan {
+                expected_revision,
+                choices,
+            } => json!(
+                store
+                    .plan_rates(
+                        expected_revision,
+                        choices,
+                        self.peer()?,
+                        self.config.timeout_ms
+                    )
+                    .await?
+            ),
+            FlowAction::PublishRates {
+                expected_revision,
+                plan_digest,
+            } => json!(
+                store
+                    .publish_rates(
+                        expected_revision,
+                        &plan_digest,
+                        self.peer()?,
+                        self.config.timeout_ms,
+                        key.ok_or(Error::Invalid)?
+                    )
+                    .await?
+            ),
             FlowAction::PublicationPlan {
                 expected_revision,
                 offers_only,
@@ -588,7 +697,9 @@ impl Flow {
             } => {
                 let plan = store.publication_plan(expected_revision, offers_only)?;
                 require(plan.plan_digest == plan_digest)?;
-                let permit = if offers_only { None } else {
+                let permit = if offers_only {
+                    None
+                } else {
                     let guard = store::Guard::open(&self.config.directory)?;
                     let retained: Option<Value> = guard.read_json("wizard-enrollment.json")?;
                     retained.and_then(|v|v.get("invoice").and_then(|v|v.get("permit")).cloned()).filter(|v|!v.is_null()).map(|v|serde_json::from_value::<AdmissionPermit>(json!({"permit":v["body"],"issuer_signature":v["issuer_signature"]})).map_err(|_|Error::Invalid)).transpose()?

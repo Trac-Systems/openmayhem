@@ -69,7 +69,7 @@ pub async fn add(args: AddArgs) -> Result<()> {
     // Verify normal wallet identity before installing; do not open capacity or
     // recovery stores, increment fences, run probes, or publish a ledger write.
     let _signer = Authority::from_unlocked_wallet(key, prepared.identity().clone())?;
-    let name = child_name(prepared.identity())?;
+    let name = child_name(prepared.identity(), &home, &config)?;
     let binary = std::env::current_exe()?.canonicalize()?;
     let child = child_config(
         &name,
@@ -153,12 +153,31 @@ fn ensure_loopback(value: &str) -> Result<()> {
     );
     Ok(())
 }
-fn child_name(identity: &mayhem_proxy::attempts::Identity) -> Result<String> {
-    // One controller per wallet+network on this local supervisor; putting aliases
-    // into another file must not create competing authorities for the same wallet.
+fn child_name(
+    identity: &mayhem_proxy::attempts::Identity,
+    home: &Path,
+    config: &Path,
+) -> Result<String> {
     let hash = blake3::hash(&serde_json::to_vec(identity)?);
+    let root = std::fs::canonicalize(home)?.join("proxy-setup");
+    // Existing root bundles retain their exact installed controller identity.
+    // A named bundle owns its controller even if its managed config changes.
+    if let Ok(relative) = config.strip_prefix(&root) {
+        if let Some(name) = relative
+            .components()
+            .next()
+            .and_then(|part| part.as_os_str().to_str())
+        {
+            if let Ok(name) = name.parse::<mayhem_proxy::setup::named::Name>() {
+                if root.join(name.as_str()).join("wizard.json").is_file() {
+                    return Ok(format!("provider-proxy-{}-{name}", hash.to_hex()));
+                }
+            }
+        }
+    }
     Ok(format!("provider-proxy-{}", hash.to_hex()))
 }
+
 fn child_config(
     name: &str,
     binary: &Path,
@@ -231,14 +250,17 @@ fn read_password(path: &Path) -> Result<String> {
 }
 #[cfg(windows)]
 fn read_password(path: &Path) -> Result<String> {
-    let bytes = mayhem_proxy::connector::config::private_file(path, 8192)
-        .map_err(|_| anyhow::anyhow!("wallet password requires a protected owner-only regular file"))?;
+    let bytes = mayhem_proxy::connector::config::private_file(path, 8192).map_err(|_| {
+        anyhow::anyhow!("wallet password requires a protected owner-only regular file")
+    })?;
     let mut value = std::str::from_utf8(&bytes)
         .map_err(|_| anyhow::anyhow!("wallet password must be UTF-8"))?
         .to_owned();
     if value.ends_with('\n') {
         value.pop();
-        if value.ends_with('\r') { value.pop(); }
+        if value.ends_with('\r') {
+            value.pop();
+        }
     }
     Ok(value)
 }
@@ -250,6 +272,57 @@ fn read_password(_: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn named_controllers_are_distinct_and_default_bundle_keeps_its_identity() {
+        let temporary = crate::temp_work_dir("named-controller-test").unwrap();
+        let home = std::fs::canonicalize(&temporary).unwrap();
+        let root = home.join("proxy-setup");
+        std::fs::create_dir_all(root.join("state")).unwrap();
+        std::fs::write(root.join("wizard.json"), b"{}").unwrap();
+        let d = |n| mayhem_proxy::attempts::Digest::new(format!("{n:064x}")).unwrap();
+        let identity = mayhem_proxy::attempts::Identity {
+            network_id: "918".into(),
+            msb_bootstrap: d(1),
+            subnet_bootstrap: d(2),
+            controller_pubkey: d(3),
+        };
+        let original = format!(
+            "provider-proxy-{}",
+            blake3::hash(&serde_json::to_vec(&identity).unwrap()).to_hex()
+        );
+        assert_eq!(
+            child_name(
+                &identity,
+                &home,
+                &root.join("state/wizard-managed-old.json")
+            )
+            .unwrap(),
+            original
+        );
+        let mut names = Vec::new();
+        for name in ["alpha", "beta"] {
+            let bundle = root.join(name);
+            std::fs::create_dir_all(bundle.join("state")).unwrap();
+            std::fs::write(bundle.join("wizard.json"), b"{}").unwrap();
+            let first = child_name(
+                &identity,
+                &home,
+                &bundle.join("state/wizard-managed-first.json"),
+            )
+            .unwrap();
+            let revised = child_name(
+                &identity,
+                &home,
+                &bundle.join("state/wizard-managed-revised.json"),
+            )
+            .unwrap();
+            assert_eq!(first, revised);
+            assert_ne!(first, original);
+            names.push(first);
+        }
+        assert_ne!(names[0], names[1]);
+        std::fs::remove_dir_all(temporary).unwrap();
+    }
     #[test]
     fn persistent_child_uses_file_references_and_fixed_existing_binary() {
         let child = child_config(

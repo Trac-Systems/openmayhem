@@ -33,13 +33,17 @@ impl RunLifecycle for Host {
     fn binding(
         &self,
         identity: &attempts::Identity,
-        _: &Path,
+        path: &Path,
         digest: &Digest,
     ) -> mayhem_proxy::setup::Result<LaunchBinding> {
         Ok(LaunchBinding {
             schema_version: 1,
             authority_digest: d(60),
-            child_name: format!("provider-proxy-{}", identity.controller_pubkey.as_str()),
+            child_name: format!(
+                "provider-proxy-{}-{}",
+                identity.controller_pubkey.as_str(),
+                &blake3::hash(path.parent().unwrap().as_os_str().as_encoded_bytes()).to_hex()[..16]
+            ),
             child_config_hash: digest.clone(),
         })
     }
@@ -131,6 +135,149 @@ fn limits() -> capacity::Limits {
         max_leases: 16,
         max_evidence_age: Duration::from_secs(60),
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn two_setup_run_plans_and_open_controllers_keep_independent_stores_and_budgets() {
+    let mut first = publication::owned(ProxyEndpoint::Decisions, 122);
+    let peer = publication::Peer::start(&mut first).await;
+    let mut second = publication::owned(ProxyEndpoint::Decisions, 122);
+    second.input.network = first.input.network.clone();
+    let mut profile = super::flow::config(&second).profile;
+    profile.upstream_model = "second-runtime".into();
+    if let mayhem_proxy::setup::ProfileMarket::CreateMarket { slug, model } = &mut profile.market {
+        *slug = "second-runtime".into();
+        model.model_id = "second-runtime".into();
+    }
+    profile.membership.capacity_group = d(72).as_str().into();
+    profile.sequence = 3;
+    second.input = profile.prepare().unwrap();
+    let root = first.dir.path().join("proxy-setup");
+    private_directory(&root);
+    let mut backends = Vec::new();
+    let mut providers = Vec::new();
+    let mut plans = Vec::new();
+    for (index, (name, fixture)) in [("alpha", &mut first), ("beta", &mut second)]
+        .into_iter()
+        .enumerate()
+    {
+        let bundle = root.join(name);
+        private_directory(&bundle);
+        fixture.store = bundle.join("state");
+        private_directory(&fixture.store);
+        private_directory(&bundle.join("runtime"));
+        private_directory(&bundle.join("worker"));
+        backends.push(probes::backend(
+            fixture,
+            200,
+            serde_json::to_vec(&json!({"id":"u","answers":{"q":{"type":"noul","noul":0.7}}}))
+                .unwrap(),
+            false,
+            Duration::ZERO,
+        ));
+        let mut probe = probes::plan(
+            fixture,
+            json!({"model":"public-model","state":"synthetic","questions":{"q":{"type":"noul","instructions":"hello?"}}}),
+        );
+        probe.scope.capacity_file = bundle.join("runtime/capacity.redb");
+        probe.worker_directory = bundle.join("worker");
+        probe.scope.route = d(70 + index as u8);
+        probe.scope.connection_group =
+            Digest::new(&fixture.input.membership.capacity_group).unwrap();
+        let created = fixture.store().create(fixture.input.clone()).unwrap();
+        let checked = fixture.store().check(created.revision).unwrap();
+        let checked = fixture
+            .store()
+            .probe(checked.revision, probe.clone())
+            .await
+            .unwrap();
+        assert_eq!(checked.probe_status, "protocol_validated");
+        let publication = fixture
+            .store()
+            .publication_plan(checked.revision, false)
+            .unwrap();
+        let permit = if index == 0 {
+            Some(peer.permit(&publication, "fiat").await)
+        } else {
+            None
+        };
+        let published = fixture
+            .store()
+            .publish(
+                checked.revision,
+                &peer.rpc(),
+                5000,
+                publication
+                    .authorize(&publication::signer(122), permit)
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            published.publication_status,
+            "canonical_operations_confirmed"
+        );
+        let host = Host::new();
+        let plan = fixture
+            .store()
+            .run_plan(
+                published.revision,
+                template(fixture),
+                probe.clone(),
+                &peer.rpc(),
+                &host,
+            )
+            .unwrap();
+        assert_eq!(plan.probe_budget.max_attempts, 2);
+        let report = fixture
+            .store()
+            .start_run(
+                published.revision,
+                template(fixture),
+                probe,
+                &peer.rpc(),
+                &plan.plan_digest,
+                &host,
+            )
+            .await
+            .unwrap();
+        assert_eq!(report.state, "installed");
+        let config_path = fixture.store.join(format!(
+            "wizard-managed-{}.json",
+            plan.config_digest.as_str()
+        ));
+        let prepared =
+            managed::Prepared::load_supervised_pinned(&config_path, &plan.config_digest).unwrap();
+        let signer = Arc::new(
+            Authority::from_unlocked_wallet(publication::signer(122), identity(fixture)).unwrap(),
+        );
+        providers.push(prepared.open(signer).unwrap());
+        plans.push(plan);
+    }
+    assert_ne!(plans[0].launch.child_name, plans[1].launch.child_name);
+    assert_ne!(
+        plans[0].launch.child_config_hash,
+        plans[1].launch.child_config_hash
+    );
+    assert_ne!(plans[0].config_digest, plans[1].config_digest);
+    assert_eq!(providers.len(), 2);
+    assert_eq!(peer.call("status", json!({})).await["permits"], 1);
+    drop(providers);
+    for (name, fixture) in [("alpha", &first), ("beta", &second)] {
+        let authority = capacity::Authority::open(
+            root.join(name).join("runtime/capacity.redb"),
+            identity(fixture),
+            limits(),
+        )
+        .unwrap();
+        let group = Digest::new(&fixture.input.membership.capacity_group).unwrap();
+        let budget = authority.probe_budget(&group).unwrap().unwrap();
+        assert_eq!(budget.used_attempts, 1);
+        assert_eq!(budget.allocated_cost_microusd, 10);
+    }
+    drop(backends);
+    peer.close().await;
 }
 // Fixture for a declaration already authored by the separately tested Store flow.
 // Exercise the actual managed-loader/run boundary without a second registry server.
@@ -612,7 +759,10 @@ async fn run_cli_real_supervisor_publication_restart() {
         json!({"model":"public-model","state":"synthetic","questions":{"q":{"type":"noul","instructions":"hello?"}}}),
     );
     if let Some(install) = cli_assets::installed_root() {
-        assert_eq!(std::fs::canonicalize(daemon.parent().unwrap()).unwrap(), install.join("bin"));
+        assert_eq!(
+            std::fs::canonicalize(daemon.parent().unwrap()).unwrap(),
+            install.join("bin")
+        );
         probe.worker_program = install.join("bin").join(if cfg!(windows) {
             "mayhem-proxy-worker.exe"
         } else {

@@ -110,7 +110,7 @@ impl RunLifecycle for Host {
         if identity.controller_pubkey != self.provider {
             return Err(setup::Error::RunConflict);
         }
-        let name = child_name(identity).map_err(|_| setup::Error::Invalid)?;
+        let name = child_name(identity, &self.home, path).map_err(|_| setup::Error::Invalid)?;
         let child = self
             .child(&name, path, digest)
             .map_err(|_| setup::Error::Invalid)?;

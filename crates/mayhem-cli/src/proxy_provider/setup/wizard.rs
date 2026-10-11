@@ -10,7 +10,9 @@ mod rates;
 pub struct WizardArgs {
     /// Protected host configuration: private connection, profile and optional probe/admission services.
     #[arg(long, value_name = "PATH")]
-    config: PathBuf,
+    config: Option<PathBuf>,
+    #[arg(long)]
+    name: Option<Name>,
     /// Print the local operator projection without changing state or contacting services.
     #[arg(long, conflicts_with = "action_file")]
     inspect: bool,
@@ -22,7 +24,8 @@ pub struct WizardArgs {
 }
 pub(super) async fn resume(config: PathBuf, wallet: WalletLocatorArgs) -> Result<()> {
     run(WizardArgs {
-        config,
+        config: Some(config),
+        name: None,
         inspect: false,
         action_file: None,
         wallet,
@@ -63,12 +66,16 @@ fn show(view: &FlowView) -> Result<()> {
             step.get("state").unwrap_or(&step["structural"])
         );
     }
-    if view.review.as_ref().is_some_and(|r| r.publication_status == "canonical_operations_confirmed") {
+    if view
+        .review
+        .as_ref()
+        .is_some_and(|r| r.publication_status == "canonical_operations_confirmed")
+    {
         println!("Published offers still need payment registration and verified payout bindings for this exact provider identity. Use provider proxy setup payment-registration to review them; a running controller alone is not readiness.");
     }
     if let Some(saved) = &view.enrollment {
         if saved["state"] == "admitted" {
-            println!("Admission recorded: {}", saved["entitlement_id"]);
+            println!("The provider is already admitted, so this setup does not require another admission fee.");
             if let Some(code) = saved["review_code"].as_str() {
                 println!("Payment requires review: {code}. Admission history is retained; reconcile status for updates.");
             }
@@ -102,7 +109,11 @@ async fn execute(
 ) -> Result<mayhem_proxy::setup::FlowResult> {
     if matches!(
         action,
-        FlowAction::Enrollment { .. } | FlowAction::AdmissionReturns { .. } | FlowAction::Publish { .. } | FlowAction::PublishRates { .. } | FlowAction::ConfirmDeclaration { .. }
+        FlowAction::Enrollment { .. }
+            | FlowAction::AdmissionReturns { .. }
+            | FlowAction::Publish { .. }
+            | FlowAction::PublishRates { .. }
+            | FlowAction::ConfirmDeclaration { .. }
     ) {
         let keypair = resolve_wallet_keypair_path(wallet)?;
         let key = cached_wallet_signing_key(
@@ -116,7 +127,16 @@ async fn execute(
     }
 }
 pub async fn run(args: WizardArgs) -> Result<()> {
-    let mut flow = Flow::open(FlowConfig::load(&args.config)?)?;
+    let config = config_path(
+        args.wallet.home.as_ref(),
+        args.name.as_ref(),
+        args.config.as_ref(),
+    )?;
+    let mut flow = Flow::open(FlowConfig::load(&config)?)?;
+    if args.inspect {
+        println!("{}", serde_json::to_string(&flow.view()?)?);
+        return Ok(());
+    }
     if let Some(settings) = flow.run_settings() {
         let home = args
             .wallet
@@ -132,10 +152,6 @@ pub async fn run(args: WizardArgs) -> Result<()> {
         )?;
         flow = flow.with_run_lifecycle(std::sync::Arc::new(host));
     }
-    if args.inspect {
-        println!("{}", serde_json::to_string(&flow.view()?)?);
-        return Ok(());
-    }
     if let Some(path) = args.action_file {
         let bytes = mayhem_proxy::connector::config::private_file(&path, 64 * 1024)?;
         let action: FlowAction = serde_json::from_slice(&bytes)?;
@@ -147,7 +163,9 @@ pub async fn run(args: WizardArgs) -> Result<()> {
     loop {
         let view = flow.view()?;
         show(&view)?;
-        if let Some(d) = &view.declaration { println!("Data handling: {} (declared, not verified)", d.state); }
+        if let Some(d) = &view.declaration {
+            println!("Data handling: {} (declared, not verified)", d.state);
+        }
         println!("j Review data-handling declarations  y Sign retained declaration review  w Review withdrawal");
         println!("e Review new rates (same market)  z Publish retained rate review");
         println!("m Review/register shared payment rails after paid admission");
@@ -161,17 +179,27 @@ pub async fn run(args: WizardArgs) -> Result<()> {
             || revision.ok_or_else(|| anyhow::anyhow!("save your selection first"));
         if command == "m" {
             let review = super::payments::execute(super::payments::Args {
-                config: args.config.clone(), expected_revision: needs_revision()?, submit: false,
-                accept_rules_hash: None, wallet: args.wallet.clone(),
-            }).await;
+                config: Some(config.clone()),
+                name: None,
+                expected_revision: needs_revision()?,
+                submit: false,
+                accept_rules_hash: None,
+                wallet: args.wallet.clone(),
+            })
+            .await;
             let review = match review {
                 Ok(value) => value,
-                Err(error) => { eprintln!("Payment registration unavailable: {error}. Keep the original invoice."); continue; }
+                Err(error) => {
+                    eprintln!(
+                        "Payment registration unavailable: {error}. Keep the original invoice."
+                    );
+                    continue;
+                }
             };
             println!("{}", serde_json::to_string_pretty(&review)?);
             if prompt("Accept these exact rules and register the shown payment rails? Payout targets stay unchanged. (yes/no)", "no")? == "yes" {
                 let result = super::payments::execute(super::payments::Args {
-                    config: args.config.clone(), expected_revision: review["draft_revision"].as_u64().context("missing draft revision")?,
+                    config: Some(config.clone()), name: None, expected_revision: review["draft_revision"].as_u64().context("missing draft revision")?,
                     submit: true, accept_rules_hash: Some(review["rules"]["hash"].as_str().context("missing reviewed rules hash")?.into()),
                     wallet: args.wallet.clone(),
                 }).await;
@@ -185,18 +213,36 @@ pub async fn run(args: WizardArgs) -> Result<()> {
         let action = match command.as_str() {
             "e" => rates::review(&view)?,
             "z" => {
-                let pending = view.rates.as_ref().ok_or_else(|| anyhow::anyhow!("review rates first"))?;
+                let pending = view
+                    .rates
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("review rates first"))?;
                 println!("{}", serde_json::to_string_pretty(pending)?);
                 if prompt("Publish exactly these rates? Existing accepted jobs keep their terms; no second fee or inference restart. (yes/no)", "no")? != "yes" { continue; }
-                FlowAction::PublishRates { expected_revision: needs_revision()?, plan_digest: pending.plan.plan_digest.clone() }
+                FlowAction::PublishRates {
+                    expected_revision: needs_revision()?,
+                    plan_digest: pending.plan.plan_digest.clone(),
+                }
             }
             "j" => declarations::review(&flow, &view).await?,
             "w" => declarations::withdraw(&view)?,
             "y" => {
-                let pending=view.pending_declaration.as_ref().ok_or_else(|| anyhow::anyhow!("review declarations first"))?;
-                println!("{}",serde_json::to_string_pretty(pending)?);
-                if prompt("Sign exactly these promises until their stated expiry? (yes/no)","no")? != "yes" { continue; }
-                FlowAction::ConfirmDeclaration { expected_revision:needs_revision()?, plan_digest:pending.plan.plan_digest.clone() }
+                let pending = view
+                    .pending_declaration
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("review declarations first"))?;
+                println!("{}", serde_json::to_string_pretty(pending)?);
+                if prompt(
+                    "Sign exactly these promises until their stated expiry? (yes/no)",
+                    "no",
+                )? != "yes"
+                {
+                    continue;
+                }
+                FlowAction::ConfirmDeclaration {
+                    expected_revision: needs_revision()?,
+                    plan_digest: pending.plan.plan_digest.clone(),
+                }
             }
             "c" => FlowAction::Connect {},
             "d" => FlowAction::Discover {
@@ -318,10 +364,24 @@ pub async fn run(args: WizardArgs) -> Result<()> {
                 expected_revision: needs_revision()?,
             },
             "n" => {
-                let cursor = prompt("Next cursor from the previous return page (blank for first page)", "")?;
-                FlowAction::AdmissionReturns { expected_revision: needs_revision()?, after: if cursor.is_empty() { None } else { Some(cursor) } }
+                let cursor = prompt(
+                    "Next cursor from the previous return page (blank for first page)",
+                    "",
+                )?;
+                FlowAction::AdmissionReturns {
+                    expected_revision: needs_revision()?,
+                    after: if cursor.is_empty() {
+                        None
+                    } else {
+                        Some(cursor)
+                    },
+                }
             }
             "i" | "t" | "f" | "q" => {
+                if command != "t" && flow.provider_is_admitted(needs_revision()?).await? {
+                    println!("The provider is already admitted, so this setup does not require another admission fee.");
+                    continue;
+                }
                 let operation = match command.as_str() {
                     "i" => EnrollmentAction::Create,
                     "t" => EnrollmentAction::Status,
@@ -349,10 +409,17 @@ pub async fn run(args: WizardArgs) -> Result<()> {
                     operation,
                     rail,
                     quote: if command == "q" {
-                        let saved = view.enrollment.as_ref().ok_or_else(|| anyhow::anyhow!("Reconcile invoice status first"))?;
+                        let saved = view
+                            .enrollment
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!("Reconcile invoice status first"))?;
                         let invoice = &saved["invoice"];
-                        Some(serde_json::from_value(serde_json::json!({"invoice_id":invoice["invoice_id"],"invoice_commitment":invoice["invoice_commitment"]}))?)
-                    } else { None },
+                        Some(serde_json::from_value(
+                            serde_json::json!({"invoice_id":invoice["invoice_id"],"invoice_commitment":invoice["invoice_commitment"]}),
+                        )?)
+                    } else {
+                        None
+                    },
                 }
             }
             "v" | "u" => {

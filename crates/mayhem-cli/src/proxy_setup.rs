@@ -7,6 +7,9 @@ use std::{collections::BTreeMap, path::PathBuf, sync::Arc, time::Duration};
 
 #[derive(Debug, ClapArgs)]
 pub struct Args {
+    /// Select the proxied setup opened or created by the local dashboard.
+    #[arg(long)]
+    pub name: Option<mayhem_proxy::setup::named::Name>,
     /// Enable first-time provider setup in the existing loopback dashboard.
     #[arg(long, conflicts_with_all=["proxy_setup_config","dev_embedded_catalog"])]
     pub proxy_setup: bool,
@@ -98,8 +101,11 @@ pub async fn prepare(
         password.clone(),
         provider_pubkey.clone(),
     )?);
+    let destination =
+        mayhem_proxy::setup::named::directory(&home, &args.name.clone().unwrap_or_default())?;
+    mayhem_proxy::setup::named::prepare_root(&home)?;
     Ok(GatewayProxySetupBootstrap {
-        destination: home.join("proxy-setup"),
+        destination,
         host: Host {
             network,
             provider_pubkey,
@@ -111,7 +117,11 @@ pub async fn prepare(
             ),
             wallet_password_file: password,
             admission_origin: args.proxy_setup_admission_origin.clone(),
-            declaration_registry: args.proxy_setup_declaration_registry_file.as_deref().map(mayhem_proxy::setup::DeclarationRegistry::load).transpose()?,
+            declaration_registry: args
+                .proxy_setup_declaration_registry_file
+                .as_deref()
+                .map(mayhem_proxy::setup::DeclarationRegistry::load)
+                .transpose()?,
         },
         tokenizers,
         credentials,
@@ -122,6 +132,21 @@ pub async fn prepare(
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    #[test]
+    fn dashboard_selects_the_same_name_with_new_or_retained_configuration() {
+        for mode in ["--proxy-setup", "--proxy-setup-config"] {
+            let parsed =
+                crate::Cli::try_parse_from(["mayhem", "use", mode, "--name", "model-two"]).unwrap();
+            let crate::Commands::Use(args) = parsed.command else {
+                panic!("use");
+            };
+            assert_eq!(args.setup_bootstrap.name.unwrap().as_str(), "model-two");
+            assert!(
+                crate::Cli::try_parse_from(["mayhem", "use", mode, "--name", "../invalid"])
+                    .is_err()
+            );
+        }
+    }
     #[test]
     fn dashboard_bootstrap_real_use_command_preserves_native_default() {
         let native = crate::Cli::try_parse_from(["mayhem", "use"]).unwrap();

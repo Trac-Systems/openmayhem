@@ -53,12 +53,12 @@ The examples use `$MAYHEM_HOME` for that existing home and `$TOKENIZER_FILE` and
 Decisions. Add `--api-key-file PATH` for a protected upstream key reference.
 
 ```sh
-mayhem provider proxy setup init --home "$MAYHEM_HOME" \
+mayhem provider proxy setup init --name llama --home "$MAYHEM_HOME" \
   --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
 mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
-  --config "$MAYHEM_HOME/proxy-setup/wizard.json" --inspect
+  --name llama --inspect
 mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
-  --config "$MAYHEM_HOME/proxy-setup/wizard.json"
+  --name llama
 ```
 
 `init` opens the wizard after saving the new bundle. Resume its existing
@@ -66,6 +66,48 @@ mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
 `--inspect` is a local read and performs no upstream request. Use the current
 revision returned by each action, rather than assuming how far a lost response
 advanced the draft.
+
+## Choosing a named setup
+
+A seller can serve several proxied models from one Core home. Each model has its
+own setup, offers, controller and cumulative probe allowance. Names contain
+1 to 32 lowercase letters, digits or hyphens. Commands select `default` when
+`--name` is omitted. New setups live in `<home>/proxy-setup/<name>`. If
+`<home>/proxy-setup/wizard.json` exists, that bundle is the setup named `default`;
+Core reads it in place and retains its installed controller identity.
+
+```sh
+mayhem provider proxy setup init --name second-model --home "$MAYHEM_HOME"
+mayhem provider proxy setup list --home "$MAYHEM_HOME" --limit 16
+mayhem provider proxy setup list --home "$MAYHEM_HOME" --after llama --limit 16
+mayhem provider proxy setup wizard --name second-model --home "$MAYHEM_HOME"
+mayhem provider proxy setup resume --name second-model --home "$MAYHEM_HOME"
+mayhem provider proxy setup status --name second-model --home "$MAYHEM_HOME"
+mayhem provider proxy setup payment-registration --name second-model \
+  --home "$MAYHEM_HOME" --expected-revision <current-revision>
+mayhem use --home "$MAYHEM_HOME" --proxy-setup-config --name second-model
+```
+
+`list` reads one page of local snapshots and returns `next` when another page is
+available. Pass that name as `--after`. It shows the proxied lane, name, upstream
+model, market, publication state and retained Run state. It never contacts the
+supervisor or creates a draft lock, so its Run state does not prove live health.
+`resume` and `status` inspect the saved draft; `wizard` opens the guided flow.
+The lower-level draft commands also accept `--name` and `--home` instead of
+`--directory`. Existing explicit configuration and draft paths remain valid.
+When both `--name` and `--config` are supplied, they must select the same bundle.
+
+Before requesting another invoice, the wizard reads canonical admission for the
+provider public key. An admitted provider receives no new invoice or permit.
+The ledger verifies each later publication independently. An unavailable or
+revoked canonical admission read does not become permission to pay another fee.
+The wallet, peer, bridge and payment registration remain shared. Each setup keeps
+its own managed child name, runtime and worker directories, locks, journals,
+capacity groups, route IDs and cumulative probe budget. Managed controllers use
+the shared bridge and do not bind another HTTP port or install another OS service.
+If separate dashboard processes are needed, assign each an explicit unused
+loopback `--bind` address. Per-model concurrency and probe allowances apply to
+that setup, so allocate them with the upstream account's total limits in mind.
 
 The interactive wizard exposes these explicit steps:
 
@@ -143,8 +185,8 @@ publication signs only the exact acknowledged `plan_digest`.
 
 ## Guided first setup without configuration JSON
 
-`mayhem provider proxy setup init --home <existing-private-home>` creates the
-initial standard-profile bundle under `<home>/proxy-setup`. It reuses the saved
+`mayhem provider proxy setup init --name llama --home <existing-private-home>` creates the
+named standard-profile bundle under `<home>/proxy-setup/<name>`. It reuses the saved
 Core peer/bridge, canonical network checks, existing wallet and installed worker.
 It does not start/reconfigure Core, the supervisor or a model server. The parent
 home must already be owner-only. An existing bundle is always retained: resume

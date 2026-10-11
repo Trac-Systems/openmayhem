@@ -5,21 +5,95 @@ use super::{cached_wallet_signing_key, resolve_wallet_keypair_path, WalletLocato
 use anyhow::Result;
 use clap::{Args, Subcommand};
 use mayhem_proxy::setup::{
-    profiles, AdmissionPermit, EnrollmentAction, EnrollmentQuote, Input, ProbePlan, ProfileInput, Store,
+    profiles, AdmissionPermit, EnrollmentAction, EnrollmentQuote, Input, ProbePlan, ProfileInput,
+    Store,
 };
 use std::path::PathBuf;
 mod bootstrap;
-mod wizard;
 mod payments;
+mod wizard;
+use mayhem_proxy::setup::named::{self, Name};
 
 #[derive(Debug, Args)]
 pub struct DraftArgs {
     /// Existing owner-only setup directory, separate from all runtime stores.
     #[arg(long, value_name = "PATH")]
-    directory: PathBuf,
+    directory: Option<PathBuf>,
+    /// Select the named proxied setup in this Core home.
+    #[arg(long, conflicts_with = "directory")]
+    name: Option<Name>,
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+}
+impl DraftArgs {
+    fn resolve(&self) -> mayhem_proxy::setup::Result<PathBuf> {
+        if let Some(path) = &self.directory {
+            return Ok(path.clone());
+        }
+        let home = home(self.home.as_ref()).map_err(|_| mayhem_proxy::setup::Error::Protection)?;
+        Ok(named::directory(&home, &self.name.clone().unwrap_or_default())?.join("state"))
+    }
+}
+
+pub(crate) fn home(value: Option<&PathBuf>) -> Result<PathBuf> {
+    crate::absolutize(value.cloned().map(Ok).unwrap_or_else(crate::default_home)?)
+}
+pub(crate) fn config_path(
+    home_path: Option<&PathBuf>,
+    name: Option<&Name>,
+    explicit: Option<&PathBuf>,
+) -> Result<PathBuf> {
+    if let Some(explicit) = explicit.filter(|p| !p.as_os_str().is_empty()) {
+        let path = crate::absolutize(explicit.clone())?;
+        if let Some(name) = name {
+            let selected = named::directory(&home(home_path)?, name)?.join("wizard.json");
+            anyhow::ensure!(
+                std::fs::canonicalize(&path)? == std::fs::canonicalize(selected)?,
+                "The configuration path must belong to the selected setup."
+            );
+        }
+        return Ok(path);
+    }
+    Ok(
+        named::directory(&home(home_path)?, &name.cloned().unwrap_or_default())?
+            .join("wizard.json"),
+    )
+}
+
+#[derive(Debug, Args)]
+pub struct ListArgs {
+    #[arg(long, value_name = "PATH")]
+    home: Option<PathBuf>,
+    /// Continue after the name returned in the previous page.
+    #[arg(long)]
+    after: Option<Name>,
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..=64))]
+    limit: u16,
+}
+
+#[derive(Debug, Args)]
+pub struct SetupWalletArgs {
+    #[arg(long, value_name = "PATH")]
+    keypair: Option<PathBuf>,
+    #[arg(long, default_value = "main")]
+    peer_store_name: String,
+    #[arg(long = "wallet-password-file", value_name = "PATH", value_parser = crate::read_secret_file_arg)]
+    wallet_password: Option<String>,
+}
+impl SetupWalletArgs {
+    fn locator(self, home: Option<PathBuf>) -> WalletLocatorArgs {
+        WalletLocatorArgs {
+            home,
+            keypair: self.keypair,
+            peer_store_name: self.peer_store_name,
+            wallet_password: self.wallet_password,
+        }
+    }
 }
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// List one page of retained proxied setups without contacting services.
+    List(ListArgs),
     /// Prepare shared payment registration after paid proxy admission. Does not select payout targets.
     PaymentRegistration(payments::Args),
     /// Create protected standard-profile setup through explicit prompts; no hand-authored JSON.
@@ -36,6 +110,9 @@ pub enum Command {
         /// Trusted admission API origin, HTTPS or literal loopback for local tests.
         #[arg(long)]
         admission_origin: String,
+        /// Read canonical provider admission before requesting a fee.
+        #[arg(long)]
+        peer_rpc: Option<String>,
         #[arg(long, default_value_t = 15000)]
         timeout_ms: u64,
         #[arg(long, value_enum, default_value_t = EnrollmentCommand::Status)]
@@ -49,7 +126,7 @@ pub enum Command {
         #[arg(long, requires = "invoice_id")]
         invoice_commitment: Option<String>,
         #[command(flatten)]
-        wallet: WalletLocatorArgs,
+        wallet: SetupWalletArgs,
     },
     /// Inspect, preview or export signed data-only connector recipes offline.
     Recipe {
@@ -83,7 +160,7 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         admission_permit: Option<PathBuf>,
         #[command(flatten)]
-        wallet: WalletLocatorArgs,
+        wallet: SetupWalletArgs,
     },
     /// Resume the original signed publication. No wallet unlock or new permit.
     RecoverPublication {
@@ -181,7 +258,7 @@ pub enum Command {
         expected_revision: u64,
     },
     /// Resume the same draft and display its redacted public review.
-    #[command(alias = "resume")]
+    #[command(aliases = ["resume", "status"])]
     Inspect(DraftArgs),
 }
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -219,6 +296,25 @@ pub enum RecipeCommand {
 }
 pub async fn run(command: Command) -> Result<()> {
     let command = match command {
+        Command::Inspect(args) if args.directory.is_none() => {
+            let path = config_path(args.home.as_ref(), args.name.as_ref(), None)?;
+            let view = tokio::task::spawn_blocking(move || {
+                mayhem_proxy::setup::Flow::open(mayhem_proxy::setup::FlowConfig::load(&path)?)?
+                    .view()
+            })
+            .await??;
+            println!("{}", serde_json::to_string(&view)?);
+            return Ok(());
+        }
+        Command::List(args) => {
+            let page = named::list(
+                &home(args.home.as_ref())?,
+                args.after.as_ref(),
+                args.limit as usize,
+            )?;
+            println!("{}", serde_json::to_string(&page)?);
+            return Ok(());
+        }
         Command::PaymentRegistration(args) => return payments::run(args).await,
         Command::Init(args) => return bootstrap::run(args).await,
         Command::Wizard(args) => return wizard::run(args).await,
@@ -226,6 +322,7 @@ pub async fn run(command: Command) -> Result<()> {
             args,
             expected_revision,
             admission_origin,
+            peer_rpc,
             timeout_ms,
             action,
             rail,
@@ -233,6 +330,7 @@ pub async fn run(command: Command) -> Result<()> {
             invoice_commitment,
             wallet,
         } => {
+            let wallet = wallet.locator(args.home.clone());
             anyhow::ensure!(
                 matches!(action, EnrollmentCommand::Create) == rail.is_some(),
                 "--rail is required only for --action create"
@@ -242,13 +340,45 @@ pub async fn run(command: Command) -> Result<()> {
                     && invoice_id.is_some() == invoice_commitment.is_some(),
                 "--invoice-id and --invoice-commitment are required only for --action refresh"
             );
-            let quote = invoice_id.zip(invoice_commitment).map(|(invoice_id, invoice_commitment)| {
-                serde_json::from_value::<EnrollmentQuote>(serde_json::json!({
-                    "invoice_id": invoice_id, "invoice_commitment": invoice_commitment
-                }))
-            }).transpose()?;
+            let quote = invoice_id
+                .zip(invoice_commitment)
+                .map(|(invoice_id, invoice_commitment)| {
+                    serde_json::from_value::<EnrollmentQuote>(serde_json::json!({
+                        "invoice_id": invoice_id, "invoice_commitment": invoice_commitment
+                    }))
+                })
+                .transpose()?;
+            if !matches!(action, EnrollmentCommand::Status) {
+                let directory = args.resolve()?;
+                let peer = match peer_rpc {
+                    Some(peer) => Some(peer),
+                    None if args.directory.is_none() => {
+                        mayhem_proxy::setup::FlowConfig::load(&config_path(
+                            args.home.as_ref(),
+                            args.name.as_ref(),
+                            None,
+                        )?)?
+                        .peer_rpc
+                    }
+                    None => None,
+                };
+                if let Some(peer) = peer {
+                    if let Some(provider) = Store::open(directory)?
+                        .admitted_provider(expected_revision, &peer, timeout_ms)
+                        .await?
+                    {
+                        println!(
+                            "{}",
+                            serde_json::to_string(
+                                &mayhem_proxy::setup::EnrollmentResult::already_admitted(provider)
+                            )?
+                        );
+                        return Ok(());
+                    }
+                }
+            }
             let client = tokio::task::spawn_blocking(move || {
-                Store::open(args.directory)?.enrollment_client(
+                Store::open(args.resolve()?)?.enrollment_client(
                     expected_revision,
                     &admission_origin,
                     timeout_ms,
@@ -301,7 +431,7 @@ pub async fn run(command: Command) -> Result<()> {
             offers_only,
         } => {
             let plan = tokio::task::spawn_blocking(move || {
-                Store::open(args.directory)?.publication_plan(expected_revision, offers_only)
+                Store::open(args.resolve()?)?.publication_plan(expected_revision, offers_only)
             })
             .await??;
             println!("{}", serde_json::to_string(&plan)?);
@@ -316,8 +446,9 @@ pub async fn run(command: Command) -> Result<()> {
             admission_permit,
             wallet,
         } => {
+            let wallet = wallet.locator(args.home.clone());
             let (store, plan, permit) = tokio::task::spawn_blocking(move || {
-                let store = Store::open(args.directory)?;
+                let store = Store::open(args.resolve()?)?;
                 let plan = store.publication_plan(expected_revision, offers_only)?;
                 let permit = admission_permit
                     .as_deref()
@@ -346,7 +477,7 @@ pub async fn run(command: Command) -> Result<()> {
             peer_rpc,
             timeout_ms,
         } => {
-            let store = tokio::task::spawn_blocking(move || Store::open(args.directory)).await??;
+            let store = tokio::task::spawn_blocking(move || Store::open(args.resolve()?)).await??;
             let review = store
                 .recover_publication(expected_revision, &peer_rpc, timeout_ms)
                 .await?;
@@ -359,7 +490,7 @@ pub async fn run(command: Command) -> Result<()> {
             peer_rpc,
             timeout_ms,
         } => {
-            let store = tokio::task::spawn_blocking(move || Store::open(args.directory)).await??;
+            let store = tokio::task::spawn_blocking(move || Store::open(args.resolve()?)).await??;
             let review = store
                 .admission_check(expected_revision, &peer_rpc, timeout_ms)
                 .await?;
@@ -376,7 +507,7 @@ pub async fn run(command: Command) -> Result<()> {
             expected_revision,
             timeout_ms,
         } => {
-            let store = tokio::task::spawn_blocking(move || Store::open(args.directory)).await??;
+            let store = tokio::task::spawn_blocking(move || Store::open(args.resolve()?)).await??;
             let review = store
                 .discover(&connection, expected_revision, timeout_ms)
                 .await?;
@@ -385,7 +516,7 @@ pub async fn run(command: Command) -> Result<()> {
         }
         Command::Inventory { args, show_models } => {
             let review = tokio::task::spawn_blocking(move || {
-                Store::open(args.directory)?.inspect_connection(show_models)
+                Store::open(args.resolve()?)?.inspect_connection(show_models)
             })
             .await??;
             println!("{}", serde_json::to_string(&review)?);
@@ -401,7 +532,7 @@ pub async fn run(command: Command) -> Result<()> {
     {
         let (store, plan) = tokio::task::spawn_blocking(move || {
             Ok::<_, mayhem_proxy::setup::Error>((
-                Store::open(args.directory)?,
+                Store::open(args.resolve()?)?,
                 ProbePlan::load(&plan)?,
             ))
         })
@@ -419,7 +550,8 @@ pub async fn run(command: Command) -> Result<()> {
             | Command::RecoverProbe { args, .. }
             | Command::Probe { args, .. }
             | Command::Inspect(args) => args,
-            Command::Init(_)
+            Command::List(_)
+            | Command::Init(_)
             | Command::Wizard(_)
             | Command::PaymentRegistration(_)
             | Command::Enrollment { .. }
@@ -434,7 +566,7 @@ pub async fn run(command: Command) -> Result<()> {
                 unreachable!("handled before the blocking operation")
             }
         };
-        let store = Store::open(&args.directory)?;
+        let store = Store::open(args.resolve()?)?;
         match command {
             Command::Create { input, .. } => store.create(Input::load(&input)?),
             Command::Prepare {
@@ -455,7 +587,8 @@ pub async fn run(command: Command) -> Result<()> {
             } => store.recover_probe(expected_revision),
             Command::Probe { .. } => unreachable!("handled before the blocking operation"),
             Command::Inspect(_) => store.inspect(),
-            Command::Init(_)
+            Command::List(_)
+            | Command::Init(_)
             | Command::Wizard(_)
             | Command::PaymentRegistration(_)
             | Command::Enrollment { .. }
@@ -536,8 +669,11 @@ mod recipe_tests {
         assert!(matches!(
             Cli::try_parse_from(args).unwrap().command,
             Command::Enrollment {
-                action: EnrollmentCommand::Refresh, rail: None,
-                invoice_id: Some(_), invoice_commitment: Some(_), ..
+                action: EnrollmentCommand::Refresh,
+                rail: None,
+                invoice_id: Some(_),
+                invoice_commitment: Some(_),
+                ..
             }
         ));
     }

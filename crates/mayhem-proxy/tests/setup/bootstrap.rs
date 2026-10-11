@@ -100,6 +100,120 @@ fn choices(f: &Fixture, endpoint: ProxyEndpoint) -> Choices {
         closed_retention_ms: 86400000,
     }
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn named_bundles_are_paged_readonly_and_keep_separate_runtime_resources() {
+    use mayhem_proxy::setup::named::{self, Name};
+    let f = Fixture::new(ProxyEndpoint::Decisions);
+    let home = f.dir.path();
+    named::prepare_root(home).unwrap();
+    let mut configurations = Vec::new();
+    for (name, model) in [("alpha", "model-alpha"), ("beta", "model-beta")] {
+        let name: Name = name.parse().unwrap();
+        let path = named::directory(home, &name).unwrap();
+        let mut choice = choices(&f, ProxyEndpoint::Decisions);
+        choice.upstream_model = model.into();
+        if let ProfileMarket::CreateMarket { slug, .. } = &mut choice.market {
+            *slug = name.to_string();
+        }
+        bootstrap::create(&path, host(&f), choice).unwrap();
+        configurations.push(FlowConfig::load(&path.join("wizard.json")).unwrap());
+        assert!(!path.join("state/draft.lock").exists());
+    }
+    let first = named::list(home, None, 1).unwrap();
+    assert_eq!(first.setups.len(), 1);
+    assert_eq!(first.setups[0].name, "alpha");
+    assert_eq!(first.setups[0].model, "model-alpha");
+    assert_eq!(first.setups[0].market["slug"], "alpha");
+    assert_eq!(first.setups[0].publication, "not_submitted");
+    assert_eq!(first.setups[0].run, "not_started");
+    let after = first.next.unwrap().parse().unwrap();
+    let second = named::list(home, Some(&after), 1).unwrap();
+    assert_eq!(second.setups[0].name, "beta");
+    assert_eq!(second.setups[0].model, "model-beta");
+    assert!(second.next.is_none());
+    for config in &configurations {
+        assert!(
+            !config.directory.join("draft.lock").exists(),
+            "listing created a lock"
+        );
+    }
+    let [a, b] = configurations.as_slice() else {
+        panic!("two setups");
+    };
+    let pa = ProbePlan::load(a.probe_plan.as_ref().unwrap()).unwrap();
+    let pb = ProbePlan::load(b.probe_plan.as_ref().unwrap()).unwrap();
+    assert_ne!(a.directory, b.directory);
+    assert_ne!(pa.scope.capacity_file, pb.scope.capacity_file);
+    assert_ne!(pa.scope.connection_group, pb.scope.connection_group);
+    assert_ne!(pa.scope.route, pb.scope.route);
+    assert_ne!(pa.worker_directory, pb.worker_directory);
+    assert_ne!(
+        a.run.as_ref().unwrap().template,
+        b.run.as_ref().unwrap().template
+    );
+    assert_eq!(a.profile.provider_pubkey, b.profile.provider_pubkey);
+    assert_eq!(a.peer_rpc, b.peer_rpc);
+    let ta = RunTemplate::load(&a.run.as_ref().unwrap().template).unwrap();
+    let tb = RunTemplate::load(&b.run.as_ref().unwrap().template).unwrap();
+    assert_eq!(ta.bridge.url, tb.bridge.url);
+    assert_eq!(ta.bridge.token_file, tb.bridge.token_file);
+    for config in configurations {
+        let flow = Flow::open(config).unwrap();
+        let choice = flow.view().unwrap().selection;
+        flow.execute(
+            FlowAction::Select {
+                expected_revision: None,
+                choice,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+        flow.execute(
+            FlowAction::Check {
+                expected_revision: 1,
+            },
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    let page = named::list(home, None, 2).unwrap();
+    assert_eq!(page.setups[0].model, "model-alpha");
+    assert_eq!(page.setups[1].model, "model-beta");
+    assert!(page.next.is_none());
+    assert!(f.listener.accept().is_err());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn existing_root_bundle_is_default_without_moving_or_resetting_files() {
+    use mayhem_proxy::setup::named::{self, Name};
+    let f = Fixture::new(ProxyEndpoint::Decisions);
+    let root = f.dir.path().join("proxy-setup");
+    bootstrap::create(&root, host(&f), choices(&f, ProxyEndpoint::Decisions)).unwrap();
+    let original = std::fs::read(root.join("wizard.json")).unwrap();
+    assert_eq!(
+        named::directory(f.dir.path(), &Name::default()).unwrap(),
+        root
+    );
+    named::prepare_root(f.dir.path()).unwrap();
+    let extra = named::directory(f.dir.path(), &"extra".parse().unwrap()).unwrap();
+    bootstrap::create(&extra, host(&f), choices(&f, ProxyEndpoint::Decisions)).unwrap();
+    let page = named::list(f.dir.path(), None, 16).unwrap();
+    assert_eq!(
+        page.setups
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect::<Vec<_>>(),
+        ["default", "extra"]
+    );
+    assert_eq!(std::fs::read(root.join("wizard.json")).unwrap(), original);
+    assert!(!root.join("default").exists());
+    assert!(bootstrap::create(&root, host(&f), choices(&f, ProxyEndpoint::Decisions)).is_err());
+}
 #[tokio::test]
 #[cfg_attr(
     windows,
@@ -564,7 +678,7 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
         assert!(!stdout.contains(hidden));
     }
     assert_eq!(peer.control.identity_reads.load(Ordering::SeqCst), 3);
-    let target = home.join("proxy-setup");
+    let target = home.join("proxy-setup/default");
     let cfg = FlowConfig::load(&target.join("wizard.json")).unwrap();
     assert_eq!(cfg.profile.provider_pubkey, f.input.provider_pubkey);
     assert_eq!(cfg.profile.network.network_id, "918");
@@ -578,8 +692,87 @@ async fn bootstrap_cli_actual_guided_first_bundle_and_conflict_recovery() {
     assert_eq!(original, std::fs::read(target.join("wizard.json")).unwrap());
     assert!(flow.view().unwrap().review.is_none());
     assert!(!target.join("runtime/capacity.redb").exists());
+    let mut second = command
+        .args(["--name", "second"])
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let second_lines = lines
+        .replace("\nexternal\n", "\nexternal-second\n")
+        .replace("\nbootstrap-market\n", "\nbootstrap-market-second\n");
+    second
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(second_lines.as_bytes())
+        .await
+        .unwrap();
+    let second = tokio::time::timeout(Duration::from_secs(30), second.wait_with_output())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "second setup failed: {}",
+        String::from_utf8_lossy(&second.stderr)
+    );
+    assert_eq!(peer.control.identity_reads.load(Ordering::SeqCst), 6);
+    assert_eq!(original, std::fs::read(target.join("wizard.json")).unwrap());
+    let mut list = Command::new(&binary);
+    list.args(["provider", "proxy", "setup", "list", "--home"])
+        .arg(&home);
+    cli_assets::configure(&mut list, &assets, &home);
+    let result = list.output().await.unwrap();
+    assert!(result.status.success());
+    let page: Value = serde_json::from_slice(&result.stdout).unwrap();
+    assert_eq!(page["setups"].as_array().unwrap().len(), 2);
+    assert_eq!(page["setups"][0]["name"], "default");
+    assert_eq!(page["setups"][1]["name"], "second");
+    for (name, model) in [("default", "external"), ("second", "external-second")] {
+        let mut inspect = Command::new(&binary);
+        inspect
+            .args([
+                "provider",
+                "proxy",
+                "setup",
+                "wizard",
+                "--inspect",
+                "--name",
+                name,
+                "--home",
+            ])
+            .arg(&home)
+            .arg("--keypair")
+            .arg(&keypair);
+        cli_assets::configure(&mut inspect, &assets, &home);
+        let result = inspect.output().await.unwrap();
+        assert!(
+            result.status.success(),
+            "named inspection failed: {}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        let view: Value = serde_json::from_slice(&result.stdout).unwrap();
+        assert_eq!(view["selection"]["upstream_model"], model);
+        for action in ["resume", "status"] {
+            let mut read = Command::new(&binary);
+            read.args([
+                "provider", "proxy", "setup", action, "--name", name, "--home",
+            ])
+            .arg(&home);
+            cli_assets::configure(&mut read, &assets, &home);
+            let result = read.output().await.unwrap();
+            assert!(
+                result.status.success(),
+                "named {action} failed: {}",
+                String::from_utf8_lossy(&result.stderr)
+            );
+            let view: Value = serde_json::from_slice(&result.stdout).unwrap();
+            assert_eq!(view["selection"]["upstream_model"], model);
+        }
+    }
+    assert_eq!(peer.control.identity_reads.load(Ordering::SeqCst), 6);
     if let Some(path) = std::env::var_os("MAYHEM_BOOTSTRAP_CLI_EVIDENCE") {
-        std::fs::write(path,serde_json::to_vec_pretty(&json!({"schema_version":1,"fixture":"actual_cli_guided_create_with_normal_synthetic_encrypted_wallet_and_read_only_peer_double","network_identity_reads":3,"upstream_calls":0,"hand_authored_setup_json":false,"same_wallet":true,"retained_after_retry":true,"capacity_created":false,"published":false,"run":false})).unwrap()).unwrap();
+        std::fs::write(path,serde_json::to_vec_pretty(&json!({"schema_version":1,"fixture":"actual_cli_guided_create_with_normal_synthetic_encrypted_wallet_and_read_only_peer_double","network_identity_reads":6,"named_setups":2,"upstream_calls":0,"hand_authored_setup_json":false,"same_wallet":true,"retained_after_retry":true,"capacity_created":false,"published":false,"run":false})).unwrap()).unwrap();
     }
     assert_eq!(peer.control.models_calls.load(Ordering::SeqCst), 0);
     assert!(!peer.control.queries.lock().unwrap().is_empty());

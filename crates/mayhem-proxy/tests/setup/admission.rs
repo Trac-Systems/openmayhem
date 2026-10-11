@@ -98,6 +98,45 @@ fn checked(f: &Fixture) {
 }
 
 #[tokio::test]
+async fn fee_skip_requires_current_canonical_identity_and_enabled_unrevoked_admission() {
+    for fault in 0..7 {
+        let f = Fixture::new(ProxyEndpoint::Chat);
+        checked(&f);
+        let server = peer(
+            &f,
+            move |mut wire, _| {
+                wire["provider"] =
+                    json!({"sequence":8, "operation_digest":d(40), "entitlement_id":d(41)});
+                match fault {
+                    1 => wire["provider"] = Value::Null,
+                    2 => wire["registry_enabled"] = json!(false),
+                    3 => wire["provider_revoked"] = json!(true),
+                    4 => wire["admission_revoked"] = json!(true),
+                    5 => wire["provider_pubkey"] = json!(d(99)),
+                    6 => return (503, json!({})),
+                    _ => (),
+                }
+                (200, wire)
+            },
+            Duration::ZERO,
+        );
+        let before = std::fs::read(f.store.join("draft.json")).unwrap();
+        let result = f.store().admitted_provider(2, &server.url, 2000).await;
+        match fault {
+            0 => assert_eq!(result.unwrap().unwrap().entitlement_id, d(41)),
+            1 => assert!(result.unwrap().is_none()),
+            _ => assert!(result.is_err(), "fault {fault}"),
+        }
+        assert_eq!(std::fs::read(f.store.join("draft.json")).unwrap(), before);
+        assert!(!f.store.join("wizard-enrollment.json").exists());
+        assert!(matches!(
+            f.store().admitted_provider(1, &server.url, 2000).await,
+            Err(Error::Conflict)
+        ));
+    }
+}
+
+#[tokio::test]
 #[cfg_attr(
     windows,
     ignore = "requires isolated native Windows private NTFS fixture parent"

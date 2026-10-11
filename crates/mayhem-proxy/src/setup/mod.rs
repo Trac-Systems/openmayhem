@@ -3,11 +3,12 @@
 //! the existing bounded upstream controller; setup never opens a wallet.
 mod admission;
 pub mod bootstrap;
-pub mod guided;
 mod connection;
 mod declarations;
 mod enrollment;
 mod flow;
+pub mod guided;
+pub mod named;
 mod probe;
 mod profile;
 mod publication;
@@ -18,8 +19,13 @@ mod store;
 pub use admission::{AdmissionEvidence, AdmissionReport, AdmissionState, CanonicalProvider};
 pub use connection::{preview_models, DiscoveryState, InventoryReview, ModelsPreview};
 pub use declarations::{DeclarationChoice, DeclarationPlan, DeclarationReport, DeclarationSource};
-pub use enrollment::{EnrollmentAction, EnrollmentClient, EnrollmentInvoice, EnrollmentQuote, EnrollmentResult, EnrollmentReturn, EnrollmentReturns};
-pub use flow::{DeclarationRegistry, Flow, FlowAction, FlowChoice, FlowConfig, FlowResult, FlowView};
+pub use enrollment::{
+    EnrollmentAction, EnrollmentClient, EnrollmentInvoice, EnrollmentQuote, EnrollmentResult,
+    EnrollmentReturn, EnrollmentReturns,
+};
+pub use flow::{
+    DeclarationRegistry, Flow, FlowAction, FlowChoice, FlowConfig, FlowResult, FlowView,
+};
 pub use probe::{ProbeGroup, ProbePlan, ProbeReport, ProbeScope, ProbeState};
 pub use profile::{
     profiles, EndpointProfile, MembershipInput, OfferInput, ProfileInput, ProfileMarket,
@@ -61,6 +67,8 @@ const MAX_DRAFT_BYTES: usize = MAX_BYTES + 17 * 65536 + 32768;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("Setup names must contain 1 to 32 lowercase letters, digits or hyphens.")]
+    Name,
     #[error("invalid provider setup declaration or binding")]
     Invalid,
     #[error("provider setup bootstrap validation failed: {0}")]

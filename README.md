@@ -530,20 +530,29 @@ With `MAYHEM_HOME`, `TOKENIZER_FILE` and `ADMISSION_ORIGIN` set to your chosen
 home, protected file and trusted admission service:
 
 ```sh
-mayhem provider proxy setup init --home "$MAYHEM_HOME" \
+mayhem provider proxy setup init --name llama --home "$MAYHEM_HOME" \
   --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
 # Resume the original saved setup:
 mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
-  --config "$MAYHEM_HOME/proxy-setup/wizard.json"
+  --name llama
 ```
 
 Alternatively use the existing local gateway's authenticated provider dashboard:
 
 ```sh
-mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 --proxy-setup \
+mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 --proxy-setup --name llama \
   --proxy-setup-tokenizer-file "$TOKENIZER_FILE" \
   --proxy-setup-admission-origin "$ADMISSION_ORIGIN"
 ```
+
+Each proxied model has its own named setup in the same Core home. Use
+`setup init --name <name>` for another model and `setup list --home "$MAYHEM_HOME"`
+to inspect the saved setups. Names contain 1 to 32 lowercase letters, digits or
+hyphens and default to `default`. New bundles live in `proxy-setup/<name>`.
+An existing `proxy-setup/wizard.json` remains the `default` setup in place.
+The canonical provider identity pays admission once; the wizard skips another
+invoice for an already admitted provider. See [the named setup commands](crates/mayhem-proxy/docs/SETUP_WIZARD.md#choosing-a-named-setup)
+for paging, recovery and runtime isolation.
 
 Omit the tokenizer option for Decisions. Open the session URL printed by Core.
 Guided setup browses canonical families and exact create/join markets, collects

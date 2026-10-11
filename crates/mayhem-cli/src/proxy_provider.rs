@@ -1,6 +1,6 @@
 //! Provider startup uses the existing encrypted wallet and protected SC-Bridge.
-mod setup;
 mod recovery;
+pub(crate) mod setup;
 pub(crate) mod supervisor;
 use super::{cached_wallet_signing_key, resolve_wallet_keypair_path, WalletLocatorArgs};
 use anyhow::{Context, Result};
@@ -114,6 +114,65 @@ mod tests {
     struct Cli {
         #[command(subcommand)]
         command: Command,
+    }
+    #[test]
+    fn all_setup_openers_accept_validated_names_and_core_home() {
+        for command in ["init", "wizard", "resume", "status", "inspect"] {
+            assert!(
+                Cli::try_parse_from([
+                    "proxy",
+                    "setup",
+                    command,
+                    "--name",
+                    "model-two",
+                    "--home",
+                    "/private/core"
+                ])
+                .is_ok(),
+                "{command}"
+            );
+            assert!(
+                Cli::try_parse_from(["proxy", "setup", command, "--name", "../escape"]).is_err(),
+                "{command}"
+            );
+        }
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "payment-registration",
+            "--name",
+            "model-two",
+            "--home",
+            "/private/core",
+            "--expected-revision",
+            "2"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "list",
+            "--home",
+            "/private/core",
+            "--after",
+            "alpha",
+            "--limit",
+            "1"
+        ])
+        .is_ok());
+        for limit in ["0", "65"] {
+            assert!(Cli::try_parse_from(["proxy", "setup", "list", "--limit", limit]).is_err());
+        }
+        assert!(Cli::try_parse_from([
+            "proxy",
+            "setup",
+            "resume",
+            "--name",
+            "alpha",
+            "--directory",
+            "/private/other"
+        ])
+        .is_err());
     }
     #[test]
     fn proxy_provider_serve_uses_existing_wallet_arguments_and_preserves_catalog() {
@@ -364,7 +423,7 @@ mod tests {
                 args.extend(["--peer-rpc", "http://127.0.0.1:17800/v1"]);
             }
             assert!(Cli::try_parse_from(args.clone()).is_ok());
-            args.extend(["--home", "/private/wallet"]);
+            args.extend(["--wallet-password-file", "/private/wallet-password"]);
             assert!(Cli::try_parse_from(args).is_err());
         }
         assert!(Cli::try_parse_from([

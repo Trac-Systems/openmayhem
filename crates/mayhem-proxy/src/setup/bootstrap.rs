@@ -124,7 +124,7 @@ pub fn create(destination: &Path, host: Host, choices: Choices) -> Result<Bundle
     let lock = fs::File::from(
         openat(
             &dir,
-            ".proxy-bootstrap.lock",
+            &format!(".proxy-setup-{name}.lock"),
             OFlags::RDWR | OFlags::CREATE | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
             Mode::from_raw_mode(0o600),
         )
@@ -160,7 +160,7 @@ pub fn create(destination: &Path, host: Host, choices: Choices) -> Result<Bundle
                 .create(stage.join(name))
                 .map_err(|_| Error::Storage)?;
         }
-        build(&stage, host, choices)?;
+        build(&stage, &destination, host, choices)?;
         for name in ["state", "runtime", "worker"] {
             fs::File::open(stage.join(name))
                 .and_then(|v| v.sync_all())
@@ -218,8 +218,8 @@ fn write(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn build(stage: &Path, host: Host, choices: Choices) -> Result<()> {
-    let validation = generate(stage, host, choices, write)?;
+fn build(stage: &Path, destination: &Path, host: Host, choices: Choices) -> Result<()> {
+    let validation = generate(stage, destination, host, choices, write)?;
     validate_generated(stage, validation)
 }
 struct Validation {
@@ -229,6 +229,7 @@ struct Validation {
 }
 fn generate(
     stage: &Path,
+    destination: &Path,
     host: Host,
     choices: Choices,
     mut put: impl FnMut(&Path, &[u8]) -> Result<()>,
@@ -305,7 +306,11 @@ fn generate(
         .fingerprint()
         .map_err(|_| Error::Bootstrap("connection policy"))?;
     put(&stage.join("connection.json"), &serialize(&connection)?)?;
-    let scope_bytes = serialize(&(host.network.clone(), host.provider_pubkey.clone()))?;
+    let scope_bytes = serialize(&(
+        host.network.clone(),
+        host.provider_pubkey.clone(),
+        destination,
+    ))?;
     let connection_group = Digest::hash("mayhem/proxy/bootstrap-connection/v1", &[&scope_bytes]);
     let profile = ProfileInput {
         schema_version: 1,

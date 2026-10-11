@@ -23,6 +23,9 @@ use std::{
 
 #[derive(Debug, Args)]
 pub struct InitArgs {
+    /// Select a setup name containing 1 to 32 lowercase letters, digits or hyphens.
+    #[arg(long, default_value = "default")]
+    name: Name,
     #[command(flatten)]
     wallet: WalletLocatorArgs,
     /// Existing protected upstream bearer-key file. Never accepts the key itself.
@@ -411,7 +414,7 @@ pub async fn run(mut args: InitArgs) -> Result<()> {
             .map(Ok)
             .unwrap_or_else(crate::default_home)?,
     )?;
-    let destination = home.join("proxy-setup");
+    let destination = named::directory(&home, &args.name)?;
     ensure!(
         std::fs::symlink_metadata(&destination).is_err(),
         "a setup already exists; resume its wizard.json, do not reset the original Run or budget"
@@ -471,7 +474,11 @@ pub async fn run(mut args: InitArgs) -> Result<()> {
         )),
         wallet_password_file: password.clone(),
         admission_origin: args.admission_origin.clone(),
-        declaration_registry: args.declaration_registry_file.as_deref().map(mayhem_proxy::setup::DeclarationRegistry::load).transpose()?,
+        declaration_registry: args
+            .declaration_registry_file
+            .as_deref()
+            .map(mayhem_proxy::setup::DeclarationRegistry::load)
+            .transpose()?,
     };
     let mut output = io::stdout();
     writeln!(output,"Choose an existing model server and canonical market. Only explicitly requested discovery reads run here; no probe, payment, publication or service change.")?;
@@ -500,6 +507,7 @@ pub async fn run(mut args: InitArgs) -> Result<()> {
         "setup cancelled"
     );
     Canonical::new(&host)?.revalidate(&chosen).await?;
+    named::prepare_root(&home)?;
     let bundle = tokio::task::spawn_blocking(move || bootstrap::create(&destination, host, chosen))
         .await??;
     let password_arg = password

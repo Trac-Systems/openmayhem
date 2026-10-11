@@ -15,16 +15,14 @@ async fn guided_cli_prompts_discover_choose_create_or_join_and_convert_exact_pri
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
-    let home = Temporary(
-        std::env::temp_dir().join(format!(
+    let home = Temporary(std::env::temp_dir().join(format!(
             "mayhem-guided-cli-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
-        )),
-    );
+        )));
     {
         use std::os::unix::fs::DirBuilderExt;
         std::fs::DirBuilder::new()
@@ -47,12 +45,19 @@ async fn guided_cli_prompts_discover_choose_create_or_join_and_convert_exact_pri
         peer_rpc: peer.url.clone(),
         bridge_url: "ws://127.0.0.1:9/".into(),
         bridge_token_file: home.path().join("bridge"),
-        worker_program: std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("mayhem-proxy-worker"),
+        worker_program: std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("mayhem-proxy-worker"),
         wallet_password_file: None,
         admission_origin: None,
         declaration_registry: None,
     };
     let args = InitArgs {
+        name: Name::default(),
         wallet: WalletLocatorArgs {
             home: None,
             keypair: None,
