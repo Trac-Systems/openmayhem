@@ -109,7 +109,7 @@
     }
     const retained = v.enrollment, invoice = retained?.invoice;
     $('invoice').replaceChildren();
-    if (!invoice) { text('invoice', retained ? `${retained.state}. No invoice payment instructions available.` : 'No reconciled invoice. Read admission first; create/recover only when needed.'); }
+    if (!invoice) { text('invoice', retained?.state === 'admitted' ? 'The provider is already admitted, so this setup does not require another admission fee.' : retained ? `${retained.state}. No invoice payment instructions available.` : 'No reconciled invoice. Read admission first; create/recover only when needed.'); }
     else {
       const p = document.createElement('p'); p.textContent = `Invoice ${invoice.invoice_id}: ${invoice.payment_status}; ${invoice.rail.toUpperCase()}. Fee USD ${invoice.fee_usd}. Required ${invoice.amount_base_units}, verified ${invoice.received_amount_base_units}, short ${invoice.missing_amount_base_units}, excess ${invoice.excess_amount_base_units} (rail base units; FIAT minor units). Quote ${invoice.quote_expired ? 'expired' : 'expires at ' + new Date(invoice.quote_expires_at_ms).toISOString()}. ${retained.for_current_revision ? '' : 'Saved projection belongs to an older draft revision; reconcile status.'}`;
       $('invoice').append(p);
