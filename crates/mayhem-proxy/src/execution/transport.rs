@@ -108,7 +108,6 @@ impl Transport<'_> {
                 }
             };
             let pushed = decoder.push(&chunk, &mut receive).await;
-            drop(receive);
             if !saved_upstream_id {
                 if let Some(id) = stream.upstream_id() {
                     delivery.upstream_id(id).await?;
@@ -163,7 +162,6 @@ impl Transport<'_> {
                     Error::Decoder(e)
                 }
             })?;
-        drop(receive);
         let result = stream.finish()?;
         decoder.verify_stream_result(&result).await?;
         let reply = request
