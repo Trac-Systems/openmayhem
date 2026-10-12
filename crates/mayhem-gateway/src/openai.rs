@@ -1596,7 +1596,15 @@ impl GatewayAccessControl {
                 "invalid gateway key budget operation",
                 Some("Authorization"),
             ),
-            key_budget::Error::Unavailable | key_budget::Error::Full => {
+            key_budget::Error::ReservationsFull => ApiError::service_unavailable(
+                "gateway key budget concurrent reservation limit reached; pending work must settle or release",
+                Some("Authorization"),
+            ),
+            key_budget::Error::Full => ApiError::service_unavailable(
+                "gateway key budget account capacity reached",
+                Some("Authorization"),
+            ),
+            key_budget::Error::Unavailable => {
                 ApiError::service_unavailable(
                     "gateway key budget unavailable; retained exposure requires recovery",
                     Some("Authorization"),
@@ -2177,8 +2185,14 @@ impl GatewayAccessControl {
                 })
             })
             .collect::<Vec<_>>();
+        let budget_capacity = self.durable_budget.as_ref().and_then(|budget| {
+            budget.capacity().map_err(|_| {
+                reload_error = Some("gateway key budget unavailable".into());
+            }).ok()
+        });
         json!({
             "require_auth": self.require_auth,
+            "budget_capacity": budget_capacity,
             "token_count": store.tokens.len(),
             "active_token_count": store.active_token_count(now),
             "tokens": tokens,

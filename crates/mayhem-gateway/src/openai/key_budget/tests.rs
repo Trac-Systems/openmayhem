@@ -540,7 +540,7 @@ fn key_budget_native_release_does_not_erase_later_signed_charge_and_identity_is_
     assert_eq!(t.spent_total_au, 20);
 }
 #[test]
-fn key_budget_closed_capacity_fences_new_work_without_preventing_recovery() {
+fn key_budget_pending_capacity_recovers_after_settlement_without_losing_replay_fences() {
     let dir = private_dir();
     let t = token();
     let store = Authority::create(
@@ -557,18 +557,87 @@ fn key_budget_closed_capacity_fences_new_work_without_preventing_recovery() {
         .unwrap();
     assert_eq!(
         store.reserve(&t, Lane::Native, "other", "buyer", "other", 1, 2),
-        Err(Error::Full)
+        Err(Error::ReservationsFull)
     );
     store
         .settle_proxy(&t.token_id, "job", "fp", "terms", 10, true, "proof", 3)
         .unwrap();
-    assert_eq!(
-        store.reserve(&t, Lane::Native, "other", "buyer", "other", 1, 3),
-        Err(Error::Full)
-    );
+    store.reserve(&t, Lane::Native, "other", "buyer", "other", 1, 3).unwrap();
+    assert_eq!(store.capacity().unwrap().pending_reservations, 1);
+    assert_eq!(store.capacity().unwrap().retained_reservations, 2);
     assert!(store
         .settle_proxy(&t.token_id, "job", "fp", "terms", 10, true, "proof", 4)
         .is_ok());
+    // Closing a request that never reached admission must work at capacity too.
+    store.fence_proxy_non_admission(&t.token_id, "denied", "fp2", "terms2", 1, "fence", 4).unwrap();
+    assert_eq!(store.reserve(&t, Lane::Proxy, "denied", "fp2", "terms2", 1, 4), Err(Error::Conflict));
+    assert_eq!(store.reserve(&t, Lane::Proxy, "job", "fp", "terms", 100, 4), Err(Error::Conflict));
+    store.release_native(&t.token_id, "other", 5).unwrap();
+    drop(store);
+    let store = Authority::open(&dir.path().join("budget.redb"), Limits { max_tokens: 1, max_reservations: 1 }, std::slice::from_ref(&t)).unwrap();
+    assert_eq!(store.capacity().unwrap().pending_reservations, 0);
+    assert_eq!(store.capacity().unwrap().retained_reservations, 3);
+    store.reserve(&t, Lane::Proxy, "new", "fp3", "terms3", 1, 6).unwrap();
+    assert_eq!(store.settle_proxy(&t.token_id, "job", "fp", "terms", 10, true, "proof", 6), Ok(0));
+    assert_eq!(store.reserve(&t, Lane::Proxy, "denied", "fp2", "terms2", 1, 6), Err(Error::Conflict));
+}
+
+#[test]
+fn key_budget_lifetime_traffic_exceeds_capacity_across_native_proxy_and_restart() {
+    let dir = private_dir();
+    let mut t = token();
+    t.budget_au = None;
+    let limit = Limits { max_tokens: 1, max_reservations: 2 };
+    let path = dir.path().join("budget.redb");
+    let mut store = Authority::create(&path, limit, std::slice::from_ref(&t)).unwrap();
+    // An uncertain request must retain its slot and money throughout turnover.
+    store.reserve(&t, Lane::Proxy, "uncertain", "fp", "terms", 100, 2).unwrap();
+    for n in 0..128 {
+        if n == 64 {
+            drop(store);
+            store = Authority::open(&path, limit, std::slice::from_ref(&t)).unwrap();
+        }
+        let request = format!("request-{n}");
+        let lane = if n % 3 == 0 { Lane::Proxy } else { Lane::Native };
+        store.reserve(&t, lane, &request, "buyer", &request, 100, n + 3).unwrap();
+        assert_eq!(store.reserve(&t, Lane::Native, "overflow", "buyer", "overflow", 1, n + 3), Err(Error::ReservationsFull));
+        match n % 3 {
+            0 => { store.settle_proxy(&t.token_id, &request, "buyer", &request, 1, true, "proof", n + 3).unwrap(); }
+            1 => { store.release_native(&t.token_id, &request, n + 3).unwrap(); }
+            _ => {
+                let receipt = NativeReceipt { billing_id: &request, ..native(1, 1, true, "proof") };
+                assert_eq!(store.settle_native(&t.token_id, &request, receipt, n + 3), Ok(1));
+            }
+        }
+        assert_eq!(store.capacity().unwrap().pending_reservations, 1);
+    }
+    assert_eq!(store.capacity().unwrap().retained_reservations, 129);
+    assert_eq!(store.settle_native(&t.token_id, "request-1", NativeReceipt { billing_id: "request-1", ..native(1, 1, true, "late-proof") }, 200), Ok(1));
+    assert_eq!(store.settle_native(&t.token_id, "request-1", NativeReceipt { billing_id: "request-1", ..native(1, 1, true, "late-proof") }, 201), Ok(0));
+    assert_eq!(store.settle_proxy(&t.token_id, "request-0", "buyer", "request-0", 1, true, "proof", 201), Ok(0));
+    let mut projected = t.clone();
+    store.project(&mut projected, 201).unwrap();
+    assert_eq!(projected.spent_total_au, 86);
+    assert_eq!(store.reserve(&t, Lane::Proxy, "request-0", "buyer", "request-0", 100, 201), Err(Error::Conflict));
+    assert_eq!(store.pending(None, 64).unwrap().len(), 1);
+}
+
+#[test]
+fn key_budget_pending_capacity_is_atomic_across_native_and_proxy() {
+    let dir = private_dir();
+    let mut t = token();
+    t.budget_au = None;
+    let store = Arc::new(Authority::create(&dir.path().join("budget.redb"), Limits { max_tokens: 1, max_reservations: 1 }, std::slice::from_ref(&t)).unwrap());
+    let barrier = Arc::new(Barrier::new(3));
+    let workers: Vec<_> = [Lane::Native, Lane::Proxy].into_iter().enumerate().map(|(n, lane)| {
+        let store = store.clone(); let barrier = barrier.clone(); let t = t.clone();
+        std::thread::spawn(move || { barrier.wait(); store.reserve(&t, lane, &format!("concurrent-{n}"), "buyer", "terms", 1, 2) })
+    }).collect();
+    barrier.wait();
+    let results: Vec<_> = workers.into_iter().map(|w| w.join().unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|r| **r == Err(Error::ReservationsFull)).count(), 1);
+    assert_eq!(store.capacity().unwrap().pending_reservations, 1);
 }
 
 #[test]

@@ -1,6 +1,7 @@
 //! Local API-key budget authority. This is not canonical money or execution
-//! authority. Closed rows are retained deduplication fences; capacity exhaustion
-//! stops new admissions, never settlement/recovery. No request-history scans.
+//! authority. Retained rows are deduplication fences, not occupied admission
+//! slots. Only unresolved reservations count toward admission capacity. Neither
+//! settlement nor recovery consumes a slot. No request-history scans.
 use super::{GatewayTokenBudgetPeriod as Period, GatewayTokenRecord, MoneyAu};
 use redb::{ReadableDatabase, ReadableTable, ReadableTableMetadata, TableDefinition};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,8 @@ const RECORD_BYTES: usize = 8192;
 #[derive(Clone, Copy, Debug)]
 pub struct Limits {
     pub max_tokens: u64,
+    /// Maximum unresolved reservations, shared by native and proxy requests.
+    /// Closed/released replay fences are retained separately from this limit.
     pub max_reservations: u64,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +34,13 @@ pub(super) enum Error {
     Conflict,
     Cap,
     Full,
+    ReservationsFull,
+}
+#[derive(Debug, Serialize)]
+pub(super) struct Capacity {
+    pending_reservations: u64,
+    max_pending_reservations: u64,
+    retained_reservations: u64,
 }
 pub(super) type Result<T> = std::result::Result<T, Error>;
 fn db<T>(v: std::result::Result<T, impl std::fmt::Debug>) -> Result<T> {
@@ -352,7 +362,11 @@ impl Authority {
                     Error::Conflict,
                 );
             }
-            require(db(rows.len())? < self.limits.max_reservations, Error::Full)?;
+            let mut pending = db(tx.open_table(PENDING))?;
+            require(
+                db(pending.len())? < self.limits.max_reservations,
+                Error::ReservationsFull,
+            )?;
             let mut accounts = db(tx.open_table(ACCOUNTS))?;
             let existing = db(accounts.get(t.token_id.as_str()))?
                 .map(|v| decode::<Account>(v.value()))
@@ -383,9 +397,7 @@ impl Authority {
             };
             db(accounts.insert(t.token_id.as_str(), encode(&a)?.as_slice()))?;
             db(rows.insert(k.as_str(), encode(&r)?.as_slice()))?;
-            db(tx.open_table(PENDING))?
-                .insert(k.as_str(), 1)
-                .map_err(|_| Error::Unavailable)?;
+            db(pending.insert(k.as_str(), 1))?;
             Ok(())
         })
     }
@@ -591,7 +603,8 @@ impl Authority {
                 db(accounts.insert(token_id, encode(&a)?.as_slice()))?;
                 r
             } else {
-                require(db(rows.len())? < self.limits.max_reservations, Error::Full)?;
+                // This verified fence creates no financial exposure and must
+                // remain writable even when new reservations are at capacity.
                 Reservation {
                     token_id: token_id.into(),
                     lane: Lane::Proxy,
@@ -616,6 +629,16 @@ impl Authority {
                 .remove(k.as_str())
                 .map_err(|_| Error::Unavailable)?;
             Ok(())
+        })
+    }
+    /// Table metadata only: do not enumerate request/receipt history for status.
+    pub(super) fn capacity(&self) -> Result<Capacity> {
+        require(!self.failed.load(Ordering::Acquire), Error::Unavailable)?;
+        let tx = db(self.database.begin_read())?;
+        Ok(Capacity {
+            pending_reservations: db(db(tx.open_table(PENDING))?.len())?,
+            max_pending_reservations: self.limits.max_reservations,
+            retained_reservations: db(db(tx.open_table(RESERVATIONS))?.len())?,
         })
     }
     // Native owners retain their established explicit/Drop release behavior.
