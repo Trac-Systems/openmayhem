@@ -186,6 +186,48 @@ async fn canonical_closure_is_recovery_evidence_not_a_new_dispatch_permission() 
     assert!(state.initial_binding().is_err());
     f.stop().await;
 }
+
+#[tokio::test]
+async fn canonical_observation_retries_only_transport_failures_with_bounded_attempts() {
+    let mut f = Fixture::new("tnk", "llm").await;
+    f.command("financial_unavailable_once").await;
+    let before = f.request("status").await["calls"].as_u64().unwrap();
+    assert!(f
+        .client
+        .observe(&f.auth)
+        .await
+        .unwrap()
+        .initial_binding()
+        .is_ok());
+    assert_eq!(
+        f.request("status").await["calls"].as_u64().unwrap() - before,
+        2
+    );
+    f.command("financial_unavailable").await;
+    let before = f.request("status").await["calls"].as_u64().unwrap();
+    assert!(f.client.observe(&f.auth).await.is_err());
+    assert_eq!(
+        f.request("status").await["calls"].as_u64().unwrap() - before,
+        3
+    );
+    f.command("financial_available").await;
+    // A malformed successful response reaches the Rust verifier. A bad nonce
+    // is rejected earlier by the peer and intentionally surfaces as HTTP 500.
+    f.command("signature").await;
+    let before = f.request("status").await["calls"].as_u64().unwrap();
+    assert!(f.client.observe(&f.auth).await.is_err());
+    assert_eq!(
+        f.request("status").await["calls"].as_u64().unwrap() - before,
+        1,
+        "invalid signed observations must not be retried as transport failures"
+    );
+    assert_eq!(
+        f.request("status").await["publications"],
+        0,
+        "reads never publish"
+    );
+    f.stop().await;
+}
 #[tokio::test]
 async fn altered_challenge_network_authorization_and_reservation_cannot_admit() {
     let mut f = Fixture::new("tap", "llm").await;

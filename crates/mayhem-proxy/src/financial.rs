@@ -302,11 +302,26 @@ impl std::fmt::Debug for Retained {
 impl Retained {
     pub(crate) fn capture(observation: &Observation) -> Result<Self> {
         observation.initial_binding()?;
-        Ok(Self {
+        Ok(Self::from_observation(observation))
+    }
+    /// Closure evidence only: expiry prohibits new execution, but must not
+    /// prevent returning a still-reserved, provably unspent balance.
+    pub(crate) fn capture_for_unsent_closure(observation: &Observation) -> Result<Self> {
+        require(
+            observation.started.elapsed() <= FRESHNESS
+                && !observation.has_receipt()
+                && !observation.is_closed(),
+            "canonical reservation is not open for nonexecution closure",
+        )?;
+        observation.reserved_binding()?;
+        Ok(Self::from_observation(observation))
+    }
+    fn from_observation(observation: &Observation) -> Self {
+        Self {
             accepted: observation.wire.accepted.clone(),
             context: observation.wire.context.clone(),
             proof: observation.wire.proof.clone(),
-        })
+        }
     }
     pub fn accepted(&self) -> &Accepted {
         &self.accepted
@@ -588,6 +603,33 @@ impl Client {
         Ok(())
     }
     pub async fn observe(&self, authorization: &ProxySpendAuthorization) -> Result<Observation> {
+        // Publication can be durably accepted just before the canonical read
+        // becomes available. Retry only this read, with a fresh challenge each
+        // time; never resubmit money or execute inference from an HTTP ACK.
+        let started = Instant::now();
+        for attempt in 0..3 {
+            let remaining = FRESHNESS
+                .checked_sub(started.elapsed())
+                .ok_or_else(|| invalid("canonical financial observation unavailable"))?;
+            let result = tokio::time::timeout(remaining, self.observe_once(authorization))
+                .await
+                .map_err(|_| invalid("canonical financial observation unavailable"))?;
+            let retry = match &result {
+                Err(Error::Http { status, .. }) => *status == 429 || (500..600).contains(status),
+                Err(Error::Transport(error)) => {
+                    error.is_timeout() || error.is_connect() || error.is_body()
+                }
+                _ => false,
+            };
+            if !retry || attempt == 2 {
+                return result;
+            }
+            tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
+        }
+        unreachable!()
+    }
+
+    async fn observe_once(&self, authorization: &ProxySpendAuthorization) -> Result<Observation> {
         let _permit = self
             .slots
             .try_acquire()
@@ -614,10 +656,12 @@ impl Client {
             .send()
             .await
             .map_err(Error::Transport)?;
-        require(
-            response.status().is_success(),
-            "canonical financial observation unavailable",
-        )?;
+        if !response.status().is_success() {
+            return Err(Error::Http {
+                status: response.status().as_u16(),
+                code: "canonical_financial_observation_unavailable".into(),
+            });
+        }
         require(
             response
                 .content_length()

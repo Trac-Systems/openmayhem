@@ -191,7 +191,11 @@ impl Session {
                 // Negotiation saves a Prepared attempt before the buyer can
                 // publish its hold. Only that exact durable countersignature
                 // can bridge into paid admission; no unsigned draft may do so.
-                saved.record.phase == crate::attempts::Phase::Prepared
+                // A cancellation before Execute retains no financial snapshot,
+                // but its exact journal fence must remain recoverable for a
+                // signed zero-charge closure. It cannot authorize dispatch.
+                (saved.record.phase == crate::attempts::Phase::Prepared
+                    || saved.record.unsent_cancellation_evidence().is_some())
                     && saved.acceptance.is_some()
                     && saved.request.is_some()
                     && executor

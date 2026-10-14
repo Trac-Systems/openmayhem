@@ -1073,6 +1073,8 @@ impl Shared {
         let mut streamed = false;
         let mut observed = None;
         let mut failed = false;
+        let mut cancelled_prepared = false;
+        let mut cancellation_accepted = false;
         // Control steps and provisional events have separate bounds; no history
         // is retained. Generation itself has no total timer.
         let mut controls = 0;
@@ -1177,11 +1179,26 @@ impl Shared {
                     failed = true;
                 }
                 Message::State {
-                    state:
-                        PublicState::Prepared
-                        | PublicState::Running
-                        | PublicState::OutcomeUnknown
-                        | PublicState::CancelRequested,
+                    state: PublicState::Prepared,
+                } if recovery && !cancelled_prepared => {
+                    // Recovery never sends Execute. An accepted purchase that
+                    // lost confirmation before dispatch would otherwise stay
+                    // Prepared forever. Fence it cancelled at the provider and
+                    // require its signed zero-charge waiver before releasing funds.
+                    cancelled_prepared = true;
+                    sender
+                        .send(&Message::Cancel)
+                        .await
+                        .map_err(|_| p.error(Code::Transport))?;
+                }
+                // Status may be followed by a retained result/receipt or a
+                // cancellation waiver. Do not abandon that proof after the state
+                // frame. The existing control deadline bounds this wait.
+                Message::State {
+                    state: PublicState::CancelRequested,
+                } if recovery => cancellation_accepted = true,
+                Message::State {
+                    state: PublicState::Running | PublicState::OutcomeUnknown,
                 } if recovery => {
                     let Message::State { state } = received.message() else {
                         unreachable!()
@@ -1269,7 +1286,7 @@ impl Shared {
                             value.clone(),
                             saved.request().to_vec(),
                             None,
-                            false,
+                            cancellation_accepted,
                             crate::supervisor::unix_ms(),
                         )
                         .await

@@ -4,6 +4,54 @@ use mayhem_bridge::ScBridgeClient;
 fn opener(context: &n::Context) -> Value {
     json!({"t":"p.negotiate.open","schema_version":1,"context":context})
 }
+
+#[tokio::test]
+async fn provider_opening_drains_closed_sessions_without_hiding_close_from_session_owner() {
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let peer = Peer::start(ProxyRail::Tnk, &f, &chat(), false, None).await;
+    let context = context(&peer);
+    let bridge = Bridge::start(context.buyer.as_str(), &context.offer.provider_pubkey).await;
+    let mut listener =
+        n::opening::Listener::connect(bridge.config(false), peer.identity.clone(), wire_limits())
+            .await
+            .unwrap();
+    let mut buyer = ScBridgeClient::connect(bridge.config(true)).await.unwrap();
+    let mut owner = ScBridgeClient::connect(bridge.config(false)).await.unwrap();
+    let closed = d(910);
+    owner.session_subscribe([closed.as_str()]).await.unwrap();
+    let send = async {
+        // More notifications than either the fixture's 16-event buffer or the
+        // production 64-event buffer. No active-session buffers are enlarged.
+        for i in 0..128 {
+            buyer
+                .session_close(&context.offer.provider_pubkey, d(910 + i).as_str())
+                .await
+                .unwrap();
+        }
+        buyer
+            .session_send(
+                &context.offer.provider_pubkey,
+                context.session_id.as_str(),
+                opener(&context),
+            )
+            .await
+            .unwrap();
+    };
+    let (_, incoming) = tokio::join!(send, listener.next(Duration::from_secs(5)));
+    assert_eq!(incoming.unwrap().context().session_id, context.session_id);
+    assert_eq!(listener.counts().unrelated, 128);
+    assert_eq!(listener.counts().accepted, 1);
+    let event = owner
+        .next_session_event(Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(event["type"], "session_closed");
+    assert_eq!(event["session_id"], closed.as_str());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    peer.stop().await;
+}
+
 #[tokio::test]
 async fn provider_opening_dispatcher_keeps_existing_sessions_responsive_at_global_quota() {
     use serving::dispatch::{Dispatcher, Health, Limits, Registration};

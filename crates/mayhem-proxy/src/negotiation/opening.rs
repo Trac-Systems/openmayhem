@@ -142,7 +142,10 @@ impl Listener {
                 .ok_or(Error::Interrupted)?;
             let event = self
                 .bridge
-                .next_session_frame(left)
+                // This listener owns openings, not established sessions. Drain
+                // their close notifications too: a frame-only read queues them
+                // forever and eventually exhausts the bounded bridge buffer.
+                .next_session_event(left)
                 .await
                 .map_err(Error::Transport)?;
             let tag = event

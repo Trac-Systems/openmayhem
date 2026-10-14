@@ -287,6 +287,7 @@ async fn buyer_controller_json_chat_and_decisions_settle_exact_original_terms_on
             let gate = Gate::allow();
             let request = make_request(&s, &f, &peer, &bytes, gate.clone());
             let id = request.identity();
+            peer.command("financial_unavailable_once").await;
             let (stop, rx) = watch::channel(false);
             let (result, provider_result) = tokio::join!(buyer.execute(request, rx), async {
                 provider
@@ -365,6 +366,114 @@ async fn buyer_controller_json_chat_and_decisions_settle_exact_original_terms_on
             assert_eq!(buyer.active_sessions(), 0);
             peer.stop().await;
         }
+    }
+}
+
+#[tokio::test]
+async fn buyer_controller_recovers_never_dispatched_purchase_with_verified_waiver_on_all_rails() {
+    for (rail, expired) in [
+        (ProxyRail::Fiat, false),
+        (ProxyRail::Tnk, false),
+        (ProxyRail::Tap, false),
+        (ProxyRail::Fiat, true),
+        (ProxyRail::Tnk, true),
+        (ProxyRail::Tap, true),
+    ] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let bytes = chat();
+        let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let mut peer = Peer::start(rail, &f, &bytes, false, None).await;
+        let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+        let (provider, _) = observed_server(&s, &f, &peer);
+        let ctx = context(&peer);
+        let bridge = Bridge::start(ctx.buyer.as_str(), &ctx.offer.provider_pubkey).await;
+        let (buyer, negotiation, _) = buyer_controller(&s, &f, &peer, &bridge, 1);
+        let mut listener = listener(&bridge, &peer).await;
+        let gate = Gate::allow();
+        let request = make_request(&s, &f, &peer, &bytes, gate.clone());
+        let id = request.identity();
+        let (stop, rx) = watch::channel(false);
+        let balance_before = peer.command("state").await["summary"]["reserved_au"].clone();
+        peer.command("financial_unavailable").await;
+        let (result, handle) = tokio::join!(buyer.execute(request, rx), async {
+            provider
+                .accept(listener.next(Duration::from_secs(5)).await.unwrap())
+                .unwrap()
+        });
+        let failure = error(result);
+        assert_eq!(failure.code, buyer::Code::Unconfirmed);
+        assert_eq!(failure.stage, buyer::Stage::Accepted);
+        assert!(failure.recovery_required);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        handle.wait().await.unwrap();
+        peer.command("financial_available").await;
+        if expired {
+            let saved = negotiation
+                .lookup(id.billing_id.clone(), id.billing_attempt)
+                .await
+                .unwrap()
+                .unwrap();
+            peer.command(
+                &json!({"epoch": saved.offer().terms.reservation_expires_after_epoch}).to_string(),
+            )
+            .await;
+        }
+        let (result, provider_result) = tokio::join!(
+            buyer.recover(id.clone(), gate.clone(), stop.subscribe()),
+            async {
+                provider
+                    .accept(listener.next(Duration::from_secs(5)).await.unwrap())
+                    .unwrap()
+                    .wait()
+                    .await
+            }
+        );
+        assert!(
+            provider_result.is_ok(),
+            "provider: {provider_result:?}; buyer: {:?}",
+            result.as_ref().err()
+        );
+        assert_eq!(provider_result.unwrap(), serving::End::Settled);
+        let buyer::Outcome::Closed {
+            identity,
+            authorization,
+            settlement,
+        } = result.unwrap()
+        else {
+            panic!("verified cancellation required")
+        };
+        assert_eq!(identity, id);
+        assert_eq!(authorization.terms.rail, rail);
+        assert!(matches!(settlement, FinancialOutcome::Waived { .. }));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(gate.terms.lock().unwrap().len(), 1);
+        assert!(gate.outputs.lock().unwrap().is_empty());
+        assert!(negotiation
+            .lookup(id.billing_id.clone(), id.billing_attempt)
+            .await
+            .unwrap()
+            .unwrap()
+            .confirmed());
+        assert_eq!(
+            peer.command("status").await["publications"],
+            2,
+            "one reservation and one closure"
+        );
+        assert_eq!(
+            peer.command("state").await["summary"]["reserved_au"],
+            balance_before
+        );
+        assert!(matches!(
+            buyer.recover(id, gate, stop.subscribe()).await.unwrap(),
+            buyer::Outcome::Closed {
+                settlement: FinancialOutcome::Waived { .. },
+                ..
+            }
+        ));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(peer.command("status").await["publications"], 2);
+        buyer.shutdown().await.unwrap();
+        peer.stop().await;
     }
 }
 

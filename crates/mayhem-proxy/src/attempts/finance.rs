@@ -48,6 +48,27 @@ impl Journal {
         observation: &Observation,
     ) -> Result<()> {
         let value = Retained::capture(observation).map_err(|_| Error::Conflict)?;
+        self.retain_financial(invocation, attempt, value, false)
+    }
+    /// Recovery only, after the durable pre-dispatch cancellation fence. This
+    /// cannot create a Prepared attempt or grant permission for another POST.
+    pub(crate) fn retain_unsent_financial_acceptance(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+        observation: &Observation,
+    ) -> Result<()> {
+        let value =
+            Retained::capture_for_unsent_closure(observation).map_err(|_| Error::Conflict)?;
+        self.retain_financial(invocation, attempt, value, true)
+    }
+    fn retain_financial(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+        value: Retained,
+        closing_unsent: bool,
+    ) -> Result<()> {
         let tx = self.transaction()?;
         let record = current(&tx, invocation)?.ok_or(Error::NotFound)?;
         if record.attempt != attempt {
@@ -75,7 +96,11 @@ impl Journal {
             )?;
             return Ok(());
         }
-        require(record.phase == Phase::Prepared)?;
+        require(if closing_unsent {
+            record.unsent_cancellation_evidence().is_some()
+        } else {
+            record.phase == Phase::Prepared
+        })?;
         let bytes = serde_json::to_vec(&value).map_err(|_| Error::Invalid)?;
         require(bytes.len() <= MAX_BYTES)?;
         meta.payload_bytes = meta

@@ -174,6 +174,15 @@ impl Bridge {
                                     }
                                     if attack==Some("lost_ack"){break}
                                 }
+                                if kind=="session_close" {
+                                    // The real bridge broadcasts closes separately from the
+                                    // caller's correlated reply, including to wildcard listeners.
+                                    let targets=peers.lock().await.values().filter(|client|client.own==request["remote"].as_str().unwrap()
+                                        && (client.all || client.sessions.contains(request["session_id"].as_str().unwrap())))
+                                        .map(|client|client.tx.clone()).collect::<Vec<_>>();
+                                    let event=json!({"type":"session_closed","remote":own,"session_id":request["session_id"]});
+                                    for target in targets {let _=target.send(event.clone()).await;}
+                                }
                                 if kind=="send" {let mut frames=capture.lock().await;if frames.len()<256 {frames.push(request.clone());}}
                                 let typ=match kind {"session_subscribe"=>"session_subscribed","session_open"=>"session_opened",
                                     "session_send"=>"session_sent","session_close"=>"session_closed","join"=>"joined","send"=>"sent","subscribe"=>"subscribed","clear_filter"=>"filter_set",_=>panic!("unexpected test command")};

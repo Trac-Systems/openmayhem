@@ -236,6 +236,30 @@ impl PaidExecutor {
     ) -> Result<attempts::WaiverDraft> {
         self.resolve_saved_non_execution(invocation, attempt)
             .await?;
+        let saved = self.recovery_header(invocation, attempt).await?;
+        if saved.financial.is_none() && saved.record.unsent_cancellation_evidence().is_some() {
+            // Acceptance may have been published while its confirmation was
+            // unavailable, so Execute never retained the provider's snapshot.
+            // Observe the exact original reservation only after cancellation;
+            // expired execution permission does not prevent a signed refund.
+            let key = invocation.clone();
+            let accepted = self
+                .executor
+                .storage
+                .run(move |j| j.provider_acceptance(&key, attempt))
+                .await?
+                .ok_or(Error::Binding)?;
+            let observation = self
+                .financial
+                .observe(&accepted.authorization)
+                .await
+                .map_err(Error::Financial)?;
+            let key = invocation.clone();
+            self.executor
+                .storage
+                .run(move |j| j.retain_unsent_financial_acceptance(&key, attempt, &observation))
+                .await?;
+        }
         let key = invocation.clone();
         self.executor
             .storage

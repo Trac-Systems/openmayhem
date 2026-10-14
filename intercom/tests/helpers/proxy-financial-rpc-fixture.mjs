@@ -48,7 +48,7 @@ const buyerLocal={...peer,wallet:wallet(f.buyer)};
 const buyerParticipant=new MayhemFeature(buyerLocal,{});buyerParticipant.key='mayhem';
 buyerParticipant._adminKey=async()=>f.admin.publicKey;
 participant._adminKey=async()=>f.admin.publicKey;
-let mutation=null,calls=0,operatorCalls=0,operatorUnavailable=false;
+let mutation=null,calls=0,operatorCalls=0,operatorUnavailable=false,financialUnavailable=0;
 let submissions=0,publications=0,pending=null,publicationMode=null,publicationTail=Promise.resolve();
 // Test transport uses the actual RPC, receipt validator/accounting planner and
 // canonical signed-view service. The remote relay/indexer transport is simulated;
@@ -73,6 +73,10 @@ participant.relay=buyerParticipant.relay=(key,value)=>{
 };
 function requestsFor(actor) { return async(service,request)=>{
   calls++;
+  if(service==='proxy_financial_state' && financialUnavailable>0) {
+    financialUnavailable--;
+    throw new Error('fixture canonical financial state temporarily unavailable');
+  }
   if(service===PROXY_OPERATOR_STATE_SERVICE) {
     operatorCalls++;
     if(operatorUnavailable)throw new Error('fixture canonical operator service unavailable');
@@ -170,6 +174,9 @@ try {
       console.log(JSON.stringify({provider:Array.from(f.provider.wallet.secretKey.subarray(0,32)),
         buyer:Array.from(f.buyer.wallet.secretKey.subarray(0,32))}));continue;
     }
+    else if(command==='financial_unavailable_once')financialUnavailable=1;
+    else if(command==='financial_unavailable')financialUnavailable=1000;
+    else if(command==='financial_available')financialUnavailable=0;
     else if(command==='status'){}
     else if(command==='state') {console.log(JSON.stringify({summary:await f.read(f.summaryKey),balance:await f.read(f.balanceKey),billing:await f.read(f.ledger.receiptBillingKey(f.terms.billing_id))}));continue;}
     else if(command==='publish_pending')publicationMode='pending';

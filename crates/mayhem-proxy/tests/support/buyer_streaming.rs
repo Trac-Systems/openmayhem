@@ -55,6 +55,7 @@ async fn buyer_streaming_all_three_endpoints_and_rails_verify_original_output_be
             let mut listener = listener(&bridge, &peer).await;
             let gate = Gate::allow();
             let request = make_request(&s, &f, &peer, &bytes, gate.clone());
+            peer.command("financial_unavailable_once").await;
             let (send, mut receive) = channel();
             let (_stop, rx) = watch::channel(false);
             let (result, provider_result, events) = tokio::join!(
