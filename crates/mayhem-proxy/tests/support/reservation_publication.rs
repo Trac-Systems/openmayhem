@@ -13,7 +13,7 @@ async fn buyer_reservation_retries_http_200_accounting_backpressure_without_dupl
                 .await
                 .unwrap();
             f.command("publish_busy_three").await;
-            let o = r.publish_reservation(id.clone(), 8).await.unwrap();
+            let o = r.publish_reservation_wait(id.clone(), 8).await.unwrap();
             assert_eq!(o.initial_binding().unwrap().accepted_terms, id);
             let status = f.request("status").await;
             assert_eq!(status["submissions"], 4);
@@ -24,7 +24,7 @@ async fn buyer_reservation_retries_http_200_accounting_backpressure_without_dupl
                 after["summary"]["reserved_au"],
                 (50 + f.auth.terms.max_spend_au).to_string()
             );
-            r.publish_reservation(id, 9).await.unwrap();
+            r.publish_reservation_wait(id, 9).await.unwrap();
             assert_eq!(f.request("status").await["submissions"], 4);
             f.stop().await;
         }
@@ -41,7 +41,7 @@ async fn buyer_reservation_waits_for_pending_canonical_admission_not_just_http_a
         .await
         .unwrap();
     f.command("publish_pending_delayed").await;
-    let (admitted, ()) = tokio::join!(r.publish_reservation(id.clone(), 8), async {
+    let (admitted, ()) = tokio::join!(r.publish_reservation_wait(id.clone(), 8), async {
         tokio::time::sleep(Duration::from_millis(500)).await;
         assert_eq!(f.request("status").await["publications"], 0);
         assert!(
@@ -79,7 +79,7 @@ async fn buyer_reservation_backpressure_is_bounded_and_permanent_rejection_is_no
             .unwrap();
         f.command(mode).await;
         let started = std::time::Instant::now();
-        assert!(r.publish_reservation(id.clone(), 8).await.is_err());
+        assert!(r.publish_reservation_wait(id.clone(), 8).await.is_err());
         assert!(started.elapsed() < Duration::from_secs(27));
         let status = f.request("status").await;
         assert_eq!(status["submissions"], submissions);

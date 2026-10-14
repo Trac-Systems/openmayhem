@@ -167,6 +167,21 @@ impl BuyerRecovery {
     /// journal, then require a fresh signed canonical observation. Pending/lost
     /// publication remains recoverable; callers must not start a replacement hold.
     pub async fn publish_reservation(&self, key: Digest, at_ms: u64) -> Result<Observation> {
+        self.publish_reservation_inner(key, at_ms, false).await
+    }
+
+    /// Foreground negotiation can wait for its newly published reservation.
+    /// Background recovery already has a paced schedule and keeps ordinary reads.
+    pub async fn publish_reservation_wait(&self, key: Digest, at_ms: u64) -> Result<Observation> {
+        self.publish_reservation_inner(key, at_ms, true).await
+    }
+
+    async fn publish_reservation_inner(
+        &self,
+        key: Digest,
+        at_ms: u64,
+        wait: bool,
+    ) -> Result<Observation> {
         let r = self.run(move |s| s.get(key.as_str())).await?;
         require(
             !r.expired_unadmitted(),
@@ -181,7 +196,7 @@ impl BuyerRecovery {
             }
             None => Ok(()), // Already observed, or a pre-existing recovery record.
         };
-        let observation = if unpublished.is_some() {
+        let observation = if wait && unpublished.is_some() {
             self.client.observe_published(&r.authorization).await
         } else {
             // Confirmed/legacy recovery is an ordinary read, not initial

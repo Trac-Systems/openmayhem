@@ -826,7 +826,7 @@ impl BuyerNegotiation {
                 let k = recovery
                     .retain_reservation(auth, saved.policy().clone(), saved.record.at_ms)
                     .await?;
-                recovery.publish_reservation(k, at_ms).await?
+                recovery.publish_reservation_wait(k, at_ms).await?
             };
         self.run(move |s| s.observe(observed, at_ms)).await
     }
