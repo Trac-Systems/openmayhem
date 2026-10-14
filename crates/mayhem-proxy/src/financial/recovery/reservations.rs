@@ -172,7 +172,8 @@ impl BuyerRecovery {
             !r.expired_unadmitted(),
             "reservation intention expired without admission",
         )?;
-        let submission = match r.reservation.as_ref().filter(|v| v.proof.is_none()) {
+        let unpublished = r.reservation.as_ref().filter(|v| v.proof.is_none());
+        let submission = match unpublished {
             Some(intent) => {
                 self.client
                     .submit_reservation(&r.authorization, intent.at)
@@ -180,7 +181,14 @@ impl BuyerRecovery {
             }
             None => Ok(()), // Already observed, or a pre-existing recovery record.
         };
-        let observed = match self.client.observe_published(&r.authorization).await {
+        let observation = if unpublished.is_some() {
+            self.client.observe_published(&r.authorization).await
+        } else {
+            // Confirmed/legacy recovery is an ordinary read, not initial
+            // admission. Do not extend recovery scans or their shutdown delay.
+            self.client.observe(&r.authorization).await
+        };
+        let observed = match observation {
             Ok(value) => value,
             Err(error) => {
                 // A missing observation alone proves nothing. Only a fresh
