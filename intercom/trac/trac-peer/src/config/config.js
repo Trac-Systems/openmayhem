@@ -1,5 +1,6 @@
 import b4a from "b4a";
 import path from "path";
+import { TX_CONTENT_HASH } from "../utils/types.js";
 
 const DEFAULT_HYPERBEE_CACHE_MAX_ENTRIES = 65_536;
 const DEFAULT_MAX_MSB_SIGNED_LENGTH_FUTURE_DELTA = 1_000_000;
@@ -128,6 +129,12 @@ export class Config {
             throw new Error("Peer: apiMsgExposed must be set.");
         }
         this.apiMsgExposed = apiMsgExposedRaw === true;
+
+        const txContentHashRaw = this.#select("txContentHash", options, defaults) ?? TX_CONTENT_HASH.UTF8;
+        if (!Object.values(TX_CONTENT_HASH).includes(txContentHashRaw)) {
+            throw new Error(`Peer: txContentHash must be one of ${Object.values(TX_CONTENT_HASH).join(", ")}.`);
+        }
+        this.txContentHash = txContentHashRaw;
 
         const bootstrapRaw = this.#select("bootstrap", options, defaults);
         if (bootstrapRaw === undefined) {

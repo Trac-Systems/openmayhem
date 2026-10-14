@@ -1,4 +1,4 @@
-import { formatNumberString, resolveNumberString, jsonStringify, jsonParse, safeClone, createHash } from "../utils/types.js";
+import { formatNumberString, resolveNumberString, jsonStringify, jsonParse, safeClone, createTxContentHash, acceptedTxContentHashes } from "../utils/types.js";
 import {ProtocolApi} from '../api.js';
 import Wallet from 'trac-wallet';
 import b4a from 'b4a';
@@ -165,9 +165,29 @@ class Protocol{
         return b4a.toString(tx, 'hex');
     }
 
+    /**
+     * Content hash for a transaction. Own transactions use the configured digest. A surrogate carries the hash
+     * its signer used: taken from surrogate.ch when present, otherwise matched against surrogate.tx among the
+     * accepted digests (UTF-8, and legacy unless txContentHash is 'utf8-strict').
+     */
+    async resolveTxContentHash(obj, surrogate = null){
+        const json = this.safeJsonStringify(obj);
+        if(surrogate === null) return await createTxContentHash(json, this.peer.config.txContentHash);
+        if(typeof surrogate.ch === 'string') return surrogate.ch;
+        const candidates = await acceptedTxContentHashes(json, this.peer.config.txContentHash);
+        const txvHex = await this.peer.msbClient.getTxvHex();
+        const subnetBootstrapHex = (b4a.isBuffer(this.peer.config.bootstrap) ? this.peer.config.bootstrap.toString('hex') : (''+this.peer.config.bootstrap)).toLowerCase();
+        for(const candidate of candidates){
+            const tx = await this.generateTx(this.peer.msbClient.networkId, txvHex, this.peer.writerLocalKey,
+                candidate, subnetBootstrapHex, this.peer.msbClient.bootstrapHex, surrogate.nonce);
+            if(tx === surrogate.tx) return candidate;
+        }
+        return candidates[0];
+    }
+
     async simulateTransaction(validator_pub_key, obj, surrogate = null){
         const storage = new SimStorage(this.peer);
-        const content_hash = await createHash(this.safeJsonStringify(obj));
+        const content_hash = await this.resolveTxContentHash(obj, surrogate);
         const txvHex = await this.peer.msbClient.getTxvHex();
         const msbBootstrapHex = this.peer.msbClient.bootstrapHex;
         const subnetBootstrapHex = (b4a.isBuffer(this.peer.config.bootstrap) ? this.peer.config.bootstrap.toString('hex') : (''+this.peer.config.bootstrap)).toLowerCase();
@@ -241,7 +261,7 @@ class Protocol{
         let msbBootstrapHex = this.peer.msbClient.bootstrapHex;
         let subnetBootstrapHex = (b4a.isBuffer(this.peer.config.bootstrap) ? this.peer.config.bootstrap.toString('hex') : (''+this.peer.config.bootstrap)).toLowerCase();
         let incomingWritingKeyHex = this.peer.writerLocalKey;
-        let content_hash = await createHash(this.safeJsonStringify(obj));
+        let content_hash = await this.resolveTxContentHash(obj, surrogate);
 
         let nonceHex, txHex, signatureHex, pubKeyHex;
         if(surrogate !== null) {

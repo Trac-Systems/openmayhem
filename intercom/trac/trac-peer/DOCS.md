@@ -466,7 +466,8 @@ Where does step (1) happen?
 
 Client tx flow specifics:
 - The client fetches MSB tx context from `GET /v1/contract/tx/context`.
-- The client computes `command_hash = blake3(JSON.stringify(prepared_command))`, then computes `tx` from the MSB preimage fields + `nonce`.
+- The client computes `command_hash = blake3(utf8Bytes(JSON.stringify(prepared_command)))`, then computes `tx` from the MSB preimage fields + `nonce`. Hash the UTF-8 bytes of the JSON string, not the JS string itself.
+- Peers accept that digest and, for transactions from clients before 0.4.10, the previous digest of the string (`txContentHash` peer option: `utf8` default, `legacy` to keep producing the previous digest while a network upgrades, `utf8-strict` to accept UTF-8 digests only).
 - The wallet signs `tx`.
 - The client submits the signed payload to `POST /v1/contract/tx` with `sim: true` to simulate (recommended), then `sim: false` to broadcast.
 

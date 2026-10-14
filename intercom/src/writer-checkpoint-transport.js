@@ -1,7 +1,7 @@
 import b4a from 'b4a';
 import { safeDecodeApplyOperation } from 'trac-msb/src/utils/protobuf/operationHelpers.js';
 import nodeEntryUtils from 'trac-msb/src/core/state/utils/nodeEntry.js';
-import { createHash } from 'trac-peer/src/utils/types.js';
+import { isAcceptedTxContentHash } from 'trac-peer/src/utils/types.js';
 import { adminContractTxDigest, CONTRACT_VERSION } from '../contract/contract.js';
 import { getStateValue } from './rpc.js';
 
@@ -102,10 +102,11 @@ export class WriterCheckpointTransport {
         dispatch.value.slot < 1 || !/^[0-9a-f]{64}$/.test(dispatch.value.snapshot_hash ?? '')) {
       throw new Error('Persisted paid checkpoint has an invalid command or network identity.');
     }
-    const contentHash = await createHash(this.peer.protocol.instance.safeJsonStringify(dispatch));
+    const contentHashAccepted = await isAcceptedTxContentHash(
+      this.peer.protocol.instance.safeJsonStringify(dispatch), s.ch, this.peer.config.txContentHash);
     const expectedTx = await this.peer.protocol.instance.generateTx(prepared.network_id,
-      s.txv, s.iw, contentHash, s.bs, s.mbs, s.nonce);
-    if (s.ch !== contentHash || s.tx !== expectedTx ||
+      s.txv, s.iw, s.ch, s.bs, s.mbs, s.nonce);
+    if (!contentHashAccepted || s.tx !== expectedTx ||
         !this.peer.wallet.verify(s.signature, b4a.from(s.tx, 'hex'), s.address)) {
       throw new Error('Persisted paid checkpoint bytes or signature changed.');
     }

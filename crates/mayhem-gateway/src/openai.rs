@@ -40429,8 +40429,9 @@ fn gateway_contract_tx_digest(
         .ok_or_else(|| "contract tx context omitted msb".to_owned())?;
     let network_id = gateway_contract_u32_field(msb.get("networkId"), "msb.networkId")?;
     let operation_type = gateway_contract_u32_field(msb.get("operationType"), "msb.operationType")?;
-    let command_hash =
-        gateway_peer_string_blake3_compat(&stable_json_value(prepared_command).to_string());
+    let command_hash = blake3::hash(stable_json_value(prepared_command).to_string().as_bytes())
+        .to_hex()
+        .to_string();
     let mut message = Vec::with_capacity(4 + (6 * 32) + 4);
     message.extend_from_slice(&network_id.to_be_bytes());
     message.extend_from_slice(&gateway_contract_hex32(msb.get("txv"), "msb.txv")?);
@@ -40447,22 +40448,6 @@ fn gateway_contract_tx_digest(
     )?);
     message.extend_from_slice(&operation_type.to_be_bytes());
     Ok(blake3::hash(&message).to_hex().to_string())
-}
-
-fn gateway_peer_string_blake3_compat(value: &str) -> String {
-    // trac-peer's historical @tracsystems/blake3 wrapper is called with a JS
-    // string for contract command hashes. TypedArray#set coerces each string
-    // character separately, so digits become 0..9 and all JSON punctuation /
-    // letters become 0. Match that wire behavior here; raw byte BLAKE3 would
-    // produce a different tx id.
-    let projected = value
-        .encode_utf16()
-        .map(|unit| match unit {
-            0x30..=0x39 => (unit - 0x30) as u8,
-            _ => 0,
-        })
-        .collect::<Vec<_>>();
-    blake3::hash(&projected).to_hex().to_string()
 }
 
 fn gateway_contract_tx_retryable_error(message: &str) -> bool {
@@ -56245,8 +56230,8 @@ mod tests {
     }
 
     #[test]
-    fn gateway_contract_tx_digest_matches_peer_create_message_vector() {
-        let prepared_command = stable_json_value(&json!({
+    fn gateway_contract_tx_digest_matches_peer_utf8_create_message_vectors() {
+        let mut prepared_command = stable_json_value(&json!({
             "type": "probeResult",
             "value": {
                 "at": 7,
@@ -56266,12 +56251,21 @@ mod tests {
             },
         });
         assert_eq!(
-            gateway_peer_string_blake3_compat(&prepared_command.to_string()),
-            "43f47a87993e605041034edc2cc82fbff5e4eca1bf8654a9a857d3f214509a61"
+            blake3::hash(prepared_command.to_string().as_bytes())
+                .to_hex()
+                .as_str(),
+            "937b6f4635f87d8c8d0db8e2653688c0932964220196084b32c92c40ffc5278a"
         );
         assert_eq!(
             gateway_contract_tx_digest(&prepared_command, &"01".repeat(32), &context).unwrap(),
-            "d0418782738f7c76472480d7ceb0c1ae8161ef201265abc8f9b3b764fe8aeaab"
+            "db81cc256f7153a9b14187b0ae35e936743c07e11d2e1580db8270bf5154da16"
+        );
+        // Keep the cross-runtime vector sensitive to both UTF-8 encoding and
+        // canonical field order: model_id is inserted after the other fields.
+        prepared_command["value"]["model_id"] = json!("modèle/東京🚀");
+        assert_eq!(
+            gateway_contract_tx_digest(&prepared_command, &"01".repeat(32), &context).unwrap(),
+            "250e710df35ab8988030e6a6c09303520e0dd254370d78538203e09713e67cea"
         );
     }
 

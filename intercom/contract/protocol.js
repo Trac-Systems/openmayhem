@@ -1,7 +1,7 @@
 import { proxyPublicationParticipant } from './proxy-publication.js';
 import { Protocol } from 'trac-peer';
 import b4a from 'b4a';
-import { createHash } from 'trac-peer/src/utils/types.js';
+import { createTxContentHash } from 'trac-peer/src/utils/types.js';
 import MayhemContract, { CONTRACT_VERSION } from './contract.js';
 import { assertProxyPublicationNotPaid } from './proxy-protocol.js';
 
@@ -147,7 +147,7 @@ class MayhemProtocol extends Protocol {
     const surrogate = {
       nonce: this.generateNonce(), address: hex(peer.wallet.publicKey),
       txv: await peer.msbClient.getTxvHex(), iw: hex(peer.writerLocalKey),
-      ch: await createHash(this.safeJsonStringify(dispatch)),
+      ch: await createTxContentHash(this.safeJsonStringify(dispatch), peer.config.txContentHash),
       bs: hex(peer.config.bootstrap), mbs: peer.msbClient.bootstrapHex,
     };
     surrogate.tx = await this.generateTx(peer.msbClient.networkId, surrogate.txv,

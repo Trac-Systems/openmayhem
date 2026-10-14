@@ -15,6 +15,7 @@ import { readProxyFinancialState, validateProxyFinancialStateRequest, PROXY_FINA
   PROXY_FINANCIAL_STATE_MAX_BYTES, PROXY_FINANCIAL_STATE_MAX_AGE_MS } from './proxy-financial-state.js';
 import { validateProxyPublication, proxyPublicationFeatureKey, proxyPublicationParticipant } from '../../contract/proxy-publication.js';
 import Feature from 'trac-peer/src/artifacts/feature.js';
+import { createTxContentHash } from 'trac-peer/src/utils/types.js';
 import crypto from 'crypto';
 import b4a from 'b4a';
 import { blake3 } from '@tracsystems/blake3';
@@ -502,16 +503,15 @@ class MayhemFeature extends Feature {
           const versionedCommand = typeof this.peer?.protocol?.instance?.versionedTransactionObject === 'function'
             ? this.peer.protocol.instance.versionedTransactionObject(value.prepared_command)
             : value.prepared_command;
-          const commandHash = b4a.toString(
-            await blake3(safeJsonStringify(versionedCommand)),
-            'hex'
-          );
+          const commandHash = await createTxContentHash(
+            safeJsonStringify(versionedCommand), this.peer.config.txContentHash);
           const simNonce = crypto.randomBytes(32).toString('hex');
           const simContext = typeof txApi.generateTxContext === 'function'
             ? await txApi.generateTxContext(commandHash, simNonce)
             : {
                 tx: await txApi.generateTx(value.address, commandHash, simNonce),
                 nonce: simNonce,
+                ch: commandHash,
               };
           const simSignature = this.peer.wallet.sign(b4a.from(simContext.tx, 'hex'));
           const result = await this.peer.protocol.instance.simulateTransaction(

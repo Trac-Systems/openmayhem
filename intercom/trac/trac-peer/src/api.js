@@ -1,5 +1,5 @@
 import b4a from "b4a";
-import { jsonStringify, createHash } from "./utils/types.js";
+import { jsonStringify, acceptedTxContentHashes } from "./utils/types.js";
 
 export class ProtocolApi {
 
@@ -215,7 +215,7 @@ export class ProtocolApi {
      *
      * let address = your_ed25519_wallet.getAccountAddress()
      * let nonce = api.generateNonce()
-     * let tx_hash = api.generateTx(address, a_blake3_function(JSON.stringify(api.prepareTxCommand(command))), nonce)
+     * let tx_hash = api.generateTx(address, blake3_hex(utf8_bytes(JSON.stringify(api.prepareTxCommand(command)))), nonce)
      * let signature = your_ed25519_wallet.sign(tx + nonce)
      * // simulating
      * let sim_result = api.tx(tx_hash, api.prepareTxCommand(command), address, signature, nonce, true)
@@ -246,9 +246,14 @@ export class ProtocolApi {
         if(b4a.toString(b4a.from(nonce, 'hex'), 'hex') !== nonce) throw new Error('Invalid nonce.');
         const verified = this.peer.wallet.verify(signature, b4a.from(tx, 'hex'), address);
         if(false === verified) throw new Error('Invalid signature.');
-        const content_hash = await createHash(this.peer.protocol.instance.safeJsonStringify(prepared_command));
-        const txContext = await this.generateTxContext(content_hash, nonce);
-        if(tx !== txContext.tx) throw new Error('Invalid TX.');
+        const contentHashes = await acceptedTxContentHashes(
+            this.peer.protocol.instance.safeJsonStringify(prepared_command), this.peer.config.txContentHash);
+        let txContext = null;
+        for (const contentHash of contentHashes) {
+            const candidate = await this.generateTxContext(contentHash, nonce);
+            if (tx === candidate.tx) { txContext = candidate; break; }
+        }
+        if (txContext === null) throw new Error('Invalid TX.');
         const surrogate = { ...txContext, signature : ''+signature, address : ''+address };
         const res = await this.peer.protocol.instance.broadcastTransaction(
             {

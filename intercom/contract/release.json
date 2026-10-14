@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "release_version": "0.2.275",
+  "release_version": "0.2.276",
   "contract_version": 30,
-  "contract_code_sha256": "a53d00a96534e0f0a637dc697a2ac2ab6c6a9911db8bb66db1b66162f69a43d6",
+  "contract_code_sha256": "fe2fbb2471b4e14e041265ad31c593148608064528570e9724ae84746318ad4b",
   "files": [
     {
       "path": "contract/contract.js",
@@ -38,7 +38,7 @@
     },
     {
       "path": "contract/protocol.js",
-      "sha256": "734bbbd9eb0dd315f49322f557546bb42158698494cb48e5c2599c880f13b9d8"
+      "sha256": "2cb27f01fdd1a7345f7d7923410710d757ee6e566bcf70c3491be2777cb2885a"
     },
     {
       "path": "contract/proxy-closure.js",
@@ -86,7 +86,7 @@
     },
     {
       "path": "features/mayhem/index.js",
-      "sha256": "62a07c9eee17c755d6447a454ec558cbdad7c7910793c0c34b4b87f99747c804"
+      "sha256": "1337e89dbaa11ccd04820cf774d7e168eb27c2ca698f3979c0617765f9217e4a"
     },
     {
       "path": "features/mayhem/proxy-admission.js",
@@ -134,7 +134,7 @@
     },
     {
       "path": "trac/trac-peer/src/operations/tx/index.js",
-      "sha256": "13828ee3a6edb24c089e855d8aa68287be9e64ce2305c290bc4f85098ebee62e"
+      "sha256": "22c5a6e8a7118ca104d4a80b4c5209cdce4c40dd69bafa604b4a040dcc58ac11"
     }
   ]
 }

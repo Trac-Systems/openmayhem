@@ -2,7 +2,7 @@ import { canonicalReplayContext } from '../../base/canonical-replay.js';
 import { BaseCheck } from '../../base/check.js';
 import b4a from 'b4a';
 import { safeDecodeApplyOperation } from 'trac-msb/src/utils/protobuf/operationHelpers.js';
-import { jsonStringify, safeClone, createHash } from '../../utils/types.js';
+import { jsonStringify, safeClone, acceptedTxContentHashes } from '../../utils/types.js';
 
 export class TxOperation {
     #validator
@@ -70,8 +70,9 @@ export class TxOperation {
                 : [op.value.dispatch];
         let contentHashMatches = false;
         for (const dispatchCandidate of dispatchCandidates) {
-            const contentHash = await createHash(this.#protocolInstance.safeJsonStringify(dispatchCandidate));
-            if (expectedContentHash === contentHash) {
+            const contentHashes = await acceptedTxContentHashes(
+                this.#protocolInstance.safeJsonStringify(dispatchCandidate), this.#config.txContentHash);
+            if (expectedContentHash !== null && contentHashes.includes(expectedContentHash)) {
                 contentHashMatches = true;
                 break;
             }

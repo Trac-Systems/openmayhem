@@ -183,7 +183,7 @@ The response contains an `msb` object with the fields the client needs to build 
 - `operationType` (currently `12`)
 
 From there, the client computes locally:
-- `command_hash = blake3(JSON.stringify(prepared_command))` (hex32)
+- `command_hash = blake3(utf8Bytes(JSON.stringify(prepared_command)))` (hex32; hash the UTF-8 bytes, not the JS string)
 - `tx = blake3(createMessage(networkId, txv, iw, command_hash, bs, mbs, nonce, operationType))` (hex32)
 
 ### Step D — Sign locally with the wallet

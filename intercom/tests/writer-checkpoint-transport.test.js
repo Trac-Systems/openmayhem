@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import b4a from 'b4a';
+import { blake3 } from '@tracsystems/blake3';
 import Wallet from 'trac-peer/src/wallet.js';
 import PeerWallet from 'trac-wallet';
 import { TxOperation } from 'trac-peer/src/operations/tx/index.js';
@@ -77,6 +78,8 @@ test('exact signed MSB bytes recover through the real subnet TX verifier after a
   const ctx = await harness();
   const snapshot = await ctx.transport.prepareSnapshot(100, 3000);
   const paid = await ctx.transport.preparePayment(snapshot);
+  assert.equal(paid.surrogate.ch, b4a.toString(
+    await blake3(b4a.from(JSON.stringify(paid.dispatch), 'utf8')), 'hex'));
   assert.equal(await ctx.storage.get('checkpoint/current'), null, 'simulation must not write canonical state');
   assert.equal(ctx.contract.storage, null, 'simulation must leave live consensus context untouched');
   const persisted = JSON.parse(JSON.stringify(paid));
@@ -145,30 +148,59 @@ const paidOperation = (paid, proof = { signed_length: 100, validator: 'ab'.repea
     ipk: paid.surrogate.address, wp: proof.validator, msbsl: proof.signed_length },
 });
 
-test('v24 durable checkpoint survives v26 restart and exact paid replay only once', async () => {
-  const ctx = await harness();
-  const paid = await historicalPreparation(ctx);
-  await assert.rejects(ctx.transport.broadcast(paid), /response lost/);
-  const storage = MemoryStorage.fromSnapshotBytes(ctx.storage.snapshotBytes());
-  const contract = new MayhemContract(ctx.protocol, {});
-  ctx.peer.contract.instance = contract;
-  const apply = new TxOperation({ validateNode: () => true, validate: () => true }, {
-    wallet: ctx.peer.wallet, protocolInstance: ctx.protocol, contractInstance: contract,
-    msbClient: ctx.peer.msbClient, config: ctx.peer.config,
+for (const sourceVersion of [24, CONTRACT_VERSION]) {
+  test(`v${sourceVersion} legacy paid checkpoint survives default UTF-8 restart exactly once`, async () => {
+    const ctx = await harness();
+    ctx.peer.config.txContentHash = 'legacy';
+    const paid = sourceVersion === 24
+      ? await historicalPreparation(ctx)
+      : await ctx.transport.preparePayment(await ctx.transport.prepareSnapshot(100, 3000));
+    const serialized = JSON.stringify(paid.dispatch);
+    const utf8Hash = b4a.toString(await blake3(b4a.from(serialized, 'utf8')), 'hex');
+    assert.equal(paid.surrogate.ch, b4a.toString(await blake3(serialized), 'hex'));
+    assert.notEqual(paid.surrogate.ch, utf8Hash);
+    const persistedBytes = JSON.stringify(paid);
+    if (sourceVersion === 24) await assert.rejects(ctx.transport.broadcast(paid), /response lost/);
+    const storage = MemoryStorage.fromSnapshotBytes(ctx.storage.snapshotBytes());
+    delete ctx.peer.config.txContentHash;
+    const protocol = new MayhemProtocol(ctx.peer, ctx.peer.base, ctx.peer.config);
+    ctx.peer.protocol.instance = protocol;
+    const restored = JSON.parse(persistedBytes);
+    const contract = new MayhemContract(protocol, {});
+    ctx.peer.contract.instance = contract;
+    const apply = new TxOperation({ validateNode: () => true, validate: () => true }, {
+      wallet: ctx.peer.wallet, protocolInstance: protocol, contractInstance: contract,
+      msbClient: ctx.peer.msbClient, config: ctx.peer.config,
+    });
+    ctx.peer.base.append = (op) => apply.handle(op, storage, ctx.peer.base, {});
+    const transport = new WriterCheckpointTransport({ peer: ctx.peer,
+      releaseIdentity: { contractVersion: CONTRACT_VERSION } });
+    transport.state = async (key) => (await storage.get(key))?.value ?? null;
+    if (sourceVersion === CONTRACT_VERSION) {
+      // The current-version preparation was persisted before its first payment.
+      // Its first broadcast after restart must retain the complete signed payload.
+      const originalBroadcast = ctx.peer.msbClient.broadcastTransaction;
+      ctx.peer.msbClient.broadcastTransaction = async (payload) => {
+        assert.deepEqual(payload, restored.payload);
+        return originalBroadcast(payload);
+      };
+      await assert.rejects(transport.broadcast(restored), /response lost/);
+    }
+    const rehashed = structuredClone(restored);
+    rehashed.surrogate.ch = utf8Hash;
+    rehashed.payload.txo.ch = utf8Hash;
+    await assert.rejects(transport.validatePrepared(rehashed), /bytes or signature changed/);
+    const inspected = await transport.inspect(restored, '30000000000000000');
+    await transport.reconcileSubnet(restored, inspected.proof);
+    const checkpoint = await transport.reconcileSubnet(restored, inspected.proof);
+    await ctx.peer.base.append(paidOperation(restored, inspected.proof));
+    assert.equal(checkpoint.tx, restored.surrogate.tx);
+    assert.equal((await storage.get('txl')).value, 1);
+    assert.equal((await storage.get('txi/0')).value.err, null);
+    assert.equal(ctx.broadcasts, 1);
+    assert.equal(JSON.stringify(restored), persistedBytes, 'recovery must retain the signed preparation');
   });
-  ctx.peer.base.append = (op) => apply.handle(op, storage, ctx.peer.base, {});
-  const transport = new WriterCheckpointTransport({ peer: ctx.peer,
-    releaseIdentity: { contractVersion: CONTRACT_VERSION } });
-  transport.state = async (key) => (await storage.get(key))?.value ?? null;
-  const inspected = await transport.inspect(paid, '30000000000000000');
-  await transport.reconcileSubnet(paid, inspected.proof);
-  const checkpoint = await transport.reconcileSubnet(paid, inspected.proof);
-  await ctx.peer.base.append(paidOperation(paid, inspected.proof));
-  assert.equal(checkpoint.tx, paid.surrogate.tx);
-  assert.equal((await storage.get('txl')).value, 1);
-  assert.equal((await storage.get('txi/0')).value.err, null);
-  assert.equal(ctx.broadcasts, 1);
-});
+}
 
 test('fresh v24 dispatch cannot fabricate historical preparation', async () => {
   const ctx = await harness();

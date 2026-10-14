@@ -75,7 +75,39 @@ export function safeClone(obj){
     return obj2;
 }
 
+// blake3 expects bytes; string input is hashed as its UTF-8 bytes.
 export async function createHash(message) {
+    const input = typeof message === 'string' ? b4a.from(message, 'utf8') : message;
+    const out = await blake3(input);
+    return b4a.toString(out, 'hex');
+}
+
+// Digest that versions before 0.4.10 produced for string input (the string handed to blake3 as-is).
+// Kept only to verify transactions created by older clients.
+export async function createLegacyHash(message) {
     const out = await blake3(message);
     return b4a.toString(out, 'hex');
+}
+
+export const TX_CONTENT_HASH = Object.freeze({
+    UTF8: 'utf8',               // produce UTF-8 digests, accept UTF-8 and legacy digests
+    LEGACY: 'legacy',           // produce legacy digests (mixed-version rollouts), accept both
+    UTF8_STRICT: 'utf8-strict', // produce and accept UTF-8 digests only (networks without legacy history)
+});
+
+// Content hash a peer puts into its own transactions.
+export async function createTxContentHash(json, mode) {
+    return mode === TX_CONTENT_HASH.LEGACY ? createLegacyHash(json) : createHash(json);
+}
+
+// True when contentHashHex is an accepted content hash for json (e.g. re-validating a persisted transaction).
+export async function isAcceptedTxContentHash(json, contentHashHex, mode) {
+    return (await acceptedTxContentHashes(json, mode)).includes(`${contentHashHex}`.toLowerCase());
+}
+
+// Content hashes accepted when verifying a transaction.
+export async function acceptedTxContentHashes(json, mode) {
+    const hashes = [await createHash(json)];
+    if (mode !== TX_CONTENT_HASH.UTF8_STRICT) hashes.push(await createLegacyHash(json));
+    return hashes;
 }
