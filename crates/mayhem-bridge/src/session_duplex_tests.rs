@@ -114,6 +114,73 @@ async fn handoff_preserves_already_queued_events_and_release_reclaims_byte_capac
 }
 
 #[tokio::test]
+async fn handoff_discards_discovery_queued_before_session_subscription() {
+    // The real bridge permits discovery between auth_ok and the subscription
+    // that mutes sidechannels. Request/reply reads retain that earlier event.
+    let discovery = json!({"type":"sidechannel_message","id":"discovery-event",
+        "channel":"discovery","message":{"t":"heartbeat"}});
+    let (client, mut socket) = connection(2, 8192, vec![discovery, event(1)]).await;
+    let (mut tx, mut rx) = client
+        .into_session_duplex(&remote(), "duplex-test")
+        .unwrap();
+    assert_eq!(rx.next_event().await.unwrap()["frame"]["n"], 1);
+    let peer = async {
+        let request = read(&mut socket).await;
+        ack(&mut socket, &request).await;
+        send(&mut socket, event(2)).await;
+    };
+    let (result, ()) = tokio::join!(tx.send(json!({"out":1})), peer);
+    result.unwrap();
+    assert_eq!(rx.next_event().await.unwrap()["frame"]["n"], 2);
+}
+
+#[tokio::test]
+async fn discovery_at_handoff_does_not_relax_queued_session_identity_checks() {
+    for field in ["session_id", "remote"] {
+        let mut wrong = event(1);
+        wrong[field] = json!(if field == "remote" {
+            "b".repeat(64)
+        } else {
+            "other-session".into()
+        });
+        let (client, _socket) = connection(
+            2,
+            8192,
+            vec![
+                json!({"type":"sidechannel_message","message":"unrelated"}),
+                wrong,
+            ],
+        )
+        .await;
+        assert!(matches!(
+            client.into_session_duplex(&remote(), "duplex-test"),
+            Err(BridgeError::Protocol(_))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn discovery_cleanup_preserves_close_and_rejects_new_unexpected_traffic() {
+    let discovery = json!({"type":"sidechannel_message","message":"unrelated"});
+    let closed = json!({"type":"session_closed","remote":remote(),"session_id":"duplex-test"});
+    let (client, _socket) = connection(2, 8192, vec![discovery.clone(), closed.clone()]).await;
+    let (_tx, mut rx) = client
+        .into_session_duplex(&remote(), "duplex-test")
+        .unwrap();
+    assert_eq!(rx.next_event().await.unwrap(), closed);
+
+    let (client, mut socket) = connection(2, 8192, vec![]).await;
+    let (_tx, mut rx) = client
+        .into_session_duplex(&remote(), "duplex-test")
+        .unwrap();
+    send(&mut socket, discovery).await;
+    assert!(matches!(
+        rx.next_event().await,
+        Err(BridgeError::Protocol(_))
+    ));
+}
+
+#[tokio::test]
 async fn unconsumed_events_fail_closed_at_both_count_and_byte_bounds() {
     for (count, bytes) in [(1, 8192), (8, json_value_bytes(&event(1)))] {
         let (client, mut socket) = connection(count, bytes, vec![]).await;

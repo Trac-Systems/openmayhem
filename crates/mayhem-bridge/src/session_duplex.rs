@@ -172,6 +172,15 @@ impl ScBridgeClient {
         let (terminal, ended) = watch::channel(None);
         let used = Arc::new(AtomicUsize::new(0));
         for value in std::mem::take(&mut self.queued_events) {
+            // Authentication precedes the subscription that mutes discovery.
+            // A sidechannel event received in that interval remains queued by
+            // request/reply reads. It belongs to the old mixed-purpose client,
+            // not this session-only owner. Discard only that queued event type;
+            // session identity, close events and subsequent wire traffic retain
+            // their existing fail-closed checks and resource bounds.
+            if value["type"] == "sidechannel_message" {
+                continue;
+            }
             queue(
                 &events,
                 &used,

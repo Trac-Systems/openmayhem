@@ -6,6 +6,13 @@ unrelated session-close notifications indefinitely. It now consumes those
 notifications too. Established sessions still receive their own close events;
 queue limits and authenticated opening validation remain unchanged.
 
+A discovery message can also arrive between bridge authentication and the
+session-only subscription. That already-queued message previously caused the
+paid-session handoff to reject its own connection before execution. The handoff
+now discards only pre-existing discovery events. Queued session frames and close
+notifications remain intact; wrong-session messages, invalid replies, subsequent
+unexpected traffic and queue limits retain their existing checks.
+
 A proxy reservation can be accepted before its canonical financial observation
 is available. Previously, a temporary read failure could leave a never-executed
 purchase pending indefinitely. Financial observation now retries transport
