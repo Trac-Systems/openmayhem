@@ -451,6 +451,77 @@ async fn comparable_latency_reduces_concurrency_without_cancelling_or_misclassif
     }
     assert_eq!(m.snapshot(&d(1)).unwrap().allowance, 4);
 }
+
+#[tokio::test(start_paused = true)]
+async fn buffered_llm_completion_duration_does_not_reduce_capacity() {
+    let m = monitor();
+    let buffered = Class::new(1024, Thinking::Disabled, false);
+    for _ in 0..12 {
+        good(&m, &d(1), buffered, 100).await;
+    }
+    assert_eq!(m.snapshot(&d(1)).unwrap().allowance, 4);
+    // The same input/control class can return one word or hundreds of words.
+    // A buffered completion supplies no first-token timing for comparison.
+    for _ in 0..2 {
+        good(&m, &d(1), buffered, 5000).await;
+    }
+    let view = m.snapshot(&d(1)).unwrap();
+    assert_eq!(view.state, State::Ready);
+    assert_eq!(view.allowance, 4);
+    assert_eq!(view.last_measurement.unwrap().total_ms, 5000);
+    // Non-LLM decision timing keeps its existing complete-response baseline.
+    for _ in 0..12 {
+        good(&m, &d(2), buffered, 100).await;
+    }
+    for _ in 0..2 {
+        good(&m, &d(2), buffered, 5000).await;
+    }
+    assert_eq!(m.snapshot(&d(2)).unwrap().reason, Reason::SlowResponse);
+}
+
+#[tokio::test(start_paused = true)]
+async fn expired_performance_class_can_recover_conservatively_with_a_fresh_native_probe() {
+    for reason in [Reason::SlowResponse, Reason::SlowGeneration] {
+        let m = measured_monitor();
+        for _ in 0..12 {
+            rate(m.observe_request(&d(1), class()).unwrap(), 5, 100, 1000).await;
+        }
+        for _ in 0..2 {
+            if reason == Reason::SlowResponse {
+                let mut sample = m.observe_request(&d(1), class()).unwrap();
+                advance(5000).await;
+                sample.delta(&delta());
+                sample.native_progress(d(9), 0).unwrap();
+                advance(1000).await;
+                sample.native_progress(d(9), 100).unwrap();
+                sample.success(Some(100));
+            } else {
+                rate(m.observe_request(&d(1), class()).unwrap(), 5, 10, 10_000).await;
+            }
+        }
+        assert_eq!(m.snapshot(&d(1)).unwrap().reason, reason);
+        // A deployment cannot synthesize every historical prompt/control class.
+        // Expiry does not itself restore service; a new real speed measurement
+        // may reopen one slot, never the full configured capacity immediately.
+        advance(policy().evidence_ttl_ms + 1).await;
+        assert_eq!(m.snapshot(&d(1)).unwrap().allowance, 0);
+        let probe_class = Class::new(128, Thinking::Unknown, true);
+        rate(
+            m.observe_recovery(&d(1), probe_class).unwrap(),
+            5,
+            100,
+            1000,
+        )
+        .await;
+        let view = m.snapshot(&d(1)).unwrap();
+        assert_eq!(view.allowance, 1, "{reason:?}");
+        assert!(view.meets_native_floor(5), "{reason:?}");
+        for _ in 0..2 {
+            rate(m.observe_request(&d(1), class()).unwrap(), 5, 100, 1000).await;
+        }
+        assert_eq!(m.snapshot(&d(1)).unwrap().allowance, 2);
+    }
+}
 #[tokio::test(start_paused = true)]
 async fn route_and_class_memory_is_bounded_and_rates_do_not_apply_to_decisions() {
     let m = monitor();

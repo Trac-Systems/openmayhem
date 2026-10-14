@@ -633,65 +633,84 @@ impl Monitor {
                         }
                     }
                 }
-                let latency = measurement.first_output_ms.unwrap_or(measurement.total_ms);
-                let mut latency_bad = false;
-                if let Some(baseline) = route.classes.get_mut(&sample.class) {
-                    if millis(now.saturating_duration_since(baseline.last))
-                        >= policy.evidence_ttl_ms
-                    {
-                        *baseline = Baseline {
-                            mean_ms: latency,
-                            samples: 1,
-                            last: now,
-                            bad: 0,
-                        };
-                    } else {
-                        latency_bad = baseline.samples >= policy.latency_baseline_samples
-                            && latency
-                                > baseline
-                                    .mean_ms
-                                    .saturating_mul(u64::from(policy.latency_multiplier))
-                            && latency.saturating_sub(baseline.mean_ms)
-                                >= policy.latency_increase_ms;
-                        if latency_bad {
-                            baseline.bad = baseline.bad.saturating_add(1)
-                        } else {
-                            baseline.bad = 0;
-                            baseline.mean_ms =
-                                baseline.mean_ms.saturating_mul(7).saturating_add(latency) / 8;
-                            baseline.samples = baseline.samples.saturating_add(1);
-                            baseline.last = now;
-                        }
-                        if baseline.bad >= policy.bad_samples_to_reduce && slow_reason.is_none() {
-                            slow_reason = Some(Reason::SlowResponse)
-                        }
-                    }
+                // A buffered LLM response arrives only after generation. Its
+                // duration varies with actual output length even for identical
+                // input/control classes, so it is not a first-token measurement.
+                let latency = if route.llm {
+                    sample
+                        .class
+                        .streaming
+                        .then_some(measurement.first_output_ms)
+                        .flatten()
                 } else {
-                    if route.classes.len() >= policy.max_classes_per_route {
-                        let oldest = route
-                            .classes
-                            .iter()
-                            .min_by_key(|(_, v)| v.last)
-                            .map(|(k, _)| *k);
-                        if let Some(key) = oldest {
-                            route.classes.remove(&key);
+                    Some(measurement.first_output_ms.unwrap_or(measurement.total_ms))
+                };
+                let mut latency_bad = false;
+                if let Some(latency) = latency {
+                    if let Some(baseline) = route.classes.get_mut(&sample.class) {
+                        if millis(now.saturating_duration_since(baseline.last))
+                            >= policy.evidence_ttl_ms
+                        {
+                            *baseline = Baseline {
+                                mean_ms: latency,
+                                samples: 1,
+                                last: now,
+                                bad: 0,
+                            };
+                        } else {
+                            latency_bad = baseline.samples >= policy.latency_baseline_samples
+                                && latency
+                                    > baseline
+                                        .mean_ms
+                                        .saturating_mul(u64::from(policy.latency_multiplier))
+                                && latency.saturating_sub(baseline.mean_ms)
+                                    >= policy.latency_increase_ms;
+                            if latency_bad {
+                                baseline.bad = baseline.bad.saturating_add(1)
+                            } else {
+                                baseline.bad = 0;
+                                baseline.mean_ms =
+                                    baseline.mean_ms.saturating_mul(7).saturating_add(latency) / 8;
+                                baseline.samples = baseline.samples.saturating_add(1);
+                                baseline.last = now;
+                            }
+                            if baseline.bad >= policy.bad_samples_to_reduce && slow_reason.is_none()
+                            {
+                                slow_reason = Some(Reason::SlowResponse)
+                            }
                         }
+                    } else {
+                        if route.classes.len() >= policy.max_classes_per_route {
+                            let oldest = route
+                                .classes
+                                .iter()
+                                .min_by_key(|(_, v)| v.last)
+                                .map(|(k, _)| *k);
+                            if let Some(key) = oldest {
+                                route.classes.remove(&key);
+                            }
+                        }
+                        route.classes.insert(
+                            sample.class,
+                            Baseline {
+                                mean_ms: latency,
+                                samples: 1,
+                                last: now,
+                                bad: 0,
+                            },
+                        );
                     }
-                    route.classes.insert(
-                        sample.class,
-                        Baseline {
-                            mean_ms: latency,
-                            samples: 1,
-                            last: now,
-                            bad: 0,
-                        },
-                    );
                 }
                 let was_slow = matches!(route.gate.reason, Reason::SlowGeneration);
                 let recovery_class_matches = route
                     .gate
                     .performance_class
-                    .is_none_or(|class| class == sample.class);
+                    .is_none_or(|class| class == sample.class)
+                    // A stale historical workload must not prevent all future
+                    // recovery. Only a real recovery observation can reopen it;
+                    // good() resets stale allowance to one and native checks
+                    // below still require fresh approved-tokenizer evidence.
+                    || (sample.recovery && !route.gate.fresh(evaluated_at, policy.evidence_ttl_ms));
                 let speed_recovery = measurement
                     .native_tok_s
                     .is_some_and(|rate| rate >= f64::from(policy.min_native_tok_s));

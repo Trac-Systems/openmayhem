@@ -47,6 +47,17 @@ existing terms, signatures, identity checks, quotas and dispatch fence.
 
 ## Operator update
 
+Proxy LLM health no longer treats a buffered completion's full generation time
+as first-token latency. Longer valid answers cannot reduce concurrency simply
+because earlier answers were shorter. Streaming latency and independently
+measured native throughput retain their checks. Expired workload-specific
+performance evidence can recover through a fresh bounded probe, reopening one
+slot before capacity ramps; timers alone never restore availability.
+
+Optional `MAYHEM_PROXY_DIAGNOSTICS=1` records bounded session failure categories
+at most once per 30 seconds. It omits raw errors, prompts, URLs and credentials.
+Disable it by removing the variable and restarting the affected controller.
+
 Update affected proxy provider controllers and proxy buyer gateways. Install the
 matching proxy worker with each buyer/controller that uses one; its IPC handshake
 requires the same release version. Preserve all configuration, wallets,

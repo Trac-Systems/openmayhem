@@ -48,7 +48,8 @@ pub(super) async fn run(
     });
     io.spawn(async move {
         while let Some(entry) = outgoing.recv().await {
-            if sender.send(&entry.message).await.is_err() {
+            if let Err(error) = sender.send(&entry.message).await {
+                super::diagnostics::report("send", &error);
                 break;
             }
             if let Some(delivered) = entry.delivered {
@@ -75,13 +76,26 @@ pub(super) async fn run(
                 idle=Instant::now()+owner.limits.control_wait;
                 if result.is_err() {break Err(Error::Task)}
                 // A delivery error leaves its retained result/receipt recoverable.
-                if matches!(result,Ok(Err(_))) {break Ok(End::Disconnected)}
+                if let Ok(Err(error)) = result {
+                    super::diagnostics::report("execution", &error);
+                    break Ok(End::Disconnected)
+                }
             },
             command=incoming.recv()=>{
-                let Some(Ok(command))=command else {break Ok(End::Disconnected)};
+                let command = match command {
+                    Some(Ok(command)) => command,
+                    Some(Err(error)) => {
+                        super::diagnostics::report("receive", &error);
+                        break Ok(End::Disconnected)
+                    },
+                    None => break Ok(End::Disconnected),
+                };
                 idle=Instant::now()+owner.limits.control_wait;
                 let result=handle(&owner,&session,command,&output,&mut job).await;
-                match result {Ok(true)=>break Ok(End::Settled),Ok(false)=>(),Err(error)=>break Err(error)}
+                match result {Ok(true)=>break Ok(End::Settled),Ok(false)=>(),Err(error)=>{
+                    super::diagnostics::report("control", &error);
+                    break Err(error)
+                }}
             }
         }
     };

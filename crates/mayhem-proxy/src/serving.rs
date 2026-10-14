@@ -2,6 +2,7 @@
 //! an authenticated negotiation channel, never by deserializing a claimed buyer.
 //! No public startup, native provider change or implicit financial waiver.
 mod connection;
+mod diagnostics;
 pub mod dispatch;
 pub mod maintenance;
 mod queue;
