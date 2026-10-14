@@ -1,6 +1,96 @@
 use super::*;
 
 #[tokio::test]
+async fn buyer_reservation_retries_http_200_accounting_backpressure_without_duplicate_hold() {
+    for family in ["llm", "decisions"] {
+        for rail in ["fiat", "tnk", "tap"] {
+            let mut f = Fixture::new_with_mode(rail, family, "unreserved").await;
+            let d = dir();
+            let r = recovery(&f, &d);
+            let before = f.request("state").await;
+            let id = r
+                .retain_reservation(f.auth.clone(), f.policy.clone(), 7)
+                .await
+                .unwrap();
+            f.command("publish_busy_three").await;
+            let o = r.publish_reservation(id.clone(), 8).await.unwrap();
+            assert_eq!(o.initial_binding().unwrap().accepted_terms, id);
+            let status = f.request("status").await;
+            assert_eq!(status["submissions"], 4);
+            assert_eq!(status["publications"], 1);
+            let after = f.request("state").await;
+            assert_eq!(after["balance"], before["balance"]);
+            assert_eq!(
+                after["summary"]["reserved_au"],
+                (50 + f.auth.terms.max_spend_au).to_string()
+            );
+            r.publish_reservation(id, 9).await.unwrap();
+            assert_eq!(f.request("status").await["submissions"], 4);
+            f.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn buyer_reservation_waits_for_pending_canonical_admission_not_just_http_ack() {
+    let mut f = Fixture::new_with_mode("tap", "llm", "unreserved").await;
+    let d = dir();
+    let r = recovery(&f, &d);
+    let id = r
+        .retain_reservation(f.auth.clone(), f.policy.clone(), 7)
+        .await
+        .unwrap();
+    f.command("publish_pending_delayed").await;
+    let (admitted, ()) = tokio::join!(r.publish_reservation(id.clone(), 8), async {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(f.request("status").await["publications"], 0);
+        assert!(
+            !r.recover(id.clone())
+                .await
+                .unwrap()
+                .reservation
+                .unwrap()
+                .confirmed
+        );
+    });
+    assert_eq!(
+        admitted.unwrap().initial_binding().unwrap().accepted_terms,
+        id
+    );
+    assert_eq!(f.request("status").await["publications"], 1);
+    assert_eq!(f.request("status").await["submissions"], 1);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn buyer_reservation_backpressure_is_bounded_and_permanent_rejection_is_not_republished() {
+    for (mode, submissions) in [
+        ("publish_busy_forever", 10),
+        ("publish_rejected", 1),
+        ("publish_malformed", 1),
+    ] {
+        let mut f = Fixture::new_with_mode("tnk", "llm", "unreserved").await;
+        let d = dir();
+        let r = recovery(&f, &d);
+        let before = f.request("state").await;
+        let id = r
+            .retain_reservation(f.auth.clone(), f.policy.clone(), 7)
+            .await
+            .unwrap();
+        f.command(mode).await;
+        let started = std::time::Instant::now();
+        assert!(r.publish_reservation(id.clone(), 8).await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(27));
+        let status = f.request("status").await;
+        assert_eq!(status["submissions"], submissions);
+        assert_eq!(status["publications"], 0);
+        assert!(!r.recover(id).await.unwrap().reservation.unwrap().confirmed);
+        assert_eq!(f.request("state").await, before);
+        f.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn buyer_reservation_publication_all_rails_and_families_is_durable_and_confirmed() {
     for family in ["llm", "decisions"] {
         for rail in ["fiat", "tnk", "tap"] {

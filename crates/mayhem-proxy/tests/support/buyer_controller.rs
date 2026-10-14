@@ -288,6 +288,7 @@ async fn buyer_controller_json_chat_and_decisions_settle_exact_original_terms_on
             let request = make_request(&s, &f, &peer, &bytes, gate.clone());
             let id = request.identity();
             peer.command("financial_unavailable_once").await;
+            peer.command("publish_busy_three").await;
             let (stop, rx) = watch::channel(false);
             let (result, provider_result) = tokio::join!(buyer.execute(request, rx), async {
                 provider

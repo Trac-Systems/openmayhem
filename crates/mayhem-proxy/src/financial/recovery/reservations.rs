@@ -180,7 +180,7 @@ impl BuyerRecovery {
             }
             None => Ok(()), // Already observed, or a pre-existing recovery record.
         };
-        let observed = match self.client.observe(&r.authorization).await {
+        let observed = match self.client.observe_published(&r.authorization).await {
             Ok(value) => value,
             Err(error) => {
                 // A missing observation alone proves nothing. Only a fresh

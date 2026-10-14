@@ -14,6 +14,17 @@ deadline, using a fresh challenge for each read. Successful responses still pass
 all existing signature, identity, freshness and financial checks. Invalid
 observations are not accepted, and these retries publish no transactions.
 
+Proxy financial publication now checks the application acknowledgment inside an
+HTTP-success response. Explicit temporary accounting dependency or journal
+capacity conflicts retry the **same immutable signed operation**, with at most
+ten attempts and a total ten-second deadline. Permanent rejections, invalid
+responses and ambiguous transport failures are not blindly republished. The
+existing canonical journal retains its accounting fences and deduplication.
+Reservation admission can wait for delayed canonical visibility with at most
+twelve fresh reads inside fifteen seconds; ordinary observation keeps its
+three-read budget. Neither publication acknowledgment nor a timeout authorizes
+inference, settlement, a replacement hold or release of customer funds.
+
 Recovery still never sends another Execute. If the provider reports that the
 original attempt is Prepared, recovery requests cancellation and waits for a
 signed, verified zero-charge closure. It also consumes retained results or

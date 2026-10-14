@@ -25,6 +25,29 @@ use url::Url;
 
 const MAX_BYTES: usize = 131072;
 const FRESHNESS: Duration = Duration::from_secs(15);
+const PUBLICATION_WAIT: Duration = Duration::from_secs(10);
+const PUBLICATION_ATTEMPTS: usize = 10;
+
+// The existing peer RPC reports application rejection inside HTTP 200 and does
+// not provide a machine-readable busy code. Recognize only its exact temporary
+// journal conflicts; invalid signatures, insufficient funds and unknown errors
+// are never treated as backpressure. This is transport compatibility, not a
+// relaxation of canonical admission or a retry of model execution.
+fn publication_retryable(reply: &Value) -> bool {
+    reply["ok"] == false
+        && reply["accepted"] == false
+        && reply["status"] == "rejected"
+        && matches!(reply["message"].as_str(), Some(
+            "Proxy publication journal: another operation in this provider/policy scope is pending or an accounting dependency is reserved; recover it before retrying."
+            | "Proxy publication journal: active publication capacity reached; retry the same operation."
+            | "Proxy publication journal: pending capacity reached."
+            | "Proxy publication journal: admission dependencies changed; retry the same operation."
+        ))
+}
+
+fn publication_backoff(attempt: usize) -> Duration {
+    Duration::from_millis(250u64 << attempt.min(2))
+}
 
 #[derive(Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -581,11 +604,47 @@ impl Client {
             bytes.len() <= MAX_BYTES,
             "financial publication exceeds bound",
         )?;
+        let started = Instant::now();
+        for attempt in 0..PUBLICATION_ATTEMPTS {
+            let remaining = PUBLICATION_WAIT
+                .checked_sub(started.elapsed())
+                .ok_or_else(|| invalid("financial publication admission unavailable"))?;
+            let reply = tokio::time::timeout(remaining, self.submit_feature_once(&bytes))
+                .await
+                .map_err(|_| invalid("financial publication needs reconciliation"))??;
+            if publication_retryable(&reply) {
+                require(
+                    attempt + 1 < PUBLICATION_ATTEMPTS,
+                    "financial publication admission unavailable",
+                )?;
+                let delay = publication_backoff(attempt);
+                require(
+                    started.elapsed() + delay < PUBLICATION_WAIT,
+                    "financial publication admission unavailable",
+                )?;
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+            require(
+                (reply["ok"] == true
+                    && reply["accepted"] != false
+                    && reply["result"]["ok"] != false)
+                    || (reply["accepted"] == true && reply["status"] == "pending"),
+                "financial publication rejected or unconfirmed",
+            )?;
+            // This is only a publication acknowledgment. Every caller still
+            // requires exact signed canonical evidence before spending/releasing.
+            return Ok(());
+        }
+        unreachable!()
+    }
+
+    async fn submit_feature_once(&self, bytes: &[u8]) -> Result<Value> {
         let mut response = self
             .http
             .post(self.publication_endpoint.clone())
             .header("content-type", "application/json")
-            .body(bytes)
+            .body(bytes.to_vec())
             .send()
             .await
             .map_err(Error::Transport)?;
@@ -593,21 +652,45 @@ impl Client {
             response.status().is_success(),
             "financial publication needs reconciliation",
         )?;
-        let mut size = 0usize;
+        require(
+            response
+                .content_length()
+                .is_none_or(|n| n <= MAX_BYTES as u64),
+            "financial reply exceeds bound",
+        )?;
+        let mut bytes = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(Error::Transport)? {
-            size = size
-                .checked_add(chunk.len())
-                .ok_or_else(|| invalid("financial reply exceeds bound"))?;
-            require(size <= MAX_BYTES, "financial reply exceeds bound")?;
+            require(
+                bytes.len().saturating_add(chunk.len()) <= MAX_BYTES,
+                "financial reply exceeds bound",
+            )?;
+            bytes.extend_from_slice(&chunk);
         }
-        Ok(())
+        Ok(serde_json::from_slice(&bytes)?)
     }
     pub async fn observe(&self, authorization: &ProxySpendAuthorization) -> Result<Observation> {
+        self.observe_with_attempts(authorization, 3).await
+    }
+
+    // Only the reservation publication path waits for asynchronous canonical
+    // admission. Regular finance reads keep their smaller retry budget.
+    pub(crate) async fn observe_published(
+        &self,
+        authorization: &ProxySpendAuthorization,
+    ) -> Result<Observation> {
+        self.observe_with_attempts(authorization, 12).await
+    }
+
+    async fn observe_with_attempts(
+        &self,
+        authorization: &ProxySpendAuthorization,
+        attempts: usize,
+    ) -> Result<Observation> {
         // Publication can be durably accepted just before the canonical read
         // becomes available. Retry only this read, with a fresh challenge each
         // time; never resubmit money or execute inference from an HTTP ACK.
         let started = Instant::now();
-        for attempt in 0..3 {
+        for attempt in 0..attempts {
             let remaining = FRESHNESS
                 .checked_sub(started.elapsed())
                 .ok_or_else(|| invalid("canonical financial observation unavailable"))?;
@@ -621,10 +704,14 @@ impl Client {
                 }
                 _ => false,
             };
-            if !retry || attempt == 2 {
+            if !retry || attempt + 1 == attempts {
                 return result;
             }
-            tokio::time::sleep(Duration::from_millis(250 << attempt)).await;
+            let delay = publication_backoff(attempt);
+            if started.elapsed() + delay >= FRESHNESS {
+                return result;
+            }
+            tokio::time::sleep(delay).await;
         }
         unreachable!()
     }

@@ -50,6 +50,8 @@ buyerParticipant._adminKey=async()=>f.admin.publicKey;
 participant._adminKey=async()=>f.admin.publicKey;
 let mutation=null,calls=0,operatorCalls=0,operatorUnavailable=false,financialUnavailable=0;
 let submissions=0,publications=0,pending=null,publicationMode=null,publicationTail=Promise.resolve();
+let publicationBusy=0,delayedPublication=null;
+const publicationEnvelopes=new Map();
 // Test transport uses the actual RPC, receipt validator/accounting planner and
 // canonical signed-view service. The remote relay/indexer transport is simulated;
 // its durable append journal has separate real-Autobase integration coverage.
@@ -64,6 +66,19 @@ async function applyReceipt(key,value) {
 participant.relay=buyerParticipant.relay=(key,value)=>{
   const job=publicationTail.then(async()=>{
     submissions++;
+    const encoded=JSON.stringify(value), previous=publicationEnvelopes.get(key);
+    if(previous!==undefined && previous!==encoded)throw new Error('fixture immutable publication changed');
+    publicationEnvelopes.set(key,encoded);
+    if(publicationBusy>0) {
+      publicationBusy--;
+      return {ok:false,accepted:false,status:'rejected',message:'Proxy publication journal: another operation in this provider/policy scope is pending or an accounting dependency is reserved; recover it before retrying.'};
+    }
+    if(publicationMode==='rejected')return {ok:false,accepted:false,status:'rejected',message:'Insufficient funds.'};
+    if(publicationMode==='malformed')return {message:'not an acknowledgment'};
+    if(publicationMode==='pending_delayed') {
+      if(!delayedPublication)delayedPublication=new Promise(resolve=>setTimeout(resolve,2000)).then(()=>applyReceipt(key,value));
+      return {ok:false,accepted:true,status:'pending'};
+    }
     if(publicationMode==='pending') {pending={key,value};return {ok:true,pending:true};}
     const result=await applyReceipt(key,value);
     if(publicationMode==='lost_ack')throw new Error('fixture lost acknowledgment after canonical application');
@@ -180,6 +195,11 @@ try {
     else if(command==='status'){}
     else if(command==='state') {console.log(JSON.stringify({summary:await f.read(f.summaryKey),balance:await f.read(f.balanceKey),billing:await f.read(f.ledger.receiptBillingKey(f.terms.billing_id))}));continue;}
     else if(command==='publish_pending')publicationMode='pending';
+    else if(command==='publish_busy_three')publicationBusy=3;
+    else if(command==='publish_busy_forever')publicationBusy=1000;
+    else if(command==='publish_rejected')publicationMode='rejected';
+    else if(command==='publish_malformed')publicationMode='malformed';
+    else if(command==='publish_pending_delayed')publicationMode='pending_delayed';
     else if(command==='publish_lost_ack')publicationMode='lost_ack';
     else if(command==='flush_publication') {if(pending){await applyReceipt(pending.key,pending.value);pending=null;}publicationMode=null;}
     else if(['nonce','network','hold','signature','unknown','delay'].includes(command))mutation=command;
@@ -187,6 +207,7 @@ try {
     console.log(JSON.stringify({done:command,calls,operator_calls:operatorCalls,submissions,publications}));
   }
 } finally {
+  if(delayedPublication)await delayedPublication;
   await participant.stop();await buyerParticipant.stop();await admin.stop();server.closeAllConnections();buyerServer.closeAllConnections();
   await new Promise(resolve=>buyerServer.close(resolve));
   await new Promise(resolve=>server.close(resolve));await view.close();await store.close();
