@@ -28,11 +28,11 @@ export function createProxyCanonicalReader(peer, contractVersion) {
     const core = base?.view?.core;
     const applied = base?._applyState?.view?.core;
     if (base?.writable !== true || base?.isIndexer !== true || base.closing || base.paused ||
-        peer?.contract?.instance?._mayhemReplayStatus?.active === true) fail('canonical indexer is not ready');
+        peer?.contract?.instance?._mayhemReplayStatus?.active === true) fail('canonical indexer is not ready', 'proxy_snapshot_unavailable');
     if (!core || !applied || core.closing || applied.closing ||
-        typeof core.treeHash !== 'function' || typeof applied.treeHash !== 'function') fail('canonical view is missing');
+        typeof core.treeHash !== 'function' || typeof applied.treeHash !== 'function') fail('canonical view is missing', 'proxy_snapshot_unavailable');
     const length = core.signedLength;
-    if (!Number.isSafeInteger(length) || length < 1 || applied.length < length) fail('confirmed state is not materialized');
+    if (!Number.isSafeInteger(length) || length < 1 || applied.length < length) fail('confirmed state is not materialized', 'proxy_snapshot_unavailable');
     const key = hex(core.key);
     const fork = core.fork;
     const admin = hex(peer?.wallet?.publicKey);
@@ -111,13 +111,13 @@ export function createProxyCanonicalSnapshot(peer, contractVersion) {
         try {
           if (current.key !== initial.key || current.fork !== initial.fork || current.length < initial.length ||
               current.admin !== initial.admin || JSON.stringify(current.context) !== JSON.stringify(initial.context)) {
-            fail('canonical context changed');
+            fail('canonical context changed', 'proxy_snapshot_changed');
           }
           // Native activity may advance the head. Compare only keys this
           // admission actually consulted; never rescan a prefix/history.
           if (current.length !== initial.length) {
             for (const [key, value] of observed) {
-              if (JSON.stringify(await current.read(key)) !== JSON.stringify(value)) fail('registry state changed during validation');
+              if (JSON.stringify(await current.read(key)) !== JSON.stringify(value)) fail('registry state changed during validation', 'proxy_snapshot_changed');
             }
           }
         } finally { await current.view.close(); }

@@ -150,6 +150,14 @@ fn observed_server(
     f: &Fixture,
     peer: &Peer,
 ) -> (serving::Controller, mayhem_proxy::health::Monitor) {
+    observed_server_with_wait(s, f, peer, bounds().control_wait)
+}
+fn observed_server_with_wait(
+    s: &Controlled,
+    f: &Fixture,
+    peer: &Peer,
+    control_wait: Duration,
+) -> (serving::Controller, mayhem_proxy::health::Monitor) {
     use mayhem_proxy::{
         health::{Class, Monitor, Policy, Thinking},
         supervisor::RefreshPolicy,
@@ -203,6 +211,10 @@ fn observed_server(
             .unwrap()
             .success(None);
     }
+    let limits = serving::Limits {
+        control_wait,
+        ..bounds()
+    };
     let controller = if f.adapter.endpoint() != ProxyEndpoint::Decisions {
         serving::Controller::new_measured(
             s.runtime.clone(),
@@ -210,7 +222,7 @@ fn observed_server(
             s.signing.clone(),
             peer.client.clone(),
             pool(f),
-            bounds(),
+            limits,
             monitor.clone(),
             crate::native_execution::source(f),
         )
@@ -221,7 +233,7 @@ fn observed_server(
             s.signing.clone(),
             peer.client.clone(),
             pool(f),
-            bounds(),
+            limits,
             monitor.clone(),
         )
     }

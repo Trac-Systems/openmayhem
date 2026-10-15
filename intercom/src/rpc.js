@@ -1,3 +1,4 @@
+import { proxyFinancialError, proxyFinancialHttpError } from '../features/mayhem/proxy-financial-errors.js';
 import http from 'http';
 import b4a from 'b4a';
 import { applyCors } from '../trac/trac-peer/rpc/cors.js';
@@ -467,9 +468,9 @@ export async function requestProxyQuoteState(peer, body) {
 }
 
 export async function requestProxyFinancialState(peer, body) {
-  if (!isObject(body) || Object.keys(body).sort().join('|') !== 'accepted_terms|request_nonce') throw new Error('Invalid proxy financial query.');
+  if (!isObject(body) || Object.keys(body).sort().join('|') !== 'accepted_terms|request_nonce') throw proxyFinancialError('proxy_financial_invalid');
   const feature = peer.protocol?.instance?.features?.mayhem;
-  if (typeof feature?.proxyFinancialState !== 'function') throw new Error('Proxy financial relay is not ready.');
+  if (typeof feature?.proxyFinancialState !== 'function') throw proxyFinancialError('proxy_financial_unavailable');
   return proxyServicePayload(await feature.proxyFinancialState(body));
 }
 
@@ -681,6 +682,10 @@ export const createServer = (
       }
       respond(404, { error: 'Not Found' });
     } catch (error) {
+      if (requestPath === '/v1/proxy/financial-state' && !['BODY_TOO_LARGE', 'BAD_JSON'].includes(error?.code)) {
+        const safe = proxyFinancialHttpError(error);
+        return respond(safe.status, safe.body);
+      }
       const [code, message] = errorResponse(error);
       if (code === 500) console.error('RPC handler error:', error);
       respond(code, { error: message, ...(requestPath === '/v1/proxy/discovery'

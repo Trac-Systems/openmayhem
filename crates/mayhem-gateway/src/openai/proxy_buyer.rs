@@ -253,9 +253,19 @@ impl Runtime {
             // upstream strings, request contents, credentials or payment terms.
             if is_execution {
                 if let Err(error) = &outcome {
+                    if matches!(error.code, buyer_controller::Code::Unconfirmed)
+                        && matches!(error.stage, buyer_controller::Stage::Accepted)
+                    {
+                        if let Some(code @ ("proxy_financial_pending" | "proxy_financial_busy"
+                            | "proxy_financial_unavailable" | "proxy_financial_snapshot_changed")) = error.financial_code {
+                            // Failed diagnostic persistence never releases a hold or
+                            // grants retry. Canonical closure is still mandatory.
+                            let _ = owner.note_confirmation_failure(code).await;
+                        }
+                    }
                     eprintln!(
-                        "Proxy execution did not complete: job_id={} code={:?} stage={:?} recovery_required={}",
-                        binding.job_id, error.code, error.stage, error.recovery_required
+                        "Proxy execution did not complete: job_id={} code={:?} stage={:?} recovery_required={} financial_code={:?}",
+                        binding.job_id, error.code, error.stage, error.recovery_required, error.financial_code
                     );
                 }
             }

@@ -1,3 +1,5 @@
+import { createServer } from '../src/rpc.js';
+import { proxyFinancialError, classifyProxyFinancialError } from '../features/mayhem/proxy-financial-errors.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import b4a from 'b4a';
@@ -58,4 +60,58 @@ test('failed proxy observations never expose arbitrary service exceptions or cla
   feature.requestService = async () => ({ ok: false, message: 'private exception' });
   await assert.rejects(feature.proxyOperatorState({ provider_pubkey: f.provider.publicKey,
     request_nonce: h(34) }), /Proxy operator state is unavailable/);
+});
+
+test('financial RPC uses fixed codes and never leaks private exceptions', async t => {
+  let fault;
+  const peer = { protocol: { instance: { features: { mayhem: {
+    proxyFinancialState: async () => { throw fault; },
+  } } } } };
+  const server = createServer(peer);
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => { server.closeAllConnections(); server.close(resolve); }));
+  for (const [code, status] of [
+    ['proxy_financial_pending', 503], ['proxy_financial_busy', 503],
+    ['proxy_financial_unavailable', 503], ['proxy_financial_snapshot_changed', 503],
+    ['proxy_financial_unknown', 503],
+    ['proxy_financial_invalid', 400], ['proxy_financial_rejected', 400],
+    [null, 400],
+  ]) {
+    fault = code ? proxyFinancialError(code, 'PRIVATE diagnostic') : new Error('PRIVATE unknown exception');
+    const res = await fetch(`http://127.0.0.1:${server.address().port}/v1/proxy/financial-state`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ accepted_terms: 'ab'.repeat(32), request_nonce: 'cd'.repeat(32) }),
+    });
+    assert.equal(res.status, status);
+    const body = await res.json();
+    assert.equal(body.code, code ?? 'proxy_financial_invalid');
+    assert.doesNotMatch(JSON.stringify(body), /PRIVATE/);
+  }
+});
+
+test('legacy financial failures remain unknown rather than a known temporary cause', async () => {
+  const f = await proxyReservationFixture();
+  const feature = Object.create(MayhemFeature.prototype);
+  feature.peer = { ...f.peer, wallet: { publicKey: f.provider.publicKey,
+    sign: bytes => b4a.toString(f.provider.wallet.sign(bytes), 'hex') } };
+  feature._adminKey = async () => f.admin.publicKey;
+  for (const result of [null, {}, { ok: false, message: 'private validation rejection' },
+    { ok: false, code: 'unknown_old_code', message: 'private temporary failure' }]) {
+    feature.requestService = async () => result;
+    await assert.rejects(feature.proxyFinancialState({ accepted_terms: h(44), request_nonce: h(45) }), error => {
+      assert.equal(error.code, 'proxy_financial_unknown');
+      assert.doesNotMatch(error.message, /private/);
+      return true;
+    });
+  }
+});
+
+test('only fixed transient causes are recoverable; arbitrary codes remain invalid', () => {
+  for (const code of ['proxy_snapshot_unavailable', 'REQUEST_TIMEOUT', 'ETIMEDOUT']) {
+    assert.equal(classifyProxyFinancialError({ code }).code, 'proxy_financial_unavailable');
+  }
+  assert.equal(classifyProxyFinancialError({ code: 'proxy_snapshot_changed' }).code, 'proxy_financial_snapshot_changed');
+  for (const code of ['proxy_snapshot_invalid', 'private-key-value', '__proto__']) {
+    assert.equal(classifyProxyFinancialError({ code }).code, 'proxy_financial_invalid');
+  }
 });

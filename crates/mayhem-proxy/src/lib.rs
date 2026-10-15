@@ -69,6 +69,8 @@ pub enum Error {
     Transport(#[source] reqwest::Error),
     #[error("proxy discovery HTTP status {status}: {code}")]
     Http { status: u16, code: String },
+    #[error("proxy financial admission remains unconfirmed")]
+    FinancialAdmissionUnavailable,
     #[error("proxy catalog blocking task failed")]
     Task,
 }

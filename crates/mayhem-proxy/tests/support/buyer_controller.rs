@@ -3,6 +3,8 @@ use mayhem_proxy::buyer_controller as buyer;
 use mayhem_proxy::financial::recovery::FinancialOutcome;
 use std::{future::Future, pin::Pin};
 use tokio::sync::{watch, Notify};
+#[path = "buyer_admission.rs"]
+mod admission;
 #[path = "buyer_streaming.rs"]
 mod streaming;
 
@@ -127,6 +129,20 @@ fn buyer_controller(
     Arc<BuyerNegotiation>,
     Arc<BuyerRecovery>,
 ) {
+    buyer_controller_with_wait(s, f, peer, bridge, sessions, Duration::from_secs(5))
+}
+fn buyer_controller_with_wait(
+    s: &Controlled,
+    f: &Fixture,
+    peer: &Peer,
+    bridge: &Bridge,
+    sessions: usize,
+    admission_wait: Duration,
+) -> (
+    Arc<buyer::Controller>,
+    Arc<BuyerNegotiation>,
+    Arc<BuyerRecovery>,
+) {
     let negotiation = Arc::new(
         BuyerNegotiation::new(
             Arc::new(
@@ -163,6 +179,8 @@ fn buyer_controller(
             control_wait: Duration::from_secs(5),
         },
     )
+    .unwrap()
+    .with_admission_wait(admission_wait)
     .unwrap();
     (Arc::new(controller), negotiation, recovery)
 }

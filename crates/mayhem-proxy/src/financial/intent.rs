@@ -119,7 +119,7 @@ impl Client {
         let _permit = self
             .slots
             .try_acquire()
-            .map_err(|_| invalid("intent observation capacity unavailable"))?;
+            .map_err(|_| Error::FinancialAdmissionUnavailable)?;
         let mut nonce = [0u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| invalid("intent challenge unavailable"))?;
         let nonce = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -135,10 +135,9 @@ impl Client {
             .send()
             .await
             .map_err(Error::Transport)?;
-        require(
-            response.status().is_success(),
-            "canonical intent observation unavailable",
-        )?;
+        if !response.status().is_success() {
+            return Err(observation_http_error(&mut response).await?);
+        }
         require(
             response
                 .content_length()

@@ -515,7 +515,7 @@ impl Store {
         self.commit(tx)?;
         Ok(SavedPurchase { key: k, record })
     }
-    fn observe(&self, observation: Observation, at_ms: u64) -> Result<SavedPurchase> {
+    fn observe(&self, observation: &Observation, at_ms: u64) -> Result<SavedPurchase> {
         require(
             observation.started.elapsed() <= FRESHNESS && at_ms <= PROXY_MAX_SAFE_INTEGER,
             "stale negotiation observation",
@@ -828,7 +828,44 @@ impl BuyerNegotiation {
                     .await?;
                 recovery.publish_reservation_wait(k, at_ms).await?
             };
-        self.run(move |s| s.observe(observed, at_ms)).await
+        self.run(move |s| s.observe(&observed, at_ms)).await
+    }
+
+    pub(crate) async fn publish_foreground(
+        &self,
+        key: Digest,
+        recovery: &recovery::BuyerRecovery,
+        at_ms: u64,
+        deadline: tokio::time::Instant,
+        unknown: &AtomicBool,
+    ) -> Result<(SavedPurchase, Observation)> {
+        tokio::time::timeout_at(deadline, async {
+            let saved = self
+                .recover(key)
+                .await?
+                .ok_or_else(|| invalid("negotiation not found"))?;
+            require(
+                saved.record.unadmitted.is_none(),
+                "intention expired without admission; create a fresh purchase",
+            )?;
+            let auth = saved
+                .authorization()
+                .ok_or_else(|| invalid("provider has not accepted purchase"))?;
+            let key = recovery
+                .retain_reservation(auth, saved.policy().clone(), saved.record.at_ms)
+                .await?;
+            let observed = recovery
+                .publish_reservation_until(key, at_ms, deadline, unknown)
+                .await?;
+            self.run(move |s| {
+                let saved = s.observe(&observed, at_ms)?;
+                observed.initial_binding()?;
+                Ok((saved, observed))
+            })
+            .await
+        })
+        .await
+        .map_err(|_| admission_timeout(Some(unknown)))?
     }
     pub async fn refresh(&self, key: Digest, at_ms: u64) -> Result<SavedPurchase> {
         let saved = self
@@ -863,7 +900,7 @@ impl BuyerNegotiation {
             }
         };
         let observed = self.client.observe(&auth).await?;
-        self.run(move |s| s.observe(observed, at_ms)).await
+        self.run(move |s| s.observe(&observed, at_ms)).await
     }
     pub async fn pending(&self, after: Option<Digest>, limit: usize) -> Result<Vec<Digest>> {
         self.run(move |s| s.pending(after.as_ref(), limit)).await

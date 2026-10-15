@@ -290,7 +290,9 @@ fn error_code(error: &Error) -> &'static str {
     match error {
         Error::Database(_) | Error::Io(_) | Error::Task => "recovery_storage_failed",
         Error::Identity => "recovery_identity_mismatch",
-        Error::Transport(_) | Error::Http { .. } => "financial_peer_unavailable",
+        Error::Transport(_) | Error::Http { .. } | Error::FinancialAdmissionUnavailable => {
+            "financial_peer_unavailable"
+        }
         _ => "financial_evidence_rejected",
     }
 }

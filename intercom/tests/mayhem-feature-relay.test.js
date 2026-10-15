@@ -3775,3 +3775,37 @@ test('an admin-added cross-signing writer still relays participant features to t
   assert.equal(relayCalls, 1);
   assert.equal(appendCalls, 0);
 });
+
+
+test('financial error codes survive authenticated relay without private exception text', async t => {
+  const participant = peerFor(providerKey);
+  const writer = peerFor(adminKey, { writable: true });
+  const pf = new MayhemFeature(participant.peer, { timeoutMs: 1000, retryMs: 100 });
+  const wf = new MayhemFeature(writer.peer, { timeoutMs: 1000, retryMs: 100 });
+  t.after(async () => { await pf.stop(); await wf.stop(); });
+  pf.key = wf.key = 'mayhem';
+  participant.peer.protocol.instance.features.mayhem = pf;
+  writer.peer.protocol.instance.features.mayhem = wf;
+  connect(participant.peer, pf, writer.peer, wf);
+  connect(writer.peer, wf, participant.peer, pf);
+  const { proxyFinancialError } = await import('../features/mayhem/proxy-financial-errors.js');
+  let fault = proxyFinancialError('proxy_financial_pending', 'PRIVATE diagnostic path or customer content');
+  wf._handleService = async service => {
+    assert.equal(service, 'proxy_financial_state');
+    throw fault;
+  };
+  const query = { accepted_terms: 'dd'.repeat(32), request_nonce: 'ee'.repeat(32) };
+  await assert.rejects(pf.proxyFinancialState(query), error => {
+    assert.equal(error.code, 'proxy_financial_pending');
+    assert.doesNotMatch(error.message, /PRIVATE/);
+    return true;
+  });
+  fault = new Error('PRIVATE invalid state or customer content');
+  await assert.rejects(pf.proxyFinancialState(query), error => {
+    assert.equal(error.code, 'proxy_financial_invalid');
+    assert.doesNotMatch(error.message, /PRIVATE/);
+    return true;
+  });
+  assert.equal(participant.appended.length, 0);
+  assert.equal(writer.appended.length, 0);
+});

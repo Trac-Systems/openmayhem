@@ -9,6 +9,7 @@ import Corestore from 'corestore';
 import Hyperbee from 'hyperbee';
 import MayhemFeature from '../../features/mayhem/index.js';
 import { createProxyCanonicalSnapshot } from '../../features/mayhem/proxy-canonical-view.js';
+import { proxyFinancialError } from '../../features/mayhem/proxy-financial-errors.js';
 import { createServer } from '../../src/rpc.js';
 import { CONTRACT_VERSION } from '../../contract/contract.js';
 import { proxyReceiptFixture } from './proxy-finance.js';
@@ -49,6 +50,7 @@ const buyerParticipant=new MayhemFeature(buyerLocal,{});buyerParticipant.key='ma
 buyerParticipant._adminKey=async()=>f.admin.publicKey;
 participant._adminKey=async()=>f.admin.publicKey;
 let mutation=null,calls=0,operatorCalls=0,operatorUnavailable=false,financialUnavailable=0;
+let financialUnavailableCode='proxy_financial_unavailable';
 let submissions=0,publications=0,pending=null,publicationMode=null,publicationTail=Promise.resolve();
 let publicationBusy=0,delayedPublication=null;
 const publicationEnvelopes=new Map();
@@ -90,7 +92,7 @@ function requestsFor(actor) { return async(service,request)=>{
   calls++;
   if(service==='proxy_financial_state' && financialUnavailable>0) {
     financialUnavailable--;
-    throw new Error('fixture canonical financial state temporarily unavailable');
+    throw proxyFinancialError(financialUnavailableCode);
   }
   if(service===PROXY_OPERATOR_STATE_SERVICE) {
     operatorCalls++;
@@ -189,8 +191,9 @@ try {
       console.log(JSON.stringify({provider:Array.from(f.provider.wallet.secretKey.subarray(0,32)),
         buyer:Array.from(f.buyer.wallet.secretKey.subarray(0,32))}));continue;
     }
-    else if(command==='financial_unavailable_once')financialUnavailable=1;
-    else if(command==='financial_unavailable')financialUnavailable=1000;
+    else if(command==='financial_unavailable_once'){financialUnavailable=1;financialUnavailableCode='proxy_financial_unavailable';}
+    else if(command==='financial_unavailable'){financialUnavailable=1000;financialUnavailableCode='proxy_financial_unavailable';}
+    else if(command==='financial_unknown'){financialUnavailable=1000;financialUnavailableCode='proxy_financial_unknown';}
     else if(command==='financial_available')financialUnavailable=0;
     else if(command==='status'){}
     else if(command==='state') {console.log(JSON.stringify({summary:await f.read(f.summaryKey),balance:await f.read(f.balanceKey),billing:await f.read(f.ledger.receiptBillingKey(f.terms.billing_id))}));continue;}

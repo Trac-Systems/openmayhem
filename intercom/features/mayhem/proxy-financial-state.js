@@ -1,6 +1,7 @@
 // Exact-attempt financial recovery through the authenticated canonical service.
 // No append, history traversal, dispatch permission or backend-capacity claim.
 import b4a from 'b4a';
+import { proxyFinancialError } from './proxy-financial-errors.js';
 import MayhemContract from '../../contract/contract.js';
 import { acceptedSpend, proxyReservationKeys, normalizeProxySpendSessionRecord,
   validateProxyCanonicalReceiptHead, validateProxyBillingAnchor } from '../../contract/proxy-reservations.js';
@@ -11,7 +12,9 @@ export const PROXY_FINANCIAL_STATE_SERVICE = 'proxy_financial_state';
 export const PROXY_FINANCIAL_STATE_MAX_BYTES = 131072;
 export const PROXY_FINANCIAL_STATE_MAX_AGE_MS = 15000;
 const hex = value => typeof value === 'string' && /^[a-f0-9]{64}$/.test(value);
-const need = (ok, message) => { if (!ok) throw new Error(`Proxy financial state: ${message}.`); };
+const need = (ok, message, code = 'proxy_financial_invalid') => {
+  if (!ok) throw proxyFinancialError(code, `Proxy financial state: ${message}.`);
+};
 
 export function validateProxyFinancialStateRequest(value) {
   need(value && typeof value === 'object' && !Array.isArray(value)
@@ -28,9 +31,13 @@ export async function readProxyFinancialState({ request, withCanonicalSnapshot, 
     const ledger = Object.create(MayhemContract.prototype);
     ledger.get = key => snapshot.read(key);
     ledger.put = ledger.del = () => { throw new Error('Financial recovery cannot write.'); };
+    // The same bounded snapshot memoizes this exact key. Absence is pending;
+    // a present but malformed accepted record remains a validation failure.
+    need(await ledger.get(proxyReservationKeys.accepted(request.accepted_terms)) !== null,
+      'accepted purchase is pending', 'proxy_financial_pending');
     const accepted = await acceptedSpend(ledger, request.accepted_terms);
     const terms = accepted.authorization.terms;
-    need([terms.buyer_pubkey, terms.offer.provider_pubkey].includes(request.requester), 'requester is not a party');
+    need([terms.buyer_pubkey, terms.offer.provider_pubkey].includes(request.requester), 'requester is not a party', 'proxy_financial_rejected');
     for (const key of ['network_id', 'msb_bootstrap', 'subnet_bootstrap']) {
       need(terms[key] === snapshot.context[key], 'accepted network differs');
     }

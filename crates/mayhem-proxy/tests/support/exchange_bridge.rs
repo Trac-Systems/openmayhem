@@ -120,10 +120,15 @@ impl Bridge {
                                         "direct":true,"relayed":false,"frame":request["frame"]});
                                     let attack={
                                         let mut mode=mode.lock().await;
-                                        if matches!(*mode,Some("stream_content"|"stream_identity")) {
+                                        if matches!(*mode,Some("stream_content"|"stream_identity"|"prepared_delay"|"prepared_drop")) {
                                             let payload=event["frame"]["data"].as_str().and_then(|v|STANDARD.decode(v).ok())
                                                 .and_then(|v|serde_json::from_slice::<Value>(&v).ok());
-                                            if payload.as_ref().is_some_and(|v|v["kind"]=="stream") {mode.take()} else {None}
+                                            let selected=payload.as_ref().is_some_and(|v| {
+                                                if matches!(*mode,Some("prepared_delay"|"prepared_drop")) {
+                                                    v["kind"]=="state" && v["state"]=="prepared"
+                                                } else {v["kind"]=="stream"}
+                                            });
+                                            if selected {mode.take()} else {None}
                                         } else {mode.take()}
                                     };
                                     match attack {
@@ -168,7 +173,12 @@ impl Bridge {
                                         _=>{},
                                     }
                                     {let mut stored=capture.lock().await;if stored.len()<256{stored.push(event.clone());}}
+                                    // Funding may become visible while the buyer is already
+                                    // reading Prepared. Capture first so the test controls that
+                                    // ordering without racing a wall-clock sleep.
+                                    if attack==Some("prepared_delay") {tokio::time::sleep(Duration::from_secs(2)).await;}
                                     for target in targets {
+                                        if attack==Some("prepared_drop") {continue}
                                         if target.send(event.clone()).await.is_err(){continue}
                                         if attack==Some("duplicate") {let _=target.send(event.clone()).await;}
                                     }

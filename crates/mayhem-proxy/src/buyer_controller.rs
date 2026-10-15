@@ -2,6 +2,7 @@
 //! account/key budgets belong to the caller. This controller never selects another
 //! offer, changes a rail, retries Execute, or calls a native inference backend.
 pub use crate::financial::negotiation::NonAdmission;
+mod admission;
 mod streaming;
 use crate::{
     attempts::{Digest, Identity},
@@ -184,6 +185,8 @@ pub struct Error {
     /// False only describes this local attempt before signing; it is never a
     /// permission for cross-provider, cross-rail or native fallback.
     pub recovery_required: bool,
+    /// Fixed financial diagnostic only; never a peer exception or retry authority.
+    pub financial_code: Option<&'static str>,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -236,6 +239,7 @@ struct Shared {
     verifier: Arc<Pool>,
     bridge: ScBridgeConfig,
     limits: Limits,
+    admission_wait: Duration,
     conformance: std::sync::OnceLock<Arc<crate::conformance::Recorder>>,
 }
 type Slot = (Digest, u64);
@@ -348,6 +352,7 @@ impl Controller {
                 verifier,
                 bridge,
                 limits,
+                admission_wait: financial::ADMISSION_WAIT,
                 conformance: std::sync::OnceLock::new(),
             }),
             sessions: Arc::new(Semaphore::new(limits.sessions)),
@@ -360,6 +365,18 @@ impl Controller {
             shutdown,
             joining: tokio::sync::Mutex::new(()),
         })
+    }
+    /// Trusted startup policy for the initial live purchase, never inference or
+    /// evidence freshness. Cannot change while a session owns this controller.
+    pub fn with_admission_wait(mut self, wait: Duration) -> crate::Result<Self> {
+        crate::require(
+            !wait.is_zero() && wait <= financial::ADMISSION_WAIT,
+            "invalid buyer admission wait",
+        )?;
+        Arc::get_mut(&mut self.shared)
+            .ok_or_else(|| crate::invalid("buyer admission policy is already in use"))?
+            .admission_wait = wait;
+        Ok(self)
     }
     pub fn identity(&self) -> &Identity {
         self.shared.signer.identity()
@@ -528,6 +545,7 @@ impl Controller {
             code,
             stage: Stage::Admission,
             recovery_required: true,
+            financial_code: None,
         };
         if self.stopped.load(Ordering::Acquire) || *external.borrow() {
             return Err(fail(Code::Stopped));
@@ -662,7 +680,16 @@ impl Progress {
             code,
             stage: self.stage,
             recovery_required: self.retained,
+            financial_code: None,
         }
+    }
+    fn financial_error(&self, error: crate::Error) -> Error {
+        let mut result = self.error(match &error {
+            crate::Error::Database(_) | crate::Error::Io(_) => Code::Storage,
+            _ => Code::Unconfirmed,
+        });
+        result.financial_code = Some(financial::diagnostic_code(&error));
+        result
     }
     fn check(&self, stop: &watch::Receiver<bool>) -> Result<()> {
         if *stop.borrow() {
@@ -895,29 +922,28 @@ impl Shared {
             .map_err(|_| p.error(Code::Storage))?;
         p.stage = Stage::Accepted;
         p.check(stop)?;
-        let saved = self
-            .negotiation
-            .publish(
-                saved.key().clone(),
-                &self.recovery,
-                crate::supervisor::unix_ms(),
-            )
-            .await
-            .map_err(|_| p.error(Code::Unconfirmed))?;
+        // Promotion binds the signed parties only. Status keeps the original
+        // provider session alive; Execute still requires fresh canonical funding.
+        let mut paid = channel
+            .into_paid(self.signer.identity())
+            .map_err(|_| p.error(Code::Verification))?;
+        let (saved, funding) = self
+            .confirm_foreground(&mut paid, saved.key().clone(), p, stop)
+            .await?;
         p.stage = Stage::Funded;
         p.check(stop)?;
         if !saved.confirmed() {
             return Err(p.error(Code::Unconfirmed));
         }
-        let mut paid = channel
-            .into_paid(self.signer.identity())
-            .map_err(|_| p.error(Code::Verification))?;
-        p.stage = Stage::Executing;
         let conformance = self.conformance.get().and_then(|r| {
             saved
                 .authorization()
                 .and_then(|a| r.begin(&a.terms, &value).ok())
         });
+        funding
+            .initial_binding()
+            .map_err(|error| p.financial_error(error))?;
+        p.stage = Stage::Executing;
         paid.send(&Message::Execute {
             request: value,
             streaming,

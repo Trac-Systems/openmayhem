@@ -176,6 +176,133 @@ impl BuyerRecovery {
         self.publish_reservation_inner(key, at_ms, true).await
     }
 
+    /// One live foreground purchase owns this deadline, including publication,
+    /// fresh observations, intent checks and durable confirmation. Background
+    /// recovery continues to use the smaller ordinary read budget above.
+    pub(crate) async fn publish_reservation_until(
+        &self,
+        key: Digest,
+        at_ms: u64,
+        deadline: tokio::time::Instant,
+        unknown: &AtomicBool,
+    ) -> Result<Observation> {
+        tokio::time::timeout_at(deadline, async {
+            let r = self.run(move |s| s.get(key.as_str())).await?;
+            require(
+                !r.expired_unadmitted(),
+                "reservation intention expired without admission",
+            )?;
+            let unpublished = r.reservation.as_ref().filter(|v| v.proof.is_none());
+            let mut submission = match unpublished {
+                Some(intent) => {
+                    self.client
+                        .submit_reservation_tracked(&r.authorization, intent.at, Some(unknown))
+                        .await
+                }
+                None => Ok(()),
+            };
+            let offer = negotiation::BuyerOffer {
+                terms: r.authorization.terms.clone(),
+                buyer_sig: r.authorization.buyer_sig.clone(),
+            };
+            loop {
+                let observation = self
+                    .client
+                    .observe_with_attempts(&r.authorization, 3, Some(unknown))
+                    .await;
+                let observed = match observation {
+                    Ok(observed) => Some(observed),
+                    Err(error) => {
+                        // A malformed success, invalid binding/signature or
+                        // explicit permanent rejection is never a pending read.
+                        if !observation_retryable(&error) {
+                            return Err(error);
+                        }
+                        let mut observed = None;
+                        if unpublished.is_some() {
+                            match self.client.intent_state(&offer).await {
+                                Ok(intent) => match intent.status()? {
+                                    intent::Status::Expired => {
+                                        let key = r.key()?;
+                                        self.run(move |s| {
+                                            s.close_unadmitted_reservation(&key, intent, at_ms)
+                                        })
+                                        .await?;
+                                        return Err(invalid(
+                                            "reservation intention expired without admission",
+                                        ));
+                                    }
+                                    intent::Status::Admitted => {
+                                        require(
+                                            intent.authorization()? == Some(&r.authorization),
+                                            "admitted reservation authorization differs",
+                                        )?;
+                                        // Admission can become visible after the
+                                        // last finance read. Require its full
+                                        // independently challenged state now.
+                                        match self.client.observe_once(&r.authorization).await {
+                                            Ok(value) => observed = Some(value),
+                                            Err(error) if observation_retryable(&error) => {
+                                                mark_unknown(&error, Some(unknown));
+                                            }
+                                            Err(error) => return Err(error),
+                                        }
+                                    }
+                                    intent::Status::Open => {
+                                        if submission
+                                            .as_ref()
+                                            .err()
+                                            .is_some_and(observation_retryable)
+                                        {
+                                            // Replay only the saved envelope and
+                                            // timestamp through its durable journal.
+                                            submission = self
+                                                .client
+                                                .submit_reservation_tracked(
+                                                    &r.authorization,
+                                                    unpublished.unwrap().at,
+                                                    Some(unknown),
+                                                )
+                                                .await;
+                                        }
+                                    }
+                                },
+                                Err(error) if observation_retryable(&error) => {
+                                    mark_unknown(&error, Some(unknown));
+                                }
+                                Err(error) => return Err(error),
+                            }
+                        }
+                        if observed.is_none()
+                            && submission
+                                .as_ref()
+                                .err()
+                                .is_some_and(|error| !observation_retryable(error))
+                        {
+                            return Err(submission.err().unwrap());
+                        }
+                        observed
+                    }
+                };
+                if let Some(observed) = observed {
+                    // A historical acceptance or a financial closure is not
+                    // permission to start execution on this foreground channel.
+                    observed.initial_binding()?;
+                    return self
+                        .run(move |s| {
+                            s.observe(&observed, false, at_ms)?;
+                            observed.initial_binding()?;
+                            Ok(observed)
+                        })
+                        .await;
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        })
+        .await
+        .map_err(|_| admission_timeout(Some(unknown)))?
+    }
+
     async fn publish_reservation_inner(
         &self,
         key: Digest,

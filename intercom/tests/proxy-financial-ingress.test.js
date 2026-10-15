@@ -493,3 +493,22 @@ test('offer service binds provider ownership, fresh challenges and canonical pay
   assert.equal(f.base.local.length, before);
   assert.equal(f.appends, 0);
 });
+
+
+test('financial service distinguishes pending admission from malformed canonical acceptance', async t => {
+  const f = await fixture(t);
+  const digest = await proxySpendTermsDigest(f.terms);
+  const query = { accepted_terms: digest, request_nonce: 'd'.repeat(64), requester: f.provider.publicKey };
+  const read = () => f.feature._handleService(PROXY_FINANCIAL_STATE_SERVICE, query, {});
+  await assert.rejects(read(), error => error.code === 'proxy_financial_pending');
+  assert.equal(f.appends, 0, 'observation cannot reserve or execute');
+  await f.seed([[`proxy/v1/accepted/${digest}`, { type: 'malformed', accepted_terms: digest }]]);
+  const { classifyProxyFinancialError } = await import('../features/mayhem/proxy-financial-errors.js');
+  await assert.rejects(read(), error => classifyProxyFinancialError(error).code === 'proxy_financial_invalid');
+  await f.seed([[`proxy/v1/accepted/${digest}`, null]]);
+  await f.submit(f.authorize(f.terms));
+  assert.equal((await read()).accepted.accepted_terms, digest);
+  await assert.rejects(f.feature._handleService(PROXY_FINANCIAL_STATE_SERVICE,
+    { ...query, requester: f.admin.publicKey }, {}), error => error.code === 'proxy_financial_rejected');
+  assert.equal(f.appends, 1);
+});

@@ -20,13 +20,115 @@ use mayhem_proto::proxy::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::time::{Duration, Instant};
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    time::{Duration, Instant},
+};
 use url::Url;
 
 const MAX_BYTES: usize = 131072;
 const FRESHNESS: Duration = Duration::from_secs(15);
 const PUBLICATION_WAIT: Duration = Duration::from_secs(10);
 const PUBLICATION_ATTEMPTS: usize = 10;
+// One foreground purchase may await asynchronous admission longer than one
+// observation remains fresh. This never extends a signed response's lifetime.
+pub(crate) const ADMISSION_WAIT: Duration = Duration::from_secs(60);
+
+fn financial_code(code: &str) -> Option<&'static str> {
+    match code {
+        "proxy_financial_pending" => Some("proxy_financial_pending"),
+        "proxy_financial_busy" => Some("proxy_financial_busy"),
+        "proxy_financial_unavailable" => Some("proxy_financial_unavailable"),
+        "proxy_financial_snapshot_changed" => Some("proxy_financial_snapshot_changed"),
+        "proxy_financial_invalid" => Some("proxy_financial_invalid"),
+        "proxy_financial_rejected" => Some("proxy_financial_rejected"),
+        "proxy_financial_unknown" => Some("proxy_financial_unknown"),
+        _ => None,
+    }
+}
+
+pub(crate) fn diagnostic_code(error: &Error) -> &'static str {
+    if let Error::Http { code, .. } = error {
+        if let Some(code) = financial_code(code) {
+            return code;
+        }
+    }
+    if observation_retryable(error) {
+        if matches!(error, Error::Http { .. }) {
+            "proxy_financial_unknown"
+        } else {
+            "proxy_financial_unavailable"
+        }
+    } else {
+        "proxy_financial_invalid"
+    }
+}
+
+fn mark_unknown(error: &Error, unknown: Option<&AtomicBool>) {
+    if diagnostic_code(error) == "proxy_financial_unknown" {
+        if let Some(unknown) = unknown {
+            unknown.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
+// Legacy peers conflate temporary and permanent failures. A deadline cannot
+// promote any such reply into authority for another purchase, even if later
+// reads merely time out. This one sticky bit is diagnostic, never financial proof.
+pub(crate) fn admission_timeout(unknown: Option<&AtomicBool>) -> Error {
+    if unknown.is_some_and(|value| value.load(Ordering::Relaxed)) {
+        Error::Http {
+            status: 503,
+            code: "proxy_financial_unknown".into(),
+        }
+    } else {
+        Error::FinancialAdmissionUnavailable
+    }
+}
+
+pub(crate) fn observation_retryable(error: &Error) -> bool {
+    match error {
+        Error::Http { status, code } => {
+            !matches!(
+                code.as_str(),
+                "proxy_financial_invalid" | "proxy_financial_rejected"
+            ) && (*status == 429 || (500..600).contains(status))
+        }
+        Error::Transport(error) => transient_transport(error),
+        Error::FinancialAdmissionUnavailable => true,
+        _ => false,
+    }
+}
+
+// Only fixed codes cross the diagnostic boundary. Neither error messages nor
+// arbitrary peer fields become a log string or authority to retry bad proofs.
+async fn observation_http_error(response: &mut reqwest::Response) -> Result<Error> {
+    let status = response.status().as_u16();
+    require(
+        response
+            .content_length()
+            .is_none_or(|n| n <= MAX_BYTES as u64),
+        "financial error response exceeds bound",
+    )?;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(Error::Transport)? {
+        require(
+            bytes.len().saturating_add(chunk.len()) <= MAX_BYTES,
+            "financial error response exceeds bound",
+        )?;
+        bytes.extend_from_slice(&chunk);
+    }
+    let value = serde_json::from_slice::<Value>(&bytes).ok();
+    let code = match value.as_ref().and_then(|v| v.get("code")) {
+        Some(Value::String(code)) => financial_code(code).unwrap_or("proxy_financial_invalid"),
+        Some(_) => "proxy_financial_invalid",
+        None => "canonical_financial_observation_unavailable", // Older peer RPCs.
+    };
+    Ok(Error::Http {
+        status,
+        code: code.into(),
+    })
+}
 
 fn transient_transport(error: &reqwest::Error) -> bool {
     if error.is_timeout() || error.is_connect() || error.is_body() {
@@ -484,6 +586,15 @@ impl Client {
         authorization: &ProxySpendAuthorization,
         at: u64,
     ) -> Result<()> {
+        self.submit_reservation_tracked(authorization, at, None)
+            .await
+    }
+    async fn submit_reservation_tracked(
+        &self,
+        authorization: &ProxySpendAuthorization,
+        at: u64,
+        unknown: Option<&AtomicBool>,
+    ) -> Result<()> {
         let t = &authorization.terms;
         authorization
             .verify(crate::receipts::verify_signature)
@@ -499,9 +610,10 @@ impl Client {
         let digest = t
             .digest()
             .map_err(|_| invalid("invalid reservation terms"))?;
-        self.submit_feature(
+        self.submit_feature_tracked(
             format!("proxy/spend/{digest}"),
             json!({"op":"proxy_spend_reserve","authorization":authorization,"at":at}),
+            unknown,
         )
         .await
     }
@@ -616,10 +728,18 @@ impl Client {
         .await
     }
     async fn submit_feature(&self, key: String, value: Value) -> Result<()> {
+        self.submit_feature_tracked(key, value, None).await
+    }
+    async fn submit_feature_tracked(
+        &self,
+        key: String,
+        value: Value,
+        unknown: Option<&AtomicBool>,
+    ) -> Result<()> {
         let _permit = self
             .slots
             .try_acquire()
-            .map_err(|_| invalid("financial publication capacity unavailable"))?;
+            .map_err(|_| Error::FinancialAdmissionUnavailable)?;
         let bytes = serde_json::to_vec(&json!({"feature":"mayhem","key":key,"value":value}))?;
         require(
             bytes.len() <= MAX_BYTES,
@@ -629,10 +749,13 @@ impl Client {
         for attempt in 0..PUBLICATION_ATTEMPTS {
             let remaining = PUBLICATION_WAIT
                 .checked_sub(started.elapsed())
-                .ok_or_else(|| invalid("financial publication admission unavailable"))?;
+                .ok_or_else(|| admission_timeout(unknown))?;
             let result = tokio::time::timeout(remaining, self.submit_feature_once(&bytes))
                 .await
-                .map_err(|_| invalid("financial publication needs reconciliation"))?;
+                .map_err(|_| admission_timeout(unknown))?;
+            if let Err(error) = &result {
+                mark_unknown(error, unknown);
+            }
             let retry = match &result {
                 Ok(reply) => publication_retryable(reply),
                 Err(Error::Http { status, .. }) => *status == 429 || (500..600).contains(status),
@@ -643,15 +766,13 @@ impl Client {
                 // Ambiguous delivery retries the original serialized envelope.
                 // The canonical journal retains its nonce and dispatch evidence;
                 // this acknowledgment never authorizes inference or settlement.
-                require(
-                    attempt + 1 < PUBLICATION_ATTEMPTS,
-                    "financial publication admission unavailable",
-                )?;
+                if attempt + 1 == PUBLICATION_ATTEMPTS {
+                    return Err(admission_timeout(unknown));
+                }
                 let delay = publication_backoff(attempt);
-                require(
-                    started.elapsed() + delay < PUBLICATION_WAIT,
-                    "financial publication admission unavailable",
-                )?;
+                if started.elapsed() + delay >= PUBLICATION_WAIT {
+                    return Err(admission_timeout(unknown));
+                }
                 tokio::time::sleep(delay).await;
                 continue;
             }
@@ -702,7 +823,7 @@ impl Client {
         Ok(serde_json::from_slice(&bytes)?)
     }
     pub async fn observe(&self, authorization: &ProxySpendAuthorization) -> Result<Observation> {
-        self.observe_with_attempts(authorization, 3).await
+        self.observe_with_attempts(authorization, 3, None).await
     }
 
     // Only the reservation publication path waits for asynchronous canonical
@@ -711,13 +832,14 @@ impl Client {
         &self,
         authorization: &ProxySpendAuthorization,
     ) -> Result<Observation> {
-        self.observe_with_attempts(authorization, 12).await
+        self.observe_with_attempts(authorization, 12, None).await
     }
 
     async fn observe_with_attempts(
         &self,
         authorization: &ProxySpendAuthorization,
         attempts: usize,
+        unknown: Option<&AtomicBool>,
     ) -> Result<Observation> {
         // Publication can be durably accepted just before the canonical read
         // becomes available. Retry only this read, with a fresh challenge each
@@ -726,17 +848,14 @@ impl Client {
         for attempt in 0..attempts {
             let remaining = FRESHNESS
                 .checked_sub(started.elapsed())
-                .ok_or_else(|| invalid("canonical financial observation unavailable"))?;
+                .ok_or_else(|| admission_timeout(unknown))?;
             let result = tokio::time::timeout(remaining, self.observe_once(authorization))
                 .await
-                .map_err(|_| invalid("canonical financial observation unavailable"))?;
-            let retry = match &result {
-                Err(Error::Http { status, .. }) => *status == 429 || (500..600).contains(status),
-                Err(Error::Transport(error)) => {
-                    error.is_timeout() || error.is_connect() || error.is_body()
-                }
-                _ => false,
-            };
+                .map_err(|_| admission_timeout(unknown))?;
+            if let Err(error) = &result {
+                mark_unknown(error, unknown);
+            }
+            let retry = result.as_ref().err().is_some_and(observation_retryable);
             if !retry || attempt + 1 == attempts {
                 return result;
             }
@@ -753,7 +872,7 @@ impl Client {
         let _permit = self
             .slots
             .try_acquire()
-            .map_err(|_| invalid("financial observation capacity unavailable"))?;
+            .map_err(|_| Error::FinancialAdmissionUnavailable)?;
         let t = &authorization.terms;
         t.validate()
             .map_err(|_| invalid("invalid financial terms"))?;
@@ -777,10 +896,7 @@ impl Client {
             .await
             .map_err(Error::Transport)?;
         if !response.status().is_success() {
-            return Err(Error::Http {
-                status: response.status().as_u16(),
-                code: "canonical_financial_observation_unavailable".into(),
-            });
+            return Err(observation_http_error(&mut response).await?);
         }
         require(
             response

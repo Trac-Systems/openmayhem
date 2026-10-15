@@ -389,8 +389,10 @@ impl GatewayJobStore {
         if self.proxy_failed {
             return None;
         }
-        self.records.get(id).filter(|job| job.proxy.is_some()
-            && (job.status == GatewayJobStatus::ReconciliationPending || job.expires_at > now))
+        self.records.get(id).filter(|job| {
+            job.proxy.is_some()
+                && (job.status == GatewayJobStatus::ReconciliationPending || job.expires_at > now)
+        })
     }
 
     pub(crate) fn proxy_enabled(&self) -> bool {
@@ -449,6 +451,45 @@ impl GatewayJobStore {
         }
         self.records.insert(job.id.clone(), job.clone());
         Ok(job)
+    }
+    /// One exact-job diagnostic, never financial authority. Only the owning
+    /// foreground controller may record a transient failure before Execute.
+    pub(crate) fn note_proxy_confirmation_failure(
+        &mut self,
+        id: &str,
+        code: &str,
+    ) -> Result<(), String> {
+        require(
+            matches!(
+                code,
+                "proxy_financial_pending"
+                    | "proxy_financial_busy"
+                    | "proxy_financial_unavailable"
+                    | "proxy_financial_snapshot_changed"
+            ),
+            "unsupported proxy confirmation diagnostic",
+        )?;
+        let mut job = self.proxy_job(id)?;
+        let proxy = job.proxy.as_ref().unwrap();
+        require(
+            job.status == GatewayJobStatus::ReconciliationPending
+                && proxy.terms.is_some()
+                && proxy.closure.is_none()
+                && proxy.output_receipt.is_none()
+                && job.result.is_none(),
+            "proxy confirmation diagnostic is too late",
+        )?;
+        if job.error_info.is_some() {
+            return Ok(());
+        }
+        job.error_info = Some(GatewayJobErrorInfo {
+            code: code.to_owned(),
+            category: "proxy_confirmation".to_owned(),
+            retryable: false,
+            phase: Some("accepted".to_owned()),
+        });
+        self.persist_proxy(job)?;
+        Ok(())
     }
     /// Durable idempotency ownership, even before a quote or owner budget grant.
     pub(crate) fn begin_proxy(
@@ -766,6 +807,21 @@ impl GatewayJobStore {
         }
         let paid = matches!(closure.outcome, FinancialOutcome::Paid { .. });
         let unknown = matches!(closure.outcome, FinancialOutcome::ExpiredUnknown { .. });
+        let transient_not_executed = matches!(&closure.outcome,
+            FinancialOutcome::Waived { closure }
+                if closure.body.outcome == mayhem_proto::proxy::finance::ProxyClosureOutcome::NotExecuted)
+            && job.result.is_none()
+            && job.error_info.as_ref().is_some_and(|info| {
+                info.category == "proxy_confirmation"
+                    && info.phase.as_deref() == Some("accepted")
+                    && matches!(
+                        info.code.as_str(),
+                        "proxy_financial_pending"
+                            | "proxy_financial_busy"
+                            | "proxy_financial_unavailable"
+                            | "proxy_financial_snapshot_changed"
+                    )
+            });
         proxy.budget_marker = Some(budget_marker);
         job.status = if paid {
             GatewayJobStatus::Completed
@@ -774,6 +830,9 @@ impl GatewayJobStore {
         };
         job.finished_at = now;
         job.expires_at = now.saturating_add(self.ttl_seconds);
+        if paid {
+            job.error_info = None;
+        }
         if !paid {
             job.error = Some(
                 if unknown {
@@ -783,22 +842,26 @@ impl GatewayJobStore {
                 }
                 .to_owned(),
             );
-            job.error_info = Some(GatewayJobErrorInfo {
-                code: if unknown {
-                    "proxy_execution_unknown"
-                } else {
-                    "proxy_purchase_waived"
-                }
-                .to_owned(),
-                category: if unknown {
-                    "execution_unknown"
-                } else {
-                    "proxy"
-                }
-                .to_owned(),
-                retryable: false,
-                phase: None,
-            });
+            if transient_not_executed {
+                job.error_info.as_mut().unwrap().retryable = true;
+            } else {
+                job.error_info = Some(GatewayJobErrorInfo {
+                    code: if unknown {
+                        "proxy_execution_unknown"
+                    } else {
+                        "proxy_purchase_waived"
+                    }
+                    .to_owned(),
+                    category: if unknown {
+                        "execution_unknown"
+                    } else {
+                        "proxy"
+                    }
+                    .to_owned(),
+                    retryable: false,
+                    phase: None,
+                });
+            }
         }
         self.persist_proxy(job)
     }

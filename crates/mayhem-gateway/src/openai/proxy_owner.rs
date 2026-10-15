@@ -98,6 +98,25 @@ impl Owner {
         .await
     }
 
+    pub(crate) async fn note_confirmation_failure(
+        &self,
+        code: &'static str,
+    ) -> Result<(), GateError> {
+        let jobs = self.jobs.clone();
+        let binding = self.binding.clone();
+        Self::storage(move || {
+            let mut jobs = jobs.lock().map_err(|_| GateError::Unavailable)?;
+            let existing = jobs
+                .get(&binding.job_id, now_secs())
+                .map_err(|_| GateError::Unavailable)?
+                .ok_or(GateError::Rejected)?;
+            Self::check(&existing, &binding)?;
+            jobs.note_proxy_confirmation_failure(&binding.job_id, code)
+                .map_err(|_| GateError::Unavailable)
+        })
+        .await
+    }
+
     /// A fresh canonical observation is required before accounting. Persist the
     /// outcome first, then settle its exact commitment in the common budget
     /// journal, then finish the job. Repeating after a crash is idempotent at

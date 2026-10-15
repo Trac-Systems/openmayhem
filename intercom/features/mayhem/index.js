@@ -1,3 +1,4 @@
+import { proxyFinancialError, classifyProxyFinancialError, isProxyFinancialCode } from './proxy-financial-errors.js';
 import { validateAdmissionMsbSnapshot } from './proxy-admission-msb.js';
 import { readProxyAdmissionPolicy, validateProxyAdmissionPolicyRequest, PROXY_ADMISSION_POLICY_SERVICE,
   PROXY_ADMISSION_POLICY_MAX_BYTES, PROXY_ADMISSION_POLICY_MAX_AGE_MS } from './proxy-admission-policy.js';
@@ -815,14 +816,18 @@ class MayhemFeature extends Feature {
       signing_version: SERVICE_SIGNING_VERSION,
       signature: b4a.isBuffer(signature) ? b4a.toString(signature, 'hex') : signature });
     const elapsed = Date.now() - started;
-    if (elapsed < 0 || elapsed > PROXY_FINANCIAL_STATE_MAX_AGE_MS) throw new Error('Proxy financial observation expired; check the same attempt again.');
-    if (result?.ok !== true) throw new Error('Proxy financial state is unavailable.');
+    if (elapsed < 0 || elapsed > PROXY_FINANCIAL_STATE_MAX_AGE_MS) throw proxyFinancialError('proxy_financial_unavailable');
+    if (result?.ok !== true) {
+      // Older peers conflated temporary and permanent failures. A bounded
+      // re-observation is safe, but this is not proof of a transient cause.
+      throw proxyFinancialError(isProxyFinancialCode(result?.code) ? result.code : 'proxy_financial_unknown');
+    }
     const context = proxyRuntimeContext(this.peer, CONTRACT_VERSION, result.context?.epoch);
     if (result.accepted_terms !== payload.accepted_terms || result.request_nonce !== payload.request_nonce
         || result.requester !== requester || result.lane !== 'proxy' || result.schema_version !== 1
         || stableJson(result.context) !== stableJson(context)
         || b4a.byteLength(JSON.stringify(result)) > PROXY_FINANCIAL_STATE_MAX_BYTES) {
-      throw new Error('Proxy financial response does not match this request/network.');
+      throw proxyFinancialError('proxy_financial_invalid');
     }
     validateProxySnapshotProof(result.proof);
     return { ...result, request_nonce: query.request_nonce };
@@ -2064,7 +2069,9 @@ class MayhemFeature extends Feature {
       const busy = this._prepareServiceResult(
         expectedId,
         transport,
-        relayError('Mayhem admin service is busy; retry this signed request.', expectedId)
+        message.service === PROXY_FINANCIAL_STATE_SERVICE
+          ? { ...relayError('The canonical financial service is busy.', expectedId), code: 'proxy_financial_busy' }
+          : relayError('Mayhem admin service is busy; retry this signed request.', expectedId)
       );
       this.peer.sidechannel.broadcast(this.channel, busy.message);
       return;
@@ -2072,10 +2079,13 @@ class MayhemFeature extends Feature {
     if (!cached) {
       const promise = Promise.resolve()
         .then(() => this._handleService(message.service, envelope.payload, envelope))
-        .catch((error) => relayError(
-          error?.message || 'Mayhem admin service request failed.',
-          expectedId
-        ))
+        .catch((error) => {
+          if (message.service === PROXY_FINANCIAL_STATE_SERVICE) {
+            const safe = classifyProxyFinancialError(error);
+            return { ...relayError(safe.message, expectedId), code: safe.code };
+          }
+          return relayError(error?.message || 'Mayhem admin service request failed.', expectedId);
+        })
         .then((response) => this._prepareServiceResult(expectedId, transport, response));
       cached = {
         at: Date.now(),

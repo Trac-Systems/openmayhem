@@ -493,6 +493,9 @@ fn proxy_expiry_finishes_unknown_without_authorizing_retry_or_claiming_output() 
     let root = tempfile::tempdir().unwrap();
     let mut store = open(root.path(), 4, 1024 * 1024, 1);
     let (terms, _) = authorized(&mut store, "job_expiry");
+    store
+        .note_proxy_confirmation_failure("job_expiry", "proxy_financial_pending")
+        .unwrap();
     let auth = output(&terms).authorization;
     let body = ProxyExpiryBody {
         schema_version: 1,
@@ -551,4 +554,104 @@ fn proxy_rejects_foreign_output_altered_terms_and_unprotected_storage() {
     forged.receipt.provider_sig = "0".repeat(128);
     assert!(store.retain_proxy_output("job_bound", forged, 2).is_err());
     assert!(store.get("job_bound", 3).unwrap().unwrap().result.is_none());
+}
+
+#[test]
+fn proxy_confirmation_diagnostic_only_allows_retry_after_verified_nonexecution_and_budget_close() {
+    use mayhem_proto::proxy::finance::{
+        ProxyClosureBody, ProxyClosureOutcome, ProxyReservationClosure,
+    };
+    for outcome in [
+        ProxyClosureOutcome::NotExecuted,
+        ProxyClosureOutcome::Cancelled,
+        ProxyClosureOutcome::Failed,
+        ProxyClosureOutcome::CompletedUnbilled,
+    ] {
+        for diagnostic in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut store = open(root.path(), 4, 1024 * 1024, 1);
+            let (terms, _) = authorized(&mut store, "job_confirmation");
+            assert!(store
+                .note_proxy_confirmation_failure("job_confirmation", "proxy_financial_invalid")
+                .is_err());
+            if diagnostic {
+                store
+                    .note_proxy_confirmation_failure("job_confirmation", "proxy_financial_pending")
+                    .unwrap();
+                store
+                    .note_proxy_confirmation_failure("job_confirmation", "proxy_financial_pending")
+                    .unwrap();
+                let pending = store.get("job_confirmation", 3).unwrap().unwrap();
+                assert_eq!(pending.status, GatewayJobStatus::ReconciliationPending);
+                assert!(!pending.error_info.unwrap().retryable);
+            }
+            drop(store);
+            let mut store = open(root.path(), 4, 1024 * 1024, 3);
+            let body = ProxyClosureBody {
+                schema_version: 1,
+                lane: mayhem_proto::proxy::ProxyLane::Proxy,
+                accepted_terms: terms.digest().unwrap(),
+                outcome,
+                evidence_hash: digest(55).as_str().to_owned(),
+                at_ms: 100,
+            };
+            let closure = ProxyClosure {
+                proof: proof(),
+                outcome: FinancialOutcome::Waived {
+                    closure: ProxyReservationClosure {
+                        buyer_sig: sign(41, &body.buyer_signing_bytes().unwrap()),
+                        provider_sig: sign(42, &body.provider_signing_bytes().unwrap()),
+                        body,
+                    },
+                },
+            };
+            let marker = closure.commitment().unwrap();
+            let mut job = store.proxy_job("job_confirmation").unwrap();
+            let proxy = job.proxy.as_mut().unwrap();
+            proxy.authorization = Some(output(&terms).authorization);
+            proxy.buyer_journal_seen = true;
+            proxy.closure = Some(closure);
+            store.persist_proxy(job).unwrap();
+            assert!(store
+                .finish_proxy("job_confirmation", digest(99), 4)
+                .is_err());
+            let job = store
+                .finish_proxy("job_confirmation", marker.clone(), 4)
+                .unwrap();
+            assert_eq!(job.status, GatewayJobStatus::Failed);
+            assert_eq!(
+                job.error_info.as_ref().unwrap().retryable,
+                diagnostic && outcome == ProxyClosureOutcome::NotExecuted
+            );
+            assert!(store
+                .note_proxy_confirmation_failure("job_confirmation", "proxy_financial_busy")
+                .is_err());
+            assert_eq!(
+                store
+                    .finish_proxy("job_confirmation", marker, 4)
+                    .unwrap()
+                    .error_info,
+                job.error_info
+            );
+        }
+    }
+}
+
+#[test]
+fn paid_proxy_closure_clears_transient_confirmation_diagnostic() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = open(root.path(), 4, 1024 * 1024, 1);
+    let (terms, _) = authorized(&mut store, "job_paid_confirmation");
+    store
+        .note_proxy_confirmation_failure("job_paid_confirmation", "proxy_financial_unavailable")
+        .unwrap();
+    store
+        .retain_proxy_output("job_paid_confirmation", output(&terms), 3)
+        .unwrap();
+    let marker = stage_paid_closure(&mut store, "job_paid_confirmation");
+    let job = store
+        .finish_proxy("job_paid_confirmation", marker, 4)
+        .unwrap();
+    assert_eq!(job.status, GatewayJobStatus::Completed);
+    assert!(job.error_info.is_none());
 }
