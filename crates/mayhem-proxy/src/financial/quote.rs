@@ -12,6 +12,8 @@ use mayhem_proto::{
 pub(crate) use purchase::RetainedPurchase;
 pub use purchase::{Lifetimes, Maximum, PreparedPurchase, PurchaseRequest, SessionBinding};
 
+const QUOTE_ATTEMPTS: usize = 3;
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Query {
@@ -227,12 +229,37 @@ impl Client {
             .slots
             .try_acquire()
             .map_err(|_| invalid("quote observation capacity unavailable"))?;
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + FRESHNESS;
+        for attempt in 0..QUOTE_ATTEMPTS {
+            // Retry only the exact read, with a new challenge. A successful
+            // response that fails validation is never treated as backpressure.
+            let result = tokio::time::timeout_at(deadline, self.quote_once(query, started))
+                .await
+                .map_err(|_| invalid("canonical quote observation unavailable"))?;
+            let retry = match &result {
+                Err(Error::Http { status, .. }) => *status == 429 || (500..600).contains(status),
+                Err(Error::Transport(error)) => transient_transport(error),
+                _ => false,
+            };
+            if !retry || attempt + 1 == QUOTE_ATTEMPTS {
+                return result;
+            }
+            let delay = publication_backoff(attempt);
+            if tokio::time::Instant::now() + delay >= deadline {
+                return result;
+            }
+            tokio::time::sleep(delay).await;
+        }
+        unreachable!()
+    }
+
+    async fn quote_once(&self, query: &Query, started: Instant) -> Result<Observation> {
         let mut nonce = [0u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| invalid("quote challenge unavailable"))?;
         let nonce = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
         let mut body = serde_json::to_value(query)?;
         body["request_nonce"] = json!(nonce);
-        let started = Instant::now();
         let mut response = self
             .http
             .post(
@@ -244,10 +271,12 @@ impl Client {
             .send()
             .await
             .map_err(Error::Transport)?;
-        require(
-            response.status().is_success(),
-            "canonical quote is unavailable; recover or requote",
-        )?;
+        if !response.status().is_success() {
+            return Err(Error::Http {
+                status: response.status().as_u16(),
+                code: "canonical_quote_observation_unavailable".into(),
+            });
+        }
         require(
             response
                 .content_length()

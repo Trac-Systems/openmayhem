@@ -28,6 +28,27 @@ const FRESHNESS: Duration = Duration::from_secs(15);
 const PUBLICATION_WAIT: Duration = Duration::from_secs(10);
 const PUBLICATION_ATTEMPTS: usize = 10;
 
+fn transient_transport(error: &reqwest::Error) -> bool {
+    if error.is_timeout() || error.is_connect() || error.is_body() {
+        return true;
+    }
+    // reqwest 0.13 can wrap an interrupted body read in a Decode error. Do
+    // not retry arbitrary decoding failures, only its nested transport cause.
+    if error.is_decode() {
+        let mut cause = std::error::Error::source(error);
+        while let Some(source) = cause {
+            if source
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|error| error.is_body() || error.is_timeout() || error.is_connect())
+            {
+                return true;
+            }
+            cause = source.source();
+        }
+    }
+    false
+}
+
 // The existing peer RPC reports application rejection inside HTTP 200 and does
 // not provide a machine-readable busy code. Recognize only its exact temporary
 // journal conflicts; invalid signatures, insufficient funds and unknown errors
@@ -609,10 +630,19 @@ impl Client {
             let remaining = PUBLICATION_WAIT
                 .checked_sub(started.elapsed())
                 .ok_or_else(|| invalid("financial publication admission unavailable"))?;
-            let reply = tokio::time::timeout(remaining, self.submit_feature_once(&bytes))
+            let result = tokio::time::timeout(remaining, self.submit_feature_once(&bytes))
                 .await
-                .map_err(|_| invalid("financial publication needs reconciliation"))??;
-            if publication_retryable(&reply) {
+                .map_err(|_| invalid("financial publication needs reconciliation"))?;
+            let retry = match &result {
+                Ok(reply) => publication_retryable(reply),
+                Err(Error::Http { status, .. }) => *status == 429 || (500..600).contains(status),
+                Err(Error::Transport(error)) => transient_transport(error),
+                _ => false,
+            };
+            if retry {
+                // Ambiguous delivery retries the original serialized envelope.
+                // The canonical journal retains its nonce and dispatch evidence;
+                // this acknowledgment never authorizes inference or settlement.
                 require(
                     attempt + 1 < PUBLICATION_ATTEMPTS,
                     "financial publication admission unavailable",
@@ -625,6 +655,7 @@ impl Client {
                 tokio::time::sleep(delay).await;
                 continue;
             }
+            let reply = result?;
             require(
                 (reply["ok"] == true
                     && reply["accepted"] != false
@@ -648,10 +679,12 @@ impl Client {
             .send()
             .await
             .map_err(Error::Transport)?;
-        require(
-            response.status().is_success(),
-            "financial publication needs reconciliation",
-        )?;
+        if !response.status().is_success() {
+            return Err(Error::Http {
+                status: response.status().as_u16(),
+                code: "financial_publication_unavailable".into(),
+            });
+        }
         require(
             response
                 .content_length()
@@ -796,3 +829,6 @@ impl Client {
         Ok(Observation { wire: w, started })
     }
 }
+
+#[cfg(test)]
+mod publication_recovery;
