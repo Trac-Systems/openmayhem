@@ -120,11 +120,15 @@ impl Bridge {
                                         "direct":true,"relayed":false,"frame":request["frame"]});
                                     let attack={
                                         let mut mode=mode.lock().await;
-                                        if matches!(*mode,Some("stream_content"|"stream_identity"|"prepared_delay"|"prepared_drop")) {
+                                        if matches!(*mode,Some("stream_content"|"stream_identity"|"prepared_delay"|"prepared_drop"|"ack_lost"|"ack_drop"|"settled_drop"|"settled_delay")) {
                                             let payload=event["frame"]["data"].as_str().and_then(|v|STANDARD.decode(v).ok())
                                                 .and_then(|v|serde_json::from_slice::<Value>(&v).ok());
                                             let selected=payload.as_ref().is_some_and(|v| {
-                                                if matches!(*mode,Some("prepared_delay"|"prepared_drop")) {
+                                                if matches!(*mode,Some("ack_lost"|"ack_drop")) {
+                                                    v["kind"]=="acknowledge"
+                                                } else if matches!(*mode,Some("settled_drop"|"settled_delay")) {
+                                                    v["kind"]=="state" && v["state"]=="settled"
+                                                } else if matches!(*mode,Some("prepared_delay"|"prepared_drop")) {
                                                     v["kind"]=="state" && v["state"]=="prepared"
                                                 } else {v["kind"]=="stream"}
                                             });
@@ -176,13 +180,13 @@ impl Bridge {
                                     // Funding may become visible while the buyer is already
                                     // reading Prepared. Capture first so the test controls that
                                     // ordering without racing a wall-clock sleep.
-                                    if attack==Some("prepared_delay") {tokio::time::sleep(Duration::from_secs(2)).await;}
+                                    if matches!(attack,Some("prepared_delay"|"settled_delay")) {tokio::time::sleep(Duration::from_secs(2)).await;}
                                     for target in targets {
-                                        if attack==Some("prepared_drop") {continue}
+                                        if matches!(attack,Some("prepared_drop"|"ack_drop"|"settled_drop")) {continue}
                                         if target.send(event.clone()).await.is_err(){continue}
                                         if attack==Some("duplicate") {let _=target.send(event.clone()).await;}
                                     }
-                                    if attack==Some("lost_ack"){break}
+                                    if matches!(attack,Some("lost_ack"|"ack_lost")){break}
                                 }
                                 if kind=="session_close" {
                                     // The real bridge broadcasts closes separately from the

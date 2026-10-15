@@ -3,6 +3,8 @@ use mayhem_proxy::buyer_controller as buyer;
 use mayhem_proxy::financial::recovery::FinancialOutcome;
 use std::{future::Future, pin::Pin};
 use tokio::sync::{watch, Notify};
+#[path = "buyer_acknowledgment.rs"]
+mod acknowledgment;
 #[path = "buyer_admission.rs"]
 mod admission;
 #[path = "buyer_streaming.rs"]

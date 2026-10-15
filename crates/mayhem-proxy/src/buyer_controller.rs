@@ -2,6 +2,7 @@
 //! account/key budgets belong to the caller. This controller never selects another
 //! offer, changes a rail, retries Execute, or calls a native inference backend.
 pub use crate::financial::negotiation::NonAdmission;
+mod acknowledgment;
 mod admission;
 mod streaming;
 use crate::{
@@ -366,8 +367,8 @@ impl Controller {
             joining: tokio::sync::Mutex::new(()),
         })
     }
-    /// Trusted startup policy for the initial live purchase, never inference or
-    /// evidence freshness. Cannot change while a session owns this controller.
+    /// Trusted startup policy for live financial confirmation phases, never
+    /// inference or evidence freshness. Cannot change while a session owns this controller.
     pub fn with_admission_wait(mut self, wait: Duration) -> crate::Result<Self> {
         crate::require(
             !wait.is_zero() && wait <= financial::ADMISSION_WAIT,
@@ -1339,61 +1340,5 @@ impl Shared {
                 _ => return Err(p.error(Code::Verification)),
             }
         }
-    }
-    async fn acknowledge(
-        &self,
-        sender: &mut exchange::Sender,
-        receiver: &mut exchange::Receiver,
-        authorization: &ProxySpendAuthorization,
-        key: Digest,
-        p: &mut Progress,
-        stop: &mut watch::Receiver<bool>,
-    ) -> Result<FinancialOutcome> {
-        p.stage = Stage::Acknowledging;
-        let acknowledgment = self
-            .recovery
-            .sign_approved(&self.signer, key)
-            .await
-            .map_err(|_| p.error(Code::Storage))?;
-        p.check(stop)?;
-        sender
-            .send(&Message::Acknowledge {
-                acknowledgment: acknowledgment.clone(),
-            })
-            .await
-            .map_err(|_| p.error(Code::Transport))?;
-        let response = tokio::select! {
-            result = receiver.receive(Some(self.limits.control_wait)) => result.map_err(|_| p.error(Code::Transport))?,
-            _ = stopped(stop) => return Err(p.error(Code::Stopped)),
-        };
-        if !matches!(
-            response.message(),
-            Message::State {
-                state: PublicState::Settled
-            }
-        ) {
-            return Err(p.error(Code::Unconfirmed));
-        }
-        let settlement = self
-            .recovery
-            .refresh(authorization, crate::supervisor::unix_ms())
-            .await
-            .map_err(|_| p.error(Code::Unconfirmed))?
-            .ok_or_else(|| p.error(Code::Unconfirmed))?;
-        let exact = match (&acknowledgment, &settlement) {
-            (
-                SignedAcknowledgment::Receipt { receipt: expected },
-                FinancialOutcome::Paid { receipt },
-            ) => expected == receipt,
-            (
-                SignedAcknowledgment::Waiver { closure: expected },
-                FinancialOutcome::Waived { closure },
-            ) => expected == closure,
-            _ => false,
-        };
-        if !exact {
-            return Err(p.error(Code::Verification));
-        }
-        Ok(settlement)
     }
 }
