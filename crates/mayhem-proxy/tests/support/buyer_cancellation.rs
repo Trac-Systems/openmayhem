@@ -142,6 +142,23 @@ async fn buyer_controller_cancelled_json_and_stream_recover_original_receipt_on_
             .await
             .unwrap();
             occupied(&s, 1);
+            // A status-only recovery reports live cancelled work promptly. It
+            // must not monopolize a control slot or interrupt the original drain.
+            let (_resume, rx) = watch::channel(false);
+            let (pending, recovery_handle) =
+                tokio::join!(buyer.recover(id.clone(), gate.clone(), rx), async {
+                    provider
+                        .accept(listener.next(Duration::from_secs(5)).await.unwrap())
+                        .unwrap()
+                });
+            assert!(matches!(pending.unwrap(), buyer::Outcome::Pending {
+                identity, state: exchange::PublicState::Running,
+            } if identity == id));
+            assert_eq!(
+                recovery_handle.wait().await.unwrap(),
+                serving::End::ControlIdle
+            );
+            occupied(&s, 1);
             release.notify_one();
             let _ = tokio::time::timeout(Duration::from_secs(5), handle.wait())
                 .await
@@ -327,7 +344,9 @@ async fn buyer_controller_orphan_expiry_uses_original_policy_and_canonical_1125_
                             .unwrap()
                     }
                 );
-                assert!(error(result).recovery_required);
+                assert!(matches!(result.unwrap(), buyer::Outcome::Pending {
+                    identity, state: exchange::PublicState::OutcomeUnknown,
+                } if identity == id));
                 let _ = handle.wait().await;
                 let retained = recovery.recover(key.clone()).await.unwrap();
                 assert!(

@@ -92,7 +92,7 @@ pub(super) async fn run(
                 };
                 idle=Instant::now()+owner.limits.control_wait;
                 let result=handle(&owner,&session,command,&output,&mut job).await;
-                match result {Ok(true)=>break Ok(End::Settled),Ok(false)=>(),Err(error)=>{
+                match result {Ok(Some(end))=>break Ok(end),Ok(None)=>(),Err(error)=>{
                     super::diagnostics::report("control", &error);
                     break Err(error)
                 }}
@@ -196,7 +196,7 @@ async fn handle(
     command: exchange::Received,
     output: &queue::Output,
     job: &mut Option<JoinHandle<Result<()>>>,
-) -> Result<bool> {
+) -> Result<Option<End>> {
     match command.message() {
         Message::Execute { request, streaming } => {
             if mayhem_proto::endpoint_request_fingerprint(request)
@@ -212,7 +212,7 @@ async fn handle(
                     output.control(Message::State {
                         state: PublicState::Running,
                     })?;
-                    return Ok(false);
+                    return Ok(None);
                 }
                 Err(error) => return Err(error),
             };
@@ -291,6 +291,12 @@ async fn handle(
             {
                 state = PublicState::Running;
             }
+            if result.is_none()
+                && matches!(state, PublicState::Running | PublicState::OutcomeUnknown)
+            {
+                output.deliver(Message::State { state }).await?;
+                return Ok(job.is_none().then_some(End::ControlIdle));
+            }
             output.control(Message::State { state })?;
             if let Some(response) = result {
                 output.control(Message::Result { response })?;
@@ -299,6 +305,14 @@ async fn handle(
                     .await?
                     .ok_or(Error::Configuration)?;
                 receipt(owner, session, output, saved.record.attempt).await?;
+            } else if state == PublicState::CancelRequested {
+                // Cancellation is not terminal evidence. Deliver any proof
+                // retained since the status snapshot before ending this bounded
+                // recovery read; otherwise the buyer waits for a receipt that
+                // may never exist and occupies a control slot until timeout.
+                if recover_cancelled_status(owner, session, output).await? && job.is_none() {
+                    return Ok(Some(End::ControlIdle));
+                }
             } else if state != PublicState::Settled {
                 offer_non_execution(owner, session, output).await?;
             }
@@ -330,11 +344,11 @@ async fn handle(
                     },
                 })
                 .await?;
-            return Ok(confirmed);
+            return Ok(confirmed.then_some(End::Settled));
         }
         _ => return Err(Error::Transport(exchange::Error::Protocol)),
     }
-    Ok(false)
+    Ok(None)
 }
 async fn recover(owner: &Inner, session: &Session, output: &queue::Output) -> Result<()> {
     let saved = session
@@ -349,6 +363,38 @@ async fn recover(owner: &Inner, session: &Session, output: &queue::Output) -> Re
             .await?;
     }
     receipt(owner, session, output, saved.record.attempt).await
+}
+async fn recover_cancelled_status(
+    owner: &Inner,
+    session: &Session,
+    output: &queue::Output,
+) -> Result<bool> {
+    let saved = session
+        .existing(&owner.executor)
+        .await?
+        .ok_or(Error::Configuration)?;
+    if let Some(result) = saved.result {
+        output
+            .send(Message::Result {
+                response: result.reply.body,
+            })
+            .await?;
+    } else if saved.record.non_execution_evidence().is_none() {
+        // Finish delivery before releasing this control connection. Closing a
+        // local socket alone does not close the bridge's logical session.
+        output
+            .deliver(Message::State {
+                state: if owner.cancellation(session.invocation())?.is_some() {
+                    PublicState::Running
+                } else {
+                    PublicState::OutcomeUnknown
+                },
+            })
+            .await?;
+        return Ok(true);
+    }
+    receipt(owner, session, output, saved.record.attempt).await?;
+    Ok(false)
 }
 async fn receipt(
     owner: &Inner,

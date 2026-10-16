@@ -53,6 +53,229 @@ async fn provider_opening_drains_closed_sessions_without_hiding_close_from_sessi
 }
 
 #[tokio::test]
+async fn cancelled_unknown_recovery_reads_release_both_control_slots_for_fresh_generation() {
+    unknown_recovery_reads_release_control_slots(true).await;
+}
+
+#[tokio::test]
+async fn uncancelled_unknown_recovery_reads_release_both_control_slots_for_fresh_generation() {
+    unknown_recovery_reads_release_control_slots(false).await;
+}
+
+async fn unknown_recovery_reads_release_control_slots(cancelled: bool) {
+    use serving::dispatch::{Dispatcher, Health, Limits, Registration};
+    let bytes = chat();
+    let backend = backend(200, answer(), Duration::ZERO).await;
+    let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let mut peer = Peer::start(ProxyRail::Fiat, &f, &bytes, false, None).await;
+    let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+    let controller = server(
+        &s,
+        &f,
+        &peer,
+        serving::Limits {
+            sessions: 2,
+            ..bounds()
+        },
+    );
+    let original = context(&peer);
+    let executor = make_executor(&f, &peer, &s.runtime, &s.journal);
+    let recovery = recovery(&f, &peer);
+    let mut histories = Vec::new();
+    for id in [920, 930] {
+        let mut context = original.clone();
+        context.session_id = d(id);
+        context.billing_id = d(id + 1);
+        let pair = open(&peer, context.clone(), 1024 * 1024).await;
+        let handle = controller.start(pair.provider).unwrap();
+        let (buyer, saved) = purchase(&s, &peer, &bytes, pair.buyer, &context).await;
+        s.buyer
+            .publish(saved.key().clone(), &recovery, 1002)
+            .await
+            .unwrap();
+        executor
+            .prepare_accepted(
+                context.invocation().unwrap(),
+                buyer.session().authorization(),
+                &bytes,
+                false,
+            )
+            .await
+            .unwrap();
+        handle.disconnect();
+        handle.wait().await.unwrap();
+        drop((buyer, pair.bridge));
+        // Fixture an old cancelled dispatch with no retained result. Independent
+        // upstream-stop evidence releases physical capacity, not its outcome.
+        let invocation = context.invocation().unwrap();
+        let record = s.journal.get(&invocation).unwrap().unwrap();
+        s.journal
+            .begin_dispatch(&invocation, record.generation, record.updated_at_ms)
+            .unwrap();
+        let record = s.journal.get(&invocation).unwrap().unwrap();
+        let record = if cancelled {
+            s.journal
+                .advance(
+                    &invocation,
+                    record.generation,
+                    attempts::Event::CancelRequested,
+                    record.updated_at_ms,
+                )
+                .unwrap()
+        } else {
+            record
+        };
+        let dispatch = s
+            .runtime
+            .capacity
+            .dispatch_accepted(
+                &record.binding.capacity_lease,
+                &capacity::Work {
+                    invocation,
+                    request_hash: record.binding.request_hash.clone(),
+                },
+                &d(201),
+            )
+            .unwrap();
+        s.runtime
+            .capacity
+            .complete(capacity::VerifiedCompletion {
+                lease: dispatch.lease().clone(),
+                evidence: d(id + 2),
+            })
+            .unwrap();
+        histories.push((context, record));
+    }
+    assert_eq!(
+        s.runtime.capacity.status(&d(201)).unwrap().group_occupied,
+        0
+    );
+    let bridge = Bridge::start(original.buyer.as_str(), &original.offer.provider_pubkey).await;
+    let listener =
+        n::opening::Listener::connect(bridge.config(false), peer.identity.clone(), wire_limits())
+            .await
+            .unwrap();
+    let dispatcher = Dispatcher::new(
+        listener,
+        vec![Registration::new(&original.offer, controller).unwrap()],
+        Limits {
+            sessions: 2,
+            registrations: 1,
+            observation_wait: Duration::from_millis(50),
+        },
+        maintenance_policy(),
+        8,
+    )
+    .unwrap();
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let (updates, health) = tokio::sync::watch::channel(Health::default());
+    let task = tokio::spawn(dispatcher.run(stopped, updates));
+    let mut readers = Vec::new();
+    for (context, _) in &histories {
+        let mut buyer = n::Channel::dial(
+            bridge.config(true),
+            context.clone(),
+            &identity(&peer),
+            wire_limits(),
+        )
+        .await
+        .unwrap();
+        buyer.send(&n::Message::Recover).await.unwrap();
+        assert!(matches!(
+            buyer
+                .receive(Duration::from_secs(2))
+                .await
+                .unwrap()
+                .into_message(context, Role::Buyer)
+                .unwrap(),
+            n::Message::Accepted { .. }
+        ));
+        readers.push(buyer.into_paid(&identity(&peer)).unwrap());
+    }
+    assert_eq!(health.borrow().active, 2);
+    for reader in &mut readers {
+        reader.send(&exchange::Message::Status).await.unwrap();
+    }
+    for reader in &mut readers {
+        if cancelled {
+            assert!(matches!(
+                next(reader).await.message(),
+                exchange::Message::State {
+                    state: exchange::PublicState::CancelRequested,
+                }
+            ));
+        }
+        assert!(matches!(
+            reader
+                .receive(Some(Duration::from_secs(2)))
+                .await
+                .unwrap()
+                .message(),
+            exchange::Message::State {
+                state: exchange::PublicState::OutcomeUnknown
+            }
+        ));
+    }
+    // These are bounded Pending reads, not a claim of nonexecution or settlement.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while health.borrow().active != 0 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(health.borrow().completed, 2);
+    assert_eq!(health.borrow().failed, 0);
+    drop(readers);
+    for (context, record) in &histories {
+        let invocation = context.invocation().unwrap();
+        assert_eq!(s.journal.get(&invocation).unwrap().as_ref(), Some(record));
+        assert!(s
+            .journal
+            .recover(&invocation, record.attempt)
+            .unwrap()
+            .result
+            .is_none());
+        assert!(record.resolution.is_none() && record.closure.is_none());
+    }
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        peer.command("status").await["publications"],
+        2,
+        "only the original holds"
+    );
+    let buyer = n::Channel::dial(
+        bridge.config(true),
+        original.clone(),
+        &identity(&peer),
+        wire_limits(),
+    )
+    .await
+    .unwrap();
+    let (mut buyer, saved) = purchase(&s, &peer, &bytes, buyer, &original).await;
+    s.buyer
+        .publish(saved.key().clone(), &recovery, 1002)
+        .await
+        .unwrap();
+    drop(recovery);
+    buyer
+        .send(&exchange::Message::Execute {
+            request: serde_json::from_slice(&bytes).unwrap(),
+            streaming: false,
+        })
+        .await
+        .unwrap();
+    let result = next(&mut buyer).await;
+    settle(&s, &f, &peer, &mut buyer, &bytes, result).await;
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(peer.command("status").await["publications"], 4);
+    stop.send_replace(true);
+    task.await.unwrap().unwrap();
+    assert_eq!(health.borrow().accepted, 3);
+    peer.stop().await;
+}
+
+#[tokio::test]
 async fn provider_opening_dispatcher_keeps_existing_sessions_responsive_at_global_quota() {
     use serving::dispatch::{Dispatcher, Health, Limits, Registration};
     let backend = backend(200, answer(), Duration::ZERO).await;

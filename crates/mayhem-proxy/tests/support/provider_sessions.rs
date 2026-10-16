@@ -333,7 +333,9 @@ async fn purchase(
         lifetimes(),
     )
     .unwrap();
-    let quote = peer.buyer_client.quote(&query(peer)).await.unwrap();
+    let mut query = query(peer);
+    query.billing_id = context.billing_id.as_str().into();
+    let quote = peer.buyer_client.quote(&query).await.unwrap();
     let purchase = quote
         .prepare_purchase(&request, &proposal.session_binding(&context).unwrap())
         .unwrap();
