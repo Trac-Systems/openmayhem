@@ -1106,6 +1106,7 @@ impl Shared {
         let mut failed = false;
         let mut cancelled_prepared = false;
         let mut cancellation_accepted = false;
+        let mut awaiting_receipt = false;
         // Control steps and provisional events have separate bounds; no history
         // is retained. Generation itself has no total timer.
         let mut controls = 0;
@@ -1241,7 +1242,19 @@ impl Shared {
                 }
                 Message::State {
                     state: PublicState::AwaitingReceipt,
-                } if recovery => {}
+                } if recovery => {
+                    // The first status marker may precede a retained result or
+                    // waiver. After that context, this marker means this read
+                    // could not offer its signed proof; retain the original
+                    // purchase for another recovery without claiming settlement.
+                    if observed.is_some() || cancellation_accepted || awaiting_receipt {
+                        return Ok(Outcome::Pending {
+                            identity: p.identity.clone(),
+                            state: PublicState::AwaitingReceipt,
+                        });
+                    }
+                    awaiting_receipt = true;
+                }
                 Message::State {
                     state: PublicState::Settled,
                 } if recovery => {

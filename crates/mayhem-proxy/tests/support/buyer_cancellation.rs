@@ -78,6 +78,292 @@ async fn gated_backend(streaming: bool, terminal: bool) -> (Backend, Arc<Notify>
     )
 }
 
+// Fail only the provider's financial observations. Buyer canonical reads remain
+// available, so a recovery can reach Status without racing the injected fault.
+struct ProviderFinancialFault {
+    blocked: Arc<std::sync::atomic::AtomicBool>,
+    failures: Arc<AtomicUsize>,
+    task: JoinHandle<()>,
+}
+impl Drop for ProviderFinancialFault {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+impl ProviderFinancialFault {
+    async fn install(peer: &mut Peer) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let upstream = peer.rpc_url.trim_end_matches('/').to_owned();
+        let blocked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fault = blocked.clone();
+        let failures = Arc::new(AtomicUsize::new(0));
+        let count = failures.clone();
+        let task = tokio::spawn(async move {
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = Vec::new();
+                let mut buffer = [0; 4096];
+                let boundary = loop {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert!(n > 0 && bytes.len() < 2 * 1024 * 1024);
+                    bytes.extend_from_slice(&buffer[..n]);
+                    if let Some(n) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                        break n + 4;
+                    }
+                };
+                let header = String::from_utf8(bytes[..boundary].to_vec()).unwrap();
+                let path = header
+                    .lines()
+                    .next()
+                    .unwrap()
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap();
+                let length = header
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|n| n.trim().parse::<usize>().ok())
+                    })
+                    .unwrap();
+                assert!(length < 2 * 1024 * 1024);
+                while bytes.len() < boundary + length {
+                    let n = socket.read(&mut buffer).await.unwrap();
+                    assert!(n > 0);
+                    bytes.extend_from_slice(&buffer[..n]);
+                }
+                let (status, body) =
+                    if path == "/proxy/financial-state" && fault.load(Ordering::SeqCst) {
+                        count.fetch_add(1, Ordering::SeqCst);
+                        (
+                            503,
+                            br#"{"ok":false,"code":"proxy_financial_unavailable"}"#.to_vec(),
+                        )
+                    } else {
+                        let response = client
+                            .post(format!("{upstream}{path}"))
+                            .header("content-type", "application/json")
+                            .body(bytes[boundary..boundary + length].to_vec())
+                            .send()
+                            .await
+                            .unwrap();
+                        let status = response.status().as_u16();
+                        let body = response.bytes().await.unwrap().to_vec();
+                        assert!(body.len() < 2 * 1024 * 1024);
+                        (status, body)
+                    };
+                let header = format!("HTTP/1.1 {status} Fixture\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                socket.write_all(header.as_bytes()).await.unwrap();
+                socket.write_all(&body).await.unwrap();
+            }
+        });
+        peer.client = Arc::new(
+            financial::Client::new(
+                &base,
+                mayhem_proxy::discovery::Identity {
+                    network_id: peer.identity.network_id.clone(),
+                    msb_bootstrap: peer.identity.msb_bootstrap.as_str().into(),
+                    subnet_bootstrap: peer.identity.subnet_bootstrap.as_str().into(),
+                    contract_version: peer.template.terms.contract_version,
+                },
+                peer.identity.controller_pubkey.as_str().into(),
+                4,
+            )
+            .unwrap(),
+        );
+        Self {
+            blocked,
+            failures,
+            task,
+        }
+    }
+}
+
+#[tokio::test]
+async fn buyer_recovery_pending_receipt_releases_control_and_later_settles_retained_result() {
+    for cancelled in [false, true] {
+        pending_proof_recovery(cancelled, false).await;
+    }
+}
+
+#[tokio::test]
+async fn buyer_recovery_pending_waiver_releases_control_and_later_closes_without_execution() {
+    pending_proof_recovery(true, true).await;
+}
+
+async fn pending_proof_recovery(cancelled: bool, waiver: bool) {
+    let (backend, release) = gated_backend(false, true).await;
+    let bytes = chat();
+    let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let policy = json!({"schema_version":1,"lane":"proxy","payable_outcomes":["cancelled","complete"],"allow_checkpoints":false});
+    let mut peer = Peer::start(ProxyRail::Fiat, &f, &bytes, false, Some(policy)).await;
+    let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+    let fault = ProviderFinancialFault::install(&mut peer).await;
+    let (provider, _) = observed_server(&s, &f, &peer);
+    let ctx = context(&peer);
+    let invocation = ctx.invocation().unwrap();
+    let bridge = Bridge::start(ctx.buyer.as_str(), &ctx.offer.provider_pubkey).await;
+    let (buyer, negotiation, recovery) = buyer_controller(&s, &f, &peer, &bridge, 1);
+    let mut listener = listener(&bridge, &peer).await;
+    let gate = Gate::allow();
+    let request = make_request(&s, &f, &peer, &bytes, gate.clone());
+    let id = request.identity();
+    let (stop, rx) = watch::channel(false);
+    if waiver {
+        // Retain an accepted purchase before Execute, so recovery must send the
+        // real Prepared -> Cancel exchange to establish nonexecution evidence.
+        peer.command("financial_unavailable").await;
+    }
+    let active = buyer.clone();
+    let task = tokio::spawn(async move { active.execute(request, rx).await });
+    let handle = provider
+        .accept(listener.next(Duration::from_secs(5)).await.unwrap())
+        .unwrap();
+    if waiver {
+        let failure = error(task.await.unwrap());
+        assert_eq!(failure.code, buyer::Code::Unconfirmed);
+        assert_eq!(failure.stage, buyer::Stage::Accepted);
+        handle.wait().await.unwrap();
+        peer.command("financial_available").await;
+        fault.blocked.store(true, Ordering::SeqCst);
+    } else {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while backend.calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+        })
+        .await
+        .unwrap();
+        fault.blocked.store(true, Ordering::SeqCst);
+        if cancelled {
+            stop.send_replace(true);
+            assert_eq!(error(task.await.unwrap()).code, buyer::Code::Stopped);
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !s
+                    .journal
+                    .get(&invocation)
+                    .unwrap()
+                    .unwrap()
+                    .cancellation_requested
+                {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+            })
+            .await
+            .unwrap();
+            release.notify_one();
+        } else {
+            release.notify_one();
+            assert!(error(task.await.unwrap()).recovery_required);
+        }
+        handle.disconnect();
+        let _ = tokio::time::timeout(Duration::from_secs(5), handle.wait())
+            .await
+            .unwrap();
+    }
+    let mut original = s.journal.get(&invocation).unwrap().unwrap();
+    let retained = s.journal.recover(&invocation, original.attempt).unwrap();
+    assert_eq!(retained.result.is_some(), !waiver);
+    assert!(original.closure.is_none());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), usize::from(!waiver));
+    let finance_before = peer.command("state").await;
+    let saved = negotiation
+        .lookup(id.billing_id.clone(), id.billing_attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    let authorization = saved.authorization().unwrap();
+    let key = Digest::new(authorization.terms.digest().unwrap()).unwrap();
+    // Repeat the failed proof recovery: both Prepared -> Cancel and subsequent
+    // Status-only waiver reads must release their connection without settlement.
+    for round in 0..2 {
+        let (_resume, rx) = watch::channel(false);
+        let (pending, handle) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::join!(buyer.recover(id.clone(), gate.clone(), rx), async {
+                provider
+                    .accept(listener.next(Duration::from_secs(2)).await.unwrap())
+                    .unwrap()
+            })
+        })
+        .await
+        .unwrap();
+        assert!(matches!(pending.unwrap(), buyer::Outcome::Pending {
+        identity, state: exchange::PublicState::AwaitingReceipt,
+    } if identity == id));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), handle.wait())
+                .await
+                .unwrap()
+                .unwrap(),
+            serving::End::ControlIdle
+        );
+        if waiver && round == 0 {
+            original = s.journal.get(&invocation).unwrap().unwrap();
+            assert!(original.cancellation_requested);
+            assert!(matches!(
+                original.resolution,
+                Some(attempts::Resolution::NotExecuted { .. })
+            ));
+            assert!(original.closure.is_none());
+        }
+        assert_eq!(
+            s.journal.get(&invocation).unwrap().as_ref(),
+            Some(&original)
+        );
+    }
+    assert!(fault.failures.load(Ordering::SeqCst) > 0);
+    assert_eq!(
+        s.journal.get(&invocation).unwrap().as_ref(),
+        Some(&original)
+    );
+    let again = s.journal.recover(&invocation, original.attempt).unwrap();
+    assert_eq!(
+        again.result.as_ref().map(|r| (&r.digest, &r.reply.body)),
+        retained.result.as_ref().map(|r| (&r.digest, &r.reply.body))
+    );
+    let financial = recovery.recover(key).await.unwrap();
+    assert!(
+        financial.draft.is_none() && financial.signed.is_none() && financial.confirmed.is_none()
+    );
+    assert_eq!(peer.command("state").await, finance_before);
+    assert_eq!(peer.command("status").await["publications"], 1);
+    assert!(gate.outputs.lock().unwrap().is_empty());
+    fault.blocked.store(false, Ordering::SeqCst);
+    let (_resume, rx) = watch::channel(false);
+    let (completed, end) = tokio::join!(buyer.recover(id.clone(), gate.clone(), rx), async {
+        provider
+            .accept(listener.next(Duration::from_secs(5)).await.unwrap())
+            .unwrap()
+            .wait()
+            .await
+    });
+    assert_eq!(end.unwrap(), serving::End::Settled);
+    match completed.unwrap() {
+        buyer::Outcome::Completed {
+            settlement: FinancialOutcome::Paid { receipt },
+            ..
+        } if !waiver => {
+            assert_eq!(
+                serde_json::to_value(receipt.body.outcome).unwrap(),
+                json!(if cancelled { "cancelled" } else { "complete" })
+            );
+        }
+        buyer::Outcome::Closed {
+            settlement: FinancialOutcome::Waived { .. },
+            ..
+        } if waiver => {}
+        _ => panic!("the original signed proof must settle"),
+    }
+    assert_eq!(backend.calls.load(Ordering::SeqCst), usize::from(!waiver));
+    assert_eq!(peer.command("status").await["publications"], 2);
+    assert_eq!(gate.terms.lock().unwrap().len(), 1);
+    buyer.shutdown().await.unwrap();
+    peer.stop().await;
+}
+
 #[tokio::test]
 async fn buyer_controller_cancelled_json_and_stream_recover_original_receipt_on_all_rails() {
     for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
