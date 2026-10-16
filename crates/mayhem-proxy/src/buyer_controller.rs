@@ -831,8 +831,19 @@ impl Shared {
             result = channel.receive(self.limits.control_wait) => result.map_err(|e| p.transport_error("buyer_proposal_receive", &e))?,
             _ = stopped(stop) => return Err(p.error(Code::Stopped)),
         }.into_message(&context, Role::Buyer).map_err(|_| p.error(Code::Verification))?;
-        let negotiation::Message::Proposal { mut proposal } = response else {
-            return Err(p.error(Code::Refused));
+        let mut proposal = match response {
+            negotiation::Message::Proposal { proposal } => proposal,
+            negotiation::Message::Refused { failure }
+                if failure.code == crate::connector::failure::Code::LocalCapacity
+                    && failure.scope == crate::connector::failure::Scope::Request
+                    && failure.stage == crate::connector::failure::Stage::BeforeDispatch
+                    && failure.execution == crate::connector::failure::Execution::Unknown =>
+            {
+                // This authenticated refusal precedes the owner gate and every
+                // signature. Later refusals must retain their recovery obligation.
+                return Err(p.error(Code::Busy));
+            }
+            _ => return Err(p.error(Code::Refused)),
         };
         // Public limits are buyer-local and do not change the opaque recipe hash.
         // Never adopt the provider's memory/choice/schema resource allowances.

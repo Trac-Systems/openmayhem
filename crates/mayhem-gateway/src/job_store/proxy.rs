@@ -132,6 +132,14 @@ fn identity_matches(identity: &RequestIdentity, terms: &ProxySpendTerms) -> bool
         && identity.request_hash.as_str() == terms.request_hash
 }
 impl ProxyJobState {
+    pub(crate) fn capacity_not_authorized(&self, job: &StoredGatewayJob) -> bool {
+        self.not_authorized
+            && job
+                .error_info
+                .as_ref()
+                .is_some_and(|e| e.code == "capacity_unavailable")
+            && self.validate(job).is_ok()
+    }
     pub(crate) fn identity(&self) -> &RequestIdentity {
         &self.identity
     }
@@ -191,10 +199,13 @@ impl ProxyJobState {
                     && job.result.is_none()
                     && job.receipt.is_none()
                     && job.artifacts.is_empty()
-                    && job
-                        .error_info
-                        .as_ref()
-                        .is_some_and(|e| e.code == "proxy_not_authorized"),
+                    && job.error_info.as_ref().is_some_and(|e| {
+                        e.code == "proxy_not_authorized"
+                            || (e.code == "capacity_unavailable"
+                                && e.category == "proxy_admission"
+                                && e.retryable
+                                && e.phase.as_deref() == Some("admission"))
+                    }),
                 "unsigned proxy failure contains authorized obligations",
             );
         }
@@ -568,6 +579,21 @@ impl GatewayJobStore {
         id: &str,
         now: u64,
     ) -> Result<StoredGatewayJob, String> {
+        self.fail_proxy_unsigned(id, now, false)
+    }
+    pub(crate) fn fail_proxy_capacity_before_authorization(
+        &mut self,
+        id: &str,
+        now: u64,
+    ) -> Result<StoredGatewayJob, String> {
+        self.fail_proxy_unsigned(id, now, true)
+    }
+    fn fail_proxy_unsigned(
+        &mut self,
+        id: &str,
+        now: u64,
+        capacity: bool,
+    ) -> Result<StoredGatewayJob, String> {
         let mut job = self.proxy_job(id)?;
         let proxy = job.proxy.as_mut().unwrap();
         require(
@@ -581,12 +607,18 @@ impl GatewayJobStore {
         job.status = GatewayJobStatus::Failed;
         job.finished_at = now;
         job.expires_at = now.saturating_add(self.ttl_seconds);
-        job.error = Some(
+        job.error = Some(if capacity {
+            "Proxy capacity is temporarily unavailable; spending was not authorized and no inference was dispatched"
+        } else {
             "Proxy request ended before spending was authorized; no inference was dispatched"
-                .into(),
-        );
+        }.into());
         job.error_info = Some(GatewayJobErrorInfo {
-            code: "proxy_not_authorized".into(),
+            code: if capacity {
+                "capacity_unavailable"
+            } else {
+                "proxy_not_authorized"
+            }
+            .into(),
             category: "proxy_admission".into(),
             retryable: true,
             phase: Some("admission".into()),
