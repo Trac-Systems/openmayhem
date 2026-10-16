@@ -105,6 +105,7 @@ pub(crate) struct StoredGatewayJobSummary {
     pub(crate) receipt: Option<Value>,
     pub(crate) error: Option<String>,
     pub(crate) error_info: Option<GatewayJobErrorInfo>,
+    pub(crate) proxy_recovery_reason: Option<&'static str>,
 }
 
 impl From<&StoredGatewayJob> for StoredGatewayJobSummary {
@@ -131,6 +132,7 @@ impl From<&StoredGatewayJob> for StoredGatewayJobSummary {
             receipt: job.receipt.clone(),
             error: job.error.clone(),
             error_info: job.error_info.clone(),
+            proxy_recovery_reason: job.proxy.as_ref().and_then(|proxy| proxy.recovery_reason()),
         }
     }
 }

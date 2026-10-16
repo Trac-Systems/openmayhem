@@ -8,7 +8,52 @@ use std::{
     },
 };
 
+/// Local diagnostics only. These fixed labels never cross the paid-session wire
+/// or grant retry, settlement, or a different spending allowance.
+#[derive(Debug, thiserror::Error)]
+enum ReceiptPreparationCause {
+    #[error("budget")]
+    Budget,
+    #[error("financial")]
+    Financial,
+    #[error("binding")]
+    Binding,
+    #[error("storage")]
+    Storage,
+    #[error("capacity")]
+    Capacity,
+    #[error("recovery_required")]
+    RecoveryRequired,
+    #[error("evidence")]
+    Evidence,
+}
+impl ReceiptPreparationCause {
+    fn from_error(error: &crate::execution::Error) -> Self {
+        use crate::{attempts::Error as J, execution::Error as E};
+        match error {
+            E::Journal(J::ReceiptBudget) => Self::Budget,
+            E::Financial(_) => Self::Financial,
+            E::Binding | E::Configuration => Self::Binding,
+            E::StorageWorker | E::Journal(J::Storage | J::File | J::UnsupportedFileProtection) => {
+                Self::Storage
+            }
+            E::StorageCapacity | E::Capacity(_) | E::Journal(J::Capacity) => Self::Capacity,
+            E::RecoveryRequired | E::ExistingResult => Self::RecoveryRequired,
+            _ => Self::Evidence,
+        }
+    }
+}
+pub(crate) fn receipt_preparation(error: &crate::execution::Error) {
+    report(
+        "receipt_prepare",
+        &ReceiptPreparationCause::from_error(error),
+    );
+}
+
 fn details(error: &(dyn Error + 'static)) -> (&'static str, Option<String>) {
+    if let Some(cause) = error.downcast_ref::<ReceiptPreparationCause>() {
+        return ("receipt_preparation", Some(cause.to_string()));
+    }
     if let Some(error) = error.downcast_ref::<mayhem_bridge::BridgeError>() {
         use mayhem_bridge::BridgeError as B;
         let code = match error {
@@ -84,6 +129,25 @@ pub(crate) fn report(stage: &'static str, error: &(dyn Error + 'static)) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn receipt_preparation_diagnostics_are_fixed_and_preserve_budget_failure() {
+        use crate::{attempts::Error as J, execution::Error as E};
+        for (error, label) in [
+            (E::Journal(J::ReceiptBudget), "budget"),
+            (
+                E::Financial(crate::invalid("private provider details")),
+                "financial",
+            ),
+            (E::Journal(J::Storage), "storage"),
+            (E::StorageCapacity, "capacity"),
+            (E::Binding, "binding"),
+            (E::RecoveryRequired, "recovery_required"),
+            (E::Journal(J::Conflict), "evidence"),
+        ] {
+            let cause = ReceiptPreparationCause::from_error(&error);
+            assert_eq!(details(&cause), ("receipt_preparation", Some(label.into())));
+        }
+    }
     #[test]
     fn nested_errors_preserve_identity_without_disclosing_raw_data() {
         let private = "private prompt https://example.invalid/secret?token=private";

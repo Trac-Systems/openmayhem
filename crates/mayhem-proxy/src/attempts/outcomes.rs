@@ -374,7 +374,10 @@ impl Journal {
             at_ms,
             previous.as_ref(),
         )
-        .map_err(|_| Error::Conflict)?;
+        .map_err(|error| match error {
+            crate::metering::Error::Budget => Error::ReceiptBudget,
+            _ => Error::Conflict,
+        })?;
         let draft = TerminalDraft {
             invocation: invocation.clone(),
             attempt,

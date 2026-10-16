@@ -59,6 +59,8 @@ pub enum Error {
     Identity,
     #[error("idempotency key already belongs to a different request")]
     Conflict,
+    #[error("observed result exceeds the accepted receipt budget")]
+    ReceiptBudget,
     #[error("proxy attempt changed; read its current state")]
     Stale,
     #[error("proxy attempt transition is not allowed")]

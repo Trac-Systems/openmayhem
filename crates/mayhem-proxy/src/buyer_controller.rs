@@ -1363,12 +1363,16 @@ impl Shared {
                 }
                 Message::State {
                     state: PublicState::AwaitingReceipt,
-                } if recovery => {
+                } if recovery || observed.is_some() || failed => {
                     // The first status marker may precede a retained result or
                     // waiver. After that context, this marker means this read
                     // could not offer its signed proof; retain the original
                     // purchase for another recovery without claiming settlement.
-                    if observed.is_some() || cancellation_accepted || awaiting_receipt {
+                    // Foreground receipt preparation can also be unavailable
+                    // after a terminal result/failure. Preserve the same purchase
+                    // for recovery; this is neither invalid output nor settlement.
+                    if !recovery || observed.is_some() || cancellation_accepted || awaiting_receipt
+                    {
                         return Ok(Outcome::Pending {
                             identity: p.identity.clone(),
                             state: PublicState::AwaitingReceipt,

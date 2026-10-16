@@ -257,7 +257,13 @@ async fn pending_proof_recovery(cancelled: bool, waiver: bool) {
             release.notify_one();
         } else {
             release.notify_one();
-            assert!(error(task.await.unwrap()).recovery_required);
+            assert!(matches!(
+                task.await.unwrap().unwrap(),
+                buyer::Outcome::Pending {
+                    state: mayhem_proxy::exchange::PublicState::AwaitingReceipt,
+                    ..
+                }
+            ));
         }
         handle.disconnect();
         let _ = tokio::time::timeout(Duration::from_secs(5), handle.wait())

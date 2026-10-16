@@ -727,6 +727,15 @@ impl Request {
         self.metering.policy_hash()
     }
     pub fn maximum_usage(&self, output_units: Option<u64>) -> Result<BTreeMap<String, u64>> {
+        // Native tokenizer limits are not observable billing units. In automatic
+        // mode cover the complete normalized response admitted by this exact
+        // adapter. Its JSON byte bound contains every metered text/reasoning/tool
+        // byte; the monetary maximum is still checked before signing a purchase.
+        let output_units = if self.endpoint == ProxyEndpoint::Decisions {
+            output_units
+        } else {
+            output_units.or(Some(self.limits.response_bytes.div_ceil(4) as u64))
+        };
         self.metering
             .maximum_usage(output_units)
             .map_err(|_| Error::Configuration)

@@ -248,6 +248,17 @@ impl Runtime {
                 _ = cancellation.cancelled() => { stop.send_replace(true); operation.await },
                 _ = stop_signal(&mut halted) => { stop.send_replace(true); operation.await },
             };
+            if matches!(&outcome, Ok(buyer_controller::Outcome::Pending {
+                state: mayhem_proxy::exchange::PublicState::AwaitingReceipt, ..
+            })) {
+                // Both foreground and original-purchase recovery can observe
+                // this state. Persist before another financial read can fail.
+                // The diagnostic never changes output or settlement authority.
+                if let Ok(Some(saved)) = runtime.controller.retained_purchase(&binding.identity).await {
+                    let _ = owner.note_purchase(saved).await;
+                }
+                let _ = owner.note_receipt_pending().await;
+            }
             // One bounded diagnostic per admitted execution, never per recovery
             // poll. Only local enums and the opaque job ID are logged: no
             // upstream strings, request contents, credentials or payment terms.

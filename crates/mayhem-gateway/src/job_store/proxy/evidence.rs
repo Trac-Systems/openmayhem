@@ -21,6 +21,10 @@ pub(crate) struct Evidence<'a> {
     financial: Financial<'a>,
     #[serde(skip_serializing_if = "Option::is_none")]
     admission_failure: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    execution_status: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_reason: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -107,5 +111,7 @@ pub(crate) fn project(job: &StoredGatewayJob) -> Result<Evidence<'_>, String> {
         result_verified: state.output_receipt.is_some(),
         financial,
         admission_failure: state.capacity_not_authorized(job).then_some("capacity"),
+        execution_status: state.recovery_reason().map(|_| "reconciling"),
+        recovery_reason: state.recovery_reason(),
     })
 }

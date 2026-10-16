@@ -207,6 +207,158 @@ fn error(result: buyer::Result<buyer::Outcome>) -> buyer::Error {
 }
 
 #[tokio::test]
+async fn buyer_automatic_output_allowance_settles_long_results_on_all_text_endpoints() {
+    for endpoint in [
+        ProxyEndpoint::Chat,
+        ProxyEndpoint::Completions,
+        ProxyEndpoint::Responses,
+    ] {
+        let (body, response) = match endpoint {
+            ProxyEndpoint::Chat => (
+                json!({"model":"public-model","messages":[{"role":"user","content":"hi"}]}),
+                json!({"choices":[{"index":0,"message":{"role":"assistant","content":"x".repeat(24576),"reasoning":"r".repeat(8192)},"finish_reason":"stop"}]}),
+            ),
+            ProxyEndpoint::Completions => (
+                json!({"model":"public-model","prompt":"hi"}),
+                json!({"choices":[{"index":0,"text":"x".repeat(32768),"finish_reason":"stop"}]}),
+            ),
+            ProxyEndpoint::Responses => (
+                json!({"model":"public-model","input":"hi"}),
+                json!({"status":"completed","output":[{"id":"i","type":"message","role":"assistant","content":[{"type":"output_text","text":"x".repeat(32768)}]}]}),
+            ),
+            _ => unreachable!(),
+        };
+        let backend = backend(200, response, Duration::ZERO).await;
+        let config = serde_json::from_value::<ConnectionConfig>(json!({"schema_version":1,"id":"fixture","revision":1,"base_url":backend.base,"network":{"mode":"pinned","networks":["127.0.0.1/32"],"allow_http":true},"paths":{"chat_completions":"chat/completions","completions":"completions","responses":"responses","decisions":"decisions"},"error_profile":"open_ai"})).unwrap();
+        let f = Fixture::with_connection_limits(
+            config,
+            endpoint,
+            128 * 1024 * 1024,
+            "upstream-model".into(),
+            Limits {
+                request_bytes: 1024 * 1024,
+                response_bytes: 65536,
+                choices: 8,
+                tools: 16,
+                questions: 16,
+                decision_options: 32,
+            },
+        );
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let mut peer = Peer::start(ProxyRail::Tnk, &f, &bytes, false, None).await;
+        let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+        let (provider, _) = observed_server(&s, &f, &peer);
+        let ctx = context(&peer);
+        let bridge = Bridge::start(ctx.buyer.as_str(), &ctx.offer.provider_pubkey).await;
+        let (buyer, _, _) = buyer_controller(&s, &f, &peer, &bridge, 1);
+        let mut listener = listener(&bridge, &peer).await;
+        let gate = Gate::allow();
+        let mut request = make_request(&s, &f, &peer, &bytes, gate.clone());
+        request.authorization.output_units = None;
+        let cap = request.authorization.prices.max_total_spend_au;
+        let (_stop, rx) = watch::channel(false);
+        let (result, handle) = tokio::join!(buyer.execute(request, rx), async {
+            provider
+                .accept(listener.next(Duration::from_secs(5)).await.unwrap())
+                .unwrap()
+        });
+        let buyer::Outcome::Completed {
+            authorization,
+            settlement: FinancialOutcome::Paid { receipt },
+            ..
+        } = result.unwrap()
+        else {
+            panic!("long output must settle with its automatically bounded allowance")
+        };
+        assert_eq!(authorization.terms.max_usage["output_token"], 16384);
+        assert!(authorization.terms.max_spend_au <= cap);
+        assert_eq!(receipt.body.usage["output_token"], 8192);
+        assert_eq!(handle.wait().await.unwrap(), serving::End::Settled);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(gate.outputs.lock().unwrap().len(), 1);
+        assert_eq!(peer.command("status").await["publications"], 2);
+        buyer.shutdown().await.unwrap();
+        peer.stop().await;
+    }
+}
+
+#[tokio::test]
+async fn buyer_receipt_budget_failure_is_pending_and_recovery_never_reexecutes() {
+    let mut response = answer();
+    response["choices"][0]["message"]["content"] = json!("x".repeat(512));
+    let backend = backend(200, response, Duration::ZERO).await;
+    let bytes = chat();
+    let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let mut peer = Peer::start(ProxyRail::Tnk, &f, &bytes, false, None).await;
+    let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+    let (provider, _) = observed_server(&s, &f, &peer);
+    let ctx = context(&peer);
+    let bridge = Bridge::start(ctx.buyer.as_str(), &ctx.offer.provider_pubkey).await;
+    let (buyer, negotiation, _) = buyer_controller(&s, &f, &peer, &bridge, 1);
+    let mut listener = listener(&bridge, &peer).await;
+    let gate = Gate::allow();
+    let mut request = make_request(&s, &f, &peer, &bytes, gate.clone());
+    request.authorization.output_units = Some(1);
+    let id = request.identity();
+    let (stop, rx) = watch::channel(false);
+    let (result, handle) = tokio::join!(buyer.execute(request, rx), async {
+        provider
+            .accept(listener.next(Duration::from_secs(5)).await.unwrap())
+            .unwrap()
+    });
+    assert!(matches!(result.unwrap(), buyer::Outcome::Pending {
+        identity, state: exchange::PublicState::AwaitingReceipt,
+    } if identity == id));
+    handle.disconnect();
+    handle.wait().await.unwrap();
+    let purchase = negotiation
+        .lookup(id.billing_id.clone(), id.billing_attempt)
+        .await
+        .unwrap()
+        .unwrap();
+    let terms = purchase.authorization().unwrap().terms;
+    let invocation = exchange::invocation_for_terms(&terms).unwrap();
+    let record = s.journal.get(&invocation).unwrap().unwrap();
+    assert_eq!(record.phase, Phase::Dispatched);
+    let saved = s.journal.recover(&invocation, record.attempt).unwrap();
+    assert_eq!(
+        saved.result.unwrap().reply.observed_usage.unwrap().units["output_token"],
+        128
+    );
+    assert_eq!(terms.max_usage["output_token"], 1);
+    assert!(matches!(
+        s.journal
+            .prepare_terminal_draft(&invocation, record.attempt, 2000, None),
+        Err(mayhem_proxy::attempts::Error::ReceiptBudget)
+    ));
+    assert!(s
+        .journal
+        .terminal_draft(&invocation, record.attempt)
+        .unwrap()
+        .is_none());
+    assert!(gate.outputs.lock().unwrap().is_empty());
+    let (recovered, provider_result) = tokio::join!(
+        buyer.recover(id.clone(), gate.clone(), stop.subscribe()),
+        async {
+            provider
+                .accept(listener.next(Duration::from_secs(5)).await.unwrap())
+                .unwrap()
+                .wait()
+                .await
+        }
+    );
+    provider_result.unwrap();
+    assert!(matches!(recovered.unwrap(), buyer::Outcome::Pending {
+        identity, state: exchange::PublicState::AwaitingReceipt,
+    } if identity == id));
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(gate.terms.lock().unwrap().len(), 1);
+    assert_eq!(peer.command("status").await["publications"], 1);
+    buyer.shutdown().await.unwrap();
+    peer.stop().await;
+}
+
+#[tokio::test]
 async fn buyer_capacity_refusal_is_transient_only_before_proposal_and_signing() {
     use mayhem_proxy::connector::failure::{Code, Failure, Scope, Stage};
     for (code, scope, stage, execution, signed, expected) in [

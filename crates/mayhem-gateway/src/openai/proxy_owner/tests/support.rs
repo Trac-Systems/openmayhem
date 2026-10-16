@@ -602,6 +602,8 @@ impl Harness {
                     control_wait: Duration::from_secs(5),
                 },
             )
+            .unwrap()
+            .with_admission_wait(Duration::from_secs(5))
             .unwrap(),
         );
         Self {
