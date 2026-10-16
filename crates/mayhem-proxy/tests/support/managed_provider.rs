@@ -313,6 +313,10 @@ async fn managed_provider_aliases_share_health_and_durable_probe_budget() {
         bridge.config(false).url.as_str(),
         ProxyEndpoint::Chat,
     );
+    // Independent connections need separate verifier resources; aliases share
+    // one recovery latch and must not be counted twice by the startup gate.
+    value["limits"]["recovery_worker"]["max_children"] = json!(1);
+    value["limits"]["recovery_worker"]["max_buffer_bytes"] = json!(32 * 1024 * 1024);
     let mut alias = value["routes"][0].clone();
     alias["id"] = json!(d(21));
     alias["offers"][0]["market_id"] = json!(d(32));
@@ -351,12 +355,126 @@ async fn managed_provider_aliases_share_health_and_durable_probe_budget() {
     task.await.unwrap().unwrap();
 }
 
+fn add_independent_recovery_connection(root: &Path, value: &mut Value, base: &str) {
+    let mut connection: Value =
+        serde_json::from_slice(&std::fs::read(root.join("connection.json")).unwrap()).unwrap();
+    connection["id"] = json!("independent-fixture");
+    connection["base_url"] = json!(format!("{}/", base.trim_end_matches('/')));
+    private(
+        &root.join("independent-connection.json"),
+        &serde_json::to_vec(&connection).unwrap(),
+    );
+    let mut group = value["connections"][0].clone();
+    group["group"] = json!(d(12));
+    group["config_file"] = json!("independent-connection.json");
+    value["connections"].as_array_mut().unwrap().push(group);
+    value["allocations"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id":d(13),"ceiling":2}));
+    let mut route = value["routes"][0].clone();
+    route["id"] = json!(d(21));
+    route["connection"] = json!(d(12));
+    route["constraints"] = json!([d(13)]);
+    route["offers"][0]["market_id"] = json!(d(32));
+    value["routes"].as_array_mut().unwrap().push(route);
+}
+
+#[tokio::test]
+async fn managed_recovery_resources_reject_insufficient_children_or_buffers_before_state_or_network(
+) {
+    let response = json!({"id":"u","answers":{"q":{"type":"noul","noul":0.7}}});
+    let first = backend(200, response.clone(), Duration::ZERO).await;
+    let second = backend(200, response, Duration::ZERO).await;
+    let root = dir();
+    let bridge = bridge::Bridge::start(d(70).as_str(), &public_key()).await;
+    let mut value = config(
+        root.path(),
+        &first.base,
+        bridge.config(false).url.as_str(),
+        ProxyEndpoint::Decisions,
+    );
+    add_independent_recovery_connection(root.path(), &mut value, &second.base);
+    for (children, buffers) in [(1, 64 * 1024 * 1024), (2, 32 * 1024 * 1024)] {
+        let mut insufficient = value.clone();
+        insufficient["limits"]["recovery_worker"]["max_children"] = json!(children);
+        insufficient["limits"]["recovery_worker"]["max_buffer_bytes"] = json!(buffers);
+        assert!(
+            matches!(
+                managed::Prepared::load(&save(root.path(), &insufficient)),
+                Err(managed::Error::RecoveryCapacity)
+            ),
+            "children={children}, buffers={buffers}"
+        );
+        assert!(!root.path().join("state").exists());
+        assert_eq!(first.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(second.calls.load(Ordering::SeqCst), 0);
+        assert!(bridge.frames.lock().await.is_empty());
+    }
+    managed::Prepared::load(&save(root.path(), &value)).unwrap();
+    assert!(!root.path().join("state").exists());
+    assert_eq!(first.calls.load(Ordering::SeqCst), 0);
+    assert_eq!(second.calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn managed_recovery_stalled_connection_cannot_starve_independent_connection() {
+    let response = json!({"id":"u","answers":{"q":{"type":"noul","noul":0.7}}});
+    let stalled = backend(200, response.clone(), Duration::from_secs(60)).await;
+    let healthy = backend(200, response, Duration::from_millis(10)).await;
+    let root = dir();
+    let bridge = bridge::Bridge::start(d(70).as_str(), &public_key()).await;
+    let mut value = config(
+        root.path(),
+        &stalled.base,
+        bridge.config(false).url.as_str(),
+        ProxyEndpoint::Decisions,
+    );
+    add_independent_recovery_connection(root.path(), &mut value, &healthy.base);
+    value["routes"][0]["recovery"]["timeout_ms"] = json!(50);
+    let provider = open(root.path(), &value);
+    let (stop, rx) = watch::channel(false);
+    let (updates, mut health) = watch::channel(managed::Health::default());
+    let task = tokio::spawn(provider.run(rx, updates));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            {
+                let view = health.borrow();
+                if view.routes.get(&d(20)).is_some_and(|r| {
+                    r.reason == mayhem_proxy::health::Reason::Unreachable && r.recovery_in_progress
+                }) && view.routes.get(&d(21)).is_some_and(|r| r.allowance > 0)
+                {
+                    break;
+                }
+            }
+            health.changed().await.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(stalled.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(healthy.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(health.borrow().routes[&d(20)].allowance, 0);
+    assert!(health.borrow().recovery.active > 0);
+    // There is no canonical offer fixture here: local readiness is evidence of
+    // resource isolation, never permission to fabricate signed public presence.
+    stop.send_replace(true);
+    tokio::time::timeout(Duration::from_secs(3), task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let restarted = open(root.path(), &value);
+    assert_eq!(restarted.route_status(&d(20)).unwrap().1.group_occupied, 1);
+    assert_eq!(restarted.route_status(&d(21)).unwrap().1.group_occupied, 0);
+}
+
 #[tokio::test]
 async fn managed_provider_uncertain_probe_retains_capacity_and_does_not_resend_after_restart() {
     let backend = backend(
         200,
         json!({"id":"u","answers":{"q":{"type":"noul","noul":0.7}}}),
-        Duration::from_secs(1),
+        Duration::from_secs(60),
     )
     .await;
     let root = dir();
@@ -380,9 +498,16 @@ async fn managed_provider_uncertain_probe_retains_capacity_and_does_not_resend_a
         let task = tokio::spawn(provider.run(rx, updates));
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if health.borrow().recovery.failed > 0 {
+                let view = health.borrow();
+                if (pass == 0
+                    && view.routes.get(&d(20)).is_some_and(|route| {
+                        route.reason == mayhem_proxy::health::Reason::Unreachable
+                    }))
+                    || (pass == 1 && view.recovery.failed > 0)
+                {
                     break;
                 }
+                drop(view);
                 health.changed().await.unwrap();
             }
         })
@@ -395,7 +520,11 @@ async fn managed_provider_uncertain_probe_retains_capacity_and_does_not_resend_a
             "unknown execution cannot become a new probe"
         );
         stop.send_replace(true);
-        task.await.unwrap().unwrap();
+        tokio::time::timeout(Duration::from_secs(3), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     // Operator resolution is separate from automatic health/restart and never

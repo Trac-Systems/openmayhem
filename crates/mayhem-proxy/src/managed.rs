@@ -42,6 +42,8 @@ pub enum Error {
     RestartCredential,
     #[error("proxy provider configuration is invalid or exceeds its resource limits")]
     Configuration,
+    #[error("proxy recovery_worker must provide one child and sufficient combined decoder buffers for each independently monitored connection; increase its approved limits or use separate controllers")]
+    RecoveryCapacity,
     #[error("proxy provider requires protected local configuration and state files")]
     Protection,
     #[error("proxy provider wallet does not match configured identity")]

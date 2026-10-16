@@ -44,6 +44,33 @@ pub struct PoolLimits {
     pub processing_timeout: Duration,
 }
 impl PoolLimits {
+    /// A stalled recovery exchange must not consume another connection's
+    /// verifier allowance. Call with one maximum response bound per monitored
+    /// connection, not once per alias. Match each actual semaphore reservation's
+    /// rounding; rounding only the combined byte count can under-budget.
+    pub(crate) fn require_parallel_received_limits(
+        self,
+        response_limits: impl IntoIterator<Item = usize>,
+    ) -> Result<()> {
+        self.validate()?;
+        let mut children = 0usize;
+        let mut buffers = 0u32;
+        for max_bytes in response_limits {
+            children = children.checked_add(1).ok_or(Error::Configuration)?;
+            let bytes = decoder_buffer_bytes(
+                DecodeLimits {
+                    max_total_bytes: max_bytes,
+                    max_event_bytes: max_bytes,
+                },
+                true,
+            )?;
+            buffers = buffers
+                .checked_add(units(bytes)?)
+                .ok_or(Error::Configuration)?;
+        }
+        config(children <= self.max_children && buffers <= units(self.max_buffer_bytes)?)
+    }
+
     fn validate(self) -> Result<()> {
         config(
             (1..=128).contains(&self.max_children)
@@ -686,6 +713,50 @@ impl Worker {
 #[cfg(all(test, unix))]
 mod received_limit_tests {
     use super::*;
+    #[test]
+    fn parallel_received_limits_reserve_each_rounded_semaphore_allocation() {
+        let response_bytes = 1;
+        let one = decoder_buffer_bytes(
+            DecodeLimits {
+                max_total_bytes: response_bytes,
+                max_event_bytes: response_bytes,
+            },
+            true,
+        )
+        .unwrap();
+        let reservation = units(one).unwrap();
+        let combined = units(one * 2).unwrap();
+        assert_eq!(
+            reservation * 2,
+            combined + 1,
+            "fixture crosses an independent rounding boundary"
+        );
+        let limits = PoolLimits {
+            max_children: 2,
+            max_buffer_bytes: combined as usize * CHUNK_BYTES,
+            startup_timeout: Duration::from_secs(1),
+            processing_timeout: Duration::from_secs(1),
+        };
+        // The aggregate bytes fit but the real per-child semaphore permits do
+        // not. The startup gate must match the latter.
+        let available = Arc::new(Semaphore::new(combined as usize));
+        let _first = available
+            .clone()
+            .try_acquire_many_owned(reservation)
+            .unwrap();
+        assert!(available.try_acquire_many_owned(reservation).is_err());
+        assert!(matches!(
+            limits.require_parallel_received_limits([response_bytes; 2]),
+            Err(Error::Configuration)
+        ));
+        assert!(PoolLimits {
+            max_buffer_bytes: reservation as usize * 2 * CHUNK_BYTES,
+            ..limits
+        }
+        .require_parallel_received_limits([response_bytes; 2])
+        .is_ok());
+    }
+
     #[test]
     fn impossible_received_ceiling_is_rejected_before_paid_admission() {
         use std::os::unix::fs::PermissionsExt;

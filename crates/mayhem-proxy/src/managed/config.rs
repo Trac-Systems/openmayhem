@@ -463,6 +463,24 @@ impl Prepared {
             });
         }
         require(offer_keys.len() <= config.limits.registrations)?;
+        // A health deadline keeps observing the same upstream exchange. Its
+        // decoder can remain occupied, so reserve room for every independent
+        // monitored connection before opening stores or dispatching anything.
+        // Aliases share the existing connection recovery latch and count once.
+        let mut recovery_limits = BTreeMap::<Digest, usize>::new();
+        for route in &routes {
+            if route.spec.recovery.is_some() {
+                let maximum = recovery_limits
+                    .entry(route.spec.connection.clone())
+                    .or_default();
+                *maximum = (*maximum).max(route.adapter.limits().response_bytes);
+            }
+        }
+        config
+            .limits
+            .recovery_worker
+            .require_parallel_received_limits(recovery_limits.into_values())
+            .map_err(|_| Error::RecoveryCapacity)?;
         Ok(Self {
             config,
             identity,
