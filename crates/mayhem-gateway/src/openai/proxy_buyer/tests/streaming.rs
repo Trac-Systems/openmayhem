@@ -203,16 +203,14 @@ async fn proxy_sse_terminal_observation_cannot_bypass_failed_budget_commit() {
     std::fs::write(f.directory.path().join("tokens.json"), b"{").unwrap();
     f.harness.stream_backend.release.add_permits(1);
     let mut bytes = Vec::new();
-    while let Some(frame) = tokio::time::timeout(Duration::from_secs(15), body.next())
-        .await
-        .unwrap()
-    {
-        bytes.extend_from_slice(&frame.unwrap());
+    let until = tokio::time::Instant::now() + Duration::from_secs(7);
+    while let Ok(frame) = tokio::time::timeout_at(until, body.next()).await {
+        bytes.extend_from_slice(&frame.expect("budget-pending stream ended").unwrap());
     }
     assert!(!bytes.windows(6).any(|part| part == b"[DONE]"));
     assert!(payloads(&bytes)
         .iter()
-        .any(|event| event["error"]["code"] == "proxy_recovery_required"));
+        .all(|event| event.get("error").is_none()));
     let job = f
         .state
         .jobs
@@ -244,6 +242,15 @@ async fn proxy_sse_terminal_observation_cannot_bypass_failed_budget_commit() {
     .unwrap();
     f.harness.command("financial_available").await;
     wait_completed(&f, &id).await;
+    while let Some(frame) = tokio::time::timeout(Duration::from_secs(15), body.next())
+        .await
+        .unwrap()
+    {
+        bytes.extend_from_slice(&frame.unwrap());
+    }
+    assert!(std::str::from_utf8(&bytes)
+        .unwrap()
+        .ends_with("data: [DONE]\n\n"));
     assert!(f
         .state
         .access_control
@@ -253,6 +260,59 @@ async fn proxy_sse_terminal_observation_cannot_bypass_failed_budget_commit() {
     assert_eq!(f.harness.backend_calls(), 1);
     assert_eq!(f.harness.status().await["publications"], 2);
     f.stop().await;
+}
+
+#[tokio::test]
+async fn proxy_sse_pending_settlement_disconnect_releases_observer_without_new_purchase() {
+    for shutdown in [false, true] {
+        let mut f = Fixture::start().await;
+        f.harness
+            .stream_backend
+            .paused
+            .store(true, Ordering::SeqCst);
+        let response = f.stream_post("pending-disconnect").await;
+        let id = job_id(&response);
+        let mut body = response.into_body().into_data_stream();
+        tokio::time::timeout(Duration::from_secs(10), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        f.harness.command("publish_pending").await;
+        f.harness.stream_backend.release.add_permits(1);
+        let until = tokio::time::Instant::now() + Duration::from_secs(7);
+        while let Ok(frame) = tokio::time::timeout_at(until, body.next()).await {
+            let bytes = frame.expect("settlement observer ended").unwrap();
+            assert!(payloads(&bytes).iter().all(|v| v.get("error").is_none()));
+        }
+        assert_eq!(f.runtime.streams.available_permits(), 1);
+        if shutdown {
+            f.stopped.send_replace(true);
+            let mut tail = vec![];
+            while let Some(frame) = tokio::time::timeout(Duration::from_secs(5), body.next())
+                .await
+                .unwrap()
+            {
+                tail.extend_from_slice(&frame.unwrap());
+            }
+            assert!(payloads(&tail)
+                .iter()
+                .any(|v| v["error"]["code"] == "proxy_recovery_required"));
+            assert!(!std::str::from_utf8(&tail).unwrap().contains("[DONE]"));
+            assert_eq!(f.harness.backend_calls(), 1);
+            drop(body);
+            assert_eq!(f.runtime.streams.available_permits(), 2);
+            f.stop().await;
+            continue;
+        }
+        drop(body);
+        assert_eq!(f.runtime.streams.available_permits(), 2);
+        f.harness.command("flush_publication").await;
+        wait_completed(&f, &id).await;
+        assert_eq!(f.harness.backend_calls(), 1);
+        assert_eq!(f.harness.status().await["publications"], 2);
+        f.stop().await;
+    }
 }
 
 #[tokio::test]
@@ -405,67 +465,86 @@ async fn proxy_sse_delta_precedes_upstream_tail_and_canonical_closure_precedes_t
 }
 
 #[tokio::test]
-async fn proxy_sse_pending_receipt_has_no_success_terminal_and_recovers_original_result() {
-    let mut f = Fixture::start().await;
-    f.harness
-        .stream_backend
-        .paused
-        .store(true, Ordering::SeqCst);
-    let response = f.stream_post("closure-original").await;
-    let id = job_id(&response);
-    let mut body = response.into_body().into_data_stream();
-    tokio::time::timeout(Duration::from_secs(10), body.next())
-        .await
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    f.harness.command("publish_pending").await;
-    f.harness.stream_backend.release.add_permits(1);
-    let mut tail = vec![];
-    while let Some(frame) = tokio::time::timeout(Duration::from_secs(15), body.next())
-        .await
-        .unwrap()
-    {
-        tail.extend_from_slice(&frame.unwrap());
-    }
-    assert!(!std::str::from_utf8(&tail).unwrap().contains("[DONE]"));
-    assert_eq!(
-        payloads(&tail).last().unwrap()["error"]["code"],
-        "proxy_recovery_required"
-    );
-    let (_, evidence) = f
-        .get(
-            &format!("/v1/jobs/{id}/proxy-evidence"),
-            "owner-fixture-key",
-        )
-        .await;
-    assert_eq!(evidence["result_verified"], true);
-    assert_eq!(evidence["financial"]["kind"], "pending");
-    let pending = f.stream_post("closure-original").await;
-    assert_eq!(pending.status(), StatusCode::ACCEPTED);
-    assert_eq!(job_id(&pending), id);
-    f.harness.command("flush_publication").await;
-    tokio::time::timeout(Duration::from_secs(20), async {
-        loop {
-            let replay = f.stream_post("closure-original").await;
-            if replay.status() == StatusCode::OK {
-                assert_eq!(replay.headers()["content-type"], "application/json");
-                assert_eq!(
-                    serde_json::from_slice::<Value>(&collect(replay.into_body()).await).unwrap()
-                        ["choices"][0]["message"]["content"],
-                    "hello"
-                );
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(50)).await;
+async fn proxy_sse_pending_receipt_stays_attached_through_confirmation_and_finishes_original_result(
+) {
+    for (endpoint, rail) in [
+        (ProxyEndpoint::Chat, ProxyRail::Fiat),
+        (ProxyEndpoint::Completions, ProxyRail::Tnk),
+        (ProxyEndpoint::Responses, ProxyRail::Tap),
+    ] {
+        let mut f = Fixture::start_with(endpoint, rail).await;
+        f.harness
+            .stream_backend
+            .paused
+            .store(true, Ordering::SeqCst);
+        let response = f.stream_post("closure-original").await;
+        let id = job_id(&response);
+        let mut body = response.into_body().into_data_stream();
+        tokio::time::timeout(Duration::from_secs(10), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        f.harness.command("publish_pending").await;
+        f.harness.stream_backend.release.add_permits(1);
+        let mut tail = vec![];
+        // The fixture's foreground confirmation deadline is five seconds. Pass it
+        // without receiving either a success terminal or a recovery error.
+        let until = tokio::time::Instant::now() + Duration::from_secs(7);
+        while let Ok(frame) = tokio::time::timeout_at(until, body.next()).await {
+            tail.extend_from_slice(&frame.expect("pending observation ended").unwrap());
         }
-    })
-    .await
-    .unwrap();
-    assert_eq!(f.harness.backend_calls(), 1);
-    assert_eq!(f.harness.status().await["publications"], 2);
-    drop(body);
-    f.stop().await;
+        assert!(!std::str::from_utf8(&tail).unwrap().contains("[DONE]"));
+        assert!(payloads(&tail)
+            .iter()
+            .all(|v| v.get("error").is_none() && v["type"] != "response.completed"));
+        let (_, evidence) = f
+            .get(
+                &format!("/v1/jobs/{id}/proxy-evidence"),
+                "owner-fixture-key",
+            )
+            .await;
+        assert_eq!(evidence["result_verified"], true);
+        assert_eq!(evidence["financial"]["kind"], "pending");
+        let pending = f.stream_post("closure-original").await;
+        assert_eq!(pending.status(), StatusCode::ACCEPTED);
+        assert_eq!(job_id(&pending), id);
+        f.harness.command("flush_publication").await;
+        while let Some(frame) = tokio::time::timeout(Duration::from_secs(15), body.next())
+            .await
+            .unwrap()
+        {
+            tail.extend_from_slice(&frame.unwrap());
+        }
+        let events = payloads(&tail);
+        assert!(events.iter().all(|v| v.get("error").is_none()));
+        if endpoint == ProxyEndpoint::Responses {
+            assert_eq!(events.last().unwrap()["type"], "response.completed");
+        } else {
+            assert!(std::str::from_utf8(&tail)
+                .unwrap()
+                .ends_with("data: [DONE]\n\n"));
+        }
+        tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                let replay = f.stream_post("closure-original").await;
+                if replay.status() == StatusCode::OK {
+                    assert_eq!(replay.headers()["content-type"], "application/json");
+                    let retained: Value =
+                        serde_json::from_slice(&collect(replay.into_body()).await).unwrap();
+                    assert!(serde_json::to_string(&retained).unwrap().contains("hello"));
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(f.harness.backend_calls(), 1);
+        assert_eq!(f.harness.status().await["publications"], 2);
+        drop(body);
+        f.stop().await;
+    }
 }
 
 #[tokio::test]

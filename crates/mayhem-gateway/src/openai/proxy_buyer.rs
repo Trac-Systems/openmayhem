@@ -830,9 +830,21 @@ async fn submit(
         Some((sender, receiver, permit)) => (Some(sender), Some((receiver, permit))),
         None => (None, None),
     };
+    let observer_binding = binding.clone();
     let receiver = runtime.launch((*state).clone(), binding, Some(paid), sender, claim)?;
     if let Some((events, permit)) = observer {
-        return Ok(streaming::response(&id, endpoint, events, receiver, permit));
+        return Ok(streaming::response(
+            &id,
+            endpoint,
+            events,
+            receiver,
+            permit,
+            streaming::SettlementObserver::new(
+                state.clone(),
+                observer_binding,
+                runtime.halt.subscribe(),
+            ),
+        ));
     }
     if gateway_prefers_async_response(&headers) {
         return Ok(gateway_job_pending_response(&id));

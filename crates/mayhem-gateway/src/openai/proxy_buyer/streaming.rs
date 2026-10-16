@@ -3,13 +3,76 @@
 use super::*;
 use axum::{
     http::{header, HeaderValue},
-    response::sse::{Event, Sse},
+    response::sse::{Event, KeepAlive, Sse},
 };
 use futures_util::stream;
 use serde_json::json;
 use std::convert::Infallible;
 
 type Reply = oneshot::Receiver<Result<StoredGatewayJob, ApiError>>;
+
+/// The foreground controller's confirmation timeout does not make a verified
+/// answer fail. Continue observing the original durable owner while its existing
+/// recovery task settles it. This observer never sends, signs, or reconciles work.
+pub(super) struct SettlementObserver {
+    state: SharedState,
+    binding: Binding,
+    halted: watch::Receiver<bool>,
+}
+impl SettlementObserver {
+    pub(super) fn new(state: SharedState, binding: Binding, halted: watch::Receiver<bool>) -> Self {
+        Self {
+            state,
+            binding,
+            halted,
+        }
+    }
+
+    async fn wait(&mut self) -> Option<StoredGatewayJob> {
+        use crate::job_store::proxy::ProxyPhase;
+        loop {
+            if *self.halted.borrow() {
+                return None;
+            }
+            let jobs = self.state.jobs.clone();
+            let binding = self.binding.clone();
+            let observation = tokio::select! {
+                biased;
+                _ = stop_signal(&mut self.halted) => return None,
+                value = storage(move || {
+                    let jobs = jobs.lock().map_err(|_| unavailable())?;
+                    // One indexed borrowed record: no expiry sweep, ledger read,
+                    // result clone, or growing history traversal on a poll.
+                    let job = jobs.proxy_evidence_record(&binding.job_id, now_secs()).ok_or_else(unavailable)?;
+                    let proxy = job.proxy.as_ref().ok_or_else(unavailable)?;
+                    if job.model != binding.model || job.request_fingerprint != binding.fingerprint
+                        || job.owner_token_id.as_deref() != Some(binding.token.token_id.as_str())
+                        || proxy.identity() != &binding.identity {
+                        return Err(unavailable());
+                    }
+                    match (job.status, proxy.phase()) {
+                        (GatewayJobStatus::Completed, ProxyPhase::Closed) if job.result.is_some() => Ok(Some(job.clone())),
+                        (GatewayJobStatus::ReconciliationPending,
+                            ProxyPhase::OutputRetained | ProxyPhase::ClosurePendingBudget) => Ok(None),
+                        // Unverified output and actual terminal failures still
+                        // expose recovery. A pending budget commit cannot grant success.
+                        _ => Err(unavailable()),
+                    }
+                }) => value,
+            };
+            match observation {
+                Ok(Some(job)) => return Some(job),
+                Err(_) => return None,
+                Ok(None) => (),
+            }
+            tokio::select! {
+                biased;
+                _ = stop_signal(&mut self.halted) => return None,
+                _ = tokio::time::sleep(Duration::from_secs(2)) => (),
+            }
+        }
+    }
+}
 
 pub(super) fn channel(
     runtime: &Runtime,
@@ -43,6 +106,7 @@ struct Observer {
     sequence: u64,
     ended: bool,
     job: String,
+    settlement: SettlementObserver,
     _permit: OwnedSemaphorePermit,
 }
 
@@ -52,6 +116,7 @@ pub(super) fn response(
     events: buyer_controller::StreamReceiver,
     reply: Reply,
     permit: OwnedSemaphorePermit,
+    settlement: SettlementObserver,
 ) -> Response {
     let observer = Observer {
         events: Some(events),
@@ -61,6 +126,7 @@ pub(super) fn response(
         sequence: 0,
         ended: false,
         job: id.into(),
+        settlement,
         _permit: permit,
     };
     // No forwarding task/queue. Dropping this body drops the receiver; the
@@ -89,11 +155,16 @@ pub(super) fn response(
                 return Some((Ok::<_, Infallible>(frame), state));
             }
             state.events = None;
-            let job = state.reply.take().expect("one owner reply").await;
-            match job {
+            let job = match state.reply.take().expect("one owner reply").await {
                 Ok(Ok(job))
                     if job.status == GatewayJobStatus::Completed && job.result.is_some() =>
                 {
+                    Some(job)
+                }
+                _ => state.settlement.wait().await,
+            };
+            match job {
+                Some(job) if job.status == GatewayJobStatus::Completed && job.result.is_some() => {
                     // Completed is possible only after verified output, exact
                     // canonical closure and durable key-budget settlement.
                     state.final_events = Some(FinalEvents::new(
@@ -119,7 +190,9 @@ pub(super) fn response(
             None => None,
         }
     });
-    let mut response = Sse::new(body).into_response();
+    let mut response = Sse::new(body)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response();
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("private, no-store"),
