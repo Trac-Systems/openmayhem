@@ -14,6 +14,7 @@ import MayhemFeature, {
   MAYHEM_RELAY_CHANNEL,
   MAYHEM_RELAY_MAX_PAYLOAD_BYTES,
   MAYHEM_RELAY_POW_EXEMPT_CONTROLS,
+  serviceSigningMessage,
 } from '../features/mayhem/index.js';
 import Sidechannel from '../features/sidechannel/index.js';
 import { CONTRACT_VERSION } from '../contract/contract.js';
@@ -137,6 +138,134 @@ const connectSidechannels = (leftPeer, left, rightPeer, right) => {
   return [leftConnection, rightConnection];
 };
 
+// Retain the previous sender's signed TTL-one broadcast wire behavior. Receive
+// encoding, signature validation and Mayhem feature code are unchanged.
+const useLegacyBroadcast = (sidechannel) => {
+  sidechannel.broadcast = function (channel, message) {
+    const entry = this.channels.get(channel);
+    const payload = this._buildPayload(channel, message);
+    if (!entry || !this._payloadWithinBounds(channel, payload)) return false;
+    this._sendBroadcastPayload(entry, payload, false);
+    return true;
+  };
+};
+
+for (const legacy of [null, 'participant', 'writer']) {
+  test(`signed service survives cold reconnect and lost result/ACK with ${legacy ?? 'no'} legacy sender`, async t => {
+    const [participantWallet, writerWallet, observerWallet, actorWallet] = await Promise.all(
+      Array.from({ length: 4 }, makeWallet)
+    );
+    const admin = writerWallet.publicKey;
+    const participant = peerFor(participantWallet, admin, false);
+    const writer = peerFor(writerWallet, admin, true);
+    const observer = peerFor(observerWallet, admin, false);
+    for (const peer of [participant, writer, observer]) {
+      peer.swarm = { connections: new Set(), joinPeer() {} };
+    }
+    let handled = 0;
+    let receivedResults = 0;
+    let receivedAcks = 0;
+    let directConnections = [];
+    let reconnects = 0;
+    let connectTimer = null;
+    const connections = [];
+    const received = [];
+    const unrelated = [];
+    const participantFeature = new MayhemFeature(participant, { timeoutMs: 1500, retryMs: 50 });
+    const writerFeature = new MayhemFeature(writer, {
+      resultRetryMs: 20, resultRetryMax: 4, resultConnectGraceMs: 5, connectTimeoutMs: 250,
+      serviceHandler: async (service, value, authorization) => {
+        assert.equal(service, 'stripe_connect_status');
+        assert.equal(authorization.actor, actorWallet.publicKey);
+        assert.equal(authorization.transport, participantWallet.publicKey);
+        assert.equal(value.provider, actorWallet.publicKey);
+        handled += 1;
+        // Lose the direct session after the request was authenticated. The
+        // existing result owner must reconnect without broadcasting a result.
+        for (const [index, connection] of directConnections.entries()) {
+          [participant, writer][index].swarm.connections.delete(connection);
+          connection.destroy();
+        }
+        directConnections = [];
+        await new Promise(resolve => setImmediate(resolve));
+        return { ok: true, status: 'applied', provider: value.provider };
+      },
+    });
+    participantFeature.key = writerFeature.key = 'mayhem';
+    participant.sidechannel = new Sidechannel(participant, {
+      ...sidechannelConfig((channel, payload) => {
+        received.push(payload);
+        if (payload.message.control === 'mayhem_service_result' && ++receivedResults === 1) return;
+        return participantFeature.handleSidechannelMessage(channel, payload);
+      }, { relayEnabled: true }),
+      directConnectPollMs: 5,
+    });
+    writer.sidechannel = new Sidechannel(writer, {
+      ...sidechannelConfig((channel, payload) => {
+        received.push(payload);
+        if (payload.message.control === 'mayhem_service_result_ack' && ++receivedAcks === 1) return;
+        return writerFeature.handleSidechannelMessage(channel, payload);
+      }, { relayEnabled: true }),
+      directConnectPollMs: 5,
+    });
+    observer.sidechannel = new Sidechannel(observer,
+      sidechannelConfig((_channel, payload) => unrelated.push(payload), { relayEnabled: true }));
+    for (const peer of [participant, writer, observer]) peer.sidechannel.started = true;
+    if (legacy) useLegacyBroadcast({ participant, writer }[legacy].sidechannel);
+    t.after(async () => {
+      if (connectTimer !== null) clearTimeout(connectTimer);
+      await participantFeature.stop();
+      await writerFeature.stop();
+      for (const connection of connections) connection.destroy();
+      for (const peer of [participant, writer, observer]) await peer.sidechannel.stop();
+    });
+    connections.push(
+      ...connectSidechannels(participant, participant.sidechannel, observer, observer.sidechannel),
+      ...connectSidechannels(writer, writer.sidechannel, observer, observer.sidechannel)
+    );
+    await waitFor(() => (
+      participant.sidechannel._directPeerChannelReady(observerWallet.publicKey, MAYHEM_RELAY_CHANNEL)
+      && writer.sidechannel._directPeerChannelReady(observerWallet.publicKey, MAYHEM_RELAY_CHANNEL)
+    ));
+    const connectWhenRequested = () => {
+      if (connectTimer !== null || directConnections.length > 0) return;
+      connectTimer = setTimeout(() => {
+        connectTimer = null;
+        reconnects += 1;
+        directConnections = connectSidechannels(participant, participant.sidechannel, writer, writer.sidechannel);
+        connections.push(...directConnections);
+      }, 30);
+    };
+    participant.swarm.joinPeer = writer.swarm.joinPeer = connectWhenRequested;
+    const service = 'stripe_connect_status';
+    const envelope = {
+      actor: actorWallet.publicKey, admin, transport: participantWallet.publicKey, signing_version: 1,
+      payload: { provider: actorWallet.publicKey, request_nonce: '12'.repeat(32) },
+    };
+    envelope.signature = actorWallet.sign(serviceSigningMessage(service, envelope));
+    const result = await participantFeature.requestService(service, envelope);
+    assert.equal(result.ok, true);
+    assert.equal(result.provider, actorWallet.publicKey);
+    await waitFor(() => writerFeature.serviceProcessed.values().next().value?.acked === true);
+    assert.equal(handled, 1, 'lost transport and ACKs cannot repeat the service work');
+    assert.equal(reconnects, 2, 'both initial request and result used the existing cold-connect owner');
+    assert.ok(receivedResults >= 3, 'lost result and lost ACK each require another identical result');
+    assert.ok(receivedAcks >= 2);
+    const resultDigests = new Set(received.filter(payload =>
+      payload.message.control === 'mayhem_service_result').map(payload => payload.message.result_digest));
+    assert.equal(resultDigests.size, 1);
+    const legacyKey = legacy ? { participant, writer }[legacy].wallet.publicKey : null;
+    for (const payload of received) {
+      assert.equal(participant.sidechannel.verifyPayload(payload), true);
+      if (payload.from === legacyKey) assert.ok(payload.ttl === 0 || payload.ttl === 1);
+      else assert.equal(payload.ttl, 0);
+    }
+    assert.ok(unrelated.every(payload => payload.from === legacyKey), 'updated senders never fan out addressed controls');
+    if (legacy) assert.ok(unrelated.some(payload => payload.ttl === 1), 'legacy senders retain their existing fanout behavior');
+    else assert.equal(unrelated.length, 0);
+  });
+}
+
 test('feature result and ACK cross the real bidirectional Sidechannel Protomux session', async () => {
   const [participantWallet, writerWallet] = await Promise.all([makeWallet(), makeWallet()]);
   const admin = writerWallet.publicKey;
@@ -232,7 +361,7 @@ test('feature result and ACK cross the real bidirectional Sidechannel Protomux s
   writerConnection.destroy();
 });
 
-test('five concurrent provider records return through real direct and relayed Protomux paths', async () => {
+test('five concurrent provider records keep results and ACKs off the unrelated Protomux peer', async () => {
   const [participantWallet, writerWallet, relayWallet] = await Promise.all([
     makeWallet(),
     makeWallet(),
@@ -285,21 +414,25 @@ test('five concurrent provider records return through real direct and relayed Pr
     };
   };
 
+  const addressed = [];
+  const unrelated = [];
   const participantSidechannel = new Sidechannel(
     participantPeer,
-    sidechannelConfig((channel, payload) => (
-      participantFeature.handleSidechannelMessage(channel, payload)
-    ), { relayEnabled: true })
+    sidechannelConfig((channel, payload) => {
+      if (payload.message.control === 'mayhem_feature_result') addressed.push(payload);
+      return participantFeature.handleSidechannelMessage(channel, payload);
+    }, { relayEnabled: true })
   );
   const writerSidechannel = new Sidechannel(
     writerPeer,
-    sidechannelConfig((channel, payload) => (
-      writerFeature.handleSidechannelMessage(channel, payload)
-    ), { relayEnabled: true })
+    sidechannelConfig((channel, payload) => {
+      if (payload.message.control === 'mayhem_feature_result_ack') addressed.push(payload);
+      return writerFeature.handleSidechannelMessage(channel, payload);
+    }, { relayEnabled: true })
   );
   const relaySidechannel = new Sidechannel(
     relayPeer,
-    sidechannelConfig(() => {}, { relayEnabled: true })
+    sidechannelConfig((_channel, payload) => unrelated.push(payload), { relayEnabled: true })
   );
   participantPeer.sidechannel = participantSidechannel;
   writerPeer.sidechannel = writerSidechannel;
@@ -361,6 +494,13 @@ test('five concurrent provider records return through real direct and relayed Pr
     assert.equal(cached.acked, true);
     assert.equal(cached.deliveryStarted, false);
   }
+  assert.equal(addressed.length, 10);
+  for (const payload of addressed) {
+    assert.equal(payload.ttl, 0);
+    assert.equal(participantSidechannel.verifyPayload(payload), true);
+  }
+  assert.equal(unrelated.length, 5, 'only the five unaddressed feature requests retain gossip');
+  assert.ok(unrelated.every(payload => payload.message.control === 'mayhem_feature_request'));
 
   await participantFeature.stop();
   await writerFeature.stop();
@@ -534,13 +674,17 @@ test('proxy preflight and publication cross signed Protomux into the actual cano
   });
   const preflights = new Set();
   const forwarded = new Set();
+  const serviceFrames = [];
   writer.sidechannel = new Sidechannel(writer, sidechannelConfig((channel, payload) => {
+    if (payload.message.control.startsWith('mayhem_service_')) serviceFrames.push(payload);
     if (payload.message.control === 'mayhem_service_request') preflights.add(payload.message.request_id);
     if (payload.message.control === 'mayhem_feature_request') forwarded.add(payload.message.request_id);
     return writerFeature.handleSidechannelMessage(channel, payload);
   }));
-  provider.sidechannel = new Sidechannel(provider, sidechannelConfig((channel, payload) =>
-    providerFeature.handleSidechannelMessage(channel, payload)));
+  provider.sidechannel = new Sidechannel(provider, sidechannelConfig((channel, payload) => {
+    if (payload.message.control.startsWith('mayhem_service_')) serviceFrames.push(payload);
+    return providerFeature.handleSidechannelMessage(channel, payload);
+  }));
   writer.sidechannel.started = true; provider.sidechannel.started = true;
   connections = connectSidechannels(provider, provider.sidechannel, writer, writer.sidechannel);
   await waitFor(() => provider.sidechannel._directPeerChannelReady(f.admin.publicKey, MAYHEM_RELAY_CHANNEL));
@@ -579,4 +723,15 @@ test('proxy preflight and publication cross signed Protomux into the actual cano
   assert.deepEqual(againDiscovery.entries, []);
   assert.notEqual(againDiscovery.request_nonce, discovery.request_nonce, 'a fresh read is not a cached old challenge');
   await assert.rejects(providerFeature.discoverProxyCatalog({ kind: 'markets', prefix: 'bal/' }), /Invalid/);
+  await assert.rejects(providerFeature.proxyFinancialState({
+    accepted_terms: 'dd'.repeat(32), request_nonce: 'ee'.repeat(32),
+  }), { code: 'proxy_financial_pending' });
+  assert.equal(featureAppends, 1, 'financial observation cannot append a transaction');
+  assert.equal(base.view.core.signedLength, signedLength);
+  assert.ok(serviceFrames.some(payload => payload.message.service === 'proxy_financial_state'));
+  assert.ok(serviceFrames.some(payload => payload.message.service === 'proxy_discovery'));
+  for (const payload of serviceFrames) {
+    assert.equal(payload.ttl, 0);
+    assert.equal(provider.sidechannel.verifyPayload(payload), true);
+  }
 });

@@ -34,6 +34,11 @@ const DEFAULT_MAX_RELAY_SOURCES = 1024;
 const DEFAULT_POW_YIELD_EVERY = 4_096;
 const DEFAULT_MAX_POW_QUEUE = 64;
 const MAX_MESSAGE_ID_BYTES = 256;
+const MAYHEM_DIRECT_CHANNEL = '0000mayhem-relay';
+const MAYHEM_DIRECT_RESULTS = new Set([
+  'mayhem_feature_result', 'mayhem_feature_result_ack',
+  'mayhem_service_result', 'mayhem_service_result_ack',
+]);
 
 const safeIntegerOr = (value, fallback, { min = 0 } = {}) => (
   Number.isSafeInteger(value) && value >= min ? value : fallback
@@ -2038,9 +2043,128 @@ class Sidechannel extends Feature {
     return true;
   }
 
+  _directSendReady(channel, connection, record, allowPreAuthSend) {
+    return (
+      !this.closedConnections.has(connection)
+      && connection?.destroyed !== true
+      && connection?.closed !== true
+      && this.connections.get(connection)?.get(channel) === record
+      && typeof record?.message?.send === 'function'
+      && record.channel?.opened === true
+      && record.channel.closed !== true
+      && record.channel.destroyed !== true
+      && record.channel.drained !== false
+      && (allowPreAuthSend || this._remoteAuthorized(channel, connection))
+    );
+  }
+
+  _checkDirectedPayloadBounds(channel, payload) {
+    // The receive bucket charges the entire JSON envelope, not just the message.
+    // A frame larger than its burst can never become admissible by waiting.
+    const maxBytes = this.rateBytesPerSecond > 0
+      ? Math.min(this._maxMessageBytes(channel), this.rateBurstBytes)
+      : this._maxMessageBytes(channel);
+    let valid = false;
+    try {
+      valid = jsonShapeWithinBounds(payload, undefined, undefined, this._maxStringBytes(channel))
+        && b4a.byteLength(JSON.stringify(payload), 'utf8') <= maxBytes;
+    } catch (_error) {}
+    if (!valid) {
+      const error = new Error('Directed sidechannel message exceeds configured bounds.');
+      error.code = 'SIDECHANNEL_SEND_TOO_LARGE';
+      throw error;
+    }
+  }
+
+  _sendDirectedPayload(entry, connection, record, payload, allowPreAuthSend) {
+    if (this.channels.get(entry.name) !== entry
+      || !this._directSendReady(entry.name, connection, record, allowPreAuthSend)) return false;
+    try {
+      // Protomux send(false) means the frame was queued with backpressure. It
+      // must not be sent again here; channel.drained gates subsequent calls.
+      record.message.send(payload);
+      this._rememberSeen(payload.id, this._now());
+      return true;
+    } catch (error) {
+      this._reportEventError(`direct send ${entry.name}`, error, connection);
+      return false;
+    }
+  }
+
+  // Directed delivery never joins a channel, connects a peer, or falls back to
+  // gossip. False means not accepted; true includes bounded queued PoW work or
+  // transport backpressure. Deterministic size rejection throws before a send.
+  sendTo(name, recipient, message) {
+    const channel = normalizeChannel(name);
+    const target = normalizeKeyHex(recipient);
+    const entry = this.channels.get(channel);
+    if (!entry || !target || !/^[0-9a-f]{64}$/.test(target)) return false;
+    const allowPreAuthSend = message?.control === 'auth';
+    const selfKey = normalizeKeyHex(this.peer?.wallet?.publicKey);
+    if (this._ownerWriteOnly(channel) && !allowPreAuthSend
+      && (!selfKey || this._getOwnerKey(channel) !== selfKey)) return false;
+    if (this._inviteRequired(channel) && !this.inviterKeys?.has(selfKey)
+      && !this._isLocallyInvited(channel)) return false;
+    let connection = null;
+    let record = null;
+    for (const [candidate, perConn] of this.connections) {
+      if (this._getRemoteKey(candidate) !== target) continue;
+      const candidateRecord = perConn.get(channel);
+      if (!this._directSendReady(channel, candidate, candidateRecord, allowPreAuthSend)) continue;
+      connection = candidate;
+      record = candidateRecord;
+      break;
+    }
+    if (!record) return false;
+    const payload = this._buildPayload(channel, message, null, { deferPow: true });
+    payload.ttl = 0;
+    const needsPow = this._powRequired(channel, message);
+    const upperBoundPayload = { ...payload, sig: '0'.repeat(128) };
+    if (needsPow) upperBoundPayload.pow = {
+      nonce: Number.MAX_SAFE_INTEGER, difficulty: this.powDifficulty,
+    };
+    this._checkDirectedPayloadBounds(channel, upperBoundPayload);
+    if (!needsPow) {
+      if (!this._attachSig(payload)) return false;
+      this._checkDirectedPayloadBounds(channel, payload);
+      return this._sendDirectedPayload(entry, connection, record, payload, allowPreAuthSend);
+    }
+    if (this.powQueueDepth >= this.maxPowQueue) return false;
+    this.powQueueDepth += 1;
+    const mineAndSend = async () => {
+      try {
+        await this._attachPowCooperatively(payload);
+        if (!this._attachSig(payload)) return;
+        this._checkDirectedPayloadBounds(channel, payload);
+        this._sendDirectedPayload(entry, connection, record, payload, allowPreAuthSend);
+      } catch (error) {
+        this._reportEventError(`PoW direct send ${channel}`, error, connection);
+      } finally {
+        this.powQueueDepth -= 1;
+      }
+    };
+    this.powQueue = this.powQueue.then(mineAndSend, mineAndSend);
+    return true;
+  }
+
   broadcast(name, message, options = {}) {
     const channel = String(name || '').trim();
     if (!channel) return false;
+    // These existing Mayhem frames name their sole authenticated recipient.
+    // Feature requests do not carry an admin destination and retain discovery
+    // broadcast semantics. Never send malformed addressed frames to other peers.
+    if (channel === MAYHEM_DIRECT_CHANNEL
+      && (message?.control === 'mayhem_service_request' || MAYHEM_DIRECT_RESULTS.has(message?.control))) {
+      const recipient = message.control === 'mayhem_service_request' ? message.value?.admin : message.to;
+      if (typeof recipient !== 'string' || !/^[0-9a-f]{64}$/i.test(recipient.trim())) return false;
+      try {
+        return this.sendTo(channel, recipient, message);
+      } catch (error) {
+        // Preserve broadcast's boolean bounds rejection for existing callers.
+        if (error?.code === 'SIDECHANNEL_SEND_TOO_LARGE') return false;
+        throw error;
+      }
+    }
     const isAuthControl =
       message && typeof message === 'object' && String(message.control || '') === 'auth';
     const allowPreAuthSend = isAuthControl;
