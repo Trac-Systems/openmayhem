@@ -476,11 +476,17 @@ async fn buyer_controller_json_chat_and_decisions_settle_exact_original_terms_on
                 authorization,
                 settlement,
                 response,
+                observation,
             } = result.unwrap()
             else {
                 panic!("verified completed result required")
             };
             assert_eq!(identity, id);
+            assert_eq!(observation.accepted().authorization, authorization);
+            assert_eq!(
+                observation.financial_outcome().unwrap(),
+                Some(settlement.clone())
+            );
             assert_eq!(authorization.terms.offer, ctx.offer);
             assert_eq!(authorization.terms.rail, rail);
             assert_eq!(
@@ -612,11 +618,17 @@ async fn buyer_controller_recovers_never_dispatched_purchase_with_verified_waive
             identity,
             authorization,
             settlement,
+            observation,
         } = result.unwrap()
         else {
             panic!("verified cancellation required")
         };
         assert_eq!(identity, id);
+        assert_eq!(observation.accepted().authorization, authorization);
+        assert_eq!(
+            observation.financial_outcome().unwrap(),
+            Some(settlement.clone())
+        );
         assert_eq!(authorization.terms.rail, rail);
         assert!(matches!(settlement, FinancialOutcome::Waived { .. }));
         assert_eq!(backend.calls.load(Ordering::SeqCst), 0);

@@ -14,7 +14,7 @@ impl Shared {
         key: Digest,
         p: &mut Progress,
         stop: &mut watch::Receiver<bool>,
-    ) -> Result<FinancialOutcome> {
+    ) -> Result<(FinancialOutcome, financial::Observation)> {
         p.stage = Stage::Acknowledging;
         let acknowledgment = self
             .recovery
@@ -50,10 +50,10 @@ impl Shared {
             loop {
                 match self
                     .recovery
-                    .refresh(authorization, crate::supervisor::unix_ms())
+                    .refresh_observed(authorization, crate::supervisor::unix_ms())
                     .await
                 {
-                    Ok(Some(settlement)) => {
+                    Ok((Some(settlement), observation)) => {
                         let exact = match (&acknowledgment, &settlement) {
                             (
                                 SignedAcknowledgment::Receipt { receipt: expected },
@@ -68,9 +68,9 @@ impl Shared {
                         if !exact {
                             return Err(p.error(Code::Verification));
                         }
-                        return Ok(settlement);
+                        return Ok((settlement, observation));
                     }
-                    Ok(None) => (),
+                    Ok((None, _)) => (),
                     Err(error) if financial::observation_retryable(&error) => {
                         if financial::diagnostic_code(&error) == "proxy_financial_unknown" {
                             unknown.store(true, Ordering::Relaxed);

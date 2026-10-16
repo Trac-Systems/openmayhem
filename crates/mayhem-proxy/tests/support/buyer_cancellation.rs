@@ -473,6 +473,7 @@ async fn buyer_controller_cancelled_json_and_stream_recover_original_receipt_on_
                 response,
                 authorization,
                 settlement: FinancialOutcome::Paid { receipt },
+                ..
             } = result.unwrap()
             else {
                 panic!("original cancelled outcome must reconcile")
@@ -595,12 +596,20 @@ async fn buyer_controller_orphan_expiry_uses_original_policy_and_canonical_1125_
                 let buyer::Outcome::Closed {
                     authorization,
                     settlement: FinancialOutcome::ExpiredUnknown { expiry },
+                    observation,
                     ..
                 } = result
                 else {
                     panic!("canonical unresolved expiry required")
                 };
                 assert_eq!(authorization, original);
+                assert_eq!(observation.accepted().authorization, original);
+                assert_eq!(
+                    observation.financial_outcome().unwrap(),
+                    Some(FinancialOutcome::ExpiredUnknown {
+                        expiry: expiry.clone()
+                    })
+                );
                 assert_eq!(expiry.body.observed_epoch, 1126);
                 let retained = recovery.recover(key.clone()).await.unwrap();
                 assert_eq!(retained.signed, Some(expiry.clone()));

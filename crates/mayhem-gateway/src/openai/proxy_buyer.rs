@@ -273,21 +273,31 @@ impl Runtime {
             }
             // No result/error string from an upstream may release money. Exact
             // canonical closure and durable output are required independently.
-            let mut result = runtime.refresh_owner(&state, &binding, &owner).await;
-            if outcome
+            let failed = outcome.is_err();
+            let unsigned_failure = outcome
                 .as_ref()
-                .is_err_and(|error| !error.recovery_required)
-            {
+                .is_err_and(|error| !error.recovery_required);
+            let capacity = outcome.as_ref().is_err_and(|error| {
+                error.code == buyer_controller::Code::Busy
+                    && error.stage == buyer_controller::Stage::Negotiating
+                    && !error.recovery_required
+            });
+            let mut result = match outcome {
+                Ok(buyer_controller::Outcome::Completed { observation, .. }
+                    | buyer_controller::Outcome::Closed { observation, .. }) => {
+                    // Keep the exact observation and its original age. Owner
+                    // still checks its binding/freshness and commits the budget
+                    // before the job can become terminal or reach the caller.
+                    owner.close(observation).await.map_err(|_| unavailable())
+                }
+                _ => runtime.refresh_owner(&state, &binding, &owner).await,
+            };
+            if unsigned_failure {
                 if result.as_ref().is_ok_and(|job| {
                     job.proxy
                         .as_ref()
                         .is_some_and(|p| p.terms().is_none() && p.non_admission().is_none())
                 }) {
-                    let capacity = outcome.as_ref().is_err_and(|error| {
-                        error.code == buyer_controller::Code::Busy
-                            && error.stage == buyer_controller::Stage::Negotiating
-                            && !error.recovery_required
-                    });
                     result = fail_unsigned_with_capacity(&state, &binding.job_id, capacity).await;
                 }
             }
@@ -296,10 +306,9 @@ impl Runtime {
                     active.remove(&binding.job_id);
                 }
             }
-            let result = match (result, outcome) {
-                (Ok(job), _) => Ok(job),
-                (Err(_), Err(_)) => Err(unavailable()),
-                (Err(error), Ok(_)) => Err(error),
+            let result = match result {
+                Err(_) if failed => Err(unavailable()),
+                result => result,
             };
             let _ = reply.send(result);
         });

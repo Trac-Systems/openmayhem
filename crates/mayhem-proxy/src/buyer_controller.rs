@@ -287,6 +287,8 @@ pub enum Outcome {
         response: Value,
         authorization: ProxySpendAuthorization,
         settlement: FinancialOutcome,
+        /// Original canonical evidence; its freshness deadline is not renewed.
+        observation: financial::Observation,
     },
     /// Canonical financial closure; may be Paid, Waived or ExpiredUnknown.
     /// Absence of a response does not establish non-execution or retry safety.
@@ -294,6 +296,8 @@ pub enum Outcome {
         identity: RequestIdentity,
         authorization: ProxySpendAuthorization,
         settlement: FinancialOutcome,
+        /// Original canonical evidence, including an exact expiry when closed.
+        observation: financial::Observation,
     },
     /// Original accepted purchase remains open. Recovery never resends Execute.
     Pending {
@@ -1127,16 +1131,17 @@ impl Shared {
             let auth = saved
                 .authorization()
                 .ok_or_else(|| p.error(Code::Verification))?;
-            if let Some(settlement) = self
+            let (settlement, observation) = self
                 .recovery
                 .refresh_or_expire(&self.signer, &auth, crate::supervisor::unix_ms())
                 .await
-                .map_err(|_| p.error(Code::Unconfirmed))?
-            {
+                .map_err(|_| p.error(Code::Unconfirmed))?;
+            if let Some(settlement) = settlement {
                 return Ok(Outcome::Closed {
                     identity: p.identity.clone(),
                     authorization: auth,
                     settlement,
+                    observation,
                 });
             }
         }
@@ -1374,16 +1379,17 @@ impl Shared {
                 Message::State {
                     state: PublicState::Settled,
                 } if recovery => {
-                    let settlement = self
+                    let (settlement, observation) = self
                         .recovery
-                        .refresh(&authorization, crate::supervisor::unix_ms())
+                        .refresh_observed(&authorization, crate::supervisor::unix_ms())
                         .await
-                        .map_err(|_| p.error(Code::Unconfirmed))?
-                        .ok_or_else(|| p.error(Code::Unconfirmed))?;
+                        .map_err(|_| p.error(Code::Unconfirmed))?;
+                    let settlement = settlement.ok_or_else(|| p.error(Code::Unconfirmed))?;
                     return Ok(Outcome::Closed {
                         identity: p.identity.clone(),
                         authorization,
                         settlement,
+                        observation,
                     });
                 }
                 Message::Receipt { value } if observed.is_some() => {
@@ -1414,7 +1420,7 @@ impl Shared {
                         .retain_receipt(verified, crate::supervisor::unix_ms())
                         .await
                         .map_err(|_| p.error(Code::Storage))?;
-                    let settlement = self
+                    let (settlement, observation) = self
                         .acknowledge(
                             &mut sender,
                             &mut receiver,
@@ -1437,6 +1443,7 @@ impl Shared {
                         response,
                         authorization,
                         settlement,
+                        observation,
                     });
                 }
                 Message::Waiver { value } if observed.is_none() && !streamed => {
@@ -1451,7 +1458,7 @@ impl Shared {
                         )
                         .await
                         .map_err(|_| p.error(Code::Verification))?;
-                    let settlement = self
+                    let (settlement, observation) = self
                         .acknowledge(
                             &mut sender,
                             &mut receiver,
@@ -1468,6 +1475,7 @@ impl Shared {
                         identity: p.identity.clone(),
                         authorization,
                         settlement,
+                        observation,
                     });
                 }
                 _ => return Err(p.error(Code::Verification)),

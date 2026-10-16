@@ -730,8 +730,20 @@ impl BuyerRecovery {
         authorization: &ProxySpendAuthorization,
         at_ms: u64,
     ) -> Result<Option<FinancialOutcome>> {
+        self.refresh_observed(authorization, at_ms)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+    /// Preserve the same authenticated observation after its recovery write so
+    /// the durable owner can validate and account for it without another read.
+    /// Moving it preserves its original freshness deadline.
+    pub(crate) async fn refresh_observed(
+        &self,
+        authorization: &ProxySpendAuthorization,
+        at_ms: u64,
+    ) -> Result<(Option<FinancialOutcome>, Observation)> {
         let o = self.client.observe(authorization).await?;
-        self.run(move |s| Ok(s.observe(&o, false, at_ms)?.confirmed))
+        self.run(move |s| Ok((s.observe(&o, false, at_ms)?.confirmed, o)))
             .await
     }
     /// Recover one original hold using the owner's existing store and signer.
@@ -742,14 +754,14 @@ impl BuyerRecovery {
         signer: &crate::signing::Authority,
         authorization: &ProxySpendAuthorization,
         at_ms: u64,
-    ) -> Result<Option<FinancialOutcome>> {
+    ) -> Result<(Option<FinancialOutcome>, Observation)> {
         let observation = self.client.observe(authorization).await?;
         let eligible = observation.expiry_eligible()?;
-        let saved = self
-            .run(move |s| s.observe(&observation, eligible, at_ms))
+        let (saved, observation) = self
+            .run(move |s| Ok((s.observe(&observation, eligible, at_ms)?, observation)))
             .await?;
         if saved.confirmed.is_some() || !eligible {
-            return Ok(saved.confirmed);
+            return Ok((saved.confirmed, observation));
         }
         let key = Digest::new(
             saved
@@ -762,7 +774,8 @@ impl BuyerRecovery {
         if saved.signed.is_none() {
             self.sign_expiry(signer, key.clone()).await?;
         }
-        self.publish_expiry(key, crate::supervisor::unix_ms()).await
+        self.publish_expiry_observed(key, crate::supervisor::unix_ms())
+            .await
     }
     /// Adopt already verified canonical history during negotiation recovery,
     /// including accepted terms from an earlier contract version. No new append.
@@ -815,6 +828,15 @@ impl BuyerRecovery {
         key: Digest,
         at_ms: u64,
     ) -> Result<Option<FinancialOutcome>> {
+        self.publish_expiry_observed(key, at_ms)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+    async fn publish_expiry_observed(
+        &self,
+        key: Digest,
+        at_ms: u64,
+    ) -> Result<(Option<FinancialOutcome>, Observation)> {
         let k = key.clone();
         let r = self.run(move |s| s.get(k.as_str())).await?;
         let o = self.client.observe(&r.authorization).await?;
@@ -822,19 +844,21 @@ impl BuyerRecovery {
             .run(move |s| Ok((s.observe(&o, false, at_ms)?, o)))
             .await?;
         if fresh.confirmed.is_some() {
-            return Ok(fresh.confirmed);
+            return Ok((fresh.confirmed, observed));
         }
         let signed = r
             .signed
             .ok_or_else(|| invalid("expiry signature missing"))?;
         let submission = self.client.submit_expiry(&observed, &signed).await;
         let o = self.client.observe(&r.authorization).await?;
-        let fresh = self.run(move |s| s.observe(&o, false, at_ms)).await?;
+        let (fresh, observed) = self
+            .run(move |s| Ok((s.observe(&o, false, at_ms)?, o)))
+            .await?;
         if fresh.confirmed.is_some() {
-            return Ok(fresh.confirmed);
+            return Ok((fresh.confirmed, observed));
         }
         submission?;
-        Ok(None)
+        Ok((None, observed))
     }
     pub async fn pending(&self, after: Option<Digest>, limit: usize) -> Result<Vec<Digest>> {
         self.run(move |s| s.pending(after, limit)).await
