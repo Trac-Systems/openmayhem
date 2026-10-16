@@ -736,7 +736,50 @@ impl Journal {
         now_ms: u64,
     ) -> Result<Record> {
         let tx = self.transaction()?;
-        let mut r = checked_current(&tx, invocation, generation, now_ms)?;
+        let r = checked_current(&tx, invocation, generation, now_ms)?;
+        self.advance_transaction(tx, r, event, now_ms)
+    }
+
+    /// Parent lifecycle observations are fenced to the exact attempt. Read and
+    /// apply under one write transaction so cancellation and stream metadata do
+    /// not race through separate reads of the generation. This cannot resolve
+    /// an outcome or bypass the explicit generation check for final closure.
+    pub(crate) fn observe_attempt(
+        &self,
+        invocation: &Digest,
+        attempt: u64,
+        event: Event,
+        now_ms: u64,
+    ) -> Result<Record> {
+        require(matches!(
+            &event,
+            Event::CancelRequested | Event::Accepted(_) | Event::FirstOutput | Event::Failure(_)
+        ))?;
+        let tx = self.transaction()?;
+        let r = current(&tx, invocation)?.ok_or(Error::NotFound)?;
+        if r.attempt != attempt {
+            return Err(Error::Stale);
+        }
+        if matches!(&event, Event::FirstOutput) && r.cancellation_requested {
+            // The stream owner drains without delivery after cancellation.
+            return Ok(r);
+        }
+        if matches!(&event, Event::CancelRequested) && r.phase == Phase::Closed {
+            return Ok(r);
+        }
+        // A queued local observation can acquire the lock after another event.
+        // Preserve monotonic journal time without extending any authorization.
+        let now_ms = now_ms.max(r.updated_at_ms);
+        self.advance_transaction(tx, r, event, now_ms)
+    }
+
+    fn advance_transaction(
+        &self,
+        tx: Transaction<'_>,
+        mut r: Record,
+        event: Event,
+        now_ms: u64,
+    ) -> Result<Record> {
         match event {
             Event::Failure(failure)
                 if r.phase == Phase::Resolved
@@ -808,7 +851,7 @@ impl Journal {
                 );
                 let mut unfinished = storage(tx.open_table(UNFINISHED))?;
                 require(
-                    storage(unfinished.remove(invocation.as_str()))?
+                    storage(unfinished.remove(r.invocation.as_str()))?
                         .is_some_and(|v| v.value() == r.attempt),
                 )?;
                 let mut meta = metadata(&tx)?;
@@ -1144,6 +1187,212 @@ mod tests {
             recipe_digest: d(11),
             rail: ProxyRail::Fiat,
         }
+    }
+
+    fn observation_journal(path: &Path) -> Journal {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            path.parent().unwrap(),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        Journal::open(
+            path,
+            Identity {
+                network_id: "918".into(),
+                msb_bootstrap: d(100),
+                subnet_bootstrap: d(101),
+                controller_pubkey: d(102),
+            },
+            Limits {
+                max_records: 10,
+                max_unfinished: 10,
+                closed_retention_ms: 1000,
+                max_payload_bytes: 128 * 1024 * 1024,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn observe_attempt_serializes_cancellation_and_metadata_and_retains_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        let j = Arc::new(observation_journal(&path));
+        let r = j.prepare(d(200), binding(), 100).unwrap();
+        j.begin_dispatch(&r.invocation, r.generation, 101).unwrap();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let workers = [
+            Event::CancelRequested,
+            Event::Accepted(RemoteId::new("original-job").unwrap()),
+        ]
+        .into_iter()
+        .map(|event| {
+            let j = j.clone();
+            let barrier = barrier.clone();
+            let invocation = r.invocation.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                j.observe_attempt(&invocation, r.attempt, event, 102)
+                    .unwrap()
+            })
+        })
+        .collect::<Vec<_>>();
+        let observed = workers
+            .into_iter()
+            .map(|w| w.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_ne!(observed[0].generation, observed[1].generation);
+        let saved = j.get(&r.invocation).unwrap().unwrap();
+        assert!(saved.cancellation_requested);
+        assert_eq!(saved.remote_id.as_ref().unwrap().as_str(), "original-job");
+        assert_eq!(saved.phase, Phase::Dispatched);
+        assert!(saved.resolution.is_none());
+        drop(j);
+        assert_eq!(
+            observation_journal(&path).get(&r.invocation).unwrap(),
+            Some(saved)
+        );
+    }
+
+    #[test]
+    fn observe_attempt_preserves_delivery_order_and_monotonic_time() {
+        for cancel_first in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let j = observation_journal(&dir.path().join("journal"));
+            let r = j.prepare(d(200), binding(), 100).unwrap();
+            j.begin_dispatch(&r.invocation, r.generation, 101).unwrap();
+            let events = if cancel_first {
+                [Event::CancelRequested, Event::FirstOutput]
+            } else {
+                [Event::FirstOutput, Event::CancelRequested]
+            };
+            for (event, timestamp) in events.into_iter().zip([200, 150]) {
+                j.observe_attempt(&r.invocation, r.attempt, event, timestamp)
+                    .unwrap();
+            }
+            let saved = j.get(&r.invocation).unwrap().unwrap();
+            assert!(saved.cancellation_requested);
+            assert_eq!(saved.output_may_have_been_delivered, !cancel_first);
+            assert_eq!(saved.updated_at_ms, 200);
+            for event in [Event::FirstOutput, Event::CancelRequested] {
+                assert_eq!(
+                    j.observe_attempt(&r.invocation, r.attempt, event, 201)
+                        .unwrap(),
+                    saved
+                );
+            }
+            let failure = FailureSnapshot::from(&Failure::new(
+                Code::UpstreamTimeout,
+                Scope::Model,
+                Stage::ResponseBody,
+                Execution::Unknown,
+            ));
+            let failed = j
+                .observe_attempt(
+                    &r.invocation,
+                    r.attempt,
+                    Event::Failure(failure.clone()),
+                    150,
+                )
+                .unwrap();
+            assert_eq!(failed.last_failure, Some(failure));
+            assert_eq!(failed.updated_at_ms, 200);
+            assert!(failed.cancellation_requested);
+            assert_eq!(failed.phase, Phase::Dispatched);
+            assert!(failed.resolution.is_none());
+            assert!(matches!(
+                j.advance(
+                    &r.invocation,
+                    saved.generation,
+                    Event::Accepted(RemoteId::new("job").unwrap()),
+                    201
+                ),
+                Err(Error::Stale)
+            ));
+            assert!(matches!(
+                j.advance(
+                    &r.invocation,
+                    failed.generation,
+                    Event::CancelRequested,
+                    199
+                ),
+                Err(Error::Invalid)
+            ));
+        }
+    }
+
+    #[test]
+    fn observe_attempt_rejects_stale_attempts_and_keeps_terminal_generation_checks() {
+        let dir = tempfile::tempdir().unwrap();
+        let j = observation_journal(&dir.path().join("journal"));
+        let r = j.prepare(d(200), binding(), 100).unwrap();
+        let dispatched = j
+            .begin_dispatch(&r.invocation, r.generation, 101)
+            .unwrap()
+            .record()
+            .clone();
+        for event in [
+            Event::Resolve(Resolution::NotExecuted { evidence: d(400) }),
+            Event::Close(d(401)),
+        ] {
+            assert!(matches!(
+                j.observe_attempt(&r.invocation, r.attempt, event, 102),
+                Err(Error::Invalid)
+            ));
+        }
+        assert_eq!(j.get(&r.invocation).unwrap(), Some(dispatched.clone()));
+        let failure = FailureSnapshot::from(&Failure::new(
+            Code::LocalCapacity,
+            Scope::Model,
+            Stage::BeforeDispatch,
+            Execution::NotDispatched,
+        ));
+        let resolved = j
+            .observe_attempt(&r.invocation, r.attempt, Event::Failure(failure), 102)
+            .unwrap();
+        assert_eq!(resolved.phase, Phase::Resolved);
+        assert!(matches!(
+            j.advance(
+                &r.invocation,
+                dispatched.generation,
+                Event::Close(d(401)),
+                103
+            ),
+            Err(Error::Stale)
+        ));
+        let closed = j
+            .advance(
+                &r.invocation,
+                resolved.generation,
+                Event::Close(d(401)),
+                103,
+            )
+            .unwrap();
+        assert_eq!(
+            j.observe_attempt(&r.invocation, r.attempt, Event::CancelRequested, 104)
+                .unwrap(),
+            closed
+        );
+        let replacement = j
+            .replace_not_executed(&r.invocation, closed.generation, binding(), 105)
+            .unwrap();
+        assert_ne!(replacement.attempt, r.attempt);
+        for event in [
+            Event::CancelRequested,
+            Event::FirstOutput,
+            Event::Accepted(RemoteId::new("old-job").unwrap()),
+        ] {
+            assert!(matches!(
+                j.observe_attempt(&r.invocation, r.attempt, event, 106),
+                Err(Error::Stale)
+            ));
+        }
+        assert_eq!(j.get(&r.invocation).unwrap(), Some(replacement));
+        assert_eq!(
+            j.get_attempt(&r.invocation, r.attempt).unwrap(),
+            Some(closed)
+        );
     }
 
     #[test]

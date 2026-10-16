@@ -675,6 +675,10 @@ struct Progress {
     retained: bool,
 }
 impl Progress {
+    fn transport_error(&self, stage: &'static str, error: &exchange::Error) -> Error {
+        crate::serving::diagnostics::report(stage, error);
+        self.error(Code::Transport)
+    }
     fn error(&self, code: Code) -> Error {
         Error {
             identity: self.identity.clone(),
@@ -814,7 +818,7 @@ impl Shared {
         }
         p.stage = Stage::Negotiating;
         let mut channel = tokio::select! {
-            result = negotiation::Channel::dial(self.bridge.clone(), context.clone(), self.signer.identity(), exchange::Limits { max_message_bytes: self.limits.message_bytes }) => result.map_err(|_| p.error(Code::Transport))?,
+            result = negotiation::Channel::dial(self.bridge.clone(), context.clone(), self.signer.identity(), exchange::Limits { max_message_bytes: self.limits.message_bytes }) => result.map_err(|e| p.transport_error("buyer_negotiate_dial", &e))?,
             _ = stopped(stop) => return Err(p.error(Code::Stopped)),
         };
         channel
@@ -822,13 +826,24 @@ impl Shared {
                 request: value.clone(),
             })
             .await
-            .map_err(|_| p.error(Code::Transport))?;
+            .map_err(|e| p.transport_error("buyer_request_send", &e))?;
         let response = tokio::select! {
-            result = channel.receive(self.limits.control_wait) => result.map_err(|_| p.error(Code::Transport))?,
+            result = channel.receive(self.limits.control_wait) => result.map_err(|e| p.transport_error("buyer_proposal_receive", &e))?,
             _ = stopped(stop) => return Err(p.error(Code::Stopped)),
         }.into_message(&context, Role::Buyer).map_err(|_| p.error(Code::Verification))?;
-        let negotiation::Message::Proposal { mut proposal } = response else {
-            return Err(p.error(Code::Refused));
+        let mut proposal = match response {
+            negotiation::Message::Proposal { proposal } => proposal,
+            negotiation::Message::Refused { failure }
+                if failure.code == crate::connector::failure::Code::LocalCapacity
+                    && failure.scope == crate::connector::failure::Scope::Request
+                    && failure.stage == crate::connector::failure::Stage::BeforeDispatch
+                    && failure.execution == crate::connector::failure::Execution::Unknown =>
+            {
+                // This authenticated refusal precedes the owner gate and every
+                // signature. Later refusals must retain their recovery obligation.
+                return Err(p.error(Code::Busy));
+            }
+            _ => return Err(p.error(Code::Refused)),
         };
         // Public limits are buyer-local and do not change the opaque recipe hash.
         // Never adopt the provider's memory/choice/schema resource allowances.
@@ -950,7 +965,7 @@ impl Shared {
             streaming,
         })
         .await
-        .map_err(|_| p.error(Code::Transport))?;
+        .map_err(|e| p.transport_error("buyer_execute_send", &e))?;
         self.finish(paid, saved, p, stop, false, &gate, observer, conformance)
             .await
     }
@@ -1009,7 +1024,7 @@ impl Shared {
                 .ok_or_else(|| p.error(Code::Verification))?;
             if let Some(settlement) = self
                 .recovery
-                .refresh(&auth, crate::supervisor::unix_ms())
+                .refresh_or_expire(&self.signer, &auth, crate::supervisor::unix_ms())
                 .await
                 .map_err(|_| p.error(Code::Unconfirmed))?
             {
@@ -1102,6 +1117,7 @@ impl Shared {
         let mut failed = false;
         let mut cancelled_prepared = false;
         let mut cancellation_accepted = false;
+        let mut awaiting_receipt = false;
         // Control steps and provisional events have separate bounds; no history
         // is retained. Generation itself has no total timer.
         let mut controls = 0;
@@ -1112,7 +1128,7 @@ impl Shared {
             let wait =
                 (recovery || observed.is_some() || failed).then_some(self.limits.control_wait);
             let received = tokio::select! {
-                result = receiver.receive(wait) => result.map_err(|_| p.error(Code::Transport))?,
+                result = receiver.receive(wait) => result.map_err(|e| p.transport_error("buyer_result_receive", &e))?,
                 _ = stopped(stop) => {
                     // Only a request to cancel. Losing this send or disconnecting
                     // is not evidence of stopped execution or released funds.
@@ -1223,7 +1239,7 @@ impl Shared {
                 // frame. The existing control deadline bounds this wait.
                 Message::State {
                     state: PublicState::CancelRequested,
-                } if recovery => cancellation_accepted = true,
+                } if recovery && observed.is_none() => cancellation_accepted = true,
                 Message::State {
                     state: PublicState::Running | PublicState::OutcomeUnknown,
                 } if recovery => {
@@ -1237,7 +1253,19 @@ impl Shared {
                 }
                 Message::State {
                     state: PublicState::AwaitingReceipt,
-                } if recovery => {}
+                } if recovery => {
+                    // The first status marker may precede a retained result or
+                    // waiver. After that context, this marker means this read
+                    // could not offer its signed proof; retain the original
+                    // purchase for another recovery without claiming settlement.
+                    if observed.is_some() || cancellation_accepted || awaiting_receipt {
+                        return Ok(Outcome::Pending {
+                            identity: p.identity.clone(),
+                            state: PublicState::AwaitingReceipt,
+                        });
+                    }
+                    awaiting_receipt = true;
+                }
                 Message::State {
                     state: PublicState::Settled,
                 } if recovery => {
@@ -1265,7 +1293,7 @@ impl Shared {
                             saved.snapshot().clone(),
                             saved.request().to_vec(),
                             reply,
-                            false,
+                            cancellation_accepted,
                         )
                         .await
                         .map_err(|_| p.error(Code::Verification))?;

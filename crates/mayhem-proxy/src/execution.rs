@@ -27,7 +27,10 @@ use crate::{
 use std::{
     fmt,
     future::Future,
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{watch, Semaphore};
@@ -118,14 +121,8 @@ impl Storage {
     }
     async fn event(&self, invocation: &Digest, attempt: u64, event: Event) -> Result<Record> {
         let key = invocation.clone();
-        self.run(move |j| {
-            let r = j.get(&key)?.ok_or(attempts::Error::NotFound)?;
-            if r.attempt != attempt {
-                return Err(attempts::Error::Stale);
-            }
-            j.advance(&key, r.generation, event, now_ms())
-        })
-        .await
+        self.run(move |j| j.observe_attempt(&key, attempt, event, now_ms()))
+            .await
     }
 }
 
@@ -246,7 +243,9 @@ impl Executor {
                 .validate_tokenizer(route, source.digest())
                 .map_err(|_| Error::Configuration)?;
         }
-        source.bind_pool(&self.pool).map_err(|_| Error::Configuration)?;
+        source
+            .bind_pool(&self.pool)
+            .map_err(|_| Error::Configuration)?;
         self.tokenizer = Some(source);
         Ok(self)
     }
@@ -458,40 +457,79 @@ impl Executor {
         if let (Some(sample), Some(source)) = (&mut sample, &self.tokenizer) {
             sample.use_native(source)
         }
-        let operation = async {
-            if let Some(lease) = job_lease {
-                drop(active);
-                self.submit_job(&record, &request, lease).await
-            } else if streaming {
-                self.transport()
-                    .perform_stream(
-                        &request,
-                        active,
-                        &public_id,
-                        &transport::Delivery::Customer {
-                            storage: &self.storage,
-                            record: &record,
-                        },
-                        &mut emit,
-                        &mut sample,
-                    )
-                    .await
+        let recoverable_job = job_lease.is_some();
+        // A consumer going away is not evidence that a stateless upstream
+        // stopped. Detach delivery, but keep the original bounded response and
+        // decoder alive so its terminal outcome can settle the accepted work.
+        // Job adapters retain their separate cancellation/lookup protocol.
+        let delivery_detached = AtomicBool::new(false);
+        let mut deliver = |value| {
+            let detached = &delivery_detached;
+            let output = if cancel.is_cancelled() || detached.load(Ordering::Relaxed) {
+                None
             } else {
-                self.transport()
-                    .perform(
-                        &request,
-                        active,
-                        &public_id,
-                        record.created_at_ms / 1000,
-                        &mut sample,
-                    )
-                    .await
+                Some(emit(value))
+            };
+            async move {
+                if let Some(output) = output {
+                    let delivered = tokio::select! {
+                        biased;
+                        _ = cancel.cancelled() => false,
+                        result = output => result.is_ok(),
+                    };
+                    if !delivered {
+                        // A lost transport is not a buyer's cancellation and
+                        // must not relabel the signed financial outcome.
+                        detached.store(true, Ordering::Relaxed);
+                    }
+                }
+                Ok(())
             }
         };
-        let outcome = tokio::select! {
-            biased;
-            _=cancel.cancelled() => Err(Error::Cancelled),
-            result=operation => result,
+        let outcome = {
+            let operation = async {
+                if let Some(lease) = job_lease {
+                    drop(active);
+                    self.submit_job(&record, &request, lease).await
+                } else if streaming {
+                    self.transport()
+                        .perform_stream(
+                            &request,
+                            active,
+                            &public_id,
+                            &transport::Delivery::Customer {
+                                storage: &self.storage,
+                                record: &record,
+                            },
+                            &mut deliver,
+                            &mut sample,
+                        )
+                        .await
+                } else {
+                    self.transport()
+                        .perform(
+                            &request,
+                            active,
+                            &public_id,
+                            record.created_at_ms / 1000,
+                            &mut sample,
+                        )
+                        .await
+                }
+            };
+            tokio::pin!(operation);
+            tokio::select! {
+                biased;
+                _=cancel.cancelled() => {
+                    self.storage.event(invocation, record.attempt, Event::CancelRequested).await?;
+                    if recoverable_job {
+                        Err(Error::Cancelled)
+                    } else {
+                        operation.await
+                    }
+                },
+                result=&mut operation => result,
+            }
         };
         if let Some(sample) = sample {
             match &outcome {

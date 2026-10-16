@@ -1,4 +1,5 @@
 mod buyer_policy;
+mod capacity;
 mod conformance;
 mod data_handling;
 mod contract;

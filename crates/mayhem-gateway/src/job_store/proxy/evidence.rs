@@ -19,6 +19,8 @@ pub(crate) struct Evidence<'a> {
     acceptance: Option<Acceptance<'a>>,
     result_verified: bool,
     financial: Financial<'a>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    admission_failure: Option<&'static str>,
 }
 
 #[derive(Serialize)]
@@ -104,5 +106,6 @@ pub(crate) fn project(job: &StoredGatewayJob) -> Result<Evidence<'_>, String> {
         }),
         result_verified: state.output_receipt.is_some(),
         financial,
+        admission_failure: state.capacity_not_authorized(job).then_some("capacity"),
     })
 }

@@ -7,6 +7,8 @@ use tokio::sync::{watch, Notify};
 mod acknowledgment;
 #[path = "buyer_admission.rs"]
 mod admission;
+#[path = "buyer_cancellation.rs"]
+mod cancellation;
 #[path = "buyer_streaming.rs"]
 mod streaming;
 
@@ -201,6 +203,157 @@ fn error(result: buyer::Result<buyer::Outcome>) -> buyer::Error {
     match result {
         Err(error) => error,
         Ok(_) => panic!("expected buyer failure"),
+    }
+}
+
+#[tokio::test]
+async fn buyer_capacity_refusal_is_transient_only_before_proposal_and_signing() {
+    use mayhem_proxy::connector::failure::{Code, Failure, Scope, Stage};
+    for (code, scope, stage, execution, signed, expected) in [
+        (
+            Code::LocalCapacity,
+            Scope::Request,
+            Stage::BeforeDispatch,
+            Execution::Unknown,
+            false,
+            buyer::Code::Busy,
+        ),
+        (
+            Code::ProviderUnavailable,
+            Scope::Request,
+            Stage::BeforeDispatch,
+            Execution::Unknown,
+            false,
+            buyer::Code::Refused,
+        ),
+        (
+            Code::LocalCapacity,
+            Scope::Connection,
+            Stage::BeforeDispatch,
+            Execution::Unknown,
+            false,
+            buyer::Code::Refused,
+        ),
+        (
+            Code::LocalCapacity,
+            Scope::Request,
+            Stage::Dispatch,
+            Execution::Unknown,
+            false,
+            buyer::Code::Refused,
+        ),
+        (
+            Code::LocalCapacity,
+            Scope::Request,
+            Stage::BeforeDispatch,
+            Execution::NotDispatched,
+            false,
+            buyer::Code::Refused,
+        ),
+        (
+            Code::LocalCapacity,
+            Scope::Request,
+            Stage::BeforeDispatch,
+            Execution::Unknown,
+            true,
+            buyer::Code::Refused,
+        ),
+    ] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let bytes = chat();
+        let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let mut peer = Peer::start(ProxyRail::Fiat, &f, &bytes, false, None).await;
+        let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+        let ctx = context(&peer);
+        let bridge = Bridge::start(ctx.buyer.as_str(), &ctx.offer.provider_pubkey).await;
+        let (buyer, negotiation, _) = buyer_controller(&s, &f, &peer, &bridge, 1);
+        let mut listener = listener(&bridge, &peer).await;
+        let gate = Gate::allow();
+        let request = make_request(&s, &f, &peer, &bytes, gate.clone());
+        let id = request.identity();
+        let (_stop, stop) = watch::channel(false);
+        let (result, ()) = tokio::join!(buyer.execute(request, stop), async {
+            let incoming = listener.next(Duration::from_secs(5)).await.unwrap();
+            assert_eq!(incoming.context().digest().unwrap(), ctx.digest().unwrap());
+            // This authenticated provider double chooses the exact refusal;
+            // production Incoming::accept remains restricted to the serving owner.
+            let mut channel = n::Channel::connect(
+                bridge.config(false),
+                ctx.clone(),
+                &peer.identity,
+                Role::Provider,
+                exchange::Limits {
+                    max_message_bytes: 2 * 1024 * 1024,
+                },
+            )
+            .await
+            .unwrap();
+            let mut opening = mayhem_bridge::ScBridgeClient::connect(bridge.config(false))
+                .await
+                .unwrap();
+            opening
+                .session_send(
+                    ctx.buyer.as_str(),
+                    ctx.session_id.as_str(),
+                    json!({
+                        "t":"p.negotiate.ready", "schema_version":1,
+                        "session_id":ctx.session_id, "context_digest":ctx.digest().unwrap(),
+                    }),
+                )
+                .await
+                .unwrap();
+            let received = channel.receive(Duration::from_secs(5)).await.unwrap();
+            assert!(matches!(received.message(), n::Message::Request { .. }));
+            if signed {
+                let proposal = s.proposals.propose(ctx.clone(), received).await.unwrap();
+                channel
+                    .send(&n::Message::Proposal { proposal })
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    channel
+                        .receive(Duration::from_secs(5))
+                        .await
+                        .unwrap()
+                        .message(),
+                    n::Message::Offer { .. }
+                ));
+            }
+            let failure = Failure::new(code, scope, stage, execution);
+            channel
+                .send(&n::Message::Refused {
+                    failure: (&failure).into(),
+                })
+                .await
+                .unwrap();
+        });
+        let failure = error(result);
+        assert_eq!(failure.code, expected);
+        assert_eq!(
+            failure.stage,
+            if signed {
+                buyer::Stage::Signing
+            } else {
+                buyer::Stage::Negotiating
+            }
+        );
+        assert_eq!(failure.recovery_required, signed);
+        assert_eq!(gate.terms.lock().unwrap().len(), usize::from(signed));
+        assert!(gate.outputs.lock().unwrap().is_empty());
+        assert!(gate.non_admissions.lock().unwrap().is_empty());
+        assert_eq!(
+            negotiation
+                .lookup(id.billing_id.clone(), id.billing_attempt)
+                .await
+                .unwrap()
+                .is_some(),
+            signed
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(peer.command("status").await["publications"], 0);
+        s.proposals.cancel_unsigned(ctx).await.unwrap();
+        buyer.shutdown().await.unwrap();
+        peer.stop().await;
     }
 }
 

@@ -11,8 +11,9 @@
 use super::*;
 
 const BUDGETS: TableDefinition<&str, &[u8]> = TableDefinition::new("capacity_probe_budgets_v1");
-const PROBES: TableDefinition<&str, &[u8]> = TableDefinition::new("capacity_probes_v1");
-const SCOPES: TableDefinition<&str, &str> = TableDefinition::new("capacity_probe_groups_v1");
+pub(super) const PROBES: TableDefinition<&str, &[u8]> = TableDefinition::new("capacity_probes_v1");
+pub(super) const SCOPES: TableDefinition<&str, &str> =
+    TableDefinition::new("capacity_probe_groups_v1");
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -87,6 +88,7 @@ pub struct Probe {
 pub struct Reservation {
     probe: Probe,
     owner: Digest,
+    expansion: bool,
 }
 impl Reservation {
     pub fn probe(&self) -> &Probe {
@@ -166,6 +168,52 @@ fn require_index(
 }
 
 impl Authority {
+    /// Recheck existing paid allocations without letting an operator expansion
+    /// probe consume their learned-health allowance. The probe still occupies
+    /// every physical scope. Only its own recovery scopes receive credit, from
+    /// exact durable indexes in the caller's reservation transaction; no new
+    /// admission or evidence renewal is granted here.
+    pub(super) fn reserved_allowances(
+        &self,
+        groups: &[Group],
+        route: &RouteState,
+        scopes: &impl ReadableTable<&'static str, &'static str>,
+        probes: &impl ReadableTable<&'static str, &'static [u8]>,
+        routes: &impl ReadableTable<&'static str, &'static [u8]>,
+    ) -> Result<Allowances> {
+        let physically_fits = groups.iter().all(|g| g.occupied <= g.ceiling)
+            && route.occupied <= route.config.max_concurrency;
+        let mut paid_groups = groups.to_vec();
+        let mut paid_route = route.clone();
+        for group in &mut paid_groups {
+            let Some(id) = db(scopes.get(group.id.as_str()))? else {
+                continue;
+            };
+            let probe: Probe = read(probes, id.value())?;
+            require(probe.id.as_str() == id.value())?;
+            let probe_route: RouteState = read(routes, probe.specification.route.as_str())?;
+            let ids = valid_spec(&probe.specification, &probe_route)?;
+            require(ids.contains(&group.id))?;
+            require_index(scopes, &ids, &probe.id)?;
+            if probe.controller_fence != self.fence
+                || !matches!(probe.phase, ProbePhase::Prepared | ProbePhase::Dispatched)
+            {
+                continue;
+            }
+            if group.mode == GroupMode::Observed && group.id == probe.specification.budget_group {
+                group.occupied = group.occupied.checked_sub(1).ok_or(Error::Invalid)?;
+            }
+            if probe.specification.route == route.config.id {
+                // The same probe is indexed in every shared group. Discount it
+                // only once for its route, never for a different model/alias.
+                paid_route.occupied = route.occupied.checked_sub(1).ok_or(Error::Invalid)?;
+            }
+        }
+        let mut allowances = self.allowances(&paid_groups, &paid_route, self.now()?)?;
+        allowances.fits &= physically_fits;
+        Ok(allowances)
+    }
+
     /// Pure identity derivation, including every authority/specification field.
     /// The caller can durably retain the original ID before any reservation.
     /// This hash is not a Reservation or Dispatch capability.
@@ -232,7 +280,7 @@ impl Authority {
     /// This ignores only health allowance, never physical/configured ceilings or
     /// active/uncertain work. Obtain a due Monitor::observe_recovery first.
     pub fn reserve_probe(&self, specification: Specification) -> Result<Reservation> {
-        self.reserve_probe_inner(specification, None)
+        self.reserve_probe_inner(specification, None, false)
     }
     /// A single attempt for a previously persisted intent. Duplicate/stale
     /// callers must recover the original ID; no existing reservation is ever
@@ -243,12 +291,30 @@ impl Authority {
         intent: ReservationIntent,
     ) -> Result<Reservation> {
         let id = self.probe_intent_id(&specification, &intent)?;
-        self.reserve_probe_inner(specification, Some((id, intent.expected_used_attempts)))
+        self.reserve_probe_inner(
+            specification,
+            Some((id, intent.expected_used_attempts)),
+            false,
+        )
+    }
+    pub(crate) fn reserve_capacity_probe(
+        &self,
+        specification: Specification,
+        intent: Option<ReservationIntent>,
+    ) -> Result<Reservation> {
+        let intent = intent
+            .map(|intent| {
+                self.probe_intent_id(&specification, &intent)
+                    .map(|id| (id, intent.expected_used_attempts))
+            })
+            .transpose()?;
+        self.reserve_probe_inner(specification, intent, true)
     }
     fn reserve_probe_inner(
         &self,
         specification: Specification,
         intent: Option<(Digest, u64)>,
+        expansion: bool,
     ) -> Result<Reservation> {
         let tx = self.write()?;
         let mut m = meta(&tx)?;
@@ -278,12 +344,16 @@ impl Authority {
         }
         let mut groups = db(tx.open_table(GROUPS))?;
         let mut values = load_groups(&groups, &route)?;
+        if expansion && self.allowances(&values, &route, self.now()?)?.free != 0 {
+            return Err(Error::Busy);
+        }
         if self
             .allowances_with_recovery(
                 &values,
                 &route,
                 self.now()?,
                 Some(&specification.budget_group),
+                expansion.then_some(false),
             )?
             .free
             == 0
@@ -350,6 +420,7 @@ impl Authority {
         Ok(Reservation {
             probe,
             owner: self.nonce.clone(),
+            expansion,
         })
     }
     /// Commit before sending. No read/reconnect can recreate this consumable permit.
@@ -374,6 +445,7 @@ impl Authority {
                 &route,
                 self.now()?,
                 Some(&probe.specification.budget_group),
+                reservation.expansion.then_some(true),
             )?
             .fits
         {

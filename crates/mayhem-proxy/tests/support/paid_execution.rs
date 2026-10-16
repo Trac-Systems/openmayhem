@@ -654,6 +654,102 @@ async fn paid_terminal_partial_refusal_and_cancelled_charge_only_under_the_origi
 }
 
 #[tokio::test]
+async fn paid_cancelled_stateless_json_and_stream_reconcile_on_all_rails_without_redispatch() {
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        for streaming in [false, true] {
+            let bytes = if streaming { stream_request() } else { chat() };
+            let backend = if streaming {
+                backend_raw(
+                    200,
+                    sse(&[delta("ready", json!("stop"))], true),
+                    "text/event-stream",
+                    Duration::from_millis(80),
+                )
+                .await
+            } else {
+                backend(200, answer(), Duration::from_millis(80)).await
+            };
+            let policy = json!({"schema_version":1,"lane":"proxy","payable_outcomes":["cancelled","complete","partial","refused"],"allow_checkpoints":false});
+            let mut p = Paid::start_with_policy(
+                &backend.base,
+                ProxyEndpoint::Chat,
+                rail,
+                &bytes,
+                streaming,
+                Some(policy),
+            )
+            .await;
+            let cancel = Cancellation::default();
+            let execute = async {
+                if streaming {
+                    p.executor
+                        .execute_stream(&p.record.invocation, &bytes, &cancel, |_| async { Ok(()) })
+                        .await
+                } else {
+                    p.executor
+                        .execute_json(&p.record.invocation, &bytes, &cancel)
+                        .await
+                }
+            };
+            let stop = async {
+                while backend.calls.load(Ordering::SeqCst) == 0 {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                cancel.cancel();
+            };
+            let (result, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::join!(execute, stop)
+            })
+            .await
+            .unwrap();
+            assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+            assert!(p
+                .journal
+                .recover(&p.record.invocation, p.record.attempt)
+                .unwrap()
+                .result
+                .is_some());
+            assert!(p
+                .executor
+                .reconcile_capacity(&p.record.invocation, p.record.attempt)
+                .await
+                .unwrap());
+            assert!(p.authority.lease(&p.lease).unwrap().is_none());
+            let receipt = signed_terminal(&mut p).await;
+            assert_eq!(
+                serde_json::to_value(receipt.body.outcome).unwrap(),
+                json!("cancelled")
+            );
+            p.executor
+                .retain_terminal_receipt(&p.record.invocation, p.record.attempt, &receipt)
+                .await
+                .unwrap();
+            assert!(p
+                .executor
+                .publish_terminal_receipt(&p.record.invocation, p.record.attempt)
+                .await
+                .unwrap());
+            assert!(p
+                .peer
+                .client
+                .observe(&p.authorization)
+                .await
+                .unwrap()
+                .confirms_receipt(&receipt)
+                .unwrap());
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            assert!(p
+                .executor
+                .execute_json(&p.record.invocation, &bytes, &Cancellation::default())
+                .await
+                .is_err());
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            p.peer.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn paid_terminal_disallowed_outcomes_require_explicit_mutual_waiver_on_every_rail() {
     for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
         for kind in ["partial", "refused", "cancelled"] {
@@ -1293,6 +1389,16 @@ async fn paid_receipt_http_ack_is_not_canonical_confirmation_and_ack_loss_recove
             .await
             .unwrap();
         assert_eq!(done, mode == "publish_lost_ack");
+        let submissions = p.peer.command("status").await["submissions"]
+            .as_u64()
+            .unwrap();
+        if mode == "publish_pending" {
+            assert_eq!(submissions, 1);
+        } else {
+            // This fixture loses every HTTP acknowledgment. The bounded client
+            // may resubmit identical signed bytes; canonical application is once.
+            assert!((1..=10).contains(&submissions));
+        }
         if !done {
             assert_eq!(
                 p.journal.get(&p.record.invocation).unwrap().unwrap().phase,
@@ -1307,7 +1413,7 @@ async fn paid_receipt_http_ack_is_not_canonical_confirmation_and_ack_loss_recove
             .await
             .unwrap());
         let stats = p.peer.command("status").await;
-        assert_eq!(stats["submissions"], 1);
+        assert_eq!(stats["submissions"], submissions);
         assert_eq!(stats["publications"], 1);
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         p.peer.stop().await;

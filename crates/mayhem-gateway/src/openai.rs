@@ -10001,6 +10001,11 @@ fn gateway_existing_job_response(job: StoredGatewayJob) -> Response {
     let status = match job.status {
         GatewayJobStatus::Completed => StatusCode::OK,
         GatewayJobStatus::ReconciliationPending => StatusCode::ACCEPTED,
+        GatewayJobStatus::Failed
+            if job.proxy.as_ref().is_some_and(|p| p.capacity_not_authorized(&job)) =>
+        {
+            StatusCode::SERVICE_UNAVAILABLE
+        }
         GatewayJobStatus::Cancelled | GatewayJobStatus::Failed => StatusCode::CONFLICT,
     };
     let id = job.id.clone();

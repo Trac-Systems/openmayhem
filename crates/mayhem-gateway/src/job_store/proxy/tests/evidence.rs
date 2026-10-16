@@ -5,6 +5,69 @@ fn public(job: &StoredGatewayJob) -> Value {
 }
 
 #[test]
+fn proxy_capacity_refusal_evidence_reopens_and_cannot_override_authorized_proof() {
+    let root = tempfile::tempdir().unwrap();
+    let mut store = open(root.path(), 8, 1024 * 1024, 1);
+    let (terms, _) = fixture();
+    begin(&mut store, "job_capacity", &terms).unwrap();
+    let retired = store
+        .fail_proxy_capacity_before_authorization("job_capacity", 2)
+        .unwrap();
+    let expected = public(&retired);
+    assert_eq!(expected["financial"], json!({"kind":"not_authorized"}));
+    assert_eq!(expected["admission_failure"], "capacity");
+    assert_eq!(
+        retired.error_info.as_ref().unwrap().code,
+        "capacity_unavailable"
+    );
+    drop(store);
+    let mut store = open(root.path(), 8, 1024 * 1024, 2);
+    assert_eq!(
+        public(&store.get("job_capacity", 2).unwrap().unwrap()),
+        expected
+    );
+    assert_eq!(
+        public(
+            &store
+                .fail_proxy_before_authorization("job_capacity", 2)
+                .unwrap()
+        ),
+        expected
+    );
+
+    begin(&mut store, "job_other_refusal", &terms).unwrap();
+    let other = store
+        .fail_proxy_before_authorization("job_other_refusal", 2)
+        .unwrap();
+    assert!(public(&other).get("admission_failure").is_none());
+    assert_eq!(other.error_info.unwrap().code, "proxy_not_authorized");
+
+    let (terms, _) = authorized(&mut store, "job_authorized");
+    assert!(store
+        .fail_proxy_capacity_before_authorization("job_authorized", 2)
+        .is_err());
+    let signed = store
+        .retain_proxy_output("job_authorized", output(&terms), 2)
+        .unwrap();
+    assert!(store
+        .fail_proxy_capacity_before_authorization("job_authorized", 2)
+        .is_err());
+    assert!(public(&signed).get("admission_failure").is_none());
+    assert_eq!(public(&signed)["financial"]["kind"], "pending");
+    // A capacity label cannot turn signed evidence into unsigned retirement.
+    let mut forged = signed;
+    forged.proxy.as_mut().unwrap().not_authorized = true;
+    forged.status = GatewayJobStatus::Failed;
+    forged.error_info = retired.error_info;
+    assert!(crate::job_store::proxy::evidence::project(&forged).is_err());
+    assert!(!forged
+        .proxy
+        .as_ref()
+        .unwrap()
+        .capacity_not_authorized(&forged));
+}
+
+#[test]
 fn proxy_evidence_unknown_is_not_release_and_unsigned_retirement_is_explicit() {
     let root = tempfile::tempdir().unwrap();
     let mut store = open(root.path(), 4, 1024 * 1024, 1);

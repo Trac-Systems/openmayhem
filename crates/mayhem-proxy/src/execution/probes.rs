@@ -177,7 +177,9 @@ impl Controller {
         }
         self.monitor
             .validate_tokenizer(&self.specification.route, source.digest())?;
-        source.bind_pool(&self.pool).map_err(|_| ProbeError::Configuration)?;
+        source
+            .bind_pool(&self.pool)
+            .map_err(|_| ProbeError::Configuration)?;
         self.tokenizer = Some(source);
         Ok(self)
     }
@@ -202,16 +204,28 @@ impl Controller {
     /// There is no idle polling loop here. Due/backoff and single-scope observation
     /// are enforced before the durable attempt/cost/capacity reservation.
     pub async fn run(&self) -> ProbeResult<Outcome> {
-        let mut sample = Some(
+        let expansion = self.monitor.snapshot(&self.specification.route)?.allowance > 0;
+        if expansion {
+            let route = self.specification.route.clone();
+            let status = self.storage(move |a| a.status(&route)).await?;
+            if status.state != capacity::Readiness::Busy || status.available != 0 {
+                return Err(health::Error::RecoveryBusy.into());
+            }
+        }
+        let mut sample = Some(if expansion {
             self.monitor
-                .observe_recovery(&self.specification.route, self.request.health_class)?,
-        );
+                .observe_capacity_recovery(&self.specification.route, self.request.health_class)?
+        } else {
+            self.monitor
+                .observe_recovery(&self.specification.route, self.request.health_class)?
+        });
         let specification = self.specification.clone();
         let intent = self.reservation_intent.clone();
         let reserved = self
-            .storage(move |a| match intent {
-                Some(intent) => a.reserve_probe_once(specification, intent),
-                None => a.reserve_probe(specification),
+            .storage(move |a| match (expansion, intent) {
+                (true, intent) => a.reserve_capacity_probe(specification, intent),
+                (false, Some(intent)) => a.reserve_probe_once(specification, intent),
+                (false, None) => a.reserve_probe(specification),
             })
             .await?;
         let id = reserved.probe().id.clone();

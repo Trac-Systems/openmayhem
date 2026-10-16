@@ -400,13 +400,19 @@ impl Monitor {
     /// Passive observation of an independently admitted request. This cannot
     /// bypass the durable capacity/financial admission checks of its caller.
     pub fn observe_request(&self, id: &Digest, class: Class) -> Result<Sample> {
-        self.sample(id, class, false)
+        self.sample(id, class, false, false)
     }
     /// At most one observation per shared scope. A permit is NOT authority to
     /// launch paid traffic: the caller needs independent durable probe admission,
     /// operator funding and safe same-job recovery before making any request.
     pub fn observe_recovery(&self, id: &Digest, class: Class) -> Result<Sample> {
-        self.sample(id, class, true)
+        self.sample(id, class, true, false)
+    }
+    /// Only the operator-funded probe controller may exercise a spare physical
+    /// slot when durable occupancy consumes a fresh health allowance. Capacity
+    /// independently verifies saturation, ceilings and the reserved probe.
+    pub(crate) fn observe_capacity_recovery(&self, id: &Digest, class: Class) -> Result<Sample> {
+        self.sample(id, class, true, true)
     }
     fn recovery_is_current(&self, sample: &Sample) -> Result<bool> {
         let data = self.inner.data.lock().map_err(|_| Error::Unavailable)?;
@@ -414,16 +420,20 @@ impl Monitor {
         Ok(sample.recovery
             && data.recovery == Some(sample.sequence)
             && sample.generation == (data.connection.generation, route.gate.generation)
-            && snapshot(&data, &sample.route, &self.inner.policy, Instant::now())?.allowance == 0)
+            && snapshot(&data, &sample.route, &self.inner.policy, Instant::now())?.allowance
+                == sample.recovery_allowance)
     }
-    fn sample(&self, id: &Digest, class: Class, recovery: bool) -> Result<Sample> {
+    fn sample(&self, id: &Digest, class: Class, recovery: bool, expansion: bool) -> Result<Sample> {
         if class.input_bytes_log2 > usize::BITS as u8 {
             return Err(Error::Invalid);
         }
         let mut data = self.inner.data.lock().map_err(|_| Error::Unavailable)?;
         let now = Instant::now();
         let view = snapshot(&data, id, &self.inner.policy, now)?;
-        if recovery && (data.recovery.is_some() || view.recovery_after_ms > 0 || view.allowance > 0)
+        if recovery
+            && (data.recovery.is_some()
+                || view.recovery_after_ms > 0
+                || (view.allowance > 0) != expansion)
         {
             return Err(Error::RecoveryBusy);
         }
@@ -441,6 +451,7 @@ impl Monitor {
             generation,
             sequence,
             recovery,
+            view.allowance,
             now,
         ))
     }

@@ -281,7 +281,12 @@ impl Runtime {
                         .as_ref()
                         .is_some_and(|p| p.terms().is_none() && p.non_admission().is_none())
                 }) {
-                    result = fail_unsigned(&state, &binding.job_id).await;
+                    let capacity = outcome.as_ref().is_err_and(|error| {
+                        error.code == buyer_controller::Code::Busy
+                            && error.stage == buyer_controller::Stage::Negotiating
+                            && !error.recovery_required
+                    });
+                    result = fail_unsigned_with_capacity(&state, &binding.job_id, capacity).await;
                 }
             }
             if let Ok(mut active) = state.active_job_cancellations.lock() {
@@ -439,13 +444,23 @@ async fn load(state: &GatewayState, id: &str) -> Result<Option<StoredGatewayJob>
     .await
 }
 async fn fail_unsigned(state: &GatewayState, id: &str) -> Result<StoredGatewayJob, ApiError> {
+    fail_unsigned_with_capacity(state, id, false).await
+}
+async fn fail_unsigned_with_capacity(
+    state: &GatewayState,
+    id: &str,
+    capacity: bool,
+) -> Result<StoredGatewayJob, ApiError> {
     let jobs = state.jobs.clone();
     let id = id.to_owned();
     storage(move || {
-        jobs.lock()
-            .map_err(|_| unavailable())?
-            .fail_proxy_before_authorization(&id, now_secs())
-            .map_err(|_| unavailable())
+        let mut jobs = jobs.lock().map_err(|_| unavailable())?;
+        if capacity {
+            jobs.fail_proxy_capacity_before_authorization(&id, now_secs())
+        } else {
+            jobs.fail_proxy_before_authorization(&id, now_secs())
+        }
+        .map_err(|_| unavailable())
     })
     .await
 }

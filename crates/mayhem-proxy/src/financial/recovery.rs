@@ -734,6 +734,36 @@ impl BuyerRecovery {
         self.run(move |s| Ok(s.observe(&o, false, at_ms)?.confirmed))
             .await
     }
+    /// Recover one original hold using the owner's existing store and signer.
+    /// Only canonical expiry under its accepted opt-in policy can release an
+    /// unresolved hold; this never establishes execution or authorizes retry.
+    pub(crate) async fn refresh_or_expire(
+        &self,
+        signer: &crate::signing::Authority,
+        authorization: &ProxySpendAuthorization,
+        at_ms: u64,
+    ) -> Result<Option<FinancialOutcome>> {
+        let observation = self.client.observe(authorization).await?;
+        let eligible = observation.expiry_eligible()?;
+        let saved = self
+            .run(move |s| s.observe(&observation, eligible, at_ms))
+            .await?;
+        if saved.confirmed.is_some() || !eligible {
+            return Ok(saved.confirmed);
+        }
+        let key = Digest::new(
+            saved
+                .authorization
+                .terms
+                .digest()
+                .map_err(|_| invalid("invalid recovery terms"))?,
+        )
+        .map_err(|_| invalid("invalid recovery key"))?;
+        if saved.signed.is_none() {
+            self.sign_expiry(signer, key.clone()).await?;
+        }
+        self.publish_expiry(key, crate::supervisor::unix_ms()).await
+    }
     /// Adopt already verified canonical history during negotiation recovery,
     /// including accepted terms from an earlier contract version. No new append.
     pub(crate) async fn retain_observation(

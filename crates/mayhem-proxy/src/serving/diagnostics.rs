@@ -9,6 +9,21 @@ use std::{
 };
 
 fn details(error: &(dyn Error + 'static)) -> (&'static str, Option<String>) {
+    if let Some(error) = error.downcast_ref::<mayhem_bridge::BridgeError>() {
+        use mayhem_bridge::BridgeError as B;
+        let code = match error {
+            B::Timeout => "timeout",
+            B::Closed => "closed",
+            B::Protocol(_) => "protocol",
+            B::ResourceLimit(_) => "resource_limit",
+            B::WebSocket(_) => "websocket",
+            B::Http(_) => "http",
+            B::Json(_) => "json",
+            B::InvalidUrl(_) => "url",
+            B::RpcStatus { .. } => "rpc_status",
+        };
+        return ("bridge", Some(code.into()));
+    }
     if let Some(error) = error.downcast_ref::<crate::Error>() {
         return match error {
             crate::Error::Invalid(message) => (
@@ -41,7 +56,7 @@ fn details(error: &(dyn Error + 'static)) -> (&'static str, Option<String>) {
     }
 }
 
-pub(super) fn report(stage: &'static str, error: &(dyn Error + 'static)) {
+pub(crate) fn report(stage: &'static str, error: &(dyn Error + 'static)) {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     static LAST: AtomicU64 = AtomicU64::new(0);
     static COUNT: AtomicU64 = AtomicU64::new(0);
@@ -85,5 +100,12 @@ mod tests {
             code: private.into(),
         };
         assert_eq!(details(&http), ("financial_http", Some("503".into())));
+        let bridge =
+            crate::exchange::Error::Transport(mayhem_bridge::BridgeError::Protocol(private.into()));
+        assert_eq!(details(&bridge), ("bridge", Some("protocol".into())));
+        assert_eq!(
+            details(&mayhem_bridge::BridgeError::Timeout),
+            ("bridge", Some("timeout".into()))
+        );
     }
 }
