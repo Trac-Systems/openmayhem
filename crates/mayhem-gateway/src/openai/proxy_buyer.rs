@@ -264,8 +264,10 @@ impl Runtime {
                         }
                     }
                     eprintln!(
-                        "Proxy execution did not complete: job_id={} code={:?} stage={:?} recovery_required={} financial_code={:?}",
-                        binding.job_id, error.code, error.stage, error.recovery_required, error.financial_code
+                        "Proxy execution did not complete: job_id={} code={:?} stage={:?} recovery_required={} financial_code={:?} verification_step={:?} verification_cause={:?}",
+                        binding.job_id, error.code, error.stage, error.recovery_required, error.financial_code,
+                        error.verification_step.map(buyer_controller::VerificationStep::as_str),
+                        error.verification_cause.map(buyer_controller::VerificationCause::as_str)
                     );
                 }
             }

@@ -177,6 +177,87 @@ pub enum Code {
     Verification,
     Unconfirmed,
 }
+/// Local diagnostic labels only; neither classification grants retry or spending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerificationStep {
+    ProposalBinding,
+    AdapterBinding,
+    QuoteRead,
+    QuotePolicy,
+    SessionBinding,
+    PurchasePrepare,
+}
+impl VerificationStep {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ProposalBinding => "proposal_binding",
+            Self::AdapterBinding => "adapter_binding",
+            Self::QuoteRead => "quote_read",
+            Self::QuotePolicy => "quote_policy",
+            Self::SessionBinding => "session_binding",
+            Self::PurchasePrepare => "purchase_prepare",
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VerificationCause {
+    Binding,
+    Deadline,
+    Expired,
+    Capacity,
+    Budget,
+    BindingOrFunding,
+    ExistingPurchase,
+    Http,
+    Transport,
+    Decode,
+    Storage,
+    Unavailable,
+    Validation,
+    Control,
+}
+impl VerificationCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Binding => "binding",
+            Self::Deadline => "deadline",
+            Self::Expired => "expired",
+            Self::Capacity => "capacity",
+            Self::Budget => "budget",
+            Self::BindingOrFunding => "binding_or_funding",
+            Self::ExistingPurchase => "existing_purchase",
+            Self::Http => "http",
+            Self::Transport => "transport",
+            Self::Decode => "decode",
+            Self::Storage => "storage",
+            Self::Unavailable => "unavailable",
+            Self::Validation => "validation",
+            Self::Control => "control",
+        }
+    }
+    fn financial(error: &crate::Error) -> Self {
+        use crate::Error as E;
+        match error {
+            // Exact local messages, never arbitrary peer text or substring matches.
+            E::Invalid(message) => match message.as_str() {
+                "canonical quote observation unavailable" => Self::Deadline,
+                "quote observation expired; requote" => Self::Expired,
+                "quote observation capacity unavailable" => Self::Capacity,
+                "purchase maximum exceeds explicit total limit" => Self::Budget,
+                "quote differs from buyer, payment binding or funding" => Self::BindingOrFunding,
+                "recover the existing purchase before a new attempt" => Self::ExistingPurchase,
+                _ => Self::Validation,
+            },
+            E::Transport(error) if error.is_timeout() => Self::Deadline,
+            E::Transport(_) => Self::Transport,
+            E::Http { .. } => Self::Http,
+            E::Json(_) => Self::Decode,
+            E::Database(_) | E::Io(_) => Self::Storage,
+            E::FinancialAdmissionUnavailable => Self::Unavailable,
+            _ => Self::Control,
+        }
+    }
+}
 #[derive(Debug, thiserror::Error)]
 #[error("proxy buyer operation failed: {code:?} at {stage:?}")]
 pub struct Error {
@@ -188,6 +269,8 @@ pub struct Error {
     pub recovery_required: bool,
     /// Fixed financial diagnostic only; never a peer exception or retry authority.
     pub financial_code: Option<&'static str>,
+    pub verification_step: Option<VerificationStep>,
+    pub verification_cause: Option<VerificationCause>,
 }
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -547,6 +630,8 @@ impl Controller {
             stage: Stage::Admission,
             recovery_required: true,
             financial_code: None,
+            verification_step: None,
+            verification_cause: None,
         };
         if self.stopped.load(Ordering::Acquire) || *external.borrow() {
             return Err(fail(Code::Stopped));
@@ -686,7 +771,18 @@ impl Progress {
             stage: self.stage,
             recovery_required: self.retained,
             financial_code: None,
+            verification_step: None,
+            verification_cause: None,
         }
+    }
+    fn verification_error(&self, step: VerificationStep, cause: VerificationCause) -> Error {
+        let mut result = self.error(Code::Verification);
+        result.verification_step = Some(step);
+        result.verification_cause = Some(cause);
+        result
+    }
+    fn verification_financial_error(&self, step: VerificationStep, error: &crate::Error) -> Error {
+        self.verification_error(step, VerificationCause::financial(error))
     }
     fn financial_error(&self, error: crate::Error) -> Error {
         let mut result = self.error(match &error {
@@ -830,7 +926,7 @@ impl Shared {
         let response = tokio::select! {
             result = channel.receive(self.limits.control_wait) => result.map_err(|e| p.transport_error("buyer_proposal_receive", &e))?,
             _ = stopped(stop) => return Err(p.error(Code::Stopped)),
-        }.into_message(&context, Role::Buyer).map_err(|_| p.error(Code::Verification))?;
+        }.into_message(&context, Role::Buyer).map_err(|_| p.verification_error(VerificationStep::ProposalBinding, VerificationCause::Binding))?;
         let mut proposal = match response {
             negotiation::Message::Proposal { proposal } => proposal,
             negotiation::Message::Refused { failure }
@@ -853,7 +949,9 @@ impl Shared {
         if adapter.contract_hash() != &authorization.endpoint_contract
             || adapter.recipe_hash() != &authorization.recipe_hash
         {
-            return Err(p.error(Code::Verification));
+            return Err(
+                p.verification_error(VerificationStep::AdapterBinding, VerificationCause::Binding)
+            );
         }
         let purchase_request = PurchaseRequest::new(
             proposal.adapter.clone(),
@@ -873,20 +971,27 @@ impl Shared {
             .client
             .quote(&query)
             .await
-            .map_err(|_| p.error(Code::Verification))?;
-        if quote.policy().map_err(|_| p.error(Code::Verification))?
+            .map_err(|e| p.verification_financial_error(VerificationStep::QuoteRead, &e))?;
+        if quote
+            .policy()
+            .map_err(|e| p.verification_financial_error(VerificationStep::QuotePolicy, &e))?
             != &authorization.settlement_policy
         {
-            return Err(p.error(Code::Verification));
+            return Err(
+                p.verification_error(VerificationStep::QuotePolicy, VerificationCause::Binding)
+            );
         }
         let purchase = quote
             .prepare_purchase(
                 &purchase_request,
-                &proposal
-                    .session_binding(&context)
-                    .map_err(|_| p.error(Code::Verification))?,
+                &proposal.session_binding(&context).map_err(|_| {
+                    p.verification_error(
+                        VerificationStep::SessionBinding,
+                        VerificationCause::Binding,
+                    )
+                })?,
             )
-            .map_err(|_| p.error(Code::Verification))?;
+            .map_err(|e| p.verification_financial_error(VerificationStep::PurchasePrepare, &e))?;
         if purchase.terms().billing_attempt != context.billing_attempt {
             return Err(p.error(Code::RecoveryRequired));
         }
@@ -1366,6 +1471,92 @@ impl Shared {
                     });
                 }
                 _ => return Err(p.error(Code::Verification)),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn verification_diagnostics_preserve_semantics_and_redact_causes() {
+        let private = "private prompt https://example.invalid/secret?token=private";
+        for (step, source, expected) in [
+            (
+                VerificationStep::QuoteRead,
+                crate::invalid("canonical quote observation unavailable"),
+                VerificationCause::Deadline,
+            ),
+            (
+                VerificationStep::QuotePolicy,
+                crate::invalid("quote observation expired; requote"),
+                VerificationCause::Expired,
+            ),
+            (
+                VerificationStep::QuoteRead,
+                crate::invalid("quote observation capacity unavailable"),
+                VerificationCause::Capacity,
+            ),
+            (
+                VerificationStep::PurchasePrepare,
+                crate::invalid("purchase maximum exceeds explicit total limit"),
+                VerificationCause::Budget,
+            ),
+            (
+                VerificationStep::PurchasePrepare,
+                crate::invalid("quote differs from buyer, payment binding or funding"),
+                VerificationCause::BindingOrFunding,
+            ),
+            (
+                VerificationStep::QuoteRead,
+                crate::Error::Http {
+                    status: 503,
+                    code: private.into(),
+                },
+                VerificationCause::Http,
+            ),
+            (
+                VerificationStep::QuoteRead,
+                crate::Error::FinancialAdmissionUnavailable,
+                VerificationCause::Unavailable,
+            ),
+            (
+                VerificationStep::PurchasePrepare,
+                crate::invalid(private),
+                VerificationCause::Validation,
+            ),
+            (
+                VerificationStep::QuoteRead,
+                crate::invalid(format!(
+                    "canonical quote observation unavailable: {private}"
+                )),
+                VerificationCause::Validation,
+            ),
+        ] {
+            for retained in [false, true] {
+                let p = Progress {
+                    identity: RequestIdentity {
+                        billing_id: Digest::new("01".repeat(32)).unwrap(),
+                        billing_attempt: 1,
+                        session_id: Digest::new("02".repeat(32)).unwrap(),
+                        request_hash: Digest::new("03".repeat(32)).unwrap(),
+                    },
+                    stage: Stage::Negotiating,
+                    retained,
+                };
+                let failure = p.verification_financial_error(step, &source);
+                assert_eq!(failure.code, Code::Verification);
+                assert_eq!(failure.stage, Stage::Negotiating);
+                assert_eq!(failure.recovery_required, retained);
+                assert_eq!(failure.identity, p.identity);
+                assert_eq!(failure.financial_code, None);
+                assert_eq!(failure.verification_step, Some(step));
+                assert_eq!(failure.verification_cause, Some(expected));
+                assert!(!format!("{failure:?}").contains(private));
+                assert!(!format!("{} {}", step.as_str(), expected.as_str()).contains(private));
+                assert_eq!(p.error(Code::Transport).verification_step, None);
             }
         }
     }
