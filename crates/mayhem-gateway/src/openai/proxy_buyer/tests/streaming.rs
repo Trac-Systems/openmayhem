@@ -51,6 +51,64 @@ fn job_id(response: &Response) -> String {
 }
 
 #[tokio::test]
+async fn proxy_sse_receipt_budget_failure_exposes_durable_recovery_without_reexecution() {
+    let mut f = Fixture::start().await;
+    f.harness
+        .stream_backend
+        .chunk_bytes
+        .store(512, Ordering::SeqCst);
+    let mut body = f.stream_body();
+    body["proxy"]["output_units"] = json!(1);
+    let response = f.stream_post_body("receipt-budget", body.clone()).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = job_id(&response);
+    let bytes = collect(response.into_body()).await;
+    assert!(!std::str::from_utf8(&bytes).unwrap().contains("[DONE]"));
+    assert_eq!(
+        payloads(&bytes).last().unwrap()["error"]["code"],
+        "proxy_recovery_required"
+    );
+    let (_, evidence) = f
+        .get(
+            &format!("/v1/jobs/{id}/proxy-evidence"),
+            "owner-fixture-key",
+        )
+        .await;
+    assert_eq!(evidence["execution_status"], "reconciling");
+    assert_eq!(evidence["recovery_reason"], "receipt_preparation_pending");
+    assert_eq!(evidence["financial"]["kind"], "pending");
+    assert_eq!(evidence["result_verified"], false);
+    assert_eq!(evidence["terms"]["max_usage"]["output_token"], 1);
+    let (status, metadata) = f.get(&format!("/v1/jobs/{id}"), "owner-fixture-key").await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(metadata["execution_status"], "reconciling");
+    assert_eq!(metadata["recovery_reason"], "receipt_preparation_pending");
+    let replay = f.stream_post_body("receipt-budget", body).await;
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    assert_eq!(job_id(&replay), id);
+    assert_eq!(f.harness.backend_calls(), 1);
+    assert_eq!(f.harness.status().await["publications"], 1);
+    let pending = f
+        .state
+        .access_control
+        .pending_key_budgets(None, 64)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(
+        pending[0].1.maximum.to_string(),
+        evidence["terms"]["max_spend_au"]
+    );
+    let denied = f
+        .get(
+            &format!("/v1/jobs/{id}/proxy-evidence"),
+            "other-fixture-key",
+        )
+        .await;
+    assert_eq!(denied.0, StatusCode::NOT_FOUND);
+    f.stop().await;
+}
+
+#[tokio::test]
 async fn proxy_sse_terminal_observation_closes_budget_before_success_without_refetch() {
     let mut f = Fixture::start().await;
     f.harness.command("buyer_unavailable_after_terminal").await;

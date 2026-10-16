@@ -35,6 +35,22 @@ pub(crate) struct ProxyJobState {
     not_authorized: bool,
     #[serde(default)]
     non_admission: Option<ProxyNonAdmission>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    recovery_reason: Option<ProxyRecoveryReason>,
+}
+
+/// An authenticated controller observation, never financial closure or retry authority.
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ProxyRecoveryReason {
+    ReceiptPreparationPending,
+}
+impl ProxyRecoveryReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::ReceiptPreparationPending => "receipt_preparation_pending",
+        }
+    }
 }
 impl std::fmt::Debug for ProxyJobState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -132,6 +148,15 @@ fn identity_matches(identity: &RequestIdentity, terms: &ProxySpendTerms) -> bool
         && identity.request_hash.as_str() == terms.request_hash
 }
 impl ProxyJobState {
+    pub(crate) fn recovery_reason(&self) -> Option<&'static str> {
+        // A subsequent verified receipt or canonical closure supersedes this
+        // historical observation; it must not keep a completed job reconciling.
+        if !self.buyer_journal_seen || self.closure.is_some() || self.output_receipt.is_some() {
+            None
+        } else {
+            self.recovery_reason.map(ProxyRecoveryReason::as_str)
+        }
+    }
     pub(crate) fn capacity_not_authorized(&self, job: &StoredGatewayJob) -> bool {
         self.not_authorized
             && job
@@ -195,6 +220,7 @@ impl ProxyJobState {
                     && self.closure.is_none()
                     && self.budget_marker.is_none()
                     && self.non_admission.is_none()
+                    && self.recovery_reason.is_none()
                     && job.status == GatewayJobStatus::Failed
                     && job.result.is_none()
                     && job.receipt.is_none()
@@ -216,6 +242,11 @@ impl ProxyJobState {
         require(
             self.terms.is_some() == self.policy.is_some(),
             "proxy policy/terms presence differs",
+        )?;
+        require(
+            self.recovery_reason.is_none()
+                || (self.terms.is_some() && !self.not_authorized && self.non_admission.is_none()),
+            "proxy recovery observation lacks an authorized purchase",
         )?;
         require(
             !self.buyer_journal_seen || self.terms.is_some(),
@@ -502,6 +533,27 @@ impl GatewayJobStore {
         self.persist_proxy(job)?;
         Ok(())
     }
+    /// Persist the exact controller's receipt-pending observation. It does not
+    /// make unverified output public, alter accepted terms, or release a hold.
+    pub(crate) fn note_proxy_receipt_pending(&mut self, id: &str) -> Result<(), String> {
+        let mut job = self.proxy_job(id)?;
+        let proxy = job.proxy.as_mut().unwrap();
+        if proxy.closure.is_some() || proxy.output_receipt.is_some() {
+            return Ok(());
+        }
+        require(
+            job.status == GatewayJobStatus::ReconciliationPending
+                && proxy.terms.is_some()
+                && proxy.non_admission.is_none(),
+            "proxy receipt observation lacks an open purchase",
+        )?;
+        if proxy.recovery_reason == Some(ProxyRecoveryReason::ReceiptPreparationPending) {
+            return Ok(());
+        }
+        proxy.recovery_reason = Some(ProxyRecoveryReason::ReceiptPreparationPending);
+        self.persist_proxy(job)?;
+        Ok(())
+    }
     /// Durable idempotency ownership, even before a quote or owner budget grant.
     pub(crate) fn begin_proxy(
         &mut self,
@@ -566,6 +618,7 @@ impl GatewayJobStore {
                 budget_marker: None,
                 not_authorized: false,
                 non_admission: None,
+                recovery_reason: None,
             }),
         };
         self.persist_proxy(job)?;

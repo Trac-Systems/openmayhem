@@ -9929,7 +9929,7 @@ fn persisted_job_error_info(message: &str, error_info: Option<&GatewayJobErrorIn
 }
 
 fn gateway_job_summary_metadata(job: &StoredGatewayJobSummary) -> Value {
-    json!({
+    let mut metadata = json!({
         "id": job.id,
         "object": "mayhem.job",
         "status": job.status.as_str(),
@@ -9949,7 +9949,12 @@ fn gateway_job_summary_metadata(job: &StoredGatewayJobSummary) -> Value {
         "receipt": job.receipt,
         "error": job.error,
         "error_info": job.error.as_deref().map(|message| persisted_job_error_info(message, job.error_info.as_ref())),
-    })
+    });
+    if let Some(reason) = job.proxy_recovery_reason {
+        metadata["execution_status"] = json!("reconciling");
+        metadata["recovery_reason"] = json!(reason);
+    }
+    metadata
 }
 
 fn gateway_job_pending_response(id: &str) -> Response {

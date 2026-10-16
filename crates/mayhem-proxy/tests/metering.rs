@@ -63,6 +63,94 @@ fn answer() -> Value {
 }
 
 #[test]
+fn automatic_allowance_covers_long_reasoning_and_text_without_a_hidden_token_default() {
+    for streaming in [false, true] {
+        let adapter = adapter(ProxyEndpoint::Chat);
+        let mut body = chat();
+        body["stream"] = json!(streaming);
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let request = if streaming {
+            adapter.prepare_stream(&bytes)
+        } else {
+            adapter.prepare_json(&bytes)
+        }
+        .unwrap();
+        let allowance = request.maximum_usage(None).unwrap();
+        assert_eq!(allowance["output_token"], 1024 * 1024 / 4);
+        let result = json!({"choices":[{"index":0,"message":{"role":"assistant",
+            "content":"answer 🧠\n".repeat(2500),"reasoning":"reasoning ".repeat(1500)},"finish_reason":"stop"}]});
+        let reply = request.decode_json(result, "r", 0).unwrap();
+        let units = &reply.observed_usage.unwrap().units;
+        assert!(units["output_token"] > 4096);
+        assert!(units["output_token"] <= allowance["output_token"]);
+        // Explicit financial allowances remain explicit, never enlarged.
+        assert_eq!(request.maximum_usage(Some(37)).unwrap()["output_token"], 37);
+        // A native tokenizer control is not an observable-output conversion.
+        body["max_tokens"] = json!(123);
+        body["stream"] = json!(false);
+        let native = adapter
+            .prepare_json(&serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        assert_eq!(
+            native.maximum_usage(None).unwrap()["output_token"],
+            allowance["output_token"]
+        );
+    }
+}
+
+#[test]
+fn automatic_allowance_covers_tools_multiple_choices_and_responses_but_not_decision_tokens() {
+    for (endpoint, mut body, output) in [
+        (
+            ProxyEndpoint::Chat,
+            chat(),
+            json!({"choices":(0..1).map(|i| json!({"index":i,"message":{"role":"assistant",
+            "content":"🌍".repeat(5000),"reasoning_content":"reason ".repeat(1000),
+            "tool_calls":[{"id":format!("call{i}"),"type":"function","function":{"name":"save","arguments":json!({"text":"quoted \\\" 😃".repeat(1500)}).to_string()}}]},"finish_reason":"tool_calls"})).collect::<Vec<_>>()}),
+        ),
+        (
+            ProxyEndpoint::Completions,
+            json!({"model":"m","prompt":"hi","n":2}),
+            json!({"choices":(0..2).map(|i| json!({"index":i,"text":"word\n".repeat(6000),"finish_reason":"stop"})).collect::<Vec<_>>()}),
+        ),
+        (
+            ProxyEndpoint::Responses,
+            json!({"model":"m","input":"hi"}),
+            json!({"status":"completed","output":[
+            {"id":"r1","type":"reasoning","content":[{"type":"reasoning_text","text":"think ".repeat(4000)}],"summary":[]},
+            {"id":"m1","type":"message","role":"assistant","content":[{"type":"output_text","text":"🌍 answer".repeat(5000),"annotations":[]}]},
+            {"id":"f1","type":"function_call","call_id":"c1","name":"save","arguments":json!({"text":"🌍".repeat(2000)}).to_string()}]}),
+        ),
+    ] {
+        if endpoint == ProxyEndpoint::Chat {
+            body["tools"] = json!([{"type":"function","function":{"name":"save","parameters":{"type":"object","properties":{"text":{"type":"string"}}}}}]);
+        } else if endpoint == ProxyEndpoint::Responses {
+            body["tools"] = json!([{"type":"function","name":"save","parameters":{"type":"object","properties":{"text":{"type":"string"}}}}]);
+        }
+        let request = adapter(endpoint)
+            .prepare_json(&serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        let allowance = request.maximum_usage(None).unwrap();
+        let reply = request
+            .decode_json(output, "r", 0)
+            .unwrap_or_else(|e| panic!("{endpoint:?}: {e:?}"));
+        let units = reply.observed_usage.unwrap().units["output_token"];
+        assert!(units > 4096, "{endpoint:?}");
+        assert!(units <= allowance["output_token"], "{endpoint:?}");
+    }
+    let body =
+        json!({"model":"m","state":"hi","questions":{"q":{"type":"noul","instructions":"score"}}});
+    let request = adapter(ProxyEndpoint::Decisions)
+        .prepare_json(&serde_json::to_vec(&body).unwrap())
+        .unwrap();
+    assert_eq!(
+        request.maximum_usage(None).unwrap(),
+        std::collections::BTreeMap::from([("decision".into(), 1)])
+    );
+    assert!(request.maximum_usage(Some(10)).is_err());
+}
+
+#[test]
 fn normalized_input_and_observed_output_ignore_vendor_usage_and_transport_settings() {
     let adapter = adapter(ProxyEndpoint::Chat);
     let mut body = chat();

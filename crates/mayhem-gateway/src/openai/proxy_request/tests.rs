@@ -218,7 +218,7 @@ fn envelope_strips_controls_only_and_requires_explicit_limits_and_policy() {
         serde_json::from_slice::<Value>(request.provider_request()).unwrap(),
         expected
     );
-    for field in ["prices", "rail", "settlement_policy_hash", "output_units"] {
+    for field in ["prices", "rail", "settlement_policy_hash"] {
         let mut broken = body.clone();
         broken["proxy"].as_object_mut().unwrap().remove(field);
         assert!(
@@ -337,7 +337,18 @@ fn completion_and_response_controls_preserve_endpoint_schema_and_bind_body_exact
                 "{endpoint:?}/{field}"
             );
         }
-        for output in [Value::Null, json!(0), json!(PROXY_MAX_SAFE_INTEGER + 1)] {
+        let mut automatic = body.clone();
+        automatic["proxy"]["output_units"] = Value::Null;
+        let automatic = Request::parse(endpoint, automatic, &policy())
+            .unwrap()
+            .unwrap();
+        assert_eq!(automatic.controls().output_units, None);
+        assert_eq!(
+            automatic.controls().prices.max_total_spend_au,
+            request.controls().prices.max_total_spend_au
+        );
+        assert_eq!(automatic.provider_request(), request.provider_request());
+        for output in [json!(0), json!(PROXY_MAX_SAFE_INTEGER + 1)] {
             let mut changed = body.clone();
             changed["proxy"]["output_units"] = output;
             assert!(Request::parse(endpoint, changed, &policy()).is_err());

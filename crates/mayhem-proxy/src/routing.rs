@@ -260,7 +260,7 @@ impl Policy {
                 && if self.endpoint == ProxyEndpoint::Decisions {
                     c.output_units.is_none() && c.minimum_tokens_per_second.is_none()
                 } else {
-                    c.output_units.is_some()
+                    true // None derives a finite allowance from the verified adapter.
                 },
             "invalid routing context/output constraints",
         )?;

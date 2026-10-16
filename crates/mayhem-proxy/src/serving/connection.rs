@@ -263,13 +263,24 @@ async fn handle(
                             }
                         }
                         if let Some(saved) = saved.filter(|s| s.result.is_some()) {
-                            output.send(Message::State { state: PublicState::CancelRequested }).await?;
-                            output.send(Message::Result {
-                                response: saved.result.expect("retained result checked").reply.body,
-                            }).await?;
+                            output
+                                .send(Message::State {
+                                    state: PublicState::CancelRequested,
+                                })
+                                .await?;
+                            output
+                                .send(Message::Result {
+                                    response: saved
+                                        .result
+                                        .expect("retained result checked")
+                                        .reply
+                                        .body,
+                                })
+                                .await?;
                             receipt(&owner, &session, &output, saved.record.attempt).await?;
                         } else {
-                            let failure = classify(exchange::Error::Execution(execution::Error::Cancelled));
+                            let failure =
+                                classify(exchange::Error::Execution(execution::Error::Cancelled));
                             output.send(Message::Failure { failure }).await?;
                             offer_non_execution(&owner, &session, &output).await?;
                         }
@@ -375,11 +386,7 @@ async fn recover(owner: &Inner, session: &Session, output: &queue::Output) -> Re
     }
     receipt(owner, session, output, saved.record.attempt).await
 }
-async fn recover_status(
-    owner: &Inner,
-    session: &Session,
-    output: &queue::Output,
-) -> Result<bool> {
+async fn recover_status(owner: &Inner, session: &Session, output: &queue::Output) -> Result<bool> {
     let saved = session
         .existing(&owner.executor)
         .await?
@@ -461,7 +468,8 @@ async fn receipt_pending(
             output.send(value).await?;
             Ok(false)
         }
-        Err(_) => {
+        Err(error) => {
+            super::diagnostics::receipt_preparation(&error);
             let pending = Message::State {
                 state: PublicState::AwaitingReceipt,
             };
@@ -494,7 +502,8 @@ async fn offer_non_execution_pending(
         if saved.record.phase != crate::attempts::Phase::Closed
             && saved.record.non_execution_evidence().is_some()
         {
-            return receipt_pending(owner, session, output, saved.record.attempt, status_read).await;
+            return receipt_pending(owner, session, output, saved.record.attempt, status_read)
+                .await;
         }
     }
     Ok(false)

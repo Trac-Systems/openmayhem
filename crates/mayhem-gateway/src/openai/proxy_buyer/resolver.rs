@@ -475,7 +475,6 @@ async fn start(
             .is_some_and(|n| controls.output_units.is_none_or(|v| v > n))
         || (endpoint == ProxyEndpoint::Decisions
             && (controls.output_units.is_some() || controls.minimum_tokens_per_second.is_some()))
-        || (endpoint != ProxyEndpoint::Decisions && controls.output_units.is_none())
     {
         return Err(invalid());
     }

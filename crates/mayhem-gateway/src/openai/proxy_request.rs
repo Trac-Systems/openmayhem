@@ -251,13 +251,12 @@ impl Request {
             return Err(Error::Invalid);
         }
         // Decisions charge their defined outcomes, not an invented token rate.
-        // Generative requests must explicitly authorize a bounded output amount.
+        // Text may derive a bounded output allowance from its verified adapter;
+        // the explicit price ceiling remains mandatory and is never enlarged.
         if endpoint == ProxyEndpoint::Decisions {
             if controls.output_units.is_some() || controls.minimum_tokens_per_second.is_some() {
                 return Err(Error::Invalid);
             }
-        } else if controls.output_units.is_none() {
-            return Err(Error::Invalid);
         }
         if let Some(profile) = &controls.profile {
             profile.validate().map_err(|_| Error::Invalid)?;

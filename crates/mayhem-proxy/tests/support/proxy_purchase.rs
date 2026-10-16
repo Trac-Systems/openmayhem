@@ -171,6 +171,58 @@ async fn purchase_uses_owned_request_and_explicit_budget_then_reserves_exact_cos
 }
 
 #[tokio::test]
+async fn automatic_purchase_uses_finite_response_bound_and_checks_money_before_reserving() {
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        for (endpoint, bytes, _) in cases() {
+            let backend = backend(200, answer(), Duration::ZERO).await;
+            let f = Fixture::new(&backend.base, endpoint);
+            let mut peer = Peer::start(rail, &f, &bytes, false, None).await;
+            let mut ample = prices(&peer);
+            ample.max_total_spend_au = u128::MAX;
+            let intent = PurchaseRequest::new(
+                f.adapter.public_snapshot(),
+                bytes.clone(),
+                ample,
+                None,
+                lifetimes(),
+            )
+            .unwrap();
+            let maximum = intent.maximum(&peer.template.terms.offer).unwrap();
+            if endpoint == ProxyEndpoint::Decisions {
+                assert_eq!(
+                    maximum.max_usage,
+                    std::collections::BTreeMap::from([("decision".into(), 1)])
+                );
+            } else {
+                assert_eq!(
+                    maximum.max_usage["output_token"],
+                    f.adapter.limits().response_bytes.div_ceil(4) as u64
+                );
+            }
+            let q = peer.buyer_client.quote(&query(&peer)).await.unwrap();
+            assert_eq!(
+                maximum.max_spend_au,
+                peer.template.terms.offer.cost(&maximum.max_usage).unwrap()
+            );
+            let mut insufficient = prices(&peer);
+            insufficient.max_total_spend_au = maximum.max_spend_au - 1;
+            let insufficient = PurchaseRequest::new(
+                f.adapter.public_snapshot(),
+                bytes.clone(),
+                insufficient,
+                None,
+                lifetimes(),
+            )
+            .unwrap();
+            assert!(q.prepare_purchase(&insufficient, &session(&peer)).is_err());
+            assert_eq!(peer.command("status").await["publications"], 0);
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+            peer.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn purchase_rejects_incompatible_recipe_budget_lifetime_and_oversized_or_invalid_requests() {
     for (endpoint, bytes, _) in cases() {
         let backend = backend(200, answer(), Duration::ZERO).await;
@@ -184,7 +236,7 @@ async fn purchase_rejects_incompatible_recipe_budget_lifetime_and_oversized_or_i
         for budget in if endpoint == ProxyEndpoint::Decisions {
             vec![Some(1), Some(0)]
         } else {
-            vec![None, Some(0), Some(u64::MAX)]
+            vec![Some(0), Some(u64::MAX)]
         } {
             assert!(intent(
                 f.adapter.public_snapshot(),

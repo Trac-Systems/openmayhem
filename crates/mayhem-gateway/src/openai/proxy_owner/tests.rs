@@ -295,6 +295,62 @@ impl AuthorizationGate for InspectGate {
 }
 
 #[tokio::test]
+async fn owner_receipt_pending_observation_survives_restart_without_financial_authority() {
+    let f = Harness::start(&worker_path()).await;
+    let purchase = f.prepare().await;
+    let s = StoredOwner::new(&f, purchase.terms().max_spend_au + 10);
+    assert!(s.owner().note_receipt_pending().await.is_err());
+    let mut request = f.request(s.owner());
+    request.authorization.output_units = Some(1);
+    let (_stop, rx) = watch::channel(false);
+    assert!(matches!(
+        f.buyer.execute(request, rx).await.unwrap(),
+        buyer::Outcome::Pending {
+            state: mayhem_proxy::exchange::PublicState::AwaitingReceipt,
+            ..
+        }
+    ));
+    let saved = f
+        .negotiation
+        .lookup(
+            s.binding.identity.billing_id.clone(),
+            s.binding.identity.billing_attempt,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    s.owner().note_purchase(saved).await.unwrap();
+    let terms = s.job().proxy.as_ref().unwrap().terms().unwrap().clone();
+    s.owner().note_receipt_pending().await.unwrap();
+    s.owner().note_receipt_pending().await.unwrap();
+    let s = s.reopen();
+    let job = s.job();
+    assert_eq!(job.status, GatewayJobStatus::ReconciliationPending);
+    assert!(job.result.is_none());
+    assert_eq!(job.proxy.as_ref().unwrap().terms(), Some(&terms));
+    let evidence =
+        serde_json::to_value(crate::job_store::proxy::evidence::project(&job).unwrap()).unwrap();
+    assert_eq!(evidence["execution_status"], "reconciling");
+    assert_eq!(evidence["recovery_reason"], "receipt_preparation_pending");
+    assert_eq!(evidence["result_verified"], false);
+    assert_eq!(evidence["financial"]["kind"], "pending");
+    assert_eq!(s.access.pending_key_budgets(None, 64).unwrap().len(), 1);
+    // Existing vault records omit this additive observation. Absence must remain
+    // unknown rather than manufacturing a live or completed execution state.
+    let mut legacy = serde_json::to_value(&job).unwrap();
+    legacy["proxy"]
+        .as_object_mut()
+        .unwrap()
+        .remove("recovery_reason");
+    let legacy: StoredGatewayJob = serde_json::from_value(legacy).unwrap();
+    let evidence =
+        serde_json::to_value(crate::job_store::proxy::evidence::project(&legacy).unwrap()).unwrap();
+    assert!(evidence.get("execution_status").is_none());
+    assert!(evidence.get("recovery_reason").is_none());
+    f.stop().await;
+}
+
+#[tokio::test]
 async fn owner_exact_binding_and_budget_intent_survive_without_buyer_journal() {
     let mut f = Harness::start(&worker_path()).await;
     let purchase = f.prepare().await;
