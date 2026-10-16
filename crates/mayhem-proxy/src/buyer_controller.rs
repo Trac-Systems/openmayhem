@@ -675,6 +675,10 @@ struct Progress {
     retained: bool,
 }
 impl Progress {
+    fn transport_error(&self, stage: &'static str, error: &exchange::Error) -> Error {
+        crate::serving::diagnostics::report(stage, error);
+        self.error(Code::Transport)
+    }
     fn error(&self, code: Code) -> Error {
         Error {
             identity: self.identity.clone(),
@@ -814,7 +818,7 @@ impl Shared {
         }
         p.stage = Stage::Negotiating;
         let mut channel = tokio::select! {
-            result = negotiation::Channel::dial(self.bridge.clone(), context.clone(), self.signer.identity(), exchange::Limits { max_message_bytes: self.limits.message_bytes }) => result.map_err(|_| p.error(Code::Transport))?,
+            result = negotiation::Channel::dial(self.bridge.clone(), context.clone(), self.signer.identity(), exchange::Limits { max_message_bytes: self.limits.message_bytes }) => result.map_err(|e| p.transport_error("buyer_negotiate_dial", &e))?,
             _ = stopped(stop) => return Err(p.error(Code::Stopped)),
         };
         channel
@@ -822,9 +826,9 @@ impl Shared {
                 request: value.clone(),
             })
             .await
-            .map_err(|_| p.error(Code::Transport))?;
+            .map_err(|e| p.transport_error("buyer_request_send", &e))?;
         let response = tokio::select! {
-            result = channel.receive(self.limits.control_wait) => result.map_err(|_| p.error(Code::Transport))?,
+            result = channel.receive(self.limits.control_wait) => result.map_err(|e| p.transport_error("buyer_proposal_receive", &e))?,
             _ = stopped(stop) => return Err(p.error(Code::Stopped)),
         }.into_message(&context, Role::Buyer).map_err(|_| p.error(Code::Verification))?;
         let negotiation::Message::Proposal { mut proposal } = response else {
@@ -950,7 +954,7 @@ impl Shared {
             streaming,
         })
         .await
-        .map_err(|_| p.error(Code::Transport))?;
+        .map_err(|e| p.transport_error("buyer_execute_send", &e))?;
         self.finish(paid, saved, p, stop, false, &gate, observer, conformance)
             .await
     }
@@ -1112,7 +1116,7 @@ impl Shared {
             let wait =
                 (recovery || observed.is_some() || failed).then_some(self.limits.control_wait);
             let received = tokio::select! {
-                result = receiver.receive(wait) => result.map_err(|_| p.error(Code::Transport))?,
+                result = receiver.receive(wait) => result.map_err(|e| p.transport_error("buyer_result_receive", &e))?,
                 _ = stopped(stop) => {
                     // Only a request to cancel. Losing this send or disconnecting
                     // is not evidence of stopped execution or released funds.

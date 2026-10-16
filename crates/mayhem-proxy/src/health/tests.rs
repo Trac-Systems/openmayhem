@@ -69,10 +69,203 @@ async fn capacity_recovery_keeps_single_owner_and_invalidates_changed_or_stale_e
     assert_eq!(m.snapshot(&d(2)).unwrap().allowance, 0);
 }
 
+fn paid_reservation_with_expansion_probe(
+    paid_route: u64,
+) -> (
+    tempfile::TempDir,
+    crate::capacity::Authority,
+    Monitor,
+    crate::capacity::Reservation,
+    crate::capacity::probes::Reservation,
+) {
+    use crate::capacity::{self, probes};
+    let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let a = capacity::Authority::open(
+        dir.path().join("capacity"),
+        crate::attempts::Identity {
+            network_id: "918".into(),
+            msb_bootstrap: d(10),
+            subnet_bootstrap: d(11),
+            controller_pubkey: d(12),
+        },
+        capacity::Limits {
+            max_groups: 2,
+            max_routes: 2,
+            max_leases: 4,
+            max_evidence_age: Duration::from_secs(60),
+        },
+    )
+    .unwrap();
+    let m = monitor();
+    a.configure_allocation_group(d(20), 2).unwrap();
+    a.configure_group(d(21), 2).unwrap();
+    for id in [1, 2] {
+        a.configure_route_with_constraints(
+            capacity::Route {
+                id: d(id),
+                group: d(20),
+                lane: capacity::Lane::Proxy,
+                max_concurrency: 2,
+            },
+            vec![d(21)],
+        )
+        .unwrap();
+        a.bind_live(
+            capacity::Scope::Route(d(id)),
+            m.route_source(&d(id)).unwrap(),
+        )
+        .unwrap();
+    }
+    a.bind_live(capacity::Scope::Group(d(21)), m.connection_source())
+        .unwrap();
+    m.observe_recovery(&d(2), Class::new(1, Thinking::Disabled, false))
+        .unwrap()
+        .success(None);
+    assert_eq!(m.snapshot(&d(2)).unwrap().allowance, 1);
+    if paid_route != 2 {
+        m.observe_request(&d(paid_route), Class::new(1, Thinking::Disabled, false))
+            .unwrap()
+            .success(None);
+    }
+    let paid = a
+        .reserve(
+            &d(paid_route),
+            capacity::Work {
+                invocation: d(30),
+                request_hash: d(31),
+            },
+        )
+        .unwrap();
+    a.configure_probe_budget(
+        &d(21),
+        probes::Budget {
+            max_attempts: 1,
+            max_cost_microusd: 10,
+            per_attempt_cost_microusd: 10,
+        },
+    )
+    .unwrap();
+    let prepared = a
+        .reserve_capacity_probe(
+            probes::Specification {
+                route: d(2),
+                budget_group: d(21),
+                request_hash: d(40),
+                connection_digest: d(41),
+                connection_revision: 1,
+                recipe_digest: d(42),
+            },
+            None,
+        )
+        .unwrap();
+    (dir, a, m, paid, prepared)
+}
+
+#[tokio::test(start_paused = true)]
+async fn capacity_expansion_probe_preserves_an_existing_paid_reservation() {
+    use crate::capacity;
+    for paid_route in [2, 1] {
+        let (_dir, a, _m, paid, prepared) = paid_reservation_with_expansion_probe(paid_route);
+        // Probe preparation must not invalidate countersigning either. Sharing
+        // a physical/connection group does not require sharing a route/model.
+        a.check_reserved(paid.lease()).unwrap();
+        let probe = a.dispatch_probe(prepared).unwrap();
+        a.check_reserved(paid.lease()).unwrap();
+        for group in [20, 21] {
+            assert_eq!(a.group_status(&d(group)).unwrap().occupied, 2);
+        }
+        assert_eq!(a.status(&d(paid_route)).unwrap().available, 0);
+        assert!(matches!(
+            a.reserve(
+                &d(paid_route),
+                capacity::Work {
+                    invocation: d(50),
+                    request_hash: d(51)
+                }
+            ),
+            Err(capacity::Error::Busy)
+        ));
+        let dispatched = a.dispatch(&paid).unwrap();
+        assert_eq!(dispatched.lease().phase, capacity::Phase::Dispatched);
+        for group in [20, 21] {
+            assert_eq!(a.group_status(&d(group)).unwrap().occupied, 2);
+            assert_eq!(
+                a.probe_for_group(&d(group)).unwrap().as_ref(),
+                Some(probe.probe())
+            );
+        }
+        let budget = a.probe_budget(&d(21)).unwrap().unwrap();
+        assert_eq!(budget.used_attempts, 1);
+        assert_eq!(budget.allocated_cost_microusd, 10);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn capacity_expansion_probe_never_excuses_stale_or_failed_paid_readiness() {
+    use crate::capacity;
+    for stale in [true, false] {
+        let (_dir, a, m, paid, prepared) = paid_reservation_with_expansion_probe(2);
+        let probe = a.dispatch_probe(prepared).unwrap();
+        if stale {
+            advance(60_000).await;
+        } else {
+            m.observe_request(&d(2), class())
+                .unwrap()
+                .failure(fail(Code::UpstreamAuthentication, Scope::Connection));
+        }
+        let check = a.check_reserved(paid.lease());
+        let dispatch = a.dispatch(&paid);
+        if stale {
+            assert!(matches!(check, Err(capacity::Error::Checking)));
+            assert!(matches!(dispatch, Err(capacity::Error::Checking)));
+        } else {
+            assert!(matches!(check, Err(capacity::Error::Unavailable)));
+            assert!(matches!(dispatch, Err(capacity::Error::Unavailable)));
+        }
+        assert_eq!(
+            a.lease(&paid.lease().id).unwrap().as_ref(),
+            Some(paid.lease())
+        );
+        assert_eq!(
+            a.probe_for_group(&d(21)).unwrap().as_ref(),
+            Some(probe.probe())
+        );
+        assert_eq!(a.group_status(&d(20)).unwrap().occupied, 2);
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn capacity_expansion_probe_never_excuses_a_reduced_physical_ceiling() {
+    use crate::capacity;
+    let (_dir, a, _m, paid, prepared) = paid_reservation_with_expansion_probe(2);
+    a.dispatch_probe(prepared).unwrap();
+    a.configure_allocation_group(d(20), 1).unwrap();
+    assert!(matches!(
+        a.check_reserved(paid.lease()),
+        Err(capacity::Error::Busy)
+    ));
+    assert!(matches!(a.dispatch(&paid), Err(capacity::Error::Busy)));
+    assert_eq!(a.group_status(&d(20)).unwrap().occupied, 2);
+    assert_eq!(
+        a.lease(&paid.lease().id).unwrap().as_ref(),
+        Some(paid.lease())
+    );
+}
+
 #[tokio::test(start_paused = true)]
 async fn capacity_recovery_stale_after_preparation_cannot_dispatch_or_refund_budget() {
     use crate::capacity::{self, probes};
     let dir = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     let a = capacity::Authority::open(
         dir.path().join("capacity"),
         crate::attempts::Identity {

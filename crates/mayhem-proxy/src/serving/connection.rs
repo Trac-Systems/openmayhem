@@ -275,6 +275,7 @@ async fn handle(
                         }
                     }
                     Err(error) => {
+                        super::diagnostics::report("dispatch", &error);
                         let failure = classify(error);
                         output.send(Message::Failure { failure }).await?;
                         offer_non_execution(&owner, &session, &output).await?;

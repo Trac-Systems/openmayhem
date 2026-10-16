@@ -1038,7 +1038,13 @@ impl Authority {
             self.fence,
             &allocation_groups[0],
             &r,
-            self.allowances(&allocation_groups, &r, self.now()?)?,
+            self.reserved_allowances(
+                &allocation_groups,
+                &r,
+                &db(tx.open_table(probes::SCOPES))?,
+                &db(tx.open_table(probes::PROBES))?,
+                &db(tx.open_table(ROUTES))?,
+            )?,
         )?;
         Ok(r.config)
     }
@@ -1058,7 +1064,13 @@ impl Authority {
             self.fence,
             &allocation_groups[0],
             &r,
-            self.allowances(&allocation_groups, &r, self.now()?)?,
+            self.reserved_allowances(
+                &allocation_groups,
+                &r,
+                &db(tx.open_table(probes::SCOPES))?,
+                &db(tx.open_table(probes::PROBES))?,
+                &db(tx.open_table(ROUTES))?,
+            )?,
         )?;
         require(r.config.lane == Lane::Proxy)?;
         validate_signing_intent(buyer, &lease, &self.identity)?;
@@ -1192,7 +1204,13 @@ impl Authority {
             self.fence,
             &allocation_groups[0],
             &r,
-            self.allowances(&allocation_groups, &r, self.now()?)?,
+            self.reserved_allowances(
+                &allocation_groups,
+                &r,
+                &db(tx.open_table(probes::SCOPES))?,
+                &db(tx.open_table(probes::PROBES))?,
+                &db(tx.open_table(ROUTES))?,
+            )?,
         )?;
         require(lease.phase == Phase::Reserved)?;
         lease.phase = Phase::Dispatched;
