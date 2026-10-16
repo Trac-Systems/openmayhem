@@ -554,66 +554,80 @@ async fn dispatched(backend: &Backend) {
 }
 
 #[tokio::test]
-async fn provider_session_disconnect_retains_json_result_and_recovers_without_a_second_post() {
-    let bytes = chat();
-    let backend = backend(200, answer(), Duration::from_millis(300)).await;
-    let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
-    let mut peer = Peer::start(ProxyRail::Tap, &f, &bytes, false, None).await;
-    let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
-    let (controller, _monitor) = observed_server(&s, &f, &peer);
-    let (bridge, mut buyer, handle, saved) = connect(&s, &peer, &bytes, &controller).await;
-    s.buyer
-        .publish(saved.key().clone(), &recovery(&f, &peer), 1002)
-        .await
-        .unwrap();
-    buyer
-        .send(&exchange::Message::Execute {
-            request: serde_json::from_slice(&bytes).unwrap(),
-            streaming: false,
-        })
-        .await
-        .unwrap();
-    dispatched(&backend).await;
-    handle.disconnect();
-    drop(buyer);
-    drop(bridge);
-    assert_eq!(handle.wait().await.unwrap(), serving::End::Disconnected);
-    // The handle waits for the ongoing inference to finish and persist its result.
-    // Lost delivery/ACK retains the result and financial obligation, not a GPU slot.
-    occupied(&s, 0);
-    let Pair {
-        bridge: _bridge,
-        mut buyer,
-        provider,
-        context,
-    } = open(&peer, context(&peer), 1024 * 1024).await;
-    let handle = controller.start(provider).unwrap();
-    buyer.send(&n::Message::Recover).await.unwrap();
-    let reply = buyer
-        .receive(Duration::from_secs(5))
-        .await
-        .unwrap()
-        .into_message(&context, Role::Buyer)
-        .unwrap();
-    assert!(matches!(reply, n::Message::Accepted { .. }));
-    let mut buyer = buyer.into_paid(&identity(&peer)).unwrap();
-    buyer.send(&exchange::Message::Status).await.unwrap();
-    assert!(matches!(
-        next(&mut buyer).await.message(),
-        exchange::Message::State {
-            state: exchange::PublicState::AwaitingReceipt
+async fn provider_session_disconnect_retains_original_result_on_every_rail_without_a_second_post() {
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        for streaming in [false, true] {
+            let bytes = if streaming { stream_request() } else { chat() };
+            let backend = if streaming {
+                backend_raw(
+                    200,
+                    sse(&[delta("ready", json!("stop"))], true),
+                    "text/event-stream",
+                    Duration::from_millis(300),
+                )
+                .await
+            } else {
+                backend(200, answer(), Duration::from_millis(300)).await
+            };
+            let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+            let mut peer = Peer::start(rail, &f, &bytes, streaming, None).await;
+            let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+            let (controller, _monitor) = observed_server(&s, &f, &peer);
+            let (bridge, mut buyer, handle, saved) = connect(&s, &peer, &bytes, &controller).await;
+            s.buyer
+                .publish(saved.key().clone(), &recovery(&f, &peer), 1002)
+                .await
+                .unwrap();
+            buyer
+                .send(&exchange::Message::Execute {
+                    request: serde_json::from_slice(&bytes).unwrap(),
+                    streaming,
+                })
+                .await
+                .unwrap();
+            dispatched(&backend).await;
+            handle.disconnect();
+            drop(buyer);
+            drop(bridge);
+            assert_eq!(handle.wait().await.unwrap(), serving::End::Disconnected);
+            // The handle waits for the ongoing inference to finish and persist its result.
+            // Lost delivery/ACK retains the result and financial obligation, not a GPU slot.
+            occupied(&s, 0);
+            let Pair {
+                bridge: _bridge,
+                mut buyer,
+                provider,
+                context,
+            } = open(&peer, context(&peer), 1024 * 1024).await;
+            let handle = controller.start(provider).unwrap();
+            buyer.send(&n::Message::Recover).await.unwrap();
+            let reply = buyer
+                .receive(Duration::from_secs(5))
+                .await
+                .unwrap()
+                .into_message(&context, Role::Buyer)
+                .unwrap();
+            assert!(matches!(reply, n::Message::Accepted { .. }));
+            let mut buyer = buyer.into_paid(&identity(&peer)).unwrap();
+            buyer.send(&exchange::Message::Status).await.unwrap();
+            assert!(matches!(
+                next(&mut buyer).await.message(),
+                exchange::Message::State {
+                    state: exchange::PublicState::AwaitingReceipt
+                }
+            ));
+            let result = next(&mut buyer).await;
+            settle(&s, &f, &peer, &mut buyer, &bytes, result).await;
+            assert_eq!(handle.wait().await.unwrap(), serving::End::Settled);
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+            occupied(&s, 0);
+            peer.stop().await;
         }
-    ));
-    let result = next(&mut buyer).await;
-    settle(&s, &f, &peer, &mut buyer, &bytes, result).await;
-    assert_eq!(handle.wait().await.unwrap(), serving::End::Settled);
-    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
-    occupied(&s, 0);
-    peer.stop().await;
+    }
 }
 
 #[tokio::test]
-async fn provider_session_long_generation_outlives_control_wait_and_explicit_cancel_stays_uncertain(
+async fn provider_session_long_generation_outlives_control_wait_and_explicit_cancel_retains_the_original_outcome(
 ) {
     for cancel in [false, true] {
         let bytes = chat();
@@ -646,25 +660,14 @@ async fn provider_session_long_generation_outlives_control_wait_and_explicit_can
         ));
         if cancel {
             buyer.send(&exchange::Message::Cancel).await.unwrap();
-            let mut cancelled = false;
-            let mut failed = false;
-            for _ in 0..2 {
-                match next(&mut buyer).await.message() {
-                    exchange::Message::State {
-                        state: exchange::PublicState::CancelRequested,
-                    } => cancelled = true,
-                    exchange::Message::Failure { failure } => {
-                        assert_eq!(
-                            failure.code,
-                            mayhem_proxy::connector::failure::Code::RequestCancelled
-                        );
-                        failed = true;
-                    }
-                    _ => panic!("unexpected cancellation output"),
-                }
-            }
-            assert!(cancelled && failed);
-            occupied(&s, 1);
+            assert!(matches!(next(&mut buyer).await.message(), exchange::Message::State {
+                state: exchange::PublicState::CancelRequested,
+            }));
+            assert!(matches!(next(&mut buyer).await.message(), exchange::Message::State {
+                state: exchange::PublicState::CancelRequested,
+            }));
+            assert!(matches!(next(&mut buyer).await.message(), exchange::Message::Result { .. }));
+            occupied(&s, 0);
             handle.disconnect();
             assert_eq!(handle.wait().await.unwrap(), serving::End::Disconnected);
         } else {

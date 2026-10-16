@@ -588,7 +588,7 @@ impl Authority {
         }
     }
     fn allowances(&self, groups: &[Group], route: &RouteState, now: u64) -> Result<Allowances> {
-        self.allowances_with_recovery(groups, route, now, None)
+        self.allowances_with_recovery(groups, route, now, None, None)
     }
     fn allowances_with_recovery(
         &self,
@@ -596,6 +596,9 @@ impl Authority {
         route: &RouteState,
         now: u64,
         recovery_group: Option<&Digest>,
+        // Some(false): reserving one expansion probe; Some(true): its already
+        // counted reservation. This credit is never used by paid admission.
+        expansion_reserved: Option<bool>,
     ) -> Result<Allowances> {
         require(!groups.is_empty() && groups.len() <= MAX_CONSTRAINTS + 1)?;
         let mut sources = Vec::with_capacity(groups.len() + 1);
@@ -621,6 +624,8 @@ impl Authority {
                     self.allowance(&group.gate, source.as_deref(), now, group.ceiling),
                     recovery_group == Some(&group.id),
                     group.ceiling,
+                    group.occupied,
+                    expansion_reserved,
                 )?
             };
             free = free.min(allowed.saturating_sub(group.occupied));
@@ -635,6 +640,8 @@ impl Authority {
             ),
             recovery_group.is_some(),
             route.config.max_concurrency,
+            route.occupied,
+            expansion_reserved,
         )?;
         free = free.min(allowed.saturating_sub(route.occupied));
         fits &= route.occupied <= allowed;
@@ -1389,11 +1396,28 @@ struct Allowances {
     free: u32,
     fits: bool,
 }
-fn recovery_allowance(value: Result<u32>, recovering: bool, ceiling: u32) -> Result<u32> {
+fn recovery_allowance(
+    value: Result<u32>,
+    recovering: bool,
+    ceiling: u32,
+    occupied: u32,
+    expansion_reserved: Option<bool>,
+) -> Result<u32> {
     match value {
-        // Only an excluded gate in the explicitly recovered scope is bypassed.
-        // Healthy observed allowances and unrelated failed groups remain binding.
-        Err(Error::Busy | Error::Unavailable | Error::Checking) if recovering => Ok(ceiling),
+        Ok(allowed) if recovering && expansion_reserved.is_some() => {
+            // Exercise exactly one spare slot, without forgiving any retained
+            // occupancy. All unrelated constraints and physical ceilings bind.
+            let target = occupied.saturating_add(u32::from(expansion_reserved == Some(false)));
+            Ok(allowed.max(target).min(ceiling))
+        }
+        // Ordinary zero-allowance recovery may bypass only its excluded scope.
+        // Expansion requires the original positive evidence to remain fresh;
+        // an expiry or fault during preparation must stop its dispatch.
+        Err(Error::Busy | Error::Unavailable | Error::Checking)
+            if recovering && expansion_reserved.is_none() =>
+        {
+            Ok(ceiling)
+        }
         value => value,
     }
 }

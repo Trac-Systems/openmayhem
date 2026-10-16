@@ -87,6 +87,7 @@ pub struct Probe {
 pub struct Reservation {
     probe: Probe,
     owner: Digest,
+    expansion: bool,
 }
 impl Reservation {
     pub fn probe(&self) -> &Probe {
@@ -232,7 +233,7 @@ impl Authority {
     /// This ignores only health allowance, never physical/configured ceilings or
     /// active/uncertain work. Obtain a due Monitor::observe_recovery first.
     pub fn reserve_probe(&self, specification: Specification) -> Result<Reservation> {
-        self.reserve_probe_inner(specification, None)
+        self.reserve_probe_inner(specification, None, false)
     }
     /// A single attempt for a previously persisted intent. Duplicate/stale
     /// callers must recover the original ID; no existing reservation is ever
@@ -243,12 +244,30 @@ impl Authority {
         intent: ReservationIntent,
     ) -> Result<Reservation> {
         let id = self.probe_intent_id(&specification, &intent)?;
-        self.reserve_probe_inner(specification, Some((id, intent.expected_used_attempts)))
+        self.reserve_probe_inner(
+            specification,
+            Some((id, intent.expected_used_attempts)),
+            false,
+        )
+    }
+    pub(crate) fn reserve_capacity_probe(
+        &self,
+        specification: Specification,
+        intent: Option<ReservationIntent>,
+    ) -> Result<Reservation> {
+        let intent = intent
+            .map(|intent| {
+                self.probe_intent_id(&specification, &intent)
+                    .map(|id| (id, intent.expected_used_attempts))
+            })
+            .transpose()?;
+        self.reserve_probe_inner(specification, intent, true)
     }
     fn reserve_probe_inner(
         &self,
         specification: Specification,
         intent: Option<(Digest, u64)>,
+        expansion: bool,
     ) -> Result<Reservation> {
         let tx = self.write()?;
         let mut m = meta(&tx)?;
@@ -278,12 +297,16 @@ impl Authority {
         }
         let mut groups = db(tx.open_table(GROUPS))?;
         let mut values = load_groups(&groups, &route)?;
+        if expansion && self.allowances(&values, &route, self.now()?)?.free != 0 {
+            return Err(Error::Busy);
+        }
         if self
             .allowances_with_recovery(
                 &values,
                 &route,
                 self.now()?,
                 Some(&specification.budget_group),
+                expansion.then_some(false),
             )?
             .free
             == 0
@@ -350,6 +373,7 @@ impl Authority {
         Ok(Reservation {
             probe,
             owner: self.nonce.clone(),
+            expansion,
         })
     }
     /// Commit before sending. No read/reconnect can recreate this consumable permit.
@@ -374,6 +398,7 @@ impl Authority {
                 &route,
                 self.now()?,
                 Some(&probe.specification.budget_group),
+                reservation.expansion.then_some(true),
             )?
             .fits
         {

@@ -699,7 +699,7 @@ impl PaidExecutor {
                 if r.phase == Phase::Closed || r.cancellation_requested {
                     return Ok(r);
                 }
-                journal.advance(&key, r.generation, Event::CancelRequested, now_ms())
+                journal.observe_attempt(&key, r.attempt, Event::CancelRequested, now_ms())
             })
             .await?;
         cancel.cancel();

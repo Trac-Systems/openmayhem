@@ -546,7 +546,12 @@ async fn authenticated_exchange_waives_from_public_evidence_without_private_meta
 
 #[tokio::test]
 async fn authenticated_exchange_cancel_after_dispatch_keeps_unknown_capacity_and_cannot_retry() {
-    let backend = backend(200, answer(), Duration::from_secs(2)).await;
+    let backend = backend(
+        200,
+        json!({"unrecognized":"no terminal result"}),
+        Duration::from_secs(2),
+    )
+    .await;
     let p = paid(
         ProxyEndpoint::Chat,
         ProxyRail::Tnk,

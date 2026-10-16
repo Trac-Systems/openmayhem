@@ -784,8 +784,7 @@ async fn upstream_auth_rate_limit_and_protocol_failures_are_saved_without_false_
 }
 
 #[tokio::test]
-async fn cancellation_before_dispatch_does_not_call_backend_and_after_dispatch_retains_uncertainty()
-{
+async fn cancellation_before_dispatch_does_not_call_backend_and_after_dispatch_retains_result() {
     let backend = backend(200, answer(), Duration::from_millis(250)).await;
     let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
     let bytes = chat();
@@ -816,6 +815,19 @@ async fn cancellation_before_dispatch_does_not_call_backend_and_after_dispatch_r
     assert_eq!(current.phase, Phase::Dispatched);
     assert!(current.cancellation_requested);
     assert!(current.closure.is_none());
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    let saved = fixture.journal.recover(&b.invocation, b.attempt).unwrap();
+    assert!(
+        saved.result.is_some(),
+        "cancellation must preserve the original terminal outcome"
+    );
+    assert!(matches!(
+        fixture
+            .executor
+            .execute_json(&b.invocation, &bytes, &cancel)
+            .await,
+        Err(Error::RecoveryRequired)
+    ));
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
 }
 
@@ -1399,7 +1411,7 @@ async fn missing_terminal_changed_provider_and_midstream_error_are_not_success()
 }
 
 #[tokio::test]
-async fn client_stream_sink_failure_is_cancellation_not_provider_cooldown() {
+async fn client_stream_sink_failure_retains_completion_without_fabricating_cancellation() {
     let backend = backend_raw(
         200,
         sse(
@@ -1413,17 +1425,96 @@ async fn client_stream_sink_failure_is_cancellation_not_provider_cooldown() {
     let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
     let body = stream_request();
     let r = fixture.prepare_kind(1, &body, ProxyRail::Fiat, true);
+    let deliveries = AtomicUsize::new(0);
+    let result = fixture
+        .executor
+        .execute_stream(&r.invocation, &body, &Cancellation::default(), |_| {
+            deliveries.fetch_add(1, Ordering::SeqCst);
+            async { Err(()) }
+        })
+        .await;
+    assert!(result.is_ok(), "{result:?}");
+    let current = fixture.journal.get(&r.invocation).unwrap().unwrap();
+    assert!(!current.cancellation_requested);
+    assert!(current.last_failure.is_none());
+    assert!(current.closure.is_none());
+    assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+    let saved = fixture.journal.recover(&r.invocation, r.attempt).unwrap();
+    assert_eq!(
+        saved.result.unwrap().reply.body["choices"][0]["message"]["content"],
+        "text"
+    );
+}
+
+#[tokio::test]
+async fn explicit_stream_cancellation_detaches_blocked_delivery_and_retains_original_result() {
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        let backend = backend_raw(
+            200,
+            sse(
+                &[delta("first", Value::Null), delta(" second", json!("stop"))],
+                true,
+            ),
+            "text/event-stream",
+            Duration::ZERO,
+        )
+        .await;
+        let fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let body = stream_request();
+        let r = fixture.prepare_kind(1, &body, rail, true);
+        let cancel = Cancellation::default();
+        let deliveries = AtomicUsize::new(0);
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture
+                .executor
+                .execute_stream(&r.invocation, &body, &cancel, |_| {
+                    deliveries.fetch_add(1, Ordering::SeqCst);
+                    cancel.cancel();
+                    std::future::pending::<std::result::Result<(), ()>>()
+                }),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        assert_eq!(deliveries.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        let saved = fixture.journal.recover(&r.invocation, r.attempt).unwrap();
+        assert!(saved.record.cancellation_requested);
+        assert_eq!(
+            saved.result.unwrap().reply.body["choices"][0]["message"]["content"],
+            "first second"
+        );
+        assert_eq!(saved.record.binding.rail, rail);
+    }
+}
+
+#[tokio::test]
+async fn detached_stream_still_validates_terminal_outcome_and_keeps_unknown_work_occupied() {
+    let backend = backend_raw(
+        200,
+        sse(&[delta("partial", Value::Null)], false),
+        "text/event-stream",
+        Duration::ZERO,
+    )
+    .await;
+    let mut fixture = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+    let capacity = shared_capacity(&fixture);
+    let body = stream_request();
+    let (r, _) = reserve_execution(&fixture, &capacity, 1, &body, true);
+    fixture.executor = fixture.executor.with_capacity(capacity.clone(), d(201));
     let result = fixture
         .executor
         .execute_stream(&r.invocation, &body, &Cancellation::default(), |_| async {
             Err(())
         })
         .await;
-    assert!(matches!(result, Err(Error::Cancelled)));
-    let current = fixture.journal.get(&r.invocation).unwrap().unwrap();
-    assert!(current.cancellation_requested);
-    assert!(current.last_failure.is_none());
-    assert!(current.closure.is_none());
+    assert!(result.is_err());
+    let saved = fixture.journal.recover(&r.invocation, r.attempt).unwrap();
+    assert!(saved.result.is_none());
+    assert_eq!(capacity.status(&d(201)).unwrap().group_occupied, 1);
+    assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]

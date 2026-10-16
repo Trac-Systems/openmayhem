@@ -26,6 +26,7 @@ pub struct Sample {
     pub(super) generation: (u64, u64),
     pub(super) sequence: u64,
     pub(super) recovery: bool,
+    pub(super) recovery_allowance: u32,
     start: Instant,
     headers: Option<Instant>,
     first: Option<Instant>,
@@ -70,6 +71,7 @@ impl Sample {
         generation: (u64, u64),
         sequence: u64,
         recovery: bool,
+        recovery_allowance: u32,
         start: Instant,
     ) -> Self {
         Self {
@@ -79,6 +81,7 @@ impl Sample {
             generation,
             sequence,
             recovery,
+            recovery_allowance,
             start,
             headers: None,
             first: None,

@@ -176,7 +176,7 @@ async fn health_real_upstream_faults_withdraw_admissions_without_retry_refund_or
 }
 
 #[tokio::test]
-async fn health_consumer_cancel_and_invalid_request_do_not_poison_backend() {
+async fn health_consumer_disconnect_and_invalid_request_do_not_poison_backend() {
     let backend = backend_raw(
         200,
         sse(
@@ -205,12 +205,11 @@ async fn health_consumer_cancel_and_invalid_request_do_not_poison_backend() {
             |_| async { Err(()) },
         )
         .await;
-    assert!(matches!(result, Err(Error::Cancelled)));
+    assert!(result.is_ok(), "{result:?}");
     let view = monitor.snapshot(&d(90)).unwrap();
-    assert_eq!(view.state, State::Checking);
-    assert_eq!(view.reason, Reason::NoEvidence);
+    assert_eq!(view.state, State::Ready);
     assert_eq!(view.recovery_after_ms, 0);
-    assert!(view.last_measurement.is_none());
+    assert!(view.last_measurement.is_some());
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
 }
 

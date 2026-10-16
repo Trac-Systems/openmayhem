@@ -1009,7 +1009,7 @@ impl Shared {
                 .ok_or_else(|| p.error(Code::Verification))?;
             if let Some(settlement) = self
                 .recovery
-                .refresh(&auth, crate::supervisor::unix_ms())
+                .refresh_or_expire(&self.signer, &auth, crate::supervisor::unix_ms())
                 .await
                 .map_err(|_| p.error(Code::Unconfirmed))?
             {
@@ -1223,7 +1223,7 @@ impl Shared {
                 // frame. The existing control deadline bounds this wait.
                 Message::State {
                     state: PublicState::CancelRequested,
-                } if recovery => cancellation_accepted = true,
+                } if recovery && observed.is_none() => cancellation_accepted = true,
                 Message::State {
                     state: PublicState::Running | PublicState::OutcomeUnknown,
                 } if recovery => {
@@ -1265,7 +1265,7 @@ impl Shared {
                             saved.snapshot().clone(),
                             saved.request().to_vec(),
                             reply,
-                            false,
+                            cancellation_accepted,
                         )
                         .await
                         .map_err(|_| p.error(Code::Verification))?;

@@ -573,6 +573,167 @@ async fn real_json_probes_verify_all_endpoints_without_customer_finance_or_inven
 }
 
 #[tokio::test]
+async fn funded_probes_recover_spare_capacity_without_releasing_unknown_shared_work() {
+    for alias in [false, true] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let (a, m) = setup(&f);
+        let body = bounded(
+            serde_json::from_slice(&chat()).unwrap(),
+            ProxyEndpoint::Chat,
+        );
+        let c = controller(
+            &f,
+            a.clone(),
+            m.clone(),
+            &body,
+            false,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        c.run().await.unwrap();
+        assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 1);
+        let route = if alias {
+            m.register(d(21), 2, true).unwrap();
+            a.configure_route_with_constraints(
+                capacity::Route {
+                    id: d(21),
+                    group: d(10),
+                    lane: capacity::Lane::Proxy,
+                    max_concurrency: 2,
+                },
+                vec![d(11)],
+            )
+            .unwrap();
+            a.bind_live(
+                capacity::Scope::Route(d(21)),
+                m.route_source(&d(21)).unwrap(),
+            )
+            .unwrap();
+            m.observe_request(
+                &d(21),
+                health::Class::new(1, health::Thinking::Disabled, false),
+            )
+            .unwrap()
+            .success(None);
+            d(21)
+        } else {
+            d(20)
+        };
+        let reserved = a
+            .reserve(
+                &route,
+                capacity::Work {
+                    invocation: d(500),
+                    request_hash: d(501),
+                },
+            )
+            .unwrap();
+        let dispatch = a.dispatch(&reserved).unwrap();
+        let unknown = a.uncertain(dispatch).unwrap();
+        assert_eq!(a.status(&d(20)).unwrap().available, 0);
+        c.run().await.unwrap();
+        if !alias {
+            // The configured success threshold still applies; one good probe
+            // must not immediately invent a second observed allowance.
+            assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 1);
+            assert_eq!(a.status(&d(20)).unwrap().available, 0);
+            c.run().await.unwrap();
+        }
+        assert_eq!(a.status(&d(20)).unwrap().available, 1);
+        assert_eq!(a.lease(&unknown.id).unwrap(), Some(unknown));
+        for group in [10, 11] {
+            assert_eq!(a.group_status(&d(group)).unwrap().occupied, 1);
+        }
+        assert!(a.probe_for_group(&d(10)).unwrap().is_none());
+        let attempts = if alias { 2 } else { 3 };
+        assert_eq!(
+            a.probe_budget(&d(10)).unwrap().unwrap().used_attempts,
+            attempts
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), attempts as usize);
+        assert!(matches!(
+            c.run().await,
+            Err(probes::ProbeError::Health(health::Error::RecoveryBusy))
+        ));
+        assert_eq!(
+            a.probe_budget(&d(10)).unwrap().unwrap().used_attempts,
+            attempts
+        );
+        assert!(f
+            .journal
+            .recovery_page(None, 64)
+            .unwrap()
+            .records
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn capacity_recovery_keeps_physical_ceilings_and_operator_budget_binding() {
+    for blocked_by_budget in [false, true] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let (a, m) = setup(&f);
+        let body = bounded(
+            serde_json::from_slice(&chat()).unwrap(),
+            ProxyEndpoint::Chat,
+        );
+        let c = controller(
+            &f,
+            a.clone(),
+            m.clone(),
+            &body,
+            false,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        c.run().await.unwrap();
+        let reserved = a
+            .reserve(
+                &d(20),
+                capacity::Work {
+                    invocation: d(510),
+                    request_hash: d(511),
+                },
+            )
+            .unwrap();
+        let dispatch = a.dispatch(&reserved).unwrap();
+        let unknown = a.uncertain(dispatch).unwrap();
+        if blocked_by_budget {
+            a.configure_probe_budget(
+                &d(10),
+                Budget {
+                    max_attempts: 1,
+                    max_cost_microusd: 10,
+                    per_attempt_cost_microusd: 10,
+                },
+            )
+            .unwrap();
+            assert!(matches!(
+                c.run().await,
+                Err(probes::ProbeError::Execution(Error::Capacity(
+                    capacity::Error::ProbeBudget
+                )))
+            ));
+        } else {
+            a.configure_allocation_group(d(11), 1).unwrap();
+            assert!(matches!(
+                c.run().await,
+                Err(probes::ProbeError::Execution(Error::Capacity(
+                    capacity::Error::Busy
+                )))
+            ));
+        }
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(a.probe_budget(&d(10)).unwrap().unwrap().used_attempts, 1);
+        assert_eq!(a.lease(&unknown.id).unwrap(), Some(unknown));
+        assert!(a.probe_for_group(&d(10)).unwrap().is_none());
+        assert!(!m.snapshot(&d(20)).unwrap().recovery_in_progress);
+    }
+}
+
+#[tokio::test]
 async fn real_streaming_probes_share_tool_schema_and_terminal_validation_on_all_llm_endpoints() {
     for (endpoint, body, answer) in [
         (

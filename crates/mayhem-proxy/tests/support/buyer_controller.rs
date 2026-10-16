@@ -7,6 +7,8 @@ use tokio::sync::{watch, Notify};
 mod acknowledgment;
 #[path = "buyer_admission.rs"]
 mod admission;
+#[path = "buyer_cancellation.rs"]
+mod cancellation;
 #[path = "buyer_streaming.rs"]
 mod streaming;
 

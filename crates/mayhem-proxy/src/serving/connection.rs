@@ -247,6 +247,33 @@ async fn handle(
                     Err(exchange::Error::Execution(execution::Error::ExistingResult)) => {
                         recover(&owner, &session, &output).await?;
                     }
+                    Err(exchange::Error::Execution(execution::Error::Cancelled)) => {
+                        // Delivery cancellation may now retain the original
+                        // terminal result. Release only proven completed work,
+                        // even if the consumer cannot receive the cancellation.
+                        let saved = session.existing(&owner.executor).await?;
+                        if let Some(saved) = &saved {
+                            if saved.result.is_some()
+                                || saved.record.non_execution_evidence().is_some()
+                            {
+                                owner
+                                    .executor
+                                    .reconcile_capacity(session.invocation(), saved.record.attempt)
+                                    .await?;
+                            }
+                        }
+                        if let Some(saved) = saved.filter(|s| s.result.is_some()) {
+                            output.send(Message::State { state: PublicState::CancelRequested }).await?;
+                            output.send(Message::Result {
+                                response: saved.result.expect("retained result checked").reply.body,
+                            }).await?;
+                            receipt(&owner, &session, &output, saved.record.attempt).await?;
+                        } else {
+                            let failure = classify(exchange::Error::Execution(execution::Error::Cancelled));
+                            output.send(Message::Failure { failure }).await?;
+                            offer_non_execution(&owner, &session, &output).await?;
+                        }
+                    }
                     Err(error) => {
                         let failure = classify(error);
                         output.send(Message::Failure { failure }).await?;

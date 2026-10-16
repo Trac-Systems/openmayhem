@@ -25,6 +25,26 @@ pub struct Failure {
     pub upstream: Option<crate::connector::failure::Failure>,
 }
 
+enum ProbeRun {
+    NotDue,
+    Finished(Option<Failure>),
+}
+
+impl Health {
+    fn record(&mut self, route: &Digest, result: ProbeRun) {
+        let ProbeRun::Finished(failure) = result else {
+            return;
+        };
+        self.completed = self.completed.saturating_add(1);
+        if let Some(failure) = failure {
+            self.failed = self.failed.saturating_add(1);
+            self.failures.insert(route.clone(), failure);
+        } else {
+            self.failures.remove(route);
+        }
+    }
+}
+
 fn failure(error: probes::ProbeError) -> Failure {
     use crate::execution::Error as E;
     use probes::ProbeError as P;
@@ -82,7 +102,7 @@ impl Runner {
         mut stop: watch::Receiver<bool>,
         updates: watch::Sender<Health>,
     ) -> Result<()> {
-        let mut pending: JoinSet<(usize, Option<Failure>)> = JoinSet::new();
+        let mut pending: JoinSet<(usize, ProbeRun)> = JoinSet::new();
         let mut active = BTreeSet::new();
         let mut cursor = 0;
         let mut timer = tokio::time::interval(self.interval);
@@ -98,15 +118,9 @@ impl Runner {
                 _ = stopped(&mut stop) => break Ok(()),
                 value = pending.join_next(), if !pending.is_empty() => {
                     match value {
-                        Some(Ok((id, failure))) => {
+                        Some(Ok((id, result))) => {
                             active.remove(&id);
-                            health.completed = health.completed.saturating_add(1);
-                            if let Some(failure) = failure {
-                                health.failed = health.failed.saturating_add(1);
-                                health.failures.insert(self.entries[id].route.clone(), failure);
-                            } else {
-                                health.failures.remove(&self.entries[id].route);
-                            }
+                            health.record(&self.entries[id].route, result);
                         },
                         _ => break Err(Error::Task),
                     }
@@ -121,10 +135,16 @@ impl Runner {
                         let entry = &self.entries[i];
                         if active.contains(&i) { continue; }
                         let Ok(view) = entry.monitor.snapshot(&entry.route) else { continue };
-                        if view.allowance > 0 || view.recovery_after_ms > 0 || view.recovery_in_progress { continue; }
+                        if view.recovery_after_ms > 0 || view.recovery_in_progress { continue; }
                         active.insert(i);
                         let owner = entry.owner.clone();
-                        pending.spawn(async move { (i, owner.run().await.err().map(failure)) });
+                        pending.spawn(async move {
+                            let result = match owner.run().await {
+                                Err(probes::ProbeError::Health(health::Error::RecoveryBusy)) => ProbeRun::NotDue,
+                                value => ProbeRun::Finished(value.err().map(failure)),
+                            };
+                            (i, result)
+                        });
                     }
                 }
             }
@@ -134,17 +154,8 @@ impl Runner {
         // Started probes have their own explicit duration budget and durable
         // unknown-outcome handling. Do not abandon their completion publication.
         while let Some(value) = pending.join_next().await {
-            health.completed = health.completed.saturating_add(1);
             match value {
-                Ok((id, Some(failure))) => {
-                    health.failed = health.failed.saturating_add(1);
-                    health
-                        .failures
-                        .insert(self.entries[id].route.clone(), failure);
-                }
-                Ok((id, None)) => {
-                    health.failures.remove(&self.entries[id].route);
-                }
+                Ok((id, result)) => health.record(&self.entries[id].route, result),
                 Err(_) => {
                     health.failed = health.failed.saturating_add(1);
                 }
