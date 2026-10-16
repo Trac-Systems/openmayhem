@@ -38,6 +38,7 @@ const MAX_MESSAGE_ID_BYTES = 256;
 const safeIntegerOr = (value, fallback, { min = 0 } = {}) => (
   Number.isSafeInteger(value) && value >= min ? value : fallback
 );
+const saturatingAdd = (value, increment = 1) => Math.min(Number.MAX_SAFE_INTEGER, value + increment);
 
 // Join topics must be deterministic and collision-resistant.
 // The previous implementation (alloc(32).fill(name)) could collide for different names.
@@ -415,6 +416,17 @@ class Sidechannel extends Feature {
         strikes: 0,
         strikeResetAt: now + this.strikeWindowMs,
         blockedUntil: 0,
+        receiveStats: {
+          allowedMessages: 0,
+          allowedBytes: 0,
+          droppedMessages: 0,
+          droppedBytes: 0,
+          unmeasuredDroppedMessages: 0,
+          blockedDroppedMessages: 0,
+          blocks: 0,
+          lastDropAt: null,
+          lastDropReason: null,
+        },
       };
       this.rateLimits.set(connection, state);
     }
@@ -427,11 +439,49 @@ class Sidechannel extends Feature {
     return this._now() < state.blockedUntil;
   }
 
+  // Metadata only: observing a connection must not create or refill its bucket.
+  receiveThrottleStats(connection) {
+    const state = this.rateLimits.get(connection);
+    const stats = state?.receiveStats;
+    return {
+      enabled: this.rateBytesPerSecond > 0,
+      rate_bytes_per_second: this.rateBytesPerSecond,
+      burst_bytes: this.rateBurstBytes,
+      allowed_messages: stats?.allowedMessages ?? 0,
+      allowed_bytes: stats?.allowedBytes ?? 0,
+      dropped_messages: stats?.droppedMessages ?? 0,
+      dropped_bytes: stats?.droppedBytes ?? 0,
+      unmeasured_dropped_messages: stats?.unmeasuredDroppedMessages ?? 0,
+      blocked_dropped_messages: stats?.blockedDroppedMessages ?? 0,
+      blocks: stats?.blocks ?? 0,
+      strikes: state?.strikes ?? 0,
+      blocked_remaining_ms: Math.max(0, (state?.blockedUntil ?? 0) - this._now()),
+      last_drop_at_ms: stats?.lastDropAt ?? null,
+      last_drop_reason: stats?.lastDropReason ?? null,
+    };
+  }
+
+  _recordRateDrop(state, bytes, reason, now = this._now()) {
+    const stats = state.receiveStats;
+    stats.droppedMessages = saturatingAdd(stats.droppedMessages);
+    if (Number.isSafeInteger(bytes) && bytes >= 0) {
+      stats.droppedBytes = saturatingAdd(stats.droppedBytes, bytes);
+    } else {
+      stats.unmeasuredDroppedMessages = saturatingAdd(stats.unmeasuredDroppedMessages);
+    }
+    if (reason === 'blocked') stats.blockedDroppedMessages = saturatingAdd(stats.blockedDroppedMessages);
+    stats.lastDropAt = now;
+    stats.lastDropReason = reason;
+  }
+
   _checkRate(connection, bytes) {
     if (this.rateBytesPerSecond <= 0) return true;
     const state = this._getLimiter(connection);
     const now = this._now();
-    if (now < state.blockedUntil) return false;
+    if (now < state.blockedUntil) {
+      this._recordRateDrop(state, bytes, 'blocked', now);
+      return false;
+    }
 
     if (now > state.strikeResetAt) {
       state.strikes = 0;
@@ -449,14 +499,18 @@ class Sidechannel extends Feature {
       state.strikes += 1;
       if (state.strikes >= this.maxStrikes) {
         state.blockedUntil = now + this.blockMs;
+        state.receiveStats.blocks = saturatingAdd(state.receiveStats.blocks);
         if (this.debug) {
           console.log(`[sidechannel] rate-limit block ${this._getRemoteKey(connection)} for ${this.blockMs}ms`);
         }
       }
+      this._recordRateDrop(state, bytes, 'rate', now);
       return false;
     }
 
     state.tokens -= bytes;
+    state.receiveStats.allowedMessages = saturatingAdd(state.receiveStats.allowedMessages);
+    state.receiveStats.allowedBytes = saturatingAdd(state.receiveStats.allowedBytes, bytes);
     return true;
   }
 
@@ -1368,7 +1422,12 @@ class Sidechannel extends Feature {
       ),
       onmessage: (payload) => {
         try {
-          if (this._isBlocked(connection)) return;
+          if (this._isBlocked(connection)) {
+            // Preserve the early rejection: use decoder metadata without parsing
+            // or serializing blocked content, and never retain the content itself.
+            this._recordRateDrop(this.rateLimits.get(connection), decodedJsonByteLength(payload), 'blocked');
+            return;
+          }
           let payloadBytes = decodedJsonByteLength(payload);
           if (decodedJsonWasRejected(payload)) {
             this._checkRate(connection, payloadBytes ?? this._maxMessageBytes(entry.name));
