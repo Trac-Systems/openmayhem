@@ -103,6 +103,7 @@ impl Runner {
         updates: watch::Sender<Health>,
     ) -> Result<()> {
         let mut pending: JoinSet<(usize, ProbeRun)> = JoinSet::new();
+        let (shutdown, stopping) = watch::channel(false);
         let mut active = BTreeSet::new();
         let mut cursor = 0;
         let mut timer = tokio::time::interval(self.interval);
@@ -138,8 +139,9 @@ impl Runner {
                         if view.recovery_after_ms > 0 || view.recovery_in_progress { continue; }
                         active.insert(i);
                         let owner = entry.owner.clone();
+                        let mut stopping = stopping.clone();
                         pending.spawn(async move {
-                            let result = match owner.run().await {
+                            let result = match owner.run_until(stopped(&mut stopping)).await {
                                 Err(probes::ProbeError::Health(health::Error::RecoveryBusy)) => ProbeRun::NotDue,
                                 value => ProbeRun::Finished(value.err().map(failure)),
                             };
@@ -151,8 +153,9 @@ impl Runner {
             health.active = pending.len();
             updates.send_replace(health.clone());
         };
-        // Started probes have their own explicit duration budget and durable
-        // unknown-outcome handling. Do not abandon their completion publication.
+        // Shutdown ends unresolved network waits while retaining their dispatch.
+        // Join instead of aborting: verified completion may be committing locally.
+        shutdown.send_replace(true);
         while let Some(value) = pending.join_next().await {
             match value {
                 Ok((id, result)) => health.record(&self.entries[id].route, result),

@@ -949,6 +949,7 @@ class ScBridge extends Feature {
         const sidechannelConnections = Array.from(this.sidechannel.connections.entries())
           .map(([connection, perConnection]) => ({
             remote: keyHex(connection?.remotePublicKey),
+            receiveThrottle: this.sidechannel.receiveThrottleStats?.(connection) ?? null,
             openChannels: Array.from(perConnection.entries())
               .filter(([, record]) => record?.message && record.channel?.opened === true)
               .map(([name]) => name)

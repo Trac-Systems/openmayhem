@@ -51,6 +51,153 @@ fn job_id(response: &Response) -> String {
 }
 
 #[tokio::test]
+async fn proxy_sse_terminal_observation_closes_budget_before_success_without_refetch() {
+    let mut f = Fixture::start().await;
+    f.harness.command("buyer_unavailable_after_terminal").await;
+    let response = f.stream_post("one-terminal-observation").await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let id = job_id(&response);
+    let bytes = collect(response.into_body()).await;
+    assert!(payloads(&bytes)
+        .iter()
+        .all(|event| event.get("error").is_none()));
+    assert!(std::str::from_utf8(&bytes)
+        .unwrap()
+        .ends_with("data: [DONE]\n\n"));
+    let job = f
+        .state
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&id, now_secs())
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.status, GatewayJobStatus::Completed);
+    assert!(job.result.is_some());
+    assert!(f
+        .state
+        .access_control
+        .pending_key_budgets(None, 64)
+        .unwrap()
+        .is_empty());
+    let (_, evidence) = f
+        .get(
+            &format!("/v1/jobs/{id}/proxy-evidence"),
+            "owner-fixture-key",
+        )
+        .await;
+    assert_eq!(evidence["result_verified"], true);
+    assert_eq!(evidence["financial"]["budget_settled"], true);
+    let status = f.harness.status().await;
+    assert_eq!(status["buyer_terminal_observations"], 1);
+    assert_eq!(status["buyer_terminal_reads_rejected"], 0);
+    assert_eq!(status["publications"], 2);
+    assert_eq!(f.harness.backend_calls(), 1);
+
+    // Prove that this was a real unavailable next read, not merely a counter.
+    let saved = f
+        .harness
+        .buyer
+        .retained_purchase(job.proxy.as_ref().unwrap().identity())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(f.harness.buyer.observe_purchase(&saved).await.is_err());
+    assert!(
+        f.harness.status().await["buyer_terminal_reads_rejected"]
+            .as_u64()
+            .unwrap()
+            > 0
+    );
+    let replay = f.stream_post("one-terminal-observation").await;
+    assert_eq!(replay.status(), StatusCode::OK);
+    assert_eq!(replay.headers()["content-type"], "application/json");
+    assert_eq!(
+        serde_json::from_slice::<Value>(&collect(replay.into_body()).await).unwrap(),
+        job.result.unwrap()
+    );
+    assert_eq!(f.harness.backend_calls(), 1);
+    f.stop().await;
+}
+
+#[tokio::test]
+async fn proxy_sse_terminal_observation_cannot_bypass_failed_budget_commit() {
+    let mut f = Fixture::start().await;
+    f.harness.command("buyer_unavailable_after_terminal").await;
+    f.harness
+        .stream_backend
+        .paused
+        .store(true, Ordering::SeqCst);
+    let response = f.stream_post("failed-budget-commit").await;
+    let id = job_id(&response);
+    let mut body = response.into_body().into_data_stream();
+    let first = tokio::time::timeout(Duration::from_secs(10), body.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        payloads(&first)[0]["choices"][0]["delta"]["content"],
+        "hello"
+    );
+    // Admission already reserved the budget. Break only the later durable
+    // settlement boundary, after output has begun and before the receipt.
+    std::fs::write(f.directory.path().join("tokens.json"), b"{").unwrap();
+    f.harness.stream_backend.release.add_permits(1);
+    let mut bytes = Vec::new();
+    while let Some(frame) = tokio::time::timeout(Duration::from_secs(15), body.next())
+        .await
+        .unwrap()
+    {
+        bytes.extend_from_slice(&frame.unwrap());
+    }
+    assert!(!bytes.windows(6).any(|part| part == b"[DONE]"));
+    assert!(payloads(&bytes)
+        .iter()
+        .any(|event| event["error"]["code"] == "proxy_recovery_required"));
+    let job = f
+        .state
+        .jobs
+        .lock()
+        .unwrap()
+        .get(&id, now_secs())
+        .unwrap()
+        .unwrap();
+    assert_ne!(job.status, GatewayJobStatus::Completed);
+    assert!(job.result.is_some());
+    assert_eq!(
+        job.proxy.unwrap().phase(),
+        crate::job_store::proxy::ProxyPhase::ClosurePendingBudget
+    );
+    assert_eq!(
+        f.state
+            .access_control
+            .pending_key_budgets(None, 64)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(f.harness.status().await["buyer_terminal_observations"], 1);
+
+    std::fs::write(
+        f.directory.path().join("tokens.json"),
+        serde_json::to_vec(&f.tokens).unwrap(),
+    )
+    .unwrap();
+    f.harness.command("financial_available").await;
+    wait_completed(&f, &id).await;
+    assert!(f
+        .state
+        .access_control
+        .pending_key_budgets(None, 64)
+        .unwrap()
+        .is_empty());
+    assert_eq!(f.harness.backend_calls(), 1);
+    assert_eq!(f.harness.status().await["publications"], 2);
+    f.stop().await;
+}
+
+#[tokio::test]
 async fn proxy_sse_three_endpoints_all_rails_complete_then_replay_retained_json_once() {
     for endpoint in [
         ProxyEndpoint::Chat,

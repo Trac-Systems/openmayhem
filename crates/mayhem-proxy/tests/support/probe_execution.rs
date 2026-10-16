@@ -782,8 +782,105 @@ async fn real_streaming_probes_share_tool_schema_and_terminal_validation_on_all_
 }
 
 #[tokio::test]
-async fn probe_timeout_retains_unknown_dispatch_and_cannot_send_again_after_backoff_or_restart() {
-    let backend = backend(200, answer(), Duration::from_secs(2)).await;
+async fn probe_health_deadline_drains_same_json_or_stream_then_requires_fresh_health() {
+    for streaming in [false, true] {
+        let body = if streaming {
+            sse(&[delta("hi", json!(null)), delta("", json!("stop"))], true)
+        } else {
+            serde_json::to_vec(&answer()).unwrap()
+        };
+        let backend = backend_raw(
+            200,
+            body,
+            if streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+            Duration::from_millis(500),
+        )
+        .await;
+        let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let (a, m) = setup(&f);
+        let body = bounded(
+            serde_json::from_slice(&if streaming { stream_request() } else { chat() }).unwrap(),
+            ProxyEndpoint::Chat,
+        );
+        let c = controller(
+            &f,
+            a.clone(),
+            m.clone(),
+            &body,
+            streaming,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let run = c.run();
+        tokio::pin!(run);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                tokio::select! {
+                    _ = &mut run => panic!("deadline abandoned the original exchange"),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                        if m.snapshot(&d(20)).unwrap().reason == health::Reason::Unreachable { break; }
+                    }
+                }
+            }
+        }).await.unwrap();
+        probe_counts(&a, 1);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(a.probe_budget(&d(10)).unwrap().unwrap().used_attempts, 1);
+        assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 0);
+        assert!(matches!(
+            c.run().await,
+            Err(probes::ProbeError::Health(health::Error::RecoveryBusy))
+        ));
+        assert!(
+            matches!(tokio::time::timeout(Duration::from_secs(3), &mut run).await.unwrap(),
+            Err(probes::ProbeError::Execution(Error::Upstream(f))) if f.code == Code::UpstreamTimeout)
+        );
+        probe_counts(&a, 0);
+        assert!(a.probe_for_group(&d(10)).unwrap().is_none());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        let view = m.snapshot(&d(20)).unwrap();
+        assert_eq!(
+            view.allowance, 0,
+            "late completion must not advertise readiness"
+        );
+        assert!(!view.recovery_in_progress);
+        assert!(a
+            .probe_budget(&d(10))
+            .unwrap()
+            .unwrap()
+            .last_completed
+            .is_some());
+        controller(
+            &f,
+            a.clone(),
+            m.clone(),
+            &body,
+            streaming,
+            Duration::from_secs(2),
+        )
+        .unwrap()
+        .run()
+        .await
+        .unwrap();
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(a.status(&d(20)).unwrap().available, 1);
+        assert_eq!(a.probe_budget(&d(10)).unwrap().unwrap().used_attempts, 2);
+        assert!(f
+            .journal
+            .recovery_page(None, 64)
+            .unwrap()
+            .records
+            .is_empty());
+    }
+}
+
+#[tokio::test]
+async fn abandoned_probe_after_health_deadline_retains_unknown_dispatch_across_restart() {
+    let backend = backend(200, answer(), Duration::from_secs(60)).await;
     let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
     let (a, m) = setup(&f);
     let bytes = bounded(
@@ -799,8 +896,23 @@ async fn probe_timeout_retains_unknown_dispatch_and_cannot_send_again_after_back
         Duration::from_millis(100),
     )
     .unwrap();
-    assert!(
-        matches!(c.run().await, Err(probes::ProbeError::Execution(Error::Upstream(f))) if f.code == Code::UpstreamTimeout)
+    let mut run = Box::pin(c.run());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            tokio::select! {
+                _ = &mut run => panic!("deadline abandoned the original exchange"),
+                _ = tokio::time::sleep(Duration::from_millis(5)) => {
+                    if m.snapshot(&d(20)).unwrap().reason == health::Reason::Unreachable { break; }
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(run);
+    assert_eq!(
+        m.snapshot(&d(20)).unwrap().reason,
+        health::Reason::Unreachable
     );
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     probe_counts(&a, 1);
@@ -827,6 +939,57 @@ async fn probe_timeout_retains_unknown_dispatch_and_cannot_send_again_after_back
     ));
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     assert_eq!(a.probe_budget(&d(10)).unwrap().unwrap().used_attempts, 1);
+}
+
+#[tokio::test]
+async fn late_invalid_json_or_incomplete_stream_eof_does_not_release_probe() {
+    for streaming in [false, true] {
+        let body = if streaming {
+            sse(&[delta("hi", json!(null)), delta("", json!("stop"))], false)
+        } else {
+            br#"{"not":"an answer"}"#.to_vec()
+        };
+        let backend = backend_raw(
+            200,
+            body,
+            if streaming {
+                "text/event-stream"
+            } else {
+                "application/json"
+            },
+            Duration::from_millis(300),
+        )
+        .await;
+        let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let (a, m) = setup(&f);
+        let body = bounded(
+            serde_json::from_slice(&if streaming { stream_request() } else { chat() }).unwrap(),
+            ProxyEndpoint::Chat,
+        );
+        let c = controller(
+            &f,
+            a.clone(),
+            m.clone(),
+            &body,
+            streaming,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(5), c.run())
+            .await
+            .unwrap()
+            .is_err());
+        probe_counts(&a, 1);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 0);
+        assert!(!m.snapshot(&d(20)).unwrap().recovery_in_progress);
+        let budget = a.probe_budget(&d(10)).unwrap().unwrap();
+        assert_eq!(budget.used_attempts, 1);
+        assert!(
+            budget.last_completed.is_none(),
+            "EOF alone is not terminal proof"
+        );
+    }
 }
 
 #[tokio::test]

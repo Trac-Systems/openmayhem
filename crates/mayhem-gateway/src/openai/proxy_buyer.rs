@@ -264,28 +264,40 @@ impl Runtime {
                         }
                     }
                     eprintln!(
-                        "Proxy execution did not complete: job_id={} code={:?} stage={:?} recovery_required={} financial_code={:?}",
-                        binding.job_id, error.code, error.stage, error.recovery_required, error.financial_code
+                        "Proxy execution did not complete: job_id={} code={:?} stage={:?} recovery_required={} financial_code={:?} verification_step={:?} verification_cause={:?}",
+                        binding.job_id, error.code, error.stage, error.recovery_required, error.financial_code,
+                        error.verification_step.map(buyer_controller::VerificationStep::as_str),
+                        error.verification_cause.map(buyer_controller::VerificationCause::as_str)
                     );
                 }
             }
             // No result/error string from an upstream may release money. Exact
             // canonical closure and durable output are required independently.
-            let mut result = runtime.refresh_owner(&state, &binding, &owner).await;
-            if outcome
+            let failed = outcome.is_err();
+            let unsigned_failure = outcome
                 .as_ref()
-                .is_err_and(|error| !error.recovery_required)
-            {
+                .is_err_and(|error| !error.recovery_required);
+            let capacity = outcome.as_ref().is_err_and(|error| {
+                error.code == buyer_controller::Code::Busy
+                    && error.stage == buyer_controller::Stage::Negotiating
+                    && !error.recovery_required
+            });
+            let mut result = match outcome {
+                Ok(buyer_controller::Outcome::Completed { observation, .. }
+                    | buyer_controller::Outcome::Closed { observation, .. }) => {
+                    // Keep the exact observation and its original age. Owner
+                    // still checks its binding/freshness and commits the budget
+                    // before the job can become terminal or reach the caller.
+                    owner.close(observation).await.map_err(|_| unavailable())
+                }
+                _ => runtime.refresh_owner(&state, &binding, &owner).await,
+            };
+            if unsigned_failure {
                 if result.as_ref().is_ok_and(|job| {
                     job.proxy
                         .as_ref()
                         .is_some_and(|p| p.terms().is_none() && p.non_admission().is_none())
                 }) {
-                    let capacity = outcome.as_ref().is_err_and(|error| {
-                        error.code == buyer_controller::Code::Busy
-                            && error.stage == buyer_controller::Stage::Negotiating
-                            && !error.recovery_required
-                    });
                     result = fail_unsigned_with_capacity(&state, &binding.job_id, capacity).await;
                 }
             }
@@ -294,10 +306,9 @@ impl Runtime {
                     active.remove(&binding.job_id);
                 }
             }
-            let result = match (result, outcome) {
-                (Ok(job), _) => Ok(job),
-                (Err(_), Err(_)) => Err(unavailable()),
-                (Err(error), Ok(_)) => Err(error),
+            let result = match result {
+                Err(_) if failed => Err(unavailable()),
+                result => result,
             };
             let _ = reply.send(result);
         });

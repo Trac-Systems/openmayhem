@@ -454,6 +454,78 @@ async fn owner_non_admission_recovers_retained_fence_before_budget_release_exact
 }
 
 #[tokio::test]
+async fn owner_carried_observation_rejects_wrong_owner_terms_and_original_age() {
+    let f = Harness::start(&worker_path()).await;
+    let s = StoredOwner::new(&f, 100_000);
+    // Same public request identity, different exact connection terms. Both
+    // owners reserve independently in ephemeral local budget stores.
+    let foreign = StoredOwner::new(&f, 100_000);
+    foreign
+        .owner()
+        .authorize(&f.prepare_connection(digest(93)).await)
+        .await
+        .unwrap();
+    let (_stop, rx) = watch::channel(false);
+    let buyer::Outcome::Completed {
+        authorization,
+        observation,
+        ..
+    } = f.buyer.execute(f.request(s.owner()), rx).await.unwrap()
+    else {
+        panic!("verified output required")
+    };
+    let original = s.job().result.unwrap();
+    for field in ["job", "token", "model", "fingerprint", "identity"] {
+        let mut wrong = s.binding.clone();
+        match field {
+            "job" => wrong.job_id.push_str("-foreign"),
+            "token" => wrong.token.token_id.push_str("-foreign"),
+            "model" => wrong.model.push_str("-foreign"),
+            "fingerprint" => wrong.fingerprint = digest(92).as_str().into(),
+            _ => wrong.identity.session_id = digest(93),
+        }
+        assert!(
+            Owner::new(s.jobs.clone(), s.access.clone(), wrong)
+                .close(f.financial.observe(&authorization).await.unwrap())
+                .await
+                .is_err(),
+            "{field}"
+        );
+    }
+    assert!(foreign
+        .owner()
+        .close(f.financial.observe(&authorization).await.unwrap())
+        .await
+        .is_err());
+    assert_eq!(
+        foreign.job().proxy.unwrap().phase(),
+        ProxyPhase::AwaitingBuyerJournal
+    );
+    assert_eq!(
+        foreign.access.pending_key_budgets(None, 64).unwrap().len(),
+        1
+    );
+
+    // Use the real observation clock: transfer does not restart its 15-second
+    // lifetime, and stale terminal proof cannot release even a matching budget.
+    tokio::time::sleep(std::time::Duration::from_secs(16)).await;
+    assert!(s.owner().close(observation).await.is_err());
+    assert_eq!(s.job().proxy.unwrap().phase(), ProxyPhase::OutputRetained);
+    assert_eq!(s.job().result.as_ref(), Some(&original));
+    assert_eq!(s.access.pending_key_budgets(None, 64).unwrap().len(), 1);
+    let completed = s
+        .owner()
+        .close(f.financial.observe(&authorization).await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(completed.status, GatewayJobStatus::Completed);
+    assert_eq!(completed.result.as_ref(), Some(&original));
+    assert!(s.access.pending_key_budgets(None, 64).unwrap().is_empty());
+    assert_eq!(f.backend_calls(), 1);
+    f.stop().await;
+}
+
+#[tokio::test]
 async fn owner_output_precedes_approval_then_restart_closes_once_despite_revocation_and_cap() {
     let mut f = Harness::start(&worker_path()).await;
     let mut s = StoredOwner::new(&f, 100_000);
@@ -514,13 +586,14 @@ async fn owner_output_precedes_approval_then_restart_closes_once_despite_revocat
         .recover(s.binding.identity.clone(), gate.clone(), stop.subscribe())
         .await
         .unwrap();
-    assert!(matches!(
-        outcome,
-        buyer::Outcome::Completed {
-            settlement: FinancialOutcome::Paid { .. },
-            ..
-        }
-    ));
+    let buyer::Outcome::Completed {
+        settlement: FinancialOutcome::Paid { .. },
+        observation,
+        ..
+    } = outcome
+    else {
+        panic!("verified recovered output required")
+    };
     assert_eq!(s.job().result.as_ref(), Some(&original));
     assert_eq!(
         f.backend_calls(),
@@ -546,17 +619,15 @@ async fn owner_output_precedes_approval_then_restart_closes_once_despite_revocat
     // A real boundary failure after canonical outcome persistence must retain
     // both the output and the budget obligation for restart reconciliation.
     std::fs::write(s.root.path().join("tokens.json"), b"{").unwrap();
-    assert!(gate
-        .owner
-        .close(f.financial.observe(&auth).await.unwrap())
-        .await
-        .is_err());
+    f.command("financial_unavailable").await;
+    assert!(gate.owner.close(observation).await.is_err());
     assert_eq!(
         s.job().proxy.unwrap().phase(),
         ProxyPhase::ClosurePendingBudget
     );
     assert_eq!(s.job().result.as_ref(), Some(&original));
     assert_eq!(s.access.pending_key_budgets(None, 64).unwrap().len(), 1);
+    f.command("financial_available").await;
     s.configure(|_| {});
     drop(gate);
     s = s.reopen();

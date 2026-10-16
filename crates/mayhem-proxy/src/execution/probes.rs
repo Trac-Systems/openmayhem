@@ -22,8 +22,9 @@ pub struct Limits {
     pub max_request_bytes: usize,
     pub max_response_bytes: usize,
     pub max_output_tokens: u64,
-    /// Applies only to this operator-authorized probe, never customer generation.
-    /// Expiry leaves unknown dispatch retained; it does not authorize a retry.
+    /// Health-observation deadline for this operator-authorized probe, never
+    /// customer generation. Expiry marks health failed while the original
+    /// exchange drains to verified completion; it does not authorize a retry.
     pub timeout: Duration,
     pub storage_workers: usize,
 }
@@ -68,6 +69,56 @@ pub struct Conformance {
     pub(crate) class: crate::conformance::Class,
     pub(crate) assertions: Vec<crate::conformance::Assertion>,
     pub(crate) completed: std::time::Instant,
+}
+
+struct ProbeWait<T> {
+    result: Result<T>,
+    expired: bool,
+    started: bool,
+}
+
+async fn wait_for_probe<T>(
+    inference: impl Future<Output = Result<T>>,
+    shutdown: impl Future<Output = ()>,
+    deadline: tokio::time::Instant,
+    on_timeout: impl FnOnce(),
+) -> ProbeWait<T> {
+    let mut started = false;
+    let mut expired = false;
+    let mut on_timeout = Some(on_timeout);
+    let result = {
+        let inference = async {
+            started = true;
+            inference.await
+        };
+        tokio::pin!(inference, shutdown);
+        let timer = tokio::time::sleep_until(deadline);
+        tokio::pin!(timer);
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut shutdown => break Err(Error::Cancelled),
+                _ = &mut timer, if !expired => {
+                    expired = true;
+                    if let Some(observe) = on_timeout.take() { observe(); }
+                }
+                result = &mut inference => {
+                    // The inference poll itself may cross the deadline even
+                    // after the timer was checked. Never publish late success.
+                    if !expired && tokio::time::Instant::now() >= deadline {
+                        expired = true;
+                        if let Some(observe) = on_timeout.take() { observe(); }
+                    }
+                    break result;
+                }
+            }
+        }
+    };
+    ProbeWait {
+        result,
+        expired,
+        started,
+    }
 }
 
 impl Controller {
@@ -204,6 +255,20 @@ impl Controller {
     /// There is no idle polling loop here. Due/backoff and single-scope observation
     /// are enforced before the durable attempt/cost/capacity reservation.
     pub async fn run(&self) -> ProbeResult<Outcome> {
+        self.run_until(std::future::pending()).await
+    }
+    /// Shutdown may abandon an unresolved exchange, never its durable occupancy.
+    /// Storage transitions are outside the cancellable network wait.
+    pub(crate) async fn run_until(
+        &self,
+        shutdown: impl Future<Output = ()>,
+    ) -> ProbeResult<Outcome> {
+        tokio::pin!(shutdown);
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => return Err(Error::Cancelled.into()),
+            _ = std::future::ready(()) => (),
+        }
         let expansion = self.monitor.snapshot(&self.specification.route)?.allowance > 0;
         if expansion {
             let route = self.specification.route.clone();
@@ -275,6 +340,14 @@ impl Controller {
             self.cancel_prepared(id).await?;
             return Err(health::Error::RecoveryBusy.into());
         }
+        tokio::select! {
+            biased;
+            _ = &mut shutdown => {
+                self.cancel_prepared(id).await?;
+                return Err(Error::Cancelled.into());
+            }
+            _ = std::future::ready(()) => (),
+        }
         let dispatched = match self.storage(move |a| a.dispatch_probe(reserved)).await {
             Ok(dispatched) => dispatched,
             Err(error) => {
@@ -326,20 +399,44 @@ impl Controller {
                     .await
             }
         };
-        let result = match tokio::time::timeout(self.limits.timeout, inference).await {
-            Ok(result) => result,
-            Err(_) => Err(Error::Upstream(Failure::new(
-                Code::UpstreamTimeout,
-                Scope::Model,
-                Stage::ResponseBody,
-                Execution::Unknown,
-            ))),
-        };
+        let timeout_failure = Failure::new(
+            Code::UpstreamTimeout,
+            Scope::Model,
+            Stage::ResponseBody,
+            Execution::Unknown,
+        );
+        let ProbeWait {
+            result,
+            expired,
+            started,
+        } = wait_for_probe(
+            inference,
+            shutdown,
+            tokio::time::Instant::now() + self.limits.timeout,
+            || {
+                // The original exchange still owns its measurement. Publish
+                // failure without dropping it or granting another dispatch.
+                if let Ok(observer) = self
+                    .monitor
+                    .observe_request(&self.specification.route, self.request.health_class)
+                {
+                    observer.failure(timeout_failure.clone());
+                }
+            },
+        )
+        .await;
+        if !started {
+            // Shutdown won before this process ever polled the HTTP operation.
+            // A dispatch record alone must not turn known-unsent work unknown.
+            let evidence = Digest::hash(
+                "mayhem/proxy/probe-unsent-shutdown/v1",
+                &[probe.id.as_str().as_bytes()],
+            );
+            self.complete(probe, evidence).await?;
+            return Err(Error::Cancelled.into());
+        }
         match result {
             Ok(reply) => {
-                let observation = sample.take().map(|sample| {
-                    sample.prepare_success(reply.reported_usage.as_ref().map(|v| v.output_tokens))
-                });
                 let bytes =
                     serde_json::to_vec(&reply.body).map_err(|_| ProbeError::Configuration)?;
                 let evidence = Digest::hash(
@@ -347,6 +444,15 @@ impl Controller {
                     &[probe.id.as_str().as_bytes(), &bytes],
                 );
                 self.complete(probe.clone(), evidence.clone()).await?;
+                if expired {
+                    // A late verified result proves physical completion, not a
+                    // successful deadline or a fresh conformance measurement.
+                    drop(sample.take());
+                    return Err(Error::Upstream(timeout_failure).into());
+                }
+                let observation = sample.take().map(|sample| {
+                    sample.prepare_success(reply.reported_usage.as_ref().map(|v| v.output_tokens))
+                });
                 if let Some(observation) = observation {
                     observation.publish();
                 }
@@ -427,5 +533,74 @@ impl Controller {
         self.storage(move |a| a.complete_probe(VerifiedCompletion { probe, evidence }))
             .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[tokio::test]
+    async fn expired_deadline_wins_when_completion_is_already_ready() {
+        let observations = Cell::new(0);
+        let result = wait_for_probe(
+            std::future::ready(Ok(())),
+            std::future::pending(),
+            tokio::time::Instant::now() - Duration::from_millis(1),
+            || observations.set(observations.get() + 1),
+        )
+        .await;
+        assert!(result.result.is_ok());
+        assert!(result.started && result.expired);
+        assert_eq!(observations.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn completion_poll_crossing_deadline_cannot_skip_timeout_observation() {
+        let observations = Cell::new(0);
+        let result = wait_for_probe(
+            async {
+                std::thread::sleep(Duration::from_millis(20));
+                Ok(())
+            },
+            std::future::pending(),
+            tokio::time::Instant::now() + Duration::from_millis(5),
+            || observations.set(observations.get() + 1),
+        )
+        .await;
+        assert!(result.result.is_ok());
+        assert!(result.started && result.expired);
+        assert_eq!(observations.get(), 1);
+    }
+
+    #[tokio::test]
+    async fn shutdown_before_first_inference_poll_preserves_nonexecution_proof() {
+        let result = wait_for_probe::<()>(
+            async { panic!("shutdown must not start upstream work") },
+            std::future::ready(()),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            || panic!("shutdown is not an upstream health failure"),
+        )
+        .await;
+        assert!(matches!(result.result, Err(Error::Cancelled)));
+        assert!(!result.started && !result.expired);
+    }
+
+    #[tokio::test]
+    async fn shutdown_after_first_inference_poll_cannot_claim_nonexecution() {
+        let dispatched = tokio::sync::Notify::new();
+        let result = wait_for_probe::<()>(
+            async {
+                dispatched.notify_one();
+                std::future::pending().await
+            },
+            dispatched.notified(),
+            tokio::time::Instant::now() + Duration::from_secs(1),
+            || panic!("shutdown is not an upstream health failure"),
+        )
+        .await;
+        assert!(matches!(result.result, Err(Error::Cancelled)));
+        assert!(result.started && !result.expired);
     }
 }

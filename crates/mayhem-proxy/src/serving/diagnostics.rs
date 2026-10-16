@@ -32,6 +32,7 @@ fn details(error: &(dyn Error + 'static)) -> (&'static str, Option<String>) {
             ),
             crate::Error::Http { status, .. } => ("financial_http", Some(status.to_string())),
             crate::Error::Transport(_) => ("financial_transport", None),
+            crate::Error::FinancialAdmissionUnavailable => ("financial_unavailable", None),
             _ => ("control", None),
         };
     }
@@ -100,6 +101,13 @@ mod tests {
             code: private.into(),
         };
         assert_eq!(details(&http), ("financial_http", Some("503".into())));
+        assert_eq!(
+            details(&crate::Error::FinancialAdmissionUnavailable),
+            ("financial_unavailable", None)
+        );
+        let admission =
+            crate::execution::Error::Financial(crate::Error::FinancialAdmissionUnavailable);
+        assert_eq!(details(&admission), ("financial_unavailable", None));
         let bridge =
             crate::exchange::Error::Transport(mayhem_bridge::BridgeError::Protocol(private.into()));
         assert_eq!(details(&bridge), ("bridge", Some("protocol".into())));

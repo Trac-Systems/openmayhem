@@ -216,11 +216,17 @@ async fn paid_case(rail: ProxyRail, streaming: bool, fault: &'static str) {
             response,
             authorization,
             settlement,
+            observation,
         } = result.unwrap()
         else {
             panic!("verified same purchase must complete")
         };
         assert_eq!(identity, id);
+        assert_eq!(observation.accepted().authorization, authorization);
+        assert_eq!(
+            observation.financial_outcome().unwrap(),
+            Some(settlement.clone())
+        );
         let FinancialOutcome::Paid { receipt } = settlement else {
             panic!("exact final receipt required")
         };
@@ -351,11 +357,17 @@ async fn buyer_acknowledgment_exact_waiver_survives_lost_settled_reply_on_all_ra
             identity,
             authorization,
             settlement,
+            observation,
         } = result.unwrap()
         else {
             panic!("signed waiver required")
         };
         assert_eq!(identity, id);
+        assert_eq!(observation.accepted().authorization, authorization);
+        assert_eq!(
+            observation.financial_outcome().unwrap(),
+            Some(settlement.clone())
+        );
         let FinancialOutcome::Waived { closure } = settlement else {
             panic!("waiver required")
         };

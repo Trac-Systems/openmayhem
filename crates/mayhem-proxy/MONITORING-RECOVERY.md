@@ -1,9 +1,24 @@
 # Recovering an interrupted proxy monitoring probe
 
-A monitoring timeout or controller restart does not prove that the upstream
-stopped working. The controller retains the probe's capacity and its spent
-monitoring allowance instead of silently sending it again. `retained_work` in
-the bounded recovery diagnostics identifies this case.
+A monitoring deadline marks health failed without abandoning the original
+upstream exchange. The controller keeps that exchange, its bounded decoder and
+its capacity until verified completion. A late verified result releases only
+physical capacity: it does not advertise healthy service or refund monitoring
+allowance. A fresh successful probe is required before readiness returns.
+
+Before opening state, configuration validation requires the recovery worker pool
+to cover one child and the maximum decoder buffer reservation for every
+independent connection with a configured probe. Aliases of one connection count
+once. This prevents a stalled backend from blocking other backends' recovery.
+Limits are never increased automatically; an insufficient configuration is
+rejected with an actionable error. Paid-response and settlement worker pools
+remain independent.
+
+Shutdown, transport failure, or invalid output can leave the outcome unknown.
+None proves that the upstream stopped working. The controller retains the
+probe's capacity and its spent monitoring allowance instead of silently sending
+it again. `retained_work` in the bounded recovery diagnostics identifies this
+case. Shutdown stops the unresolved network wait; it does not invent completion.
 
 Stop the affected proxy controller before these commands. The existing capacity
 store's exclusive lock rejects inspection or resolution while it is open. Keep

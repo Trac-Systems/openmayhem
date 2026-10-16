@@ -51,6 +51,7 @@ buyerParticipant._adminKey=async()=>f.admin.publicKey;
 participant._adminKey=async()=>f.admin.publicKey;
 let mutation=null,calls=0,operatorCalls=0,operatorUnavailable=false,financialUnavailable=0;
 let financialUnavailableCode='proxy_financial_unavailable';
+let buyerUnavailableAfterTerminal=false,buyerTerminalObservations=0,buyerTerminalReadsRejected=0;
 let submissions=0,publications=0,pending=null,publicationMode=null,publicationTail=Promise.resolve();
 let publicationBusy=0,delayedPublication=null;
 const publicationEnvelopes=new Map();
@@ -90,6 +91,11 @@ participant.relay=buyerParticipant.relay=(key,value)=>{
 };
 function requestsFor(actor) { return async(service,request)=>{
   calls++;
+  const buyerFinancial=service==='proxy_financial_state' && actor.publicKey===f.buyer.publicKey;
+  if(buyerFinancial && buyerUnavailableAfterTerminal && buyerTerminalObservations>0) {
+    buyerTerminalReadsRejected++;
+    throw proxyFinancialError('proxy_financial_unavailable');
+  }
   if(service==='proxy_financial_state' && financialUnavailable>0) {
     financialUnavailable--;
     throw proxyFinancialError(financialUnavailableCode);
@@ -102,6 +108,12 @@ function requestsFor(actor) { return async(service,request)=>{
   const verified=admin._verifyServiceRequest(service,request,{admin:f.admin.publicKey,transport:actor.publicKey});
   if(!verified)throw new Error('fixture signature rejected');
   const result=await admin._handleService(service,verified.payload,verified);
+  // Preserve the first real canonical terminal response, then fail every later
+  // buyer financial read. Provider settlement is unaffected by this test fault.
+  if(buyerFinancial && buyerUnavailableAfterTerminal &&
+    (result.receipt_head?.receipt?.body?.final===true || result.resolution || result.expiry)) {
+    buyerTerminalObservations++;
+  }
   if(mutation==='nonce')result.request_nonce='0'.repeat(64);
   if(mutation==='network')result.context.network_id='wrong-network';
   if(mutation==='hold')result.session.max_spend_au='0';
@@ -194,7 +206,8 @@ try {
     else if(command==='financial_unavailable_once'){financialUnavailable=1;financialUnavailableCode='proxy_financial_unavailable';}
     else if(command==='financial_unavailable'){financialUnavailable=1000;financialUnavailableCode='proxy_financial_unavailable';}
     else if(command==='financial_unknown'){financialUnavailable=1000;financialUnavailableCode='proxy_financial_unknown';}
-    else if(command==='financial_available')financialUnavailable=0;
+    else if(command==='buyer_unavailable_after_terminal'){buyerUnavailableAfterTerminal=true;buyerTerminalObservations=0;buyerTerminalReadsRejected=0;}
+    else if(command==='financial_available'){financialUnavailable=0;buyerUnavailableAfterTerminal=false;}
     else if(command==='status'){}
     else if(command==='state') {console.log(JSON.stringify({summary:await f.read(f.summaryKey),balance:await f.read(f.balanceKey),billing:await f.read(f.ledger.receiptBillingKey(f.terms.billing_id))}));continue;}
     else if(command==='publish_pending')publicationMode='pending';
@@ -207,7 +220,8 @@ try {
     else if(command==='flush_publication') {if(pending){await applyReceipt(pending.key,pending.value);pending=null;}publicationMode=null;}
     else if(['nonce','network','hold','signature','unknown','delay'].includes(command))mutation=command;
     else throw new Error('unknown fixture command');
-    console.log(JSON.stringify({done:command,calls,operator_calls:operatorCalls,submissions,publications}));
+    console.log(JSON.stringify({done:command,calls,operator_calls:operatorCalls,submissions,publications,
+      buyer_terminal_observations:buyerTerminalObservations,buyer_terminal_reads_rejected:buyerTerminalReadsRejected}));
   }
 } finally {
   if(delayedPublication)await delayedPublication;
