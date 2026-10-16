@@ -241,7 +241,7 @@ test('relay egress is one hop, gated, and bounded per node and authenticated aut
     const connection = { remotePublicKey: b4a.from(key.repeat(32), 'hex') };
     relay.connections.set(connection, new Map([[
       channelName,
-      { message: { send: (payload) => sent.push(payload) } },
+      { channel: { opened: true, drained: true }, message: { send: (payload) => sent.push(payload) } },
     ]]));
   }
   const firstConnection = { remotePublicKey: firstPeer.wallet.publicKey };
@@ -585,14 +585,12 @@ test('direct peer recovery leaves unrelated peer connections and channels untouc
   assert.equal(harness.counts.healthProofs, 1);
 });
 
-test('sidechannel does not send from a stale fully-opened callback after channel removal', async () => {
+test('sidechannel does not send queued work after channel removal', async () => {
   const room = 'room-race';
-  let resolveOpened = null;
   let sends = 0;
   const transportChannel = {
     opened: false,
     close() {},
-    fullyOpened: () => new Promise((resolve) => { resolveOpened = resolve; }),
   };
   const record = {
     channel: transportChannel,
@@ -607,11 +605,13 @@ test('sidechannel does not send from a stale fully-opened callback after channel
 
   assert.equal(sidechannel.broadcast(room, { text: 'must not escape after leave' }), true);
   await sidechannel.removeChannel(room);
-  resolveOpened(true);
-  await new Promise((resolve) => setTimeout(resolve, 0));
+  transportChannel.opened = true;
+  sidechannel._drainOutbound(connection);
 
   assert.equal(sends, 0);
   assert.equal(sidechannel.channels.has(room), false);
+  assert.equal(sidechannel.outboundMessages, 0);
+  await sidechannel.stop();
 });
 
 test('fast PoW mining stays byte-identical to the canonical pow base', () => {

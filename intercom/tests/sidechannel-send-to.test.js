@@ -54,11 +54,12 @@ const connect = (sender, receiver) => {
 test('directed delivery avoids unrelated triangle traffic while preserving the default receive budget', async (t) => {
   const peers = await Promise.all([makePeer(), makePeer(), makePeer()]);
   const run = (directed) => {
+    let now = 1000;
     const delivered = [[], [], []];
     const nodes = peers.map((peer, i) => new Sidechannel(peer, {
       ...config, onMessage: (_name, payload) => delivered[i].push(payload),
     }));
-    for (const node of nodes) { node._now = () => 1000; t.after(() => node.stop()); }
+    for (const node of nodes) { node._now = () => now; t.after(() => node.stop()); }
     const [sender, recipient, observer] = nodes;
     const toRecipient = connect(sender, recipient);
     const toObserver = connect(sender, observer);
@@ -68,7 +69,8 @@ test('directed delivery avoids unrelated triangle traffic while preserving the d
       if (directed) return sender.broadcast(channel, addressed);
       // Simulate the pre-routing sender with the unchanged legacy envelope and
       // broadcast path, including its one-hop relay behavior at the receiver.
-      sender._sendBroadcastPayload(sender.channels.get(channel), sender._buildPayload(channel, addressed), false);
+      const payload = sender._buildPayload(channel, addressed);
+      for (const perConn of sender.connections.values()) perConn.get(channel).message.send(payload);
       return true;
     };
     for (let n = 0; n < 4; n += 1) {
@@ -76,6 +78,11 @@ test('directed delivery avoids unrelated triangle traffic while preserving the d
     }
     for (let n = 0; n < 3; n += 1) {
       assert.equal(send(observer, { control, recipient: key(observer.peer), n, data: 'y'.repeat(20_000) }), true);
+    }
+    if (directed) {
+      for (; now <= 8000; now += 50) {
+        for (const node of nodes) for (const connection of node.connections.keys()) node._drainOutbound(connection);
+      }
     }
     return { nodes, delivered, toRecipient, toObserver, relayed };
   };
@@ -99,13 +106,14 @@ test('directed delivery avoids unrelated triangle traffic while preserving the d
   assert.equal(stats.rate_bytes_per_second, 64_000);
   assert.equal(stats.burst_bytes, 256_000);
   assert.equal(stats.dropped_messages, 0);
-  // Unique, correctly addressed traffic still cannot exceed the same burst.
+  // Further addressed traffic shares the paced connection, retaining the same
+  // receiver limit without turning a legitimate sender burst into a block.
   for (let n = 0; n < 3; n += 1) {
     assert.equal(directed.nodes[0].sendTo(channel, key(peers[1]), {
       control, n, data: 'z'.repeat(20_000),
     }), true);
   }
-  assert.equal(directed.nodes[1].receiveThrottleStats(directed.toRecipient.from).blocks, 1);
+  assert.equal(directed.nodes[1].receiveThrottleStats(directed.toRecipient.from).blocks, 0);
 });
 
 test('transparent routing is restricted to the five addressed Mayhem controls on their canonical channel', async (t) => {

@@ -34,6 +34,12 @@ const DEFAULT_MAX_RELAY_SOURCES = 1024;
 const DEFAULT_POW_YIELD_EVERY = 4_096;
 const DEFAULT_MAX_POW_QUEUE = 64;
 const MAX_MESSAGE_ID_BYTES = 256;
+const OUTBOUND_MAX_BYTES = 512_000;
+const OUTBOUND_MAX_MESSAGES = 128;
+const OUTBOUND_GLOBAL_MAX_BYTES = 8_192_000;
+const OUTBOUND_GLOBAL_MAX_MESSAGES = 2048;
+const OUTBOUND_MAX_AGE_MS = 10_000;
+const OUTBOUND_PRIORITY_QUANTUM_BYTES = 64_000;
 const MAYHEM_DIRECT_CHANNEL = '0000mayhem-relay';
 const MAYHEM_DIRECT_RESULTS = new Set([
   'mayhem_feature_result', 'mayhem_feature_result_ack',
@@ -105,6 +111,9 @@ class Sidechannel extends Feature {
     this.channels = new Map();
     this.connections = new Map();
     this.rateLimits = new Map();
+    this.outbound = new Map();
+    this.outboundBytes = 0;
+    this.outboundMessages = 0;
     this.preparedConnections = new WeakSet();
     this.closedConnections = new WeakSet();
     this.directRecoveries = new Map();
@@ -519,6 +528,138 @@ class Sidechannel extends Feature {
     return true;
   }
 
+  _addressedRecipient(channel, message) {
+    if (channel !== MAYHEM_DIRECT_CHANNEL
+      || (message?.control !== 'mayhem_service_request' && !MAYHEM_DIRECT_RESULTS.has(message?.control))) return undefined;
+    const recipient = normalizeKeyHex(message.control === 'mayhem_service_request' ? message.value?.admin : message.to);
+    return recipient && /^[0-9a-f]{64}$/.test(recipient) ? recipient : null;
+  }
+
+  _outboundCurrent(connection, item) {
+    return !this.closedConnections.has(connection)
+      && connection?.destroyed !== true && connection?.closed !== true
+      && this.channels.get(item.entry.name) === item.entry
+      && this.connections.get(connection)?.get(item.entry.name) === item.record
+      && typeof item.record.message?.send === 'function'
+      && item.record.channel?.closed !== true && item.record.channel?.destroyed !== true
+      && (item.allowPreAuthSend || this._remoteAuthorized(item.entry.name, connection));
+  }
+
+  // One owner for every channel on a physical connection, matching the receive
+  // bucket's scope. Leave rate/burst headroom and pace large admissible frames
+  // by charging their entire envelope, including debt beyond the small burst.
+  _queueOutbound(connection, record, entry, payload, allowPreAuthSend) {
+    let encoded;
+    let bytes;
+    try { encoded = JSON.stringify(payload); bytes = b4a.byteLength(encoded, 'utf8'); } catch (_error) { return false; }
+    const maxBytes = this.rateBytesPerSecond > 0
+      ? Math.min(this._maxMessageBytes(entry.name), this.rateBurstBytes)
+      : this._maxMessageBytes(entry.name);
+    if (bytes > maxBytes) return false;
+    // Retain the exact bounded bytes admitted here, not mutable caller objects.
+    payload = JSON.parse(encoded);
+    const now = this._now();
+    const control = payload?.message?.control;
+    const priority = normalizeKeyHex(payload.from) === normalizeKeyHex(this.peer?.wallet?.publicKey)
+      && (control === 'auth' || control === 'welcome'
+        || this._addressedRecipient(entry.name, payload.message) === this._getRemoteKey(connection));
+    const item = { record, entry, payload, bytes, allowPreAuthSend, at: now };
+    if (!this._outboundCurrent(connection, item)) return false;
+    let state = this.outbound.get(connection);
+    if (!state) {
+      state = { priority: [], normal: [], bytes: 0, messages: 0, normalBytes: 0,
+        tokens: Math.min(64_000, this.rateBurstBytes), lastRefill: now,
+        priorityBytes: 0, timer: null, draining: false };
+      this.outbound.set(connection, state);
+    }
+    this._drainOutbound(connection);
+    if (this.outbound.get(connection) !== state || !this._outboundCurrent(connection, item)) return false;
+    // Background fanout cannot fill the reserved half of either queue budget.
+    if (state.messages >= OUTBOUND_MAX_MESSAGES || state.bytes + bytes > OUTBOUND_MAX_BYTES
+      || this.outboundMessages >= OUTBOUND_GLOBAL_MAX_MESSAGES
+      || this.outboundBytes + bytes > OUTBOUND_GLOBAL_MAX_BYTES
+      || (!priority && (state.normal.length >= OUTBOUND_MAX_MESSAGES / 2
+        || state.normalBytes + bytes > OUTBOUND_MAX_BYTES / 2
+        || this.outboundMessages >= OUTBOUND_GLOBAL_MAX_MESSAGES / 2
+        || this.outboundBytes + bytes > OUTBOUND_GLOBAL_MAX_BYTES / 2))) return false;
+    state[priority ? 'priority' : 'normal'].push(item);
+    state.bytes += bytes;
+    state.messages += 1;
+    if (!priority) state.normalBytes += bytes;
+    this.outboundBytes += bytes;
+    this.outboundMessages += 1;
+    this._drainOutbound(connection);
+    return item.sendFailed !== true;
+  }
+
+  _takeOutbound(state, queue) {
+    const item = queue.shift();
+    state.bytes -= item.bytes;
+    state.messages -= 1;
+    if (queue === state.normal) state.normalBytes -= item.bytes;
+    this.outboundBytes -= item.bytes;
+    this.outboundMessages -= 1;
+    return item;
+  }
+
+  _drainOutbound(connection) {
+    const state = this.outbound.get(connection);
+    if (!state || state.draining) return;
+    if (state.timer !== null) clearTimeout(state.timer);
+    state.timer = null;
+    state.draining = true;
+    let waitMs = 50;
+    try {
+      const now = this._now();
+      const burst = Math.min(64_000, this.rateBurstBytes);
+      const rate = Math.max(1, Math.min(64_000, this.rateBytesPerSecond) * 0.75);
+      if (now > state.lastRefill) {
+        state.tokens = Math.min(burst, state.tokens + (now - state.lastRefill) * rate / 1000);
+        state.lastRefill = now;
+      }
+      while (state.messages > 0 && this.outbound.get(connection) === state) {
+        for (const queue of [state.priority, state.normal]) {
+          while (queue.length && (now - queue[0].at >= OUTBOUND_MAX_AGE_MS
+            || !this._outboundCurrent(connection, queue[0]))) this._takeOutbound(state, queue);
+        }
+        if (!state.messages) break;
+        let queue = state.priority.length
+          && (!state.normal.length || state.priorityBytes < OUTBOUND_PRIORITY_QUANTUM_BYTES)
+          ? state.priority : state.normal;
+        const ready = item => item?.record.channel?.opened === true && item.record.channel.drained !== false;
+        if (!ready(queue[0])) {
+          const other = queue === state.priority ? state.normal : state.priority;
+          if (!ready(other[0])) break;
+          queue = other;
+        }
+        const item = queue[0];
+        const needed = Math.min(item.bytes, burst);
+        if (this.rateBytesPerSecond > 0 && state.tokens < needed) {
+          waitMs = Math.max(1, Math.ceil((needed - state.tokens) * 1000 / rate));
+          break;
+        }
+        this._takeOutbound(state, queue);
+        state.tokens -= item.bytes;
+        state.priorityBytes = queue === state.priority ? state.priorityBytes + item.bytes : 0;
+        try {
+          // false means Protomux accepted the frame into its own queue. Never
+          // enqueue it again; subsequent frames wait for channel.drained.
+          const sent = item.record.message.send(item.payload);
+          if (sent === false) break;
+        } catch (error) {
+          item.sendFailed = true;
+          this._reportEventError(`paced send ${item.entry.name}`, error, connection);
+        }
+      }
+    } finally {
+      state.draining = false;
+      if (state.messages > 0 && this.outbound.get(connection) === state) {
+        state.timer = setTimeout(() => this._drainOutbound(connection), Math.min(waitMs, 1000));
+        state.timer.unref?.();
+      }
+    }
+  }
+
   _buildPayload(channel, message, invite = null, { deferPow = false } = {}) {
     const ts = this._now();
     // Encode keys as hex strings, not Buffers, because we transmit payloads via JSON encoding.
@@ -581,6 +722,11 @@ class Sidechannel extends Feature {
     if (control === 'auth' || control === 'welcome') return;
     const ttl = Number.isFinite(payload?.ttl) ? payload.ttl : 0;
     if (ttl <= 0) return;
+    // Legacy senders still broadcast these signed, addressed frames. The final
+    // recipient consumes them; a one-hop relay can forward only to that exact
+    // destination. Unaddressed native feature requests retain their gossip path.
+    const recipient = this._addressedRecipient(channel, payload.message);
+    if (recipient === null || recipient === normalizeKeyHex(this.peer?.wallet?.publicKey)) return;
     const relayed = {
       ...payload,
       ttl: ttl - 1,
@@ -605,14 +751,16 @@ class Sidechannel extends Feature {
     if (relayedBytes > this._maxMessageBytes(channel)) return;
     for (const [connection, perConn] of this.connections.entries()) {
       if (connection === originConnection) continue;
+      if (recipient !== undefined && this._getRemoteKey(connection) !== recipient) continue;
       if (!this._remoteAuthorized(channel, connection)) continue;
       const record = perConn.get(channel);
       if (record?.message) {
         if (!this._checkRelayBudget(author, relayedBytes)) continue;
         try {
-          record.message.send(relayed);
-          this.relayCounters.messages += 1;
-          this.relayCounters.bytes += relayedBytes;
+          if (this._queueOutbound(connection, record, this.channels.get(channel), relayed, false)) {
+            this.relayCounters.messages += 1;
+            this.relayCounters.bytes += relayedBytes;
+          }
         } catch (error) {
           this._reportEventError(`relay ${channel}`, error, connection);
         }
@@ -1320,10 +1468,10 @@ class Sidechannel extends Feature {
     if (!record?.message) return;
     const payload = this._buildPayload(entry.name, { control: 'welcome', welcome });
     this._rememberSeen(payload.id, this._now());
-    record.message.send(payload);
+    this._queueOutbound(connection, record, entry, payload, true);
   }
 
-  _sendAuth(record, entry) {
+  _sendAuth(record, entry, connection) {
     if (!record?.message || record.authSent) return;
     if (!this._inviteRequired(entry.name)) return;
     const selfKey = normalizeKeyHex(this.peer?.wallet?.publicKey);
@@ -1337,8 +1485,7 @@ class Sidechannel extends Feature {
       invite,
     });
     this._rememberSeen(payload.id, this._now());
-    record.message.send(payload);
-    record.authSent = true;
+    record.authSent = this._queueOutbound(connection, record, entry, payload, true);
   }
 
   _remoteAuthorized(channel, connection) {
@@ -1659,7 +1806,7 @@ class Sidechannel extends Feature {
           if (record.openTimer) clearTimeout(record.openTimer);
           if (perConn._openRetries) perConn._openRetries.delete(entry.name);
           this._sendWelcome(record, entry, connection);
-          this._sendAuth(record, entry);
+          this._sendAuth(record, entry, connection);
           return;
         }
         if (record.openTimer) clearTimeout(record.openTimer);
@@ -1969,7 +2116,9 @@ class Sidechannel extends Feature {
       return false;
     }
     const payloadBytes = b4a.byteLength(payloadJson, 'utf8');
-    const maxMessageBytes = this._maxMessageBytes(channel);
+    const maxMessageBytes = this.rateBytesPerSecond > 0
+      ? Math.min(this._maxMessageBytes(channel), this.rateBurstBytes)
+      : this._maxMessageBytes(channel);
     if (payloadBytes > maxMessageBytes) {
       console.log(
         `[sidechannel:${channel}] message too large (${payloadBytes} bytes > ${maxMessageBytes}).`
@@ -1985,6 +2134,8 @@ class Sidechannel extends Feature {
       console.log(`[sidechannel:${channel}] sending to ${this.connections.size} connections`);
     }
     this._rememberSeen(payload.id, this._now());
+    let eligible = 0;
+    let accepted = false;
     for (const [connection, perConn] of this.connections.entries()) {
       if (!allowPreAuthSend && !this._remoteAuthorized(channel, connection)) {
         if (this.debug) {
@@ -1994,33 +2145,13 @@ class Sidechannel extends Feature {
       }
       const record = perConn.get(channel);
       if (record?.message) {
-        if (!record.channel?.opened) {
-          record.channel
-            ?.fullyOpened()
-            .then((opened) => {
-              if (
-                opened &&
-                !this.closedConnections.has(connection) &&
-                this.connections.get(connection)?.get(channel) === record &&
-                this.channels.get(channel) === entry
-              ) {
-                record.message.send(payload);
-              }
-            })
-            .catch((error) => {
-              this._reportEventError(`deferred send ${channel}`, error, connection);
-            });
-        } else {
-          try {
-            record.message.send(payload);
-          } catch (error) {
-            this._reportEventError(`send ${channel}`, error, connection);
-          }
-        }
+        eligible += 1;
+        if (this._queueOutbound(connection, record, entry, payload, allowPreAuthSend)) accepted = true;
       } else if (this.debug) {
         console.log(`[sidechannel:${channel}] no message session for connection.`);
       }
     }
+    return accepted || eligible === 0;
   }
 
   _queuePowBroadcast(entry, payload, allowPreAuthSend) {
@@ -2082,7 +2213,7 @@ class Sidechannel extends Feature {
     try {
       // Protomux send(false) means the frame was queued with backpressure. It
       // must not be sent again here; channel.drained gates subsequent calls.
-      record.message.send(payload);
+      if (!this._queueOutbound(connection, record, entry, payload, allowPreAuthSend)) return false;
       this._rememberSeen(payload.id, this._now());
       return true;
     } catch (error) {
@@ -2206,8 +2337,7 @@ class Sidechannel extends Feature {
       return this._queuePowBroadcast(entry, payload, allowPreAuthSend);
     }
     if (!this._payloadWithinBounds(channel, payload)) return false;
-    this._sendBroadcastPayload(entry, payload, allowPreAuthSend);
-    return true;
+    return this._sendBroadcastPayload(entry, payload, allowPreAuthSend);
   }
 
   async start() {
@@ -2319,6 +2449,16 @@ class Sidechannel extends Feature {
     }
     this.connections.delete(connection);
     this.rateLimits.delete(connection);
+    const outbound = this.outbound.get(connection);
+    if (outbound) {
+      if (outbound.timer !== null) clearTimeout(outbound.timer);
+      this.outboundBytes -= outbound.bytes;
+      this.outboundMessages -= outbound.messages;
+      outbound.priority.length = 0;
+      outbound.normal.length = 0;
+      outbound.bytes = outbound.messages = outbound.normalBytes = 0;
+      this.outbound.delete(connection);
+    }
   }
 
   async stop() {
@@ -2344,6 +2484,10 @@ class Sidechannel extends Feature {
     this.directRecoveries.clear();
     this.directConnectFailures.clear();
     this.rateLimits.clear();
+    for (const state of this.outbound.values()) if (state.timer !== null) clearTimeout(state.timer);
+    this.outbound.clear();
+    this.outboundBytes = 0;
+    this.outboundMessages = 0;
     this.relaySourceLimits.clear();
   }
 }
