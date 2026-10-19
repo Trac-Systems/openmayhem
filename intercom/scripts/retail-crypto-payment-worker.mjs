@@ -679,12 +679,14 @@ function e18ToDecimal(amount) {
   return fraction ? `${whole}.${fraction}` : whole.toString();
 }
 
-async function waitForCoreRecord(config, work, key, expectedAu, timeoutSeconds = 600) {
+export async function waitForCoreRecord(config, work, key, timeoutSeconds = 600) {
   const deadline = Date.now() + timeoutSeconds * 1_000;
   while (Date.now() <= deadline) {
     const record = await readCore(config.coreRpc, key);
     const value = record.value;
-    if (value && typeof value.au === 'string' && BigInt(value.au) >= BigInt(expectedAu)) {
+    // Deposits are immutable. A confirmed value below the retail quote is a
+    // funding difference for the API to cover, not an unconfirmed transaction.
+    if (value && typeof value.au === 'string' && /^[1-9][0-9]*$/.test(value.au)) {
       return { value, signedLength: BigInt(record.signed_length), key };
     }
     await config.api.renew(work);
@@ -778,9 +780,9 @@ async function bridgeTnk(config, work, checkpoint) {
   }
   const record = credited.value
     ? { value: credited.value, signedLength: BigInt(credited.signed_length), key: creditedKey }
-    : await waitForCoreRecord(config, work, creditedKey, intent.expected_core_au, config.bridgeTimeoutSeconds);
+    : await waitForCoreRecord(config, work, creditedKey, config.bridgeTimeoutSeconds);
   if (String(record.value.user).toLowerCase() !== config.platformBuyer ||
-      BigInt(record.value.au) < BigInt(intent.expected_core_au)) {
+      !/^[1-9][0-9]*$/.test(String(record.value.au))) {
     throw new RetryWork('core_bridge_pending', 30, true);
   }
   checkpoint.core_record_key = record.key;
@@ -933,8 +935,8 @@ async function bridgeTap(config, work, checkpoint, rpc) {
     block_hash: normalizeHex(deposit.blockHash, 32, 'TAP bridge block hash'),
   };
   const key = `dep/tap/${tapDepositKey(normalized)}`;
-  const record = await waitForCoreRecord(config, work, key, intent.expected_core_au, config.bridgeTimeoutSeconds);
-  if (String(record.value.who).toLowerCase() !== config.platformBuyer || BigInt(record.value.au) < BigInt(intent.expected_core_au)) {
+  const record = await waitForCoreRecord(config, work, key, config.bridgeTimeoutSeconds);
+  if (String(record.value.who).toLowerCase() !== config.platformBuyer || !/^[1-9][0-9]*$/.test(String(record.value.au))) {
     throw new RetryWork('core_bridge_pending', 30, true);
   }
   checkpoint.core_record_key = key;
@@ -969,10 +971,17 @@ async function processWork(config, work) {
     ? await bridgeTap(config, work, checkpoint, rpc ?? new TapRpc(config.tapRpcUrls, config.tapChainId))
     : await bridgeTnk(config, work, checkpoint);
   console.log(JSON.stringify({ event: 'crypto_payment_core_backed', intent_id: work.intent.id, rail: work.intent.rail }));
-  await config.api.evidence(work, { ...external, core });
+  const result = await config.api.evidence(work, { ...external, core });
+  assertRetailCreditCompleted(result);
   checkpoint.credited = true;
   checkpoint.credited_at = new Date().toISOString();
   atomicJson(checkpointFile, checkpoint);
+}
+
+export function assertRetailCreditCompleted(result) {
+  if (result?.status !== 'SUCCEEDED') {
+    throw new RetryWork('bridge_funding_shortfall', 30, true);
+  }
 }
 
 async function processWorkWithLease(config, work) {
