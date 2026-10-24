@@ -20,6 +20,14 @@ fn setup_policy(
     tokenizer: Option<Digest>,
     identity: Option<Identity>,
 ) -> (Arc<capacity::Authority>, health::Monitor) {
+    setup_with_ttl(f, tokenizer, identity, 60_000)
+}
+fn setup_with_ttl(
+    f: &Fixture,
+    tokenizer: Option<Digest>,
+    identity: Option<Identity>,
+    ttl_ms: u64,
+) -> (Arc<capacity::Authority>, health::Monitor) {
     let a = Arc::new(
         capacity::Authority::open(
             f._store.path().join("probe-capacity"),
@@ -63,7 +71,7 @@ fn setup_policy(
         health::Policy {
             max_routes: 8,
             max_classes_per_route: 8,
-            evidence_ttl_ms: 60_000,
+            evidence_ttl_ms: ttl_ms,
             successes_to_increase: 2,
             bad_samples_to_reduce: 2,
             latency_baseline_samples: 3,
@@ -152,6 +160,68 @@ fn probe_counts(a: &capacity::Authority, expected: u32) {
         assert_eq!(a.group_status(&d(group)).unwrap().occupied, expected);
     }
     assert_eq!(a.status(&d(20)).unwrap().route_occupied, expected);
+}
+
+#[tokio::test]
+async fn idle_refresh_runs_before_expiry_and_remains_budgeted_for_chat_and_decisions() {
+    for (endpoint, input, output) in [
+        (
+            ProxyEndpoint::Chat,
+            serde_json::from_slice(&chat()).unwrap(),
+            answer(),
+        ),
+        (
+            ProxyEndpoint::Decisions,
+            json!({"model":"public-model","state":"hi","questions":{"q":{"type":"noul","instructions":"hello?"}}}),
+            json!({"id":"u","answers":{"q":{"type":"noul","noul":0.7}}}),
+        ),
+    ] {
+        let backend = backend(200, output, Duration::ZERO).await;
+        let f = Fixture::new(&backend.base, endpoint);
+        let (a, m) = setup_with_ttl(&f, None, None, 1_000);
+        let body = bounded(input, endpoint);
+        let c = controller(
+            &f,
+            a.clone(),
+            m.clone(),
+            &body,
+            false,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        c.run().await.unwrap();
+        assert!(matches!(
+            c.run().await,
+            Err(probes::ProbeError::Health(health::Error::RecoveryBusy))
+        ));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert!(a.status(&d(20)).unwrap().available > 0);
+        c.run().await.unwrap();
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        probe_counts(&a, 0);
+        // Pass the original expiry; the second real response renewed health.
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert!(a.status(&d(20)).unwrap().available > 0);
+        c.run().await.unwrap();
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 3);
+        tokio::time::sleep(Duration::from_millis(550)).await;
+        assert!(matches!(
+            c.run().await,
+            Err(probes::ProbeError::Execution(Error::Capacity(
+                capacity::Error::ProbeBudget
+            )))
+        ));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(a.probe_budget(&d(10)).unwrap().unwrap().used_attempts, 3);
+        probe_counts(&a, 0);
+        assert!(f
+            .journal
+            .recovery_page(None, 64)
+            .unwrap()
+            .records
+            .is_empty());
+    }
 }
 
 #[tokio::test]

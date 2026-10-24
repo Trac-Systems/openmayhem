@@ -400,30 +400,56 @@ impl Monitor {
     /// Passive observation of an independently admitted request. This cannot
     /// bypass the durable capacity/financial admission checks of its caller.
     pub fn observe_request(&self, id: &Digest, class: Class) -> Result<Sample> {
-        self.sample(id, class, false, false)
+        self.sample(id, class, false, false, None)
     }
     /// At most one observation per shared scope. A permit is NOT authority to
     /// launch paid traffic: the caller needs independent durable probe admission,
     /// operator funding and safe same-job recovery before making any request.
     pub fn observe_recovery(&self, id: &Digest, class: Class) -> Result<Sample> {
-        self.sample(id, class, true, false)
+        self.sample(id, class, true, false, None)
     }
     /// Only the operator-funded probe controller may exercise a spare physical
     /// slot when durable occupancy consumes a fresh health allowance. Capacity
     /// independently verifies saturation, ceilings and the reserved probe.
     pub(crate) fn observe_capacity_recovery(&self, id: &Digest, class: Class) -> Result<Sample> {
-        self.sample(id, class, true, true)
+        self.sample(id, class, true, true, None)
+    }
+    /// Refresh still-valid evidence using an independently reserved free slot.
+    /// This never extends evidence or creates capacity before a verified result.
+    pub(crate) fn refresh_due(&self, id: &Digest, lead: Duration) -> Result<bool> {
+        let view = self.snapshot(id)?;
+        Ok(!view.recovery_in_progress
+            && view.recovery_after_ms == 0
+            && refresh_window(&view, &self.inner.policy, lead))
+    }
+    pub(crate) fn observe_refresh(
+        &self,
+        id: &Digest,
+        class: Class,
+        lead: Duration,
+    ) -> Result<Sample> {
+        self.sample(id, class, true, false, Some(lead))
     }
     fn recovery_is_current(&self, sample: &Sample) -> Result<bool> {
         let data = self.inner.data.lock().map_err(|_| Error::Unavailable)?;
         let route = data.routes.get(&sample.route).ok_or(Error::Invalid)?;
+        let view = snapshot(&data, &sample.route, &self.inner.policy, Instant::now())?;
         Ok(sample.recovery
             && data.recovery == Some(sample.sequence)
             && sample.generation == (data.connection.generation, route.gate.generation)
-            && snapshot(&data, &sample.route, &self.inner.policy, Instant::now())?.allowance
-                == sample.recovery_allowance)
+            && view.allowance == sample.recovery_allowance
+            && sample
+                .refresh_lead
+                .is_none_or(|lead| refresh_window(&view, &self.inner.policy, lead)))
     }
-    fn sample(&self, id: &Digest, class: Class, recovery: bool, expansion: bool) -> Result<Sample> {
+    fn sample(
+        &self,
+        id: &Digest,
+        class: Class,
+        recovery: bool,
+        expansion: bool,
+        refresh: Option<Duration>,
+    ) -> Result<Sample> {
         if class.input_bytes_log2 > usize::BITS as u8 {
             return Err(Error::Invalid);
         }
@@ -433,7 +459,10 @@ impl Monitor {
         if recovery
             && (data.recovery.is_some()
                 || view.recovery_after_ms > 0
-                || (view.allowance > 0) != expansion)
+                || match refresh {
+                    Some(lead) => !refresh_window(&view, &self.inner.policy, lead),
+                    None => (view.allowance > 0) != expansion,
+                })
         {
             return Err(Error::RecoveryBusy);
         }
@@ -452,12 +481,23 @@ impl Monitor {
             sequence,
             recovery,
             view.allowance,
+            refresh,
             now,
         ))
     }
 }
 fn millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+fn refresh_window(view: &Snapshot, policy: &Policy, lead: Duration) -> bool {
+    // Leave time for the bounded probe, but never turn a long timeout into
+    // continuous monitoring. Paid observations postpone refresh naturally.
+    let lead_ms = millis(lead).max(1).min(policy.evidence_ttl_ms / 2);
+    view.state == State::Ready
+        && view.allowance > 0
+        && view.evidence_age_ms.is_some_and(|age| {
+            age >= policy.evidence_ttl_ms.saturating_sub(lead_ms) && age < policy.evidence_ttl_ms
+        })
 }
 fn snapshot(data: &Data, id: &Digest, policy: &Policy, now: Instant) -> Result<Snapshot> {
     let route = data.routes.get(id).ok_or(Error::Invalid)?;
@@ -733,6 +773,22 @@ impl Monitor {
                     if route.native.as_ref().is_none_or(|(old, _, _)| at >= *old) {
                         route.native = Some((at, rate, tokenizer.clone()));
                     }
+                }
+                if sample.refresh_lead.is_some()
+                    && route.required_tokenizer.is_some()
+                    && measurement.native_tok_s.is_none()
+                {
+                    // An inconclusive proactive probe must neither recycle the
+                    // previous speed's lifetime nor loop on every scheduler tick.
+                    // Keep still-valid evidence, with bounded retry backoff; its
+                    // original expiry continues to close admission if needed.
+                    let failures = route.gate.failures.saturating_add(1);
+                    let delay = data.schedule.retry(failures);
+                    let route = data.routes.get_mut(&sample.route).expect("route checked");
+                    route.gate.failures = failures;
+                    route.gate.retry_start = evaluated_at;
+                    route.gate.retry_ms = delay;
+                    return;
                 }
                 // A technically valid short/buffered probe may fail to establish
                 // the required speed. Back off instead of repeatedly charging

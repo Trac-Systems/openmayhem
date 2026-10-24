@@ -27,6 +27,7 @@ pub struct Sample {
     pub(super) sequence: u64,
     pub(super) recovery: bool,
     pub(super) recovery_allowance: u32,
+    pub(super) refresh_lead: Option<Duration>,
     start: Instant,
     headers: Option<Instant>,
     first: Option<Instant>,
@@ -72,6 +73,7 @@ impl Sample {
         sequence: u64,
         recovery: bool,
         recovery_allowance: u32,
+        refresh_lead: Option<Duration>,
         start: Instant,
     ) -> Self {
         Self {
@@ -82,6 +84,7 @@ impl Sample {
             sequence,
             recovery,
             recovery_allowance,
+            refresh_lead,
             start,
             headers: None,
             first: None,

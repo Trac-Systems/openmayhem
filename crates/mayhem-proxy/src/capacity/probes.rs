@@ -88,7 +88,13 @@ pub struct Probe {
 pub struct Reservation {
     probe: Probe,
     owner: Digest,
-    expansion: bool,
+    admission: Admission,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Admission {
+    Recovery,
+    Expansion,
+    Refresh,
 }
 impl Reservation {
     pub fn probe(&self) -> &Probe {
@@ -280,7 +286,7 @@ impl Authority {
     /// This ignores only health allowance, never physical/configured ceilings or
     /// active/uncertain work. Obtain a due Monitor::observe_recovery first.
     pub fn reserve_probe(&self, specification: Specification) -> Result<Reservation> {
-        self.reserve_probe_inner(specification, None, false)
+        self.reserve_probe_inner(specification, None, Admission::Recovery)
     }
     /// A single attempt for a previously persisted intent. Duplicate/stale
     /// callers must recover the original ID; no existing reservation is ever
@@ -294,7 +300,7 @@ impl Authority {
         self.reserve_probe_inner(
             specification,
             Some((id, intent.expected_used_attempts)),
-            false,
+            Admission::Recovery,
         )
     }
     pub(crate) fn reserve_capacity_probe(
@@ -308,13 +314,28 @@ impl Authority {
                     .map(|id| (id, intent.expected_used_attempts))
             })
             .transpose()?;
-        self.reserve_probe_inner(specification, intent, true)
+        self.reserve_probe_inner(specification, intent, Admission::Expansion)
+    }
+    /// Proactive monitoring consumes only already-healthy free capacity. Unlike
+    /// recovery/expansion, it may not bypass any live health allowance.
+    pub(crate) fn reserve_refresh_probe(
+        &self,
+        specification: Specification,
+        intent: Option<ReservationIntent>,
+    ) -> Result<Reservation> {
+        let intent = intent
+            .map(|intent| {
+                self.probe_intent_id(&specification, &intent)
+                    .map(|id| (id, intent.expected_used_attempts))
+            })
+            .transpose()?;
+        self.reserve_probe_inner(specification, intent, Admission::Refresh)
     }
     fn reserve_probe_inner(
         &self,
         specification: Specification,
         intent: Option<(Digest, u64)>,
-        expansion: bool,
+        admission: Admission,
     ) -> Result<Reservation> {
         let tx = self.write()?;
         let mut m = meta(&tx)?;
@@ -344,20 +365,23 @@ impl Authority {
         }
         let mut groups = db(tx.open_table(GROUPS))?;
         let mut values = load_groups(&groups, &route)?;
-        if expansion && self.allowances(&values, &route, self.now()?)?.free != 0 {
+        if admission == Admission::Expansion
+            && self.allowances(&values, &route, self.now()?)?.free != 0
+        {
             return Err(Error::Busy);
         }
-        if self
-            .allowances_with_recovery(
+        let allowances = if admission == Admission::Refresh {
+            self.allowances(&values, &route, self.now()?)?
+        } else {
+            self.allowances_with_recovery(
                 &values,
                 &route,
                 self.now()?,
                 Some(&specification.budget_group),
-                expansion.then_some(false),
+                (admission == Admission::Expansion).then_some(false),
             )?
-            .free
-            == 0
-        {
+        };
+        if allowances.free == 0 {
             return Err(Error::Busy);
         }
         let mut budgets = db(tx.open_table(BUDGETS))?;
@@ -420,7 +444,7 @@ impl Authority {
         Ok(Reservation {
             probe,
             owner: self.nonce.clone(),
-            expansion,
+            admission,
         })
     }
     /// Commit before sending. No read/reconnect can recreate this consumable permit.
@@ -439,16 +463,18 @@ impl Authority {
         let ids = valid_spec(&probe.specification, &route)?;
         require_index(&db(tx.open_table(SCOPES))?, &ids, &probe.id)?;
         let groups = load_groups(&db(tx.open_table(GROUPS))?, &route)?;
-        if !self
-            .allowances_with_recovery(
+        let allowances = if reservation.admission == Admission::Refresh {
+            self.allowances(&groups, &route, self.now()?)?
+        } else {
+            self.allowances_with_recovery(
                 &groups,
                 &route,
                 self.now()?,
                 Some(&probe.specification.budget_group),
-                reservation.expansion.then_some(true),
+                (reservation.admission == Admission::Expansion).then_some(true),
             )?
-            .fits
-        {
+        };
+        if !allowances.fits {
             return Err(Error::Busy);
         }
         // A lowered/disabled allowance stops an unsent probe; allocations already

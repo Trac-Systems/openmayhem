@@ -32,6 +32,90 @@ fn monitor() -> Monitor {
 }
 
 #[tokio::test(start_paused = true)]
+async fn idle_refresh_is_due_before_expiry_and_preserves_valid_evidence() {
+    let m = monitor();
+    let class = Class::new(1, Thinking::Disabled, false);
+    let lead = Duration::from_secs(30);
+    m.observe_recovery(&d(2), class).unwrap().success(None);
+    assert!(!m.refresh_due(&d(2), lead).unwrap());
+    assert!(matches!(
+        m.observe_refresh(&d(2), class, lead),
+        Err(Error::RecoveryBusy)
+    ));
+    advance(30_000).await;
+    assert!(m.refresh_due(&d(2), lead).unwrap());
+    let sample = m.observe_refresh(&d(2), class, lead).unwrap();
+    assert_eq!(m.snapshot(&d(2)).unwrap().allowance, 1);
+    assert_eq!(m.snapshot(&d(2)).unwrap().evidence_age_ms, Some(30_000));
+    assert!(sample.recovery_is_current().unwrap());
+    assert!(matches!(
+        m.observe_refresh(&d(2), class, lead),
+        Err(Error::RecoveryBusy)
+    ));
+    assert!(matches!(
+        m.observe_recovery(&d(1), class),
+        Err(Error::RecoveryBusy)
+    ));
+    advance(5_000).await;
+    sample.success(None);
+    assert_eq!(m.snapshot(&d(2)).unwrap().evidence_age_ms, Some(0));
+    assert!(m.snapshot(&d(2)).unwrap().allowance > 0);
+    assert!(!m.refresh_due(&d(2), lead).unwrap());
+}
+
+#[tokio::test(start_paused = true)]
+async fn idle_refresh_does_not_extend_evidence_or_override_new_faults() {
+    for fault in [false, true] {
+        let m = monitor();
+        let class = Class::new(1, Thinking::Disabled, false);
+        m.observe_recovery(&d(2), class).unwrap().success(None);
+        advance(30_000).await;
+        let sample = m
+            .observe_refresh(&d(2), class, Duration::from_secs(30))
+            .unwrap();
+        if fault {
+            m.observe_request(&d(2), class)
+                .unwrap()
+                .failure(Failure::new(
+                    Code::UpstreamRateLimited,
+                    crate::connector::failure::Scope::Connection,
+                    Stage::ResponseHeaders,
+                    Execution::Unknown,
+                ));
+        } else {
+            advance(30_000).await;
+        }
+        assert!(!sample.recovery_is_current().unwrap());
+        drop(sample);
+        assert_eq!(m.snapshot(&d(2)).unwrap().allowance, 0);
+        assert!(!m.refresh_due(&d(2), Duration::from_secs(30)).unwrap());
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn paid_activity_postpones_idle_refresh_and_long_probe_timeout_is_bounded() {
+    let m = monitor();
+    let class = Class::new(1, Thinking::Disabled, false);
+    m.observe_recovery(&d(2), class).unwrap().success(None);
+    advance(20_000).await;
+    assert!(!m.refresh_due(&d(2), Duration::from_secs(3600)).unwrap());
+    advance(10_000).await;
+    assert!(m.refresh_due(&d(2), Duration::from_secs(3600)).unwrap());
+    m.observe_request(&d(2), class).unwrap().success(None);
+    assert!(!m.refresh_due(&d(2), Duration::from_secs(30)).unwrap());
+    advance(29_999).await;
+    assert!(!m.refresh_due(&d(2), Duration::from_secs(30)).unwrap());
+    advance(1).await;
+    assert!(m.refresh_due(&d(2), Duration::from_secs(30)).unwrap());
+    let pending = m
+        .observe_refresh(&d(2), class, Duration::from_secs(30))
+        .unwrap();
+    assert!(pending.recovery_is_current().unwrap());
+    m.observe_request(&d(2), class).unwrap().success(None);
+    assert!(!pending.recovery_is_current().unwrap());
+}
+
+#[tokio::test(start_paused = true)]
 async fn capacity_recovery_keeps_single_owner_and_invalidates_changed_or_stale_evidence() {
     let m = monitor();
     let class = Class::new(1, Thinking::Disabled, false);
@@ -164,6 +248,103 @@ fn paid_reservation_with_expansion_probe(
         )
         .unwrap();
     (dir, a, m, paid, prepared)
+}
+
+#[tokio::test(start_paused = true)]
+async fn refresh_capacity_preserves_paid_alias_work_and_never_bypasses_health_or_budget() {
+    use crate::capacity::{self, probes};
+    for paid_route in [1, 2] {
+        for failure in ["none", "stale", "fault", "ceiling"] {
+            let (_dir, a, m, paid, old) = paid_reservation_with_expansion_probe(paid_route);
+            let specification = old.probe().specification.clone();
+            assert!(a.cancel_prepared_probe(&old.probe().id).unwrap());
+            let class = Class::new(1, Thinking::Disabled, false);
+            for _ in 0..2 {
+                m.observe_request(&d(2), class).unwrap().success(None);
+            }
+            assert_eq!(a.status(&d(2)).unwrap().available, 1);
+            // An expired budget cannot be bypassed by calling refresh.
+            assert!(matches!(
+                a.reserve_refresh_probe(specification.clone(), None),
+                Err(capacity::Error::ProbeBudget)
+            ));
+            a.configure_probe_budget(
+                &d(21),
+                probes::Budget {
+                    max_attempts: 2,
+                    max_cost_microusd: 20,
+                    per_attempt_cost_microusd: 10,
+                },
+            )
+            .unwrap();
+            advance(30_000).await;
+            let prepared = a
+                .reserve_refresh_probe(specification.clone(), None)
+                .unwrap();
+            let probe_id = prepared.probe().id.clone();
+            assert_eq!(a.group_status(&d(20)).unwrap().occupied, 2);
+            assert!(a.reserve_refresh_probe(specification, None).is_err());
+            a.check_reserved(paid.lease()).unwrap();
+            match failure {
+                "stale" => advance(30_000).await,
+                "fault" => m
+                    .observe_request(&d(2), class)
+                    .unwrap()
+                    .failure(Failure::new(
+                        Code::UpstreamRateLimited,
+                        crate::connector::failure::Scope::Connection,
+                        Stage::ResponseHeaders,
+                        Execution::Unknown,
+                    )),
+                "ceiling" => a.configure_allocation_group(d(20), 1).unwrap(),
+                _ => (),
+            }
+            let dispatched = a.dispatch_probe(prepared);
+            if failure == "none" {
+                let probe = dispatched.unwrap();
+                a.check_reserved(paid.lease()).unwrap();
+                a.complete_probe(probes::VerifiedCompletion {
+                    probe: probe.probe().clone(),
+                    evidence: d(90),
+                })
+                .unwrap();
+            } else {
+                assert!(dispatched.is_err());
+                assert!(a.cancel_prepared_probe(&probe_id).unwrap());
+            }
+            assert_eq!(
+                a.lease(&paid.lease().id).unwrap().as_ref(),
+                Some(paid.lease())
+            );
+            assert_eq!(a.group_status(&d(20)).unwrap().occupied, 1);
+            assert_eq!(a.probe_budget(&d(21)).unwrap().unwrap().used_attempts, 2);
+        }
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn refresh_requires_new_measured_speed_and_keeps_the_throughput_floor() {
+    let m = measured_monitor();
+    rate(m.observe_recovery(&d(1), class()).unwrap(), 0, 10, 100).await;
+    advance(30_000).await;
+    let lead = Duration::from_secs(30);
+    let old_speed = m.snapshot(&d(1)).unwrap().native_speed.unwrap();
+    m.observe_refresh(&d(1), class(), lead)
+        .unwrap()
+        .success(None);
+    assert!(m.snapshot(&d(1)).unwrap().allowance > 0);
+    assert!(m.snapshot(&d(1)).unwrap().recovery_after_ms > 0);
+    assert!(!m.refresh_due(&d(1), lead).unwrap());
+    assert_eq!(
+        m.snapshot(&d(1)).unwrap().native_speed.unwrap().age_ms,
+        old_speed.age_ms
+    );
+    // An actual measured refresh renews evidence; billing usage alone did not.
+    let wait = m.snapshot(&d(1)).unwrap().recovery_after_ms;
+    advance(wait).await;
+    rate(m.observe_refresh(&d(1), class(), lead).unwrap(), 0, 10, 100).await;
+    assert!(m.snapshot(&d(1)).unwrap().meets_native_floor(5));
+    assert!(!m.refresh_due(&d(1), lead).unwrap());
 }
 
 #[tokio::test(start_paused = true)]

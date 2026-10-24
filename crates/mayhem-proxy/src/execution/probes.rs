@@ -269,15 +269,31 @@ impl Controller {
             _ = &mut shutdown => return Err(Error::Cancelled.into()),
             _ = std::future::ready(()) => (),
         }
-        let expansion = self.monitor.snapshot(&self.specification.route)?.allowance > 0;
-        if expansion {
+        let mut refresh = false;
+        let mut expansion = false;
+        if self.monitor.snapshot(&self.specification.route)?.allowance > 0 {
             let route = self.specification.route.clone();
             let status = self.storage(move |a| a.status(&route)).await?;
-            if status.state != capacity::Readiness::Busy || status.available != 0 {
+            if status.available > 0 {
+                refresh = self
+                    .monitor
+                    .refresh_due(&self.specification.route, self.limits.timeout)?;
+                if !refresh {
+                    return Err(health::Error::RecoveryBusy.into());
+                }
+            } else if status.state == capacity::Readiness::Busy {
+                expansion = true;
+            } else {
                 return Err(health::Error::RecoveryBusy.into());
             }
         }
-        let mut sample = Some(if expansion {
+        let mut sample = Some(if refresh {
+            self.monitor.observe_refresh(
+                &self.specification.route,
+                self.request.health_class,
+                self.limits.timeout,
+            )?
+        } else if expansion {
             self.monitor
                 .observe_capacity_recovery(&self.specification.route, self.request.health_class)?
         } else {
@@ -287,10 +303,11 @@ impl Controller {
         let specification = self.specification.clone();
         let intent = self.reservation_intent.clone();
         let reserved = self
-            .storage(move |a| match (expansion, intent) {
-                (true, intent) => a.reserve_capacity_probe(specification, intent),
-                (false, Some(intent)) => a.reserve_probe_once(specification, intent),
-                (false, None) => a.reserve_probe(specification),
+            .storage(move |a| match (refresh, expansion, intent) {
+                (true, _, intent) => a.reserve_refresh_probe(specification, intent),
+                (false, true, intent) => a.reserve_capacity_probe(specification, intent),
+                (false, false, Some(intent)) => a.reserve_probe_once(specification, intent),
+                (false, false, None) => a.reserve_probe(specification),
             })
             .await?;
         let id = reserved.probe().id.clone();
