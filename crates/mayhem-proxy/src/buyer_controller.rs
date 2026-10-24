@@ -186,6 +186,7 @@ pub enum VerificationStep {
     QuotePolicy,
     SessionBinding,
     PurchasePrepare,
+    FinancialRead,
 }
 impl VerificationStep {
     pub fn as_str(self) -> &'static str {
@@ -196,6 +197,7 @@ impl VerificationStep {
             Self::QuotePolicy => "quote_policy",
             Self::SessionBinding => "session_binding",
             Self::PurchasePrepare => "purchase_prepare",
+            Self::FinancialRead => "financial_read",
         }
     }
 }
@@ -246,6 +248,15 @@ impl VerificationCause {
                 "purchase maximum exceeds explicit total limit" => Self::Budget,
                 "quote differs from buyer, payment binding or funding" => Self::BindingOrFunding,
                 "recover the existing purchase before a new attempt" => Self::ExistingPurchase,
+                "canonical financial observation expired"
+                | "reservation no longer admits new execution" => Self::Expired,
+                "attempt already has execution or closure evidence" => Self::ExistingPurchase,
+                "financial response binding differs"
+                | "accepted financial record differs"
+                | "reserved session differs"
+                | "financial identity differs"
+                | "reservation is not active"
+                | "billing anchor is not active for this attempt" => Self::BindingOrFunding,
                 _ => Self::Validation,
             },
             E::Transport(error) if error.is_timeout() => Self::Deadline,
@@ -794,6 +805,8 @@ impl Progress {
             _ => Code::Unconfirmed,
         });
         result.financial_code = Some(financial::diagnostic_code(&error));
+        result.verification_step = Some(VerificationStep::FinancialRead);
+        result.verification_cause = Some(VerificationCause::financial(&error));
         result
     }
     fn check(&self, stop: &watch::Receiver<bool>) -> Result<()> {
@@ -1491,6 +1504,53 @@ impl Shared {
 #[cfg(test)]
 mod diagnostic_tests {
     use super::*;
+
+    #[test]
+    fn financial_admission_diagnostics_distinguish_peer_rejection_from_local_validation() {
+        for (source, expected) in [
+            (
+                crate::Error::Http {
+                    status: 400,
+                    code: "proxy_financial_invalid".into(),
+                },
+                VerificationCause::Http,
+            ),
+            (
+                crate::invalid("financial response binding differs"),
+                VerificationCause::BindingOrFunding,
+            ),
+            (
+                crate::invalid("canonical financial observation expired"),
+                VerificationCause::Expired,
+            ),
+            (
+                crate::invalid("private prompt or credential"),
+                VerificationCause::Validation,
+            ),
+        ] {
+            let p = Progress {
+                identity: RequestIdentity {
+                    billing_id: Digest::new("01".repeat(32)).unwrap(),
+                    billing_attempt: 1,
+                    session_id: Digest::new("02".repeat(32)).unwrap(),
+                    request_hash: Digest::new("03".repeat(32)).unwrap(),
+                },
+                stage: Stage::Accepted,
+                retained: true,
+            };
+            let failure = p.financial_error(source);
+            assert_eq!(failure.code, Code::Unconfirmed);
+            assert_eq!(failure.stage, Stage::Accepted);
+            assert!(failure.recovery_required);
+            assert_eq!(failure.financial_code, Some("proxy_financial_invalid"));
+            assert_eq!(
+                failure.verification_step,
+                Some(VerificationStep::FinancialRead)
+            );
+            assert_eq!(failure.verification_cause, Some(expected));
+            assert!(!format!("{failure:?}").contains("private"));
+        }
+    }
 
     #[test]
     fn verification_diagnostics_preserve_semantics_and_redact_causes() {

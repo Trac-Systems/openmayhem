@@ -79,6 +79,80 @@ fn fixture(endpoint: ProxyEndpoint) -> (PublicRequest, Vec<Value>, Value) {
 }
 
 #[test]
+fn named_tool_stop_round_trips_streamed_arguments_through_provider_and_buyer() {
+    let adapter = Adapter::new(
+        ProxyEndpoint::Chat,
+        mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+        )
+        .unwrap(),
+        "upstream".into(),
+        Limits {
+            request_bytes: 64 * 1024,
+            response_bytes: 64 * 1024,
+            choices: 8,
+            tools: 8,
+            questions: 8,
+            decision_options: 8,
+        },
+    )
+    .unwrap();
+    let body = serde_json::to_vec(&json!({
+        "model":"public","messages":[{"role":"user","content":"read"}],"stream":true,
+        "tools":[{"type":"function","function":{"name":"read_file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}],
+        "tool_choice":{"type":"function","function":{"name":"read_file"}}
+    })).unwrap();
+    let request = adapter.prepare_stream(&body).unwrap();
+    let buyer = PublicAdapter::restore(adapter.public_snapshot())
+        .unwrap()
+        .prepare_stream(&body)
+        .unwrap();
+    let mut stream = stream::Stream::new(&request, "proxy_named", 7).unwrap();
+    let mut public = buyer.stream("proxy_named", 7).unwrap();
+    let mut events = Vec::new();
+    for value in [
+        json!({"choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{ \"path\": "}}]},"finish_reason":null}]}),
+        json!({"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"src/game.js\" }"}}]},"finish_reason":"stop"}]}),
+    ] {
+        if let Some(event) = stream
+            .push(Decoded::Sse {
+                event: String::new(),
+                data: value.to_string(),
+                id: None,
+            })
+            .unwrap()
+        {
+            public.push(&event).unwrap();
+            events.push(event);
+        }
+    }
+    stream
+        .push(Decoded::Sse {
+            event: String::new(),
+            data: "[DONE]".into(),
+            id: None,
+        })
+        .unwrap();
+    let result = request
+        .decode_json(stream.finish().unwrap(), "proxy_named", 7)
+        .unwrap()
+        .body;
+    assert_eq!(result["choices"][0]["finish_reason"], "stop");
+    assert_eq!(
+        result["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{ \"path\": \"src/game.js\" }"
+    );
+    public.verify_final(&result).unwrap();
+    let mut changed = result;
+    changed["choices"][0]["message"]["tool_calls"][0]["function"]["name"] = json!("other_tool");
+    let mut public = buyer.stream("proxy_named", 7).unwrap();
+    for event in events {
+        public.push(&event).unwrap();
+    }
+    assert!(public.verify_final(&changed).is_err());
+}
+
+#[test]
 fn normalized_stream_agrees_with_real_provider_text_tools_reasoning_and_final() {
     for endpoint in [
         ProxyEndpoint::Chat,

@@ -127,6 +127,64 @@ fn rejects_truncated_choices_undeclared_tools_bad_arguments_and_duplicate_ids() 
 }
 
 #[test]
+fn named_tool_stop_preserves_complete_calls_and_still_rejects_invalid_output() {
+    let adapter = adapter(ProxyEndpoint::Chat);
+    let mut body = chat();
+    body["tools"] = tools();
+    body["tools"].as_array_mut().unwrap().push(json!({
+        "type":"function","function":{"name":"other_tool","parameters":{"type":"object"}}
+    }));
+    body["tool_choice"] = json!({"type":"function","function":{"name":"read_file"}});
+    let request = adapter
+        .prepare_json(&serde_json::to_vec(&body).unwrap())
+        .unwrap();
+    let mut response = answer();
+    response["choices"][0]["message"]["tool_calls"] = json!([call()]);
+    for finish in ["stop", "tool_calls"] {
+        response["choices"][0]["finish_reason"] = json!(finish);
+        let reply = request.decode_json(response.clone(), "id", 0).unwrap();
+        assert_eq!(reply.body["choices"][0]["finish_reason"], finish);
+        assert_eq!(
+            reply.body["choices"][0]["message"]["tool_calls"],
+            json!([call()])
+        );
+    }
+    response["choices"][0]["finish_reason"] = json!("stop");
+    for case in [
+        "wrong_name",
+        "arguments",
+        "duplicate",
+        "length",
+        "content_filter",
+        "missing",
+    ] {
+        let mut bad = response.clone();
+        match case {
+            "wrong_name" => {
+                bad["choices"][0]["message"]["tool_calls"][0]["function"]["name"] =
+                    json!("other_tool")
+            }
+            "arguments" => {
+                bad["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"] =
+                    json!("{\"path\":")
+            }
+            "duplicate" => bad["choices"][0]["message"]["tool_calls"] = json!([call(), call()]),
+            "missing" => bad["choices"][0]["message"]["tool_calls"] = json!([]),
+            finish => bad["choices"][0]["finish_reason"] = json!(finish),
+        }
+        assert!(request.decode_json(bad, "id", 0).is_err(), "{case}");
+    }
+    // Required/automatic choice has no named-tool exception.
+    for choice in ["required", "auto"] {
+        body["tool_choice"] = json!(choice);
+        let request = adapter
+            .prepare_json(&serde_json::to_vec(&body).unwrap())
+            .unwrap();
+        assert!(request.decode_json(response.clone(), "id", 0).is_err());
+    }
+}
+
+#[test]
 fn enforced_tool_selection_and_incomplete_or_refusal_outcomes_are_distinct() {
     let adapter = adapter(ProxyEndpoint::Chat);
     let mut body = chat();

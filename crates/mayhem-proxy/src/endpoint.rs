@@ -899,7 +899,16 @@ impl Request {
                 .map(|v| self.calls(v, false))
                 .transpose()?
                 .unwrap_or_default();
-            require((finish == "tool_calls") == !calls.is_empty())?;
+            // Named tool selection may finish with `stop` (for example vLLM).
+            // `calls` has already checked the forced name and complete arguments.
+            // Do not accept this exception for automatic tools or truncation.
+            let tool_finish =
+                finish == "tool_calls" || (finish == "stop" && self.forced_tool.is_some());
+            if calls.is_empty() {
+                require(finish != "tool_calls")?;
+            } else {
+                require(tool_finish)?;
+            }
             let refusal = message
                 .get("refusal")
                 .and_then(Value::as_str)
