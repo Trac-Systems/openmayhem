@@ -9,6 +9,8 @@ mod acknowledgment;
 mod admission;
 #[path = "buyer_cancellation.rs"]
 mod cancellation;
+#[path = "buyer_capacity_wait.rs"]
+mod capacity_wait;
 #[path = "buyer_streaming.rs"]
 mod streaming;
 

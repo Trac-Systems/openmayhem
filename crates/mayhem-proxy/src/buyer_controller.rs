@@ -930,33 +930,80 @@ impl Shared {
             return Err(p.error(Code::Invalid));
         }
         p.stage = Stage::Negotiating;
-        let mut channel = tokio::select! {
-            result = negotiation::Channel::dial(self.bridge.clone(), context.clone(), self.signer.identity(), exchange::Limits { max_message_bytes: self.limits.message_bytes }) => result.map_err(|e| p.transport_error("buyer_negotiate_dial", &e))?,
-            _ = stopped(stop) => return Err(p.error(Code::Stopped)),
-        };
-        channel
-            .send(&negotiation::Message::Request {
-                request: value.clone(),
-            })
-            .await
-            .map_err(|e| p.transport_error("buyer_request_send", &e))?;
-        let response = tokio::select! {
-            result = channel.receive(self.limits.control_wait) => result.map_err(|e| p.transport_error("buyer_proposal_receive", &e))?,
-            _ = stopped(stop) => return Err(p.error(Code::Stopped)),
-        }.into_message(&context, Role::Buyer).map_err(|_| p.verification_error(VerificationStep::ProposalBinding, VerificationCause::Binding))?;
-        let mut proposal = match response {
-            negotiation::Message::Proposal { proposal } => proposal,
-            negotiation::Message::Refused { failure }
-                if failure.code == crate::connector::failure::Code::LocalCapacity
-                    && failure.scope == crate::connector::failure::Scope::Request
-                    && failure.stage == crate::connector::failure::Stage::BeforeDispatch
-                    && failure.execution == crate::connector::failure::Execution::Unknown =>
-            {
-                // This authenticated refusal precedes the owner gate and every
-                // signature. Later refusals must retain their recovery obligation.
-                return Err(p.error(Code::Busy));
+        // Only an authenticated pre-proposal refusal permits another admission
+        // attempt. Keep the exact context, request and owner; no offer, signature,
+        // funding or Execute has happened. Never retry later/ambiguous failures.
+        let mut capacity_deadline = None;
+        let mut delay = Duration::from_millis(100);
+        let (mut channel, mut proposal) = loop {
+            p.check(stop)?;
+            let attempt = async {
+                let mut channel = negotiation::Channel::dial(
+                    self.bridge.clone(),
+                    context.clone(),
+                    self.signer.identity(),
+                    exchange::Limits {
+                        max_message_bytes: self.limits.message_bytes,
+                    },
+                )
+                .await
+                .map_err(|e| p.transport_error("buyer_negotiate_dial", &e))?;
+                channel
+                    .send(&negotiation::Message::Request {
+                        request: value.clone(),
+                    })
+                    .await
+                    .map_err(|e| p.transport_error("buyer_request_send", &e))?;
+                let response = channel
+                    .receive(self.limits.control_wait)
+                    .await
+                    .map_err(|e| p.transport_error("buyer_proposal_receive", &e))?
+                    .into_message(&context, Role::Buyer)
+                    .map_err(|_| {
+                        p.verification_error(
+                            VerificationStep::ProposalBinding,
+                            VerificationCause::Binding,
+                        )
+                    })?;
+                Ok::<_, Error>((channel, response))
+            };
+            let (channel, response) = tokio::select! {
+                _ = stopped(stop) => return Err(p.error(Code::Stopped)),
+                result = async {
+                    match capacity_deadline {
+                        Some(deadline) => tokio::time::timeout_at(deadline, attempt).await
+                            .map_err(|_| p.error(Code::Busy))?,
+                        None => attempt.await,
+                    }
+                } => result?,
+            };
+            match response {
+                negotiation::Message::Proposal { proposal } => break (channel, proposal),
+                negotiation::Message::Refused { failure }
+                    if failure.code == crate::connector::failure::Code::LocalCapacity
+                        && failure.scope == crate::connector::failure::Scope::Request
+                        && failure.stage == crate::connector::failure::Stage::BeforeDispatch
+                        && failure.execution == crate::connector::failure::Execution::Unknown =>
+                {
+                    drop(channel);
+                    let deadline = *capacity_deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + self.limits.control_wait
+                    });
+                    let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+                    if remaining.is_zero() {
+                        return Err(p.error(Code::Busy));
+                    }
+                    tokio::select! {
+                        _ = stopped(stop) => return Err(p.error(Code::Stopped)),
+                        _ = tokio::time::sleep(delay.min(remaining)) => (),
+                    }
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(p.error(Code::Busy));
+                    }
+                    delay = (delay * 2).min(Duration::from_secs(1));
+                }
+                _ => return Err(p.error(Code::Refused)),
             }
-            _ => return Err(p.error(Code::Refused)),
         };
         // Public limits are buyer-local and do not change the opaque recipe hash.
         // Never adopt the provider's memory/choice/schema resource allowances.
