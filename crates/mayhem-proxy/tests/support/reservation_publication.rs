@@ -1,6 +1,37 @@
 use super::*;
 
 #[tokio::test]
+async fn snapshot_conflict_recovers_one_canonical_hold_across_rails_and_families() {
+    for family in ["llm", "decisions"] {
+        for rail in ["fiat", "tnk", "tap"] {
+            let mut f = Fixture::new_with_mode(rail, family, "unreserved").await;
+            let d = dir();
+            let r = recovery(&f, &d);
+            let before = f.request("state").await;
+            let id = r
+                .retain_reservation(f.auth.clone(), f.policy.clone(), 7)
+                .await
+                .unwrap();
+            f.command("publish_snapshot_changed_once").await;
+            let o = r.publish_reservation_wait(id.clone(), 8).await.unwrap();
+            assert_eq!(o.initial_binding().unwrap().accepted_terms, id);
+            let status = f.request("status").await;
+            assert_eq!(status["submissions"], 2);
+            assert_eq!(status["publications"], 1);
+            let after = f.request("state").await;
+            assert_eq!(after["balance"], before["balance"]);
+            assert_eq!(
+                after["summary"]["reserved_au"],
+                (50 + f.auth.terms.max_spend_au).to_string()
+            );
+            r.publish_reservation_wait(id, 9).await.unwrap();
+            assert_eq!(f.request("status").await["submissions"], 2);
+            f.stop().await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn buyer_reservation_retries_http_200_accounting_backpressure_without_duplicate_hold() {
     for family in ["llm", "decisions"] {
         for rail in ["fiat", "tnk", "tap"] {

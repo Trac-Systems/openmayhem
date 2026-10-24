@@ -800,6 +800,7 @@ impl Progress {
         self.verification_error(step, VerificationCause::financial(error))
     }
     fn financial_error(&self, error: crate::Error) -> Error {
+        crate::serving::diagnostics::report("buyer_financial", &error);
         let mut result = self.error(match &error {
             crate::Error::Database(_) | crate::Error::Io(_) => Code::Storage,
             _ => Code::Unconfirmed,

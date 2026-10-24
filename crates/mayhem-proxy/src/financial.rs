@@ -153,7 +153,7 @@ fn transient_transport(error: &reqwest::Error) -> bool {
 
 // The existing peer RPC reports application rejection inside HTTP 200 and does
 // not provide a machine-readable busy code. Recognize only its exact temporary
-// journal conflicts; invalid signatures, insufficient funds and unknown errors
+// journal/snapshot conflicts; invalid signatures, insufficient funds and unknown errors
 // are never treated as backpressure. This is transport compatibility, not a
 // relaxation of canonical admission or a retry of model execution.
 fn publication_retryable(reply: &Value) -> bool {
@@ -165,6 +165,12 @@ fn publication_retryable(reply: &Value) -> bool {
             | "Proxy publication journal: active publication capacity reached; retry the same operation."
             | "Proxy publication journal: pending capacity reached."
             | "Proxy publication journal: admission dependencies changed; retry the same operation."
+            // Another admitted operation can update an exact accounting key,
+            // or advance the epoch, while the canonical preflight awaits I/O.
+            // The peer rejects that stale snapshot before dispatch. Revalidate
+            // the identical envelope; never reuse the stale proof as authority.
+            | "Proxy canonical snapshot unavailable: registry state changed during validation."
+            | "Proxy canonical snapshot unavailable: canonical context changed."
         ))
 }
 

@@ -77,6 +77,10 @@ participant.relay=buyerParticipant.relay=(key,value)=>{
       return {ok:false,accepted:false,status:'rejected',message:'Proxy publication journal: another operation in this provider/policy scope is pending or an accounting dependency is reserved; recover it before retrying.'};
     }
     if(publicationMode==='rejected')return {ok:false,accepted:false,status:'rejected',message:'Insufficient funds.'};
+    if(publicationMode==='snapshot_changed_once') {
+      publicationMode=null;
+      return {ok:false,accepted:false,status:'rejected',message:'Proxy canonical snapshot unavailable: registry state changed during validation.'};
+    }
     if(publicationMode==='malformed')return {message:'not an acknowledgment'};
     if(publicationMode==='pending_delayed') {
       if(!delayedPublication)delayedPublication=new Promise(resolve=>setTimeout(resolve,2000)).then(()=>applyReceipt(key,value));
@@ -214,6 +218,7 @@ try {
     else if(command==='publish_busy_three')publicationBusy=3;
     else if(command==='publish_busy_forever')publicationBusy=1000;
     else if(command==='publish_rejected')publicationMode='rejected';
+    else if(command==='publish_snapshot_changed_once')publicationMode='snapshot_changed_once';
     else if(command==='publish_malformed')publicationMode='malformed';
     else if(command==='publish_pending_delayed')publicationMode='pending_delayed';
     else if(command==='publish_lost_ack')publicationMode='lost_ack';

@@ -343,6 +343,29 @@ async fn only_existing_exact_semantic_backpressure_is_retried() {
 }
 
 #[tokio::test]
+async fn canonical_snapshot_conflicts_republish_only_the_original_signed_envelope() {
+    for message in [
+        "Proxy canonical snapshot unavailable: registry state changed during validation.",
+        "Proxy canonical snapshot unavailable: canonical context changed.",
+    ] {
+        for (message, expected) in [(message.to_owned(), 2), (format!("{message} extra"), 1)] {
+            let f = Fixture::new(
+                vec![
+                    Reply::Json(
+                        json!({"ok":false,"accepted":false,"status":"rejected","message":message}),
+                    ),
+                    Reply::Ack,
+                ],
+                None,
+            )
+            .await;
+            assert_eq!(f.submit().await.is_ok(), expected == 2);
+            f.assert_publications(expected).await;
+        }
+    }
+}
+
+#[tokio::test]
 async fn publication_attempts_remain_bounded_and_backed_off() {
     let f = Fixture::new(
         (0..11)
@@ -566,6 +589,58 @@ async fn recovery_fixture(f: &Fixture, root: &tempfile::TempDir) -> recovery::Bu
         1,
     )
     .unwrap()
+}
+
+#[tokio::test]
+async fn snapshot_republication_still_requires_fresh_canonical_admission() {
+    for malformed in [false, true] {
+        let f = Fixture::with_observations(
+            vec![
+                Reply::Json(json!({"ok":false,"accepted":false,"status":"rejected",
+                    "message":"Proxy canonical snapshot unavailable: registry state changed during validation."})),
+                Reply::Ack,
+            ],
+            None,
+            vec![if malformed { Reply::BadProof } else { Reply::Financial }],
+        )
+        .await;
+        let root = tempfile::tempdir().unwrap();
+        let recovery = recovery_fixture(&f, &root).await;
+        let key = recovery
+            .retain_reservation(f.authorization.clone(), f.policy.clone(), 1234)
+            .await
+            .unwrap();
+        let result = recovery
+            .publish_reservation_until(
+                key.clone(),
+                1235,
+                tokio::time::Instant::now() + Duration::from_secs(3),
+                &AtomicBool::new(false),
+            )
+            .await;
+        if malformed {
+            assert_eq!(
+                diagnostic_code(&result.err().unwrap()),
+                "proxy_financial_invalid"
+            );
+        } else {
+            assert_eq!(
+                result.unwrap().initial_binding().unwrap().accepted_terms,
+                key
+            );
+        }
+        assert_eq!(
+            recovery
+                .recover(key)
+                .await
+                .unwrap()
+                .reservation
+                .unwrap()
+                .confirmed,
+            !malformed
+        );
+        f.assert_publications(2).await;
+    }
 }
 
 #[tokio::test]
