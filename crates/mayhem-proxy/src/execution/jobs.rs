@@ -308,6 +308,7 @@ impl Executor {
             return Err(invalid());
         }
         let reply = transport::Transport {
+            completion: None,
             connection: &self.connection,
             adapter,
         }

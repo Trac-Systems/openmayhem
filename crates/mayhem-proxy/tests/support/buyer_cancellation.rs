@@ -668,7 +668,10 @@ async fn buyer_controller_orphan_expiry_uses_original_policy_and_canonical_1125_
             .unwrap()
             .result
             .is_none());
-        occupied(&s, 1);
+        // A complete synchronous JSON reply ends execution even when invalid.
+        // Truncated SSE still has no terminal evidence and retains capacity.
+        occupied(&s, if streaming { 1 } else { 0 });
+        assert_eq!(retained.execution_ended.is_some(), !streaming);
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         assert_eq!(gate.terms.lock().unwrap().len(), 1);
         assert!(gate.outputs.lock().unwrap().is_empty());

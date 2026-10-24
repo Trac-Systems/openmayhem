@@ -4,6 +4,7 @@ use super::*;
 pub(super) struct Transport<'a> {
     pub connection: &'a HttpConnection,
     pub adapter: &'a Adapter,
+    pub completion: Option<Arc<crate::connector::http::Completion>>,
 }
 pub(super) enum Delivery<'a> {
     Customer {
@@ -58,7 +59,11 @@ impl Transport<'_> {
     {
         let response = self
             .connection
-            .send(self.adapter.operation(), Some(request.body().to_vec()))
+            .send_observed(
+                self.adapter.operation(),
+                Some(request.body().to_vec()),
+                self.completion.clone(),
+            )
             .await
             .map_err(Error::Upstream)?;
         if let Some(sample) = sample {
@@ -82,14 +87,38 @@ impl Transport<'_> {
         let mut stream =
             crate::endpoint::stream::Stream::new(request, public_id, delivery.created())?;
         let mut saved_upstream_id = false;
+        let mut decode_failure = None;
         let mut last_read = tokio::time::Instant::now();
         while let Some((chunk, at)) = response.next().await? {
             // One timestamp per network read. Decoding a buffered batch into
             // many SSE events must not manufacture a generation interval.
             last_read = at;
             let blocked = sample.as_ref().and_then(health::Sample::backpressure);
-            let mut receive = |frame| {
-                let piece = stream.push(frame).map_err(stream_frame_error);
+            let mut receive = |frame: Decoded| {
+                // Framing remains in the isolated decoder. A real terminal SSE
+                // event ends execution even when earlier semantic output was bad.
+                // Plain EOF, JSON strings containing [DONE], and partial events do not.
+                if matches!(
+                    request.endpoint(),
+                    mayhem_proto::proxy::ProxyEndpoint::Chat
+                        | mayhem_proto::proxy::ProxyEndpoint::Completions
+                ) && matches!(&frame, Decoded::Sse { event, data, .. } if (event == "message" || event.is_empty()) && data.trim() == "[DONE]")
+                {
+                    if let Some(completion) = &self.completion {
+                        completion.mark();
+                    }
+                }
+                let piece = if decode_failure.is_some() {
+                    Ok(None)
+                } else {
+                    match stream.push(frame).map_err(stream_frame_error) {
+                        Ok(value) => Ok(value),
+                        Err(error) => {
+                            decode_failure = Some(Error::Decoder(error));
+                            Ok(None)
+                        }
+                    }
+                };
                 let future = match piece {
                     Ok(Some(value)) => {
                         if let Some(sample) = sample {
@@ -114,20 +143,32 @@ impl Transport<'_> {
                     saved_upstream_id = true;
                 }
             }
-            pushed.map_err(|e| {
+            let pushed = pushed.map_err(|e| {
                 if matches!(e, worker::Error::Cancelled) {
                     Error::Cancelled
                 } else {
                     Error::Decoder(e)
                 }
-            })?;
-            if stream.is_done() {
+            });
+            if let Err(error) = pushed {
+                return Err(error);
+            }
+            if stream.is_done()
+                || (decode_failure.is_some()
+                    && self.completion.as_ref().is_some_and(|c| c.observed()))
+            {
+                if let Some(completion) = &self.completion {
+                    completion.mark();
+                }
                 break;
             }
         }
         // [DONE] is terminal in this profile. A conforming long-lived SSE HTTP
         // connection need not close before result verification can finish.
         drop(response);
+        if let Some(error) = decode_failure {
+            return Err(error);
+        }
         if let Some(sample) = sample {
             sample.network_complete(last_read);
         }
@@ -182,7 +223,11 @@ impl Transport<'_> {
     ) -> Result<ProtocolReply> {
         let response = self
             .connection
-            .send(self.adapter.operation(), Some(request.body().to_vec()))
+            .send_observed(
+                self.adapter.operation(),
+                Some(request.body().to_vec()),
+                self.completion.clone(),
+            )
             .await
             .map_err(Error::Upstream)?;
         self.receive_json(request, decoder, response, public_id, created, sample)
@@ -211,11 +256,21 @@ impl Transport<'_> {
             return Err(Error::Upstream(failure));
         }
         let mut last_read = tokio::time::Instant::now();
+        let mut decode_failure = None;
         while let Some((chunk, at)) = response.next_timed_chunk().await.map_err(Error::Upstream)? {
             last_read = at;
-            decoder
+            if decode_failure.is_some() {
+                continue;
+            }
+            if let Err(error) = decoder
                 .push(&chunk, |_| async { Err(worker::Error::Protocol) })
-                .await?;
+                .await
+            {
+                decode_failure = Some(error);
+            }
+        }
+        if let Some(error) = decode_failure {
+            return Err(Error::Decoder(error));
         }
         if let Some(sample) = sample {
             sample.network_complete(last_read);

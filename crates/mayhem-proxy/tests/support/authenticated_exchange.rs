@@ -545,7 +545,8 @@ async fn authenticated_exchange_waives_from_public_evidence_without_private_meta
 }
 
 #[tokio::test]
-async fn authenticated_exchange_cancel_after_dispatch_keeps_unknown_capacity_and_cannot_retry() {
+async fn authenticated_exchange_cancel_then_complete_invalid_response_frees_only_capacity_and_cannot_retry(
+) {
     let backend = backend(
         200,
         json!({"unrecognized":"no terminal result"}),
@@ -598,7 +599,14 @@ async fn authenticated_exchange_cancel_after_dispatch_keeps_unknown_capacity_and
     let (state, output) = session.status(received, &p.executor).await.unwrap();
     assert_eq!(state, exchange::PublicState::CancelRequested);
     assert!(output.is_none());
-    assert!(p.authority.lease(&p.lease).unwrap().is_some());
+    assert!(p.authority.lease(&p.lease).unwrap().is_none());
+    assert!(p
+        .journal
+        .get(&p.record.invocation)
+        .unwrap()
+        .unwrap()
+        .execution_ended
+        .is_some());
     let received = receive(
         &mut buyer,
         &mut provider,

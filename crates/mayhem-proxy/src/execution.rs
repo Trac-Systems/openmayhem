@@ -458,6 +458,17 @@ impl Executor {
             sample.use_native(source)
         }
         let recoverable_job = job_lease.is_some();
+        // Background/job execution outlives an HTTP response. Only stateless,
+        // synchronous requests may use response completion to free a slot.
+        #[derive(serde::Deserialize)]
+        struct Lifecycle {
+            background: Option<bool>,
+        }
+        let background = serde_json::from_slice::<Lifecycle>(request.body())
+            .map(|v| v.background.unwrap_or(false))
+            .unwrap_or(true);
+        let completion = (!recoverable_job && !background)
+            .then(|| Arc::new(crate::connector::http::Completion::default()));
         // A consumer going away is not evidence that a stateless upstream
         // stopped. Detach delivery, but keep the original bounded response and
         // decoder alive so its terminal outcome can settle the accepted work.
@@ -492,7 +503,7 @@ impl Executor {
                     drop(active);
                     self.submit_job(&record, &request, lease).await
                 } else if streaming {
-                    self.transport()
+                    self.transport_observed(completion.clone())
                         .perform_stream(
                             &request,
                             active,
@@ -506,7 +517,7 @@ impl Executor {
                         )
                         .await
                 } else {
-                    self.transport()
+                    self.transport_observed(completion.clone())
                         .perform(
                             &request,
                             active,
@@ -531,6 +542,21 @@ impl Executor {
                 result=&mut operation => result,
             }
         };
+        if outcome.is_err() && completion.as_ref().is_some_and(|c| c.observed()) {
+            let evidence = Digest::hash(
+                "mayhem/proxy/execution-ended/v1",
+                &[
+                    record.invocation.as_str().as_bytes(),
+                    &record.attempt.to_le_bytes(),
+                    record.binding.request_hash.as_str().as_bytes(),
+                    record.binding.connection_digest.as_str().as_bytes(),
+                    record.binding.capacity_lease.as_str().as_bytes(),
+                ],
+            );
+            self.storage
+                .event(invocation, record.attempt, Event::ExecutionEnded(evidence))
+                .await?;
+        }
         if let Some(sample) = sample {
             match &outcome {
                 Ok(reply) => sample.success(reply.reported_usage.as_ref().map(|u| u.output_tokens)),
@@ -619,10 +645,14 @@ impl Executor {
             }
         }
     }
-    fn transport(&self) -> transport::Transport<'_> {
+    fn transport_observed(
+        &self,
+        completion: Option<Arc<crate::connector::http::Completion>>,
+    ) -> transport::Transport<'_> {
         transport::Transport {
             connection: &self.connection,
             adapter: &self.adapter,
+            completion,
         }
     }
 }

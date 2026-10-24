@@ -2380,3 +2380,6 @@ async fn signed_terminal_recovery_skips_job_payloads_and_upstream_after_independ
     assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
     p.peer.stop().await;
 }
+
+#[path = "paid_execution_end.rs"]
+mod execution_end;

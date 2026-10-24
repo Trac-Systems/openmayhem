@@ -329,6 +329,10 @@ pub struct Record {
     pub output_may_have_been_delivered: bool,
     pub cancellation_requested: bool,
     pub last_failure: Option<FailureSnapshot>,
+    /// Parent-verified end of synchronous upstream execution. This frees only
+    /// physical capacity; it proves neither a valid result nor a billing outcome.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_ended: Option<Digest>,
     pub resolution: Option<Resolution>,
     /// Financial/capacity reconciliation acknowledgment, NOT a connector finish.
     pub closure: Option<Digest>,
@@ -363,6 +367,7 @@ impl Record {
         require(match self.phase {
             Phase::Prepared => {
                 self.remote_id.is_none()
+                    && self.execution_ended.is_none()
                     && !self.output_may_have_been_delivered
                     && self.resolution.is_none()
                     && !self.cancellation_requested
@@ -459,6 +464,7 @@ pub enum Event {
     FirstOutput,
     CancelRequested,
     Failure(FailureSnapshot),
+    ExecutionEnded(Digest),
     Resolve(Resolution),
     /// Supplied only after the parent reconciles money AND backend capacity.
     Close(Digest),
@@ -693,6 +699,7 @@ impl Journal {
             output_may_have_been_delivered: false,
             cancellation_requested: false,
             last_failure: None,
+            execution_ended: None,
             resolution: None,
             closure: None,
             expires_at_ms: None,
@@ -755,7 +762,11 @@ impl Journal {
     ) -> Result<Record> {
         require(matches!(
             &event,
-            Event::CancelRequested | Event::Accepted(_) | Event::FirstOutput | Event::Failure(_)
+            Event::CancelRequested
+                | Event::Accepted(_)
+                | Event::FirstOutput
+                | Event::Failure(_)
+                | Event::ExecutionEnded(_)
         ))?;
         let tx = self.transaction()?;
         let r = current(&tx, invocation)?.ok_or(Error::NotFound)?;
@@ -783,6 +794,13 @@ impl Journal {
         now_ms: u64,
     ) -> Result<Record> {
         match event {
+            Event::ExecutionEnded(evidence) if r.phase != Phase::Prepared => {
+                if let Some(saved) = &r.execution_ended {
+                    require(saved == &evidence)?;
+                    return Ok(r);
+                }
+                r.execution_ended = Some(evidence);
+            }
             Event::Failure(failure)
                 if r.phase == Phase::Resolved
                     && r.last_failure.as_ref() == Some(&failure)
@@ -1214,6 +1232,48 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn execution_end_is_exact_durable_and_not_a_financial_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("journal");
+        let j = observation_journal(&path);
+        let r = j.prepare(d(200), binding(), 100).unwrap();
+        assert!(j
+            .observe_attempt(&r.invocation, r.attempt, Event::ExecutionEnded(d(301)), 101)
+            .is_err());
+        j.begin_dispatch(&r.invocation, r.generation, 101).unwrap();
+        assert!(j
+            .observe_attempt(
+                &r.invocation,
+                r.attempt + 1,
+                Event::ExecutionEnded(d(301)),
+                102
+            )
+            .is_err());
+        let ended = j
+            .observe_attempt(&r.invocation, r.attempt, Event::ExecutionEnded(d(301)), 102)
+            .unwrap();
+        assert_eq!(ended.phase, Phase::Dispatched);
+        assert!(ended.resolution.is_none() && ended.closure.is_none());
+        assert!(j
+            .begin_dispatch(&r.invocation, ended.generation, 103)
+            .is_err());
+        assert_eq!(
+            j.observe_attempt(&r.invocation, r.attempt, Event::ExecutionEnded(d(301)), 103)
+                .unwrap(),
+            ended
+        );
+        assert!(j
+            .observe_attempt(&r.invocation, r.attempt, Event::ExecutionEnded(d(302)), 104)
+            .is_err());
+        drop(j);
+        let saved = observation_journal(&path)
+            .get(&r.invocation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved, ended);
     }
 
     #[test]

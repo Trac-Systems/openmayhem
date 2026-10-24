@@ -64,11 +64,17 @@ impl PaidExecutor {
         self.resolve_saved_non_execution(invocation, attempt)
             .await?;
         let header = self.recovery_header(invocation, attempt).await?;
-        if header.record.phase == Phase::Dispatched && !header.has_result {
+        if header.record.phase == Phase::Dispatched
+            && !header.has_result
+            && header.record.execution_ended.is_none()
+        {
             self.executor.resume_job(invocation, attempt).await?;
         }
         let saved = self.recovery_header(invocation, attempt).await?;
-        if saved.has_result || saved.record.non_execution_evidence().is_some() {
+        if saved.has_result
+            || saved.record.non_execution_evidence().is_some()
+            || saved.record.execution_ended.is_some()
+        {
             self.reconcile_capacity(invocation, attempt).await?;
         }
         let key = invocation.clone();
@@ -536,6 +542,13 @@ impl PaidExecutor {
         invocation: &Digest,
         result: &Result<UnsettledReply>,
     ) -> Result<()> {
+        if result.is_err() {
+            let record = self.executor.storage.current(invocation).await?;
+            if record.execution_ended.is_some() {
+                self.reconcile_capacity(invocation, record.attempt).await?;
+                return Ok(());
+            }
+        }
         if matches!(result, Err(Error::Upstream(f) | Error::Decoder(worker::Error::Upstream(f))) if f.known_non_execution())
         {
             let saved = self
@@ -604,6 +617,27 @@ impl PaidExecutor {
                     .is_none()
                 {
                     return Ok(false);
+                }
+                if let Some(evidence) = &header.record.execution_ended {
+                    let r = &header.record;
+                    let lease = authority
+                        .lease(&r.binding.capacity_lease)?
+                        .ok_or(Error::Binding)?;
+                    if r.phase == Phase::Prepared
+                        || lease.route != route
+                        || lease.work.invocation != r.invocation
+                        || lease.work.request_hash != r.binding.request_hash
+                        || !matches!(
+                            lease.phase,
+                            capacity::Phase::Dispatched | capacity::Phase::Uncertain
+                        )
+                    {
+                        return Err(Error::Binding);
+                    }
+                    return Ok(authority.complete(capacity::VerifiedCompletion {
+                        lease,
+                        evidence: evidence.clone(),
+                    })?);
                 }
                 let saved = journal.recover(&key, attempt)?;
                 let r = &saved.record;

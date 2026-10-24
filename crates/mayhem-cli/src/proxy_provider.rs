@@ -34,6 +34,9 @@ pub enum Command {
     ResolveRecoveryProbe(recovery::Args),
     /// Inspect retained monitoring probes and allowance; stop the proxy controller first.
     RecoveryStatus(recovery::StatusArgs),
+    /// Recover one failed customer capacity slot after verifying its upstream stopped.
+    /// Stop this controller first. Preserves uncertain billing and prevents redispatch.
+    ResolveStoppedExecution(recovery::Args),
 }
 #[derive(Debug, Args)]
 pub struct ServeArgs {
@@ -58,6 +61,7 @@ pub async fn run(command: Command) -> Result<()> {
         Command::Add(args) => return supervisor::add(args).await,
         Command::ResolveRecoveryProbe(args) => return recovery::resolve(args).await,
         Command::RecoveryStatus(args) => return recovery::status(args).await,
+        Command::ResolveStoppedExecution(args) => return recovery::resolve_execution(args).await,
     };
     let config = args.config;
     let expected_config_digest = args

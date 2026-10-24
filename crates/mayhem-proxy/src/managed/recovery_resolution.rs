@@ -1,4 +1,4 @@
-//! Explicit operator recovery of monitoring work, never customer execution.
+//! Explicit operator recovery of physical capacity, never financial outcomes.
 use super::*;
 use serde::Deserialize;
 
@@ -25,7 +25,115 @@ pub struct RecoveryStatus {
     pub probe: Option<capacity::probes::Probe>,
     pub budget: Option<capacity::probes::BudgetStatus>,
 }
+
+/// Exact operator attestation for an old customer attempt whose HTTP terminal
+/// evidence was not retained. This is capacity recovery, never a refund or retry.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutionRecoveryConfirmation {
+    pub schema_version: u32,
+    pub route: Digest,
+    pub invocation: Digest,
+    pub attempt: u64,
+    pub capacity_lease: Digest,
+    pub connection_digest: Digest,
+    pub evidence_digest: Digest,
+    pub upstream_stopped: bool,
+}
+#[derive(Serialize)]
+pub struct ExecutionRecoveryResolution {
+    pub invocation: Digest,
+    pub attempt: u64,
+    pub released: bool,
+    pub evidence_digest: Digest,
+}
 impl Prepared {
+    /// Exclusive capacity/journal locks require the controller to be stopped.
+    /// No POST, ledger write, signature, outcome rewriting or history scan.
+    pub fn resolve_stopped_execution(
+        self,
+        signer: &Authority,
+        confirmation: ExecutionRecoveryConfirmation,
+    ) -> Result<ExecutionRecoveryResolution> {
+        if signer.identity() != &self.identity {
+            return Err(Error::Identity);
+        }
+        require(confirmation.schema_version == 1 && confirmation.upstream_stopped)?;
+        let route = self
+            .routes
+            .iter()
+            .find(|r| r.spec.id == confirmation.route)
+            .ok_or(Error::Configuration)?;
+        let connection = self
+            .connections
+            .get(&route.spec.connection)
+            .ok_or(Error::Configuration)?;
+        require(connection.http.fingerprint() == &confirmation.connection_digest)?;
+        let authority = self.recovery_capacity()?;
+        let path = self
+            .config
+            .state_dir
+            .join(format!("route-{}.redb", route.spec.id.as_str()));
+        require(path.is_file() && !path.is_symlink())?;
+        let journal = Journal::open(
+            &path,
+            self.identity.clone(),
+            self.config.limits.journal.clone(),
+        )
+        .map_err(|_| Error::Setup)?;
+        let record = journal
+            .get_attempt(&confirmation.invocation, confirmation.attempt)
+            .map_err(|_| Error::Setup)?
+            .ok_or(Error::Configuration)?;
+        require(
+            record.phase == attempts::Phase::Dispatched
+                && record.last_failure.is_some()
+                && record.binding.connection_digest == confirmation.connection_digest
+                && record.binding.capacity_lease == confirmation.capacity_lease
+                && record.binding.recipe_digest == *route.adapter.recipe_hash(),
+        )?;
+        let evidence = Digest::hash(
+            "mayhem/proxy/operator-execution-ended/v1",
+            &[&serde_json::to_vec(&confirmation).map_err(|_| Error::Configuration)?],
+        );
+        let lease = authority
+            .lease(&confirmation.capacity_lease)
+            .map_err(|_| Error::Setup)?;
+        if let Some(lease) = &lease {
+            require(
+                lease.phase == capacity::Phase::Uncertain
+                    && lease.route == confirmation.route
+                    && lease.work.invocation == record.invocation
+                    && lease.work.request_hash == record.binding.request_hash,
+            )?;
+        } else {
+            require(record.execution_ended.as_ref() == Some(&evidence))?;
+        }
+        journal
+            .observe_attempt(
+                &record.invocation,
+                record.attempt,
+                attempts::Event::ExecutionEnded(evidence.clone()),
+                crate::supervisor::unix_ms(),
+            )
+            .map_err(|_| Error::Setup)?;
+        let released = if let Some(lease) = lease {
+            authority
+                .complete(capacity::VerifiedCompletion {
+                    lease,
+                    evidence: evidence.clone(),
+                })
+                .map_err(|_| Error::Setup)?
+        } else {
+            false
+        };
+        Ok(ExecutionRecoveryResolution {
+            invocation: record.invocation,
+            attempt: record.attempt,
+            released,
+            evidence_digest: evidence,
+        })
+    }
     /// Inspect only configured groups while the controller is stopped. Opening
     /// the authority retains its normal restart fence; this is not a live reader.
     pub fn recovery_status(self, signer: &Authority) -> Result<Vec<RecoveryStatus>> {

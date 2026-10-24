@@ -365,6 +365,7 @@ impl Controller {
             sample.use_native(source)
         }
         let transport = transport::Transport {
+            completion: None,
             connection: &self.connection,
             adapter: &self.adapter,
         };

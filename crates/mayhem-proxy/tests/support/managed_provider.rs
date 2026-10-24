@@ -652,3 +652,6 @@ async fn managed_provider_uncertain_probe_retains_capacity_and_does_not_resend_a
     );
     assert_eq!(capacity.group_occupied, 0);
 }
+
+#[path = "managed_execution_recovery.rs"]
+mod execution_recovery;

@@ -124,7 +124,7 @@ async fn paid_verified_refusal_frees_capacity_but_only_signed_closure_releases_f
 }
 
 #[tokio::test]
-async fn paid_generic_upstream_error_cannot_release_capacity_or_offer_nonexecution_waiver() {
+async fn paid_completed_error_response_frees_only_capacity_without_claiming_nonexecution() {
     for (status, response, profile) in [
         (503, vllm_refusal(false), "open_ai"),
         (
@@ -174,17 +174,17 @@ async fn paid_generic_upstream_error_cannot_release_capacity_or_offer_nonexecuti
                 p.journal.get(&p.record.invocation).unwrap().unwrap().phase,
                 Phase::Dispatched
             );
-            assert!(p.authority.lease(&p.lease).unwrap().is_some());
+            assert!(p.authority.lease(&p.lease).unwrap().is_none());
             assert!(p
                 .executor
                 .prepare_waiver(&p.record.invocation, p.record.attempt)
                 .await
                 .is_err());
-            assert!(p
+            assert!(!p
                 .executor
                 .reconcile_capacity(&p.record.invocation, p.record.attempt)
                 .await
-                .is_err());
+                .unwrap());
             assert_eq!(p.peer.command("status").await["publications"], 1);
             assert!(!p
                 .peer

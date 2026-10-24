@@ -17,11 +17,27 @@ use std::{
     collections::BTreeMap,
     fmt, io,
     net::{SocketAddr, ToSocketAddrs},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
     time::{Duration, SystemTime},
 };
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
+
+/// Parent-owned lifecycle observation, never supplied by a decoder or vendor
+/// error message. Used only for synchronous execution, not background jobs.
+#[derive(Default)]
+pub(crate) struct Completion(AtomicBool);
+impl Completion {
+    pub(crate) fn mark(&self) {
+        self.0.store(true, Ordering::Release);
+    }
+    pub(crate) fn observed(&self) -> bool {
+        self.0.load(Ordering::Acquire)
+    }
+}
 
 struct SystemDns {
     permits: Arc<Semaphore>,
@@ -76,6 +92,7 @@ mod tests {
             status: 200,
             format: WireFormat::Sse,
             error_profile: ErrorProfile::HttpStatus,
+            completion: None,
         };
         let mut total = 0;
         while let Some((bytes, observed)) = response.next_timed_chunk().await.unwrap() {
@@ -254,6 +271,14 @@ impl HttpConnection {
         operation: Operation,
         body: Option<Vec<u8>>,
     ) -> Result<UpstreamResponse, Failure> {
+        self.send_observed(operation, body, None).await
+    }
+    pub(crate) async fn send_observed(
+        &self,
+        operation: Operation,
+        body: Option<Vec<u8>>,
+        completion: Option<Arc<Completion>>,
+    ) -> Result<UpstreamResponse, Failure> {
         let before = |code| {
             Failure::new(
                 code,
@@ -329,7 +354,13 @@ impl HttpConnection {
         })?;
         let status = response.status().as_u16();
         if !response.status().is_success() {
-            return Err(decode_http_failure(response, self.error_profile, refusal_eligible).await);
+            return Err(decode_http_failure(
+                response,
+                self.error_profile,
+                refusal_eligible,
+                completion.as_deref(),
+            )
+            .await);
         }
         if response
             .content_length()
@@ -367,6 +398,13 @@ impl HttpConnection {
             status,
             format,
             error_profile: self.error_profile,
+            // HTTP 202 transfers execution to a background job; EOF cannot
+            // establish completion even on a misconfigured synchronous route.
+            completion: if status == 200 && format == WireFormat::Json {
+                completion
+            } else {
+                None
+            },
         })
     }
 }
@@ -375,6 +413,7 @@ async fn decode_http_failure(
     mut response: Response,
     profile: ErrorProfile,
     refusal_eligible: bool,
+    completion: Option<&Completion>,
 ) -> Failure {
     let status = response.status().as_u16();
     let retry_after = response
@@ -383,7 +422,7 @@ async fn decode_http_failure(
         .and_then(|v| v.to_str().ok())
         .filter(|v| v.len() <= 128)
         .map(str::to_owned);
-    if matches!(profile, ErrorProfile::HttpStatus) {
+    if matches!(profile, ErrorProfile::HttpStatus) && completion.is_none() {
         return failure::openai_error(status, &[], retry_after.as_deref(), SystemTime::now());
     }
     let json = response
@@ -408,6 +447,11 @@ async fn decode_http_failure(
     })
     .await
     .unwrap_or(false);
+    if complete {
+        if let Some(completion) = completion {
+            completion.mark();
+        }
+    }
     // Incomplete diagnostics may not carry a trusted error code or refusal.
     if !complete {
         bytes.clear();
@@ -448,6 +492,7 @@ pub struct UpstreamResponse {
     pub status: u16,
     pub format: WireFormat,
     error_profile: ErrorProfile,
+    completion: Option<Arc<Completion>>,
 }
 
 impl fmt::Debug for UpstreamResponse {
@@ -521,6 +566,9 @@ impl UpstreamResponse {
                     self.pending = chunk;
                 }
                 Ok(None) => {
+                    if let Some(completion) = &self.completion {
+                        completion.mark();
+                    }
                     self.response = None;
                     self.permit = None;
                     return Ok(None);

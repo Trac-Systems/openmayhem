@@ -33,7 +33,7 @@ pub async fn status(args: StatusArgs) -> Result<()> {
 pub struct Args {
     #[arg(long)]
     config: PathBuf,
-    /// Owner-only JSON confirmation binding the exact probe, upstream and evidence digest.
+    /// Owner-only JSON confirmation binding the exact attempt or probe, upstream and evidence digest.
     #[arg(long)]
     confirmation: PathBuf,
     /// A timeout is insufficient: independently check the original upstream has stopped.
@@ -61,6 +61,30 @@ pub async fn resolve(args: Args) -> Result<()> {
     let result =
         tokio::task::spawn_blocking(move || prepared.resolve_recovery_probe(&signer, confirmation))
             .await??;
+    println!("{}", serde_json::to_string(&result)?);
+    Ok(())
+}
+
+pub async fn resolve_execution(args: Args) -> Result<()> {
+    ensure!(
+        args.confirm_upstream_stopped,
+        "independent upstream-stop confirmation is required"
+    );
+    let prepared = Prepared::load_supervised(&args.config)?;
+    let bytes = mayhem_proxy::connector::config::private_file(&args.confirmation, 16 * 1024)?;
+    let confirmation: mayhem_proxy::managed::ExecutionRecoveryConfirmation =
+        serde_json::from_slice(&bytes)?;
+    let keypair = resolve_wallet_keypair_path(&args.wallet)?;
+    let key = cached_wallet_signing_key(
+        &keypair,
+        args.wallet.wallet_password.as_deref().unwrap_or_default(),
+    )
+    .await?;
+    let signer = Authority::from_unlocked_wallet(key, prepared.identity().clone())?;
+    let result = tokio::task::spawn_blocking(move || {
+        prepared.resolve_stopped_execution(&signer, confirmation)
+    })
+    .await??;
     println!("{}", serde_json::to_string(&result)?);
     Ok(())
 }
