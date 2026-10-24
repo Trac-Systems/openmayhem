@@ -152,10 +152,33 @@ async fn negotiate(owner: &Inner, channel: &mut negotiation::Channel) -> Result<
     Ok(true)
 }
 async fn refuse(channel: &mut negotiation::Channel, error: Option<crate::Error>) -> Result<()> {
-    let failure = match error {
+    if let Some(error) = error.as_ref() {
+        if !matches!(
+            error,
+            crate::Error::ProviderCapacity(
+                crate::capacity::Error::Busy
+                    | crate::capacity::Error::Quota
+                    | crate::capacity::Error::Checking
+            )
+        ) {
+            super::diagnostics::report("proposal_refusal", error);
+        }
+    }
+    let failure = refusal(error);
+    channel
+        .send(&negotiation::Message::Refused {
+            failure: (&failure).into(),
+        })
+        .await?;
+    Ok(())
+}
+fn refusal(error: Option<crate::Error>) -> Failure {
+    match error {
         Some(crate::Error::ProviderRequest(crate::endpoint::Error::Request(failure))) => failure,
         Some(crate::Error::ProviderCapacity(
-            crate::capacity::Error::Busy | crate::capacity::Error::Quota,
+            crate::capacity::Error::Busy
+            | crate::capacity::Error::Quota
+            | crate::capacity::Error::Checking,
         )) => Failure::new(
             Code::LocalCapacity,
             Scope::Request,
@@ -174,13 +197,7 @@ async fn refuse(channel: &mut negotiation::Channel, error: Option<crate::Error>)
             Stage::BeforeDispatch,
             Execution::Unknown,
         ),
-    };
-    channel
-        .send(&negotiation::Message::Refused {
-            failure: (&failure).into(),
-        })
-        .await?;
-    Ok(())
+    }
 }
 pub(super) async fn stopped(stop: &mut watch::Receiver<bool>) {
     loop {
@@ -558,4 +575,43 @@ fn classify(error: exchange::Error) -> FailureSnapshot {
         ),
     };
     (&failure).into()
+}
+
+#[cfg(test)]
+mod refusal_tests {
+    use super::*;
+    #[test]
+    fn only_transient_capacity_conditions_allow_bounded_pre_proposal_wait() {
+        use crate::capacity::Error as C;
+        for cause in [C::Busy, C::Quota, C::Checking] {
+            let snapshot: FailureSnapshot =
+                (&refusal(Some(crate::Error::ProviderCapacity(cause)))).into();
+            assert_eq!(snapshot.code, Code::LocalCapacity);
+            assert_eq!(snapshot.scope, Scope::Request);
+            assert_eq!(snapshot.stage, Stage::BeforeDispatch);
+            assert_eq!(snapshot.execution, Execution::Unknown);
+        }
+        for cause in [
+            C::Invalid,
+            C::Identity,
+            C::Storage,
+            C::File,
+            C::InUse,
+            C::NotFound,
+            C::Stale,
+            C::Unavailable,
+            C::ExistingWork,
+            C::ProbeBudget,
+            C::Binding,
+        ] {
+            let snapshot: FailureSnapshot =
+                (&refusal(Some(crate::Error::ProviderCapacity(cause)))).into();
+            assert_eq!(snapshot.code, Code::ProviderUnavailable);
+        }
+        let invalid: FailureSnapshot =
+            (&refusal(Some(crate::invalid("private request details")))).into();
+        assert_eq!(invalid.code, Code::ProviderUnavailable);
+        let unknown: FailureSnapshot = (&refusal(None)).into();
+        assert_eq!(unknown.code, Code::RecoveryRequired);
+    }
 }

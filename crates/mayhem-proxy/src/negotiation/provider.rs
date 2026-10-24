@@ -766,18 +766,20 @@ impl Inner {
             )
             .map_err(Error::ProviderCapacity)?;
         let route = self.runtime.capacity.check_reserved(reservation.lease());
-        if !route.is_ok_and(|r| {
-            r.lane == capacity::Lane::Proxy
-                && r.group.as_str() == member.capacity_group
-                && r.max_concurrency <= member.max_concurrency
-        }) {
+        let validation = route.map_err(Error::ProviderCapacity).and_then(|r| {
+            require(
+                r.lane == capacity::Lane::Proxy
+                    && r.group.as_str() == member.capacity_group
+                    && r.max_concurrency <= member.max_concurrency,
+                "provider capacity configuration differs from membership",
+            )
+        });
+        if let Err(error) = validation {
             self.runtime
                 .capacity
                 .cancel_reserved(reservation)
                 .map_err(|_| invalid("proposal capacity cleanup requires reconciliation"))?;
-            return Err(invalid(
-                "provider capacity configuration differs from membership",
-            ));
+            return Err(error);
         }
         let proposal = Proposal {
             adapter: self.runtime.adapter.public_snapshot(),

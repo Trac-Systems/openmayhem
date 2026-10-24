@@ -78,6 +78,7 @@ fn details(error: &(dyn Error + 'static)) -> (&'static str, Option<String>) {
             crate::Error::Http { status, .. } => ("financial_http", Some(status.to_string())),
             crate::Error::Transport(_) => ("financial_transport", None),
             crate::Error::FinancialAdmissionUnavailable => ("financial_unavailable", None),
+            crate::Error::ProviderCapacity(error) => details(error),
             _ => ("control", None),
         };
     }
@@ -150,6 +151,12 @@ mod tests {
     }
     #[test]
     fn nested_errors_preserve_identity_without_disclosing_raw_data() {
+        assert_eq!(
+            details(&crate::Error::ProviderCapacity(
+                crate::capacity::Error::Checking
+            )),
+            ("capacity", Some("Checking".into()))
+        );
         let private = "private prompt https://example.invalid/secret?token=private";
         let error = crate::serving::Error::Transport(crate::exchange::Error::Execution(
             crate::execution::Error::Financial(crate::invalid(private)),

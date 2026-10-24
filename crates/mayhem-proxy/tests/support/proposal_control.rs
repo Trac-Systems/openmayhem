@@ -223,6 +223,95 @@ impl Controlled {
 }
 
 #[tokio::test]
+async fn proposal_capacity_recheck_preserves_transient_cause_and_releases_only_unsigned_lease() {
+    struct Changing {
+        reads: AtomicUsize,
+        recovered: std::sync::atomic::AtomicBool,
+        changed: capacity::Readiness,
+    }
+    impl capacity::ReadinessSource for Changing {
+        fn revision(&self) -> capacity::Result<u64> {
+            Ok(1)
+        }
+        fn evidence(&self) -> capacity::Result<capacity::Evidence> {
+            let ready = self.recovered.load(Ordering::SeqCst)
+                || self.reads.fetch_add(1, Ordering::SeqCst) == 0;
+            Ok(capacity::Evidence {
+                state: if ready {
+                    capacity::Readiness::Ready
+                } else {
+                    self.changed
+                },
+                allowance: if ready { 2 } else { 0 },
+                age: Duration::ZERO,
+                valid_for: Duration::from_secs(60),
+            })
+        }
+    }
+    for changed in [
+        capacity::Readiness::Checking,
+        capacity::Readiness::Busy,
+        capacity::Readiness::Unavailable,
+    ] {
+        let backend = backend(200, answer(), Duration::ZERO).await;
+        let bytes = chat();
+        let f = Fixture::new(&backend.base, ProxyEndpoint::Chat);
+        let mut peer = Peer::start(ProxyRail::Tnk, &f, &bytes, false, None).await;
+        let s = Controlled::new(&f, &mut peer, limits(), 128 * 1024 * 1024).await;
+        let source = Arc::new(Changing {
+            reads: AtomicUsize::new(0),
+            recovered: std::sync::atomic::AtomicBool::new(false),
+            changed,
+        });
+        s.runtime
+            .capacity
+            .bind_live(capacity::Scope::Route(d(201)), source.clone())
+            .unwrap();
+        let ctx = context(&peer);
+        let failure = match s.start(&peer, ctx.clone(), &bytes).await {
+            Err(e) => e,
+            Ok(_) => panic!("changed health must reject unsigned proposal"),
+        };
+        assert!(
+            matches!(
+                (&failure, changed),
+                (
+                    mayhem_proxy::Error::ProviderCapacity(capacity::Error::Checking),
+                    capacity::Readiness::Checking
+                ) | (
+                    mayhem_proxy::Error::ProviderCapacity(capacity::Error::Busy),
+                    capacity::Readiness::Busy
+                ) | (
+                    mayhem_proxy::Error::ProviderCapacity(capacity::Error::Unavailable),
+                    capacity::Readiness::Unavailable
+                )
+            ),
+            "{failure:?}"
+        );
+        assert_eq!(
+            s.runtime.capacity.group_status(&d(200)).unwrap().occupied,
+            0
+        );
+        assert_eq!(s.proposals.status().await.unwrap().unsigned, 0);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(peer.command("status").await["publications"], 0);
+        source.recovered.store(true, Ordering::SeqCst);
+        let (_pair, _proposal) = s.start(&peer, ctx.clone(), &bytes).await.unwrap();
+        assert_eq!(
+            s.runtime.capacity.group_status(&d(200)).unwrap().occupied,
+            1
+        );
+        assert!(s.proposals.cancel_unsigned(ctx).await.unwrap());
+        assert_eq!(
+            s.runtime.capacity.group_status(&d(200)).unwrap().occupied,
+            0
+        );
+        assert_eq!(peer.command("status").await["publications"], 0);
+        peer.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn provider_controller_negotiates_funds_and_dispatches_once_on_every_endpoint_and_rail() {
     for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
         for (endpoint, bytes, response) in cases() {
