@@ -1169,7 +1169,7 @@ class ScBridge extends Feature {
       throw new Error('SC-Bridge requires --sc-bridge-token when auth is required.');
     }
     this.started = true;
-    this.server = new ws.Server({ host: this.host, port: this.port }, (socket) => {
+    this.server = new ws.Server({ host: this.host, port: this.port }, (socket, request) => {
       if (this.clients.size >= this.maxClients) {
         closeBridgeSocket(socket);
         return;
@@ -1192,6 +1192,24 @@ class ScBridge extends Feature {
         authTimer: null,
       };
       this.clients.add(client);
+      // The WebSocket wrapper can remain destroying while an interrupted write
+      // awaits drain. Its underlying HTTP-upgraded transport is authoritative:
+      // reclaim our registrations even if the wrapper never emits close/end.
+      // Install cleanup before the first write, which can itself fail or block.
+      const cleanup = () => this._dropClient(client, 'socket closed', true);
+      socket.on('close', cleanup);
+      socket.on('end', cleanup);
+      socket.on('error', cleanup);
+      const transport = request?.socket;
+      if (transport && transport !== socket) {
+        transport.on('close', cleanup);
+        transport.on('end', cleanup);
+        transport.on('error', cleanup);
+        if (transport.destroying || transport.destroyed) {
+          cleanup();
+          return;
+        }
+      }
       if (this.requireAuth) {
         client.authTimer = setTimeout(() => {
           if (!client.authed) this._dropClient(client, 'authentication timed out', true);
@@ -1213,12 +1231,6 @@ class ScBridge extends Feature {
       this._broadcastToClient(client, hello);
 
       socket.on('data', (data) => this._handleSocketData(client, data));
-      const cleanup = () => {
-        this._dropClient(client, 'socket closed', false);
-      };
-      socket.on('close', cleanup);
-      socket.on('end', cleanup);
-      socket.on('error', cleanup);
     });
   }
 

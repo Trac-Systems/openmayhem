@@ -4,6 +4,7 @@
   "type": "module",
   "main": "src/main.js",
   "scripts": {
+    "test:sc-bridge-sockets": "bare tests/sc-bridge-socket-lifecycle.bare.mjs",
     "msb:genesis": "node scripts/msb-local-genesis.mjs",
     "msb:run": "node scripts/msb-local-run.mjs --serve",
     "msb:probe": "node scripts/msb-local-probe.mjs",
