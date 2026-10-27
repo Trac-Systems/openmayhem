@@ -9,6 +9,7 @@ import { ethers } from 'ethers';
 import { distribution } from './merkle.mjs';
 import { signRootProposal } from './pool-governance.mjs';
 import { safeErrorMessage } from './safe-output.mjs';
+import { tapRootEventReader } from './tap-root-events.mjs';
 import {
   TAP_GOVERNANCE_SIGNER_ENV,
   TAP_ROLLER_SIGNER_ENV,
@@ -1743,6 +1744,7 @@ async function confirmedRootEventEvidence({
   priorCheckpoint,
   epochApplyHash,
   tapRateLock,
+  rootEventReader,
 } = {}) {
   if (!pool?.queryFilter || !pool?.filters?.RootPosted || !pool?.filters?.RootProposed) {
     throw new Error('TAP pool event queries are required for checkpoint confirmation');
@@ -1751,7 +1753,7 @@ async function confirmedRootEventEvidence({
   if (!provider?.getBlock || !provider?.getNetwork) {
     throw new Error('TAP pool provider cannot prove settlement finality');
   }
-  let queryThroughBlock = 'latest';
+  let queryThroughBlock;
   if (typeof provider.send === 'function') {
     const rawBlockNumber = await provider.send('eth_blockNumber', []);
     const blockNumber = Number(BigInt(rawBlockNumber));
@@ -1759,34 +1761,17 @@ async function confirmedRootEventEvidence({
       throw new Error('TAP pool returned an invalid latest block number');
     }
     queryThroughBlock = blockNumber;
+  } else {
+    queryThroughBlock = (await provider.getBlock('latest'))?.number;
+    if (!Number.isSafeInteger(queryThroughBlock) || queryThroughBlock < 0) {
+      throw new Error('TAP pool returned an invalid latest block number');
+    }
   }
-  const postedEvents = await pool.queryFilter(
-    pool.filters.RootPosted(epoch),
-    0,
-    queryThroughBlock
-  );
-  const posted = postedEvents.find((event) => (
-    String(event.args?.merkleRoot ?? '').toLowerCase() === root.toLowerCase() &&
-    parseBigIntString(
-      event.args?.cumulativeSpent,
-      'RootPosted cumulative spent'
-    ) === cumulativeSpentWei
-  ));
+  const readEvent = rootEventReader ?? await tapRootEventReader({ pool, epoch, rateTimestamp: tapRateLock?.rate_ts });
+  const posted = await readEvent({ name: 'RootPosted', root, cumulativeSpentWei, throughBlock: queryThroughBlock });
   if (!posted) throw new Error('confirmed TAP RootPosted event is missing');
   const nonce = parseBigIntString(posted.args?.nonce, 'RootPosted nonce');
-  const proposedEvents = await pool.queryFilter(
-    pool.filters.RootProposed(epoch),
-    0,
-    queryThroughBlock
-  );
-  const proposed = proposedEvents.find((event) => (
-    String(event.args?.merkleRoot ?? '').toLowerCase() === root.toLowerCase() &&
-    parseBigIntString(
-      event.args?.cumulativeSpent,
-      'RootProposed cumulative spent'
-    ) === cumulativeSpentWei &&
-    parseBigIntString(event.args?.nonce, 'RootProposed nonce') === nonce
-  ));
+  const proposed = await readEvent({ name: 'RootProposed', root, cumulativeSpentWei, nonce, throughBlock: queryThroughBlock });
   if (!proposed) throw new Error('confirmed TAP RootProposed event is missing');
   const proposalRecord = await rootEventRecord(proposed, 'RootProposed');
   const executionRecord = await rootEventRecord(posted, 'RootPosted');
@@ -1929,6 +1914,7 @@ export async function rollTapSettlement({
   operatorAddress,
   epoch,
   canonicalPreparationSubmitter,
+  rootEventReader,
   post = true,
 } = {}) {
   const inputBundle = receipts ? { receipts } : bundle;
@@ -2449,6 +2435,7 @@ export async function rollTapSettlement({
         priorCheckpoint: prior?.tap_settlement_checkpoint,
         epochApplyHash,
         tapRateLock,
+        rootEventReader,
       });
     } catch (error) {
       if (error?.code !== 'TAP_FINALITY_PENDING') throw error;
@@ -3615,6 +3602,16 @@ async function main() {
     preparationAdminSigner = await tapPreparationAdminSignerFromEnv();
   }
 
+  const eventEpoch = parsePositiveInt(bundle.epoch ?? bundle.settlement_epoch, 'TAP event epoch');
+  if (args.epoch && parsePositiveInt(args.epoch, '--epoch') !== eventEpoch) {
+    throw new Error('explicit TAP settlement epoch conflicts with the canonical bundle');
+  }
+  const rootEventReader = pool ? await tapRootEventReader({ pool,
+    epoch: eventEpoch,
+    rateTimestamp: tapRateLock.rate_ts,
+    file: args['event-cursor-file'] ?? (tapRateLockPath ? `${tapRateLockPath}.events.json` : undefined),
+  }) : undefined;
+
   const report = await rollTapSettlement({
     bundle,
     targetedSessionBindings: targetedPayouts.sessionBindings,
@@ -3633,6 +3630,7 @@ async function main() {
     ownerSigner,
     governanceSigner,
     operatorAddress,
+    rootEventReader,
     epoch: args.epoch ? parsePositiveInt(args.epoch, '--epoch') : undefined,
     canonicalPreparationSubmitter: confirm
       ? ({ plan }) => submitCanonicalTapPreparationPlan({

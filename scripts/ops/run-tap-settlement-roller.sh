@@ -94,6 +94,7 @@ while true; do
   fi
   buyer_accounts="$working/$name.buyers.json"
   rate_lock="$working/$name.tap-rate.json"
+  event_cursor="$rate_lock.events.json"
   dry_report="$working/$name.dry-run.json"
   raw_report="$working/$name.settlement.raw.json"
   bound_report="$working/$name.settlement.bound.json"
@@ -225,7 +226,7 @@ PY
     install -m 600 "$rate_lock" "$processed/$name.tap-rate.json"
     mv "$bundle" "$processed/"
     [[ -f "$buyer_accounts" ]] && mv "$buyer_accounts" "$processed/"
-    rm -f "$rate_lock" "$dry_report" "$raw_report" "$bound_report" "$final_report"
+    rm -f "$rate_lock" "$event_cursor" "$dry_report" "$raw_report" "$bound_report" "$final_report"
     continue
   fi
   if ! jq -e '
@@ -359,6 +360,7 @@ PY
   install -m 600 "$final_report" "$processed/$name.settlement.json"
   install -m 600 "$final_report" "$processed/latest.json"
   install -m 600 "$rate_lock" "$processed/$name.tap-rate.json"
+  [[ ! -f "$event_cursor" ]] || mv "$event_cursor" "$processed/"
   mv "$bundle" "$processed/"
   [[ -f "$buyer_accounts" ]] && mv "$buyer_accounts" "$processed/"
   rm -f "$rate_lock" "$dry_report" "$raw_report" "$bound_report" "$final_report"
