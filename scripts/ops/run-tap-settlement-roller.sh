@@ -263,24 +263,50 @@ if report.get("epoch") != epoch:
 root = report.get("root")
 if not isinstance(root, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", root):
     raise SystemExit("TAP settlement report root is not a 32-byte hash")
-tx = report.get("execution_tx") or report.get("proposal_tx")
-if report.get("root_already_posted") is not True and (
-    not isinstance(tx, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx)
-):
-    raise SystemExit("TAP settlement report root transaction is invalid")
-for field in ("operator_fee", "burn"):
-    record = report.get(field)
-    if not isinstance(record, dict):
-        raise SystemExit(f"TAP settlement report {field} evidence is missing")
-    predicted = record.get("predicted_claimable_wei")
-    if not isinstance(predicted, str) or not predicted.isdigit():
-        raise SystemExit(f"TAP settlement report {field} amount is invalid")
-    if predicted != "0" and (
-        record.get("auto_sent") is not True
-        or not isinstance(record.get("tx"), str)
-        or not re.fullmatch(r"0x[0-9a-fA-F]{64}", record["tx"])
+if report.get("awaiting_governance_delay") is True:
+    # A recovered proposal need not have a locally retained transaction hash.
+    # The roller has checked the exact on-chain root and canonical preparation.
+    # Fees and burn cannot execute until this mandatory delay has elapsed.
+    pending = report.get("pending_root")
+    execute_after = report.get("execute_after")
+    spent = report.get("cumulative_spent_wei")
+    if (
+        report.get("blocked") is True
+        or report.get("posted") is not False
+        or report.get("root_pending") is not True
+        or report.get("root_confirmed") is not False
+        or report.get("canonical_preparation_confirmed") is not True
+        or not isinstance(pending, dict)
+        or pending.get("merkle_root") != root.lower()
+        or pending.get("epoch") != epoch
+        or not isinstance(spent, str)
+        or not re.fullmatch(r"(0|[1-9][0-9]*)", spent)
+        or pending.get("cumulative_spent_wei") != spent
+        or not isinstance(execute_after, int)
+        or isinstance(execute_after, bool)
+        or execute_after < 1
+        or pending.get("execute_after") != execute_after
     ):
-        raise SystemExit(f"TAP settlement report {field} transaction is invalid")
+        raise SystemExit("TAP settlement pending root evidence does not match the prepared payout")
+else:
+    tx = report.get("execution_tx") or report.get("proposal_tx")
+    if report.get("root_already_posted") is not True and (
+        not isinstance(tx, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx)
+    ):
+        raise SystemExit("TAP settlement report root transaction is invalid")
+    for field in ("operator_fee", "burn"):
+        record = report.get(field)
+        if not isinstance(record, dict):
+            raise SystemExit(f"TAP settlement report {field} evidence is missing")
+        predicted = record.get("predicted_claimable_wei")
+        if not isinstance(predicted, str) or not predicted.isdigit():
+            raise SystemExit(f"TAP settlement report {field} amount is invalid")
+        if predicted != "0" and (
+            record.get("auto_sent") is not True
+            or not isinstance(record.get("tx"), str)
+            or not re.fullmatch(r"0x[0-9a-fA-F]{64}", record["tx"])
+        ):
+            raise SystemExit(f"TAP settlement report {field} transaction is invalid")
 report["rail"] = "tap"
 report["epoch_apply_hash"] = apply_hash
 report["bundle_sha256"] = hashlib.sha256(bundle_raw).hexdigest()
@@ -308,6 +334,8 @@ PY
   if ! jq -e '
     .blocked != true and
     .root_confirmed == true and
+    .awaiting_finality != true and
+    (.tap_settlement_checkpoint | type == "object") and
     (
       .root_already_posted == true or
       (.posted == true and ((.execution_tx | type == "string") or (.proposal_tx | type == "string")))
@@ -319,7 +347,11 @@ PY
     .burn.remaining_claimable_wei == "0" and
     (.burn.predicted_claimable_wei == "0" or .burn.auto_sent == true)
   ' "$final_report" >/dev/null; then
-    echo "TAP settlement report did not confirm root, fee, and burn completion for $name" >&2
+    if jq -e '.awaiting_finality == true' "$final_report" >/dev/null; then
+      echo "TAP settlement root for $name is executed and waiting for chain finality." >&2
+    else
+      echo "TAP settlement report did not confirm root, fee, burn, and checkpoint completion for $name" >&2
+    fi
     sleep "$interval"
     continue
   fi

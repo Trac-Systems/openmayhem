@@ -4,6 +4,7 @@ import Ganache from 'ganache';
 import { ethers } from 'ethers';
 import { deployPool } from '../scripts/deploy-local.mjs';
 import { checkBundledCli } from './helpers/mixed-payout-cli.mjs';
+import { checkTapSpoolReport } from './helpers/tap-spool-report.mjs';
 import { createHash } from 'node:crypto';
 import { proxyPayoutEpoch, matureFixtureLiabilities } from '../../intercom/tests/helpers/proxy-payout-epoch.mjs';
 import { deriveTapReceiptBundle } from '../../intercom/scripts/payout-tap-receipts.mjs';
@@ -137,7 +138,8 @@ test('actual mixed TAP roller resumes after confirmed external fee transfer with
   const f = await fixture();
   const chain = Ganache.provider({ logging: { quiet: true }, chain: { chainId: 1 }, wallet: { totalAccounts: 3 } });
   t.after(async () => { await chain.disconnect(); });
-  const provider = new ethers.BrowserProvider(chain);
+  // Time and blocks are advanced explicitly; do not reuse ethers' cached head.
+  const provider = new ethers.BrowserProvider(chain, undefined, { cacheTimeout: -1 });
   const owner = await provider.getSigner(0), buyer = await provider.getSigner(1), treasury = await provider.getSigner(2);
   const { token, pool, poolAddr, governanceWallet } = await deployPool(owner, { governanceDelay: 3600n, maxEpochDelta: ethers.parseEther('20') });
   await (await token.mint(await buyer.getAddress(), ethers.parseEther('20'))).wait();
@@ -177,17 +179,46 @@ test('actual mixed TAP roller resumes after confirmed external fee transfer with
   } });
   const pending = await rollTapSettlement({ ...args, pool: wrap(pool) });
   assert.equal(pending.root_pending, true);
+  const pendingBound = checkTapSpoolReport(f.bundle, pending);
+  assert.equal(pendingBound.status, 0, pendingBound.error);
+  assert.equal(pendingBound.finalizable, false, 'a proposed root cannot leave the working spool');
+  const retriedPending = await rollTapSettlement({ ...args, pool: wrap(pool) });
+  assert.equal(retriedPending.proposal_tx, null, 'restart recovers pending state without sending another proposal');
+  const retryBound = checkTapSpoolReport(f.bundle, retriedPending);
+  assert.equal(retryBound.status, 0, retryBound.error);
+  assert.equal(retryBound.finalizable, false);
+  for (const change of [
+    value => value.pending_root.epoch++,
+    value => { value.pending_root.merkle_root = '0x' + 'f'.repeat(64); },
+    value => { value.pending_root.cumulative_spent_wei = '1'; },
+    value => value.execute_after++,
+    value => { value.canonical_preparation_confirmed = false; },
+  ]) {
+    const invalid = JSON.parse(JSON.stringify(retriedPending)); change(invalid);
+    assert.notEqual(checkTapSpoolReport(f.bundle, invalid).status, 0, 'mismatched waiting evidence is rejected');
+  }
   await provider.send('evm_increaseTime', [3601]); await provider.send('evm_mine', []);
   await assert.rejects(rollTapSettlement({ ...args, pool: wrap(pool) }), /crash after confirmed fee transfer/);
   assert.equal(feeSends, 1);
   const paid = await token.balanceOf(await treasury.getAddress());
   assert.equal(paid, BigInt(f.recomputed.totals.fee_au));
   const resumed = await rollTapSettlement({ ...args, pool: wrap(pool) });
+  assert.equal(resumed.awaiting_finality, true);
+  const finalityBound = checkTapSpoolReport(f.bundle, resumed);
+  assert.equal(finalityBound.status, 0, finalityBound.error);
+  assert.equal(finalityBound.finalizable, false, 'an executed root still waits for its finalized checkpoint');
   for (let count = 0; count < 12; count++) await provider.send('evm_mine', []);
   await new Promise(resolve => setTimeout(resolve, 300));
   const confirmed = await rollTapSettlement({ ...args, pool: wrap(pool), prior: resumed });
   assert.equal(confirmed.root_confirmed, true, JSON.stringify({ resumed: { root: resumed.root, blocked: resumed.blocked, reasons: resumed.reasons, awaiting_finality: resumed.awaiting_finality }, confirmed: { root: confirmed.root, blocked: confirmed.blocked, reasons: confirmed.reasons, awaiting_finality: confirmed.awaiting_finality } }));
   assert.ok(confirmed.tap_settlement_checkpoint);
+  const confirmedBound = checkTapSpoolReport(f.bundle, confirmed);
+  assert.equal(confirmedBound.status, 0, confirmedBound.error);
+  assert.equal(confirmedBound.finalizable, true, JSON.stringify({ error: confirmedBound.gateError,
+    flags: ['blocked', 'root_confirmed', 'root_already_posted', 'posted', 'awaiting_finality', 'operator_fee', 'burn']
+      .map(key => [key, confirmed[key]]) }));
+  const missingCheckpoint = { ...confirmed, tap_settlement_checkpoint: null };
+  assert.equal(checkTapSpoolReport(f.bundle, missingCheckpoint).finalizable, false);
   assert.equal(feeSends, 1);
   assert.equal(await token.balanceOf(await treasury.getAddress()), paid);
   assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 1);
