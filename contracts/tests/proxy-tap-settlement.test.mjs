@@ -8,6 +8,9 @@ import { createHash } from 'node:crypto';
 import { proxyPayoutEpoch, matureFixtureLiabilities } from '../../intercom/tests/helpers/proxy-payout-epoch.mjs';
 import { deriveTapReceiptBundle } from '../../intercom/scripts/payout-tap-receipts.mjs';
 import { buildTapSettlement, buildVerifiedTapSettlement, resolveTargetedTapPayoutsFromLedger, rollTapSettlement } from '../scripts/tap-settlement-roller.mjs';
+import { buildCanonicalTapPreparationPlan, submitCanonicalTapPreparationPlan } from '../scripts/tap-settlement-roller.mjs';
+import { CONTRACT_VERSION } from '../../intercom/contract/contract.js';
+import { executeFeature } from '../../intercom/tests/helpers/contract.js';
 
 async function fixture({ retry = false } = {}) {
   const source = await proxyPayoutEpoch('tap', { mixed: true, retry });
@@ -83,6 +86,52 @@ function rateLock(f, pool = '0x' + '1'.repeat(40), token = '0x' + '2'.repeat(40)
     rate_record_key: `rate/tap/${f.epoch * 3600}/${'e'.repeat(64)}`, posted_by: f.f.admin.publicKey,
     posted_by_role: 'admin', chain_id: 1, token_address: token, pool_address: pool, payment_config_ver: 1 } };
 }
+
+test('TAP worker signs current-contract preparations and recovers a lost acknowledgement without duplicate writes', async () => {
+  const f = await fixture();
+  const settlement = await buildVerifiedTapSettlement(f.args);
+  const lock = rateLock(f);
+  const plan = await buildCanonicalTapPreparationPlan({ settlement, bundle: f.bundle,
+    epoch: f.epoch, epochApplyHash: f.applyHash, tapRateLock: lock.tapRateLock });
+  const originalPlan = structuredClone(plan);
+  const submissions = [];
+  let loseAcknowledgement = true;
+  const fetchImpl = async (input, options = {}) => {
+    const url = new URL(input);
+    assert.equal(url.origin, 'http://fixture.invalid');
+    if (options.method !== 'POST') {
+      assert.equal(url.searchParams.get('confirmed'), 'true');
+      const key = url.searchParams.get('key');
+      return { ok: true, json: async () => ({ key, confirmed: true, value: await f.f.read(key) }) };
+    }
+    assert.equal(url.pathname, '/v1/contract/feature');
+    const { key, value } = JSON.parse(options.body);
+    submissions.push(value);
+    const result = await executeFeature(f.f.contract, f.f.storage, 'mayhem_feature', key, value, f.f.admin.publicKey);
+    assert.equal(result.ok, true, result.message);
+    assert.equal(value.contract_version, CONTRACT_VERSION);
+    if (loseAcknowledgement) {
+      loseAcknowledgement = false;
+      throw new Error('lost acknowledgement after canonical preparation');
+    }
+    return { ok: true, json: async () => result };
+  };
+  const args = { plan, peerRpcUrl: 'http://fixture.invalid/v1/', fetchImpl,
+    adminSigner: { publicKey: f.f.admin.publicKey,
+      sign: message => Buffer.from(f.f.admin.wallet.sign(Buffer.from(message))).toString('hex') } };
+  await assert.rejects(submitCanonicalTapPreparationPlan(args), /lost acknowledgement/);
+  const completed = await submitCanonicalTapPreparationPlan(args);
+  assert.equal(completed.records.length, 3, 'native and proxy liabilities plus root preparation');
+  assert.equal(submissions.length, 3, 'confirmed preparation is not resubmitted');
+  const replay = await submitCanonicalTapPreparationPlan(args);
+  assert.equal(replay.all_existing, true);
+  assert.equal(submissions.length, 3);
+  assert.deepEqual(plan, originalPlan, 'recovery preserves payout amounts, recipients and identities');
+  const altered = structuredClone(plan);
+  altered.preparations[0].payload.fee_bps++;
+  await assert.rejects(submitCanonicalTapPreparationPlan({ ...args, plan: altered }), /conflicts with the planned operation/);
+  assert.equal(submissions.length, 3, 'conflicting recovery cannot write or pay');
+});
 
 test('actual mixed TAP roller resumes after confirmed external fee transfer with one root and no duplicate transfer', { timeout: 60_000 }, async t => {
   const f = await fixture();

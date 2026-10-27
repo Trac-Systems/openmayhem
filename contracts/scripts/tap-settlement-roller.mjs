@@ -26,7 +26,6 @@ const SESSION_RECEIPT_SCHEMA_VERSION = 12;
 const SETTLEMENT_RECEIPT_SCHEMA_VERSIONS = new Set([10, 11, SESSION_RECEIPT_SCHEMA_VERSION]);
 const SIGNING_MESSAGE_VERSION = 2;
 const DEFAULT_TAP_CHALLENGE_EPOCHS = 6;
-const CONTRACT_VERSION = 19;
 const TAP_BURN_BPS = 1_000n;
 const MIN_TAP_CONFIRMATION_DEPTH = 12;
 const PREPARATION_CONFIRM_TIMEOUT_MS = 30_000;
@@ -2818,10 +2817,12 @@ async function preparationDependencies() {
     import('../../intercom/node_modules/@tracsystems/blake3/dist/wasm/blake3.mjs'),
     import('../../intercom/node_modules/b4a/index.js'),
     import('../../intercom/node_modules/trac-wallet/index.js'),
-  ]).then(([blake3Module, b4aModule, walletModule]) => ({
+    import('../../intercom/contract/contract.js'),
+  ]).then(([blake3Module, b4aModule, walletModule, contractModule]) => ({
     blake3: blake3Module.blake3,
     b4a: b4aModule.default,
     PeerWallet: walletModule.default,
+    contractVersion: contractModule.CONTRACT_VERSION,
   }));
   return preparationDependenciesPromise;
 }
@@ -3211,6 +3212,9 @@ export async function submitCanonicalTapPreparationPlan({
   if (!isObject(plan) || !Array.isArray(plan.preparations)) {
     throw new Error('canonical TAP preparation plan is missing');
   }
+  // Sign for the contract shipped in this runtime; a separate version constant
+  // can leave settlement permanently rejected after a contract upgrade.
+  const { contractVersion } = await preparationDependencies();
   const admin = String(adminSigner?.publicKey ?? '').toLowerCase();
   if (!isHexBytes(admin, 32) || typeof adminSigner?.sign !== 'function') {
     throw new Error('canonical TAP preparation requires an Ed25519 admin signer');
@@ -3239,7 +3243,7 @@ export async function submitCanonicalTapPreparationPlan({
     );
     const unsigned = {
       op: 'prepare_targeted_payout',
-      contract_version: CONTRACT_VERSION,
+      contract_version: contractVersion,
       economic_op_id: preparation.economic_op_id,
       rail: 'tap',
       epoch: plan.intent.epoch,

@@ -2076,6 +2076,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     }],
     ['epoch/apply/state', { updated_epoch: 7 }],
     ['params/challenge_epochs', { current: { value: 6, effective_at: 0 }, pending: null }],
+    ['params/payout_min_au', { key: 'payout_min_au', current: { value: '0', effective_at: 0, ver: 1 }, pending: null }],
     ['tap/rate/latest', {
       denom: 'tap_usd_au',
       tap_usd_au: String(TAP_USD_AU),
@@ -2150,7 +2151,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
     const key = url.searchParams.get('key');
     const value = ledgerState.get(key) ?? null;
     response.writeHead(200, { 'content-type': 'application/json' });
-    response.end(JSON.stringify({ value }));
+    response.end(JSON.stringify({ key, value, confirmed: true, signed_length: 100 }));
   });
   await new Promise((resolve) => ledgerServer.listen(0, '127.0.0.1', resolve));
   t.after(() => ledgerServer.close());
