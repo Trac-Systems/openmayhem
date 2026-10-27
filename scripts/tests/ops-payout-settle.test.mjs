@@ -6,6 +6,8 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 import { fileURLToPath } from 'node:url';
+import MayhemContract from '../../intercom/contract/contract.js';
+const tapContract = new MayhemContract({}, {});
 
 const ROOT = fileURLToPath(new URL('../..', import.meta.url));
 const SCRIPT = path.join(ROOT, 'scripts/ops-payout-settle.sh');
@@ -21,12 +23,12 @@ const EPOCH_COMMIT_HASH = '0'.repeat(64);
 const EPOCH_APPLIED_AT = 'f'.repeat(64);
 const FIAT_ROOT = 'b'.repeat(64);
 const TNK_ROOT = 'c'.repeat(64);
-const TAP_ROOT = `0x${'d'.repeat(64)}`;
 const TAP_TX = `0x${'e'.repeat(64)}`;
 const TAP_EXECUTION_TX = `0x${'f'.repeat(64)}`;
 const TAP_PROVIDER = '8'.repeat(64);
 const TAP_PAYOUT_REVISION = '9'.repeat(64);
 const TAP_TARGET = `0x${'1'.repeat(40)}`;
+const TAP_ROOT = tapContract.targetedTapSettlementRoot([{account:'0x'+'0'.repeat(39)+'2',cumulative_wei:'4'},{account:TAP_TARGET,cumulative_wei:'10'}]);
 const FIAT_PROVIDER = '6'.repeat(64);
 const FIAT_PAYOUT_REVISION = '7'.repeat(64);
 const FIAT_QUOTE_HASH = 'aeb7dc5278b6ad207b3dfad34b7708b1859690166b1d1f8751fd4afe5204b7d8';
@@ -1414,6 +1416,16 @@ function writeTapReport(ctx, bundleName, overrides = {}) {
     confirmation_depth: 12,
     confirmation_policy: 'finalized-tag',
     cumulative_spent_wei: '14',
+    preparation_ids: ['a'.repeat(64)],
+    root_preparation_id: 'b'.repeat(64),
+    external_effect_ids: ['c'.repeat(64), 'd'.repeat(64)],
+    provider_cumulative_claimed_wei: '10',
+    buyer_refund_wei: '4',
+    fee_bps: 1500,
+    tap_burn_bps: 1000,
+    provider_share_bps: 7500,
+    provider_entries: [{account:TAP_TARGET,cumulative_wei:'10'}],
+    refunds: [{account:'0x'+'0'.repeat(39)+'2',cumulative_wei:'4'}],
     provider_count: 1,
     provider_paid_au: '10',
     provider_tap_wei: '10',
@@ -1431,6 +1443,9 @@ function writeTapReport(ctx, bundleName, overrides = {}) {
       provider: TAP_PROVIDER,
       payout_revision: TAP_PAYOUT_REVISION,
       to: TAP_TARGET,
+      paid_cum_au_before: '0',
+      aggregate_paid_cum_au_before: '0',
+      prior_cumulative_claim_wei: '0',
       paid_au: '10',
       tap_wei: '10',
       cumulative_claim_wei: '10',
@@ -1594,6 +1609,11 @@ test('ambiguous prior-epoch TAP payout reconciles before current remaining liabi
   report.tap_settlement_checkpoint.outputs[0].tap_wei = '100';
   report.tap_settlement_checkpoint.outputs[0].cumulative_claim_wei = '100';
   report.root_confirmation.onchain_cumulative_spent_wei = '104';
+  report.tap_settlement_checkpoint.provider_cumulative_claimed_wei = '100';
+  report.tap_settlement_checkpoint.provider_entries[0].cumulative_wei = '100';
+  report.root = tapContract.targetedTapSettlementRoot(report.tap_settlement_checkpoint.entries);
+  report.tap_settlement_checkpoint.root = report.root;
+  report.root_confirmation.onchain_root = report.root;
   writeJson(reportPath, report);
   writeJson(ctx.tapLiabilityState, {
     provider: TAP_PROVIDER,

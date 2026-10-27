@@ -1896,6 +1896,7 @@ PY
 
 validate_tap_processed() {
   local report="$1" bundle="$2"
+  node "$SOURCE_DIR/scripts/validate-tap-settlement-checkpoint.mjs" "$report" || return 1
   python3 - "$report" "$bundle" "$applied_epoch" "$apply_hash" <<'PY'
 import hashlib, json, re, sys
 report_path, bundle_path, expected_epoch, expected_hash = sys.argv[1:]
@@ -1926,28 +1927,10 @@ if d.get("root_already_posted") is not True:
     if d.get("posted") is not True or not isinstance(tx, str) or not re.fullmatch(r"0x[0-9a-fA-F]{64}", tx):
         raise SystemExit("TAP report has no confirmed root transaction evidence")
 
-def stable_json(value):
-    return json.dumps(value, sort_keys=True, separators=(",", ":"))
-
-def canonical_uint(value, label):
-    if not isinstance(value, str) or not re.fullmatch(r"(0|[1-9][0-9]*)", value):
-        raise SystemExit(f"{label} is not a canonical unsigned integer")
-    return int(value)
-
 checkpoint = d.get("tap_settlement_checkpoint")
-checkpoint_keys = {
-    "op", "epoch", "at", "rail", "chain_id", "token_address",
-    "pool_address", "payment_config_ver", "epoch_apply_hash",
-    "tap_rate_lock", "root", "root_confirmed", "proposal_tx",
-    "proposal_block_number", "proposal_block_hash", "execution_tx",
-    "execution_status", "execution_block_number", "execution_block_hash",
-    "finalized_block_number", "confirmation_depth", "confirmation_policy",
-    "cumulative_spent_wei", "provider_count", "provider_paid_au",
-    "provider_tap_wei", "entries", "outputs",
-}
+
 if (
     not isinstance(checkpoint, dict)
-    or set(checkpoint) != checkpoint_keys
     or checkpoint.get("op") != "settle_targeted_tap"
     or checkpoint.get("rail") != "tap"
     or checkpoint.get("epoch") != expected_epoch
@@ -1969,7 +1952,9 @@ if (
 confirmation = d.get("root_confirmation")
 proposal = confirmation.get("proposal") if isinstance(confirmation, dict) else None
 execution = confirmation.get("execution") if isinstance(confirmation, dict) else None
-if (
+# Older reports duplicated these fields outside the canonical checkpoint.
+# If present, keep checking that copy; current reports carry the proof once.
+if confirmation is not None and (
     not isinstance(confirmation, dict)
     or confirmation.get("confirmed") is not True
     or confirmation.get("onchain_epoch") != expected_epoch
@@ -1995,76 +1980,6 @@ if (
         checkpoint.get("finalized_block_number") - checkpoint.get("execution_block_number")
 ):
     raise SystemExit("TAP canonical settlement checkpoint root confirmation is invalid")
-entries = checkpoint.get("entries")
-if not isinstance(entries, list) or not entries:
-    raise SystemExit("TAP canonical settlement checkpoint entries are invalid")
-entry_map = {}
-for entry in entries:
-    if (
-        not isinstance(entry, dict)
-        or set(entry) != {"account", "cumulative_wei"}
-        or not re.fullmatch(r"0x[0-9a-f]{40}", str(entry.get("account", "")))
-    ):
-        raise SystemExit("TAP canonical settlement checkpoint entry shape is invalid")
-    account = entry["account"]
-    if account in entry_map:
-        raise SystemExit("TAP canonical settlement checkpoint entry is duplicated")
-    entry_map[account] = canonical_uint(
-        entry.get("cumulative_wei"),
-        "TAP cumulative entry",
-    )
-if entries != sorted(entries, key=lambda entry: entry["account"]):
-    raise SystemExit("TAP canonical settlement checkpoint entries are not sorted")
-if str(sum(entry_map.values())) != checkpoint.get("cumulative_spent_wei"):
-    raise SystemExit("TAP canonical cumulative settlement total is invalid")
-outputs = checkpoint.get("outputs")
-if (
-    not isinstance(outputs, list)
-    or not outputs
-    or checkpoint.get("provider_count") != len(outputs)
-):
-    raise SystemExit("TAP canonical settlement checkpoint outputs are invalid")
-seen = set()
-net_au = 0
-tap_wei = 0
-for output in outputs:
-    if not isinstance(output, dict) or sorted(output) != [
-        "cumulative_claim_wei",
-        "paid_au",
-        "payout_revision",
-        "provider",
-        "tap_wei",
-        "to",
-    ]:
-        raise SystemExit("TAP canonical provider checkpoint output shape is invalid")
-    identity = (output.get("provider"), output.get("payout_revision"))
-    if (
-        not re.fullmatch(r"[0-9a-f]{64}", str(identity[0] or ""))
-        or not re.fullmatch(r"[0-9a-f]{64}", str(identity[1] or ""))
-        or not re.fullmatch(r"0x[0-9a-f]{40}", str(output.get("to", "")))
-        or identity in seen
-    ):
-        raise SystemExit("TAP canonical provider checkpoint identity is invalid")
-    seen.add(identity)
-    paid_now = canonical_uint(output.get("paid_au"), "TAP paid_au")
-    output_wei = canonical_uint(output.get("tap_wei"), "TAP output tap_wei")
-    cumulative = canonical_uint(
-        output.get("cumulative_claim_wei"),
-        "TAP cumulative claim",
-    )
-    if (
-        paid_now <= 0
-        or output_wei <= 0
-        or entry_map.get(output.get("to")) != cumulative
-    ):
-        raise SystemExit("TAP canonical provider checkpoint amount is invalid")
-    net_au += paid_now
-    tap_wei += output_wei
-if (
-    str(net_au) != checkpoint.get("provider_paid_au")
-    or str(tap_wei) != checkpoint.get("provider_tap_wei")
-):
-    raise SystemExit("TAP canonical settlement checkpoint totals do not match outputs")
 for field in ("operator_fee", "burn"):
     record = d.get(field)
     if not isinstance(record, dict):

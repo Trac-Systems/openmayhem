@@ -4,7 +4,7 @@ import Ganache from 'ganache';
 import { ethers } from 'ethers';
 import { deployPool } from '../scripts/deploy-local.mjs';
 import { checkBundledCli } from './helpers/mixed-payout-cli.mjs';
-import { checkTapSpoolReport } from './helpers/tap-spool-report.mjs';
+import { checkTapSpoolReport, checkTapProcessedReport } from './helpers/tap-spool-report.mjs';
 import { createHash } from 'node:crypto';
 import { proxyPayoutEpoch, matureFixtureLiabilities } from '../../intercom/tests/helpers/proxy-payout-epoch.mjs';
 import { deriveTapReceiptBundle } from '../../intercom/scripts/payout-tap-receipts.mjs';
@@ -85,7 +85,7 @@ function rateLock(f, pool = '0x' + '1'.repeat(40), token = '0x' + '2'.repeat(40)
     bundle_sha256: createHash('sha256').update(JSON.stringify(f.bundle)).digest('hex'),
     denom: 'tap_usd_au', tap_usd_au: f.args.tapUsdAu, source: 'isolated-fixed-rate', rate_ts: f.epoch * 3600,
     rate_record_key: `rate/tap/${f.epoch * 3600}/${'e'.repeat(64)}`, posted_by: f.f.admin.publicKey,
-    posted_by_role: 'admin', chain_id: 1, token_address: token, pool_address: pool, payment_config_ver: 1 } };
+    posted_by_role: 'admin', chain_id: 1, token_address: token.toLowerCase(), pool_address: pool.toLowerCase(), payment_config_ver: 1 } };
 }
 
 test('TAP worker signs current-contract preparations and recovers a lost acknowledgement without duplicate writes', async () => {
@@ -217,6 +217,21 @@ test('actual mixed TAP roller resumes after confirmed external fee transfer with
   assert.equal(confirmedBound.finalizable, true, JSON.stringify({ error: confirmedBound.gateError,
     flags: ['blocked', 'root_confirmed', 'root_already_posted', 'posted', 'awaiting_finality', 'operator_fee', 'burn']
       .map(key => [key, confirmed[key]]) }));
+  const processed = checkTapProcessedReport(f.bundle, confirmedBound.bound);
+  assert.equal(processed.status, 0, processed.error);
+  for (const mutate of [
+    value => { delete value.tap_settlement_checkpoint.preparation_ids; },
+    value => { value.tap_settlement_checkpoint.unrecognized = true; },
+    value => { value.tap_settlement_checkpoint.root = '0x' + 'f'.repeat(64); },
+    value => { value.tap_settlement_checkpoint.outputs[0].tap_wei = '1'; },
+    value => { value.tap_settlement_checkpoint.outputs[0].prior_cumulative_claim_wei = '1'; },
+    value => { value.tap_settlement_checkpoint.provider_share_bps++; },
+    value => { value.root_confirmation = {confirmed:true,execution:{tx_hash:'0x'+'f'.repeat(64)}}; },
+    value => { value.burn.completed = false; },
+  ]) {
+    const invalid = structuredClone(confirmedBound.bound);mutate(invalid);
+    assert.notEqual(checkTapProcessedReport(f.bundle, invalid).status, 0);
+  }
   const missingCheckpoint = { ...confirmed, tap_settlement_checkpoint: null };
   assert.equal(checkTapSpoolReport(f.bundle, missingCheckpoint).finalizable, false);
   assert.equal(feeSends, 1);

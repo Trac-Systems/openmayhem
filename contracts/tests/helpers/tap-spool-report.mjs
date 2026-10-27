@@ -24,3 +24,20 @@ export function checkTapSpoolReport(bundle, report) {
     fs.rmSync(root, { recursive: true, force: true });
   }
 }
+
+// Exercise the next worker's actual processed-report gate as well. Keeping this
+// joined to a real roller report prevents copied mock schemas from drifting.
+export function checkTapProcessedReport(bundle, report) {
+  const source = fs.readFileSync(new URL('../../../scripts/ops-payout-settle.sh', import.meta.url), 'utf8');
+  const check = source.match(/validate_tap_processed\(\) \{[\s\S]*?<<'PY'\n([\s\S]*?)\nPY/);
+  assert.ok(check, 'production processed-report gate exists');
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'tap-processed-report-'));
+  try {
+    const reportPath = path.join(root, 'report.json'), bundlePath = path.join(root, 'bundle.json');
+    fs.writeFileSync(reportPath, JSON.stringify(report));fs.writeFileSync(bundlePath, JSON.stringify(bundle));
+    const validation = spawnSync(process.execPath, [new URL('../../../scripts/validate-tap-settlement-checkpoint.mjs', import.meta.url).pathname, reportPath], {encoding:'utf8'});
+    if (validation.status !== 0) return {status:validation.status,error:validation.stderr.trim()};
+    const result = spawnSync('python3', ['-', reportPath, bundlePath, String(bundle.epoch), bundle.epoch_apply_hash], {input:check[1],encoding:'utf8'});
+    return {status:result.status,error:result.stderr.trim()};
+  } finally { fs.rmSync(root, {recursive:true,force:true}); }
+}
