@@ -1,8 +1,10 @@
 import sinon from "sinon";
 import { test } from "brittle";
 import b4a from "b4a";
+import EventEmitter from "bare-events";
 import tracCryptoApi from "trac-crypto-api";
 import ValidatorObserverService from "../../../../src/core/network/services/ValidatorObserverService.js";
+import ConnectionManager from "../../../../src/core/network/services/ConnectionManager.js";
 import { bufferToAddress } from "../../../../src/core/state/utils/address.js";
 
 if (typeof setTimeout !== "undefined" && typeof setTimeout.restore === "function") {
@@ -466,15 +468,15 @@ test("does NOT drop connections when it is the admin and threshold reached", asy
     }
 });
 
-test("removes admin when threshold exceeded", async (t) => {
+test("detaches admin without closing replication when threshold exceeded", async (t) => {
     const clock = sinon.useFakeTimers({ now: 0 });
 
-    let removed = 0;
+    const removed = [];
 
     const { network, config } = createBaseMocks({
         network: {
             validatorConnectionManager: {
-                remove: () => removed++,
+                remove: (_key, options) => removed.push(options),
             },
         },
         config: { maxWritersForAdminIndexerConnection: 0 },
@@ -510,14 +512,15 @@ test("removes admin when threshold exceeded", async (t) => {
     try {
         await service.start();
 
-        for (let i = 0; i < 20 && removed === 0; i++) {
+        for (let i = 0; i < 20 && removed.length === 0; i++) {
             clock.tick(10);
             await Promise.resolve();
         }
 
         await service.stopValidatorObserver(false);
 
-        t.ok(removed >= 1);
+        t.ok(removed.length >= 1);
+        t.ok(removed.every(options => options?.endConnection === false), "admin replication remains open");
     } finally {
         clock.restore();
         sinon.restore();
@@ -965,6 +968,32 @@ test("keeps a validator connected when stopped before scanning its active replac
         t.ok(connected.has(publicKeyHex), "the active wallet remains connected");
     } finally {
         resumeScan();
+        await cleanup(service);
+        clock.restore();
+        sinon.restore();
+    }
+});
+
+test("drops the validator role of a removed writer without ending its connection", async (t) => {
+    const clock = sinon.useFakeTimers({ now: 0 });
+    const writers = [{ key: b4a.alloc(32, 1), value: { isRemoved: true } }];
+    const { network, state, config, publicKeyHex } = createWriterHistoryMocks(writers, true);
+    const connection = new EventEmitter();
+    connection.end = sinon.stub();
+    const manager = new ConnectionManager(config);
+    manager.addValidator(publicKeyHex, connection);
+    network.validatorConnectionManager = manager;
+    const service = new ValidatorObserverService(network, state, "self", config);
+
+    try {
+        t.ok(manager.connected(publicKeyHex), "the validator starts in the pool");
+
+        await service.start();
+        await clock.tickAsync(50);
+
+        t.absent(manager.exists(publicKeyHex), "the validator is no longer in the pool");
+        t.is(connection.end.callCount, 0, "the connection is not ended");
+    } finally {
         await cleanup(service);
         clock.restore();
         sinon.restore();

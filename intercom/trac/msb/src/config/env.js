@@ -53,10 +53,11 @@ const configData = {
         rateLimitConnectionTimeoutMs: 60_000, // Rate limiting constants
         rateLimitMaxTransactionsPerSecond: 50, // Rate limiting constants
         maxPendingRequestsInPendingRequestsService: 50_000, // Maximum number of pending requests in PendingRequestService (This value should not exceed 256MB)
-        pendingRequestTimeout: 3000, // constant after which time the transaction will be considered invalid
-        txCommitTimeout: 2200,
+        pendingRequestTimeout: 10_000, // Deadline for a pending V1 response (ms), including health checks
+        txCommitTimeout: 5_000, // Wait for local append and publication proof (ms); shorter than the response deadline
         txPoolSize: 1000, // size of transaction pool
         validatorHealthCheckInterval: 5 * 60 * 1000, // How often to check validator health (ms)
+        validatorHealthCheckFailureThreshold: 3, // Consecutive failed health checks before a validator is removed
         storesDirectory: 'stores/',
         storeName: 'testnet',
     },
@@ -103,10 +104,11 @@ const configData = {
         rateLimitConnectionTimeoutMs: 60_000, // Rate limiting constants
         rateLimitMaxTransactionsPerSecond: 50, // Rate limiting constants
         maxPendingRequestsInPendingRequestsService: 50_000, // Maximum number of pending requests in PendingRequestService (This value should not exceed 256MB)
-        pendingRequestTimeout: 3000, // constant after which time the transaction will be considered invalid
-        txCommitTimeout: 2200,
+        pendingRequestTimeout: 10_000, // Deadline for a pending V1 response (ms), including health checks
+        txCommitTimeout: 5_000, // Wait for local append and publication proof (ms); shorter than the response deadline
         txPoolSize: 1000, // size of transaction pool
         validatorHealthCheckInterval: 5 * 60 * 1000, // How often to check validator health (ms)
+        validatorHealthCheckFailureThreshold: 3, // Consecutive failed health checks before a validator is removed
         storesDirectory: 'stores/',
         storeName: 'mainnet',
     },
@@ -153,10 +155,11 @@ const configData = {
         rateLimitConnectionTimeoutMs: 60_000, // Rate limiting constants
         rateLimitMaxTransactionsPerSecond: 50, // Rate limiting constants
         maxPendingRequestsInPendingRequestsService: 50_000, // Maximum number of pending requests in PendingRequestService (This value should not exceed 256MB)
-        pendingRequestTimeout: 3000, // constant after which time the transaction will be considered invalid
-        txCommitTimeout: 2200,
+        pendingRequestTimeout: 10_000, // Deadline for a pending V1 response (ms), including health checks
+        txCommitTimeout: 5_000, // Wait for local append and publication proof (ms); shorter than the response deadline
         txPoolSize: 1000, // size of transaction pool
         validatorHealthCheckInterval: 1_000, // How often to check validator health (ms)
+        validatorHealthCheckFailureThreshold: 3, // Consecutive failed health checks before a validator is removed
         storesDirectory: 'stores/',
         storeName: 'development',
     }

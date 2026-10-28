@@ -263,7 +263,10 @@ class Network extends ReadyResource {
                         new Error('Connection closed before response')
                     );
                     this.#swarm?.leavePeer(connection.remotePublicKey);
-                    this.#validatorConnectionManager.remove(publicKey);
+                    // only act on the connection this event belongs to
+                    if (this.#validatorConnectionManager.isCurrent(publicKey, connection)) {
+                        this.#validatorConnectionManager.remove(publicKey);
+                    }
                     if (connection.protocolSession) {
                         try {
                             connection.protocolSession.close();
@@ -350,7 +353,8 @@ class Network extends ReadyResource {
         this.#pendingConnections.set(publicKey, { type, timeoutId });
 
         const target = b4a.from(publicKey, 'hex');
-        if (!this.#swarm.peers.has(publicKey)) {
+        // A retained peer may have lost explicit retries after leavePeer().
+        if (!this.#swarm.peers.get(publicKey)?.explicit) {
             this.#swarm.joinPeer(target);
         }
 

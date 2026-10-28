@@ -16,6 +16,7 @@ async function loadNetwork(options = {}) {
     const { default: esmock } = await import('esmock');
     let swarmInstance = null;
     let connectionManagerInstance = null;
+    let pendingRequestServiceInstance = null;
 
     class HyperswarmMock extends EventEmitter {
         constructor() {
@@ -25,7 +26,7 @@ async function loadNetwork(options = {}) {
             this._allConnections = new Map();
             this.joinPeer = sinon.stub().callsFake((target) => {
                 const publicKeyHex = b4a.toString(target, 'hex');
-                this.peers.set(publicKeyHex, { publicKey: target });
+                this.peers.set(publicKeyHex, { publicKey: target, explicit: true });
             });
             this.leavePeer = sinon.stub();
             this.join = sinon.stub();
@@ -39,7 +40,7 @@ async function loadNetwork(options = {}) {
     class ConnectionManagerMock {
         constructor() {
             connectionManagerInstance = this;
-            this.validators = new Set();
+            this.validators = new Map();
             this.removed = [];
         }
 
@@ -53,9 +54,14 @@ async function loadNetwork(options = {}) {
             this.validators.delete(publicKeyHex);
         }
 
-        addValidator(publicKey) {
-            this.validators.add(normalizePublicKey(publicKey));
+        addValidator(publicKey, connection = null) {
+            this.validators.set(normalizePublicKey(publicKey), connection);
             return true;
+        }
+
+        isCurrent(publicKey, connection) {
+            const publicKeyHex = normalizePublicKey(publicKey);
+            return this.validators.has(publicKeyHex) && this.validators.get(publicKeyHex) === connection;
         }
 
         connected(publicKey) {
@@ -63,7 +69,7 @@ async function loadNetwork(options = {}) {
         }
 
         connectedValidators() {
-            return Array.from(this.validators);
+            return Array.from(this.validators.keys());
         }
 
         connectionCount() {
@@ -92,8 +98,17 @@ async function loadNetwork(options = {}) {
     }
 
     class PendingRequestServiceMock {
+        constructor() {
+            pendingRequestServiceInstance = this;
+            this.rejected = [];
+        }
+
         isProbePending() { return false; }
-        rejectPendingRequestsForPeer() {}
+
+        rejectPendingRequestsForPeer(publicKey) {
+            this.rejected.push(normalizePublicKey(publicKey));
+        }
+
         close() {}
     }
 
@@ -165,7 +180,7 @@ async function loadNetwork(options = {}) {
     };
     await network.replicate({}, store, wallet);
 
-    return { network, swarmInstance, connectionManagerInstance, store, wallet };
+    return { network, swarmInstance, connectionManagerInstance, pendingRequestServiceInstance, store, wallet };
 }
 
 function deferred() {
@@ -181,6 +196,32 @@ if (isBareRuntime) {
         t.pass('skipped in Bare because esmock depends on node:module');
     });
 } else {
+    test('Network#tryConnect rejoins a retained peer without explicit retries', async t => {
+        const { network, swarmInstance } = await loadNetwork();
+        t.teardown(() => network.cleanupPendingConnections());
+        const publicKey = 'd'.repeat(64);
+        const target = b4a.from(publicKey, 'hex');
+        swarmInstance.peers.set(publicKey, { publicKey: target, explicit: false, waiting: false });
+
+        t.is(await network.tryConnect(publicKey, 'validator'), CONNECTION_STATUS.PENDING);
+        t.is(swarmInstance.joinPeer.callCount, 1, 'retained peer is explicitly joined again');
+        t.alike(swarmInstance.joinPeer.firstCall?.args, [target]);
+        t.is(await network.tryConnect(publicKey, 'validator'), CONNECTION_STATUS.IGNORED);
+        t.is(swarmInstance.joinPeer.callCount, 1, 'pending attempts remain deduplicated');
+    });
+
+    test('Network#tryConnect preserves backoff for an already explicit peer', async t => {
+        const { network, swarmInstance } = await loadNetwork();
+        t.teardown(() => network.cleanupPendingConnections());
+        const publicKey = 'd'.repeat(64);
+        swarmInstance.peers.set(publicKey, {
+            publicKey: b4a.from(publicKey, 'hex'), explicit: true, waiting: true,
+        });
+
+        t.is(await network.tryConnect(publicKey, 'validator'), CONNECTION_STATUS.PENDING);
+        t.is(swarmInstance.joinPeer.callCount, 0, 'existing retry timer is left to Hyperswarm');
+    });
+
     test('Network#disconnectValidatorPeer clears pending validator attempts', async t => {
         const publicKey = 'a'.repeat(64);
         const { network, swarmInstance } = await loadNetwork();
@@ -224,6 +265,61 @@ if (isBareRuntime) {
         t.absent(disconnected, 'non-validator peer should be ignored by validator disconnect helper');
         t.ok(network.isConnectionPending(publicKey), 'non-validator pending connection should remain tracked');
         t.is(swarmInstance.leavePeer.callCount, 0, 'generic peer should not be left');
+    });
+
+    test('Network removes a validator when its tracked connection closes', async t => {
+        const publicKey = 'd'.repeat(64);
+        const { swarmInstance, connectionManagerInstance, pendingRequestServiceInstance } = await loadNetwork();
+        const connection = new EventEmitter();
+        connection.remotePublicKey = b4a.from(publicKey, 'hex');
+        connection.destroy = sinon.stub();
+
+        swarmInstance.emit('connection', connection);
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        connectionManagerInstance.addValidator(publicKey, connection);
+        connection.emit('close');
+
+        t.absent(connectionManagerInstance.exists(publicKey), 'tracked validator should be removed');
+        t.alike(
+            connectionManagerInstance.removed,
+            [{ publicKey, options: {} }],
+            'removal should be requested once for the tracked validator'
+        );
+        t.alike(pendingRequestServiceInstance.rejected, [publicKey], 'pending requests for the peer should be rejected');
+        t.is(swarmInstance.leavePeer.callCount, 1, 'peer discovery should be cancelled');
+    });
+
+    test('Network keeps a validator when a connection other than the tracked one closes', async t => {
+        const publicKey = 'e'.repeat(64);
+        const { swarmInstance, connectionManagerInstance, pendingRequestServiceInstance } = await loadNetwork();
+        const first = new EventEmitter();
+        first.remotePublicKey = b4a.from(publicKey, 'hex');
+        first.destroy = sinon.stub();
+        const second = new EventEmitter();
+        second.remotePublicKey = b4a.from(publicKey, 'hex');
+        second.destroy = sinon.stub();
+
+        swarmInstance.emit('connection', first);
+        await new Promise(resolve => setTimeout(resolve, 0));
+        swarmInstance.emit('connection', second);
+        await new Promise(resolve => setTimeout(resolve, 0));
+
+        connectionManagerInstance.addValidator(publicKey, second);
+        first.emit('close');
+
+        t.ok(connectionManagerInstance.exists(publicKey), 'tracked validator should stay in the pool');
+        t.alike(connectionManagerInstance.removed, [], 'no removal should be requested');
+        t.ok(connectionManagerInstance.isCurrent(publicKey, second), 'the tracked connection should stay unchanged');
+        t.alike(pendingRequestServiceInstance.rejected, [publicKey], 'pending requests for the peer should be rejected');
+        t.is(swarmInstance.leavePeer.callCount, 1, 'peer discovery should be cancelled');
+
+        second.emit('close');
+        t.alike(
+            connectionManagerInstance.removed,
+            [{ publicKey, options: {} }],
+            'the tracked connection closing should remove the validator'
+        );
     });
 
     test('Network#close prevents late connection setup from replicating a closed Corestore', async t => {

@@ -122,7 +122,7 @@ class ValidatorObserverService {
      *
      * If the count of fully connected writers exceeds the threshold:
      * - The admin node is excluded from the validator pool (handled in selection phase).
-     * - Non-admin nodes actively disconnect from the admin validator (if currently connected).
+     * - Non-admin nodes detach the admin from the validator pool, preserving replication.
      *
      * NOTE:
      * The admin is not forcibly disconnected from all roles.
@@ -144,7 +144,7 @@ class ValidatorObserverService {
         // Non-admin nodes: ensure the admin is not kept as a validator connection
         const adminWriter = writers.find((w) => w.address === adminEntry?.address);
         if (adminWriter?.publicKey) {
-            this.#network.validatorConnectionManager.remove(adminWriter.publicKey);
+            this.#network.validatorConnectionManager.remove(adminWriter.publicKey, { endConnection: false });
         }
     }
 
@@ -156,7 +156,8 @@ class ValidatorObserverService {
         const manager = this.#network.validatorConnectionManager;
 
         if (manager.connected(publicKey)) {
-            manager.remove(publicKey);
+            // leave the transport to the swarm
+            manager.remove(publicKey, { endConnection: false });
             this.#logger.debug(`Removed stale validator connection: ${b4a.toString(publicKey, "hex")}`);
         }
     }

@@ -6,6 +6,8 @@ import {Logger} from "../../../utils/logger.js";
  * @typedef {import('hyperswarm').Connection} Connection
  */
 
+const DEFAULT_HEALTH_CHECK_FAILURE_THRESHOLD = 3;
+
 export class ConnectionManagerError extends Error {
     constructor(message) {
         super(message);
@@ -18,6 +20,8 @@ class ConnectionManager {
     #maxValidators
     #config
     #healthCheckService
+    #healthCheckFailures
+    #healthCheckFailureThreshold
     #boundedHealthCheckHandler
     #logger
     // Note: #validators is using publicKey (Buffer) as key
@@ -28,8 +32,11 @@ class ConnectionManager {
      **/
     constructor(config) {
         this.#validators = new Map();
+        // consecutive failed health checks per validator
+        this.#healthCheckFailures = new Map();
         this.#config = config
         this.#maxValidators = config.maxValidators
+        this.#healthCheckFailureThreshold = this.#resolveHealthCheckFailureThreshold(config);
         this.#boundedHealthCheckHandler = this.#healthCheckHandler.bind(this);
         this.#logger = new Logger(config)
     }
@@ -98,10 +105,15 @@ class ConnectionManager {
         }
 
         if (!success) {
-            this.#logger.debug(`healthCheck: liveness request failed, removing validator. Address = ${targetAddress}; Request ID = ${requestId}`);
-            this.remove(publicKey);
-            this.#stopHealthCheck(publicKey);
+            const failures = this.#countHealthCheckFailure(publicKey);
+            this.#logger.debug(`healthCheck: liveness request failed. Address = ${targetAddress}; Request ID = ${requestId}; Consecutive failures = ${failures}`);
+            if (failures >= this.#healthCheckFailureThreshold) {
+                this.#logger.debug(`healthCheck: failure threshold reached, removing validator. Address = ${targetAddress}; Request ID = ${requestId}`);
+                this.remove(publicKey);
+                this.#stopHealthCheck(publicKey);
+            }
         } else {
+            this.#clearHealthCheckFailures(publicKey);
             this.#logger.debug(`healthCheck: success. Address = ${targetAddress}; Request ID = ${requestId}`);
         }
     };
@@ -123,6 +135,23 @@ class ConnectionManager {
         }
     }
 
+    #resolveHealthCheckFailureThreshold(config) {
+        const threshold = Number(config.validatorHealthCheckFailureThreshold);
+        if (!Number.isInteger(threshold) || threshold < 1) return DEFAULT_HEALTH_CHECK_FAILURE_THRESHOLD;
+        return threshold;
+    }
+
+    #countHealthCheckFailure(publicKey) {
+        const publicKeyHex = this.#toHexString(publicKey);
+        const failures = (this.#healthCheckFailures.get(publicKeyHex) || 0) + 1;
+        this.#healthCheckFailures.set(publicKeyHex, failures);
+        return failures;
+    }
+
+    #clearHealthCheckFailures(publicKey) {
+        this.#healthCheckFailures.delete(this.#toHexString(publicKey));
+    }
+
     /**
      * Retrieves the Hyperswarm connection object for a given validator public key.
      * @param {String | Buffer} publicKey - The public key (Buffer or hex string) of the validator.
@@ -132,6 +161,18 @@ class ConnectionManager {
         const publicKeyHex = this.#toHexString(publicKey);
         const entry = this.#validators.get(publicKeyHex);
         return entry ? entry.connection : undefined;
+    }
+
+    /**
+     * Checks whether a connection is the one currently tracked for a validator.
+     * @param {String | Buffer} publicKey - The public key (Buffer or hex string) of the validator.
+     * @param {Object} connection - The connection object to compare with the tracked one.
+     * @returns {Boolean} - Returns true if the tracked connection is the given connection, false otherwise.
+     */
+    isCurrent(publicKey, connection) {
+        const publicKeyHex = this.#toHexString(publicKey);
+        const entry = this.#validators.get(publicKeyHex);
+        return !!entry && entry.connection === connection;
     }
 
     /**
@@ -194,6 +235,7 @@ class ConnectionManager {
         this.#logger.debug(`remove: removing validator ${publicKeyToAddress(publicKey, this.#config)}`);
         const publicKeyHex = this.#toHexString(publicKey);
         this.#stopHealthCheck(publicKeyHex);
+        this.#clearHealthCheckFailures(publicKeyHex);
         if (this.exists(publicKeyHex)) {
             const entry = this.#validators.get(publicKeyHex);
             if (endConnection && entry && entry.connection && typeof entry.connection.end === 'function') {
@@ -326,8 +368,11 @@ class ConnectionManager {
             return;
         }
         this.#validators.set(publicKeyHex, {connection, sent: 0});
+        this.#clearHealthCheckFailures(publicKeyHex);
         connection.on('close', () => {
             this.#logger.debug(`#append: connection closing for validator ${publicKeyToAddress(publicKey, this.#config)}`);
+            // only act on the connection this event belongs to
+            if (!this.isCurrent(publicKeyHex, connection)) return;
             this.remove(publicKeyHex);
             this.#logger.debug(`#append: connection closed for validator ${publicKeyToAddress(publicKey, this.#config)}`);
         });
@@ -350,6 +395,7 @@ class ConnectionManager {
         } else {
             this.#validators.set(publicKeyHex, {connection, sent: 0});
         }
+        this.#clearHealthCheckFailures(publicKeyHex);
     }
 
     #toHexString(publicKey) {

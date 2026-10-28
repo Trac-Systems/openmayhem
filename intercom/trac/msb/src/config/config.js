@@ -231,6 +231,11 @@ export class Config {
         return this.#config.validatorHealthCheckInterval
     }
 
+    get validatorHealthCheckFailureThreshold() {
+        if (this.#isOverriden('validatorHealthCheckFailureThreshold')) return this.#options.validatorHealthCheckFailureThreshold
+        return this.#config.validatorHealthCheckFailureThreshold
+    }
+
     get maxPendingRequestsInPendingRequestsService() {
         return this.#config.maxPendingRequestsInPendingRequestsService
     }
