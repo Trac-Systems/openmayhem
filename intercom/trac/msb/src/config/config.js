@@ -236,6 +236,11 @@ export class Config {
         return this.#config.validatorHealthCheckFailureThreshold
     }
 
+    get confirmationStallTimeout() {
+        if (this.#isOverriden('confirmationStallTimeout')) return this.#options.confirmationStallTimeout
+        return this.#config.confirmationStallTimeout
+    }
+
     get maxPendingRequestsInPendingRequestsService() {
         return this.#config.maxPendingRequestsInPendingRequestsService
     }

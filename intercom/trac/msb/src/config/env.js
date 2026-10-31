@@ -58,6 +58,7 @@ const configData = {
         txPoolSize: 1000, // size of transaction pool
         validatorHealthCheckInterval: 5 * 60 * 1000, // How often to check validator health (ms)
         validatorHealthCheckFailureThreshold: 3, // Consecutive failed health checks before a validator is removed
+        confirmationStallTimeout: 120_000, // Force a fast-forward when the confirmed length has not moved for this long while unconfirmed entries wait (ms, 0 = off)
         storesDirectory: 'stores/',
         storeName: 'testnet',
     },
@@ -109,6 +110,7 @@ const configData = {
         txPoolSize: 1000, // size of transaction pool
         validatorHealthCheckInterval: 5 * 60 * 1000, // How often to check validator health (ms)
         validatorHealthCheckFailureThreshold: 3, // Consecutive failed health checks before a validator is removed
+        confirmationStallTimeout: 120_000, // Force a fast-forward when the confirmed length has not moved for this long while unconfirmed entries wait (ms, 0 = off)
         storesDirectory: 'stores/',
         storeName: 'mainnet',
     },
@@ -160,6 +162,7 @@ const configData = {
         txPoolSize: 1000, // size of transaction pool
         validatorHealthCheckInterval: 1_000, // How often to check validator health (ms)
         validatorHealthCheckFailureThreshold: 3, // Consecutive failed health checks before a validator is removed
+        confirmationStallTimeout: 120_000, // Force a fast-forward when the confirmed length has not moved for this long while unconfirmed entries wait (ms, 0 = off)
         storesDirectory: 'stores/',
         storeName: 'development',
     }

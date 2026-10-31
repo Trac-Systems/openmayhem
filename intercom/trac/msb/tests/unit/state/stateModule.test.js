@@ -10,6 +10,7 @@ async function runStateTests() {
     await import('./utils/nodeEntry.test.js');
     await import('./utils/lengthEntry.test.js');
     await import('./utils/roles.test.js');
+    await import('./ConfirmationWatch.test.js');
     // These tests are skipped temoporarily because the mock library sinon does not work with bare.
     // TODO: replace esmock, sinon is actually fine
     await import('./apply/state.apply.test.js');

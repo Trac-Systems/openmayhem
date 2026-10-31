@@ -42,6 +42,7 @@ import { deepCopyBuffer } from '../../utils/buffer.js';
 import { Status } from './utils/transaction.js';
 import remote from 'hypercore/lib/fully-remote-proof.js'
 import PQueue from 'p-queue';
+import { ConfirmationWatch } from './ConfirmationWatch.js';
 
 const OVERSIZED_BATCH_PENALTY_MULTIPLIER = BATCH_SIZE;
 
@@ -56,6 +57,7 @@ class State extends ReadyResource {
     #config
     #wallet
     #activeWriterCountCache = new Map();
+    #confirmationWatch = null;
 
     /**
      * @param {Corestore} store
@@ -96,10 +98,13 @@ class State extends ReadyResource {
         console.log("State initialization...")
         await this.#base.ready();
         this.#writingKey = this.#base.local.key;
+        this.#confirmationWatch = new ConfirmationWatch(this.#base, { timeout: this.#config.confirmationStallTimeout });
+        this.#confirmationWatch.start();
     }
 
     async _close() {
         console.log("State: closing gracefully...");
+        this.#confirmationWatch?.stop();
         if (this.#bee !== null) {
             await this.#bee.close();
         }
