@@ -15,7 +15,7 @@ import {
     TRAC_NAMESPACE,
     CustomEventType
 } from '../../utils/constants.js';
-import { isHexString, sleep, isTransactionRecordPut } from '../../utils/helpers.js';
+import { isHexString, sleep } from '../../utils/helpers.js';
 import tracCryptoApi from 'trac-crypto-api';
 import Check from '../../utils/check.js';
 import { safeDecodeApplyOperation } from '../../utils/protobuf/operationHelpers.js';
@@ -372,18 +372,13 @@ class State extends ReadyResource {
             throw new Error("Invalid hash format");
         }
 
-        const confirmedLength = this.getSignedLength();
-        const historyStream = this.#base.view.createHistoryStream({
-            gte: 0,
-            lte: confirmedLength
-        });
-
-        for await (const entry of historyStream) {
-            if (isTransactionRecordPut(entry) && entry.key === hash) {
-                return entry.seq;
-            }
+        const snapshot = this.#base.view.checkout(this.getSignedLength());
+        try {
+            const entry = await snapshot.get(hash);
+            return entry ? entry.seq : null;
+        } finally {
+            await snapshot.close();
         }
-        return null;
     }
 
     async confirmedTransactionsBetween(startSignedLength, endSignedLength) {

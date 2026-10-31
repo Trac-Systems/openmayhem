@@ -38,4 +38,4 @@ VOLUME ["/msb/stores"]
 EXPOSE 5000
 
 ENTRYPOINT ["npm", "run"]
-CMD ["env-prod-rpc-docker"]
+CMD ["env-rpc-docker"]
