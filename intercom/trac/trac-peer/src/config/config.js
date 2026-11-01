@@ -68,6 +68,20 @@ export class Config {
         }
         this.maxMsbSignedLengthFutureDelta = maxMsbSignedLengthFutureDelta;
 
+        const readSliceRaw = this.#select("msbReadSliceMs", options, defaults);
+        const msbReadSliceMs = readSliceRaw === undefined ? 30000 : readSliceRaw;
+        if (!Number.isSafeInteger(msbReadSliceMs) || msbReadSliceMs < 1000) {
+            throw new Error("Peer: msbReadSliceMs must be a safe integer of at least 1000.");
+        }
+        this.msbReadSliceMs = msbReadSliceMs;
+
+        const stallTimeoutRaw = this.#select("subnetStallTimeout", options, defaults);
+        const subnetStallTimeout = stallTimeoutRaw === undefined ? 60000 : stallTimeoutRaw;
+        if (!Number.isSafeInteger(subnetStallTimeout) || subnetStallTimeout < 0) {
+            throw new Error("Peer: subnetStallTimeout must be a non-negative safe integer.");
+        }
+        this.subnetStallTimeout = subnetStallTimeout;
+
         const maxMsbApplyOperationBytes = this.#select("maxMsbApplyOperationBytes", options, defaults);
         if (!Number.isSafeInteger(maxMsbApplyOperationBytes)) {
             throw new Error("Peer: maxMsbApplyOperationBytes must be a safe integer.");
