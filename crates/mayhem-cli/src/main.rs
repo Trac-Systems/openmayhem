@@ -6,6 +6,7 @@ mod gemma4;
 mod intercom_runtime;
 mod managed_openai_compatible;
 mod provider_failure_recovery;
+mod provider_output_diagnostics;
 mod provider_output_stream;
 mod proxy_buyer;
 mod proxy_control;
@@ -81565,6 +81566,31 @@ impl std::fmt::Display for ProviderSessionOutputError {
 
 impl std::error::Error for ProviderSessionOutputError {}
 
+#[derive(Debug)]
+struct ProviderOutputDiagnosticError {
+    original: anyhow::Error,
+    shape: provider_output_diagnostics::OutputShape,
+}
+
+impl std::fmt::Display for ProviderOutputDiagnosticError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.original, f)
+    }
+}
+
+impl std::error::Error for ProviderOutputDiagnosticError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.original.as_ref())
+    }
+}
+
+fn with_provider_output_diagnostic(
+    original: anyhow::Error,
+    shape: provider_output_diagnostics::OutputShape,
+) -> anyhow::Error {
+    anyhow::Error::new(ProviderOutputDiagnosticError { original, shape })
+}
+
 fn provider_session_request_error(message: impl Into<String>) -> anyhow::Error {
     anyhow::Error::new(ProviderSessionRequestError(message.into()))
 }
@@ -81704,6 +81730,22 @@ fn provider_output_diagnostic_reason(error: &anyhow::Error) -> &'static str {
         Some(message) if message.contains("selected session byte-derived unit budget") => {
             "output_unit_budget_exceeded"
         }
+        Some(message) if message.contains("context input tokens exceed served context") => {
+            "context_usage_exceeds_served_context"
+        }
+        Some(message) if message.contains("output is not valid JSON") => "structured_json_invalid",
+        Some(message) if message.contains("output violates JSON schema") => {
+            "structured_schema_mismatch"
+        }
+        Some(message) if message.contains("provider tool output missing") => {
+            "tool_envelope_incomplete"
+        }
+        Some(message) if message.contains("attribution exceeds") => {
+            "usage_attribution_exceeds_output"
+        }
+        Some(message) if message.contains("unsupported usage attribution") => {
+            "usage_attribution_unsupported"
+        }
         Some(_) => "other_output_contract_failure",
         None if error.chain().any(|cause| {
             matches!(
@@ -81752,6 +81794,13 @@ fn log_provider_output_diagnostic(error: &anyhow::Error, request_id: &str) {
         "[provider-output] code=model_output_invalid reason={} request_id={safe_request_id}",
         provider_output_diagnostic_reason(error),
     );
+    if let Some(shape) = error.chain().find_map(|cause| {
+        cause
+            .downcast_ref::<ProviderOutputDiagnosticError>()
+            .map(|error| &error.shape)
+    }) {
+        eprintln!("[provider-output-detail] request_id={safe_request_id} {shape}");
+    }
 }
 
 async fn run_provider_session_heartbeats(ctx: ProviderSessionHeartbeatTask) -> Result<()> {
@@ -85729,16 +85778,40 @@ where
                         live_stream.as_mut(),
                         &cancellation,
                     )?;
+                    let diagnostic = provider_output_diagnostics::OutputShape {
+                        stage: "session_validation",
+                        input_tokens: output
+                            .usage_attribution
+                            .get("context_input_tokens")
+                            .copied(),
+                        output_tokens: output.completion_tokens,
+                        reasoning_tokens: output
+                            .usage_attribution
+                            .get("reasoning_output_tokens")
+                            .copied()
+                            .unwrap_or(0),
+                        output_limit: provider_requested_max_output_tokens(&body),
+                        finish: provider_output_diagnostics::Finish::from_label(
+                            &output.finish_reason,
+                        ),
+                        text_bytes: output
+                            .content
+                            .len()
+                            .saturating_add(output.reasoning_evidence.len()),
+                        tools: Some(output.tools.len()),
+                    };
                     provider_session_output_result(normalize_provider_visible_output_usage(
                         &body,
                         &mut output,
-                    ))?;
+                    ))
+                    .map_err(|error| with_provider_output_diagnostic(error, diagnostic))?;
                     cancellation
                         .check()
                         .context("provider request cancelled before response publication")?;
                     provider_session_output_result(validate_provider_session_output(
                         terms, &body, &output,
-                    ))?;
+                    ))
+                    .map_err(|error| with_provider_output_diagnostic(error, diagnostic))?;
                     if let Some(stream) = live_stream.as_mut() {
                         stream.finish()?;
                     }
@@ -94787,6 +94860,7 @@ fn provider_engine_session_response_with_sampling_bounded(
     // tools-only endpoint is metered from the model-visible query and selected
     // tools so buyer and provider agree without charging transport metadata.
     let estimated_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body, adapter));
+    let effective_output_limit = u64::from(request.max_new_tokens);
     let generated = backend.generate_with_artifacts(
         request,
         &mut |chunk: mayhem_engine::TokenChunk| {
@@ -94820,131 +94894,148 @@ fn provider_engine_session_response_with_sampling_bounded(
         return Err(error.context("streaming provider session response"));
     }
     let output = generated.context("generating provider session response with mayhem-engine")?;
-    if let Some(stream) = live_stream.as_deref_mut() {
-        let mut trailing = reasoning_stream_filter.finish_split();
-        if let Some(filter) = tool_stream_filter.as_mut() {
-            let delta = filter.push(&trailing.visible);
-            stream.append_tool_deltas(delta.tools);
-            trailing.visible = delta.text;
-        }
-        stream.append_filtered_text(trailing);
-    }
-    let artifacts = provider_session_output_result(artifact_chunks.finish())?;
-    let mut tools = tool_mode
-        .as_ref()
-        .and_then(|mode| {
-            provider_engine_tool_call_outputs_after_reasoning(
-                &output.text,
-                reasoning_output_mode,
-                reasoning_speciality_enabled,
-                reasoning_delimiters,
-                mode.strategy,
-                &mode.tools,
-                json_grammar_enforced,
-            )
-        })
-        .unwrap_or_default();
-    if let Some(mode) = tool_mode.as_ref() {
-        validate_provider_engine_tool_call_outputs(&tools, &mode.tools)?;
-    }
-    if tool_mode
-        .as_ref()
-        .is_some_and(|mode| !mode.parallel && tools.len() > 1)
-    {
-        return Err(provider_session_output_error(format!(
-            "provider engine returned {} tool calls while parallel_tool_calls=false",
-            tools.len()
-        )));
-    }
-    if tool_mode.as_ref().is_some_and(|mode| mode.required) && tools.is_empty() {
-        return Err(provider_session_output_error(format!(
-            "provider engine did not return a valid required tool call: {}",
-            output.text.trim()
-        )));
-    }
-    let streamed_content = if let (Some(stream), Some(filter)) =
-        (live_stream.as_deref_mut(), tool_stream_filter.as_mut())
-    {
-        validate_streamed_tool_call_count(filter.emitted_count(), tools.len())?;
-        for (index, call) in tools.iter_mut().enumerate().take(filter.emitted_count()) {
-            call["id"] = json!(stream.tool_stream_id(index));
-        }
-        let tail = filter.finish_text(!tools.is_empty());
-        stream.append_filtered_text(ProviderReasoningFilteredText {
-            visible: tail,
-            hidden: String::new(),
-        });
-        Some(filter.text.clone())
-    } else {
-        None
+    let diagnostic = provider_output_diagnostics::OutputShape {
+        stage: "native_validation",
+        input_tokens: Some(u64::from(output.usage.prompt_tokens)),
+        output_tokens: u64::from(output.usage.completion_tokens),
+        reasoning_tokens: u64::from(output.usage.reasoning_tokens),
+        output_limit: Some(effective_output_limit),
+        finish: provider_output_diagnostics::Finish::from_label(&output.finish_reason.to_string()),
+        text_bytes: output.text.len(),
+        tools: None,
     };
-    let completion_tokens = u64::from(output.usage.completion_tokens);
-    let reasoning_tokens = u64::from(output.usage.reasoning_tokens).min(completion_tokens);
-    let vision_tokens = u64::from(output.usage.vision_tokens);
-    let audio_tokens = u64::from(output.usage.audio_tokens);
-    let prompt_tokens = protocol_prompt_tokens.unwrap_or(estimated_prompt_tokens);
-    let billed_prompt_tokens = prompt_tokens
-        .saturating_add(vision_tokens)
-        .saturating_add(audio_tokens);
-    let mut usage_attribution = BTreeMap::new();
-    // Negotiated, signed context telemetry is independent of canonical billing
-    // units. Older gateways reject unknown attribution axes, so opt in explicitly.
-    if provider_request_supports_context_usage(body) && output.usage.prompt_tokens > 0 {
-        usage_attribution.insert(
-            "context_input_tokens".to_owned(),
-            u64::from(output.usage.prompt_tokens),
-        );
-    }
-    if reasoning_tokens > 0 {
-        usage_attribution.insert("reasoning_output_tokens".to_owned(), reasoning_tokens);
-    }
-    if vision_tokens > 0 {
-        usage_attribution.insert("vision_input_tokens".to_owned(), vision_tokens);
-    }
-    if audio_tokens > 0 {
-        usage_attribution.insert("audio_input_tokens".to_owned(), audio_tokens);
-    }
-    let finish_reason = if tools.is_empty() {
-        output.finish_reason.to_string()
-    } else {
-        "tool_calls".to_owned()
-    };
-    let filtered_output = provider_reasoning_output_parts_with_delimiters(
-        &output.text,
-        reasoning_output_mode,
-        reasoning_delimiters,
-    );
-    if tool_mode.is_none() && provider_wants_json(request_body) {
-        let schema = provider_response_json_schema(request_body);
-        mayhem_gateway::structured_schema::validate_output(&schema, &filtered_output.visible)
-            .map_err(|error| provider_session_output_error(error.to_string()))?;
-    }
-    Ok(ProviderSessionOutput {
-        usage: provider_chat_receipt_usage(request_body, billed_prompt_tokens, completion_tokens),
-        content: streamed_content.unwrap_or_else(|| {
-            if tools.is_empty() {
-                filtered_output.visible
-            } else {
-                provider_engine_visible_content_before_tools(
-                    &filtered_output.visible,
-                    tool_mode
-                        .as_ref()
-                        .expect("tool output requires tool mode")
-                        .strategy,
-                )
+    (|| {
+        if let Some(stream) = live_stream.as_deref_mut() {
+            let mut trailing = reasoning_stream_filter.finish_split();
+            if let Some(filter) = tool_stream_filter.as_mut() {
+                let delta = filter.push(&trailing.visible);
+                stream.append_tool_deltas(delta.tools);
+                trailing.visible = delta.text;
             }
-        }),
-        reasoning_evidence: filtered_output.hidden,
-        tools,
-        embeddings: None,
-        transcription: None,
-        artifacts,
-        finish_reason,
-        prompt_tokens: billed_prompt_tokens,
-        completion_tokens,
-        token_ids,
-        usage_attribution,
-    })
+            stream.append_filtered_text(trailing);
+        }
+        let artifacts = provider_session_output_result(artifact_chunks.finish())?;
+        let mut tools = tool_mode
+            .as_ref()
+            .and_then(|mode| {
+                provider_engine_tool_call_outputs_after_reasoning(
+                    &output.text,
+                    reasoning_output_mode,
+                    reasoning_speciality_enabled,
+                    reasoning_delimiters,
+                    mode.strategy,
+                    &mode.tools,
+                    json_grammar_enforced,
+                )
+            })
+            .unwrap_or_default();
+        if let Some(mode) = tool_mode.as_ref() {
+            validate_provider_engine_tool_call_outputs(&tools, &mode.tools)?;
+        }
+        if tool_mode
+            .as_ref()
+            .is_some_and(|mode| !mode.parallel && tools.len() > 1)
+        {
+            return Err(provider_session_output_error(format!(
+                "provider engine returned {} tool calls while parallel_tool_calls=false",
+                tools.len()
+            )));
+        }
+        if tool_mode.as_ref().is_some_and(|mode| mode.required) && tools.is_empty() {
+            return Err(provider_session_output_error(format!(
+                "provider engine did not return a valid required tool call: {}",
+                output.text.trim()
+            )));
+        }
+        let streamed_content = if let (Some(stream), Some(filter)) =
+            (live_stream.as_deref_mut(), tool_stream_filter.as_mut())
+        {
+            validate_streamed_tool_call_count(filter.emitted_count(), tools.len())?;
+            for (index, call) in tools.iter_mut().enumerate().take(filter.emitted_count()) {
+                call["id"] = json!(stream.tool_stream_id(index));
+            }
+            let tail = filter.finish_text(!tools.is_empty());
+            stream.append_filtered_text(ProviderReasoningFilteredText {
+                visible: tail,
+                hidden: String::new(),
+            });
+            Some(filter.text.clone())
+        } else {
+            None
+        };
+        let completion_tokens = u64::from(output.usage.completion_tokens);
+        let reasoning_tokens = u64::from(output.usage.reasoning_tokens).min(completion_tokens);
+        let vision_tokens = u64::from(output.usage.vision_tokens);
+        let audio_tokens = u64::from(output.usage.audio_tokens);
+        let prompt_tokens = protocol_prompt_tokens.unwrap_or(estimated_prompt_tokens);
+        let billed_prompt_tokens = prompt_tokens
+            .saturating_add(vision_tokens)
+            .saturating_add(audio_tokens);
+        let mut usage_attribution = BTreeMap::new();
+        // Negotiated, signed context telemetry is independent of canonical billing
+        // units. Older gateways reject unknown attribution axes, so opt in explicitly.
+        if provider_request_supports_context_usage(body) && output.usage.prompt_tokens > 0 {
+            usage_attribution.insert(
+                "context_input_tokens".to_owned(),
+                u64::from(output.usage.prompt_tokens),
+            );
+        }
+        if reasoning_tokens > 0 {
+            usage_attribution.insert("reasoning_output_tokens".to_owned(), reasoning_tokens);
+        }
+        if vision_tokens > 0 {
+            usage_attribution.insert("vision_input_tokens".to_owned(), vision_tokens);
+        }
+        if audio_tokens > 0 {
+            usage_attribution.insert("audio_input_tokens".to_owned(), audio_tokens);
+        }
+        let finish_reason = if tools.is_empty() {
+            output.finish_reason.to_string()
+        } else {
+            "tool_calls".to_owned()
+        };
+        let filtered_output = provider_reasoning_output_parts_with_delimiters(
+            &output.text,
+            reasoning_output_mode,
+            reasoning_delimiters,
+        );
+        if tool_mode.is_none() && provider_wants_json(request_body) {
+            let schema = provider_response_json_schema(request_body);
+            mayhem_gateway::structured_schema::validate_output(&schema, &filtered_output.visible)
+                .map_err(|error| provider_session_output_error(error.to_string()))?;
+        }
+        Ok(ProviderSessionOutput {
+            usage: provider_chat_receipt_usage(
+                request_body,
+                billed_prompt_tokens,
+                completion_tokens,
+            ),
+            content: streamed_content.unwrap_or_else(|| {
+                if tools.is_empty() {
+                    filtered_output.visible
+                } else {
+                    provider_engine_visible_content_before_tools(
+                        &filtered_output.visible,
+                        tool_mode
+                            .as_ref()
+                            .expect("tool output requires tool mode")
+                            .strategy,
+                    )
+                }
+            }),
+            reasoning_evidence: filtered_output.hidden,
+            tools,
+            embeddings: None,
+            transcription: None,
+            artifacts,
+            finish_reason,
+            prompt_tokens: billed_prompt_tokens,
+            completion_tokens,
+            token_ids,
+            usage_attribution,
+        })
+    })()
+    .map_err(|error| with_provider_output_diagnostic(error, diagnostic))
 }
 
 struct ProviderAudioTranscriptionRequest {
@@ -122492,6 +122583,29 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             provider_output_diagnostic_reason(&engine_error),
             "engine_invalid_output"
         );
+        for (message, expected) in [
+            (
+                "output is not valid JSON: PRIVATE",
+                "structured_json_invalid",
+            ),
+            (
+                "output violates JSON schema: PRIVATE",
+                "structured_schema_mismatch",
+            ),
+            (
+                "provider context input tokens exceed served context",
+                "context_usage_exceeds_served_context",
+            ),
+            (
+                "provider tool output missing arguments",
+                "tool_envelope_incomplete",
+            ),
+        ] {
+            assert_eq!(
+                provider_output_diagnostic_reason(&provider_session_output_error(message)),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -124245,6 +124359,21 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         .expect_err("required tool mode rejects a non-tool response");
 
         assert!(format!("{err:#}").contains("valid required tool call"));
+        assert_eq!(provider_response_error_code(&err), "model_output_invalid");
+        assert_eq!(
+            provider_output_diagnostic_reason(&err),
+            "required_tool_missing"
+        );
+        // Extra diagnostics must preserve the existing failure and its type.
+        assert!(err.to_string().contains("valid required tool call"));
+        let detail = err
+            .chain()
+            .find_map(|cause| cause.downcast_ref::<ProviderOutputDiagnosticError>())
+            .expect("failed native validation retains output metadata");
+        assert_eq!(detail.shape.stage, "native_validation");
+        assert_eq!(detail.shape.text_bytes, 8);
+        assert!(detail.shape.output_limit.is_some());
+        assert!(!detail.shape.to_string().contains("not json"));
         assert!(matches!(
             backend
                 .last_request
