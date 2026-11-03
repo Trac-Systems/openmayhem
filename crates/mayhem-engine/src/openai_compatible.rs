@@ -706,6 +706,9 @@ struct OpenAiCompatibleConcurrent {
 }
 
 impl ConcurrentGenerationBackend for OpenAiCompatibleConcurrent {
+    fn backend_id(&self) -> &'static str {
+        "openai-compatible"
+    }
     fn capacity(&self) -> usize {
         self.loaded.gate.capacity
     }
@@ -1390,6 +1393,13 @@ struct StreamAttempt {
 }
 
 fn combine_recovered_output(mut first: GenerateOutput, second: GenerateOutput) -> GenerateOutput {
+    first.generation_timing = match (first.generation_timing, second.generation_timing) {
+        (Some(first), Some(second)) => Some(crate::GenerationTiming {
+            first_output: first.first_output,
+            last_output: second.last_output,
+        }),
+        _ => None,
+    };
     first.text.push_str(&second.text);
     first.usage.completion_tokens = first
         .usage
@@ -1488,6 +1498,7 @@ async fn stream_completion_attempt(
 
 #[derive(Default)]
 struct StreamCollector {
+    generation_timing: Option<crate::GenerationTiming>,
     text: String,
     reasoning: String,
     reasoning_open: bool,
@@ -1608,6 +1619,37 @@ impl StreamCollector {
             let Some(delta) = choice.get("delta").and_then(Value::as_object) else {
                 continue;
             };
+            // Observe native output before buffering tools or adding synthetic tags.
+            // Roles, usage-only events and keepalives do not start the decode clock.
+            let has_output = ["content", "reasoning_content"].iter().any(|key| {
+                delta
+                    .get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| !text.is_empty())
+            }) || delta
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|calls| {
+                    calls.iter().any(|call| {
+                        call.get("function").is_some_and(|function| {
+                            ["name", "arguments"].iter().any(|key| {
+                                function
+                                    .get(*key)
+                                    .and_then(Value::as_str)
+                                    .is_some_and(|text| !text.is_empty())
+                            })
+                        })
+                    })
+                });
+            if has_output {
+                let now = Instant::now();
+                self.generation_timing
+                    .get_or_insert(crate::GenerationTiming {
+                        first_output: now,
+                        last_output: now,
+                    })
+                    .last_output = now;
+            }
             if let Some(reasoning) = delta.get("reasoning_content").and_then(Value::as_str) {
                 if !reasoning.is_empty() {
                     if !self.reasoning_open {
@@ -1710,6 +1752,7 @@ impl StreamCollector {
             output.push_str(&envelope);
         }
         Ok(GenerateOutput {
+            generation_timing: self.generation_timing,
             text: output,
             usage: self.usage,
             finish_reason: self.finish_reason.unwrap_or(FinishReason::Stop),
@@ -2946,6 +2989,45 @@ mod tests {
         assert!(!collector.advertised_reasoning_tool_call(&body));
         collector.finish_reason = Some(FinishReason::Length);
         assert!(collector.unexecuted_reasoning_tool_call(&body));
+    }
+
+    #[test]
+    fn native_output_timing_ignores_roles_and_usage_but_includes_buffered_tools() {
+        let (events, _receiver) = mpsc::channel();
+        let mut collector = StreamCollector::default();
+        collector
+            .push(
+                json!({"choices":[{"delta":{"role":"assistant","content":""}}]}),
+                &events,
+            )
+            .unwrap();
+        collector
+            .push(
+                json!({"usage":{"completion_tokens":0},"choices":[]}),
+                &events,
+            )
+            .unwrap();
+        assert!(collector.generation_timing.is_none());
+        collector.push(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"probe","arguments":"{"}}]}}]}), &events).unwrap();
+        let first = collector.generation_timing.unwrap();
+        collector.push(json!({"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"}"}}]}}]}), &events).unwrap();
+        let last = collector.generation_timing.unwrap();
+        assert_eq!(first.first_output, last.first_output);
+        assert!(last.last_output >= first.last_output);
+        collector
+            .push(
+                json!({"usage":{"prompt_tokens":100000,"completion_tokens":246},"choices":[]}),
+                &events,
+            )
+            .unwrap();
+        assert_eq!(collector.generation_timing, Some(last));
+        let output = collector.finish(&events).unwrap();
+        assert_eq!(output.usage.completion_tokens, 246);
+        assert_eq!(output.generation_timing, Some(last));
+        assert!(serde_json::to_value(&output)
+            .unwrap()
+            .get("generation_timing")
+            .is_none());
     }
 
     #[test]

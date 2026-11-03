@@ -1200,8 +1200,17 @@ pub struct ArtifactChunk {
     pub final_chunk: bool,
 }
 
+/// In-process native output timing. Transport fragments and billing units are not tokens.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct GenerationTiming {
+    pub first_output: std::time::Instant,
+    pub last_output: std::time::Instant,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct GenerateOutput {
+    #[serde(skip)]
+    pub generation_timing: Option<GenerationTiming>,
     pub text: String,
     pub usage: UsageCounters,
     pub finish_reason: FinishReason,
@@ -1625,6 +1634,9 @@ impl ArtifactSink for NoopArtifactSink {
 }
 
 pub trait ConcurrentGenerationBackend: Send + Sync {
+    fn backend_id(&self) -> &'static str {
+        "unknown"
+    }
     fn capacity(&self) -> usize;
     fn tokenize(&self, _text: &str) -> Result<Tokenization> {
         Err(EngineError::InvalidConfig(
@@ -7395,6 +7407,7 @@ mod llama_cpp_backend {
             let reasoning_budget = llama_reasoning_budget(&request)?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
+                    generation_timing: None,
                     text: String::new(),
                     usage: UsageCounters::default(),
                     finish_reason: FinishReason::Length,
@@ -7559,6 +7572,7 @@ mod llama_cpp_backend {
             usage.reasoning_tokens =
                 llama_reasoning_tokens(model, &request, &stop_stream.output, completion_tokens);
             Ok(GenerateOutput {
+                generation_timing: None,
                 text: stop_stream.output,
                 usage,
                 finish_reason,
@@ -7797,6 +7811,7 @@ mod llama_cpp_backend {
                 }
             }
             Ok(GenerateOutput {
+                generation_timing: None,
                 text: stop_stream.output,
                 usage,
                 finish_reason,
@@ -9029,6 +9044,7 @@ mod mlx_backend {
             request.validate_sampling()?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
+                    generation_timing: None,
                     text: String::new(),
                     usage: UsageCounters::default(),
                     finish_reason: FinishReason::Length,
@@ -9861,6 +9877,9 @@ mod vllm_backend {
     }
 
     impl ConcurrentGenerationBackend for VllmConcurrentGeneration {
+        fn backend_id(&self) -> &'static str {
+            "vllm"
+        }
         fn capacity(&self) -> usize {
             self.limiter.capacity()
         }
@@ -9926,6 +9945,7 @@ mod vllm_backend {
             }
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
+                    generation_timing: None,
                     text: String::new(),
                     usage: UsageCounters::default(),
                     finish_reason: FinishReason::Length,
@@ -14299,6 +14319,7 @@ mod trt_llm_backend {
             request.validate_sampling()?;
             if request.max_new_tokens == 0 {
                 return Ok(GenerateOutput {
+                    generation_timing: None,
                     text: String::new(),
                     usage: UsageCounters::default(),
                     finish_reason: FinishReason::Length,
@@ -15527,6 +15548,7 @@ mod tests {
             _cancellation: &CancellationToken,
         ) -> Result<GenerateOutput> {
             Ok(GenerateOutput {
+                generation_timing: None,
                 text: request.prompt,
                 usage: UsageCounters::new(1, 1),
                 finish_reason: FinishReason::Stop,

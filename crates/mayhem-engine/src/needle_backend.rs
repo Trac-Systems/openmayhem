@@ -376,6 +376,7 @@ impl EngineBackend for NeedleBackend {
         };
         *self.last_generation.borrow_mut() = Some(metrics);
         Ok(GenerateOutput {
+            generation_timing: None,
             text: result.output_text,
             usage: UsageCounters::new(result.prompt_tokens, result.completion_tokens),
             finish_reason: match result.finish_reason.as_str() {

@@ -62022,6 +62022,27 @@ fn provider_session_throughput_unit(usage: &ReceiptUsage) -> &'static str {
     }
 }
 
+fn native_generation_throughput(
+    output: &mayhem_engine::GenerateOutput,
+    last_delivered_at: Option<Instant>,
+) -> Option<f64> {
+    let timing = output.generation_timing?;
+    // One buffered native event does not provide a decode interval.
+    if timing.last_output <= timing.first_output {
+        return None;
+    }
+    let last = last_delivered_at
+        .unwrap_or(timing.last_output)
+        .max(timing.last_output);
+    let intervals = u64::from(output.usage.completion_tokens).checked_sub(1)?;
+    let seconds = last
+        .checked_duration_since(timing.first_output)?
+        .as_secs_f64();
+    (intervals > 0 && seconds > 0.0)
+        .then(|| intervals as f64 / seconds)
+        .filter(|value| value.is_finite() && *value > 0.0)
+}
+
 fn provider_session_measured_throughput(
     output: &ProviderSessionOutput,
     elapsed: Duration,
@@ -63595,7 +63616,10 @@ struct ConcurrentEngineBackend {
 
 impl EngineBackend for ConcurrentEngineBackend {
     fn backend_id(&self) -> &'static str {
-        "vllm"
+        match &self.backend {
+            ProviderConcurrentEngine::Generation(backend) => backend.backend_id(),
+            ProviderConcurrentEngine::Embedding(_) => "concurrent-embedding",
+        }
     }
 
     fn load(
@@ -86280,6 +86304,8 @@ struct ProviderSessionLiveStream<'a> {
     first_token_at: Option<Instant>,
     last_token_at: Option<Instant>,
     generated_tokens: u64,
+    stream_token_ids_are_native: bool,
+    native_generation_tok_s: Option<f64>,
     delivered_metered_units: u64,
     prompt_tokens: u64,
     streamed_any: bool,
@@ -86541,6 +86567,8 @@ impl<'a> ProviderSessionLiveStream<'a> {
             first_token_at: None,
             last_token_at: None,
             generated_tokens: 0,
+            stream_token_ids_are_native: true,
+            native_generation_tok_s: None,
             delivered_metered_units: 0,
             prompt_tokens: 0,
             streamed_any: false,
@@ -86565,7 +86593,9 @@ impl<'a> ProviderSessionLiveStream<'a> {
             let ttft_ms = duration_millis_u64(self.request_started.elapsed()).max(1);
             self.first_ttft_ms = Some(ttft_ms);
             self.first_token_at = Some(token_at);
-            self.heartbeat_load.record_ttft_ms(ttft_ms);
+            if self.stream_token_ids_are_native {
+                self.heartbeat_load.record_ttft_ms(ttft_ms);
+            }
         }
         self.last_token_at = Some(token_at);
         provider_session_debug(format!(
@@ -86693,6 +86723,9 @@ impl<'a> ProviderSessionLiveStream<'a> {
     }
 
     fn measured_generation_tok_s(&self) -> Option<f64> {
+        if !self.stream_token_ids_are_native {
+            return self.native_generation_tok_s;
+        }
         let token_intervals = self.generated_tokens.checked_sub(1)?;
         if token_intervals == 0 {
             return None;
@@ -86780,6 +86813,7 @@ impl<'a> ProviderSessionLiveStream<'a> {
                         "d":if first { self.pending_text.as_str() } else { "" },
                         "reasoning_evidence_delta":if first { self.pending_hidden_reasoning.as_str() } else { "" },
                         "token_ids_delta":if first { self.pending_token_ids.as_slice() } else { &[] },
+                        "token_count_kind":if self.stream_token_ids_are_native { "native" } else { "fragments" },
                         "tool_calls_delta":tool_fragments.get(part_index).map(|delta| vec![delta]).unwrap_or_default(),
                         "tools":null,"fin":null,
                     });
@@ -94861,6 +94895,9 @@ fn provider_engine_session_response_with_sampling_bounded(
     // tools so buyer and provider agree without charging transport metadata.
     let estimated_prompt_tokens = rough_text_tokens(&provider_session_prompt_text(body, adapter));
     let effective_output_limit = u64::from(request.max_new_tokens);
+    if let Some(stream) = live_stream.as_deref_mut() {
+        stream.stream_token_ids_are_native = backend.backend_id() != "openai-compatible";
+    }
     let generated = backend.generate_with_artifacts(
         request,
         &mut |chunk: mayhem_engine::TokenChunk| {
@@ -94894,6 +94931,21 @@ fn provider_engine_session_response_with_sampling_bounded(
         return Err(error.context("streaming provider session response"));
     }
     let output = generated.context("generating provider session response with mayhem-engine")?;
+    if let Some(stream) = live_stream.as_deref_mut() {
+        if !stream.stream_token_ids_are_native {
+            stream.native_generation_tok_s =
+                native_generation_throughput(&output, stream.last_token_at);
+            if let Some(first) = output.generation_timing.and_then(|timing| {
+                timing
+                    .first_output
+                    .checked_duration_since(stream.request_started)
+            }) {
+                let ttft_ms = duration_millis_u64(first).max(1);
+                stream.first_ttft_ms = Some(ttft_ms);
+                stream.heartbeat_load.record_ttft_ms(ttft_ms);
+            }
+        }
+    }
     let diagnostic = provider_output_diagnostics::OutputShape {
         stage: "native_validation",
         input_tokens: Some(u64::from(output.usage.prompt_tokens)),
@@ -99485,6 +99537,7 @@ mod tests {
             let mut usage = mayhem_engine::UsageCounters::new(1, 1);
             usage.reasoning_tokens = reasoning_tokens;
             Ok(mayhem_engine::GenerateOutput {
+                generation_timing: None,
                 text: token_id.to_string(),
                 usage,
                 finish_reason: mayhem_engine::FinishReason::Stop,
@@ -99497,6 +99550,7 @@ mod tests {
             Self {
                 backend_id: "fake",
                 output: mayhem_engine::GenerateOutput {
+                    generation_timing: None,
                     text: text.to_owned(),
                     usage: mayhem_engine::UsageCounters::new(4, 2),
                     finish_reason: mayhem_engine::FinishReason::Stop,
@@ -122878,6 +122932,24 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
         );
     }
 
+    struct FakeConcurrentGeneration(Mutex<FakeEngineBackend>);
+    impl ConcurrentGenerationBackend for FakeConcurrentGeneration {
+        fn backend_id(&self) -> &'static str {
+            self.0.lock().unwrap().backend_id()
+        }
+        fn capacity(&self) -> usize {
+            2
+        }
+        fn generate(
+            &self,
+            request: GenerateRequest,
+            sink: &mut dyn mayhem_engine::TokenSink,
+            cancellation: &CancellationToken,
+        ) -> mayhem_engine::Result<mayhem_engine::GenerateOutput> {
+            self.0.lock().unwrap().generate(request, sink, cancellation)
+        }
+    }
+
     #[test]
     fn openai_compatible_reasoning_mode_preserves_content_only_answer() {
         let catalog_path = repo_path("catalog/models.json").unwrap();
@@ -122916,7 +122988,53 @@ printf '{"kind":"nvidia_nvtrust_offline_jwt","evidence":"boot:%s:%s","platform_i
             .unwrap();
             assert_eq!(output.content, expected_answer);
             assert_eq!(output.reasoning_evidence, expected_hidden);
+            let mut concurrent = ConcurrentEngineBackend {
+                backend: ProviderConcurrentEngine::Generation(Arc::new(FakeConcurrentGeneration(
+                    Mutex::new(
+                        FakeEngineBackend::new(native_output).with_backend_id("openai-compatible"),
+                    ),
+                ))),
+            };
+            assert_eq!(concurrent.backend_id(), "openai-compatible");
+            let concurrent_output = provider_engine_session_response_with_sampling(
+                &mut concurrent,
+                Some(&model.model_id),
+                &model.adapter,
+                &model.sampling,
+                model.workflow.as_ref(),
+                &sealed,
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+            assert_eq!(concurrent_output.content, expected_answer);
+            assert_eq!(concurrent_output.reasoning_evidence, expected_hidden);
         }
+    }
+
+    #[test]
+    fn provider_native_throughput_uses_native_usage_and_includes_delivery_backpressure() {
+        let now = Instant::now();
+        let mut output = FakeEngineBackend::new("a grouped fragment").output;
+        output.usage = mayhem_engine::UsageCounters::new(100_000, 246);
+        output.generation_timing = Some(mayhem_engine::GenerationTiming {
+            first_output: now,
+            last_output: now + Duration::from_secs(5),
+        });
+        assert_eq!(native_generation_throughput(&output, None), Some(49.0));
+        assert_eq!(
+            native_generation_throughput(&output, Some(now + Duration::from_secs(10))),
+            Some(24.5)
+        );
+        output.usage.completion_tokens = 1;
+        assert_eq!(native_generation_throughput(&output, None), None);
+        output.usage.completion_tokens = 0;
+        assert_eq!(native_generation_throughput(&output, None), None);
+        output.usage.completion_tokens = 246;
+        output.generation_timing.as_mut().unwrap().last_output = now;
+        assert_eq!(native_generation_throughput(&output, None), None);
+        output.generation_timing = None;
+        assert_eq!(native_generation_throughput(&output, None), None);
     }
 
     #[test]

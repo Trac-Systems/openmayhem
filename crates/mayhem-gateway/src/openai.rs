@@ -20008,6 +20008,7 @@ enum DirectSessionTimeoutKind {
 
 #[derive(Clone, Debug)]
 struct DirectSessionWatchdog {
+    stream_token_ids_are_native: bool,
     started_at_millis: u64,
     first_delta_at_millis: Option<u64>,
     last_delta_at_millis: Option<u64>,
@@ -20026,6 +20027,7 @@ impl DirectSessionWatchdog {
         min_tok_s: Option<f64>,
     ) -> Self {
         Self {
+            stream_token_ids_are_native: true,
             started_at_millis,
             first_delta_at_millis: None,
             last_delta_at_millis: None,
@@ -20034,6 +20036,28 @@ impl DirectSessionWatchdog {
             overall_timeout_millis: overall_timeout.map(duration_millis_u64),
             min_tok_s: min_tok_s.filter(|value| value.is_finite() && *value > 0.0),
         }
+    }
+
+    fn record_output_frame(&mut self, frame: &Value, now_millis: u64) {
+        // Sticky for the session: fragment hashes remain evidence, never tokenizer IDs.
+        if frame
+            .get("token_count_kind")
+            .is_some_and(|kind| kind.as_str() != Some("native"))
+        {
+            self.stream_token_ids_are_native = false;
+        }
+        self.record_delta(now_millis);
+    }
+
+    fn measured_generation_tok_s(&self, token_ids: &[i32], now_millis: u64) -> Option<f64> {
+        if !self.stream_token_ids_are_native || token_ids.is_empty() {
+            return None;
+        }
+        generated_tokens_per_second(
+            token_ids.len() as u64,
+            self.first_delta_at_millis?,
+            now_millis,
+        )
     }
 
     fn record_delta(&mut self, now_millis: u64) {
@@ -20107,6 +20131,9 @@ impl DirectSessionWatchdog {
     }
 
     fn throughput_floor_violation(&self, output_tokens: u64, now_millis: u64) -> Option<f64> {
+        if !self.stream_token_ids_are_native {
+            return None;
+        }
         let min_tok_s = self.min_tok_s?;
         self.first_delta_at_millis?;
         let token_intervals = output_tokens.checked_sub(1)?;
@@ -20166,6 +20193,7 @@ fn visible_output_unit_count(content: &str, tool_calls: &[ToolCallOutput]) -> u6
     visible_output_units(content, &visible_tool_calls(tool_calls))
 }
 
+#[cfg(test)]
 fn streamed_output_token_count(content: &str, token_ids: &[i32]) -> u64 {
     if token_ids.is_empty() {
         rough_tokens(content)
@@ -20828,7 +20856,7 @@ async fn collect_direct_session_output(
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
                 delta_sequence.observe(&frame)?;
                 let now = now_millis_u64();
-                watchdog.record_delta(now);
+                watchdog.record_output_frame(&frame, now);
                 if let Some(delta) = session_delta_text(&frame)? {
                     append_session_text(&mut content, delta, max_text_bytes, "chat output")?;
                     ensure_metered_text_within_limit(
@@ -20903,7 +20931,7 @@ async fn collect_direct_session_output(
                         provider_quality.or_else(|| quality_from_session_delta(&frame));
                 }
                 if finish_reason.is_none() {
-                    let output_tokens = streamed_output_token_count(&content, &token_ids);
+                    let output_tokens = token_ids.len() as u64;
                     if let Some(tok_s) = watchdog.throughput_floor_violation(output_tokens, now) {
                         let min_tok_s = failover.min_tok_s.ok_or_else(|| {
                             GatewaySessionError::new(
@@ -21110,11 +21138,7 @@ async fn collect_direct_session_output(
             .first_delta_at_millis
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
-                tok_s: generated_tokens_per_second(
-                    streamed_output_token_count(&content, &token_ids),
-                    first_delta_at_millis,
-                    completed_at_millis,
-                ),
+                tok_s: watchdog.measured_generation_tok_s(&token_ids, completed_at_millis),
             })
     });
     let artifacts = finish_session_artifacts(artifact_builders)?;
@@ -21254,7 +21278,7 @@ async fn collect_direct_session_embedding_output(
             Some("s.delta") if frame.get("rid").and_then(Value::as_str) == Some(request_id) => {
                 delta_sequence.observe(&frame)?;
                 let now = now_millis_u64();
-                watchdog.record_delta(now);
+                watchdog.record_output_frame(&frame, now);
                 if embeddings.is_none() {
                     embeddings = embeddings_from_session_delta(&frame, &mut delta_payload_chunks)?;
                 }
@@ -22032,11 +22056,7 @@ fn interrupted_direct_session_partial(
     let usage = usage_from_receipt_usage(&provider_receipt.body.usage);
     let quality = Some(GatewaySessionQuality {
         ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
-        tok_s: generated_tokens_per_second(
-            streamed_output_token_count(content, token_ids),
-            first_delta_at_millis,
-            now_millis,
-        ),
+        tok_s: watchdog.measured_generation_tok_s(token_ids, now_millis),
     });
     Some(GatewaySessionPartial {
         output: ChatOutput {
@@ -22116,11 +22136,7 @@ fn client_disconnect_direct_session_error(
     let usage = observed_chat_usage(request, content, reasoning_evidence, &tool_calls);
     let quality = Some(GatewaySessionQuality {
         ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
-        tok_s: generated_tokens_per_second(
-            streamed_output_token_count(content, token_ids),
-            first_delta_at_millis,
-            now_millis,
-        ),
+        tok_s: watchdog.measured_generation_tok_s(token_ids, now_millis),
     });
     GatewaySessionError::retryable_interrupted(
         err.message,
@@ -22156,11 +22172,7 @@ fn direct_session_checkpoint_partial(
             .first_delta_at_millis
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(watchdog.started_at_millis),
-                tok_s: generated_tokens_per_second(
-                    streamed_output_token_count(content, token_ids),
-                    first_delta_at_millis,
-                    now_millis,
-                ),
+                tok_s: watchdog.measured_generation_tok_s(token_ids, now_millis),
             });
     GatewaySessionPartial {
         output: ChatOutput {
@@ -25712,6 +25724,69 @@ fn chat_context_capacity_error(
     })
 }
 
+fn chat_throughput_exclusion_error(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+    options: &GatewayRequestOptions,
+) -> Option<ApiError> {
+    let floor = state.generation_floor_tok_s_for_model(model, options)?;
+    let now = now_millis_u64();
+    let requirements = request_requirements_for_chat(
+        state,
+        model,
+        request,
+        now,
+        options.max_price_au,
+        options.min_ctx,
+        Some(floor),
+    );
+    let mut without_floor = requirements.clone();
+    without_floor.min_throughput = None;
+    let entries = state
+        .provider_table
+        .lock_recover("provider table")
+        .entries(now);
+    let otherwise_eligible = selector_eligible_route_keys(
+        state,
+        model,
+        &entries,
+        options.min_att_tier,
+        options.quant.as_deref(),
+        &without_floor,
+        now,
+    );
+    let preferred = state.preferred_provider_order(model, options);
+    let relevant = entries
+        .iter()
+        .filter(|entry| {
+            otherwise_eligible.contains(&entry.key)
+                && preferred.as_ref().is_none_or(|providers| {
+                    providers
+                        .iter()
+                        .any(|provider| provider.eq_ignore_ascii_case(&entry.key.provider))
+                })
+        })
+        .collect::<Vec<_>>();
+    if relevant.is_empty()
+        || relevant.iter().any(|entry| {
+            crate::provider_table::evaluate_eligibility(entry, &requirements)
+                != Err(crate::provider_table::IneligibilityReason::ThroughputFloor)
+        })
+    {
+        return None;
+    }
+    Some(ApiError::service_unavailable(
+        "The selected providers do not currently meet the generation throughput requirement.",
+        Some("X-Mayhem-Min-Tok-S"),
+    )
+    .with_public_error("provider_throughput_unavailable", "route_selection", true)
+    .with_safe_detail(json!({
+        "availability_reason": "throughput_floor",
+        "minimum_tokens_per_second": floor.minimum,
+    })))
+}
+
 fn no_eligible_chat_route_error(
     state: &GatewayState,
     model: &GatewayModel,
@@ -25722,15 +25797,17 @@ fn no_eligible_chat_route_error(
         direct_chat_endpoint_family(request),
         request.endpoint_request.as_ref(),
     );
-    chat_context_capacity_error(state, model, request, options).unwrap_or_else(|| {
-        no_eligible_route_error(
-            state,
-            model,
-            options,
-            &chat_required_modalities(&request.messages),
-            Some(&compatible),
-        )
-    })
+    chat_context_capacity_error(state, model, request, options)
+        .or_else(|| chat_throughput_exclusion_error(state, model, request, options))
+        .unwrap_or_else(|| {
+            no_eligible_route_error(
+                state,
+                model,
+                options,
+                &chat_required_modalities(&request.messages),
+                Some(&compatible),
+            )
+        })
 }
 
 struct RouteWaitOutcome<'a> {
@@ -28264,7 +28341,7 @@ async fn run_live_direct_chat_sse_inner(
                 delta_sequence.observe(&frame)?;
                 let now = now_millis_u64();
                 latest_checkpoint_ack_frame = None;
-                watchdog.record_delta(now);
+                watchdog.record_output_frame(&frame, now);
                 if let Some(delta) = session_delta_text(&frame)? {
                     append_session_text(&mut content, delta, max_text_bytes, "chat output")?;
                     ensure_metered_text_within_limit(
@@ -28462,7 +28539,7 @@ async fn run_live_direct_chat_sse_inner(
                     claimed_usage_attribution = usage_attribution_from_session_delta(&frame)?;
                 }
                 if finish_reason.is_none() {
-                    let output_tokens = streamed_output_token_count(&content, &token_ids);
+                    let output_tokens = token_ids.len() as u64;
                     if let Some(tok_s) = watchdog.throughput_floor_violation(output_tokens, now) {
                         let min_tok_s = failover.min_tok_s.ok_or_else(|| {
                             GatewaySessionError::new(
@@ -28679,11 +28756,7 @@ async fn run_live_direct_chat_sse_inner(
             .first_delta_at_millis
             .map(|first_delta_at_millis| GatewaySessionQuality {
                 ttft_ms: first_delta_at_millis.saturating_sub(started_at_millis),
-                tok_s: generated_tokens_per_second(
-                    streamed_output_token_count(&content, &token_ids),
-                    first_delta_at_millis,
-                    completed_at_millis,
-                ),
+                tok_s: watchdog.measured_generation_tok_s(&token_ids, completed_at_millis),
             });
     let artifacts = finish_session_artifacts(artifact_builders)?;
     let finish_reason = finish_reason.ok_or_else(|| {
@@ -43462,6 +43535,37 @@ mod tests {
     }
 
     #[test]
+    fn direct_session_watchdog_never_counts_fragment_hashes_as_native_tokens() {
+        let mut watchdog =
+            DirectSessionWatchdog::new(0, None, Some(Duration::from_secs(20)), None, Some(5.0));
+        watchdog.record_output_frame(&json!({"token_count_kind":"fragments"}), 100);
+        assert_eq!(watchdog.throughput_floor_violation(2, 1_100), None);
+        assert_eq!(watchdog.measured_generation_tok_s(&[1, 2], 1_100), None);
+        watchdog.record_output_frame(&json!({"token_count_kind":"native"}), 200);
+        assert_eq!(watchdog.throughput_floor_violation(2, 1_100), None);
+        assert_eq!(
+            watchdog.timeout_kind(20_201),
+            Some(DirectSessionTimeoutKind::IdleGap)
+        );
+        let quality =
+            quality_from_session_delta(&json!({"quality":{"ttft_ms":100,"throughput":49.0}}))
+                .unwrap();
+        assert_eq!(quality.tok_s, Some(49.0));
+    }
+
+    #[test]
+    fn direct_session_watchdog_requires_exact_ids_for_local_generation_samples() {
+        let mut watchdog = DirectSessionWatchdog::new(0, None, None, None, Some(5.0));
+        watchdog.record_output_frame(&json!({"token_count_kind":"native"}), 100);
+        assert_eq!(
+            watchdog.measured_generation_tok_s(&[1, 2, 3, 4, 5, 6], 1_100),
+            Some(5.0)
+        );
+        assert_eq!(watchdog.measured_generation_tok_s(&[], 1_100), None);
+        assert_eq!(watchdog.throughput_floor_violation(2, 1_100), Some(1.0));
+    }
+
+    #[test]
     fn generation_throughput_uses_subsecond_samples_only_when_output_is_substantial() {
         assert_eq!(generated_tokens_per_second(1, 100, 10_000), None);
         assert_eq!(generated_tokens_per_second(5, 100, 10_000), None);
@@ -49895,6 +49999,14 @@ mod tests {
         )
         .is_empty());
 
+        let error = no_eligible_chat_route_error(&state, &model, &request, &strict_floor);
+        assert_eq!(error.public_code, "provider_throughput_unavailable");
+        let mut pinned_floor = strict_floor.clone();
+        pinned_floor.preferred_providers =
+            Some(vec![model.mayhem.route_candidates[0].provider.clone()]);
+        let error = no_eligible_chat_route_error(&state, &model, &request, &pinned_floor);
+        assert_eq!(error.public_code, "provider_throughput_unavailable");
+
         let disabled_floor = GatewayRequestOptions {
             failover_overrides: GatewayFailoverPolicyConfig {
                 min_tok_s: Some(0.0),
@@ -53644,11 +53756,11 @@ mod tests {
         );
         let ack = receipt_ack_for_body(&test_user_seed(), &provider_receipt.body).unwrap();
         let mut feature = test_receipt_settlement_feature(&provider_receipt, &ack);
-        feature["value"]["contract_version"] = json!(CONTRACT_VERSION - 1);
+        feature["value"]["contract_version"] = json!(26);
         let envelope = feature["value"]["receipt"].clone();
         feature["key"] = json!(record_usage_receipt_feature_key_from_envelope_for_contract(
             &envelope,
-            CONTRACT_VERSION - 1,
+            26,
         )
         .unwrap());
         feature["value"]["provider_sig"] = json!(sign_hex(

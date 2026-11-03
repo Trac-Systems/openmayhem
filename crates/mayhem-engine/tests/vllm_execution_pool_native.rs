@@ -967,6 +967,7 @@ impl ConcurrentGenerationBackend for FakePool {
             })?;
         }
         Ok(mayhem_engine::GenerateOutput {
+            generation_timing: None,
             text: "ok".to_owned(),
             usage: mayhem_engine::UsageCounters::new(1, 2),
             finish_reason: mayhem_engine::FinishReason::Stop,
