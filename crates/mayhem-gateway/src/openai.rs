@@ -58004,12 +58004,15 @@ mod tests {
             &model, &test_chat_request(&model.id),
             Some(&model.mayhem.route_candidates[0]), &GatewayRequestOptions::default(),
         ).unwrap();
+        let reservations = state.wallet_spend.lock().unwrap().reservations.clone();
         state.replace_model_catalog(vec![refreshed_price_model(&model, 1)]);
         let error = refresh_model_after_price_refusal(
             &state, &model, &invocation, RouteWaitDeadline::new(0), Duration::from_millis(250),
         ).await.unwrap_err();
         assert_eq!(public_error_code(&error), "catalog_price_refresh_pending");
-        assert!(state.wallet_spend.lock().unwrap().reservations.is_empty());
+        // The caller owns the original invocation's reservation. Refreshing
+        // alone must neither replace it nor create a second hold.
+        assert_eq!(state.wallet_spend.lock().unwrap().reservations, reservations);
     }
 
     #[tokio::test]
