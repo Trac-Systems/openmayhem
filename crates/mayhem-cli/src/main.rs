@@ -3,6 +3,7 @@
 mod catalog;
 mod endpoint_calibration;
 mod gemma4;
+mod gateway_catalog;
 mod intercom_runtime;
 mod managed_openai_compatible;
 mod provider_failure_recovery;
@@ -45165,6 +45166,7 @@ struct GatewayCatalogWatcherConfig {
     hardware: HardwareReport,
     home: PathBuf,
     refresh_interval: Duration,
+    price_history: gateway_catalog::PriceHistory,
 }
 
 #[derive(Clone)]
@@ -45214,13 +45216,15 @@ async fn run_gateway_catalog_watcher(
         .context("building gateway catalog watcher HTTP client")?;
     let mut applied_snapshot = String::new();
     let mut last_error = None;
+    let mut price_history = config.price_history.clone();
     loop {
         tokio::select! {
             _ = sleep(config.refresh_interval) => {},
             _ = state.wait_for_catalog_refresh_request() => {},
         }
+        let refresh_started = Instant::now();
         let refresh = async {
-            let contract = read_contract_catalog(&rpc).await?;
+            let contract = gateway_catalog::read_current_catalog(&rpc, &mut price_history).await?;
             let contract_models = gateway_models_from_contract(&contract)?;
             let policy_epoch = contract.active_billing_epoch;
             let (
@@ -45351,7 +45355,8 @@ async fn run_gateway_catalog_watcher(
                     );
                     applied_snapshot = snapshot;
                     eprintln!(
-                        "Gateway authenticated catalog refreshed from contract: {model_count} model(s)"
+                        "Gateway authenticated catalog refreshed from contract: {model_count} model(s), {} ms",
+                        refresh_started.elapsed().as_millis()
                     );
                 }
                 state.complete_catalog_refresh();
@@ -45975,6 +45980,7 @@ async fn use_gateway(args: UseArgs) -> Result<()> {
                 hardware: hardware.clone(),
                 home: home.clone(),
                 refresh_interval: Duration::from_millis(catalog_refresh_millis),
+                price_history: gateway_catalog::PriceHistory::from_catalog(&contract),
             });
         }
         let model_count = models.len();
@@ -73392,12 +73398,27 @@ async fn read_provider_session_record_at<T: DeserializeOwned>(
     }
 }
 
+async fn read_catalog_value(rpc: &PeerRpcClient, key: &str, signed_length: Option<u64>) -> Result<Option<Value>> {
+    match signed_length {
+        Some(length) => read_state_value_at(rpc, key, length).await,
+        None => read_state_value(rpc, key).await,
+    }
+}
+
 async fn read_active_provider_payout_revisions(
     rpc: &PeerRpcClient,
     active_epoch: u64,
 ) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
+    read_active_provider_payout_revisions_at(rpc, active_epoch, None).await
+}
+
+async fn read_active_provider_payout_revisions_at(
+    rpc: &PeerRpcClient,
+    active_epoch: u64,
+    signed_length: Option<u64>,
+) -> Result<BTreeMap<String, BTreeMap<String, String>>> {
     let mut revisions = BTreeMap::<String, BTreeMap<String, String>>::new();
-    for entry in read_prefix_entries(rpc, "payout/current/").await? {
+    for entry in read_prefix_entries_at(rpc, "payout/current/", signed_length).await?.1 {
         let Some(tail) = entry.key.strip_prefix("payout/current/") else {
             continue;
         };
@@ -73418,7 +73439,7 @@ async fn read_active_provider_payout_revisions(
             continue;
         }
         let binding_key = format!("payout/binding/{rail}/{provider}/{revision}");
-        let Some(binding) = read_state_value(rpc, &binding_key).await? else {
+        let Some(binding) = read_catalog_value(rpc, &binding_key, signed_length).await? else {
             continue;
         };
         if binding.get("verified").and_then(Value::as_bool) != Some(true)
@@ -73439,7 +73460,7 @@ async fn read_active_provider_payout_revisions(
             let verification_pointer_key =
                 format!("payout/stripe-verified/target/{provider}/{target}");
             let Some(verification_pointer) =
-                read_state_value(rpc, &verification_pointer_key).await?
+                read_catalog_value(rpc, &verification_pointer_key, signed_length).await?
             else {
                 continue;
             };
@@ -73449,7 +73470,7 @@ async fn read_active_provider_payout_revisions(
             else {
                 continue;
             };
-            let Some(verification) = read_state_value(rpc, record_key).await? else {
+            let Some(verification) = read_catalog_value(rpc, record_key, signed_length).await? else {
                 continue;
             };
             if verification_pointer.get("ready").and_then(Value::as_bool) != Some(true)
@@ -117044,6 +117065,99 @@ esac
         assert_eq!(seen.len(), 9);
         assert!(seen.contains(&price_key));
         assert!(!seen.iter().any(|key| key == "price/" || key == "ev/price/"));
+    }
+
+    #[tokio::test]
+    async fn gateway_current_catalog_avoids_historical_prefixes_and_preserves_routes() {
+        use std::net::TcpListener;
+        use std::thread;
+        let mut source = test_contract(&"aa".repeat(32));
+        let enclave = source.enclaves[0].enclave_id.clone();
+        let provider = source.providers[0].provider.clone();
+        let revision = "ab".repeat(32);
+        source.providers[0].accepted_rails = vec!["tnk".to_owned()];
+        source.active_payout_revisions = BTreeMap::from([(provider.clone(), BTreeMap::from([("tnk".to_owned(), revision.clone())]))]);
+        let old = json!({"epoch":5,"price_ver":1,"enclave_id":enclave,
+            "ctx_bracket":source.prices[0].ctx_bracket,"model_id":source.enclaves[0].model_id});
+        let fresh = json!({"epoch":6,"price_ver":2,"enclave_id":enclave,
+            "ctx_bracket":source.prices[0].ctx_bracket,"model_id":source.enclaves[0].model_id});
+        source.price_derivations = vec![old.clone()];
+        let mut history = gateway_catalog::PriceHistory::from_catalog(&source);
+        source.price_derivations.push(fresh.clone());
+        source.prices[0].current.as_mut().unwrap().ver = 2;
+        let mut records = BTreeMap::<String, Value>::new();
+        for item in &source.enclaves { records.insert(format!("enclave/{}",item.enclave_id),serde_json::to_value(item).unwrap()); }
+        for item in &source.rooms { records.insert(format!("room/{}",item.room_id),serde_json::to_value(item).unwrap()); }
+        for item in &source.roomserve { records.insert(format!("roomserve/{}/{}/{}",item.room_id,item.provider,item.enclave_id),serde_json::to_value(item).unwrap()); }
+        for item in &source.serves { records.insert(format!("serve/{}/{}",item.provider,item.enclave_id),serde_json::to_value(item).unwrap()); }
+        for item in &source.providers { records.insert(format!("prov/{}",item.provider),serde_json::to_value(item).unwrap()); }
+        for item in &source.prices { records.insert(format!("price/{}",ledger_price_market_key(&item.enclave_id,item.ctx_bracket.as_deref())),serde_json::to_value(item).unwrap()); }
+        records.insert("ctx_brackets".to_owned(),serde_json::to_value(&source.ctx_bracket_schedule).unwrap());
+        records.insert("rules/current".to_owned(),serde_json::to_value(source.rules.as_ref().unwrap()).unwrap());
+        records.insert("epoch/apply/state".to_owned(),json!({"updated_epoch":6}));
+        records.insert(format!("payout/current/tnk/{provider}"),json!({"current_revision":revision}));
+        records.insert(format!("payout/binding/tnk/{provider}/{revision}"),json!({"provider":provider,
+            "rail":"tnk","revision":revision,"verified":true,"activation_epoch":1}));
+        let market = ledger_price_market_key(&enclave,source.prices[0].ctx_bracket.as_deref());
+        records.insert(format!("ev/price/5/{market}"),old);
+        records.insert(format!("ev/price/6/{market}"),fresh);
+        // These entries must not be visited. A larger ledger does not change
+        // the live reader's request count or returned current price.
+        for n in 0..10_000 {
+            records.insert(format!("price/{market}/v/{n}"),json!({"historical":n}));
+            records.insert(format!("ev/price/0/{n}"),json!({"historical":n}));
+        }
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_seen = seen.clone(); let server_stop = stop.clone();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now()+Duration::from_secs(20);
+            while !server_stop.load(Ordering::Acquire) && Instant::now()<deadline {
+                let (mut stream,_) = match listener.accept() {
+                    Ok(value)=>value, Err(error) if error.kind()==std::io::ErrorKind::WouldBlock => {thread::sleep(Duration::from_millis(1));continue},
+                    Err(error)=>panic!("{error}"),
+                };
+                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                let mut bytes=Vec::new();
+                loop {
+                    let mut chunk=[0u8;4096];let n=stream.read(&mut chunk).unwrap();assert!(n>0);bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.windows(4).any(|part|part==b"\r\n\r\n"){break}
+                }
+                let line=String::from_utf8(bytes).unwrap();
+                let url=reqwest::Url::parse(&format!("http://{address}{}",line.split_whitespace().nth(1).unwrap())).unwrap();
+                let query=url.query_pairs().collect::<BTreeMap<_,_>>();
+                assert_eq!(query.get("confirmed").map(|s|s.as_ref()),Some("true"));
+                let body=if let Some(prefix)=query.get("prefix") {
+                    assert!(!matches!(prefix.as_ref(),"price/"|"ev/price/"),"must not scan historical versions");
+                    server_seen.lock().unwrap().push(prefix.to_string());
+                    if prefix.as_ref()!="rules/current" {assert_eq!(query.get("signed_length").map(|s|s.as_ref()),Some("42"));}
+                    let values=records.iter().filter(|(key,_)|key.starts_with(prefix.as_ref()))
+                        .map(|(key,value)|json!({"key":key,"value":value})).collect::<Vec<_>>();
+                    json!({"prefix":prefix,"confirmed":true,"signed_length":42,"truncated":false,"next_cursor":null,"values":values})
+                } else {
+                    let key=query.get("key").unwrap();
+                    assert_eq!(query.get("signed_length").map(|s|s.as_ref()),Some("42"));
+                    server_seen.lock().unwrap().push(key.to_string());
+                    json!({"key":key,"confirmed":true,"signed_length":42,"value":records.get(key.as_ref())})
+                }.to_string();
+                write!(stream,"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",body.len()).unwrap();
+                stream.flush().unwrap();
+            }
+        });
+        let rpc=PeerRpcClient::new(format!("http://{address}/v1")).unwrap();
+        let result=gateway_catalog::read_current_catalog(&rpc,&mut history).await;
+        stop.store(true,Ordering::Release);server.join().unwrap();
+        let actual=result.unwrap();
+        assert_eq!(serde_json::to_value(gateway_models_from_contract(&actual).unwrap()).unwrap(),
+            serde_json::to_value(gateway_models_from_contract(&source).unwrap()).unwrap());
+        assert_eq!(actual.active_payout_revisions,source.active_payout_revisions);
+        let seen=seen.lock().unwrap();assert!(seen.len()<50,"bounded reads: {}",seen.len());
+        assert!(seen.contains(&format!("price/{market}")));
+        assert!(seen.contains(&"ev/price/5/".to_owned()));assert!(seen.contains(&"ev/price/6/".to_owned()));
+        assert!(!seen.iter().any(|key|key.contains("/v/")));
     }
 
     #[test]

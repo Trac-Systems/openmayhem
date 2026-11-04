@@ -24349,7 +24349,8 @@ async fn run_embedding_with_route_retry(
                 // penalize or exhaust the provider, or discard prior partials.
                 drop(_modality_admission);
                 current_model =
-                    refresh_model_after_price_refusal(state, model, &invocation, deadline).await?;
+                    refresh_model_after_price_refusal(state, model, &invocation, deadline, recovery.price_retry_delay()).await?;
+                recovery.record_price_refresh();
                 let model = &current_model;
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
@@ -24592,7 +24593,8 @@ async fn run_image_generation_with_route_retry(
                 // penalize or exhaust the provider, or discard prior partials.
                 drop(_modality_admission);
                 current_model =
-                    refresh_model_after_price_refusal(state, model, &invocation, deadline).await?;
+                    refresh_model_after_price_refusal(state, model, &invocation, deadline, recovery.price_retry_delay()).await?;
+                recovery.record_price_refresh();
                 let model = &current_model;
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
@@ -24829,7 +24831,8 @@ async fn run_audio_speech_with_route_retry(
                 // penalize or exhaust the provider, or discard prior partials.
                 drop(_modality_admission);
                 current_model =
-                    refresh_model_after_price_refusal(state, model, &invocation, deadline).await?;
+                    refresh_model_after_price_refusal(state, model, &invocation, deadline, recovery.price_retry_delay()).await?;
+                recovery.record_price_refresh();
                 let model = &current_model;
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
@@ -25070,7 +25073,8 @@ async fn run_audio_transcription_with_route_retry(
                 // penalize or exhaust the provider, or discard prior partials.
                 drop(_modality_admission);
                 current_model =
-                    refresh_model_after_price_refusal(state, model, &invocation, deadline).await?;
+                    refresh_model_after_price_refusal(state, model, &invocation, deadline, recovery.price_retry_delay()).await?;
+                recovery.record_price_refresh();
                 let model = &current_model;
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
@@ -25354,7 +25358,8 @@ async fn run_artifact_generation_with_route_retry(
                 // penalize or exhaust the provider, or discard prior partials.
                 drop(_modality_admission);
                 current_model =
-                    refresh_model_after_price_refusal(state, model, &invocation, deadline).await?;
+                    refresh_model_after_price_refusal(state, model, &invocation, deadline, recovery.price_retry_delay()).await?;
+                recovery.record_price_refresh();
                 let model = &current_model;
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
@@ -25854,6 +25859,7 @@ async fn refresh_model_after_price_refusal(
     model: &GatewayModel,
     invocation: &GatewaySessionInvocation,
     deadline: RouteWaitDeadline,
+    retry_delay: Duration,
 ) -> Result<GatewayModel, ApiError> {
     if invocation
         .client_cancellation
@@ -25861,6 +25867,9 @@ async fn refresh_model_after_price_refusal(
         .is_some_and(|c| c.is_cancelled())
     {
         return Err(ApiError::client_closed_request("request cancelled"));
+    }
+    if deadline.remaining().is_zero() {
+        return Err(catalog_price_refresh_error());
     }
     // A concurrent request or the periodic watcher may already have obtained
     // newer authenticated terms while this request was awaiting s.reject.
@@ -25892,21 +25901,39 @@ async fn refresh_model_after_price_refusal(
         {
             return Err(ApiError::client_closed_request("request cancelled"));
         }
+        if deadline.remaining().is_zero() {
+            return Err(catalog_price_refresh_error());
+        }
         if state
             .catalog_refresh
             .lock_recover("catalog refresh")
             .generation
             != generation
         {
-            return state
-                .models_snapshot()
-                .iter()
-                .find(|current| current.id == model.id)
-                .cloned()
-                .ok_or_else(catalog_price_refresh_error);
-        }
-        if deadline.remaining().is_zero() {
-            return Err(catalog_price_refresh_error());
+            let current = state.models_snapshot().iter()
+                .find(|current| current.id == model.id).cloned()
+                .ok_or_else(catalog_price_refresh_error)?;
+            let route = current.mayhem.route_candidates.iter().find(|route|
+                invocation.selected_route_key.as_ref() == Some(&route_key(route)));
+            if route_price_ref_au(&current, route).ver == invocation.price_ver {
+                // A successful read can still precede peer catch-up. Do not
+                // burn the route budget in a tight loop on unchanged terms.
+                // The original admission deadline and cancellation still win.
+                let remaining = deadline.remaining();
+                if remaining.is_zero() { return Err(catalog_price_refresh_error()); }
+                tokio::select! {
+                    _ = tokio::time::sleep(retry_delay.min(remaining)) => {},
+                    _ = async {
+                        match invocation.client_cancellation.as_ref() {
+                            Some(cancel) => cancel.cancelled().await,
+                            None => std::future::pending::<()>().await,
+                        }
+                    } => return Err(ApiError::client_closed_request("request cancelled")),
+                }
+                if deadline.remaining().is_zero() { return Err(catalog_price_refresh_error()); }
+            }
+            return state.models_snapshot().iter().find(|current| current.id == model.id)
+                .cloned().ok_or_else(catalog_price_refresh_error);
         }
         tokio::select! {
             _ = &mut completed => {},
@@ -25954,6 +25981,7 @@ struct RouteAdmissionRecovery {
     safe_same_route_retry_counts: BTreeMap<ProviderKey, u8>,
     dev_route_attempted: bool,
     attempts_made: usize,
+    price_refusals: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -25974,6 +26002,7 @@ impl RouteAdmissionRecovery {
             safe_same_route_retry_counts: BTreeMap::new(),
             dev_route_attempted: false,
             attempts_made: 0,
+            price_refusals: 0,
         }
     }
 
@@ -26086,6 +26115,17 @@ impl RouteAdmissionRecovery {
 
     fn can_attempt(&self) -> bool {
         self.attempts_made < self.total_attempt_limit
+    }
+
+    fn price_retry_delay(&self) -> Duration {
+        Duration::from_millis(250 * (1u64 << self.price_refusals.min(3)))
+    }
+
+    fn record_price_refresh(&mut self) {
+        // PRICE_VER is a confirmed pre-spend refusal, not a failed inference
+        // route. Recovery is bounded by the existing deadline and backoff.
+        self.price_refusals = self.price_refusals.saturating_add(1);
+        self.total_attempt_limit = self.total_attempt_limit.saturating_add(1);
     }
 
     fn admission_attempt_budget(&self, candidate_count: usize) -> Option<Duration> {
@@ -27364,8 +27404,9 @@ async fn prepare_live_direct_chat_session(
             }
             Err(err) if is_price_version_refusal(&err) => {
                 drop(modality_admission);
-                model = refresh_model_after_price_refusal(&state, &model, &invocation, deadline)
+                model = refresh_model_after_price_refusal(&state, &model, &invocation, deadline, recovery.price_retry_delay())
                     .await?;
+                recovery.record_price_refresh();
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
                 retain_most_specific_route_attempt_error(&mut last_retryable_error, err.message);
@@ -29323,7 +29364,8 @@ async fn run_chat_with_route_retry(
                 // penalize or exhaust the provider, or discard prior partials.
                 drop(_modality_admission);
                 current_model =
-                    refresh_model_after_price_refusal(state, model, &invocation, deadline).await?;
+                    refresh_model_after_price_refusal(state, model, &invocation, deadline, recovery.price_retry_delay()).await?;
+                recovery.record_price_refresh();
                 let model = &current_model;
                 billing = billing.after_attempt(None);
                 attempt_options.billing = Some(billing.clone());
@@ -57634,7 +57676,7 @@ mod tests {
         let mut invocation = test_invocation();
         invocation.client_cancellation = Some(cancellation.clone());
         let deadline = RouteWaitDeadline::new(5_000);
-        let refresh = refresh_model_after_price_refusal(&state, &model, &invocation, deadline);
+        let refresh = refresh_model_after_price_refusal(&state, &model, &invocation, deadline, Duration::from_millis(250));
         let drive = async {
             state.wait_for_catalog_refresh_request().await;
             let generation = state.request_catalog_refresh();
@@ -57888,7 +57930,7 @@ mod tests {
                 &state,
                 &model,
                 &test_chat_request(&model.id),
-                GatewayRequestOptions::default(),
+                GatewayRequestOptions { max_wait_ms: 100, ..GatewayRequestOptions::default() },
             )
             .await,
         );
@@ -57897,12 +57939,40 @@ mod tests {
         assert_eq!(error.status, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
             backend.attempts.lock().unwrap().len(),
-            usize::from(DEFAULT_MAX_OPEN_ATTEMPTS)
+            1,
+            "unchanged terms must wait, not spin through the route budget"
         );
         assert!(state.wallet_spend.lock().unwrap().reservations.is_empty());
         assert!(
             !state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64())
         );
+    }
+
+    #[tokio::test]
+    async fn price_transition_waits_for_catch_up_beyond_the_inference_route_budget() {
+        let model = test_routed_model(1);
+        let refreshed = refreshed_price_model(&model, 1);
+        let backend = price_transition_backend(refreshed.mayhem.price_ref_au.ver);
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(backend.clone());
+        let watcher_state = state.clone();
+        let stale_reads = usize::from(DEFAULT_MAX_OPEN_ATTEMPTS) + 1;
+        let watcher = tokio::spawn(async move {
+            for _ in 0..stale_reads {
+                watcher_state.wait_for_catalog_refresh_request().await;
+                watcher_state.complete_catalog_refresh();
+            }
+            watcher_state.wait_for_catalog_refresh_request().await;
+            watcher_state.replace_model_catalog(vec![refreshed]);
+            watcher_state.complete_catalog_refresh();
+        });
+        let result = discard_route_result(run_chat_with_route_retry(&state, &model, &test_chat_request(&model.id),
+            GatewayRequestOptions { max_wait_ms: 30_000, ..GatewayRequestOptions::default() }).await);
+        assert!(result.is_ok(), "catch-up must preserve the request: {:?}", result.err());
+        watcher.await.unwrap();
+        assert_eq!(backend.attempts.lock().unwrap().len(), stale_reads + 2);
+        assert!(state.wallet_spend.lock().unwrap().reservations.is_empty());
+        assert!(state.receipts().is_empty());
+        assert!(!state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64()));
     }
 
     #[tokio::test]
@@ -57924,6 +57994,22 @@ mod tests {
         assert!(
             !state.route_provider_in_cooloff(&model.mayhem.route_candidates[0], now_millis_u64())
         );
+    }
+
+    #[tokio::test]
+    async fn price_transition_already_refreshed_catalog_cannot_extend_expired_deadline() {
+        let model = test_routed_model(1);
+        let state = test_gateway_state_from_models(vec![model.clone()]);
+        let invocation = state.prepare_chat_invocation_for_route(
+            &model, &test_chat_request(&model.id),
+            Some(&model.mayhem.route_candidates[0]), &GatewayRequestOptions::default(),
+        ).unwrap();
+        state.replace_model_catalog(vec![refreshed_price_model(&model, 1)]);
+        let error = refresh_model_after_price_refusal(
+            &state, &model, &invocation, RouteWaitDeadline::new(0), Duration::from_millis(250),
+        ).await.unwrap_err();
+        assert_eq!(public_error_code(&error), "catalog_price_refresh_pending");
+        assert!(state.wallet_spend.lock().unwrap().reservations.is_empty());
     }
 
     #[tokio::test]
