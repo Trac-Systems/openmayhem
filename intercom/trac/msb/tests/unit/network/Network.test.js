@@ -23,6 +23,7 @@ async function loadNetwork(options = {}) {
             super();
             swarmInstance = this;
             this.peers = new Map();
+            this.connections = new Set();
             this._allConnections = new Map();
             this.joinPeer = sinon.stub().callsFake((target) => {
                 const publicKeyHex = b4a.toString(target, 'hex');
@@ -174,11 +175,12 @@ async function loadNetwork(options = {}) {
         address: 'trac_test',
     };
 
-    const network = new Network({}, config, wallet.address);
+    const state = { base: { view: { core: { signedLength: 1 } } }, setReadRecoveryHandler: sinon.stub() };
+    const network = new Network(state, config, wallet.address);
     const store = options.store ?? {
         replicate: sinon.stub().returns(new EventEmitter()),
     };
-    await network.replicate({}, store, wallet);
+    await network.replicate(state, store, wallet);
 
     return { network, swarmInstance, connectionManagerInstance, pendingRequestServiceInstance, store, wallet };
 }

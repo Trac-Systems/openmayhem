@@ -3,6 +3,7 @@ import { default as test } from 'brittle';
 async function runNetworkModuleTests() {
     test.pause();
     await import('./Network.test.js');
+    await import('./ReadRecovery.test.js');
     await import('./services/ConnectionManager.test.js');
     await import('./LegacyNetworkMessageRouter.test.js');
     await import('./ProtocolSession.test.js');

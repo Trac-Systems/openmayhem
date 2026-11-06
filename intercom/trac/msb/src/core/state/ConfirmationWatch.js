@@ -19,13 +19,16 @@ export class ConfirmationWatch {
     #timer = null;
     #mark = null;
     #running = false;
+    #stopped = false;
+    #onStall;
 
-    constructor(base, { timeout, interval = DEFAULT_CHECK_INTERVAL, now = Date.now, log = console.log } = {}) {
+    constructor(base, { timeout, interval = DEFAULT_CHECK_INTERVAL, now = Date.now, log = console.log, onStall = null } = {}) {
         this.#base = base;
         this.#timeout = timeout;
         this.#interval = Math.min(interval, timeout);
         this.#now = now;
         this.#log = log;
+        this.#onStall = onStall;
     }
 
     get enabled() {
@@ -34,6 +37,7 @@ export class ConfirmationWatch {
 
     start() {
         if (!this.enabled || this.#timer !== null) return;
+        this.#stopped = false;
         this.#timer = setInterval(() => { this.check().catch(() => {}) }, this.#interval);
         this.#timer.unref?.();
     }
@@ -41,12 +45,13 @@ export class ConfirmationWatch {
     stop() {
         if (this.#timer !== null) clearInterval(this.#timer);
         this.#timer = null;
+        this.#stopped = true;
     }
 
     /** @returns {Promise<boolean>} true when a fast-forward was forced */
     async check() {
         const base = this.#base;
-        if (this.#running || base.closing || base.isIndexer) return false;
+        if (!this.enabled || this.#stopped || this.#running || base.closing || base.closed || base.isIndexer) return false;
         if (base.isFastForwarding?.()) {
             this.#mark = null;
             return false;
@@ -67,13 +72,30 @@ export class ConfirmationWatch {
         if (now - this.#mark.since < this.#timeout) return false;
 
         this.#running = true;
+        const failedAt = base.fastForwardFailedAt;
+        let failure = null;
         try {
             this.#log(`[MSB] Confirmed length stuck at ${confirmed} (local ${total}) for ${Math.round((now - this.#mark.since) / 1000)} s; forcing a fast-forward`);
             await base.forceFastForward();
-            this.#log(`[MSB] Fast-forward finished: confirmed ${base.view.core.signedLength}, local ${base.view.core.length}`);
         } catch (error) {
-            this.#log(`[MSB] Fast-forward failed: ${error?.message ?? error}`);
+            failure = error;
         } finally {
+            const advanced = base.view.core.signedLength > confirmed;
+            const failed = failure !== null || base.fastForwardFailedAt > (failedAt ?? 0);
+            if (!this.#stopped && !base.closing && !base.closed) {
+                // A normally returned call may still have failed inside Autobase.
+                // A scheduled fast-forward is not proof of signed progress either.
+                const outcome = advanced ? 'advanced' : failed ? 'failed' : 'no_progress';
+                const detail = base.fastForwardLastFailure;
+                const event = { event: 'msb_confirmation_recovery', outcome,
+                    code: 'MSB_CONFIRMATION_STALLED', signedLength: base.view.core.signedLength,
+                    previousSignedLength: confirmed, localLength: base.view.core.length,
+                    failure: detail && detail.at >= now ? detail : null };
+                try { this.#log(`[MSB] ${JSON.stringify(event)}`); } catch {}
+                if (!advanced) {
+                    try { this.#onStall?.(event)?.catch?.(() => {}); } catch {}
+                }
+            }
             this.#running = false;
             this.#mark = { confirmed: base.view.core.signedLength, since: this.#now() };
         }

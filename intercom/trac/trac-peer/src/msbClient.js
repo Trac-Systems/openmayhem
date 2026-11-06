@@ -24,8 +24,10 @@ export class MsbClient extends ReadyResource {
     #onReadStall
     #log
     #now
+    #confirmationStallMs
+    #lastWaitRecoveryAt = -Infinity
 
-    constructor(msbInstance, { readSliceMs = 30000, onReadStall = null, log = console.log, now = Date.now } = {}) {
+    constructor(msbInstance, { readSliceMs = 30000, confirmationStallMs = 120000, onReadStall = null, log = console.log, now = Date.now } = {}) {
         super();
         this.#msb = msbInstance || null;
         this.#partialTransactionValidator = null;
@@ -33,6 +35,7 @@ export class MsbClient extends ReadyResource {
         this.#onReadStall = onReadStall;
         this.#log = log;
         this.#now = now;
+        this.#confirmationStallMs = confirmationStallMs;
     }
 
     async _open() {
@@ -40,7 +43,11 @@ export class MsbClient extends ReadyResource {
         this.#partialTransactionValidator = new PartialTransactionValidator(this.#msb.state, null, this.#msb.config)
         const swarm = this.#msb.network?.swarm;
         const topic = this.#msb.config?.channel;
-        if (this.#onReadStall === null && swarm && topic) {
+        if (this.#onReadStall === null && typeof this.#msb.network?.recoverRead === 'function') {
+            // All MSB consumers, including its standalone confirmation watch,
+            // share the network's recovery cooldown and in-flight discovery.
+            this.#onReadStall = event => this.#msb.network.recoverRead(event);
+        } else if (this.#onReadStall === null && swarm && topic) {
             this.#onReadStall = createReadRecovery({
                 base: this.#msb.state.base, swarm, topic, label: 'MSB', rotate: false,
                 now: this.#now, log: this.#log,
@@ -49,7 +56,11 @@ export class MsbClient extends ReadyResource {
     }
 
     recoverRead(event) {
-        try { return this.#onReadStall?.(event) ?? false; }
+        try {
+            const result = this.#onReadStall?.(event) ?? false;
+            result?.catch?.(() => {});
+            return result;
+        }
         catch { return false; }
     }
 
@@ -132,7 +143,8 @@ export class MsbClient extends ReadyResource {
     }
 
     async waitForSignedLengthAtLeast(targetSignedLength, { pollMs = 1_000 } = {}) {
-        const core = this.#msb.state?.base?.view?.core ?? null;
+        const base = this.#msb.state?.base;
+        const core = base?.view?.core ?? null;
         if (!core) throw new Error('MSB view core not available.');
         if (!Number.isSafeInteger(targetSignedLength) || targetSignedLength < 0) {
             throw new Error('Invalid MSB signed length target.');
@@ -141,13 +153,36 @@ export class MsbClient extends ReadyResource {
             throw new Error('Invalid MSB signed length wait poll interval.');
         }
         const started = this.#now();
-        const reporter = setInterval(() => this.#report({
-            event: 'msb_wait_signed_length', msbsl: targetSignedLength,
-            signedLength: core.signedLength, elapsedMs: Math.max(0, this.#now() - started),
-        }), this.#readSliceMs);
+        let confirmed = core.signedLength, progressedAt = started;
+        const observe = () => {
+            const current = base.view.core;
+            const now = this.#now();
+            if (current.signedLength !== confirmed) {
+                confirmed = current.signedLength;
+                progressedAt = now;
+            }
+            return { current, now };
+        };
+        const reporter = setInterval(() => {
+            const { current, now } = observe();
+            if (base.closing || base.closed || this.closing || this.closed || current.signedLength >= targetSignedLength) return;
+            const event = { code: 'MSB_CONFIRMATION_STALLED', event: 'msb_wait_signed_length',
+                msbsl: targetSignedLength, signedLength: current.signedLength,
+                elapsedMs: Math.max(0, now - started), stalledMs: Math.max(0, now - progressedAt) };
+            this.#report(event);
+            if (Number.isFinite(this.#confirmationStallMs) && this.#confirmationStallMs > 0 &&
+                event.stalledMs >= this.#confirmationStallMs && now - this.#lastWaitRecoveryAt >= this.#readSliceMs) {
+                this.#lastWaitRecoveryAt = now;
+                this.recoverRead(event);
+            }
+        }, this.#readSliceMs);
         reporter.unref?.();
         try {
-            while (core.signedLength < targetSignedLength) {
+            while (base.view.core.signedLength < targetSignedLength) {
+                const { current } = observe();
+                if (base.closing || base.closed || this.closing || this.closed || current.closed) {
+                    throw Object.assign(new Error('MSB closed while waiting for confirmation.'), { code: 'SESSION_CLOSED' });
+                }
                 await new Promise((resolve) => {
                     const onAppend = () => {
                         cleanup();
@@ -155,17 +190,15 @@ export class MsbClient extends ReadyResource {
                     };
                     const cleanup = () => {
                         clearTimeout(timer);
-                        if (typeof core.off === 'function') {
-                            core.off('append', onAppend);
-                        } else if (typeof core.removeListener === 'function') {
-                            core.removeListener('append', onAppend);
-                        }
+                        current.removeListener('append', onAppend);
+                        current.removeListener('close', onAppend);
                     };
                     const timer = setTimeout(() => {
                         cleanup();
                         resolve();
                     }, pollMs);
-                    core.once('append', onAppend);
+                    current.once('append', onAppend);
+                    current.once('close', onAppend);
                 });
             }
         } finally { clearInterval(reporter); }

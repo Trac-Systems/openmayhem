@@ -119,3 +119,27 @@ test('ConfirmationWatch is off with a zero timeout', async t => {
     watch.start();
     watch.stop();
 });
+
+test('normal return without progress is not reported as success and requests recovery', async t => {
+    const c = clock(), logs = [], events = [];
+    const base = fakeBase({ confirmed: 1, total: 2 });
+    const watch = new ConfirmationWatch(base, { timeout: 10, now: c.now, log: x => logs.push(x), onStall: x => events.push(x) });
+    await watch.check(); c.t += 10; await watch.check();
+    t.is(events.length, 1); t.is(events[0].outcome, 'no_progress');
+    t.not(logs.some(x => x.includes('finished')), true);
+    base.forceFastForward = async () => { base.fastForwardFailedAt = c.t; };
+    c.t += 10; await watch.check(); t.is(events[1].outcome, 'failed');
+    base.forceFastForward = async () => { base.view.core.signedLength++; };
+    c.t += 10; await watch.check(); t.is(events.length, 2, 'actual advancement does not repair transport');
+    t.ok(logs.some(x => x.includes('"outcome":"advanced"')));
+});
+
+test('in-flight fast-forward is single-flight and stop suppresses late recovery', async t => {
+    const c = clock(); let finish, recovered = 0;
+    const base = fakeBase({ confirmed: 1, total: 2 });
+    base.forceFastForward = () => new Promise(r => { finish = r; });
+    const watch = new ConfirmationWatch(base, { timeout: 10, now: c.now, log: quiet, onStall: () => recovered++ });
+    await watch.check(); c.t += 10; const pending = watch.check();
+    t.is(await watch.check(), false); watch.stop(); finish(); await pending;
+    t.is(recovered, 0); t.is(await watch.check(), false);
+});
