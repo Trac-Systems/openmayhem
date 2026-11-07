@@ -19,7 +19,6 @@ import TransactionCommitService from "./services/TransactionCommitService.js";
 import ValidatorHealthCheckService from './services/ValidatorHealthCheckService.js';
 import { Logger } from '../../utils/logger.js';
 import { WalletProvider } from 'trac-wallet';
-import { createReadRecovery } from './services/ReadRecovery.js';
 
 const wakeup = new w();
 
@@ -41,8 +40,6 @@ class Network extends ReadyResource {
     #validatorHealthCheckService;
     #logger;
     #closing = false;
-    #readRecovery = null;
-    #state;
 
     /**
      * @param {State} state
@@ -51,7 +48,6 @@ class Network extends ReadyResource {
      **/
     constructor(state, config, address = null) {
         super();
-        this.#state = state;
         this.#config = config
         this.#connectTimeoutMs = config.connectTimeoutMs || 5000;
         this.#maxPendingConnections = config.maxPendingConnections || 50;
@@ -67,11 +63,6 @@ class Network extends ReadyResource {
 
     get swarm() {
         return this.#swarm;
-    }
-
-    recoverRead(event) {
-        if (this.#closing) return false;
-        return this.#readRecovery?.(event) ?? false;
     }
 
     get transactionPoolService() {
@@ -103,9 +94,6 @@ class Network extends ReadyResource {
     async _close() {
         this.#logger.info('Network: closing gracefully...');
         this.#closing = true;
-        this.#state.setReadRecoveryHandler?.(null);
-        this.#readRecovery?.close();
-        this.#readRecovery = null;
         await this.transactionPoolService.stopPool();
         await sleep(100);
         await this.#validatorObserverService.stopValidatorObserver();
@@ -305,10 +293,7 @@ class Network extends ReadyResource {
 
             });
 
-            const discovery = this.#swarm.join(this.#config.channel, { server: true, client: true });
-            this.#readRecovery = createReadRecovery({ base: state.base, swarm: this.#swarm,
-                topic: this.#config.channel, discovery });
-            state.setReadRecoveryHandler?.(event => this.recoverRead(event));
+            this.#swarm.join(this.#config.channel, { server: true, client: true });
             this.#swarm.flush();
         }
     }

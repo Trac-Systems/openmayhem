@@ -1826,9 +1826,6 @@ hydrate_intercom_runtime_tree() {
   [[ "$peer_lock_hash" == "$(sha256_file "$intercom_root/trac/trac-peer/package-lock.json")" ]] ||
     die "npm changed the pinned trac-peer package-lock.json"
   node "$intercom_root/scripts/materialize-local-dependencies.mjs" "$intercom_root"
-  # Release hydration disables npm lifecycle scripts. Apply the reviewed,
-  # checksum-bound MSB dependency correction explicitly after materialization.
-  node "$intercom_root/scripts/apply-msb-read-recovery.mjs"
   node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$intercom_root"
   verify_intercom_production_dependency_tree "$intercom_root"
   finalize_intercom_native_artifacts \

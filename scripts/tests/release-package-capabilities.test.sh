@@ -231,8 +231,6 @@ grep -F 'verify-intercom-dependency-topology.mjs' <<<"$release_hydration" >/dev/
   fail "release packaging does not verify the hydrated Intercom topology"
 grep -F 'materialize-local-dependencies.mjs' <<<"$release_hydration" >/dev/null ||
   fail "release packaging does not restore exact pinned runtime files after npm packing"
-grep -F 'apply-msb-read-recovery.mjs' <<<"$release_hydration" >/dev/null ||
-  fail "release packaging omits the MSB correction when lifecycle scripts are disabled"
 grep -F 'native_host="$(native_host_target)"' <<<"$release_hydration" >/dev/null ||
   fail "Intercom native dependency checks trust emulated shell architecture"
 grep -F '[[ "$TARGET" == "$(native_host_target)" ]]' \

@@ -5,7 +5,7 @@ import { normalizeDecodedPayloadForJson } from 'trac-msb/src/utils/normalizers.j
 import { OperationType } from 'trac-msb/src/utils/constants.js';
 import { isAddressValid } from 'trac-msb/src/core/state/utils/address.js';
 import { waitForMinimumSignedLength } from './msb-reader-catchup.mjs';
-import { need, hex, uint } from './proxy-admission-wire.mjs';
+import { need, hex, uint, amount } from './proxy-admission-wire.mjs';
 import { RetryWork } from './retail-crypto-verification.mjs';
 import { validateAdmissionMsbSnapshot } from '../features/mayhem/proxy-admission-msb.js';
 
@@ -90,8 +90,10 @@ export async function scanTnkSignedPage(msb, { from, frontier, signal, addressPr
         const transfer = normalizeDecodedPayloadForJson(decoded, { addressPrefix });
         need(typeof transfer.tro.to === 'string' && transfer.tro.to.length <= 128 && isAddressValid(transfer.tro.to, addressPrefix)
           && isAddressValid(transfer.address, addressPrefix)
-          && typeof transfer.tro.am === 'string' && /^[1-9][0-9]{0,38}$/.test(transfer.tro.am)
-          && BigInt(transfer.tro.am) < (1n << 128n), 'TNK signed transfer invalid');
+          && amount(transfer.tro.am), 'TNK signed transfer invalid');
+        // MSB permits zero-value transfers. They are valid history but cannot
+        // pay an admission fee; advance past them without queuing a payment.
+        if (transfer.tro.am === '0') continue;
         transfers.push({ destination: transfer.tro.to, position: String(entry.seq), transaction_hash: entry.key });
       }
     }

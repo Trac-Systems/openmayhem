@@ -63,9 +63,31 @@ test('discovery pages all signed positions without moving reads, skips unrelated
   assert.equal(empty.transfers.length, 0); assert.equal(historyReads, Math.ceil(frontier / 16));
 });
 
-test('discovery does not advance over corrupt signed payloads or wrong transfer hashes', async t => {
+test('discovery advances past zero transfers across pages and reopen without observing a payment', async t => {
   const f = await fixture(t);
-  for (const bytes of [Buffer.from([255]), encoded(other), encoded(hash, 0n), encoded(hash, 1n, 'invalid-address'), Buffer.alloc(16385)]) {
+  // Fill an entire page with zero transfers, including unrelated recipients.
+  for (let n = 0; n < 17; n++) {
+    const key = n.toString(16).padStart(64, '0');
+    await f.view.put(key, encoded(key, 0n, n % 2 ? sender : destination));
+  }
+  await f.view.put(hash, encoded(hash));
+  const frontier = f.view.core.signedLength;
+  const msb = () => ({ state: { base: { view: f.view }, getSignedLength: () => f.view.core.signedLength } });
+  const scan = from => scanTnkSignedPage(msb(), { from, frontier, signal: AbortSignal.timeout(1000), addressPrefix });
+  const first = await scan(0);
+  assert.equal(first.next_cursor, '16');
+  assert.deepEqual(first.transfers, []);
+  assert.deepEqual(await scan(0), first, 'retry of the same page is deterministic');
+  await f.reopen();
+  const second = await scan(Number(first.next_cursor));
+  assert.equal(second.next_cursor, String(frontier));
+  assert.deepEqual(second.transfers, [{ destination, position: String((await f.view.get(hash)).seq), transaction_hash: hash }]);
+  assert.equal(second.proof.tree_hash, first.proof.tree_hash);
+});
+
+test('discovery does not advance over corrupt signed payloads or wrong transfer hashes, including zero transfers', async t => {
+  const f = await fixture(t);
+  for (const bytes of [Buffer.from([255]), encoded(other), encoded(other, 0n), encoded(hash, 0n, 'invalid-address'), encoded(hash, 1n, 'invalid-address'), Buffer.alloc(16385)]) {
     await f.view.put(hash, bytes); const entry = await f.view.get(hash), frontier = f.view.core.signedLength;
     const msb = { state: { base: { view: f.view }, getSignedLength: () => frontier } };
     await assert.rejects(scanTnkSignedPage(msb, { from: entry.seq, frontier, signal: AbortSignal.timeout(1000), addressPrefix }));

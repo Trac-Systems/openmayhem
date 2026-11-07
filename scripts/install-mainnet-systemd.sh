@@ -393,7 +393,6 @@ hydrate_intercom_package() {
   rm -rf "$dir/trac/msb/node_modules" "$dir/trac/trac-peer/node_modules"
   runuser -u mayhem -- npm ci --omit=dev --install-links=true --prefix "$dir"
   runuser -u mayhem -- node "$materializer" "$dir"
-  runuser -u mayhem -- node "$dir/scripts/apply-msb-read-recovery.mjs"
   runuser -u mayhem -- node "$verifier" "$dir"
 }
 

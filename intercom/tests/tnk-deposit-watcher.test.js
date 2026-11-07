@@ -9,6 +9,7 @@ import {
   pubKeyHexToMsbAddress,
   resolveActiveBillingEpoch,
   resolveMinimumMsbSignedLength,
+  scanMsbTransfers,
   transferFromTxDetails,
   waitForDepositState,
 } from '../scripts/tnk-deposit-watcher.mjs';
@@ -16,6 +17,27 @@ import {
 const pubkey = '00'.repeat(32);
 const sender = pubKeyHexToMsbAddress(pubkey, 'testtrac');
 const treasury = 'testtrac1treasury';
+
+test('TNK retail and deposit scanning skips zero transfers and reaches later positive payments', async () => {
+  const zero = 'a'.repeat(64), paid = 'b'.repeat(64);
+  let reads = 0;
+  const result = await scanMsbTransfers({
+    state: { getSignedLength: () => 20 },
+    getTxHashes: async (from, to) => {
+      assert.equal(from, 10); assert.equal(to, 17);
+      return { hashes: [{ hash: zero }, { hash: paid }] };
+    },
+    getTxDetails: async hash => {
+      reads++;
+      return { address: sender, tro: { tx: hash, to: treasury, am: hash === zero ? '0' : '9' } };
+    },
+  }, { fromSignedLength: 10, minimumSignedLength: 11, finalitySignedLengths: 3, chunkSize: 16, timeoutSec: 1 });
+  assert.equal(reads, 2);
+  assert.equal(result.safeEnd, 17);
+  assert.equal(result.transfers.length, 1);
+  assert.equal(result.transfers[0].hash, paid);
+  assert.equal(result.transfers[0].tnk_e18, '9');
+});
 
 test('tnk deposit watcher derives the active billing epoch from ledger apply state', async () => {
   const stateFetch = async () => ({
