@@ -129,3 +129,50 @@ test('large peer cache is scanned in bounded windows and retirement stays rate l
     g.tick(10); g.base.view.core.signedLength++; g.fail(2); g.recover();
     g.tick(30); g.fail(2); g.recover(); t.is(b.destroyed, false, 'confirmed progress resets evidence');
 });
+
+test('live confirmation demand recovers without a fast-forward error above the ordinary connection cap', async t => {
+    const f = fixture({ limit: 2 }); f.peer(4); const a = f.connect(1); f.connect(2); f.connect(3);
+    f.base.core = { peers: [{remotePublicKey: key(1)}] };
+    const event = () => ({code:'MSB_CONFIRMATION_STALLED', signedLength:10, msbsl:11, stalledMs:999999});
+    f.recover(event()); await turn(); t.is(a.destroyed,false,'caller elapsed does not bypass local observation');
+    f.tick(40); f.recover(event()); await turn();
+    t.is(a.destroyed,true); t.is(f.calls.length,1,'one-for-one replacement dials above ordinary cap');
+    t.is(f.base.view.core.signedLength,10,'never manufactures confirmation');
+});
+
+test('confirmation demand expires, respects pins and progress, and coalesces waiters', async t => {
+    for (const mode of ['expired','pin','progress','wrong-height','reached','not-participant','new-socket']) {
+        const f=fixture({limit:2});f.peer(3);let a=f.connect(1);f.connect(2);
+        f.base.view.core.peers=[{remotePublicKey:key(1)}];
+        const e={code:'MSB_CONFIRMATION_STALLED',signedLength:10,msbsl:11,stalledMs:999999};
+        if(mode==='pin')f.peer(1).explicit=true;
+        if(mode==='wrong-height')e.signedLength=9;
+        if(mode==='reached')e.msbsl=10;
+        if(mode==='not-participant')f.base.view.core.peers=[];
+        for(let i=0;i<100;i++)f.recover(e);
+        f.tick(mode==='expired'?100:40);
+        if(mode==='progress')f.base.view.core.signedLength=11;
+        if(mode==='new-socket'){a.destroy();a=f.connect(1);}
+        f.recover(mode==='expired'?undefined:e);await turn();
+        t.is(a.destroyed,false,mode);t.is(f.calls.length,0,mode);
+    }
+});
+
+test('replacement cannot increase the pre-retirement footprint or clear another explicit pin', async t => {
+    const f=fixture({limit:2});const replacement=f.peer(4);const a=f.connect(1);f.connect(2);f.connect(3);
+    f.base.core={peers:[{remotePublicKey:key(1)}]};
+    const e={code:'MSB_CONFIRMATION_STALLED',signedLength:10,msbsl:11};
+    f.recover(e);f.tick(40);
+    a.destroy=function(){this.destroyed=true;f.swarm.connections.delete(this);f.connect(5);replacement.explicit=true;this.emit('close')};
+    f.recover(e);await turn();t.is(f.calls.length,0,'slot or pin changed before asynchronous dial');t.is(replacement.explicit,true);
+});
+
+test('standalone MSB fast-forward and known signed system head supply real pending work', async t => {
+    for(const mode of ['forwarding','system-head','unconfirmed']){
+        const f=fixture({limit:2});f.peer(3);const a=f.connect(1);f.connect(2);
+        f.base.core={peers:[{remotePublicKey:key(1)}],length:10,core:{state:{length:mode==='system-head'?11:10}}};
+        f.base.isFastForwarding=()=>mode==='forwarding';
+        f.base.view.core.length=mode==='unconfirmed'?11:10;
+        f.recover();f.tick(40);f.recover();await turn();t.is(a.destroyed,true,mode);t.is(f.calls.length,1);
+    }
+});

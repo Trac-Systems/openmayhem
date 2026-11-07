@@ -40,8 +40,11 @@ try{
  let repairs=0;const alternate={publicKey:Buffer.alloc(32,207),proven:true};
  swarm={connections:sockets,peers:new Map([['alternate',alternate]]),maxPeers:2,maxClientConnections:2,connecting:0,
  joinPeer(){repairs++;link(b,d)},leavePeer(){}};
- recover=createReadRecovery({base:b.base,swarm,topic:Buffer.alloc(32,7),repairMs:100,retireMs:6000,log:s=>logs.push(s),discovery:{refresh:async()=>true}});
- client=new MsbClient({state:{base:b.base},network:{recoverRead:recover},config:{},ready:async()=>{}},{readSliceMs:30,confirmationStallMs:100,log:s=>logs.push(s)});
+ // Exercise the failed-read branch independently; the separate demand test covers
+ // live confirmation events and base work signals. Replication remains real.
+ const failureOnlyBase={get view(){return {core:{signedLength:b.base.view.core.signedLength}}},get fastForwardLastFailure(){return b.base.fastForwardLastFailure},get closing(){return b.base.closing},get closed(){return b.base.closed}};
+ recover=createReadRecovery({base:failureOnlyBase,swarm,topic:Buffer.alloc(32,7),repairMs:100,retireMs:6000,log:s=>logs.push(s),discovery:{refresh:async()=>true}});
+ client=new MsbClient({state:{base:b.base},network:{recoverRead:()=>recover()},config:{},ready:async()=>{}},{readSliceMs:30,confirmationStallMs:100,log:s=>logs.push(s)});
  await client.ready();
  const pending=Promise.all(Array.from({length:4},()=>client.waitForSignedLengthAtLeast(firstTarget,{pollMs:10}).then(()=>resolved++)));pending.catch(()=>{});
  const failures=[];
