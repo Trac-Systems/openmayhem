@@ -361,7 +361,7 @@ pub async fn prepare(
     rpc_url: String,
     key: SigningKey,
 ) -> Result<Prepared> {
-    tokio::task::spawn_blocking(move || {
+    let (prepared, verifier) = tokio::task::spawn_blocking(move || -> Result<_> {
         let config = Config::load(&path)?;
         ensure!(
             config.network == expected
@@ -412,7 +412,7 @@ pub async fn prepare(
                 recovery,
                 client,
                 signer,
-                verifier,
+                verifier.clone(),
                 bridge,
                 ControllerLimits {
                     sessions: config.sessions,
@@ -439,14 +439,21 @@ pub async fn prepare(
                 .with_retail_authorization(retail)
                 .map_err(anyhow::Error::msg)?;
         }
-        Ok(Prepared {
-            runtime: Arc::new(runtime),
-            budget_path: config.state_dir.join(BUDGET),
-            budget_limits,
-        })
+        Ok((
+            Prepared {
+                runtime: Arc::new(runtime),
+                budget_path: config.state_dir.join(BUDGET),
+                budget_limits,
+            },
+            verifier,
+        ))
     })
     .await
-    .context("preparing explicit proxy buyer")?
+    .context("preparing explicit proxy buyer")??;
+    verifier.check_compatibility().await.context(
+        "proxy buyer worker startup check failed; install and configure the mayhem-proxy-worker bundled with this Core release",
+    )?;
+    Ok(prepared)
 }
 
 /// An explicit operator provisioning action, never called by serving/recovery.

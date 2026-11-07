@@ -127,6 +127,32 @@ fn decoder_buffer_bytes(limits: DecodeLimits, semantic_policy: bool) -> Result<u
 }
 
 impl Pool {
+    /// Check the configured executable using the real contained IPC handshake.
+    /// Call once at buyer startup, before admitting purchases. This performs no
+    /// network, inference, journal or financial operation; the child is reaped
+    /// before returning and all startup/process limits remain in effect.
+    pub async fn check_compatibility(&self) -> Result<()> {
+        self.start(Init {
+            abi: ABI,
+            release: RELEASE.into(),
+            session: Session {
+                invocation: Digest::hash("mayhem/proxy/worker-startup/v1", &[]),
+                attempt: 1,
+                binding_hash: Digest::hash("mayhem/proxy/worker-startup-binding/v1", &[]),
+            },
+            format: WireFormat::Json,
+            error_profile: ErrorProfile::HttpStatus,
+            limits: DecodeLimits {
+                max_total_bytes: 1,
+                max_event_bytes: 1,
+            },
+            semantic_policy: None,
+        })
+        .await?
+        .stop()
+        .await
+    }
+
     /// Admission must never promise a response size that cannot fit even one
     /// isolated verifier. Concurrent use may wait for recovery; an impossible
     /// per-result allocation must instead fail at configuration time.

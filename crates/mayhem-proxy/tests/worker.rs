@@ -92,6 +92,72 @@ fn pool(work: &Path, limits: PoolLimits) -> Pool {
 }
 
 #[tokio::test]
+async fn startup_checks_real_worker_and_releases_its_only_slot() {
+    let work = dir();
+    let pool = pool(work.path(), limits(1));
+    pool.check_compatibility().await.unwrap();
+    pool.check_compatibility().await.unwrap();
+    // A real paid decoder can still acquire the sole permit after preflight.
+    let store = dir();
+    let journal = journal(&store.path().join("attempts"));
+    let record = record(&journal, 1);
+    let ready = pool.start(init(&record, WireFormat::Json)).await.unwrap();
+    ready.stop().await.unwrap();
+    assert_eq!(
+        journal.get(&record.invocation).unwrap().unwrap().phase,
+        attempts::Phase::Prepared
+    );
+}
+
+#[tokio::test]
+async fn startup_rejects_mismatched_worker_and_bounds_unresponsive_worker() {
+    let fixture_dir = dir();
+    let work = dir();
+    let fixture = fixture_dir.path().join("worker");
+    let ready = serde_json::to_vec(&serde_json::json!({
+        "abi": worker::ABI,
+        "release": "0.0.0-mismatched",
+        "session": {
+            "invocation": blake3::Hasher::new_derive_key("mayhem/proxy/worker-startup/v1").finalize().to_hex().to_string(),
+            "attempt": 1,
+            "binding_hash": blake3::Hasher::new_derive_key("mayhem/proxy/worker-startup-binding/v1").finalize().to_hex().to_string()
+        }
+    }))
+    .unwrap();
+    let mut packet = vec![16u8];
+    packet.extend_from_slice(&(ready.len() as u32).to_le_bytes());
+    packet.extend_from_slice(&ready);
+    let escaped = packet
+        .iter()
+        .map(|v| format!("\\{v:03o}"))
+        .collect::<String>();
+    std::fs::write(
+        &fixture,
+        format!("#!/bin/sh\nprintf '{escaped}'\nexec sleep 5\n"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fixture, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let wrong = Pool::new(&fixture, work.path(), limits(1)).unwrap();
+    assert!(matches!(
+        wrong.check_compatibility().await,
+        Err(worker::Error::Identity)
+    ));
+
+    let hanging = fixture_dir.path().join("hanging-worker");
+    std::fs::write(&hanging, "#!/bin/sh\nexec sleep 5\n").unwrap();
+    std::fs::set_permissions(&hanging, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut bound = limits(1);
+    bound.startup_timeout = Duration::from_millis(30);
+    let hanging = Pool::new(&hanging, work.path(), bound).unwrap();
+    let start = Instant::now();
+    assert!(matches!(
+        hanging.check_compatibility().await,
+        Err(worker::Error::ProcessingTimeout)
+    ));
+    assert!(start.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
 async fn semantic_policy_is_bound_and_must_compile_before_worker_activation() {
     use mayhem_proxy::semantics::{Output, Policy};
     let store = dir();
