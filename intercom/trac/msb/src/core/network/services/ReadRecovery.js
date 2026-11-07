@@ -6,6 +6,10 @@ export function createReadRecovery({ base, swarm, topic, discovery, repairMs = 3
     retireMs = 120000, now = Date.now, log = console.log }) {
     let lastRepair = -Infinity, lastRetire = -Infinity, refreshing = null;
     let retired = null, closed = false, cursor = null, blocked = null;
+    let observedConnections = new WeakMap();
+    // Allow observation/scheduling jitter without treating an old error as an
+    // indefinitely active failure. At least two distinct failures are required.
+    const failureAgeMs = retireMs + 2 * repairMs;
     const stopped = () => closed || base.closing || base.closed || swarm.destroyed || swarm.suspended;
     const hex = key => key ? b4a.toString(key, 'hex') : null;
     const emit = (event, fields = {}) => {
@@ -46,30 +50,43 @@ export function createReadRecovery({ base, swarm, topic, discovery, repairMs = 3
         const connections = live();
         const confirmed = base.view?.core?.signedLength ?? null;
         const failure = base.fastForwardLastFailure;
-        // Only consider replacing a socket after repeated timeouts on the SAME
-        // block, no confirmation progress and no data received on that core/peer.
-        // A quiet node or a connection count alone is never a retirement reason.
+        for (const connection of connections) {
+            if (!observedConnections.has(connection)) observedConnections.set(connection, time);
+        }
+        // Follow confirmed progress, not the requested tip: new blocks and a
+        // different diagnostic peer sample do not mean a stuck reader recovered.
+        // Receiving unrelated blocks is also not completion of the failed read.
+        // Only a long-lived connection implicated in the current failed read is
+        // eligible. Quiet/idle nodes and a lone old error cannot trigger this.
         let stuckPeer = null;
-        if (failure?.code === 'REQUEST_TIMEOUT' && Number.isSafeInteger(failure.index) &&
-            time >= failure.at && time - failure.at <= retireMs && Array.isArray(failure.peers)) {
-            const key = `${failure.coreKey}:${failure.index}`;
-            if (!blocked || blocked.key !== key || blocked.confirmed !== confirmed) {
-                blocked = { key, confirmed, peers: new Map() };
+        const fresh = failure?.code === 'REQUEST_TIMEOUT' && Number.isSafeInteger(confirmed) &&
+            Number.isSafeInteger(failure.index) && failure.index >= 0 &&
+            /^[a-f0-9]{64}$/.test(failure.coreKey ?? '') && Number.isFinite(failure.at) &&
+            time >= failure.at && time - failure.at <= failureAgeMs && Array.isArray(failure.peers);
+        if (fresh) {
+            if (!blocked || blocked.confirmed !== confirmed || failure.at < blocked.lastFailureAt ||
+                failure.at - blocked.lastFailureAt > failureAgeMs) {
+                blocked = { confirmed, since: time, lastFailureAt: failure.at, failures: 1 };
+            } else if (failure.at > blocked.lastFailureAt) {
+                blocked.lastFailureAt = failure.at;
+                blocked.failures = 2;
             }
-            const seen = new Set();
-            for (const p of failure.peers.slice(0, 4)) {
-                if (!/^[a-f0-9]{64}$/.test(p.remoteKey ?? '') || !Number.isSafeInteger(p.dataRx)) continue;
-                seen.add(p.remoteKey);
-                let prior = blocked.peers.get(p.remoteKey);
-                if (!prior || prior.dataRx !== p.dataRx) prior = { dataRx: p.dataRx, since: time };
-                blocked.peers.set(p.remoteKey, prior);
-                if (time - prior.since >= retireMs && !stuckPeer) stuckPeer = p.remoteKey;
+            if (blocked.failures >= 2 && time - blocked.since >= retireMs) {
+                for (const p of failure.peers.slice(0, 4)) {
+                    if (!/^[a-f0-9]{64}$/.test(p.remoteKey ?? '')) continue;
+                    if (swarm.peers.get(p.remoteKey)?.explicit) continue;
+                    const connection = connections.find(c => hex(c.remotePublicKey) === p.remoteKey);
+                    if (connection && time - observedConnections.get(connection) >= retireMs) {
+                        stuckPeer = p.remoteKey;
+                        break;
+                    }
+                }
             }
-            for (const key of blocked.peers.keys()) if (!seen.has(key)) blocked.peers.delete(key);
         } else blocked = null;
 
         emit('msb_replication_recovery', { connected: connections.length, known: swarm.peers.size,
-            discoveryPending: refreshing !== null, failedRead: failure && time - failure.at <= retireMs ? failure : null });
+            discoveryPending: refreshing !== null, failedRead: fresh ? failure : null,
+            stalledMs: blocked ? time - blocked.since : 0, repeatedFailure: blocked?.failures === 2 });
         if (!refreshing && discovery) {
             refreshing = Promise.resolve().then(() => stopped() ? undefined : discovery.refresh())
                 .then(ok => { if (ok === false && !stopped()) emit('msb_discovery_failed'); })
@@ -103,7 +120,7 @@ export function createReadRecovery({ base, swarm, topic, discovery, repairMs = 3
     handler.close = () => {
         closed = true;
         if (retired) retired.connection.removeListener('close', retired.onClose);
-        retired = null; blocked = null; cursor = null;
+        retired = null; blocked = null; cursor = null; observedConnections = new WeakMap();
     };
     emit('msb_replication_recovery_ready', { repairMs, retireMs });
     return handler;

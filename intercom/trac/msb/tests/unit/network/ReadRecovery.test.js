@@ -13,7 +13,7 @@ function fixture({ refresh = async () => false, limit = 3 } = {}) {
         joinPeer(k) { calls.push(b4a.toString(k, 'hex')); }, leavePeer() {} };
     const recover = createReadRecovery({ base, swarm, topic: key(9), repairMs: 10, retireMs: 40,
         now: () => time, log: x => logs.push(x), discovery: { refresh() { refreshes++; return refresh(); } } });
-    const peer = n => { const p = { publicKey: key(n), proven: true }; swarm.peers.set(n, p); return p; };
+    const peer = n => { const p = { publicKey: key(n), proven: true }; swarm.peers.set(key(n).toString('hex'), p); return p; };
     const connect = n => {
         const c = Object.assign(new EventEmitter(), { remotePublicKey: key(n), destroyed: false,
             destroy() { this.destroyed = true; swarm.connections.delete(this); this.emit('close'); } });
@@ -47,14 +47,12 @@ test('full connections alone cannot cause replacement; repeated failed block can
     t.is(c.listenerCount('close'), 0);
 });
 
-test('confirmation or replication progress resets retirement; stale errors cannot retire', async t => {
-    for (const mode of ['confirmation', 'data', 'other-block', 'stale']) {
+test('confirmation progress and stale or single errors cannot retire', async t => {
+    for (const mode of ['confirmation', 'single', 'stale']) {
         const f = fixture({ limit: 2 }); f.peer(3); const c = f.connect(1); f.connect(2);
         f.fail(1); f.recover(); f.tick(40);
         if (mode === 'confirmation') { f.base.view.core.signedLength++; f.fail(1); }
-        if (mode === 'data') f.fail(1, 1);
-        if (mode === 'other-block') f.fail(1, 0, 10);
-        if (mode === 'stale') f.tick(1);
+        if (mode === 'stale') f.tick(21);
         f.recover(); t.is(c.destroyed, false, mode);
     }
 });
@@ -83,4 +81,51 @@ test('connecting slots and suspended swarms are respected', t => {
     f.recover(); t.is(f.calls.length, 0);
     f.tick(); f.swarm.connecting = 0; f.swarm.suspended = true;
     t.is(f.recover(), false); t.is(f.calls.length, 0);
+});
+
+
+test('moving tips and peer samples recover without treating unrelated data as confirmation', async t => {
+    const f = fixture({ limit: 2 }); f.peer(3); const a = f.connect(1), b = f.connect(2);
+    f.fail(1, 0, 9); f.recover();
+    f.tick(20); f.fail(2, 5, 10); f.recover();
+    f.tick(21); f.fail(1, 12, 11); f.recover(); await turn();
+    t.is(a.destroyed, true); t.is(b.destroyed, false); t.is(f.calls.length, 1);
+    t.is(f.base.view.core.signedLength, 10, 'never fabricates confirmation');
+});
+
+test('observation jitter is tolerated only with repeated fresh failures', async t => {
+    const f = fixture({ limit: 2 }); f.peer(3); const a = f.connect(1); f.connect(2);
+    f.fail(1); f.tick(1); f.recover();
+    f.tick(20); f.fail(1, 0, 10); f.recover();
+    f.tick(21); f.recover(); await turn();
+    t.is(a.destroyed, true, 'two failures remain fresh despite initial polling delay');
+});
+
+test('new connections and explicit pins are never selected as stalled sockets', async t => {
+    for (const mode of ['new', 'pinned']) {
+        const f = fixture({ limit: 2 }); f.peer(3); let a = f.connect(1); f.connect(2);
+        if (mode === 'pinned') f.peer(1).explicit = true;
+        f.fail(1); f.recover(); f.tick(40);
+        if (mode === 'new') { a.destroy(); a = f.connect(1); }
+        f.fail(1, 0, 12); f.recover(); await turn();
+        t.is(a.destroyed, false, mode); t.is(f.calls.length, 0, mode);
+    }
+});
+
+test('large peer cache is scanned in bounded windows and retirement stays rate limited', async t => {
+    const f = fixture({ limit: 2 });
+    let visited = 0;
+    f.swarm.peers = new Map(Array.from({length: 10000}, (_, n) => [n, {
+        get publicKey() { visited++; return key(3); }, proven: true, banned: true
+    }]));
+    f.connect(1); f.connect(2); f.fail(1); f.recover();
+    t.ok(visited <= 768, 'at most 256 candidates, with bounded field accesses');
+    f.swarm.peers = new Map(); f.peer(3);
+    // New fixture isolates the retirement counter from the synthetic cache iterator.
+    const g = fixture({ limit: 2 }); g.peer(3); g.connect(1); const b = g.connect(2);
+    g.fail(1); g.recover(); g.tick(40); g.fail(1); g.recover(); await turn();
+    g.connect(4); g.tick(10); g.fail(2); g.recover(); await turn();
+    t.is(b.destroyed, false, 'one socket at most per retirement interval');
+    g.tick(10); g.base.view.core.signedLength++; g.fail(2); g.recover();
+    g.tick(30); g.fail(2); g.recover(); t.is(b.destroyed, false, 'confirmed progress resets evidence');
 });
