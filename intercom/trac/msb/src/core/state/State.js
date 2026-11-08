@@ -58,6 +58,7 @@ class State extends ReadyResource {
     #wallet
     #activeWriterCountCache = new Map();
     #confirmationWatch = null;
+    #readRecovery = null;
 
     /**
      * @param {Corestore} store
@@ -94,17 +95,25 @@ class State extends ReadyResource {
         return this.#apply.bind(this);
     }
 
+    setReadRecoveryHandler(handler) {
+        this.#readRecovery = typeof handler === 'function' ? handler : null;
+    }
+
     async _open() {
         console.log("State initialization...")
         await this.#base.ready();
         this.#writingKey = this.#base.local.key;
-        this.#confirmationWatch = new ConfirmationWatch(this.#base, { timeout: this.#config.confirmationStallTimeout });
+        this.#confirmationWatch = new ConfirmationWatch(this.#base, {
+            timeout: this.#config.confirmationStallTimeout,
+            onStall: event => this.#readRecovery?.(event),
+        });
         this.#confirmationWatch.start();
     }
 
     async _close() {
         console.log("State: closing gracefully...");
         this.#confirmationWatch?.stop();
+        this.#readRecovery = null;
         if (this.#bee !== null) {
             await this.#bee.close();
         }

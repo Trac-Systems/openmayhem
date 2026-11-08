@@ -82,18 +82,20 @@ test('ConfirmationWatch never runs on an indexer', async t => {
     t.is(base.forced, 0);
 });
 
-test('ConfirmationWatch waits while Autobase is fast-forwarding and restarts its clock', async t => {
+test('ConfirmationWatch preserves stalled progress while fast-forwarding', async t => {
     const base = fakeBase({ confirmed: 100, total: 200 });
     const c = clock();
-    const watch = new ConfirmationWatch(base, { timeout: 120_000, now: c.now, log: quiet });
+    const events = [];
+    const watch = new ConfirmationWatch(base, { timeout: 120_000, now: c.now, log: quiet, onStall: e => events.push(e) });
     await watch.check();
     c.t += 100_000;
     base.fastForwarding = true;
     t.is(await watch.check(), false);
-    base.fastForwarding = false;
     c.t += 60_000;
-    t.is(await watch.check(), false, 'clock restarted after the fast-forward');
-    c.t += 120_000;
+    t.is(await watch.check(), false, 'does not overlap fast-forward operations');
+    t.is(events.length, 1, 'transport recovery remains active');
+    t.is(events[0].msbsl, 200);
+    base.fastForwarding = false;
     t.is(await watch.check(), true);
     t.is(base.forced, 1);
 });
@@ -118,4 +120,54 @@ test('ConfirmationWatch is off with a zero timeout', async t => {
     t.is(watch.enabled, false);
     watch.start();
     watch.stop();
+});
+
+test('normal return without progress is not reported as success and requests recovery', async t => {
+    const c = clock(), logs = [], events = [];
+    const base = fakeBase({ confirmed: 1, total: 2 });
+    const watch = new ConfirmationWatch(base, { timeout: 10, now: c.now, log: x => logs.push(x), onStall: x => events.push(x) });
+    await watch.check(); c.t += 10; await watch.check();
+    t.is(events.length, 1); t.is(events[0].outcome, 'no_progress');
+    t.not(logs.some(x => x.includes('finished')), true);
+    base.forceFastForward = async () => { base.fastForwardFailedAt = c.t; };
+    c.t += 10; await watch.check(); t.is(events[1].outcome, 'failed');
+    base.forceFastForward = async () => { base.view.core.signedLength++; };
+    c.t += 10; await watch.check(); t.is(events.length, 2, 'actual advancement does not repair transport');
+    t.ok(logs.some(x => x.includes('"outcome":"advanced"')));
+});
+
+test('in-flight fast-forward is single-flight and stop suppresses late recovery', async t => {
+    const c = clock(); let finish, recovered = 0;
+    const base = fakeBase({ confirmed: 1, total: 2 });
+    base.forceFastForward = () => new Promise(r => { finish = r; });
+    const watch = new ConfirmationWatch(base, { timeout: 10, now: c.now, log: quiet, onStall: () => recovered++ });
+    await watch.check(); c.t += 10; const pending = watch.check();
+    t.is(await watch.check(), false); t.is(recovered, 1, 'pending work requests transport recovery');
+    watch.stop(); finish(); await pending;
+    t.is(recovered, 1, 'shutdown suppresses any late recovery'); t.is(await watch.check(), false);
+});
+
+test('known signed system head recovers when local view has no unconfirmed entries', async t => {
+    const c=clock(),events=[],base=fakeBase({confirmed:10,total:10});
+    base.core={length:20,core:{state:{length:40}}};
+    const watch=new ConfirmationWatch(base,{timeout:10,now:c.now,log:quiet,onStall:e=>events.push(e)});
+    await watch.check();c.t+=10;await watch.check();t.is(base.forced,1);t.is(events.length,1);
+});
+
+test('pending force operation keeps requesting transport recovery without overlapping force calls', async t => {
+    const c=clock(),events=[],base=fakeBase({confirmed:10,total:11});let finish;
+    base.forceFastForward=()=>{base.forced++;return new Promise(r=>{finish=r})};
+    const watch=new ConfirmationWatch(base,{timeout:10,now:c.now,log:quiet,onStall:e=>events.push(e)});
+    await watch.check();c.t+=10;const pending=watch.check();c.t+=10;await watch.check();
+    t.is(base.forced,1);t.is(events.length,1);t.is(events[0].msbsl,11);
+    watch.stop();finish();await pending;t.is(events.length,1,'no late callback after shutdown');
+});
+
+test('confirmed progress while force is pending clears the mark safely', async t => {
+    const c=clock(),events=[],base=fakeBase({confirmed:10,total:11});let finish;
+    base.forceFastForward=()=>new Promise(r=>{finish=r});
+    const watch=new ConfirmationWatch(base,{timeout:10,now:c.now,log:quiet,onStall:e=>events.push(e)});
+    await watch.check();c.t+=10;const pending=watch.check();
+    base.view.core.signedLength=11;await watch.check();finish();await pending;
+    t.is(events.length,0,'no recovery after genuine progress');watch.stop();
 });
