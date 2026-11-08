@@ -4111,7 +4111,8 @@ async fn send_receipt_ack_and_queue_settlement(
     if let Some(reason) = reason {
         frame["reason"] = json!(reason);
     }
-    send_direct_session_frame_with_peer_reconnect(
+    let mut timing = verification_diagnostics::start_receipt_timing();
+    let ack_result = send_direct_session_frame_with_peer_reconnect(
         bridge,
         direct_peer,
         &invocation.session_id,
@@ -4119,15 +4120,28 @@ async fn send_receipt_ack_and_queue_settlement(
         invocation.failover.open_timeout(),
         ack_context,
     )
-    .await?;
-    receive_and_queue_receipt_settlement(
+    .await;
+    if let Some(timing) = timing.as_mut() {
+        timing.acknowledged();
+    }
+    if let Err(error) = ack_result {
+        if let Some(timing) = timing {
+            timing.finish(false);
+        }
+        return Err(error);
+    }
+    let result = receive_and_queue_receipt_settlement(
         bridge,
         direct_peer,
         invocation,
         provider_receipt,
         receipt_ack,
     )
-    .await
+    .await;
+    if let Some(timing) = timing {
+        timing.finish(result.is_ok());
+    }
+    result
 }
 
 async fn reconcile_and_persist_completed_invocation_job(
@@ -24367,6 +24381,11 @@ async fn run_embedding_with_route_retry(
                 .into_iter()
                 .cloned()
                 .collect();
+                if pending_routes.is_empty() {
+                    reject_repriced_routes_above_ceiling(
+                        state, model, &attempt_options, &requirements, &invocation,
+                    )?;
+                }
                 continue;
             }
             Err(err) if err.retryable => {
@@ -24610,6 +24629,11 @@ async fn run_image_generation_with_route_retry(
                 .into_iter()
                 .cloned()
                 .collect();
+                if pending_routes.is_empty() {
+                    reject_repriced_routes_above_ceiling(
+                        state, model, &attempt_options, &requirements, &invocation,
+                    )?;
+                }
                 continue;
             }
             Err(err) if err.retryable => {
@@ -24848,6 +24872,11 @@ async fn run_audio_speech_with_route_retry(
                 .into_iter()
                 .cloned()
                 .collect();
+                if pending_routes.is_empty() {
+                    reject_repriced_routes_above_ceiling(
+                        state, model, &attempt_options, &requirements, &invocation,
+                    )?;
+                }
                 continue;
             }
             Err(err) if err.retryable => {
@@ -25090,6 +25119,11 @@ async fn run_audio_transcription_with_route_retry(
                 .into_iter()
                 .cloned()
                 .collect();
+                if pending_routes.is_empty() {
+                    reject_repriced_routes_above_ceiling(
+                        state, model, &attempt_options, &requirements, &invocation,
+                    )?;
+                }
                 continue;
             }
             Err(err) if err.retryable => {
@@ -25375,6 +25409,11 @@ async fn run_artifact_generation_with_route_retry(
                 .into_iter()
                 .cloned()
                 .collect();
+                if pending_routes.is_empty() {
+                    reject_repriced_routes_above_ceiling(
+                        state, model, &attempt_options, &requirements, &invocation,
+                    )?;
+                }
                 continue;
             }
             Err(err) if err.retryable => {
@@ -25950,6 +25989,33 @@ async fn refresh_model_after_price_refusal(
             } => return Err(ApiError::client_closed_request("request cancelled")),
         }
     }
+}
+
+// A refreshed catalog can remove every route because its price increased.
+// Preserve the caller's ceiling, but report that current exclusion rather than
+// the preceding PRICE_VER refusal. Only a wholly unspent invocation may expose
+// the price-gate error that retail admission can safely requote.
+fn reject_repriced_routes_above_ceiling(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+    requirements: &RequestRequirements,
+    invocation: &GatewaySessionInvocation,
+) -> Result<(), ApiError> {
+    if options.max_price_au.is_none()
+        || invocation.spend_voucher.body.billing_prior_au_owed_cum != 0
+        || !invocation.spend_voucher.body.billing_prior_usage.units().is_empty()
+    {
+        return Ok(());
+    }
+    let error = no_eligible_route_error(
+        state, model, options, &requirements.required_modalities,
+        requirements.compatible_execution_modes.as_deref(),
+    );
+    if error.public_code == "no_provider_within_price_band" {
+        return Err(error);
+    }
+    Ok(())
 }
 
 async fn wait_for_pending_receipt_settlement(
@@ -27421,6 +27487,11 @@ async fn prepare_live_direct_chat_session(
                 .into_iter()
                 .cloned()
                 .collect();
+                if pending_routes.is_empty() {
+                    reject_repriced_routes_above_ceiling(
+                        &state, &model, &attempt_options, &requirements, &invocation,
+                    )?;
+                }
                 continue;
             }
             Err(err) if err.retryable => {
@@ -29381,6 +29452,11 @@ async fn run_chat_with_route_retry(
                 .into_iter()
                 .cloned()
                 .collect();
+                if pending_routes.is_empty() {
+                    reject_repriced_routes_above_ceiling(
+                        state, model, &attempt_options, &initial_requirements, &invocation,
+                    )?;
+                }
                 continue;
             }
             Err(err) if err.retryable => {
@@ -57644,30 +57720,58 @@ mod tests {
 
     #[tokio::test]
     async fn price_transition_does_not_bypass_explicit_price_ceiling() {
-        let model = test_routed_model(1);
-        let refreshed = refreshed_price_model(&model, 100);
-        let backend = price_transition_backend(refreshed.mayhem.price_ref_au.ver);
+        for runner in FocusedRouteRunner::ALL {
+            for rail in ["fiat", "tnk", "tap"] {
+                let model = focused_route_runner_model(runner, 1);
+                let refreshed = refreshed_price_model(&model, 100);
+                let backend = price_transition_backend(refreshed.mayhem.price_ref_au.ver);
+                let state = test_gateway_state_from_models(vec![model.clone()])
+                    .with_session_backend(backend.clone()).with_receipt_rail(rail);
+                let refresh = serve_one_catalog_refresh(state.clone(), refreshed);
+                let options = GatewayRequestOptions {
+                    max_price_au: Some(price_rate_gate_basis_au(&model.mayhem.price_ref_au)),
+                    ..GatewayRequestOptions::default()
+                };
+                let error = run_focused_route_runner(runner, &state, &model, options)
+                    .await.err().expect("price ceiling must reject");
+                assert_eq!(error.public_code, "no_provider_within_price_band", "{runner:?}/{rail}");
+                refresh.await.unwrap();
+                assert_eq!(backend.attempts.lock().unwrap().len(), 1,
+                    "must not sign a voucher beyond caller's ceiling");
+                assert!(state.receipts().is_empty());
+                assert!(state.wallet_spend.lock().unwrap().reservations.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn price_transition_after_partial_never_claims_unspent_price_refusal() {
+        let model = test_routed_model(2);
+        let refreshed = refreshed_price_model(&model, 2);
+        let backend = Arc::new(PriceTransitionBackend {
+            expected_price_ver: refreshed.mayhem.price_ref_au.ver,
+            partial_first: true,
+            attempts: Arc::new(Mutex::new(Vec::new())),
+            chat: Arc::new(PartialThenSuccessBackend {
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                providers: Arc::new(Mutex::new(Vec::new())),
+            }),
+        });
         let state = test_gateway_state_from_models(vec![model.clone()])
             .with_session_backend(backend.clone());
         let refresh = serve_one_catalog_refresh(state.clone(), refreshed);
-        let request = test_chat_request(&model.id);
+        let mut request = test_chat_request(&model.id);
+        request.max_tokens = Some(8);
         let options = GatewayRequestOptions {
-            max_price_au: Some(rate_gate_basis_au(
-                &model.mayhem.price_ref_au.rate_map,
-                model.mayhem.price_ref_au.per_req_au,
-                model.mayhem.price_ref_au.min_session_au,
-            )),
+            max_price_au: Some(price_rate_gate_basis_au(&model.mayhem.price_ref_au)),
             ..GatewayRequestOptions::default()
         };
-        let result = run_chat_with_route_retry(&state, &model, &request, options).await;
-        assert!(result.is_err());
+        let error = run_chat_with_route_retry(&state, &model, &request, options)
+            .await.err().expect("price ceiling must prevent continuation");
         refresh.await.unwrap();
-        assert_eq!(
-            backend.attempts.lock().unwrap().len(),
-            1,
-            "must not sign a voucher beyond caller's ceiling"
-        );
-        assert!(state.receipts().is_empty());
+        assert_ne!(error.public_code, "no_provider_within_price_band");
+        assert_eq!(backend.attempts.lock().unwrap().len(), 2);
+        assert_eq!(state.receipts().len(), 1, "retain already billed partial evidence");
     }
 
     #[tokio::test]
@@ -57759,6 +57863,11 @@ mod tests {
 
     #[tokio::test]
     async fn price_transition_streaming_admission_reopens_with_refreshed_signed_voucher() {
+        check_streaming_price_transition(false).await;
+        check_streaming_price_transition(true).await;
+    }
+
+    async fn check_streaming_price_transition(exceeds_ceiling: bool) {
         use futures_util::{SinkExt, StreamExt};
         use tokio_tungstenite::tungstenite::Message;
         let mut model = test_model();
@@ -57772,7 +57881,7 @@ mod tests {
         route.manifest_hash = contract.manifest_hash;
         route.binary_hash = contract.binary_hash;
         model.mayhem.route_candidates = vec![route];
-        let refreshed = refreshed_price_model(&model, 1);
+        let refreshed = refreshed_price_model(&model, if exceeds_ceiling { 100 } else { 1 });
         let new_version = refreshed.mayhem.price_ref_au.ver;
         let state = test_gateway_state_from_models(vec![model.clone()]);
         let refresh = serve_one_catalog_refresh(state.clone(), refreshed.clone());
@@ -57873,7 +57982,9 @@ mod tests {
                             );
                             return opens;
                         }
-                        "s.close" => {}
+                        "s.close" => {
+                            if exceeds_ceiling { return opens; }
+                        }
                         other => panic!("unexpected session frame {other}"),
                     }
                 }
@@ -57886,15 +57997,27 @@ mod tests {
                 Arc::new(state.clone()),
                 model.clone(),
                 request,
-                GatewayRequestOptions::default(),
+                GatewayRequestOptions {
+                    max_price_au: exceeds_ceiling.then(|| price_rate_gate_basis_au(&model.mayhem.price_ref_au)),
+                    ..GatewayRequestOptions::default()
+                },
                 "stream-price-transition".to_owned(),
                 now_secs(),
                 ScBridgeGatewaySessionConfig::new(format!("ws://{address}"), "test-token"),
             ),
         )
         .await
-        .unwrap()
         .unwrap();
+        if exceeds_ceiling {
+            let error = session.err().expect("repriced stream must respect ceiling");
+            assert_eq!(error.public_code, "no_provider_within_price_band");
+            assert_eq!(error.status, StatusCode::BAD_REQUEST);
+            assert_eq!(server.await.unwrap().len(), 1);
+            refresh.await.unwrap();
+            assert!(state.receipts().is_empty());
+            return;
+        }
+        let session = session.unwrap();
         assert_eq!(session.invocation.price_ver, new_version);
         let opens = server.await.unwrap();
         refresh.await.unwrap();

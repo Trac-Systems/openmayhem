@@ -11,6 +11,10 @@ static BUDGET: Mutex<Budget> = Mutex::new(Budget {
     first: None,
     emitted: 0,
 });
+static TIMING_BUDGET: Mutex<Budget> = Mutex::new(Budget {
+    first: None,
+    emitted: 0,
+});
 struct Budget {
     first: Option<Instant>,
     emitted: u8,
@@ -98,6 +102,40 @@ pub(super) fn record(message: &str) {
         "[gateway-verification] at_ms={at} reason={}",
         reason(message)
     );
+}
+
+pub(super) struct ReceiptTiming {
+    started: Instant,
+    acked: Option<Instant>,
+}
+
+pub(super) fn start_receipt_timing() -> Option<ReceiptTiming> {
+    let path = std::env::var_os("MAYHEM_GATEWAY_RECEIPT_TIMING_DIAGNOSTICS_FILE")?;
+    if !Path::new(&path).is_file() {
+        return None;
+    }
+    let started = Instant::now();
+    if !TIMING_BUDGET.lock().ok()?.take(started) {
+        return None;
+    }
+    Some(ReceiptTiming { started, acked: None })
+}
+
+impl ReceiptTiming {
+    pub(super) fn acknowledged(&mut self) {
+        self.acked = Some(Instant::now());
+    }
+
+    pub(super) fn finish(self, success: bool) {
+        let finished = Instant::now();
+        let acked = self.acked.unwrap_or(finished);
+        // Numeric timings only; an independent 64-record/10-minute budget.
+        eprintln!(
+            "[gateway-receipt-timing] ack_us={} handoff_us={} success={success}",
+            acked.saturating_duration_since(self.started).as_micros(),
+            finished.saturating_duration_since(acked).as_micros(),
+        );
+    }
 }
 
 #[cfg(test)]
