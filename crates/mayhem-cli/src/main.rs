@@ -65879,10 +65879,6 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     let contract = read_contract_catalog(&rpc).await?;
     let provider_catalog = resolve_provider_start_catalog(&args, &home, &rpc, &rpc_url).await?;
 
-    provider_log(&args, "Running hwprobe and selecting a backend");
-    let hardware = provider_hwprobe(&args)?;
-    let hardware_fingerprint = provider_hardware_fingerprint(&hardware);
-    let identity_anchor = format!("fingerprint:{hardware_fingerprint}");
     let requested_enclave = args.enclave.clone();
     let memory_claim_admission_lock = if args.serve_sessions {
         let lock = lock_provider_memory_claim_admission(&home)?;
@@ -65891,6 +65887,33 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
     } else {
         None
     };
+    if args.serve_sessions && env::var_os("MAYHEM_OPENAI_COMPATIBLE_URL").is_none() {
+        for enclave in contract.enclaves.iter().filter(|enclave| {
+            enclave.backend == "openai-compatible"
+                && enclave.status == "active"
+                && admin_role_marker_ok(enclave.created_by_role.as_deref())
+                && ledger_enclave_identity_is_self_consistent(enclave)
+                && requested_enclave
+                    .as_deref()
+                    .is_none_or(|requested| requested_provider_enclave_matches(requested, enclave))
+        }) {
+            if managed_openai_compatible::recover_abandoned_runtime(
+                &home,
+                &wallet.public_key,
+                &enclave.enclave_id,
+                || resolve_executable(Path::new("docker")),
+            )? {
+                provider_log(
+                    &args,
+                    "Recovered an abandoned owned model runtime before memory admission",
+                );
+            }
+        }
+    }
+    provider_log(&args, "Running hwprobe and selecting a backend");
+    let hardware = provider_hwprobe(&args)?;
+    let hardware_fingerprint = provider_hardware_fingerprint(&hardware);
+    let identity_anchor = format!("fingerprint:{hardware_fingerprint}");
     let selected = select_provider_candidate_with_config_defaults(
         &contract,
         &provider_catalog.catalog_doc,

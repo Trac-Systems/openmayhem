@@ -16,6 +16,8 @@ const IMAGE: &str =
 pub(crate) const GB10_RUNTIME_ID: &str = "sglang-gb10";
 pub(crate) const GB10_CONTAINER_MEMORY_BYTES: u64 = 112 * 1024 * 1024 * 1024;
 mod gb10;
+mod recovery;
+pub(crate) use recovery::recover_abandoned_runtime;
 const SOURCE_FORMAT: &str = "pennyroyal_source_bundle_tar_gzip_v1";
 const SOURCE_LAYOUT: &str = "source";
 const MATERIALIZATION: &str = "derive_from_signed_snapshot_v1";
