@@ -14492,7 +14492,10 @@ type SseEventStream = Pin<Box<dyn Stream<Item = Option<Value>> + Send>>;
 const LIVE_SSE_MIN_EVENT_BUFFER: usize = 1;
 const LIVE_SSE_MAX_EVENT_BUFFER: usize = 8;
 const LIVE_SSE_DEFAULT_MAX_TOKENS: usize = 1024;
-const LIVE_SSE_RECEIPT_CHECKPOINT_TOKENS: u64 = 8;
+// Output deltas have their own small batch size. Requiring a synchronous
+// signed receipt handoff for every delta makes network RTT the generation
+// speed limit. This remains bounded by the configured signed checkpoint cap.
+const LIVE_SSE_RECEIPT_CHECKPOINT_TOKENS: u64 = 64;
 const DIRECT_SESSION_CHECKPOINT_ACK_RESEND_MS: u64 = 5_000;
 
 enum ChatResponse {
@@ -44243,12 +44246,26 @@ mod tests {
                 .body
                 .checkpoint_every
                 .tokens,
-            LIVE_SSE_RECEIPT_CHECKPOINT_TOKENS
+            32.min(LIVE_SSE_RECEIPT_CHECKPOINT_TOKENS)
         );
         assert_eq!(
             stream_checkpointed.spend_voucher.body.checkpoint_every.ms,
             2500
         );
+        for (configured, expected) in [(4, 4), (64, 64), (8192, 64)] {
+            let state = GatewayState::from_models(vec![model.clone()])
+                .with_receipt_checkpoint_every(CheckpointPolicy {
+                    tokens: configured,
+                    ms: 2500,
+                });
+            let stream = state.receipt_checkpoint_every_for_request(&stream_request);
+            assert_eq!(stream.tokens, expected);
+            assert_eq!(stream.ms, 2500);
+            assert_eq!(
+                state.receipt_checkpoint_every_for_request(&request).tokens,
+                configured
+            );
+        }
 
         let low_balance = GatewayState::from_models(vec![model.clone()])
             .with_receipt_user_seed(user_seed)
