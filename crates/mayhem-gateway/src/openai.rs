@@ -31918,13 +31918,18 @@ fn record_route_attempt_error(
     {
         record_capacity_mismatch_if_advertised(state, route);
     }
+    // Real s.open refusals are both clean and safe to retry. Retry permission
+    // does not turn a capacity/policy refusal into a provider malfunction.
+    // Keep independent false-capacity reporting above, but never feed these
+    // pre-spend refusals into the error-rate circuit breaker.
+    if err.clean_refusal {
+        return;
+    }
     if err.safe_same_route_retry {
         record_route_observation(state, route, observation_sample_from_error(elapsed));
         return;
     }
-    if !err.clean_refusal {
-        record_route_failure_attempt(state, route, elapsed);
-    }
+    record_route_failure_attempt(state, route, elapsed);
 }
 
 fn record_capacity_mismatch_if_advertised(
@@ -58697,6 +58702,44 @@ mod tests {
     }
 
     #[test]
+    fn retry_safe_admission_refusals_do_not_trip_provider_circuit() {
+        for code in ["CAPACITY", "BUSY", "RATE", "QUOTA", "DRAINING", "BALANCE", "PRICE_FLOOR", "PRICE_VER", "EXECUTION_MODE"] {
+            let model = test_routed_model(1);
+            let state = test_gateway_state_from_models(vec![model.clone()]);
+            let route = &model.mayhem.route_candidates[0];
+            // The real s.open path adds this flag after classifying s.reject.
+            // A bare mock clean_refusal does not exercise that combination.
+            let error = provider_reject_session_error(
+                &json!({"t":"s.reject", "code":code, "reason":"admission declined before work"}),
+                "test-session",
+            ).into_safe_same_route_retry();
+            assert!(error.clean_refusal && error.safe_same_route_retry);
+            for _ in 0..4 {
+                record_route_attempt_error(&state, Some(route), Duration::from_millis(5), &error);
+            }
+            let observed = state.provider_table.lock_recover("provider table")
+                .entries(now_millis_u64()).into_iter()
+                .find(|entry| entry.key == route_key(route)).unwrap().observed;
+            assert_eq!(observed.samples, 0, "{code}");
+            assert_eq!(observed.consecutive_failures, 0, "{code}");
+            assert_eq!(observed.circuit_open_until_millis, None, "{code}");
+            assert!(!state.route_provider_in_cooloff(route, now_millis_u64()), "{code}");
+
+            // Retry permission does not excuse an actual failed transport.
+            let transport = GatewaySessionError::retryable("connecting provider failed")
+                .into_safe_same_route_retry();
+            for _ in 0..3 {
+                record_route_attempt_error(&state, Some(route), Duration::from_millis(5), &transport);
+            }
+            let observed = state.provider_table.lock_recover("provider table")
+                .entries(now_millis_u64()).into_iter()
+                .find(|entry| entry.key == route_key(route)).unwrap().observed;
+            assert_eq!(observed.consecutive_failures, 3, "{code}");
+            assert!(observed.circuit_open_until_millis.is_some(), "{code}");
+        }
+    }
+
+    #[test]
     fn capacity_refusal_only_penalizes_sustained_false_free_capacity() {
         let model = test_routed_model(1);
         let state = test_gateway_state_from_models(vec![model.clone()]);
@@ -58704,7 +58747,7 @@ mod tests {
         let capacity = GatewaySessionError::clean_refusal_with_code(
             "provider rejected session session-a with CAPACITY: full",
             Some("CAPACITY"),
-        );
+        ).into_safe_same_route_retry();
 
         record_route_attempt_error(&state, Some(route), Duration::from_millis(5), &capacity);
         record_route_attempt_error(&state, Some(route), Duration::from_millis(5), &capacity);
