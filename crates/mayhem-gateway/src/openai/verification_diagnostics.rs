@@ -41,6 +41,7 @@ fn reason(message: &str) -> &'static str {
         "provider receipt billing_id mismatch",
         "provider receipt cached output usage mismatch",
         "provider receipt cached prompt usage mismatch",
+        "provider reasoning attribution did not match gateway-observed reasoning evidence",
         "provider receipt ctx_bracket mismatch",
         "provider receipt ctx_bracket_table_ver mismatch",
         "provider receipt enclave mismatch",
@@ -107,9 +108,11 @@ pub(super) fn record(message: &str) {
 pub(super) struct ReceiptTiming {
     started: Instant,
     acked: Option<Instant>,
+    received: Option<Instant>,
+    persisted: Option<Instant>,
 }
 
-pub(super) fn start_receipt_timing() -> Option<ReceiptTiming> {
+pub(super) fn start_record_timing() -> Option<Instant> {
     let path = std::env::var_os("MAYHEM_GATEWAY_RECEIPT_TIMING_DIAGNOSTICS_FILE")?;
     if !Path::new(&path).is_file() {
         return None;
@@ -118,7 +121,23 @@ pub(super) fn start_receipt_timing() -> Option<ReceiptTiming> {
     if !TIMING_BUDGET.lock().ok()?.take(started) {
         return None;
     }
-    Some(ReceiptTiming { started, acked: None })
+    Some(started)
+}
+
+pub(super) fn finish_record_timing(started: Instant, success: bool) {
+    eprintln!(
+        "[gateway-receipt-record] elapsed_us={} success={success}",
+        started.elapsed().as_micros()
+    );
+}
+
+pub(super) fn start_receipt_timing() -> Option<ReceiptTiming> {
+    Some(ReceiptTiming {
+        started: start_record_timing()?,
+        acked: None,
+        received: None,
+        persisted: None,
+    })
 }
 
 impl ReceiptTiming {
@@ -126,14 +145,27 @@ impl ReceiptTiming {
         self.acked = Some(Instant::now());
     }
 
+    pub(super) fn received(&mut self) {
+        self.received = Some(Instant::now());
+    }
+
+    pub(super) fn persisted(&mut self) {
+        self.persisted = Some(Instant::now());
+    }
+
     pub(super) fn finish(self, success: bool) {
         let finished = Instant::now();
         let acked = self.acked.unwrap_or(finished);
+        let received = self.received.unwrap_or(finished);
+        let persisted = self.persisted.unwrap_or(finished);
         // Numeric timings only; an independent 64-record/10-minute budget.
         eprintln!(
-            "[gateway-receipt-timing] ack_us={} handoff_us={} success={success}",
+            "[gateway-receipt-timing] ack_us={} handoff_us={} receive_us={} persist_us={} queue_us={} success={success}",
             acked.saturating_duration_since(self.started).as_micros(),
             finished.saturating_duration_since(acked).as_micros(),
+            received.saturating_duration_since(acked).as_micros(),
+            persisted.saturating_duration_since(received).as_micros(),
+            finished.saturating_duration_since(persisted).as_micros(),
         );
     }
 }

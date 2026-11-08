@@ -4136,6 +4136,7 @@ async fn send_receipt_ack_and_queue_settlement(
         invocation,
         provider_receipt,
         receipt_ack,
+        timing.as_mut(),
     )
     .await;
     if let Some(timing) = timing {
@@ -20907,6 +20908,13 @@ async fn collect_direct_session_output(
                     token_ids.push(token_id);
                 }
                 ensure_session_token_ids_within_limit(&token_ids, request, invocation)?;
+                if tool_calls.is_empty() {
+                    if let Some(calls) =
+                        tool_calls_from_session_delta_resolving(&frame, &mut delta_payload_chunks)?
+                    {
+                        tool_calls = calls;
+                    }
+                }
                 if let Some(receipt) = pending_checkpoint_receipt.take() {
                     if maybe_ack_direct_session_checkpoint_receipt(
                         bridge,
@@ -20929,13 +20937,6 @@ async fn collect_direct_session_output(
                         latest_checkpoint_receipt = Some(receipt);
                     } else {
                         pending_checkpoint_receipt = Some(receipt);
-                    }
-                }
-                if tool_calls.is_empty() {
-                    if let Some(calls) =
-                        tool_calls_from_session_delta_resolving(&frame, &mut delta_payload_chunks)?
-                    {
-                        tool_calls = calls;
                     }
                 }
                 collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
@@ -22262,32 +22263,41 @@ async fn maybe_ack_direct_session_checkpoint_receipt(
     model: &GatewayModel,
 ) -> Result<Option<Value>, GatewaySessionError> {
     let observed = observed_chat_usage(request, content, reasoning_evidence, &tool_calls);
-    let observed_usage = expected_chat_usage_for_invocation(
+    let claimed_prompt_tokens = receipt.body.usage.prompt_tokens();
+    let claimed_output_tokens = receipt.body.usage.output_tokens();
+    let prior_output_tokens = invocation
+        .spend_voucher
+        .body
+        .billing_prior_usage
+        .output_tokens();
+    // Validate prompt/cache and prior-attempt accounting independently of frame
+    // arrival order. The claimed output is used only for this prompt check;
+    // nothing may be acknowledged until the actual observed output matches.
+    let expected_prompt_usage = expected_chat_usage_for_invocation(
         model,
         request,
         Some(&receipt.body.usage),
         observed.prompt_tokens,
-        observed.completion_tokens,
+        claimed_output_tokens.saturating_sub(prior_output_tokens),
         &invocation.spend_voucher.body.locked_rate_map,
         invocation,
     )?;
-    let claimed_prompt_tokens = receipt.body.usage.prompt_tokens();
-    let claimed_output_tokens = receipt.body.usage.output_tokens();
     validate_usage_attribution(&receipt.body.usage, &receipt.body.usage_attribution)?;
-    validate_reasoning_evidence_attribution(reasoning_evidence, &receipt.body.usage_attribution)?;
-    if claimed_prompt_tokens != observed_usage.prompt_tokens() {
+    if claimed_prompt_tokens != expected_prompt_usage.prompt_tokens() {
         return Err(GatewaySessionError::new(
             "provider partial receipt prompt usage mismatch",
         ));
     }
-    if claimed_output_tokens > observed_usage.output_tokens() {
+    let observed_output_tokens = prior_output_tokens.saturating_add(observed.completion_tokens);
+    if claimed_output_tokens > observed_output_tokens {
         return Ok(None);
     }
-    if claimed_output_tokens < observed_usage.output_tokens() {
+    if claimed_output_tokens < observed_output_tokens {
         return Err(GatewaySessionError::new(
             "provider partial receipt trails gateway-observed output",
         ));
     }
+    validate_reasoning_evidence_attribution(reasoning_evidence, &receipt.body.usage_attribution)?;
 
     let partial = direct_session_checkpoint_partial(
         request,
@@ -22852,22 +22862,29 @@ fn record_direct_session_receipt(
     provider_receipt: &ProviderSignedReceipt,
     receipt_ack: &ReceiptAck,
 ) -> Result<(), GatewaySessionError> {
-    persist_stream_checkpoint_evidence(invocation, provider_receipt, receipt_ack)?;
-    invocation
-        .receipt_recorder
-        .record(StoredReceipt {
-            rail: invocation.rail.clone(),
-            voucher: invocation.spend_voucher.clone(),
-            receipt: SessionReceipt {
-                body: provider_receipt.body.clone(),
-                enclave_sig: provider_receipt.enclave_sig.clone(),
-                enclave_pubkey: provider_receipt.enclave_pubkey.clone(),
-                user_sig: receipt_ack.user_sig.clone(),
-            },
-            receipt_ack: receipt_ack.clone(),
-            access_token: invocation.access_token.clone(),
-        })
-        .map_err(|error| GatewaySessionError::new(error.message))
+    let timing = verification_diagnostics::start_record_timing();
+    let result = (|| {
+        persist_stream_checkpoint_evidence(invocation, provider_receipt, receipt_ack)?;
+        invocation
+            .receipt_recorder
+            .record(StoredReceipt {
+                rail: invocation.rail.clone(),
+                voucher: invocation.spend_voucher.clone(),
+                receipt: SessionReceipt {
+                    body: provider_receipt.body.clone(),
+                    enclave_sig: provider_receipt.enclave_sig.clone(),
+                    enclave_pubkey: provider_receipt.enclave_pubkey.clone(),
+                    user_sig: receipt_ack.user_sig.clone(),
+                },
+                receipt_ack: receipt_ack.clone(),
+                access_token: invocation.access_token.clone(),
+            })
+            .map_err(|error| GatewaySessionError::new(error.message))
+    })();
+    if let Some(started) = timing {
+        verification_diagnostics::finish_record_timing(started, result.is_ok());
+    }
+    result
 }
 
 fn persist_stream_checkpoint_evidence(
@@ -23067,6 +23084,7 @@ async fn receive_and_queue_receipt_settlement(
     invocation: &GatewaySessionInvocation,
     provider_receipt: &ProviderSignedReceipt,
     receipt_ack: &ReceiptAck,
+    mut timing: Option<&mut verification_diagnostics::ReceiptTiming>,
 ) -> Result<(), GatewaySessionError> {
     let frame = next_session_frame_with_optional_wait(
         bridge,
@@ -23076,6 +23094,9 @@ async fn receive_and_queue_receipt_settlement(
         &["s.receipt_settlement", "s.error", "s.close"],
     )
     .await?;
+    if let Some(timing) = timing.as_mut() {
+        timing.received();
+    }
     match frame.get("t").and_then(Value::as_str) {
         Some("s.receipt_settlement") => {}
         Some("s.error") => {
@@ -23112,6 +23133,9 @@ async fn receive_and_queue_receipt_settlement(
     if let Some(job) = invocation.job.as_ref() {
         job.persist_reconciliation_settlement_feature(feature.clone())
             .await?;
+    }
+    if let Some(timing) = timing {
+        timing.persisted();
     }
     invocation
         .receipt_recorder
@@ -28560,30 +28584,6 @@ async fn run_live_direct_chat_sse_inner(
                         now,
                     ));
                 }
-                if let Some(receipt) = pending_checkpoint_receipt.take() {
-                    if let Some(ack_frame) = maybe_ack_direct_session_checkpoint_receipt(
-                        &mut session.bridge,
-                        &session.provider,
-                        &session.invocation.session_id,
-                        &session.request,
-                        &session.invocation,
-                        &content,
-                        &reasoning_evidence,
-                        tool_calls.clone(),
-                        &receipt,
-                        &token_ids,
-                        &watchdog,
-                        now,
-                        &session.model,
-                    )
-                    .await?
-                    {
-                        latest_checkpoint_receipt = Some(receipt);
-                        latest_checkpoint_ack_frame = Some(ack_frame);
-                    } else {
-                        pending_checkpoint_receipt = Some(receipt);
-                    }
-                }
                 if tool_calls.is_empty() {
                     if let Some(next_tool_calls) =
                         tool_calls_from_session_delta_resolving(&frame, &mut delta_payload_chunks)?
@@ -28614,6 +28614,30 @@ async fn run_live_direct_chat_sse_inner(
                             ));
                         }
                         tool_calls = next_tool_calls;
+                    }
+                }
+                if let Some(receipt) = pending_checkpoint_receipt.take() {
+                    if let Some(ack_frame) = maybe_ack_direct_session_checkpoint_receipt(
+                        &mut session.bridge,
+                        &session.provider,
+                        &session.invocation.session_id,
+                        &session.request,
+                        &session.invocation,
+                        &content,
+                        &reasoning_evidence,
+                        tool_calls.clone(),
+                        &receipt,
+                        &token_ids,
+                        &watchdog,
+                        now,
+                        &session.model,
+                    )
+                    .await?
+                    {
+                        latest_checkpoint_receipt = Some(receipt);
+                        latest_checkpoint_ack_frame = Some(ack_frame);
+                    } else {
+                        pending_checkpoint_receipt = Some(receipt);
                     }
                 }
                 collect_artifact_from_session_delta(&frame, &mut artifact_builders)?;
@@ -41948,6 +41972,229 @@ mod tests {
         attestation_signing_bytes, ctx_bracket_for_tokens, reassemble_json_payload,
         AttestationSigner, CTX_BRACKET_TABLE_VERSION,
     };
+
+    #[tokio::test]
+    async fn checkpoint_waits_for_observed_output_before_cached_or_reasoning_validation() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let mut failures = Vec::new();
+        for mode in ["plain", "cached", "reasoning", "tools"] {
+            let model = if mode == "tools" {
+                tools_only_test_model()
+            } else {
+                test_model()
+            };
+            let request = if mode == "tools" {
+                tool_heavy_test_request(&model.id)
+            } else {
+                test_chat_request(&model.id)
+            };
+            let mut invocation = test_invocation();
+            invocation.transport_peer = Some("ab".repeat(32));
+            let publisher = Arc::new(RecordingReceiptSettlementPublisher::default());
+            invocation.receipt_recorder.settlement_publisher = Arc::new(Some(publisher.clone()));
+            let prompt = tools_only_prompt_token_units(&model, &request, invocation.served_ctx)
+                .unwrap()
+                .unwrap_or_else(|| rough_tokens(&chat_prompt_text(&request)));
+            let output = ChatOutput {
+                reasoning_content: String::new(),
+                content: Some("a".repeat(32)),
+                tool_calls: Vec::new(),
+                artifacts: Vec::new(),
+                finish_reason: "checkpoint".into(),
+                usage: Usage {
+                    prompt_tokens: prompt,
+                    completion_tokens: 8,
+                    total_tokens: prompt + 8,
+                },
+            };
+            let mut receipt = test_provider_receipt_with_finality(
+                &model,
+                &request,
+                &output,
+                &invocation,
+                1,
+                false,
+            );
+            if mode == "cached" {
+                assert!(prompt > 0);
+                receipt.body.usage = ReceiptUsage::text_with_cached(prompt - 1, 1, 8);
+            }
+            if mode == "reasoning" {
+                receipt
+                    .body
+                    .usage_attribution
+                    .insert("reasoning_output_tokens".into(), 8);
+            }
+            receipt.body.au_owed_cum = calculate_locked_au_owed(&invocation, &receipt.body.usage);
+            receipt.enclave_sig = sign_hex(
+                &test_enclave_seed(),
+                &receipt_signing_bytes(&receipt.body).unwrap(),
+            );
+            let expected_ack = receipt_ack_for_body(&test_user_seed(), &receipt.body).unwrap();
+            let feature = test_receipt_settlement_feature(&receipt, &expected_ack);
+            let remote = invocation.transport_peer.clone().unwrap();
+            let session = invocation.session_id.clone();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let auth: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                socket
+                    .send(Message::Text(
+                        json!({"id":auth["id"], "type":"auth_ok"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let sent: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(sent["frame"]["t"], "s.receipt_ack");
+                assert_eq!(sent["frame"]["user_sig"], expected_ack.user_sig);
+                socket
+                    .send(Message::Text(
+                        json!({"id":sent["id"],"type":"session_sent"})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                socket.send(Message::Text(json!({"type":"session_frame","remote":remote,"session_id":session,
+                    "frame":{"t":"s.receipt_settlement","session_id":session,"seq":1,"feature":feature}}).to_string().into())).await.unwrap();
+            });
+            let mut bridge = ScBridgeClient::connect(
+                ScBridgeConfig::new(format!("ws://{address}"), "test-token").unwrap(),
+            )
+            .await
+            .unwrap();
+            let watchdog = DirectSessionWatchdog::new(1, None, None, None, None);
+            let result = tokio::time::timeout(
+                Duration::from_secs(1),
+                maybe_ack_direct_session_checkpoint_receipt(
+                    &mut bridge,
+                    invocation.provider_pubkey.as_deref().unwrap(),
+                    &invocation.session_id,
+                    &request,
+                    &invocation,
+                    "",
+                    "",
+                    Vec::new(),
+                    &receipt,
+                    &[],
+                    &watchdog,
+                    2,
+                    &model,
+                ),
+            )
+            .await
+            .unwrap();
+            if !matches!(&result, Ok(None)) {
+                failures.push(format!(
+                    "{mode}: {:?}",
+                    result.as_ref().err().map(|e| &e.message)
+                ));
+            }
+            assert!(invocation
+                .receipt_recorder
+                .receipts
+                .lock()
+                .unwrap()
+                .is_empty());
+            assert!(publisher.features.lock().unwrap().is_empty());
+            if !matches!(result, Ok(None)) {
+                server.abort();
+                continue;
+            }
+            let full = "a".repeat(32);
+            let (content, reasoning) = if mode == "reasoning" {
+                ("", full.as_str())
+            } else {
+                (full.as_str(), "")
+            };
+            for attack in ["amount", "signature", "prompt", "reasoning"] {
+                let mut invalid = receipt.clone();
+                match attack {
+                    "amount" => invalid.body.au_owed_cum += 1,
+                    "prompt" => invalid.body.prompt_hash = "ff".repeat(32),
+                    "reasoning" => {
+                        invalid.body.usage_attribution.insert(
+                            "reasoning_output_tokens".into(),
+                            if mode == "reasoning" { 7 } else { 1 },
+                        );
+                    }
+                    _ => {}
+                }
+                invalid.enclave_sig = if attack == "signature" {
+                    "00".repeat(64)
+                } else {
+                    sign_hex(
+                        &test_enclave_seed(),
+                        &receipt_signing_bytes(&invalid.body).unwrap(),
+                    )
+                };
+                let rejected = maybe_ack_direct_session_checkpoint_receipt(
+                    &mut bridge,
+                    invocation.provider_pubkey.as_deref().unwrap(),
+                    &invocation.session_id,
+                    &request,
+                    &invocation,
+                    content,
+                    reasoning,
+                    Vec::new(),
+                    &invalid,
+                    &[],
+                    &watchdog,
+                    3,
+                    &model,
+                )
+                .await;
+                assert!(
+                    rejected.is_err(),
+                    "{mode}/{attack} must not be acknowledged"
+                );
+                assert!(invocation
+                    .receipt_recorder
+                    .receipts
+                    .lock()
+                    .unwrap()
+                    .is_empty());
+            }
+            let resumed = tokio::time::timeout(
+                Duration::from_secs(1),
+                maybe_ack_direct_session_checkpoint_receipt(
+                    &mut bridge,
+                    invocation.provider_pubkey.as_deref().unwrap(),
+                    &invocation.session_id,
+                    &request,
+                    &invocation,
+                    content,
+                    reasoning,
+                    Vec::new(),
+                    &receipt,
+                    &[],
+                    &watchdog,
+                    4,
+                    &model,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(resumed.is_some());
+            assert_eq!(
+                invocation.receipt_recorder.receipts.lock().unwrap().len(),
+                1
+            );
+            assert_eq!(publisher.features.lock().unwrap().len(), 1);
+            server.await.unwrap();
+        }
+        assert!(failures.is_empty(), "{}", failures.join("; "));
+    }
 
     #[test]
     fn schema_preflight_is_request_scoped_for_chat_and_responses() {
