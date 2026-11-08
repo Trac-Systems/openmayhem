@@ -146,6 +146,7 @@ mod durable_streaming_tests;
 #[cfg(test)]
 mod existing_job_access_tests;
 mod failure_recovery;
+mod verification_diagnostics;
 mod incremental_output;
 mod key_budget;
 pub mod proxy_buyer;
@@ -18874,6 +18875,7 @@ fn provider_session_api_error(err: &GatewaySessionError) -> ApiError {
         || lower.contains("usage exceeded signed spend voucher")
         || (lower.contains("receipt") && lower.contains("mismatch"))
     {
+        verification_diagnostics::record(&err.message);
         return ApiError::bad_gateway(
             "The provider returned signed session data that failed verification.",
             Some("model"),
