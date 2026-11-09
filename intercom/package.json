@@ -20,7 +20,8 @@
     "test:features": "node --test tests/direct-session.test.js tests/internal-stripe-auth.test.js tests/mayhem-feature-autobase.test.js tests/mayhem-feature-protomux.test.js tests/mayhem-feature-relay.test.js tests/runtime-errors.test.js tests/sc-bridge-containment.test.js tests/sidechannel-join-window.test.mjs tests/sidechannel-owner-write.test.js tests/sidechannel-policy.test.js",
     "start": "node scripts/pear-runner.mjs",
     "peer": "node scripts/pear-runner.mjs",
-    "test:pear-runner": "node --test tests/pear-runner.test.mjs"
+    "test:pear-runner": "node --test tests/pear-runner.test.mjs",
+    "postinstall": "node scripts/materialize-local-dependencies.mjs . && node scripts/apply-hypercore-stallfix.mjs ."
   },
   "pear": {
     "name": "mayhem-intercom",

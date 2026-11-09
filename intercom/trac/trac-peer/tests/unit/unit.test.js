@@ -16,4 +16,6 @@ await import('./readRecovery.test.js');
 await import('./subnetStallWatch.test.js');
 await import('./msbReadBounds.test.js');
 await import('./updater.test.js');
+await import('./reconnectAll.test.js');
+await import('./hypercore/hypercore.test.js');
 test.resume();

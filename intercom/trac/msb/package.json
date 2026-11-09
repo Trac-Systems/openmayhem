@@ -1,7 +1,7 @@
 {
   "name": "trac-msb",
   "main": "msb.mjs",
-  "version": "0.2.26",
+  "version": "0.2.27",
   "pear": {
     "name": "trac-msb",
     "type": "terminal"
@@ -13,10 +13,12 @@
     "NOTICE",
     "rpc/",
     "SECURITY.md",
+    "scripts/hypercore-stallfix/",
     "scripts/pear-runner.js",
     "src/"
   ],
   "scripts": {
+    "postinstall": "node scripts/hypercore-stallfix/apply.mjs",
     "start": "NODE_OPTIONS='--max-old-space-size=4096' node scripts/pear-runner.js",
     "rpc": "NODE_OPTIONS='--max-old-space-size=4096' node scripts/pear-runner.js --rpc --host ${npm_config_host} --port ${npm_config_port}",
     "env": "if [ -f .env ]; then set -a; . ./.env; set +a; fi; NODE_OPTIONS='--max-old-space-size=4096' node scripts/pear-runner.js --stores-directory ${STORES_DIRECTORY:-stores} --network ${NETWORK:-mainnet}",

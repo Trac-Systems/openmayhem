@@ -1,5 +1,6 @@
 import {
     handleHealth,
+    handleReplication,
     handleBalance,
     handleTxv,
     handleFee,
@@ -15,6 +16,7 @@ import {
 
 export const v1Routes = [
     { method: 'GET', path: '/health', handler: handleHealth },
+    { method: 'GET', path: '/replication', handler: handleReplication },
     { method: 'GET', path: '/balance', handler: handleBalance },
     { method: 'GET', path: '/txv', handler: handleTxv },
     { method: 'GET', path: '/fee', handler: handleFee },

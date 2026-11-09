@@ -18,7 +18,9 @@ import { TransactionObserver } from './tasks/transactionObserver.js';
 import { Updater } from './tasks/updater.js';
 import { createReadRecovery } from './network/readRecovery.js';
 import { createSubnetStallWatch } from './tasks/subnetStallWatch.js';
-export { createReadRecovery, createSubnetStallWatch };
+import { createReconnectAll } from './network/reconnectAll.js';
+import { hypercoreStallfixLine, hypercoreStallfixStatus } from './utils/hypercoreStallfix.js';
+export { createReadRecovery, createSubnetStallWatch, createReconnectAll, hypercoreStallfixStatus };
 export { ensureTextCodecs } from './textCodec.js';
 export {default as Protocol} from "./artifacts/protocol.js";
 export {default as Contract} from "./artifacts/contract.js";
@@ -44,6 +46,7 @@ export class Peer extends ReadyResource {
         this.msbClient.on('read-stall', event => this.emit('msb-read-stall', event));
         this.swarm = null;
         this.recoverSubnet = null;
+        this.reconnectSubnet = null;
         this.subnetStallWatch = null;
         this.base = null;
         this.key = null;
@@ -66,6 +69,7 @@ export class Peer extends ReadyResource {
         await this.msbClient.ready()
         this._boot();
         await this.base.ready();
+        console.log(hypercoreStallfixLine('trac-peer', this.base.core));
 
         if (this.config.enableBackgroundTasks) this.txObserver();
 
@@ -85,6 +89,7 @@ export class Peer extends ReadyResource {
                 recover: event => {
                     this.emit('subnet-stall', event);
                     this.recoverSubnet?.(event);
+                    this.reconnectSubnet?.(event);
                 },
             });
             this.subnetStallWatch.start();
@@ -139,6 +144,19 @@ export class Peer extends ReadyResource {
             }
         })
         this.base.on('warning', (e) => console.log(e))
+    }
+
+    /** Replication health of the subnet and of the MSB this peer uses. Read-only. */
+    replicationStatus() {
+        return {
+            subnet: {
+                hypercoreStallfix: hypercoreStallfixStatus(this.base?.core, this.store),
+                stall: this.subnetStallWatch?.status?.() ?? null,
+                reconnect: this.reconnectSubnet?.status?.() ?? null,
+                connections: this.swarm?.connections?.size ?? 0
+            },
+            msb: this.msbClient.replicationStatus()
+        };
     }
 
     async sendTx(msg){
@@ -284,6 +302,10 @@ export class Peer extends ReadyResource {
                 discovery, label: 'SUBNET', rotate: false,
             });
             await this.swarm.flush();
+            // After the flush on purpose: intercom-dex patches the join..flush block above by exact text at install time.
+            this.reconnectSubnet = createReconnectAll({
+                swarm: this.swarm, discovery, label: 'SUBNET', afterMs: this.config.subnetReconnectTimeout,
+            });
         }
     }
 }

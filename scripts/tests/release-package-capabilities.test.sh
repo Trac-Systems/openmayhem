@@ -348,7 +348,7 @@ JSON
 mkdir -p \
   "$topology/node_modules/trac-msb/node_modules/trac-wallet" \
   "$topology/node_modules/trac-peer/node_modules/trac-wallet"
-for relative in migration proto rpc src whitelist; do
+for relative in migration proto rpc src whitelist scripts/hypercore-stallfix; do
   mkdir -p \
     "$topology/trac/msb/$relative" \
     "$topology/node_modules/trac-msb/$relative"
@@ -359,7 +359,7 @@ cp \
   "$topology/node_modules/trac-msb/migration/initial_balances.csv"
 printf 'export {};\n' >"$topology/trac/msb/msb.mjs"
 cp "$topology/trac/msb/msb.mjs" "$topology/node_modules/trac-msb/msb.mjs"
-for relative in rpc src; do
+for relative in rpc src scripts/hypercore-stallfix; do
   mkdir -p \
     "$topology/trac/trac-peer/$relative" \
     "$topology/node_modules/trac-peer/$relative"

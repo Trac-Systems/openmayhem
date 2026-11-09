@@ -19,6 +19,8 @@ WORKDIR /msb
 USER node
 
 COPY package*.json ./
+# postinstall applies the Hypercore stall fix (scripts/hypercore-stallfix/), so it must exist before npm ci
+COPY scripts/hypercore-stallfix ./scripts/hypercore-stallfix
 RUN npm ci --omit=dev
 COPY . .
 

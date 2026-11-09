@@ -7,7 +7,7 @@ const MIN_FAST_FORWARD = 16;
 export function createSubnetStallWatch({ base, recover, stallMs = 60000, checkIntervalMs = 15000,
   now = Date.now, log = console.log }) {
   if (typeof base._queueFastForward !== 'function') throw new Error('Subnet reader fast-forward hook unavailable');
-  let mark = null, timer = null, stopped = false;
+  let mark = null, timer = null, stopped = false, stalledSince = null;
   const emit = (event, extra) => log(`[trac-peer] ${JSON.stringify({ chain: 'SUBNET', event, ...extra })}`);
   const check = () => {
     if (stopped || !base.opened || base.closing || base.closed || base.writable || base.isIndexer ||
@@ -20,24 +20,29 @@ export function createSubnetStallWatch({ base, recover, stallMs = 60000, checkIn
     if (![applied, total, signed].every(Number.isSafeInteger) || applied < 0 || total < applied ||
         signed - total < MIN_FAST_FORWARD) {
       mark = null;
+      stalledSince = null;
       return false;
     }
     const at = now(), id = core.id;
     if (!mark || mark.id !== id || mark.applied !== applied || mark.total !== total || at < mark.since) {
-      mark = { id, applied, total, since: at };
+      mark = { id, applied, total, since: at, first: at };
+      stalledSince = null;
       return false;
     }
     const elapsedMs = at - mark.since;
     if (elapsedMs < stallMs) return false;
     mark.since = at;
+    // stalledMs: time since the stall began (elapsedMs restarts after every report)
+    const stalledMs = at - mark.first;
+    if (stalledSince === null) stalledSince = mark.first;
     emit('subnet_apply_stalled', { appliedLength: applied, systemLength: total, systemSignedLength: signed,
       viewSignedLength: base.view?.core?.signedLength ?? null, elapsedMs,
       systemKey: core.key?.toString('hex') ?? null, applying: !!base._applyState?.applying, draining: !!base._draining,
       fastForwarding: !!base.fastForwarding, fastForwardTo: base.fastForwardTo?.length ?? null,
-      fastForwardFailedAt: base.fastForwardFailedAt });
+      fastForwardFailedAt: base.fastForwardFailedAt, stalledMs });
     // A valid signed head does not guarantee that a connected replica has
     // the blocks FF/replay needs. Repair transport even while FF is in flight.
-    try { recover?.({ code: 'SUBNET_APPLY_STALLED', elapsedMs }); }
+    try { recover?.({ code: 'SUBNET_APPLY_STALLED', elapsedMs, stalledMs }); }
     catch (error) { emit('subnet_recovery_failed', { error: error.message }); }
     // Keep the base's threshold, failure cooldown, verification and serialized
     // apply path. Never replace/cancel an in-flight or already prepared FF.
@@ -49,6 +54,10 @@ export function createSubnetStallWatch({ base, recover, stallMs = 60000, checkIn
   };
   return {
     check,
+    status() {
+      return { enabled: true, state: stalledSince !== null ? 'stalled' : mark !== null ? 'behind' : 'ok',
+        stalledSince, appliedLength: mark?.applied ?? null, systemLength: mark?.total ?? null };
+    },
     start() {
       if (timer !== null) return;
       stopped = false;
@@ -61,6 +70,7 @@ export function createSubnetStallWatch({ base, recover, stallMs = 60000, checkIn
       if (timer !== null) clearInterval(timer);
       timer = null;
       mark = null;
+      stalledSince = null;
     }
   };
 }

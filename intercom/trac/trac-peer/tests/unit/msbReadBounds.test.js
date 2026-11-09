@@ -224,39 +224,6 @@ test('MSB signed-length wait preserves poll fallback and input validation', asyn
   t.ok((await settle(f.client.waitForSignedLengthAtLeast(12, { pollMs: 0 }), 1000)).error);
 });
 
-test('stalled confirmation wait recovers once per shared slice but never resolves unconfirmed', async t => {
-  const timers = fakeIntervals(t); let time = 0, recovered = 0, done = 0;
-  const f = stub(null, { readSliceMs: 10, confirmationStallMs: 40, now: () => time,
-    log() {}, onReadStall() { recovered++; return Promise.reject(new Error('unavailable')); } });
-  const waits = Array.from({ length: 4 }, () => f.client.waitForSignedLengthAtLeast(14, { pollMs: 5 }).then(() => done++));
-  time = 39; timers.tick(); t.is(recovered, 0);
-  time = 40; timers.tick(); t.is(recovered, 1); t.is(done, 0);
-  time = 50; f.core.signedLength = 13; timers.tick(); t.is(recovered, 1, 'progress resets stall clock');
-  time = 89; timers.tick(); t.is(recovered, 1);
-  time = 90; timers.tick(); t.is(recovered, 2); t.is(done, 0);
-  f.core.signedLength = 14; f.core.emit('append'); await Promise.all(waits);
-  t.is(done, 4); t.is(timers.active.size, 0); t.is(f.core.listenerCount('append'), 0); t.is(f.core.listenerCount('close'), 0);
-});
-
-test('confirmation wait follows replacement view cores and rejects shutdown', async t => {
-  const f = stub(null, { log() {} });
-  const pending = f.client.waitForSignedLengthAtLeast(15, { pollMs: 2 });
-  f.base.view.core = Object.assign(new EventEmitter(), { signedLength: 15 });
-  f.core.emit('close'); await pending;
-  t.is(f.core.listenerCount('append'), 0);
-  const next = settle(f.client.waitForSignedLengthAtLeast(16, { pollMs: 2 }), 1000);
-  f.base.closing = true; f.base.view.core.emit('close');
-  t.is((await next).error?.code, 'SESSION_CLOSED');
-  t.is(f.base.view.core.listenerCount('append'), 0);
-});
-
-test('MSB clients delegate to the same network recovery used by the watch', async t => {
-  const f = stub(null, { log() {} }); let calls = 0;
-  f.msb.network.recoverRead = () => { calls++; return true; };
-  await f.client.ready(); t.is(f.client.recoverRead({}), true); t.is(calls, 1);
-  await f.client.close();
-});
-
 test('MSB opening installs default transport recovery only when no callback was supplied', async t => {
   const f = stub(async () => null, { log() {} });
   let joins = 0, leaves = 0, refreshes = 0;
@@ -300,4 +267,16 @@ test('read and stall config defaults apply to every environment and older defaul
   for (const value of [null, -1, 0.5, '60000', NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
     await t.exception(() => createConfig(ENV.DEVELOPMENT, { subnetStallTimeout: value }), /subnetStallTimeout/);
   }
+});
+
+test('confirmation wait follows replacement view cores and rejects shutdown', async t => {
+  const f = stub(null, { log() {} });
+  const pending = f.client.waitForSignedLengthAtLeast(15, { pollMs: 2 });
+  f.base.view.core = Object.assign(new EventEmitter(), { signedLength: 15 });
+  f.core.emit('close'); await pending;
+  t.is(f.core.listenerCount('append'), 0);
+  const next = settle(f.client.waitForSignedLengthAtLeast(16, { pollMs: 2 }), 1000);
+  f.base.closing = true; f.base.view.core.emit('close');
+  t.is((await next).error?.code, 'SESSION_CLOSED');
+  t.is(f.base.view.core.listenerCount('append'), 0);
 });

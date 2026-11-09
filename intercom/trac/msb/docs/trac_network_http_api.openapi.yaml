@@ -37,6 +37,55 @@ paths:
                 example:
                   error: "Could not connect to RPC server"
 
+  /v1/replication:
+      get:
+        tags: [Network]
+        summary: Replication health of this node
+        description: >-
+          Whether the loaded Hypercore carries the replication stall fix (install-time patch shipped by trac-msb),
+          and the state of the replication stall guard (ok, behind or stalled; reconnect-all count). Read-only.
+        responses:
+          "200":
+            description: Replication status.
+            content:
+              application/json:
+                schema:
+                  type: object
+                  properties:
+                    hypercoreStallfix:
+                      type: object
+                      properties:
+                        patched: { type: boolean }
+                        marker: { type: string, nullable: true }
+                        expiredRequests: { type: integer, nullable: true }
+                        notAvailableSent: { type: integer, nullable: true }
+                        notAvailableSuppressed: { type: integer, nullable: true }
+                        invalidOperationPauses: { type: integer, nullable: true }
+                        invalidOperationPermanent: { type: integer, nullable: true }
+                    stall:
+                      type: object
+                      nullable: true
+                      properties:
+                        enabled: { type: boolean }
+                        state: { type: string, enum: [ok, behind, stalled] }
+                        confirmedLength: { type: integer, nullable: true }
+                        systemLength: { type: integer, nullable: true }
+                        systemSignedLength: { type: integer, nullable: true }
+                        behindSince: { type: integer, nullable: true }
+                        stalledSince: { type: integer, nullable: true }
+                        reconnects: { type: integer }
+                        lastReconnectAt: { type: integer, nullable: true }
+                        lastReconnectClosed: { type: integer }
+                    connections: { type: integer }
+          "503":
+            description: Service Unavailable - RPC node is down or state is initializing.
+            content:
+              application/json:
+                schema:
+                  $ref: "#/components/schemas/ErrorResponse"
+                example:
+                  error: "Could not connect to RPC server"
+
   /v1/balance/{address}:
     get:
       tags: [Wallet]

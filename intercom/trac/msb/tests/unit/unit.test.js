@@ -11,6 +11,7 @@ async function runTests() {
     await import('./messages/messages.test.js');
     await import('./network/networkModule.test.js')
     await import('./state/stateModule.test.js');
+    await import('./hypercore/hypercore.test.js');
     test.resume();
 }
 

@@ -24,6 +24,15 @@ export async function handleHealth({ msbInstance, respond }) {
     }
 }
 
+export async function handleReplication({ msbInstance, respond }) {
+    try {
+        if (!msbInstance?.opened || typeof msbInstance.replicationStatus !== 'function') throw new Error("RPC_OFFLINE");
+        respond(200, msbInstance.replicationStatus());
+    } catch {
+        respond(503, { error: "Could not connect to RPC server" });
+    }
+}
+
 export async function handleBalance({ req, respond, msbInstance }) {
     const url = buildRequestUrl(req);
     const parts = url.pathname.split("/").filter(Boolean);

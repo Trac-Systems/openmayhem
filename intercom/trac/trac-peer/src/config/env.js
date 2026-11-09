@@ -14,6 +14,7 @@ const configData = {
         storeName: "mainnet",
         msbReadSliceMs: 30000,
         subnetStallTimeout: 60000,
+        subnetReconnectTimeout: 600000, // close all subnet connections once (max 1 per 10 min) after a stall this long (ms, 0 = off)
         txPoolMaxSize: 1_000,
         maxTxDelay: 60,
         hyperbeeCacheMaxEntries: 65_536,
@@ -42,6 +43,7 @@ const configData = {
         storeName: "testnet",
         msbReadSliceMs: 30000,
         subnetStallTimeout: 60000,
+        subnetReconnectTimeout: 600000, // close all subnet connections once (max 1 per 10 min) after a stall this long (ms, 0 = off)
         txPoolMaxSize: 1_000,
         maxTxDelay: 60,
         hyperbeeCacheMaxEntries: 65_536,
@@ -70,6 +72,7 @@ const configData = {
         storeName: "peer",
         msbReadSliceMs: 30000,
         subnetStallTimeout: 60000,
+        subnetReconnectTimeout: 600000, // close all subnet connections once (max 1 per 10 min) after a stall this long (ms, 0 = off)
         txPoolMaxSize: 1_000,
         maxTxDelay: 60,
         hyperbeeCacheMaxEntries: 65_536,

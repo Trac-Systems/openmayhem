@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "release_version": "0.2.301",
+  "release_version": "0.2.302",
   "contract_version": 30,
-  "contract_code_sha256": "ce2ee0f1a2bcab59963e03140b062a8f709e8e623a62a13f010371a723069f00",
+  "contract_code_sha256": "1ea34defa8d2c9c9382cf1818687700794c59f21391f2c6bc53dc95f6c9a9deb",
   "files": [
     {
       "path": "contract/contract.js",
@@ -130,7 +130,7 @@
     },
     {
       "path": "trac/trac-peer/src/index.js",
-      "sha256": "83877820310b4a335ab92c9debae0ffbb8239497aab95861b4a9b359caac8c12"
+      "sha256": "9fa8c1ae056c31c9f76eb74a427e9624369a3abf4bb5e3397ebc7438e4ab81ce"
     },
     {
       "path": "trac/trac-peer/src/operations/feature/index.js",

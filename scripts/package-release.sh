@@ -55,9 +55,11 @@ INTERCOM_SOURCE_ALLOWLIST=(
   intercom/features
   intercom/scripts
   intercom/src
+  intercom/trac/upstream-pins.json
   intercom/trac/msb/package.json
   intercom/trac/msb/package-lock.json
   intercom/trac/msb/msb.mjs
+  intercom/trac/msb/scripts/hypercore-stallfix
   intercom/trac/msb/migration
   intercom/trac/msb/proto
   intercom/trac/msb/rpc
@@ -67,6 +69,7 @@ INTERCOM_SOURCE_ALLOWLIST=(
   intercom/trac/trac-peer/package-lock.json
   intercom/trac/trac-peer/rpc
   intercom/trac/trac-peer/scripts/run-peer.mjs
+  intercom/trac/trac-peer/scripts/hypercore-stallfix
   intercom/trac/trac-peer/src
 )
 
@@ -1826,6 +1829,7 @@ hydrate_intercom_runtime_tree() {
   [[ "$peer_lock_hash" == "$(sha256_file "$intercom_root/trac/trac-peer/package-lock.json")" ]] ||
     die "npm changed the pinned trac-peer package-lock.json"
   node "$intercom_root/scripts/materialize-local-dependencies.mjs" "$intercom_root"
+  node "$intercom_root/scripts/apply-hypercore-stallfix.mjs" "$intercom_root"
   node "$ROOT_DIR/scripts/verify-intercom-dependency-topology.mjs" "$intercom_root"
   verify_intercom_production_dependency_tree "$intercom_root"
   finalize_intercom_native_artifacts \

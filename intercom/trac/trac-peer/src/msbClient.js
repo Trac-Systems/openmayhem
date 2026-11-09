@@ -11,6 +11,7 @@ import {
 import { applyStateMessageFactory } from 'trac-msb/src/messages/state/applyStateMessageFactory.js';
 import { safeEncodeApplyOperation } from 'trac-msb/src/utils/protobuf/operationHelpers.js';
 import { createReadRecovery } from './network/readRecovery.js';
+import { hypercoreStallfixStatus } from './utils/hypercoreStallfix.js';
 
 export const MSB_OPERATION_TYPE = Object.freeze({
     BOOTSTRAP_DEPLOYMENT: 11,
@@ -24,10 +25,8 @@ export class MsbClient extends ReadyResource {
     #onReadStall
     #log
     #now
-    #confirmationStallMs
-    #lastWaitRecoveryAt = -Infinity
 
-    constructor(msbInstance, { readSliceMs = 30000, confirmationStallMs = 120000, onReadStall = null, log = console.log, now = Date.now } = {}) {
+    constructor(msbInstance, { readSliceMs = 30000, onReadStall = null, log = console.log, now = Date.now } = {}) {
         super();
         this.#msb = msbInstance || null;
         this.#partialTransactionValidator = null;
@@ -35,7 +34,6 @@ export class MsbClient extends ReadyResource {
         this.#onReadStall = onReadStall;
         this.#log = log;
         this.#now = now;
-        this.#confirmationStallMs = confirmationStallMs;
     }
 
     async _open() {
@@ -43,11 +41,7 @@ export class MsbClient extends ReadyResource {
         this.#partialTransactionValidator = new PartialTransactionValidator(this.#msb.state, null, this.#msb.config)
         const swarm = this.#msb.network?.swarm;
         const topic = this.#msb.config?.channel;
-        if (this.#onReadStall === null && typeof this.#msb.network?.recoverRead === 'function') {
-            // All MSB consumers, including its standalone confirmation watch,
-            // share the network's recovery cooldown and in-flight discovery.
-            this.#onReadStall = event => this.#msb.network.recoverRead(event);
-        } else if (this.#onReadStall === null && swarm && topic) {
+        if (this.#onReadStall === null && swarm && topic) {
             this.#onReadStall = createReadRecovery({
                 base: this.#msb.state.base, swarm, topic, label: 'MSB', rotate: false,
                 now: this.#now, log: this.#log,
@@ -55,12 +49,19 @@ export class MsbClient extends ReadyResource {
         }
     }
 
-    recoverRead(event) {
+    /** MSB replication health: trac-msb's own report when it has one, else the loaded Hypercore's marker. */
+    replicationStatus() {
         try {
-            const result = this.#onReadStall?.(event) ?? false;
-            result?.catch?.(() => {});
-            return result;
+            const own = this.#msb?.replicationStatus?.();
+            if (own) return own;
+            return { hypercoreStallfix: hypercoreStallfixStatus(this.#msb?.state?.base?.core), stall: null };
+        } catch {
+            return null;
         }
+    }
+
+    recoverRead(event) {
+        try { return this.#onReadStall?.(event) ?? false; }
         catch { return false; }
     }
 
@@ -170,11 +171,6 @@ export class MsbClient extends ReadyResource {
                 msbsl: targetSignedLength, signedLength: current.signedLength,
                 elapsedMs: Math.max(0, now - started), stalledMs: Math.max(0, now - progressedAt) };
             this.#report(event);
-            if (Number.isFinite(this.#confirmationStallMs) && this.#confirmationStallMs > 0 &&
-                event.stalledMs >= this.#confirmationStallMs && now - this.#lastWaitRecoveryAt >= this.#readSliceMs) {
-                this.#lastWaitRecoveryAt = now;
-                this.recoverRead(event);
-            }
         }, this.#readSliceMs);
         reporter.unref?.();
         try {

@@ -179,6 +179,7 @@ export async function getMayhemStatus(peer, metadata = {}, { appliedViewLength =
       chatStatus: chatStatus?.value ?? null,
     },
     consensus: { ...adminWriterDiagnostics(peer), applied_view_proof: await appliedViewProof(peer, appliedViewLength) },
+    replication: typeof peer.replicationStatus === 'function' ? peer.replicationStatus() : null,
     writerCheckpoint: typeof peer.writerCheckpointStatus === 'function'
       ? peer.writerCheckpointStatus() : { enabled: false },
     msb: {

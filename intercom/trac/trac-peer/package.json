@@ -1,7 +1,7 @@
 {
   "name": "trac-peer",
   "main": "src/index.js",
-  "version": "0.4.14",
+  "version": "0.4.15",
   "type": "module",
   "pear": {
     "name": "trac-peer",
@@ -19,6 +19,7 @@
     "./src/*": "./src/*"
   },
   "scripts": {
+    "postinstall": "node scripts/hypercore-stallfix/apply.mjs",
     "peer:run": "node scripts/run-peer.mjs",
     "peer:run-rpc": "node scripts/run-peer.mjs --rpc",
     "peer:smoke": "node scripts/smoke-msb-sync.mjs",

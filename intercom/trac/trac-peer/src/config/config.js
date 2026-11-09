@@ -82,6 +82,13 @@ export class Config {
         }
         this.subnetStallTimeout = subnetStallTimeout;
 
+        const reconnectRaw = this.#select("subnetReconnectTimeout", options, defaults);
+        const subnetReconnectTimeout = reconnectRaw === undefined ? 600000 : reconnectRaw;
+        if (!Number.isSafeInteger(subnetReconnectTimeout) || subnetReconnectTimeout < 0) {
+            throw new Error("Peer: subnetReconnectTimeout must be a non-negative safe integer.");
+        }
+        this.subnetReconnectTimeout = subnetReconnectTimeout;
+
         const maxMsbApplyOperationBytes = this.#select("maxMsbApplyOperationBytes", options, defaults);
         if (!Number.isSafeInteger(maxMsbApplyOperationBytes)) {
             throw new Error("Peer: maxMsbApplyOperationBytes must be a safe integer.");

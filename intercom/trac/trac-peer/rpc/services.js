@@ -42,6 +42,7 @@ export async function getStatus(peer) {
       networkId: peer.msbClient.networkId,
       signedLength: peer.msbClient.getSignedLength()
     },
+    replication: typeof peer.replicationStatus === "function" ? peer.replicationStatus() : null,
   };
 }
 

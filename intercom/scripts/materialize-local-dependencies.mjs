@@ -8,6 +8,7 @@ export const LOCAL_PACKAGE_RUNTIME_PATHS = Object.freeze({
   'trac-msb': Object.freeze([
     'package.json',
     'msb.mjs',
+    'scripts/hypercore-stallfix',
     'migration',
     'proto',
     'rpc',
@@ -18,6 +19,7 @@ export const LOCAL_PACKAGE_RUNTIME_PATHS = Object.freeze({
     'package.json',
     'rpc',
     'scripts/run-peer.mjs',
+    'scripts/hypercore-stallfix',
     'src',
   ]),
 });
