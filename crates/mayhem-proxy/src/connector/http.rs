@@ -26,6 +26,10 @@ use std::{
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use url::Url;
 
+// Failure-only terminal observation. These bounds do not limit healthy requests.
+pub(crate) const FAILURE_OBSERVATION_BYTES: usize = 512 * 1024;
+pub(crate) const FAILURE_OBSERVATION_TIME: Duration = Duration::from_secs(2);
+
 /// Parent-owned lifecycle observation, never supplied by a decoder or vendor
 /// error message. Used only for synchronous execution, not background jobs.
 #[derive(Default)]
@@ -78,6 +82,135 @@ impl Resolve for SystemDns {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    async fn oversized_fixture(
+        body: Vec<u8>,
+        mime: &str,
+        chunked: bool,
+        close: bool,
+    ) -> (HttpConnection, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1/", listener.local_addr().unwrap());
+        let length = if chunked {
+            "Transfer-Encoding: chunked".to_owned()
+        } else {
+            format!("Content-Length: {}", body.len() + usize::from(!close))
+        };
+        let header = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: {mime}\r\n{length}\r\nConnection: close\r\n\r\n"
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buffer = [0; 4096];
+            socket.read(&mut buffer).await.unwrap();
+            if socket.write_all(header.as_bytes()).await.is_err() {
+                return;
+            }
+            if chunked {
+                for bytes in body.chunks(128) {
+                    if socket
+                        .write_all(format!("{:x}\r\n", bytes.len()).as_bytes())
+                        .await
+                        .is_err()
+                        || socket.write_all(bytes).await.is_err()
+                        || socket.write_all(b"\r\n").await.is_err()
+                    {
+                        return;
+                    }
+                }
+                if close {
+                    let _ = socket.write_all(b"0\r\n\r\n").await;
+                }
+            } else {
+                let _ = socket.write_all(&body).await;
+            }
+            if !close {
+                let _ = socket.read(&mut buffer).await;
+            }
+        });
+        let config = serde_json::from_value(
+            serde_json::json!({"schema_version":1,"id":"fixture","revision":1,"base_url":base,
+            "network":{"mode":"pinned","networks":["127.0.0.1/32"],"allow_http":true},
+            "paths":{"chat_completions":"chat/completions"},"limits":{"max_response_bytes":64}}),
+        )
+        .unwrap();
+        (HttpConnection::new(config).unwrap(), server)
+    }
+    #[tokio::test]
+    async fn oversized_transport_retains_terminal_proof_but_never_accepts_output() {
+        for chunked in [false, true] {
+            for mime in ["application/json", "text/event-stream"] {
+                let body = if mime == "application/json" {
+                    format!("{{\"text\":\"{}\"}}", "x".repeat(2048)).into_bytes()
+                } else {
+                    format!("data: {}\n\ndata: [DONE]\n\n", "x".repeat(2048)).into_bytes()
+                };
+                let (connection, server) = oversized_fixture(body, mime, chunked, true).await;
+                let completion = Arc::new(Completion::default());
+                let error = match connection
+                    .send_observed(
+                        Operation::ChatCompletions,
+                        Some(b"{}".to_vec()),
+                        Some(completion.clone()),
+                    )
+                    .await
+                {
+                    Err(error) => error,
+                    Ok(mut response) => loop {
+                        match response.next_chunk().await {
+                            Err(error) => break error,
+                            Ok(Some(_)) => (),
+                            Ok(None) => panic!("oversized output accepted"),
+                        }
+                    },
+                };
+                assert_eq!(error.code, Code::ResponseTooLarge);
+                assert_eq!(error.execution, Execution::Unknown);
+                assert!(completion.observed(), "{mime} chunked={chunked}");
+                assert_eq!(connection.permits.available_permits(), 2);
+                server.await.unwrap();
+            }
+        }
+    }
+    #[tokio::test]
+    async fn failed_tail_observation_obeys_time_and_byte_bounds_without_false_completion() {
+        for huge in [false, true] {
+            let body = if huge {
+                format!(
+                    "data: {}\n\ndata: [DONE]\n\n",
+                    "x".repeat(FAILURE_OBSERVATION_BYTES + 1000)
+                )
+                .into_bytes()
+            } else {
+                b"data: unfinished".repeat(8)
+            };
+            let (connection, server) =
+                oversized_fixture(body, "text/event-stream", false, false).await;
+            let completion = Arc::new(Completion::default());
+            let start = tokio::time::Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(4),
+                connection.send_observed(
+                    Operation::ChatCompletions,
+                    Some(b"{}".to_vec()),
+                    Some(completion.clone()),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.unwrap_err().code, Code::ResponseTooLarge);
+            assert!(!completion.observed());
+            if !huge {
+                assert!(start.elapsed() >= FAILURE_OBSERVATION_TIME);
+            }
+            assert_eq!(connection.permits.available_permits(), 2);
+            server.abort();
+        }
+    }
     #[tokio::test(start_paused = true)]
     async fn slicing_one_buffered_body_does_not_create_new_timing_evidence() {
         let at = tokio::time::Instant::now();
@@ -93,6 +226,7 @@ mod tests {
             format: WireFormat::Sse,
             error_profile: ErrorProfile::HttpStatus,
             completion: None,
+            sse_terminal: None,
         };
         let mut total = 0;
         while let Some((bytes, observed)) = response.next_timed_chunk().await.unwrap() {
@@ -362,19 +496,9 @@ impl HttpConnection {
             )
             .await);
         }
-        if response
+        let oversized = response
             .content_length()
-            .is_some_and(|n| n > self.limits.max_response_bytes as u64)
-        {
-            let mut error = Failure::new(
-                Code::ResponseTooLarge,
-                Scope::Model,
-                Stage::ResponseHeaders,
-                Execution::Unknown,
-            );
-            error.upstream_status = Some(status);
-            return Err(error);
-        }
+            .is_some_and(|n| n > self.limits.max_response_bytes as u64);
         let format = response
             .headers()
             .get(CONTENT_TYPE)
@@ -387,7 +511,16 @@ impl HttpConnection {
             Some("application/x-ndjson" | "application/ndjson") => WireFormat::Ndjson,
             _ => WireFormat::Unknown,
         };
-        Ok(UpstreamResponse {
+        let sse_terminal = (completion.is_some()
+            && status == 200
+            && format == WireFormat::Sse
+            && matches!(
+                operation,
+                Operation::ChatCompletions | Operation::Completions
+            ))
+        .then(super::terminal::SseTerminal::default);
+        let observed = status == 200 && (format == WireFormat::Json || sse_terminal.is_some());
+        let mut response = UpstreamResponse {
             response: Some(response),
             permit: Some(permit),
             pending: Bytes::new(),
@@ -400,12 +533,16 @@ impl HttpConnection {
             error_profile: self.error_profile,
             // HTTP 202 transfers execution to a background job; EOF cannot
             // establish completion even on a misconfigured synchronous route.
-            completion: if status == 200 && format == WireFormat::Json {
-                completion
-            } else {
-                None
-            },
-        })
+            completion: if observed { completion } else { None },
+            sse_terminal,
+        };
+        if oversized {
+            response.observe_failed_execution().await;
+            let mut error = response.fail(Code::ResponseTooLarge);
+            error.stage = Stage::ResponseHeaders;
+            return Err(error);
+        }
+        Ok(response)
     }
 }
 
@@ -493,6 +630,7 @@ pub struct UpstreamResponse {
     pub format: WireFormat,
     error_profile: ErrorProfile,
     completion: Option<Arc<Completion>>,
+    sse_terminal: Option<super::terminal::SseTerminal>,
 }
 
 impl fmt::Debug for UpstreamResponse {
@@ -505,6 +643,59 @@ impl fmt::Debug for UpstreamResponse {
 }
 
 impl UpstreamResponse {
+    pub(crate) fn completion_observer(&self) -> Option<Arc<Completion>> {
+        self.completion.clone()
+    }
+    fn observe_chunk(&mut self, bytes: &[u8]) {
+        if self.sse_terminal.as_mut().is_some_and(|s| s.push(bytes)) {
+            if let Some(completion) = &self.completion {
+                completion.mark();
+            }
+        }
+    }
+
+    /// Read only a bounded tail after failure. Retain the original error and
+    /// financial uncertainty. A timeout/disconnect/partial marker proves nothing.
+    pub(crate) async fn observe_failed_execution(&mut self) {
+        self.observe_failed_tail(None).await;
+    }
+
+    async fn observe_failed_tail(&mut self, mut first: Option<Bytes>) {
+        let Some(completion) = self.completion.clone() else {
+            return;
+        };
+        let _ = tokio::time::timeout(FAILURE_OBSERVATION_TIME, async {
+            let mut remaining = FAILURE_OBSERVATION_BYTES;
+            while !completion.observed() && remaining > 0 {
+                let chunk = if let Some(bytes) = first.take() {
+                    Ok(Some(bytes))
+                } else if let Some(response) = self.response.as_mut() {
+                    response.chunk().await
+                } else {
+                    break;
+                };
+                match chunk {
+                    Ok(Some(bytes)) => {
+                        let used = bytes.len().min(remaining);
+                        self.observe_chunk(&bytes[..used]);
+                        remaining -= used;
+                        if bytes.len() > used {
+                            break;
+                        }
+                    }
+                    Ok(None) => {
+                        if self.format == WireFormat::Json {
+                            completion.mark();
+                        }
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+        })
+        .await;
+    }
+
     fn fail(&mut self, code: Code) -> Failure {
         self.response = None;
         self.pending = Bytes::new();
@@ -560,13 +751,19 @@ impl UpstreamResponse {
                         self.received_at = tokio::time::Instant::now();
                     }
                     if chunk.len() > self.max_bytes.saturating_sub(self.received_bytes) {
+                        self.observe_failed_tail(Some(chunk)).await;
                         return Err(self.fail(Code::ResponseTooLarge));
                     }
+                    self.observe_chunk(&chunk);
                     self.received_bytes += chunk.len();
                     self.pending = chunk;
                 }
                 Ok(None) => {
-                    if let Some(completion) = &self.completion {
+                    if let Some(completion) = self
+                        .completion
+                        .as_ref()
+                        .filter(|_| self.format == WireFormat::Json)
+                    {
                         completion.mark();
                     }
                     self.response = None;

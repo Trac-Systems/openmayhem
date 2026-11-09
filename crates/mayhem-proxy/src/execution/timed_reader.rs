@@ -10,13 +10,16 @@ type Piece = std::result::Result<Option<(Bytes, Instant)>, Failure>;
 pub(super) struct Reader {
     direct: Option<UpstreamResponse>,
     measured: Option<(mpsc::Receiver<Piece>, JoinHandle<()>)>,
+    completion: Option<Arc<crate::connector::http::Completion>>,
 }
 impl Reader {
     pub fn new(mut response: UpstreamResponse, blocked: Option<Arc<AtomicBool>>) -> Self {
+        let completion = response.completion_observer();
         let Some(blocked) = blocked else {
             return Self {
                 direct: Some(response),
                 measured: None,
+                completion,
             };
         };
         let (tx, rx) = mpsc::channel(8);
@@ -44,6 +47,7 @@ impl Reader {
         Self {
             direct: None,
             measured: Some((rx, task)),
+            completion,
         }
     }
     pub async fn next(&mut self) -> Result<Option<(Bytes, Instant)>> {
@@ -55,6 +59,28 @@ impl Reader {
             .await
             .ok_or(Error::TransportWorker)?
             .map_err(Error::Upstream)
+    }
+    pub async fn observe_failed_execution(&mut self) {
+        use crate::connector::http::{FAILURE_OBSERVATION_BYTES, FAILURE_OBSERVATION_TIME};
+        if let Some(response) = &mut self.direct {
+            response.observe_failed_execution().await;
+            return;
+        }
+        let Some(completion) = self.completion.clone() else {
+            return;
+        };
+        // The owned reader observes terminal framing before sending a chunk.
+        // Consume only a bounded tail, and never start another HTTP request.
+        let _ = tokio::time::timeout(FAILURE_OBSERVATION_TIME, async {
+            let mut remaining = FAILURE_OBSERVATION_BYTES;
+            while remaining > 0 && !completion.observed() {
+                match self.next().await {
+                    Ok(Some((bytes, _))) => remaining = remaining.saturating_sub(bytes.len()),
+                    _ => break,
+                }
+            }
+        })
+        .await;
     }
 }
 impl Drop for Reader {

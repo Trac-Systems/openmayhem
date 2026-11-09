@@ -151,7 +151,12 @@ impl Transport<'_> {
                 }
             });
             if let Err(error) = pushed {
+                response.observe_failed_execution().await;
                 return Err(error);
+            }
+            if decode_failure.is_some() && self.completion.is_some() {
+                response.observe_failed_execution().await;
+                break;
             }
             if stream.is_done()
                 || (decode_failure.is_some()
@@ -267,6 +272,10 @@ impl Transport<'_> {
                 .await
             {
                 decode_failure = Some(error);
+                if self.completion.is_some() {
+                    response.observe_failed_execution().await;
+                    break;
+                }
             }
         }
         if let Some(error) = decode_failure {

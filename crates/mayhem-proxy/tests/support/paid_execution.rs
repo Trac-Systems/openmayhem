@@ -346,6 +346,17 @@ impl Paid {
         profile: &str,
     ) -> Self {
         let f = Fixture::with_profile(base, endpoint, 128 * 1024 * 1024, profile);
+        Self::start_fixture(f, rail, bytes, streaming, policy, publish, scoped).await
+    }
+    async fn start_fixture(
+        f: Fixture,
+        rail: ProxyRail,
+        bytes: &[u8],
+        streaming: bool,
+        policy: Option<Value>,
+        publish: bool,
+        scoped: bool,
+    ) -> Self {
         let mut peer = Peer::start(rail, &f, bytes, streaming, policy).await;
         let invocation = if scoped {
             mayhem_proxy::exchange::invocation(&peer.template).unwrap()

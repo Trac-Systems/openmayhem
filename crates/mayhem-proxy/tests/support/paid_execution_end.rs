@@ -1,6 +1,154 @@
 use super::*;
 
 #[tokio::test]
+async fn oversized_complete_output_releases_only_capacity_on_all_rails_and_survives_restart() {
+    for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {
+        for streaming in [false, true] {
+            for transport_limit in [false, true] {
+                let content = "x".repeat(4096);
+                let body = if streaming {
+                    sse(&[delta(&content, Value::Null)], true)
+                } else {
+                    serde_json::to_vec(&json!({"oversized":content})).unwrap()
+                };
+                let b = backend_raw(
+                    200,
+                    body,
+                    if streaming {
+                        "text/event-stream"
+                    } else {
+                        "application/json"
+                    },
+                    Duration::ZERO,
+                )
+                .await;
+                let mut config: ConnectionConfig = serde_json::from_value(json!({"schema_version":1,"id":"fixture","revision":1,"base_url":b.base,"network":{"mode":"pinned","networks":["127.0.0.1/32"],"allow_http":true},"paths":{"chat_completions":"chat/completions"},"error_profile":"open_ai"})).unwrap();
+                if transport_limit {
+                    config.limits.max_response_bytes = 1024;
+                }
+                let f = Fixture::with_connection_limits(
+                    config,
+                    ProxyEndpoint::Chat,
+                    128 * 1024 * 1024,
+                    "upstream-model".into(),
+                    Limits {
+                        request_bytes: 1024 * 1024,
+                        response_bytes: 1024,
+                        choices: 8,
+                        tools: 16,
+                        questions: 16,
+                        decision_options: 32,
+                    },
+                );
+                let bytes = if streaming { stream_request() } else { chat() };
+                let mut p =
+                    Paid::start_fixture(f, rail, &bytes, streaming, None, false, false).await;
+                let publications = p.peer.command("status").await["publications"].clone();
+                let binding = p.record.binding.clone();
+                let result = if streaming {
+                    p.executor
+                        .execute_stream(
+                            &p.record.invocation,
+                            &bytes,
+                            &Cancellation::default(),
+                            |_| async { Ok(()) },
+                        )
+                        .await
+                } else {
+                    p.executor
+                        .execute_json(&p.record.invocation, &bytes, &Cancellation::default())
+                        .await
+                };
+                assert!(result.is_err(), "oversized output must remain an error");
+                let saved = p
+                    .journal
+                    .recover(&p.record.invocation, p.record.attempt)
+                    .unwrap();
+                assert!(
+                    saved.record.execution_ended.is_some(),
+                    "{rail:?} streaming={streaming} transport={transport_limit}"
+                );
+                assert_eq!(saved.record.binding, binding);
+                assert_eq!(saved.record.phase, Phase::Dispatched);
+                assert!(
+                    saved.result.is_none()
+                        && saved.record.resolution.is_none()
+                        && saved.record.closure.is_none()
+                );
+                assert!(p.authority.lease(&p.lease).unwrap().is_none());
+                assert!(!p
+                    .peer
+                    .client
+                    .observe(&p.authorization)
+                    .await
+                    .unwrap()
+                    .is_closed());
+                assert_eq!(p.peer.command("status").await["publications"], publications);
+                let mut p = p.reopen();
+                assert!(!p
+                    .executor
+                    .resume_saved_for_test(&p.record.invocation, p.record.attempt)
+                    .await
+                    .unwrap());
+                assert!(p.authority.lease(&p.lease).unwrap().is_none());
+                assert_eq!(p.peer.command("status").await["publications"], publications);
+                assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+                p.peer.stop().await;
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn oversized_stream_without_terminal_evidence_keeps_capacity_and_finances_unresolved() {
+    for tail in ["", "data: [DONE]\n", "data: text\ndata: [DONE]\n\n"] {
+        let body = format!("data: {}\n\n{tail}", "x".repeat(4096)).into_bytes();
+        let b = backend_raw(200, body, "text/event-stream", Duration::ZERO).await;
+        let mut config: ConnectionConfig = serde_json::from_value(json!({"schema_version":1,"id":"fixture","revision":1,"base_url":b.base,"network":{"mode":"pinned","networks":["127.0.0.1/32"],"allow_http":true},"paths":{"chat_completions":"chat/completions"},"error_profile":"open_ai"})).unwrap();
+        config.limits.max_response_bytes = 1024;
+        let f = Fixture::with_connection_limits(
+            config,
+            ProxyEndpoint::Chat,
+            128 * 1024 * 1024,
+            "upstream-model".into(),
+            Limits {
+                request_bytes: 1024 * 1024,
+                response_bytes: 1024,
+                choices: 8,
+                tools: 16,
+                questions: 16,
+                decision_options: 32,
+            },
+        );
+        let bytes = stream_request();
+        let p = Paid::start_fixture(f, ProxyRail::Tap, &bytes, true, None, false, false).await;
+        assert!(p
+            .executor
+            .execute_stream(
+                &p.record.invocation,
+                &bytes,
+                &Cancellation::default(),
+                |_| async { Ok(()) }
+            )
+            .await
+            .is_err());
+        let saved = p
+            .journal
+            .recover(&p.record.invocation, p.record.attempt)
+            .unwrap();
+        assert!(saved.record.execution_ended.is_none());
+        assert!(p.authority.lease(&p.lease).unwrap().is_some());
+        assert!(
+            saved.result.is_none()
+                && saved.record.resolution.is_none()
+                && saved.record.closure.is_none()
+        );
+        assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+        p.peer.stop().await;
+    }
+}
+
+#[tokio::test]
 async fn failed_complete_responses_release_capacity_on_every_rail_without_billing_or_redispatch() {
     let invalid_stream = sse(
         &[json!({"choices":[{"index":9,"delta":{"content":"invalid"}}]})],
