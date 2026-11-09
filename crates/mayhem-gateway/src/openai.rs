@@ -26039,6 +26039,13 @@ async fn refresh_model_after_price_refusal(
     deadline: RouteWaitDeadline,
     retry_delay: Duration,
 ) -> Result<GatewayModel, ApiError> {
+    // The provider refused before spend and its terms are not usable yet.
+    // Other requests may use a different eligible route while this caller
+    // waits for ledger evidence. Route selection resumes the ticket only after
+    // refreshing its eligibility; preserve its cancellation and deadline.
+    if let Some(ticket) = &invocation.admission_ticket {
+        ticket.pause();
+    }
     if invocation
         .client_cancellation
         .as_ref()
@@ -58788,6 +58795,36 @@ mod tests {
         assert_ne!(error.public_code, "no_provider_within_price_band");
         assert_eq!(backend.attempts.lock().unwrap().len(), 2);
         assert_eq!(state.receipts().len(), 1, "retain already billed partial evidence");
+    }
+
+    #[tokio::test]
+    async fn price_refresh_wait_does_not_block_other_admission_tickets() {
+        for runner in FocusedRouteRunner::ALL {
+            let model = focused_route_runner_model(runner, 1);
+            let backend = price_transition_backend(model.mayhem.price_ref_au.ver + 1);
+            let state = test_gateway_state_from_models(vec![model.clone()])
+                .with_session_backend(backend);
+            let cancellation = GatewayRequestCancellation::new();
+            let options = GatewayRequestOptions {
+                client_cancellation: Some(cancellation.clone()),
+                max_wait_ms: 5_000,
+                ..GatewayRequestOptions::default()
+            };
+            let run = run_focused_route_runner(runner, &state, &model, options);
+            let observe = async {
+                state.wait_for_catalog_refresh_request().await;
+                let route = route_key(&model.mayhem.route_candidates[0]);
+                let next = state.admission_queue.register(BTreeSet::from([route.clone()])).unwrap();
+                assert!(next.can_attempt(&route), "{runner:?}: price synchronization must not hold FIFO priority");
+                cancellation.cancel();
+            };
+            let (result, _) = tokio::time::timeout(Duration::from_secs(6), async {
+                tokio::join!(run, observe)
+            }).await.unwrap();
+            assert_eq!(result.err().expect("cancelled price refresh").status, StatusCode::from_u16(499).unwrap());
+            assert_eq!(state.admission_queue.request_count(), 0);
+            assert!(state.receipts().is_empty());
+        }
     }
 
     #[tokio::test]
