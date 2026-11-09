@@ -141,6 +141,7 @@ use tower::limit::ConcurrencyLimitLayer;
 
 type SharedState = Arc<GatewayState>;
 
+mod admission_queue;
 #[cfg(test)]
 mod durable_streaming_tests;
 #[cfg(test)]
@@ -340,6 +341,7 @@ pub struct GatewayState {
     modality_admission: Arc<Mutex<BTreeMap<(ProviderKey, String), u32>>>,
     modality_admission_generation: Arc<AtomicU64>,
     modality_admission_notify: Arc<Notify>,
+    admission_queue: Arc<admission_queue::AdmissionQueue>,
     provider_cooloffs: Arc<Mutex<BTreeMap<ProviderKey, u64>>>,
     chat_affinity: Arc<Mutex<BTreeMap<ChatAffinityKey, ProviderKey>>>,
     preferred_providers: Arc<Mutex<BTreeMap<String, Vec<String>>>>,
@@ -688,6 +690,7 @@ struct GatewayModalityAdmissionGuard {
     generation: Arc<AtomicU64>,
     notify: Arc<Notify>,
     reservations: Vec<(ProviderKey, String, u32)>,
+    route_lease: Option<admission_queue::Lease>,
 }
 
 #[derive(Debug)]
@@ -4765,6 +4768,7 @@ pub struct GatewaySessionInvocation {
     pub access_token: Option<GatewayTokenAttribution>,
     pub expected_execution_mode: Option<ExecutionModeBinding>,
     selected_route_key: Option<ProviderKey>,
+    admission_ticket: Option<admission_queue::Handle>,
     execution_mode_canary: Option<GatewayCanaryModelConfig>,
     verified_attestation_evidence: Arc<Mutex<Option<VerifiedAttestation>>>,
     client_cancellation: Option<GatewayRequestCancellation>,
@@ -5272,6 +5276,8 @@ impl GatewayState {
             eprintln!("Invalid gateway media limit during state construction: {err}");
             GatewayMediaLimits::default()
         });
+        let admission_generation = Arc::new(AtomicU64::new(0));
+        let admission_notify = Arc::new(Notify::new());
         Self {
             catalog_runtime: Arc::new(Mutex::new(GatewayCatalogRuntime {
                 models: Arc::new(models),
@@ -5322,8 +5328,12 @@ impl GatewayState {
             provider_load_progress_dir: Arc::new(None),
             provider_table: Arc::new(Mutex::new(provider_table)),
             modality_admission: Arc::new(Mutex::new(BTreeMap::new())),
-            modality_admission_generation: Arc::new(AtomicU64::new(0)),
-            modality_admission_notify: Arc::new(Notify::new()),
+            modality_admission_generation: Arc::clone(&admission_generation),
+            modality_admission_notify: Arc::clone(&admission_notify),
+            admission_queue: admission_queue::AdmissionQueue::new(
+                admission_generation,
+                admission_notify,
+            ),
             provider_cooloffs: Arc::new(Mutex::new(BTreeMap::new())),
             chat_affinity: Arc::new(Mutex::new(BTreeMap::new())),
             preferred_providers: Arc::new(Mutex::new(BTreeMap::new())),
@@ -10329,7 +10339,7 @@ async fn retrieve_gateway_job(
     if let Err(err) = authorize_gateway_job(&state, &headers, &job) {
         return err.into_response();
     }
-    gateway_job_lookup_response(job)
+    gateway_job_lookup_response(&state, job)
 }
 
 fn durable_streaming_endpoint_family(family: &str) -> bool {
@@ -10409,10 +10419,10 @@ async fn lookup_gateway_job_by_key(
     if authorize_gateway_job(&state, &headers, &job).is_err() {
         return ApiError::not_found("gateway job was not found", Some("job_id")).into_response();
     }
-    gateway_job_lookup_response(job)
+    gateway_job_lookup_response(&state, job)
 }
 
-fn gateway_job_lookup_response(job: GatewayJobLookup) -> Response {
+fn gateway_job_lookup_response(state: &GatewayState, job: GatewayJobLookup) -> Response {
     let status = if matches!(job, GatewayJobLookup::InProgress { .. })
         || matches!(
             &job,
@@ -10423,7 +10433,16 @@ fn gateway_job_lookup_response(job: GatewayJobLookup) -> Response {
     } else {
         StatusCode::OK
     };
-    let mut response = (status, Json(gateway_job_lookup_metadata(&job))).into_response();
+    let mut metadata = gateway_job_lookup_metadata(&job);
+    if matches!(job, GatewayJobLookup::InProgress { .. }) {
+        if let Some(admission) = state
+            .admission_queue
+            .job_status(gateway_job_lookup_id(&job))
+        {
+            metadata["admission"] = admission;
+        }
+    }
+    let mut response = (status, Json(metadata)).into_response();
     attach_gateway_job_headers(&mut response, gateway_job_lookup_id(&job));
     response
 }
@@ -14736,7 +14755,15 @@ impl GatewayBillingContext {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+struct QueuedAdmission {
+    ticket: admission_queue::Ticket,
+    requirements: RequestRequirements,
+    warm_preference: Option<(ProviderKey, Instant)>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 struct GatewayRequestOptions {
+    queued_admission: Option<QueuedAdmission>,
     hedge_requested: bool,
     min_att_tier: Option<u8>,
     max_price_au: Option<MoneyAu>,
@@ -14765,6 +14792,7 @@ enum GatewayExecutionModeExpectation {
 impl Default for GatewayRequestOptions {
     fn default() -> Self {
         Self {
+            queued_admission: None,
             hedge_requested: false,
             min_att_tier: None,
             max_price_au: None,
@@ -16625,6 +16653,7 @@ fn request_scoped_api_error(error: &GatewaySessionError) -> Option<ApiError> {
 impl GatewayRequestOptions {
     fn from_headers(headers: &HeaderMap) -> Result<Self, ApiError> {
         Ok(Self {
+            queued_admission: None,
             hedge_requested: parse_x_mayhem_hedge(headers)?,
             min_att_tier: parse_x_mayhem_min_att_tier(headers)?,
             max_price_au: parse_x_mayhem_max_price_au(headers)?,
@@ -24227,6 +24256,7 @@ async fn run_embedding_with_route_retry(
             DEFAULT_EMBEDDING_INPUT_TOKENS_FLOOR_PER_S,
         ),
     );
+    let options = queued_admission_options(state, model, options, &requirements)?;
     let eligible_routes = ordered_route_candidates_for_embedding_with_options(
         state,
         model,
@@ -24306,6 +24336,7 @@ async fn run_embedding_with_route_retry(
             pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
+                options.client_cancellation.as_ref(),
                 || {
                     ordered_route_candidates_for_embedding_with_options(
                         state,
@@ -24320,7 +24351,7 @@ async fn run_embedding_with_route_retry(
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
-            .await;
+            .await?;
         }
         let owned_route = pending_routes.first().cloned();
         let route = owned_route.as_ref();
@@ -24330,24 +24361,26 @@ async fn run_embedding_with_route_retry(
         {
             break;
         }
-        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
-            Ok(admission) => admission,
-            Err(err) => {
-                last_retryable_error =
-                    Some(recovery.record_modality_admission_error(state, route, err));
-                pending_routes = ordered_route_candidates_for_embedding_with_options(
-                    state,
-                    model,
-                    Some(request),
-                    inputs,
-                    &attempt_options,
-                )
-                .into_iter()
-                .cloned()
-                .collect();
-                continue;
-            }
-        };
+        check_admission_cancellation(options.client_cancellation.as_ref())?;
+        let _modality_admission =
+            match state.try_acquire_queued_admission(route, &requirements, &options) {
+                Ok(admission) => admission,
+                Err(err) => {
+                    last_retryable_error =
+                        Some(recovery.record_modality_admission_error(state, route, err));
+                    pending_routes = ordered_route_candidates_for_embedding_with_options(
+                        state,
+                        model,
+                        Some(request),
+                        inputs,
+                        &attempt_options,
+                    )
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                    continue;
+                }
+            };
         let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
         let mut invocation = state.prepare_embedding_invocation_for_route(
@@ -24420,6 +24453,10 @@ async fn run_embedding_with_route_retry(
                 let balance_refusal = terminal_balance_refusal(&err);
                 let payment_pending =
                     route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if balance_refusal.is_some() || payment_pending {
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.pause(); }
+                    drop(_modality_admission);
+                }
                 if (balance_refusal.is_some() || payment_pending)
                     && wait_for_pending_receipt_settlement(
                         state.receipt_settlement_publisher.as_ref().as_ref(),
@@ -24432,6 +24469,7 @@ async fn run_embedding_with_route_retry(
                     recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
                     billing = billing.after_attempt(None);
                     attempt_options.billing = Some(billing.clone());
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.resume(); }
                     continue;
                 }
                 if let Some(refusal) = balance_refusal {
@@ -24484,6 +24522,7 @@ async fn run_image_generation_with_route_retry(
         options.max_price_au,
         state.throughput_floor_for_model(model, &options, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S),
     );
+    let options = queued_admission_options(state, model, options, &requirements)?;
     let eligible_routes =
         ordered_route_candidates_for_image_generation_with_options(state, model, request, &options);
     let RouteWaitOutcome {
@@ -24554,6 +24593,7 @@ async fn run_image_generation_with_route_retry(
             pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
+                options.client_cancellation.as_ref(),
                 || {
                     ordered_route_candidates_for_image_generation_with_options(
                         state,
@@ -24567,7 +24607,7 @@ async fn run_image_generation_with_route_retry(
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
-            .await;
+            .await?;
         }
         let owned_route = pending_routes.first().cloned();
         let route = owned_route.as_ref();
@@ -24577,23 +24617,25 @@ async fn run_image_generation_with_route_retry(
         {
             break;
         }
-        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
-            Ok(admission) => admission,
-            Err(err) => {
-                last_retryable_error =
-                    Some(recovery.record_modality_admission_error(state, route, err));
-                pending_routes = ordered_route_candidates_for_image_generation_with_options(
-                    state,
-                    model,
-                    request,
-                    &attempt_options,
-                )
-                .into_iter()
-                .cloned()
-                .collect();
-                continue;
-            }
-        };
+        check_admission_cancellation(options.client_cancellation.as_ref())?;
+        let _modality_admission =
+            match state.try_acquire_queued_admission(route, &requirements, &options) {
+                Ok(admission) => admission,
+                Err(err) => {
+                    last_retryable_error =
+                        Some(recovery.record_modality_admission_error(state, route, err));
+                    pending_routes = ordered_route_candidates_for_image_generation_with_options(
+                        state,
+                        model,
+                        request,
+                        &attempt_options,
+                    )
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                    continue;
+                }
+            };
         let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
         let mut invocation = state.prepare_image_generation_invocation_for_route(
@@ -24668,6 +24710,10 @@ async fn run_image_generation_with_route_retry(
                 let balance_refusal = terminal_balance_refusal(&err);
                 let payment_pending =
                     route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if balance_refusal.is_some() || payment_pending {
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.pause(); }
+                    drop(_modality_admission);
+                }
                 if (balance_refusal.is_some() || payment_pending)
                     && wait_for_pending_receipt_settlement(
                         state.receipt_settlement_publisher.as_ref().as_ref(),
@@ -24680,6 +24726,7 @@ async fn run_image_generation_with_route_retry(
                     recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
                     billing = billing.after_attempt(None);
                     attempt_options.billing = Some(billing.clone());
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.resume(); }
                     continue;
                 }
                 if let Some(refusal) = balance_refusal {
@@ -24731,6 +24778,7 @@ async fn run_audio_speech_with_route_retry(
         options.max_price_au,
         state.throughput_floor_for_model(model, &options, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR),
     );
+    let options = queued_admission_options(state, model, options, &requirements)?;
     let eligible_routes =
         ordered_route_candidates_for_audio_speech_with_options(state, model, request, &options);
     let RouteWaitOutcome {
@@ -24797,6 +24845,7 @@ async fn run_audio_speech_with_route_retry(
             pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
+                options.client_cancellation.as_ref(),
                 || {
                     ordered_route_candidates_for_audio_speech_with_options(
                         state,
@@ -24810,7 +24859,7 @@ async fn run_audio_speech_with_route_retry(
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
-            .await;
+            .await?;
         }
         let owned_route = pending_routes.first().cloned();
         let route = owned_route.as_ref();
@@ -24820,23 +24869,25 @@ async fn run_audio_speech_with_route_retry(
         {
             break;
         }
-        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
-            Ok(admission) => admission,
-            Err(err) => {
-                last_retryable_error =
-                    Some(recovery.record_modality_admission_error(state, route, err));
-                pending_routes = ordered_route_candidates_for_audio_speech_with_options(
-                    state,
-                    model,
-                    request,
-                    &attempt_options,
-                )
-                .into_iter()
-                .cloned()
-                .collect();
-                continue;
-            }
-        };
+        check_admission_cancellation(options.client_cancellation.as_ref())?;
+        let _modality_admission =
+            match state.try_acquire_queued_admission(route, &requirements, &options) {
+                Ok(admission) => admission,
+                Err(err) => {
+                    last_retryable_error =
+                        Some(recovery.record_modality_admission_error(state, route, err));
+                    pending_routes = ordered_route_candidates_for_audio_speech_with_options(
+                        state,
+                        model,
+                        request,
+                        &attempt_options,
+                    )
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                    continue;
+                }
+            };
         let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
         let mut invocation = state.prepare_audio_speech_invocation_for_route(
@@ -24911,6 +24962,10 @@ async fn run_audio_speech_with_route_retry(
                 let balance_refusal = terminal_balance_refusal(&err);
                 let payment_pending =
                     route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if balance_refusal.is_some() || payment_pending {
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.pause(); }
+                    drop(_modality_admission);
+                }
                 if (balance_refusal.is_some() || payment_pending)
                     && wait_for_pending_receipt_settlement(
                         state.receipt_settlement_publisher.as_ref().as_ref(),
@@ -24923,6 +24978,7 @@ async fn run_audio_speech_with_route_retry(
                     recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
                     billing = billing.after_attempt(None);
                     attempt_options.billing = Some(billing.clone());
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.resume(); }
                     continue;
                 }
                 if let Some(refusal) = balance_refusal {
@@ -24973,6 +25029,7 @@ async fn run_audio_transcription_with_route_retry(
         options.max_price_au,
         state.throughput_floor_for_model(model, &options, DEFAULT_AUDIO_REALTIME_FACTOR_FLOOR),
     );
+    let options = queued_admission_options(state, model, options, &requirements)?;
     let eligible_routes = ordered_route_candidates_for_audio_transcription_with_options(
         state, model, request, &options,
     );
@@ -25044,6 +25101,7 @@ async fn run_audio_transcription_with_route_retry(
             pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
+                options.client_cancellation.as_ref(),
                 || {
                     ordered_route_candidates_for_audio_transcription_with_options(
                         state,
@@ -25057,7 +25115,7 @@ async fn run_audio_transcription_with_route_retry(
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
-            .await;
+            .await?;
         }
         let owned_route = pending_routes.first().cloned();
         let route = owned_route.as_ref();
@@ -25067,23 +25125,25 @@ async fn run_audio_transcription_with_route_retry(
         {
             break;
         }
-        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
-            Ok(admission) => admission,
-            Err(err) => {
-                last_retryable_error =
-                    Some(recovery.record_modality_admission_error(state, route, err));
-                pending_routes = ordered_route_candidates_for_audio_transcription_with_options(
-                    state,
-                    model,
-                    request,
-                    &attempt_options,
-                )
-                .into_iter()
-                .cloned()
-                .collect();
-                continue;
-            }
-        };
+        check_admission_cancellation(options.client_cancellation.as_ref())?;
+        let _modality_admission =
+            match state.try_acquire_queued_admission(route, &requirements, &options) {
+                Ok(admission) => admission,
+                Err(err) => {
+                    last_retryable_error =
+                        Some(recovery.record_modality_admission_error(state, route, err));
+                    pending_routes = ordered_route_candidates_for_audio_transcription_with_options(
+                        state,
+                        model,
+                        request,
+                        &attempt_options,
+                    )
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                    continue;
+                }
+            };
         let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
         let mut invocation = state.prepare_audio_transcription_invocation_for_route(
@@ -25158,6 +25218,10 @@ async fn run_audio_transcription_with_route_retry(
                 let balance_refusal = terminal_balance_refusal(&err);
                 let payment_pending =
                     route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if balance_refusal.is_some() || payment_pending {
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.pause(); }
+                    drop(_modality_admission);
+                }
                 if (balance_refusal.is_some() || payment_pending)
                     && wait_for_pending_receipt_settlement(
                         state.receipt_settlement_publisher.as_ref().as_ref(),
@@ -25170,6 +25234,7 @@ async fn run_audio_transcription_with_route_retry(
                     recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
                     billing = billing.after_attempt(None);
                     attempt_options.billing = Some(billing.clone());
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.resume(); }
                     continue;
                 }
                 if let Some(refusal) = balance_refusal {
@@ -25229,6 +25294,7 @@ async fn run_artifact_generation_with_route_retry(
             },
         ),
     );
+    let options = queued_admission_options(state, model, options, &requirements)?;
     let eligible_routes = ordered_route_candidates_for_artifact_generation_with_options(
         state, model, request, &options,
     );
@@ -25300,6 +25366,7 @@ async fn run_artifact_generation_with_route_retry(
             pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
+                options.client_cancellation.as_ref(),
                 || {
                     ordered_route_candidates_for_artifact_generation_with_options(
                         state,
@@ -25313,7 +25380,7 @@ async fn run_artifact_generation_with_route_retry(
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
-            .await;
+            .await?;
         }
         let owned_route = pending_routes.first().cloned();
         let route = owned_route.as_ref();
@@ -25357,24 +25424,28 @@ async fn run_artifact_generation_with_route_retry(
                 },
             ),
         );
-        let _modality_admission =
-            match state.try_acquire_modality_admission(route, &attempt_requirements) {
-                Ok(admission) => admission,
-                Err(err) => {
-                    last_retryable_error =
-                        Some(recovery.record_modality_admission_error(state, route, err));
-                    pending_routes = ordered_route_candidates_for_artifact_generation_with_options(
-                        state,
-                        model,
-                        request,
-                        &attempt_options,
-                    )
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                    continue;
-                }
-            };
+        check_admission_cancellation(options.client_cancellation.as_ref())?;
+        let _modality_admission = match state.try_acquire_queued_admission(
+            route,
+            &attempt_requirements,
+            &attempt_options,
+        ) {
+            Ok(admission) => admission,
+            Err(err) => {
+                last_retryable_error =
+                    Some(recovery.record_modality_admission_error(state, route, err));
+                pending_routes = ordered_route_candidates_for_artifact_generation_with_options(
+                    state,
+                    model,
+                    request,
+                    &attempt_options,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+                continue;
+            }
+        };
         let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
         let mut invocation = state.prepare_artifact_generation_invocation_for_route(
@@ -25448,6 +25519,10 @@ async fn run_artifact_generation_with_route_retry(
                 let balance_refusal = terminal_balance_refusal(&err);
                 let payment_pending =
                     route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if balance_refusal.is_some() || payment_pending {
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.pause(); }
+                    drop(_modality_admission);
+                }
                 if (balance_refusal.is_some() || payment_pending)
                     && wait_for_pending_receipt_settlement(
                         state.receipt_settlement_publisher.as_ref().as_ref(),
@@ -25460,6 +25535,7 @@ async fn run_artifact_generation_with_route_retry(
                     recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
                     billing = billing.after_attempt(None);
                     attempt_options.billing = Some(billing.clone());
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.resume(); }
                     continue;
                 }
                 if let Some(refusal) = balance_refusal {
@@ -25508,6 +25584,40 @@ impl GatewayState {
                 .cloned()
         })
     }
+}
+
+fn order_queued_routes<'a>(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+    routes: Vec<&'a GatewayRouteCandidate>,
+) -> Vec<&'a GatewayRouteCandidate> {
+    let routes = order_strict_preferred_routes(state, model, options, routes);
+    let routes = if let Some(queued) = options.queued_admission.as_ref() {
+        let mut requirements = queued.requirements.clone();
+        requirements.max_price_au = options.max_price_au;
+        if let Some(min_ctx) = options.min_ctx {
+            requirements.min_ctx = requirements.min_ctx.max(min_ctx);
+        }
+        let mut interests = waiting_route_keys(state, model, options, &requirements);
+        if let Some((warm, until)) = &queued.warm_preference {
+            // Do not retain a preference after price, trust, context, health or
+            // customer filters stop permitting it. Other routes remain usable.
+            if Instant::now() < *until && interests.contains(warm) {
+                interests.retain(|key| key == warm);
+            }
+        }
+        if !queued.ticket.update_routes(interests) {
+            return Vec::new();
+        }
+        routes
+            .into_iter()
+            .filter(|route| queued.ticket.can_attempt(&route_key(route)))
+            .collect()
+    } else {
+        routes
+    };
+    routes
 }
 
 fn order_strict_preferred_routes<'a>(
@@ -25978,11 +26088,16 @@ async fn refresh_model_after_price_refusal(
             .generation
             != generation
         {
-            let current = state.models_snapshot().iter()
-                .find(|current| current.id == model.id).cloned()
+            let current = state
+                .models_snapshot()
+                .iter()
+                .find(|current| current.id == model.id)
+                .cloned()
                 .ok_or_else(catalog_price_refresh_error)?;
-            let route = current.mayhem.route_candidates.iter().find(|route|
-                invocation.selected_route_key.as_ref() == Some(&route_key(route)));
+            let route =
+                current.mayhem.route_candidates.iter().find(|route| {
+                    invocation.selected_route_key.as_ref() == Some(&route_key(route))
+                });
             if route_price_ref_au(&current, route).ver == invocation.price_ver {
                 // A successful read can still precede peer catch-up. Do not
                 // burn the route budget in a tight loop on unchanged terms.
@@ -26347,6 +26462,24 @@ struct KnownRouteCooloff {
     until_millis: u64,
 }
 
+fn check_admission_cancellation(
+    cancellation: Option<&GatewayRequestCancellation>,
+) -> Result<(), ApiError> {
+    if cancellation.is_some_and(GatewayRequestCancellation::is_cancelled) {
+        return Err(ApiError::client_closed_request(
+            "request cancelled while waiting for provider admission",
+        ));
+    }
+    Ok(())
+}
+
+async fn admission_cancelled(cancellation: Option<&GatewayRequestCancellation>) {
+    match cancellation {
+        Some(cancellation) => cancellation.cancelled().await,
+        None => std::future::pending::<()>().await,
+    }
+}
+
 async fn wait_for_eligible_routes<'a, F>(
     state: &GatewayState,
     model: &'a GatewayModel,
@@ -26359,6 +26492,7 @@ async fn wait_for_eligible_routes<'a, F>(
 where
     F: FnMut() -> Vec<&'a GatewayRouteCandidate>,
 {
+    check_admission_cancellation(options.client_cancellation.as_ref())?;
     reject_proven_request_capacity_mismatch(state, model, options, requirements)?;
     let started = Instant::now();
     let outcome = wait_for_eligible_routes_with_poll(
@@ -26372,6 +26506,7 @@ where
         Duration::from_millis(ROUTE_WAIT_POLL_MS),
     )
     .await;
+    check_admission_cancellation(options.client_cancellation.as_ref())?;
     if outcome.routes.is_empty() {
         log_route_admission_exclusions(state, model, options, requirements, started.elapsed());
         reject_proven_request_capacity_mismatch(state, model, options, requirements)?;
@@ -26485,10 +26620,28 @@ where
     }
     let mut waited = false;
     while !deadline.remaining().is_zero() {
+        if options
+            .client_cancellation
+            .as_ref()
+            .is_some_and(GatewayRequestCancellation::is_cancelled)
+        {
+            break;
+        }
         waited = true;
+        let notified = state.modality_admission_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        routes = refresh();
+        if !routes.is_empty() {
+            break;
+        }
         let remaining = deadline.remaining();
         let nap = remaining.min(poll_interval.max(Duration::from_millis(1)));
-        tokio::time::sleep(nap).await;
+        tokio::select! {
+            _ = tokio::time::sleep(nap) => {}
+            _ = notified => {}
+            _ = admission_cancelled(options.client_cancellation.as_ref()) => break,
+        }
         routes = refresh();
         if !routes.is_empty() {
             break;
@@ -26530,17 +26683,21 @@ where
 async fn wait_for_owned_capacity_recovery<F>(
     state: &GatewayState,
     recovery: &RouteAdmissionRecovery,
+    cancellation: Option<&GatewayRequestCancellation>,
     mut refresh: F,
     poll_interval: Duration,
-) -> Vec<GatewayRouteCandidate>
+) -> Result<Vec<GatewayRouteCandidate>, ApiError>
 where
     F: FnMut() -> Vec<GatewayRouteCandidate>,
 {
     loop {
+        check_admission_cancellation(cancellation)?;
         let notified = state.modality_admission_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         let routes = recovery.filter_owned_routes(state, refresh());
         if !routes.is_empty() || recovery.deadline.remaining().is_zero() {
-            return routes;
+            return Ok(routes);
         }
         let nap = recovery
             .deadline
@@ -26549,6 +26706,7 @@ where
         tokio::select! {
             _ = tokio::time::sleep(nap) => {}
             _ = notified => {}
+            _ = admission_cancelled(cancellation) => { check_admission_cancellation(cancellation)?; }
         }
     }
 }
@@ -26731,6 +26889,80 @@ fn route_static_filters_have_candidates(
             preferred.as_deref(),
         )
     })
+}
+
+fn waiting_route_keys(
+    state: &GatewayState,
+    model: &GatewayModel,
+    options: &GatewayRequestOptions,
+    requirements: &RequestRequirements,
+) -> BTreeSet<ProviderKey> {
+    let now = now_millis_u64();
+    let preferred = state.preferred_provider_order(model, options);
+    let entries = state
+        .provider_table
+        .lock_recover("provider table")
+        .entries(now)
+        .into_iter()
+        .map(|entry| (entry.key.clone(), entry))
+        .collect::<BTreeMap<_, _>>();
+    let mut requirements = requirements.clone();
+    requirements.now_millis = now;
+    model
+        .mayhem
+        .route_candidates
+        .iter()
+        .filter_map(|route| {
+            let key = route_key(route);
+            let entry = entries.get(&key)?;
+            (route_matches_request_scope(
+                state,
+                model,
+                route,
+                options,
+                &requirements.required_modalities,
+                preferred.as_deref(),
+            ) && !state.route_provider_in_cooloff(route, now)
+                && route_execution_mode_is_eligible(state, route, entry)
+                && crate::provider_table::evaluate_waiting_eligibility(entry, &requirements)
+                    .is_ok())
+            .then_some(key)
+        })
+        .collect()
+}
+
+fn queued_admission_options(
+    state: &GatewayState,
+    model: &GatewayModel,
+    mut options: GatewayRequestOptions,
+    requirements: &RequestRequirements,
+) -> Result<GatewayRequestOptions, ApiError> {
+    check_admission_cancellation(options.client_cancellation.as_ref())?;
+    // A redispatch has its own queue position; the preceding provider may
+    // still be draining its signed receipt. Never reuse its occupied ticket.
+    options.queued_admission = None;
+    if model.mayhem.route_candidates.is_empty() {
+        return Ok(options);
+    }
+    state.refresh_provider_table_routes(model);
+    let routes = waiting_route_keys(state, model, &options, requirements);
+    let ticket = state
+        .admission_queue
+        .register_job(routes, options.job.as_ref().map(|job| job.id.as_str()))
+        .ok_or_else(|| {
+            ApiError::service_unavailable(
+                "provider admission queue is full; retry shortly",
+                Some("model"),
+            )
+            .with_public_error("provider_admission_no_capacity", "provider_admission", true)
+            .with_safe_detail(json!({ "admission_state": "queue_full" }))
+        })?;
+    options.queued_admission = Some(QueuedAdmission {
+        ticket,
+        requirements: requirements.clone(),
+        warm_preference: None,
+    });
+    Ok(options)
 }
 
 /// Reject only when every candidate in the caller's route scope has fresh
@@ -27336,6 +27568,7 @@ async fn prepare_live_direct_chat_session(
         options.min_ctx,
         state.generation_floor_tok_s_for_model(&model, &options),
     );
+    let options = queued_chat_admission_options(&state, &model, &request, options, &requirements)?;
     let eligible_route_refs =
         ordered_route_candidates_for_request_with_options(&state, &model, &request, &options);
     if eligible_route_refs.is_empty() {
@@ -27413,6 +27646,7 @@ async fn prepare_live_direct_chat_session(
             pending_routes = wait_for_owned_capacity_recovery(
                 &state,
                 &recovery,
+                options.client_cancellation.as_ref(),
                 || {
                     ordered_route_candidates_for_request_with_options(
                         &state,
@@ -27426,30 +27660,34 @@ async fn prepare_live_direct_chat_session(
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
-            .await;
+            .await?;
         }
         let route = pending_routes.first().cloned();
         if route.is_none() {
             break;
         }
-        let modality_admission =
-            match state.try_acquire_modality_admission(route.as_ref(), &requirements) {
-                Ok(admission) => admission,
-                Err(err) => {
-                    last_retryable_error =
-                        Some(recovery.record_modality_admission_error(&state, route.as_ref(), err));
-                    pending_routes = ordered_route_candidates_for_request_with_options(
-                        &state,
-                        &model,
-                        &request,
-                        &attempt_options,
-                    )
-                    .into_iter()
-                    .cloned()
-                    .collect();
-                    continue;
-                }
-            };
+        check_admission_cancellation(options.client_cancellation.as_ref())?;
+        let modality_admission = match state.try_acquire_queued_admission(
+            route.as_ref(),
+            &requirements,
+            &attempt_options,
+        ) {
+            Ok(admission) => admission,
+            Err(err) => {
+                last_retryable_error =
+                    Some(recovery.record_modality_admission_error(&state, route.as_ref(), err));
+                pending_routes = ordered_route_candidates_for_request_with_options(
+                    &state,
+                    &model,
+                    &request,
+                    &attempt_options,
+                )
+                .into_iter()
+                .cloned()
+                .collect();
+                continue;
+            }
+        };
         let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route.as_ref());
         let mut invocation = state.prepare_chat_invocation_for_route(
@@ -27526,6 +27764,10 @@ async fn prepare_live_direct_chat_session(
                 let balance_refusal = terminal_balance_refusal(&err);
                 let payment_pending =
                     route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if balance_refusal.is_some() || payment_pending {
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.pause(); }
+                    drop(modality_admission);
+                }
                 if (balance_refusal.is_some() || payment_pending)
                     && wait_for_pending_receipt_settlement(
                         state.receipt_settlement_publisher.as_ref().as_ref(),
@@ -27541,6 +27783,7 @@ async fn prepare_live_direct_chat_session(
                     recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
                     billing = billing.after_attempt(None);
                     attempt_options.billing = Some(billing.clone());
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.resume(); }
                     continue;
                 }
                 if let Some(refusal) = balance_refusal {
@@ -27768,6 +28011,11 @@ async fn send_open_and_validate_session_accept(
         )
     }
     .await;
+    if result.is_ok() {
+        if let (Some(ticket), Some(route)) = (&invocation.admission_ticket, &invocation.selected_route_key) {
+            ticket.provider_accepted(route);
+        }
+    }
     if result.is_err() {
         let _ = close_direct_session_channel(
             bridge,
@@ -28167,6 +28415,7 @@ async fn recover_live_direct_chat_after_retryable(
     )
     .await;
     session.invocation.receipt_recorder.release_reservation();
+    drop(session._modality_admission.take());
 
     let current_billing = GatewayBillingContext {
         billing_id: session.invocation.spend_voucher.body.billing_id.clone(),
@@ -29238,6 +29487,8 @@ async fn run_chat_with_route_retry(
         options.min_ctx,
         state.generation_floor_tok_s_for_model(model, &options),
     );
+    let options =
+        queued_chat_admission_options(state, model, request, options, &initial_requirements)?;
     let eligible_routes =
         ordered_route_candidates_for_request_with_options(state, model, request, &options);
     if eligible_routes.is_empty() {
@@ -29320,6 +29571,7 @@ async fn run_chat_with_route_retry(
             pending_routes = wait_for_owned_capacity_recovery(
                 state,
                 &recovery,
+                options.client_cancellation.as_ref(),
                 || {
                     ordered_route_candidates_for_request_with_options(
                         state,
@@ -29333,7 +29585,7 @@ async fn run_chat_with_route_retry(
                 },
                 Duration::from_millis(ROUTE_WAIT_POLL_MS),
             )
-            .await;
+            .await?;
         }
         let owned_route = pending_routes.first().cloned();
         let route = owned_route.as_ref();
@@ -29362,23 +29614,25 @@ async fn run_chat_with_route_retry(
             attempt_options.min_ctx,
             state.generation_floor_tok_s_for_model(model, &attempt_options),
         );
-        let _modality_admission = match state.try_acquire_modality_admission(route, &requirements) {
-            Ok(admission) => admission,
-            Err(err) => {
-                last_retryable_error =
-                    Some(recovery.record_modality_admission_error(state, route, err));
-                pending_routes = ordered_route_candidates_for_request_with_options(
-                    state,
-                    model,
-                    &attempt_request,
-                    &attempt_options,
-                )
-                .into_iter()
-                .cloned()
-                .collect();
-                continue;
-            }
-        };
+        check_admission_cancellation(options.client_cancellation.as_ref())?;
+        let _modality_admission =
+            match state.try_acquire_queued_admission(route, &requirements, &attempt_options) {
+                Ok(admission) => admission,
+                Err(err) => {
+                    last_retryable_error =
+                        Some(recovery.record_modality_admission_error(state, route, err));
+                    pending_routes = ordered_route_candidates_for_request_with_options(
+                        state,
+                        model,
+                        &attempt_request,
+                        &attempt_options,
+                    )
+                    .into_iter()
+                    .cloned()
+                    .collect();
+                    continue;
+                }
+            };
         let admission_attempt_budget = recovery.admission_attempt_budget(pending_routes.len());
         recovery.begin_attempt(route);
         let mut invocation = state.prepare_chat_invocation_for_route(
@@ -29491,6 +29745,10 @@ async fn run_chat_with_route_retry(
                 let balance_refusal = terminal_balance_refusal(&err);
                 let payment_pending =
                     route_attempt_error_code(Some(&err.message)).0 == "payment_reservation_failed";
+                if balance_refusal.is_some() || payment_pending {
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.pause(); }
+                    drop(_modality_admission);
+                }
                 if (balance_refusal.is_some() || payment_pending)
                     && wait_for_pending_receipt_settlement(
                         state.receipt_settlement_publisher.as_ref().as_ref(),
@@ -29503,6 +29761,7 @@ async fn run_chat_with_route_retry(
                     recovery.total_attempt_limit = recovery.total_attempt_limit.saturating_add(1);
                     billing = billing.after_attempt(None);
                     attempt_options.billing = Some(billing.clone());
+                    if let Some(ticket) = &invocation.admission_ticket { ticket.resume(); }
                     continue;
                 }
                 if let Some(refusal) = balance_refusal {
@@ -29585,7 +29844,7 @@ fn ordered_route_candidates_for_request_with_options<'a>(
         state.generation_floor_tok_s_for_model(model, options),
         seed,
     );
-    order_strict_preferred_routes(state, model, options, routes)
+    order_queued_routes(state, model, options, routes)
 }
 
 fn ordered_route_candidates_for_embedding_with_options<'a>(
@@ -29611,7 +29870,7 @@ fn ordered_route_candidates_for_embedding_with_options<'a>(
         ),
         seed,
     );
-    order_strict_preferred_routes(state, model, options, routes)
+    order_queued_routes(state, model, options, routes)
 }
 
 fn ordered_route_candidates_for_image_generation_with_options<'a>(
@@ -29631,7 +29890,7 @@ fn ordered_route_candidates_for_image_generation_with_options<'a>(
         state.throughput_floor_for_model(model, options, DEFAULT_IMAGE_FLOOR_IMAGES_PER_S),
         seed,
     );
-    order_strict_preferred_routes(state, model, options, routes)
+    order_queued_routes(state, model, options, routes)
 }
 
 fn ordered_route_candidates_for_audio_speech_with_options<'a>(
@@ -29658,7 +29917,7 @@ fn ordered_route_candidates_for_audio_speech_with_options<'a>(
         ),
         now_millis,
     );
-    order_strict_preferred_routes(state, model, options, routes)
+    order_queued_routes(state, model, options, routes)
 }
 
 fn ordered_route_candidates_for_audio_transcription_with_options<'a>(
@@ -29685,7 +29944,7 @@ fn ordered_route_candidates_for_audio_transcription_with_options<'a>(
         ),
         now_millis,
     );
-    order_strict_preferred_routes(state, model, options, routes)
+    order_queued_routes(state, model, options, routes)
 }
 
 fn ordered_route_candidates_for_artifact_generation_with_options<'a>(
@@ -29721,7 +29980,7 @@ fn ordered_route_candidates_for_artifact_generation_with_options<'a>(
         ),
         now_millis,
     );
-    order_strict_preferred_routes(state, model, options, routes)
+    order_queued_routes(state, model, options, routes)
 }
 
 async fn run_hedge_probes_if_requested(
@@ -30570,6 +30829,67 @@ impl GatewayState {
         Ok(())
     }
 
+    fn try_acquire_queued_admission(
+        &self,
+        route: Option<&GatewayRouteCandidate>,
+        requirements: &RequestRequirements,
+        options: &GatewayRequestOptions,
+    ) -> Result<Option<GatewayModalityAdmissionGuard>, ModalityAdmissionError> {
+        let (Some(queued), Some(route)) = (options.queued_admission.as_ref(), route) else {
+            return self.try_acquire_modality_admission(route, requirements);
+        };
+        let key = route_key(route);
+        let heartbeat = self
+            .provider_table
+            .lock_recover("provider table")
+            .fresh_heartbeat(&key, now_millis_u64(), requirements.heartbeat_ttl_millis)
+            .cloned()
+            .ok_or_else(|| {
+                ModalityAdmissionError::unavailable("provider heartbeat expired before admission")
+            })?;
+        let generation = self.modality_admission_generation.load(Ordering::Acquire);
+        let lease = queued
+            .ticket
+            .try_claim(
+                &key,
+                heartbeat.slots.active,
+                heartbeat.slots.max,
+                heartbeat.q.free_slots,
+            )
+            .ok_or_else(|| {
+                ModalityAdmissionError::local_capacity(
+                    "waiting for provider capacity in admission queue",
+                    generation,
+                )
+            })?;
+        let mut guard = match self.try_acquire_modality_admission(Some(route), requirements) {
+            Ok(guard) => guard,
+            Err(error) => {
+                drop(lease);
+                // Releasing this unsuccessful local claim is not new capacity.
+                // Observe the generation after release to avoid a busy retry loop.
+                return Err(match error {
+                    ModalityAdmissionError::LocalCapacity { message, .. } => {
+                        ModalityAdmissionError::local_capacity(
+                            message,
+                            self.modality_admission_generation.load(Ordering::Acquire),
+                        )
+                    }
+                    other => other,
+                });
+            }
+        };
+        let acquired = guard.get_or_insert_with(|| GatewayModalityAdmissionGuard {
+            active: Arc::clone(&self.modality_admission),
+            generation: Arc::clone(&self.modality_admission_generation),
+            notify: Arc::clone(&self.modality_admission_notify),
+            reservations: Vec::new(),
+            route_lease: None,
+        });
+        acquired.route_lease = Some(lease);
+        Ok(guard)
+    }
+
     fn try_acquire_modality_admission(
         &self,
         route: Option<&GatewayRouteCandidate>,
@@ -30678,6 +30998,7 @@ impl GatewayState {
             generation: Arc::clone(&self.modality_admission_generation),
             notify: Arc::clone(&self.modality_admission_notify),
             reservations,
+            route_lease: None,
         }))
     }
 
@@ -30901,6 +31222,154 @@ fn chat_affinity_key(
             model_id: model.id.clone(),
             conversation_id: format!("user:{}", blake3_hex(user.as_bytes())),
         })
+        .or_else(|| chat_history_affinity_key(model, request))
+}
+
+/// Bounded prefix affinity for ordinary OpenAI chat clients. Only digests are
+/// retained, never message bodies. This is a routing hint, not cache proof or
+/// authorization; every normal eligibility and provider check still applies.
+fn chat_history_affinity_key(
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+) -> Option<ChatAffinityKey> {
+    let first_user = request
+        .messages
+        .iter()
+        .take(16)
+        .position(|message| message.role == "user")?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"mayhem-chat-prefix-v1");
+    let mut prefix_budget = 32_768usize;
+    for message in request.messages.iter().take(first_user) {
+        hasher.update(message.role.as_bytes());
+        hash_affinity_text(&mut hasher, &message.content, &mut prefix_budget);
+    }
+    let mut user_budget = 32_768usize;
+    hash_affinity_text(
+        &mut hasher,
+        &request.messages[first_user].content,
+        &mut user_budget,
+    );
+    if user_budget == 32_768 {
+        return None;
+    }
+    Some(ChatAffinityKey {
+        model_id: model.id.clone(),
+        conversation_id: format!("prefix:{}", hasher.finalize().to_hex()),
+    })
+}
+
+fn hash_affinity_text(hasher: &mut blake3::Hasher, content: &Value, budget: &mut usize) {
+    let mut hash_text = |text: &str| {
+        let count = text.len().min(*budget);
+        if count > 0 {
+            hasher.update(&(count as u64).to_le_bytes());
+            hasher.update(&text.as_bytes()[..count]);
+            *budget -= count;
+        }
+    };
+    if let Some(text) = content.as_str() {
+        hash_text(text);
+    } else if let Some(parts) = content.as_array() {
+        for part in parts.iter().take(64) {
+            if let Some(text) = part.get("text").and_then(Value::as_str) {
+                hash_text(text);
+            }
+        }
+    }
+}
+
+/// Wait briefly for a known warm route only if fresh latency evidence supports
+/// it. The wait consumes the existing deadline (at most a quarter, capped at 5s)
+/// and cannot change price/trust/context filters or serialize provider slots.
+fn queued_chat_admission_options(
+    state: &GatewayState,
+    model: &GatewayModel,
+    request: &ChatCompletionRequest,
+    options: GatewayRequestOptions,
+    requirements: &RequestRequirements,
+) -> Result<GatewayRequestOptions, ApiError> {
+    let mut options = queued_admission_options(state, model, options, requirements)?;
+    if options.max_wait_ms == 0 || options.hedge_requested {
+        return Ok(options);
+    }
+    let Some(affinity) = chat_affinity_key(model, request) else {
+        return Ok(options);
+    };
+    let Some(warm) = state
+        .chat_affinity
+        .lock_recover("chat affinity map")
+        .get(&affinity)
+        .cloned()
+    else {
+        return Ok(options);
+    };
+    let keys = waiting_route_keys(state, model, &options, requirements);
+    if keys.len() < 2 || !keys.contains(&warm) {
+        return Ok(options);
+    }
+    let warm_reputation = model
+        .mayhem
+        .route_candidates
+        .iter()
+        .find(|route| route_key(route) == warm)
+        .map(|route| route.reputation_bps)
+        .unwrap_or(0);
+    if model.mayhem.route_candidates.iter().any(|route| {
+        keys.contains(&route_key(route))
+            && route.reputation_bps.saturating_sub(warm_reputation)
+                >= ROUTE_REPUTATION_PRIORITY_BPS_DELTA
+    }) {
+        return Ok(options);
+    }
+    let now = now_millis_u64();
+    let entries = state
+        .provider_table
+        .lock_recover("provider table")
+        .entries(now);
+    let recent_latency = |key: &ProviderKey| -> Option<f64> {
+        let entry = entries.iter().find(|entry| &entry.key == key)?;
+        let recent = |at: u64| {
+            at <= now
+                && now.saturating_sub(at)
+                    <= crate::provider_table::DEFAULT_THROUGHPUT_OBSERVATION_TTL_MILLIS
+        };
+        let local = entry
+            .observed
+            .throughput_observed_at_millis
+            .filter(|at| recent(*at))
+            .and(entry.observed.ewma_ttft_ms);
+        local
+            .or_else(|| {
+                entry
+                    .heartbeat
+                    .as_ref()
+                    .filter(|hb| hb.perf.measured_at_ms.is_some_and(recent))
+                    .map(|hb| hb.perf.ttft_ms as f64)
+            })
+            .filter(|ms| ms.is_finite() && *ms > 0.0)
+    };
+    let Some(warm_ms) = recent_latency(&warm) else {
+        return Ok(options);
+    };
+    let Some(cold_ms) = keys
+        .iter()
+        .filter(|key| *key != &warm)
+        .map(recent_latency)
+        .collect::<Option<Vec<_>>>()
+        .and_then(|times| times.into_iter().min_by(f64::total_cmp))
+    else {
+        return Ok(options);
+    };
+    let wait_ms = ((cold_ms - warm_ms).max(0.0) / 4.0)
+        .min(5_000.0)
+        .min(options.max_wait_ms as f64 / 4.0) as u64;
+    if wait_ms >= 100 {
+        if let Some(queued) = options.queued_admission.as_mut() {
+            queued.warm_preference = Some((warm, Instant::now() + Duration::from_millis(wait_ms)));
+        }
+    }
+    Ok(options)
 }
 
 /// Explicit throughput constraints keep using the last known measured evidence.
@@ -36896,6 +37365,7 @@ impl GatewayState {
             access_token: options.access_token.clone(),
             expected_execution_mode,
             selected_route_key: route.map(route_key),
+            admission_ticket: options.queued_admission.as_ref().map(|queued| queued.ticket.handle()),
             execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
@@ -37035,6 +37505,7 @@ impl GatewayState {
             access_token: options.access_token.clone(),
             expected_execution_mode,
             selected_route_key: route.map(route_key),
+            admission_ticket: options.queued_admission.as_ref().map(|queued| queued.ticket.handle()),
             execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
@@ -37146,6 +37617,7 @@ impl GatewayState {
             access_token: options.access_token.clone(),
             expected_execution_mode,
             selected_route_key: route.map(route_key),
+            admission_ticket: options.queued_admission.as_ref().map(|queued| queued.ticket.handle()),
             execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
@@ -37257,6 +37729,7 @@ impl GatewayState {
             access_token: options.access_token.clone(),
             expected_execution_mode,
             selected_route_key: route.map(route_key),
+            admission_ticket: options.queued_admission.as_ref().map(|queued| queued.ticket.handle()),
             execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
@@ -37368,6 +37841,7 @@ impl GatewayState {
             access_token: options.access_token.clone(),
             expected_execution_mode,
             selected_route_key: route.map(route_key),
+            admission_ticket: options.queued_admission.as_ref().map(|queued| queued.ticket.handle()),
             execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
@@ -37483,6 +37957,7 @@ impl GatewayState {
             access_token: options.access_token.clone(),
             expected_execution_mode,
             selected_route_key: route.map(route_key),
+            admission_ticket: options.queued_admission.as_ref().map(|queued| queued.ticket.handle()),
             execution_mode_canary,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: options.client_cancellation.clone(),
@@ -47397,6 +47872,7 @@ mod tests {
             access_token: None,
             expected_execution_mode: None,
             selected_route_key: None,
+            admission_ticket: None,
             execution_mode_canary: None,
             verified_attestation_evidence: Arc::new(Mutex::new(None)),
             client_cancellation: None,
@@ -49839,6 +50315,277 @@ mod tests {
                 })
             })
         }
+    }
+
+    #[derive(Debug)]
+    struct QueuedTestBackend {
+        started: Arc<Mutex<Vec<u64>>>,
+        finish: Arc<tokio::sync::Semaphore>,
+        delegate: SuccessBackend,
+    }
+
+    impl GatewaySessionBackend for QueuedTestBackend {
+        fn name(&self) -> &str {
+            "queued-test"
+        }
+        fn run_chat<'a>(
+            &'a self,
+            model: &'a GatewayModel,
+            request: &'a ChatCompletionRequest,
+            invocation: &'a GatewaySessionInvocation,
+        ) -> GatewaySessionFuture<'a> {
+            Box::pin(async move {
+                self.started
+                    .lock()
+                    .unwrap()
+                    .push(request.metadata["queue_test"].as_u64().unwrap());
+                self.finish.acquire().await.unwrap().forget();
+                self.delegate.run_chat(model, request, invocation).await
+            })
+        }
+    }
+
+    async fn admission_test_wait(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("bounded admission test condition");
+    }
+
+    #[tokio::test]
+    async fn admission_queue_keeps_fifo_and_two_slot_concurrency_through_real_chat_runner() {
+        let model = test_routed_model(1);
+        let mut heartbeat =
+            heartbeat_for_route(&model, &model.mayhem.route_candidates[0], now_millis_u64());
+        heartbeat.slots.max = 2;
+        heartbeat.q.free_slots = 2;
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let finish = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = Arc::new(
+            GatewayState::from_models(vec![model.clone()])
+                .with_provider_heartbeats(vec![heartbeat])
+                .with_session_backend(Arc::new(QueuedTestBackend {
+                    started: Arc::clone(&started),
+                    finish: Arc::clone(&finish),
+                    delegate: SuccessBackend {
+                        providers: Arc::new(Mutex::new(Vec::new())),
+                    },
+                })),
+        );
+        let mut tasks = Vec::new();
+        for id in 0..4u64 {
+            let state_for_task = Arc::clone(&state);
+            let model = model.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut request = test_chat_request(&model.id);
+                request.metadata.insert("queue_test".to_owned(), json!(id));
+                run_chat_with_route_retry(
+                    &state_for_task,
+                    &model,
+                    &request,
+                    GatewayRequestOptions {
+                        max_wait_ms: 5_000,
+                        ..GatewayRequestOptions::default()
+                    },
+                )
+                .await
+            }));
+            admission_test_wait(|| state.admission_queue.request_count() == id as usize + 1).await;
+            if id < 2 {
+                admission_test_wait(|| started.lock().unwrap().len() == id as usize + 1).await;
+            }
+        }
+        assert_eq!(*started.lock().unwrap(), vec![0, 1]);
+        finish.add_permits(1);
+        admission_test_wait(|| started.lock().unwrap().len() == 3).await;
+        assert_eq!(*started.lock().unwrap(), vec![0, 1, 2]);
+        finish.add_permits(3);
+        for task in tasks {
+            assert!(task.await.unwrap().is_ok());
+        }
+        assert_eq!(*started.lock().unwrap(), vec![0, 1, 2, 3]);
+        assert_eq!(state.admission_queue.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_queue_cancelled_request_releases_position_in_actual_route_wait() {
+        let model = test_routed_model(1);
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let finish = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = Arc::new(
+            test_gateway_state_from_models(vec![model.clone()]).with_session_backend(Arc::new(
+                QueuedTestBackend {
+                    started: Arc::clone(&started),
+                    finish: Arc::clone(&finish),
+                    delegate: SuccessBackend {
+                        providers: Arc::new(Mutex::new(Vec::new())),
+                    },
+                },
+            )),
+        );
+        let spawn = |id: u64| {
+            let state = Arc::clone(&state);
+            let model = model.clone();
+            tokio::spawn(async move {
+                let mut request = test_chat_request(&model.id);
+                request.metadata.insert("queue_test".to_owned(), json!(id));
+                run_chat_with_route_retry(
+                    &state,
+                    &model,
+                    &request,
+                    GatewayRequestOptions::default(),
+                )
+                .await
+            })
+        };
+        let first = spawn(0);
+        admission_test_wait(|| started.lock().unwrap().len() == 1).await;
+        let cancelled = spawn(1);
+        admission_test_wait(|| state.admission_queue.request_count() == 2).await;
+        let last = spawn(2);
+        admission_test_wait(|| state.admission_queue.request_count() == 3).await;
+        cancelled.abort();
+        assert!(matches!(cancelled.await, Err(error) if error.is_cancelled()));
+        finish.add_permits(2);
+        assert!(first.await.unwrap().is_ok());
+        assert!(last.await.unwrap().is_ok());
+        assert_eq!(*started.lock().unwrap(), vec![0, 2]);
+        assert_eq!(state.admission_queue.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_queue_explicit_client_cancellation_wakes_without_dispatch() {
+        let model = test_routed_model(1);
+        let started = Arc::new(Mutex::new(Vec::new()));
+        let finish = Arc::new(tokio::sync::Semaphore::new(0));
+        let state = Arc::new(
+            test_gateway_state_from_models(vec![model.clone()]).with_session_backend(Arc::new(
+                QueuedTestBackend {
+                    started: Arc::clone(&started),
+                    finish: Arc::clone(&finish),
+                    delegate: SuccessBackend {
+                        providers: Arc::new(Mutex::new(Vec::new())),
+                    },
+                },
+            )),
+        );
+        let cancellation = GatewayRequestCancellation::new();
+        let spawn = |id: u64| {
+            let cancellation = cancellation.clone();
+            let state = Arc::clone(&state);
+            let model = model.clone();
+            tokio::spawn(async move {
+                let mut request = test_chat_request(&model.id);
+                request.metadata.insert("queue_test".to_owned(), json!(id));
+                run_chat_with_route_retry(
+                    &state,
+                    &model,
+                    &request,
+                    GatewayRequestOptions {
+                        client_cancellation: (id == 1).then_some(cancellation),
+                        ..GatewayRequestOptions::default()
+                    },
+                )
+                .await
+            })
+        };
+        let first = spawn(0);
+        admission_test_wait(|| started.lock().unwrap().len() == 1).await;
+        let cancelled = spawn(1);
+        admission_test_wait(|| state.admission_queue.request_count() == 2).await;
+        let last = spawn(2);
+        admission_test_wait(|| state.admission_queue.request_count() == 3).await;
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(200), cancelled)
+            .await
+            .expect("cancellation must wake admission")
+            .unwrap();
+        let Err(error) = result else {
+            panic!("cancelled waiter must not dispatch");
+        };
+        assert_eq!(error.status, StatusCode::from_u16(499).unwrap());
+        finish.add_permits(2);
+        assert!(first.await.unwrap().is_ok());
+        assert!(last.await.unwrap().is_ok());
+        assert_eq!(*started.lock().unwrap(), vec![0, 2]);
+        assert_eq!(state.admission_queue.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_queue_already_cancelled_never_registers_or_serves() {
+        let model = test_routed_model(1);
+        let providers = Arc::new(Mutex::new(Vec::new()));
+        let state = test_gateway_state_from_models(vec![model.clone()]).with_session_backend(
+            Arc::new(SuccessBackend {
+                providers: Arc::clone(&providers),
+            }),
+        );
+        let cancellation = GatewayRequestCancellation::new();
+        cancellation.cancel();
+        let result = run_chat_with_route_retry(
+            &state,
+            &model,
+            &test_chat_request(&model.id),
+            GatewayRequestOptions {
+                client_cancellation: Some(cancellation),
+                ..GatewayRequestOptions::default()
+            },
+        )
+        .await;
+        let Err(error) = result else {
+            panic!("cancelled request must not dispatch");
+        };
+        assert_eq!(error.status, StatusCode::from_u16(499).unwrap());
+        assert!(providers.lock().unwrap().is_empty());
+        assert_eq!(state.admission_queue.request_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn admission_streaming_cancel_while_busy_never_opens_provider_transport() {
+        let model = test_routed_model(1);
+        let mut heartbeat =
+            heartbeat_for_route(&model, &model.mayhem.route_candidates[0], now_millis_u64());
+        heartbeat.slots.active = heartbeat.slots.max;
+        heartbeat.q.free_slots = 0;
+        heartbeat.accepting_new = false;
+        let state = Arc::new(
+            GatewayState::from_models(vec![model.clone()])
+                .with_provider_heartbeats(vec![heartbeat]),
+        );
+        let cancellation = GatewayRequestCancellation::new();
+        let token = cancellation.clone();
+        let pending_state = Arc::clone(&state);
+        let task = tokio::spawn(async move {
+            let request = test_chat_request(&model.id);
+            prepare_live_direct_chat_session(
+                pending_state,
+                model,
+                request,
+                GatewayRequestOptions {
+                    client_cancellation: Some(token),
+                    ..GatewayRequestOptions::default()
+                },
+                "cancel-stream-admission".into(),
+                now_secs(),
+                ScBridgeGatewaySessionConfig::new("ws://127.0.0.1:9", "unused-fixture-token"),
+            )
+            .await
+        });
+        admission_test_wait(|| state.admission_queue.request_count() == 1).await;
+        cancellation.cancel();
+        let result = tokio::time::timeout(Duration::from_millis(200), task)
+            .await
+            .expect("stream admission cancellation")
+            .unwrap();
+        let Err(error) = result else {
+            panic!("cancelled stream opened provider session");
+        };
+        assert_eq!(error.status, StatusCode::from_u16(499).unwrap());
+        assert_eq!(state.admission_queue.request_count(), 0);
+        assert!(state.receipts().is_empty());
     }
 
     #[tokio::test]
@@ -59239,10 +59986,12 @@ mod tests {
         let recovered = wait_for_owned_capacity_recovery(
             &state,
             &recovery,
+            None,
             || model.mayhem.route_candidates.clone(),
             Duration::from_millis(1),
         )
-        .await;
+        .await
+        .expect("capacity recovery");
         assert_eq!(recovered, vec![route]);
     }
 
@@ -59293,6 +60042,138 @@ mod tests {
         let selected =
             ordered_route_candidates_for_request_with_seed(&state, &model, &request, None, seed);
         assert_eq!(selected[0].provider, served_provider);
+    }
+
+    #[test]
+    fn conversation_affinity_ordinary_history_survives_tools_without_retaining_text() {
+        let model = test_routed_model(2);
+        let mut request = test_chat_request(&model.id);
+        request.metadata.clear();
+        request.user = None;
+        let key = chat_affinity_key(&model, &request).expect("ordinary chat affinity");
+        request.messages.push(ChatMessage {
+            role: "assistant".into(),
+            content: json!("tool result"),
+            name: None,
+            extra: BTreeMap::new(),
+        });
+        request.messages.push(ChatMessage {
+            role: "user".into(),
+            content: json!("continue"),
+            name: None,
+            extra: BTreeMap::new(),
+        });
+        assert_eq!(chat_affinity_key(&model, &request), Some(key.clone()));
+        request
+            .messages
+            .iter_mut()
+            .find(|message| message.role == "user")
+            .unwrap()
+            .content = json!("a different conversation");
+        assert_ne!(chat_affinity_key(&model, &request), Some(key));
+        request.messages[0].content = json!("x".repeat(1_000_000));
+        assert!(
+            chat_affinity_key(&model, &request)
+                .unwrap()
+                .conversation_id
+                .len()
+                < 100
+        );
+    }
+
+    #[test]
+    fn admission_warm_route_preference_expires_and_respects_scope_and_health() {
+        let model = test_routed_model(2);
+        let warm = &model.mayhem.route_candidates[0];
+        let cold = &model.mayhem.route_candidates[1];
+        let now = now_millis_u64();
+        let mut warm_hb = heartbeat_for_route(&model, warm, now);
+        warm_hb.slots.active = warm_hb.slots.max;
+        warm_hb.q.free_slots = 0;
+        warm_hb.accepting_new = false;
+        warm_hb.perf.ttft_ms = 500;
+        warm_hb.perf.measured_at_ms = Some(now);
+        let mut cold_hb = heartbeat_for_route(&model, cold, now);
+        cold_hb.perf.ttft_ms = 100_000;
+        cold_hb.perf.measured_at_ms = Some(now);
+        let state = GatewayState::from_models(vec![model.clone()])
+            .with_provider_heartbeats(vec![warm_hb, cold_hb]);
+        let request = test_chat_request(&model.id);
+        state.record_chat_affinity(&model, &request, warm);
+        let base = GatewayRequestOptions {
+            max_wait_ms: 800,
+            ..GatewayRequestOptions::default()
+        };
+        let requirements =
+            request_requirements_for_chat(&state, &model, &request, now, None, None, None);
+        let mut options =
+            queued_chat_admission_options(&state, &model, &request, base.clone(), &requirements)
+                .unwrap();
+        assert!(options
+            .queued_admission
+            .as_ref()
+            .unwrap()
+            .warm_preference
+            .is_some());
+        assert!(ordered_route_candidates_for_request_with_options(
+            &state, &model, &request, &options
+        )
+        .is_empty());
+        options
+            .queued_admission
+            .as_mut()
+            .unwrap()
+            .warm_preference
+            .as_mut()
+            .unwrap()
+            .1 = Instant::now();
+        assert_eq!(
+            ordered_route_candidates_for_request_with_options(&state, &model, &request, &options)
+                [0]
+            .provider,
+            cold.provider
+        );
+        drop(options);
+        let restricted = queued_chat_admission_options(
+            &state,
+            &model,
+            &request,
+            GatewayRequestOptions {
+                preferred_providers: Some(vec![cold.provider.clone()]),
+                ..base.clone()
+            },
+            &requirements,
+        )
+        .unwrap();
+        assert!(restricted
+            .queued_admission
+            .as_ref()
+            .unwrap()
+            .warm_preference
+            .is_none());
+        assert_eq!(
+            ordered_route_candidates_for_request_with_options(
+                &state,
+                &model,
+                &request,
+                &restricted
+            )[0]
+            .provider,
+            cold.provider
+        );
+        drop(restricted);
+        let options =
+            queued_chat_admission_options(&state, &model, &request, base, &requirements).unwrap();
+        state
+            .provider_cooloffs
+            .lock_recover("provider cooloff map")
+            .insert(route_key(warm), now + 30_000);
+        assert_eq!(
+            ordered_route_candidates_for_request_with_options(&state, &model, &request, &options)
+                [0]
+            .provider,
+            cold.provider
+        );
     }
 
     #[test]

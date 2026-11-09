@@ -892,3 +892,36 @@ async fn status_advertises_the_three_live_surfaces_in_both_capability_locations(
             .contains(&json!(family)));
     }
 }
+
+#[tokio::test]
+async fn pending_job_reads_report_bounded_admission_phase_on_all_streaming_surfaces() {
+    for (_, family) in SURFACES {
+        let state = GatewayState::from_models(vec![model()]);
+        let raw = request(&model().id, family);
+        let headers = headers("queued-status");
+        let job = start(&state, family, &raw, &headers).await;
+        let route = ProviderKey::new("provider", "enclave", "room");
+        let ticket = state
+            .admission_queue
+            .register_job(BTreeSet::from([route.clone()]), Some(&job.id))
+            .unwrap();
+        let response = openai_router(state.clone())
+            .oneshot(lookup_request(family, &headers))
+            .await
+            .unwrap();
+        let metadata = body(response).await;
+        assert_eq!(metadata["status"], "in_progress");
+        assert_eq!(metadata["admission"]["state"], "waiting_for_provider");
+        assert!(metadata["receipt"].is_null());
+        let lease = ticket.try_claim(&route, 0, 1, 1).unwrap();
+        let response = openai_router(state.clone())
+            .oneshot(lookup_request(family, &headers))
+            .await
+            .unwrap();
+        assert_eq!(
+            body(response).await["admission"]["state"],
+            "provider_selected"
+        );
+        drop((lease, ticket));
+    }
+}

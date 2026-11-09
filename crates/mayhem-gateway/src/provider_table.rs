@@ -915,6 +915,14 @@ pub fn baseline_route_state(
     entry: &ProviderTableEntry,
     requirements: &BaselineRouteRequirements,
 ) -> BaselineRouteState {
+    baseline_route_state_inner(entry, requirements, false)
+}
+
+fn baseline_route_state_inner(
+    entry: &ProviderTableEntry,
+    requirements: &BaselineRouteRequirements,
+    waiting: bool,
+) -> BaselineRouteState {
     if entry.contract.consent_ver != requirements.current_rules_ver {
         return BaselineRouteState::ConsentVersion;
     }
@@ -964,13 +972,14 @@ pub fn baseline_route_state(
     if requirements.requires_transport_peer && heartbeat.transport_peer.is_none() {
         return BaselineRouteState::TransportPeerMissing;
     }
-    if !heartbeat.accepting_new {
+    let full = heartbeat.slots.active >= heartbeat.slots.max || heartbeat.q.free_slots == 0;
+    if !heartbeat.accepting_new && !(waiting && full) {
         return BaselineRouteState::Draining;
     }
-    if heartbeat.sat >= requirements.saturation_cutoff {
+    if !waiting && heartbeat.sat >= requirements.saturation_cutoff {
         return BaselineRouteState::Saturated;
     }
-    if heartbeat.slots.active >= heartbeat.slots.max || heartbeat.q.free_slots == 0 {
+    if !waiting && full {
         return BaselineRouteState::AtCapacity;
     }
     let Some(attestation) = entry.attestation_head.as_ref() else {
@@ -990,14 +999,33 @@ pub fn evaluate_eligibility(
     entry: &ProviderTableEntry,
     request: &RequestRequirements,
 ) -> Result<MoneyAu, IneligibilityReason> {
+    evaluate_eligibility_inner(entry, request, false)
+}
+
+/// Whether this request may queue for a busy route. This is NOT authorization
+/// to start work: ordinary eligibility and provider admission remain mandatory.
+/// Keep all trust, price, context, per-request and signed capability checks.
+pub(crate) fn evaluate_waiting_eligibility(
+    entry: &ProviderTableEntry,
+    request: &RequestRequirements,
+) -> Result<MoneyAu, IneligibilityReason> {
+    evaluate_eligibility_inner(entry, request, true)
+}
+
+fn evaluate_eligibility_inner(
+    entry: &ProviderTableEntry,
+    request: &RequestRequirements,
+    waiting: bool,
+) -> Result<MoneyAu, IneligibilityReason> {
     if entry.contract.consent_ver != request.current_rules_ver {
         return Err(IneligibilityReason::ConsentVersion);
     }
     if entry.contract.reputation < request.min_reputation {
         return Err(IneligibilityReason::Reputation);
     }
-    if let Some(reason) = baseline_route_state(entry, &BaselineRouteRequirements::from(request))
-        .ineligibility_reason()
+    if let Some(reason) =
+        baseline_route_state_inner(entry, &BaselineRouteRequirements::from(request), waiting)
+            .ineligibility_reason()
     {
         return Err(reason);
     }
@@ -1054,7 +1082,7 @@ pub fn evaluate_eligibility(
         let Some(class) = heartbeat.workflow_classes.get(&workflow.outcome_class) else {
             return Err(IneligibilityReason::Workflow);
         };
-        if class.active >= class.max_concurrent {
+        if !waiting && class.active >= class.max_concurrent {
             return Err(IneligibilityReason::Saturated);
         }
         provider_min_ask_au = class.min_ask_au;
@@ -1076,7 +1104,10 @@ pub fn evaluate_eligibility(
             || load.item_count > capacity.max_items_per_request
             || load.max_item_bytes > capacity.max_item_bytes
             || load.max_item_units > capacity.max_item_units
-            || capacity.active_items.saturating_add(load.item_count) > capacity.max_inflight_items
+            || load.item_count > capacity.max_inflight_items
+            || (!waiting
+                && capacity.active_items.saturating_add(load.item_count)
+                    > capacity.max_inflight_items)
         {
             return Err(IneligibilityReason::ModalityCapacity);
         }
@@ -1132,7 +1163,7 @@ pub fn evaluate_eligibility(
             .get(&entry.contract.provider)
             .copied()
             .unwrap_or_default();
-        if active_sessions >= probation.caps.max_concurrent_sessions_per_user {
+        if !waiting && active_sessions >= probation.caps.max_concurrent_sessions_per_user {
             return Err(IneligibilityReason::ProbationConcurrentLimit);
         }
         let reference_price_au = estimate_reference_request_price_au(&entry.contract, request);
@@ -1790,6 +1821,48 @@ mod tests {
             now_millis: now,
             ..RequestRequirements::default()
         }
+    }
+
+    #[test]
+    fn admission_waiting_ignores_occupancy_but_preserves_price_context_and_trust() {
+        let now = 10_000;
+        let mut entry = entry_for(1, now, 0.0, 100);
+        let mut request = eligible_request(now + 1);
+        assert!(evaluate_eligibility(&entry, &request).is_ok());
+        let hb = entry.heartbeat.as_mut().unwrap();
+        hb.slots.active = hb.slots.max;
+        hb.q.free_slots = 0;
+        hb.accepting_new = false;
+        assert!(evaluate_eligibility(&entry, &request).is_err());
+        assert!(evaluate_waiting_eligibility(&entry, &request).is_ok());
+        request.max_price_au = Some(0);
+        assert_eq!(
+            evaluate_waiting_eligibility(&entry, &request),
+            Err(IneligibilityReason::Price)
+        );
+        request.max_price_au = Some(100);
+        request.min_ctx = u32::MAX;
+        assert_eq!(
+            evaluate_waiting_eligibility(&entry, &request),
+            Err(IneligibilityReason::Capabilities)
+        );
+        request.min_ctx = 4096;
+        entry.contract.reputation = 0.0;
+        assert_eq!(
+            evaluate_waiting_eligibility(&entry, &request),
+            Err(IneligibilityReason::Reputation)
+        );
+    }
+
+    #[test]
+    fn admission_waiting_does_not_treat_a_free_but_draining_provider_as_available() {
+        let now = 10_000;
+        let mut entry = entry_for(1, now, 0.0, 100);
+        entry.heartbeat.as_mut().unwrap().accepting_new = false;
+        assert_eq!(
+            evaluate_waiting_eligibility(&entry, &eligible_request(now + 1)),
+            Err(IneligibilityReason::Draining)
+        );
     }
 
     fn workflow_request(now: u64) -> RequestRequirements {
