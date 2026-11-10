@@ -59,6 +59,11 @@ function runScript(dir, args = []) {
 
 const replicatorSha = (dir) => sha256Hex(fs.readFileSync(path.join(dir, 'lib', 'replicator.js'), 'utf8'))
 
+function releasedV1(version) {
+  const set = sets.get(version)
+  return unapplyPatchSet(applyPatchSet(pristine.get(version), set), { edits: set.upgradeEdits })
+}
+
 test('apply: pristine sources rebuilt from the installed copies match the recorded hashes', (t) => {
   t.ok(versions.length >= 1, 'at least one supported hypercore installed: ' + versions.join(', '))
   for (const v of versions) {
@@ -89,8 +94,8 @@ test('apply: hoisted + nested layout, both packages, idempotent, concurrent', as
 
   // both postinstalls at the same time (npm may run them in parallel), several rounds on fresh copies
   for (let round = 0; round < 8; round++) {
-    hypercoreAt(hoisted, v18, pristine.get(v18))
-    if (v8) hypercoreAt(nested, v8, pristine.get(v8))
+    hypercoreAt(hoisted, v18, round % 2 ? releasedV1(v18) : pristine.get(v18))
+    if (v8) hypercoreAt(nested, v8, round % 2 ? releasedV1(v8) : pristine.get(v8))
     const [a, b] = await Promise.all([runScript(msb), runScript(peer)])
     t.is(a.code, 0, 'trac-msb script ok, round ' + round)
     t.is(b.code, 0, 'trac-peer script ok, round ' + round)
@@ -122,7 +127,7 @@ test('apply: mismatching content on a supported version exits non-zero and write
   t.is(replicatorSha(hc), before, 'file unchanged')
 
   // a copy patched by another stallfix revision is refused too
-  hypercoreAt(hc, v, applyPatchSet(pristine.get(v), sets.get(v)).replace("'openmayhem-stallfix-v1'", "'openmayhem-stallfix-v0'"))
+  hypercoreAt(hc, v, applyPatchSet(pristine.get(v), sets.get(v)).replace("'openmayhem-stallfix-v2'", "'openmayhem-stallfix-v0'"))
   const r2 = await runScript(msb)
   t.is(r2.code, 1, 'exit 1 for another revision')
   t.ok(/different stallfix revision/.test(r2.out), 'names the other revision')
@@ -151,4 +156,55 @@ test('apply: run() API reports every copy', async (t) => {
   const res = await run({ packageDir: pkgRoot, check: true, log: () => {}, warn: () => {} })
   t.ok(res.ok, 'this package\'s own copies are patched (postinstall ran)')
   t.ok(res.results.length >= 1)
+})
+
+test('apply: released v1 upgrades to v2; check is read-only and altered v1 is refused', async (t) => {
+  const root = tmpdir()
+  t.teardown(() => fs.rmSync(root, { recursive: true, force: true }))
+  const msb = path.join(root, 'node_modules', 'trac-msb')
+  const hc = path.join(root, 'node_modules', 'hypercore')
+  packageWithScript(msb, 'trac-msb')
+  for (const v of versions) {
+    const set = sets.get(v)
+    const previous = releasedV1(v)
+    t.is(sha256Hex(previous), set.previousPatchedSha256, v + ' exact released v1 bytes')
+    hypercoreAt(hc, v, previous)
+    const check = await runScript(msb, ['--check'])
+    t.is(check.code, 1, v + ' v1 is not current')
+    t.is(replicatorSha(hc), set.previousPatchedSha256, v + ' check leaves v1 unchanged')
+    const upgrade = await runScript(msb)
+    t.is(upgrade.code, 0, v + ' upgrade succeeds')
+    t.ok(upgrade.out.includes('UPGRADED v1 -> v2'), v + ' visible upgrade')
+    t.is(replicatorSha(hc), set.patchedSha256, v + ' upgrade matches pristine install')
+    t.is((await runScript(msb)).code, 0, v + ' repeat succeeds')
+    t.is((await runScript(msb, ['--check'])).code, 0, v + ' current check passes')
+    const changed = previous + '\n// unexpected modification\n'
+    hypercoreAt(hc, v, changed)
+    t.is((await runScript(msb)).code, 1, v + ' modified v1 refused')
+    t.is(replicatorSha(hc), sha256Hex(changed), v + ' refused file unchanged')
+  }
+})
+
+test('apply: exact-text entries and result hashes fail closed', async (t) => {
+  for (const v of versions) {
+    const set = sets.get(v)
+    const guard = set.edits.at(-1)
+    t.exception(() => applyPatchSet('', { edits: [guard] }), /exactly once, found 0/, v + ' missing match')
+    t.exception(() => applyPatchSet(guard[0] + guard[0], { edits: [guard] }), /exactly once, found 2/, v + ' duplicate match')
+  }
+  const root = tmpdir()
+  t.teardown(() => fs.rmSync(root, { recursive: true, force: true }))
+  const msb = path.join(root, 'node_modules', 'trac-msb')
+  const hc = path.join(root, 'node_modules', 'hypercore')
+  packageWithScript(msb, 'trac-msb')
+  const v = versions[0]
+  const patchFile = path.join(msb, 'scripts', 'hypercore-stallfix', 'hypercore-' + v + '.mjs')
+  fs.writeFileSync(patchFile, fs.readFileSync(patchFile, 'utf8').replace(sets.get(v).patchedSha256, '0'.repeat(64)))
+  for (const input of [pristine.get(v), releasedV1(v)]) {
+    hypercoreAt(hc, v, input)
+    const result = await runScript(msb)
+    t.is(result.code, 1, 'unexpected output hash refused')
+    t.ok(result.out.includes('patched result has an unexpected hash'))
+    t.is(replicatorSha(hc), sha256Hex(input), 'no write on result mismatch')
+  }
 })

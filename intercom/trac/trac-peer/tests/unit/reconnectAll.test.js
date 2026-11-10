@@ -77,7 +77,7 @@ test('trac-peer reports the loaded hypercore stall fix (subnet copy) and exports
   await core.ready();
   const status = hypercoreStallfixStatus(core, store);
   t.is(status.patched, true, 'subnet hypercore copy is patched');
-  t.is(status.marker, 'openmayhem-stallfix-v1');
+  t.is(status.marker, 'openmayhem-stallfix-v2');
   t.is(typeof Peer.prototype.replicationStatus, 'function');
 });
 

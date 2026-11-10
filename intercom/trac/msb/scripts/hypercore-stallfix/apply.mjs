@@ -8,6 +8,7 @@
 //     cool-down (30 s doubling to 4 min); one unref'd sweep per replicator, bounded work per sweep;
 //   - backports upstream 8cf8ad9 (#896) fix 2 (a stale block-queue entry no longer consumes a peer update);
 //   - answers NOT_AVAILABLE (max 16 per minute per peer, silent beyond) to a peer we paused, instead of silence.
+//   - backports upstream c24f37a (#911): never attach a stream that closed while the core was opening (v2).
 // No wire-format change: patched and unpatched nodes interoperate.
 //
 // What this script does: finds every Hypercore copy this package loads (its own resolution plus the copies that
@@ -15,6 +16,7 @@
 //   - supported version, file hash = original  -> applies the patch set (each original text must occur exactly once),
 //                                                 checks the result hash, writes atomically (tmp + rename);
 //   - supported version, file hash = patched   -> "already patched" (idempotent; safe when both packages run it);
+//   - supported version, file hash = released v1 -> upgrades only the marker and #911 guard, checks the result hash;
 //   - supported version, any other content      -> exit 1 with a clear message (nothing is written);
 //   - unsupported version                       -> loud warning, no change.
 // Usage: node scripts/hypercore-stallfix/apply.mjs [--check] [--quiet]
@@ -118,6 +120,7 @@ export function inspectCopy(copy, sets) {
   result.sha256 = sha256(text)
   if (result.sha256 === set.patchedSha256) result.state = 'patched'
   else if (result.sha256 === set.originalSha256) result.state = 'original'
+  else if (result.sha256 === set.previousPatchedSha256) result.state = 'previous-patched'
   else if (text.includes('OPENMAYHEM-STALLFIX')) result.state = 'other-stallfix-revision'
   else result.state = 'mismatch'
   return result
@@ -140,15 +143,16 @@ export async function run({ packageDir, check = false, quiet = false, log = cons
       warn(tag + ' WARNING: hypercore ' + r.version + ' at ' + where + ' is not a supported version (' + [...sets.keys()].join(', ') + '); NOT patched')
     } else if (r.state === 'patched') {
       if (!quiet) log(tag + ' hypercore ' + r.version + ' at ' + where + ': already patched (sha256 ' + r.sha256 + ')')
-    } else if (r.state === 'original' && check) {
-      warn(tag + ' hypercore ' + r.version + ' at ' + where + ': NOT patched')
+    } else if ((r.state === 'original' || r.state === 'previous-patched') && check) {
+      warn(tag + ' hypercore ' + r.version + ' at ' + where + ': NOT patched to v2' + (r.state === 'previous-patched' ? ' (released v1 needs upgrade)' : ''))
       failed = true
-    } else if (r.state === 'original') {
+    } else if (r.state === 'original' || r.state === 'previous-patched') {
       const set = sets.get(r.version)
       const file = path.join(r.dir, set.file)
+      const upgrading = r.state === 'previous-patched'
       let patched
       try {
-        patched = applyPatchSet(r.text, set)
+        patched = applyPatchSet(r.text, upgrading ? { edits: set.upgradeEdits } : set)
       } catch (err) {
         warn(tag + ' ERROR: hypercore ' + r.version + ' at ' + where + ': ' + err.message + '; nothing written')
         failed = true
@@ -167,12 +171,12 @@ export async function run({ packageDir, check = false, quiet = false, log = cons
       fs.renameSync(tmp, file)
       r.state = 'patched'
       r.sha256 = set.patchedSha256
-      log(tag + ' hypercore ' + r.version + ' at ' + where + ': PATCHED (sha256 ' + r.sha256 + ')')
+      log(tag + ' hypercore ' + r.version + ' at ' + where + ': ' + (upgrading ? 'UPGRADED v1 -> v2' : 'PATCHED v2') + ' (sha256 ' + r.sha256 + ')')
     } else {
       const set = sets.get(r.version)
       warn(tag + ' ERROR: hypercore ' + r.version + ' at ' + where + ' has unexpected ' + set.file + ' content (sha256 ' + r.sha256 +
         (r.state === 'other-stallfix-revision' ? ', patched by a different stallfix revision' : '') +
-        '; expected original ' + set.originalSha256 + ' or patched ' + set.patchedSha256 + '). Refusing to patch.')
+        '; expected original ' + set.originalSha256 + ', released v1 ' + set.previousPatchedSha256 + ' or patched v2 ' + set.patchedSha256 + '). Refusing to patch.')
       failed = true
     }
     results.push(r)

@@ -88,7 +88,7 @@ async function writerWithClones(t, n) {
 
 test('stallfix: the loaded hypercore carries the stallfix marker', async (t) => {
   const core = await create(t)
-  t.is(core.replicator.constructor.STALLFIX, 'openmayhem-stallfix-v1')
+  t.is(core.replicator.constructor.STALLFIX, 'openmayhem-stallfix-v2')
 })
 
 async function silentRespondersCase(t, maxAge) {

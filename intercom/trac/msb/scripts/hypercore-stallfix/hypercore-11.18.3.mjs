@@ -1,12 +1,30 @@
-// Exact-text patch set for hypercore 11.18.3 lib/replicator.js (OPENMAYHEM-STALLFIX v1).
+// Exact-text patch set for hypercore 11.18.3 lib/replicator.js (OPENMAYHEM-STALLFIX v2).
 // Each edit is [original, replacement]; the original must occur exactly once in the unpatched file.
 // Keep this file free of backticks and dollar-brace sequences inside the edit texts (String.raw templates).
+
+// Upstream c24f37a6 (#911): a close event that already fired cannot detach a later attachment.
+const closedStreamGuard = [
+  String.raw`  attachTo(protomux) {
+    if (this.core.closed) return
+`,
+  String.raw`  attachTo(protomux) {
+    if (this.core.closed) return
+    if (protomux.stream.destroying) return
+`
+]
 
 export default {
   version: '11.18.3',
   file: 'lib/replicator.js',
   originalSha256: '2e7a2631a0d8e805861339bbc75e6f6de75565813cf201256105408c53c8ac93',
-  patchedSha256: '79944caa33cc875d563f7eba8b820ffbd9323984d30e2fd6c58030804ded2f6c',
+  patchedSha256: '1ba2f169d20840d41333cc55e8fbb7da9bc5b4698d808739ad97acce0cbe0f1a',
+  // Only this exact released v1 file is eligible for an in-place upgrade.
+  previousPatchedSha256: '79944caa33cc875d563f7eba8b820ffbd9323984d30e2fd6c58030804ded2f6c',
+  upgradeEdits: [
+    ['// OPENMAYHEM-STALLFIX v1 (hypercore 11.18.3).', '// OPENMAYHEM-STALLFIX v2 (hypercore 11.18.3).'],
+    ["const STALLFIX = 'openmayhem-stallfix-v1'", "const STALLFIX = 'openmayhem-stallfix-v2'"],
+    closedStreamGuard
+  ],
   edits: [
     // 1. Constants + marker.
     [
@@ -14,12 +32,12 @@ export default {
 `,
       String.raw`const MAX_BACKOFFS = MAX_INVALID_REQUESTS / 2
 
-// OPENMAYHEM-STALLFIX v1 (hypercore 11.18.3). Install-time patch shipped by trac-msb and trac-peer
+// OPENMAYHEM-STALLFIX v2 (hypercore 11.18.3). Install-time patch shipped by trac-msb and trac-peer
 // (scripts/hypercore-stallfix/). Fixes the waiting-side replication stall: an in-flight request that a peer
 // never answers is cancelled after STALLFIX_REQUEST_MAX_AGE and asked elsewhere; that peer gets a cool-down;
 // a peer we paused gets a capped NOT_AVAILABLE instead of silence; an INVALID_OPERATION verification error pauses
 // a peer for an escalating time instead of until disconnect. Wire format unchanged.
-const STALLFIX = 'openmayhem-stallfix-v1'
+const STALLFIX = 'openmayhem-stallfix-v2'
 const STALLFIX_REQUEST_MAX_AGE = 30000 // ms an in-flight request may wait for its answer
 const STALLFIX_SWEEP_INTERVAL = 5000 // one unref'd timer per replicator, only while requests are in flight
 const STALLFIX_MAX_SCAN = 4096 // request slots looked at per sweep
@@ -409,6 +427,8 @@ const STALLFIX_OP_PAUSE_EPISODES = 5 // timed pauses without valid data in betwe
 
 function setDownloadingLater(repl, downloading, session) {
 `
-    ]
+    ],
+    // Upstream #911, in addition to the existing stall fixes.
+    closedStreamGuard
   ]
 }

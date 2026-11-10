@@ -1,7 +1,7 @@
 {
   "name": "trac-msb",
   "main": "msb.mjs",
-  "version": "0.2.27",
+  "version": "0.2.28",
   "pear": {
     "name": "trac-msb",
     "type": "terminal"

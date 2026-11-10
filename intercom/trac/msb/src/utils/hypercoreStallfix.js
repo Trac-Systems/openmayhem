@@ -1,6 +1,6 @@
 // Runtime view of the install-time Hypercore patch (scripts/hypercore-stallfix/). It looks at the Replicator class
 // of a live core, so it reports the Hypercore copy that is actually loaded, not the one npm resolution suggests.
-export const HYPERCORE_STALLFIX_MARKER = 'openmayhem-stallfix-v1';
+export const HYPERCORE_STALLFIX_MARKER = 'openmayhem-stallfix-v2';
 
 /**
  * @param {object} core a Hypercore session (for MSB: state.base.core, the system view)
@@ -47,7 +47,7 @@ export function hypercoreStallfixStatus(core, store = null) {
 /** One startup line for logs/alerts. */
 export function hypercoreStallfixLine(label, core) {
     const { patched, marker } = hypercoreStallfixStatus(core);
-    if (patched) return `[${label}] Hypercore replication stall fix: active (${marker})`;
+    if (patched) return `[${label}] Hypercore replication stall fix: active (${marker}); closed-stream guard #911 active`;
     return `[${label}] WARNING: Hypercore replication stall fix NOT active in the loaded hypercore` +
         ` (marker: ${marker ?? 'none'}). Reinstall without --ignore-scripts or run scripts/hypercore-stallfix/apply.mjs.`;
 }

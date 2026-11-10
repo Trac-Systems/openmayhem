@@ -16,7 +16,8 @@ test('hypercoreStallfixStatus reports the loaded hypercore copy and sums counter
     t.is(hypercoreStallfixStatus(core, store).expiredRequests, 3, 'summed from the store');
     core.core.replicator._sfStats.invalidOperationPauses += 2;
     t.is(hypercoreStallfixStatus(core, store).invalidOperationPauses, 2);
-    t.ok(hypercoreStallfixLine('MSB', core).includes('active (openmayhem-stallfix-v1)'));
+    t.ok(hypercoreStallfixLine('MSB', core).includes('active (openmayhem-stallfix-v2)'));
+    t.ok(hypercoreStallfixLine('MSB', core).includes('closed-stream guard #911 active'));
 });
 
 test('hypercoreStallfixStatus on an unpatched or missing core', (t) => {
@@ -24,6 +25,9 @@ test('hypercoreStallfixStatus on an unpatched or missing core', (t) => {
     const fake = { core: { replicator: new Replicator() } };
     t.alike(hypercoreStallfixStatus(fake), { patched: false, marker: null, expiredRequests: null, notAvailableSent: null, notAvailableSuppressed: null, invalidOperationPauses: null, invalidOperationPermanent: null });
     t.is(hypercoreStallfixStatus(null).patched, false);
+    t.ok(hypercoreStallfixLine('MSB', fake).includes('NOT active'));
+    Replicator.STALLFIX = 'openmayhem-stallfix-v1';
+    t.is(hypercoreStallfixStatus(fake).patched, false, 'old marker does not claim the guard');
     t.ok(hypercoreStallfixLine('MSB', fake).includes('NOT active'));
 });
 
