@@ -37,7 +37,7 @@ pub struct InitArgs {
     /// Existing wallet password reference retained for unattended restarts.
     #[arg(long, value_name = "PATH")]
     restart_password_file: Option<PathBuf>,
-    /// Explicit trusted admission API origin; omission keeps enrollment unavailable.
+    /// Override the trusted admission API origin. Official mainnet has a release-bound default.
     #[arg(long)]
     admission_origin: Option<String>,
     /// Protected registry trust configuration for optional provider declarations.

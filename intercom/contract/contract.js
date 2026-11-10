@@ -5,6 +5,12 @@ import { secp256k1 } from 'ethereum-cryptography/secp256k1';
 import { Contract } from 'trac-peer';
 import { consumeCanonicalReplayContext } from 'trac-peer/src/base/canonical-replay.js';
 import PeerWallet from 'trac-wallet';
+import ContractV17 from './history/v17.js';
+import ContractV18 from './history/v18.js';
+import ContractV19 from './history/v19.js';
+import ContractV20 from './history/v20.js';
+import ContractV21 from './history/v21.js';
+import ContractV22 from './history/v22.js';
 import ContractV23 from './history/v23.js';
 import ContractV24 from './history/v24.js';
 import ContractV25 from './history/v25.js';
@@ -19,6 +25,22 @@ import { normalizeProxySpendSessionRecord, validateProxyCanonicalReceiptHead } f
 import { advanceDemand, demandObservation, DEMAND_CONSTANTS, scaleDemandPrice } from './reference-demand.js';
 
 export const CONTRACT_VERSION = 30;
+// Only authenticated canonical replay can select these exact prior reducers.
+const HISTORICAL_CONTRACTS = new Map([
+  [17, ContractV17],
+  [18, ContractV18],
+  [19, ContractV19],
+  [20, ContractV20],
+  [21, ContractV21],
+  [22, ContractV22],
+  [23, ContractV23],
+  [24, ContractV24],
+  [25, ContractV25],
+  [26, ContractV26],
+  [27, ContractV27],
+  [28, ContractV28],
+  [29, ContractV29],
+]);
 // Recovery is limited to receipt evidence already signed by v23-v29
 // participants. New prior-version operations are not admitted;
 // separately authenticated canonical replay does not constitute new admission.
@@ -915,7 +937,7 @@ class MayhemContract extends Contract {
       const versioned = versionedMayhemOperation(op);
       const canonicalReplay = consumeCanonicalReplayContext(consensusContext, op, storage);
       const historical = versioned.present && (
-        ([23, 24, 25, 26, 27, 28, 29].includes(versioned.version) && canonicalReplay) ||
+        (HISTORICAL_CONTRACTS.has(versioned.version) && canonicalReplay) ||
         ([24, 25, 26, 27, 28, 29].includes(versioned.version) &&
           await this.isPreparedCheckpointReplay(op, storage))
       );
@@ -923,19 +945,7 @@ class MayhemContract extends Contract {
         // Replaying with today's pricing/receipt methods would produce a
         // different signed view. Retained implementations preserve the exact
         // historical transition, and never participate in new admission.
-        const Implementation = versioned.version === 23
-          ? ContractV23
-          : versioned.version === 24
-            ? ContractV24
-            : versioned.version === 25
-              ? ContractV25
-              : versioned.version === 26
-                ? ContractV26
-                : versioned.version === 27
-                  ? ContractV27
-                  : versioned.version === 28
-                    ? ContractV28
-                    : ContractV29;
+        const Implementation = HISTORICAL_CONTRACTS.get(versioned.version);
         this._historicalContracts ??= new Map();
         if (!this._historicalContracts.has(versioned.version)) {
           this._historicalContracts.set(versioned.version, new Implementation(this.protocol, this.config));

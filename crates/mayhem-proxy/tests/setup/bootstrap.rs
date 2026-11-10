@@ -101,6 +101,58 @@ fn choices(f: &Fixture, endpoint: ProxyEndpoint) -> Choices {
     }
 }
 
+#[tokio::test]
+#[cfg_attr(
+    windows,
+    ignore = "requires isolated native Windows private NTFS fixture parent"
+)]
+async fn bootstrap_persists_only_the_matching_mainnet_default_and_preserves_explicit_origins() {
+    let manifest: serde_json::Value =
+        serde_json::from_str(include_str!("../../../../config/beta/mainnet.json")).unwrap();
+    for (i, explicit) in [None, Some("https://operator.example")]
+        .into_iter()
+        .enumerate()
+    {
+        let f = Fixture::new(ProxyEndpoint::Decisions);
+        let mut host = host(&f);
+        host.network.network_id = manifest["network"]["msb"]["network_id"].to_string();
+        host.network.msb_bootstrap = manifest["network"]["msb"]["bootstrap"]
+            .as_str()
+            .unwrap()
+            .into();
+        host.network.subnet_bootstrap = manifest["network"]["subnet"]["bootstrap"]
+            .as_str()
+            .unwrap()
+            .into();
+        host.admission_origin = explicit.map(str::to_owned);
+        let b = bootstrap::create(
+            &f.dir.path().join(format!("mainnet-{i}")),
+            host,
+            choices(&f, ProxyEndpoint::Decisions),
+        )
+        .unwrap();
+        let config = FlowConfig::load(&b.config_file).unwrap();
+        assert_eq!(
+            config.admission_origin.as_deref(),
+            Some(explicit.unwrap_or("https://api.openmayhem.ai"))
+        );
+        assert_eq!(b.network_requests, 0);
+        assert!(!b.authorizes_probe && !b.authorizes_publication && !b.authorizes_run);
+        assert!(f.listener.accept().is_err());
+    }
+    let f = Fixture::new(ProxyEndpoint::Decisions);
+    let b = bootstrap::create(
+        &f.dir.path().join("other-network"),
+        host(&f),
+        choices(&f, ProxyEndpoint::Decisions),
+    )
+    .unwrap();
+    assert!(FlowConfig::load(&b.config_file)
+        .unwrap()
+        .admission_origin
+        .is_none());
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn named_bundles_are_paged_readonly_and_keep_separate_runtime_resources() {

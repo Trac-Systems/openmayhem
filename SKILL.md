@@ -124,14 +124,14 @@ aggregate admission refusal or compensate with an undocumented memory override.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.305` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.306` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.305
+  git checkout --detach v0.2.306
   ./install.sh --from-source
   ```
 
@@ -139,7 +139,7 @@ aggregate admission refusal or compensate with an undocumented memory override.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.305
+  git checkout --detach v0.2.306
   .\install.ps1 -FromSource
   ```
 On updated source checkouts, `mayhem up` verifies and, when needed, deterministically repairs only
@@ -802,13 +802,15 @@ LLMs and decision models; it does not add proxy media or embedding support.
    a complete matching Core package with `mayhem-proxy-worker`. Start Core with
    `mayhem up` if needed; do not start a native model just to configure a proxy.
 3. Select an exact upstream model ID, protected tokenizer file for LLM speed
-   measurement, trusted admission origin, prices, rails and bounded probe budget.
+   measurement, prices, rails and bounded probe budget. Official mainnet defaults
+   to `https://api.openmayhem.ai` for admission, including saved drafts without
+   an origin. For other networks use an operator-approved `--admission-origin`.
    Never expose upstream keys in command arguments. Decisions needs no tokenizer.
 4. With operator-selected variables, start or resume the same named setup:
 
    ```sh
    mayhem provider proxy setup init --name my-model --home "$MAYHEM_HOME" \
-     --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
+     --tokenizer-file "$TOKENIZER_FILE"
    mayhem provider proxy setup wizard --name my-model --home "$MAYHEM_HOME"
    ```
 
@@ -857,8 +859,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.305 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.305; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.306 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.306; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start native catalog provider | `mayhem up --provider --yes` |
 | Start proxy setup | `mayhem provider proxy setup init --help` |

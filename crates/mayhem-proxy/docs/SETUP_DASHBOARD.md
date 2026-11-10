@@ -18,8 +18,7 @@ For the first bundle, with the named variables set to operator-selected inputs:
 
 ```sh
 mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 --proxy-setup --name llama \
-  --proxy-setup-tokenizer-file "$TOKENIZER_FILE" \
-  --proxy-setup-admission-origin "$ADMISSION_ORIGIN"
+  --proxy-setup-tokenizer-file "$TOKENIZER_FILE"
 ```
 
 For a retained bundle use `--proxy-setup-config` instead of `--proxy-setup`:
@@ -50,7 +49,10 @@ Optional host arguments:
 - `--proxy-setup-restart-password-file PATH`: existing protected wallet password
   reference, otherwise the existing host reference is reused when present.
 - `--proxy-setup-admission-origin ORIGIN`: explicit trusted admission service.
-  Omission leaves enrollment unavailable; no receiver, fee or issuer is inferred.
+  Official mainnet defaults to `https://api.openmayhem.ai`, including saved
+  configurations without an origin. Other networks require an explicit origin.
+  Enrollment and payment still require confirmation; fees and receivers come
+  from the service’s bound quote.
 - `--proxy-setup-declaration-registry-file PATH`: protected host-selected trust
   configuration for [declared data-handling fields](DATA_HANDLING_SETUP.md).
   Signing a promise does not upgrade it to verified privacy or model evidence.

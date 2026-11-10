@@ -344,7 +344,10 @@ async fn timeout_and_restart_keep_original_physical_occupancy_and_never_redispat
         200,
         serde_json::to_vec(&answer()).unwrap(),
         false,
-        Duration::from_secs(2),
+        // Keep this upstream active beyond the connector's existing bounded
+        // terminal-evidence observation. A two-second response can finish
+        // during that observation and legitimately release physical capacity.
+        Duration::from_secs(30),
     );
     let rev = checked(&f);
     let mut p = plan(&f, chat());

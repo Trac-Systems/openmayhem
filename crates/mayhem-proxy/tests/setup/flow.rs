@@ -524,3 +524,50 @@ async fn flow_scoped_signed_enrollment_retains_short_payment_across_checkout_and
     server.await.unwrap();
     f.no_network_or_secret();
 }
+
+#[tokio::test]
+async fn mainnet_enrollment_default_is_network_bound_and_has_no_setup_side_effects() {
+    let manifest: Value =
+        serde_json::from_str(include_str!("../../../../config/beta/mainnet.json")).unwrap();
+    let mainnet: mayhem_proxy::discovery::Identity = serde_json::from_value(json!({
+        "network_id": manifest["network"]["msb"]["network_id"].as_u64().unwrap().to_string(),
+        "msb_bootstrap": manifest["network"]["msb"]["bootstrap"],
+        "subnet_bootstrap": manifest["network"]["subnet"]["bootstrap"],
+        "contract_version": mayhem_proto::CONTRACT_VERSION,
+    }))
+    .unwrap();
+    for case in 0..5 {
+        let f = Fixture::new(ProxyEndpoint::Chat);
+        let mut cfg = config(&f);
+        cfg.profile.network = mainnet.clone();
+        match case {
+            1 => cfg.profile.network.network_id = "other-network".into(),
+            2 => cfg.profile.network.msb_bootstrap = "01".repeat(32),
+            3 => cfg.profile.network.subnet_bootstrap = "02".repeat(32),
+            4 => cfg.admission_origin = Some("https://operator.example".into()),
+            _ => {}
+        }
+        // Loading an existing private draft must receive the same default as
+        // opening a newly created one, without writing back or enrolling it.
+        let saved = f.dir.path().join("wizard.json");
+        let bytes = serde_json::to_vec(&cfg).unwrap();
+        private(&saved, &bytes);
+        let flow = Flow::open(FlowConfig::load(&saved).unwrap()).unwrap();
+        let view = flow.view().unwrap();
+        assert_eq!(view.capabilities["enrollment"], case == 0 || case == 4);
+        assert!(view.review.is_none());
+        assert_eq!(std::fs::read(&saved).unwrap(), bytes);
+        assert_eq!(
+            f.listener.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+    let f = Fixture::new(ProxyEndpoint::Chat);
+    let mut cfg = config(&f);
+    cfg.profile.network = mainnet;
+    cfg.admission_origin = Some("http://untrusted.example".into());
+    assert!(
+        Flow::open(cfg).is_err(),
+        "invalid explicit origin must not fall back"
+    );
+}

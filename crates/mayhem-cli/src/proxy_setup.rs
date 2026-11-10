@@ -22,7 +22,7 @@ pub struct Args {
     /// Existing protected password reference for unattended managed restarts.
     #[arg(long, value_name = "PATH", requires = "proxy_setup")]
     pub proxy_setup_restart_password_file: Option<PathBuf>,
-    /// Trusted admission API origin. Omission leaves enrollment unavailable.
+    /// Override the trusted admission API origin. Official mainnet has a release-bound default.
     #[arg(long, requires = "proxy_setup")]
     pub proxy_setup_admission_origin: Option<String>,
     /// Protected registry trust configuration for optional provider declarations.

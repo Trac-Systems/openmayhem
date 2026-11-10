@@ -413,7 +413,9 @@ fn generate(
         profile,
         probe_plan: Some("probe.json".into()),
         peer_rpc: Some(host.peer_rpc.clone()),
-        admission_origin: host.admission_origin,
+        admission_origin: host
+            .admission_origin
+            .or_else(|| admission::mainnet_origin(&host.network).map(str::to_owned)),
         declaration_registry: host.declaration_registry,
         timeout_ms: 5000,
         run: Some(RunSettings {

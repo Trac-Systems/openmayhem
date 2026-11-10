@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import crypto from 'node:crypto';
+import {CONTRACT_CODE_PATHS} from '../src/release-identity.js';
 import fs from 'node:fs';import os from 'node:os';import path from 'node:path';
 import Autobase from 'autobase';import Corestore from 'corestore';import Hyperbee from 'hyperbee';
 import b4a from 'b4a';
@@ -13,8 +15,16 @@ import { FeatureOperation, FeatureCheck } from 'trac-peer/src/operations/feature
 import { canonicalReplayContext, consumeCanonicalReplayContext, canonicalReplayView } from 'trac-peer/src/base/canonical-replay.js';
 import {adminWriterDiagnostics,appliedViewProof} from '../src/rpc.js';
 import MayhemContract from '../contract/contract.js';
+import Contract17 from '../contract/history/v17.js';
+import Contract18 from '../contract/history/v18.js';
+import Contract19 from '../contract/history/v19.js';
+import Contract20 from '../contract/history/v20.js';
+import Contract21 from '../contract/history/v21.js';
+import Contract22 from '../contract/history/v22.js';
 import Contract23 from '../contract/history/v23.js';import Contract24 from '../contract/history/v24.js';import Contract25 from '../contract/history/v25.js';import Contract26 from '../contract/history/v26.js';import Contract27 from '../contract/history/v27.js';import Contract28 from '../contract/history/v28.js';import Contract29 from '../contract/history/v29.js';
 import { MemoryStorage } from './helpers/contract.js';
+const historicalContracts=new Map([[17,Contract17],[18,Contract18],[19,Contract19],[20,Contract20],[21,Contract21],[22,Contract22],[23,Contract23],[24,Contract24],[25,Contract25],[26,Contract26],[27,Contract27],[28,Contract28],[29,Contract29]]);
+const versions=[...historicalContracts.keys()];
 const delay=ms=>new Promise(r=>setTimeout(r,ms));
 const protocol={featMaxBytes:()=>1e6};
 const handler=(wallet,contract,canonicalView)=>new FeatureOperation(new FeatureCheck(),{wallet,protocolInstance:protocol,contractInstance:contract,canonicalView});
@@ -25,7 +35,7 @@ async function fixture(version,kind='feature'){
  const config={bootstrap:'43'.repeat(32),maxMsbSignedLength:1e9,maxMsbSignedLengthFutureDelta:100000,maxMsbApplyOperationBytes:4096};let msbEntry;
  const msbClient={networkId:918,bootstrapHex:'44'.repeat(32),getTxvHex:async()=> '45'.repeat(32),getFee:()=>FEE,pubKeyHexToAddress:toAddress,addressToPubKeyHex:a=>b4a.toString(PeerWallet.decodeBech32mSafe(a),'hex'),getSignedLength:()=>100,waitForSignedLengthAtLeast:async()=>{},getSignedAtLength:async()=>msbEntry};
  const peer={wallet,writerLocalKey:'42'.repeat(32),config,msbClient};const proto=new MayhemProtocol(peer,{},config);
- const Implementation=version===23?Contract23:version===24?Contract24:version===25?Contract25:version===26?Contract26:version===27?Contract27:version===28?Contract28:Contract29;const old=new Implementation(proto,{});let store,base,lastNode;
+ const Implementation=historicalContracts.get(version);const old=new Implementation(proto,{});let store,base,lastNode;
  const applyHandler=(contract,view)=>kind==='feature'?handler(wallet,contract,view):new TxOperation(new TxCheck(),{wallet,protocolInstance:proto,contractInstance:contract,canonicalView:view,msbClient,config});
  async function open(){store=new Corestore(dir);base=new Autobase(store,null,{ackInterval:0,valueEncoding:'json',open:s=>new Hyperbee(s.get('view'),{extension:false,keyEncoding:'utf-8',valueEncoding:'json'}),async apply(nodes,view){const batch=view.batch();for(const node of nodes){if(node.value?.type==='seed'){await batch.put('admin',wallet.publicKey);continue;}if(node.value){lastNode=node;await applyHandler(old,view).handle(node.value,batch,base,node);}}await batch.flush();await batch.close();}});await base.ready();peer.base=base;}
  await open();await base.append({type:'seed'});await base.update();
@@ -47,23 +57,23 @@ async function fixture(version,kind='feature'){
  async function replay(){const replayStore=new Corestore(path.join(dir,'replay'));const view=new Hyperbee(replayStore.get({name:'view'}),{extension:false,keyEncoding:'utf-8',valueEncoding:'json'});await view.ready();await view.put('admin',wallet.publicKey);const batch=view.batch();const current=new MayhemContract(proto,{});await applyHandler(current,base.view).handle(op,batch,base,node);await batch.flush();await batch.close();assert.equal((await view.core.treeHash()).toString('hex'),expectedHash,'Full authenticated tree must match historical writer');const once=view.core.length;const duplicate=view.batch();await applyHandler(current,base.view).handle(op,duplicate,base,node);await duplicate.flush();await duplicate.close();assert.equal(view.core.length,once);const state=await collect(view);await view.close();await replayStore.close();return state;}
  return {wallet,op,node,proto,replay,get view(){return base.view;},expected,before:()=>new MemoryStorage({admin:wallet.publicKey}),async close(){await base.close();await store.close();fs.rmSync(dir,{recursive:true,force:true});}};
 }
-for(const version of [23,24,25,26,27,28,29])for(const kind of ['feature','tx'])test(`persisted signed v${version} ${kind} history preserves full tree under30 exactly once`,async()=>{
+for(const version of versions)for(const kind of ['feature','tx'])test(`persisted signed v${version} ${kind} history preserves full tree under30 exactly once`,async()=>{
  const f=await fixture(version,kind);try{const replayed=await f.replay();assert.equal(replayed.snapshotBytes(),f.expected.snapshotBytes());if(kind==='tx')assert.equal((await replayed.get('params/price_min_bps')).value.pending.value,version>=25?2500:1,'Historical pricing bound must not be reinterpreted');}finally{await f.close();}
 });
-test('fresh, unbound, mutated and wrong-version historical Feature calls remain rejected',async()=>{
- const f=await fixture(24);try{const c=new MayhemContract({},{});
- await assert.rejects(c.execute(f.op,f.before()),/expected CONTRACT_VERSION 30, got 24/);
- await assert.rejects(c.execute(f.op,f.before(),{replay:true}),/expected CONTRACT_VERSION 30, got 24/);
+for (const version of [17,22,24]) test(`fresh, unbound, mutated and wrong-version v${version} Feature calls remain rejected`,async()=>{
+ const f=await fixture(version);try{const c=new MayhemContract({},{});
+ await assert.rejects(c.execute(f.op,f.before()),new RegExp('expected CONTRACT_VERSION 30, got '+version));
+ await assert.rejects(c.execute(f.op,f.before(),{replay:true}),new RegExp('expected CONTRACT_VERSION 30, got '+version));
  const fresh=structuredClone(f.op);fresh.value.dispatch.nonce='fresh';fresh.value.dispatch.hash=f.wallet.sign(JSON.stringify(fresh.value.dispatch.value)+'fresh');
- const unsignedNode={...f.node,value:fresh};await assert.rejects(handler(f.wallet,c,f.view).handle(fresh,f.before(),{},unsignedNode),/expected CONTRACT_VERSION 30, got 24/);
+ const unsignedNode={...f.node,value:fresh};await assert.rejects(handler(f.wallet,c,f.view).handle(fresh,f.before(),{},unsignedNode),new RegExp('expected CONTRACT_VERSION 30, got '+version));
  const bad=structuredClone(f.op);bad.value.dispatch.contract_version=23;await assert.rejects(handler(f.wallet,c,f.view).handle(bad,f.before(),{},{...f.node,value:bad}),/expected CONTRACT_VERSION 30, got 23/);
  const storage=f.before(),token=await canonicalReplayContext(f.op,storage,f.node,f.view);assert(token);assert.equal(consumeCanonicalReplayContext(token,f.op,f.before()),false);assert.equal(consumeCanonicalReplayContext(token,f.op,storage),false,'failed use consumes capability');
  const token2=await canonicalReplayContext(f.op,storage,f.node,f.view);f.op.value.dispatch.key+='tampered';assert.equal(consumeCanonicalReplayContext(token2,f.op,storage),false);
  }finally{await f.close();}
 });
 
-test('ordinary historical TX requires exact canonical index and original signed bytes',async()=>{
- const f=await fixture(24,'tx');try{const c=new MayhemContract(f.proto,{}),storage=f.before();await assert.rejects(c.execute(f.op,storage),/expected CONTRACT_VERSION 30, got 24/);
+for (const version of [17,22,24]) test(`ordinary v${version} TX requires exact canonical index and original signed bytes`,async()=>{
+ const f=await fixture(version,'tx');try{const c=new MayhemContract(f.proto,{}),storage=f.before();await assert.rejects(c.execute(f.op,storage),new RegExp('expected CONTRACT_VERSION 30, got '+version));
  const noIndex={core:f.view.core,checkout:length=>{const view=f.view.checkout(length);return {close:()=>view.close(),get:async key=>key.startsWith('tx/')?null:view.get(key)};}};
  assert.equal(await canonicalReplayContext(f.op,storage,f.node,noIndex),null);
  const badRecord={core:f.view.core,checkout:length=>{const view=f.view.checkout(length);return {close:()=>view.close(),get:async key=>{const row=await view.get(key);return key.startsWith('txi/')?{...row,value:{...row.value,ipk:'00'.repeat(32)}}:row;}};}};
@@ -73,10 +83,10 @@ test('ordinary historical TX requires exact canonical index and original signed 
  }finally{await f.close();}
 });
 
-for (const version of [23, 24, 25, 26, 27, 28, 29]) test(`persisted remote v${version} Feature reads signed default view ahead of apply batch`, async () => {
+for (const version of versions) test(`persisted remote v${version} Feature reads signed default view ahead of apply batch`, async () => {
  const dir=fs.mkdtempSync(path.join(os.tmpdir(),'mayhem-remote-history-'));
  const wallet=new Wallet();await wallet.ready;await wallet.generateKeyPair();
- const old=new (version===23?Contract23:version===24?Contract24:version===25?Contract25:version===26?Contract26:version===27?Contract27:version===28?Contract28:Contract29)(protocol,{});
+ const old=new (historicalContracts.get(version))(protocol,{});
  const opened=new Set(), streams=[];
  async function open(name,key,contract,broken=false){
   const store=new Corestore(path.join(dir,name));let base;
@@ -128,4 +138,16 @@ for (const version of [23, 24, 25, 26, 27, 28, 29]) test(`persisted remote v${ve
   assert.equal(current._mayhemReplayStatus.completed,1,'Repeated signed input must not apply twice');
   assert.equal((await fixed.base.view.core.treeHash()).toString('hex'),expected);
  }finally{for(const close of streams)close();for(const state of opened)await close(state);fs.rmSync(dir,{recursive:true,force:true});}
+});
+
+test('retained v17–22 sources are exact originals and bound into release identity',()=>{
+ const origins=JSON.parse(fs.readFileSync(new URL('../contract/history/origins-17-22.json',import.meta.url)));
+ assert.deepEqual(origins.map(x=>x.version),[17,18,19,20,21,22]);
+ for(const {version,source_commit,sha256} of origins){
+  assert.match(source_commit,/^[0-9a-f]{40}$/);
+  const relative=`contract/history/v${version}.js`;
+  assert(CONTRACT_CODE_PATHS.includes(relative));
+  const bytes=fs.readFileSync(new URL('../'+relative,import.meta.url));
+  assert.equal(crypto.createHash('sha256').update(bytes).digest('hex'),sha256);
+ }
 });

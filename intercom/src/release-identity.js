@@ -6,6 +6,12 @@ export const RELEASE_MANIFEST_PATH = 'contract/release.json';
 export const INTERCOM_BUNDLE_ASSET_PREFIX = 'share/mayhem/intercom/';
 export const CONTRACT_CODE_PATHS = Object.freeze([
   'contract/contract.js',
+  'contract/history/v17.js',
+  'contract/history/v18.js',
+  'contract/history/v19.js',
+  'contract/history/v20.js',
+  'contract/history/v21.js',
+  'contract/history/v22.js',
   'contract/history/v23.js',
   'contract/history/v24.js',
   'contract/history/v25.js',

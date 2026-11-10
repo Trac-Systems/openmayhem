@@ -1,12 +1,36 @@
 {
   "schema": 1,
-  "release_version": "0.2.305",
+  "release_version": "0.2.306",
   "contract_version": 30,
-  "contract_code_sha256": "1ea34defa8d2c9c9382cf1818687700794c59f21391f2c6bc53dc95f6c9a9deb",
+  "contract_code_sha256": "30ece4a2cb7fcd5a2bec359a4d3b1a15216ebc9241645d4f78fd4cf35443596a",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "b0e6bbbcdc5c07178a5d387f55aeeb2ab2976275fa44d7d26ab73c3fbabdad50"
+      "sha256": "bd499c64b5d9ce0d8faf9712c7c1b867439b30eeb244393b1096a283877885a3"
+    },
+    {
+      "path": "contract/history/v17.js",
+      "sha256": "327056b31c530658bdf34488c32959c9dff0127c093b769d771d700d41733685"
+    },
+    {
+      "path": "contract/history/v18.js",
+      "sha256": "6d180662e9c581321425fa8b933d45c91d8d21d02fc233fb90725f21e24ebe03"
+    },
+    {
+      "path": "contract/history/v19.js",
+      "sha256": "12ee6c3e2483e93c4d22fc9bcb92ad276dbd1b42dcce087b673ae5332a101009"
+    },
+    {
+      "path": "contract/history/v20.js",
+      "sha256": "e5a6cee17287aed0e01c855148478f90134f44a1cf840de574d8f9fbbc4200cc"
+    },
+    {
+      "path": "contract/history/v21.js",
+      "sha256": "a4111dcf8793277169ae10c78f53d540be52c3ca069ee8d24b2dfff60db39804"
+    },
+    {
+      "path": "contract/history/v22.js",
+      "sha256": "0e2b83ec9ef84b1d8c9ee4439b08ecd1b15700b2e1da46ef7993c4a01ab280a1"
     },
     {
       "path": "contract/history/v23.js",

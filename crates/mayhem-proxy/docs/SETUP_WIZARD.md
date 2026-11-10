@@ -50,17 +50,19 @@ these operator inputs ready:
   bytes are imported and pinned; the tokenizer is used for speed measurement,
   not billing or verification of the remote model. Decisions needs no tokenizer.
 - Your concurrency, price, rail, settlement and probe allowance choices. A trusted
-  admission origin is needed for enrollment; its current response supplies the
-  actual fee and collection instructions. Never substitute a buyer deposit.
+  admission origin is needed for enrollment. Official mainnet uses
+  `https://api.openmayhem.ai` automatically; other networks need an explicit
+  operator-approved origin. The service supplies the actual fee and collection
+  instructions. Never substitute a buyer deposit.
 - An existing protected wallet password file for unattended restarts, if needed.
 
-The examples use `$MAYHEM_HOME` for that existing home and `$TOKENIZER_FILE` and
-`$ADMISSION_ORIGIN` for inputs you have selected. Omit the tokenizer option for
+The examples use `$MAYHEM_HOME` for that existing home and `$TOKENIZER_FILE`
+for the protected tokenizer you selected. Omit the tokenizer option for
 Decisions. Add `--api-key-file PATH` for a protected upstream key reference.
 
 ```sh
 mayhem provider proxy setup init --name llama --home "$MAYHEM_HOME" \
-  --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
+  --tokenizer-file "$TOKENIZER_FILE"
 mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
   --name llama --inspect
 mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
@@ -150,7 +152,10 @@ or treat the flag as a new fee or automatic revocation.
   finite allowance, installed worker and **existing shared** capacity authority.
 - `peer_rpc`: configured trusted Core peer RPC base, or null.
 - `admission_origin`: trusted admission API **origin**, or null. HTTPS is required
-  except explicit literal loopback HTTP fixtures.
+  except explicit literal loopback HTTP fixtures. Null uses the release-bound
+  mainnet origin only when the network ID and both bootstrap keys match official
+  mainnet. This also applies when opening an existing saved configuration; the
+  file is not rewritten. Explicit origins are validated and preserved.
 - `run`: optional protected runtime handoff settings, absent/null when disabled.
   `{ "template": "/private/runtime-policy.json", "wallet_password_file": null }`.
   The password field is a protected **file reference**, using the existing wallet
@@ -229,9 +234,9 @@ permission for its exact retained probe plan.
 
 Charging outcomes, checkpoints and hold-expiry behavior require explicit choices;
 no financial policy, fee, receiver or FX rate is invented. `--admission-origin`
-selects an explicitly trusted admission service; omission leaves enrollment
-unavailable. `--restart-password-file` retains an existing protected wallet
-password reference (otherwise the existing `<home>/secrets/wallet-password` is
+overrides the release-bound mainnet admission service. On other networks,
+omission leaves enrollment unavailable. `--restart-password-file` retains an
+existing protected wallet password reference (otherwise the existing `<home>/secrets/wallet-password` is
 used when available). No new wallet or payout identity is created.
 
 The `bounded_single_connection_v1` resource preset generates runtime policy:
@@ -526,3 +531,6 @@ shared release seal or disable verification. The actual encrypted synthetic
 wallet helper, CLI and mayhemd are exercised; canonical publication is the local
 contract fixture and SC-Bridge is a bounded loopback protocol double. This is not
 production relay/fee collection evidence.
+
+For a historical contract-version error during first sync, see
+[recovery without deleting state](../../../PROVIDING.md#recovering-an-interrupted-first-sync).

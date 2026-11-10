@@ -7,6 +7,17 @@ const MAX_RESPONSE: usize = 8192;
 const MAX_AGE_MS: u64 = 15_000;
 const MAX_SAFE: u64 = mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER;
 
+/// The release's mainnet service, never a destination supplied by an upstream.
+/// Choosing an origin does not authorize enrollment, payment or publication.
+pub(super) fn mainnet_origin(network: &Identity) -> Option<&'static str> {
+    (network.network_id == "918"
+        && network.msb_bootstrap
+            == "acbc3a4344d3a804101d40e53db1dda82b767646425af73599d4cd6577d69685"
+        && network.subnet_bootstrap
+            == "2bd91db6dcc2bfc518ead2440739cbfca7055c095b2e7c2bf96349783a876e67")
+        .then_some("https://api.openmayhem.ai")
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AdmissionState {

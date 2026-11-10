@@ -81,21 +81,21 @@ Top-level `mayhem proxy` commands are buyer controls, not provider onboarding.
    providers, wallet, stores and supervisor.
 3. **Prepare setup inputs.** Select the server's exact model ID, protected local
    `tokenizer.json` for LLM speed measurement, context and concurrency you can
-   support, prices, payment rails, and a trusted admission-service origin. Get
-   the admission origin from the network operator; never guess a receiver or use
-   a buyer deposit as admission. Upstream keys belong in protected files, not
-   command arguments. Decisions does not require a tokenizer.
+   support, prices and payment rails. Official mainnet uses the trusted admission
+   origin `https://api.openmayhem.ai` automatically. Other networks need their
+   operator-approved `--admission-origin`; explicit overrides are preserved.
+   Never guess a receiver or use a buyer deposit as admission. Upstream keys
+   belong in protected files, not command arguments. Decisions does not require a tokenizer.
 4. **Create a named setup.** With the variables below set to your own inputs:
 
    ```sh
    mayhem provider proxy setup init --name my-model --home "$MAYHEM_HOME" \
-     --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
+     --tokenizer-file "$TOKENIZER_FILE"
    ```
 
    `MAYHEM_HOME` is your existing private Core home; `TOKENIZER_FILE` is the
-   approved local tokenizer file; `ADMISSION_ORIGIN` is the trusted admission API
-   origin. The wizard prompts for the upstream API URL, authentication choice,
-   model and market. A local server such as `http://127.0.0.1:8080/v1/` needs the
+   approved local tokenizer file. The wizard prompts for the upstream API URL,
+   authentication choice, model and market. A local server such as `http://127.0.0.1:8080/v1/` needs the
    explicit local network `127.0.0.1/32` and permission for HTTP. This grants no
    access to other destinations. Creating or joining a proxy market does not
    require a native catalog entry.
@@ -126,3 +126,18 @@ configuration; do not start another listener on an occupied port.
 
 If an upstream is incompatible or too large for the machine, explain that exact
 limit. Do not bypass checks or promise readiness based only on a model name.
+
+## Recovering an interrupted first sync
+
+If an older release stops with `expected CONTRACT_VERSION 30, got 17` (or
+18–22), install v0.2.306 or later as a complete package and restart the existing
+Core stack using the same home. The older number belongs to a retained ledger
+operation. Current releases replay it only with authenticated canonical evidence
+and the original version’s rules. Do not delete the store, wallet or identity,
+change the contract version, or start a second stack on the same home.
+
+After synchronization, resume the same named proxy wizard. Existing mainnet
+drafts without an admission origin now use `https://api.openmayhem.ai`. If a
+provider admission already exists, the wizard reuses it; do not send another fee
+just because setup was interrupted. A provider that has never paid admission
+still needs the explicit quoted enrollment step before publication.

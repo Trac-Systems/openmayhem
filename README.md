@@ -107,8 +107,10 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.305` clarifies native and proxy provider onboarding. It retains the runtime
-from `v0.2.304`; contract version 30 and transaction formats are unchanged.
+`v0.2.306` restores authenticated replay of retained contract versions 17–22
+for fresh synchronization and supplies the mainnet proxy admission-service
+default. Contract version 30 and transaction formats are unchanged. Existing
+wallets, identities, stores and saved provider setups are preserved.
 
 Automatic [failure recovery](crates/mayhem-gateway/DURABLE_STREAMING.md)
 and [image references](crates/mayhem-engine/IMAGE_REFERENCES.md) remain available.
@@ -116,7 +118,7 @@ and [image references](crates/mayhem-engine/IMAGE_REFERENCES.md) remain availabl
 LLM admission continues to require initialized prefix caching introduced in
 v0.2.178. See [runtime details and limits](crates/mayhem-engine/PREFIX_CACHING.md).
 
-`v0.2.305` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.306` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -125,7 +127,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.305
+git checkout --detach v0.2.306
 ./install.sh --from-source
 ```
 
@@ -134,7 +136,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.305
+git checkout --detach v0.2.306
 .\install.ps1 -FromSource
 ```
 
@@ -559,12 +561,14 @@ or downloads it. It does not prove the remote model's identity. Decisions needs
 no tokenizer. Upstream credentials remain protected file references or write-only
 local dashboard input; never put their values in command arguments.
 
-With `MAYHEM_HOME`, `TOKENIZER_FILE` and `ADMISSION_ORIGIN` set to your chosen
-home, protected file and trusted admission service:
+Official mainnet setup uses `https://api.openmayhem.ai` for admission, including
+saved drafts without an origin. Other networks need an explicit trusted origin;
+`--admission-origin` overrides the default. Choosing the service does not authorize
+a fee or publication. With your existing home and protected tokenizer file:
 
 ```sh
 mayhem provider proxy setup init --name llama --home "$MAYHEM_HOME" \
-  --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
+  --tokenizer-file "$TOKENIZER_FILE"
 # Resume the original saved setup:
 mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
   --name llama
@@ -574,8 +578,7 @@ Alternatively use the existing local gateway's authenticated provider dashboard:
 
 ```sh
 mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 --proxy-setup --name llama \
-  --proxy-setup-tokenizer-file "$TOKENIZER_FILE" \
-  --proxy-setup-admission-origin "$ADMISSION_ORIGIN"
+  --proxy-setup-tokenizer-file "$TOKENIZER_FILE"
 ```
 
 Each proxied model has its own named setup in the same Core home. Use
@@ -1203,7 +1206,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.305` is source-only. The GitHub release contains the tagged source, not
+`v0.2.306` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -1211,7 +1214,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.305
+git checkout --detach v0.2.306
 ./install.sh --from-source
 ```
 
@@ -1220,7 +1223,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.305
+git checkout --detach v0.2.306
 .\install.ps1 -FromSource
 ```
 

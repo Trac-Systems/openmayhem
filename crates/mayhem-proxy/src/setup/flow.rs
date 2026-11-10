@@ -257,8 +257,14 @@ impl Flow {
             .is_some())
     }
 
-    pub fn open(config: FlowConfig) -> Result<Self> {
+    pub fn open(mut config: FlowConfig) -> Result<Self> {
         config.validate()?;
+        // Also covers saved setups created before the mainnet default existed.
+        // Explicit origins retain their validation and are never replaced.
+        if config.admission_origin.is_none() {
+            config.admission_origin =
+                admission::mainnet_origin(&config.profile.network).map(str::to_owned);
+        }
         Store::open(&config.directory)?;
         let registry = config
             .declaration_registry

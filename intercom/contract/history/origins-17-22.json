@@ -1,0 +1,32 @@
+[
+  {
+    "version": 17,
+    "source_commit": "3608a798eeb38d170c0f46b501cbbd151f8d9b1a",
+    "sha256": "327056b31c530658bdf34488c32959c9dff0127c093b769d771d700d41733685"
+  },
+  {
+    "version": 18,
+    "source_commit": "c4a2444785704ed5590370718e70b7cbc16e6fba",
+    "sha256": "6d180662e9c581321425fa8b933d45c91d8d21d02fc233fb90725f21e24ebe03"
+  },
+  {
+    "version": 19,
+    "source_commit": "688119a64c46878d72e9fd51133fdf5916ae04db",
+    "sha256": "12ee6c3e2483e93c4d22fc9bcb92ad276dbd1b42dcce087b673ae5332a101009"
+  },
+  {
+    "version": 20,
+    "source_commit": "8438fdd31b6e5305348e587d5c01998c4e1b54f2",
+    "sha256": "e5a6cee17287aed0e01c855148478f90134f44a1cf840de574d8f9fbbc4200cc"
+  },
+  {
+    "version": 21,
+    "source_commit": "43d266c5811ad4e6ad1a74e53a2cf645d5e346c4",
+    "sha256": "a4111dcf8793277169ae10c78f53d540be52c3ca069ee8d24b2dfff60db39804"
+  },
+  {
+    "version": 22,
+    "source_commit": "785ba673b4febce7e9972dbd00119519eb84c1ed",
+    "sha256": "0e2b83ec9ef84b1d8c9ee4439b08ecd1b15700b2e1da46ef7993c4a01ab280a1"
+  }
+]
