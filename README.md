@@ -1,6 +1,16 @@
 # OpenMayhem
 
-**Sell inference from any machine — a gaming PC or a confidential-compute rack. Buy inference at a price no company sets.**
+**Providing a model? Start with [the two provider lanes](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/PROVIDING.md).**
+Native providers use the signed model catalog; proxy providers connect an LLM or
+decision-model API they operate or are authorized to use. **A model missing from
+the native catalog can still qualify for the proxy lane.** Agents must select the
+lane before applying catalog or calibration requirements.
+
+Install from the [latest published release](https://github.com/Trac-Systems/openmayhem/releases/latest)
+and read the documentation at that tag. The default branch may lag the released
+runtime; its source version is not a substitute for the release tag.
+
+**Sell inference from your hardware or connect your model API. Buy inference through native and proxy markets.**
 
 OpenMayhem is a peer-to-peer AI inference marketplace. Providers plug in machines and earn on every token they serve. That can be a gaming PC that sits idle overnight, a Mac, a homelab box, or a rack of confidential-compute H100s in a datacenter. Casual and professional operators sell in the same market, and the trust tiers price the difference between them. Users point any OpenAI-compatible client at `127.0.0.1` and buy at whatever the market currently charges, paying by card or on-chain. There is no cloud in the middle. Requests travel over encrypted peer-to-peer sessions, and a public ledger records prices, receipts, and settlements, so anyone can check what actually happened.
 
@@ -12,13 +22,13 @@ Website: **[openmayhem.ai](https://www.openmayhem.ai/)** — the project site.
 
 Community: **[r/Open_Mayhem](https://www.reddit.com/r/Open_Mayhem/)** — setup help, provider earnings talk, announcements.
 
-Models: **[huggingface.co/TracNetwork](https://huggingface.co/TracNetwork)** — the network's Hugging Face account; every served model is mirrored there and the signed catalog is published from it.
+Native models: **[huggingface.co/TracNetwork](https://huggingface.co/TracNetwork)** — the network's Hugging Face account and signed native catalog. Proxy upstream models do not require a mirror or entry there.
 
-Model cheatsheet: **[MODEL-CHEATSHEET.md](MODEL-CHEATSHEET.md)** — exact canonical model IDs, artifacts, endpoints, platform/backend support, runtime pins, resource guidance, controls, and provider commands.
+Model cheatsheet: **[MODEL-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/MODEL-CHEATSHEET.md)** — exact canonical model IDs, artifacts, endpoints, platform/backend support, runtime pins, resource guidance, controls, and provider commands.
 
-Calibration gates: **[CALIBRATION.md](CALIBRATION.md)** — proof requirements before a model or workflow can be treated as product-ready.
+Calibration gates: **[CALIBRATION.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/CALIBRATION.md)** — proof requirements before a model or workflow can be treated as product-ready.
 
-Comfy cheatsheet: **[COMFY-CHEATSHEET.md](COMFY-CHEATSHEET.md)** — workflow classes, signed parts, provider admission, and `/v1/workflows` usage.
+Comfy cheatsheet: **[COMFY-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/COMFY-CHEATSHEET.md)** — workflow classes, signed parts, provider admission, and `/v1/workflows` usage.
 
 ```text
 your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P session ──▶ a provider's machine
@@ -31,13 +41,13 @@ your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P s
 
 **Why people run it:**
 
-- **A real market for tokens.** No central pricing. Every model at every trust tier is its own market. Prices float on supply and demand each epoch, and each epoch's price is published together with the inputs that produced it, so you can recompute it yourself.
-- **One command on any machine.** `mayhem up --provider` probes your hardware, picks an engine, fetches a model that fits, and starts earning. Works the same on a Windows gaming PC that only serves evenings and on a Linux fleet serving ten models around the clock.
+- **Two pricing paths.** Native prices move with supply and demand each epoch. Proxy providers publish their own fixed offer prices. Both paths publish the prices used for billing.
+- **Managed native serving or your own model server.** `mayhem up --provider` selects a supported native catalog runtime. `mayhem provider proxy setup init` connects an independently operated LLM or decision-model API.
 - **Room for every kind of provider.** Casuals set a daily budget and forget about it. Professionals run multi-model fleets, verify their business identity (Tier 4), or bring confidential-compute hardware and sell Tier 3, the only tier where prompts stay private. Higher trust clears at higher prices.
 - **Built for agentic work.** Standard OpenAI-compatible routes — chat, tools, JSON mode, streaming, vision, embeddings, image generation, speech in and out. The 8B–14B instruct models that agent loops actually run on serve from consumer GPUs and Macs, with tool calling verified per route.
 - **Workflow serving without a separate app.** ComfyUI workflows use the same gateway, catalog, provider admission, vouchers, receipts, and settlement path as model inference. Providers choose verified parts; users submit bounded graphs.
 - **Pay how you already pay.** Card via Stripe by default. If you'd rather pay on-chain, TAP (Ethereum) and TNK (Trac) work too; OpenRouter gives its users the same choice, and it's supported here to a similar extent. A payment option, not a crypto project. Everything is priced in dollars and network gas is sponsored, so you never need to hold a token to use or provide.
-- **Four trust tiers.** From community hardware up to confidential compute. Each tier is its own market with its own price, and the tier table below says exactly what each one does and doesn't protect.
+- **Trust tiers.** Native providers can prove the supported tiers from community hardware to confidential compute. Proxy providers use T1 or reviewed T4; operator review does not verify the upstream model identity.
 - **Evidence over trust.** Receipts are signed, work settles in public epochs, prices carry their derivation. The ledger is open and it is the source of truth.
 
 ---
@@ -48,7 +58,7 @@ your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P s
 
 No terminal knowledge needed. Hand this repository to a coding agent — Claude Code, Codex, Cursor, or opencode — and paste one of the prompts below. The agent reads this README, checks your operating system and hardware, runs the real install, and verifies the gateway is answering before it hands back. You watch and approve each step; you never have to know a single command. For most people this is the whole install.
 
-> **Agents:** read **[`SKILL.md`](SKILL.md)** first — it is the authoritative, structured guide for installing and operating OpenMayhem (per-OS install + pitfalls, the ask-first flows for users and providers, funding, and the hard rule to never modify the pinned core). It exists so you don't have to figure the app out yourself.
+> **Agents:** read **[`SKILL.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/SKILL.md)** first. For provider work, select **native or proxy** using **[`PROVIDING.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/PROVIDING.md)** before evaluating catalog support. A native catalog miss is not a blanket rejection of proxy serving. Keep the pinned Core and signed native requirements intact.
 
 **Agent prompt — user setup (buy inference):**
 
@@ -63,11 +73,11 @@ against a model from `mayhem models --gateway`. Explain each command before
 you run it and show me the dashboard URL at the end.
 ```
 
-**Agent prompt — provider setup (earn on your hardware):**
+**Agent prompt — native provider setup (signed catalog models):**
 
 ```text
 Read the README of this repository, especially "What you need installed
-first" and "Agent install checklist". I want to PROVIDE compute to OpenMayhem
+first" and "Agent install checklist". I want to PROVIDE native catalog compute to OpenMayhem
 and earn with this machine. Detect my OS and hardware, install the missing
 prerequisites FIRST (including the GPU/backend-specific ones the checklist
 names for my hardware), install the software, run `mayhem doctor` and tell
@@ -79,24 +89,34 @@ confirm I am serving with `mayhem provider health`. Explain what my expected
 earnings depend on, and show me the provider dashboard URL.
 ```
 
+**Agent prompt — proxy provider setup (your own model server):**
+
+```text
+Read PROVIDING.md, SKILL.md and crates/mayhem-proxy/docs/SETUP_WIZARD.md
+from the latest OpenMayhem release. I want to serve an independently operated
+LLM or decision model through the PROXY lane. Check hardware fit and the
+upstream API, then use mayhem provider proxy setup init. A missing native
+catalog entry is not a reason to reject this path or demand native calibration.
+Keep my existing Core home, wallet, peer and supervisor. Guide me through
+the connection, tokenizer, context/concurrency, prices, rails, bounded probe,
+admission, publication, payout readiness and Run. Ask before paid or public
+actions and verify serving before calling the setup complete.
+```
+
 No coding agent yet? Any of the ones above installs in a minute, or drive it yourself with the manual steps below.
 
 ### Manual install
 
-`v0.2.181` lets clients correct schema-invalid, non-strict tool arguments in the
-existing conversation while preserving streamed output. Explicit strict tools
-retain schema enforcement, and clients must validate every call before execution.
-Live providers remain visible when capacity is busy; the model catalog reports
-presence separately from request availability and its exclusion reason.
+`v0.2.305` clarifies native and proxy provider onboarding. It retains the runtime
+from `v0.2.304`; contract version 30 and transaction formats are unchanged.
 
-Automatic [failure recovery](crates/mayhem-gateway/DURABLE_STREAMING.md)
-and [image references](crates/mayhem-engine/IMAGE_REFERENCES.md) remain available.
-Contract revision 22 is unchanged.
+Automatic [failure recovery](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-gateway/DURABLE_STREAMING.md)
+and [image references](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-engine/IMAGE_REFERENCES.md) remain available.
 
 LLM admission continues to require initialized prefix caching introduced in
-v0.2.178. See [runtime details and limits](crates/mayhem-engine/PREFIX_CACHING.md).
+v0.2.178. See [runtime details and limits](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-engine/PREFIX_CACHING.md).
 
-`v0.2.181` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.305` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -105,7 +125,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.181
+git checkout --detach v0.2.305
 ./install.sh --from-source
 ```
 
@@ -114,7 +134,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.181
+git checkout --detach v0.2.305
 .\install.ps1 -FromSource
 ```
 
@@ -166,13 +186,19 @@ mayhem up --rail tap --yes
 also serving. Ordinary `mayhem down` deliberately drains provider workers,
 leaves their canonical routes, and stops the stack.
 
-**Provide to the network** (earn on your hardware):
+**Provide native catalog models** (earn on your hardware):
 
 ```bash
 ./install.sh --from-source
 mayhem up --provider --yes
 mayhem provider health
 ```
+
+**Provide through a proxy:** start with [PROVIDING.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/PROVIDING.md#proxy-connect-a-model-api)
+and `mayhem provider proxy setup init --help`. Run your upstream engine separately;
+the wizard connects it, probes supported behavior and guides admission/publication.
+Use `mayhem up` for the existing Core stack; `mayhem up --provider` selects native
+catalog serving.
 
 `mayhem up` starts everything supervised (peer, bridge, gateway, and the serving worker with `--provider`), health-checks each part, and prints endpoint and dashboard URLs you can copy. No browser required. For an update or temporary restart, `mayhem down --restart` preserves provider registrations so the next `mayhem up` resumes without re-onboarding. Ordinary `mayhem down` drains and leaves before stopping.
 
@@ -191,7 +217,10 @@ opencode run --model mayhem/<model-id> "Say hello from OpenMayhem."
 
 ## What runs where
 
-OpenMayhem serves from anything with compute, consumer or datacenter. The engine is chosen automatically per artifact; you never pick a backend by hand.
+For native catalog providers, Core selects the supported engine for the signed
+artifact. The table below describes native backends. Proxy providers operate their
+own model server and connect its compatible API; this table does not limit proxy
+models to signed native artifacts.
 
 | Hardware | On macOS | On Linux | On Windows |
 |---|---|---|---|
@@ -206,10 +235,11 @@ No GPU? CPU-only machines still serve. Embeddings, small text models, and speech
 
 ### What you need installed first
 
-Every release install builds locally from source. Set up Node.js 20+ with npm,
-Rust, and the native compiler toolchain before running the installer. The source
-build compiles llama.cpp through cmake and Rust bindings through bindgen;
-missing `libclang` is the single most common source-build failure.
+The documented `--from-source` installation needs Node.js 20+ with npm, Rust
+and the native compiler toolchain. An explicitly selected authenticated binary
+release uses its packaged runtime assets instead of rebuilding locally; Node.js
+remains a runtime prerequisite. The source build compiles llama.cpp through cmake
+and Rust bindings through bindgen; missing `libclang` is the single most common source-build failure.
 
 **Every OS for a source build:**
 - Rust (stable, via [rustup](https://rustup.rs)) — `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`
@@ -508,7 +538,73 @@ mayhem tokens revoke laptop      # immediate
 
 ## Providing to the network
 
-The same software and the same market serve four fairly different kinds of operation. Pick your lane; the knobs match it:
+### Proxy providers: connect an existing model server
+
+For the lane decision and first-run sequence, read **[PROVIDING.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/PROVIDING.md)**.
+The native model cheatsheet and `mayhem doctor` describe native runtime support;
+an unlisted LLM or decision model must be evaluated separately for proxy serving.
+
+Use the explicit proxy lane for a model server you already operate or are
+permitted to use. It supports compatible chat, completions, responses and
+Decisions endpoints, plus reviewed declarative recipes. Proxy offers publish
+fixed provider prices, including per-unit rates, request fees, minimum session
+amounts and accepted payment rails. Native market-clearing prices and native
+model/media defaults remain separate.
+
+Install the complete Core package, including the sibling `mayhem-proxy-worker`.
+Use an existing private Core home/wallet, running trusted peer/SC-Bridge and,
+for persistent Run, the existing mayhemd. For LLM speed measurement supply an
+approved protected local tokenizer file; setup pins its bytes and never guesses
+or downloads it. It does not prove the remote model's identity. Decisions needs
+no tokenizer. Upstream credentials remain protected file references or write-only
+local dashboard input; never put their values in command arguments.
+
+With `MAYHEM_HOME`, `TOKENIZER_FILE` and `ADMISSION_ORIGIN` set to your chosen
+home, protected file and trusted admission service:
+
+```sh
+mayhem provider proxy setup init --name llama --home "$MAYHEM_HOME" \
+  --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
+# Resume the original saved setup:
+mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
+  --name llama
+```
+
+Alternatively use the existing local gateway's authenticated provider dashboard:
+
+```sh
+mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 --proxy-setup --name llama \
+  --proxy-setup-tokenizer-file "$TOKENIZER_FILE" \
+  --proxy-setup-admission-origin "$ADMISSION_ORIGIN"
+```
+
+Each proxied model has its own named setup in the same Core home. Use
+`setup init --name <name>` for another model and `setup list --home "$MAYHEM_HOME"`
+to inspect the saved setups. Names contain 1 to 32 lowercase letters, digits or
+hyphens and default to `default`. New bundles live in `proxy-setup/<name>`.
+An existing `proxy-setup/wizard.json` remains the `default` setup in place.
+The canonical provider identity pays admission once; the wizard skips another
+invoice for an already admitted provider. See [the named setup commands](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-proxy/docs/SETUP_WIZARD.md#choosing-a-named-setup)
+for paging, recovery and runtime isolation.
+
+Omit the tokenizer option for Decisions. Open the session URL printed by Core.
+Guided setup browses canonical families and exact create/join markets, collects
+explicit price/probe limits, and saves a private bundle. Probe, fee checkout,
+publication and Run each remain separate explicit actions. A buyer deposit does
+not pay the provider admission fee. A saved draft, payment return page, published
+offer or running process is not proof of available capacity.
+
+Follow the [setup and recovery guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-proxy/docs/SETUP_WIZARD.md)
+for admission, Run, offer-only rate changes and health from the correct control
+instance, or the [dashboard guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-proxy/docs/SETUP_DASHBOARD.md).
+Those guides state the tested OS boundaries. Native Windows worker enforcement
+is verified on the documented host; complete first-run/managed-service acceptance
+and other OS targets remain release gates, not inferred from packaging.
+
+### Native providers
+
+The native lane serves four fairly different kinds of operation. Pick your
+operating model; the knobs match it:
 
 | You are | Typical setup | How you run it |
 |---|---|---|
@@ -719,7 +815,9 @@ mayhem provider rails get
 
 | Command | What it does |
 |---|---|
-| `mayhem up --provider` | start serving with everything supervised |
+| `mayhem up --provider` | start native catalog serving with everything supervised |
+| `mayhem provider proxy setup init` | create a guided proxy-provider setup for your model API |
+| `mayhem provider proxy setup wizard` | resume proxy setup, admission, publication and Run |
 | `mayhem provider list / health` | joins, ledger state, heartbeats, visibility |
 | `mayhem provider rails set/get` | which payment rails you accept |
 | `mayhem provider payout set/get/rotate` | bind or rotate a provider-signed TAP/TNK destination |
@@ -746,19 +844,15 @@ Context is part of the deal too. Providers advertise the context window they ser
 
 ## Pricing
 
-Every market has one price at a time, and everyone active in the same epoch pays that same number. Nobody types the price in. Not providers, not users, and after seeding the starting price once, not us either.
+Markets have a shared price schedule, with separate context or outcome classes where applicable. Contract 29 sets the next quote from signed, settled paid units within 25%–400% of the calibrated reference price. Session prices remain locked at admission; later price changes cannot reprice accepted work.
 
-The clock behind it is the epoch: the network's settlement window, one hour by default. At the end of each hour, all the signed receipts from that hour are settled, and that settlement doubles as the price input for the next hour.
+The settlement epoch is one hour by default. Each market establishes a frozen busy-demand reference from its first 72 usable observations, beginning with paid work. Unit rates are normalized independently before aggregation, so tokens, images, audio and workflow units use the same controller. Existing markets can initialize from bounded, verified historical evidence; new markets hold their current quote during reference construction.
 
-Here is the loop. Each epoch the network measures how busy a market was: paid work that actually settled, divided by the capacity of the providers taking part. Above roughly 85% utilization the price steps up for the next epoch. Below it, the price steps down. A single step is capped at 10%, but steps compound, so a market that stays hot climbs hour after hour until enough supply shows up or demand cools.
+Subsequent hourly demand is normalized against that frozen reference and clipped to 0–1. If `q` is its last-six-observation mean and `s` its last-72-observation mean, the reference-price multiplier is `min(0.25 + 3.75*q, 1 + 3*s*s)`. Prices are calculated directly from the calibrated reference, without compounding previous prices or applying an ordinary percentage-step cap. Sustained busy demand can reach 400%; known empty epochs can reach 25%. A price can leave either bound when the demand signal changes.
 
-Providers steer it with a min-ask, the lowest price they are willing to serve at. When the market price is under your ask, you sit out. That shrinks supply, the market runs hotter, and the price climbs until it crosses your number and you flow back in. An ask does not name the price. It decides when you work, and who is working is what moves the price.
+Missing or incompatible usage evidence holds the quote instead of inventing zero demand. Confirmed zero fulfilled work counts as zero, including outages with no completed work: this controller does not infer lost demand or independent GPU availability. It follows settlement time. A thin launch sample is identified in the evidence, and references never silently retune themselves. Provider counts, slot claims and dollars spent do not choose price direction.
 
-Users steer it from the other side with a max-bid. If the price is above your bid, you get a clear "no provider at your price" and pay nothing. Enough buyers stepping back cools the market, and the price sinks toward where the buyers actually are.
-
-Your session keeps its price. The rate at the moment a session opens is locked into the spend voucher and the provider receipt, and settlement uses that locked rate no matter where the market moves afterwards. Nobody can reprice work you already agreed to.
-
-Two guardrails hold it steady. A market with fewer than two active providers stays pinned at its seed price, so a lone machine cannot steer the controller. And utilization counts only receipt-verified settled work, so posted intent, fake demand, and phantom supply move nothing.
+Providers can set a minimum ask and buyers a maximum bid. Those filters determine whether a request can trade at the current quote; neither guarantees that a future price will cross the selected threshold. FIAT, TNK and TAP keep their existing accounting and settlement rails.
 
 ### What a machine can earn
 
@@ -865,13 +959,14 @@ Separately calibrated vLLM execution modes can be selected with
 `--execution-mode <mode-id>` on `provider serve plan`, `add`, or `switch` when
 the signed catalog lists the mode for that artifact. Omitting the flag keeps baseline
 behavior; parallel dispatch needs the selected mode's own approval. See
-[the provider instructions](MODEL-CHEATSHEET.md#optional-vllm-execution-modes).
+[the provider instructions](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/MODEL-CHEATSHEET.md#optional-vllm-execution-modes).
 
 **Routes:**
 
 | Class | Routes |
 |-------|--------|
 | Text generation | `/v1/chat/completions`, `/v1/completions`, `/v1/responses` — tools, JSON mode, streaming, vision input where the catalog says so |
+| Exact token counting | `/v1/tokenize`, `/v1/count_tokens` — accepts `messages` or a single `prompt`; set `return_tokens` to include token IDs |
 | Embedding | `/v1/embeddings` |
 | Image generation | `/v1/images/generations` |
 | Video generation | `/v1/videos` |
@@ -972,7 +1067,7 @@ curl 'http://127.0.0.1:11435/v1/models?endpoint_family=mayhem_comfy_workflows&li
 ```
 
 The full provider/user workflow, outcome-class grid, and current signed parts inventory are in
-**[COMFY-CHEATSHEET.md](COMFY-CHEATSHEET.md)**.
+**[COMFY-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/COMFY-CHEATSHEET.md)**.
 That file is the public GitHub reference for workflow routing details, including
 the MiniMax H3 split between `video.minimax_h3.t2v_i2v` and
 `video.minimax_h3.r2v`. Users and providers should be able to understand
@@ -1092,7 +1187,7 @@ The SSH tunnel only transports the connection; it does not replace the dashboard
 Production figures come from the current catalog, contract, ledger, gateway records, or provider heartbeats, with freshness and unavailable states kept explicit. Workbench fixtures are labelled and isolated from production data.
 
 For dashboard UI work without starting the full stack, use the isolated fixture
-[dashboard workbench](crates/mayhem-gateway/DASHBOARD_WORKBENCH.md).
+[dashboard workbench](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-gateway/DASHBOARD_WORKBENCH.md).
 
 ## How the money is secured
 
@@ -1108,7 +1203,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.181` is source-only. The GitHub release contains the tagged source, not
+`v0.2.305` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -1116,7 +1211,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.181
+git checkout --detach v0.2.305
 ./install.sh --from-source
 ```
 
@@ -1125,7 +1220,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.181
+git checkout --detach v0.2.305
 .\install.ps1 -FromSource
 ```
 
@@ -1340,6 +1435,37 @@ modality health immediately instead of rerunning an expensive functional canary
 before their first room heartbeat. The Comfy runtime default device is `auto`;
 explicit `MAYHEM_COMFYUI_DEVICE=cpu` still forces CPU for hosts that need it.
 
+The `0.2.217` source release adds an optional
+`MAYHEM_COMFYUI_RESERVE_VRAM_GB` provider setting. It passes a bounded VRAM
+reserve to ComfyUI so a workflow provider can offload more model state to system
+memory while leaving measured GPU headroom for another local workload. Leave it
+unset unless the host has a calibrated coexistence profile.
+
+The `0.2.218` source release preserves assistant commentary before native
+OpenAI-compatible tool calls while streaming the calls as structured deltas;
+partial tool envelopes now fail closed instead of appearing as chat text. It
+also keeps ComfyUI request journals deletable inside the Windows sandbox.
+
+The `0.2.219` source release admits signed workflow inventory against the
+maximum parts one request can select. Providers still verify every advertised
+part, while optional model-part catalogs no longer consume memory admission as
+if every choice were loaded together.
+
+The `0.2.220` source release recovers expired inference reservations from the
+canonical ledger even when a gateway's local job record is unavailable. Any
+confirmed partial receipt is retained when the expired reservation closes.
+
+The `0.2.221` source release lets idle workflow engines release retained model
+and allocator memory when a provider's runtime floor activates. ComfyUI uses
+its supported unload and free-memory control path, restoring cohosted provider
+admission without interrupting an active workflow.
+
+The `0.2.222` source release adds a canonical endpoint-contract fingerprint to
+the existing request envelope. Updated providers prefer the canonical value,
+while the legacy fingerprint remains present for older peers. Equivalent
+contracts now survive JSON object reordering and JavaScript number round trips
+without disrupting mixed-version routes.
+
 The `0.2.118` source release documents the current Comfy parts inventory,
 binds workflow providers to the signed outcome-class definition instead of the
 local ComfyUI runtime directory, canonicalizes integer-valued workflow JSON
@@ -1351,7 +1477,7 @@ combined generation plus upscaler canary. It also carries bounded workflow `inpu
 source media, which lipsync and talking-video policies use through the normal
 paid `/v1/workflows` path, and validates muxed A/V workflow canaries whose audio
 track is embedded in the returned MP4. The dedicated Comfy reference is
-**[COMFY-CHEATSHEET.md](COMFY-CHEATSHEET.md)**.
+**[COMFY-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/COMFY-CHEATSHEET.md)**.
 
 The `0.2.104` source release makes local builds self-consistent across macOS,
 Linux, and Windows. Source installers select exactly one available llama.cpp
@@ -1428,7 +1554,7 @@ node scripts/knob-inventory.mjs --write && node scripts/knob-inventory.mjs --che
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Copyright © 2026 Trac Systems UG (haftungsbeschränkt). The code is yours to use, fork, and build on. The "OpenMayhem" and "Trac" names and logos are trademarks of Trac Systems UG and are not part of the code license.
+MIT — see [LICENSE](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/LICENSE). Copyright © 2026 Trac Systems UG (haftungsbeschränkt). The code is yours to use, fork, and build on. The "OpenMayhem" and "Trac" names and logos are trademarks of Trac Systems UG and are not part of the code license.
 
 ---
 
