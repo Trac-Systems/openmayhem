@@ -1,5 +1,10 @@
 # First-time local provider dashboard
 
+This dashboard connects a **proxy** provider. See
+[the two provider lanes](../../../PROVIDING.md) before applying native catalog
+requirements. An unlisted LLM or decision-model API can qualify for proxy setup.
+The ordinary native dashboard does not enable this wizard automatically.
+
 Start the existing wallet-backed gateway with explicit `mayhem use --proxy-setup`
 activation. It remains bound to a literal loopback address. Open the authenticated
 provider dashboard URL printed by Core, then **Open proxy setup wizard**. Alternate

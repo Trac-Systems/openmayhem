@@ -1,5 +1,13 @@
 # Canonical Model Cheatsheet
 
+**Scope: native catalog providers.** OpenMayhem also has a separate proxy lane
+for compatible independently operated LLM and decision-model APIs. **A missing
+entry here does not mean the model cannot be served through a proxy.** Start with
+[the two provider lanes](PROVIDING.md), then use
+[`mayhem provider proxy setup init`](crates/mayhem-proxy/docs/SETUP_WIZARD.md)
+when proxy serving fits the request. Native artifact/calibration requirements
+remain mandatory for native serving and do not certify a proxy upstream.
+
 This is the provider and operator reference for every model currently present in
 the signed canonical catalog. It is derived from
 [`catalog/models.json`](catalog/models.json), its
@@ -48,7 +56,7 @@ Windows x86_64 hosts. Apple Metal/MPS is not eligible for the GPU market.
 
 ## How to read this document
 
-- **Hard requirement** means the signed catalog or release code enforces it.
+- **Hard requirement** means the native signed catalog or release code enforces it.
   Failing it prevents admission or startup.
 - **Measured guidance** reports a calibration observation. It helps size a
   machine but is not a new admission rule, throughput promise, or exact minimum.
@@ -59,7 +67,7 @@ Windows x86_64 hosts. Apple Metal/MPS is not eligible for the GPU market.
   higher tier is admitted at that tier; if a higher proof is unavailable or
   fails, admission falls through to the next lower provable tier. Tier 4 is an
   optional admin elevation, not a prerequisite for joining.
-- Providers join permissionlessly. They do not create canonical models,
+- Native providers join permissionlessly. They do not create canonical models,
   enclaves, rooms, prices, or price brackets, and no admin manually approves a
   provider or its payout binding.
 

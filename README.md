@@ -1,6 +1,16 @@
 # OpenMayhem
 
-**Sell inference from any machine — a gaming PC or a confidential-compute rack. Buy inference at a price no company sets.**
+**Providing a model? Start with [the two provider lanes](PROVIDING.md).**
+Native providers use the signed model catalog; proxy providers connect an LLM or
+decision-model API they operate or are authorized to use. **A model missing from
+the native catalog can still qualify for the proxy lane.** Agents must select the
+lane before applying catalog or calibration requirements.
+
+Install from the [latest published release](https://github.com/Trac-Systems/openmayhem/releases/latest)
+and read the documentation at that tag. The default branch may lag the released
+runtime; its source version is not a substitute for the release tag.
+
+**Sell inference from your hardware or connect your model API. Buy inference through native and proxy markets.**
 
 OpenMayhem is a peer-to-peer AI inference marketplace. Providers plug in machines and earn on every token they serve. That can be a gaming PC that sits idle overnight, a Mac, a homelab box, or a rack of confidential-compute H100s in a datacenter. Casual and professional operators sell in the same market, and the trust tiers price the difference between them. Users point any OpenAI-compatible client at `127.0.0.1` and buy at whatever the market currently charges, paying by card or on-chain. There is no cloud in the middle. Requests travel over encrypted peer-to-peer sessions, and a public ledger records prices, receipts, and settlements, so anyone can check what actually happened.
 
@@ -12,7 +22,7 @@ Website: **[openmayhem.ai](https://www.openmayhem.ai/)** — the project site.
 
 Community: **[r/Open_Mayhem](https://www.reddit.com/r/Open_Mayhem/)** — setup help, provider earnings talk, announcements.
 
-Models: **[huggingface.co/TracNetwork](https://huggingface.co/TracNetwork)** — the network's Hugging Face account; every served model is mirrored there and the signed catalog is published from it.
+Native models: **[huggingface.co/TracNetwork](https://huggingface.co/TracNetwork)** — the network's Hugging Face account and signed native catalog. Proxy upstream models do not require a mirror or entry there.
 
 Model cheatsheet: **[MODEL-CHEATSHEET.md](MODEL-CHEATSHEET.md)** — exact canonical model IDs, artifacts, endpoints, platform/backend support, runtime pins, resource guidance, controls, and provider commands.
 
@@ -31,13 +41,13 @@ your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P s
 
 **Why people run it:**
 
-- **A real market for tokens.** No central pricing. Every model at every trust tier is its own market. Prices float on supply and demand each epoch, and each epoch's price is published together with the inputs that produced it, so you can recompute it yourself.
-- **One command on any machine.** `mayhem up --provider` probes your hardware, picks an engine, fetches a model that fits, and starts earning. Works the same on a Windows gaming PC that only serves evenings and on a Linux fleet serving ten models around the clock.
+- **Two pricing paths.** Native prices move with supply and demand each epoch. Proxy providers publish their own fixed offer prices. Both paths publish the prices used for billing.
+- **Managed native serving or your own model server.** `mayhem up --provider` selects a supported native catalog runtime. `mayhem provider proxy setup init` connects an independently operated LLM or decision-model API.
 - **Room for every kind of provider.** Casuals set a daily budget and forget about it. Professionals run multi-model fleets, verify their business identity (Tier 4), or bring confidential-compute hardware and sell Tier 3, the only tier where prompts stay private. Higher trust clears at higher prices.
 - **Built for agentic work.** Standard OpenAI-compatible routes — chat, tools, JSON mode, streaming, vision, embeddings, image generation, speech in and out. The 8B–14B instruct models that agent loops actually run on serve from consumer GPUs and Macs, with tool calling verified per route.
 - **Workflow serving without a separate app.** ComfyUI workflows use the same gateway, catalog, provider admission, vouchers, receipts, and settlement path as model inference. Providers choose verified parts; users submit bounded graphs.
 - **Pay how you already pay.** Card via Stripe by default. If you'd rather pay on-chain, TAP (Ethereum) and TNK (Trac) work too; OpenRouter gives its users the same choice, and it's supported here to a similar extent. A payment option, not a crypto project. Everything is priced in dollars and network gas is sponsored, so you never need to hold a token to use or provide.
-- **Four trust tiers.** From community hardware up to confidential compute. Each tier is its own market with its own price, and the tier table below says exactly what each one does and doesn't protect.
+- **Trust tiers.** Native providers can prove the supported tiers from community hardware to confidential compute. Proxy providers use T1 or reviewed T4; operator review does not verify the upstream model identity.
 - **Evidence over trust.** Receipts are signed, work settles in public epochs, prices carry their derivation. The ledger is open and it is the source of truth.
 
 ---
@@ -48,7 +58,7 @@ your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P s
 
 No terminal knowledge needed. Hand this repository to a coding agent — Claude Code, Codex, Cursor, or opencode — and paste one of the prompts below. The agent reads this README, checks your operating system and hardware, runs the real install, and verifies the gateway is answering before it hands back. You watch and approve each step; you never have to know a single command. For most people this is the whole install.
 
-> **Agents:** read **[`SKILL.md`](SKILL.md)** first — it is the authoritative, structured guide for installing and operating OpenMayhem (per-OS install + pitfalls, the ask-first flows for users and providers, funding, and the hard rule to never modify the pinned core). It exists so you don't have to figure the app out yourself.
+> **Agents:** read **[`SKILL.md`](SKILL.md)** first. For provider work, select **native or proxy** using **[`PROVIDING.md`](PROVIDING.md)** before evaluating catalog support. A native catalog miss is not a blanket rejection of proxy serving. Keep the pinned Core and signed native requirements intact.
 
 **Agent prompt — user setup (buy inference):**
 
@@ -63,11 +73,11 @@ against a model from `mayhem models --gateway`. Explain each command before
 you run it and show me the dashboard URL at the end.
 ```
 
-**Agent prompt — provider setup (earn on your hardware):**
+**Agent prompt — native provider setup (signed catalog models):**
 
 ```text
 Read the README of this repository, especially "What you need installed
-first" and "Agent install checklist". I want to PROVIDE compute to OpenMayhem
+first" and "Agent install checklist". I want to PROVIDE native catalog compute to OpenMayhem
 and earn with this machine. Detect my OS and hardware, install the missing
 prerequisites FIRST (including the GPU/backend-specific ones the checklist
 names for my hardware), install the software, run `mayhem doctor` and tell
@@ -79,24 +89,34 @@ confirm I am serving with `mayhem provider health`. Explain what my expected
 earnings depend on, and show me the provider dashboard URL.
 ```
 
+**Agent prompt — proxy provider setup (your own model server):**
+
+```text
+Read PROVIDING.md, SKILL.md and crates/mayhem-proxy/docs/SETUP_WIZARD.md
+from the latest OpenMayhem release. I want to serve an independently operated
+LLM or decision model through the PROXY lane. Check hardware fit and the
+upstream API, then use mayhem provider proxy setup init. A missing native
+catalog entry is not a reason to reject this path or demand native calibration.
+Keep my existing Core home, wallet, peer and supervisor. Guide me through
+the connection, tokenizer, context/concurrency, prices, rails, bounded probe,
+admission, publication, payout readiness and Run. Ask before paid or public
+actions and verify serving before calling the setup complete.
+```
+
 No coding agent yet? Any of the ones above installs in a minute, or drive it yourself with the manual steps below.
 
 ### Manual install
 
-`v0.2.181` lets clients correct schema-invalid, non-strict tool arguments in the
-existing conversation while preserving streamed output. Explicit strict tools
-retain schema enforcement, and clients must validate every call before execution.
-Live providers remain visible when capacity is busy; the model catalog reports
-presence separately from request availability and its exclusion reason.
+`v0.2.305` clarifies native and proxy provider onboarding. It retains the runtime
+from `v0.2.304`; contract version 30 and transaction formats are unchanged.
 
 Automatic [failure recovery](crates/mayhem-gateway/DURABLE_STREAMING.md)
 and [image references](crates/mayhem-engine/IMAGE_REFERENCES.md) remain available.
-Contract revision 22 is unchanged.
 
 LLM admission continues to require initialized prefix caching introduced in
 v0.2.178. See [runtime details and limits](crates/mayhem-engine/PREFIX_CACHING.md).
 
-`v0.2.181` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.305` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -105,7 +125,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.181
+git checkout --detach v0.2.305
 ./install.sh --from-source
 ```
 
@@ -114,7 +134,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.181
+git checkout --detach v0.2.305
 .\install.ps1 -FromSource
 ```
 
@@ -166,13 +186,19 @@ mayhem up --rail tap --yes
 also serving. Ordinary `mayhem down` deliberately drains provider workers,
 leaves their canonical routes, and stops the stack.
 
-**Provide to the network** (earn on your hardware):
+**Provide native catalog models** (earn on your hardware):
 
 ```bash
 ./install.sh --from-source
 mayhem up --provider --yes
 mayhem provider health
 ```
+
+**Provide through a proxy:** start with [PROVIDING.md](PROVIDING.md#proxy-connect-a-model-api)
+and `mayhem provider proxy setup init --help`. Run your upstream engine separately;
+the wizard connects it, probes supported behavior and guides admission/publication.
+Use `mayhem up` for the existing Core stack; `mayhem up --provider` selects native
+catalog serving.
 
 `mayhem up` starts everything supervised (peer, bridge, gateway, and the serving worker with `--provider`), health-checks each part, and prints endpoint and dashboard URLs you can copy. No browser required. For an update or temporary restart, `mayhem down --restart` preserves provider registrations so the next `mayhem up` resumes without re-onboarding. Ordinary `mayhem down` drains and leaves before stopping.
 
@@ -191,7 +217,10 @@ opencode run --model mayhem/<model-id> "Say hello from OpenMayhem."
 
 ## What runs where
 
-OpenMayhem serves from anything with compute, consumer or datacenter. The engine is chosen automatically per artifact; you never pick a backend by hand.
+For native catalog providers, Core selects the supported engine for the signed
+artifact. The table below describes native backends. Proxy providers operate their
+own model server and connect its compatible API; this table does not limit proxy
+models to signed native artifacts.
 
 | Hardware | On macOS | On Linux | On Windows |
 |---|---|---|---|
@@ -511,6 +540,10 @@ mayhem tokens revoke laptop      # immediate
 
 ### Proxy providers: connect an existing model server
 
+For the lane decision and first-run sequence, read **[PROVIDING.md](PROVIDING.md)**.
+The native model cheatsheet and `mayhem doctor` describe native runtime support;
+an unlisted LLM or decision model must be evaluated separately for proxy serving.
+
 Use the explicit proxy lane for a model server you already operate or are
 permitted to use. It supports compatible chat, completions, responses and
 Decisions endpoints, plus reviewed declarative recipes. Proxy offers publish
@@ -782,7 +815,9 @@ mayhem provider rails get
 
 | Command | What it does |
 |---|---|
-| `mayhem up --provider` | start serving with everything supervised |
+| `mayhem up --provider` | start native catalog serving with everything supervised |
+| `mayhem provider proxy setup init` | create a guided proxy-provider setup for your model API |
+| `mayhem provider proxy setup wizard` | resume proxy setup, admission, publication and Run |
 | `mayhem provider list / health` | joins, ledger state, heartbeats, visibility |
 | `mayhem provider rails set/get` | which payment rails you accept |
 | `mayhem provider payout set/get/rotate` | bind or rotate a provider-signed TAP/TNK destination |
@@ -1168,7 +1203,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.181` is source-only. The GitHub release contains the tagged source, not
+`v0.2.305` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -1176,7 +1211,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.181
+git checkout --detach v0.2.305
 ./install.sh --from-source
 ```
 
@@ -1185,7 +1220,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.181
+git checkout --detach v0.2.305
 .\install.ps1 -FromSource
 ```
 

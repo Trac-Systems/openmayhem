@@ -1,5 +1,30 @@
 # SKILL.md — Agent guide for installing & operating OpenMayhem
 
+## Start here: native or proxy provider
+
+Read this guide from the [latest published release](https://github.com/Trac-Systems/openmayhem/releases/latest).
+For provider work, read **[PROVIDING.md](PROVIDING.md)** before selecting a model.
+The default branch may have older runtime source; install the chosen release tag
+and check `mayhem --version` and its own command help.
+
+- **Native:** signed catalog artifacts, managed runtimes and calibration/canary
+  requirements. Entry point: `mayhem up --provider`.
+- **Proxy:** an independently operated compatible LLM or decision-model API.
+  Entry point: `mayhem provider proxy setup init`. Core still runs as the control
+  instance for routing, metering, availability and payments.
+
+**Absence from the native catalog is not a full rejection.** For an unlisted LLM
+or decision model, check proxy suitability before reporting that OpenMayhem cannot
+serve it. Native backend/platform restrictions do not prove that an independently
+operated upstream is incompatible. Keep native requirements intact; do not edit a
+catalog, bypass calibration or claim a proxy is a native model.
+
+If the user specifies an upstream API or an independent model runtime, follow
+[the proxy wizard guide](crates/mayhem-proxy/docs/SETUP_WIZARD.md). If the lane is
+unclear, explain both and ask. Hardware fit, upstream permission, supported
+protocol and verified capabilities still matter. Proxy support does not prove
+that an arbitrary model fits the machine or that every upstream feature works.
+
 **You are a coding agent driving OpenMayhem for a human.** Agent-driven install and operation is the
 PRIMARY path — most users and providers never type a command themselves. This file exists so you do
 not have to reverse-engineer the app: follow it and you save the user tokens and time, and even a
@@ -16,16 +41,17 @@ A peer-to-peer AI-inference marketplace. Two roles:
 - **Provider** — serves models from their own machine (gaming PC, Mac, homelab, datacenter) and
   earns per token.
 
-The CLI binary is `mayhem`. The network runs on Trac. Prices float on an automated per-epoch market.
+The CLI binary is `mayhem`. The network runs on Trac. Native prices use the
+automated per-epoch market; proxy providers set their signed offer prices.
 Pay by card (Stripe/fiat), or on-chain via **TAP** (Ethereum ERC-20) or **TNK** (Trac native). The
 gateway is loopback-only; a public ledger records prices, receipts, settlements.
 
-Before selecting or serving a model, read the canonical
+Before selecting or serving a **native catalog model**, read the canonical
 **[`MODEL-CHEATSHEET.md`](MODEL-CHEATSHEET.md)**. It records every current exact model
 selector, signed artifact, endpoint and modality surface, supported backend/platform pair, runtime
 pin, resource floor, measured guidance, unsupported combination, and provider start command. Live
 enclave IDs, rooms, routes, and prices must still come from `mayhem models --gateway`.
-Before declaring a new model or workflow done, read
+Before declaring a new **native model or workflow** done, read
 **[`CALIBRATION.md`](CALIBRATION.md)** and verify the relevant proof gates.
 For ComfyUI workflows, also read **[`COMFY-CHEATSHEET.md`](COMFY-CHEATSHEET.md)** before
 calibrating, admitting, serving, or using a workflow class. It lists every current outcome class,
@@ -59,7 +85,7 @@ and `/v1/jobs/<id>/artifacts/<artifact_id>`. Without `Prefer: respond-async`, a
 plain synchronous workflow request waits for delivery and a premature client
 disconnect is cancellation, not a background render promise.
 
-When one host will serve multiple models, start their provider workers **serially**. Wait for each
+When one host will serve multiple native models, start their provider workers **serially**. Wait for each
 worker to finish artifact verification, model load, functional canary, and fresh-heartbeat
 stabilization before admitting and starting the next worker. Concurrent startup can overlap
 transient load headroom and cause an OOM even when the models fit together at steady state. After
@@ -98,14 +124,14 @@ aggregate admission refusal or compensate with an undocumented memory override.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.168` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.305` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.168
+  git checkout --detach v0.2.305
   ./install.sh --from-source
   ```
 
@@ -113,7 +139,7 @@ aggregate admission refusal or compensate with an undocumented memory override.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.168
+  git checkout --detach v0.2.305
   .\install.ps1 -FromSource
   ```
 On updated source checkouts, `mayhem up` verifies and, when needed, deterministically repairs only
@@ -314,7 +340,11 @@ canonical dashboard.
 mode preserves provider registrations if this stack also serves. Rails never convert into each
 other.
 
-### 4.2 Provider — earn on this machine
+### 4.2 Native provider — earn with signed catalog models
+
+This section applies after selecting the native lane. For an upstream model API
+or an unlisted LLM/decision model, use [proxy provider setup](#43-proxy-provider-connect-your-model-api).
+
 **Ask first:**
 - **Which payment rails to ACCEPT?** (any subset of `fiat,tap,tnk`; default at registration is
   `fiat` — a provider that wants on-chain MUST set rails or it silently rejects those users).
@@ -759,7 +789,43 @@ claimed non-custodially with `mayhem withdraw` (`mayhem claim` is its visible al
 sponsored; explain earnings depend on uptime, price, saturation, and reputation. Use
 `mayhem provider drain` to stop taking new sessions without a hard stop.
 
-### 4.3 Wire a coding agent (opencode)
+### 4.3 Proxy provider: connect your model API
+
+Use [PROVIDING.md](PROVIDING.md#proxy-connect-a-model-api) and the
+[CLI wizard](crates/mayhem-proxy/docs/SETUP_WIZARD.md). The signed native model
+matrix above is not the proxy eligibility list. Proxy serving currently covers
+LLMs and decision models; it does not add proxy media or embedding support.
+
+1. Verify the separately operated upstream model server, endpoint and permission
+   to use it. Check actual memory/context/concurrency and protocol behavior.
+2. Reuse the existing private Core home, wallet, peer, SC-Bridge and mayhemd. Have
+   a complete matching Core package with `mayhem-proxy-worker`. Start Core with
+   `mayhem up` if needed; do not start a native model just to configure a proxy.
+3. Select an exact upstream model ID, protected tokenizer file for LLM speed
+   measurement, trusted admission origin, prices, rails and bounded probe budget.
+   Never expose upstream keys in command arguments. Decisions needs no tokenizer.
+4. With operator-selected variables, start or resume the same named setup:
+
+   ```sh
+   mayhem provider proxy setup init --name my-model --home "$MAYHEM_HOME" \
+     --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
+   mayhem provider proxy setup wizard --name my-model --home "$MAYHEM_HOME"
+   ```
+
+5. Follow explicit checks, probe, admission, publication, payment registration,
+   verified payout bindings and Run. Read the actual fee/receiver from the trusted
+   admission service. Buyer credits do not pay provider admission, and an already
+   admitted provider identity does not pay a new fee for each model.
+6. Verify current managed-controller health and a permitted paid request. Neither
+   a published offer nor a successful model-list request alone proves readiness.
+
+The dashboard needs explicit `mayhem use --proxy-setup` activation; an ordinary
+dashboard without the button is not evidence of missing proxy support. Follow the
+[dashboard guide](crates/mayhem-proxy/docs/SETUP_DASHBOARD.md); reuse the existing
+gateway configuration and do not bind another listener on its occupied port.
+Top-level `mayhem proxy` is buyer control, not this provider entry point.
+
+### 4.4 Wire a coding agent (opencode)
 ```
 mayhem opencode                                 # registers a `mayhem` provider in opencode.json, fills models from /v1/models
 opencode run --model mayhem/<model-id> "Say hello from OpenMayhem."
@@ -768,7 +834,7 @@ Re-run `mayhem opencode` after the catalog changes to re-sync. It leaves other p
 Client sampling (temperature, top_p, seed) is set in the client (e.g. opencode.json `options`) and
 forwarded as-is.
 
-### 4.4 Ongoing surfaces (same protocol: ask if needed → execute → relay)
+### 4.5 Ongoing surfaces (same protocol: ask if needed → execute → relay)
 - **Spend controls:** `mayhem config max-price <value|--clear>` (a per-token price CEILING — note it
   bounds the RATE, not the token volume; a bigger/longer request still costs more).
 - **Preferred providers (per model):** `mayhem config` preferred-provider `add|remove|list` — pins
@@ -791,10 +857,13 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.168 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.168; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.305 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.305; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
-| Start provider | `mayhem up --provider --yes` |
+| Start native catalog provider | `mayhem up --provider --yes` |
+| Start proxy setup | `mayhem provider proxy setup init --help` |
+| Resume proxy setup | `mayhem provider proxy setup wizard --name <name> --home <existing-home>` |
+| List saved proxy setups | `mayhem provider proxy setup list --home <existing-home>` |
 | Stop and leave provider registrations | `mayhem down` |
 | Temporary restart/update | `mayhem down --restart` |
 | Fund (card) | `mayhem pay stripe …` → relay Stripe URL |
@@ -804,7 +873,7 @@ forwarded as-is.
 | Models (live) | `mayhem models --gateway` |
 | Price + derivation | `mayhem price show` |
 | Max price ceiling | `mayhem config max-price <v\|--clear>` |
-| What fits (provider) | `mayhem doctor` |
+| What fits the native catalog runtime | `mayhem doctor` |
 | Accept rails | `mayhem provider rails set --rails fiat,tap,tnk --submit` |
 | Bind TAP payout | `mayhem provider payout set --rail tap --submit` |
 | Bind TNK payout | `mayhem provider payout set --rail tnk --submit` |

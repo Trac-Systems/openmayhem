@@ -1,5 +1,11 @@
 # Local shared provider setup
 
+**This is the proxy-provider lane.** Start with
+[the native/proxy comparison](../../../PROVIDING.md) if choosing a lane.
+A model missing from the signed native catalog may qualify here as a compatible
+LLM or decision-model API. Use `mayhem provider proxy setup init`; native
+`mayhem up --provider` and top-level buyer `mayhem proxy` are different entry points.
+
 The CLI wizard and the opt-in gateway dashboard use `setup::Flow` and the same
 owner-only `Store`. This is a connected setup surface for the existing four
 compatible endpoint profiles and reviewed custom profiles. Compatible profiles
