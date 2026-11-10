@@ -43,7 +43,7 @@ catalog route or claim native calibration/attestation from its model name.
 Use the [latest published source release](https://github.com/Trac-Systems/openmayhem/releases/latest)
 and its own README/SKILL. Install the complete package, including `mayhem`,
 `mayhemd` and `mayhem-proxy-worker`; copying only the CLI is insufficient.
-Read the [installation prerequisites](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/README.md#what-you-need-installed-first).
+Read the [installation prerequisites](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/README.md#what-you-need-installed-first).
 
 Check `mayhem --version` and `mayhem provider proxy setup --help`. If the proxy
 command is absent, check the installed release and PATH before rejecting the
@@ -51,7 +51,7 @@ model. Updating Core is separate from changing the model or its quantization.
 
 ## Native: use a catalog runtime
 
-Read the [native model cheatsheet](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/MODEL-CHEATSHEET.md), inspect current routes,
+Read the [native model cheatsheet](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/MODEL-CHEATSHEET.md), inspect current routes,
 and use the exact model and artifact identifiers. Native catalog, calibration,
 canary and runtime requirements continue to apply.
 
@@ -65,8 +65,8 @@ mayhem provider health --json
 ## Proxy: connect a model API
 
 The executable entry point is **`mayhem provider proxy setup init`**. The detailed
-[CLI wizard guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-proxy/docs/SETUP_WIZARD.md) and
-[dashboard guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-proxy/docs/SETUP_DASHBOARD.md) cover setup and recovery.
+[CLI wizard guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-proxy/docs/SETUP_WIZARD.md) and
+[dashboard guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-proxy/docs/SETUP_DASHBOARD.md) cover setup and recovery.
 Top-level `mayhem proxy` commands are buyer controls, not provider onboarding.
 
 1. **Run the upstream server.** For example, operate a supported MLX or llama.cpp
@@ -81,21 +81,21 @@ Top-level `mayhem proxy` commands are buyer controls, not provider onboarding.
    providers, wallet, stores and supervisor.
 3. **Prepare setup inputs.** Select the server's exact model ID, protected local
    `tokenizer.json` for LLM speed measurement, context and concurrency you can
-   support, prices, payment rails, and a trusted admission-service origin. Get
-   the admission origin from the network operator; never guess a receiver or use
-   a buyer deposit as admission. Upstream keys belong in protected files, not
-   command arguments. Decisions does not require a tokenizer.
+   support, prices and payment rails. Official mainnet uses the trusted admission
+   origin `https://api.openmayhem.ai` automatically. Other networks need their
+   operator-approved `--admission-origin`; explicit overrides are preserved.
+   Never guess a receiver or use a buyer deposit as admission. Upstream keys
+   belong in protected files, not command arguments. Decisions does not require a tokenizer.
 4. **Create a named setup.** With the variables below set to your own inputs:
 
    ```sh
    mayhem provider proxy setup init --name my-model --home "$MAYHEM_HOME" \
-     --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
+     --tokenizer-file "$TOKENIZER_FILE"
    ```
 
    `MAYHEM_HOME` is your existing private Core home; `TOKENIZER_FILE` is the
-   approved local tokenizer file; `ADMISSION_ORIGIN` is the trusted admission API
-   origin. The wizard prompts for the upstream API URL, authentication choice,
-   model and market. A local server such as `http://127.0.0.1:8080/v1/` needs the
+   approved local tokenizer file. The wizard prompts for the upstream API URL,
+   authentication choice, model and market. A local server such as `http://127.0.0.1:8080/v1/` needs the
    explicit local network `127.0.0.1/32` and permission for HTTP. This grants no
    access to other destinations. Creating or joining a proxy market does not
    require a native catalog entry.
@@ -119,10 +119,25 @@ mayhem provider proxy setup wizard --name my-model --home "$MAYHEM_HOME"
 
 The dashboard wizard appears only when the local gateway has explicitly enabled
 `--proxy-setup` (first creation) or `--proxy-setup-config` (saved setup). Follow the
-[dashboard launch instructions](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-proxy/docs/SETUP_DASHBOARD.md) and
+[dashboard launch instructions](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-proxy/docs/SETUP_DASHBOARD.md) and
 open Core's authenticated provider link. An absent button in the ordinary
 dashboard does not mean the proxy lane is unsupported. Reuse the existing gateway
 configuration; do not start another listener on an occupied port.
 
 If an upstream is incompatible or too large for the machine, explain that exact
 limit. Do not bypass checks or promise readiness based only on a model name.
+
+## Recovering an interrupted first sync
+
+If an older release stops with `expected CONTRACT_VERSION 30, got 17` (or
+18–22), install v0.2.306 or later as a complete package and restart the existing
+Core stack using the same home. The older number belongs to a retained ledger
+operation. Current releases replay it only with authenticated canonical evidence
+and the original version’s rules. Do not delete the store, wallet or identity,
+change the contract version, or start a second stack on the same home.
+
+After synchronization, resume the same named proxy wizard. Existing mainnet
+drafts without an admission origin now use `https://api.openmayhem.ai`. If a
+provider admission already exists, the wizard reuses it; do not send another fee
+just because setup was interrupted. A provider that has never paid admission
+still needs the explicit quoted enrollment step before publication.

@@ -3,18 +3,18 @@
 **Scope: native catalog providers.** OpenMayhem also has a separate proxy lane
 for compatible independently operated LLM and decision-model APIs. **A missing
 entry here does not mean the model cannot be served through a proxy.** Start with
-[the two provider lanes](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/PROVIDING.md), then use
-[`mayhem provider proxy setup init`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-proxy/docs/SETUP_WIZARD.md)
+[the two provider lanes](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/PROVIDING.md), then use
+[`mayhem provider proxy setup init`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-proxy/docs/SETUP_WIZARD.md)
 when proxy serving fits the request. Native artifact/calibration requirements
 remain mandatory for native serving and do not certify a proxy upstream.
 
 This is the provider and operator reference for every model currently present in
 the signed canonical catalog. It is derived from
-[`catalog/models.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/models.json), its
-[detached signature](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/signatures/models.json.sig), the canaries named
+[`catalog/models.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/models.json), its
+[detached signature](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/signatures/models.json.sig), the canaries named
 by that catalog, the managed-runtime locks in
-[`python_runtime.rs`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-cli/src/python_runtime.rs), and
-[`CALIBRATION.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/CALIBRATION.md).
+[`python_runtime.rs`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-cli/src/python_runtime.rs), and
+[`CALIBRATION.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/CALIBRATION.md).
 
 The live ledger remains authoritative for active enclave IDs, rooms, prices,
 routes, and revisions. Never copy an enclave ID or price from documentation:
@@ -30,7 +30,7 @@ runtime, co-resident memory, endpoint-floor, Sulphur, Chatterbox, ACE-Step,
 Needle, and Comfy workflow market fixes, and adds the current Comfy parts
 inventory plus bounded workflow `input_files` for image/audio/video source
 media. The dedicated Comfy provider/user reference is
-[`COMFY-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/COMFY-CHEATSHEET.md); it lists every outcome class, the
+[`COMFY-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/COMFY-CHEATSHEET.md); it lists every outcome class, the
 current signed parts index, required part sets, and `/v1/workflows` usage.
 Ledger-only workflow outcome classes expose endpoint family
 `mayhem_comfy_workflows`, providers can resolve workflow enclaves without a
@@ -129,7 +129,7 @@ generation execution profile and overlap proof; without that opt-in it remains
 exclusive. Capacity is still derived from the provider's actual resources.
 Mode-aware providers and gateways are required to serve these routes; older
 gateways ignore their advertisements. Baseline routes remain unchanged. See
-[CALIBRATION.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/CALIBRATION.md#optional-execution-modes) for evidence rules.
+[CALIBRATION.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/CALIBRATION.md#optional-execution-modes) for evidence rules.
 
 ## Public API error codes
 
@@ -288,7 +288,7 @@ Krea providers must add these signed parts before admission:
 ### Current Comfy parts inventory
 
 The authoritative Comfy workflow reference is
-[`COMFY-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/COMFY-CHEATSHEET.md). It lists every workflow outcome
+[`COMFY-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/COMFY-CHEATSHEET.md). It lists every workflow outcome
 class, the class-fit matrix, required Krea/LTX/H3/lipsync part sets, provider
 commands, user API shape, and all 96 signed parts.
 
@@ -312,7 +312,7 @@ signed as parts before the proof counts. Manual out-of-policy downloads are not
 OpenMayhem calibration evidence.
 
 The final proof must also pass the Comfy acceptance gate in
-[`COMFY-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/COMFY-CHEATSHEET.md): signed inventory, blessed runtime
+[`COMFY-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/COMFY-CHEATSHEET.md): signed inventory, blessed runtime
 nodes, embedded workflow policy, human-inspected quality, and a paid
 `/v1/workflows` request. A valid container, frame count, or waveform alone is
 not sufficient if the media does not match the requested task.
@@ -365,7 +365,7 @@ atomic activation before using it to materialize a frozen runtime.
 | Backend | Exact managed runtime |
 |---|---|
 | vLLM | `uv 0.11.29`, Python 3.12, `vllm 0.24.0`, `torch 2.11.0`, `transformers 5.12.1`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `compressed-tensors 0.17.0`, `triton 3.6.0`, `av 18` |
-| vLLM optional `flashinfer_speculative_metadata_v1` | Only when selected by the signed execution-mode profile: `vllm 0.24.0+mayhem.specmeta1`, with the same remaining direct dependency pins as baseline. Linux x86_64/aarch64 wheels are size/SHA-256 pinned in [`vllm-specmeta-v1-wheels.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-cli/resources/python/vllm-specmeta-v1-wheels.json). Uses a separate managed Python 3.12 environment with `Python.h` and `pyconfig.h` required for CUDA JIT compilation; explicit interpreter overrides must pass the same header, version and module-integrity checks. Verified wheels are cached separately from the venv for repair/reuse. |
+| vLLM optional `flashinfer_speculative_metadata_v1` | Only when selected by the signed execution-mode profile: `vllm 0.24.0+mayhem.specmeta1`, with the same remaining direct dependency pins as baseline. Linux x86_64/aarch64 wheels are size/SHA-256 pinned in [`vllm-specmeta-v1-wheels.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-cli/resources/python/vllm-specmeta-v1-wheels.json). Uses a separate managed Python 3.12 environment with `Python.h` and `pyconfig.h` required for CUDA JIT compilation; explicit interpreter overrides must pass the same header, version and module-integrity checks. Verified wheels are cached separately from the venv for repair/reuse. |
 | MLX language/vision | `uv 0.11.29`, Python 3.12, `mlx-lm 0.31.3`, `mlx-vlm 0.6.3`, `mlx 0.32.0`, `llguidance 1.7.6`, `transformers 5.12.1`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `av 18` |
 | llama.cpp media | `llama-cpp-2`/`llama-cpp-sys-2 0.1.150` from llama.cpp revision `7f15e87e3cb0f636e236243e6ee4fc2a4c357277`, with `llguidance` and `mtmd`; acceleration is compile-time CUDA, Metal, or Vulkan. macOS source builds use Metal with runtime CPU fallback; Linux x86_64/aarch64 and Windows x86_64 select working CUDA, then Vulkan, then CPU; Windows ARM64 uses CPU. `MAYHEM_LLAMA_CPP_FEATURES` preserves an explicit, validated operator override. |
 | Transformers ASR | `uv 0.11.29`, Python 3.12, `transformers 5.14.1`, `torch 2.13.0`, `tokenizers 0.22.2`, `safetensors 0.8.0`, `numpy 2.4.6`, `soundfile 0.14.0`, `soxr 1.1.0`, `librosa 0.11.0` |
@@ -376,11 +376,11 @@ atomic activation before using it to materialize a frozen runtime.
 | Needle | Model `Cactus-Compute/needle@5f89b4307696d669c3df1d38ae057e6e1728b107`; runtime source `Cactus-Compute/needle-hf@ffd0d081401257fee31150d30c494b2f98910fc0`; exact hash-pinned release locks are split by CPU and CUDA platform. Apple MPS is measured but intentionally not market-eligible. |
 
 The authoritative full locks are
-[`python_runtime.rs`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-cli/src/python_runtime.rs),
-[`sulphur-runtime-requirements.txt`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-cli/resources/python/sulphur-runtime-requirements.txt),
-[`sulphur-mlx-runtime-requirements.txt`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-cli/resources/python/sulphur-mlx-runtime-requirements.txt),
+[`python_runtime.rs`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-cli/src/python_runtime.rs),
+[`sulphur-runtime-requirements.txt`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-cli/resources/python/sulphur-runtime-requirements.txt),
+[`sulphur-mlx-runtime-requirements.txt`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-cli/resources/python/sulphur-mlx-runtime-requirements.txt),
 and the four
-[`chatterbox-runtime-*`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-cli/resources/python) lock
+[`chatterbox-runtime-*`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-cli/resources/python/) lock
 directories. Stable-diffusion.cpp is the one external engine below: its
 executable version is not release-pinned, so this document does not invent one.
 
@@ -433,7 +433,7 @@ website billing proof, and the full `0.2.164` fleet rollout are complete.
   23,114,056,343 bytes. Only complete hash- and Merkle-verified safetensors
   from the canonical mirror are eligible.
 - Canary:
-  [`canary-qwen3.8-27b-nvfp4-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-qwen3.8-27b-nvfp4-v1.json),
+  [`canary-qwen3.8-27b-nvfp4-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-qwen3.8-27b-nvfp4-v1.json),
   `token_fingerprint`, `match_min=0.9`, with 14 cases.
 
 **Hard requirements and surface**
@@ -512,7 +512,7 @@ usage, and final receipt.
 - Primary `model.safetensors`: 23,354,242,416 bytes, plus eight signed
   configuration, tokenizer, processor, template, and recipe sidecars.
 - Canary:
-  [`canary-launch-v2.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-launch-v2.json)
+  [`canary-launch-v2.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-launch-v2.json)
 
 **Hard requirements and surface**
 
@@ -567,7 +567,7 @@ unless a provider is explicitly running it.
 - Primary GGUF: 5,335,289,664 bytes. Mandatory BF16 multimodal projector:
   991,551,840 bytes.
 - Canary:
-  [`canary-gemma4-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-gemma4-launch-v1.json)
+  [`canary-gemma4-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-gemma4-launch-v1.json)
 
 **Hard requirements and surface**
 
@@ -614,7 +614,7 @@ projector.
 - Primary GGUF: 3,864,250,304 bytes. Mandatory Qwen text encoder:
   2,497,281,120 bytes. Mandatory VAE: 335,304,388 bytes.
 - Canary:
-  [`canary-z-image-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-z-image-launch-v1.json)
+  [`canary-z-image-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-z-image-launch-v1.json)
 
 **Hard requirements and surface**
 
@@ -662,7 +662,7 @@ or VAE.
 - Primary weights: 2,508,311,120 bytes plus five signed processor, tokenizer,
   and configuration sidecars.
 - Canary:
-  [`canary-stt-launch-v2.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-stt-launch-v2.json)
+  [`canary-stt-launch-v2.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-stt-launch-v2.json)
 
 **Hard requirements and surface**
 
@@ -710,7 +710,7 @@ upstream NeMo checkout.
 - Primary DiT: 4,787,825,604 bytes. Total primary plus 25 sidecars:
   10,092,101,191 bytes.
 - Canary:
-  [`canary-music-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-music-launch-v1.json)
+  [`canary-music-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-music-launch-v1.json)
 
 **Hard requirements and surface**
 
@@ -765,7 +765,7 @@ not enable arbitrary remote code or replace individual composite components.
   `prism-ml/Ternary-Bonsai-27B-mlx-2bit@70f75f3ad081ab840a42f3304c02c27e7f89bfb7`.
   Total: 8,521,049,516 bytes.
 - Canary:
-  [`canary-bonsai-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-bonsai-launch-v1.json)
+  [`canary-bonsai-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-bonsai-launch-v1.json)
 
 **Hard requirements and surface**
 
@@ -821,7 +821,7 @@ canonical artifact. Never mix a projector or primary across the two variants.
   `MLXBits/sulphur-2-distill-mlx-q4@d210a0937cac3464ef80c74806e886beddf19a8e`.
   Total: 47,589,019,748 bytes.
 - Canary:
-  [`canary-sulphur-calibration-v3.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-sulphur-calibration-v3.json)
+  [`canary-sulphur-calibration-v3.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-sulphur-calibration-v3.json)
 
 **Hard requirements and surface**
 
@@ -881,7 +881,7 @@ environments.
   `s3gen.safetensors`, `tokenizer.json`, and `conds.pt` bring the total to
   3,191,966,992 bytes.
 - Canary:
-  [`canary-chatterbox-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-chatterbox-launch-v1.json)
+  [`canary-chatterbox-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-chatterbox-launch-v1.json)
 
 **Hard requirements and surface**
 
@@ -931,7 +931,7 @@ runtime or a usable NVIDIA device is absent.
 - Primary GGUF: 21,166,757,536 bytes. Mandatory BF16 projector:
   902,821,824 bytes.
 - Canary:
-  [`canary-a1-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-a1-launch-v1.json)
+  [`canary-a1-launch-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-a1-launch-v1.json)
 
 **Hard requirements and surface**
 
@@ -1030,7 +1030,7 @@ Do not map MPS to `needle-gpu` or add a third canonical market.
   `e228d4e36517c331c3ddf034753cf974a7f73d2ac3dd0be4ef145722eccdc26c`
 - Two weight shards total 8,043,548,672 bytes.
 - Canary:
-  [`canary-qwen3-embedding-4b-bf16-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-qwen3-embedding-4b-bf16-v1.json)
+  [`canary-qwen3-embedding-4b-bf16-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-qwen3-embedding-4b-bf16-v1.json)
 
 **Hard requirements and surface**
 
@@ -1092,7 +1092,7 @@ host's measured memory reserve.
 - Runtime requirements SHA-256:
   `b146de268c7caf04ee58e7c70bde58e7876ee9b280a8de63cf79c68fd06bab14`
 - Canary:
-  [`canary-laya-decision-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/catalog/canaries/canary-laya-decision-v1.json)
+  [`canary-laya-decision-v1.json`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/catalog/canaries/canary-laya-decision-v1.json)
 
 **Hard requirements and surface**
 

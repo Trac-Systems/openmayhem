@@ -1,6 +1,6 @@
 # OpenMayhem
 
-**Providing a model? Start with [the two provider lanes](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/PROVIDING.md).**
+**Providing a model? Start with [the two provider lanes](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/PROVIDING.md).**
 Native providers use the signed model catalog; proxy providers connect an LLM or
 decision-model API they operate or are authorized to use. **A model missing from
 the native catalog can still qualify for the proxy lane.** Agents must select the
@@ -24,11 +24,11 @@ Community: **[r/Open_Mayhem](https://www.reddit.com/r/Open_Mayhem/)** — setup 
 
 Native models: **[huggingface.co/TracNetwork](https://huggingface.co/TracNetwork)** — the network's Hugging Face account and signed native catalog. Proxy upstream models do not require a mirror or entry there.
 
-Model cheatsheet: **[MODEL-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/MODEL-CHEATSHEET.md)** — exact canonical model IDs, artifacts, endpoints, platform/backend support, runtime pins, resource guidance, controls, and provider commands.
+Model cheatsheet: **[MODEL-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/MODEL-CHEATSHEET.md)** — exact canonical model IDs, artifacts, endpoints, platform/backend support, runtime pins, resource guidance, controls, and provider commands.
 
-Calibration gates: **[CALIBRATION.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/CALIBRATION.md)** — proof requirements before a model or workflow can be treated as product-ready.
+Calibration gates: **[CALIBRATION.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/CALIBRATION.md)** — proof requirements before a model or workflow can be treated as product-ready.
 
-Comfy cheatsheet: **[COMFY-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/COMFY-CHEATSHEET.md)** — workflow classes, signed parts, provider admission, and `/v1/workflows` usage.
+Comfy cheatsheet: **[COMFY-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/COMFY-CHEATSHEET.md)** — workflow classes, signed parts, provider admission, and `/v1/workflows` usage.
 
 ```text
 your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P session ──▶ a provider's machine
@@ -58,7 +58,7 @@ your OpenAI client ──▶ local gateway (127.0.0.1) ──▶ encrypted P2P s
 
 No terminal knowledge needed. Hand this repository to a coding agent — Claude Code, Codex, Cursor, or opencode — and paste one of the prompts below. The agent reads this README, checks your operating system and hardware, runs the real install, and verifies the gateway is answering before it hands back. You watch and approve each step; you never have to know a single command. For most people this is the whole install.
 
-> **Agents:** read **[`SKILL.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/SKILL.md)** first. For provider work, select **native or proxy** using **[`PROVIDING.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/PROVIDING.md)** before evaluating catalog support. A native catalog miss is not a blanket rejection of proxy serving. Keep the pinned Core and signed native requirements intact.
+> **Agents:** read **[`SKILL.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/SKILL.md)** first. For provider work, select **native or proxy** using **[`PROVIDING.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/PROVIDING.md)** before evaluating catalog support. A native catalog miss is not a blanket rejection of proxy serving. Keep the pinned Core and signed native requirements intact.
 
 **Agent prompt — user setup (buy inference):**
 
@@ -107,16 +107,18 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
-`v0.2.305` clarifies native and proxy provider onboarding. It retains the runtime
-from `v0.2.304`; contract version 30 and transaction formats are unchanged.
+`v0.2.306` restores authenticated replay of retained contract versions 17–22
+for fresh synchronization and supplies the mainnet proxy admission-service
+default. Contract version 30 and transaction formats are unchanged. Existing
+wallets, identities, stores and saved provider setups are preserved.
 
-Automatic [failure recovery](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-gateway/DURABLE_STREAMING.md)
-and [image references](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-engine/IMAGE_REFERENCES.md) remain available.
+Automatic [failure recovery](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-gateway/DURABLE_STREAMING.md)
+and [image references](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-engine/IMAGE_REFERENCES.md) remain available.
 
 LLM admission continues to require initialized prefix caching introduced in
-v0.2.178. See [runtime details and limits](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-engine/PREFIX_CACHING.md).
+v0.2.178. See [runtime details and limits](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-engine/PREFIX_CACHING.md).
 
-`v0.2.305` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.306` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -125,7 +127,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.305
+git checkout --detach v0.2.306
 ./install.sh --from-source
 ```
 
@@ -134,7 +136,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.305
+git checkout --detach v0.2.306
 .\install.ps1 -FromSource
 ```
 
@@ -194,7 +196,7 @@ mayhem up --provider --yes
 mayhem provider health
 ```
 
-**Provide through a proxy:** start with [PROVIDING.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/PROVIDING.md#proxy-connect-a-model-api)
+**Provide through a proxy:** start with [PROVIDING.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/PROVIDING.md#proxy-connect-a-model-api)
 and `mayhem provider proxy setup init --help`. Run your upstream engine separately;
 the wizard connects it, probes supported behavior and guides admission/publication.
 Use `mayhem up` for the existing Core stack; `mayhem up --provider` selects native
@@ -540,7 +542,7 @@ mayhem tokens revoke laptop      # immediate
 
 ### Proxy providers: connect an existing model server
 
-For the lane decision and first-run sequence, read **[PROVIDING.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/PROVIDING.md)**.
+For the lane decision and first-run sequence, read **[PROVIDING.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/PROVIDING.md)**.
 The native model cheatsheet and `mayhem doctor` describe native runtime support;
 an unlisted LLM or decision model must be evaluated separately for proxy serving.
 
@@ -559,12 +561,14 @@ or downloads it. It does not prove the remote model's identity. Decisions needs
 no tokenizer. Upstream credentials remain protected file references or write-only
 local dashboard input; never put their values in command arguments.
 
-With `MAYHEM_HOME`, `TOKENIZER_FILE` and `ADMISSION_ORIGIN` set to your chosen
-home, protected file and trusted admission service:
+Official mainnet setup uses `https://api.openmayhem.ai` for admission, including
+saved drafts without an origin. Other networks need an explicit trusted origin;
+`--admission-origin` overrides the default. Choosing the service does not authorize
+a fee or publication. With your existing home and protected tokenizer file:
 
 ```sh
 mayhem provider proxy setup init --name llama --home "$MAYHEM_HOME" \
-  --tokenizer-file "$TOKENIZER_FILE" --admission-origin "$ADMISSION_ORIGIN"
+  --tokenizer-file "$TOKENIZER_FILE"
 # Resume the original saved setup:
 mayhem provider proxy setup wizard --home "$MAYHEM_HOME" \
   --name llama
@@ -574,8 +578,7 @@ Alternatively use the existing local gateway's authenticated provider dashboard:
 
 ```sh
 mayhem use --home "$MAYHEM_HOME" --bind 127.0.0.1:11435 --proxy-setup --name llama \
-  --proxy-setup-tokenizer-file "$TOKENIZER_FILE" \
-  --proxy-setup-admission-origin "$ADMISSION_ORIGIN"
+  --proxy-setup-tokenizer-file "$TOKENIZER_FILE"
 ```
 
 Each proxied model has its own named setup in the same Core home. Use
@@ -584,7 +587,7 @@ to inspect the saved setups. Names contain 1 to 32 lowercase letters, digits or
 hyphens and default to `default`. New bundles live in `proxy-setup/<name>`.
 An existing `proxy-setup/wizard.json` remains the `default` setup in place.
 The canonical provider identity pays admission once; the wizard skips another
-invoice for an already admitted provider. See [the named setup commands](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-proxy/docs/SETUP_WIZARD.md#choosing-a-named-setup)
+invoice for an already admitted provider. See [the named setup commands](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-proxy/docs/SETUP_WIZARD.md#choosing-a-named-setup)
 for paging, recovery and runtime isolation.
 
 Omit the tokenizer option for Decisions. Open the session URL printed by Core.
@@ -594,9 +597,9 @@ publication and Run each remain separate explicit actions. A buyer deposit does
 not pay the provider admission fee. A saved draft, payment return page, published
 offer or running process is not proof of available capacity.
 
-Follow the [setup and recovery guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-proxy/docs/SETUP_WIZARD.md)
+Follow the [setup and recovery guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-proxy/docs/SETUP_WIZARD.md)
 for admission, Run, offer-only rate changes and health from the correct control
-instance, or the [dashboard guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-proxy/docs/SETUP_DASHBOARD.md).
+instance, or the [dashboard guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-proxy/docs/SETUP_DASHBOARD.md).
 Those guides state the tested OS boundaries. Native Windows worker enforcement
 is verified on the documented host; complete first-run/managed-service acceptance
 and other OS targets remain release gates, not inferred from packaging.
@@ -959,7 +962,7 @@ Separately calibrated vLLM execution modes can be selected with
 `--execution-mode <mode-id>` on `provider serve plan`, `add`, or `switch` when
 the signed catalog lists the mode for that artifact. Omitting the flag keeps baseline
 behavior; parallel dispatch needs the selected mode's own approval. See
-[the provider instructions](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/MODEL-CHEATSHEET.md#optional-vllm-execution-modes).
+[the provider instructions](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/MODEL-CHEATSHEET.md#optional-vllm-execution-modes).
 
 **Routes:**
 
@@ -1067,7 +1070,7 @@ curl 'http://127.0.0.1:11435/v1/models?endpoint_family=mayhem_comfy_workflows&li
 ```
 
 The full provider/user workflow, outcome-class grid, and current signed parts inventory are in
-**[COMFY-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/COMFY-CHEATSHEET.md)**.
+**[COMFY-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/COMFY-CHEATSHEET.md)**.
 That file is the public GitHub reference for workflow routing details, including
 the MiniMax H3 split between `video.minimax_h3.t2v_i2v` and
 `video.minimax_h3.r2v`. Users and providers should be able to understand
@@ -1187,7 +1190,7 @@ The SSH tunnel only transports the connection; it does not replace the dashboard
 Production figures come from the current catalog, contract, ledger, gateway records, or provider heartbeats, with freshness and unavailable states kept explicit. Workbench fixtures are labelled and isolated from production data.
 
 For dashboard UI work without starting the full stack, use the isolated fixture
-[dashboard workbench](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/crates/mayhem-gateway/DASHBOARD_WORKBENCH.md).
+[dashboard workbench](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-gateway/DASHBOARD_WORKBENCH.md).
 
 ## How the money is secured
 
@@ -1203,7 +1206,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.305` is source-only. The GitHub release contains the tagged source, not
+`v0.2.306` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -1211,7 +1214,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.305
+git checkout --detach v0.2.306
 ./install.sh --from-source
 ```
 
@@ -1220,7 +1223,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.305
+git checkout --detach v0.2.306
 .\install.ps1 -FromSource
 ```
 
@@ -1477,7 +1480,7 @@ combined generation plus upscaler canary. It also carries bounded workflow `inpu
 source media, which lipsync and talking-video policies use through the normal
 paid `/v1/workflows` path, and validates muxed A/V workflow canaries whose audio
 track is embedded in the returned MP4. The dedicated Comfy reference is
-**[COMFY-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/COMFY-CHEATSHEET.md)**.
+**[COMFY-CHEATSHEET.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/COMFY-CHEATSHEET.md)**.
 
 The `0.2.104` source release makes local builds self-consistent across macOS,
 Linux, and Windows. Source installers select exactly one available llama.cpp
@@ -1554,7 +1557,7 @@ node scripts/knob-inventory.mjs --write && node scripts/knob-inventory.mjs --che
 
 ## License
 
-MIT — see [LICENSE](https://github.com/Trac-Systems/openmayhem/blob/v0.2.305/LICENSE). Copyright © 2026 Trac Systems UG (haftungsbeschränkt). The code is yours to use, fork, and build on. The "OpenMayhem" and "Trac" names and logos are trademarks of Trac Systems UG and are not part of the code license.
+MIT — see [LICENSE](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/LICENSE). Copyright © 2026 Trac Systems UG (haftungsbeschränkt). The code is yours to use, fork, and build on. The "OpenMayhem" and "Trac" names and logos are trademarks of Trac Systems UG and are not part of the code license.
 
 ---
 
