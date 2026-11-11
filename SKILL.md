@@ -3,7 +3,7 @@
 ## Start here: native or proxy provider
 
 Read this guide from the [latest published release](https://github.com/Trac-Systems/openmayhem/releases/latest).
-For provider work, read **[PROVIDING.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/PROVIDING.md)** before selecting a model.
+For provider work, read **[PROVIDING.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.307/PROVIDING.md)** before selecting a model.
 The default branch may have older runtime source; install the chosen release tag
 and check `mayhem --version` and its own command help.
 
@@ -20,7 +20,7 @@ operated upstream is incompatible. Keep native requirements intact; do not edit 
 catalog, bypass calibration or claim a proxy is a native model.
 
 If the user specifies an upstream API or an independent model runtime, follow
-[the proxy wizard guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-proxy/docs/SETUP_WIZARD.md). If the lane is
+[the proxy wizard guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.307/crates/mayhem-proxy/docs/SETUP_WIZARD.md). If the lane is
 unclear, explain both and ask. Hardware fit, upstream permission, supported
 protocol and verified capabilities still matter. Proxy support does not prove
 that an arbitrary model fits the machine or that every upstream feature works.
@@ -47,13 +47,13 @@ Pay by card (Stripe/fiat), or on-chain via **TAP** (Ethereum ERC-20) or **TNK** 
 gateway is loopback-only; a public ledger records prices, receipts, settlements.
 
 Before selecting or serving a **native catalog model**, read the canonical
-**[`MODEL-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/MODEL-CHEATSHEET.md)**. It records every current exact model
+**[`MODEL-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.307/MODEL-CHEATSHEET.md)**. It records every current exact model
 selector, signed artifact, endpoint and modality surface, supported backend/platform pair, runtime
 pin, resource floor, measured guidance, unsupported combination, and provider start command. Live
 enclave IDs, rooms, routes, and prices must still come from `mayhem models --gateway`.
 Before declaring a new **native model or workflow** done, read
-**[`CALIBRATION.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/CALIBRATION.md)** and verify the relevant proof gates.
-For ComfyUI workflows, also read **[`COMFY-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/COMFY-CHEATSHEET.md)** before
+**[`CALIBRATION.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.307/CALIBRATION.md)** and verify the relevant proof gates.
+For ComfyUI workflows, also read **[`COMFY-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.307/COMFY-CHEATSHEET.md)** before
 calibrating, admitting, serving, or using a workflow class. It lists every current outcome class,
 the signed parts index, required part sets, and `/v1/workflows` request shape.
 Publicly needed workflow behavior must live in `README.md`, `SKILL.md`,
@@ -124,14 +124,14 @@ aggregate admission refusal or compensate with an undocumented memory override.
 ## 3. Install
 
 ### 3.1 Get the code — exact source release (MANDATORY rule)
-- `v0.2.306` is source-only. Never invent or offer a native archive URL: the release has no unsigned
+- `v0.2.307` is source-only. Never invent or offer a native archive URL: the release has no unsigned
   OpenMayhem executable assets. Clone the exact release tag and build it locally.
 
   **macOS/Linux:**
   ```bash
   git clone https://github.com/Trac-Systems/openmayhem.git
   cd openmayhem
-  git checkout --detach v0.2.306
+  git checkout --detach v0.2.307
   ./install.sh --from-source
   ```
 
@@ -139,7 +139,7 @@ aggregate admission refusal or compensate with an undocumented memory override.
   ```powershell
   git clone https://github.com/Trac-Systems/openmayhem.git
   Set-Location openmayhem
-  git checkout --detach v0.2.306
+  git checkout --detach v0.2.307
   .\install.ps1 -FromSource
   ```
 On updated source checkouts, `mayhem up` verifies and, when needed, deterministically repairs only
@@ -379,7 +379,7 @@ mayhem provider health                          # green AND the model appears in
 with `--execution-mode <mode-id>` only when the exact artifact's signed catalog
 lists that mode. Omit it for baseline behavior. Do not invent runtime overrides,
 copy baseline canaries, or assume independent dispatch transfers to the mode.
-See [optional vLLM execution modes](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/MODEL-CHEATSHEET.md#optional-vllm-execution-modes)
+See [optional vLLM execution modes](https://github.com/Trac-Systems/openmayhem/blob/v0.2.307/MODEL-CHEATSHEET.md#optional-vllm-execution-modes)
 for the supervised start sequence and compatibility requirements.
 
 Accepted rails are not enough for buyer routing. A provider can be active,
@@ -746,7 +746,7 @@ the immutable ledger enclave tuple with the ledger-pinned signed catalog; provid
 around a genuine mismatch locally.
 
 For Comfy workflow providers, do not serve a workflow class until the parts inventory and admission
-proof both pass. Keep **[`COMFY-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/COMFY-CHEATSHEET.md)** open while doing this.
+proof both pass. Keep **[`COMFY-CHEATSHEET.md`](https://github.com/Trac-Systems/openmayhem/blob/v0.2.307/COMFY-CHEATSHEET.md)** open while doing this.
 Pull only from a verified parts-index layout:
 
 ```bash
@@ -791,8 +791,8 @@ sponsored; explain earnings depend on uptime, price, saturation, and reputation.
 
 ### 4.3 Proxy provider: connect your model API
 
-Use [PROVIDING.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/PROVIDING.md#proxy-connect-a-model-api) and the
-[CLI wizard](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-proxy/docs/SETUP_WIZARD.md). The signed native model
+Use [PROVIDING.md](https://github.com/Trac-Systems/openmayhem/blob/v0.2.307/PROVIDING.md#proxy-connect-a-model-api) and the
+[CLI wizard](https://github.com/Trac-Systems/openmayhem/blob/v0.2.307/crates/mayhem-proxy/docs/SETUP_WIZARD.md). The signed native model
 matrix above is not the proxy eligibility list. Proxy serving currently covers
 LLMs and decision models; it does not add proxy media or embedding support.
 
@@ -823,7 +823,7 @@ LLMs and decision models; it does not add proxy media or embedding support.
 
 The dashboard needs explicit `mayhem use --proxy-setup` activation; an ordinary
 dashboard without the button is not evidence of missing proxy support. Follow the
-[dashboard guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.306/crates/mayhem-proxy/docs/SETUP_DASHBOARD.md); reuse the existing
+[dashboard guide](https://github.com/Trac-Systems/openmayhem/blob/v0.2.307/crates/mayhem-proxy/docs/SETUP_DASHBOARD.md); reuse the existing
 gateway configuration and do not bind another listener on its occupied port.
 Top-level `mayhem proxy` is buyer control, not this provider entry point.
 
@@ -859,8 +859,8 @@ forwarded as-is.
 
 | Goal | Command |
 |---|---|
-| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.306 && ./install.sh --from-source` |
-| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.306; .\install.ps1 -FromSource` |
+| Install release (macOS/Linux) | `git clone …/openmayhem.git && cd openmayhem && git checkout --detach v0.2.307 && ./install.sh --from-source` |
+| Install release (PowerShell) | `git clone …/openmayhem.git; Set-Location openmayhem; git checkout --detach v0.2.307; .\install.ps1 -FromSource` |
 | Start user gateway | `mayhem up --rail <fiat\|tap\|tnk> --yes` |
 | Start native catalog provider | `mayhem up --provider --yes` |
 | Start proxy setup | `mayhem provider proxy setup init --help` |
