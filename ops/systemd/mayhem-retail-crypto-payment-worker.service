@@ -1,0 +1,28 @@
+[Unit]
+Description=OpenMayhem retail TNK/TAP verifier and Core funding bridge
+Requires=mayhem-stack.service
+After=network-online.target mayhem-stack.service mayhem-tap-deposit.service mayhem-tnk-deposit.service
+Wants=network-online.target mayhem-tap-deposit.service mayhem-tnk-deposit.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=@@SERVICE_USER@@
+Group=@@SERVICE_GROUP@@
+WorkingDirectory=@@REPO@@/intercom
+EnvironmentFile=-@@SYSTEM_ENV@@
+EnvironmentFile=@@WORKER_ENV@@
+UMask=0077
+ExecStartPre=/usr/bin/node @@REPO@@/scripts/mainnet-proof.mjs --timeout-seconds 0 --json
+ExecStart=/usr/bin/node @@REPO@@/intercom/scripts/retail-crypto-payment-worker.mjs
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=@@STATE_DIR@@ @@BUYER_HOME@@
+
+[Install]
+WantedBy=multi-user.target

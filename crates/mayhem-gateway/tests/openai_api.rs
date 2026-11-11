@@ -1927,9 +1927,18 @@ async fn av3_missing_policy_filters_tier2_and_routes_tier1_fallback() {
         mayhem["registered_route_candidates"][0]["dispatch_eligible"],
         false
     );
-    assert_eq!(mayhem["registered_route_candidates"][0]["presence"], "online");
-    assert_eq!(mayhem["registered_route_candidates"][0]["availability"], "unavailable");
-    assert_eq!(mayhem["registered_route_candidates"][0]["availability_reason"], "attestation_policy");
+    assert_eq!(
+        mayhem["registered_route_candidates"][0]["presence"],
+        "online"
+    );
+    assert_eq!(
+        mayhem["registered_route_candidates"][0]["availability"],
+        "unavailable"
+    );
+    assert_eq!(
+        mayhem["registered_route_candidates"][0]["availability_reason"],
+        "attestation_policy"
+    );
     let tier1 = &mayhem["route_candidates"][0]["attestation_verification"];
     assert_eq!(tier1["policy_required"], false);
     assert_eq!(tier1["locally_ready"], true);
@@ -2217,8 +2226,7 @@ async fn models_endpoint_reports_busy_image_presence_and_immediate_capacity_rele
         .route_candidates
         .iter()
         .map(|candidate| {
-            let mut heartbeat =
-                test_provider_heartbeat(&model, candidate, 0.2, 1, 1, None, 150);
+            let mut heartbeat = test_provider_heartbeat(&model, candidate, 0.2, 1, 1, None, 150);
             heartbeat.accepting_new = false;
             heartbeat.q.free_slots = 0;
             let capacity = heartbeat.caps.modality_capacity.get_mut("image").unwrap();
@@ -2228,11 +2236,9 @@ async fn models_endpoint_reports_busy_image_presence_and_immediate_capacity_rele
             heartbeat
         })
         .collect::<Vec<_>>();
-    let state =
-        GatewayState::from_models(vec![model]).with_provider_heartbeats(heartbeats.clone());
+    let state = GatewayState::from_models(vec![model]).with_provider_heartbeats(heartbeats.clone());
     let app = openai_router(state.clone());
-    let (status, body) =
-        json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
+    let (status, body) = json_request(app.clone(), Method::GET, "/v1/models", Value::Null).await;
     assert_eq!(status, StatusCode::OK);
     let mayhem = &body["data"][0]["mayhem"];
     assert_eq!(mayhem["providers_online"], 2);
@@ -6888,6 +6894,7 @@ fn test_canary_registry(expected_tokens: &[i32]) -> GatewayCanaryRegistry {
                     "aa".repeat(32),
                     BTreeMap::from([("fixed-probe".to_owned(), expected_tokens.to_vec())]),
                 )]),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::new(),
@@ -6953,6 +6960,7 @@ fn test_image_canary_registry(expected_hash: String) -> GatewayCanaryRegistry {
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::from([(
                     "aa".repeat(32),
                     BTreeMap::from([("fixed-image".to_owned(), expected_hash)]),
@@ -7021,6 +7029,7 @@ fn test_embedding_canary_registry(expected_vector: Vec<f32>) -> GatewayCanaryReg
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 embedding_vectors_by_artifact_root: BTreeMap::from([(
                     "aa".repeat(32),
@@ -7093,6 +7102,7 @@ fn test_transcript_canary_registry(audio: Vec<u8>) -> GatewayCanaryRegistry {
                 prompts: vec![runtime_prompt, calibration_prompt],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::from([(
@@ -7167,6 +7177,7 @@ fn test_audio_fingerprint_canary_registry(expected_fingerprint: String) -> Gatew
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::new(),
@@ -7251,6 +7262,7 @@ fn test_music_audio_fingerprint_canary_registry(
                 }],
                 fingerprints_by_artifact_root: BTreeMap::new(),
                 token_prefixes_by_artifact_root: BTreeMap::new(),
+                openai_compatible_artifact_roots: BTreeSet::new(),
                 perceptual_hashes_by_artifact_root: BTreeMap::new(),
                 embedding_vectors_by_artifact_root: BTreeMap::new(),
                 transcripts_by_artifact_root: BTreeMap::new(),
@@ -7952,7 +7964,8 @@ async fn legacy_completions_return_text_completion_shape_and_stream() {
     assert_eq!(body["mayhem"]["dev_session"], true);
     assert_eq!(body["mayhem"]["receipt"], Value::Null);
 
-    let request = json!({ "model": openai_test_model_id().await, "prompt": "Hello", "stream": true });
+    let request =
+        json!({ "model": openai_test_model_id().await, "prompt": "Hello", "stream": true });
     let (status, headers, bytes) =
         raw_request(app, Method::POST, "/v1/completions", Some(request)).await;
     assert_eq!(status, StatusCode::OK);

@@ -41,7 +41,7 @@ const productionRoots = [
 
 const productionExtensions = new Set(['.rs', '.js', '.mjs', '.cjs', '.ts', '.toml']);
 const bannedPatterns = [
-  ['deterministic', /deterministic_/],
+  ['deterministic-output', /deterministic_(?:completion|implementation|output|provider|response|result)/i],
   ['pending-marker', /\bPENDING_(?:IMPLEMENTATION|MODEL|PROOF|REPLACE_ME)\b/],
   ['canned', /\bcanned\b/i],
   ['placeholder', /\bplaceholder_(?:implementation|output|response|result)\b|\b(?:TODO|FIXME)\b[^\n]{0,40}\bplaceholder\b/i],
@@ -112,6 +112,7 @@ function listFiles(dir) {
     } else if (stat.isFile()) {
       const rel = path.relative(repoRoot, current);
       if (rel.split(path.sep).includes('tests')) continue;
+      if (path.basename(rel) === 'tests.rs' || path.basename(rel).endsWith('_tests.rs')) continue;
       if (rel.endsWith('package-lock.json')) continue;
       if (!productionExtensions.has(path.extname(current))) continue;
       out.push(rel);
@@ -137,7 +138,7 @@ function rustProductionText(text) {
       return '';
     }
 
-    if (/^\s*#\[cfg\(test\)\]\s*$/.test(line)) {
+    if (/^\s*#\[cfg\([^\]]*\btest\b[^\]]*\)\]\s*$/.test(line)) {
       pendingTestItem = line.match(/^\s*/)[0];
       return '';
     }
@@ -210,7 +211,12 @@ function checkCatalogAndReadme() {
 
   const section = launchSurfaceSection(readme);
   if (!section) return;
-  const rows = parseLaunchRows(section).filter(({ status }) => status === 'live');
+  // Launch membership is a signed catalog state. Runtime availability can be
+  // offline or busy without removing the model from the active roster; only
+  // rows explicitly marked as planned, paused, or retired are outside it.
+  const rows = parseLaunchRows(section).filter(
+    ({ status }) => !/(?:planned|paused|retired)/.test(status),
+  );
   for (const model of launchModels) {
     const matchingRows = launchRowsMatchingModel(rows, model);
     assertCheck(

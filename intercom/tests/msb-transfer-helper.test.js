@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import test from 'node:test';
 
 import { parseRootMsbBalanceHelperArgs } from '../src/msb-balance-helper.js';
@@ -9,6 +12,7 @@ import {
 } from '../src/network-config.js';
 import {
   executeTransfer,
+  readWalletPasswordFile,
 } from '../src/msb-settlement-transfer-helper.js';
 import { runRootMsbTransferHelper } from '../src/msb-transfer-helper.js';
 import { bigIntTo16ByteBuffer } from 'trac-msb/src/utils/amountSerialization.js';
@@ -26,6 +30,14 @@ test('root Intercom app resolves the bundled MSB transfer helper', async () => {
     runRootMsbTransferHelper('settlement-transfer-execute'),
     /Missing --network/
   );
+});
+
+test('wallet password files ignore a terminal line break only', (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'mayhem-wallet-password-'));
+  t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
+  const passwordFile = path.join(directory, 'password');
+  fs.writeFileSync(passwordFile, '  wallet password  \r\n', { mode: 0o600 });
+  assert.equal(readWalletPasswordFile(passwordFile), '  wallet password  ');
 });
 
 test('root Intercom app parses a read-only official-MSB balance helper', () => {

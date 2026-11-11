@@ -1,0 +1,207 @@
+{
+  "schema_version": 1,
+  "status": "complete_artifact_identity_pending_runtime_canaries_and_resource_admission",
+  "model_id": "Qwen/Qwen3.8-Flash-Next",
+  "artifact_name": "nvfp4",
+  "artifact": {
+    "engine": "openai-compatible",
+    "kv_cache": {
+      "dtype": "fp8_e4m3",
+      "bits": 8,
+      "group_size": 1,
+      "quantized_start_tokens": 0,
+      "full_attention_layers": 12,
+      "total_layers": 48,
+      "bytes_per_token": 12288,
+      "measurement_source": "Pinned model structure and retained SGLang allocation: 12 target full-attention layers, 2 KV heads, 256 dimensions, K plus V at one byte per element; the separately allocated one-layer speculative draft cache is runtime overhead."
+    },
+    "source": {
+      "kind": "huggingface",
+      "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+      "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+      "publisher_key": "huggingface-repo"
+    },
+    "upstream_source": {
+      "kind": "huggingface",
+      "repo": "RadixArk/Qwen3.8-Flash-Next-NVFP4",
+      "revision": "7b719225242aacd3dbd3f9407468c2ee9a9d2594",
+      "publisher_key": "huggingface-repo"
+    },
+    "path": "download-manifest.json",
+    "artifact_root": "78191c28fa91602e536baa8ede39891d6d500615086ce2ba42cb920c3b46eabe",
+    "artifact_root_kind": "blake3_merkle_v1",
+    "weights_bytes": 135253622894,
+    "source_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
+    "tokenizer_sha256": "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3",
+    "chat_template_sha256": "c3cf9e34abf4f9e36c2d72165aa9c132d3e2a725b6c2586aaa3a8af9d7a81041",
+    "min_compute_cap": "12.0",
+    "download_check": true,
+    "notes": "Byte-for-byte mirror of the pinned RadixArk ModelOpt NVFP4 snapshot. OpenMayhem did not perform the upstream quantization. hf_quant_config.json is SHA-256 7e69ef4b94302ae5b6f453b913621f698d5631a1d023d8b3e9e3b829721b98e8 and conversion_environment.json is SHA-256 10dadc9b3421b669e533ffcdb3ffb1bf56f42d35936fc24aa2020db0df7480ac; the upstream card does not pin every base checkpoint input used for that conversion.",
+    "sidecars": {
+      "pennyroyal_source": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+          "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+          "publisher_key": "huggingface-repo"
+        },
+        "path": "runtime/pennyroyal-v2.5.0-source-2c675da096939cb01102f8f4871bda3db55f7f28.tar.gz",
+        "artifact_root": "72c6b143926e6d669f474b52e9ddfecd4b25dbc328edb817ee9600bb0e8dbe23",
+        "artifact_root_kind": "blake3_merkle_v1",
+        "weights_bytes": 64070181,
+        "source_sha256": "776f6d4b1883c78c7d1eaafa23a936fe82d6cc2220bfb9631ec3598b5e342df4"
+      },
+      "runtime_recipe": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+          "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+          "publisher_key": "huggingface-repo"
+        },
+        "path": "runtime/managed-runtime-recipe-v1.json",
+        "artifact_root": "9c9ba2e9fe4b0cd4570ae5deeb58a363ee904b7a62e4bd02f6b77487f02c4666",
+        "artifact_root_kind": "blake3_merkle_v1",
+        "weights_bytes": 3204,
+        "source_sha256": "7f248046c72b771620da09f36d9cf554134cc70789c3e832017f8d29dbd5b41c"
+      },
+      "seccomp_profile": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+          "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+          "publisher_key": "huggingface-repo"
+        },
+        "path": "runtime/docker-29.1.3-ple-io-uring.json",
+        "artifact_root": "f3ad6f80ad1ef9702ba87171fd18890d655cfd0df21553b3827c5846dec5a915",
+        "artifact_root_kind": "blake3_merkle_v1",
+        "weights_bytes": 16286,
+        "source_sha256": "c7a33fb8ae1f8346356a61ce833d579c45acf2bc94967c6763634e81010ff816"
+      },
+      "snapshot_manifest": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+          "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+          "publisher_key": "huggingface-repo"
+        },
+        "path": "download-manifest.json",
+        "artifact_root": "ee2bc36da770d609bbc09da82f61ca5bfc5ecd17cc89af3dd454f01b929889bf",
+        "artifact_root_kind": "blake3_merkle_v1",
+        "weights_bytes": 111025,
+        "source_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374"
+      },
+      "ple_plugin_wheel": {
+        "source": {
+          "kind": "huggingface",
+          "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+          "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+          "publisher_key": "huggingface-repo"
+        },
+        "path": "runtime/sglang_ssd_stream-0.2.0+pennyroyal2-cp312-cp312-linux_x86_64.whl",
+        "artifact_root": "c53a31e21cd48728e6a6d71b9c7a63927f062efe77c2661dee4d37d4803321ac",
+        "artifact_root_kind": "blake3_merkle_v1",
+        "weights_bytes": 292987,
+        "source_sha256": "5fd3bf79524aec7068729e99823a8278e4f3bd7dcacd222f2c55f4395454112f"
+      }
+    },
+    "openai_compatible": {
+      "schema_version": 1,
+      "runtime_id": "pennyroyal",
+      "runtime_version": "2.5.0",
+      "runtime_revision": "2c675da096939cb01102f8f4871bda3db55f7f28",
+      "implementation": "sglang",
+      "implementation_version": "0.0.0.dev1+gd91c3682b",
+      "container_image_digest": "sha256:12d3392bdc8be8d35e9a95f191df6aef99c5114bdbefd41bfdc7e760e6d25ec1",
+      "served_model": "Qwen/Qwen3.8-Flash-Next",
+      "native_context": 262144,
+      "served_context": 524288,
+      "max_concurrent": 2,
+      "capabilities": [
+        "cancellation",
+        "image",
+        "json",
+        "prefix_cache",
+        "reasoning",
+        "streaming",
+        "tools",
+        "video"
+      ],
+      "preflight": {
+        "non_reasoning_chat_template_kwargs": {
+          "enable_thinking": false
+        },
+        "reasoning_chat_template_kwargs": {
+          "enable_thinking": true,
+          "preserve_thinking": true,
+          "reasoning_effort": "xhigh"
+        },
+        "streaming_max_tokens": 32,
+        "tools_max_tokens": 384,
+        "json_max_tokens": 256,
+        "reasoning_max_tokens": 1024,
+        "cache_max_tokens": 32,
+        "cancellation_max_tokens": 4096,
+        "concurrency_max_tokens": 4096,
+        "cancellation_idle_metrics": [
+          "sglang:num_queue_reqs",
+          "sglang:num_running_reqs"
+        ],
+        "concurrency_active_metric": "sglang:num_running_reqs"
+      },
+      "server_info_checks": {
+        "/chunked_prefill_size": 4096,
+        "/context_length": 524288,
+        "/default_chat_template_kwargs/enable_thinking": true,
+        "/default_chat_template_kwargs/preserve_thinking": true,
+        "/default_chat_template_kwargs/reasoning_effort": "xhigh",
+        "/disable_cuda_graph": false,
+        "/disable_radix_cache": false,
+        "/dtype": "bfloat16",
+        "/enable_hierarchical_cache": true,
+        "/hicache_io_backend": "kernel",
+        "/hicache_size": 32,
+        "/hicache_storage_backend": "nixl",
+        "/kv_cache_dtype": "fp8_e4m3",
+        "/load_format": "safetensors",
+        "/max_mamba_cache_size": 24,
+        "/max_running_requests": 4,
+        "/max_total_num_tokens": 824384,
+        "/max_total_tokens": 824384,
+        "/page_size": 64,
+        "/quantization": "modelopt_fp4",
+        "/reasoning_parser": "qwen3",
+        "/served_model_name": "Qwen/Qwen3.8-Flash-Next",
+        "/speculative_algorithm": "EAGLE",
+        "/speculative_eagle_topk": 1,
+        "/speculative_num_draft_tokens": 4,
+        "/speculative_num_steps": 3,
+        "/tool_call_parser": "qwen3_coder",
+        "/version": "0.0.0.dev1+gd91c3682b"
+      },
+      "prefix_cache_metric": "sglang:cached_tokens_total",
+      "lifecycle": "managed_or_verified_attach",
+      "snapshot_manifest_sidecar": "snapshot_manifest",
+      "snapshot_manifest_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
+      "runtime_recipe_sidecar": "runtime_recipe",
+      "runtime_recipe_sha256": "7f248046c72b771620da09f36d9cf554134cc70789c3e832017f8d29dbd5b41c",
+      "model_snapshot_file_count": 419
+    }
+  },
+  "provenance_conversion": {
+    "tool": "huggingface_hub",
+    "method": "immutable-byte-mirror:pinned-radixark-nvfp4-snapshot-manifest",
+    "input_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
+    "output_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374"
+  },
+  "directory_root_evidence": {
+    "file_count": 419,
+    "payload_bytes": 135253622894,
+    "framed_stream_bytes": 135253645960,
+    "framed_stream_sha256": "e59e92ab3ce981a018c412134707d12bd293bd54d8ab42ba30c5f1037d0031ae"
+  },
+  "publication_gates": [
+    "Fill signed portable text and media admission profiles from final-runtime measurements.",
+    "Complete the canonical native-provider and gateway canary rerun.",
+    "Validate this binding with the finalized openai-compatible catalog schema before signing."
+  ]
+}

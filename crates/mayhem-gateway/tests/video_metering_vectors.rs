@@ -45,10 +45,8 @@ fn repo_path(relative: &str) -> PathBuf {
 
 fn read_json(relative: &str) -> Value {
     let path = repo_path(relative);
-    let bytes = fs::read(&path)
-        .unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
-    serde_json::from_slice(&bytes)
-        .unwrap_or_else(|err| panic!("parsing {}: {err}", path.display()))
+    let bytes = fs::read(&path).unwrap_or_else(|err| panic!("reading {}: {err}", path.display()));
+    serde_json::from_slice(&bytes).unwrap_or_else(|err| panic!("parsing {}: {err}", path.display()))
 }
 
 fn vectors() -> Value {
@@ -73,10 +71,15 @@ fn decimal_field(case: &Value, key: &str) -> MoneyAu {
 /// these vectors exercise the meter, not admission.
 fn metering_policy(pricing_unit: &str) -> ComfyWorkflowDerivationPolicy {
     ComfyWorkflowDerivationPolicy {
-        whitelisted_nodes: ["MiniMaxH3Easy", "BasicScheduler", "CreateVideo", "SaveVideo"]
-            .into_iter()
-            .map(str::to_owned)
-            .collect(),
+        whitelisted_nodes: [
+            "MiniMaxH3Easy",
+            "BasicScheduler",
+            "CreateVideo",
+            "SaveVideo",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect(),
         pricing_unit: Some(pricing_unit.to_owned()),
         max_width: 8_192,
         max_height: 8_192,
@@ -151,11 +154,9 @@ fn video_metering_vectors_match_derivation_and_pricing() {
             "{label}: pixel_frame granularity must be 1_000_000"
         );
 
-        let derivation = derive_comfy_workflow(
-            &video_graph(case),
-            &metering_policy(USAGE_PIXEL_FRAME),
-        )
-        .unwrap_or_else(|err| panic!("{label}: derivation failed: {err}"));
+        let derivation =
+            derive_comfy_workflow(&video_graph(case), &metering_policy(USAGE_PIXEL_FRAME))
+                .unwrap_or_else(|err| panic!("{label}: derivation failed: {err}"));
 
         assert!(
             derivation
@@ -281,7 +282,10 @@ fn vector_tariffs_match_the_published_grid_and_catalog() {
         let Some(definition) = model.pointer("/workflow/outcome_class_definition") else {
             continue;
         };
-        let class_id = definition["class_id"].as_str().expect("class id").to_owned();
+        let class_id = definition["class_id"]
+            .as_str()
+            .expect("class id")
+            .to_owned();
         let pricing_unit = definition["pricing_unit"].as_str().expect("pricing unit");
         catalog_tariffs.insert(
             class_id.clone(),
@@ -471,7 +475,8 @@ fn unknown_pricing_units_fail_closed_instead_of_billing_one_unit() {
     let err = derive_comfy_workflow(&video_graph(&case), &policy)
         .expect_err("an unknown pricing unit must fail closed");
     assert!(
-        err.to_string().contains("unsupported pricing_unit seller_second"),
+        err.to_string()
+            .contains("unsupported pricing_unit seller_second"),
         "unexpected error: {err}"
     );
     // Guard the old defect directly: the fallback used to quote one unit.

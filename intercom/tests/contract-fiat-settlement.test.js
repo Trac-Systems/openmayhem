@@ -542,6 +542,14 @@ test('fiat outputs settle independently and an earlier recipient survives later 
   assert.equal(retry.ok, true, retry.message);
   assert.equal(retry.idempotent, true);
 
+  const feeBefore = (await ctx.storage.get('fee/fiat/cum')).value;
+  await ctx.storage.put('fee/fiat/cum', {
+    ...feeBefore,
+    cum_au: (BigInt(feeBefore.cum_au) + 3n * CENT_AU).toString(),
+    settled_cum_au: (BigInt(feeBefore.settled_cum_au) + 3n * CENT_AU).toString(),
+    updated_epoch: 2,
+  });
+
   const feeOutput = ctx.outputs[1];
   assert.equal((await prepareEconomicOutput(ctx, plan, feeOutput)).ok, true);
   const feeAttempt = await prepareAttempt(ctx, plan, feeOutput, 1);
@@ -558,6 +566,12 @@ test('fiat outputs settle independently and an earlier recipient survives later 
   assert.equal(
     (await settleOutput(ctx, plan, feeOutput, feeAttempt.value, feeTransfer)).result.ok,
     true
+  );
+  const feeAfter = (await ctx.storage.get('fee/fiat/cum')).value;
+  assert.equal(feeAfter.swept_cum_au, feeOutput.paid_au);
+  assert.equal(
+    BigInt(feeAfter.cum_au) - BigInt(feeAfter.swept_cum_au),
+    3n * CENT_AU
   );
   assert.equal((await closeEpoch(ctx, plan)).ok, true);
 });

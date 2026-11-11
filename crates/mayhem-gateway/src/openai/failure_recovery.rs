@@ -4,6 +4,232 @@ use mayhem_proto::{
     usage_reservation_close_signing_bytes, usage_reservation_close_value,
 };
 
+const LEDGER_RESERVATION_SWEEP_LIMIT: usize = 32;
+const LEDGER_RESERVATION_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(super) struct LedgerReservationSweepPass {
+    pub(super) discovered: usize,
+    pub(super) eligible: usize,
+    pub(super) submitted: usize,
+    pub(super) already_closed: usize,
+    pub(super) finalized: usize,
+}
+
+async fn confirmed_at(
+    rpc: &PeerRpcClient,
+    key: &str,
+    signed_length: Option<u64>,
+) -> Result<Value, GatewaySessionError> {
+    let result = rpc
+        .state_at(Some(key), Some(true), signed_length)
+        .await
+        .map_err(|error| GatewaySessionError::retryable(error.to_string()))?;
+    if result["confirmed"] != true
+        || result["key"] != key
+        || signed_length.is_some_and(|expected| result["signed_length"] != expected)
+    {
+        return Err(GatewaySessionError::retryable(
+            "reservation sweep requires one exact confirmed ledger view",
+        ));
+    }
+    Ok(result)
+}
+
+/// Expire reservations from canonical session shards rather than relying only
+/// on the gateway job vault. The shard is sufficient signed authority for the
+/// buyer to close its own expired hold after the provider grace period, so a
+/// lost/replaced local store cannot strand credit forever.
+pub(super) async fn sweep_ledger_reservations_once(
+    state: &GatewayState,
+    rpc: &PeerRpcClient,
+    limit: usize,
+) -> Result<LedgerReservationSweepPass, GatewaySessionError> {
+    let user = verifying_key_hex(&state.receipt_config.user_seed);
+    let rail = state.receipt_config.rail.as_str();
+    if let Some(publisher) = state.receipt_settlement_publisher.as_ref().as_ref() {
+        if publisher
+            .has_pending_final_receipts(&user, rail)
+            .map_err(GatewaySessionError::retryable)?
+        {
+            return Ok(LedgerReservationSweepPass::default());
+        }
+    }
+
+    let epoch = confirmed_at(rpc, "epoch/apply/state", None).await?;
+    let current_epoch = epoch["value"]["updated_epoch"]
+        .as_u64()
+        .ok_or_else(|| GatewaySessionError::retryable("canonical epoch is unavailable"))?;
+    let signed_length = epoch["signed_length"]
+        .as_u64()
+        .ok_or_else(|| GatewaySessionError::retryable("canonical signed length is unavailable"))?;
+    let prefix = format!("hold/targeted-session/{rail}/{user}/");
+    let mut after = None::<String>;
+    let mut pass = LedgerReservationSweepPass::default();
+
+    loop {
+        let page = rpc
+            .state_prefix_page(
+                &prefix,
+                Some(true),
+                Some(500),
+                Some(signed_length),
+                after.as_deref(),
+            )
+            .await
+            .map_err(|error| GatewaySessionError::retryable(error.to_string()))?;
+        if page["confirmed"] != true
+            || page["prefix"] != prefix
+            || page["signed_length"] != signed_length
+        {
+            return Err(GatewaySessionError::retryable(
+                "reservation sweep prefix snapshot changed",
+            ));
+        }
+        let entries = page["values"].as_array().ok_or_else(|| {
+            GatewaySessionError::retryable("reservation sweep returned an invalid state page")
+        })?;
+        for entry in entries {
+            let key = entry["key"].as_str().unwrap_or_default();
+            let session = &entry["value"];
+            if !key.starts_with(&prefix)
+                || session["type"] != "targeted_spend_session"
+                || session["user"] != user
+                || session["rail"] != rail
+            {
+                return Err(GatewaySessionError::new(
+                    "reservation sweep returned an invalid session shard",
+                ));
+            }
+            pass.discovered += 1;
+            let Some(eligible_epoch) = session["reservation_expires_after_epoch"]
+                .as_u64()
+                .and_then(|expiry| {
+                    session["reservation_receipt_grace_epochs"]
+                        .as_u64()
+                        .and_then(|grace| expiry.checked_add(grace))
+                })
+            else {
+                return Err(GatewaySessionError::new(
+                    "reservation sweep found an invalid expiry",
+                ));
+            };
+            if current_epoch < eligible_epoch {
+                continue;
+            }
+            pass.eligible += 1;
+            if pass.submitted >= limit.max(1) {
+                continue;
+            }
+            let id = session["reservation_id"]
+                .as_str()
+                .filter(|id| is_lower_hex_len(id, 64))
+                .ok_or_else(|| GatewaySessionError::new("invalid reservation identity"))?;
+            let reservation = confirmed_at(
+                rpc,
+                &format!("receipt/reservation/{id}"),
+                Some(signed_length),
+            )
+            .await?;
+            if reservation["value"]["status"] == "closed" {
+                pass.already_closed += 1;
+                continue;
+            }
+            if reservation["value"]["status"] != "active"
+                || !reservation_binding_matches(session, &reservation["value"])
+            {
+                return Err(GatewaySessionError::new(
+                    "reservation sweep binding does not match canonical state",
+                ));
+            }
+            let billing_id = session["billing_id"]
+                .as_str()
+                .filter(|id| is_lower_hex_len(id, 64))
+                .ok_or_else(|| GatewaySessionError::new("invalid reservation billing identity"))?;
+            let billing_attempt = session["billing_attempt"]
+                .as_u64()
+                .ok_or_else(|| GatewaySessionError::new("invalid reservation billing attempt"))?;
+            let head = confirmed_at(
+                rpc,
+                &format!("receipt/head/{billing_id}/{billing_attempt}"),
+                Some(signed_length),
+            )
+            .await?;
+            if head["value"]["settlement_ready"] == true
+                || head["value"]["receipt"]["body"]["final"] == true
+            {
+                pass.finalized += 1;
+                continue;
+            }
+            let mut value = usage_reservation_close_value(
+                session,
+                (!head["value"].is_null()).then_some(&head["value"]),
+                true,
+                now_secs(),
+                "gateway_ledger_sweep",
+            )
+            .map_err(GatewaySessionError::new)?;
+            value["actor_sig"] = json!(sign_hex(
+                &state.receipt_config.user_seed,
+                &usage_reservation_close_signing_bytes(&value).map_err(GatewaySessionError::new)?,
+            ));
+            let feature =
+                usage_reservation_close_feature(value).map_err(GatewaySessionError::new)?;
+            let response = rpc
+                .submit_feature(feature)
+                .await
+                .map_err(|error| GatewaySessionError::retryable(error.to_string()))?;
+            if response["ok"] != true {
+                return Err(GatewaySessionError::retryable(
+                    "canonical reservation expiry submission remains pending",
+                ));
+            }
+            pass.submitted += 1;
+        }
+
+        if page["truncated"] != true {
+            break;
+        }
+        let cursor = page["next_cursor"]
+            .as_str()
+            .filter(|cursor| {
+                entries.last().and_then(|entry| entry["key"].as_str()) == Some(*cursor)
+            })
+            .ok_or_else(|| GatewaySessionError::retryable("reservation sweep cursor is invalid"))?;
+        if after.as_deref().is_some_and(|previous| previous >= cursor) {
+            return Err(GatewaySessionError::retryable(
+                "reservation sweep cursor did not advance",
+            ));
+        }
+        after = Some(cursor.to_owned());
+    }
+    Ok(pass)
+}
+
+pub(super) fn spawn_ledger_reservation_sweep(state: &GatewayState) {
+    let Some(rpc) = state.canary_probe_contract_rpc.as_ref().as_ref().cloned() else {
+        return;
+    };
+    let state = state.clone();
+    tokio::spawn(async move {
+        loop {
+            match sweep_ledger_reservations_once(&state, &rpc, LEDGER_RESERVATION_SWEEP_LIMIT).await
+            {
+                Ok(pass) if pass.submitted > 0 => eprintln!(
+                    "Gateway canonical reservation sweep submitted {} of {} eligible holds",
+                    pass.submitted, pass.eligible
+                ),
+                Ok(_) => {}
+                Err(error) => eprintln!(
+                    "Gateway canonical reservation sweep remains pending: {}",
+                    error.message
+                ),
+            }
+            tokio::time::sleep(LEDGER_RESERVATION_SWEEP_INTERVAL).await;
+        }
+    });
+}
+
 pub(super) fn persist_reservation(
     invocation: &GatewaySessionInvocation,
 ) -> Result<(), GatewaySessionError> {

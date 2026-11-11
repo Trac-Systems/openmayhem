@@ -22,6 +22,7 @@ def load_health_scope():
         "EngineHealthMonitor",
         "stop_engine_health_monitor",
         "async_handle_generate",
+        "config_value",
         "handle_load",
         "handle",
         "emit_control_response",

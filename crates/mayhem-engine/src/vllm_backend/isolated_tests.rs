@@ -351,13 +351,31 @@ fn shared_worker_preserves_separate_memory_limits_on_reload() {
     let mut backend = fixture.backend();
     backend.load(config.clone()).unwrap();
     #[cfg(target_os = "linux")]
-    assert_eq!(backend.worker.as_ref().unwrap().containment_report.as_ref().unwrap()
-        .address_space_limit_bytes, config.vllm_worker_address_space_limit_bytes);
+    assert_eq!(
+        backend
+            .worker
+            .as_ref()
+            .unwrap()
+            .containment_report
+            .as_ref()
+            .unwrap()
+            .address_space_limit_bytes,
+        config.vllm_worker_address_space_limit_bytes
+    );
     config.vllm_worker_address_space_limit_bytes = Some(96 * 1024 * 1024 * 1024);
     backend.load(config.clone()).unwrap();
     #[cfg(target_os = "linux")]
-    assert_eq!(backend.worker.as_ref().unwrap().containment_report.as_ref().unwrap()
-        .address_space_limit_bytes, config.vllm_worker_address_space_limit_bytes);
+    assert_eq!(
+        backend
+            .worker
+            .as_ref()
+            .unwrap()
+            .containment_report
+            .as_ref()
+            .unwrap()
+            .address_space_limit_bytes,
+        config.vllm_worker_address_space_limit_bytes
+    );
     drop(backend);
     fixture.assert_exited(2);
 }
@@ -572,14 +590,25 @@ fn prefix_caching_missing_or_false_rejects_every_pool_worker_and_recovery() {
     for value in [Value::Null, json!(false)] {
         let mut bad = plan(8192);
         if value.is_null() {
-            bad["load"]["result"].as_object_mut().unwrap().remove("prefix_caching");
+            bad["load"]["result"]
+                .as_object_mut()
+                .unwrap()
+                .remove("prefix_caching");
         } else {
             bad["load"]["result"]["prefix_caching"] = value;
         }
         for index in [0, 1] {
-            let fixture = Fixture::new(if index == 0 { json!([bad.clone()]) } else { json!([plan(8192), bad.clone()]) });
+            let fixture = Fixture::new(if index == 0 {
+                json!([bad.clone()])
+            } else {
+                json!([plan(8192), bad.clone()])
+            });
             let mut backend = fixture.backend();
-            assert!(backend.load(fixture.config(2)).unwrap_err().to_string().contains("prefix caching"));
+            assert!(backend
+                .load(fixture.config(2))
+                .unwrap_err()
+                .to_string()
+                .contains("prefix caching"));
             assert!(!backend.prefix_caching_enabled());
             assert!(backend.process_ids().is_empty());
             fixture.assert_exited(index + 1);
@@ -593,9 +622,15 @@ fn prefix_caching_missing_or_false_rejects_every_pool_worker_and_recovery() {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(10));
         }
-        assert!(finish_recovery(&mut backend).unwrap_err().to_string().contains("prefix caching"));
+        assert!(finish_recovery(&mut backend)
+            .unwrap_err()
+            .to_string()
+            .contains("prefix caching"));
         assert!(!backend.component_healthy());
-        assert_eq!(finish_recovery(&mut backend).unwrap(), ComponentRecovery::Recovered);
+        assert_eq!(
+            finish_recovery(&mut backend).unwrap(),
+            ComponentRecovery::Recovered
+        );
         drop(backend);
         fixture.assert_exited(4);
     }

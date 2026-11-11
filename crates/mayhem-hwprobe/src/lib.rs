@@ -337,6 +337,7 @@ fn report_from_profile(profile: HardwareProfile) -> HardwareReport {
 fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
     vec![
         vllm_verdict(profile),
+        openai_compatible_verdict(profile),
         trt_llm_verdict(profile),
         mlx_verdict(profile),
         llama_cpp_verdict(profile),
@@ -351,6 +352,17 @@ fn compute_backend_verdicts(profile: &HardwareProfile) -> Vec<BackendVerdict> {
         needle_gpu_verdict(profile),
         sulphur_verdict(profile),
     ]
+}
+
+fn openai_compatible_verdict(profile: &HardwareProfile) -> BackendVerdict {
+    let mut verdict = vllm_verdict(profile);
+    verdict.backend = "openai-compatible".to_owned();
+    verdict.reason = verdict.reason.map(|reason| {
+        format!(
+            "CUDA serving envelope supports a signed managed OpenAI-compatible runtime; {reason}"
+        )
+    });
+    verdict
 }
 
 fn chatterbox_verdict(profile: &HardwareProfile) -> BackendVerdict {

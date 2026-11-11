@@ -1,0 +1,378 @@
+{
+  "schema_version": 1,
+  "status": "blocked_pending_signed_catalog_and_core_release_identities",
+  "placeholders": {
+    "$SIGNED_CATALOG_SHA256": "The SHA-256 of the complete validated and signed catalog payload.",
+    "$TIER1_CORE_MANIFEST_SHA256": "The 32-byte lowercase tier-1 Core release manifest hash.",
+    "$TIER2_CORE_MANIFEST_SHA256": "The distinct 32-byte lowercase tier-2 Core release manifest hash.",
+    "$CORE_BINARY_SHA256": "The 32-byte lowercase hash of the finalized generalized Core release binary.",
+    "$TIER1_ENCLAVE_ID": "Derive from admin public key, model ID, artifact root, sorted sidecar roots, tier-1 manifest hash, and Core binary hash.",
+    "$TIER2_ENCLAVE_ID": "Derive from admin public key, model ID, artifact root, sorted sidecar roots, tier-2 manifest hash, and Core binary hash.",
+    "$EFFECTIVE_AT": "Select a nonnegative integer activation time after simulation and reader convergence."
+  },
+  "set_model_ref": {
+    "op": "set_model_ref",
+    "model_id": "Qwen/Qwen3.8-Flash-Next",
+    "model_class": "text-generation",
+    "rate_map": [
+      {
+        "unit": "cached_input_token",
+        "per_unit_au": "14907000000000",
+        "granularity": 1000
+      },
+      {
+        "unit": "input_token",
+        "per_unit_au": "59628000000000",
+        "granularity": 1000
+      },
+      {
+        "unit": "output_token",
+        "per_unit_au": "201245000000000",
+        "granularity": 1000
+      }
+    ],
+    "source_hash": "$SIGNED_CATALOG_SHA256",
+    "activity_calibration": {
+      "schema_version": 1,
+      "source_hash": "45911631224860d4bb273278ec4cf2b062e48bd061deffa69fe7de9ece93c3d2",
+      "dimensions": [
+        {
+          "unit": "cached_input_token",
+          "units": "25472",
+          "work_us": "232011"
+        },
+        {
+          "unit": "input_token",
+          "units": "520000",
+          "work_us": "61440000"
+        },
+        {
+          "unit": "output_token",
+          "units": "2046",
+          "work_us": "32016500"
+        }
+      ]
+    }
+  },
+  "register_enclaves": [
+    {
+      "op": "register_enclave",
+      "enclave_id": "$TIER1_ENCLAVE_ID",
+      "model_id": "Qwen/Qwen3.8-Flash-Next",
+      "model_class": "text-generation",
+      "backend": "openai-compatible",
+      "artifact_root": "78191c28fa91602e536baa8ede39891d6d500615086ce2ba42cb920c3b46eabe",
+      "artifact_root_kind": "blake3_merkle_v1",
+      "artifact_source": {
+        "kind": "huggingface",
+        "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+        "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+        "path": "download-manifest.json"
+      },
+      "artifact_sidecars": {
+        "pennyroyal_source": {
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+            "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+            "path": "runtime/pennyroyal-v2.5.0-source-2c675da096939cb01102f8f4871bda3db55f7f28.tar.gz"
+          },
+          "path": "runtime/pennyroyal-v2.5.0-source-2c675da096939cb01102f8f4871bda3db55f7f28.tar.gz",
+          "artifact_root": "72c6b143926e6d669f474b52e9ddfecd4b25dbc328edb817ee9600bb0e8dbe23",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 64070181,
+          "source_sha256": "776f6d4b1883c78c7d1eaafa23a936fe82d6cc2220bfb9631ec3598b5e342df4"
+        },
+        "ple_plugin_wheel": {
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+            "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+            "path": "runtime/sglang_ssd_stream-0.2.0+pennyroyal2-cp312-cp312-linux_x86_64.whl"
+          },
+          "path": "runtime/sglang_ssd_stream-0.2.0+pennyroyal2-cp312-cp312-linux_x86_64.whl",
+          "artifact_root": "c53a31e21cd48728e6a6d71b9c7a63927f062efe77c2661dee4d37d4803321ac",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 292987,
+          "source_sha256": "5fd3bf79524aec7068729e99823a8278e4f3bd7dcacd222f2c55f4395454112f"
+        },
+        "runtime_recipe": {
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+            "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+            "path": "runtime/managed-runtime-recipe-v1.json"
+          },
+          "path": "runtime/managed-runtime-recipe-v1.json",
+          "artifact_root": "9c9ba2e9fe4b0cd4570ae5deeb58a363ee904b7a62e4bd02f6b77487f02c4666",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 3204,
+          "source_sha256": "7f248046c72b771620da09f36d9cf554134cc70789c3e832017f8d29dbd5b41c"
+        },
+        "seccomp_profile": {
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+            "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+            "path": "runtime/docker-29.1.3-ple-io-uring.json"
+          },
+          "path": "runtime/docker-29.1.3-ple-io-uring.json",
+          "artifact_root": "f3ad6f80ad1ef9702ba87171fd18890d655cfd0df21553b3827c5846dec5a915",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 16286,
+          "source_sha256": "c7a33fb8ae1f8346356a61ce833d579c45acf2bc94967c6763634e81010ff816"
+        },
+        "snapshot_manifest": {
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+            "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+            "path": "download-manifest.json"
+          },
+          "path": "download-manifest.json",
+          "artifact_root": "ee2bc36da770d609bbc09da82f61ca5bfc5ecd17cc89af3dd454f01b929889bf",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 111025,
+          "source_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374"
+        }
+      },
+      "source_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
+      "manifest_hash": "$TIER1_CORE_MANIFEST_SHA256",
+      "att_tier": 1,
+      "quant": "nvfp4",
+      "binary_hash": "$CORE_BINARY_SHA256",
+      "caps": {
+        "chat": true,
+        "tools": true,
+        "json": true,
+        "vision": true,
+        "ctx": 262144,
+        "ctx_max": 262144,
+        "tp_degree": 1,
+        "max_batch_size": 2,
+        "output_modality": "text",
+        "output_modalities": [
+          "text"
+        ],
+        "modality_set": [
+          "text",
+          "image",
+          "video"
+        ],
+        "speciality_levels": {
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "xhigh"
+          ],
+          "thinking_history": [
+            "latest_only",
+            "preserve"
+          ],
+          "thinking_mode": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      }
+    },
+    {
+      "op": "register_enclave",
+      "enclave_id": "$TIER2_ENCLAVE_ID",
+      "model_id": "Qwen/Qwen3.8-Flash-Next",
+      "model_class": "text-generation",
+      "backend": "openai-compatible",
+      "artifact_root": "78191c28fa91602e536baa8ede39891d6d500615086ce2ba42cb920c3b46eabe",
+      "artifact_root_kind": "blake3_merkle_v1",
+      "artifact_source": {
+        "kind": "huggingface",
+        "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+        "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+        "path": "download-manifest.json"
+      },
+      "artifact_sidecars": {
+        "pennyroyal_source": {
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+            "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+            "path": "runtime/pennyroyal-v2.5.0-source-2c675da096939cb01102f8f4871bda3db55f7f28.tar.gz"
+          },
+          "path": "runtime/pennyroyal-v2.5.0-source-2c675da096939cb01102f8f4871bda3db55f7f28.tar.gz",
+          "artifact_root": "72c6b143926e6d669f474b52e9ddfecd4b25dbc328edb817ee9600bb0e8dbe23",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 64070181,
+          "source_sha256": "776f6d4b1883c78c7d1eaafa23a936fe82d6cc2220bfb9631ec3598b5e342df4"
+        },
+        "ple_plugin_wheel": {
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+            "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+            "path": "runtime/sglang_ssd_stream-0.2.0+pennyroyal2-cp312-cp312-linux_x86_64.whl"
+          },
+          "path": "runtime/sglang_ssd_stream-0.2.0+pennyroyal2-cp312-cp312-linux_x86_64.whl",
+          "artifact_root": "c53a31e21cd48728e6a6d71b9c7a63927f062efe77c2661dee4d37d4803321ac",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 292987,
+          "source_sha256": "5fd3bf79524aec7068729e99823a8278e4f3bd7dcacd222f2c55f4395454112f"
+        },
+        "runtime_recipe": {
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+            "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+            "path": "runtime/managed-runtime-recipe-v1.json"
+          },
+          "path": "runtime/managed-runtime-recipe-v1.json",
+          "artifact_root": "9c9ba2e9fe4b0cd4570ae5deeb58a363ee904b7a62e4bd02f6b77487f02c4666",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 3204,
+          "source_sha256": "7f248046c72b771620da09f36d9cf554134cc70789c3e832017f8d29dbd5b41c"
+        },
+        "seccomp_profile": {
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+            "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+            "path": "runtime/docker-29.1.3-ple-io-uring.json"
+          },
+          "path": "runtime/docker-29.1.3-ple-io-uring.json",
+          "artifact_root": "f3ad6f80ad1ef9702ba87171fd18890d655cfd0df21553b3827c5846dec5a915",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 16286,
+          "source_sha256": "c7a33fb8ae1f8346356a61ce833d579c45acf2bc94967c6763634e81010ff816"
+        },
+        "snapshot_manifest": {
+          "source": {
+            "kind": "huggingface",
+            "repo": "TracNetwork/mayhem-catalog-Qwen-Qwen3-8-Flash-Next-NVFP4",
+            "revision": "29292a09675f9b82e4c0b7b5c0ad028fe58ee52e",
+            "path": "download-manifest.json"
+          },
+          "path": "download-manifest.json",
+          "artifact_root": "ee2bc36da770d609bbc09da82f61ca5bfc5ecd17cc89af3dd454f01b929889bf",
+          "artifact_root_kind": "blake3_merkle_v1",
+          "weights_bytes": 111025,
+          "source_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374"
+        }
+      },
+      "source_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
+      "manifest_hash": "$TIER2_CORE_MANIFEST_SHA256",
+      "att_tier": 2,
+      "quant": "nvfp4",
+      "binary_hash": "$CORE_BINARY_SHA256",
+      "caps": {
+        "chat": true,
+        "tools": true,
+        "json": true,
+        "vision": true,
+        "ctx": 262144,
+        "ctx_max": 262144,
+        "tp_degree": 1,
+        "max_batch_size": 2,
+        "output_modality": "text",
+        "output_modalities": [
+          "text"
+        ],
+        "modality_set": [
+          "text",
+          "image",
+          "video"
+        ],
+        "speciality_levels": {
+          "reasoning_effort": [
+            "low",
+            "medium",
+            "xhigh"
+          ],
+          "thinking_history": [
+            "latest_only",
+            "preserve"
+          ],
+          "thinking_mode": [
+            "disabled",
+            "enabled"
+          ]
+        }
+      }
+    }
+  ],
+  "set_prices": [
+    {
+      "op": "set_price",
+      "enclave_id": "$TIER1_ENCLAVE_ID",
+      "rate_map": [
+        {
+          "unit": "cached_input_token",
+          "per_unit_au": "14907000000000",
+          "granularity": 1000
+        },
+        {
+          "unit": "input_token",
+          "per_unit_au": "59628000000000",
+          "granularity": 1000
+        },
+        {
+          "unit": "output_token",
+          "per_unit_au": "201245000000000",
+          "granularity": 1000
+        }
+      ],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "effective_at": "$EFFECTIVE_AT"
+    },
+    {
+      "op": "set_price",
+      "enclave_id": "$TIER2_ENCLAVE_ID",
+      "rate_map": [
+        {
+          "unit": "cached_input_token",
+          "per_unit_au": "22360500000000",
+          "granularity": 1000
+        },
+        {
+          "unit": "input_token",
+          "per_unit_au": "89442000000000",
+          "granularity": 1000
+        },
+        {
+          "unit": "output_token",
+          "per_unit_au": "301867500000000",
+          "granularity": 1000
+        }
+      ],
+      "per_req_au": "0",
+      "min_session_au": "0",
+      "effective_at": "$EFFECTIVE_AT"
+    }
+  ],
+  "open_rooms": [
+    {
+      "op": "open_room",
+      "enclave_id": "$TIER1_ENCLAVE_ID",
+      "model_id": "Qwen/Qwen3.8-Flash-Next",
+      "nonce": "qwen3-8-flash-next-nvfp4-tier1-v1",
+      "label": "qwen3.8-flash-next-tier1",
+      "policy": {
+        "canary_set": "canary-qwen3.8-flash-next-nvfp4-v1"
+      }
+    },
+    {
+      "op": "open_room",
+      "enclave_id": "$TIER2_ENCLAVE_ID",
+      "model_id": "Qwen/Qwen3.8-Flash-Next",
+      "nonce": "qwen3-8-flash-next-nvfp4-tier2-v1",
+      "label": "qwen3.8-flash-next-tier2",
+      "policy": {
+        "canary_set": "canary-qwen3.8-flash-next-nvfp4-v1"
+      }
+    }
+  ],
+  "provider_join_operations": {
+    "tier_1": [],
+    "tier_2": []
+  },
+  "tier_2_empty_market_invariant": "Register the tier-2 enclave, price, and room, but submit no join_enclave or room serving operation until a formally qualified tier-2 provider exists."
+}

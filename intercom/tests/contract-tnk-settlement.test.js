@@ -448,6 +448,29 @@ test('TNK preparation binds the exact signed MSB payload and rejects effect reus
   assert.match(invalid.message, /canonical epoch plan|plan output/i);
 });
 
+test('TNK preparation refreshes a matured revision holdback before validating its liability', async () => {
+  const ctx = await setup();
+  const liabilityKey =
+    `payout/liability/tnk/${ctx.provider.publicKey}/${ctx.revision}`;
+  const liability = (await ctx.storage.get(liabilityKey)).value;
+  await ctx.storage.put(liabilityKey, {
+    ...liability,
+    held_au: liability.total_au,
+    holdbacks: [{ epoch: 0, au: liability.total_au, locked_epochs: 1 }],
+    updated_epoch: 0,
+    last_holdback_release_epoch: 0,
+  });
+
+  const plan = await buildPlan(ctx, ctx.outputs);
+  const prepared = await prepareOutput(
+    ctx,
+    plan,
+    ctx.outputs[0],
+    '8'.repeat(64)
+  );
+  assert.equal(prepared.ok, true, prepared.message);
+});
+
 test('TNK carry-only epoch closes without fabricating an external effect', async () => {
   const ctx = await setup({
     payoutMinAu: '1000000000000000000',

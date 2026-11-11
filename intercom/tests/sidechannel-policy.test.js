@@ -452,6 +452,139 @@ test('sidechannel bounds channel names/count and reclaims limiter state under co
   assert.equal(sidechannel.relaySourceLimits.has('aa'.repeat(32)), false);
 });
 
+const directRecoveryHarness = ({ healthy = false, unrelated = false, proofDelayMs = 0 } = {}) => {
+  const remote = 'dd'.repeat(32);
+  const unrelatedRemote = 'ee'.repeat(32);
+  const counts = { destroyed: 0, healthProofs: 0, leaves: 0, recoveryJoins: 0 };
+  const makeConnection = (remoteKey, opened) => ({
+    remotePublicKey: b4a.from(remoteKey, 'hex'),
+    userData: {
+      pair() {},
+      createChannel: () => ({
+        opened,
+        addMessage: () => ({ send: () => true }),
+        open() {},
+        close() {},
+        fullyOpened: async () => opened,
+      }),
+    },
+  });
+  const stale = makeConnection(remote, false);
+  const fresh = makeConnection(remote, true);
+  const base = makeConnection(unrelatedRemote, true);
+  const connections = new Set(unrelated ? [stale, base] : [stale]);
+  let sidechannel;
+  stale.destroy = () => {
+    counts.destroyed += 1;
+    stale.destroyed = true;
+    connections.delete(stale);
+  };
+  const directPeer = {
+    wallet: peer.wallet,
+    directSession: {
+      async proveConnection(connection) {
+        counts.healthProofs += 1;
+        if (proofDelayMs > 0) {
+          await new Promise((resolve) => setTimeout(resolve, proofDelayMs));
+        }
+        if (connection === stale && !healthy) throw new Error('bidirectional health timed out');
+        return { remote: connection === base ? unrelatedRemote : remote, proven: true };
+      },
+    },
+    swarm: {
+      connections,
+      joinPeer() {
+        if (!connections.has(stale) && !connections.has(fresh)) {
+          counts.recoveryJoins += 1;
+          connections.add(fresh);
+          sidechannel.connections.set(fresh, new Map());
+        }
+      },
+      leavePeer(key) {
+        assert.equal(b4a.toString(key, 'hex'), remote);
+        counts.leaves += 1;
+      },
+    },
+  };
+  sidechannel = new Sidechannel(directPeer, {
+    channels: [MAYHEM_RELAY_CHANNEL],
+    channelOpenTimeoutMs: 2,
+    directConnectMaxWaitMs: 20,
+    directConnectPollMs: 1,
+    directRecoveryHealthTimeoutMs: 2,
+    directRecoveryBackoffMs: 1,
+    openRetryMax: 0,
+  });
+  sidechannel.connections.set(stale, new Map());
+  if (unrelated) sidechannel.connections.set(base, new Map());
+  return { base, connections, counts, fresh, remote, sidechannel, stale };
+};
+
+test('direct peer connect recovers an asymmetric transport only after failed health proof', async () => {
+  const harness = directRecoveryHarness();
+
+  assert.equal(
+    await harness.sidechannel.connectDirectPeer(harness.remote, MAYHEM_RELAY_CHANNEL, 20),
+    false
+  );
+  assert.deepEqual(harness.counts, {
+    destroyed: 1,
+    healthProofs: 1,
+    leaves: 1,
+    recoveryJoins: 1,
+  });
+  assert.equal(
+    await harness.sidechannel.connectDirectPeer(harness.remote, MAYHEM_RELAY_CHANNEL, 20),
+    true,
+    'the bounded rejoin must make a fresh Mayhem channel available to the next relay attempt'
+  );
+});
+
+test('direct peer connect never churns a healthy transport with an incompatible sidechannel', async () => {
+  const harness = directRecoveryHarness({ healthy: true });
+
+  assert.equal(
+    await harness.sidechannel.connectDirectPeer(harness.remote, MAYHEM_RELAY_CHANNEL, 20),
+    false
+  );
+  assert.equal(harness.sidechannel.directConnectFailure(
+    harness.remote,
+    MAYHEM_RELAY_CHANNEL
+  )?.phase, 'protocol_incompatible');
+  assert.equal(harness.counts.destroyed, 0);
+  assert.equal(harness.counts.leaves, 0);
+  assert.equal(harness.connections.has(harness.stale), true);
+});
+
+test('concurrent direct peer callers serialize one dead-transport recovery', async () => {
+  const harness = directRecoveryHarness({ proofDelayMs: 2 });
+
+  assert.deepEqual(
+    await Promise.all(Array.from({ length: 3 }, () => (
+      harness.sidechannel.connectDirectPeer(harness.remote, MAYHEM_RELAY_CHANNEL, 20)
+    ))),
+    [false, false, false]
+  );
+  assert.equal(harness.counts.healthProofs, 1);
+  assert.equal(harness.counts.destroyed, 1);
+  assert.equal(harness.counts.leaves, 1);
+  assert.equal(harness.counts.recoveryJoins, 1);
+});
+
+test('direct peer recovery leaves unrelated peer connections and channels untouched', async () => {
+  const harness = directRecoveryHarness({ unrelated: true });
+  const unrelatedRecords = harness.sidechannel.connections.get(harness.base);
+
+  assert.equal(
+    await harness.sidechannel.connectDirectPeer(harness.remote, MAYHEM_RELAY_CHANNEL, 20),
+    false
+  );
+  assert.equal(harness.connections.has(harness.base), true);
+  assert.equal(harness.sidechannel.connections.get(harness.base), unrelatedRecords);
+  assert.equal(harness.base.destroyed, undefined);
+  assert.equal(harness.counts.healthProofs, 1);
+});
+
 test('sidechannel does not send from a stale fully-opened callback after channel removal', async () => {
   const room = 'room-race';
   let resolveOpened = null;

@@ -404,8 +404,8 @@ try {
   const playgroundOutput = page.locator('[data-playground-max-tokens]');
   const playgroundSend = page.locator('[data-playground-send]');
   const playgroundModelTrigger = page.locator('[data-playground-model-trigger]');
-  const rateOption = playgroundModel.locator('option[data-price-mode="rate"]').first();
-  const fixedOption = playgroundModel.locator('option[data-price-mode="fixed"]').first();
+  const rateOption = playgroundModel.locator('option[data-playground-mode="chat"][data-price-mode="rate"]').first();
+  const fixedOption = playgroundModel.locator('option[data-playground-mode="chat"][data-price-mode="fixed"]').first();
   const choosePlaygroundModel = async (value) => {
     if (await playgroundModelTrigger.getAttribute('aria-expanded') !== 'true') {
       await playgroundModelTrigger.click();

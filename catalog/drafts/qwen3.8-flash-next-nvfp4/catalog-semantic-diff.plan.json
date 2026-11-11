@@ -1,0 +1,81 @@
+{
+  "schema_version": 1,
+  "status": "blocked_pending_model_measurements_and_canary_values",
+  "baseline": {
+    "commit": "ea38f49fcd941b3e4e12546095220c53ccbedab0",
+    "catalog_sha256": "2112bce6b7f8fa5660c81a81b22f9d4c4f19c263972939601ff4512e5cb2c069",
+    "signature_sha256": "8245d5aa93930036277ff6cee0ad27b10a277b74486b23ccba10a23dd85a9c33",
+    "model_count": 22,
+    "generation_execution_profile_count": 1,
+    "vllm_execution_mode_count": 1,
+    "enclave_attestation_binding_count": 6
+  },
+  "operations": [
+    {
+      "op": "append_model",
+      "model_id": "Qwen/Qwen3.8-Flash-Next",
+      "compose_from": [
+        "model-surface.values.json#model_fields",
+        "artifact-binding.values.json#artifact",
+        "model-surface.values.json#adapter_derivation",
+        "model-surface.values.json#modality_assessment",
+        "model-surface.values.json#speciality_assessment",
+        "model-surface.values.json#canary_plan"
+      ],
+      "required_before_apply": [
+        "Fill every field listed in model-surface.values.json#pending_catalog_fields.",
+        "Copy the Qwen/Qwen3.8-27B adapter fields from the exact baseline and apply only the two declared public model-ID substitutions.",
+        "Validate the resulting complete model object against the finalized catalog schema."
+      ]
+    },
+    {
+      "op": "insert_generation_execution_profile",
+      "key": "78191c28fa91602e536baa8ede39891d6d500615086ce2ba42cb920c3b46eabe",
+      "value_from": "model-surface.values.json#generation_execution_profile.value"
+    }
+  ],
+  "expected_after_apply": {
+    "model_count": 23,
+    "generation_execution_profile_count": 2,
+    "vllm_execution_mode_count": 1,
+    "enclave_attestation_binding_count": 6,
+    "appended_model_id": "Qwen/Qwen3.8-Flash-Next",
+    "new_generation_execution_profile_key": "78191c28fa91602e536baa8ede39891d6d500615086ce2ba42cb920c3b46eabe"
+  },
+  "preservation_invariants": {
+    "existing_model_order": [
+      "Cactus-Compute/needle",
+      "ResembleAI/chatterbox",
+      "SulphurAI/Sulphur-2-base",
+      "acestep/ace-step-1.5",
+      "google/gemma-4-E4B-it",
+      "hauhaucs/qwen3.6-35b-a3b-uncensored",
+      "huihui-ai/Huihui-Agents-A1-abliterated",
+      "image.heavy.le17mp",
+      "image.heavy.le1_2mp",
+      "nvidia/parakeet-tdt-0.6b-v3",
+      "prism-ml/Ternary-Bonsai-27B",
+      "tongyi/z-image-turbo",
+      "upscale.conv.le24mp",
+      "upscale.diffusion",
+      "video.heavy.le0_5mpf",
+      "video.minimax_h3.t2v_i2v",
+      "video.minimax_h3.r2v",
+      "video.minimax_h3.spectrum",
+      "video.minimax_h3.lowvram_t2v_i2v",
+      "video.minimax_h3.lowvram_r2v",
+      "video.lipsync",
+      "Qwen/Qwen3.8-27B"
+    ],
+    "unchanged_sections": [
+      "attestation_policy_chain",
+      "enclave_attestation_bindings",
+      "vllm_execution_modes",
+      "every pre-existing models element",
+      "every pre-existing generation_execution_profiles entry"
+    ],
+    "new_vllm_execution_mode": false,
+    "live_catalog_mutation_in_this_branch": false,
+    "signature_mutation_in_this_branch": false
+  }
+}

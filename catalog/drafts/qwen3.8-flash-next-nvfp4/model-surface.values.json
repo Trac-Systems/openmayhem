@@ -1,0 +1,201 @@
+{
+  "schema_version": 1,
+  "status": "blocked_pending_resource_profiles_and_final_canary_fingerprints",
+  "model_fields": {
+    "model_id": "Qwen/Qwen3.8-Flash-Next",
+    "model_class": "text-generation",
+    "family": "qwen3.8",
+    "params_b": 125,
+    "tier": "launch",
+    "provenance": {
+      "source": {
+        "kind": "huggingface",
+        "repo": "Qwen/Qwen3.8-Flash-Next",
+        "revision": "de4b8e4d43b917e7706784d8bb445c9af86a3540",
+        "publisher_key": "huggingface-repo"
+      },
+      "conversion": [
+        {
+          "tool": "huggingface_hub",
+          "method": "immutable-byte-mirror:pinned-radixark-nvfp4-snapshot-manifest",
+          "input_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374",
+          "output_sha256": "5995053edba6d997fa0b4e45363293c0bd4d670f5824c2b6b7f71a7dccc54374"
+        }
+      ],
+      "license": "qwen-community-1.0",
+      "license_sha256": "a0dc422560841fd68e06d974907f8b4c709bca44a67daad2b528437bdf676c08"
+    },
+    "caps": {
+      "ctx_max": 262144,
+      "json": true,
+      "output_modalities": [
+        "text"
+      ],
+      "output_modality": "text",
+      "tools": true,
+      "vision": true
+    },
+    "sampling": {
+      "temperature": 1,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "repeat_penalty": 1,
+      "presence_penalty": 0
+    },
+    "price_ref_au": {
+      "denom": "au_usd",
+      "in_per_1k": "59628000000000",
+      "out_per_1k": "201245000000000"
+    }
+  },
+  "sampling_profiles": {
+    "thinking_enabled": {
+      "temperature": 1,
+      "top_p": 0.95,
+      "top_k": 20,
+      "min_p": 0,
+      "presence_penalty": 0,
+      "repeat_penalty": 1
+    },
+    "thinking_disabled": {
+      "temperature": 0.7,
+      "top_p": 0.8,
+      "top_k": 20,
+      "min_p": 0,
+      "presence_penalty": 1.5,
+      "repeat_penalty": 1
+    }
+  },
+  "adapter_derivation": {
+    "source_catalog_sha256": "2112bce6b7f8fa5660c81a81b22f9d4c4f19c263972939601ff4512e5cb2c069",
+    "source_model_id": "Qwen/Qwen3.8-27B",
+    "copy_fields": [
+      "adapter.chat_template_id",
+      "adapter.tool_call_strategy",
+      "adapter.reasoning_passthrough",
+      "adapter.modality_set",
+      "adapter.specialities",
+      "adapter.endpoint_families"
+    ],
+    "required_substitutions": [
+      {
+        "json_path_suffix": "request_attribute_specs.model.enum_values",
+        "from": [
+          "Qwen/Qwen3.8-27B"
+        ],
+        "to": [
+          "Qwen/Qwen3.8-Flash-Next"
+        ]
+      },
+      {
+        "json_path_suffix": "request_attribute_specs.model.calibration_values",
+        "from": [
+          "Qwen/Qwen3.8-27B"
+        ],
+        "to": [
+          "Qwen/Qwen3.8-Flash-Next"
+        ]
+      }
+    ],
+    "endpoint_families": [
+      "openai_chat_completions",
+      "openai_completions",
+      "openai_responses",
+      "hf_multimodal_chat"
+    ],
+    "speciality_defaults": {
+      "reasoning_effort": "xhigh",
+      "thinking_history": "preserve",
+      "thinking_mode": "enabled"
+    },
+    "speciality_levels": {
+      "reasoning_effort": [
+        "low",
+        "medium",
+        "xhigh"
+      ],
+      "thinking_history": [
+        "latest_only",
+        "preserve"
+      ],
+      "thinking_mode": [
+        "disabled",
+        "enabled"
+      ]
+    }
+  },
+  "modality_assessment": {
+    "detected": [
+      "text",
+      "image",
+      "video"
+    ],
+    "evidence": [
+      "The pinned official and NVFP4 configurations declare the native Qwen3.8 vision-language architecture; the pinned processor and chat-template assets carry image and video inputs."
+    ],
+    "calibrated_fingerprints": {},
+    "resource_profiles": {}
+  },
+  "speciality_assessment": {
+    "detected": [
+      "reasoning_effort",
+      "thinking_mode",
+      "thinking_history"
+    ],
+    "evidence": [
+      "The pinned official model card and chat template expose low, medium, and xhigh reasoning effort plus thinking enablement and history preservation controls."
+    ],
+    "unsupported": {},
+    "calibrated": {}
+  },
+  "canary_plan": {
+    "set_id": "canary-qwen3.8-flash-next-nvfp4-v1",
+    "match_min": 0.9,
+    "verification_method": "token_fingerprint",
+    "prompt_ids": [
+      "qwen38-text-deterministic-a",
+      "qwen38-text-deterministic-b",
+      "qwen38-tool-routing",
+      "qwen38-json-object",
+      "qwen38-reasoning-xhigh",
+      "qwen38-reasoning-medium",
+      "qwen38-reasoning-low",
+      "qwen38-preserve-thinking-true",
+      "qwen38-preserve-thinking-false",
+      "qwen38-image-understanding",
+      "qwen38-video-understanding",
+      "qwen38-sampling-thinking",
+      "qwen38-sampling-non-thinking",
+      "qwen38-temperature-upper-boundary"
+    ],
+    "fingerprints": {},
+    "token_prefixes": {}
+  },
+  "generation_execution_profile": {
+    "key": "78191c28fa91602e536baa8ede39891d6d500615086ce2ba42cb920c3b46eabe",
+    "value": {
+      "schema_version": 1,
+      "engine": "openai-compatible",
+      "independent_dispatch": true,
+      "request_modalities": [
+        [
+          "text"
+        ]
+      ],
+      "proof_sha256": "adc3b7256a75f32f112a74ce1b453fab16e007013803ded94695dca02f3ccba8"
+    }
+  },
+  "served_runtime_context": 524288,
+  "catalog_native_context_invariant": "Keep model_fields.caps.ctx_max at 262144. The 524288 YaRN runtime setting belongs only in the signed openai-compatible binding.",
+  "pending_catalog_fields": [
+    "requirements.min_ram_gb",
+    "requirements.min_vram_gb_full_offload",
+    "modality_assessment.resource_profiles.nvfp4.image",
+    "modality_assessment.resource_profiles.nvfp4.video",
+    "modality_assessment.calibrated_fingerprints.nvfp4",
+    "speciality_assessment.calibrated.nvfp4",
+    "canary.fingerprints.nvfp4",
+    "canary.token_prefixes.nvfp4"
+  ]
+}
