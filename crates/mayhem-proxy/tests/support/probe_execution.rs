@@ -138,7 +138,9 @@ pub(super) fn controller(
         streaming,
         probes::Limits {
             max_request_bytes: 16 * 1024,
-            max_response_bytes: 32 * 1024,
+            max_response_bytes: (32 * 1024)
+                .min(f.adapter.limits().response_bytes)
+                .min(f.connection.limits().max_response_bytes),
             max_output_tokens: 128,
             timeout,
             storage_workers: 2,
@@ -444,7 +446,7 @@ async fn audited_refusal_releases_probe_allocation_then_recovers_on_json_and_sse
 }
 
 #[tokio::test]
-async fn refusal_profile_is_explicit_and_cannot_clear_ambiguous_or_batched_probe_work() {
+async fn response_completion_does_not_promote_ambiguous_refusals_or_admit_batches() {
     let mut partial = vllm_refusal(false);
     partial["id"] = json!("already-started");
     for (profile, endpoint, body, reply, content_type) in [
@@ -515,14 +517,14 @@ async fn refusal_profile_is_explicit_and_cannot_clear_ambiguous_or_batched_probe
         assert!(
             matches!(c.run().await, Err(probes::ProbeError::Execution(Error::Upstream(e))) if e.execution == Execution::Unknown)
         );
-        probe_counts(&a, 1);
+        probe_counts(&a, 0);
         assert_eq!(b.calls.load(Ordering::SeqCst), 1);
         assert!(a
             .probe_budget(&d(10))
             .unwrap()
             .unwrap()
             .last_completed
-            .is_none());
+            .is_some());
     }
 }
 
@@ -1012,7 +1014,7 @@ async fn abandoned_probe_after_health_deadline_retains_unknown_dispatch_across_r
 }
 
 #[tokio::test]
-async fn late_invalid_json_or_incomplete_stream_eof_does_not_release_probe() {
+async fn late_invalid_json_releases_capacity_but_incomplete_sse_keeps_it() {
     for streaming in [false, true] {
         let body = if streaming {
             sse(&[delta("hi", json!(null)), delta("", json!("stop"))], false)
@@ -1049,22 +1051,21 @@ async fn late_invalid_json_or_incomplete_stream_eof_does_not_release_probe() {
             .await
             .unwrap()
             .is_err());
-        probe_counts(&a, 1);
+        probe_counts(&a, if streaming { 1 } else { 0 });
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 0);
         assert!(!m.snapshot(&d(20)).unwrap().recovery_in_progress);
         let budget = a.probe_budget(&d(10)).unwrap().unwrap();
         assert_eq!(budget.used_attempts, 1);
         assert!(
-            budget.last_completed.is_none(),
-            "EOF alone is not terminal proof"
+            budget.last_completed.is_some() != streaming,
+            "only completed synchronous JSON has terminal evidence here"
         );
     }
 }
 
 #[tokio::test]
-async fn http_success_with_invalid_output_is_not_recovery_and_ambiguous_refusal_does_not_free_work()
-{
+async fn completed_invalid_or_refused_output_frees_probe_but_never_certifies_health() {
     for (status, response) in [
         (200, json!({"not":"an answer"})),
         (
@@ -1090,14 +1091,14 @@ async fn http_success_with_invalid_output_is_not_recovery_and_ambiguous_refusal_
         .unwrap();
         assert!(c.run().await.is_err());
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
-        probe_counts(&a, 1);
+        probe_counts(&a, 0);
         assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 0);
         assert!(a
             .probe_budget(&d(10))
             .unwrap()
             .unwrap()
             .last_completed
-            .is_none());
+            .is_some());
         assert!(f
             .journal
             .recovery_page(None, 64)
@@ -1182,6 +1183,225 @@ async fn vllm_error_inside_a_started_stream_is_not_http_admission_evidence() {
     assert!(
         matches!(c.run().await, Err(probes::ProbeError::Execution(Error::Decoder(mayhem_proxy::worker::Error::Upstream(e)))) if e.execution == Execution::Unknown)
     );
-    probe_counts(&a, 1);
+    probe_counts(&a, 0);
     assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn completed_invalid_probe_releases_capacity_without_health_then_recovers() {
+    for streaming in [false, true] {
+        let bad = if streaming {
+            sse(
+                &[json!({"choices":[{"index":9,"delta":{"content":"bad"}}]})],
+                true,
+            )
+        } else {
+            b"invalid json".to_vec()
+        };
+        let good = if streaming {
+            sse(
+                &[delta("hello", Value::Null), delta("", json!("stop"))],
+                true,
+            )
+        } else {
+            serde_json::to_vec(&answer()).unwrap()
+        };
+        let mime = if streaming {
+            "text/event-stream"
+        } else {
+            "application/json"
+        };
+        let b = backend_sequence(vec![(200, bad, mime), (200, good, mime)], Duration::ZERO).await;
+        let f = Fixture::new(&b.base, ProxyEndpoint::Chat);
+        let (a, m) = setup(&f);
+        let bytes = bounded(
+            serde_json::from_slice(&if streaming { stream_request() } else { chat() }).unwrap(),
+            ProxyEndpoint::Chat,
+        );
+        let c = controller(
+            &f,
+            a.clone(),
+            m.clone(),
+            &bytes,
+            streaming,
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert!(c.run().await.is_err());
+        probe_counts(&a, 0);
+        assert!(a.probe_for_group(&d(10)).unwrap().is_none());
+        assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 0);
+        let budget = a.probe_budget(&d(10)).unwrap().unwrap();
+        assert_eq!(budget.used_attempts, 1);
+        assert_eq!(budget.allocated_cost_microusd, 10);
+        assert!(budget.last_completed.is_some());
+        // The original response remains invalid, with no financial journal entry.
+        assert!(f
+            .journal
+            .recovery_page(None, 64)
+            .unwrap()
+            .records
+            .is_empty());
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        c.run().await.unwrap();
+        assert_eq!(b.calls.load(Ordering::SeqCst), 2);
+        probe_counts(&a, 0);
+        assert!(m.snapshot(&d(20)).unwrap().allowance > 0);
+    }
+}
+
+#[tokio::test]
+async fn oversized_probe_requires_real_terminal_evidence_and_preserves_it_on_reopen() {
+    for (streaming, tail, ended) in [
+        (false, "", true),
+        (true, "data: [DONE]\n\n", true),
+        (true, "", false),
+        (true, "data: [DONE]\n", false),
+        (true, "data: text\ndata: [DONE]\n\n", false),
+    ] {
+        for transport_limit in [false, true] {
+            let body = if streaming {
+                format!("data: {}\n\n{tail}", "x".repeat(4096)).into_bytes()
+            } else {
+                serde_json::to_vec(&json!({"oversized":"x".repeat(4096)})).unwrap()
+            };
+            let b = backend_raw(
+                200,
+                body,
+                if streaming {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                },
+                Duration::ZERO,
+            )
+            .await;
+            let mut config: ConnectionConfig = serde_json::from_value(json!({"schema_version":1,"id":"fixture","revision":1,"base_url":b.base,"network":{"mode":"pinned","networks":["127.0.0.1/32"],"allow_http":true},"paths":{"chat_completions":"chat/completions"},"error_profile":"open_ai"})).unwrap();
+            if transport_limit {
+                config.limits.max_response_bytes = 1024;
+            }
+            let f = Fixture::with_connection_limits(
+                config,
+                ProxyEndpoint::Chat,
+                128 * 1024 * 1024,
+                "upstream-model".into(),
+                Limits {
+                    request_bytes: 1024 * 1024,
+                    response_bytes: 1024,
+                    choices: 8,
+                    tools: 16,
+                    questions: 16,
+                    decision_options: 32,
+                },
+            );
+            let (a, m) = setup(&f);
+            let bytes = bounded(
+                serde_json::from_slice(&if streaming { stream_request() } else { chat() }).unwrap(),
+                ProxyEndpoint::Chat,
+            );
+            let c = controller(
+                &f,
+                a.clone(),
+                m.clone(),
+                &bytes,
+                streaming,
+                Duration::from_secs(5),
+            )
+            .unwrap();
+            assert!(c.run().await.is_err());
+            probe_counts(&a, if ended { 0 } else { 1 });
+            assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 0);
+            assert_eq!(
+                a.probe_budget(&d(10))
+                    .unwrap()
+                    .unwrap()
+                    .last_completed
+                    .is_some(),
+                ended
+            );
+            assert!(f
+                .journal
+                .recovery_page(None, 64)
+                .unwrap()
+                .records
+                .is_empty());
+            drop(c);
+            drop(a);
+            let (a, m) = setup(&f);
+            probe_counts(&a, if ended { 0 } else { 1 });
+            assert_eq!(a.probe_budget(&d(10)).unwrap().unwrap().used_attempts, 1);
+            assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 0);
+            if !ended {
+                let c = controller(&f, a.clone(), m, &bytes, streaming, Duration::from_secs(5))
+                    .unwrap();
+                assert!(matches!(
+                    c.run().await,
+                    Err(probes::ProbeError::Execution(Error::Capacity(
+                        capacity::Error::InUse
+                    )))
+                ));
+            }
+            assert_eq!(b.calls.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_completed_measured_probe_releases_shared_group_for_another_route() {
+    let invalid = sse(
+        &[json!({"choices":[{"index":9,"delta":{"content":"bad"}}]})],
+        true,
+    );
+    let b = backend_raw(200, invalid, "text/event-stream", Duration::ZERO).await;
+    let f = Fixture::new(&b.base, ProxyEndpoint::Chat);
+    let source = super::native_execution::source(&f);
+    let (a, m) = setup_measured(&f, source.digest().clone());
+    let bytes = bounded(
+        serde_json::from_slice(&stream_request()).unwrap(),
+        ProxyEndpoint::Chat,
+    );
+    let c = controller(
+        &f,
+        a.clone(),
+        m.clone(),
+        &bytes,
+        true,
+        Duration::from_secs(5),
+    )
+    .unwrap()
+    .with_tokenizer(source)
+    .unwrap();
+    assert!(c.run().await.is_err());
+    probe_counts(&a, 0);
+    // A distinct configured route sharing the same upstream can probe again.
+    a.configure_route_with_constraints(
+        capacity::Route {
+            id: d(21),
+            group: d(10),
+            lane: capacity::Lane::Proxy,
+            max_concurrency: 2,
+        },
+        vec![d(11)],
+    )
+    .unwrap();
+    let previous = a
+        .probe_budget(&d(10))
+        .unwrap()
+        .unwrap()
+        .last_completed
+        .unwrap()
+        .probe;
+    let specification = capacity::probes::Specification {
+        route: d(21),
+        budget_group: d(10),
+        request_hash: d(99),
+        connection_digest: f.connection.fingerprint().clone(),
+        connection_revision: 1,
+        recipe_digest: f.adapter.recipe_hash().clone(),
+    };
+    let permit = a.reserve_probe(specification).unwrap();
+    assert_ne!(permit.probe().id, previous);
+    assert_eq!(a.group_status(&d(10)).unwrap().occupied, 1);
+    a.cancel_prepared_probe(&permit.probe().id).unwrap();
+    assert_eq!(m.snapshot(&d(20)).unwrap().allowance, 0);
 }

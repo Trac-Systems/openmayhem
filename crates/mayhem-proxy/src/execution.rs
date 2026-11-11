@@ -9,6 +9,7 @@
 mod jobs;
 mod paid;
 pub mod probes;
+mod probe_diagnostics;
 mod timed_reader;
 mod transport;
 pub use paid::PaidExecutor;

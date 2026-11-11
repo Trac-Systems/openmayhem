@@ -468,3 +468,38 @@ async fn async_lookup_binding_expansion_respects_original_request_byte_bound_bef
         Phase::Prepared
     );
 }
+
+#[tokio::test]
+async fn asynchronous_invalid_probe_result_does_not_treat_http_ack_as_completion() {
+    let recipe = recipe(ProxyEndpoint::Chat, false);
+    let sample = recipe.recipe.fixtures[0].clone();
+    let server = server(json!({"not":"a result"}), false, false).await;
+    let f = fixture(&server.base, recipe);
+    let (authority, monitor) = probe_execution::setup(&f);
+    let body = probe_execution::bounded(sample.request, ProxyEndpoint::Chat);
+    let controller = probe_execution::controller(
+        &f,
+        authority.clone(),
+        monitor.clone(),
+        &body,
+        false,
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    assert!(controller.run().await.is_err());
+    assert_eq!(server.calls("/submit"), 1);
+    assert_eq!(authority.group_status(&d(10)).unwrap().occupied, 1);
+    assert!(authority
+        .probe_budget(&d(10))
+        .unwrap()
+        .unwrap()
+        .last_completed
+        .is_none());
+    assert_eq!(monitor.snapshot(&d(20)).unwrap().allowance, 0);
+    assert!(f
+        .journal
+        .recovery_page(None, 10)
+        .unwrap()
+        .records
+        .is_empty());
+}

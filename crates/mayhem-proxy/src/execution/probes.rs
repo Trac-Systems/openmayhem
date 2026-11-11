@@ -381,8 +381,20 @@ impl Controller {
         if let (Some(sample), Some(source)) = (&mut sample, &self.tokenizer) {
             sample.use_native(source)
         }
+        // A synchronous response ending proves physical execution ended, even
+        // when validation rejects its output. Job/background acknowledgements
+        // do not prove that; retain their existing lookup/recovery semantics.
+        #[derive(serde::Deserialize)]
+        struct Lifecycle {
+            background: Option<bool>,
+        }
+        let background = serde_json::from_slice::<Lifecycle>(self.request.body())
+            .map(|v| v.background.unwrap_or(false))
+            .unwrap_or(true);
+        let completion = (self.adapter.job().is_none() && !background)
+            .then(|| Arc::new(crate::connector::http::Completion::default()));
         let transport = transport::Transport {
-            completion: None,
+            completion: completion.clone(),
             connection: &self.connection,
             adapter: &self.adapter,
         };
@@ -432,6 +444,11 @@ impl Controller {
             shutdown,
             tokio::time::Instant::now() + self.limits.timeout,
             || {
+                super::probe_diagnostics::report(
+                    &probe,
+                    &Error::Upstream(timeout_failure.clone()),
+                    completion.as_ref().is_some_and(|c| c.observed()),
+                );
                 // The original exchange still owns its measurement. Publish
                 // failure without dropping it or granting another dispatch.
                 if let Ok(observer) = self
@@ -512,6 +529,19 @@ impl Controller {
                 })
             }
             Err(error) => {
+                let execution_ended = completion.as_ref().is_some_and(|c| c.observed());
+                super::probe_diagnostics::report(&probe, &error, execution_ended);
+                if execution_ended {
+                    let evidence = Digest::hash(
+                        "mayhem/proxy/probe-execution-ended/v1",
+                        &[
+                            probe.id.as_str().as_bytes(),
+                            probe.specification.request_hash.as_str().as_bytes(),
+                            probe.specification.connection_digest.as_str().as_bytes(),
+                        ],
+                    );
+                    self.complete(probe.clone(), evidence).await?;
+                }
                 let failure = match &error {
                     Error::Upstream(f) | Error::Decoder(worker::Error::Upstream(f)) => {
                         Some(f.clone())
@@ -525,7 +555,9 @@ impl Controller {
                     _ => None,
                 };
                 if let Some(failure) = failure {
-                    if failure.execution == Execution::NotDispatched || failure.verified_rejection()
+                    if !execution_ended
+                        && (failure.execution == Execution::NotDispatched
+                            || failure.verified_rejection())
                     {
                         let bytes =
                             serde_json::to_vec(&failure).map_err(|_| ProbeError::Configuration)?;

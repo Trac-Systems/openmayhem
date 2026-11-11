@@ -534,3 +534,26 @@ production relay/fee collection evidence.
 
 For a historical contract-version error during first sync, see
 [recovery without deleting state](../../../PROVIDING.md#recovering-an-interrupted-first-sync).
+
+
+## Monitoring recovery
+
+A completed synchronous health-check response can fail validation without keeping
+its execution slot occupied. Core 0.2.307 retains transport completion separately
+from output validity. Invalid output still fails the health check; it does not
+certify availability, create a customer receipt or refund monitoring allowance.
+The next probe follows the existing backoff and budget.
+
+An incomplete stream, lost connection or asynchronous job acknowledgement is not
+proof that upstream execution ended. Retained uncertain probes require independent
+verification of the original upstream before operator recovery. Stop only that
+proxy controller, inspect `mayhem provider proxy recovery-status --help`, then use
+`mayhem provider proxy resolve-recovery-probe --help` for the exact confirmation
+fields. Preserve the existing configuration, wallet and state directory. Restarting
+alone does not clear a retained probe; never erase a store to clear one.
+
+Set `MAYHEM_PROXY_DIAGNOSTICS=1` in the controller's environment to record bounded
+`proxy_probe_failure` metadata. Each process emits at most 64 such records, with
+probe/route IDs, fixed failure categories and execution-end status. It records no
+prompts, responses, credentials or arbitrary upstream messages. Unset the variable
+and restart the controller to disable it. The limit is shared across its routes.
