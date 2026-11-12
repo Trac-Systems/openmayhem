@@ -213,8 +213,12 @@ impl Transport<'_> {
         let reply = request
             .decode_json(result, public_id, delivery.created())
             .map_err(Error::Endpoint)?;
-        if let Some(sample) = sample {
-            sample.finish_native().await
+        // Probe readiness requires this evidence. Paid traffic publishes it
+        // through the bounded source actor after durable result retention.
+        if matches!(delivery, Delivery::Probe { .. }) {
+            if let Some(sample) = sample {
+                sample.finish_native().await
+            }
         }
         Ok(reply)
     }

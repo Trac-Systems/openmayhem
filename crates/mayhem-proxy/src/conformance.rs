@@ -363,9 +363,13 @@ impl Signed {
 pub struct Recorder {
     store: Arc<Store>,
     signer: Arc<crate::signing::Authority>,
-    active: std::sync::atomic::AtomicU64,
-    generation: std::sync::atomic::AtomicU64,
+    activity: std::sync::Mutex<Activity>,
     writes: Arc<tokio::sync::Semaphore>,
+}
+#[derive(Default)]
+struct Activity {
+    active: u64,
+    generation: u64,
 }
 impl Recorder {
     pub fn new(store: Arc<Store>, signer: Arc<crate::signing::Authority>) -> Result<Self> {
@@ -381,8 +385,7 @@ impl Recorder {
         Ok(Self {
             store,
             signer,
-            active: 0.into(),
-            generation: 0.into(),
+            activity: std::sync::Mutex::new(Activity::default()),
             writes: Arc::new(tokio::sync::Semaphore::new(4)),
         })
     }

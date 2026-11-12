@@ -356,8 +356,10 @@ impl Drop for Guard {
     }
 }
 /// The owner must call shutdown().await before dropping the runtime. Dropping an
-/// HTTP await signals cancellation; the owned task keeps permits until pending
-/// durable commits finish. Finished handles are reaped on the next admission.
+/// HTTP await signals cancellation; the owned task keeps admission permits until
+/// required durable commits finish. Optional recording tails have separate
+/// recorder permits and are also drained by shutdown. Finished handles are reaped
+/// on the next admission.
 pub struct Controller {
     shared: Arc<Shared>,
     sessions: Arc<Semaphore>,
@@ -723,18 +725,28 @@ impl Controller {
             let (mut result, receiver) = oneshot::channel();
             let task_identity = identity.clone();
             tasks.spawn(async move {
-                let _guard = guard;
                 let (cancel, cancelled) = watch::channel(false);
-                let work = shared.run(operation, task_identity, cancelled);
-                tokio::pin!(work);
-                let outcome = tokio::select! {
-                    value = &mut work => value,
-                    _ = stopped(&mut external) => { cancel.send_replace(true); work.await },
-                    _ = stopped(&mut shutdown) => { cancel.send_replace(true); work.await },
-                    _ = result.closed() => { cancel.send_replace(true); work.await },
-                    _ = disconnected => { cancel.send_replace(true); work.await },
+                let mut telemetry = None;
+                let outcome = {
+                    let work = shared.run(operation, task_identity, cancelled, &mut telemetry);
+                    tokio::pin!(work);
+                    tokio::select! {
+                        value = &mut work => value,
+                        _ = stopped(&mut external) => { cancel.send_replace(true); work.await },
+                        _ = stopped(&mut shutdown) => { cancel.send_replace(true); work.await },
+                        _ = result.closed() => { cancel.send_replace(true); work.await },
+                        _ = disconnected => { cancel.send_replace(true); work.await },
+                    }
                 };
                 let _ = result.send(outcome);
+                // Optional recording cannot age the financial observation before
+                // its owner receives it or occupy admission/session buffers.
+                // The original task remains in our JoinSet for shutdown. Its
+                // tail has a separate, non-waiting recorder permit (at most 4).
+                drop(guard);
+                if let Some(telemetry) = telemetry {
+                    let _ = telemetry.retain().await;
+                }
             });
             receiver
         };
@@ -844,6 +856,7 @@ impl Shared {
         operation: Operation,
         identity: RequestIdentity,
         mut stop: watch::Receiver<bool>,
+        telemetry: &mut Option<crate::conformance::capture::Verified>,
     ) -> Result<Outcome> {
         let mut p = Progress {
             identity,
@@ -874,7 +887,8 @@ impl Shared {
                     return Err(p.error(Code::RecoveryRequired));
                 }
                 p.retained = false;
-                self.execute(request, observer, &mut p, &mut stop).await
+                self.execute(request, observer, &mut p, &mut stop, telemetry)
+                    .await
             }
             Operation::Recover(identity, gate) => {
                 if identity != p.identity {
@@ -894,6 +908,7 @@ impl Shared {
         observer: Option<StreamSender>,
         p: &mut Progress,
         stop: &mut watch::Receiver<bool>,
+        telemetry: &mut Option<crate::conformance::capture::Verified>,
     ) -> Result<Outcome> {
         let Request {
             context,
@@ -1136,8 +1151,18 @@ impl Shared {
         })
         .await
         .map_err(|e| p.transport_error("buyer_execute_send", &e))?;
-        self.finish(paid, saved, p, stop, false, &gate, observer, conformance)
-            .await
+        self.finish(
+            paid,
+            saved,
+            p,
+            stop,
+            false,
+            &gate,
+            observer,
+            conformance,
+            telemetry,
+        )
+        .await
     }
 
     async fn recover(
@@ -1242,7 +1267,7 @@ impl Shared {
         paid.send(&Message::Status)
             .await
             .map_err(|_| p.error(Code::Transport))?;
-        self.finish(paid, saved, p, stop, true, &gate, None, None)
+        self.finish(paid, saved, p, stop, true, &gate, None, None, &mut None)
             .await
     }
 
@@ -1256,6 +1281,7 @@ impl Shared {
         gate: &Arc<dyn AuthorizationGate>,
         mut observer: Option<StreamSender>,
         mut conformance: Option<crate::conformance::capture::Capture>,
+        telemetry: &mut Option<crate::conformance::capture::Verified>,
     ) -> Result<Outcome> {
         let authorization = saved
             .authorization()
@@ -1501,7 +1527,7 @@ impl Shared {
                     // Telemetry failure cannot change settlement or authorize a
                     // retry. The original verified result remains authoritative.
                     if let Some(capture) = conformance.take() {
-                        let _ = capture.verified(&response).await;
+                        *telemetry = capture.verified(&response).ok();
                     }
                     return Ok(Outcome::Completed {
                         identity: p.identity.clone(),

@@ -549,6 +549,40 @@ async fn native_evidence_age_does_not_restart_after_tokenization_or_durable_publ
 }
 
 #[tokio::test(start_paused = true)]
+async fn optional_success_keeps_original_freshness_and_cannot_undo_a_newer_fault() {
+    let m = monitor();
+    let mut sample = m.observe_request(&d(1), class()).unwrap();
+    sample.delta(&delta());
+    sample.native_progress(d(9), 0).unwrap();
+    advance(100).await;
+    sample.native_progress(d(9), 20).unwrap();
+    sample.network_complete(Instant::now());
+    advance(60_001).await;
+    sample.success_background(Some(999999));
+    let view = m.snapshot(&d(1)).unwrap();
+    assert_eq!(view.allowance, 0);
+    assert!(!view.meets_native_floor(5));
+    assert_eq!(view.last_measurement.unwrap().total_ms, 100);
+
+    let mut old = m.observe_request(&d(1), class()).unwrap();
+    old.delta(&delta());
+    old.network_complete(Instant::now());
+    advance(1).await;
+    m.observe_request(&d(1), class())
+        .unwrap()
+        .failure(Failure::new(
+            Code::UpstreamUnavailable,
+            Scope::Model,
+            crate::connector::failure::Stage::ResponseBody,
+            crate::connector::failure::Execution::Unknown,
+        ));
+    old.success_background(None);
+    let view = m.snapshot(&d(1)).unwrap();
+    assert_eq!(view.allowance, 0);
+    assert_eq!(view.reason, Reason::Unreachable);
+}
+
+#[tokio::test(start_paused = true)]
 async fn delayed_measurements_cannot_replace_newer_route_or_connection_evidence() {
     let m = monitor();
     let mut old = m.observe_request(&d(1), class()).unwrap();

@@ -101,12 +101,13 @@ pub async fn receive_bridge(
                 channel(&n, &signed.body.market)? == topic,
                 "presence market channel differs",
             )?;
+            let snapshot = c.read()?;
             let registered = Registered::read(
-                &c.read()?,
+                &snapshot,
                 &signed.body.market,
                 &signed.body.provider,
                 &signed.body.slot,
-                now,
+                unix_ms()?,
             )?;
             t.receive(signed, &registered, unix_ms()?)
         })

@@ -107,6 +107,11 @@ No coding agent yet? Any of the ones above installs in a minute, or drive it you
 
 ### Manual install
 
+`v0.2.308` bounds background proxy recovery, preserves foreground request
+capacity, and corrects proxy-offer freshness timing. Optional performance
+recording no longer delays verified completion. Financial confirmation remains
+required; the ledger contract and transaction formats are unchanged.
+
 `v0.2.307` fixes monitoring probes retaining capacity after completed responses
 fail validation. Invalid output still fails the health check; incomplete execution
 remains protected. Optional probe diagnostics retain bounded failure metadata.
@@ -122,7 +127,7 @@ and [image references](crates/mayhem-engine/IMAGE_REFERENCES.md) remain availabl
 LLM admission continues to require initialized prefix caching introduced in
 v0.2.178. See [runtime details and limits](crates/mayhem-engine/PREFIX_CACHING.md).
 
-`v0.2.307` is a source release. GitHub publishes the tagged source archives; it
+`v0.2.308` is a source release. GitHub publishes the tagged source archives; it
 does not publish unsigned OpenMayhem executables. Clone the exact tag and let
 the installer build for the current host.
 
@@ -131,7 +136,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.307
+git checkout --detach v0.2.308
 ./install.sh --from-source
 ```
 
@@ -140,7 +145,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.307
+git checkout --detach v0.2.308
 .\install.ps1 -FromSource
 ```
 
@@ -1210,7 +1215,7 @@ For dashboard UI work without starting the full stack, use the isolated fixture
 
 ## Install
 
-`v0.2.307` is source-only. The GitHub release contains the tagged source, not
+`v0.2.308` is source-only. The GitHub release contains the tagged source, not
 unsigned platform executables. Install from the exact release tag.
 
 macOS/Linux:
@@ -1218,7 +1223,7 @@ macOS/Linux:
 ```bash
 git clone https://github.com/Trac-Systems/openmayhem.git
 cd openmayhem
-git checkout --detach v0.2.307
+git checkout --detach v0.2.308
 ./install.sh --from-source
 ```
 
@@ -1227,7 +1232,7 @@ Windows PowerShell:
 ```powershell
 git clone https://github.com/Trac-Systems/openmayhem.git
 Set-Location openmayhem
-git checkout --detach v0.2.307
+git checkout --detach v0.2.308
 .\install.ps1 -FromSource
 ```
 

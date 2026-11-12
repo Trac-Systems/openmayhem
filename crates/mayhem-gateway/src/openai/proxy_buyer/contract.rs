@@ -59,8 +59,8 @@ async fn select(
         .map_err(|_| failure(StatusCode::SERVICE_UNAVAILABLE, "proxy_contract_busy"))?;
     tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let now = super::super::now_millis_u64();
         let catalog = control.catalog().read().map_err(|_| unavailable())?;
+        let now = super::super::now_millis_u64();
         let status = catalog.status();
         if !status.discovery_is_fresh(now, mayhem_proxy::presence::CATALOG_AGE_MS) {
             return Err(unavailable());

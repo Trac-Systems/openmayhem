@@ -192,6 +192,24 @@ impl Sample {
     pub fn success(self, reported_output_tokens: Option<u64>) {
         self.prepare_success(reported_output_tokens).publish();
     }
+    /// Paid result retention has completed. The source actor owns optional
+    /// counting; it keeps the original network times and bounded capture permit.
+    /// Probes continue to await their required evidence via finish_native.
+    pub(crate) fn success_background(mut self, reported_output_tokens: Option<u64>) {
+        self.completed.get_or_insert_with(Instant::now);
+        if let Some(capture) = self.native.take() {
+            capture.finish_background(move |evidence| {
+                if let Some(evidence) = evidence {
+                    self.tokenizer = Some(evidence.digest);
+                    self.native_first = Some((evidence.first, 0));
+                    self.native_last = Some((evidence.last, evidence.tokens));
+                }
+                self.success(reported_output_tokens);
+            });
+        } else {
+            self.success(reported_output_tokens);
+        }
+    }
     pub(crate) fn prepare_success(self, reported_output_tokens: Option<u64>) -> Success {
         let observed = self.measurement(
             reported_output_tokens.filter(|v| *v <= mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER),

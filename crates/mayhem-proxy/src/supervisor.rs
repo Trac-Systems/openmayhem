@@ -11,7 +11,7 @@ use std::{
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::watch;
+use tokio::{sync::watch, time::Instant};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
@@ -138,6 +138,14 @@ impl Schedule {
             .min(self.policy.retry_max_ms);
         self.jitter(base).min(self.policy.retry_max_ms)
     }
+
+    fn after_commit(&mut self, started: Instant) -> Instant {
+        let interval = Duration::from_millis(self.jitter(self.policy.interval_ms));
+        // Start-to-start cadence: RPC/storage time consumes the interval. A slow
+        // refresh never queues catch-up work; allow one new step after a minimum
+        // yield, still protected by the catalog's single outstanding refresh.
+        (started + interval).max(Instant::now() + Duration::from_millis(1))
+    }
 }
 
 pub fn unix_ms() -> u64 {
@@ -153,49 +161,75 @@ pub async fn run(
     client: DiscoveryClient,
     policy: RefreshPolicy,
     seed: u64,
-    mut shutdown: watch::Receiver<bool>,
+    shutdown: watch::Receiver<bool>,
     updates: watch::Sender<Health>,
 ) -> Result<()> {
+    run_refresh(
+        |observed_at_ms| catalog.refresh_page(&client, observed_at_ms),
+        unix_ms,
+        policy,
+        seed,
+        shutdown,
+        updates,
+    )
+    .await
+}
+
+async fn run_refresh<F, R>(
+    mut refresh: F,
+    clock: impl Fn() -> u64,
+    policy: RefreshPolicy,
+    seed: u64,
+    mut shutdown: watch::Receiver<bool>,
+    updates: watch::Sender<Health>,
+) -> Result<()>
+where
+    F: FnMut(u64) -> R,
+    R: std::future::Future<Output = Result<RefreshOutcome>>,
+{
     policy.validate()?;
     let mut schedule = Schedule {
         policy,
         state: seed,
     };
     let mut health = Health::default();
-    let mut delay = 0;
+    let mut deadline = Instant::now();
     loop {
         if *shutdown.borrow() || shutdown.has_changed().is_err() {
             break;
         }
-        if delay > 0 {
-            tokio::select! {
-                _ = shutdown.changed() => continue,
-                _ = tokio::time::sleep(Duration::from_millis(delay)) => {}
-            }
+        tokio::select! {
+            _ = shutdown.changed() => continue,
+            _ = tokio::time::sleep_until(deadline) => {}
         }
+        let started = Instant::now();
+        // Keep evidence anchored before the RPC. Completion must never renew an
+        // old observation, including a long multi-page traversal.
+        let observed_at_ms = clock();
         let result = tokio::select! {
             _ = shutdown.changed() => continue,
-            result = catalog.refresh_page(&client, unix_ms()) => result,
+            result = refresh(observed_at_ms) => result,
         };
         match result {
             Ok(RefreshOutcome::Staged(_)) => {
                 health.phase = Phase::Refreshing;
                 health.consecutive_failures = 0;
                 health.error_code = None;
-                delay = schedule.policy.page_pause_ms;
+                deadline = Instant::now() + Duration::from_millis(schedule.policy.page_pause_ms);
             }
             Ok(RefreshOutcome::Committed(status)) => {
                 health.phase = Phase::Ready;
                 health.consecutive_failures = 0;
                 health.error_code = None;
                 health.committed_length = status.committed.map(|c| c.proof.signed_length);
-                delay = schedule.jitter(schedule.policy.interval_ms);
+                deadline = schedule.after_commit(started);
             }
             Ok(RefreshOutcome::Invalidated) => {
                 health.phase = Phase::Degraded;
                 health.error_code = Some("proxy_cursor_invalidated");
                 health.consecutive_failures = health.consecutive_failures.saturating_add(1);
-                delay = schedule.retry(health.consecutive_failures);
+                deadline = Instant::now()
+                    + Duration::from_millis(schedule.retry(health.consecutive_failures));
             }
             Err(error) => {
                 health.phase = Phase::Degraded;
@@ -209,10 +243,15 @@ pub async fn run(
                     updates.send_replace(health);
                     return Err(error);
                 }
-                delay = schedule.retry(health.consecutive_failures);
+                deadline = Instant::now()
+                    + Duration::from_millis(schedule.retry(health.consecutive_failures));
             }
         }
-        health.retry_in_ms = Some(delay);
+        health.retry_in_ms = Some(
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis() as u64,
+        );
         updates.send_replace(health.clone());
     }
     health.phase = Phase::Stopped;
@@ -220,6 +259,10 @@ pub async fn run(
     updates.send_replace(health);
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "supervisor/timing_tests.rs"]
+mod timing_tests;
 
 #[cfg(test)]
 mod tests {

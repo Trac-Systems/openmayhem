@@ -108,6 +108,27 @@ fn refresh_policy() -> RefreshPolicy {
     }
 }
 
+// Per-refresh allowance for local storage/scheduler work (including the
+// supervisor's minimum yield). This is headroom, not a disk latency guarantee;
+// actual stale evidence still fails closed at readers.
+const REFRESH_HEADROOM_MS: u64 = 1_000;
+
+fn validate_refresh_timing(refresh: &RefreshPolicy, rpc_timeout_ms: u64) -> Result<()> {
+    refresh.validate().map_err(|_| Error::Configuration)?;
+    let latest_start = refresh
+        .interval_ms
+        .saturating_add(refresh.interval_ms * u64::from(refresh.jitter_percent) / 100);
+    let step_budget = rpc_timeout_ms.saturating_add(REFRESH_HEADROOM_MS);
+    // Previous observation -> next start -> next completed observation. When
+    // RPCs exceed the interval, both RPC budgets still count, with local work
+    // headroom for each step. Never validate only interval + one RPC.
+    let oldest_evidence = latest_start.max(step_budget).saturating_add(step_budget);
+    if rpc_timeout_ms == 0 || oldest_evidence >= presence::CATALOG_AGE_MS {
+        return Err(Error::Configuration);
+    }
+    Ok(())
+}
+
 /// Protected, identity-checked startup material; not constructible from a public
 /// request. Credentials never appear in Debug, public health or returned errors.
 pub struct Prepared {
@@ -138,16 +159,7 @@ impl Prepared {
         {
             return Err(Error::Configuration);
         }
-        config
-            .refresh
-            .validate()
-            .map_err(|_| Error::Configuration)?;
-        let latest_refresh = config.refresh.interval_ms.saturating_add(
-            config.refresh.interval_ms * u64::from(config.refresh.jitter_percent) / 100,
-        );
-        if latest_refresh.saturating_add(config.rpc_timeout_ms) >= presence::CATALOG_AGE_MS {
-            return Err(Error::Configuration);
-        }
+        validate_refresh_timing(&config.refresh, config.rpc_timeout_ms)?;
         let parent = std::fs::canonicalize(
             path.parent()
                 .filter(|p| !p.as_os_str().is_empty())

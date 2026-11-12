@@ -269,6 +269,39 @@ impl Capture {
             last,
         })
     }
+    pub(crate) fn finish_background(
+        self,
+        complete: impl FnOnce(Option<Evidence>) + Send + 'static,
+    ) {
+        let interval = self
+            .first
+            .zip(self.last)
+            .filter(|(first, last)| last > first);
+        if self.failed || self.backpressured.load(Ordering::Acquire) || interval.is_none() {
+            complete(None);
+            return;
+        }
+        let (first, last) = interval.unwrap();
+        let minimum = self.limits.minimum_tokens as u64;
+        let digest = self.digest;
+        self.pool.count_background(
+            self.fields.into_values().collect(),
+            self.permit,
+            move |count| {
+                complete(
+                    count
+                        .ok()
+                        .filter(|count| *count >= minimum)
+                        .map(|tokens| Evidence {
+                            digest,
+                            tokens,
+                            first,
+                            last,
+                        }),
+                );
+            },
+        );
+    }
 }
 fn contains_text(v: &Value) -> bool {
     match v {

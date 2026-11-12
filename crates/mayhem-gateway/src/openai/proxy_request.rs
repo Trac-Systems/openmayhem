@@ -454,6 +454,14 @@ pub async fn resolve_estimate(
     control: Arc<ProxyControl>,
     request: Arc<Request>,
 ) -> Result<EstimateCandidate> {
+    resolve_estimate_with_clock(control, request, super::now_millis_u64).await
+}
+
+async fn resolve_estimate_with_clock(
+    control: Arc<ProxyControl>,
+    request: Arc<Request>,
+    clock: impl FnOnce() -> u64 + Send + 'static,
+) -> Result<EstimateCandidate> {
     let permit = READS.try_acquire().map_err(|_| Error::Busy)?;
     let read_control = control.clone();
     let read_request = request.clone();
@@ -462,8 +470,10 @@ pub async fn resolve_estimate(
             let control = read_control;
             let request = read_request;
             let _permit = permit;
-            let now = super::now_millis_u64();
             let catalog = control.catalog().read().map_err(|_| Error::Catalog)?;
+            // Pin the MVCC snapshot before sampling time: a concurrent refresh
+            // must not make this read appear to come from the future.
+            let now = clock();
             let registered = mayhem_proxy::presence::Registered::read(
                 &catalog,
                 &request.selector.market,

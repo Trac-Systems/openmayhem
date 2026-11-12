@@ -29,7 +29,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     sync::{oneshot, watch, OwnedSemaphorePermit, Semaphore},
@@ -41,6 +41,7 @@ mod data_handling;
 mod estimation;
 pub(super) mod evidence;
 mod profile;
+mod recovery_schedule;
 mod resolver;
 mod retail;
 mod streaming;
@@ -62,6 +63,8 @@ pub struct Runtime {
     policy: proxy_request::Policy,
     settlement_policy: ProxySettlementPolicy,
     slots: Arc<Semaphore>,
+    sessions: usize,
+    recovery: Arc<Mutex<recovery_schedule::Schedule>>,
     streams: Arc<Semaphore>,
     retail: Option<Arc<retail::Authority>>,
     active: Arc<Mutex<BTreeSet<String>>>,
@@ -80,6 +83,8 @@ impl fmt::Debug for Runtime {
 struct Claim {
     id: String,
     active: Arc<Mutex<BTreeSet<String>>>,
+    recovery: Option<Arc<Mutex<recovery_schedule::Schedule>>>,
+    pending: bool,
     _permit: OwnedSemaphorePermit,
 }
 struct Running(Arc<Runtime>);
@@ -94,6 +99,11 @@ impl Drop for Claim {
     fn drop(&mut self) {
         if let Ok(mut active) = self.active.lock() {
             active.remove(&self.id);
+        }
+        if let Some(recovery) = &self.recovery {
+            if let Ok(mut recovery) = recovery.lock() {
+                recovery.finish(&self.id, self.pending, Instant::now());
+            }
         }
     }
 }
@@ -116,6 +126,8 @@ impl Runtime {
             policy,
             settlement_policy,
             slots: Arc::new(Semaphore::new(sessions)),
+            sessions,
+            recovery: Arc::new(Mutex::new(recovery_schedule::Schedule::default())),
             streams: Arc::new(Semaphore::new(sessions)),
             retail: None,
             active: Arc::new(Mutex::new(BTreeSet::new())),
@@ -188,8 +200,39 @@ impl Runtime {
         Ok(Claim {
             id: id.into(),
             active: self.active.clone(),
+            recovery: None,
+            pending: true,
             _permit: permit,
         })
+    }
+
+    fn claim_recovery(&self, id: &str) -> Result<Option<Claim>, ApiError> {
+        if !self.running.load(Ordering::Acquire) || *self.halt.borrow() {
+            return Err(unavailable());
+        }
+        let mut active = self.active.lock().map_err(|_| unavailable())?;
+        if active.contains(id) {
+            // Advance past a foreground-owned job without delaying its owner.
+            return Ok(None);
+        }
+        let permit =
+            recovery_schedule::claim_slot(&self.slots, self.sessions).map_err(|_| busy())?;
+        if !self
+            .recovery
+            .lock()
+            .map_err(|_| unavailable())?
+            .start(id, Instant::now())
+        {
+            return Err(busy());
+        }
+        active.insert(id.to_owned());
+        Ok(Some(Claim {
+            id: id.into(),
+            active: self.active.clone(),
+            recovery: Some(self.recovery.clone()),
+            pending: true,
+            _permit: permit,
+        }))
     }
 
     fn launch(
@@ -216,7 +259,7 @@ impl Runtime {
         let mut halted = self.halt.subscribe();
         let (reply, receive) = oneshot::channel();
         tasks.spawn(async move {
-            let _claim = claim;
+            let mut claim = claim;
             let (stop, stopped) = watch::channel(false);
             let owner = Arc::new(Owner::new(
                 state.jobs.clone(),
@@ -293,6 +336,11 @@ impl Runtime {
                     && error.stage == buyer_controller::Stage::Negotiating
                     && !error.recovery_required
             });
+            // Successful recovery already observed the original financial
+            // state. A Pending result does not need another canonical read
+            // here. Errors still get the fallback observation: a provider
+            // failure must not hide financial closure.
+            let observe = is_execution || !matches!(&outcome, Ok(buyer_controller::Outcome::Pending { .. }));
             let mut result = match outcome {
                 Ok(buyer_controller::Outcome::Completed { observation, .. }
                     | buyer_controller::Outcome::Closed { observation, .. }) => {
@@ -301,7 +349,7 @@ impl Runtime {
                     // before the job can become terminal or reach the caller.
                     owner.close(observation).await.map_err(|_| unavailable())
                 }
-                _ => runtime.refresh_owner(&state, &binding, &owner).await,
+                _ => runtime.refresh_owner(&state, &binding, &owner, observe).await,
             };
             if unsigned_failure {
                 if result.as_ref().is_ok_and(|job| {
@@ -321,6 +369,9 @@ impl Runtime {
                 Err(_) if failed => Err(unavailable()),
                 result => result,
             };
+            claim.pending = result.as_ref().map_or(true, |job| {
+                job.status == GatewayJobStatus::ReconciliationPending
+            });
             let _ = reply.send(result);
         });
         Ok(receive)
@@ -331,6 +382,7 @@ impl Runtime {
         state: &GatewayState,
         binding: &Binding,
         owner: &Owner,
+        observe: bool,
     ) -> Result<StoredGatewayJob, ApiError> {
         if let Some(saved) = self
             .controller
@@ -338,7 +390,7 @@ impl Runtime {
             .await
             .map_err(|_| unavailable())?
         {
-            let observation = if saved.authorization().is_some() {
+            let observation = if observe && saved.authorization().is_some() {
                 Some(
                     self.controller
                         .observe_purchase(&saved)
@@ -366,7 +418,8 @@ impl Runtime {
     }
 
     /// Caller owns this lifecycle alongside HTTP serving. Each tick reads only a
-    /// bounded page of pending job IDs. No ledger/history scan or per-token work.
+    /// bounded page of pending job IDs and admits at most one background owner.
+    /// Retry hints are bounded; no ledger/history scan or per-token work.
     pub async fn run(
         self: Arc<Self>,
         state: GatewayState,
@@ -377,22 +430,30 @@ impl Runtime {
             return Err("proxy buyer already running or stopped".into());
         }
         let _running = Running(self.clone());
-        let mut cursor: Option<String> = None;
-        let mut interval = tokio::time::interval(Duration::from_secs(2));
+        let mut interval = tokio::time::interval(recovery_schedule::TICK);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = stop_signal(&mut stop) => break,
                 _ = interval.tick() => {
                     self.resolver.expire();
+                    let after = {
+                        let recovery = self.recovery.lock().map_err(|_| "proxy recovery scheduler unavailable")?;
+                        if !recovery.available(Instant::now()) { continue; }
+                        recovery.after().map(str::to_owned)
+                    };
                     let jobs = state.jobs.clone();
-                    let after = cursor.clone();
                     let page = storage(move || jobs.lock().map_err(|_| unavailable())?
-                        .pending_proxy(after.as_deref(), 64).map_err(|_| unavailable())).await;
+                        .pending_proxy(after.as_deref(), recovery_schedule::PAGE).map_err(|_| unavailable())).await;
                     let Ok(page) = page else { continue };
-                    cursor = if page.len() < 64 { None } else { page.last().cloned() };
-                    for id in page {
-                        let Ok(claim) = self.claim(&id) else { continue };
+                    let id = self.recovery.lock().map_err(|_| "proxy recovery scheduler unavailable")?
+                        .candidate(&page, Instant::now());
+                    if let Some(id) = id {
+                        // Capacity refusal must not consume the next eligible
+                        // ID. Otherwise every busy tick can skip a whole page.
+                        let Ok(claim) = self.claim_recovery(&id) else { continue };
+                        self.recovery.lock().map_err(|_| "proxy recovery scheduler unavailable")?.visited(&id);
+                        let Some(claim) = claim else { continue };
                         let Ok(Some(job)) = load(&state, &id).await else { continue };
                         let Some(proxy) = &job.proxy else { continue };
                         let Some(owner_id) = &job.owner_token_id else { continue };

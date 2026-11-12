@@ -8,6 +8,8 @@ use std::{os::unix::fs::PermissionsExt, sync::atomic::AtomicUsize};
 use tokio::{net::TcpListener, task::JoinHandle};
 use tokio_tungstenite::{accept_async, tungstenite::Message};
 
+mod timing;
+
 fn identity() -> Identity {
     Identity {
         network_id: "918".into(),

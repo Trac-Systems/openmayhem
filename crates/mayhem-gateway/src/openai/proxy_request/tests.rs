@@ -2,6 +2,9 @@ use super::*;
 use mayhem_proto::proxy::{ProxyMarketDescriptor, ProxyMembership, ProxyRail};
 use serde_json::json;
 
+#[cfg(unix)]
+mod timing;
+
 fn digest(c: char) -> Digest {
     Digest::new(c.to_string().repeat(64)).unwrap()
 }

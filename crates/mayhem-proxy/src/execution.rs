@@ -8,8 +8,8 @@
 
 mod jobs;
 mod paid;
-pub mod probes;
 mod probe_diagnostics;
+pub mod probes;
 mod timed_reader;
 mod transport;
 pub use paid::PaidExecutor;
@@ -558,23 +558,24 @@ impl Executor {
                 .event(invocation, record.attempt, Event::ExecutionEnded(evidence))
                 .await?;
         }
-        if let Some(sample) = sample {
-            match &outcome {
-                Ok(reply) => sample.success(reply.reported_usage.as_ref().map(|u| u.output_tokens)),
-                Err(Error::Upstream(f) | Error::Decoder(worker::Error::Upstream(f))) => {
-                    sample.failure(f.clone())
+        if outcome.is_err() {
+            if let Some(sample) = sample.take() {
+                match &outcome {
+                    Err(Error::Upstream(f) | Error::Decoder(worker::Error::Upstream(f))) => {
+                        sample.failure(f.clone())
+                    }
+                    Err(Error::Endpoint(crate::endpoint::Error::Protocol)) => {
+                        sample.failure(Failure::new(
+                            Code::UpstreamProtocol,
+                            Scope::Model,
+                            Stage::ResponseBody,
+                            Execution::Unknown,
+                        ))
+                    }
+                    // Cancellation, consumer backpressure, decoder containment and
+                    // local storage failures do not prove an upstream health fault.
+                    _ => drop(sample),
                 }
-                Err(Error::Endpoint(crate::endpoint::Error::Protocol)) => {
-                    sample.failure(Failure::new(
-                        Code::UpstreamProtocol,
-                        Scope::Model,
-                        Stage::ResponseBody,
-                        Execution::Unknown,
-                    ))
-                }
-                // Cancellation, consumer backpressure, decoder containment and
-                // local storage failures do not prove an upstream health fault.
-                _ => drop(sample),
             }
         }
         // This is a handful of state writes per attempt, never per-token work or
@@ -589,6 +590,11 @@ impl Executor {
                     .storage
                     .run(move |j| j.retain_result(&key, attempt, &reply, now_ms()))
                     .await?;
+                if let Some(sample) = sample.take() {
+                    sample.success_background(
+                        owned.reply.reported_usage.as_ref().map(|u| u.output_tokens),
+                    );
+                }
                 // Check cancellation written by another controller while in flight.
                 let current = self.storage.current(invocation).await?;
                 if current.attempt != record.attempt || current.phase != Phase::Dispatched {

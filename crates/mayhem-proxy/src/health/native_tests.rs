@@ -242,3 +242,43 @@ async fn many_stream_updates_use_bounded_metadata_and_one_completed_text_encodin
     assert_eq!(c.bytes, 40_000);
     assert_eq!(c.finish().await.unwrap().tokens, 9_999);
 }
+
+#[tokio::test]
+async fn background_native_count_preserves_original_interval_and_releases_capacity() {
+    let s = source();
+    let mut capture = s.capture().unwrap();
+    let first = Instant::now() - Duration::from_secs(2);
+    let last = first + Duration::from_secs(1);
+    capture.delta(&delta("one "), first);
+    capture.delta(&delta("two three"), last);
+    let (complete, result) = tokio::sync::oneshot::channel();
+    capture.finish_background(move |evidence| {
+        let _ = complete.send(evidence);
+    });
+    let evidence = tokio::time::timeout(Duration::from_secs(5), result)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.first, first);
+    assert_eq!(evidence.last, last);
+    assert_eq!(evidence.tokens, 2);
+    assert_eq!(&evidence.digest, s.digest());
+    assert!(s.capture().is_some());
+}
+
+#[tokio::test]
+async fn background_native_count_drops_backpressured_payload_without_claiming_speed() {
+    let s = source();
+    let mut capture = s.capture().unwrap();
+    let first = Instant::now();
+    capture.delta(&delta("one "), first);
+    capture.delta(&delta("two three"), first + Duration::from_secs(1));
+    capture.backpressure().store(true, Ordering::Release);
+    let (complete, mut result) = tokio::sync::oneshot::channel();
+    capture.finish_background(move |evidence| {
+        let _ = complete.send(evidence);
+    });
+    assert!(result.try_recv().unwrap().is_none());
+    assert!(s.capture().is_some());
+}

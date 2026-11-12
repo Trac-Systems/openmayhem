@@ -7,7 +7,7 @@ use std::time::Duration;
 fn d(n: u64) -> Digest {
     hash_value(format!("{n:064x}")).unwrap()
 }
-fn signer() -> Arc<crate::signing::Authority> {
+pub(super) fn signer() -> Arc<crate::signing::Authority> {
     let key = SigningKey::from_bytes(&[91; 32]);
     let public = key
         .verifying_key()
@@ -28,7 +28,7 @@ fn signer() -> Arc<crate::signing::Authority> {
         .unwrap(),
     )
 }
-fn network() -> discovery::Identity {
+pub(super) fn network() -> discovery::Identity {
     discovery::Identity {
         network_id: "918".into(),
         msb_bootstrap: d(1).as_str().into(),
@@ -36,7 +36,7 @@ fn network() -> discovery::Identity {
         contract_version: mayhem_proto::CONTRACT_VERSION,
     }
 }
-fn config() -> Config {
+pub(super) fn config() -> Config {
     Config {
         schema_version: 1,
         tester: signer().identity().controller_pubkey.clone(),
@@ -50,7 +50,7 @@ fn config() -> Config {
     }
 }
 #[cfg(unix)]
-fn directory() -> tempfile::TempDir {
+pub(super) fn directory() -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
     std::fs::set_permissions(d.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     d
@@ -89,7 +89,7 @@ fn directory() -> PrivateDirectory {
     pending.publish(LeafName::new(&name).unwrap()).unwrap();
     PrivateDirectory(parent.join(name))
 }
-fn body(store: &Store) -> Body {
+pub(super) fn body(store: &Store) -> Body {
     let now = store.now_ms();
     Body {
         schema_version: 1,
@@ -243,11 +243,9 @@ fn expiry_quotas_and_indexed_pruning_are_bounded() {
     let mut second = b.clone();
     second.subject.offer_digest = d(77);
     second.session = d(44);
-    assert!(
-        store
-            .retain(signer().conformance(second.clone()).unwrap())
-            .is_err()
-    );
+    assert!(store
+        .retain(signer().conformance(second.clone()).unwrap())
+        .is_err());
     std::thread::sleep(Duration::from_millis(1100));
     assert!(matches!(
         store.lookup(&b.subject, &b.class).unwrap(),
@@ -312,15 +310,13 @@ fn exact_mapping_does_not_grant_t4_self_test_assurance_or_unknown_assertions() {
     other
         .help
         .insert("en".into(), "different pinned meaning".into());
-    assert!(
-        store
-            .evaluate(
-                &other,
-                &predicate,
-                &signer().conformance(b.clone()).unwrap()
-            )
-            .is_err()
-    );
+    assert!(store
+        .evaluate(
+            &other,
+            &predicate,
+            &signer().conformance(b.clone()).unwrap()
+        )
+        .is_err());
     b.tester = d(77);
     let mut false_signed = signer().conformance(body(&store)).unwrap();
     false_signed.body = b;
@@ -414,4 +410,29 @@ fn forward_then_backward_wall_time_cannot_resurrect_or_freeze_a_lease() {
         store.effective_time(original.observed_at_ms) >= before + 1,
         "advanced clock must continue to age monotonically after rollback"
     );
+}
+
+#[test]
+#[cfg_attr(
+    windows,
+    ignore = "requires an isolated native Windows private NTFS fixture parent"
+)]
+fn delayed_recording_cannot_replace_a_newer_observation() {
+    let dir = directory();
+    let store = Store::open(&dir.path().join("records"), network(), config()).unwrap();
+    let older = body(&store);
+    let mut newer = older.clone();
+    newer.session = d(78);
+    newer.observed_at_ms += 1;
+    newer.expires_at_ms += 1;
+    let newer = signer().conformance(newer).unwrap();
+    store.retain(newer.clone()).unwrap();
+    store
+        .retain(signer().conformance(older.clone()).unwrap())
+        .unwrap();
+    store.effective_time(newer.body.observed_at_ms);
+    let Lookup::Present(retained) = store.lookup(&older.subject, &older.class).unwrap() else {
+        panic!("newer observation must survive delayed recording")
+    };
+    assert_eq!(retained.digest().unwrap(), newer.digest().unwrap());
 }

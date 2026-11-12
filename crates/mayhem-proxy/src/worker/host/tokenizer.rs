@@ -24,12 +24,15 @@ struct Request {
 enum Answer {
     Async(oneshot::Sender<Result<u64>>),
     Sync(std::sync::mpsc::SyncSender<Result<u64>>),
+    // Optional passive evidence uses the existing bounded actor, with no
+    // detached waiter or additional queue. Source shutdown drops the callback.
+    Background(Box<dyn FnOnce(Result<u64>) + Send>),
 }
 impl Answer {
     async fn closed(&mut self) {
         match self {
             Self::Async(s) => s.closed().await,
-            Self::Sync(_) => std::future::pending().await,
+            Self::Sync(_) | Self::Background(_) => std::future::pending().await,
         }
     }
     fn send(self, result: Result<u64>) {
@@ -40,6 +43,7 @@ impl Answer {
             Self::Sync(s) => {
                 let _ = s.send(result);
             }
+            Self::Background(complete) => complete(result),
         }
     }
 }
@@ -138,6 +142,21 @@ impl Pool {
     }
 }
 impl Tokenizer {
+    pub(crate) fn count_background(
+        &self,
+        fields: Vec<Field>,
+        retained: OwnedSemaphorePermit,
+        complete: impl FnOnce(Result<u64>) + Send + 'static,
+    ) {
+        if let Err(error) = self.sender.try_send(Request {
+            fields,
+            retained: Some(retained),
+            answer: Answer::Background(Box::new(complete)),
+        }) {
+            // Saturation is missing telemetry, never a foreground wait.
+            error.into_inner().answer.send(Err(Error::Capacity));
+        }
+    }
     /// Installation only: consume the source's last sender and await actual
     /// reaping before moving its staging directory. Never used per inference.
     pub(crate) fn finish_installation(self) -> Result<()> {
@@ -419,6 +438,79 @@ mod tests {
             "model":{"type":"WordLevel","vocab":{"[UNK]":0,"one":1,"two":2,"三":3},"unk_token":"[UNK]"}})).unwrap();
         let d = Digest::new(blake3::hash(&b).to_hex().as_str()).unwrap();
         (Arc::from(b), d)
+    }
+    #[tokio::test]
+    async fn background_count_uses_the_bounded_queue_and_drops_queued_payloads_on_shutdown() {
+        let (sender, receiver) = mpsc::channel(1);
+        let actor = Tokenizer {
+            sender,
+            program: PathBuf::new(),
+            workdir: PathBuf::new(),
+            stopped: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
+        };
+        let captures = Arc::new(Semaphore::new(2));
+        let (first, mut pending) = oneshot::channel();
+        actor.count_background(
+            vec![Field {
+                text: "bounded output".into(),
+                first_bytes: 0,
+            }],
+            captures.clone().try_acquire_owned().unwrap(),
+            move |result| {
+                let _ = first.send(result);
+            },
+        );
+        assert!(matches!(
+            pending.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        let (second, rejected) = oneshot::channel();
+        actor.count_background(
+            vec![],
+            captures.clone().try_acquire_owned().unwrap(),
+            move |result| {
+                let _ = second.send(result);
+            },
+        );
+        assert!(matches!(rejected.await.unwrap(), Err(Error::Capacity)));
+        assert_eq!(captures.available_permits(), 1);
+        drop(receiver);
+        assert!(pending.await.is_err());
+        assert_eq!(captures.available_permits(), 2);
+    }
+
+    #[tokio::test]
+    async fn background_count_source_shutdown_drops_callback_and_reaps_before_permit_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let program = dir.path().join("fixture");
+        std::fs::write(&program, "#!/bin/sh\nexec /bin/sleep 30\n").unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let work = dir.path().join("work");
+        std::fs::create_dir(&work).unwrap();
+        let pool = fixture(&program, &work, Duration::from_secs(5));
+        let (bytes, digest) = data();
+        let actor = pool.tokenizer(bytes, digest, limits()).unwrap();
+        let captures = Arc::new(Semaphore::new(1));
+        let (complete, mut result) = oneshot::channel();
+        actor.count_background(
+            vec![],
+            captures.clone().try_acquire_owned().unwrap(),
+            move |value| {
+                let _ = complete.send(value);
+            },
+        );
+        assert_eq!(captures.available_permits(), 0);
+        assert!(matches!(
+            result.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty)
+        ));
+        // Source drop closes admission; the actor owns cancellation and reaping.
+        tokio::task::spawn_blocking(move || actor.finish_installation())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.await.is_err());
+        assert_eq!(captures.available_permits(), 1);
     }
     #[tokio::test]
     async fn tokenizer_deadline_and_cancel_retain_capture_until_reap() {

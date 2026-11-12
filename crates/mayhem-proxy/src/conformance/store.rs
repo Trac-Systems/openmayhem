@@ -92,7 +92,9 @@ impl Store {
     /// Host startup supplies the already authenticated local worker launcher.
     pub fn prepare_tokenizer(&self, pool: &crate::worker::host::Pool) -> Result<()> {
         if let Some(source) = &self.tokenizer {
-            source.validate(pool).map_err(|_| crate::invalid("isolated conformance tokenizer unavailable"))?;
+            source
+                .validate(pool)
+                .map_err(|_| crate::invalid("isolated conformance tokenizer unavailable"))?;
         }
         Ok(())
     }
@@ -207,6 +209,15 @@ impl Store {
                 let old: Signed = serde_json::from_slice(&prior)?;
                 // Repeated callbacks cannot turn one execution into a fresh sample.
                 if old.body.session == b.session {
+                    return Ok(());
+                }
+                // Optional recordings can finish out of order. An older
+                // observation must not replace newer evidence from this boot
+                // and configuration, even if its tokenizer/write ran later.
+                if old.body.boot == b.boot
+                    && old.body.configuration == b.configuration
+                    && old.body.observed_at_ms >= b.observed_at_ms
+                {
                     return Ok(());
                 }
                 total = total
