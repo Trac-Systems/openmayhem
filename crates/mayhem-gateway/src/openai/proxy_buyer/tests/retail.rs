@@ -486,7 +486,11 @@ async fn proxy_http_retail_gate_pins_core_before_callback_and_calls_once_before_
         .unwrap();
     assert_eq!(no_key.status(), StatusCode::BAD_REQUEST);
     assert_eq!(server.count(), 0);
-    let body = f.body();
+    let mut body = f.body();
+    body["messages"] = json!([
+        {"role":"assistant","content":"Earlier answer.","reasoning":null,"reasoning_content":null,"refusal":null},
+        {"role":"user","content":"Continue."}
+    ]);
     let (status, headers, result) = f
         .post(
             "retail-request-one",
@@ -508,6 +512,9 @@ async fn proxy_http_retail_gate_pins_core_before_callback_and_calls_once_before_
         recorded["request_content_digest"],
         retail_request_content_digest(&provider_body).unwrap()
     );
+    let mut dispatched = f.harness.backend_request.lock().unwrap().clone().unwrap();
+    dispatched["model"] = body["model"].clone();
+    assert_ne!(recorded["request_content_digest"], retail_request_content_digest(&dispatched).unwrap());
     let (status, _, replay) = f
         .post(
             "retail-request-one",

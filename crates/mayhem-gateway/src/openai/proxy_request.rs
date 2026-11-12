@@ -203,7 +203,7 @@ pub struct Request {
 }
 
 // Public chat responses may contain empty optional assistant metadata. Treat
-// only these nulls as absent before binding a new request; provider contracts
+// only these nulls as absent in execution bytes before financial binding; provider contracts
 // still validate all non-null values and every other supplied field unchanged.
 pub(super) fn normalize_chat_assistant_metadata(
     endpoint: ProxyEndpoint,
@@ -318,8 +318,11 @@ impl Request {
         if bytes.len() > policy.request_bytes {
             return Err(Error::Invalid);
         }
-        if normalize_chat_assistant_metadata(endpoint, &mut raw) {
-            bytes = serde_json::to_vec(&raw).map_err(|_| Error::Invalid)?;
+        if endpoint == ProxyEndpoint::Chat {
+            let mut execution = raw.clone();
+            if normalize_chat_assistant_metadata(endpoint, &mut execution) {
+                bytes = serde_json::to_vec(&execution).map_err(|_| Error::Invalid)?;
+            }
         }
         Ok(Some(Self {
             selector,
@@ -344,6 +347,8 @@ impl Request {
         &self.bytes
     }
     pub(super) fn provider_value(&self) -> &Value {
+        // Public correlation and idempotency retain the caller's exact body.
+        // Execution bytes alone omit semantically empty assistant metadata.
         &self.body
     }
     pub fn policy(&self) -> &Policy {

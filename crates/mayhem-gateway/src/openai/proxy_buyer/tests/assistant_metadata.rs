@@ -42,7 +42,11 @@ async fn public_assistant_message_roundtrips_through_paid_tool_followup() {
     let mut dispatched = f.harness.backend_request.lock().unwrap().clone().unwrap();
     assert_eq!(dispatched["model"], "upstream-model");
     dispatched["model"] = body["model"].clone();
-    assert_eq!(&dispatched, parsed.provider_value());
+    assert_eq!(
+        dispatched,
+        serde_json::from_slice::<Value>(parsed.provider_request()).unwrap()
+    );
+    assert_eq!(parsed.provider_value()["messages"], body["messages"]);
     assert_eq!(
         dispatched["messages"][1]["tool_calls"],
         client_message["tool_calls"]
@@ -55,6 +59,11 @@ async fn public_assistant_message_roundtrips_through_paid_tool_followup() {
         mayhem_proto::endpoint_request_fingerprint(&dispatched)
     );
 
+    let (status, _, replay) = f
+        .post("tool-followup", body.clone(), "owner-fixture-key", false)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay, second);
     let mut absent = body;
     for field in ["reasoning", "reasoning_content", "refusal"] {
         absent["messages"][1].as_object_mut().unwrap().remove(field);
@@ -62,18 +71,17 @@ async fn public_assistant_message_roundtrips_through_paid_tool_followup() {
     let (status, _, replay) = f
         .post("tool-followup", absent, "owner-fixture-key", false)
         .await;
-    assert_eq!(status, StatusCode::OK, "{replay}");
-    assert_eq!(replay, second);
+    assert_eq!(status, StatusCode::CONFLICT, "{replay}");
     assert_eq!(
         f.harness.backend_calls(),
         2,
-        "equivalent replay must not dispatch again"
+        "replay or changed raw identity must not dispatch again"
     );
     f.stop().await;
 }
 
 #[tokio::test]
-async fn resolver_assistant_nulls_match_prepared_and_dispatched_content_digests() {
+async fn resolver_assistant_nulls_preserve_external_raw_correlation_and_paid_execution_hash() {
     let _case = estimation::ESTIMATE_CASE.lock().await;
     let mut f = Fixture::start_with(ProxyEndpoint::Chat, ProxyRail::Fiat).await;
     let mut input = resolver::start(&f);
@@ -81,15 +89,7 @@ async fn resolver_assistant_nulls_match_prepared_and_dispatched_content_digests(
         {"role":"assistant","content":"Earlier answer.","reasoning":null,"refusal":null},
         {"role":"user","content":"Continue."}
     ]);
-    let mut expected = input["request"].clone();
-    expected["messages"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("reasoning");
-    expected["messages"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("refusal");
+    let expected = input["request"].clone();
     let (status, resolved) = resolver::send(f.router.clone(), input, "owner-fixture-key").await;
     assert_eq!(status, StatusCode::OK, "{resolved}");
     assert_eq!(resolved["status"], "selected", "{resolved}");
@@ -105,6 +105,14 @@ async fn resolver_assistant_nulls_match_prepared_and_dispatched_content_digests(
     for field in ["request_hash", "request_content_digest"] {
         assert_eq!(estimate[field], resolved["selection"]["estimate"][field]);
     }
+    let mut provider_body = selected.clone();
+    provider_body.as_object_mut().unwrap().remove("proxy");
+    // Existing external API contract hashes the original provider body, while
+    // the separate paid request_hash binds normalized execution bytes.
+    assert_eq!(
+        estimate["request_content_digest"],
+        retail_request_content_digest(&provider_body).unwrap()
+    );
     estimation::assert_no_purchase(&mut f).await;
     let (status, headers, response) = f
         .post(
@@ -125,9 +133,13 @@ async fn resolver_assistant_nulls_match_prepared_and_dispatched_content_digests(
     );
     let mut dispatched = f.harness.backend_request.lock().unwrap().clone().unwrap();
     dispatched["model"] = selected["model"].clone();
-    assert_eq!(
+    assert_ne!(
         estimate["request_content_digest"],
         retail_request_content_digest(&dispatched).unwrap()
+    );
+    assert_eq!(
+        estimate["request_hash"],
+        mayhem_proto::endpoint_request_fingerprint(&dispatched)
     );
     f.stop().await;
 }

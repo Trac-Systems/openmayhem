@@ -412,6 +412,7 @@ async fn start(
     mut model_allowlist: Option<Vec<String>>,
     retail_ranking: Option<RetailRanking>,
 ) -> Result<Session, ApiError> {
+    let request_content_digest = retail::request_content_digest(&body).map_err(|_| invalid())?;
     if let Some(list) = &mut model_allowlist {
         if list.len() > 200 {
             return Err(invalid());
@@ -439,11 +440,6 @@ async fn start(
     {
         return Err(invalid());
     }
-    proxy_request::normalize_chat_assistant_metadata(endpoint, &mut body);
-    let mut correlation_body = body.clone();
-    correlation_body["proxy"] = raw.clone();
-    let request_content_digest =
-        retail::request_content_digest(&correlation_body).map_err(|_| invalid())?;
     let mut controls: proxy_request::Controls =
         serde_json::from_value(raw).map_err(|_| invalid())?;
     let profile = controls.profile.as_ref().ok_or_else(invalid)?;
@@ -1131,10 +1127,14 @@ async fn check(
             Err(_) => return Checked::Excluded("control_preparation_unavailable", true),
         }
     };
-    let bytes = match serde_json::to_vec(&body) {
-        Ok(b) => b,
+    let mut prepared = body.clone();
+    prepared["proxy"] = serde_json::to_value(&session.controls).unwrap();
+    let request = match proxy_request::Request::parse(session.endpoint, prepared, &runtime.policy) {
+        Ok(Some(r)) => Arc::new(r),
         Err(_) => return Checked::Excluded("request_invalid", false),
+        Ok(None) => return Checked::Excluded("request_invalid", false),
     };
+    let bytes = request.provider_request().to_vec();
     let prices = session.controls.prices.clone();
     let output = session.controls.output_units;
     let lifetimes = runtime.policy.lifetimes();
@@ -1152,12 +1152,6 @@ async fn check(
         Ok(Ok(m)) => m,
         Ok(Err(_)) => return Checked::Excluded("request_or_maximum_limit", false),
         Err(_) => return Checked::Excluded("metering_unavailable", true),
-    };
-    let mut prepared = body.clone();
-    prepared["proxy"] = serde_json::to_value(&session.controls).unwrap();
-    let request = match proxy_request::Request::parse(session.endpoint, prepared, &runtime.policy) {
-        Ok(Some(r)) => Arc::new(r),
-        _ => return Checked::Excluded("request_invalid", false),
     };
     let maximum_retail_cost_micro = match &session.retail_ranking {
         Some(policy) => match policy.maximum(&published.offer, &maximum.max_usage) {

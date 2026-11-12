@@ -110,8 +110,10 @@ pub(super) async fn materialize(
             .profile
             .as_ref()
             .ok_or_else(invalid_controls)?;
-        let body = registry::apply_controls(
-            request.provider_value(),
+        let mut execution = request.provider_value().clone();
+        let normalized = proxy_request::normalize_chat_assistant_metadata(request.endpoint(), &mut execution);
+        let mut body = registry::apply_controls(
+            &execution,
             request.endpoint(),
             &adapter.contract,
             &policy.constraints.request_controls,
@@ -137,6 +139,19 @@ pub(super) async fn materialize(
         .map_err(|_| invalid_controls())?
         .maximum(&offer)
         .map_err(|_| invalid_controls())?;
+        if normalized {
+            // The public prepared body must preserve the exact submitted history.
+            // Never overwrite a control-induced change with the original messages.
+            if body.get("messages") != execution.get("messages") {
+                return Err(invalid_controls());
+            }
+            body["messages"] = request.provider_value()["messages"].clone();
+            if serde_json::to_vec(&body).map_err(|_| invalid_controls())?.len()
+                > request.policy().request_byte_limit()
+            {
+                return Err(invalid_controls());
+            }
+        }
         Ok(body)
     })
     .await

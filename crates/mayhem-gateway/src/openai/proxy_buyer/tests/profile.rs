@@ -232,11 +232,18 @@ async fn published_registry_preparation_estimate_execution_and_original_replay_a
     let _case = estimation::ESTIMATE_CASE.lock().await;
     let registry = Registry::start().await;
     let mut f = fixture(&registry).await;
-    let original = body(&f);
+    let mut original = body(&f);
+    original["messages"] = json!([
+        {"role":"assistant","content":"Earlier answer.","reasoning":null,"reasoning_content":null,"refusal":null},
+        {"role":"user","content":"Continue."}
+    ]);
     let (status, prepared) = prepare(&f, original.clone(), "owner-fixture-key").await;
     assert_eq!(status, StatusCode::OK, "{prepared}");
     assert_eq!(prepared["request"]["temperature"], json!(0.2));
     assert_eq!(prepared["request"]["messages"], original["messages"]);
+    let mut public_body = prepared["request"].clone();
+    public_body.as_object_mut().unwrap().remove("proxy");
+    assert_eq!(prepared["request_content_digest"], retail_request_content_digest(&public_body).unwrap());
     assert_eq!(
         prepared["registry_release"]["release_id"],
         registry.state.lock().unwrap().head.release_id

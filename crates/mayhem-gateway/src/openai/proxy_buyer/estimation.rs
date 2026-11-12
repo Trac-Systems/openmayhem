@@ -147,9 +147,7 @@ async fn estimate(
             let maximum = intent
                 .maximum(&offer)
                 .map_err(|_| failure("proxy_estimate_invalid", false))?;
-            let body: Value = serde_json::from_slice(prepare_request.provider_request())
-                .map_err(|_| failure("proxy_estimate_invalid", false))?;
-            let content = retail::request_content_digest(&body)
+            let content = retail::request_content_digest(prepare_request.provider_value())
                 .map_err(|_| failure("proxy_estimate_invalid", false))?;
             Ok::<_, ApiError>((maximum, content))
         })();

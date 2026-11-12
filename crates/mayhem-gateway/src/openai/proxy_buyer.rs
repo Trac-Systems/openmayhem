@@ -720,7 +720,7 @@ async fn submit(
     let retail = runtime
         .retail
         .as_ref()
-        .map(|authority| authority.correlation(&token.token_id, key, &body))
+        .map(|authority| authority.correlation(&token.token_id, key, request.provider_value()))
         .transpose()?
         .flatten();
     if require_retail && retail.is_none() {

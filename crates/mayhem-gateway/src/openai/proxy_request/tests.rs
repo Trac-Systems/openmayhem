@@ -252,7 +252,7 @@ fn envelope_strips_controls_only_and_requires_explicit_limits_and_policy() {
 }
 
 #[test]
-fn assistant_null_metadata_is_normalized_before_body_and_replay_hashes() {
+fn assistant_null_metadata_normalizes_execution_and_preserves_submitted_identity() {
     let c = candidate(false);
     let mut body = raw(&c, ProxyRail::Fiat);
     body["messages"] = json!([
@@ -262,14 +262,14 @@ fn assistant_null_metadata_is_normalized_before_body_and_replay_hashes() {
         {"role":"tool","tool_call_id":"call_1","content":"ok"}
     ]);
     let request = parse(&c, body.clone());
-    let mut absent = body;
+    let mut absent = body.clone();
     for field in ["reasoning", "reasoning_content", "refusal"] {
         absent["messages"][1].as_object_mut().unwrap().remove(field);
     }
     let expected = parse(&c, absent.clone());
     assert_eq!(request.provider_request(), expected.provider_request());
-    assert_eq!(request.provider_value(), expected.provider_value());
-    assert_eq!(
+    assert_eq!(request.provider_value()["messages"], body["messages"]);
+    assert_ne!(
         request.fingerprint(&digest('a')).unwrap(),
         expected.fingerprint(&digest('a')).unwrap()
     );
@@ -282,7 +282,7 @@ fn assistant_null_metadata_is_normalized_before_body_and_replay_hashes() {
             mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
         )
         .unwrap(),
-        request.provider_value(),
+        &serde_json::from_slice::<Value>(request.provider_request()).unwrap(),
     )
     .is_ok());
     for field in ["reasoning", "reasoning_content"] {
@@ -318,8 +318,10 @@ fn assistant_metadata_normalization_preserves_strict_contract_failures() {
         body["messages"] = json!([{"role":role,"content":"hello",field:value}]);
         let request = parse(&c, body.clone());
         assert_eq!(request.provider_value()["messages"], body["messages"]);
+        let execution: Value = serde_json::from_slice(request.provider_request()).unwrap();
+        assert_eq!(execution["messages"], body["messages"]);
         assert!(
-            mayhem_proto::validate_endpoint_request(&contract, request.provider_value()).is_err(),
+            mayhem_proto::validate_endpoint_request(&contract, &execution).is_err(),
             "{role}/{field}"
         );
     }
@@ -350,12 +352,12 @@ fn assistant_metadata_normalization_cannot_bypass_original_request_byte_limit() 
     assert!(limited.request_bytes < original_bytes);
     assert!(Request::parse(ProxyEndpoint::Chat, body.clone(), &limited).is_err());
     limited.request_bytes = original_bytes;
+    let parsed = Request::parse(ProxyEndpoint::Chat, body, &limited)
+        .unwrap()
+        .unwrap();
     assert_eq!(
-        Request::parse(ProxyEndpoint::Chat, body, &limited)
-            .unwrap()
-            .unwrap()
-            .provider_value(),
-        &provider
+        serde_json::from_slice::<Value>(parsed.provider_request()).unwrap(),
+        provider
     );
 }
 
