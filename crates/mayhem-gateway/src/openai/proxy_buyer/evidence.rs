@@ -53,7 +53,11 @@ pub(super) async fn check(
         .ok_or_else(unavailable_evidence)?
         .clone();
     let subject = subject(published)?;
-    let class = Class::request(request.provider_value()).map_err(|_| unavailable_evidence())?;
+    // Capture classifies the exact execution body bound by the paid request hash.
+    // Raw assistant null metadata remains only in public correlation/idempotency.
+    let execution: Value = serde_json::from_slice(request.provider_request())
+        .map_err(|_| unavailable_evidence())?;
+    let class = Class::request(&execution).map_err(|_| unavailable_evidence())?;
     let mut definitions = None;
     if !policy.constraints.capabilities.is_empty() {
         let binding = request

@@ -111,6 +111,82 @@ fn record(f: &Fixture, body: &Value) -> mayhem_proxy::conformance::Signed {
     };
     *record
 }
+
+fn with_assistant_nulls(mut body: Value) -> Value {
+    body["messages"].as_array_mut().unwrap().insert(0, json!({
+        "role":"assistant","content":"Earlier answer.",
+        "reasoning":null,"reasoning_content":null,"refusal":null,
+    }));
+    body
+}
+
+fn execution_body(f: &Fixture, body: &Value) -> Value {
+    let request = proxy_request::Request::parse(
+        ProxyEndpoint::Chat,
+        body.clone(),
+        &f.runtime.policy,
+    ).unwrap().unwrap();
+    serde_json::from_slice(request.provider_request()).unwrap()
+}
+
+#[tokio::test]
+async fn conformance_assistant_null_metadata_matches_actual_execution_for_capability_admission() {
+    let _case = estimation::ESTIMATE_CASE.lock().await;
+    let def = definition();
+    let registry = profile::Registry::with_definition(def.clone()).await;
+    let f = evidence_fixture(Some(registry.config()), config(Some(&def))).await;
+    let original = with_assistant_nulls(f.body());
+    let execution = execution_body(&f, &original);
+    assert_ne!(Class::request(&original).unwrap(), Class::request(&execution).unwrap());
+    let mut wanted = predicate_body(&f);
+    wanted["messages"] = original["messages"].clone();
+    let (status, missing) = profile::prepare(&f, wanted.clone(), "owner-fixture-key").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{missing}");
+    assert_eq!(f.harness.backend_calls(), 0);
+
+    let (status, _, initial) = f.post(
+        "assistant-evidence-origin", original.clone(), "owner-fixture-key", false,
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{initial}");
+    let observed = record(&f, &execution);
+    observed.verify().unwrap();
+    assert_eq!(observed.body.class, Class::request(&execution).unwrap());
+
+    let (status, prepared) = profile::prepare(&f, wanted, "owner-fixture-key").await;
+    assert_eq!(status, StatusCode::OK, "{prepared}");
+    let ready = prepared["request"].clone();
+    assert_eq!(ready["messages"], original["messages"]);
+    let mut public_body = ready.clone();
+    public_body.as_object_mut().unwrap().remove("proxy");
+    let content = retail_request_content_digest(&public_body).unwrap();
+    assert_eq!(prepared["request_content_digest"], content);
+    let (status, _, quote) = estimation::estimate(&f, ready.clone(), "owner-fixture-key").await;
+    assert_eq!(status, StatusCode::OK, "{quote}");
+    assert_eq!(quote["request_content_digest"], content);
+    assert_eq!(quote["request_hash"], mayhem_proto::endpoint_request_fingerprint(&execution));
+    assert_eq!(f.harness.backend_calls(), 1, "evidence and quotes cannot execute");
+
+    let (status, _, result) = f.post(
+        "assistant-evidence-admission", ready.clone(), "owner-fixture-key", false,
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(f.harness.backend_calls(), 2);
+    assert_eq!(record(&f, &execution).body.class, observed.body.class);
+    let (status, _, replay) = f.post(
+        "assistant-evidence-admission", ready.clone(), "owner-fixture-key", false,
+    ).await;
+    assert_eq!(status, StatusCode::OK, "{replay}");
+    assert_eq!(replay, result);
+    assert_eq!(f.harness.backend_calls(), 2);
+
+    let mut changed = ready;
+    changed["temperature"] = json!(0.2);
+    let (status, _, missing) = estimation::estimate(&f, changed, "owner-fixture-key").await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{missing}");
+    assert_eq!(f.harness.backend_calls(), 2);
+    f.stop().await;
+}
+
 #[tokio::test]
 async fn conformance_actual_completion_prepare_quote_execution_and_replay_preserve_authority() {
     let _case = estimation::ESTIMATE_CASE.lock().await;
@@ -250,8 +326,10 @@ async fn conformance_stream_speed_uses_actual_local_tokens_and_complete_scope() 
         .stream_backend
         .delay_ms
         .store(20, Ordering::SeqCst);
-    let mut request = f.body();
+    let mut request = with_assistant_nulls(f.body());
     request["stream"] = json!(true);
+    let execution = execution_body(&f, &request);
+    assert_ne!(Class::request(&request).unwrap(), Class::request(&execution).unwrap());
     let response = f.stream_post_body("speed-origin", request.clone()).await;
     assert_eq!(response.status(), StatusCode::OK);
     let bytes = streaming::collect(response.into_body()).await;
@@ -260,7 +338,7 @@ async fn conformance_stream_speed_uses_actual_local_tokens_and_complete_scope() 
         "{}",
         String::from_utf8_lossy(&bytes)
     );
-    let observed = record(&f, &request);
+    let observed = record(&f, &execution);
     let speed = observed
         .body
         .speed
@@ -271,12 +349,14 @@ async fn conformance_stream_speed_uses_actual_local_tokens_and_complete_scope() 
     assert_eq!(speed.remote_cache, "unknown");
     assert_eq!(speed.local_concurrency, 1);
     let mut start = resolver::start(&f);
+    start["request"]["messages"] = request["messages"].clone();
     start["request"]["stream"] = json!(true);
     start["request"]["proxy"]["profile"]["ranking"] = json!("preferred_speed");
     let (status, selected) =
         resolver::send(f.router.clone(), start.clone(), "owner-fixture-key").await;
     assert_eq!(status, StatusCode::OK, "{selected}");
     assert_eq!(selected["status"], "selected", "{selected}");
+    assert_eq!(selected["selection"]["request"]["messages"], request["messages"]);
     assert_eq!(
         selected["ranking_basis"],
         "locally_tokenized_generation_rate"
@@ -331,7 +411,7 @@ async fn conformance_stream_speed_uses_actual_local_tokens_and_complete_scope() 
     let bytes = streaming::collect(response.into_body()).await;
     assert!(!String::from_utf8_lossy(&bytes).contains("\"error\""));
     assert!(
-        record(&f, &request).body.speed.is_none(),
+        record(&f, &execution).body.speed.is_none(),
         "consumer backpressure cannot establish comparative generation rate"
     );
     f.stop().await;
