@@ -252,6 +252,114 @@ fn envelope_strips_controls_only_and_requires_explicit_limits_and_policy() {
 }
 
 #[test]
+fn assistant_null_metadata_is_normalized_before_body_and_replay_hashes() {
+    let c = candidate(false);
+    let mut body = raw(&c, ProxyRail::Fiat);
+    body["messages"] = json!([
+        {"role":"user","content":"Call the tool."},
+        {"role":"assistant","content":null,"reasoning":null,"reasoning_content":null,"refusal":null,
+            "tool_calls":[{"id":"call_1","type":"function","function":{"name":"health_echo","arguments":"{}"}}]},
+        {"role":"tool","tool_call_id":"call_1","content":"ok"}
+    ]);
+    let request = parse(&c, body.clone());
+    let mut absent = body;
+    for field in ["reasoning", "reasoning_content", "refusal"] {
+        absent["messages"][1].as_object_mut().unwrap().remove(field);
+    }
+    let expected = parse(&c, absent.clone());
+    assert_eq!(request.provider_request(), expected.provider_request());
+    assert_eq!(request.provider_value(), expected.provider_value());
+    assert_eq!(
+        request.fingerprint(&digest('a')).unwrap(),
+        expected.fingerprint(&digest('a')).unwrap()
+    );
+    assert_eq!(
+        request.provider_value()["messages"][1]["content"],
+        Value::Null
+    );
+    assert!(mayhem_proto::validate_endpoint_request(
+        &mayhem_proto::endpoint_family_contract_template(
+            mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS
+        )
+        .unwrap(),
+        request.provider_value(),
+    )
+    .is_ok());
+    for field in ["reasoning", "reasoning_content"] {
+        let mut with_text = absent.clone();
+        with_text["messages"][1][field] = json!("Retain this thought.");
+        let with_text = parse(&c, with_text);
+        assert_eq!(
+            with_text.provider_value()["messages"][1][field],
+            "Retain this thought."
+        );
+        assert_ne!(
+            with_text.fingerprint(&digest('a')).unwrap(),
+            expected.fingerprint(&digest('a')).unwrap()
+        );
+    }
+}
+
+#[test]
+fn assistant_metadata_normalization_preserves_strict_contract_failures() {
+    let c = candidate(false);
+    let contract = mayhem_proto::endpoint_family_contract_template(
+        mayhem_proto::ENDPOINT_OPENAI_CHAT_COMPLETIONS,
+    )
+    .unwrap();
+    for (role, field, value) in [
+        ("assistant", "refusal", json!("No.")),
+        ("assistant", "reasoning", json!({"text":"invalid type"})),
+        ("assistant", "unknown", Value::Null),
+        ("assistant", "tool_calls", Value::Null),
+        ("user", "reasoning", Value::Null),
+    ] {
+        let mut body = raw(&c, ProxyRail::Fiat);
+        body["messages"] = json!([{"role":role,"content":"hello",field:value}]);
+        let request = parse(&c, body.clone());
+        assert_eq!(request.provider_value()["messages"], body["messages"]);
+        assert!(
+            mayhem_proto::validate_endpoint_request(&contract, request.provider_value()).is_err(),
+            "{role}/{field}"
+        );
+    }
+    let mut other = json!({"messages":[{"role":"assistant","reasoning":null,"refusal":null}]});
+    let original = other.clone();
+    for endpoint in [
+        ProxyEndpoint::Completions,
+        ProxyEndpoint::Responses,
+        ProxyEndpoint::Decisions,
+    ] {
+        assert!(!normalize_chat_assistant_metadata(endpoint, &mut other));
+        assert_eq!(other, original);
+    }
+}
+
+#[test]
+fn assistant_metadata_normalization_cannot_bypass_original_request_byte_limit() {
+    let c = candidate(false);
+    let mut body = raw(&c, ProxyRail::Fiat);
+    body["messages"] = json!([{"role":"assistant","content":null,
+        "reasoning":null,"reasoning_content":null,"refusal":null}]);
+    let mut provider = body.clone();
+    provider.as_object_mut().unwrap().remove("proxy");
+    let original_bytes = serde_json::to_vec(&provider).unwrap().len();
+    normalize_chat_assistant_metadata(ProxyEndpoint::Chat, &mut provider);
+    let mut limited = policy();
+    limited.request_bytes = serde_json::to_vec(&provider).unwrap().len();
+    assert!(limited.request_bytes < original_bytes);
+    assert!(Request::parse(ProxyEndpoint::Chat, body.clone(), &limited).is_err());
+    limited.request_bytes = original_bytes;
+    assert_eq!(
+        Request::parse(ProxyEndpoint::Chat, body, &limited)
+            .unwrap()
+            .unwrap()
+            .provider_value(),
+        &provider
+    );
+}
+
+#[test]
 fn valid_offers_preserve_all_prices_rails_and_endpoint_types() {
     for decisions in [false, true] {
         for rail in [ProxyRail::Fiat, ProxyRail::Tnk, ProxyRail::Tap] {

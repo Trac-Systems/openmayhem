@@ -412,7 +412,6 @@ async fn start(
     mut model_allowlist: Option<Vec<String>>,
     retail_ranking: Option<RetailRanking>,
 ) -> Result<Session, ApiError> {
-    let request_content_digest = retail::request_content_digest(&body).map_err(|_| invalid())?;
     if let Some(list) = &mut model_allowlist {
         if list.len() > 200 {
             return Err(invalid());
@@ -436,6 +435,15 @@ async fn start(
     if serde_json::to_vec(&raw).map_err(|_| invalid())?.len() > 32 * 1024 {
         return Err(invalid());
     }
+    if serde_json::to_vec(&body).map_err(|_| invalid())?.len() > runtime.policy.request_byte_limit()
+    {
+        return Err(invalid());
+    }
+    proxy_request::normalize_chat_assistant_metadata(endpoint, &mut body);
+    let mut correlation_body = body.clone();
+    correlation_body["proxy"] = raw.clone();
+    let request_content_digest =
+        retail::request_content_digest(&correlation_body).map_err(|_| invalid())?;
     let mut controls: proxy_request::Controls =
         serde_json::from_value(raw).map_err(|_| invalid())?;
     let profile = controls.profile.as_ref().ok_or_else(invalid)?;
@@ -498,10 +506,6 @@ async fn start(
         proxy_request::Selector::parse(model)
             .map_err(|_| invalid())?
             .ok_or_else(invalid)?;
-    }
-    if serde_json::to_vec(&body).map_err(|_| invalid())?.len() > runtime.policy.request_byte_limit()
-    {
-        return Err(invalid());
     }
     let control = state.proxy_control().cloned().ok_or_else(unavailable)?;
     if !profile.constraints.request_controls.is_empty()

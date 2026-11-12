@@ -12,6 +12,7 @@ mod taxonomy;
 mod taxonomy_filters;
 mod retail;
 mod streaming;
+mod assistant_metadata;
 use super::*;
 use crate::openai::proxy_owner::tests::support::{self, ControlFixture, Harness};
 use crate::openai::{

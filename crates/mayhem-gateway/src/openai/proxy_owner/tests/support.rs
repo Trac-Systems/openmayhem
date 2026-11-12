@@ -171,6 +171,8 @@ pub(crate) struct Harness {
     peer: Peer,
     calls: Arc<AtomicUsize>,
     pub(crate) backend_status: Arc<AtomicUsize>,
+    pub(crate) backend_response: Arc<std::sync::Mutex<Option<Value>>>,
+    pub(crate) backend_request: Arc<std::sync::Mutex<Option<Value>>>,
     observed: Option<mayhem_proxy::health::Monitor>,
     connection: Arc<HttpConnection>,
     pool: Arc<Pool>,
@@ -223,12 +225,18 @@ impl Harness {
         let count = calls.clone();
         let backend_status = Arc::new(AtomicUsize::new(200));
         let status = backend_status.clone();
+        let backend_response = Arc::new(std::sync::Mutex::new(None::<Value>));
+        let reply = backend_response.clone();
+        let backend_request = Arc::new(std::sync::Mutex::new(None));
+        let request = backend_request.clone();
         let stream_backend = Arc::new(StreamBackend::default());
         let backend_stream = stream_backend.clone();
         let path = endpoint_path(endpoint);
         let app = Router::new().route(path, post(move |Json(input): Json<Value>| {
             let count = count.clone();
             let status = status.clone();
+            let reply = reply.clone();
+            let request = request.clone();
             let backend_stream = backend_stream.clone();
             async move {
                 assert_eq!(input["model"], "upstream-model");
@@ -248,6 +256,7 @@ impl Harness {
                     _ => (),
                 }
                 count.fetch_add(1, Ordering::SeqCst);
+                *request.lock().unwrap() = Some(input.clone());
                 let status = status.load(Ordering::SeqCst);
                 if status != 200 {
                     return (axum::http::StatusCode::from_u16(status as u16).unwrap(),
@@ -255,6 +264,9 @@ impl Harness {
                 }
                 if input["stream"] == true {
                     return streaming::response(endpoint, backend_stream);
+                }
+                if let Some(value) = reply.lock().unwrap().clone() {
+                    return Json(value).into_response();
                 }
                 Json(match endpoint {
                     ProxyEndpoint::Decisions => json!({"id":"private-upstream-id","answers":{"q":{"type":"noul","noul":0.7}}}),
@@ -624,6 +636,8 @@ impl Harness {
             peer,
             calls,
             backend_status,
+            backend_response,
+            backend_request,
             observed,
             connection,
             pool,

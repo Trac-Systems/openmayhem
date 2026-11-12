@@ -202,6 +202,37 @@ pub struct Request {
     policy: Policy,
 }
 
+// Public chat responses may contain empty optional assistant metadata. Treat
+// only these nulls as absent before binding a new request; provider contracts
+// still validate all non-null values and every other supplied field unchanged.
+pub(super) fn normalize_chat_assistant_metadata(
+    endpoint: ProxyEndpoint,
+    request: &mut Value,
+) -> bool {
+    if endpoint != ProxyEndpoint::Chat {
+        return false;
+    }
+    let Some(messages) = request.get_mut("messages").and_then(Value::as_array_mut) else {
+        return false;
+    };
+    let mut changed = false;
+    for message in messages {
+        let Some(message) = message.as_object_mut() else {
+            continue;
+        };
+        if message.get("role").and_then(Value::as_str) != Some("assistant") {
+            continue;
+        }
+        for field in ["reasoning", "reasoning_content", "refusal"] {
+            if message.get(field).is_some_and(Value::is_null) {
+                message.remove(field);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
 impl Request {
     /// Call before native catalog normalization. A native request without proxy
     /// controls returns None unchanged; any malformed proxy selection fails here.
@@ -283,9 +314,12 @@ impl Request {
                 return Err(Error::Constraints);
             }
         }
-        let bytes = serde_json::to_vec(&raw).map_err(|_| Error::Invalid)?;
+        let mut bytes = serde_json::to_vec(&raw).map_err(|_| Error::Invalid)?;
         if bytes.len() > policy.request_bytes {
             return Err(Error::Invalid);
+        }
+        if normalize_chat_assistant_metadata(endpoint, &mut raw) {
+            bytes = serde_json::to_vec(&raw).map_err(|_| Error::Invalid)?;
         }
         Ok(Some(Self {
             selector,
