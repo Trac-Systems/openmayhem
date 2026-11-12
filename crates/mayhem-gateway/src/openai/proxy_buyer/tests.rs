@@ -829,16 +829,22 @@ async fn proxy_http_pending_publication_recovers_original_hold_without_inventing
         .await;
     assert_eq!(status, StatusCode::ACCEPTED, "{body}");
     let id = headers["x-mayhem-job-id"].to_str().unwrap().to_owned();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    // Keep publication pending until the retained foreground owner has finished
+    // its bounded confirmation attempt. Flushing while it still owns the request
+    // legitimately permits its original Execute and does not exercise recovery.
+    tokio::time::timeout(Duration::from_secs(15), async {
         loop {
-            if f.harness.status().await["submissions"].as_u64().unwrap() > 0 {
+            if f.harness.status().await["submissions"].as_u64().unwrap() > 0
+                && !f.runtime.active.lock().unwrap().contains(&id)
+                && f.harness.buyer.active_sessions() == 0
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("original retained owner must be quiescent before publication");
     let job = f
         .state
         .jobs
@@ -848,6 +854,17 @@ async fn proxy_http_pending_publication_recovers_original_hold_without_inventing
         .unwrap()
         .unwrap();
     let terms = job.proxy.as_ref().unwrap().terms().unwrap().clone();
+    let identity = job.proxy.as_ref().unwrap().identity().clone();
+    let retained = f
+        .harness
+        .buyer
+        .retained_purchase(&identity)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.offer().terms, terms);
+    assert!(retained.authorization().is_some());
+    assert!(!retained.confirmed());
     assert!(job.result.is_none());
     let (evidence_status, evidence) = f
         .get(
@@ -861,18 +878,33 @@ async fn proxy_http_pending_publication_recovers_original_hold_without_inventing
     assert_eq!(evidence["result_verified"], false);
     assert_eq!(f.harness.backend_calls(), 0);
     assert_eq!(f.harness.status().await["publications"], 0);
-    assert_eq!(
-        f.state
-            .access_control
-            .pending_key_budgets(None, 64)
-            .unwrap()[0]
-            .1
-            .maximum,
-        terms.max_spend_au
-    );
+    let holds = f.state.access_control.pending_key_budgets(None, 64).unwrap();
+    assert_eq!(holds.len(), 1);
+    let hold = &holds[0].1;
+    assert_eq!(hold.request_id, id);
+    assert_eq!(hold.fingerprint, job.request_fingerprint);
+    assert_eq!(hold.terms, terms.digest().unwrap());
+    assert_eq!(hold.maximum, terms.max_spend_au);
+    assert_eq!(hold.charged, 0);
+    let (status, _, replay) = f
+        .post("pending-original", f.body(), "owner-fixture-key", false)
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
     f.harness.command("flush_publication").await;
     tokio::time::timeout(Duration::from_secs(15), async {
         loop {
+            let recovered = f
+                .harness
+                .buyer
+                .retained_purchase(&identity)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(recovered.key(), retained.key());
+            assert_eq!(recovered.offer().terms, terms);
+            // A retained countersignature predates canonical publication. Wait
+            // for recovery to confirm that same purchase, cancel its Prepared
+            // invocation and settle the signed zero-charge waiver.
             let job = f
                 .state
                 .jobs
@@ -881,18 +913,22 @@ async fn proxy_http_pending_publication_recovers_original_hold_without_inventing
                 .get(&id, now_secs())
                 .unwrap()
                 .unwrap();
-            if job.proxy.as_ref().unwrap().authorization().is_some() {
+            if recovered.confirmed()
+                && job.status == GatewayJobStatus::Failed
+                && !f.runtime.active.lock().unwrap().contains(&id)
+                && f.harness.buyer.active_sessions() == 0
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     })
     .await
-    .unwrap();
+    .expect("background recovery must canonically close the original retained purchase");
     let (status, _, replay) = f
         .post("pending-original", f.body(), "owner-fixture-key", false)
         .await;
-    assert_eq!(status, StatusCode::ACCEPTED, "{replay}");
+    assert_eq!(status, StatusCode::CONFLICT, "{replay}");
     let job = f
         .state
         .jobs
@@ -902,7 +938,38 @@ async fn proxy_http_pending_publication_recovers_original_hold_without_inventing
         .unwrap()
         .unwrap();
     assert_eq!(job.proxy.as_ref().unwrap().terms(), Some(&terms));
+    assert_eq!(
+        job.proxy.as_ref().unwrap().authorization(),
+        retained.authorization().as_ref()
+    );
     assert!(job.result.is_none());
+    let closure = job.proxy.as_ref().unwrap().closure().unwrap();
+    let mayhem_proxy::financial::recovery::FinancialOutcome::Waived { closure: waiver } =
+        &closure.outcome
+    else {
+        panic!("recovery must prove nonexecution with the original signed waiver");
+    };
+    waiver
+        .verify(&terms, mayhem_proxy::receipts::verify_signature)
+        .unwrap();
+    assert_eq!(
+        waiver.body.outcome,
+        mayhem_proto::proxy::finance::ProxyClosureOutcome::NotExecuted
+    );
+    let (evidence_status, evidence) = f
+        .get(&format!("/v1/jobs/{id}/proxy-evidence"), "owner-fixture-key")
+        .await;
+    assert_eq!(evidence_status, StatusCode::OK);
+    assert_eq!(evidence["terms_hash"], terms.digest().unwrap());
+    assert_eq!(evidence["result_verified"], false);
+    assert_eq!(evidence["financial"]["kind"], "canonical");
+    assert_eq!(evidence["financial"]["outcome"], json!(closure.outcome));
+    assert_eq!(evidence["financial"]["observation"], json!(closure.proof));
+    assert_eq!(
+        evidence["financial"]["commitment"],
+        json!(closure.commitment().unwrap())
+    );
+    assert_eq!(evidence["financial"]["budget_settled"], true);
     assert_eq!(
         f.harness.backend_calls(),
         0,
@@ -910,17 +977,15 @@ async fn proxy_http_pending_publication_recovers_original_hold_without_inventing
     );
     assert_eq!(
         f.harness.status().await["publications"],
-        1,
-        "original reservation only"
+        2,
+        "original reservation and its canonical nonexecution waiver only"
     );
-    assert_eq!(
-        f.state
-            .access_control
-            .pending_key_budgets(None, 64)
-            .unwrap()
-            .len(),
-        1
-    );
+    assert!(f
+        .state
+        .access_control
+        .pending_key_budgets(None, 64)
+        .unwrap()
+        .is_empty());
     assert_eq!(
         f.state.access_control.summary()["tokens"][0]["spent_total_au"],
         "0"

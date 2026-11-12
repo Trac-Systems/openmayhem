@@ -240,12 +240,34 @@ async fn estimate_requires_auth_explicit_policy_prices_and_enabled_buyer() {
         estimate(&f, body, "owner-fixture-key").await.0,
         StatusCode::BAD_REQUEST
     );
-    let mut body = f.body();
-    body["proxy"]["output_units"] = Value::Null;
+    for output in [json!(0), json!(mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER + 1)] {
+        let mut body = f.body();
+        body["proxy"]["output_units"] = output;
+        let (status, _, error) = estimate(&f, body, "owner-fixture-key").await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+        assert_eq!(error["error"]["code"], "proxy_estimate_invalid");
+    }
+    // Null selects the verified adapter's bounded automatic allowance. It does
+    // not remove or enlarge the buyer's explicit monetary ceiling.
+    let mut automatic = f.body();
+    automatic["proxy"]["output_units"] = Value::Null;
+    let (status, _, quote) = estimate(&f, automatic.clone(), "owner-fixture-key").await;
+    assert_eq!(status, StatusCode::OK, "{quote}");
+    assert_eq!(quote["controls"]["output_units"], Value::Null);
+    assert_eq!(quote["controls"]["prices"], automatic["proxy"]["prices"]);
     assert_eq!(
-        estimate(&f, body, "owner-fixture-key").await.0,
-        StatusCode::BAD_REQUEST
+        quote["max_usage"]["output_token"],
+        f.harness.buyer.response_byte_limit().div_ceil(4) as u64
     );
+    let usage = serde_json::from_value(quote["max_usage"].clone()).unwrap();
+    let maximum = f.harness.template.terms.offer.cost(&usage).unwrap();
+    assert!(maximum > 0 && maximum <= f.harness.template.terms.max_total_spend_au);
+    assert_eq!(quote["max_spend_au"], maximum.to_string());
+    validate_hash(&quote);
+    automatic["proxy"]["prices"]["max_total_spend_au"] = json!((maximum - 1).to_string());
+    let (status, _, error) = estimate(&f, automatic, "owner-fixture-key").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{error}");
+    assert_eq!(error["error"]["code"], "proxy_estimate_invalid");
     // Reading an estimate does not require unspent account budget.
     f.tokens.tokens[0].budget_au = Some(0);
     std::fs::write(
