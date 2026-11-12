@@ -5,6 +5,15 @@ use mayhem_proto::proxy::{
     finance::ProxySpendTerms, ProxyMarketDescriptor, ProxyMembership, ProxyOffer, ProxyRail,
 };
 
+const OFFER_ATTEMPTS: usize = 3;
+
+fn observation_timeout() -> Error {
+    Error::Http {
+        status: 504,
+        code: "canonical_provider_offer_observation_timeout".into(),
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Query {
@@ -181,6 +190,45 @@ impl Client {
             .slots
             .try_acquire()
             .map_err(|_| invalid("offer observation capacity unavailable"))?;
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::from_std(started + FRESHNESS);
+        for attempt in 0..OFFER_ATTEMPTS {
+            if tokio::time::Instant::now() >= deadline {
+                return Err(observation_timeout());
+            }
+            // Only repeat this read. Keep its original freshness and permit,
+            // but challenge each reply independently. Invalid successful replies
+            // and transport failures never become HTTP backpressure.
+            let result = tokio::time::timeout_at(
+                deadline,
+                self.observe_offer_once(query, follow_rates, started),
+            )
+            .await
+            .map_err(|_| observation_timeout())?;
+            let retry = matches!(
+                &result,
+                Err(Error::Http { status, .. }) if *status == 429 || (500..600).contains(status)
+            );
+            if !retry || attempt + 1 == OFFER_ATTEMPTS {
+                return result;
+            }
+            let delay = Duration::from_millis(250 << attempt);
+            if tokio::time::Instant::now() + delay >= deadline {
+                return result;
+            }
+            tokio::time::timeout_at(deadline, tokio::time::sleep(delay))
+                .await
+                .map_err(|_| observation_timeout())?;
+        }
+        unreachable!()
+    }
+
+    async fn observe_offer_once(
+        &self,
+        query: &Query,
+        follow_rates: bool,
+        started: Instant,
+    ) -> Result<Observation> {
         let mut nonce = [0u8; 32];
         getrandom::fill(&mut nonce).map_err(|_| invalid("offer challenge unavailable"))?;
         let nonce = nonce.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -189,7 +237,6 @@ impl Client {
         if follow_rates {
             body["follow_rates"] = json!(true);
         }
-        let started = Instant::now();
         let mut response = self
             .http
             .post(
@@ -201,10 +248,14 @@ impl Client {
             .send()
             .await
             .map_err(Error::Transport)?;
-        require(
-            response.status().is_success(),
-            "canonical provider offer is unavailable; refresh",
-        )?;
+        if !response.status().is_success() {
+            // Legacy peers return a generic 500 for concurrent canonical
+            // snapshot changes. Never expose or interpret their error bodies.
+            return Err(Error::Http {
+                status: response.status().as_u16(),
+                code: "canonical_provider_offer_observation_unavailable".into(),
+            });
+        }
         require(
             response
                 .content_length()
@@ -237,8 +288,14 @@ impl Client {
             "provider offer response binding differs",
         )?;
         if follow_rates {
-            let current = w.current_offer.take().ok_or_else(|| invalid("current rate offer missing"))?;
-            require(rate_successor(&query.offer, &current), "current offer changed outside its rates")?;
+            let current = w
+                .current_offer
+                .take()
+                .ok_or_else(|| invalid("current rate offer missing"))?;
+            require(
+                rate_successor(&query.offer, &current),
+                "current offer changed outside its rates",
+            )?;
             w.offer = current;
         } else {
             require(w.current_offer.is_none(), "unexpected current rate offer")?;
@@ -273,3 +330,7 @@ pub(crate) fn rate_successor(original: &ProxyOffer, current: &ProxyOffer) -> boo
     }
     comparable == *current
 }
+
+#[cfg(test)]
+#[path = "offer_tests.rs"]
+mod tests;
