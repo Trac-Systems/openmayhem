@@ -10,6 +10,16 @@ fn pending() -> Value {
         "message":"remote-private-detail-must-not-escape"})
 }
 
+fn error_envelopes(status: u16, body: Value) -> [Value; 3] {
+    let mut nested = body.clone();
+    nested["statusCode"] = json!(status);
+    [
+        body.clone(),
+        json!({"error":nested}),
+        json!({"code":body["code"],"error":nested}),
+    ]
+}
+
 fn quote() -> EnrollmentQuote {
     EnrollmentQuote {
         invoice_id: Digest::new("55".repeat(32)).unwrap(),
@@ -38,40 +48,50 @@ fn error_diagnostics_require_known_status_and_code_and_discard_remote_text() {
         (503, "proxy_admission_quote_expired"),
         (400, "proxy_admission_identity_revoked"),
     ] {
-        let body = serde_json::to_vec(&json!({"code":code,
-            "message":"private-token-secret", "stack":"private-stack"}))
-        .unwrap();
-        let error = enrollment_http_error(status, REFRESH_PATH, &body);
-        assert!(matches!(error, Error::EnrollmentService { code: actual, .. } if actual == code));
-        assert!(error.to_string().contains(code));
-        assert!(!format!("{error:?} {error}").contains("private-"));
-        assert!(matches!(
-            enrollment_http_error(418, REFRESH_PATH, &body),
-            Error::EnrollmentHttp { status: 418 }
-        ));
+        for body in error_envelopes(
+            status,
+            json!({"code":code,
+            "message":"private-token-secret", "stack":"private-stack"}),
+        ) {
+            let body = serde_json::to_vec(&body).unwrap();
+            let error = enrollment_http_error(status, REFRESH_PATH, &body);
+            assert!(
+                matches!(error, Error::EnrollmentService { code: actual, .. } if actual == code)
+            );
+            assert!(error.to_string().contains(code));
+            assert!(!format!("{error:?} {error}").contains("private-"));
+            assert!(matches!(
+                enrollment_http_error(418, REFRESH_PATH, &body),
+                Error::EnrollmentHttp { status: 418 }
+            ));
+        }
     }
-    let pending = serde_json::to_vec(&pending()).unwrap();
-    assert!(matches!(
-        enrollment_http_error(503, REFRESH_PATH, &pending),
-        Error::EnrollmentReconciliationPending
-    ));
-    for path in [
-        "v1/proxy/admission/auth/challenge",
-        "v1/proxy/admission/auth/verify",
-        "v1/proxy/admission/invoice/create",
-        "v1/proxy/admission/invoice/status",
-        "v1/proxy/admission/invoice/checkout",
-    ] {
+    for body in error_envelopes(503, pending()) {
+        let pending = serde_json::to_vec(&body).unwrap();
         assert!(matches!(
-            enrollment_http_error(503, path, &pending),
-            Error::EnrollmentHttp { status: 503 }
+            enrollment_http_error(503, REFRESH_PATH, &pending),
+            Error::EnrollmentReconciliationPending
         ));
+        for path in [
+            "v1/proxy/admission/auth/challenge",
+            "v1/proxy/admission/auth/verify",
+            "v1/proxy/admission/invoice/create",
+            "v1/proxy/admission/invoice/status",
+            "v1/proxy/admission/invoice/checkout",
+        ] {
+            assert!(matches!(
+                enrollment_http_error(503, path, &pending),
+                Error::EnrollmentHttp { status: 503 }
+            ));
+        }
     }
     for status in [200, 400, 401, 403, 409, 429, 500] {
-        assert!(matches!(
-            enrollment_http_error(status, REFRESH_PATH, &pending),
-            Error::EnrollmentHttp { .. }
-        ));
+        for body in error_envelopes(status, pending()) {
+            assert!(matches!(
+                enrollment_http_error(status, REFRESH_PATH, &serde_json::to_vec(&body).unwrap()),
+                Error::EnrollmentHttp { .. }
+            ));
+        }
     }
     for body in [
         b"private-invalid-json".to_vec(),
@@ -86,6 +106,54 @@ fn error_diagnostics_require_known_status_and_code_and_discard_remote_text() {
     }
 }
 
+#[test]
+fn malformed_ambiguous_and_duplicate_error_envelopes_are_not_diagnostics() {
+    let code = "proxy_admission_quote_reconciliation_pending";
+    for body in [
+        format!(r#"{{"code":"{code}","code":"{code}"}}"#),
+        format!(r#"{{"error":{{"code":"{code}","code":"{code}"}}}}"#),
+        format!(r#"{{"error":{{"code":"{code}"}},"error":{{"code":"{code}"}}}}"#),
+        format!(r#"{{"code":"{code}","error":{{"code":"private-other-code"}}}}"#),
+        format!(r#"{{"code":"private-other-code","error":{{"code":"{code}"}}}}"#),
+        format!(r#"{{"code":"{code}","statusCode":503,"statusCode":503}}"#),
+        format!(r#"{{"error":{{"code":"{code}","statusCode":503,"statusCode":503}}}}"#),
+        format!(r#"{{"code":"{code}","statusCode":500}}"#),
+        format!(r#"{{"code":"{code}","statusCode":null}}"#),
+        format!(r#"{{"code":"{code}","statusCode":"503"}}"#),
+        format!(r#"{{"code":"{code}","error":{{"code":"{code}","statusCode":500}}}}"#),
+        format!(r#"{{"error":{{"code":"{code}","statusCode":null}}}}"#),
+        format!(r#"{{"code":null,"error":{{"code":"{code}"}}}}"#),
+        format!(r#"{{"code":"{code}","error":null}}"#),
+        format!(r#"{{"code":"{code}","error":{{}}}}"#),
+        format!(r#"{{"code":"{code}","error":{{"code":null}}}}"#),
+        format!(r#"{{"code":"{code}","error":{{"code":7}}}}"#),
+        format!(r#"{{"code":"{code}","error":"private-detail"}}"#),
+        format!(r#"{{"error":["{code}",503]}}"#),
+        format!(r#"["{code}",null,503]"#),
+        format!(r#"{{"code":"{code}"}}{{"code":"{code}"}}"#),
+        r#"{"error":{"message":"private-detail"}}"#.to_owned(),
+        r#"{"error":{"code":"private-unknown-code"}}"#.to_owned(),
+        r#"{"error":{"error":{"code":"proxy_admission_quote_reconciliation_pending"}}}"#.to_owned(),
+    ] {
+        let error = enrollment_http_error(503, REFRESH_PATH, body.as_bytes());
+        assert!(
+            matches!(error, Error::EnrollmentHttp { status: 503 }),
+            "{body}"
+        );
+        assert!(!format!("{error:?} {error}").contains("private-"));
+    }
+    for body in [
+        json!({"error":{"code":code}}),
+        json!({"code":code,"statusCode":503}),
+        json!({"code":code,"statusCode":503,"error":{"code":code,"statusCode":503}}),
+    ] {
+        assert!(matches!(
+            enrollment_http_error(503, REFRESH_PATH, &serde_json::to_vec(&body).unwrap()),
+            Error::EnrollmentReconciliationPending
+        ));
+    }
+}
+
 async fn send_response(socket: &mut TcpStream, status: u16, body: &[u8]) {
     let header = format!("HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
     socket.write_all(header.as_bytes()).await.unwrap();
@@ -94,38 +162,40 @@ async fn send_response(socket: &mut TcpStream, status: u16, body: &[u8]) {
 
 #[tokio::test]
 async fn error_body_limit_applies_to_content_length_and_streamed_bodies() {
-    for chunked in [false, true] {
-        for oversized in [false, true] {
-            let mut body = serde_json::to_vec(&pending()).unwrap();
-            body.resize(MAX_RESPONSE + usize::from(oversized), b' ');
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let origin = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0; 4096];
-                let _ = socket.read(&mut request).await.unwrap();
-                let wire = if chunked {
-                    format!("HTTP/1.1 503 Test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n", body.len(), String::from_utf8(body).unwrap())
-                } else {
-                    format!(
+    for pending in error_envelopes(503, pending()) {
+        for chunked in [false, true] {
+            for oversized in [false, true] {
+                let mut body = serde_json::to_vec(&pending).unwrap();
+                body.resize(MAX_RESPONSE + usize::from(oversized), b' ');
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let origin = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 4096];
+                    let _ = socket.read(&mut request).await.unwrap();
+                    let wire = if chunked {
+                        format!("HTTP/1.1 503 Test\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n", body.len(), String::from_utf8(body).unwrap())
+                    } else {
+                        format!(
                         "HTTP/1.1 503 Test\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                         body.len(),
                         String::from_utf8(body).unwrap()
                     )
-                };
-                // An oversized Content-Length can close the client before body I/O.
-                let _ = socket.write_all(wire.as_bytes()).await;
-            });
-            let response = reqwest::Client::new().get(origin).send().await.unwrap();
-            let error = enrollment_response(response, REFRESH_PATH)
-                .await
-                .unwrap_err();
-            assert_eq!(
-                matches!(error, Error::EnrollmentReconciliationPending),
-                !oversized
-            );
-            assert!(!error.to_string().contains("remote-private-detail"));
-            server.await.unwrap();
+                    };
+                    // An oversized Content-Length can close the client before body I/O.
+                    let _ = socket.write_all(wire.as_bytes()).await;
+                });
+                let response = reqwest::Client::new().get(origin).send().await.unwrap();
+                let error = enrollment_response(response, REFRESH_PATH)
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    matches!(error, Error::EnrollmentReconciliationPending),
+                    !oversized
+                );
+                assert!(!error.to_string().contains("remote-private-detail"));
+                server.await.unwrap();
+            }
         }
     }
 }
@@ -321,107 +391,114 @@ impl Server {
 
 #[tokio::test]
 async fn refresh_pending_retries_same_quote_with_fresh_authorization() {
-    let quote = quote();
-    let server = Server::start(EnrollmentAction::Refresh, json!(quote), vec![(503, pending()),
+    for pending in error_envelopes(503, pending()) {
+        let quote = quote();
+        let server = Server::start(EnrollmentAction::Refresh, json!(quote), vec![(503, pending),
         (200, json!({"schema_version":1,"purpose":PURPOSE,"state":"admitted","entitlement_id":"77".repeat(32)}))],
         None, false, 5000).await;
-    let result = server
-        .client
-        .execute_with_quote(&server.key, EnrollmentAction::Refresh, None, Some(quote))
-        .await
-        .unwrap();
-    assert_eq!(result.state, "admitted");
-    assert!(!result.authorizes_publication);
-    let calls = server.stop().await;
-    assert_eq!(calls.len(), 6);
-    assert_ne!(calls[0].body["client_nonce"], calls[3].body["client_nonce"]);
-    assert_ne!(calls[1].body["challenge_id"], calls[4].body["challenge_id"]);
-    assert_ne!(calls[2].authorization, calls[5].authorization);
-    assert_eq!(calls[2].body, calls[5].body);
+        let result = server
+            .client
+            .execute_with_quote(&server.key, EnrollmentAction::Refresh, None, Some(quote))
+            .await
+            .unwrap();
+        assert_eq!(result.state, "admitted");
+        assert!(!result.authorizes_publication);
+        let calls = server.stop().await;
+        assert_eq!(calls.len(), 6);
+        assert_ne!(calls[0].body["client_nonce"], calls[3].body["client_nonce"]);
+        assert_ne!(calls[1].body["challenge_id"], calls[4].body["challenge_id"]);
+        assert_ne!(calls[2].authorization, calls[5].authorization);
+        assert_eq!(calls[2].body, calls[5].body);
+    }
 }
 
 #[tokio::test]
 async fn refresh_attempt_count_and_total_deadline_are_bounded() {
-    for (timeout_ms, stall, expected_calls) in [(5000, false, 9), (200, false, 3), (1200, true, 4)]
-    {
-        let quote = quote();
-        let server = Server::start(
-            EnrollmentAction::Refresh,
-            json!(quote),
-            vec![(503, pending()); 4],
-            None,
-            stall,
-            timeout_ms,
-        )
-        .await;
-        let started = tokio::time::Instant::now();
-        let error = server
-            .client
-            .execute_with_quote(&server.key, EnrollmentAction::Refresh, None, Some(quote))
-            .await
-            .err()
-            .unwrap();
-        assert!(matches!(error, Error::EnrollmentReconciliationPending));
-        assert!(started.elapsed() < Duration::from_millis(timeout_ms + 500));
-        assert_eq!(server.stop().await.len(), expected_calls);
+    for pending in error_envelopes(503, pending()) {
+        for (timeout_ms, stall, expected_calls) in
+            [(5000, false, 9), (200, false, 3), (1200, true, 4)]
+        {
+            let quote = quote();
+            let server = Server::start(
+                EnrollmentAction::Refresh,
+                json!(quote),
+                vec![(503, pending.clone()); 4],
+                None,
+                stall,
+                timeout_ms,
+            )
+            .await;
+            let started = tokio::time::Instant::now();
+            let error = server
+                .client
+                .execute_with_quote(&server.key, EnrollmentAction::Refresh, None, Some(quote))
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(error, Error::EnrollmentReconciliationPending));
+            assert!(started.elapsed() < Duration::from_millis(timeout_ms + 500));
+            assert_eq!(server.stop().await.len(), expected_calls);
+        }
     }
 }
 
 #[tokio::test]
 async fn pending_never_retries_other_actions_or_authentication_endpoints() {
-    for action in [
-        EnrollmentAction::Create,
-        EnrollmentAction::Status,
-        EnrollmentAction::Checkout,
-        EnrollmentAction::Returns,
-    ] {
-        let rail = if matches!(action, EnrollmentAction::Create) {
-            Some(mayhem_proto::proxy::ProxyRail::Tnk)
-        } else {
-            None
-        };
-        let request = if rail.is_some() {
-            json!({"rail":"tnk"})
-        } else {
-            json!({})
-        };
-        let server = Server::start(
-            action,
-            request,
-            vec![(503, pending()); 3],
-            None,
-            false,
-            5000,
-        )
-        .await;
-        assert!(matches!(
-            server.client.execute(&server.key, action, rail).await,
-            Err(Error::EnrollmentHttp { status: 503 })
-        ));
-        assert_eq!(server.stop().await.len(), 3);
-    }
-    for phase in ["challenge", "verify"] {
-        let quote = quote();
-        let server = Server::start(
-            EnrollmentAction::Refresh,
-            json!(quote),
-            vec![(503, pending()); 3],
-            Some((phase, 503, pending())),
-            false,
-            5000,
-        )
-        .await;
-        assert!(matches!(
-            server
-                .client
-                .execute_with_quote(&server.key, EnrollmentAction::Refresh, None, Some(quote))
-                .await,
-            Err(Error::EnrollmentHttp { status: 503 })
-        ));
-        assert_eq!(
-            server.stop().await.len(),
-            if phase == "challenge" { 1 } else { 2 }
-        );
+    for pending in error_envelopes(503, pending()) {
+        for action in [
+            EnrollmentAction::Create,
+            EnrollmentAction::Status,
+            EnrollmentAction::Checkout,
+            EnrollmentAction::Returns,
+        ] {
+            let rail = if matches!(action, EnrollmentAction::Create) {
+                Some(mayhem_proto::proxy::ProxyRail::Tnk)
+            } else {
+                None
+            };
+            let request = if rail.is_some() {
+                json!({"rail":"tnk"})
+            } else {
+                json!({})
+            };
+            let server = Server::start(
+                action,
+                request,
+                vec![(503, pending.clone()); 3],
+                None,
+                false,
+                5000,
+            )
+            .await;
+            assert!(matches!(
+                server.client.execute(&server.key, action, rail).await,
+                Err(Error::EnrollmentHttp { status: 503 })
+            ));
+            assert_eq!(server.stop().await.len(), 3);
+        }
+        for phase in ["challenge", "verify"] {
+            let quote = quote();
+            let server = Server::start(
+                EnrollmentAction::Refresh,
+                json!(quote),
+                vec![(503, pending.clone()); 3],
+                Some((phase, 503, pending.clone())),
+                false,
+                5000,
+            )
+            .await;
+            assert!(matches!(
+                server
+                    .client
+                    .execute_with_quote(&server.key, EnrollmentAction::Refresh, None, Some(quote))
+                    .await,
+                Err(Error::EnrollmentHttp { status: 503 })
+            ));
+            assert_eq!(
+                server.stop().await.len(),
+                if phase == "challenge" { 1 } else { 2 }
+            );
+        }
     }
 }
 
@@ -433,32 +510,33 @@ async fn refresh_does_not_retry_conflicts_rate_limits_or_other_service_errors() 
         (503, "proxy_admission_rate_unavailable"),
         (401, "proxy_admission_auth_invalid"),
         (500, "proxy_admission_quote_reconciliation_pending"),
+        (400, "proxy_admission_quote_reconciliation_pending"),
+        (503, "private-unknown-code"),
     ] {
-        let quote = quote();
-        let server = Server::start(
-            EnrollmentAction::Refresh,
-            json!(quote),
-            vec![
-                (
-                    status,
-                    json!({"code":code,"message":"remote-private-detail"})
-                );
-                3
-            ],
-            None,
-            false,
-            5000,
-        )
-        .await;
-        let error = server
-            .client
-            .execute_with_quote(&server.key, EnrollmentAction::Refresh, None, Some(quote))
-            .await
-            .err()
-            .unwrap();
-        assert!(!matches!(error, Error::EnrollmentReconciliationPending));
-        assert!(!error.to_string().contains("remote-private-detail"));
-        assert_eq!(server.stop().await.len(), 3);
+        for body in error_envelopes(
+            status,
+            json!({"code":code,"message":"remote-private-detail"}),
+        ) {
+            let quote = quote();
+            let server = Server::start(
+                EnrollmentAction::Refresh,
+                json!(quote),
+                vec![(status, body); 3],
+                None,
+                false,
+                5000,
+            )
+            .await;
+            let error = server
+                .client
+                .execute_with_quote(&server.key, EnrollmentAction::Refresh, None, Some(quote))
+                .await
+                .err()
+                .unwrap();
+            assert!(!matches!(error, Error::EnrollmentReconciliationPending));
+            assert!(!error.to_string().contains("remote-private-detail"));
+            assert_eq!(server.stop().await.len(), 3);
+        }
     }
 }
 

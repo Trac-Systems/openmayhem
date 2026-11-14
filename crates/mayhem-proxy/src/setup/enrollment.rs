@@ -18,16 +18,75 @@ const REFRESH_RETRY_DELAY: Duration = Duration::from_secs(1);
 /// and other error fields never enter an operator-visible error or a log.
 fn enrollment_http_error(status: u16, path: &str, bytes: &[u8]) -> Error {
     #[derive(Deserialize)]
-    struct Failure<'a> {
+    struct FailureCode<'a> {
         code: &'a str,
+        #[serde(default, rename = "statusCode", deserialize_with = "present")]
+        status: Option<u16>,
+    }
+    #[derive(Deserialize)]
+    struct Failure<'a> {
+        #[serde(borrow, default, deserialize_with = "present")]
+        code: Option<&'a str>,
+        #[serde(borrow, default, deserialize_with = "present_object")]
+        error: Option<FailureCode<'a>>,
+        #[serde(default, rename = "statusCode", deserialize_with = "present")]
+        status: Option<u16>,
+    }
+    // Missing fields are allowed, but null/wrong types are not an absent field.
+    // Deserialize directly rather than through Value so duplicate fields fail.
+    fn present<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<T>, D::Error> {
+        T::deserialize(deserializer).map(Some)
+    }
+    fn object<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<T, D::Error> {
+        struct Object<T>(std::marker::PhantomData<T>);
+        impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Object<T> {
+            type Value = T;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("an error object")
+            }
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                map: A,
+            ) -> std::result::Result<T, A::Error> {
+                T::deserialize(serde::de::value::MapAccessDeserializer::new(map))
+            }
+        }
+        deserializer.deserialize_map(Object(std::marker::PhantomData))
+    }
+    fn present_object<'de, D: serde::Deserializer<'de>, T: Deserialize<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Option<T>, D::Error> {
+        object(deserializer).map(Some)
     }
     if bytes.len() > MAX_RESPONSE {
         return Error::EnrollmentHttp { status };
     }
-    let Ok(failure) = serde_json::from_slice::<Failure<'_>>(bytes) else {
+    let mut decoder = serde_json::Deserializer::from_slice(bytes);
+    let Ok(failure) = object::<_, Failure<'_>>(&mut decoder) else {
         return Error::EnrollmentHttp { status };
     };
-    let (code, message) = match (status, failure.code) {
+    if decoder.end().is_err()
+        || failure.status.is_some_and(|value| value != status)
+        || failure
+            .error
+            .as_ref()
+            .is_some_and(|error| error.status.is_some_and(|value| value != status))
+    {
+        return Error::EnrollmentHttp { status };
+    }
+    // Prebody hooks use a root code; Nest's production filter wraps error.code.
+    // Transitional responses can expose both only when they agree exactly.
+    let code = match (failure.code, failure.error) {
+        (Some(code), None) => code,
+        (None, Some(error)) => error.code,
+        (Some(code), Some(error)) if code == error.code => code,
+        _ => return Error::EnrollmentHttp { status },
+    };
+    let (code, message) = match (status, code) {
         (503, "proxy_admission_quote_reconciliation_pending")
             if path == "v1/proxy/admission/invoice/refresh" =>
         {
