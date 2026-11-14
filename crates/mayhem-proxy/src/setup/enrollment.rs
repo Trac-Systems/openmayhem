@@ -11,6 +11,126 @@ const PURPOSE: &str = "proxy_admission_fee";
 const AUTH: &str = "mayhem/proxy/admission-auth/v1";
 const MAX_RESPONSE: usize = 16384;
 const MAX_SAFE: u64 = mayhem_proto::proxy::PROXY_MAX_SAFE_INTEGER;
+const MAX_REFRESH_ATTEMPTS: usize = 3;
+const REFRESH_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+/// Only known status/code pairs receive a diagnostic. Remote messages, headers
+/// and other error fields never enter an operator-visible error or a log.
+fn enrollment_http_error(status: u16, path: &str, bytes: &[u8]) -> Error {
+    #[derive(Deserialize)]
+    struct Failure<'a> {
+        code: &'a str,
+    }
+    if bytes.len() > MAX_RESPONSE {
+        return Error::EnrollmentHttp { status };
+    }
+    let Ok(failure) = serde_json::from_slice::<Failure<'_>>(bytes) else {
+        return Error::EnrollmentHttp { status };
+    };
+    let (code, message) = match (status, failure.code) {
+        (503, "proxy_admission_quote_reconciliation_pending")
+            if path == "v1/proxy/admission/invoice/refresh" =>
+        {
+            return Error::EnrollmentReconciliationPending;
+        }
+        (409 | 503, "proxy_admission_quote_reconciliation_required") => (
+            "proxy_admission_quote_reconciliation_required",
+            "the original quote requires reconciliation or review before renewal; do not send another fee",
+        ),
+        (503, "proxy_admission_canonical_unavailable") => (
+            "proxy_admission_canonical_unavailable",
+            "canonical admission evidence is unavailable; retain the original setup and retry later",
+        ),
+        (503, "proxy_admission_rate_unavailable") => (
+            "proxy_admission_rate_unavailable",
+            "a fresh admission exchange rate is unavailable; retain the original invoice",
+        ),
+        (503, "proxy_admission_receiver_unavailable") => (
+            "proxy_admission_receiver_unavailable",
+            "an admission collection receiver is unavailable; retain the original invoice",
+        ),
+        (503, "proxy_admission_collection_disabled") => (
+            "proxy_admission_collection_disabled",
+            "admission collection is disabled; retain the original setup",
+        ),
+        (503, "proxy_admission_rail_unavailable") => (
+            "proxy_admission_rail_unavailable",
+            "the requested admission payment rail is unavailable; retain the original invoice",
+        ),
+        (503, "proxy_admission_auth_disabled") => (
+            "proxy_admission_auth_disabled",
+            "provider authorization is disabled",
+        ),
+        (503, "proxy_admission_auth_unavailable") => (
+            "proxy_admission_auth_unavailable",
+            "provider authorization is temporarily unavailable",
+        ),
+        (401, "proxy_admission_auth_invalid") => (
+            "proxy_admission_auth_invalid",
+            "provider authorization is invalid or expired",
+        ),
+        (400, "proxy_admission_auth_invalid_request") => (
+            "proxy_admission_auth_invalid_request",
+            "the provider authorization request was rejected",
+        ),
+        (400, "proxy_admission_auth_scope") => (
+            "proxy_admission_auth_scope",
+            "provider authorization does not match this action and exact quote",
+        ),
+        (409, "proxy_admission_auth_challenge_conflict") => (
+            "proxy_admission_auth_challenge_conflict",
+            "the provider authorization challenge conflicts with an existing request",
+        ),
+        (429, "proxy_admission_auth_rate_limited") => (
+            "proxy_admission_auth_rate_limited",
+            "provider authorization is rate limited; retry the same setup later",
+        ),
+        (404, "proxy_admission_invoice_not_found") => (
+            "proxy_admission_invoice_not_found",
+            "the exact invoice was not found for this provider",
+        ),
+        (503, "proxy_admission_quote_expired") => (
+            "proxy_admission_quote_expired",
+            "the quote expired before completion; inspect the original invoice",
+        ),
+        (400, "proxy_admission_identity_revoked") => (
+            "proxy_admission_identity_revoked",
+            "the provider identity is revoked; admission cannot continue",
+        ),
+        _ => return Error::EnrollmentHttp { status },
+    };
+    Error::EnrollmentService { code, message }
+}
+
+async fn enrollment_response(mut response: reqwest::Response, path: &str) -> Result<Vec<u8>> {
+    let status = response.status();
+    let invalid = || {
+        if status.is_success() {
+            Error::EnrollmentUnavailable
+        } else {
+            Error::EnrollmentHttp {
+                status: status.as_u16(),
+            }
+        }
+    };
+    if response
+        .content_length()
+        .is_some_and(|n| n > MAX_RESPONSE as u64)
+    {
+        return Err(invalid());
+    }
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| invalid())? {
+        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE {
+            return Err(invalid());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    if !status.is_success() {
+        return Err(enrollment_http_error(status.as_u16(), path, &bytes));
+    }
+    Ok(bytes)
+}
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -476,15 +596,41 @@ impl EnrollmentClient {
             }
             _ => return Err(Error::Invalid),
         };
-        // One bounded operation, including challenge, exchange and invoice I/O.
-        // Retrying a later invocation uses the server's original provider/network
-        // invoice identity; a timeout never authorizes another fee.
-        tokio::time::timeout(
-            Duration::from_millis(self.timeout_ms),
-            self.perform(key, action, request),
-        )
-        .await
-        .map_err(|_| Error::EnrollmentUnavailable)?
+        // One deadline includes fresh challenge/exchange for every retry. Only
+        // explicit refresh reconciliation may retry, always for the same quote.
+        // A timeout after a known pending response must keep that useful state.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(self.timeout_ms);
+        let mut pending = false;
+        for attempt in 0..MAX_REFRESH_ATTEMPTS {
+            match tokio::time::timeout_at(deadline, self.perform(key, action, request.clone()))
+                .await
+            {
+                Ok(Err(Error::EnrollmentReconciliationPending))
+                    if matches!(action, EnrollmentAction::Refresh) =>
+                {
+                    pending = true;
+                    if attempt + 1 == MAX_REFRESH_ATTEMPTS
+                        || tokio::time::timeout_at(
+                            deadline,
+                            tokio::time::sleep(REFRESH_RETRY_DELAY),
+                        )
+                        .await
+                        .is_err()
+                    {
+                        return Err(Error::EnrollmentReconciliationPending);
+                    }
+                }
+                Err(_) => {
+                    return Err(if pending {
+                        Error::EnrollmentReconciliationPending
+                    } else {
+                        Error::EnrollmentUnavailable
+                    })
+                }
+                Ok(result) => return result,
+            }
+        }
+        unreachable!("bounded enrollment loop returns on its final attempt")
     }
     async fn post(&self, path: &str, body: &Value, authorization: Option<&str>) -> Result<Vec<u8>> {
         let bytes = serde_json::to_vec(body).map_err(|_| Error::Invalid)?;
@@ -505,9 +651,7 @@ impl EnrollmentClient {
             .send()
             .await
             .map_err(|_| Error::EnrollmentUnavailable)?;
-        admission::bounded_response(response, MAX_RESPONSE)
-            .await
-            .map_err(|_| Error::EnrollmentUnavailable)
+        enrollment_response(response, path).await
     }
     async fn perform(
         &self,
@@ -791,6 +935,10 @@ impl EnrollmentInvoice {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "enrollment_tests.rs"]
+mod response_tests;
 
 #[cfg(test)]
 mod admitted_review_tests {

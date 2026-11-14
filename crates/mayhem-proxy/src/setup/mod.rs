@@ -101,6 +101,17 @@ pub enum Error {
     RatesChanged,
     #[error("provider admission service is unavailable; resume the original setup, do not send another fee")]
     EnrollmentUnavailable,
+    #[error("provider admission quote reconciliation is pending (proxy_admission_quote_reconciliation_pending); retry refresh with the same invoice ID and commitment; do not send another fee")]
+    EnrollmentReconciliationPending,
+    #[error("provider admission request failed ({code}): {message}")]
+    EnrollmentService {
+        code: &'static str,
+        message: &'static str,
+    },
+    #[error(
+        "provider admission service returned HTTP {status}; retain the original setup and invoice"
+    )]
+    EnrollmentHttp { status: u16 },
     #[error("managed startup requires the exact current checked and confirmed publication with its original probe scope")]
     RunPrerequisite,
     #[error("managed startup conflicts with its retained original configuration or controller; inspect original state")]
