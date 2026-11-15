@@ -9117,24 +9117,38 @@ fn dedicated_vram_known_below(hardware: &HardwareReport, min_vram_bytes: u64) ->
 
 fn known_total_nvidia_vllm_memory_bytes(hardware: &HardwareReport) -> Option<u64> {
     let mut saw_nvidia = false;
-    let mut total = 0u64;
+    let mut dedicated_total = 0u64;
+    let mut unified_total = 0u64;
     for gpu in hardware
         .gpus
         .iter()
         .filter(|gpu| gpu.vendor == GpuVendor::Nvidia)
     {
         saw_nvidia = true;
-        let memory = match gpu.memory_bytes {
-            Some(memory) => memory,
-            None if nvidia_gpu_uses_host_unified_memory(hardware, gpu) => hardware
-                .memory
-                .available_bytes
-                .unwrap_or(hardware.memory.total_bytes),
-            None => return None,
-        };
-        total = total.saturating_add(memory);
+        let memory = nvidia_vllm_device_total_memory_bytes(hardware, gpu)?;
+        if nvidia_gpu_uses_host_unified_memory(hardware, gpu) {
+            // Multiple unified devices address the same host memory pool.
+            unified_total = unified_total.max(memory);
+        } else {
+            dedicated_total = dedicated_total.saturating_add(memory);
+        }
     }
-    saw_nvidia.then_some(total)
+    saw_nvidia.then_some(dedicated_total.saturating_add(unified_total))
+}
+
+fn nvidia_vllm_device_total_memory_bytes(hardware: &HardwareReport, gpu: &GpuInfo) -> Option<u64> {
+    if nvidia_gpu_uses_host_unified_memory(hardware, gpu) {
+        // Utilization percentages describe physical capacity, not transient
+        // free RAM. Admission separately subtracts reserves/claims from the
+        // live available-memory observation. Honor smaller explicit GPU totals.
+        Some(
+            gpu.memory_bytes
+                .unwrap_or(hardware.memory.total_bytes)
+                .min(hardware.memory.total_bytes),
+        )
+    } else {
+        gpu.memory_bytes
+    }
 }
 
 fn nvidia_gpu_uses_host_unified_memory(hardware: &HardwareReport, gpu: &GpuInfo) -> bool {
@@ -75323,9 +75337,8 @@ fn provider_memory_budget(
         .available_bytes
         .saturating_sub(reserve_bytes)
         .saturating_sub(claimed_bytes);
-    // Some unified NVIDIA probes have no dedicated-memory total and their
-    // allocation pool falls back to available RAM. Virtual mappings must use
-    // the machine's real total instead of inheriting that availability fallback.
+    // Virtual mappings use physical capacity independently of the currently
+    // available-memory budget and the signed accelerator allocation ceiling.
     let dedicated_total = hardware
         .gpus
         .iter()
@@ -75372,15 +75385,7 @@ fn scope_vllm_execution_mode_memory_pool(
         .iter()
         .filter(|gpu| gpu.vendor == GpuVendor::Nvidia)
         .map(|gpu| {
-            gpu.memory_bytes
-                .or_else(|| {
-                    nvidia_gpu_uses_host_unified_memory(hardware, gpu).then_some(
-                        hardware
-                            .memory
-                            .available_bytes
-                            .unwrap_or(hardware.memory.total_bytes),
-                    )
-                })
+            nvidia_vllm_device_total_memory_bytes(hardware, gpu)
                 .filter(|bytes| *bytes > 0)
                 .context(
                     "vLLM execution mode requires known memory for every selectable NVIDIA device",
@@ -111662,6 +111667,140 @@ status: linked
         model.canary.verification_method = CANARY_VERIFICATION_TOKEN_FINGERPRINT.to_owned();
 
         preflight_calibration_prompt_resources(&model, &document.prompts).unwrap();
+    }
+
+    #[test]
+    fn unified_vllm_signed_utilization_uses_physical_total_and_preserves_admission() {
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.host.os = "linux".to_owned();
+        hardware.host.arch = "aarch64".to_owned();
+        hardware.memory.total_bytes = 122 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(9_390 * GIB_BYTES / 100);
+        hardware.gpus.truncate(1);
+        hardware.gpus[0].memory_bytes = None;
+        hardware.gpus[0].unified_memory = false; // GB10's missing NVML total signals UMA.
+        let mut selected =
+            test_auto_fit_candidate('a', "test/embedding", "embedding", 1, 2, 1, 30.0);
+        selected.enclave.backend = "vllm".to_owned();
+        selected.enclave.caps = json!({"vllm_gpu_memory_utilization_pct":13});
+        selected.verdict.backend = "vllm".to_owned();
+        selected.feasibility.estimated_required_bytes = 1_231 * GIB_BYTES / 100;
+        let mut args = test_provider_start_args();
+        args.memory_reserve = Some("24GB".to_owned());
+
+        let budget =
+            provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args).unwrap();
+        assert_eq!(budget.total_bytes, hardware.memory.total_bytes);
+        assert_eq!(
+            budget.available_bytes,
+            hardware.memory.available_bytes.unwrap()
+        );
+        assert_eq!(budget.reserve_bytes, 24 * GIB_BYTES);
+        assert_eq!(
+            budget.worker_limit_bytes,
+            budget.available_bytes - budget.reserve_bytes
+        );
+        assert_eq!(budget.budget_bytes, hardware.memory.total_bytes * 13 / 100);
+        // The old available-as-total basis rejected this healthy startup.
+        assert!(budget.available_bytes * 13 / 100 < selected.feasibility.estimated_required_bytes);
+        selected.feasibility.memory_budget = budget;
+        assert_eq!(
+            provider_vllm_memory_utilization(&selected, Some(13))
+                .unwrap()
+                .target_pct,
+            13
+        );
+        assert!(provider_vllm_memory_utilization(&selected, Some(14)).is_err());
+
+        // A smaller signed ceiling still rejects the same model requirement.
+        selected.enclave.caps = json!({"vllm_gpu_memory_utilization_pct":9});
+        selected.feasibility.memory_budget =
+            provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args).unwrap();
+        assert!(provider_vllm_memory_utilization(&selected, Some(13)).is_err());
+        selected.enclave.caps = json!({"vllm_gpu_memory_utilization_pct":13});
+
+        // Physical capacity never overrides current host pressure or its reserve.
+        for available_gib in [35, 24, 20] {
+            hardware.memory.available_bytes = Some(available_gib * GIB_BYTES);
+            let budget =
+                provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args)
+                    .unwrap();
+            assert_eq!(budget.total_bytes, 122 * GIB_BYTES);
+            assert_eq!(
+                budget.budget_bytes,
+                (available_gib * GIB_BYTES).saturating_sub(24 * GIB_BYTES)
+            );
+            selected.feasibility.memory_budget = budget;
+            assert!(provider_vllm_memory_utilization(&selected, Some(13)).is_err());
+        }
+    }
+
+    #[test]
+    fn unified_vllm_total_counts_shared_ram_once_and_honors_explicit_device_bounds() {
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.host.os = "linux".to_owned();
+        hardware.host.arch = "aarch64".to_owned();
+        hardware.memory.total_bytes = 128 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(94 * GIB_BYTES);
+        let mut device = hardware.gpus[0].clone();
+        device.memory_bytes = None;
+        device.unified_memory = true;
+        hardware.gpus = vec![device.clone(), device];
+        assert_eq!(
+            known_total_nvidia_vllm_memory_bytes(&hardware),
+            Some(128 * GIB_BYTES)
+        );
+        let verdict = &hardware.backend_verdicts[0];
+        for tp in [1, 2] {
+            let mut pool = provider_memory_pool(&hardware, verdict, "vllm", None);
+            scope_vllm_execution_mode_memory_pool(&mut pool, &hardware, tp).unwrap();
+            assert_eq!(pool.total_bytes, 128 * GIB_BYTES);
+            assert_eq!(pool.available_bytes, 94 * GIB_BYTES);
+        }
+
+        hardware.gpus[0].memory_bytes = Some(120 * GIB_BYTES);
+        hardware.gpus[1].memory_bytes = Some(64 * GIB_BYTES);
+        assert_eq!(
+            known_total_nvidia_vllm_memory_bytes(&hardware),
+            Some(120 * GIB_BYTES)
+        );
+        let mut pool = provider_memory_pool(&hardware, verdict, "vllm", None);
+        scope_vllm_execution_mode_memory_pool(&mut pool, &hardware, 2).unwrap();
+        assert_eq!(pool.total_bytes, 64 * GIB_BYTES);
+        hardware.gpus[0].memory_bytes = Some(256 * GIB_BYTES);
+        assert_eq!(
+            known_total_nvidia_vllm_memory_bytes(&hardware),
+            Some(128 * GIB_BYTES)
+        );
+    }
+
+    #[test]
+    fn unified_vllm_total_change_preserves_windows_dedicated_memory_accounting() {
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.host.os = "windows".to_owned();
+        hardware.host.arch = "aarch64".to_owned();
+        hardware.memory.total_bytes = 128 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(4 * GIB_BYTES);
+        let mut device = hardware.gpus[0].clone();
+        device.unified_memory = false;
+        device.shared_memory_bytes = Some(64 * GIB_BYTES);
+        hardware.gpus = vec![device.clone(), device];
+        hardware.gpus[0].memory_bytes = Some(24 * GIB_BYTES);
+        hardware.gpus[1].memory_bytes = Some(80 * GIB_BYTES);
+        assert_eq!(
+            known_total_nvidia_vllm_memory_bytes(&hardware),
+            Some(104 * GIB_BYTES)
+        );
+        for (tp, expected_gib) in [(1, 24), (2, 48)] {
+            let mut pool =
+                provider_memory_pool(&hardware, &hardware.backend_verdicts[0], "vllm", None);
+            scope_vllm_execution_mode_memory_pool(&mut pool, &hardware, tp).unwrap();
+            assert_eq!(pool.total_bytes, expected_gib * GIB_BYTES);
+        }
+        hardware.gpus[0].memory_bytes = None;
+        assert_eq!(known_total_nvidia_vllm_memory_bytes(&hardware), None);
+        hardware.gpus.clear();
+        assert_eq!(known_total_nvidia_vllm_memory_bytes(&hardware), None);
     }
 
     #[test]
