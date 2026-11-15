@@ -65895,7 +65895,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         &args,
         "Reading admin catalog and canonical rooms from contract state",
     );
-    let contract = read_contract_catalog(&rpc).await?;
+    let contract = gateway_catalog::read_provider_start_catalog(&rpc).await?;
     let provider_catalog = resolve_provider_start_catalog(&args, &home, &rpc, &rpc_url).await?;
 
     let requested_enclave = args.enclave.clone();
@@ -65978,6 +65978,7 @@ async fn provider_start(mut args: ProviderStartArgs) -> Result<()> {
         );
     }
     let rooms = select_provider_rooms(&contract.rooms, &selected.enclave, &args.rooms)?;
+    drop(contract);
     let configured_protection_config =
         ProviderProtectionConfig::from_provider_args(&args, &selected)?;
     if rooms.is_empty() {
@@ -117322,6 +117323,20 @@ esac
 
     #[tokio::test]
     async fn gateway_current_catalog_avoids_historical_prefixes_and_preserves_routes() {
+        assert_current_catalog_reads(false, false).await;
+    }
+
+    #[tokio::test]
+    async fn provider_start_current_catalog_omits_history_and_preserves_pending_brackets() {
+        assert_current_catalog_reads(true, false).await;
+    }
+
+    #[tokio::test]
+    async fn provider_start_current_catalog_rejects_mismatched_price_identity() {
+        assert_current_catalog_reads(true, true).await;
+    }
+
+    async fn assert_current_catalog_reads(provider_start: bool, wrong_price_identity: bool) {
         use std::net::TcpListener;
         use std::thread;
         let mut source = test_contract(&"aa".repeat(32));
@@ -117329,7 +117344,10 @@ esac
         let provider = source.providers[0].provider.clone();
         let revision = "ab".repeat(32);
         source.providers[0].accepted_rails = vec!["tnk".to_owned()];
-        source.active_payout_revisions = BTreeMap::from([(provider.clone(), BTreeMap::from([("tnk".to_owned(), revision.clone())]))]);
+        source.active_payout_revisions = BTreeMap::from([(
+            provider.clone(),
+            BTreeMap::from([("tnk".to_owned(), revision.clone())]),
+        )]);
         let old = json!({"epoch":5,"price_ver":1,"enclave_id":enclave,
             "ctx_bracket":source.prices[0].ctx_bracket,"model_id":source.enclaves[0].model_id});
         let fresh = json!({"epoch":6,"price_ver":2,"enclave_id":enclave,
@@ -117338,53 +117356,163 @@ esac
         let mut history = gateway_catalog::PriceHistory::from_catalog(&source);
         source.price_derivations.push(fresh.clone());
         source.prices[0].current.as_mut().unwrap().ver = 2;
+        if provider_start {
+            let mut pending_table = source.ctx_bracket_schedule.current.clone();
+            pending_table.ver += 1;
+            pending_table.effective_at = 200;
+            pending_table.brackets[0].id = "pending-small".to_owned();
+            let mut pending_market = source.prices[0].clone();
+            pending_market.ctx_bracket = Some("pending-small".to_owned());
+            pending_market.ctx_bracket_table_ver = Some(pending_table.ver);
+            let current = pending_market.current.as_mut().unwrap();
+            current.ctx_bracket = pending_market.ctx_bracket.clone();
+            current.ctx_bracket_table_ver = Some(pending_table.ver);
+            source.prices.push(pending_market);
+            source.ctx_bracket_schedule.pending = Some(pending_table);
+            let mut pending_price = source.prices[0].current.clone().unwrap();
+            pending_price.ver = 9;
+            pending_price.effective_at = 200;
+            source.prices[0].pending = Some(pending_price);
+            let mut modality = source.enclaves[0].clone();
+            modality.enclave_id = "bc".repeat(32);
+            modality.model_id = "test/decision".to_owned();
+            modality.model_class = "decision".to_owned();
+            let mut modality_price = source.prices[0].clone();
+            modality_price.enclave_id = modality.enclave_id.clone();
+            modality_price.model_id = modality.model_id.clone();
+            modality_price.ctx_bracket = None;
+            modality_price.ctx_bracket_table_ver = None;
+            modality_price.pending = None;
+            modality_price.current.as_mut().unwrap().ctx_bracket = None;
+            modality_price
+                .current
+                .as_mut()
+                .unwrap()
+                .ctx_bracket_table_ver = None;
+            source.enclaves.push(modality);
+            source.prices.push(modality_price);
+        }
         let mut records = BTreeMap::<String, Value>::new();
-        for item in &source.enclaves { records.insert(format!("enclave/{}",item.enclave_id),serde_json::to_value(item).unwrap()); }
-        for item in &source.rooms { records.insert(format!("room/{}",item.room_id),serde_json::to_value(item).unwrap()); }
-        for item in &source.roomserve { records.insert(format!("roomserve/{}/{}/{}",item.room_id,item.provider,item.enclave_id),serde_json::to_value(item).unwrap()); }
-        for item in &source.serves { records.insert(format!("serve/{}/{}",item.provider,item.enclave_id),serde_json::to_value(item).unwrap()); }
-        for item in &source.providers { records.insert(format!("prov/{}",item.provider),serde_json::to_value(item).unwrap()); }
-        for item in &source.prices { records.insert(format!("price/{}",ledger_price_market_key(&item.enclave_id,item.ctx_bracket.as_deref())),serde_json::to_value(item).unwrap()); }
-        records.insert("ctx_brackets".to_owned(),serde_json::to_value(&source.ctx_bracket_schedule).unwrap());
-        records.insert("rules/current".to_owned(),serde_json::to_value(source.rules.as_ref().unwrap()).unwrap());
-        records.insert("epoch/apply/state".to_owned(),json!({"updated_epoch":6}));
-        records.insert(format!("payout/current/tnk/{provider}"),json!({"current_revision":revision}));
-        records.insert(format!("payout/binding/tnk/{provider}/{revision}"),json!({"provider":provider,
-            "rail":"tnk","revision":revision,"verified":true,"activation_epoch":1}));
-        let market = ledger_price_market_key(&enclave,source.prices[0].ctx_bracket.as_deref());
-        records.insert(format!("ev/price/5/{market}"),old);
-        records.insert(format!("ev/price/6/{market}"),fresh);
+        for item in &source.enclaves {
+            records.insert(
+                format!("enclave/{}", item.enclave_id),
+                serde_json::to_value(item).unwrap(),
+            );
+        }
+        for item in &source.rooms {
+            records.insert(
+                format!("room/{}", item.room_id),
+                serde_json::to_value(item).unwrap(),
+            );
+        }
+        for item in &source.roomserve {
+            records.insert(
+                format!(
+                    "roomserve/{}/{}/{}",
+                    item.room_id, item.provider, item.enclave_id
+                ),
+                serde_json::to_value(item).unwrap(),
+            );
+        }
+        for item in &source.serves {
+            records.insert(
+                format!("serve/{}/{}", item.provider, item.enclave_id),
+                serde_json::to_value(item).unwrap(),
+            );
+        }
+        for item in &source.providers {
+            records.insert(
+                format!("prov/{}", item.provider),
+                serde_json::to_value(item).unwrap(),
+            );
+        }
+        for item in &source.prices {
+            records.insert(
+                format!(
+                    "price/{}",
+                    ledger_price_market_key(&item.enclave_id, item.ctx_bracket.as_deref())
+                ),
+                serde_json::to_value(item).unwrap(),
+            );
+        }
+        records.insert(
+            "ctx_brackets".to_owned(),
+            serde_json::to_value(&source.ctx_bracket_schedule).unwrap(),
+        );
+        records.insert(
+            "rules/current".to_owned(),
+            serde_json::to_value(source.rules.as_ref().unwrap()).unwrap(),
+        );
+        records.insert("epoch/apply/state".to_owned(), json!({"updated_epoch":6}));
+        records.insert(
+            format!("payout/current/tnk/{provider}"),
+            json!({"current_revision":revision}),
+        );
+        records.insert(
+            format!("payout/binding/tnk/{provider}/{revision}"),
+            json!({"provider":provider,
+            "rail":"tnk","revision":revision,"verified":true,"activation_epoch":1}),
+        );
+        let market = ledger_price_market_key(&enclave, source.prices[0].ctx_bracket.as_deref());
+        if wrong_price_identity {
+            records.get_mut(&format!("price/{market}")).unwrap()["model_id"] = json!("wrong/model");
+        }
+        records.insert(format!("ev/price/5/{market}"), old);
+        records.insert(format!("ev/price/6/{market}"), fresh);
         // These entries must not be visited. A larger ledger does not change
         // the live reader's request count or returned current price.
         for n in 0..10_000 {
-            records.insert(format!("price/{market}/v/{n}"),json!({"historical":n}));
-            records.insert(format!("ev/price/0/{n}"),json!({"historical":n}));
+            records.insert(format!("price/{market}/v/{n}"), json!({"historical":n}));
+            records.insert(format!("ev/price/0/{n}"), json!({"historical":n}));
         }
         let seen = Arc::new(Mutex::new(Vec::<String>::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
-        let server_seen = seen.clone(); let server_stop = stop.clone();
+        let server_seen = seen.clone();
+        let server_stop = stop.clone();
         let server = thread::spawn(move || {
-            let deadline = Instant::now()+Duration::from_secs(20);
-            while !server_stop.load(Ordering::Acquire) && Instant::now()<deadline {
-                let (mut stream,_) = match listener.accept() {
-                    Ok(value)=>value, Err(error) if error.kind()==std::io::ErrorKind::WouldBlock => {thread::sleep(Duration::from_millis(1));continue},
-                    Err(error)=>panic!("{error}"),
+            let deadline = Instant::now() + Duration::from_secs(20);
+            while !server_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+                let (mut stream, _) = match listener.accept() {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(1));
+                        continue;
+                    }
+                    Err(error) => panic!("{error}"),
                 };
-                stream.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-                let mut bytes=Vec::new();
+                stream.set_nonblocking(false).unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut bytes = Vec::new();
                 loop {
-                    let mut chunk=[0u8;4096];let n=stream.read(&mut chunk).unwrap();assert!(n>0);bytes.extend_from_slice(&chunk[..n]);
-                    if bytes.windows(4).any(|part|part==b"\r\n\r\n"){break}
+                    let mut chunk = [0u8; 4096];
+                    let n = stream.read(&mut chunk).unwrap();
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if bytes.windows(4).any(|part| part == b"\r\n\r\n") {
+                        break;
+                    }
                 }
-                let line=String::from_utf8(bytes).unwrap();
-                let url=reqwest::Url::parse(&format!("http://{address}{}",line.split_whitespace().nth(1).unwrap())).unwrap();
-                let query=url.query_pairs().collect::<BTreeMap<_,_>>();
-                assert_eq!(query.get("confirmed").map(|s|s.as_ref()),Some("true"));
+                if bytes.is_empty() {
+                    continue; // A failed parallel price read can cancel queued connections.
+                }
+                let line = String::from_utf8(bytes).unwrap();
+                let url = reqwest::Url::parse(&format!(
+                    "http://{address}{}",
+                    line.split_whitespace().nth(1).unwrap()
+                ))
+                .unwrap();
+                let query = url.query_pairs().collect::<BTreeMap<_, _>>();
+                assert_eq!(query.get("confirmed").map(|s| s.as_ref()), Some("true"));
                 let body=if let Some(prefix)=query.get("prefix") {
                     assert!(!matches!(prefix.as_ref(),"price/"|"ev/price/"),"must not scan historical versions");
+                    assert!(!provider_start || !prefix.starts_with("ev/price/"), "provider startup must not read chart history");
                     server_seen.lock().unwrap().push(prefix.to_string());
                     if prefix.as_ref()!="rules/current" {assert_eq!(query.get("signed_length").map(|s|s.as_ref()),Some("42"));}
                     let values=records.iter().filter(|(key,_)|key.starts_with(prefix.as_ref()))
@@ -117400,17 +117528,99 @@ esac
                 stream.flush().unwrap();
             }
         });
-        let rpc=PeerRpcClient::new(format!("http://{address}/v1")).unwrap();
-        let result=gateway_catalog::read_current_catalog(&rpc,&mut history).await;
-        stop.store(true,Ordering::Release);server.join().unwrap();
-        let actual=result.unwrap();
-        assert_eq!(serde_json::to_value(gateway_models_from_contract(&actual).unwrap()).unwrap(),
-            serde_json::to_value(gateway_models_from_contract(&source).unwrap()).unwrap());
-        assert_eq!(actual.active_payout_revisions,source.active_payout_revisions);
-        let seen=seen.lock().unwrap();assert!(seen.len()<50,"bounded reads: {}",seen.len());
+        let rpc = PeerRpcClient::new(format!("http://{address}/v1")).unwrap();
+        let result = if provider_start {
+            gateway_catalog::read_provider_start_catalog(&rpc).await
+        } else {
+            gateway_catalog::read_current_catalog(&rpc, &mut history).await
+        };
+        stop.store(true, Ordering::Release);
+        server.join().unwrap();
+        if wrong_price_identity {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("current price identity"));
+            return;
+        }
+        let actual = result.unwrap();
+        if provider_start {
+            assert!(actual.price_derivations.is_empty());
+            assert_eq!(actual.ctx_bracket_schedule, source.ctx_bracket_schedule);
+            assert_eq!(actual.active_billing_epoch, source.active_billing_epoch);
+            let prices = |catalog: &ContractCatalog| {
+                catalog
+                    .prices
+                    .iter()
+                    .map(|price| {
+                        (
+                            ledger_price_market_key(
+                                &price.enclave_id,
+                                price.ctx_bracket.as_deref(),
+                            ),
+                            serde_json::to_value(price).unwrap(),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            };
+            assert_eq!(prices(&actual), prices(&source));
+            let selected_price = actual
+                .prices
+                .iter()
+                .find(|price| price.ctx_bracket == source.prices[0].ctx_bracket)
+                .unwrap();
+            assert_eq!(active_au_usd_price_at(selected_price, 199).unwrap().ver, 2);
+            assert_eq!(active_au_usd_price_at(selected_price, 200).unwrap().ver, 9);
+            assert_eq!(
+                ctx_bracket_table_at(&actual.ctx_bracket_schedule, 199).ver,
+                source.ctx_bracket_schedule.current.ver
+            );
+            assert_eq!(
+                ctx_bracket_table_at(&actual.ctx_bracket_schedule, 200).ver,
+                source.ctx_bracket_schedule.pending.as_ref().unwrap().ver
+            );
+            assert_eq!(
+                select_provider_rooms(
+                    &actual.rooms,
+                    actual
+                        .enclaves
+                        .iter()
+                        .find(|row| row.enclave_id == enclave)
+                        .unwrap(),
+                    "auto",
+                )
+                .unwrap()
+                .len(),
+                1
+            );
+            let seen = seen.lock().unwrap();
+            assert!(seen.len() < 50, "bounded reads: {}", seen.len());
+            assert!(seen.contains(&format!("price/{market}")));
+            assert!(seen.contains(&format!("price/{enclave}/pending-small")));
+            assert!(seen.contains(&format!("price/{}", "bc".repeat(32))));
+            assert!(!seen
+                .iter()
+                .any(|key| key == "price/" || key.starts_with("ev/price/") || key.contains("/v/")));
+            assert_eq!(
+                actual.active_payout_revisions,
+                source.active_payout_revisions
+            );
+            return;
+        }
+        assert_eq!(
+            serde_json::to_value(gateway_models_from_contract(&actual).unwrap()).unwrap(),
+            serde_json::to_value(gateway_models_from_contract(&source).unwrap()).unwrap()
+        );
+        assert_eq!(
+            actual.active_payout_revisions,
+            source.active_payout_revisions
+        );
+        let seen = seen.lock().unwrap();
+        assert!(seen.len() < 50, "bounded reads: {}", seen.len());
         assert!(seen.contains(&format!("price/{market}")));
-        assert!(seen.contains(&"ev/price/5/".to_owned()));assert!(seen.contains(&"ev/price/6/".to_owned()));
-        assert!(!seen.iter().any(|key|key.contains("/v/")));
+        assert!(seen.contains(&"ev/price/5/".to_owned()));
+        assert!(seen.contains(&"ev/price/6/".to_owned()));
+        assert!(!seen.iter().any(|key| key.contains("/v/")));
     }
 
     #[test]

@@ -113,6 +113,18 @@ pub(super) async fn read_current_catalog(
     rpc: &PeerRpcClient,
     history: &mut PriceHistory,
 ) -> Result<ContractCatalog> {
+    read_current_catalog_inner(rpc, Some(history)).await
+}
+
+/// Provider startup needs current admission records, never chart history.
+pub(super) async fn read_provider_start_catalog(rpc: &PeerRpcClient) -> Result<ContractCatalog> {
+    read_current_catalog_inner(rpc, None).await
+}
+
+async fn read_current_catalog_inner(
+    rpc: &PeerRpcClient,
+    history: Option<&mut PriceHistory>,
+) -> Result<ContractCatalog> {
     let length = confirmed_snapshot_signed_length(rpc, "rules/current").await?;
     let (enclaves, table, epoch, rules) = tokio::try_join!(
         records::<LedgerEnclave>(rpc, "enclave/", length, |tail| !tail.contains('/')),
@@ -128,10 +140,12 @@ pub(super) async fn read_current_catalog(
     validate_ctx_bracket_schedule(&ctx_bracket_schedule).map_err(anyhow::Error::msg)?;
     let active_billing_epoch = active_billing_epoch_from_state(epoch.as_ref())?;
     let applied_epoch = active_billing_epoch.saturating_sub(1);
-    ensure!(
-        applied_epoch >= history.through_epoch,
-        "confirmed catalog epoch moved behind retained price history"
-    );
+    if let Some(history) = history.as_ref() {
+        ensure!(
+            applied_epoch >= history.through_epoch,
+            "confirmed catalog epoch moved behind retained price history"
+        );
+    }
     let rules = rules
         .map(serde_json::from_value)
         .transpose()
@@ -190,28 +204,33 @@ pub(super) async fn read_current_catalog(
             .contains('/')),
         read_active_provider_payout_revisions_at(rpc, active_billing_epoch, Some(length)),
     )?;
-    // Refresh the current epoch too: a previous observation can precede its
-    // price evidence. Commit the cache only after every snapshot read succeeds.
-    let mut next = history.clone();
-    let first = history
-        .through_epoch
-        .max(applied_epoch.saturating_sub(HISTORY_PER_MARKET as u64 - 1));
-    for epoch in first..=applied_epoch {
-        let prefix = format!("ev/price/{epoch}/");
-        let entries = read_prefix_entries_at(rpc, &prefix, Some(length)).await?.1;
-        next.insert(entries.into_iter().map(|entry| entry.value));
-    }
-    next.through_epoch = applied_epoch;
-    // Retired enclave histories are not retained forever in the live reader.
-    let active: BTreeSet<_> = enclaves
-        .iter()
-        .filter(|enclave| enclave.status == "active")
-        .map(|enclave| enclave.enclave_id.as_str())
-        .collect();
-    next.markets
-        .retain(|key, _| active.contains(key.split('/').next().unwrap_or_default()));
-    let price_derivations = next.rows();
-    *history = next;
+    let price_derivations = if let Some(history) = history {
+        // Refresh the current epoch too: a previous observation can precede its
+        // price evidence. Commit the cache only after every snapshot read succeeds.
+        let mut next = history.clone();
+        let first = history
+            .through_epoch
+            .max(applied_epoch.saturating_sub(HISTORY_PER_MARKET as u64 - 1));
+        for epoch in first..=applied_epoch {
+            let prefix = format!("ev/price/{epoch}/");
+            let entries = read_prefix_entries_at(rpc, &prefix, Some(length)).await?.1;
+            next.insert(entries.into_iter().map(|entry| entry.value));
+        }
+        next.through_epoch = applied_epoch;
+        // Retired enclave histories are not retained forever in the live reader.
+        let active: BTreeSet<_> = enclaves
+            .iter()
+            .filter(|enclave| enclave.status == "active")
+            .map(|enclave| enclave.enclave_id.as_str())
+            .collect();
+        next.markets
+            .retain(|key, _| active.contains(key.split('/').next().unwrap_or_default()));
+        let rows = next.rows();
+        *history = next;
+        rows
+    } else {
+        Vec::new()
+    };
     Ok(ContractCatalog {
         enclaves,
         rooms,
