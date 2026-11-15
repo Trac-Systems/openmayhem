@@ -64857,7 +64857,12 @@ fn provider_backend_runtime_child_env(
         "transformers-asr" => {
             insert_path("MAYHEM_TRANSFORMERS_ASR_PYTHON", runtime.python.as_deref());
         }
-        "laya" => insert_path("MAYHEM_LAYA_PYTHON", runtime.python.as_deref()),
+        "laya" => {
+            insert_path("MAYHEM_LAYA_PYTHON", runtime.python.as_deref());
+            if let Ok(value) = env::var("MAYHEM_ENGINE_INHERITED_CGROUP") {
+                child_env.insert("MAYHEM_ENGINE_INHERITED_CGROUP".to_owned(), value);
+            }
+        }
         "stable-diffusion.cpp" => {
             insert_path(
                 "MAYHEM_STABLE_DIFFUSION_CPP_BIN",
@@ -90340,6 +90345,33 @@ fn provider_workflow_artifact_covers_audio(artifact: &ProviderSessionArtifact) -
     artifact.content_type == "video/mp4" && video_av_fingerprint(&artifact.bytes).is_ok()
 }
 
+fn provider_inherited_cgroup_address_space_limit(
+    backend: &str,
+    memory: &ProviderMemoryBudget,
+    setting: Option<&str>,
+) -> Result<Option<u64>> {
+    match setting {
+        None | Some("0") => return Ok(None),
+        Some("1") => {}
+        _ => bail!("MAYHEM_ENGINE_INHERITED_CGROUP must be 0 or 1"),
+    }
+    ensure!(
+        backend == "laya",
+        "inherited cgroup containment is currently supported only for Laya"
+    );
+    let address_limit = memory.worker_address_space_limit_bytes;
+    ensure!(
+        address_limit >= 1024
+            && address_limit <= i64::MAX as u64
+            && memory.worker_limit_bytes > 0
+            && address_limit / 1024 * 1024 >= memory.worker_limit_bytes,
+        "inherited cgroup containment requires admitted physical and finite address-space budgets"
+    );
+    // This does not alter admission, reserve, pending claims, or signed caps.
+    // The engine must verify a finite inherited kernel cap before launching.
+    Ok(Some(address_limit))
+}
+
 fn provider_engine_load_config(
     args: &ProviderStartArgs,
     selected: &ProviderCandidate,
@@ -90461,6 +90493,17 @@ fn provider_engine_load_config(
     };
     config.memory_limit_bytes = (selected.feasibility.memory_budget.worker_limit_bytes > 0)
         .then_some(selected.feasibility.memory_budget.worker_limit_bytes);
+    let inherited_cgroup_setting = match env::var("MAYHEM_ENGINE_INHERITED_CGROUP") {
+        Ok(value) => Some(value),
+        Err(env::VarError::NotPresent) => None,
+        Err(error) => return Err(error).context("reading MAYHEM_ENGINE_INHERITED_CGROUP"),
+    };
+    config.inherited_cgroup_address_space_limit_bytes =
+        provider_inherited_cgroup_address_space_limit(
+            &selected.artifact.engine,
+            &selected.feasibility.memory_budget,
+            inherited_cgroup_setting.as_deref(),
+        )?;
     config.backend_cache_dir = backend_runtime.cache_dir.clone();
     config.stable_diffusion_backend = backend_runtime.stable_diffusion_backend.clone();
     if selected.artifact.engine == "comfyui" {
@@ -111667,6 +111710,54 @@ status: linked
         model.canary.verification_method = CANARY_VERIFICATION_TOKEN_FINGERPRINT.to_owned();
 
         preflight_calibration_prompt_resources(&model, &document.prompts).unwrap();
+    }
+
+    #[test]
+    fn inherited_cgroup_opt_in_preserves_laya_physical_admission_and_reserve() {
+        let mut hardware = test_hardware(FixtureProfile::LinuxNvidia);
+        hardware.memory.total_bytes = 120 * GIB_BYTES;
+        hardware.memory.available_bytes = Some(38 * GIB_BYTES);
+        for gpu in &mut hardware.gpus {
+            gpu.unified_memory = true;
+        }
+        let mut selected = test_auto_fit_candidate('a', "test/laya", "laya", 1, 2, 1, 30.0);
+        selected.enclave.backend = "laya".to_owned();
+        selected.verdict.backend = "laya".to_owned();
+        selected.verdict.n_layers_gpu = None;
+        let mut args = test_provider_start_args();
+        args.memory_reserve = Some("24GB".to_owned());
+        let budget =
+            provider_memory_budget(&hardware, &selected.verdict, &selected.enclave, &args).unwrap();
+        assert_eq!(budget.reserve_bytes, 24 * GIB_BYTES);
+        assert_eq!(budget.worker_limit_bytes, 14 * GIB_BYTES);
+        assert_eq!(budget.worker_address_space_limit_bytes, 96 * GIB_BYTES);
+        let before = serde_json::to_value(&budget).unwrap();
+        assert_eq!(
+            provider_inherited_cgroup_address_space_limit("laya", &budget, Some("1")).unwrap(),
+            Some(96 * GIB_BYTES)
+        );
+        assert_eq!(serde_json::to_value(&budget).unwrap(), before);
+        for backend in ["laya", "vllm", "comfyui", "llama.cpp"] {
+            for setting in [None, Some("0")] {
+                assert_eq!(
+                    provider_inherited_cgroup_address_space_limit(backend, &budget, setting)
+                        .unwrap(),
+                    None
+                );
+            }
+        }
+        assert!(provider_inherited_cgroup_address_space_limit("vllm", &budget, Some("1")).is_err());
+        for setting in ["", "true", "yes", "2"] {
+            assert!(
+                provider_inherited_cgroup_address_space_limit("laya", &budget, Some(setting))
+                    .is_err()
+            );
+        }
+        let mut exhausted = budget;
+        exhausted.worker_limit_bytes = 0;
+        assert!(
+            provider_inherited_cgroup_address_space_limit("laya", &exhausted, Some("1")).is_err()
+        );
     }
 
     #[test]

@@ -15,6 +15,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+#[cfg(feature = "laya")]
+mod inherited_containment;
 mod openai_compatible;
 pub use openai_compatible::{
     OpenAiCompatibleBackend, OpenAiCompatibleBackendConfig, OpenAiCompatibleLifecycle,
@@ -586,6 +588,10 @@ pub struct LoadConfig {
     pub use_mlock: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memory_limit_bytes: Option<u64>,
+    /// Require an inherited finite cgroup-v2 RAM cap within memory_limit_bytes,
+    /// while allowing this separate finite virtual-address envelope (Laya only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_cgroup_address_space_limit_bytes: Option<u64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -744,6 +750,7 @@ impl Default for LoadConfig {
             use_mmap: true,
             use_mlock: false,
             memory_limit_bytes: None,
+            inherited_cgroup_address_space_limit_bytes: None,
         }
     }
 }
@@ -2415,6 +2422,23 @@ fn validate_load_config(config: &LoadConfig) -> Result<()> {
                 .to_owned(),
         ));
     }
+    if let Some(address_limit) = config.inherited_cgroup_address_space_limit_bytes {
+        if config.artifact.format != ArtifactFormat::LayaSafetensors {
+            return Err(EngineError::InvalidConfig(
+                "inherited cgroup containment is currently supported only for Laya".to_owned(),
+            ));
+        }
+        if address_limit < 1024
+            || address_limit > i64::MAX as u64
+            || !config
+                .memory_limit_bytes
+                .is_some_and(|physical| physical > 0 && physical <= address_limit / 1024 * 1024)
+        {
+            return Err(EngineError::InvalidConfig(
+                "inherited cgroup containment requires a positive physical budget and a finite address-space limit at least as large".to_owned(),
+            ));
+        }
+    }
     let has_vllm_execution_properties = config.vllm_task != VllmTask::Generate
         || config.vllm_generation_topology.is_some()
         || config.vllm_worker_address_space_limit_bytes.is_some()
@@ -3697,6 +3721,7 @@ mod laya_backend {
             self.worker = Some(LayaWorker::spawn(
                 &self.python,
                 config.memory_limit_bytes,
+                config.inherited_cgroup_address_space_limit_bytes,
                 config.backend_cache_dir.as_deref(),
             )?);
             let root = laya_snapshot_dir(&config.artifact.path)?;
@@ -3797,6 +3822,7 @@ mod laya_backend {
             self.worker = Some(LayaWorker::spawn(
                 &self.python,
                 config.memory_limit_bytes,
+                config.inherited_cgroup_address_space_limit_bytes,
                 config.backend_cache_dir.as_deref(),
             )?);
             let root = laya_snapshot_dir(&config.artifact.path)?;
@@ -4451,9 +4477,22 @@ mod laya_backend {
         fn spawn(
             python: &Path,
             memory_limit_bytes: Option<u64>,
+            inherited_cgroup_address_space_limit_bytes: Option<u64>,
             cache_root: Option<&Path>,
         ) -> Result<Self> {
-            let mut command = engine_worker_command(python, memory_limit_bytes);
+            let mut command = match inherited_cgroup_address_space_limit_bytes {
+                Some(address_limit) => super::inherited_containment::worker_command(
+                    python,
+                    memory_limit_bytes.ok_or_else(|| {
+                        EngineError::InvalidConfig(
+                            "inherited cgroup containment requires a physical memory budget"
+                                .to_owned(),
+                        )
+                    })?,
+                    address_limit,
+                )?,
+                None => engine_worker_command(python, memory_limit_bytes),
+            };
             configure_worker_environment(&mut command, python, cache_root)?;
             command
                 .arg("-u")
@@ -15008,6 +15047,32 @@ mod trt_llm_backend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inherited_cgroup_config_is_explicit_and_laya_only() {
+        let mut config = LoadConfig::laya_safetensors("model.safetensors");
+        validate_load_config(&config).unwrap();
+        assert!(serde_json::to_value(&config)
+            .unwrap()
+            .get("inherited_cgroup_address_space_limit_bytes")
+            .is_none());
+        config.inherited_cgroup_address_space_limit_bytes = Some(96 << 30);
+        assert!(validate_load_config(&config).is_err());
+        config.memory_limit_bytes = Some(14 << 30);
+        validate_load_config(&config).unwrap();
+        for limit in [0, 1023, 13 << 30, u64::MAX] {
+            config.inherited_cgroup_address_space_limit_bytes = Some(limit);
+            assert!(validate_load_config(&config).is_err());
+        }
+        config.inherited_cgroup_address_space_limit_bytes = Some(96 << 30);
+        config.artifact = ModelArtifact::vllm_safetensors("model.safetensors");
+        assert!(validate_load_config(&config)
+            .unwrap_err()
+            .to_string()
+            .contains("only for Laya"));
+        config.inherited_cgroup_address_space_limit_bytes = None;
+        validate_load_config(&config).unwrap();
+    }
 
     #[test]
     fn windows_worker_containment_uses_a_valid_minimum_working_set() {
