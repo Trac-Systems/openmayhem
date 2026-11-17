@@ -19,4 +19,4 @@ NoNewPrivileges=true
 PrivateTmp=true
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=multi-user.target mayhem-stack.service

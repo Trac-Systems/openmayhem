@@ -40,6 +40,7 @@ for path in \
   "$repo/scripts/ops-settle-epoch.sh" \
   "$repo/scripts/ops-epoch-cadence.sh" \
   "$repo/scripts/mainnet-proof.mjs" \
+  "$repo/scripts/ops/systemd-service-inventory.py" \
   "$repo/scripts/ops/backup-mainnet.sh"; do
   [[ -f "$path" ]] || { echo "Missing required file: $path" >&2; exit 1; }
 done
@@ -469,6 +470,9 @@ install -d -m 0750 -o root -g root "$root/libexec"
 install -m 0750 -o root -g root \
   "$repo/scripts/ops/backup-mainnet.sh" \
   "$root/libexec/backup-mainnet.sh"
+install -m 0750 -o root -g root \
+  "$repo/scripts/ops/systemd-service-inventory.py" \
+  "$root/libexec/systemd-service-inventory.py"
 chown mayhem:mayhem "$systemd_env"
 
 install -m 0644 "$repo"/ops/systemd/mayhem-*.service /etc/systemd/system/

@@ -185,7 +185,7 @@ write_initial_state() {
   : >"$state_file"
   for unit in "${UNITS[@]}"; do
     state=inactive
-    if is_initially_active "$unit"; then
+    if is_initially_active "$unit" && [[ "$unit" != "${MAYHEM_MOCK_INITIAL_INACTIVE_UNIT:-}" ]]; then
       state=active
     fi
     printf '%s %s\n' "$unit" "$state" >>"$state_file"
@@ -277,6 +277,11 @@ grep -Fq -- '-C / opt/mayhem/.mayhem-local' "$CASE_LOG" ||
 [[ "$(grep -c '^stop mayhem-payout-worker.service$' "$CASE_LOG")" == "2" ]] ||
   fail "timer-triggered inactive payout worker was not returned to inactive"
 assert_original_state "$CASE_STATE"
+
+MAYHEM_MOCK_INITIAL_INACTIVE_UNIT=mayhem-tap-deposit.service run_case stopped-tap
+[[ "$CASE_STATUS" != "0" ]] || fail "stopped TAP watcher baseline was accepted"
+grep -q 'stopped TAP deposit watcher' "$CASE_STDERR" || fail "missing actionable TAP preflight error"
+! grep -Eq '^(stop|start|tar-copy) ' "$CASE_LOG" || fail "stopped TAP preflight mutated service state"
 
 run_case sticky MAYHEM_MOCK_STICKY_UNIT=mayhem-paygate.service
 [[ "$CASE_STATUS" != "0" ]] || fail "incomplete quiescence reported success"

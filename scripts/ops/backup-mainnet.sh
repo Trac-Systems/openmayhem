@@ -168,6 +168,22 @@ for unit in "${quiesced_units[@]}"; do
   initial_states+=("$unit_state")
 done
 
+# Restoring the stack can also start enabled workers through its Wants links.
+# Refuse this inconsistent/paused baseline before stopping anything, rather
+# than briefly running a payment watcher that the backup found stopped.
+tap_initial_state=""
+stack_initial_state=""
+for ((index = 0; index < ${#quiesced_units[@]}; index += 1)); do
+  case "${quiesced_units[index]}" in
+    mayhem-tap-deposit.service) tap_initial_state="${initial_states[index]}" ;;
+    mayhem-stack.service) stack_initial_state="${initial_states[index]}" ;;
+  esac
+done
+if [[ "$stack_initial_state" == active && "$tap_initial_state" != active ]]; then
+  echo "Refusing backup: the active stack has a stopped TAP deposit watcher. Restore the watcher, or quiesce the stack explicitly before backing up." >&2
+  exit 1
+fi
+
 restore_required=1
 for unit in "${quiesced_units[@]}"; do
   systemctl stop "$unit"
