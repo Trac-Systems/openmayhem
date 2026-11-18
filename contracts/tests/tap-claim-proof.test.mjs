@@ -9,13 +9,12 @@ import { claimProofForAccount } from '../scripts/tap-claim-proof.mjs';
 import {
   auToTapWei,
   providerShareWei,
-  rollTapSettlement,
 } from '../scripts/tap-settlement-roller.mjs';
 import {
   makeReceiptIdentity,
   signedTapReceipt,
-  targetedTapBindingsFor,
 } from './helpers/signed-receipt.mjs';
+import { claimSettlementInputs, postAndFinalizeClaimSettlement } from './helpers/tap-claim-settlement.mjs';
 
 const TAP_USD_AU = '1000000000000000000';
 const usdAu = (value) => (BigInt(value) * 1_000_000_000_000_000_000n).toString();
@@ -23,18 +22,19 @@ const U = (n) => ethers.parseUnits(String(n), 18);
 
 const receipt = signedTapReceipt;
 
-test('claim-proof returns provider proof that submits to MayhemInferencePool.claim()', async () => {
+test('claim-proof returns provider proof that submits to MayhemInferencePool.claim()', async (t) => {
   const ganache = Ganache.provider({
     logging: { quiet: true },
     chain: { chainId: 61_000 },
     wallet: { totalAccounts: 4 },
   });
-  const provider = new ethers.BrowserProvider(ganache);
+  t.after(() => ganache.disconnect());
+  const provider = new ethers.BrowserProvider(ganache, undefined, { cacheTimeout: -1 });
   const operator = await provider.getSigner(0);
   const buyer = await provider.getSigner(1);
   const providerA = await provider.getSigner(2);
   const providerAccount = await providerA.getAddress();
-  const { token, pool, poolAddr, governanceWallet } = await deployPool(operator);
+  const { token, pool, tokenAddr, poolAddr, governanceWallet } = await deployPool(operator);
 
   await (await token.mint(await buyer.getAddress(), U(3))).wait();
   await (await token.connect(buyer).approve(poolAddr, U(3))).wait();
@@ -44,24 +44,23 @@ test('claim-proof returns provider proof that submits to MayhemInferencePool.cla
   const providerId = makeReceiptIdentity();
   const bundle = {
     epoch: 1,
+    epoch_apply_hash: 'ab'.repeat(32),
+    params: { payout_min_au: usdAu(1), fee_bps: 1500, challenge_epochs: 6 },
     receipts: [receipt({ session: 's1', user: userId, provider: providerId, au: usdAu(2) })],
     buyer_refunds: [{ user: userId.publicKeyHex, refund_au: usdAu(1) }],
   };
   const providerAccounts = { [providerId.publicKeyHex]: providerAccount };
-  const rolled = await rollTapSettlement({
-    bundle,
-    providerAccounts,
-    targetedSessionBindings: targetedTapBindingsFor(bundle, providerAccounts),
+  const args = {
+    ...claimSettlementInputs({ bundle, providerAccounts, tapUsdAu: TAP_USD_AU, tokenAddr, poolAddr }),
     buyerAccounts: { [userId.publicKeyHex]: await buyer.getAddress() },
-    tapUsdAu: TAP_USD_AU,
-    ledgerFeeBps: 1500,
     settleThroughEpoch: 7,
     pool,
     ownerSigner: operator,
     governanceSigner: governanceWallet,
     operatorAddress: await operator.getAddress(),
     post: true,
-  });
+  };
+  const rolled = await postAndFinalizeClaimSettlement(provider, args);
   const expectedClaim = providerShareWei(auToTapWei(usdAu(2), TAP_USD_AU));
 
   const proof = await claimProofForAccount({
