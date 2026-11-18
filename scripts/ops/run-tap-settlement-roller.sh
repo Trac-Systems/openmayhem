@@ -58,6 +58,17 @@ node "$repo/scripts/mainnet-proof.mjs" \
 }
 mv "$spool/mainnet-proof.json.tmp" "$spool/mainnet-proof.json"
 
+# The bundle moves to processed last. A restart sees either the old complete
+# report or the new one, including the prior passed to the next dry-run.
+publish_json() {
+  install -m 600 "$1" "$2.tmp" && mv "$2.tmp" "$2"
+}
+
+verify_sweep() {
+  timeout "$attempt_timeout" node "$repo/contracts/scripts/verify-tap-sweep-report.mjs" \
+    "$bundle" "$1" "$peer_rpc" "$rate_lock" "$2"
+}
+
 while true; do
   bundle="$(find "$working" -maxdepth 1 -type f -name 'epoch-*.receipts.json' -print | sort -V | head -n 1)"
   if [[ -z "$bundle" ]]; then
@@ -129,6 +140,11 @@ while true; do
     sleep "$interval"
     continue
   fi
+  if ! verify_sweep "$dry_report" dry; then
+    echo "TAP dry-run sweep evidence failed for $name" >&2
+    sleep "$interval"
+    continue
+  fi
   if jq -e '
     .posted == false and
     .blocked != true and
@@ -138,7 +154,8 @@ while true; do
     .spent_au == "0" and
     (.checkpoint_outputs == []) and
     (.reason == "provider earnings await challenge or holdback maturity" or
-      .reason == "provider earnings are below payout minimum")
+      .reason == "provider earnings are below payout minimum" or
+      .reason == "no payable TAP liabilities on this page")
   ' "$dry_report" >/dev/null; then
     if ! python3 "$repo/scripts/ops/check-tap-carry-basis.py" "$dry_report" "$processed" "$bundle"; then
       echo "TAP carry has no matching finalized distribution for $name" >&2
@@ -167,7 +184,7 @@ if (
     or not isinstance(apply_hash, str)
     or not re.fullmatch(r"[0-9a-f]{64}", apply_hash)
     or not isinstance(receipts, list)
-    or not receipts
+    or (not receipts and "tap_liability_sweep" not in bundle)
 ):
     raise SystemExit("TAP carry bundle is missing exact rail/epoch/apply binding")
 held_count = report.get("held_receipt_count")
@@ -184,7 +201,8 @@ if (
     or not isinstance(threshold_count, int)
     or isinstance(threshold_count, bool)
     or threshold_count < 0
-    or held_count + threshold_count < 1
+    or (held_count + threshold_count < 1
+        and report.get("reason") != "no payable TAP liabilities on this page")
 ):
     raise SystemExit("TAP carry report has payable or unclassified work")
 held_au = uint(report.get("held_au"), "TAP held_au")
@@ -201,7 +219,9 @@ if (
     or not isinstance(minimum_lock, dict)
     or minimum_lock.get("type") != "tap_payout_minimum_lock"
     or minimum_lock.get("key") != "params/payout_min_au"
-    or minimum_lock.get("at") != rate_lock.get("rate_ts")
+    or minimum_lock.get("at") != (
+        report["tap_liability_sweep"]["at"] if "tap_liability_sweep" in bundle else rate_lock.get("rate_ts")
+    )
     or minimum_lock.get("value") != str(payout_min_au)
     or not isinstance(minimum_lock.get("signed_length"), int)
     or minimum_lock.get("signed_length") < 1
@@ -223,9 +243,9 @@ PY
       sleep "$interval"
       continue
     fi
-    install -m 600 "$bound_report" "$processed/$name.settlement.json"
+    publish_json "$bound_report" "$processed/$name.settlement.json"
     # latest.json always refers to the last finalized Ethereum distribution.
-    install -m 600 "$rate_lock" "$processed/$name.tap-rate.json"
+    publish_json "$rate_lock" "$processed/$name.tap-rate.json"
     mv "$bundle" "$processed/"
     [[ -f "$buyer_accounts" ]] && mv "$buyer_accounts" "$processed/"
     rm -f "$rate_lock" "$event_cursor" "$dry_report" "$raw_report" "$bound_report" "$final_report"
@@ -242,6 +262,11 @@ PY
   fi
   if ! timeout "$attempt_timeout" "${args[@]}" --confirm >"$raw_report"; then
     echo "TAP settlement broadcast failed for $name" >&2
+    sleep "$interval"
+    continue
+  fi
+  if ! verify_sweep "$raw_report" confirmed; then
+    echo "TAP settlement sweep evidence failed for $name" >&2
     sleep "$interval"
     continue
   fi
@@ -359,9 +384,9 @@ PY
     continue
   fi
 
-  install -m 600 "$final_report" "$processed/$name.settlement.json"
-  install -m 600 "$final_report" "$processed/latest.json"
-  install -m 600 "$rate_lock" "$processed/$name.tap-rate.json"
+  publish_json "$final_report" "$processed/$name.settlement.json"
+  publish_json "$final_report" "$processed/latest.json"
+  publish_json "$rate_lock" "$processed/$name.tap-rate.json"
   [[ ! -f "$event_cursor" ]] || mv "$event_cursor" "$processed/"
   mv "$bundle" "$processed/"
   [[ -f "$buyer_accounts" ]] && mv "$buyer_accounts" "$processed/"

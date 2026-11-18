@@ -13,6 +13,7 @@ import { ethers } from 'ethers';
 import b4a from '../../intercom/node_modules/b4a/index.js';
 import PeerWallet from '../../intercom/node_modules/trac-wallet/index.js';
 import { receiptMessage as contractReceiptMessage } from '../../intercom/contract/contract.js';
+import { stableJson } from '../../intercom/scripts/recompute-epoch-roots.mjs';
 
 import { deployPool } from '../scripts/deploy-local.mjs';
 import { distribution } from '../scripts/merkle.mjs';
@@ -20,6 +21,7 @@ import { signRootProposal } from '../scripts/pool-governance.mjs';
 import {
   buildCanonicalTapPreparationPlan,
   buildTapSettlement,
+  buildVerifiedTapSettlement,
   connectTapSettlementPool,
   encodeBurnCalldata,
   encodeWithdrawOperatorCalldata,
@@ -1017,6 +1019,284 @@ test('held earnings after a finalized root advance without replacing claims or p
     assert.equal(refused.blocked, true);
     assert.equal(refused.carried_root, undefined);
   }
+});
+
+const sweepPool = '0xcfea9a256f1f96269d848cabf1ecb00fd2dd6a28';
+const sweepToken = '0x5e7f6e008c6d9d7ad4c7eb75bd4ce62864cc7454';
+const sweepTarget = '0x' + '32'.repeat(20);
+const sweepRow = {
+  type: 'provider_payout_liability', provider: '23'.repeat(32), rail: 'tap',
+  revision: '13'.repeat(32), target: sweepTarget, currency: null, chain_id: 1,
+  total_au: '101', held_au: '101', paid_cum_au: '0', updated_epoch: 1,
+  holdbacks: [{ epoch: 1, au: '101', locked_epochs: 3 }],
+};
+const sweepKey = row => `payout/liability/tap/${row.provider}/${row.revision}`;
+
+// Serve the real snapshot resolver from immutable fixture values. Every read
+// is pinned, including the prefix page and its exclusive continuation cursor.
+function sweepFixture(epoch, { rows = [sweepRow], receipts = [], after = null, limit = 2 } = {}) {
+  const at = epoch * 3600;
+  const pointer = { schema_version: 1, signed_length: epoch + 100, after };
+  const bundle = { epoch, rail: 'tap', at, receipts, params: { payout_min_au: '1', fee_bps: 1500 },
+    tap_liability_sweep: pointer };
+  const lock = checkpointArgs(bundle, sweepPool, sweepToken);
+  const bind = () => {
+    lock.tapRateLock.bundle_sha256 = crypto.createHash('sha256').update(stableJson(bundle)).digest('hex');
+  };
+  bind();
+  lock.tapRateLock.chain_id = 1;
+  lock.tapRateLock.tap_usd_au = (2n * BigInt(TAP_USD_AU)).toString();
+  const admin = 'aa'.repeat(32);
+  const param = (key, value) => ({ key, current: { value, ver: 1, effective_at: 0 }, pending: null });
+  const state = new Map([
+    ['admin', admin],
+    ['payments/current', { set_by: admin, set_by_role: 'admin', ver: 1, denom: 'au_usd', rails: ['tap'],
+      tnk: { network: 'mainnet' }, tap: { chain_id: 1, token_address: sweepToken, pool_address: sweepPool } }],
+    ['epoch/apply/state', { updated_epoch: epoch, last_apply_hash: bundle.epoch_apply_hash,
+      last_settlement_unix: at, updated_at: 'fixture' }],
+    [`epoch/apply-anchor/${epoch}`, { type: 'epoch_apply_anchor', epoch, apply_hash: bundle.epoch_apply_hash,
+      settlement_unix: at, applied_at: 'fixture' }],
+    ['params/payout_min_au', param('payout_min_au', '1')],
+    ['params/max_tap_settlement_outputs', param('max_tap_settlement_outputs', limit)],
+  ]);
+  for (const row of rows) {
+    const { provider, revision, target } = row;
+    state.set(sweepKey(row), row);
+    state.set(`payout/binding/tap/${provider}/${revision}`, { type: 'provider_payout_binding',
+      provider, revision, target, rail: 'tap', verified: true, currency: null, chain_id: 1,
+      network: 'mainnet', activation_epoch: 1, payment_config_version: 1 });
+    state.set(`prov/${provider}`, { provider, status: 'active' });
+    const earningKey = `earn/tap/${provider}`;
+    const earning = state.get(earningKey) ?? { provider, denom: 'au_usd', rail: 'tap',
+      pool_address: sweepPool, chain_id: 1, updated_epoch: 1, total_au: '0', held_au: '0', paid_cum_au: '0' };
+    for (const key of ['total_au', 'held_au', 'paid_cum_au']) {
+      earning[key] = String(BigInt(earning[key]) + BigInt(row[key]));
+    }
+    earning.holdbacks = earning.held_au === '0' ? [] : [{ epoch: 1, au: earning.held_au, locked_epochs: 3 }];
+    state.set(earningKey, earning);
+  }
+  const fetchImpl = async url => {
+    assert.equal(url.origin, 'http://fixture.invalid');
+    const q = url.searchParams;
+    assert.equal(q.get('confirmed'), 'true');
+    assert.equal(q.get('signed_length'), String(pointer.signed_length));
+    let result;
+    if (q.has('key')) {
+      const key = q.get('key');
+      result = { key, value: state.get(key) ?? null };
+    } else {
+      assert.equal(q.get('prefix'), 'payout/liability/tap/');
+      assert.equal(q.get('after'), after);
+      assert.equal(Number(q.get('limit')), limit);
+      const keys = [...state.keys()].filter(key => key.startsWith(q.get('prefix')) && (after === null || key > after)).sort();
+      const truncated = keys.length > limit;
+      result = { prefix: q.get('prefix'), values: keys.slice(0, limit).map(key => ({ key, value: state.get(key) })),
+        truncated, next_cursor: truncated ? keys[limit - 1] : null };
+    }
+    return { ok: true, json: async () => structuredClone({ ...result, confirmed: true, signed_length: pointer.signed_length }) };
+  };
+  const args = { bundle, ...lock, fetchImpl, peerRpcUrl: 'http://fixture.invalid', targetedSessionBindings: {},
+    canonicalLiabilities: [], tapUsdAu: lock.tapRateLock.tap_usd_au, settleThroughEpoch: epoch, post: false };
+  return { args, bind, state };
+}
+
+test('TAP sweep pays unchanged held storage in a later receiptless epoch and replays the same preparation', async () => {
+  const initial = structuredClone(sweepRow);
+  const early = await rollTapSettlement(sweepFixture(2).args);
+  assert.equal(early.reason, 'no payable TAP liabilities on this page');
+  assert.equal(early.posted, false);
+  assert.equal(early.spent_au, '0');
+  assert.deepEqual(early.checkpoint_outputs, []);
+  assert.equal(early.tap_liability_sweep.eligible_count, 0);
+
+  const { args } = sweepFixture(4);
+  const report = await rollTapSettlement({ ...args, prior: early });
+  const metadata = { schema_version: 1, signed_length: 104, after: null, next_after: null, eligible_count: 1, at: 14400 };
+  assert.deepEqual(report.tap_liability_sweep, metadata);
+  assert.equal(report.receipt_count, 0);
+  assert.deepEqual(report.payout_bindings, []);
+  assert.deepEqual(sweepRow, initial);
+  assert.equal(report.spent_au, '101');
+  assert.deepEqual(report.checkpoint_outputs.map(out => [out.payout_revision, out.held_au, out.tap_wei]),
+    [[sweepRow.revision, '0', '50']]);
+  assert.equal(report.cumulative_spent_wei, '67');
+  assert.deepEqual([report.screen.provider_cap_wei, report.screen.operator_cap_wei, report.screen.burn_cap_wei],
+    ['50', '10', '7']);
+
+  // Observe a pre-existing pending proposal, then its posted event, entirely
+  // through read-only pool fixtures. A replay cannot propose or add spend.
+  let posted = false, depth = 0;
+  const pool = {
+    getAddress: async () => sweepPool, merkleRoot: async () => posted ? report.root : ethers.ZeroHash,
+    epoch: async () => posted ? 4 : 0, cumulativeSpent: async () => posted ? 67n : 0n,
+    totalDeposited: async () => 1000n, maxEpochDelta: async () => 1000n,
+    pendingRoot: async () => posted ? {} : { merkleRoot: report.root, newEpoch: 4, newCumulativeSpent: 67n,
+      previousEpoch: 0, previousCumulativeSpent: 0n, nonce: 1n, executeAfter: 100 },
+    operatorWithdrawn: async () => 10n, totalBurned: async () => 7n,
+    runner: { provider: { getNetwork: async () => ({ chainId: 1n }), getBlock: async () => ({ timestamp: 90, number: 5 + depth }) } },
+    queryFilter: () => assert.fail(), filters: { RootPosted: true, RootProposed: true },
+  };
+  const rootEventReader = async () => ({ transactionHash: '0x' + 'ab'.repeat(32), blockHash: '0x' + 'cd'.repeat(32),
+    blockNumber: 5, args: { nonce: 1n, executeAfter: 100 }, getTransactionReceipt: async () => ({ status: 1 }) });
+  const observe = prior => rollTapSettlement({ ...args, pool, rootEventReader, prior });
+  const pending = await observe(early);
+  assert.equal(pending.root_pending, true);
+  assert.deepEqual(pending.tap_liability_sweep, metadata);
+  assert.equal((await observe(pending)).root_preparation_id, report.root_preparation_id);
+  posted = true;
+  const waiting = await observe(pending);
+  assert.equal(waiting.awaiting_finality, true);
+  depth = 12;
+  const final = await observe(waiting);
+  const replay = await observe(final);
+  for (const result of [waiting, final, replay]) {
+    assert.deepEqual(result.tap_liability_sweep, metadata);
+    assert.deepEqual(result.checkpoint_outputs, report.checkpoint_outputs);
+    assert.deepEqual(result.preparation_ids, report.preparation_ids);
+    assert.equal(result.root_preparation_id, report.root_preparation_id);
+    assert.equal(result.root, report.root);
+    assert.equal(result.cumulative_spent_wei, '67');
+    assert.equal(result.posted, false);
+  }
+  assert.deepEqual(replay.tap_settlement_checkpoint, final.tap_settlement_checkpoint);
+  assert.equal(replay.tap_settlement_checkpoint.provider_count, 1);
+  await assert.rejects(observe({ ...final, checkpoint_outputs: [] }), /outputs conflict/);
+  await assert.rejects(observe({ ...final, root_preparation_id: 'aa'.repeat(32) }), /preparations conflict/);
+  await assert.rejects(observe({ ...final, tap_settlement_checkpoint: { ...final.tap_settlement_checkpoint, outputs: [] } }),
+    /preparations conflict/);
+
+  const prior = { ...final, operator_fee: { completed: true }, burn: { completed: true } };
+  const next = sweepFixture(5);
+  await assert.rejects(rollTapSettlement({ ...next.args, prior, pool }), /stale TAP sweep revision/);
+  const staleRevision = { ...sweepRow, revision: '98'.repeat(32) };
+  await assert.rejects(rollTapSettlement({ ...sweepFixture(5, { rows: [staleRevision] }).args, prior, pool }),
+    /stale TAP sweep aggregate/);
+  const paid = { ...sweepRow, held_au: '0', paid_cum_au: sweepRow.total_au, holdbacks: [] };
+  const afterPayment = { ...sweepFixture(5, { rows: [paid] }).args, prior, pool };
+  const carry = await rollTapSettlement(afterPayment);
+  assert.equal(carry.reason, 'no payable TAP liabilities on this page');
+  assert.equal(carry.posted, false);
+  assert.equal(carry.spent_au, '0');
+  assert.equal(carry.carried_root.root, final.root);
+  assert.deepEqual(carry.providers, final.providers);
+  assert.deepEqual(carry.entries, final.entries);
+  assert.deepEqual(carry.refunds, final.refunds);
+  assert.deepEqual(carry.checkpoint_outputs, []);
+  for (const change of [
+    { prior: null }, { prior: { ...prior, tap_settlement_checkpoint: null } },
+    { pool: { ...pool, totalDeposited: async () => 1n } },
+  ]) {
+    const refused = await rollTapSettlement({ ...afterPayment, ...change });
+    assert.equal(refused.blocked, true);
+    assert.equal(refused.carried_root, undefined);
+  }
+
+  const accrued = { ...paid, total_au: '112' };
+  const nextRoot = distribution([{ account: sweepTarget, amount: 55n }]).root;
+  const nextPool = { ...pool, pendingRoot: async () => ({ merkleRoot: nextRoot, newEpoch: 5,
+    newCumulativeSpent: 74n, previousEpoch: 4, previousCumulativeSpent: 67n, nonce: 2n, executeAfter: 200 }) };
+  const additional = await rollTapSettlement({ ...sweepFixture(5, { rows: [accrued] }).args,
+    pool: nextPool, prior, operatorAddress: '0x' + '87'.repeat(20) });
+  assert.equal(additional.root_pending, true, additional.reasons?.join(', '));
+  assert.equal(additional.spent_au, '11');
+  assert.equal(additional.checkpoint_outputs[0].paid_cum_au_before, '101');
+  assert.equal(additional.checkpoint_outputs[0].aggregate_paid_cum_au_before, '101');
+  assert.equal(additional.checkpoint_outputs[0].previous_cumulative_wei, '50');
+  assert.equal(additional.providers[0].cumulative_wei, '55');
+});
+
+test('TAP sweep bounds output revisions while verifying every off-page receipt and allocation', async () => {
+  const identity = makeReceiptIdentity();
+  const provider = identity.publicKeyHex;
+  const older = { ...sweepRow, provider };
+  const rotated = { ...older, revision: '33'.repeat(32) };
+  const currentRevision = 'ee'.repeat(32);
+  const accounts = { [provider]: '0x' + '87'.repeat(20) };
+  const current = { ...older, revision: currentRevision, target: accounts[provider],
+    total_au: '75', held_au: '0', holdbacks: [] };
+  const receipts = [receipt({ session: 'off-page', provider: identity, epoch: 4, au: '100',
+    extraBody: { payout_revision: currentRevision } })];
+  const { args, bind } = sweepFixture(4, { receipts, rows: [older, rotated, current] });
+  const revisions = { [provider]: currentRevision };
+  args.targetedSessionBindings = targetedBindingsFor(args.bundle, accounts, revisions);
+  Object.values(args.targetedSessionBindings)[0].chain_id = 1;
+  args.canonicalLiabilities = canonicalLiabilitiesFor(args.bundle, accounts, revisions);
+  args.canonicalLiabilities[0].chain_id = 1;
+  const report = await rollTapSettlement(args);
+  assert.equal(report.receipt_count, 1);
+  assert.equal(report.payout_bindings[0].payout_revision, currentRevision);
+  assert.deepEqual(report.tap_liability_sweep, { ...args.bundle.tap_liability_sweep,
+    next_after: sweepKey(rotated), eligible_count: 2, at: args.bundle.at });
+  assert.deepEqual(report.checkpoint_outputs.map(out => [
+    out.payout_revision, out.aggregate_paid_cum_au_before, out.previous_cumulative_wei, out.new_cumulative_wei,
+  ]), [[older.revision, '0', '0', '50'], [rotated.revision, '101', '50', '100']]);
+  assert.deepEqual(report.providers, [{ account: sweepTarget, cumulative_wei: '100' }]);
+  const continuation = sweepFixture(4, { rows: [older, rotated, current], after: sweepKey(rotated) });
+  const last = await rollTapSettlement(continuation.args);
+  assert.equal(last.tap_liability_sweep.next_after, null);
+  assert.equal(last.checkpoint_outputs[0].payout_revision, currentRevision);
+  await assert.rejects(rollTapSettlement({ ...args, canonicalLiabilities: [] }), /liability is missing/);
+  await assert.rejects(rollTapSettlement({ ...args, targetedSessionBindings: {} }), /Missing targeted TAP payout allocation/);
+  Object.values(args.targetedSessionBindings)[0].au = '101';
+  await assert.rejects(rollTapSettlement(args), /does not equal targeted session allocation/);
+  args.bundle.receipts[0].receipt.body.au_owed_cum = '101';
+  bind();
+  await assert.rejects(rollTapSettlement(args), /signature/);
+  args.bundle.receipts[0].lane = 'proxy';
+  bind();
+  await assert.rejects(rollTapSettlement(args), /proxy accepted-spend/);
+});
+
+test('TAP sweep rejects caller projections, malformed pointers and stale policy or snapshot evidence', async () => {
+  const { args, bind, state } = sweepFixture(4);
+  const pointer = args.bundle.tap_liability_sweep;
+  for (const malformed of [null, {}, { ...pointer, schema_version: 2 }, { ...pointer, liabilities: [sweepRow] },
+    { ...pointer, signed_length: '104' }, { ...pointer, signed_length: 0 }, { ...pointer, after: '' },
+    { ...pointer, after: sweepKey(sweepRow).toUpperCase() }]) {
+    args.bundle.tap_liability_sweep = malformed;
+    await assert.rejects(rollTapSettlement(args), /invalid TAP liability sweep pointer/);
+  }
+  args.bundle.tap_liability_sweep = pointer;
+  const forced = { ...args, canonicalLiabilities: [{ ...sweepRow, aggregate_paid_cum_au: '0' }],
+    sweep: { liabilities: [sweepRow] } };
+  assert.throws(() => buildTapSettlement(forced), /requires a verified resolver page/);
+  await assert.rejects(buildVerifiedTapSettlement(forced), /requires a verified resolver page/);
+  await assert.rejects(rollTapSettlement(forced), /unrelated liability/);
+  args.bundle.liabilities = [sweepRow];
+  bind();
+  await assert.rejects(rollTapSettlement(args), /caller-supplied/);
+  delete args.bundle.liabilities;
+  await assert.rejects(rollTapSettlement(args), /rate-locked epoch bundle/);
+  bind();
+  await assert.rejects(rollTapSettlement({ ...args, epochApplyHash: 'ff'.repeat(32) }), /rate-locked epoch bundle/);
+  await assert.rejects(rollTapSettlement({ ...args, prior: { cumulativeSpentWei: '1' } }), /lacks a confirmed root/);
+  const staleFetch = async url => {
+    const record = await (await args.fetchImpl(url)).json();
+    return { ok: true, json: async () => ({ ...record, signed_length: 105 }) };
+  };
+  await assert.rejects(rollTapSettlement({ ...args, fetchImpl: staleFetch }), /signed length/);
+  await assert.rejects(resolveTapSettlementPayoutMinimum({ peerRpcUrl: args.peerRpcUrl, at: args.bundle.at,
+    signedLength: pointer.signed_length, fetchImpl: staleFetch }), /parameter evidence/);
+  args.bundle.params.fee_bps = 1499;
+  bind();
+  await assert.rejects(rollTapSettlement({ ...args, ledgerFeeBps: 1500 }), /fee or payout minimum mismatch/);
+  args.bundle.params.fee_bps = 1500;
+  bind();
+  state.get('params/payout_min_au').current.value = '2';
+  await assert.rejects(rollTapSettlement(args), /fee or payout minimum mismatch/);
+  state.get('params/payout_min_au').current.value = '1';
+  args.tapRateLock.tap_usd_au = args.tapUsdAu = String(102n * BigInt(TAP_USD_AU));
+  const dust = await rollTapSettlement(args);
+  assert.equal(dust.tap_liability_sweep.eligible_count, 1);
+  assert.equal(dust.spent_au, '0');
+  assert.equal(dust.threshold_held_au, '101');
+  assert.deepEqual(dust.checkpoint_outputs, []);
+  assert.equal(dust.canonical_deferred_liabilities[0].reason, 'below_tap_wei_precision');
+  const legacy = { ...args, bundle: { ...args.bundle } };
+  delete legacy.bundle.tap_liability_sweep;
+  const old = await rollTapSettlement({ ...legacy, fetchImpl: () => assert.fail('unexpected sweep read') });
+  assert.equal(Object.hasOwn(old, 'tap_liability_sweep'), false);
+  assert.equal(old.reason, 'no claimable provider earnings');
 });
 
 test('TAP exact payout threshold produces an exact provider cap with no fee or burn drift', () => {

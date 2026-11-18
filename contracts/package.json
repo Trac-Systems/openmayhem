@@ -26,7 +26,7 @@
     "test:tap-noncustodial": "node --test tests/tap-noncustodial-loop.test.mjs",
     "test:merkle": "node --test tests/merkle-differential.test.mjs",
     "test:governance-delay": "node --test tests/pool-governance-delay.test.mjs",
-    "test": "node scripts/pool-test.mjs && node scripts/pool-property.mjs && node --test tests/merkle-differential.test.mjs tests/pool-governance-delay.test.mjs tests/safe-output.test.mjs tests/tap-deposit-watcher.test.mjs tests/tap-price-watcher.test.mjs tests/tap-settlement-roller.test.mjs tests/tap-claim-proof.test.mjs tests/tap-calldata-builder.test.mjs tests/tap-mainnet-scripts.test.mjs tests/tap-owner-op.test.mjs tests/tap-noncustodial-loop.test.mjs"
+    "test": "node scripts/pool-test.mjs && node scripts/pool-property.mjs && node --test tests/merkle-differential.test.mjs tests/pool-governance-delay.test.mjs tests/safe-output.test.mjs tests/tap-deposit-watcher.test.mjs tests/tap-price-watcher.test.mjs tests/tap-settlement-roller.test.mjs tests/prepare-tap-sweep-bundle.test.mjs tests/tap-liability-sweep.test.mjs tests/verify-tap-sweep-report.test.mjs tests/tap-claim-proof.test.mjs tests/tap-calldata-builder.test.mjs tests/tap-mainnet-scripts.test.mjs tests/tap-owner-op.test.mjs tests/tap-noncustodial-loop.test.mjs"
   },
   "dependencies": {
     "ethers": "6.17.0"

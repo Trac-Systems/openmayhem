@@ -1017,10 +1017,15 @@ elif [[ "$*" == *"key=payout/epoch-plan/tnk/"* && -n "\${MOCK_TNK_PLAN_RECORD:-}
 elif [[ "$*" =~ key=(payout/epoch-plan/(fiat|tnk)/[0-9]+|settle/targeted/(fiat|tnk)/[0-9]+) ]]; then
   printf '{"key":"%s","confirmed":true,"signed_length":123,"value":null}\\n' "\${BASH_REMATCH[1]}"
 elif [[ "$*" == *"key=settle/targeted/tap/"* ]]; then
+  [[ "$*" == *"confirmed=true"* ]] || exit 9
   if [[ -f "$MOCK_TAP_SETTLEMENT_STATE" ]]; then
-    cat "$MOCK_TAP_SETTLEMENT_STATE"
+    if [[ "\${MOCK_TAP_UNCONFIRMED_READ:-0}" == "1" ]]; then
+      printf '%s\\n' '{"key":"settle/targeted/tap/7","confirmed":false,"signed_length":321,"value":null}'
+    else
+      cat "$MOCK_TAP_SETTLEMENT_STATE"
+    fi
   else
-    printf '%s\\n' '{"value":null}'
+    printf '%s\\n' '{"key":"settle/targeted/tap/7","confirmed":true,"signed_length":321,"value":null}'
   fi
 elif [[ "$*" == *"key=fee/tnk/cum"* ]]; then
   printf '%s\\n' '{"value":{"cum_au":"0","swept_cum_au":"0"}}'
@@ -1187,7 +1192,7 @@ if submitted:
                 out.write("\\n")
             os.replace(f"{liability_path}.tmp", liability_path)
         with open(f"{state_path}.tmp", "w") as out:
-            json.dump({"value": record}, out)
+            json.dump({"confirmed": True, "signed_length": 321, "key": f"settle/targeted/tap/{checkpoint['epoch']}", "value": record}, out)
             out.write("\\n")
         os.replace(f"{state_path}.tmp", state_path)
 report = {
@@ -1302,6 +1307,8 @@ fi
     MAYHEM_ADMIN_STORE: 'test-admin',
     MAYHEM_CADENCE_STATE_DIR: state,
     MAYHEM_TAP_SETTLEMENT_SPOOL: spool,
+    // These retained spool fixtures predate the liability sweep. The scheduler suite exercises new bundles.
+    MAYHEM_TAP_LIABILITY_SWEEP_ENABLED: '0',
     MAYHEM_PAYOUT_LOCK_HELD: '1',
     MAYHEM_PAYOUT_TEST_MODE: '1',
     MAYHEM_PAYOUT_TEST_ROOT: root,
@@ -2313,4 +2320,62 @@ test('TNK refuses an unconfirmed or malformed plan read without changing retaine
     assert.equal(logLines(ctx).some(line => line.startsWith('admin tnk-settlement')), false);
     assert.equal(fs.readFileSync(path.join(workDir, 'tnk-settlement-at'), 'utf8'), '950\n');
   }
+});
+
+test('empty-epoch TAP maturity page queues once and retains the same intent across a publication crash', t => {
+  const ctx = harness({ bundle: false });
+  t.after(() => fs.rmSync(ctx.root, { recursive: true, force: true }));
+  const mock = path.join(ctx.root, 'confirmed-sweep-state.mjs');
+  fs.writeFileSync(mock, `
+    import assert from 'node:assert/strict';
+    const hash = ${JSON.stringify(APPLY_HASH)};
+    const values = {
+      'epoch/apply/state': {updated_epoch:7,pending_epoch:null,last_apply_hash:hash,last_settlement_unix:900},
+      'epoch/apply-anchor/7': {type:'epoch_apply_anchor',epoch:7,apply_hash:hash,settlement_unix:900},
+      'epoch/seal/7': {type:'epoch_empty_seal',epoch:7,seal_hash:hash,totals:{debited_au:'0',earned_au:'0',fee_au:'0',burn_au:'0'}},
+      'params/fee_bps': null, 'params/payout_min_au':null,
+    };
+    globalThis.fetch = async url => {
+      assert.equal(url.origin,'http://mock.invalid');
+      assert.equal(url.searchParams.get('confirmed'),'true');
+      const key = url.searchParams.get('key');
+      assert(Object.hasOwn(values,key));
+      assert.equal(url.searchParams.get('signed_length'),key==='epoch/apply/state'?null:'97');
+      return {ok:true,json:async()=>({key,confirmed:true,signed_length:97,value:values[key]})};
+    };
+  `);
+  const opts = {NODE_OPTIONS:'--import=' + mock, MAYHEM_TAP_LIABILITY_SWEEP_ENABLED:'1',
+    MAYHEM_FIAT_SETTLEMENT_ENABLED:'0', MAYHEM_TNK_SETTLEMENT_ENABLED:'0'};
+  const interrupted = runWorker(ctx, {...opts, MAYHEM_PAYOUT_TEST_CRASH_AFTER_TAP_QUEUE:'1'});
+  assert.notEqual(interrupted.status,0);
+  const work = path.join(ctx.state,'payout','epoch-7-'+APPLY_HASH);
+  const spoolFile = path.join(ctx.spool,'ready','epoch-7-'+APPLY_HASH+'.receipts.json');
+  assert(fs.existsSync(spoolFile),interrupted.stderr);
+  const raw = fs.readFileSync(spoolFile);
+  assert.deepEqual(JSON.parse(raw).receipts,[]);
+  assert.deepEqual(JSON.parse(raw).tap_liability_sweep,{schema_version:1,signed_length:97,after:null});
+  assert.equal(fs.existsSync(path.join(work,'tap.complete')),false);
+  assert.equal(fs.existsSync(path.join(work,'tap.produced')),false);
+  const recovered = runWorker(ctx,{...opts, MAYHEM_TAP_LIABILITY_SWEEP_ENABLED:'0'});
+  assert.equal(recovered.status,0,recovered.stderr);
+  assert.deepEqual(fs.readFileSync(spoolFile),raw);
+  assert.equal(fs.existsSync(path.join(work,'tap.produced')),true);
+  assert.equal(fs.existsSync(path.join(work,'tap.complete')),false);
+});
+
+test('TAP confirmation cannot advance on an unconfirmed checkpoint response', t => {
+  const ctx = harness();
+  t.after(() => fs.rmSync(ctx.root, {recursive:true,force:true}));
+  assert.equal(runWorker(ctx).status, 0);
+  const name = 'epoch-7-'+APPLY_HASH+'.receipts.json';
+  fs.renameSync(path.join(ctx.spool,'ready',name),path.join(ctx.spool,'processed',name));
+  writeTapReport(ctx,name);
+  const proof=path.join(ctx.state,'payout','epoch-7-'+APPLY_HASH,'tap.complete');
+  const pending=runWorker(ctx,{MOCK_TAP_UNCONFIRMED_READ:'1'});
+  assert.notEqual(pending.status,0);
+  assert.match(pending.stderr,/lacks the confirmed epoch/);
+  assert.equal(fs.existsSync(proof),false);
+  const recovered=runWorker(ctx);
+  assert.equal(recovered.status,0,recovered.stderr);
+  assert.equal(JSON.parse(fs.readFileSync(proof)).status,'settled');
 });

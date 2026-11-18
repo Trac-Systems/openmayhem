@@ -29,6 +29,8 @@ const SIGNING_MESSAGE_VERSION = 2;
 const DEFAULT_TAP_CHALLENGE_EPOCHS = 6;
 const TAP_BURN_BPS = 1_000n;
 const MIN_TAP_CONFIRMATION_DEPTH = 12;
+const TAP_LIABILITY_CURSOR = /^payout\/liability\/tap\/[0-9a-f]{64}\/[0-9a-f]{64}$/;
+const EMPTY_TAP_PAGE = 'no payable TAP liabilities on this page';
 const PREPARATION_CONFIRM_TIMEOUT_MS = 30_000;
 const PREPARATION_CONFIRM_INTERVAL_MS = 250;
 const ED25519_SPKI_PREFIX = Buffer.from('302a300506032b6570032100', 'hex');
@@ -968,8 +970,65 @@ function sortedTapLiabilities(map) {
   ));
 }
 
+function tapSweepPointer(bundle) {
+  if (!hasOwn(bundle ?? {}, 'tap_liability_sweep')) return null;
+  const pointer = bundle.tap_liability_sweep;
+  if (!isObject(pointer) || Object.keys(pointer).length !== 3 ||
+      !['schema_version', 'signed_length', 'after'].every(key => hasOwn(pointer, key)) ||
+      pointer.schema_version !== 1 || !Number.isSafeInteger(pointer.signed_length) || pointer.signed_length < 1 ||
+      !(pointer.after === null || (typeof pointer.after === 'string' && TAP_LIABILITY_CURSOR.test(pointer.after)))) {
+    throw new Error('invalid TAP liability sweep pointer');
+  }
+  return pointer;
+}
+
+async function verifiedTapSweep({ pointer, bundle, epochApplyHash, tapRateLock, feeBps, minimum, peerRpcUrl, fetchImpl }) {
+  if (bundle.rail !== 'tap' || !Array.isArray(bundle.receipts) || !Number.isSafeInteger(bundle.epoch) ||
+      bundle.epoch < 1 || !isHexBytes(epochApplyHash, 32) || bundle.epoch_apply_hash !== epochApplyHash ||
+      !tapRateLock || tapRateLock.bundle_sha256 !== settlementBundleSha256(bundle)) {
+    throw new Error('TAP liability sweep requires its rate-locked epoch bundle');
+  }
+  if (['liabilities', 'canonicalLiabilities', 'checkpoint_outputs'].some(key => hasOwn(bundle, key))) {
+    throw new Error('TAP liability sweep cannot contain caller-supplied liabilities or outputs');
+  }
+  const at = tapPreparationAt(bundle, tapRateLock);
+  const { resolveTapLiabilitySweep } = await import('./tap-liability-sweep.mjs');
+  const page = await resolveTapLiabilitySweep({ peerRpcUrl, epoch: bundle.epoch, epochApplyHash, at,
+    signedLength: pointer.signed_length, after: pointer.after, fetchImpl });
+  if (page?.signed_length !== pointer.signed_length || page.after !== pointer.after ||
+      !(page.next_after === null || (typeof page.next_after === 'string' && TAP_LIABILITY_CURSOR.test(page.next_after) &&
+        (pointer.after === null || page.next_after > pointer.after)))) {
+    throw new Error('TAP liability sweep snapshot or cursor mismatch');
+  }
+  if (page.fee_bps !== feeBps || page.payout_min_au !== minimum.toString() ||
+      [bundle.params, bundle.audited_epoch?.params, bundle.recomputed?.params].some(params =>
+        params?.fee_bps !== undefined && params.fee_bps !== feeBps)) {
+    throw new Error('TAP liability sweep fee or payout minimum mismatch');
+  }
+  if (!Number.isSafeInteger(page.max_outputs) || page.max_outputs < 1 ||
+      !Array.isArray(page.liabilities) || page.liabilities.length > page.max_outputs) {
+    throw new Error('invalid TAP liability sweep output limit');
+  }
+  const liabilities = canonicalTapLiabilityMap(page.liabilities);
+  // The resolver verifies the revision, holdback gates and aggregate budget
+  // at the pin. Bind the resulting AU projection to this pool and policy.
+  for (const row of liabilities.values()) {
+    if (row.chain_id !== tapRateLock.chain_id || row.payable_au === 0n || row.payable_au < minimum) {
+      throw new Error('ineligible TAP sweep liability for this pool');
+    }
+  }
+  return { liabilities, metadata: { ...pointer, next_after: page.next_after, eligible_count: liabilities.size, at } };
+}
+
 function ceilDiv(value, divisor) {
   return value === 0n ? 0n : (value + divisor - 1n) / divisor;
+}
+
+function tapNoPaymentReason(emptySweepPage, heldReceiptCount, thresholdHeldProviderCount) {
+  if (emptySweepPage) return EMPTY_TAP_PAGE;
+  if (heldReceiptCount > 0) return 'provider earnings await challenge or holdback maturity';
+  if (thresholdHeldProviderCount > 0) return 'provider earnings are below payout minimum';
+  return 'no claimable provider earnings';
 }
 
 function refundDistributionEntries(report, label = 'settlement refunds') {
@@ -1099,7 +1158,10 @@ function buildTapSettlementFromEntries({
   targetedSessionBindings,
   canonicalLiabilities,
   payoutMinAu,
-} = {}, verifiedEntries = null) {
+} = {}, verifiedEntries = null, sweep = null) {
+  if (hasOwn(bundle ?? {}, 'tap_liability_sweep') && !sweep) {
+    throw new Error('TAP liability sweep requires a verified resolver page');
+  }
   const inputBundle = receipts ? { receipts } : bundle;
   const input = receipts ?? normalizedReceipts(bundle);
   validatePriorSettlementState(prior);
@@ -1117,8 +1179,6 @@ function buildTapSettlementFromEntries({
   const bundleEpoch = inputBundle?.epoch ?? inputBundle?.receipt_epoch ?? inputBundle?.settlement_epoch;
   const billingStates = new Map();
   const perProvider = priorProviderMap(prior);
-  const priorProviderClaimedWei = [...perProvider.values()]
-    .reduce((sum, amount) => sum + amount, 0n);
   const liabilityMap = canonicalTapLiabilityMap(canonicalLiabilities);
   const perBuyerRefund = priorRefundMap(prior);
   let cumulativeSpentWei = parseBigIntString(prior?.cumulative_spent_wei ?? prior?.cumulativeSpentWei, 'prior cumulative spent wei');
@@ -1155,7 +1215,7 @@ function buildTapSettlementFromEntries({
     // Proxy finals price one exact attempt. Their signed cumulative billing can
     // include earlier epochs and must never be charged again as native usage.
     const deltaAu = proxy ? safeAu(envelope.body.au_owed_cum, 'proxy attempt amount') : receiptDeltaAu(entry, body, billingStates);
-    if (deltaAu === 0n) continue;
+    if (deltaAu === 0n && !sweep) continue;
     const targetedBinding = targetedBindingForReceipt(
       entry,
       body,
@@ -1172,7 +1232,7 @@ function buildTapSettlementFromEntries({
     }
     targetedAllocatedAu.set(targetedBinding.key, nextAllocated);
     targetedBindingsUsed.set(targetedBinding.key, targetedBinding);
-    receiptCount += 1;
+    if (deltaAu > 0n) receiptCount += 1;
     const providers = receiptProviders(entry, body, targetedBinding);
     let weightTotal = 0;
     for (const provider of providers) weightTotal += provider.weight_bps;
@@ -1196,9 +1256,39 @@ function buildTapSettlementFromEntries({
       throw new Error(`confirmed canonical TAP liability is missing for ${key}`);
     }
   }
-  for (const liability of sortedTapLiabilities(new Map(
+  if (sweep && liabilityMap.size !== requiredLiabilityKeys.size) {
+    throw new Error('TAP sweep receipt evidence contains an unrelated liability');
+  }
+  const selected = sweep?.liabilities ?? new Map(
     [...liabilityMap].filter(([key]) => requiredLiabilityKeys.has(key))
-  ))) {
+  );
+  // A pending or confirmed same-epoch report already includes this page.
+  // Recover its opening claim balances from the verified deltas, then rebuild
+  // every output and its preparation ID through the normal calculation.
+  const resumingSweep = sweep && prior?.root && prior.epoch === bundleEpoch;
+  if (resumingSweep) {
+    for (const row of selected.values()) {
+      const balance = (perProvider.get(row.target) ?? 0n) - auToTapWei(row.payable_au, rate);
+      if (balance < 0n) throw new Error('prior TAP sweep claims do not cover the verified page');
+      perProvider.set(row.target, balance);
+    }
+  } else if (sweep && prior?.tap_settlement_checkpoint) {
+    const watermarks = new Map([...selected.values()].map(row => [row.provider, row.aggregate_paid_cum_au]));
+    for (const paid of prior.tap_settlement_checkpoint.outputs ?? []) {
+      const amount = BigInt(paid.paid_au);
+      const key = tapLiabilityIdentity(paid.provider, paid.payout_revision, paid.to);
+      const row = selected.get(key);
+      if (row && row.paid_cum_au < BigInt(paid.paid_cum_au_before) + amount) {
+        throw new Error('stale TAP sweep revision paid watermark');
+      }
+      const aggregate = watermarks.get(paid.provider);
+      if (aggregate !== undefined && aggregate < BigInt(paid.aggregate_paid_cum_au_before) + amount) {
+        throw new Error('stale TAP sweep aggregate paid watermark');
+      }
+    }
+  }
+  const priorProviderClaimedWei = [...perProvider.values()].reduce((sum, amount) => sum + amount, 0n);
+  for (const liability of sortedTapLiabilities(selected)) {
     if (liability.held_au > 0n) {
       heldReceiptCount += 1;
       heldAu += liability.held_au;
@@ -1248,7 +1338,7 @@ function buildTapSettlementFromEntries({
     });
   }
 
-  applyBuyerRefunds(perBuyerRefund, inputBundle, buyerAccounts, rate);
+  if (!resumingSweep) applyBuyerRefunds(perBuyerRefund, inputBundle, buyerAccounts, rate);
 
   const providers = sortedDistributionEntries(perProvider);
   const providerClaimedWei = providers.reduce((sum, entry) => sum + entry.amount, 0n);
@@ -1275,14 +1365,11 @@ function buildTapSettlementFromEntries({
   for (const entry of refunds) addWei(combined, entry.account, entry.amount);
   const entries = sortedDistributionEntries(combined);
   if (entries.length === 0) {
-    let reason = 'no claimable provider earnings';
-    if (heldReceiptCount > 0) reason = 'provider earnings await challenge or holdback maturity';
-    else if (thresholdHeldProviderCount > 0) reason = 'provider earnings are below payout minimum';
     return {
       posted: false,
       payout_model: 'non_custodial_claim',
       custodial_wallet: false,
-      reason,
+      reason: tapNoPaymentReason(sweep?.metadata.eligible_count === 0, heldReceiptCount, thresholdHeldProviderCount),
       tap_usd_au: rate,
       ledger_fee_bps: feeBps,
       receipt_count: receiptCount,
@@ -1914,61 +2001,47 @@ function tapCheckpointPayload({
   };
 }
 
-// A later epoch can hold new earnings while inheriting an already finalized
-// distribution. Keep the prior root available for claims and carry the new
-// liabilities forward without proposing an identical Ethereum transaction.
-function carriedConfirmedRoot({ settlement, prior, screen, chainRoot, chainEpoch,
-  chainSpentWei, pendingRoot, requestedEpoch, tapRateLock }) {
+function matchesConfirmedPriorRoot(prior, tapRateLock, chainRoot, chainEpoch, chainSpentWei) {
   const checkpoint = prior?.tap_settlement_checkpoint;
-  if (!checkpoint || !tapRateLock || pendingRoot || requestedEpoch <= chainEpoch ||
+  return checkpoint && tapRateLock && chainRoot && prior.root === chainRoot && checkpoint.root === chainRoot &&
+    prior.epoch === chainEpoch && checkpoint.epoch === chainEpoch &&
+    isHexBytes(prior.epoch_apply_hash, 32) && checkpoint.epoch_apply_hash === prior.epoch_apply_hash &&
+    prior.cumulative_spent_wei === chainSpentWei?.toString() && checkpoint.cumulative_spent_wei === prior.cumulative_spent_wei &&
+    prior.root_confirmed === true && checkpoint.root_confirmed === true &&
+    prior.operator_fee?.completed === true && prior.burn?.completed === true &&
+    ['chain_id', 'token_address', 'pool_address'].every(key =>
+      prior.tap_rate_lock?.[key] != null && prior.tap_rate_lock[key] === tapRateLock[key] &&
+      checkpoint[key] === tapRateLock[key]);
+}
+
+// Keep the finalized distribution available for claims while carrying
+// unpaid liabilities into the next epoch.
+function carriedConfirmedRoot({ settlement, prior, screen, chainRoot, chainEpoch,
+  chainSpentWei, pendingRoot, requestedEpoch, tapRateLock, emptySweepPage }) {
+  if (!matchesConfirmedPriorRoot(prior, tapRateLock, chainRoot, chainEpoch, chainSpentWei) ||
+      pendingRoot || requestedEpoch <= chainEpoch ||
       screen.reasons.length !== 1 || screen.reasons[0] !== 'no new spend since last root' ||
       screen.prev_epoch !== chainEpoch || screen.flags.length !== 0 ||
-      !chainRoot || prior.root !== chainRoot || checkpoint.root !== chainRoot ||
-      prior.epoch !== chainEpoch || checkpoint.epoch !== chainEpoch ||
-      !isHexBytes(prior.epoch_apply_hash, 32) || checkpoint.epoch_apply_hash !== prior.epoch_apply_hash ||
-      prior.root_confirmed !== true || checkpoint.root_confirmed !== true ||
-      prior.operator_fee?.completed !== true || prior.burn?.completed !== true ||
-      !['chain_id', 'token_address', 'pool_address'].every(key =>
-        prior.tap_rate_lock?.[key] != null && prior.tap_rate_lock[key] === tapRateLock[key] &&
-        checkpoint[key] === tapRateLock[key]) ||
-      settlement.root !== chainRoot || prior.cumulative_spent_wei !== chainSpentWei?.toString() ||
-      checkpoint.cumulative_spent_wei !== prior.cumulative_spent_wei ||
+      settlement.root !== chainRoot ||
       settlement.cumulative_spent_wei !== prior.cumulative_spent_wei ||
       settlement.spent_au !== '0' || settlement.checkpoint_outputs.length !== 0 ||
-      !(settlement.held_receipt_count > 0 || settlement.threshold_held_provider_count > 0) ||
+      !(settlement.held_receipt_count > 0 || settlement.threshold_held_provider_count > 0 ||
+        emptySweepPage) ||
       !['entries', 'providers', 'refunds'].every(key =>
         stableJson(settlement[key]) === stableJson(prior[key]))) return null;
   return { epoch: chainEpoch, epoch_apply_hash: prior.epoch_apply_hash,
     root: chainRoot, cumulative_spent_wei: prior.cumulative_spent_wei };
 }
 
-export async function rollTapSettlement({
-  bundle,
-  receipts,
-  targetedSessionBindings,
-  canonicalLiabilities,
-  payoutMinAu,
-  buyerAccounts,
-  tapUsdAu,
-  ledgerFeeBps,
-  prior,
-  settleThroughEpoch,
-  challengeEpochs,
-  holdbackEpochs,
-  epochApplyHash,
-  tapRateLock,
-  pool,
-  ownerSigner,
-  governanceSigner,
-  operatorAddress,
-  epoch,
-  canonicalPreparationSubmitter,
-  rootEventReader,
-  post = true,
-} = {}) {
+export async function rollTapSettlement(options = {}) {
+  const {
+    bundle, receipts, targetedSessionBindings, canonicalLiabilities, payoutMinAu, tapUsdAu, ledgerFeeBps,
+    prior, epochApplyHash, tapRateLock, peerRpcUrl, fetchImpl, pool, ownerSigner, governanceSigner,
+    operatorAddress, epoch, canonicalPreparationSubmitter, rootEventReader, post = true,
+  } = options;
   const inputBundle = receipts ? { receipts } : bundle;
-  tapPayoutMinAu(inputBundle, payoutMinAu);
-  tapLedgerFeeBps(inputBundle, ledgerFeeBps);
+  const minimum = tapPayoutMinAu(inputBundle, payoutMinAu);
+  const feeBps = tapLedgerFeeBps(inputBundle, ledgerFeeBps);
   if (!isObject(targetedSessionBindings)) {
     throw new Error('confirmed targeted TAP session bindings are required');
   }
@@ -1984,30 +2057,38 @@ export async function rollTapSettlement({
   if (isObject(tapRateLock) && tapRateLock.epoch !== requestedEpoch) {
     throw new Error('TAP rate lock epoch conflicts with the canonical bundle');
   }
-  const replaySettlement = checkpointReplaySettlement({
-    prior,
-    epoch: requestedEpoch,
-    epochApplyHash,
-    tapRateLock,
-    canonicalLiabilities,
-  });
-  const settlement = replaySettlement ?? await buildVerifiedTapSettlement({
-      bundle,
-      receipts,
-      buyerAccounts,
-      tapUsdAu,
-      ledgerFeeBps,
-      prior,
-      settleThroughEpoch,
-      challengeEpochs,
-      holdbackEpochs,
-      targetedSessionBindings,
-      canonicalLiabilities,
-      payoutMinAu,
-    });
-  if (!settlement.root) return settlement;
+  const pointer = tapSweepPointer(bundle);
+  const sweep = pointer
+    ? await verifiedTapSweep({ pointer, bundle: inputBundle, epochApplyHash, tapRateLock, feeBps, minimum, peerRpcUrl, fetchImpl })
+    : null;
+  const resumingSweep = sweep && prior?.root && prior.epoch === requestedEpoch;
+  if (resumingSweep && (prior.epoch_apply_hash !== epochApplyHash ||
+      stableJson(prior.tap_rate_lock) !== stableJson(tapRateLock) ||
+      stableJson(prior.tap_liability_sweep) !== stableJson(sweep.metadata))) {
+    throw new Error('prior TAP sweep report conflicts with its pinned epoch or page');
+  }
+  const settlement = sweep
+    ? buildTapSettlementFromEntries(options, await verifiedSettlementReceipts(bundle, bundle.receipts), sweep)
+    : checkpointReplaySettlement({ prior, epoch: requestedEpoch, epochApplyHash, tapRateLock, canonicalLiabilities })
+      ?? await buildVerifiedTapSettlement(options);
+  if (!sweep && hasOwn(settlement, 'tap_liability_sweep')) {
+    throw new Error('TAP sweep replay requires its original bundle pointer');
+  }
+  if (sweep) {
+    Object.assign(settlement, { tap_liability_sweep: sweep.metadata, epoch: requestedEpoch,
+      epoch_apply_hash: epochApplyHash, tap_rate_lock: tapRateLock });
+    if (resumingSweep && (settlement.root !== prior.root ||
+        stableJson(settlement.checkpoint_outputs) !== stableJson(prior.checkpoint_outputs))) {
+      throw new Error('prior TAP sweep outputs conflict with the verified page');
+    }
+    if (!prior?.root && (priorDistributionMap(prior).size || priorProviderMap(prior).size ||
+        priorRefundMap(prior).size || BigInt(prior?.cumulative_spent_wei ?? prior?.cumulativeSpentWei ?? 0) !== 0n)) {
+      throw new Error('TAP sweep prior distribution lacks a confirmed root');
+    }
+  }
+  if (!settlement.root && !sweep) return settlement;
 
-  const expectedRoot = String(settlement.root).toLowerCase();
+  const expectedRoot = settlement.root?.toLowerCase();
   const expectedSpentWei = parseBigIntString(
     settlement.cumulative_spent_wei,
     'settlement cumulative spent wei'
@@ -2031,6 +2112,18 @@ export async function rollTapSettlement({
       && requestedEpoch === chainEpoch
     );
   }
+
+  if (sweep && !rootAlreadyPosted) {
+    const baseMatches = prior?.root
+      ? matchesConfirmedPriorRoot(prior, tapRateLock, chainRoot, chainEpoch, chainSpentWei)
+      : !pool || (chainEpoch === 0 && chainRoot === ethers.ZeroHash && chainSpentWei === 0n);
+    const pendingMatches = pendingRoot && pendingRoot.epoch === requestedEpoch &&
+      pendingRoot.merkle_root === expectedRoot && pendingRoot.cumulative_spent_wei === expectedSpentWei.toString();
+    if ((resumingSweep ? !pendingMatches : !baseMatches) || (!settlement.root && pendingRoot)) {
+      return { ...settlement, posted: false, blocked: true, reasons: ['TAP sweep does not match the confirmed or pending pool state'] };
+    }
+  }
+  if (!settlement.root) return settlement;
 
   let screen;
   if (rootAlreadyPosted) {
@@ -2056,12 +2149,11 @@ export async function rollTapSettlement({
   }
   if (!screen.ok) {
     const carriedRoot = carriedConfirmedRoot({ settlement, prior, screen, chainRoot, chainEpoch,
-      chainSpentWei, pendingRoot, requestedEpoch, tapRateLock });
+      chainSpentWei, pendingRoot, requestedEpoch, tapRateLock, emptySweepPage: sweep?.metadata.eligible_count === 0 });
     if (carriedRoot) {
       return { ...settlement, posted: false, carried_root: carriedRoot,
-        reason: settlement.held_receipt_count > 0
-          ? 'provider earnings await challenge or holdback maturity'
-          : 'provider earnings are below payout minimum' };
+        reason: tapNoPaymentReason(sweep?.metadata.eligible_count === 0,
+          settlement.held_receipt_count, settlement.threshold_held_provider_count) };
     }
     return { ...settlement, posted: false, blocked: true, reasons: screen.reasons, screen };
   }
@@ -2089,6 +2181,18 @@ export async function rollTapSettlement({
     epochApplyHash,
     tapRateLock,
   });
+  if (resumingSweep) {
+    const checkpoint = prior.tap_settlement_checkpoint;
+    if (prior.root_preparation_id !== preparationPlan.root_preparation_id ||
+        stableJson(prior.preparation_ids) !== stableJson(preparationPlan.preparation_ids) ||
+        stableJson(prior.external_effect_ids) !== stableJson(preparationPlan.external_effect_ids) ||
+        (checkpoint != null && (!matchingTapCheckpoint(checkpoint, {
+          epoch: requestedEpoch, root: expectedRoot, cumulativeSpentWei: expectedSpentWei, epochApplyHash, tapRateLock,
+        }) || checkpoint.root_confirmed !== true ||
+          stableJson(checkpoint.outputs) !== stableJson(preparationPlan.intent.outputs)))) {
+      throw new Error('prior TAP sweep preparations conflict with the verified page');
+    }
+  }
   const signingAddress = ownerSigner?.getAddress
     ? normalizeAddress(await ownerSigner.getAddress(), 'owner signing address')
     : null;
@@ -2587,18 +2691,24 @@ async function readContractStateValue(rpcUrl, key, {
 export async function resolveTapSettlementPayoutMinimum({
   peerRpcUrl,
   at,
+  signedLength,
   fetchImpl = globalThis.fetch,
 } = {}) {
   const effectiveAt = parseNonNegativeInt(at, 'TAP payout minimum evidence timestamp');
   const url = new URL('state', ensureRpcBase(peerRpcUrl));
   url.searchParams.set('key', 'params/payout_min_au');
   url.searchParams.set('confirmed', 'true');
+  if (signedLength !== undefined) {
+    if (!Number.isSafeInteger(signedLength) || signedLength < 1) throw new Error('invalid TAP payout minimum signed length');
+    url.searchParams.set('signed_length', String(signedLength));
+  }
   const record = await fetchJson(url, fetchImpl);
   const schedule = record?.value;
   if (record?.confirmed !== true ||
       record?.key !== 'params/payout_min_au' ||
       !Number.isSafeInteger(record?.signed_length) ||
       record.signed_length < 1 ||
+      (signedLength !== undefined && record.signed_length !== signedLength) ||
       !isObject(schedule) ||
       schedule.key !== 'payout_min_au' ||
       !isObject(schedule.current) ||
@@ -2913,13 +3023,11 @@ function tapPreparationOutput(output) {
 }
 
 function tapPreparationAt(bundle, tapRateLock) {
-  return parseNonNegativeInt(
-    bundle?.at
-      ?? bundle?.settlement_unix
-      ?? bundle?.last_settlement_unix
-      ?? tapRateLock?.rate_ts,
-    'TAP preparation timestamp'
-  );
+  const at = bundle?.at ?? bundle?.settlement_unix ?? bundle?.last_settlement_unix ?? tapRateLock?.rate_ts;
+  if (hasOwn(bundle ?? {}, 'tap_liability_sweep') && !Number.isSafeInteger(at)) {
+    throw new Error('invalid TAP sweep preparation timestamp');
+  }
+  return parseNonNegativeInt(at, 'TAP preparation timestamp');
 }
 
 function tapPreparationOutputPayload(intent, output, outputIndex) {
@@ -3580,6 +3688,7 @@ async function main() {
   const bundlePath = args.bundle || args['receipts-file'];
   if (!bundlePath) throw new Error('Missing --bundle/--receipts-file.');
   const bundle = readJson(path.resolve(bundlePath), 'receipt bundle');
+  const sweepPointer = tapSweepPointer(bundle);
   if (args['provider-accounts'] !== undefined) {
     throw new Error('--provider-accounts is not supported.');
   }
@@ -3619,6 +3728,7 @@ async function main() {
   const payoutMinimum = await resolveTapSettlementPayoutMinimum({
     peerRpcUrl,
     at: tapPreparationAt(bundle, tapRateLock),
+    signedLength: sweepPointer?.signed_length,
   });
   const ledgerFeeBps = args['ledger-fee-bps'];
   for (const binding of Object.values(targetedPayouts.sessionBindings)) {
@@ -3664,6 +3774,7 @@ async function main() {
 
   const report = await rollTapSettlement({
     bundle,
+    peerRpcUrl,
     targetedSessionBindings: targetedPayouts.sessionBindings,
     canonicalLiabilities: targetedPayouts.liabilities,
     payoutMinAu: payoutMinimum.value,

@@ -17,6 +17,10 @@ TAP_SPOOL="${MAYHEM_TAP_SETTLEMENT_SPOOL:-$STATE_DIR/tap}"
 FIAT_ENABLED="${MAYHEM_FIAT_SETTLEMENT_ENABLED:-1}"
 TNK_ENABLED="${MAYHEM_TNK_SETTLEMENT_ENABLED:-1}"
 TAP_ENABLED="${MAYHEM_TAP_SETTLEMENT_ENABLED:-1}"
+# A mixed-version operator can upgrade both spool consumers before enabling the producer.
+# Once captured, sweep intents always finish, including after a configuration change.
+TAP_SWEEP_ENABLED="${MAYHEM_TAP_LIABILITY_SWEEP_ENABLED:-1}"
+[[ "$TAP_SWEEP_ENABLED" == 0 || "$TAP_SWEEP_ENABLED" == 1 ]] || { echo "invalid TAP sweep enable flag" >&2; exit 1; }
 MAX_ATTEMPTS="${MAYHEM_PAYOUT_MAX_ATTEMPTS:-8}"
 RETRY_BACKOFF_SECONDS="${MAYHEM_PAYOUT_RETRY_BACKOFF_SECONDS:-300}"
 FIAT_OPERATOR_ACCOUNT="${MAYHEM_FIAT_OPERATOR_ACCOUNT:-platform_balance}"
@@ -639,6 +643,12 @@ with open(path, "w") as out:
     }, out, indent=2)
     out.write("\n")
 PY
+  if [[ "$rail" == tap && -f "$work_dir/tap-sweep-intent.json" && ( "$status" == carry || "$status" == settled ) ]]; then
+    # Both the carry verifier and canonical settlement reconciliation have succeeded at this point.
+    # Advance before publishing the marker. A crash between them replays this exact cursor idempotently.
+    node "$SOURCE_DIR/contracts/scripts/prepare-tap-sweep-bundle.mjs" advance \
+      "$applied_epoch" "$apply_hash" "$work_dir" "$TAP_SPOOL" "$work_dir/$rail.complete.tmp" || return 1
+  fi
   mv "$work_dir/$rail.complete.tmp" "$work_dir/$rail.complete"
 }
 
@@ -2006,6 +2016,8 @@ PY
 
 validate_tap_no_work() {
   local report="$1" bundle="$2"
+  node "$SOURCE_DIR/contracts/scripts/verify-tap-sweep-report.mjs" \
+    "$bundle" "$report" "$RPC_URL" "${bundle%.receipts.json}.tap-rate.json" confirmed || return 1
   python3 "$SOURCE_DIR/scripts/ops/check-tap-carry-basis.py" "$report" "$TAP_SPOOL/processed" "$bundle" || return 1
   python3 - "$report" "$bundle" "$applied_epoch" "$apply_hash" <<'PY'
 import hashlib, json, re, sys
@@ -2026,7 +2038,7 @@ if (
     or bundle.get("epoch") != expected_epoch
     or bundle.get("epoch_apply_hash") != expected_hash
     or not isinstance(receipts, list)
-    or not receipts
+    or (not receipts and "tap_liability_sweep" not in bundle)
 ):
     raise SystemExit("TAP carry bundle identity is invalid")
 if (
@@ -2053,7 +2065,8 @@ if (
     or not isinstance(threshold_count, int)
     or isinstance(threshold_count, bool)
     or threshold_count < 0
-    or held_count + threshold_count < 1
+    or (held_count + threshold_count < 1
+        and report.get("reason") != "no payable TAP liabilities on this page")
 ):
     raise SystemExit("TAP carry report has no explicit held or below-threshold work")
 held_au = uint(report.get("held_au"), "TAP held_au")
@@ -2103,6 +2116,7 @@ reason = report.get("reason")
 if reason not in {
     "provider earnings await challenge or holdback maturity",
     "provider earnings are below payout minimum",
+    "no payable TAP liabilities on this page",
 }:
     raise SystemExit("TAP carry report reason is not canonical")
 PY
@@ -2113,14 +2127,16 @@ complete_tap_processed() {
   status="$(printf '%s' "$(cat "$report")" | json_field status)"
   if [[ "$status" == "no_work" ]]; then
     validate_tap_no_work "$report" "$bundle" || return 1
-    mark_rail tap carry "$report"
-    echo "tap: canonical held/below-threshold liabilities carried forward"
+    mark_rail tap carry "$report" || return 1
+    echo "tap: verified TAP carry for epoch $applied_epoch"
     return 0
   fi
   [[ -z "$status" ]] || {
     echo "tap: processed report has unsupported status $status" >&2
     return 1
   }
+  node "$SOURCE_DIR/contracts/scripts/verify-tap-sweep-report.mjs" \
+    "$bundle" "$report" "$RPC_URL" "${bundle%.receipts.json}.tap-rate.json" confirmed || return 1
   validate_tap_processed "$report" "$bundle" || return 1
   reconcile_tap_contract_checkpoint "$report"
 }
@@ -2158,7 +2174,16 @@ tap_contract_record_status() {
   python3 - "$checkpoint" "$state_file" <<'PY'
 import json, re, sys
 checkpoint = json.load(open(sys.argv[1]))
-record = json.load(open(sys.argv[2])).get("value")
+envelope = json.load(open(sys.argv[2]))
+if (
+    envelope.get("key") != f"settle/targeted/tap/{checkpoint['epoch']}"
+    or envelope.get("confirmed") is not True
+    or type(envelope.get("signed_length")) is not int
+    or envelope["signed_length"] < 1
+    or "value" not in envelope
+):
+    raise SystemExit("TAP settlement readback lacks the confirmed epoch and signed length")
+record = envelope["value"]
 if record is None:
     raise SystemExit(2)
 if not isinstance(record, dict):
@@ -2234,7 +2259,7 @@ PY
 
   for ((attempt = 1; attempt <= TAP_CONTRACT_WAIT_ATTEMPTS; attempt += 1)); do
     if ! curl -sf -m 10 \
-      "$RPC_URL/state?key=settle/targeted/tap/$applied_epoch" \
+      "$RPC_URL/state?key=settle/targeted/tap/$applied_epoch&confirmed=true" \
       >"$canonical_record.tmp"; then
       rm -f "$canonical_record.tmp"
       echo "tap: canonical settlement readback failed" >&2
@@ -2287,7 +2312,7 @@ with open(target, "w") as out:
     os.fsync(out.fileno())
 PY
   mv "$reconciliation.tmp" "$reconciliation"
-  mark_rail tap settled "$reconciliation"
+  mark_rail tap settled "$reconciliation" || return 1
   echo "tap: Ethereum execution and canonical Intercom settlement reconciled"
 }
 
@@ -2558,11 +2583,18 @@ PY
     esac
   fi
 
+  local sweep=0 empty_mode=receipts
+  tap_spool_state || return 1
+  if [[ -f "$work_dir/tap-sweep-intent.json" ]] || \
+    [[ "$TAP_SWEEP_ENABLED" == 1 && "$applied_epoch" == "$canonical_applied_epoch" && "$spool_count" == 0 ]]; then
+    sweep=1
+  fi
+  temp_bundle="$work_dir/tap-receipts.json.tmp"
   attempt="unpublished"
   bundle="$epoch_dir/epoch-bundle.json"
   if [[ ! -f "$bundle" ]]; then
     local empty_seal
-    empty_seal="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/seal/$applied_epoch")"
+    empty_seal="$(curl -sf -m 10 "$RPC_URL/state?key=epoch/seal/$applied_epoch&confirmed=true")" || return 1
     printf '%s\n' "$empty_seal" >"$work_dir/tap-empty-seal.json.tmp"
     mv "$work_dir/tap-empty-seal.json.tmp" "$work_dir/tap-empty-seal.json"
     if ! python3 - "$work_dir/tap-empty-seal.json" "$applied_epoch" "$apply_hash" <<'PY'
@@ -2586,17 +2618,20 @@ PY
       echo "tap: finalized non-empty epoch is missing its retained receipt bundle" >&2
       return 1
     fi
-    mark_rail tap no_work "$work_dir/tap-empty-seal.json"
-    echo "tap: canonical empty-epoch seal proves there is no TAP work"
-    return 0
-  fi
-
-  temp_bundle="$work_dir/tap-receipts.json.tmp"
-  if ! receipt_count="$(node "$SOURCE_DIR/intercom/scripts/payout-tap-receipts.mjs" \
-    "$bundle" "$temp_bundle" "$applied_epoch" "$apply_hash")"; then
-    rm -f "$temp_bundle"
-    echo "tap: failed to derive a rail-isolated spool bundle on attempt $attempt" >&2
-    return 1
+    empty_mode=empty
+    if [[ "$sweep" == 0 ]]; then
+      mark_rail tap no_work "$work_dir/tap-empty-seal.json" || return 1
+      echo "tap: canonical empty-epoch seal proves there are no TAP receipts"
+      return 0
+    fi
+    receipt_count=0
+  else
+    if ! receipt_count="$(node "$SOURCE_DIR/intercom/scripts/payout-tap-receipts.mjs" \
+      "$bundle" "$temp_bundle" "$applied_epoch" "$apply_hash")"; then
+      rm -f "$temp_bundle"
+      echo "tap: failed to derive a rail-isolated spool bundle on attempt $attempt" >&2
+      return 1
+    fi
   fi
   [[ "$receipt_count" =~ ^(0|[1-9][0-9]*)$ ]] || {
     rm -f "$temp_bundle"
@@ -2604,9 +2639,12 @@ PY
     return 1
   }
 
-  if [[ "$receipt_count" == "0" ]]; then
+  if [[ "$sweep" == 1 ]]; then
+    node "$SOURCE_DIR/contracts/scripts/prepare-tap-sweep-bundle.mjs" prepare \
+      "$applied_epoch" "$apply_hash" "$work_dir" "$TAP_SPOOL" "$RPC_URL" "$temp_bundle" "$empty_mode" || return 1
+  elif [[ "$receipt_count" == 0 ]]; then
     rm -f "$temp_bundle"
-    mark_rail tap no_work "$bundle"
+    mark_rail tap no_work "$bundle" || return 1
     echo "tap: finalized bundle has no TAP receipts"
     return 0
   fi
