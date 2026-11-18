@@ -11,6 +11,12 @@ import { waitForMinimumSignedLength } from './msb-reader-catchup.mjs';
 const cursor = value => typeof value === 'string' && /^(0|[1-9][0-9]{0,15})$/.test(value) && BigInt(value) <= BigInt(Number.MAX_SAFE_INTEGER);
 const ethHash = value => typeof value === 'string' && /^0x[0-9a-f]{64}$/.test(value);
 const ethAddress = value => typeof value === 'string' && /^0x[0-9a-f]{40}$/.test(value);
+const TAP_FINALITY_POLL_MS = 30000;
+
+function tapCaughtUp(work, page) {
+  if (!page.coverage) return page.next_cursor === work.from_cursor && page.next_offset === work.from_offset;
+  return page.coverage.finalized_number === work.from_cursor && BigInt(page.next_cursor) > BigInt(work.from_cursor);
+}
 export function validateDiscoveryWork(w, stream) {
   shape(w,['schema_version','purpose','phase','stream_id','stream','from_cursor','from_offset','max_positions','lease_token','lease_expires_at_ms',
     ...(Object.hasOwn(w,'previous_snapshot')?['previous_snapshot']:[])]);
@@ -29,14 +35,22 @@ export class AdmissionDiscoveryWorker {
   constructor({origin,credential,stream,scan,fetcher=fetch,allowLoopbackHttp=false,now=Date.now,timeoutMs=15000}) {
     need(typeof credential==='string'&&credential.length>=16&&typeof scan==='function'&&uint(timeoutMs,100)&&timeoutMs<=15000,'discovery configuration required');
     this.origin=fixedOrigin(origin,{allowLoopbackHttp});this.o={credential,stream,scan,fetcher,now,timeoutMs};this.active=false;
+    this.tapCaughtUpAt=null;
   }
   async post(action,body,signal) {
     return await boundedJson(`${this.origin}/internal/proxy-admission-worker/discovery/${action}`,{body,signal,
       fetcher:this.o.fetcher,headers:{authorization:`Bearer ${this.o.credential}`}});
   }
   async runOnce() {
-    need(!this.active,'discovery worker is busy');this.active=true;
-    const o=this.o,signal=AbortSignal.timeout(o.timeoutMs),envelope={schema_version:1,purpose:PURPOSE,phase:'verify'};
+    need(!this.active,'discovery worker is busy');
+    const o=this.o;
+    if(this.tapCaughtUpAt!==null){
+      const elapsed=o.now()-this.tapCaughtUpAt;
+      if(elapsed>=0&&elapsed<TAP_FINALITY_POLL_MS)return {status:'idle'};
+      this.tapCaughtUpAt=null;
+    }
+    this.active=true;
+    const signal=AbortSignal.timeout(o.timeoutMs),envelope={schema_version:1,purpose:PURPOSE,phase:'verify'};
     try {
       const response=await this.post('pull',{...envelope,rails:[o.stream.rail]},signal);
       shape(response,['schema_version','purpose','phase','work']);need(response.schema_version===1&&response.purpose===PURPOSE&&response.phase==='verify','discovery response differs');
@@ -53,10 +67,15 @@ export class AdmissionDiscoveryWorker {
       const completed=await this.post('complete',{...envelope,stream_id:work.stream_id,lease_token:work.lease_token,
         from_cursor:work.from_cursor,from_offset:work.from_offset,...page},leasedSignal);
       need(completed.accepted===true&&completed.purpose===PURPOSE&&completed.phase==='verify','discovery completion rejected');
+      // Only delay the next TAP lease once SITE has acknowledged reaching the
+      // frontier. Empty historical blocks and partial log pages still advance.
+      if(o.stream.rail==='tap'&&tapCaughtUp(work,page))this.tapCaughtUpAt=o.now();
       return {status:'observed',observations:page.observations.length};
     } finally {this.active=false;}
   }
 }
+
+class TapEndpointError extends Error {}
 
 /** Operator-owned RPC URLs may contain the credential path used by QuickNode.
  * No caller-selected endpoint, redirect or transaction-submission method. */
@@ -65,37 +84,58 @@ export function admissionTapRpc({urls,chainId,allowLoopbackHttp=false,fetcher=fe
   const endpoints=urls.map(raw=>{const u=new URL(raw);need(!u.username&&!u.password&&!u.search&&!u.hash
     &&(u.protocol==='https:'||allowLoopbackHttp&&u.protocol==='http:'&&['127.0.0.1','[::1]'].includes(u.hostname)),'invalid operator RPC URL');return u.toString();});
   let id=0;
-  const read=async(url,method,params,signal)=>{const rid=++id;
-    const r=await boundedJson(url,{body:{jsonrpc:'2.0',id:rid,method,params},signal,fetcher,maxBytes:262144});
-    need(r.jsonrpc==='2.0'&&r.id===rid&&!r.error,'TAP RPC unavailable');return r.result;};
-  return async(method,params,signal)=>{
-    need(['eth_chainId','eth_getBlockByNumber','eth_getLogs','eth_getTransactionReceipt'].includes(method),'read-only RPC required');
+  const attemptSignal=signal=>AbortSignal.any([signal,AbortSignal.timeout(4000)]);
+  const checkMethod=method=>need(['eth_chainId','eth_getBlockByNumber','eth_getLogs','eth_getTransactionReceipt'].includes(method),'read-only RPC required');
+  const read=async(url,method,params,signal)=>{
+    const rid=++id;
+    try {
+      const r=await boundedJson(url,{body:{jsonrpc:'2.0',id:rid,method,params},signal,fetcher,maxBytes:262144});
+      need(r.jsonrpc==='2.0'&&r.id===rid&&!r.error,'TAP RPC unavailable');
+      if(method==='eth_chainId')need(parseHexInt(r.result,'chain')===BigInt(chainId),'TAP chain differs');
+      return r.result;
+    } catch {throw new TapEndpointError('TAP endpoint unavailable');}
+  };
+  const tryEndpoints=async(signal,operation)=>{
     for(const url of endpoints){
       try {
-        const attempt=AbortSignal.any([signal,AbortSignal.timeout(4000)]);
-        const chain=await read(url,'eth_chainId',[],attempt);need(parseHexInt(chain,'chain')===BigInt(chainId),'TAP chain differs');
-        return method==='eth_chainId'?chain:await read(url,method,params,attempt);
-      }catch{if(signal.aborted)throw signal.reason;}
+        signal.throwIfAborted();
+        const attempt=attemptSignal(signal);
+        const chain=await read(url,'eth_chainId',[],attempt);
+        return await operation(url,chain,attempt);
+      }catch(error){
+        if(signal.aborted)throw signal.reason;
+        if(!(error instanceof TapEndpointError))throw error;
+      }
     }
     throw new Error('Configured TAP RPCs unavailable');
   };
+  const rpc=async(method,params,signal)=>{
+    checkMethod(method);
+    return tryEndpoints(signal,(url,chain,attempt)=>method==='eth_chainId'?chain:read(url,method,params,attempt));
+  };
+  // Identity is scoped to one page on this URL. After a failure, rebuild the
+  // entire page on a freshly checked endpoint, within the same lease deadline.
+  rpc.withEndpoint=(signal,scan)=>tryEndpoints(signal,(url,chain)=>scan((method,params)=>{
+    checkMethod(method);
+    return method==='eth_chainId'?chain:read(url,method,params,attemptSignal(signal));
+  }));
+  return rpc;
 }
 export function tapDiscovery({rpc,chainId,tokenContract}) {
   need(typeof rpc==='function'&&uint(chainId,1)&&ethAddress(tokenContract),'TAP discovery configuration required');
-  return async(work,signal)=>{
-    validateDiscoveryWork(work,{rail:'tap',chain_id:chainId,token_contract:tokenContract});
+  const scanPage=async(work,read)=>{
     const from=BigInt(work.from_cursor),offset=work.from_offset;
-    const finalized=await rpc('eth_getBlockByNumber',['finalized',false],signal);
+    const finalized=await read('eth_getBlockByNumber',['finalized',false]);
     need(finalized&&ethHash(finalized.hash),'TAP finalized frontier unavailable');
     const tip=parseHexInt(finalized.number,'finalized block');
     if(from>tip)return {next_cursor:String(from),next_offset:offset,observations:[]};
     // One block per page bounds RPC work. Persisted log offset handles dense
     // blocks without discarding later events or a fixed total recipient cap.
     const number=`0x${from.toString(16)}`;
-    const block=from===tip?finalized:await rpc('eth_getBlockByNumber',[number,false],signal);
+    const block=from===tip?finalized:await read('eth_getBlockByNumber',[number,false]);
     need(block?.number===number&&ethHash(block.hash)&&ethHash(block.parentHash),'TAP canonical block differs');
     const observed=Number(parseHexInt(block.timestamp,'block time'))*1000;need(uint(observed,1),'TAP block time invalid');
-    const logs=await rpc('eth_getLogs',[{blockHash:block.hash,address:tokenContract,topics:[ERC20_TRANSFER_TOPIC]}],signal);
+    const logs=await read('eth_getLogs',[{blockHash:block.hash,address:tokenContract,topics:[ERC20_TRANSFER_TOPIC]}]);
     need(Array.isArray(logs),'TAP transfer logs missing');
     let previous=-1;
     for(const log of logs){
@@ -111,6 +151,11 @@ export function tapDiscovery({rpc,chainId,tokenContract}) {
         block_time_ms:observed,finalized_number:String(tip),finalized_hash:finalized.hash,log_count:logs.length},
       observations:selected.map(log=>({destination:`0x${log.topics[2].slice(26)}`,position:String(from),observed_at_ms:observed,
         transaction_hash:log.transactionHash,log_index:Number(parseHexInt(log.logIndex,'log index'))}))};
+  };
+  return async(work,signal)=>{
+    validateDiscoveryWork(work,{rail:'tap',chain_id:chainId,token_contract:tokenContract});
+    if(rpc.withEndpoint)return rpc.withEndpoint(signal,read=>scanPage(work,read));
+    return scanPage(work,(method,params)=>rpc(method,params,signal));
   };
 }
 
