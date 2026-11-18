@@ -20,6 +20,7 @@ import { signRootProposal } from '../scripts/pool-governance.mjs';
 import {
   buildCanonicalTapPreparationPlan,
   buildTapSettlement,
+  connectTapSettlementPool,
   encodeBurnCalldata,
   encodeWithdrawOperatorCalldata,
   POOL_SETTLEMENT_ABI,
@@ -49,6 +50,52 @@ const BUYER_KEY = `0x${'22'.repeat(32)}`;
 const PROVIDER_KEY = `0x${'33'.repeat(32)}`;
 const GANACHE_BALANCE = ethers.toBeHex(ethers.parseEther('100'));
 const BURN_SINK = '0x000000000000000000000000000000000000dEaD';
+
+test('settlement dry-run probes the chain once and confirmation rejects a network change before sending', async (t) => {
+  let chainId = 1;
+  const calls = [];
+  const poolAddress = ethers.getAddress('0x' + '11'.repeat(20));
+  const token = '0x' + '22'.repeat(20);
+  const rpc = new ethers.FetchRequest('http://unused.invalid');
+  rpc.getUrlFunc = async ({ body }) => {
+    const payload = JSON.parse(ethers.toUtf8String(body));
+    const reply = ({ method, id }) => {
+      calls.push(method);
+      const results = {
+        eth_chainId: ethers.toQuantity(chainId),
+        eth_call: ethers.zeroPadValue(token, 32),
+        eth_getTransactionCount: '0x0',
+      };
+      assert.ok(Object.hasOwn(results, method), method);
+      return { jsonrpc: '2.0', id, result: results[method] };
+    };
+    const response = Array.isArray(payload) ? payload.map(reply) : reply(payload);
+    return { statusCode: 200, statusMessage: 'OK', headers: {}, body: ethers.toUtf8Bytes(JSON.stringify(response)) };
+  };
+  const args = {
+    ethRpc: rpc, poolAddress, tapRateLock: { chain_id: 1, token_address: token },
+    env: { MAYHEM_TAP_ROLLER_PRIVATE_KEY: OPERATOR_KEY, MAYHEM_TAP_GOVERNANCE_PRIVATE_KEY: BUYER_KEY },
+  };
+  const dry = await connectTapSettlementPool({ ...args, confirm: false });
+  t.after(() => dry.provider.destroy());
+  await dry.pool.epoch();
+  await dry.pool.cumulativeSpent();
+  assert.deepEqual(calls, ['eth_chainId', 'eth_call', 'eth_call', 'eth_call']);
+
+  const live = await connectTapSettlementPool({ ...args, confirm: true });
+  t.after(() => live.provider.destroy());
+  await live.signer.wallet.getNonce('pending');
+  chainId = 2;
+  calls.length = 0;
+  await assert.rejects(live.pool.connect(live.signer.wallet).executeRoot({
+    nonce: 0, gasLimit: 100_000n, maxFeePerGas: 2n, maxPriorityFeePerGas: 1n, type: 2,
+  }), /network changed/);
+  assert.ok(calls.includes('eth_chainId'));
+  assert.ok(!calls.includes('eth_sendRawTransaction'));
+  for (const confirm of [false, true]) {
+    await assert.rejects(connectTapSettlementPool({ ...args, confirm }), /canonical TAP payment chain/);
+  }
+});
 
 function runNode(args, options = {}) {
   return new Promise((resolve, reject) => {
@@ -549,6 +596,41 @@ async function tapRollFixture(session) {
   };
 }
 
+test('TAP settlement reads claimable amounts once on replay and rechecks both after writes', async () => {
+  const { provider, pool, args } = await tapRollFixture('settlement-read-counts');
+  const counts = new Map();
+  const send = provider.send.bind(provider);
+  provider.send = (method, params) => {
+    if (method === 'eth_call') {
+      const selector = params[0].data.slice(0, 10);
+      counts.set(selector, (counts.get(selector) ?? 0) + 1);
+    }
+    return send(method, params);
+  };
+  const count = (name) => counts.get(pool.interface.getFunction(name).selector) ?? 0;
+  const dry = await rollTapSettlement({ ...args, post: false });
+  assert.equal(dry.propose_root_dry_run.ok, true);
+  assert.equal(count('epoch'), 2);
+  assert.equal(count('cumulativeSpent'), 2);
+
+  const rollArgs = { ...args, canonicalPreparationSubmitter: memoryPreparationSubmitter() };
+  counts.clear();
+  const sent = await rollTapSettlement(rollArgs);
+  assert.equal(sent.operator_fee.auto_sent, true);
+  assert.equal(sent.burn.auto_sent, true);
+  assert.equal(count('operatorClaimable'), 2);
+  assert.equal(count('burnClaimable'), 2);
+
+  await mineTapConfirmations(provider);
+  counts.clear();
+  const replay = await rollTapSettlement({ ...rollArgs, prior: sent });
+  assert.equal(replay.root_already_posted, true);
+  assert.equal(replay.operator_fee.completed, true);
+  assert.equal(replay.burn.completed, true);
+  assert.equal(count('operatorClaimable'), 1);
+  assert.equal(count('burnClaimable'), 1);
+});
+
 test('targeted TAP roots preserve each session payout revision across rotation', async () => {
   const providerId = makeReceiptIdentity();
   const oldAccount = ethers.Wallet.createRandom().address.toLowerCase();
@@ -883,6 +965,58 @@ test('TAP payout minimum defers from canonical liability and crossing pays full 
   assert.equal(later.cumulative_spent_wei, '200');
   assert.equal(later.providers[0].cumulative_wei, '150');
   assert.equal(later.spent_au, '0');
+});
+
+test('held earnings after a finalized root advance without replacing claims or preparing a payment', async () => {
+  const provider = makeReceiptIdentity();
+  const account = '0x1111111111111111111111111111111111111111';
+  const poolAddress = '0x2222222222222222222222222222222222222222';
+  const token = '0x3333333333333333333333333333333333333333';
+  const accounts = { [provider.publicKeyHex]: account };
+  function inputs(epoch, minimum) {
+    const bundle = { epoch, params: { payout_min_au: minimum },
+      receipts: [receipt({ session: 'carry-' + epoch, provider, au: '100', epoch })] };
+    return { bundle, targetedSessionBindings: targetedBindingsFor(bundle, accounts),
+      canonicalLiabilities: canonicalLiabilitiesFor(bundle, accounts), tapUsdAu: TAP_USD_AU,
+      ledgerFeeBps: 1500, settleThroughEpoch: epoch + 4,
+      ...checkpointArgs(bundle, poolAddress, token) };
+  }
+  const first = inputs(1, '0');
+  const paid = buildTapSettlement(first);
+  const prior = { ...paid, epoch: 1, epoch_apply_hash: first.epochApplyHash, root_confirmed: true,
+    operator_fee: { completed: true }, burn: { completed: true }, tap_rate_lock: first.tapRateLock,
+    tap_settlement_checkpoint: { epoch: 1, epoch_apply_hash: first.epochApplyHash, root_confirmed: true,
+      chain_id: first.tapRateLock.chain_id, pool_address: poolAddress, token_address: token,
+      root: paid.root, cumulative_spent_wei: paid.cumulative_spent_wei } };
+  const pool = { epoch: async () => 1, cumulativeSpent: async () => BigInt(paid.cumulative_spent_wei),
+    merkleRoot: async () => paid.root, pendingRoot: async () => ({ executeAfter: 0n }),
+    totalDeposited: async () => 1000n, maxEpochDelta: async () => 1000n,
+    getAddress: async () => poolAddress };
+  const next = inputs(2, '100');
+  const options = { ...next, pool, prior, post: true,
+    canonicalPreparationSubmitter: () => assert.fail('carry must never reserve or pay') };
+  const carried = await rollTapSettlement(options);
+  assert.equal(carried.blocked, undefined);
+  assert.equal(carried.posted, false);
+  assert.equal(carried.reason, 'provider earnings are below payout minimum');
+  assert.equal(carried.carried_root.epoch, 1);
+  assert.equal(carried.carried_root.root, prior.root);
+  assert.deepEqual(carried.providers, prior.providers);
+  assert.deepEqual(carried.checkpoint_outputs, []);
+  assert.equal(carried.threshold_held_au, '75');
+  for (const changes of [
+    { prior: { ...prior, tap_settlement_checkpoint: null } },
+    { prior: { ...prior, tap_settlement_checkpoint: { ...prior.tap_settlement_checkpoint, chain_id: 2 } } },
+    { prior: { ...prior, burn: { completed: false } } },
+    { pool: { ...pool, totalDeposited: async () => 1n } },
+    { pool: { ...pool, pendingRoot: async () => ({
+      merkleRoot: paid.root, newEpoch: 2, newCumulativeSpent: 100n, previousEpoch: 1,
+      previousCumulativeSpent: 100n, nonce: 1n, executeAfter: 123n }) } },
+  ]) {
+    const refused = await rollTapSettlement({ ...options, ...changes });
+    assert.equal(refused.blocked, true);
+    assert.equal(refused.carried_root, undefined);
+  }
 });
 
 test('TAP exact payout threshold produces an exact provider cap with no fee or burn drift', () => {

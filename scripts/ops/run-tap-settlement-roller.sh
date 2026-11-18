@@ -128,16 +128,19 @@ while true; do
   if jq -e '
     .posted == false and
     .blocked != true and
-    .root == null and
-    .entries == [] and
-    .providers == [] and
-    .refunds == [] and
-    .cumulative_spent_wei == "0" and
+    ((.root == null and .entries == [] and .providers == [] and
+      .refunds == [] and .cumulative_spent_wei == "0") or
+      (.carried_root | type == "object")) and
     .spent_au == "0" and
     (.checkpoint_outputs == []) and
     (.reason == "provider earnings await challenge or holdback maturity" or
       .reason == "provider earnings are below payout minimum")
   ' "$dry_report" >/dev/null; then
+    if ! python3 "$repo/scripts/ops/check-tap-carry-basis.py" "$dry_report" "$processed" "$bundle"; then
+      echo "TAP carry has no matching finalized distribution for $name" >&2
+      sleep "$interval"
+      continue
+    fi
     if ! python3 - "$bundle" "$dry_report" "$bound_report" <<'PY'
 import hashlib, json, re, sys
 bundle_path, report_path, target = sys.argv[1:]
@@ -168,12 +171,7 @@ threshold_count = report.get("threshold_held_provider_count")
 if (
     report.get("posted") is not False
     or report.get("blocked") is True
-    or report.get("root") is not None
-    or report.get("entries") != []
-    or report.get("providers") != []
-    or report.get("refunds") != []
     or report.get("checkpoint_outputs") != []
-    or report.get("cumulative_spent_wei") != "0"
     or report.get("spent_au") != "0"
     or report.get("receipt_count") != len(receipts)
     or not isinstance(held_count, int)
@@ -222,7 +220,7 @@ PY
       continue
     fi
     install -m 600 "$bound_report" "$processed/$name.settlement.json"
-    install -m 600 "$bound_report" "$processed/latest.json"
+    # latest.json always refers to the last finalized Ethereum distribution.
     install -m 600 "$rate_lock" "$processed/$name.tap-rate.json"
     mv "$bundle" "$processed/"
     [[ -f "$buyer_accounts" ]] && mv "$buyer_accounts" "$processed/"

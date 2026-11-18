@@ -2006,6 +2006,7 @@ PY
 
 validate_tap_no_work() {
   local report="$1" bundle="$2"
+  python3 "$SOURCE_DIR/scripts/ops/check-tap-carry-basis.py" "$report" "$TAP_SPOOL/processed" "$bundle" || return 1
   python3 - "$report" "$bundle" "$applied_epoch" "$apply_hash" <<'PY'
 import hashlib, json, re, sys
 report_path, bundle_path, expected_epoch, expected_hash = sys.argv[1:]

@@ -567,6 +567,7 @@ function normalizeReversalList(value) {
 function normalizeCursor(raw) {
   const cursor = raw && typeof raw === 'object' ? raw : {};
   return {
+    finalized_scan: cursor.finalized_scan,
     next_block: Number.isSafeInteger(cursor.next_block) && cursor.next_block >= 0
       ? cursor.next_block
       : 0,
@@ -631,15 +632,16 @@ async function safeToBlock(provider, { toBlock, confirmations = 12, blockTag, ch
     const block = await provider.send('eth_getBlockByNumber', ['finalized', false]);
     if (!block || block.number == null) throw new Error('finalized block tag unavailable from RPC');
     const referenceBlock = Number(block.number);
+    const referenceHash = /^0x[0-9a-f]{64}$/i.test(block.hash) ? block.hash.toLowerCase() : null;
     const maxSafe = Math.max(-1, referenceBlock - MIN_TAP_CONFIRMATIONS);
     if (toBlock !== undefined && toBlock !== null && toBlock !== '') {
       const explicit = parseNonNegativeInt(toBlock, '--to-block');
       if (explicit > maxSafe) {
         throw new Error(`--to-block must be at least ${MIN_TAP_CONFIRMATIONS} blocks behind the finalized reference`);
       }
-      return { safeTo: explicit, referenceBlock, finalizedPolicy: true };
+      return { safeTo: explicit, referenceBlock, referenceHash, finalizedPolicy: true };
     }
-    return { safeTo: maxSafe, referenceBlock, finalizedPolicy: true };
+    return { safeTo: maxSafe, referenceBlock, referenceHash, finalizedPolicy: true };
   }
   const head = Number(await provider.send('eth_blockNumber', []));
   const depth = parseNonNegativeInt(confirmations, '--confirmations', 12);
@@ -668,12 +670,13 @@ export async function scanTapDeposits({
   tapUsdAu,
   chainId,
   poolAddress,
+  previousScan,
 } = {}) {
   const provider = pool.runner?.provider ?? pool.runner ?? pool.provider;
   if (!provider) throw new Error('pool contract has no provider');
   const network = chainId ? null : await provider.getNetwork();
   const normalizedChainId = Number(chainId ?? network.chainId);
-  const { safeTo, referenceBlock, finalizedPolicy } = await safeToBlock(provider, {
+  const { safeTo, referenceBlock, referenceHash, finalizedPolicy } = await safeToBlock(provider, {
     toBlock,
     confirmations,
     blockTag,
@@ -682,6 +685,24 @@ export async function scanTapDeposits({
   const requestedFrom = parseNonNegativeInt(fromBlock, '--from-block', 0);
   const lookback = parsePositiveInt(lookbackBlocks, '--lookback-blocks', DEFAULT_LOOKBACK_BLOCKS);
   const from = Math.max(0, requestedFrom - (lookback - 1));
+  const finalizedScan = referenceHash && poolAddress && safeTo >= from ? {
+    chain_id: normalizedChainId,
+    pool_address: normalizeAddress(poolAddress, 'pool address'),
+    hash: referenceHash,
+    from,
+    to: safeTo,
+  } : null;
+  if (finalizedScan && previousScan?.hash === referenceHash
+      && previousScan.chain_id === normalizedChainId
+      && previousScan.pool_address === finalizedScan.pool_address
+      && Number.isSafeInteger(previousScan.from) && previousScan.from >= 0
+      && previousScan.from <= from && previousScan.to === safeTo) {
+    // Reconcile an empty range on an idle tick. The prior scan already handled its credits.
+    return {
+      deposits: [], from: safeTo + 1, to: safeTo, referenceBlock, finalizedPolicy,
+      finalizedScan: previousScan, skipped: true,
+    };
+  }
   if (safeTo < from) {
     return {
       deposits: [],
@@ -711,7 +732,45 @@ export async function scanTapDeposits({
       }));
     }
   }
-  return { deposits, from, to: safeTo, referenceBlock, finalizedPolicy };
+  return { deposits, from, to: safeTo, referenceBlock, finalizedPolicy, finalizedScan };
+}
+
+export async function scanTapDepositCursor({ rpc, cursor, poolAddress, fromBlock, toBlock, chainId, ...options }) {
+  // Discover the real network once, then pin the read provider for this tick's log pages.
+  const probe = new ethers.JsonRpcProvider(rpc);
+  let network;
+  try {
+    network = await probe.getNetwork();
+  } finally {
+    probe.destroy();
+  }
+  if (chainId != null && network.chainId !== BigInt(chainId)) {
+    throw new Error('Ethereum RPC chain does not match --chain-id');
+  }
+  const provider = new ethers.JsonRpcProvider(rpc, network, { staticNetwork: true });
+  try {
+    const pool = new ethers.Contract(poolAddress, POOL_ABI, provider);
+    const canReuseScan = fromBlock == null && toBlock == null
+      && cursor.pending_deposits.length === 0 && cursor.pending_reversals.length === 0;
+    const scan = await scanTapDeposits({
+      ...options, pool, poolAddress, chainId: Number(network.chainId), toBlock,
+      fromBlock: fromBlock ?? cursor.next_block,
+      previousScan: canReuseScan ? cursor.finalized_scan : null,
+    });
+    if (scan.finalizedScan && !scan.skipped) {
+      // Log pages were read by height. Bind the completed range to the same fork before retaining it.
+      const anchor = await provider.send('eth_getBlockByNumber', [ethers.toQuantity(scan.referenceBlock), false]);
+      if (anchor?.hash?.toLowerCase() !== scan.finalizedScan.hash) {
+        throw new Error('TAP finalized block changed during scan');
+      }
+    }
+    if (!scan.skipped && BigInt(await provider.send('eth_chainId', [])) !== network.chainId) {
+      throw new Error('Ethereum RPC chain changed during TAP deposit scan');
+    }
+    return scan;
+  } finally {
+    provider.destroy();
+  }
 }
 
 export function mergeDeposits(existing, incoming) {
@@ -763,7 +822,7 @@ async function main() {
   const cursor = normalizeCursor(readJsonIfExists(cursorPath, {}));
   const fromBlock = args['from-block'] !== undefined
     ? parseNonNegativeInt(args['from-block'], '--from-block')
-    : cursor.next_block;
+    : undefined;
   const confirmations = parseNonNegativeInt(args.confirmations ?? 12, '--confirmations', 12);
   const chunkSize = parsePositiveInt(args['chunk-size'] ?? 5000, '--chunk-size', 5000);
   const lookbackBlocks = parsePositiveInt(
@@ -793,10 +852,9 @@ async function main() {
   const verifyTimeoutMs = parseNonNegativeInt(args['verify-timeout-ms'] ?? 0, '--verify-timeout-ms', 0);
   const verifyPollMs = parseNonNegativeInt(args['verify-poll-ms'] ?? 500, '--verify-poll-ms', 500);
 
-  const provider = new ethers.JsonRpcProvider(rpc);
-  const pool = new ethers.Contract(poolAddress, POOL_ABI, provider);
-  const scan = await scanTapDeposits({
-    pool,
+  const scan = await scanTapDepositCursor({
+    rpc,
+    cursor,
     fromBlock,
     toBlock: args['to-block'],
     confirmations,
@@ -999,6 +1057,7 @@ async function main() {
   const finalCreditedKeys = new Set(creditedDeposits.map(tapDepositKey));
   const nextCursor = {
     next_block: Math.max(cursor.next_block, scan.to + 1),
+    finalized_scan: scan.finalizedScan ?? null,
     credited_deposits: creditedDeposits,
     pending_deposits: pendingDeposits.filter(
       (deposit) => !finalCreditedKeys.has(tapDepositKey(deposit))
@@ -1022,6 +1081,7 @@ async function main() {
     tap_usd_au: tapUsdAu,
     confirmations,
     finalized_policy: scan.finalizedPolicy,
+    scan_skipped: scan.skipped === true,
     finalized_reference_block: scan.referenceBlock,
     lookback_blocks: lookbackBlocks,
     from_block: scan.from,

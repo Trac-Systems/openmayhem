@@ -78,6 +78,27 @@ export function tapGovernanceWallet(provider, env = process.env) {
   });
 }
 
+export async function connectTapSettlementPool({ ethRpc, poolAddress, tapRateLock, confirm = true, env }) {
+  // A dry-run uses one validated network for its reads. Broadcasts keep ethers' live network checks.
+  const provider = new ethers.JsonRpcProvider(ethRpc, tapRateLock.chain_id, { staticNetwork: !confirm });
+  try {
+    const signer = tapRollerWallet(provider, env);
+    const governance = tapGovernanceWallet(provider, env);
+    const actualChainId = BigInt(await provider.send('eth_chainId', []));
+    if (actualChainId !== BigInt(tapRateLock.chain_id)) {
+      throw new Error('Ethereum RPC chain does not match the canonical TAP payment chain');
+    }
+    const pool = new ethers.Contract(poolAddress, POOL_SETTLEMENT_ABI, provider);
+    if (normalizeAddress(await pool.token(), 'TAP pool token') !== tapRateLock.token_address) {
+      throw new Error('TAP pool token does not match the canonical payment token');
+    }
+    return { provider, pool, signer, governance };
+  } catch (error) {
+    provider.destroy();
+    throw error;
+  }
+}
+
 function errorMessage(error) {
   return safeErrorMessage(error);
 }
@@ -1893,6 +1914,34 @@ function tapCheckpointPayload({
   };
 }
 
+// A later epoch can hold new earnings while inheriting an already finalized
+// distribution. Keep the prior root available for claims and carry the new
+// liabilities forward without proposing an identical Ethereum transaction.
+function carriedConfirmedRoot({ settlement, prior, screen, chainRoot, chainEpoch,
+  chainSpentWei, pendingRoot, requestedEpoch, tapRateLock }) {
+  const checkpoint = prior?.tap_settlement_checkpoint;
+  if (!checkpoint || !tapRateLock || pendingRoot || requestedEpoch <= chainEpoch ||
+      screen.reasons.length !== 1 || screen.reasons[0] !== 'no new spend since last root' ||
+      screen.prev_epoch !== chainEpoch || screen.flags.length !== 0 ||
+      !chainRoot || prior.root !== chainRoot || checkpoint.root !== chainRoot ||
+      prior.epoch !== chainEpoch || checkpoint.epoch !== chainEpoch ||
+      !isHexBytes(prior.epoch_apply_hash, 32) || checkpoint.epoch_apply_hash !== prior.epoch_apply_hash ||
+      prior.root_confirmed !== true || checkpoint.root_confirmed !== true ||
+      prior.operator_fee?.completed !== true || prior.burn?.completed !== true ||
+      !['chain_id', 'token_address', 'pool_address'].every(key =>
+        prior.tap_rate_lock?.[key] != null && prior.tap_rate_lock[key] === tapRateLock[key] &&
+        checkpoint[key] === tapRateLock[key]) ||
+      settlement.root !== chainRoot || prior.cumulative_spent_wei !== chainSpentWei?.toString() ||
+      checkpoint.cumulative_spent_wei !== prior.cumulative_spent_wei ||
+      settlement.cumulative_spent_wei !== prior.cumulative_spent_wei ||
+      settlement.spent_au !== '0' || settlement.checkpoint_outputs.length !== 0 ||
+      !(settlement.held_receipt_count > 0 || settlement.threshold_held_provider_count > 0) ||
+      !['entries', 'providers', 'refunds'].every(key =>
+        stableJson(settlement[key]) === stableJson(prior[key]))) return null;
+  return { epoch: chainEpoch, epoch_apply_hash: prior.epoch_apply_hash,
+    root: chainRoot, cumulative_spent_wei: prior.cumulative_spent_wei };
+}
+
 export async function rollTapSettlement({
   bundle,
   receipts,
@@ -2006,6 +2055,14 @@ export async function rollTapSettlement({
     screen = await guardianScreenSettlement({ settlement, pool, epoch: requestedEpoch, previous: prior });
   }
   if (!screen.ok) {
+    const carriedRoot = carriedConfirmedRoot({ settlement, prior, screen, chainRoot, chainEpoch,
+      chainSpentWei, pendingRoot, requestedEpoch, tapRateLock });
+    if (carriedRoot) {
+      return { ...settlement, posted: false, carried_root: carriedRoot,
+        reason: settlement.held_receipt_count > 0
+          ? 'provider earnings await challenge or holdback maturity'
+          : 'provider earnings are below payout minimum' };
+    }
     return { ...settlement, posted: false, blocked: true, reasons: screen.reasons, screen };
   }
 
@@ -2055,6 +2112,8 @@ export async function rollTapSettlement({
       merkleRoot: settlement.root,
       newEpoch: screen.epoch,
       newCumulativeSpent: expectedSpentWei,
+      previousEpoch: screen.prev_epoch,
+      previousCumulativeSpent: screen.prev_spent_wei,
     });
     proposeRootCalldata = encodeProposeRootCalldata({
       root: settlement.root,
@@ -2353,7 +2412,7 @@ export async function rollTapSettlement({
         operatorFee.tx = feeSent.hash;
         operatorFee.auto_sent = true;
       }
-      const remainingFee = await pool.operatorClaimable();
+      const remainingFee = operatorFee.auto_sent ? await pool.operatorClaimable() : claimable;
       operatorFee.remaining_claimable_wei = remainingFee.toString();
       operatorFee.completed = remainingFee === 0n;
       if (!operatorFee.completed) {
@@ -2400,7 +2459,7 @@ export async function rollTapSettlement({
         burn.tx = burnSent.hash;
         burn.auto_sent = true;
       }
-      const remainingBurn = await pool.burnClaimable();
+      const remainingBurn = burn.auto_sent ? await pool.burnClaimable() : claimable;
       burn.remaining_claimable_wei = remainingBurn.toString();
       burn.total_burned_wei = (await pool.totalBurned()).toString();
       burn.completed = remainingBurn === 0n;
@@ -3579,24 +3638,15 @@ async function main() {
   if (confirm || ethRpc || poolAddress) {
     if (!ethRpc) throw new Error('Missing --eth-rpc or MAYHEM_TAP_ETH_RPC.');
     if (!poolAddress) throw new Error('Missing --pool or MAYHEM_TAP_POOL_ADDRESS.');
-    cliEthProvider = new ethers.JsonRpcProvider(ethRpc);
-    const signer = tapRollerWallet(cliEthProvider);
-    const governance = tapGovernanceWallet(cliEthProvider);
+    const { provider, pool: connectedPool, signer, governance } = await connectTapSettlementPool({
+      ethRpc, poolAddress, tapRateLock, confirm,
+    });
+    cliEthProvider = provider;
+    pool = connectedPool;
     ownerSigner = signer.wallet;
     governanceSigner = governance.wallet;
     signerEnvName = signer.envName;
     governanceSignerEnvName = governance.envName;
-    pool = new ethers.Contract(poolAddress, POOL_SETTLEMENT_ABI, cliEthProvider);
-    const [network, poolToken] = await Promise.all([
-      cliEthProvider.getNetwork(),
-      pool.token(),
-    ]);
-    if (network.chainId !== BigInt(tapRateLock.chain_id)) {
-      throw new Error('Ethereum RPC chain does not match the canonical TAP payment chain');
-    }
-    if (normalizeAddress(poolToken, 'TAP pool token') !== tapRateLock.token_address) {
-      throw new Error('TAP pool token does not match the canonical payment token');
-    }
   }
   if (confirm) {
     preparationAdminSigner = await tapPreparationAdminSignerFromEnv();
@@ -3658,7 +3708,7 @@ async function main() {
     confirm,
     json: true,
   });
-  if (!confirm && report.root && ethRpc && poolAddress) {
+  if (!confirm && report.root && !report.carried_root && ethRpc && poolAddress) {
     report.copy_paste_confirm_command = buildReplayCommand({
       bundlePath,
       peerRpcUrl,

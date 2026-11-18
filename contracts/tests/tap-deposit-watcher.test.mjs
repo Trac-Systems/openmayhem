@@ -12,10 +12,12 @@ import {
   buildAdminReversalCommand,
   buildAdminReversalCommandArgs,
   mergeDeposits,
+  POOL_ABI,
   reconcileCreditedDeposits,
   redactRpcUrl,
   resolveActiveBillingEpoch,
   runAdminCommandWithRetry,
+  scanTapDepositCursor,
   scanTapDeposits,
   TAP_DEPOSIT_EVENT_SIGNATURE,
   TAP_DEPOSIT_WATCHER_ID,
@@ -410,6 +412,92 @@ test('tap deposit watcher requires finalized scans on mainnet and bounds its res
     }),
     /mainnet.*requires.*finalized/i,
   );
+});
+
+test('deposit cursor skips only a completed finalized range and replays recovery against live logs', async () => {
+  const poolAddress = '0x' + '22'.repeat(20);
+  const buyer = '0x' + '11'.repeat(20);
+  const { topics, data } = new ethers.Interface(POOL_ABI).encodeEventLog('Deposit', [buyer, U(1)]);
+  let hash = '0x' + 'ab'.repeat(32);
+  let head = 100;
+  let chainId = 1;
+  let afterLog;
+  const log = {
+    address: poolAddress, topics, data, blockNumber: '0x58', blockHash: '0x' + 'aa'.repeat(32),
+    transactionHash: '0x' + 'cc'.repeat(32), transactionIndex: '0x0', logIndex: '0x0', removed: false,
+  };
+  const calls = [];
+  const rpc = new ethers.FetchRequest('http://unused.invalid');
+  rpc.getUrlFunc = async ({ body }) => {
+    const payload = JSON.parse(ethers.toUtf8String(body));
+    const reply = ({ method, id, params }) => {
+      calls.push(method);
+      let result;
+      if (method === 'eth_chainId') result = ethers.toQuantity(chainId);
+      else if (method === 'eth_getBlockByNumber') {
+        assert.ok(params[0] === 'finalized' || params[0] === ethers.toQuantity(head));
+        result = { number: ethers.toQuantity(head), hash };
+      }
+      else {
+        assert.equal(method, 'eth_getLogs');
+        const { fromBlock, toBlock } = params[0];
+        result = Number(fromBlock) <= 88 && Number(toBlock) >= 88 ? [log] : [];
+        afterLog?.();
+      }
+      return { id, jsonrpc: '2.0', result };
+    };
+    const response = Array.isArray(payload) ? payload.map(reply) : reply(payload);
+    return { statusCode: 200, statusMessage: 'OK', headers: {}, body: ethers.toUtf8Bytes(JSON.stringify(response)) };
+  };
+  const cursor = { next_block: 0, pending_deposits: [], pending_reversals: [] };
+  const tick = (options = {}) => {
+    calls.length = 0;
+    return scanTapDepositCursor({ rpc, poolAddress, cursor, chunkSize: 10, lookbackBlocks: 40, ...options });
+  };
+  const count = (method) => calls.filter((call) => call === method).length;
+  const first = await tick();
+  assert.equal(count('eth_getLogs'), 9);
+  assert.equal(count('eth_chainId'), 2);
+  assert.equal(first.deposits.length, 1);
+  cursor.next_block = first.to + 1;
+  cursor.finalized_scan = JSON.parse(JSON.stringify(first.finalizedScan));
+
+  const repeat = await tick();
+  assert.equal(count('eth_getLogs'), 0);
+  assert.equal(count('eth_getBlockByNumber'), 1);
+  assert.equal(count('eth_chainId'), 1);
+  assert.deepEqual(reconcileCreditedDeposits(first.deposits, repeat.deposits, repeat), []);
+  for (const pending of ['pending_deposits', 'pending_reversals']) {
+    cursor[pending] = [first.deposits[0]];
+    assert.deepEqual((await tick()).deposits, first.deposits);
+    assert.equal(count('eth_getLogs'), 4);
+    cursor[pending] = [];
+  }
+  assert.deepEqual((await tick({ fromBlock: 89 })).deposits, first.deposits);
+  assert.equal(count('eth_getLogs'), 4);
+
+  hash = '0x' + 'cd'.repeat(32);
+  log.blockHash = '0x' + 'ef'.repeat(32);
+  const replacement = await tick();
+  assert.equal(count('eth_getLogs'), 4);
+  assert.equal(replacement.deposits[0].block_hash, log.blockHash);
+  assert.equal(reconcileCreditedDeposits(first.deposits, replacement.deposits, replacement).length, 1);
+  cursor.finalized_scan = replacement.finalizedScan;
+  await tick({ lookbackBlocks: 50 });
+  assert.equal(count('eth_getLogs'), 5);
+  head++;
+  hash = '0x' + 'dd'.repeat(32);
+  assert.equal((await tick()).to, 89);
+  assert.equal(count('eth_getLogs'), 4);
+  chainId = 2;
+  await assert.rejects(tick({ chainId: 1 }), /does not match --chain-id/);
+  assert.equal(count('eth_getLogs'), 0);
+  chainId = 1;
+  afterLog = () => { chainId = 2; };
+  await assert.rejects(tick(), /chain changed during TAP deposit scan/);
+  chainId = 1;
+  afterLog = () => { hash = '0x' + 'ff'.repeat(32); };
+  await assert.rejects(tick(), /finalized block changed during scan/);
 });
 
 test('tap deposit watcher retries broad transient failures but stops on permanent rejection', async () => {
