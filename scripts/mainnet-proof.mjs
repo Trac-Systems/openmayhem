@@ -1,5 +1,7 @@
 #!/usr/bin/env node
 
+import { existsSync, realpathSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { setTimeout as sleep } from 'node:timers/promises';
 
 export const MAINNET_MSB = Object.freeze({
@@ -417,7 +419,7 @@ async function main() {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (import.meta.main ?? (process.argv[1] && existsSync(process.argv[1]) && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url))) {
   main().catch((error) => {
     console.error(sanitizeError(error));
     process.exit(1);

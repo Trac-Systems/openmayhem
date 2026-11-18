@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import MayhemContract from '../intercom/contract/contract.js';
 
@@ -14,7 +13,7 @@ export function validateTapSettlementCheckpoint(report) {
   return normalized;
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (import.meta.main ?? (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === fileURLToPath(import.meta.url))) {
   try {
     if (process.argv.length !== 3) throw new Error('Expected one TAP settlement report path');
     validateTapSettlementCheckpoint(JSON.parse(fs.readFileSync(process.argv[2], 'utf8')));

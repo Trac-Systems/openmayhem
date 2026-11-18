@@ -1,5 +1,5 @@
 import fs from 'node:fs/promises';
-import path from 'node:path';
+import { existsSync, realpathSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { proxyEpochAcceptances, proxyEpochReceipt } from './proxy-epoch.mjs';
 
@@ -40,7 +40,7 @@ export async function deriveTapReceiptBundle(bundle, epoch, applyHash) {
     ...(bundle.proxy_acceptances === undefined ? {} : { proxy_acceptances: structuredClone(selected) }) };
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+if (import.meta.main ?? (process.argv[1] && existsSync(process.argv[1]) && realpathSync(process.argv[1]) === fileURLToPath(import.meta.url))) {
   try {
     const [source, target, epoch, applyHash] = process.argv.slice(2);
     const result = await deriveTapReceiptBundle(JSON.parse(await fs.readFile(source, 'utf8')), Number(epoch), applyHash);

@@ -212,7 +212,7 @@ validate_execution_context() {
   }
   local proof_tmp="$STATE_DIR/payout/mainnet-proof.json.tmp"
   if ! node "$SOURCE_DIR/scripts/mainnet-proof.mjs" \
-    --peer-rpc "$RPC_URL" --timeout-seconds 0 --json >"$proof_tmp"; then
+    --peer-rpc "$RPC_URL" --timeout-seconds 0 --json >"$proof_tmp" || [[ ! -s "$proof_tmp" ]]; then
     rm -f "$proof_tmp"
     echo "abort: canonical mainnet proof failed; refusing payout execution" >&2
     return 1

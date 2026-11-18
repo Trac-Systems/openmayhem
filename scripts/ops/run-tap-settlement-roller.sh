@@ -52,6 +52,10 @@ flock -n 8 || {
 
 node "$repo/scripts/mainnet-proof.mjs" \
   --peer-rpc "$peer_rpc" --timeout-seconds 0 --json >"$spool/mainnet-proof.json.tmp"
+[[ -s "$spool/mainnet-proof.json.tmp" ]] || {
+  echo "TAP settlement mainnet proof returned no evidence" >&2
+  exit 1
+}
 mv "$spool/mainnet-proof.json.tmp" "$spool/mainnet-proof.json"
 
 while true; do

@@ -3755,7 +3755,7 @@ async function main() {
   }
 }
 
-if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) {
+if (import.meta.main ?? (process.argv[1] && fs.existsSync(process.argv[1]) && fs.realpathSync(process.argv[1]) === scriptPath)) {
   main().catch((error) => {
     if (cliEthProvider?.destroy) cliEthProvider.destroy();
     console.error(safeErrorMessage(error));
