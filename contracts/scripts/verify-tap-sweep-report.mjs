@@ -16,11 +16,15 @@ function requireEvidence(condition, message) {
   if (!condition) throw new Error(`Invalid TAP sweep: ${message}`);
 }
 
-function requireFinalReport(report, checkpoint) {
+function requireFinalReport(report, checkpoint, candidate) {
   requireEvidence(checkpoint?.root_confirmed === true && report.root_confirmed === true &&
     report.blocked !== true && report.awaiting_finality !== true && report.root_pending !== true &&
     (report.posted === true || report.root_already_posted === true) &&
-    report.canonical_preparation_confirmed === true, 'missing finalized prepared root');
+    (candidate ? report.conditional_authorization === candidate.feature.key &&
+      candidate.feature.value.stage === 'authorize_au_alternative' &&
+      candidate.plan.root_preparation_id === checkpoint.root_preparation_id &&
+      report.canonical_preparation_confirmed === false : report.canonical_preparation_confirmed === true),
+    'missing finalized prepared root');
   for (const key of ['epoch', 'epoch_apply_hash', 'root', 'cumulative_spent_wei', 'tap_rate_lock',
     'preparation_ids', 'root_preparation_id', 'external_effect_ids']) {
     requireEvidence(isDeepStrictEqual(report[key], checkpoint[key]), `checkpoint differs on ${key}`);
@@ -55,9 +59,20 @@ function requireFinalReport(report, checkpoint) {
 
 // Supply the canonical header independently verified against the finalized
 // RootProposed receipt. Inputs are decoded JSON. No reads, writes or defaults.
-export function buildCanonicalTapSubmission({ report, proposalBlock }) {
+export function buildCanonicalTapSubmission(options) {
+  return finalizedSubmission(options);
+}
+
+// Used only by settle_au_alternative, after positive Core authorization readback.
+// Ordinary checkpoint submission continues to require all preparation records.
+export function buildTapAuWinnerSubmission(options, candidate) {
+  requireEvidence(candidate?.feature?.key && candidate.plan?.root_preparation_id, 'missing candidate');
+  return finalizedSubmission(options, candidate);
+}
+
+function finalizedSubmission({ report, proposalBlock }, candidate) {
   const checkpoint = report?.tap_settlement_checkpoint;
-  requireFinalReport(report, checkpoint);
+  requireFinalReport(report, checkpoint, candidate);
   requireEvidence(Number.isSafeInteger(proposalBlock?.number) && proposalBlock.number >= 0 &&
     /^0x[0-9a-f]{64}$/.test(proposalBlock.hash) &&
     proposalBlock.number === checkpoint.proposal_block_number && proposalBlock.hash === checkpoint.proposal_block_hash &&

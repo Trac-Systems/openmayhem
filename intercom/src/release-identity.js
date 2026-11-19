@@ -34,6 +34,8 @@ export const CONTRACT_CODE_PATHS = Object.freeze([
   'contract/proxy-registry.js',
   'contract/proxy-reservations.js',
   'contract/reference-demand.js',
+  'contract/tap-epoch-proof.js',
+  'contract/tap-prepared-debt.js',
   'contract/v30.js',
   'features/mayhem/index.js',
   'features/mayhem/proxy-admission.js',

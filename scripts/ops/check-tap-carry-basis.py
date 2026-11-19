@@ -59,7 +59,8 @@ def verify(report, processed, bundle):
             or not re.fullmatch(r"0x[0-9a-f]{64}", str(basis["root"]))):
         raise ValueError("invalid prior epoch or root")
     archive = processed / f"epoch-{epoch}-{anchor}.settlement.json"
-    prior = json.loads(archive.read_bytes())
+    debt = processed / f"epoch-{epoch}-{anchor}.debt-settlement.json"
+    prior = json.loads((debt if debt.exists() else archive).read_bytes())
     checkpoint = prior.get("tap_settlement_checkpoint") or {}
     if (prior.get("rail") != "tap" or prior.get("root_confirmed") is not True
             or checkpoint.get("root_confirmed") is not True

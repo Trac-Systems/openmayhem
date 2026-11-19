@@ -9,8 +9,10 @@ import { ethers, ZeroHash } from 'ethers';
 import MayhemContract from '../../intercom/contract/contract.js';
 import { executeFeature, executeRateFeature, makeIdentity, makeVerifier, MemoryStorage } from '../../intercom/tests/helpers/contract.js';
 import { advanceSweep, loadCursor, prepareSweep, validateQueuedSweep, verifyQueuedTapSweep } from '../scripts/prepare-tap-sweep-bundle.mjs';
-import { digest, handoffFile, journalTapPreparation, nextRefunds } from '../scripts/tap-draft-files.mjs';
+import { digest, handoffFile, journalTapPreparation, sealTapSource, nextRefunds } from '../scripts/tap-draft-files.mjs';
 import { proveUnpreparedTapDraft, recoverDraft } from '../scripts/tap-draft-recovery.mjs';
+import { runDebtTimer } from './helpers/tap-debt-timer.mjs';
+import { dispatchFencedTapTick } from '../scripts/tap-debt-worker.mjs';
 import { confirmedTapContract, preflightTapSweepPreparations, verifyPriorTapClaims } from '../scripts/tap-liability-sweep.mjs';
 import { buildCanonicalTapPreparationPlan, guardianPreSignReport, projectTapRefunds, rollTapSettlement,
   resolveTapSettlementPayoutMinimum, resolveTargetedTapPayoutsFromLedger, submitCanonicalTapPreparationPlan, tapRateRecordToLock } from '../scripts/tap-settlement-roller.mjs';
@@ -542,7 +544,7 @@ async function canonicalPoolFixture(t) {
   const { default: Ganache } = await import('ganache');
   const { compileAll } = await import('../scripts/compile.mjs');
   const { deployPoolWithToken } = await import('../scripts/deploy-local.mjs');
-  const chain = Ganache.provider({ logging: { quiet: true }, chain: { chainId: 1, time: new Date(10000000) } });
+  const chain = Ganache.provider({ logging: { quiet: true }, chain: { chainId: 1, time: new Date(10000000) }, miner: { timestampIncrement: 0 } });
   t.after(() => chain.disconnect());
   const provider = new ethers.BrowserProvider(chain, undefined, { cacheTimeout: -1 });
   const owner = await provider.getSigner();
@@ -822,7 +824,323 @@ test('a v30 pre-journal mixed receipt job with a lost Core acknowledgement requi
   assert.equal(f.storage.snapshotBytes(), before);
   const archived = path.join(f.spool, 'deferred', name);
   assert.deepEqual(read(archived + '.draft.json').observed_liability_preparations, [plan.preparation_ids[0]]);
+  const retained = read(archived + '.draft.json').debt_evidence;
+  assert.deepEqual(retained.source.intent, plan.intent);
+  assert.deepEqual(retained.source.preparation_ids, plan.preparation_ids);
+  assert.equal(retained.opening_checkpoint, null);
+  assert.deepEqual(retained.records.map(r => [r.economic_op_id, r.contract_version]), [[plan.preparation_ids[0], 30]]);
   assert.deepEqual(read(archived + '.receipts.json'), bundle);
   assert.deepEqual(read(archived + '.tap-rate.json'), lock);
   assert.equal(read(path.join(dir, 'tap.complete')).status, 'fenced');
+  await assert.rejects(dispatchFencedTapTick({ ...f, payout: path.join(f.spool, 'payout'), adminSigner: {
+    publicKey: signer.publicKey, sign: () => assert.fail('An uncommitted legacy remainder cannot be signed'),
+  } }), /Partial historical TAP reservation lacks a signed full plan/);
+  assert.equal(f.storage.snapshotBytes(), before);
+});
+
+for (const [mode, name] of [
+  ['immutable', 'unattended timer replays the sole frozen provider, restores the mined quote and closes paid refund inputs'],
+  ['alternative', 'unattended timer settles a repriced AU winner at the original epoch without other business'],
+  ['original-wins', 'unattended timer reconciles the delayed original send after a competing AU offer'],
+  ['prefix', 'unattended timer restores the signed v30 prefix after lost acknowledgement with no submission journal'],
+]) test(name, async t => {
+  const alternative = mode === 'alternative', legacy = mode === 'prefix', delayed = mode === 'original-wins';
+  const signer = await makeIdentity();
+  const f = fixture(t, signer);
+  const eth = await canonicalPoolFixture(t);
+  const { pool, provider } = eth;
+  const adminSigner = { publicKey: signer.publicKey,
+    sign: msg => Buffer.from(signer.wallet.sign(Buffer.from(msg))).toString('hex') };
+  const quote = async price => {
+    const ts = (await provider.getBlock('latest')).timestamp;
+    const result = await executeRateFeature(f.reducer, f.storage, { op: 'tap_rate_oracle', source: 'uniswap-v3-twap',
+      tap_usd_au: String(price), ts }, signer.publicKey);
+    assert.equal(result.ok, true, result.message);
+    f.seal();
+  };
+  if (!legacy) f.state.delete(liabilityKey(2));
+  if (alternative || delayed) f.state.get(liabilityKey(1)).denom = 'au_usd';
+  f.epoch(3);
+  await quote(rateValue);
+  const residue = { account: addr(10), amount_au: '1' };
+  const work = await f.freeze(3, { refunds: [{ account: addr(9), amount_wei: '4' }, ...(!legacy ? [residue] : [])] });
+  const { default: ContractV30, payoutPreparationMessage } = await import('../../intercom/contract/v30.js');
+  const old = new ContractV30({ peer: { wallet: makeVerifier(signer.wallet) } }, {});
+  const prepare = async (url, options) => {
+    if (!legacy || options?.method !== 'POST') return f.fetchImpl(url, options);
+    const { value } = JSON.parse(options.body);
+    value.contract_version = 30;
+    value.admin_sig = adminSigner.sign(payoutPreparationMessage(value));
+    const key = await old.targetedPayoutPreparationFeatureKey(value);
+    const accepted = await executeFeature(old, f.storage, 'mayhem_feature', key, value, signer.publicKey);
+    assert.equal(accepted.ok, true, accepted.message);
+    f.seal();
+    throw Error('power loss after v30 Core write');
+  };
+  await assert.rejects(rollTapSettlement({ ...work.options, ...eth, post: true,
+    canonicalPreparationSubmitter: req => submitCanonicalTapPreparationPlan({ ...work, ...req, adminSigner, fetchImpl: prepare,
+      beforePost: legacy ? undefined : async () => {
+        await sealTapSource(work.prefix, req.plan, req.openingCheckpoint, req.selectionBlock, adminSigner);
+        journalTapPreparation(work.prefix + '.prepare-intent.json', req.plan);
+      } }), beforeEthereumEffect() { throw Error('power loss'); } }), /power loss/);
+  fs.writeFileSync(work.prefix + '.draft-retry', '');
+  f.epoch(4);
+  await eth.jump(2701);
+  await quote(alternative ? rateValue * 2n : rateValue);
+  await recoverDraft({ ...work, pool, action: 'fence', successor: { epoch: 4, anchor: hash(4) } });
+  const archive = path.join(f.spool, 'deferred', work.name);
+  const digestBefore = digest(fs.readFileSync(archive + '.draft.json'));
+  const sealed = read(archive + '.draft.json').debt_evidence.source;
+  const reservation = id => f.state.get(f.reducer.payoutPreparationRecordKey('tap', id));
+  const prefix = structuredClone(reservation(sealed.preparation_ids[0]));
+  let lose = false, intercept = delayed;
+  const held = [];
+  const transport = { send: async (method, params) => {
+    if (intercept && method === 'eth_sendTransaction' &&
+        params[0].data.startsWith(pool.interface.getFunction('proposeRoot').selector)) {
+      held.push(structuredClone(params));
+      throw Error('unknown transaction delivery');
+    }
+    return provider.send(method, params);
+  } };
+  // Every invocation starts with a fresh coordinator and independently reads
+  // disk, Core and Ethereum. Repeated calls do not advance either clock.
+  const tick = () => runDebtTimer({ spool: f.spool, payout: path.join(f.spool, 'payout'), peerRpcUrl: f.peerRpcUrl,
+    ...eth, provider: transport, adminSigner, fetchImpl: async (u, o) => {
+      const response = await f.fetchImpl(u, o);
+      if (lose && o?.method === 'POST') { lose = false; throw Error('accepted feature, reply lost'); }
+      return response;
+    } });
+  if (delayed) {
+    await assert.rejects(tick(), /TAP debt recovery will retry/);
+    await eth.jump(1);
+    await quote(rateValue * 2n);
+    assert.equal(await tick(), 'alternative submitted');
+    await assert.rejects(tick(), /TAP debt recovery will retry/);
+    assert.equal(held.length, 2);
+    intercept = false;
+    const signedRoots = held.map(([tx]) => pool.interface.parseTransaction(tx).args[0]);
+    assert.equal(signedRoots[0], sealed.intent.root);
+    assert.notEqual(signedRoots[1], sealed.intent.root);
+    await provider.send('eth_sendTransaction', held[0]);
+    assert.equal((await pool.pendingRoot())[0], sealed.intent.root);
+    await assert.rejects(provider.call(held[1][0]));
+  }
+  if (legacy) {
+    assert.equal(prefix.contract_version, 30);
+    assert.equal(sealed.preparation_ids.length, 2);
+    assert.equal(reservation(sealed.preparation_ids[1]), undefined);
+    assert.equal(reservation(sealed.root_preparation_id), undefined);
+    assert.equal(fs.existsSync(archive + '.prepare-intent.json'), false);
+    lose = true;
+    await assert.rejects(tick(), /accepted feature, reply lost/);
+    assert.equal(reservation(sealed.preparation_ids[1]).contract_version, 31);
+    assert.equal(await tick(), 'original preparation submitted');
+    assert.deepEqual(reservation(sealed.preparation_ids[0]), prefix);
+    assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 0);
+  }
+  if (alternative) {
+    lose = true;
+    await assert.rejects(tick(), /accepted feature, reply lost/);
+    assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 0);
+  }
+  assert.equal(await tick(), 'governance delay');
+  assert.equal(await tick(), 'governance delay');
+  await eth.jump(3601);
+  await quote(rateValue * 3n); // later prices cannot overwrite the mined selection
+  assert.equal(await tick(), 'finality');
+  for (let i = 0; i < 12; i++) await provider.send('evm_mine', []);
+  assert.equal(await tick(), 'finalized');
+  assert.equal(f.state.get(liabilityKey(1)).paid_cum_au, '0');
+  assert.equal(reservation(sealed.root_preparation_id).consumed, false);
+  lose = true;
+  await assert.rejects(tick(), /accepted feature, reply lost/);
+  assert.equal(await tick(), 'settled');
+  assert.equal(await tick(), 'idle');
+  const report = read(path.join(f.spool, 'processed/latest.json'));
+  const cp = report.tap_settlement_checkpoint;
+  if (alternative) {
+    assert.equal(cp.epoch, sealed.intent.epoch);
+    assert.notEqual(cp.root, sealed.intent.root);
+    assert.notEqual(cp.root_preparation_id, sealed.root_preparation_id);
+    assert.equal(cp.tap_rate_lock.tap_usd_au, String(rateValue * 2n));
+    assert.equal(cp.proposal_rate_record_key, undefined);
+    assert.equal(report.canonical_preparation_confirmed, false);
+    const resolution = f.state.get('payout/recovery/tap/' + sealed.root_preparation_id + '/resolution');
+    assert.equal(resolution.candidate_submission, report.conditional_authorization);
+    assert.equal(resolution.root_preparation_id, cp.root_preparation_id);
+    assert.equal(reservation(cp.root_preparation_id).consumed, true);
+  } else assert(cp.proposal_rate_record_key && cp.proposal_rate_record_key !== cp.tap_rate_lock.rate_record_key);
+  if (delayed) {
+    assert.equal(cp.root, sealed.intent.root);
+    assert.equal(cp.root_preparation_id, sealed.root_preparation_id);
+    assert.equal(report.conditional_authorization, undefined);
+    await assert.rejects(provider.call(held[1][0]));
+    assert.equal(f.state.has('payout/recovery/tap/' + sealed.root_preparation_id + '/resolution'), false);
+  }
+  assert.equal(cp.outputs[0].paid_au, '101');
+  assert.equal(f.state.get(liabilityKey(1)).paid_cum_au, '101');
+  const amount = alternative ? 25n : 50n;
+  assert.equal(report.proofs[addr(1)].cumulative_wei, String(amount));
+  const claims = [[addr(1), amount], [addr(9), 4n]];
+  if (legacy) {
+    claims.push([addr(2), 6n]);
+    assert.equal(reservation(sealed.preparation_ids[0]).admin_sig, prefix.admin_sig);
+    assert.equal(reservation(sealed.preparation_ids[0]).contract_version, 30);
+    assert.equal(reservation(sealed.preparation_ids[0]).consumed, true);
+    assert.equal(f.state.get(liabilityKey(2)).paid_cum_au, '12');
+  }
+  for (const [account, wei] of claims) {
+    await (await pool.claim(cp.epoch, account, wei, report.proofs[account].proof)).wait();
+    assert.equal(await eth.token.balanceOf(account), wei);
+    await assert.rejects(pool.claim.staticCall(cp.epoch, account, wei, report.proofs[account].proof));
+  }
+  assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 1);
+  assert.equal((await pool.queryFilter(pool.filters.RootPosted())).length, 1);
+  assert.equal(digest(fs.readFileSync(archive + '.draft.json')), digestBefore);
+  const next = await f.freeze(4);
+  assert.deepEqual(next.bundle.tap_carried_refunds, legacy ? [] : [residue]);
+  if (!legacy) {
+    const fence = read(archive + '.draft.json');
+    assert.deepEqual(fence.reserved_refund_credits, [{ account: addr(9), amount_wei: '4' }]);
+    assert.deepEqual(fence.refunds, [residue]);
+  }
+  await verifyQueuedTapSweep(f.spool, next.bundle, pool);
+  const carry = await rollTapSettlement({ ...next.options, ...eth, prior: report });
+  assert.deepEqual(carry.refunds, cp.refunds);
+  finishPage(next, carry, 'carry');
+  const remaining = nextRefunds(f.spool, loadCursor(f.spool).refund_queue);
+  assert.deepEqual(remaining?.entries, legacy ? undefined : [residue]);
+});
+
+for (const [mode, name] of [
+  ['exact', 'timer pays disjoint held funds at their own price then substitutes the skipped debt on an empty page'],
+  ['au', 'timer recovers the excluded original AU at a materially changed price and credits its buyer once'],
+  ['history', 'timer certifies multiple disjoint intervening roots and pays the original at the next empty epoch'],
+]) test(name, async t => {
+  const reprice = mode !== 'exact', history = mode === 'history';
+  const signer = await makeIdentity();
+  const f = fixture(t, signer);
+  const eth = await canonicalPoolFixture(t);
+  const { pool, provider } = eth;
+  const adminSigner = { publicKey: signer.publicKey,
+    sign: msg => Buffer.from(signer.wallet.sign(Buffer.from(msg))).toString('hex') };
+  const quote = async price => {
+    const ts = (await provider.getBlock('latest')).timestamp;
+    const result = await executeRateFeature(f.reducer, f.storage, { op: 'tap_rate_oracle', source: 'uniswap-v3-twap',
+      tap_usd_au: String(price), ts }, signer.publicKey);
+    assert.equal(result.ok, true, result.message);
+    f.seal();
+  };
+  if (reprice) f.state.get(liabilityKey(1)).denom = 'au_usd';
+  const bindingKey = 'payout/binding/tap/' + hash(2) + '/' + hash(2);
+  const binding = f.state.get(bindingKey);
+  f.state.delete(bindingKey);
+  const third = { provider: hash(3), revision: hash(3), target: addr(3) };
+  if (history) {
+    f.state.set(liabilityKey(3), { ...f.state.get(liabilityKey(2)), ...third });
+    f.state.set('earn/tap/' + hash(3), { ...f.state.get('earn/tap/' + hash(2)), ...third });
+    f.state.set('prov/' + hash(3), { ...f.state.get('prov/' + hash(2)), provider: hash(3) });
+  }
+  f.epoch(3);
+  await quote(rateValue);
+  const work = await f.freeze(3, reprice ? { refunds: [{ account: addr(9), amount_wei: '4' }] } : {});
+  const ordinary = (item, more = {}) => rollTapSettlement({ ...item.options, ...eth,
+    post: true, canonicalPreparationSubmitter: req => submitCanonicalTapPreparationPlan({ ...item, ...req, adminSigner,
+      beforePost: async () => {
+        await sealTapSource(item.prefix, req.plan, req.openingCheckpoint, req.selectionBlock, adminSigner);
+        journalTapPreparation(item.prefix + '.prepare-intent.json', req.plan);
+      } }), ...more });
+  await assert.rejects(ordinary(work, { beforeEthereumEffect() { throw Error('crash'); } }), /crash/);
+  fs.writeFileSync(work.prefix + '.draft-retry', '');
+  f.state.set(bindingKey, binding);
+  f.epoch(4);
+  await eth.jump(2701);
+  await quote(rateValue * 2n);
+  await recoverDraft({ ...work, pool, action: 'fence', successor: { epoch: 4, anchor: hash(4) } });
+  let drop = null;
+  const tick = () => runDebtTimer({ ...eth, adminSigner, spool: f.spool,
+    payout: path.join(f.spool, 'payout'), peerRpcUrl: f.peerRpcUrl, fetchImpl: async (u, opts) => {
+      const response = await f.fetchImpl(u, opts);
+      if (opts?.method === 'POST' && JSON.parse(opts.body).value.op === drop) { drop = null; throw Error('lost ack'); }
+      return response;
+    } });
+  if (!reprice) await assert.rejects(tick(), /source is not the original payable AU liability/);
+  const fresh = await f.freeze(4);
+  assert.equal(await dispatchFencedTapTick({ ...f, ...eth, adminSigner, payout: path.join(f.spool, 'payout') }), 'ordinary work');
+  assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 0);
+  const payDisjoint = async (item, prior) => {
+    const run = () => ordinary(item, { prior });
+    assert.equal((await run()).awaiting_governance_delay, true);
+    await eth.jump(3601);
+    assert.equal((await run()).awaiting_finality, true);
+    for (let i = 0; i < 12; i++) await provider.send('evm_mine', []);
+    const final = await run();
+    const cp = final.tap_settlement_checkpoint;
+    const normal = await executeFeature(f.reducer, f.storage, 'mayhem_feature',
+      await f.reducer.targetedTapSettlementFeatureKey(cp), cp, signer.publicKey);
+    assert.equal(normal.ok, true, normal.message);
+    f.seal();
+    write(path.join(f.spool, 'processed/latest.json'), final);
+    finishPage(item, final, 'settled');
+    return final;
+  };
+  let latest = await payDisjoint(fresh, null);
+  await (await pool.claim(4, addr(2), 3n, latest.proofs[addr(2)].proof)).wait();
+  const targetEpoch = history ? 6 : 5;
+  if (history) {
+    f.state.set('payout/binding/tap/' + hash(3) + '/' + hash(3), { ...binding, ...third });
+    f.epoch(5);
+    await quote(rateValue * 2n);
+    latest = await payDisjoint(await f.freeze(5), latest);
+    await (await pool.claim(5, addr(3), 3n, latest.proofs[addr(3)].proof)).wait();
+  }
+  f.epoch(targetEpoch);
+  await quote(reprice ? rateValue * 2n : 201n * 10n**16n);
+  const empty = await f.freeze(targetEpoch);
+  const carry = await ordinary(empty, { prior: latest });
+  assert.equal(carry.reason, 'no payable TAP liabilities on this page');
+  finishPage(empty, carry, 'carry');
+  if (history) {
+    drop = 'recover_prepared_tap';
+    await assert.rejects(tick(), /lost ack/);
+    assert.equal(await tick(), 'historical checkpoint confirmed');
+    assert.equal(f.state.get(liabilityKey(1)).paid_cum_au, '0');
+  }
+  drop = 'recover_prepared_tap';
+  await assert.rejects(tick(), /lost ack/);
+  assert.equal(await tick(), 'governance delay');
+  assert.equal(await tick(), 'governance delay');
+  await eth.jump(3601);
+  assert.equal(await tick(), 'finality');
+  for (let i = 0; i < 12; i++) await provider.send('evm_mine', []);
+  assert.equal(await tick(), 'finalized');
+  assert.equal(await tick(), 'checkpoint submitted');
+  assert.equal(await tick(), 'settled');
+  assert.equal(await tick(), 'idle');
+  const paid = read(path.join(f.spool, 'processed/latest.json'));
+  assert.equal(paid.tap_settlement_checkpoint.outputs[0].paid_au, '101');
+  assert.equal(await pool.merkleRootAtEpoch(3), ZeroHash);
+  const originalWei = reprice ? 25n : 50n;
+  await (await pool.claim(targetEpoch, addr(1), originalWei, paid.proofs[addr(1)].proof)).wait();
+  if (reprice) {
+    await (await pool.claim(targetEpoch, addr(9), 4n, paid.proofs[addr(9)].proof)).wait();
+    assert.equal(await eth.token.balanceOf(addr(9)), 4n);
+    await assert.rejects(pool.claim.staticCall(targetEpoch, addr(9), 4n, paid.proofs[addr(9)].proof));
+    f.epoch(targetEpoch + 1);
+    const next = await f.freeze(targetEpoch + 1);
+    assert.equal(next.bundle.tap_carried_refunds, undefined);
+  }
+  for (const [account, amount] of [[addr(1), originalWei], [addr(2), 3n]]) {
+    assert.equal(await eth.token.balanceOf(account), amount);
+    await assert.rejects(pool.claim.staticCall(targetEpoch, account, amount, paid.proofs[account].proof));
+  }
+  assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, history ? 3 : 2);
+  assert.equal((await pool.queryFilter(pool.filters.RootPosted())).length, history ? 3 : 2);
+  if (history) {
+    assert.equal(await eth.token.balanceOf(addr(3)), 3n);
+    await assert.rejects(pool.claim.staticCall(targetEpoch, addr(3), 3n, paid.proofs[addr(3)].proof));
+  }
+  assert.equal(f.state.get(liabilityKey(1)).paid_cum_au, '101');
+  assert.equal(f.state.get(liabilityKey(2)).paid_cum_au, '12');
 });

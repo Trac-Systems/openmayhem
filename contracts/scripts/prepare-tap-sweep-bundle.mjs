@@ -190,7 +190,7 @@ export function validateQueuedSweep(spool, bundle) {
 // Check the same finalized block before authorizing a new financial plan.
 export async function verifyQueuedTapSweep(spool, bundle, pool) {
   const source = validateQueuedSweep(spool, bundle);
-  if (!source?.reserved) return;
+  if (!source?.reserved || source.recovered || source.reserved_remainder) return;
   const provider = pool.runner.provider;
   const finalized = await provider.getBlock('finalized');
   assert(positive(finalized?.number) && /^0x[0-9a-f]{64}$/.test(finalized.hash), 'Missing finalized TAP refund basis');
@@ -206,7 +206,8 @@ function verifyRefundDistribution({ spool, prefix, bundle, report, intent, paid 
   let prior = null;
   if (basis !== null) {
     assert(positive(basis.epoch) && basis.epoch < intent.epoch && hash32.test(basis.anchor));
-    prior = load(path.join(spool, 'processed', 'epoch-' + basis.epoch + '-' + basis.anchor + '.settlement.json'));
+    const prefix = path.join(spool, 'processed', 'epoch-' + basis.epoch + '-' + basis.anchor);
+    prior = load(fs.existsSync(prefix + '.debt-settlement.json') ? prefix + '.debt-settlement.json' : prefix + '.settlement.json');
     assert(prior.root_confirmed === true && prior.epoch === basis.epoch && prior.epoch_apply_hash === basis.anchor &&
       prior.tap_settlement_checkpoint?.root === basis.root && prior.root === basis.root);
     assert.deepEqual(prior.refunds, prior.tap_settlement_checkpoint.refunds);
@@ -285,7 +286,7 @@ export function advanceSweep({ epoch, anchor, dir, spool, marker }) {
       'TAP sweep cursor changed while its page was in progress');
     assert.deepEqual(queue, refundQueue(previous, handoff), 'TAP refund cursor changed during preparation');
   }
-  const next = retainRefundRemainder(spool, prefix, record, unpaid, batch && paid ? batch.next : queue);
+  const next = retainRefundRemainder(spool, prefix, record, unpaid, batch && (paid || (batch.source.recovered && !batch.entries.length)) ? batch.next : queue);
   if (paid && next.reconciled_epoch !== undefined) next.reconciled_epoch = epoch;
   if (next.tail > 0) record.refund_queue = next;
   if (previous?.epoch === epoch) {

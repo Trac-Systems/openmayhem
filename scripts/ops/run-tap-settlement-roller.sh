@@ -135,6 +135,15 @@ retry_draft() {
 }
 
 while true; do
+  # Recovery shares both writers' locks. Never wait for the producer while
+  # holding roller.lock; it may itself be finishing a reservation fence.
+  if [[ -f "$spool/deferred/next-sweep.json" ]]; then
+    payout_state="${MAYHEM_CADENCE_STATE_DIR:-$(dirname "$spool")}"
+    (
+      flock -n 9 || exit 0
+      timeout "$attempt_timeout" node "$repo/contracts/scripts/tap-debt-worker.mjs" "$spool" "$payout_state" "$peer_rpc"
+    ) 9>"$payout_state/payout.lock" || echo "TAP debt recovery will retry on the next poll" >&2
+  fi
   bundle="$(find "$working" -maxdepth 1 -type f -name 'epoch-*.receipts.json' -print | sort -V | head -n 1)"
   if [[ -z "$bundle" ]]; then
     candidate="$(find "$ready" -maxdepth 1 -type f -name 'epoch-*.receipts.json' -print | sort -V | head -n 1)"
@@ -327,7 +336,7 @@ PY
     publish_json "$rate_lock" "$processed/$name.tap-rate.json"
     [[ ! -f "$buyer_accounts" ]] || publish_json "$buyer_accounts" "$processed/$name.buyers.json"
     durable_move "$bundle" "$processed/$name.receipts.json"
-    rm -f "$buyer_accounts" "$working/$name.draft-plan.json" "$working/$name.prepare-intent.json" "$working/$name.draft-retry"
+    rm -f "$buyer_accounts" "$working/$name.sealed-plan.json" "$working/$name.draft-plan.json" "$working/$name.prepare-intent.json" "$working/$name.draft-retry"
     rm -f "$rate_lock" "$event_cursor" "$dry_report" "$raw_report" "$bound_report" "$final_report"
     continue
   fi
@@ -468,6 +477,6 @@ PY
   [[ ! -f "$event_cursor" ]] || mv "$event_cursor" "$processed/"
   [[ ! -f "$buyer_accounts" ]] || publish_json "$buyer_accounts" "$processed/$name.buyers.json"
   durable_move "$bundle" "$processed/$name.receipts.json"
-  rm -f "$buyer_accounts" "$working/$name.draft-plan.json" "$working/$name.prepare-intent.json" "$working/$name.draft-retry"
+  rm -f "$buyer_accounts" "$working/$name.sealed-plan.json" "$working/$name.draft-plan.json" "$working/$name.prepare-intent.json" "$working/$name.draft-retry"
   rm -f "$rate_lock" "$dry_report" "$raw_report" "$bound_report" "$final_report" "$working/$name.proposal-block.json"
 done

@@ -6,10 +6,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Contract, FetchRequest, JsonRpcProvider, ZeroHash } from 'ethers';
 import { confirmedTapContract, MAINNET_POOL as POOL, MAINNET_TOKEN as TOKEN, tapContractAt, tapDraftWatermarks, verifyPriorTapClaims } from './tap-liability-sweep.mjs';
-import { canonicalTapPaymentScope, POOL_SETTLEMENT_ABI, resolveTargetedTapPayoutsFromLedger, tapRateRecordToLock, transferableTapRefunds,
+import { canonicalTapPaymentScope, cumulativeTapRefunds, POOL_SETTLEMENT_ABI, projectTapRefunds, reconstructTapPlan, resolveTargetedTapPayoutsFromLedger, tapRateRecordToLock, transferableTapRefunds,
   validateTapRateLock } from './tap-settlement-roller.mjs';
 import { loadCursor, sweepPointerForIntent, validateIntent } from './prepare-tap-sweep-bundle.mjs';
-import { digest, digestFile, durableWrite, handoffFile, holdTapLock, nextRefunds, readDraftFile, readDraftHeader, readHandoff, refundQueue, refundSourceFile, reservedHandoffTicket, syncDirectory } from './tap-draft-files.mjs';
+import { digest, digestFile, durableWrite, handoffFile, holdTapLock, nextRefunds, readDraftFile, readDraftHeader, readHandoff, refundQueue, refundSourceFile, registerFencedDebt, reservedHandoffTicket, syncDirectory, tapPlanSource, verifyTapSourceSeal } from './tap-draft-files.mjs';
 
 const hash = s => typeof s === 'string' && /^[0-9a-f]{64}$/.test(s);
 const evmHash = s => typeof s === 'string' && /^0x[0-9a-f]{64}$/.test(s);
@@ -222,7 +222,54 @@ async function proveReservedTapDraft({ bundle, peerRpcUrl, fetchImpl, pool, prio
     assert((await contract.guardianRequireHistoricalTapRateLock(lock, block.timestamp))?.message ===
       'Guardian TAP settlement rate invariant failed: oracle is stale.', 'TAP reservation rate must be authentic and expired');
   }
-  return { contract, basis, at, reservations, finalized };
+  return { contract, basis, at, reservations, finalized, lock };
+}
+
+// Locate the immutable signed checkout at the first accepted reservation. A
+// lost POST acknowledgement and a truncated dry report do not erase that row.
+export async function fencedSourceEvidence({ bundle, prior, companions, proof, peerRpcUrl, fetchImpl }) {
+  const { contract, at, lock, reservations, basis } = proof;
+  const opening = basis.epoch === 0 ? null : await contract.get('settle/targeted/tap/' + basis.epoch);
+  if (basis.epoch) {
+    assert.equal(opening?.root, basis.root, 'Missing original TAP opening checkpoint');
+    for (const [k, v] of Object.entries(prior.tap_settlement_checkpoint)) assert.deepEqual(opening[k], v);
+  }
+  let source, selectionBlock, signedLength;
+  if (companions['.sealed-plan.json']) {
+    const seal = verifyTapSourceSeal(json(companions['.sealed-plan.json']), await contract.get('admin'));
+    assert.deepEqual(seal.opening_checkpoint, prior?.tap_settlement_checkpoint ?? null);
+    source = seal.source;
+    selectionBlock = seal.selection_block;
+  } else {
+    const key = contract.payoutPreparationRecordKey('tap', reservations[0]);
+    let low = 1, high = contract.signedLength;
+    while (low < high) {
+      const mid = low + Math.floor((high - low) / 2);
+      if (await tapContractAt(peerRpcUrl, mid, fetchImpl).get(key) === null) low = mid + 1;
+      else high = mid;
+    }
+    signedLength = low;
+    source = tapPlanSource(await reconstructTapPlan({ bundle, prior, tapRateLock: lock, at, peerRpcUrl, fetchImpl,
+      signedLength, buyerAccounts: companions['.buyers.json'] ? json(companions['.buyers.json']) : {} }));
+  }
+  assert.equal(source.intent.epoch, bundle.epoch);
+  assert.equal(source.intent.epoch_apply_hash, bundle.epoch_apply_hash);
+  assert.equal(source.intent.at, at);
+  assert.deepEqual(source.intent.tap_rate_lock, lock);
+  assert(reservations.every(id => source.preparation_ids.includes(id)), 'Source differs from confirmed reservation');
+  const records = [];
+  for (const id of [...source.preparation_ids, source.root_preparation_id]) {
+    const record = await contract.get(contract.payoutPreparationRecordKey('tap', id));
+    if (record !== null) {
+      assert.equal(record.economic_op_id, id);
+      assert.equal(record.consumed, false);
+      records.push(record);
+    }
+  }
+  // A historical partial without a signed full source proves precisely its
+  // confirmed rows. Reconstructing the rest cannot create an admin signature.
+  return { source, opening_checkpoint: opening, records,
+    ...(selectionBlock && { selection_block: selectionBlock }), ...(signedLength && { signed_length: signedLength }) };
 }
 
 function assertLocalDraft(prefix, processedPrefix) {
@@ -264,7 +311,7 @@ function assertLocalDraft(prefix, processedPrefix) {
 
 const draftCompanions = ['.buyers.json', '.tap-rate.json', '.tap-rate.json.events.json',
   '.dry-run.json', '.draft-plan.json', '.draft-retry', '.confirmation.json'];
-const reservedCompanions = [...draftCompanions, '.prepare-intent.json', '.settlement.raw.json',
+const reservedCompanions = [...draftCompanions, '.sealed-plan.json', '.prepare-intent.json', '.settlement.raw.json',
   '.settlement.bound.json', '.settlement.json', '.proposal-block.json'];
 
 function fenceCompanions(prefix, item) {
@@ -389,7 +436,8 @@ export async function recoverDraft({ action, spool, name, dir, successor, peerRp
   assert(buyerFiles.length <= 1, 'Ambiguous TAP buyer companion');
   const buyers = buyerFiles[0];
   assert(!exists(path.join(spool, 'ready', name + '.buyers.json')), 'TAP buyer companion is in transit');
-  const refunds = transferableTapRefunds(bundle, buyers ? json(buyers) : {});
+  const accounts = buyers ? json(buyers) : {};
+  let refunds = transferableTapRefunds(bundle, accounts);
   const q = refundQueue(cursor, active);
   // The original root may have included this inherited slice as well as
   // its own refund inputs. Move both to the same fenced source exactly once.
@@ -401,16 +449,37 @@ export async function recoverDraft({ action, spool, name, dir, successor, peerRp
     position = batch.next;
     refunds.push(...batch.entries);
   }
+  let sourceEvidence;
+  if (fence) {
+    // Even an old partial archive with missing history must release disjoint work.
+    // Keep all first-party inputs so later ticks can retry historical reads.
+    try {
+      sourceEvidence = await fencedSourceEvidence({ ...inputs, proof, companions });
+    } catch (error) {
+      if (companions['.sealed-plan.json']) throw error;
+    }
+  }
+  let reservedCredits;
+  if (refunds.length && sourceEvidence && companions['.sealed-plan.json']) {
+    // The original signs the entire cumulative distribution. Its credited
+    // inputs stay with that plan even if independent roots win first. Only
+    // unresolved destinations and sub-wei AU go back into the ordinary queue.
+    const projection = projectTapRefunds(bundle, accounts, proof.lock.tap_usd_au, true);
+    assert.deepEqual(cumulativeTapRefunds(projection.credits, prior), sourceEvidence.source.intent.refunds,
+      'Signed TAP source differs from its buyer refund inputs');
+    reservedCredits = projection.credits;
+    refunds = projection.unpaid;
+  }
   const nextQueue = { ...position, tail: position.tail + (refunds.length ? 1 : 0) };
   if (fence && refunds.length) nextQueue.reconciled_epoch ??= 0;
   assert(Number.isSafeInteger(nextQueue.tail));
   const cert = { at: intent?.at ?? proof.at, source_state: state, buyers_sha256: buyers ? digestFile(buyers) : null,
     refund_queue: nextQueue, type: fence ? 'reserved_tap_sweep' : 'unprepared_tap_sweep',
-    ...(fence && { observed_liability_preparations: proof.reservations, finalized_pool_basis: proof.finalized,
+    ...(fence && { opening_epoch: proof.basis.epoch, ...(sourceEvidence && { debt_evidence: sourceEvidence }), observed_liability_preparations: proof.reservations, finalized_pool_basis: proof.finalized,
       companion_sha256: Object.fromEntries(Object.entries(companions).map(([ext, file]) => [ext, digestFile(file)])) }),
     epoch, epoch_apply_hash: anchor, bundle_sha256: bundleDigest,
     signed_length: proof.contract.signedLength, pool_basis: proof.basis, completed_cursor: cursor,
-    predecessor: active?.ticket ?? null, successor, refunds,
+    predecessor: active?.ticket ?? null, successor, refunds, ...(reservedCredits && { reserved_refund_credits: reservedCredits }),
     retry_after: !fence && bundle.tap_liability_sweep.limit === 1 && intent.after === openingCursor ? proof.page.next : openingCursor };
   fs.mkdirSync(path.dirname(archive), { recursive: true, mode: 0o700 });
   syncDirectory(spool);
@@ -468,6 +537,7 @@ function publishHandoff({ spool, name, dir, cursor }) {
   const marker = { schema_version: 1, rail: 'tap', status: cert.type === 'reserved_tap_sweep' ? 'fenced' : 'superseded', epoch: cert.epoch,
     epoch_apply_hash: cert.epoch_apply_hash, canonical_settlement_unix: cert.at,
     evidence: archive + '.draft.json', evidence_sha256: ticket.proof_sha256 };
+  if (cert.type === 'reserved_tap_sweep') registerFencedDebt(spool, name, ticket);
   const file = path.join(dir, 'tap.complete');
   if (exists(file)) assert.deepEqual(json(file), marker);
   else durableWrite(file, marker, false);

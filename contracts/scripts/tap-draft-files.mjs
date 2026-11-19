@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { createHash, randomUUID } from 'node:crypto';
+import { createHash, createPublicKey, randomUUID, verify } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 export const digest = bytes => createHash('sha256').update(bytes).digest('hex');
 
@@ -153,6 +154,39 @@ export function journalTapPreparation(file, plan, draft = false) {
   }
 }
 
+export function tapPlanSource({ intent, preparation_ids, root_preparation_id, external_effect_ids }) {
+  return { intent, preparation_ids, root_preparation_id, external_effect_ids };
+}
+
+const sourceMessage = value => 'mayhem-tap-worker-source-v1/' + digest(JSON.stringify(value));
+
+export function verifyTapSourceSeal(seal, admin) {
+  const { evidence, signature } = seal;
+  assert(/^[0-9a-f]{64}$/.test(admin) && /^[0-9a-f]{128}$/.test(signature), 'Invalid TAP source signer');
+  const publicKey = createPublicKey({ key: Buffer.from('302a300506032b6570032100' + admin, 'hex'), type: 'spki', format: 'der' });
+  assert(verify(null, Buffer.from(sourceMessage(evidence)), publicKey, Buffer.from(signature, 'hex')),
+    'Invalid TAP worker source signature');
+  return evidence;
+}
+
+export async function sealTapSource(prefix, plan, openingCheckpoint, selectionBlock, signer) {
+  const file = prefix + '.sealed-plan.json';
+  const source = tapPlanSource(plan);
+  if (fs.existsSync(file)) {
+    const prior = verifyTapSourceSeal(JSON.parse(readDraftFile(file)), signer.publicKey);
+    assert.deepEqual(prior.source, source, 'Conflicting TAP worker source');
+    assert.deepEqual(prior.opening_checkpoint, openingCheckpoint);
+    return;
+  }
+  assert(Number.isSafeInteger(selectionBlock?.number) && selectionBlock.number >= 0 &&
+    /^0x[0-9a-f]{64}$/.test(selectionBlock.hash) && Number.isSafeInteger(selectionBlock.timestamp),
+    'Missing TAP financial selection block');
+  const evidence = { source, opening_checkpoint: openingCheckpoint, selection_block: selectionBlock };
+  const seal = { evidence, signature: await signer.sign(sourceMessage(evidence)) };
+  verifyTapSourceSeal(seal, signer.publicKey);
+  durableWrite(file, seal, false);
+}
+
 // Each source is bound to a failed draft or a reconciled page's unpaid inputs.
 // A successor takes a bounded slice from the oldest source. Repeated failures
 // carry the position and never concatenate the history of refund inputs.
@@ -187,6 +221,26 @@ export function retainRefundRemainder(spool, prefix, record, refunds, queue) {
   return { ...queue, tail };
 }
 
+const debtIndex = fileURLToPath(new URL('./tap-debt-index.py', import.meta.url));
+
+export function indexedDebt(root, action, name, ticket) {
+  const result = spawnSync('python3', [debtIndex, action, path.join(root, 'pending.sqlite3'), name], {
+    input: ticket === undefined ? '' : JSON.stringify(ticket), encoding: 'utf8', timeout: 10_000, maxBuffer: 4096,
+  });
+  assert(result.status === 0, 'TAP debt index operation failed: ' + action);
+  return JSON.parse(result.stdout);
+}
+
+export function registerFencedDebt(spool, name, ticket) {
+  assert(ticket.reserved && /^[0-9a-f]{64}$/.test(ticket.anchor) && Number.isSafeInteger(ticket.epoch) &&
+    name === 'epoch-' + ticket.epoch + '-' + ticket.anchor);
+  const root = path.join(spool, 'debt');
+  fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+  syncDirectory(spool);
+  syncDirectory(root);
+  if (!fs.existsSync(path.join(root, name + '.settled.json'))) indexedDebt(root, 'put', name, ticket);
+}
+
 export function nextRefunds(spool, q) {
   if (q.head === q.tail) return null;
   const index = q.head + 1;
@@ -206,9 +260,30 @@ export function nextRefunds(spool, q) {
     Array.isArray(source.refunds) && q.offset < source.refunds.length,
   'Invalid TAP refund source');
   const reserved = source.type === 'reserved_tap_sweep';
-  if (reserved && !(q.reconciled_epoch > source.epoch)) return null;
-  const entries = source.refunds.slice(q.offset, q.offset + 32);
+  let rows = source.refunds, recovered;
+  let reservedRemainder;
+  if (reserved && Array.isArray(source.reserved_refund_credits)) {
+    assert(source.companion_sha256?.['.sealed-plan.json'] === digestFile(prefix + '.sealed-plan.json') &&
+      /^[0-9a-f]{64}$/.test(source.debt_evidence?.source.root_preparation_id), 'Missing signed refund assignment');
+    reservedRemainder = source.debt_evidence.source.root_preparation_id;
+  }
+  const name = 'epoch-' + ticket.epoch + '-' + ticket.anchor;
+  const closed = path.join(spool, 'debt', name + '.settled.json');
+  if (reserved && fs.existsSync(closed)) {
+    const marker = JSON.parse(readDraftFile(closed));
+    if (marker.refund) {
+      assert(marker.refund.index === index && Array.isArray(marker.refund.unpaid) &&
+        marker.fence_sha256 === ticket.proof_sha256, 'Conflicting TAP refund recovery');
+      const paid = path.join(spool, 'processed', 'epoch-' + marker.epoch + '-' + marker.anchor + '.debt-settlement.json');
+      assert(digestFile(paid) === marker.report_sha256, 'Recovered refund checkpoint changed');
+      recovered = marker.checkpoint;
+      rows = marker.refund.unpaid;
+      assert(q.offset === 0 || q.offset < rows.length);
+    }
+  }
+  if (reserved && !reservedRemainder && !recovered && !(q.reconciled_epoch > source.epoch)) return null;
+  const entries = rows.slice(q.offset, q.offset + 32);
   const end = entries.length + q.offset;
-  return { entries, source: { index, offset: q.offset, count: entries.length, ...ticket },
-    next: end === source.refunds.length ? { ...q, head: index, offset: 0 } : { ...q, offset: end } };
+  return { entries, source: { index, offset: q.offset, count: entries.length, ...ticket, ...(reservedRemainder && { reserved_remainder: reservedRemainder }), ...(recovered && { recovered }) },
+    next: end === rows.length ? { ...q, head: index, offset: 0 } : { ...q, offset: end } };
 }

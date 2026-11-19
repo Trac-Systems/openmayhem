@@ -19,6 +19,7 @@ import ContractV27 from './history/v27.js';
 import ContractV28 from './history/v28.js';
 import ContractV29 from './history/v29.js';
 import ContractV30 from './v30.js';
+import { applyTapDebt, isTapRateKey, verifyPreparedTapPrice } from './tap-prepared-debt.js';
 import { indexPayoutHistory, historyKey } from './payout-history.js';
 import { bookedBalance, unbookedBalance, allocationCursor, revisionScope, providerScope,
   planClaimWrites, openClaim, consumeClaimWrites, receiptMatchesOutput } from './payout-reservations.js';
@@ -1810,6 +1811,11 @@ class MayhemContract extends Contract {
     }
     if (value.op === 'index_targeted_payout_history') {
       const result = await indexPayoutHistory(this, key, value, CONTRACT_VERSION);
+      this._mayhemLastFeatureResult = result;
+      return result;
+    }
+    if (value.op === 'recover_prepared_tap') {
+      const result = await applyTapDebt(this, key, value, CONTRACT_VERSION);
       this._mayhemLastFeatureResult = result;
       return result;
     }
@@ -13031,6 +13037,7 @@ class MayhemContract extends Contract {
         'proposal_block_number',
         'proposal_block_hash',
         'proposal_block_timestamp',
+        ...(hasOwn(value ?? {}, 'proposal_rate_record_key') ? ['proposal_rate_record_key'] : []),
         'execution_tx',
         'execution_status',
         'execution_block_number',
@@ -13055,6 +13062,9 @@ class MayhemContract extends Contract {
       'targeted TAP settlement'
     );
     if (shapeError) return shapeError;
+    if (hasOwn(value, 'proposal_rate_record_key') && !isTapRateKey(value.proposal_rate_record_key)) {
+      return new Error('Invalid TAP proposal rate record key.');
+    }
     const rateLock = this.normalizeTargetedTapRateLock(value.tap_rate_lock);
     if (rateLock instanceof Error) return rateLock;
     if (value.op !== 'settle_targeted_tap' ||
@@ -13129,6 +13139,11 @@ class MayhemContract extends Contract {
         new Set(value.external_effect_ids).size !== 2) {
       return new Error('Invalid targeted TAP settlement preparation identities.');
     }
+    return this.normalizeTargetedTapDistribution(value, rateLock);
+  }
+
+  // Shared by ordinary confirmed checkpoints and pre-effect debt recovery.
+  normalizeTargetedTapDistribution(value, rateLock) {
     if (rateLock.epoch !== value.epoch ||
         rateLock.chain_id !== value.chain_id ||
         rateLock.token_address !== value.token_address ||
@@ -14317,8 +14332,8 @@ class MayhemContract extends Contract {
     return validatedTails;
   }
 
-  async consumePayoutPreparations(plans, settlementKey, independent = false) {
-    const validatedTails = independent ? [] : await this.validatePayoutPreparationConsumption(plans);
+  async consumePayoutPreparations(plans, settlementKey, independent = false, checkedTails = null) {
+    const validatedTails = checkedTails ?? (independent ? [] : await this.validatePayoutPreparationConsumption(plans));
     if (validatedTails instanceof Error) return validatedTails;
     for (const record of plans) {
       if (independent && record.liability) {
@@ -14368,7 +14383,7 @@ class MayhemContract extends Contract {
   }
 
   async targetedPayoutSettlementUpdates(outputs, rail, epoch, at, transferIds, claim = null) {
-    const keepNewest = rail === 'fiat' || rail === 'tnk';
+    const keepNewest = rail === 'fiat' || rail === 'tnk' || rail === 'tap';
     const params = await this.targetedPayoutHoldbackParamsAt(rail, at);
     if (params instanceof Error) return params;
     const liabilityUpdates = [];
@@ -14622,9 +14637,8 @@ class MayhemContract extends Contract {
         payments.tap?.pool_address?.toLowerCase() !== value.pool_address) {
       return new Error('Targeted TAP settlement does not match canonical payment configuration.');
     }
-    const rate = await this.guardianRequireHistoricalTapRateLock(
-      normalized.rate_lock,
-      value.proposal_block_timestamp
+    const rate = await verifyPreparedTapPrice(
+      this, normalized.rate_lock, value.proposal_block_timestamp, value.proposal_rate_record_key, value
     );
     if (rate instanceof Error) return rate;
 
@@ -14835,6 +14849,9 @@ class MayhemContract extends Contract {
     );
     if (updates instanceof Error) return updates;
 
+    const tails = await this.validatePayoutPreparationConsumption(preparations);
+    if (tails instanceof Error) return tails;
+
     for (const update of updates.liabilityUpdates) await this.put(update.key, update.value);
     for (const earning of updates.earningUpdates) {
       await this.put(this.earningKey(earning.provider, 'tap'), earning);
@@ -14865,8 +14882,7 @@ class MayhemContract extends Contract {
       updated_at: this.tx,
     });
     const preparationError = await this.consumePayoutPreparations(
-      preparations,
-      recordKey
+      preparations, recordKey, false, tails
     );
     if (preparationError) return preparationError;
     await this.put(recordKey, record);

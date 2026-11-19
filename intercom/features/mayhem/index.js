@@ -387,6 +387,7 @@ const participantFor = (value) => {
     'prepare_targeted_payout_epoch',
     'index_targeted_payout_history',
     'recover_fiat_preparation',
+    'recover_prepared_tap',
     'prepare_targeted_fiat_attempt',
     'finalize_targeted_fiat_attempt',
     'settle_targeted_tnk_output',

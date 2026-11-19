@@ -56,6 +56,7 @@ export const mayhemFeatureParticipant = (value) => {
     'prepare_targeted_payout_epoch',
     'index_targeted_payout_history',
     'recover_fiat_preparation',
+    'recover_prepared_tap',
     'prepare_targeted_fiat_attempt',
     'finalize_targeted_fiat_attempt',
     'settle_targeted_tnk_output',
@@ -437,6 +438,7 @@ class MayhemProtocol extends Protocol {
       json?.op === 'prepare_targeted_payout_epoch' ||
       json?.op === 'index_targeted_payout_history' ||
       json?.op === 'recover_fiat_preparation' ||
+      json?.op === 'recover_prepared_tap' ||
       json?.op === 'prepare_targeted_fiat_attempt' ||
       json?.op === 'finalize_targeted_fiat_attempt' ||
       json?.op === 'settle_targeted_tap' ||

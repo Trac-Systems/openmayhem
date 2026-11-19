@@ -2626,6 +2626,9 @@ PY
     esac
   fi
 
+  # A governed debt root is changing the claim/refund basis. Its timer clears
+  # this scheduler marker after exact checkpoint publication or an idle retry.
+  [[ ! -f "$TAP_SPOOL/debt/pool-slot.json" ]] || return 2
   local sweep=0 empty_mode=receipts
   tap_spool_state || return 1
   if [[ -f "$work_dir/tap-sweep-intent.json" ]] ||

@@ -2,11 +2,11 @@
   "schema": 1,
   "release_version": "0.2.314",
   "contract_version": 31,
-  "contract_code_sha256": "34918f90a758653128d970fb587c7cd536fb26a8991030beb0ae9396a03c77d6",
+  "contract_code_sha256": "6f62e14c2e07ea1657eeac6a8839923073b6f64c5bba0385b89ac62f9e069b41",
   "files": [
     {
       "path": "contract/contract.js",
-      "sha256": "0793b7570e40c242097f2e9f92f2da0c9003f2b522adbbd50ae38a0c02f19eb0"
+      "sha256": "b5f1dacc565137e5e53e3e3f7171b698fbeff382e56efe718b68d7aa30e7fa63"
     },
     {
       "path": "contract/fiat-recovery.js",
@@ -74,7 +74,7 @@
     },
     {
       "path": "contract/protocol.js",
-      "sha256": "e5ab29e7934338781dfd1ce03a2710438cd454a1f9bc41e22e2c2240e2de9706"
+      "sha256": "dca47fbd5fb33e2f6737dc4665cfedde2fc3a15423b646534cd7cca5bd3a71c3"
     },
     {
       "path": "contract/proxy-closure.js",
@@ -121,12 +121,20 @@
       "sha256": "3bbb52be30d4d8352026753ef91b0a1c291f4e997cbb6824afd9c12e6a94a78f"
     },
     {
+      "path": "contract/tap-epoch-proof.js",
+      "sha256": "60e9cdaac8dc5f7262f1bdde045d2dd9a29899fd4a0090fe02dbd2016339a939"
+    },
+    {
+      "path": "contract/tap-prepared-debt.js",
+      "sha256": "dc23d9f0ee28810007818509abcfa7ec71c1c2c77888ae25a1e8b23071bc4ca0"
+    },
+    {
       "path": "contract/v30.js",
       "sha256": "bd499c64b5d9ce0d8faf9712c7c1b867439b30eeb244393b1096a283877885a3"
     },
     {
       "path": "features/mayhem/index.js",
-      "sha256": "705b1a37f35b0d1d7f6530c23a1ee4d9c2e7e3f7b842518d7674237bca48e742"
+      "sha256": "7b7891ec408642bf400980915924e9a6760c03f364d9a780b93acbed59907c59"
     },
     {
       "path": "features/mayhem/proxy-admission.js",
