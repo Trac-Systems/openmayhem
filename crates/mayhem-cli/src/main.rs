@@ -20,11 +20,12 @@ mod release_bundle;
 
 use payout_dispatch::{
     booked_payout, confirmed_payout_close, confirmed_payout_output, ensure_payout_history,
-    explicit_payout, parse_payout_output_id, print_explicit_payout, print_payout_progress,
-    require_output_claim, require_prepared_fiat_attempt, require_prepared_output_locks, ExplicitPayout,
+    explicit_payout, parse_payout_output_id, payout_commitments, print_explicit_payout,
+    print_payout_progress, require_output_claim, require_prepared_fiat_attempt,
+    require_prepared_output_locks, validate_payout_receipt, ExplicitPayout,
 };
 #[cfg(test)]
-use payout_dispatch::{selected_payout_index, validate_payout_receipt, BookedPayout};
+use payout_dispatch::{selected_payout_index, BookedPayout};
 
 #[cfg(test)]
 use endpoint_calibration::run_endpoint_calibration_matrix;
@@ -37183,7 +37184,12 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
         ExplicitPayout::Dispatch(selected) => selected,
         ExplicitPayout::Report(report) => return print_explicit_payout(&report, args.tx.json),
     };
-    let signer = if args.tx.submit && !args.tx.sim {
+    let signer = if args.tx.submit
+        && !args.tx.sim
+        && read_confirmed_state_value(&rpc, &format!("settle/targeted/tnk/{epoch}"))
+            .await?
+            .is_none()
+    {
         let signer = targeted_payout_preparation_signer(&args.tx, &home, &rpc).await?;
         ensure_payout_history(&rpc, &signer, "tnk").await?;
         Some(signer)
@@ -37432,7 +37438,13 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                             }),
                     "canonical TNK payout preparation does not match its output"
                 );
-                require_prepared_output_locks(&rpc, &plan.payload, &settlement_output, &preparation).await?;
+                require_prepared_output_locks(
+                    &rpc,
+                    &plan.payload,
+                    &settlement_output,
+                    &preparation,
+                )
+                .await?;
                 payout_preparation_results.push(preparation);
                 let transfer = execute_prepared_msb_settlement_transfer(
                     &network,
@@ -37507,13 +37519,8 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
                     &output_record_key,
                     None,
                     |record| {
-                        record.get("type").and_then(Value::as_str)
-                            == Some("targeted_tnk_output_settlement")
-                            && record.get("economic_op_id").and_then(Value::as_str)
-                                == Some(operation_id.as_str())
-                            && record.pointer("/value/plan_root") == plan.payload.get("plan_root")
-                            && record.pointer("/value/external_effect_id")
-                                == Some(&json!(expected_effect))
+                        validate_payout_receipt(&plan.payload, &settlement_output, record).is_ok()
+                            && record["value"]["external_effect_id"] == expected_effect
                     },
                 )
                 .await
@@ -37530,7 +37537,7 @@ async fn run_admin_tnk_settlement_runner(args: &AdminTnkSettlementArgs) -> Resul
             .await;
             if let Err(error) = result {
                 pending_outputs.push(json!({"economic_op_id": operation_id,
-                    "output_index": index, "reason":"dispatch_error", "detail": redact_stripe_credentials(&format!("{error:#}"))}));
+                    "output_index": index, "reason":"dispatch_error", "detail": format!("{error:#}")}));
             }
         }
     }
@@ -37684,6 +37691,52 @@ fn admin_fiat_dust_sweep_payload(args: &AdminFiatDustSweepArgs) -> Result<Value>
 
 /// Read both frozen plans before any Stripe access. Once an overlapping 542
 /// plan exists, replaying the entire 508 batch could also retain its fee twice.
+// A reviewed success authorizes only accounting for the existing effect.
+async fn reviewed_fiat_success(
+    rpc: &PeerRpcClient,
+    output: &Value,
+) -> Result<Option<(Value, Value)>> {
+    let id = output["economic_op_id"]
+        .as_str()
+        .context("missing FIAT output identity")?;
+    let Some(resolution) =
+        read_confirmed_state_value(rpc, &format!("payout/recovery/fiat/{id}/resolution")).await?
+    else {
+        return Ok(None);
+    };
+    let review = &resolution["value"];
+    ensure!(
+        resolution["type"] == "fiat_recovery_resolution" && review["old_operation"] == id,
+        "FIAT recovery resolution owner mismatch"
+    );
+    if review["stage"] != "reconcile_verified" {
+        return Ok(None);
+    }
+    let finalized = &review["instruction"];
+    let attempt_id = finalized["attempt_id"]
+        .as_str()
+        .filter(|s| is_hex_len(s, 64))
+        .context("missing reviewed attempt ID")?;
+    let attempt =
+        read_confirmed_state_value(rpc, &format!("payout/attempt/fiat/{id}/{attempt_id}"))
+            .await?
+            .context("missing reviewed FIAT attempt")?;
+    let evidence = &finalized["evidence"];
+    ensure!(
+        finalized["economic_op_id"] == id
+            && finalized["status"] == "succeeded"
+            && attempt["status"] == "succeeded"
+            && attempt["economic_op_id"] == id
+            && attempt["attempt_id"] == attempt_id
+            && attempt["consumed"] == false
+            && attempt.pointer("/result/evidence") == Some(evidence)
+            && evidence["attempt_id"] == attempt_id
+            && evidence["ref"] == review["attestation"]["old_effect"],
+        "reviewed FIAT evidence does not match the succeeded original attempt"
+    );
+    Ok(Some((attempt, evidence.clone())))
+}
+
 async fn require_fiat_508_sender_open(rpc: &PeerRpcClient, old_output: &Value) -> Result<()> {
     let key = "payout/epoch-plan/fiat/542";
     let state = rpc.state(Some(key), Some(true)).await?;
@@ -37813,7 +37866,12 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
         ExplicitPayout::Dispatch(selected) => selected,
         ExplicitPayout::Report(report) => return print_explicit_payout(&report, args.tx.json),
     };
-    let signer = if args.tx.submit && !args.tx.sim {
+    let signer = if args.tx.submit
+        && !args.tx.sim
+        && read_confirmed_state_value(&rpc, &format!("settle/targeted/fiat/{epoch}"))
+            .await?
+            .is_none()
+    {
         let signer = targeted_payout_preparation_signer(&args.tx, &home, &rpc).await?;
         ensure_payout_history(&rpc, &signer, "fiat").await?;
         Some(signer)
@@ -37939,6 +37997,22 @@ async fn run_admin_fiat_settlement_runner(args: &AdminFiatSettlementArgs) -> Res
                 require_output_claim(&rpc, "fiat", &plan.payload, output).await?;
                 if epoch == 508 {
                     if output["role"] == "provider" {
+                        if let Some((attempt, evidence)) =
+                            reviewed_fiat_success(&rpc, output).await?
+                        {
+                            let paid = settle_targeted_fiat_output(
+                                &rpc,
+                                signer,
+                                &plan.payload,
+                                output,
+                                &attempt,
+                                now_unix_seconds()?,
+                                &evidence,
+                            )
+                            .await?;
+                            output_settlements.push(paid);
+                            return Ok(());
+                        }
                         require_fiat_508_sender_open(&rpc, output).await?;
                     } else if let Some(sibling) = outputs.iter().find(|o| o["role"] == "provider") {
                         require_fiat_508_sender_open(&rpc, sibling).await?;
@@ -38961,9 +39035,15 @@ async fn submit_targeted_payout_preparation(
         // freeze, by the admin then in office. Compare its original admission
         // metadata and every requested economic field without rewriting it.
         if matches!(rail, "fiat" | "tnk") {
-            ensure!(existing["prepared_at"].as_u64().is_some_and(|at| at <= 9_007_199_254_740_991)
-                && existing["admin"].as_str().is_some_and(|admin| is_hex_len(admin, 64)),
-                "canonical payout preparation has invalid original admission metadata");
+            ensure!(
+                existing["prepared_at"]
+                    .as_u64()
+                    .is_some_and(|at| at <= 9_007_199_254_740_991)
+                    && existing["admin"]
+                        .as_str()
+                        .is_some_and(|admin| is_hex_len(admin, 64)),
+                "canonical payout preparation has invalid original admission metadata"
+            );
             value["prepared_at"] = existing["prepared_at"].clone();
             value["admin"] = existing["admin"].clone();
         }
@@ -39246,26 +39326,8 @@ fn targeted_payout_epoch_plan_value(
     } else {
         "no_work"
     };
-    let outputs_root = opaque_hash(
-        "mayhem-targeted-payout-epoch-outputs-v1",
-        &json!({ "rail": rail, "epoch": epoch, "outputs": outputs }),
-    );
-    let carry_root = opaque_hash(
-        "mayhem-targeted-payout-epoch-carry-v1",
-        &json!({ "rail": rail, "epoch": epoch, "carry": carry }),
-    );
-    let plan_root = opaque_hash(
-        "mayhem-targeted-payout-epoch-plan-v1",
-        &json!({
-            "rail": rail,
-            "epoch": epoch,
-            "at": at,
-            "epoch_apply_hash": epoch_apply_hash,
-            "snapshot_signed_length": snapshot_signed_length,
-            "outcome": outcome,
-            "outputs_root": outputs_root,
-            "carry_root": carry_root,
-        }),
+    let (outputs_root, carry_root, plan_root) = payout_commitments(
+        rail, epoch, at, epoch_apply_hash, snapshot_signed_length, outcome, &outputs, &carry,
     );
     Ok(stable_json_value(&json!({
         "op": "prepare_targeted_payout_epoch",
@@ -57850,10 +57912,9 @@ async fn settle_targeted_fiat_output(
     }));
     let record_key = format!("settle/targeted/fiat/{epoch}/output/{economic_op_id}");
     submit_targeted_payout_control(rpc, signer, &value, &record_key, None, |record| {
-        record.get("type").and_then(Value::as_str) == Some("targeted_fiat_output_settlement")
-            && record.get("economic_op_id").and_then(Value::as_str) == Some(economic_op_id)
-            && record.pointer("/value/attempt_id").and_then(Value::as_str) == Some(attempt_id)
-            && record.pointer("/value/plan_root") == plan.get("plan_root")
+        validate_payout_receipt(plan, output, record).is_ok()
+            && record["value"]["attempt_id"] == attempt_id
+            && record.pointer("/value/stripe_transfer") == Some(evidence)
     })
     .await
 }

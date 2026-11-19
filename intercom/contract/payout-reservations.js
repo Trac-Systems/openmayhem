@@ -125,11 +125,11 @@ export async function reviewedPayoutCountersMatch(contract, old, replacement, li
   if (old.paid_cum_au_before === liability?.paid_cum_au &&
       old.aggregate_paid_cum_au_before === earning?.paid_cum_au) return true;
   const group = await contract.get(`payout/legacy/fiat/${revisionScope(old)}`);
-  if (!group || !group.prepared || group.blocked || group.consumed_by !== null ||
+  if (!group || group.prepared !== true || group.blocked !== false || group.consumed_by !== null ||
       group.owner !== old.economic_op_id || group.reviewed_successor !== replacement.economic_op_id ||
       group.before !== old.paid_cum_au_before ||
-      contract.compareAu(group.gross_au, replacement.liability_au) < 0 ||
-      contract.compareAu(group.paid_au, replacement.paid_au) < 0) return false;
+      !(contract.compareAu(group.gross_au, replacement.liability_au) >= 0) ||
+      !(contract.compareAu(group.paid_au, replacement.paid_au) >= 0)) return false;
   const revision = await bookedBalance(contract, 'fiat', revisionScope(old));
   const aggregate = await bookedBalance(contract, 'fiat', providerScope(old));
   if (revision instanceof Error || aggregate instanceof Error) return false;

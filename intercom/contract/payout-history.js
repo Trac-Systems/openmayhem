@@ -36,6 +36,23 @@ async function unchangedFeeSincePlan(contract, rail, fee, planKey) {
     transfers?.some(t => (rail === 'tnk' ? t.tx_hash : t.ref) === fee.last_targeted_settlement_transfer);
 }
 
+// Only the specifically reviewed 508/542 replacement can ever displace a
+// prepared owner. Cover its whole envelope while the original remains open.
+async function coversReviewedReplacement(contract, group, plan, output) {
+  if (plan.rail !== 'fiat' || plan.epoch !== 542 || output.role !== 'provider' ||
+      output.output_index !== 1 || group?.epoch !== 508 || group.index !== 0 ||
+      !group.prepared || plan.outputs.length !== 3 || plan.outputs[0].role !== 'provider' ||
+      plan.outputs[2].role !== 'operator_fee') return false;
+  const prior = await contract.get(contract.targetedPayoutEpochPlanRecordKey('fiat', 508));
+  const old = prior?.value.outputs[0];
+  return prior?.value.outputs.length === 2 && prior.value.outputs[1].role === 'operator_fee' &&
+    old?.economic_op_id === group.owner && old.role === 'provider' &&
+    ['provider', 'payout_revision', 'to', 'destination_currency', 'source_currency',
+      'paid_cum_au_before', 'aggregate_paid_cum_au_before'].every(k => old[k] === output[k]) &&
+    contract.compareAu(output.paid_au, old.paid_au) >= 0 &&
+    contract.compareAu(output.liability_au, old.liability_au) >= 0;
+}
+
 async function inventoryOutput(contract, writes, plan, output, planKey) {
   const { rail, epoch, plan_root } = plan;
   const id = output.economic_op_id;
@@ -110,10 +127,7 @@ async function inventoryOutput(contract, writes, plan, output, planKey) {
   const old = writes.get(key) ?? await contract.get(key);
   const prepared = prep !== null || inconsistent;
   const collision = Boolean(old?.prepared && prepared);
-  // The existing 508/542 review signs exact paid counters for this provider.
-  // Its absence/success adjudication must still be executable after inventory.
-  const reviewedPair = rail === 'fiat' && provider && old?.epoch === 508 && old.index === 0 &&
-    old.prepared && epoch === 542 && output.output_index === 1 && before === old.before;
+  const reviewedPair = before === old?.before && await coversReviewedReplacement(contract, old, plan, output);
   const preferred = !old || (prepared && !old.prepared);
   const max = (a, b) => a > b ? a : b;
   const min = (a, b) => a < b ? a : b;
@@ -173,7 +187,7 @@ export async function indexPayoutHistory(contract, key, value, version) {
   if (state?.through_epoch >= epoch) return { ok: true, idempotent: true };
   if (state?.complete || (state?.through_epoch ?? 0) !== after) return new Error('Payout history cursor changed.');
   const head = (await contract.epochApplyStateRecord()).updated_epoch;
-  if (epoch > head) return new Error('Payout history page exceeds applied head.');
+  if (!Number.isSafeInteger(head) || epoch > head) return new Error('Payout history page exceeds applied head.');
   const writes = new Map();
   for (let n = after+1; n <= epoch; n++) {
     const planKey = contract.targetedPayoutEpochPlanRecordKey(rail, n);

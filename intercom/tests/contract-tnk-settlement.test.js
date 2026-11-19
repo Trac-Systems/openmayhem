@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import Contract30 from '../contract/v30.js';
-import { inventory, advanceHead } from './helpers/payout-history.js';
+import { inventory, inventoryPage, advanceHead } from './helpers/payout-history.js';
 import b4a from 'b4a';
 
 import MayhemContract, {
@@ -693,3 +693,88 @@ test('a TNK aggregate coverage failure for one payee leaves another frozen payee
   assert.equal((await read(key)).paid_cum_au, '0');
   assert.match((await closeEpoch(ctx, plan)).message, /unsettled/);
 });
+
+test('historical inventory pages authenticate their cursor, resume once and hold external dispatch until complete', async () => {
+  const ctx = await setup();
+  const current = ctx.contract;
+  ctx.contract = new Contract30(current.protocol, {});
+  ctx.version = 30;
+  const [provider] = ctx.outputs;
+  const first = await buildPlan(ctx, ctx.outputs);
+  const txHash = '5'.repeat(64);
+  assert.equal((await prepareOutput(ctx, first, provider, txHash)).ok, true);
+  ctx.contract = current;
+  delete ctx.version;
+  await advanceHead(ctx.storage, 65, 'e'.repeat(64));
+  assert.match((await inventoryPage(ctx, 'tnk', 0, 33)).message, /Invalid payout history page/);
+  assert.ok((await inventoryPage(ctx, 'tnk', 0, 32, provider.provider)) instanceof Error);
+  assert.equal(await ctx.storage.get('payout/history/tnk'), null);
+  assert.equal((await inventoryPage(ctx, 'tnk', 0, 32)).ok, true);
+  const balance = `payout/booked/tnk/revision/${provider.provider}/${provider.payout_revision}`;
+  const held = await ctx.storage.get(balance);
+  assert.equal(held.value.pending_au, provider.au);
+  assert.equal((await inventoryPage(ctx, 'tnk', 0, 32)).idempotent, true);
+  assert.deepEqual(await ctx.storage.get(balance), held);
+  assert.match((await inventoryPage(ctx, 'tnk', 33, 64)).message, /cursor/);
+  assert.match((await settleOutput(ctx, first, provider, txHash)).result.message, /inventory is in progress/);
+  assert.equal((await inventoryPage(ctx, 'tnk', 32, 64)).ok, true);
+  assert.match((await inventoryPage(ctx, 'tnk', 64, 66)).message, /applied head/);
+  assert.equal((await inventoryPage(ctx, 'tnk', 64, 65)).complete, true);
+  const paid = await settleOutput(ctx, first, provider, txHash);
+  assert.equal(paid.result.ok, true, paid.result.message);
+  assert.equal((await inventoryPage(ctx, 'tnk', 32, 64)).idempotent, true);
+  assert.equal((await ctx.storage.get(balance)).value.pending_au, '0');
+  assert.equal((await ctx.storage.get(balance)).value.confirmed_au, provider.au);
+});
+
+for (const priorConfirmed of [true, false]) {
+  test(`historical TNK fee checks whether the last sweep preceded the immutable freeze (${priorConfirmed})`, async () => {
+    const ctx = await setup();
+    const current = ctx.contract;
+    ctx.contract = new Contract30(current.protocol, {});
+    ctx.version = 30;
+    // Hyperbee attests the insertion sequence of each leaf. Model its point
+    // lookups in memory while applying the actual historical reducer.
+    const sequence = new Map();
+    let seq = 1;
+    const get = ctx.storage.get.bind(ctx.storage);
+    const put = ctx.storage.put.bind(ctx.storage);
+    ctx.storage.get = async key => {
+      const row = await get(key);
+      return row && { ...row, seq: sequence.get(key) ?? 0 };
+    };
+    ctx.storage.put = async (key, value) => {
+      sequence.set(key, seq++);
+      await put(key, value);
+    };
+    const [provider, fee] = ctx.outputs;
+    const first = await buildPlan(ctx, ctx.outputs);
+    const oldHash = '3'.repeat(64);
+    assert.equal((await prepareOutput(ctx, first, fee, oldHash)).ok, true);
+    if (priorConfirmed) assert.equal((await settleOutput(ctx, first, fee, oldHash)).result.ok, true);
+    const feeKey = 'fee/tnk/cum';
+    const ledger = (await get(feeKey)).value;
+    const doubled = String(2n * BigInt(fee.au));
+    await ctx.storage.put(feeKey, { ...ledger, cum_au: doubled, settled_cum_au: doubled, updated_epoch: 2 });
+    const hash = 'c'.repeat(64);
+    await advanceHead(ctx.storage, 2, hash);
+    const secondFee = { ...fee, economic_op_id: '4'.repeat(64), au: priorConfirmed ? fee.au : doubled,
+      tnk_e18: String(BigInt(fee.tnk_e18) * (priorConfirmed ? 1n : 2n)) };
+    const second = await buildPlan(ctx, [{ ...provider, economic_op_id: '5'.repeat(64) }, secondFee], [], { epoch: 2, hash });
+    const signed = '6'.repeat(64);
+    assert.equal((await prepareOutput(ctx, second, secondFee, signed)).ok, true);
+    if (!priorConfirmed) assert.equal((await settleOutput(ctx, first, fee, oldHash)).result.ok, true);
+    ctx.contract = current;
+    delete ctx.version;
+    await inventory(ctx, 'tnk');
+    const result = (await settleOutput(ctx, second, secondFee, signed)).result;
+    if (priorConfirmed) {
+      assert.equal(result.ok, true, result.message);
+      assert.equal((await get(feeKey)).value.swept_cum_au, doubled);
+    } else {
+      assert.match(result.message, /Conflicting historical payout reservation/);
+      assert.equal((await get(feeKey)).value.swept_cum_au, fee.au);
+      assert.equal((await get(`payout/preparation/tnk/${secondFee.economic_op_id}`)).value.consumed, false);
+    }
+  });
+}

@@ -6394,10 +6394,11 @@ class MayhemContract extends Contract {
     if (!this.isZeroAu(feeBooked.pending_au)) {
       priorReservations.push({ role: 'operator_fee', paid_au: feeBooked.pending_au });
     }
-    const feeBefore = this.safeAddAu(fee.swept_cum_au, feeBooked.pending_au);
-    if (feeBefore instanceof Error) return feeBefore;
-    const payableFee = this.safeSubAu(fee.cum_au, feeBefore);
-    if (payableFee instanceof Error) return payableFee;
+    const feeOutstanding = this.safeSubAu(fee.cum_au, fee.swept_cum_au);
+    if (feeOutstanding instanceof Error) return feeOutstanding;
+    const feeAvailable = unbookedBalance(this, feeOutstanding, ZERO_AU, feeBooked);
+    if (feeAvailable instanceof Error) return feeAvailable;
+    const payableFee = feeAvailable.payable;
     const deferredFee = value.carry.find(entry => entry.role === 'operator_fee');
     if (deferredFee) {
       if (operatorOutputs.length !== 0 || deferredFee.liability_au !== payableFee) {
@@ -14367,6 +14368,7 @@ class MayhemContract extends Contract {
   }
 
   async targetedPayoutSettlementUpdates(outputs, rail, epoch, at, transferIds, claim = null) {
+    const keepNewest = rail === 'fiat' || rail === 'tnk';
     const params = await this.targetedPayoutHoldbackParamsAt(rail, at);
     if (params instanceof Error) return params;
     const liabilityUpdates = [];
@@ -14466,10 +14468,10 @@ class MayhemContract extends Contract {
       const nextLiability = {
         ...refreshed,
         paid_cum_au: paidCumAu,
-        last_holdback_release_epoch: claim ? Math.max(liability.last_holdback_release_epoch ?? 0, epoch) : refreshed.last_holdback_release_epoch,
+        last_holdback_release_epoch: keepNewest ? Math.max(liability.last_holdback_release_epoch ?? 0, epoch) : refreshed.last_holdback_release_epoch,
         updated_epoch: Math.max(refreshed.updated_epoch, epoch),
-        last_settlement_epoch: claim ? Math.max(refreshed.last_settlement_epoch ?? 0, epoch) : epoch,
-        last_settlement_transfer: claim && refreshed.last_settlement_epoch > epoch
+        last_settlement_epoch: keepNewest ? Math.max(refreshed.last_settlement_epoch ?? 0, epoch) : epoch,
+        last_settlement_transfer: keepNewest && refreshed.last_settlement_epoch > epoch
           ? refreshed.last_settlement_transfer : transferIds[outputIndex],
         updated_at: this.tx,
       };
@@ -14546,9 +14548,9 @@ class MayhemContract extends Contract {
       const nextEarning = {
         ...refreshed,
         paid_cum_au: paidCumAu,
-        last_holdback_release_epoch: claim ? Math.max(earning.last_holdback_release_epoch ?? 0, epoch) : refreshed.last_holdback_release_epoch,
+        last_holdback_release_epoch: keepNewest ? Math.max(earning.last_holdback_release_epoch ?? 0, epoch) : refreshed.last_holdback_release_epoch,
         updated_epoch: Math.max(refreshed.updated_epoch, epoch),
-        last_targeted_settlement_epoch: claim ? Math.max(refreshed.last_targeted_settlement_epoch ?? 0, epoch) : epoch,
+        last_targeted_settlement_epoch: keepNewest ? Math.max(refreshed.last_targeted_settlement_epoch ?? 0, epoch) : epoch,
         updated_at: this.tx,
       };
       const nextError = this.guardianValidateEarningRecord(
@@ -15409,6 +15411,14 @@ class MayhemContract extends Contract {
     const dustValue = unpaidValue % USD_CENT_AU;
     if (dustValue === 0n) return new Error('Provider has no fiat dust to sweep.');
     const dustAu = this.canonicalAu(dustValue);
+    const history = await this.get(historyKey('fiat'));
+    if (!history?.complete) {
+      const liabilities = await this.providerPayoutLiabilityIndex('fiat');
+      if (liabilities instanceof Error) return liabilities;
+      if (liabilities.entries.some(entry => entry.provider === this.value.provider)) {
+        return new Error('Inventory historical payouts before sweeping indexed provider dust.');
+      }
+    }
     const booked = await bookedBalance(this, 'fiat', providerScope({ provider: this.value.provider }));
     if (booked instanceof Error) return booked;
     const available = unbookedBalance(this, unpaid, ZERO_AU, booked);

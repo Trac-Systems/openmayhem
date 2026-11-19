@@ -228,12 +228,85 @@ pub(super) fn selected_payout_index(plan: &Value, id: &str) -> Result<usize> {
     Ok(index)
 }
 
+pub(super) fn payout_commitments(
+    rail: &str,
+    epoch: u64,
+    at: u64,
+    epoch_apply_hash: &str,
+    snapshot_signed_length: u64,
+    outcome: &str,
+    outputs: &[Value],
+    carry: &[Value],
+) -> (String, String, String) {
+    let outputs_root = opaque_hash(
+        "mayhem-targeted-payout-epoch-outputs-v1",
+        &json!({ "rail": rail, "epoch": epoch, "outputs": outputs }),
+    );
+    let carry_root = opaque_hash(
+        "mayhem-targeted-payout-epoch-carry-v1",
+        &json!({ "rail": rail, "epoch": epoch, "carry": carry }),
+    );
+    let plan_root = opaque_hash(
+        "mayhem-targeted-payout-epoch-plan-v1",
+        &json!({
+            "rail": rail,
+            "epoch": epoch,
+            "at": at,
+            "epoch_apply_hash": epoch_apply_hash,
+            "snapshot_signed_length": snapshot_signed_length,
+            "outcome": outcome,
+            "outputs_root": outputs_root,
+            "carry_root": carry_root,
+        }),
+    );
+    (outputs_root, carry_root, plan_root)
+}
+
+fn verify_frozen_plan_contents(plan: &Value) -> Result<()> {
+    let outputs = plan["outputs"]
+        .as_array()
+        .context("frozen plan lacks outputs")?;
+    let carry = plan["carry"]
+        .as_array()
+        .context("frozen plan lacks carries")?;
+    let outcome = if !outputs.is_empty() {
+        "payouts"
+    } else if !carry.is_empty() {
+        "carry"
+    } else {
+        "no_work"
+    };
+    let (outputs_root, carry_root, plan_root) = payout_commitments(
+        plan["rail"].as_str().context("missing rail")?,
+        plan["epoch"].as_u64().context("missing epoch")?,
+        plan["at"].as_u64().context("missing freeze timestamp")?,
+        plan["epoch_apply_hash"]
+            .as_str()
+            .context("missing epoch anchor")?,
+        plan["snapshot_signed_length"]
+            .as_u64()
+            .context("missing frozen checkpoint")?,
+        outcome,
+        outputs,
+        carry,
+    );
+    ensure!(
+        plan["outcome"] == outcome
+            && plan["outputs_root"] == outputs_root
+            && plan["carry_root"] == carry_root
+            && plan["plan_root"] == plan_root,
+        "frozen payout plan commitments do not match its retained contents"
+    );
+    Ok(())
+}
+
 pub(super) async fn confirmed_payout_close(
     rpc: &PeerRpcClient,
     plan: &Value,
 ) -> Result<Option<Value>> {
     let rail = plan["rail"].as_str().context("missing rail")?;
     let epoch = plan["epoch"].as_u64().context("missing epoch")?;
+    verify_frozen_plan_contents(plan)?;
     let row = read_confirmed_state_value(rpc, &format!("settle/targeted/{rail}/{epoch}")).await?;
     if let Some(row) = &row {
         ensure!(
@@ -241,7 +314,16 @@ pub(super) async fn confirmed_payout_close(
                 && row["rail"] == rail
                 && row["epoch"] == epoch
                 && row["plan_root"] == plan["plan_root"]
+                && row["value"]["op"] == "close_targeted_payout_epoch"
+                && row["value"]["rail"] == rail
+                && row["value"]["epoch"] == epoch
+                && row["value"]["plan_root"] == plan["plan_root"]
                 && row["value"]["epoch_apply_hash"] == plan["epoch_apply_hash"]
+                && row["outcome"] == plan["outcome"]
+                && row["output_count"].as_u64()
+                    == plan["outputs"].as_array().map(|rows| rows.len() as u64)
+                && row["carry_count"].as_u64()
+                    == plan["carry"].as_array().map(|rows| rows.len() as u64)
                 && row["outputs_root"] == plan["outputs_root"]
                 && row["carry_root"] == plan["carry_root"],
             "confirmed epoch close conflicts with the frozen plan"
@@ -360,6 +442,12 @@ pub(super) async fn explicit_payout(
         ensure!(
             freeze_only,
             "explicit payout requires a confirmed frozen epoch plan"
+        );
+        ensure!(
+            read_confirmed_state_value(rpc, &format!("settle/targeted/{rail}/{epoch}"))
+                .await?
+                .is_none(),
+            "epoch already has a historical settlement without a frozen payout plan"
         );
         return Ok(ExplicitPayout::Dispatch(None));
     };
