@@ -37,7 +37,7 @@ const receipt = signedTapReceipt;
 async function localPool(accounts = 5) {
   const ganache = Ganache.provider({
     logging: { quiet: true },
-    chain: { chainId: 61_000 },
+    chain: { chainId: 61_000, time: new Date(3600_000) },
     wallet: { totalAccounts: accounts },
   });
   const provider = new ethers.BrowserProvider(ganache, undefined, { cacheTimeout: -1 });
@@ -49,7 +49,7 @@ async function localPool(accounts = 5) {
 async function localPoolWithKnownKeys({ poorBuyerEth = '0' } = {}) {
   const ganache = Ganache.provider({
     logging: { quiet: true },
-    chain: { chainId: 61_000 },
+    chain: { chainId: 61_000, time: new Date(3600_000) },
     wallet: {
       accounts: [
         { secretKey: OPERATOR_KEY, balance: ethers.toBeHex(ethers.parseEther('100')) },

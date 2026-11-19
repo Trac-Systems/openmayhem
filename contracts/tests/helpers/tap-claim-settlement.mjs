@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 
 import { stableJson } from '../../../intercom/scripts/recompute-epoch-roots.mjs';
 import { rollTapSettlement } from '../../scripts/tap-settlement-roller.mjs';
+import { pricingFixture } from './tap-pricing.mjs';
 import { targetedTapBindingsFor } from './signed-receipt.mjs';
 
 function memoryPreparationSubmitter() {
@@ -28,7 +29,8 @@ export function claimSettlementInputs({ bundle, providerAccounts, tapUsdAu, toke
   const feeAu = grossAu * BigInt(bundle.params.fee_bps) / 10_000n;
   const burnAu = grossAu * 1_000n / 10_000n;
   const rateTs = bundle.epoch * 3_600;
-  return {
+  bundle.at ??= rateTs;
+  const args = {
     bundle,
     targetedSessionBindings,
     canonicalLiabilities: [{
@@ -64,6 +66,7 @@ export function claimSettlementInputs({ bundle, providerAccounts, tapUsdAu, toke
     },
     canonicalPreparationSubmitter: memoryPreparationSubmitter(),
   };
+  return { ...args, ...pricingFixture(args.tapRateLock) };
 }
 
 export async function postAndFinalizeClaimSettlement(provider, args) {

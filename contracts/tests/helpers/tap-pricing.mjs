@@ -1,6 +1,26 @@
 import assert from 'node:assert/strict';
 import { blake3 } from '@noble/hashes/blake3';
+import { Interface } from 'ethers';
 import { stableJson } from '../../../intercom/scripts/recompute-epoch-roots.mjs';
+
+export function rootReceiptFixture() {
+  const abi = new Interface([
+    'event RootProposed(uint256 indexed epoch, bytes32 merkleRoot, uint256 cumulativeSpent, uint256 indexed nonce, uint64 executeAfter)',
+    'event RootPosted(uint256 indexed epoch, bytes32 merkleRoot, uint256 cumulativeSpent, uint256 indexed nonce)',
+  ]);
+  const receipts = new Map();
+  return {
+    getTransactionReceipt: async hash => receipts.get(hash),
+    event(name, log) {
+      const { epoch, merkleRoot, cumulativeSpent, nonce, executeAfter } = log.args;
+      const fields = [epoch, merkleRoot, cumulativeSpent, nonce];
+      if (name === 'RootProposed') fields.push(executeAfter);
+      receipts.set(log.transactionHash, { status: 1, hash: log.transactionHash, blockNumber: log.blockNumber,
+        blockHash: log.blockHash, logs: [{ address: log.address, ...abi.encodeEventLog(name, fields) }] });
+      return log;
+    },
+  };
+}
 
 // Synthetic Core responses for the in-process EVM. The immutable oracle key
 // uses the same canonical bytes a signed native rate feature commits.

@@ -6,13 +6,15 @@ const PAGES_PER_ATTEMPT = 4;
 const HASH = /^0x[0-9a-f]{64}$/i;
 const height = value => Number.isSafeInteger(value) && value >= 0;
 
-async function blockAtOrBefore(provider, timestamp, head) {
+async function eventSearchStart(provider, timestamp, head) {
   let low = 0, high = head.number;
   while (low < high) {
-    const mid = Math.ceil((low + high) / 2);
+    const mid = Math.floor((low + high) / 2);
     const block = await provider.getBlock(mid);
     if (!block || !height(block.timestamp)) throw new Error('TAP event anchor block is unavailable');
-    if (block.timestamp <= timestamp) low = mid; else high = mid - 1;
+    // Start before the first block at the boundary, including chains where
+    // several consecutive blocks share the quote/proposal timestamp.
+    if (block.timestamp < timestamp) low = mid + 1; else high = mid;
   }
   return Math.max(0, low - 1);
 }
@@ -48,12 +50,12 @@ export async function tapRootEventReader({ pool, epoch, rateTimestamp, file } = 
     if (pendingEpoch === epoch && executeAfter > 0) {
       const proposalTime = executeAfter - Number(await pool.governanceDelay());
       if (!height(proposalTime)) throw new Error('TAP proposal time is invalid');
-      start = await blockAtOrBefore(provider, proposalTime, head);
+      start = await eventSearchStart(provider, proposalTime, head);
     } else if (Number(currentEpoch) === epoch) {
       // Upgrade recovery for a root executed before a cursor existed. The
       // immutable rate predates its proposal; subsequent pages resume on disk.
       if (!height(rateTimestamp)) throw new Error('TAP recovery rate timestamp is invalid');
-      start = await blockAtOrBefore(provider, rateTimestamp, head);
+      start = await eventSearchStart(provider, rateTimestamp, head);
     }
     state = { ...identity, start_block: start, events: {} };
   }

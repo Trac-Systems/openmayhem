@@ -49,6 +49,18 @@ test('legacy executed-root search has bounded attempts and persists forward prog
   assert.ok(f.calls.length<=4);
 });
 
+test('recovery finds the proposal at the first of several blocks sharing its timestamp', async t => {
+  const f = fixture(t, { head: 40, posted: true, pending: false, block: 12 });
+  f.args.rateTimestamp = 100;
+  f.pool.runner.provider.getBlock = async tag => {
+    const number = tag === 'latest' ? f.head : tag;
+    const timestamp = number < 12 ? 99 : number <= 20 ? 100 : 101;
+    return { number, timestamp };
+  };
+  const read = await tapRootEventReader(f.args);
+  assert.equal((await read(f.request)).blockNumber, 12);
+});
+
 test('new roots persist an anchor before broadcast and retry an RPC failure without skipping',async t=>{
   const f=fixture(t,{pending:false,block:26000001});
   const read=await tapRootEventReader(f.args),state=JSON.parse(fs.readFileSync(f.file));

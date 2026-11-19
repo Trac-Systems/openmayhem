@@ -25,7 +25,7 @@ const receipt = signedTapReceipt;
 test('claim-proof returns provider proof that submits to MayhemInferencePool.claim()', async (t) => {
   const ganache = Ganache.provider({
     logging: { quiet: true },
-    chain: { chainId: 61_000 },
+    chain: { chainId: 61_000, time: new Date(3600_000) },
     wallet: { totalAccounts: 4 },
   });
   t.after(() => ganache.disconnect());

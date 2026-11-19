@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { oracleRecord } from './tap-pricing.mjs';
 import http from 'node:http';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -32,11 +33,14 @@ export async function checkBundledCli(t, f, chain, pool, token, owner, governanc
     tap: { chain_id: 1, token_address: await token.getAddress(), pool_address: await pool.getAddress() } };
   const fixtureReads = new Map([
     ['payments/current', payment], ['epoch/apply/state', { updated_epoch: f.epoch + 1000 }],
-    ['params/challenge_epochs', { current: { value: 6, effective_at: 0 }, pending: null }],
+    ['params/challenge_epochs', { key: 'challenge_epochs', current: { ver: 1, value: 6, effective_at: 0 }, pending: null }],
     ['params/payout_min_au', { key: 'payout_min_au', current: { value: f.args.payoutMinAu, effective_at: 0, ver: 1 }, pending: null }],
     ['tap/rate/latest', { denom: 'tap_usd_au', tap_usd_au: f.args.tapUsdAu, source: 'isolated-fixed-rate', ts: f.epoch * 3600,
       updated_at: `rate/tap/${f.epoch * 3600}/${'e'.repeat(64)}`, posted_by: f.f.admin.publicKey, posted_by_role: 'admin' }],
   ]);
+  const rate = fixtureReads.get('tap/rate/latest');
+  rate.updated_at = oracleRecord({ tap_usd_au: rate.tap_usd_au, source: rate.source, rate_ts: rate.ts }).updated_at;
+  fixtureReads.set(rate.updated_at, rate);
   const ledger = http.createServer(async (request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
     if (request.method !== 'GET' || url.pathname !== '/v1/state') { response.writeHead(405); response.end(); return; }

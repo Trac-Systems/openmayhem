@@ -117,7 +117,29 @@ function snapshotReader(peerRpcUrl, signedLength, fetchImpl) {
   return { get, page };
 }
 
-async function verifyAnchor(contract, epoch, hash) {
+export function tapContractAt(peerRpcUrl, signedLength, fetchImpl = fetch) {
+  requireState(uint(signedLength) && signedLength > 0, 'Invalid signed TAP checkout length');
+  const snapshot = snapshotReader(peerRpcUrl, signedLength, fetchImpl);
+  return Object.assign(Object.create(MayhemContract.prototype), { get: snapshot.get });
+}
+
+// Financial policy and oracle history may have been written after the liability
+// page was frozen. Read these together at a fresh confirmed Core checkout.
+export async function confirmedTapContract(peerRpcUrl, fetchImpl = fetch) {
+  const url = new URL('state', String(peerRpcUrl).replace(/\/+$/, '') + '/');
+  url.search = new URLSearchParams({ key: 'admin', confirmed: 'true' });
+  const response = await fetchImpl(url, { redirect: 'error', signal: AbortSignal.timeout(10_000) });
+  requireState(response?.ok === true, 'TAP confirmed Core checkout is unavailable');
+  const head = await response.json();
+  requireState(head?.key === 'admin' && hex32(head.value) && head.confirmed === true &&
+    !Object.hasOwn(head, 'error') && uint(head.signed_length) && head.signed_length > 0,
+    'Invalid TAP confirmed Core checkout');
+  const contract = tapContractAt(peerRpcUrl, head.signed_length, fetchImpl);
+  requireState(await contract.get('admin') === head.value, 'Inconsistent TAP confirmed Core admin');
+  return contract;
+}
+
+async function verifyAnchor(contract, epoch, hash, at) {
   const head = await contract.get('epoch/apply/state');
   requireState(uint(head?.updated_epoch) && epoch <= head.updated_epoch &&
     hex32(head.last_apply_hash) && head.pending_epoch == null, 'Incomplete or future TAP sweep epoch');
@@ -129,6 +151,7 @@ async function verifyAnchor(contract, epoch, hash) {
   requireState(stored !== null || (current && uint(head.last_settlement_unix)),
     'Missing epoch apply anchor');
   const anchor = checked(await contract.requireEpochApplyAnchor(epoch, hash, 'TAP sweep'));
+  requireState(anchor.settlement_unix === at, 'TAP liability snapshot differs from the confirmed epoch anchor');
   requireState(typeof anchor.applied_at === 'string' && anchor.applied_at.length > 0 &&
     (!current || head.updated_at === anchor.applied_at), 'Inconsistent epoch anchor and apply state');
   if (head.last_settlement_unix != null) {
@@ -138,18 +161,7 @@ async function verifyAnchor(contract, epoch, hash) {
 }
 
 async function sweepParams(contract, at) {
-  const params = {};
-  for (const key of PARAMS) {
-    const record = await contract.paramRecord(key); // Includes the reducer default for an absent schedule.
-    requireState(record.key === key && uint(record.current?.effective_at) && uint(record.current.ver) &&
-      (record.pending == null || (uint(record.pending.effective_at) &&
-        uint(record.pending.ver) && record.pending.ver > record.current.ver &&
-        record.pending.effective_at >= record.current.effective_at)), `Invalid parameter schedule for ${key}`);
-    const active = contract.paramActiveEntry(record, at);
-    requireState(active.effective_at <= at, `No active value for ${key} at preparation time`);
-    params[key] = active.value;
-  }
-  checked(contract.validateParamValues(params));
+  const params = checked(await contract.targetedTapParamsAt(at, PARAMS));
   checked(contract.targetedTapPayoutSplit(params.fee_bps));
   return params;
 }
@@ -243,7 +255,7 @@ export async function resolveTapLiabilitySweep({
   const snapshot = snapshotReader(peerRpcUrl, signedLength, fetchImpl);
   // Only read-only reducer methods are used. No peer, wallet or writable storage is constructed.
   const contract = Object.assign(Object.create(MayhemContract.prototype), { get: snapshot.get });
-  await verifyAnchor(contract, epoch, epochApplyHash);
+  await verifyAnchor(contract, epoch, epochApplyHash, at);
   const payments = await mainnetPayments(contract);
   const params = await sweepParams(contract, at);
   const maxOutputs = params.max_tap_settlement_outputs;

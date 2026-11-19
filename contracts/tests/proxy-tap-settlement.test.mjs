@@ -3,8 +3,10 @@ import test from 'node:test';
 import Ganache from 'ganache';
 import { ethers } from 'ethers';
 import { deployPool } from '../scripts/deploy-local.mjs';
+import { pricingFixture } from './helpers/tap-pricing.mjs';
 import { checkBundledCli } from './helpers/mixed-payout-cli.mjs';
 import { checkTapSpoolReport, checkTapProcessedReport } from './helpers/tap-spool-report.mjs';
+import { stableJson } from '../../intercom/scripts/recompute-epoch-roots.mjs';
 import { createHash } from 'node:crypto';
 import { proxyPayoutEpoch, matureFixtureLiabilities } from '../../intercom/tests/helpers/proxy-payout-epoch.mjs';
 import { deriveTapReceiptBundle } from '../../intercom/scripts/payout-tap-receipts.mjs';
@@ -17,6 +19,7 @@ async function fixture({ retry = false } = {}) {
   const source = await proxyPayoutEpoch('tap', { mixed: true, retry });
   await matureFixtureLiabilities(source);
   const bundle = await deriveTapReceiptBundle(source.bundle, source.epoch, source.applyHash);
+  bundle.at = (await source.f.read(`epoch/apply-anchor/${source.epoch}`)).settlement_unix;
   const reads = [];
   const fetchImpl = async input => {
     const url = new URL(input);
@@ -81,11 +84,12 @@ test('proxy TAP rejects signature, rail, amount, duplicate, epoch and payout-rev
 });
 
 function rateLock(f, pool = '0x' + '1'.repeat(40), token = '0x' + '2'.repeat(40)) {
-  return { epochApplyHash: f.applyHash, tapRateLock: { type: 'tap_settlement_rate_lock', epoch: f.epoch,
-    bundle_sha256: createHash('sha256').update(JSON.stringify(f.bundle)).digest('hex'),
+  const tapRateLock = { type: 'tap_settlement_rate_lock', epoch: f.epoch,
+    bundle_sha256: createHash('sha256').update(stableJson(f.bundle)).digest('hex'),
     denom: 'tap_usd_au', tap_usd_au: f.args.tapUsdAu, source: 'isolated-fixed-rate', rate_ts: f.epoch * 3600,
     rate_record_key: `rate/tap/${f.epoch * 3600}/${'e'.repeat(64)}`, posted_by: f.f.admin.publicKey,
-    posted_by_role: 'admin', chain_id: 1, token_address: token.toLowerCase(), pool_address: pool.toLowerCase(), payment_config_ver: 1 } };
+    posted_by_role: 'admin', chain_id: 1, token_address: token.toLowerCase(), pool_address: pool.toLowerCase(), payment_config_ver: 1 };
+  return { epochApplyHash: f.applyHash, tapRateLock, ...pricingFixture(tapRateLock) };
 }
 
 test('TAP worker signs current-contract preparations and recovers a lost acknowledgement without duplicate writes', async () => {
@@ -103,7 +107,7 @@ test('TAP worker signs current-contract preparations and recovers a lost acknowl
     if (options.method !== 'POST') {
       assert.equal(url.searchParams.get('confirmed'), 'true');
       const key = url.searchParams.get('key');
-      return { ok: true, json: async () => ({ key, confirmed: true, value: await f.f.read(key) }) };
+      return { ok: true, json: async () => ({ key, confirmed: true, signed_length: 44, value: await f.f.read(key) }) };
     }
     assert.equal(url.pathname, '/v1/contract/feature');
     const { key, value } = JSON.parse(options.body);
@@ -120,6 +124,8 @@ test('TAP worker signs current-contract preparations and recovers a lost acknowl
   const args = { plan, peerRpcUrl: 'http://fixture.invalid/v1/', fetchImpl,
     adminSigner: { publicKey: f.f.admin.publicKey,
       sign: message => Buffer.from(f.f.admin.wallet.sign(Buffer.from(message))).toString('hex') } };
+  await assert.rejects(submitCanonicalTapPreparationPlan({ ...args, requireExisting: true }), /lacks its preceding/);
+  assert.equal(submissions.length, 0);
   await assert.rejects(submitCanonicalTapPreparationPlan(args), /lost acknowledgement/);
   const completed = await submitCanonicalTapPreparationPlan(args);
   assert.equal(completed.records.length, 3, 'native and proxy liabilities plus root preparation');
@@ -128,15 +134,31 @@ test('TAP worker signs current-contract preparations and recovers a lost acknowl
   assert.equal(replay.all_existing, true);
   assert.equal(submissions.length, 3);
   assert.deepEqual(plan, originalPlan, 'recovery preserves payout amounts, recipients and identities');
+  // A root may have been prepared by v30. Sign the original synthetic
+  // envelopes and require confirmation without issuing any replacement feature.
+  const { payoutPreparationMessage } = await import('../../intercom/contract/contract.js');
+  for (const record of completed.records) {
+    const historical = { ...record, contract_version: 30 };
+    historical.admin_sig = args.adminSigner.sign(payoutPreparationMessage(historical));
+    await f.f.storage.put(f.f.contract.payoutPreparationRecordKey('tap', record.economic_op_id), historical);
+  }
+  const recovery = { ...args, requireExisting: true,
+    adminSigner: { publicKey: args.adminSigner.publicKey, sign: () => assert.fail('recovery must not sign') } };
+  assert.equal((await submitCanonicalTapPreparationPlan(recovery)).all_existing, true);
+  assert.equal((await submitCanonicalTapPreparationPlan({ ...recovery, requireExisting: false })).all_existing, true);
+  assert.equal(submissions.length, 3);
+  const recordKey = f.f.contract.payoutPreparationRecordKey('tap', completed.records[0].economic_op_id);
+  await f.f.storage.put(recordKey, { ...await f.f.read(recordKey), admin_sig: '00'.repeat(64) });
+  await assert.rejects(submitCanonicalTapPreparationPlan({ ...args, requireExisting: true }), /conflicts/);
   const altered = structuredClone(plan);
   altered.preparations[0].payload.fee_bps++;
   await assert.rejects(submitCanonicalTapPreparationPlan({ ...args, plan: altered }), /conflicts with the planned operation/);
   assert.equal(submissions.length, 3, 'conflicting recovery cannot write or pay');
 });
 
-test('actual mixed TAP roller resumes after confirmed external fee transfer with one root and no duplicate transfer', { timeout: 60_000 }, async t => {
+async function mixedPoolFixture(t) {
   const f = await fixture();
-  const chain = Ganache.provider({ logging: { quiet: true }, chain: { chainId: 1 }, wallet: { totalAccounts: 3 } });
+  const chain = Ganache.provider({ logging: { quiet: true }, chain: { chainId: 1, time: new Date(f.bundle.at * 1000) }, wallet: { totalAccounts: 3 } });
   t.after(async () => { await chain.disconnect(); });
   // Time and blocks are advanced explicitly; do not reuse ethers' cached head.
   const provider = new ethers.BrowserProvider(chain, undefined, { cacheTimeout: -1 });
@@ -145,7 +167,16 @@ test('actual mixed TAP roller resumes after confirmed external fee transfer with
   await (await token.mint(await buyer.getAddress(), ethers.parseEther('20'))).wait();
   await (await token.connect(buyer).approve(poolAddr, ethers.parseEther('20'))).wait();
   await (await pool.connect(buyer).deposit(ethers.parseEther('20'))).wait();
+  return { f, chain, pool, poolAddr, token, owner, governanceWallet, treasury, provider };
+}
+
+test('mixed TAP bundled CLI dry-runs against isolated loopback peers', { timeout: 60_000 }, async t => {
+  const { f, chain, pool, token, owner, governanceWallet, treasury } = await mixedPoolFixture(t);
   await checkBundledCli(t, f, chain, pool, token, owner, governanceWallet, treasury);
+});
+
+test('actual mixed TAP roller resumes after confirmed external fee transfer with one root and no duplicate transfer', { timeout: 60_000 }, async t => {
+  const { f, pool, poolAddr, token, owner, governanceWallet, treasury, provider } = await mixedPoolFixture(t);
   // Synthetic external environment only. Retained preparation identities are
   // the real roller's exact plans, while the fixture supplies confirmation.
   const preparations = new Map();
@@ -243,8 +274,10 @@ test('actual mixed TAP roller resumes after confirmed external fee transfer with
   assert.equal(confirmed.tap_settlement_checkpoint.outputs.length, 2);
   assert.deepEqual(confirmed.tap_settlement_checkpoint.outputs.map(o => o.paid_au).sort(),
     f.args.canonicalLiabilities.map(l => l.total_au).sort());
-  const replay = await rollTapSettlement({ ...args, pool: wrap(pool), prior: confirmed, bundle: { ...f.bundle, receipts: [] } });
-  assert.equal(replay.root, confirmed.root, 'accepted checkpoint replay precedes fresh receipt access');
+  await assert.rejects(rollTapSettlement({ ...args, pool: wrap(pool), prior: confirmed,
+    bundle: { ...f.bundle, receipts: [] } }), /rate-locked bundle/);
+  const replay = await rollTapSettlement({ ...args, pool: wrap(pool), prior: confirmed });
+  assert.equal(replay.root, confirmed.root);
   assert.equal(feeSends, 1);
 });
 

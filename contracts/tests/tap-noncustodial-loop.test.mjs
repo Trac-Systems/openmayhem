@@ -30,7 +30,7 @@ const receipt = signedTapReceipt;
 test('TAP loop holds immature earnings, then provider self-claims without a custodial payout wallet', async (t) => {
   const ganache = Ganache.provider({
     logging: { quiet: true },
-    chain: { chainId: 61_000 },
+    chain: { chainId: 61_000, time: new Date(3600_000) },
     wallet: { totalAccounts: 5 },
   });
   t.after(() => ganache.disconnect());

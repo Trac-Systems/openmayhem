@@ -22,7 +22,6 @@ export const TAP_WEI = 1_000_000_000_000_000_000n;
 export const BPS = 10_000n;
 export const PROVIDER_BPS = 7_500n;
 export const OPERATOR_BPS = 1_500n;
-const PROVIDER_CAP_TOLERANCE_WEI = 0n;
 const SESSION_RECEIPT_SCHEMA_VERSION = 12;
 const SETTLEMENT_RECEIPT_SCHEMA_VERSIONS = new Set([10, 11, SESSION_RECEIPT_SCHEMA_VERSION]);
 const SIGNING_MESSAGE_VERSION = 2;
@@ -991,7 +990,7 @@ async function verifiedTapSweep({ pointer, bundle, epochApplyHash, tapRateLock, 
   if (['liabilities', 'canonicalLiabilities', 'checkpoint_outputs'].some(key => hasOwn(bundle, key))) {
     throw new Error('TAP liability sweep cannot contain caller-supplied liabilities or outputs');
   }
-  const at = tapPreparationAt(bundle, tapRateLock);
+  const at = tapPreparationAt(bundle);
   const { resolveTapLiabilitySweep } = await import('./tap-liability-sweep.mjs');
   const page = await resolveTapLiabilitySweep({ peerRpcUrl, epoch: bundle.epoch, epochApplyHash, at,
     signedLength: pointer.signed_length, after: pointer.after, schemaVersion: pointer.schema_version, fetchImpl });
@@ -1669,11 +1668,8 @@ export async function guardianPreSignReport({
   const operatorCapWei = bpsOf(cumulativeSpentWei, OPERATOR_BPS);
   const burnCapWei = cumulativeSpentWei - providerCapWei - operatorCapWei;
   const providerOwedWei = providerEntries.reduce((sum, entry) => sum + entry.amount, 0n);
-  if (providerOwedWei > providerCapWei + PROVIDER_CAP_TOLERANCE_WEI) {
-    reasons.push('provider owed > 75% spent cap');
-  } else if (providerOwedWei > providerCapWei) {
-    flags.push('provider owed exceeds exact 75% cap only by rounding tolerance');
-  }
+  if (providerOwedWei > providerCapWei) reasons.push('provider owed > 75% spent cap');
+  if (providerOwedWei < providerCapWei) reasons.push('provider owed < 75% spent cap');
   if (totalOwedWei + operatorCapWei + burnCapWei > depositedWei) {
     reasons.push('owed + operator cap + burn cap > deposited');
   }
@@ -1711,14 +1707,18 @@ function pendingRootRecord(value) {
   };
 }
 
-async function poolTimestamp(pool, blockTag = 'latest') {
-  const provider = pool?.runner?.provider;
-  if (!provider) throw new Error('Pool contract has no provider');
-  const block = await provider.getBlock(blockTag);
-  if (!block || !Number.isSafeInteger(Number(block.timestamp))) {
-    throw new Error('Could not read latest Ethereum block timestamp');
+async function currentPoolBlock(pool) {
+  const provider = pool.runner.provider;
+  // An ethers-cached 'latest' block can predate the pending proposal we just read.
+  const tag = typeof provider.send === 'function'
+    ? Number(BigInt(await provider.send('eth_blockNumber', []))) : 'latest';
+  const block = await provider.getBlock(tag);
+  if (!Number.isSafeInteger(block?.number) || block.number < 0 ||
+      (tag !== 'latest' && block.number !== tag) ||
+      !Number.isSafeInteger(block.timestamp) || block.timestamp < 0 || !/^0x[0-9a-f]{64}$/i.test(block.hash)) {
+    throw new Error('Invalid latest TAP block header');
   }
-  return Number(block.timestamp);
+  return block;
 }
 
 function matchingTapCheckpoint(checkpoint, {
@@ -1817,32 +1817,53 @@ function checkpointReplaySettlement({
   return prior;
 }
 
-async function rootEventRecord(event, label) {
-  let blockHash = event?.blockHash;
-  const isHash = (value) => (
-    typeof value === 'string' &&
-    /^0x[0-9a-f]{64}$/i.test(value)
-  );
-  if (!isHash(blockHash) && typeof event?.getBlock === 'function') {
-    blockHash = (await event.getBlock())?.hash;
-  }
-  if (!event ||
-      !isHash(event.transactionHash) ||
-      !isHash(blockHash) ||
-      !Number.isSafeInteger(event.blockNumber)) {
+async function rootEventRecord(event, provider, label, { epoch, root, cumulativeSpentWei, tapRateLock, nonce, throughBlock }) {
+  const isHash = value => typeof value === 'string' && /^0x[0-9a-f]{64}$/i.test(value);
+  if (!isHash(event?.transactionHash) || !isHash(event.blockHash) || event.removed === true ||
+      event.address?.toLowerCase() !== tapRateLock.pool_address || Number(event.args?.epoch) !== epoch ||
+      event.args?.merkleRoot?.toLowerCase() !== root || event.args?.cumulativeSpent?.toString() !== cumulativeSpentWei.toString() ||
+      event.args?.nonce == null || (nonce != null && event.args.nonce.toString() !== nonce.toString()) ||
+      !Number.isSafeInteger(event.blockNumber) || event.blockNumber < 0 || event.blockNumber > throughBlock) {
     throw new Error(`confirmed TAP ${label} event evidence is missing`);
   }
-  const args = event.args;
-  const transactionReceipt = typeof event.getTransactionReceipt === 'function'
-    ? await event.getTransactionReceipt()
-    : null;
+  // Read by height to reject an orphaned event with a still-retrievable block hash.
+  const [block, receipt] = await Promise.all([
+    provider.getBlock(event.blockNumber), provider.getTransactionReceipt(event.transactionHash),
+  ]);
+  if (!isHash(block?.hash) || block.number !== event.blockNumber ||
+      block.hash.toLowerCase() !== event.blockHash.toLowerCase() ||
+      !Number.isSafeInteger(block.timestamp) || block.timestamp < 0 ||
+      receipt?.status !== 1 || receipt.blockNumber !== event.blockNumber ||
+      receipt.blockHash?.toLowerCase() !== block.hash.toLowerCase() ||
+      receipt.hash?.toLowerCase() !== event.transactionHash.toLowerCase()) {
+    throw new Error(`TAP ${label} receipt and canonical block do not match`);
+  }
+  const fields = [epoch, root, cumulativeSpentWei, event.args.nonce];
+  if (label === 'RootProposed') fields.push(event.args.executeAfter);
+  const { data, topics } = POOL_SETTLEMENT_INTERFACE.encodeEventLog(label, fields);
+  const matchingLogs = receipt.logs?.filter(log => log.address?.toLowerCase() === tapRateLock.pool_address &&
+    log.data?.toLowerCase() === data && log.topics?.length === topics.length &&
+    topics.every((topic, i) => log.topics[i]?.toLowerCase() === topic));
+  if (matchingLogs?.length !== 1) throw new Error(`TAP ${label} is absent or ambiguous in the canonical receipt`);
   return {
-    tx_hash: String(event.transactionHash).toLowerCase(),
-    block_number: event.blockNumber,
-    block_hash: String(blockHash).toLowerCase(),
-    nonce: parseBigIntString(args?.nonce, `${label} nonce`).toString(),
-    status: transactionReceipt === null ? null : Number(transactionReceipt.status),
+    tx_hash: event.transactionHash.toLowerCase(),
+    block_number: block.number,
+    block_hash: block.hash.toLowerCase(),
+    block_timestamp: block.timestamp,
+    nonce: BigInt(event.args.nonce).toString(),
+    status: receipt.status,
   };
+}
+
+async function lookupProposedRoot({ pool, epoch, root, cumulativeSpentWei, tapRateLock,
+  rootEventReader, nonce, throughBlock }) {
+  const provider = pool.runner.provider;
+  const readEvent = rootEventReader ?? await tapRootEventReader({ pool, epoch, rateTimestamp: tapRateLock.rate_ts });
+  const proposed = await readEvent({ name: 'RootProposed', root, cumulativeSpentWei, nonce, throughBlock });
+  if (!proposed) throw new Error('confirmed TAP RootProposed event is missing');
+  const record = await rootEventRecord(proposed, provider, 'RootProposed',
+    { epoch, root, cumulativeSpentWei, tapRateLock, nonce, throughBlock });
+  return { ...record, execute_after: parseNonNegativeInt(proposed.args.executeAfter, 'RootProposed execute_after') };
 }
 
 async function confirmedRootEventEvidence({
@@ -1850,8 +1871,6 @@ async function confirmedRootEventEvidence({
   epoch,
   root,
   cumulativeSpentWei,
-  priorCheckpoint,
-  epochApplyHash,
   tapRateLock,
   rootEventReader,
 } = {}) {
@@ -1862,44 +1881,27 @@ async function confirmedRootEventEvidence({
   if (!provider?.getBlock || !provider?.getNetwork) {
     throw new Error('TAP pool provider cannot prove settlement finality');
   }
-  let queryThroughBlock;
-  if (typeof provider.send === 'function') {
-    const rawBlockNumber = await provider.send('eth_blockNumber', []);
-    const blockNumber = Number(BigInt(rawBlockNumber));
-    if (!Number.isSafeInteger(blockNumber) || blockNumber < 0) {
-      throw new Error('TAP pool returned an invalid latest block number');
-    }
-    queryThroughBlock = blockNumber;
-  } else {
-    queryThroughBlock = (await provider.getBlock('latest'))?.number;
-    if (!Number.isSafeInteger(queryThroughBlock) || queryThroughBlock < 0) {
-      throw new Error('TAP pool returned an invalid latest block number');
-    }
-  }
+  const head = await currentPoolBlock(pool);
+  const queryThroughBlock = head.number;
+  const mainnet = tapRateLock.chain_id === 1;
+  // Establish the finality boundary before checking the canonical blocks at the
+  // proposal and execution heights. A race with an unfinalized fork must retry.
+  const finalizedBlock = mainnet ? await provider.getBlock('finalized') : head;
   const readEvent = rootEventReader ?? await tapRootEventReader({ pool, epoch, rateTimestamp: tapRateLock?.rate_ts });
   const posted = await readEvent({ name: 'RootPosted', root, cumulativeSpentWei, throughBlock: queryThroughBlock });
   if (!posted) throw new Error('confirmed TAP RootPosted event is missing');
   const nonce = parseBigIntString(posted.args?.nonce, 'RootPosted nonce');
-  const proposed = await readEvent({ name: 'RootProposed', root, cumulativeSpentWei, nonce, throughBlock: queryThroughBlock });
-  if (!proposed) throw new Error('confirmed TAP RootProposed event is missing');
-  const proposalRecord = await rootEventRecord(proposed, 'RootProposed');
-  const executionRecord = await rootEventRecord(posted, 'RootPosted');
-  if (executionRecord.status !== 1) {
-    throw new Error('confirmed TAP RootPosted transaction did not succeed');
+  const proposalRecord = await lookupProposedRoot({ pool, epoch, root, cumulativeSpentWei, tapRateLock,
+    rootEventReader: readEvent, nonce, throughBlock: queryThroughBlock });
+  const executionRecord = await rootEventRecord(posted, provider, 'RootPosted',
+    { epoch, root, cumulativeSpentWei, tapRateLock, nonce, throughBlock: queryThroughBlock });
+  if (proposalRecord.block_number > executionRecord.block_number ||
+      proposalRecord.block_timestamp > executionRecord.block_timestamp ||
+      proposalRecord.execute_after > executionRecord.block_timestamp ||
+      proposalRecord.tx_hash === executionRecord.tx_hash) {
+    throw new Error('TAP execution evidence conflicts with its proposal');
   }
-  const network = await provider.getNetwork();
-  let finalizedBlock;
-  let confirmationPolicy;
-  if (network.chainId === 1n) {
-    finalizedBlock = await provider.getBlock('finalized');
-    confirmationPolicy = 'finalized-tag';
-  } else {
-    finalizedBlock = await provider.getBlock('latest');
-    confirmationPolicy = finalizedBlock
-      ? `depth-${Number(finalizedBlock.number) - executionRecord.block_number}`
-      : null;
-  }
-  const finalizedBlockNumber = Number(finalizedBlock?.number);
+  const finalizedBlockNumber = finalizedBlock?.number;
   const confirmationDepth = finalizedBlockNumber - executionRecord.block_number;
   if (!Number.isSafeInteger(finalizedBlockNumber) ||
       confirmationDepth < MIN_TAP_CONFIRMATION_DEPTH) {
@@ -1907,6 +1909,7 @@ async function confirmedRootEventEvidence({
       `TAP root awaits ${MIN_TAP_CONFIRMATION_DEPTH} confirmations`
     );
     error.code = 'TAP_FINALITY_PENDING';
+    error.proposal = proposalRecord;
     error.finalizedBlockNumber = Number.isSafeInteger(finalizedBlockNumber)
       ? finalizedBlockNumber
       : null;
@@ -1920,23 +1923,16 @@ async function confirmedRootEventEvidence({
     onchain_epoch: epoch,
     onchain_root: root.toLowerCase(),
     onchain_cumulative_spent_wei: cumulativeSpentWei.toString(),
-    proposal: {
-      ...proposalRecord,
-      execute_after: parseNonNegativeInt(
-        proposed.args?.executeAfter,
-        'RootProposed execute_after'
-      ),
-    },
+    proposal: proposalRecord,
     execution: executionRecord,
     finalized_block_number: finalizedBlockNumber,
     confirmation_depth: confirmationDepth,
-    confirmation_policy: confirmationPolicy,
+    confirmation_policy: mainnet ? 'finalized-tag' : `depth-${confirmationDepth}`,
   };
   return evidence;
 }
 
 function tapCheckpointPayload({
-  settlement,
   epoch,
   epochApplyHash,
   tapRateLock,
@@ -1979,6 +1975,7 @@ function tapCheckpointPayload({
     proposal_tx: rootConfirmation.proposal.tx_hash,
     proposal_block_number: rootConfirmation.proposal.block_number,
     proposal_block_hash: rootConfirmation.proposal.block_hash,
+    proposal_block_timestamp: rootConfirmation.proposal.block_timestamp,
     execution_tx: rootConfirmation.execution.tx_hash,
     execution_status: rootConfirmation.execution.status,
     execution_block_number: rootConfirmation.execution.block_number,
@@ -2034,6 +2031,57 @@ function carriedConfirmedRoot({ settlement, prior, screen, chainRoot, chainEpoch
     root: chainRoot, cumulative_spent_wei: prior.cumulative_spent_wei };
 }
 
+export async function verifyTapFinancialPolicy({ intent, financialAt, peerRpcUrl, fetchImpl, poolBasis }) {
+  if (!Number.isSafeInteger(intent.at) || intent.at < 0 || !Number.isSafeInteger(financialAt) || financialAt < intent.at) {
+    throw new Error('TAP financial clock precedes its liability snapshot or is unavailable');
+  }
+  const { confirmedTapContract } = await import('./tap-liability-sweep.mjs');
+  const contract = await confirmedTapContract(peerRpcUrl, fetchImpl);
+  const lock = contract.normalizeTargetedTapRateLock(intent.tap_rate_lock);
+  if (lock instanceof Error) throw lock;
+  const params = await contract.targetedTapParamsAt(intent.at, ['fee_bps', 'max_tap_settlement_outputs']);
+  if (params instanceof Error) throw params;
+  if (intent.fee_bps !== params.fee_bps || intent.outputs.length > params.max_tap_settlement_outputs) {
+    throw new Error('TAP preparation differs from its snapshot payout policy');
+  }
+  const rate = await contract.guardianRequireHistoricalTapRateLock(lock, financialAt);
+  if (rate instanceof Error) throw rate;
+  if (!poolBasis) {
+    const existing = await contract.get(`settle/targeted/tap/${intent.epoch}`);
+    if (existing !== null) {
+      if (existing.type !== 'targeted_tap_settlement' || existing.settled_by_role !== 'admin' ||
+          existing.settled_by !== lock.posted_by || existing.proposal_block_timestamp !== financialAt ||
+          Object.entries(intent).some(([key, value]) => stableJson(existing[key]) !== stableJson(value))) {
+        throw new Error('TAP settlement conflicts with the canonical checkpoint');
+      }
+      return;
+    }
+  }
+  const payments = canonicalTapPaymentScope(await contract.get('payments/current'), await contract.get('admin'));
+  if (Object.entries(payments).some(([key, value]) => lock[key] !== value || intent[key] !== value)) {
+    throw new Error('TAP financial policy payment scope mismatch');
+  }
+  const state = await contract.get(`settle/targeted/tap/state/${lock.chain_id}/${lock.pool_address}`);
+  if (state !== null && (state.type !== 'targeted_tap_settlement_state' || state.chain_id !== lock.chain_id ||
+      state.pool_address !== lock.pool_address || state.token_address !== lock.token_address ||
+      state.payment_config_ver !== lock.payment_config_ver || !Number.isSafeInteger(state.last_epoch) ||
+      state.last_epoch < 0)) throw new Error('Invalid TAP settlement basis');
+  if (state?.last_epoch >= intent.epoch) throw new Error('TAP settlement does not advance the confirmed epoch');
+  const previousSpent = state === null ? 0n : safeAu(state.cumulative_spent_wei, 'prior gross wei', { allowZero: true });
+  const previousClaim = state === null ? 0n : safeAu(state.cumulative_provider_claimed_wei, 'prior provider wei', { allowZero: true });
+  const nextSpent = BigInt(intent.cumulative_spent_wei);
+  const nextCap = bpsOf(nextSpent, PROVIDER_BPS);
+  if (previousClaim !== bpsOf(previousSpent, PROVIDER_BPS) || nextSpent <= previousSpent ||
+      intent.provider_cumulative_claimed_wei !== nextCap.toString() ||
+      intent.provider_tap_wei !== (nextCap - previousClaim).toString()) {
+    throw new Error('TAP proposal does not advance from exact confirmed cumulative caps');
+  }
+  if (poolBasis && (poolBasis.epoch !== (state?.last_epoch ?? 0) || poolBasis.spent !== previousSpent ||
+      poolBasis.root !== (state?.last_root ?? ethers.ZeroHash))) {
+    throw new Error('TAP pool does not match the confirmed Core settlement basis');
+  }
+}
+
 export async function rollTapSettlement(options = {}) {
   const {
     bundle, receipts, targetedSessionBindings, canonicalLiabilities, payoutMinAu, tapUsdAu, ledgerFeeBps,
@@ -2059,6 +2107,9 @@ export async function rollTapSettlement(options = {}) {
     throw new Error('TAP rate lock epoch conflicts with the canonical bundle');
   }
   const pointer = tapSweepPointer(bundle);
+  if (!pointer && tapRateLock && tapRateLock.bundle_sha256 !== settlementBundleSha256(inputBundle)) {
+    throw new Error('TAP settlement differs from the rate-locked bundle');
+  }
   const sweep = pointer
     ? await verifiedTapSweep({ pointer, bundle: inputBundle, epochApplyHash, tapRateLock, feeBps, minimum, peerRpcUrl, fetchImpl })
     : null;
@@ -2114,6 +2165,12 @@ export async function rollTapSettlement(options = {}) {
     );
   }
 
+  if (pool && !sweep && !rootAlreadyPosted &&
+      ((chainEpoch > 0 && (prior?.root !== chainRoot || prior?.epoch !== chainEpoch ||
+        prior.cumulative_spent_wei !== chainSpentWei.toString())) ||
+       (chainEpoch === 0 && (prior?.root || chainSpentWei !== 0n || chainRoot !== ethers.ZeroHash)))) {
+    throw new Error('Prior TAP settlement differs from the confirmed pool basis');
+  }
   if (sweep && !rootAlreadyPosted) {
     const baseMatches = prior?.root
       ? matchesConfirmedPriorRoot(prior, tapRateLock, chainRoot, chainEpoch, chainSpentWei)
@@ -2176,6 +2233,7 @@ export async function rollTapSettlement(options = {}) {
   }
 
   const preparationPlan = await buildCanonicalTapPreparationPlan({
+    snapshotAt: await resolveTapSnapshotAt(inputBundle, peerRpcUrl, fetchImpl),
     settlement,
     bundle: inputBundle,
     epoch: screen.epoch,
@@ -2193,6 +2251,39 @@ export async function rollTapSettlement(options = {}) {
           stableJson(checkpoint.outputs) !== stableJson(preparationPlan.intent.outputs)))) {
       throw new Error('prior TAP sweep preparations conflict with the verified page');
     }
+  }
+  if (pool && (await poolAddressOrNull(pool) !== tapRateLock.pool_address ||
+      (await pool.runner.provider.getNetwork()).chainId !== BigInt(tapRateLock.chain_id))) {
+    throw new Error('TAP pool or network differs from its rate lock');
+  }
+  const poolBasis = { epoch: chainEpoch, root: chainRoot, spent: chainSpentWei };
+  const checkPrice = (financialAt, basis) => verifyTapFinancialPolicy({
+    intent: preparationPlan.intent, financialAt, peerRpcUrl, fetchImpl, poolBasis: basis,
+  });
+  const checkPendingPrice = async (pending, head) => {
+    const proposal = await lookupProposedRoot({ pool, epoch: screen.epoch, root: expectedRoot,
+      cumulativeSpentWei: expectedSpentWei, tapRateLock, rootEventReader, nonce: BigInt(pending.nonce),
+      throughBlock: head.number });
+    if (proposal.execute_after !== pending.execute_after) throw new Error('TAP pending proposal delay mismatch');
+    await checkPrice(proposal.block_timestamp, poolBasis);
+  };
+  const confirmRoot = () => confirmedRootEventEvidence({
+    pool, epoch: screen.epoch, root: expectedRoot, cumulativeSpentWei: expectedSpentWei, tapRateLock, rootEventReader,
+  });
+  let observedConfirmation;
+  let waitingForFinality;
+  if (rootAlreadyPosted) {
+    try {
+      observedConfirmation = await confirmRoot();
+    } catch (error) {
+      if (error?.code !== 'TAP_FINALITY_PENDING') throw error;
+      waitingForFinality = error;
+    }
+    await checkPrice((observedConfirmation ?? waitingForFinality).proposal.block_timestamp);
+  } else if (pool) {
+    const head = await currentPoolBlock(pool);
+    if (pendingRoot) await checkPendingPrice(pendingRoot, head);
+    else await checkPrice(head?.timestamp, poolBasis);
   }
   const signingAddress = ownerSigner?.getAddress
     ? normalizeAddress(await ownerSigner.getAddress(), 'owner signing address')
@@ -2259,7 +2350,7 @@ export async function rollTapSettlement(options = {}) {
       skipped: true,
       reason: 'exact cross-signed root already pending',
     };
-    if (await poolTimestamp(pool) >= pendingRoot.execute_after) {
+    if ((await currentPoolBlock(pool)).timestamp >= pendingRoot.execute_after) {
       executeRootDryRun = await dryRunExecuteRoot({ writablePool: writable ?? pool });
     } else {
       executeRootDryRun = {
@@ -2331,7 +2422,7 @@ export async function rollTapSettlement(options = {}) {
       );
     }
     canonicalPreparation = await canonicalPreparationSubmitter({
-      plan: preparationPlan,
+      plan: preparationPlan, requireExisting: Boolean(rootAlreadyPosted || pendingRoot),
     });
     if (!isObject(canonicalPreparation) ||
         stableJson(canonicalPreparation.preparation_ids) !==
@@ -2373,6 +2464,9 @@ export async function rollTapSettlement(options = {}) {
     if (!ownerSigner) throw new Error('Missing TAP settlement owner signer for broadcast');
     if (!writable) throw new Error('Missing writable TAP pool');
     if (!rootAlreadyPosted && !pendingRoot) {
+      // Confirmation of preparations can take time. Recheck immediately before
+      // proposing, then use the actual mined proposal before executing.
+      await checkPrice((await currentPoolBlock(pool)).timestamp, poolBasis);
       const sent = await writable.proposeRoot(
         settlement.root,
         screen.epoch,
@@ -2408,7 +2502,9 @@ export async function rollTapSettlement(options = {}) {
     }
 
     if (!rootAlreadyPosted && pendingRoot) {
-      const now = await poolTimestamp(pool, proposalBlockNumber ?? 'latest');
+      const head = proposalBlockNumber === null ? await currentPoolBlock(pool) : await pool.runner.provider.getBlock(proposalBlockNumber);
+      await checkPendingPrice(pendingRoot, head);
+      const now = head.timestamp;
       if (now < pendingRoot.execute_after) {
         return {
           ...settlement,
@@ -2591,16 +2687,8 @@ export async function rollTapSettlement(options = {}) {
   if (rootConfirmed) {
     let rootConfirmation;
     try {
-      rootConfirmation = await confirmedRootEventEvidence({
-        pool,
-        epoch: screen.epoch,
-        root: expectedRoot,
-        cumulativeSpentWei: expectedSpentWei,
-        priorCheckpoint: prior?.tap_settlement_checkpoint,
-        epochApplyHash,
-        tapRateLock,
-        rootEventReader,
-      });
+      if (waitingForFinality) throw waitingForFinality;
+      rootConfirmation = observedConfirmation ?? await confirmRoot();
     } catch (error) {
       if (error?.code !== 'TAP_FINALITY_PENDING') throw error;
       return {
@@ -2626,14 +2714,31 @@ export async function rollTapSettlement(options = {}) {
         screen,
       };
     }
+    if (!observedConfirmation) await checkPrice(rootConfirmation.proposal.block_timestamp);
     tapSettlementCheckpoint = tapCheckpointPayload({
-      settlement,
       epoch: screen.epoch,
       epochApplyHash,
       tapRateLock,
       rootConfirmation,
       preparationPlan,
     });
+    const archived = prior?.tap_settlement_checkpoint;
+    if (archived?.epoch === screen.epoch) {
+      // More confirmations on replay must not create a second Core submission
+      // identity. Revalidate the archived proof against the observed chain.
+      const retained = { ...tapSettlementCheckpoint,
+        finalized_block_number: archived.finalized_block_number,
+        confirmation_depth: archived.confirmation_depth,
+        confirmation_policy: archived.confirmation_policy };
+      const timestamp = tapSettlementCheckpoint.proposal_block_timestamp;
+      if (archived.finalized_block_number > tapSettlementCheckpoint.finalized_block_number ||
+          stableJson(retained) !== stableJson({ proposal_block_timestamp: timestamp, ...archived })) {
+        throw new Error('Archived TAP checkpoint conflicts with confirmed EVM evidence');
+      }
+      const { validateTapSettlementCheckpoint } = await import('../../scripts/validate-tap-settlement-checkpoint.mjs');
+      validateTapSettlementCheckpoint({ tap_settlement_checkpoint: retained });
+      tapSettlementCheckpoint = retained;
+    }
   }
 
   return {
@@ -2725,12 +2830,17 @@ export async function resolveTapSettlementPayoutMinimum({
     );
     if (pendingEffectiveAt <= effectiveAt) selected = schedule.pending;
   }
-  const selectedEffectiveAt = parseNonNegativeInt(
+  let selectedEffectiveAt = parseNonNegativeInt(
     selected.effective_at,
     'active TAP payout_min_au effective_at'
   );
   if (selectedEffectiveAt > effectiveAt) {
-    throw new Error('TAP payout_min_au schedule has no value active at the settlement timestamp');
+    const { tapContractAt } = await import('./tap-liability-sweep.mjs');
+    const contract = tapContractAt(peerRpcUrl, record.signed_length, fetchImpl);
+    const history = await contract.targetedTapParamEntriesAt(effectiveAt, ['payout_min_au']);
+    if (history instanceof Error) throw history;
+    selected = history.payout_min_au;
+    selectedEffectiveAt = selected.effective_at;
   }
   const value = safeAu(selected.value, 'active TAP payout_min_au', {
     allowZero: true,
@@ -2922,43 +3032,17 @@ export async function resolveTargetedTapPayoutsFromLedger({
   };
 }
 
-async function resolveActiveEpochParam({ peerRpcUrl, key, fallback, fetchImpl } = {}) {
-  const record = await readContractStateValue(peerRpcUrl, `params/${key}`, {
-    confirmed: true,
-    fetchImpl,
-  });
-  const now = Math.floor(Date.now() / 1_000);
-  const active = record?.pending && Number(record.pending.effective_at) <= now
-    ? record.pending
-    : record?.current;
-  return parseNonNegativeInt(active?.value ?? fallback, `active ${key}`);
-}
-
-export async function resolveTapSettlementEpochPolicy({
-  peerRpcUrl,
-  fetchImpl,
-} = {}) {
-  const applyState = await readContractStateValue(peerRpcUrl, 'epoch/apply/state', {
-    confirmed: true,
-    fetchImpl,
-  });
-  const resolvedThrough = parseOptionalNonNegativeInt(
-    applyState?.updated_epoch,
-    'settle through epoch'
-  );
-  if (resolvedThrough === null) {
-    throw new Error('epoch/apply/state.updated_epoch is required for TAP settlement');
-  }
-  const resolvedChallenge = await resolveActiveEpochParam({
-    peerRpcUrl,
-    key: 'challenge_epochs',
-    fallback: DEFAULT_TAP_CHALLENGE_EPOCHS,
-    fetchImpl,
-  });
-  return {
-    settleThroughEpoch: resolvedThrough,
-    challengeEpochs: parseNonNegativeInt(resolvedChallenge, 'TAP settlement challenge_epochs'),
-  };
+export async function resolveTapSettlementEpochPolicy({ peerRpcUrl, at, signedLength, fetchImpl } = {}) {
+  const { confirmedTapContract, tapContractAt } = await import('./tap-liability-sweep.mjs');
+  const contract = signedLength === undefined
+    ? await confirmedTapContract(peerRpcUrl, fetchImpl) : tapContractAt(peerRpcUrl, signedLength, fetchImpl);
+  const head = await contract.get('epoch/apply/state');
+  const snapshotAt = at ?? head?.last_settlement_unix;
+  if (!Number.isSafeInteger(snapshotAt) || snapshotAt < 0) throw new Error('Missing TAP epoch policy timestamp');
+  const params = await contract.targetedTapParamsAt(snapshotAt, ['challenge_epochs']);
+  if (params instanceof Error) throw params;
+  return { settleThroughEpoch: parseNonNegativeInt(head?.updated_epoch, 'settle through epoch'),
+    challengeEpochs: params.challenge_epochs };
 }
 
 function stableJson(value) {
@@ -3023,12 +3107,23 @@ function tapPreparationOutput(output) {
   };
 }
 
-function tapPreparationAt(bundle, tapRateLock) {
-  const at = bundle?.at ?? bundle?.settlement_unix ?? bundle?.last_settlement_unix ?? tapRateLock?.rate_ts;
-  if (hasOwn(bundle ?? {}, 'tap_liability_sweep') && !Number.isSafeInteger(at)) {
-    throw new Error('invalid TAP sweep preparation timestamp');
+function tapPreparationAt(bundle, snapshotAt) {
+  const at = hasOwn(bundle ?? {}, 'tap_liability_sweep') ? bundle.at :
+    bundle?.at ?? bundle?.settlement_unix ?? bundle?.last_settlement_unix ?? snapshotAt;
+  if (!Number.isSafeInteger(at) || at < 0 || (snapshotAt !== undefined && snapshotAt !== at)) {
+    throw new Error('Missing or conflicting TAP liability snapshot timestamp');
   }
-  return parseNonNegativeInt(at, 'TAP preparation timestamp');
+  return at;
+}
+
+async function resolveTapSnapshotAt(bundle, peerRpcUrl, fetchImpl) {
+  if (bundle?.at != null || bundle?.settlement_unix != null || bundle?.last_settlement_unix != null ||
+      hasOwn(bundle ?? {}, 'tap_liability_sweep')) return tapPreparationAt(bundle);
+  const { confirmedTapContract } = await import('./tap-liability-sweep.mjs');
+  const contract = await confirmedTapContract(peerRpcUrl, fetchImpl);
+  const anchor = await contract.requireEpochApplyAnchor(bundle.epoch, bundle.epoch_apply_hash, 'TAP liability snapshot');
+  if (anchor instanceof Error) throw anchor;
+  return tapPreparationAt(bundle, anchor.settlement_unix);
 }
 
 function tapPreparationOutputPayload(intent, output, outputIndex) {
@@ -3105,6 +3200,7 @@ async function tapRootPreparationPayload(intent) {
 }
 
 export async function buildCanonicalTapPreparationPlan({
+  snapshotAt,
   settlement,
   bundle,
   epoch,
@@ -3142,7 +3238,7 @@ export async function buildCanonicalTapPreparationPlan({
   const intent = {
     op: 'settle_targeted_tap',
     epoch: safeEpoch,
-    at: tapPreparationAt(bundle, tapRateLock),
+    at: tapPreparationAt(bundle, snapshotAt),
     rail: 'tap',
     chain_id: parsePositiveInt(tapRateLock.chain_id, 'TAP preparation chain_id'),
     token_address: normalizeAddress(
@@ -3280,35 +3376,53 @@ function payoutPreparationEvidence(value) {
 }
 
 function exactUnconsumedPreparation(record, value) {
-  return isObject(record) &&
-    record.type === 'targeted_payout_preparation' &&
-    record.consumed === false &&
-    Object.entries(value).every(([key, expected]) =>
-      stableJson(record[key]) === stableJson(expected)
-    );
+  if (!isObject(record) || record.type !== 'targeted_payout_preparation' || record.consumed !== false) return false;
+  // The v31 roller can resume a confirmed v30 envelope before or after an
+  // EVM proposal. Verify the original signature over the entire planned intent.
+  if (record.contract_version !== value.contract_version &&
+      !(value.contract_version === 31 && record.contract_version === 30 && !value.admin_sig)) return false;
+  if (!isHexBytes(record.admin_sig, 64)) return false;
+  const expected = { ...value, contract_version: record.contract_version };
+  const message = 'mayhem-targeted-payout-preparation-v1' + stableJson(payoutPreparationEvidence(expected));
+  return crypto.verify(null, Buffer.from(message), ed25519PublicKeyFromRawHex(value.admin),
+    Buffer.from(record.admin_sig, 'hex')) &&
+    Object.entries(expected).every(([key, field]) => stableJson(record[key]) === stableJson(field));
 }
 
 async function submitPreparationFeature({
   peerRpcUrl,
-  value,
+  unsigned,
+  adminSigner,
   fetchImpl = globalThis.fetch,
   timeoutMs = PREPARATION_CONFIRM_TIMEOUT_MS,
   intervalMs = PREPARATION_CONFIRM_INTERVAL_MS,
+  requireExisting,
 } = {}) {
-  const recordKey = `payout/preparation/tap/${value.economic_op_id}`;
-  const existing = await readContractStateValue(
-    peerRpcUrl,
-    recordKey,
-    { confirmed: true, fetchImpl }
-  );
+  const recordKey = `payout/preparation/tap/${unsigned.economic_op_id}`;
+  const readPreparation = async () => {
+    const url = new URL('state', ensureRpcBase(peerRpcUrl));
+    url.search = new URLSearchParams({ key: recordKey, confirmed: 'true' });
+    const row = await fetchJson(url, fetchImpl);
+    if (row?.key !== recordKey || row.confirmed !== true || !Number.isSafeInteger(row.signed_length) ||
+        row.signed_length < 1 || !Object.hasOwn(row, 'value') || Object.hasOwn(row, 'error')) {
+      throw new Error('Invalid confirmed TAP preparation readback');
+    }
+    return row.value;
+  };
+  const existing = await readPreparation();
   if (existing !== null) {
-    if (!exactUnconsumedPreparation(existing, value)) {
+    if (!exactUnconsumedPreparation(existing, unsigned)) {
       throw new Error(
-        `canonical TAP preparation ${value.economic_op_id} conflicts with the planned operation`
+        `canonical TAP preparation ${unsigned.economic_op_id} conflicts with the planned operation`
       );
     }
     return { record: existing, existing: true };
   }
+  if (requireExisting) throw new Error('Existing TAP root lacks its preceding canonical preparation');
+  const message = 'mayhem-targeted-payout-preparation-v1' + stableJson(payoutPreparationEvidence(unsigned));
+  const signature = String(await adminSigner.sign(message)).toLowerCase();
+  if (!isHexBytes(signature, 64)) throw new Error('canonical TAP preparation signer returned an invalid signature');
+  const value = { ...unsigned, admin_sig: signature };
   const featureDigest = await opaqueBlake3Hash(
     'mayhem-targeted-payout-preparation-feature-v1',
     value
@@ -3339,11 +3453,7 @@ async function submitPreparationFeature({
   }
   const deadline = Date.now() + timeoutMs;
   while (Date.now() <= deadline) {
-    const confirmed = await readContractStateValue(
-      peerRpcUrl,
-      recordKey,
-      { confirmed: true, fetchImpl }
-    );
+    const confirmed = await readPreparation();
     if (confirmed !== null) {
       if (!exactUnconsumedPreparation(confirmed, value)) {
         throw new Error(
@@ -3361,6 +3471,7 @@ async function submitPreparationFeature({
 
 export async function submitCanonicalTapPreparationPlan({
   plan,
+  requireExisting = false,
   adminSigner,
   peerRpcUrl,
   fetchImpl,
@@ -3374,7 +3485,7 @@ export async function submitCanonicalTapPreparationPlan({
   // can leave settlement permanently rejected after a contract upgrade.
   const { contractVersion } = await preparationDependencies();
   const admin = String(adminSigner?.publicKey ?? '').toLowerCase();
-  if (!isHexBytes(admin, 32) || typeof adminSigner?.sign !== 'function') {
+  if (!isHexBytes(admin, 32) || (!requireExisting && typeof adminSigner?.sign !== 'function')) {
     throw new Error('canonical TAP preparation requires an Ed25519 admin signer');
   }
   const canonicalAdmin = await readContractStateValue(
@@ -3415,17 +3526,11 @@ export async function submitCanonicalTapPreparationPlan({
       external_effect_ids: preparation.external_effect_ids,
       admin,
     };
-    const message = (
-      `mayhem-targeted-payout-preparation-v1` +
-      stableJson(payoutPreparationEvidence(unsigned))
-    );
-    const signature = String(await adminSigner.sign(message)).toLowerCase();
-    if (!isHexBytes(signature, 64)) {
-      throw new Error('canonical TAP preparation signer returned an invalid signature');
-    }
     results.push(await submitPreparationFeature({
       peerRpcUrl,
-      value: { ...unsigned, admin_sig: signature },
+      unsigned,
+      adminSigner,
+      requireExisting,
       fetchImpl,
       timeoutMs,
       intervalMs,
@@ -3470,7 +3575,7 @@ export async function tapPreparationAdminSignerFromEnv(env = process.env) {
   };
 }
 
-function settlementBundleSha256(bundle) {
+export function settlementBundleSha256(bundle) {
   return crypto.createHash('sha256').update(stableJson(bundle)).digest('hex');
 }
 
@@ -3713,9 +3818,6 @@ async function main() {
     bundle,
     peerRpcUrl,
   });
-  const epochPolicy = await resolveTapSettlementEpochPolicy({
-    peerRpcUrl,
-  });
   const tapRateLockPath = args['tap-rate-lock'];
   const tapRateLock = await resolveTapSettlementRate({
     bundle,
@@ -3726,9 +3828,13 @@ async function main() {
     throw new Error('Configured TAP pool does not match the canonical payment pool');
   }
   const tapUsdAu = tapRateLock.tap_usd_au;
+  const snapshotAt = await resolveTapSnapshotAt(bundle, peerRpcUrl);
+  const epochPolicy = await resolveTapSettlementEpochPolicy({
+    peerRpcUrl, at: snapshotAt, signedLength: sweepPointer?.signed_length,
+  });
   const payoutMinimum = await resolveTapSettlementPayoutMinimum({
     peerRpcUrl,
-    at: tapPreparationAt(bundle, tapRateLock),
+    at: snapshotAt,
     signedLength: sweepPointer?.signed_length,
   });
   const ledgerFeeBps = args['ledger-fee-bps'];
@@ -3795,8 +3901,8 @@ async function main() {
     rootEventReader,
     epoch: args.epoch ? parsePositiveInt(args.epoch, '--epoch') : undefined,
     canonicalPreparationSubmitter: confirm
-      ? ({ plan }) => submitCanonicalTapPreparationPlan({
-        plan,
+      ? ({ plan, requireExisting }) => submitCanonicalTapPreparationPlan({
+        plan, requireExisting,
         adminSigner: preparationAdminSigner,
         peerRpcUrl,
       })

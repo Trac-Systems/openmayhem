@@ -37,6 +37,7 @@ import {
   rollTapSettlement,
   verifyReceiptEnvelope,
 } from '../scripts/tap-settlement-roller.mjs';
+import { oracleRecord, pricingFixture, rootReceiptFixture } from './helpers/tap-pricing.mjs';
 import { makeReceiptIdentity, signedTapReceipt } from './helpers/signed-receipt.mjs';
 
 const TAP_USD_AU = '1000000000000000000';
@@ -326,6 +327,18 @@ test('TAP roller locks payout minimum from confirmed historical parameter eviden
   });
   assert.equal(calls.length, 2);
   assert.ok(calls.every((url) => url.includes('confirmed=true')));
+  const rotated = new Map([
+    ['params/payout_min_au', { key: 'payout_min_au', current: { value: '300', ver: 3, effective_at: 30 }, pending: null }],
+    ['params/update/3', { ver: 3, values: { payout_min_au: '300' }, effective_at: 30, set_by_role: 'admin' }],
+    ['params/update/2', { ver: 2, values: { payout_min_au: '250' }, effective_at: 20, set_by_role: 'admin' }],
+  ]);
+  const historical = await resolveTapSettlementPayoutMinimum({ peerRpcUrl: 'http://fixture.invalid/v1', at: 20,
+    signedLength: 321, fetchImpl: async url => {
+      assert.equal(url.searchParams.get('signed_length'), '321');
+      const key = url.searchParams.get('key');
+      return Response.json({ key, value: rotated.get(key), signed_length: 321, confirmed: true });
+    } });
+  assert.deepEqual(historical, after);
 });
 
 function targetedBindingsFor(bundle, providerAccounts, revisions = {}) {
@@ -421,25 +434,23 @@ function canonicalLiabilitiesFor(bundle, providerAccounts, revisions = {}, overr
 
 function checkpointArgs(bundle, poolAddress, tokenAddress) {
   bundle.epoch_apply_hash ??= 'ab'.repeat(32);
-  return {
-    epochApplyHash: bundle.epoch_apply_hash,
-    tapRateLock: {
-      type: 'tap_settlement_rate_lock',
-      epoch: bundle.epoch,
-      bundle_sha256: 'cd'.repeat(32),
-      denom: 'tap_usd_au',
-      tap_usd_au: TAP_USD_AU,
-      source: 'test-fixed-rate',
-      rate_ts: 3_600,
-      rate_record_key: `rate/tap/3600/${'ef'.repeat(32)}`,
-      posted_by: 'aa'.repeat(32),
-      posted_by_role: 'admin',
-      chain_id: 61_000,
-      token_address: tokenAddress,
-      pool_address: poolAddress,
-      payment_config_ver: 1,
-    },
+  bundle.at ??= 3600;
+  const tapRateLock = {
+    type: 'tap_settlement_rate_lock',
+    epoch: bundle.epoch,
+    bundle_sha256: crypto.createHash('sha256').update(stableJson(bundle)).digest('hex'),
+    denom: 'tap_usd_au',
+    tap_usd_au: TAP_USD_AU,
+    source: 'test-fixed-rate',
+    rate_ts: bundle.at,
+    posted_by: 'aa'.repeat(32),
+    posted_by_role: 'admin',
+    chain_id: 61_000,
+    token_address: tokenAddress.toLowerCase(),
+    pool_address: poolAddress.toLowerCase(),
+    payment_config_ver: 1,
   };
+  return { epochApplyHash: bundle.epoch_apply_hash, tapRateLock, ...pricingFixture(tapRateLock) };
 }
 
 function memoryPreparationSubmitter() {
@@ -555,10 +566,10 @@ async function rollWithTapFinality(provider, args) {
   };
 }
 
-async function tapRollFixture(session) {
+async function tapRollFixture(session, deploymentOptions) {
   const ganache = Ganache.provider({
     logging: { quiet: true },
-    chain: { chainId: 61_000 },
+    chain: { chainId: 61_000, time: new Date(3600_000) },
     wallet: { totalAccounts: 4 },
   });
   const provider = new ethers.BrowserProvider(ganache);
@@ -566,7 +577,7 @@ async function tapRollFixture(session) {
   const buyer = await provider.getSigner(1);
   const providerSigner = await provider.getSigner(2);
   const operatorTreasury = await provider.getSigner(3);
-  const { token, pool, poolAddr, governanceWallet } = await deployPool(operator);
+  const { token, pool, poolAddr, governanceWallet } = await deployPool(operator, deploymentOptions);
   await (await token.mint(await buyer.getAddress(), U(5))).wait();
   await (await token.connect(buyer).approve(poolAddr, U(5))).wait();
   await (await pool.connect(buyer).deposit(U(5))).wait();
@@ -597,6 +608,112 @@ async function tapRollFixture(session) {
     },
   };
 }
+
+test('TAP rejects invalid proposal pricing and prior caps before preparing or broadcasting', async () => {
+  const { pool, provider, args } = await tapRollFixture('pre-proposal-checks');
+  const head = await provider.getBlock('latest');
+  const submit = () => assert.fail('an invalid root cannot reserve funds');
+  for (const [rateTs, message] of [[head.timestamp + 120, /future/], [head.timestamp - 2701, /stale/]]) {
+    const lock = { ...args.tapRateLock, rate_ts: rateTs };
+    await assert.rejects(rollTapSettlement({ ...args, ...pricingFixture(lock), tapRateLock: lock,
+      canonicalPreparationSubmitter: submit }), message);
+  }
+  const schedule = (key, value) => ({ key, current: { ver: 1, effective_at: 0, value }, pending: null });
+  args.state.set('params/fee_bps', schedule('fee_bps', 1400));
+  await assert.rejects(rollTapSettlement({ ...args, canonicalPreparationSubmitter: submit }), /payout policy/);
+  args.state.delete('params/fee_bps');
+  const scope = `settle/targeted/tap/state/${args.tapRateLock.chain_id}/${args.tapRateLock.pool_address}`;
+  args.state.set(scope, { type: 'targeted_tap_settlement_state', ...Object.fromEntries(
+    ['chain_id','pool_address','token_address','payment_config_ver'].map(k => [k, args.tapRateLock[k]])),
+    last_epoch: 0, last_root: null, cumulative_spent_wei: '2', cumulative_provider_claimed_wei: '0' });
+  await assert.rejects(rollTapSettlement({ ...args, canonicalPreparationSubmitter: submit }), /exact confirmed cumulative caps/);
+  args.state.delete(scope);
+  args.state.delete(args.tapRateLock.rate_record_key);
+  await assert.rejects(rollTapSettlement({ ...args, canonicalPreparationSubmitter: submit }), /exact admin-posted oracle history/);
+  assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 0);
+});
+
+test('quote expiry during Core preparation stops the EVM proposal', async () => {
+  const { pool, provider, args } = await tapRollFixture('expired-during-preparation');
+  const submit = memoryPreparationSubmitter();
+  const delayed = async request => {
+    const confirmation = await submit(request);
+    await provider.send('evm_increaseTime', [2701]);
+    await provider.send('evm_mine', []);
+    return confirmation;
+  };
+  await assert.rejects(rollTapSettlement({ ...args, canonicalPreparationSubmitter: delayed }), /stale/);
+  assert.equal(submit.created, 2);
+  assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 0);
+});
+
+test('a receipt bundle without a snapshot requires a matching signed epoch anchor', async () => {
+  const { args, pool } = await tapRollFixture('native-snapshot-anchor');
+  const snapshotAt = args.bundle.at - 90;
+  delete args.bundle.at;
+  args.tapRateLock.bundle_sha256 = crypto.createHash('sha256').update(stableJson(args.bundle)).digest('hex');
+  const anchor = { type: 'epoch_apply_anchor', epoch: args.bundle.epoch, apply_hash: args.bundle.epoch_apply_hash,
+    settlement_unix: snapshotAt, applied_at: 'fixture' };
+  const key = `epoch/apply-anchor/${anchor.epoch}`;
+  const run = () => rollTapSettlement({ ...args, canonicalPreparationSubmitter: memoryPreparationSubmitter() });
+  await assert.rejects(run(), /snapshot apply hash mismatch/);
+  args.state.set(key, { ...anchor, apply_hash: 'cd'.repeat(32) });
+  await assert.rejects(run(), /snapshot apply hash mismatch/);
+  assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 0);
+  args.state.set(key, anchor);
+  const submit = memoryPreparationSubmitter();
+  const result = await rollTapSettlement({ ...args, canonicalPreparationSubmitter: request => {
+    assert.equal(request.plan.intent.at, snapshotAt);
+    return submit(request);
+  } });
+  assert.equal(result.root_confirmed, true);
+});
+
+test('a delayed inclusion that makes the mined quote stale can never execute the pending root', async () => {
+  const { pool, provider, args } = await tapRollFixture('expired-during-mining');
+  const wrap = target => new Proxy(target, { get(object, key) {
+    if (key === 'connect') return signer => wrap(object.connect(signer));
+    const original = Reflect.get(object, key);
+    if (key !== 'proposeRoot') return typeof original === 'function' ? original.bind(object) : original;
+    const send = async (...values) => {
+      await provider.send('evm_increaseTime', [2701]);
+      return original(...values);
+    };
+    send.staticCall = original.staticCall;
+    send.estimateGas = original.estimateGas;
+    return send;
+  } });
+  const run = () => rollTapSettlement({ ...args, pool: wrap(pool), canonicalPreparationSubmitter: memoryPreparationSubmitter() });
+  await assert.rejects(run(), /stale/);
+  await assert.rejects(run(), /stale/);
+  assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 1);
+  assert.equal((await pool.queryFilter(pool.filters.RootPosted())).length, 0);
+  assert.equal(await pool.epoch(), 0n);
+});
+
+test('delayed execution and finalized recovery use the original proposal block, even after policy and oracle move', async () => {
+  const { pool, provider, args } = await tapRollFixture('valid-at-proposal', { governanceDelay: 3600n });
+  const submit = memoryPreparationSubmitter();
+  const run = prior => rollTapSettlement({ ...args, prior, canonicalPreparationSubmitter: submit });
+  const proposed = await run();
+  assert.equal(proposed.awaiting_governance_delay, true);
+  const [event] = await pool.queryFilter(pool.filters.RootProposed(1));
+  const block = await provider.getBlock(event.blockNumber);
+  args.state.set('params/fee_bps', { key: 'fee_bps', current: { ver: 1, effective_at: 0, value: 1500 },
+    pending: { ver: 2, effective_at: block.timestamp + 10, value: 1400 } });
+  args.state.set('tap/rate/latest', { tap_usd_au: '9384', ts: block.timestamp + 3000 });
+  await provider.send('evm_increaseTime', [3601]);
+  await provider.send('evm_mine', []);
+  const posted = await run();
+  assert.equal(posted.awaiting_finality, true);
+  await mineTapConfirmations(provider);
+  const final = await run(posted);
+  assert.equal(final.tap_settlement_checkpoint.proposal_block_timestamp, block.timestamp);
+  assert.equal(final.tap_settlement_checkpoint.proposal_block_hash, block.hash);
+  assert.equal(final.tap_settlement_checkpoint.at, args.bundle.at);
+  assert.equal((await pool.queryFilter(pool.filters.RootProposed())).length, 1);
+  assert.equal((await pool.queryFilter(pool.filters.RootPosted())).length, 1);
+});
 
 test('TAP settlement reads claimable amounts once on replay and rechecks both after writes', async () => {
   const { provider, pool, args } = await tapRollFixture('settlement-read-counts');
@@ -855,26 +972,21 @@ test('TAP settlement rate lock survives oracle updates and rejects a different b
   );
 });
 
-test('TAP settlement reads challenge and maturity epochs from active ledger state', async () => {
+test('TAP settlement reads challenge and maturity policy at the confirmed snapshot', async () => {
   const state = new Map([
-    ['epoch/apply/state', { updated_epoch: 19 }],
-    ['params/challenge_epochs', {
-      current: { value: 8, effective_at: 0 },
-      pending: { value: 12, effective_at: Math.floor(Date.now() / 1_000) + 3_600 },
-    }],
+    ['epoch/apply/state', { updated_epoch: 19, last_settlement_unix: 100 }],
+    ['params/challenge_epochs', { key: 'challenge_epochs', current: { ver: 1, value: 8, effective_at: 0 },
+      pending: { ver: 2, value: 12, effective_at: 101 } }],
   ]);
-  const fetchImpl = async (url) => ({
-    ok: true,
-    json: async () => ({ value: state.get(new URL(url).searchParams.get('key')) ?? null }),
-  });
-
-  assert.deepEqual(
-    await resolveTapSettlementEpochPolicy({
-      peerRpcUrl: 'http://127.0.0.1:49223/v1',
-      fetchImpl,
-    }),
-    { settleThroughEpoch: 19, challengeEpochs: 8 }
-  );
+  const fetchImpl = async url => {
+    assert.equal(url.searchParams.get('signed_length'), '42');
+    const key = url.searchParams.get('key');
+    return Response.json({ key, value: state.get(key) ?? null, confirmed: true, signed_length: 42 });
+  };
+  const args = { peerRpcUrl: 'http://fixture.invalid/v1', signedLength: 42, fetchImpl };
+  assert.deepEqual(await resolveTapSettlementEpochPolicy(args), { settleThroughEpoch: 19, challengeEpochs: 8 });
+  assert.deepEqual(await resolveTapSettlementEpochPolicy({ ...args, at: 101 }),
+    { settleThroughEpoch: 19, challengeEpochs: 12 });
 });
 
 test('TAP payout minimum defers from canonical liability and crossing pays full accrued once', () => {
@@ -1059,6 +1171,9 @@ function sweepFixture(epoch, { rows = [sweepRow], receipts = [], after = null, l
     ['params/payout_min_au', param('payout_min_au', '1')],
     ['params/max_tap_settlement_outputs', param('max_tap_settlement_outputs', limit)],
   ]);
+  const rate = oracleRecord(lock.tapRateLock);
+  lock.tapRateLock.rate_record_key = rate.updated_at;
+  state.set(rate.updated_at, rate);
   for (const row of rows) {
     const { provider, revision, target } = row;
     state.set(sweepKey(row), row);
@@ -1079,7 +1194,8 @@ function sweepFixture(epoch, { rows = [sweepRow], receipts = [], after = null, l
     assert.equal(url.origin, 'http://fixture.invalid');
     const q = url.searchParams;
     assert.equal(q.get('confirmed'), 'true');
-    assert.equal(q.get('signed_length'), String(pointer.signed_length));
+    if (q.has('signed_length')) assert.equal(q.get('signed_length'), String(pointer.signed_length));
+    else assert.equal(q.get('key'), 'admin');
     let result;
     if (q.has('key')) {
       const key = q.get('key');
@@ -1126,18 +1242,26 @@ test('TAP sweep pays unchanged held storage in a later receiptless epoch and rep
   // Observe a pre-existing pending proposal, then its posted event, entirely
   // through read-only pool fixtures. A replay cannot propose or add spend.
   let posted = false, depth = 0;
+  const chainEvidence = rootReceiptFixture();
   const pool = {
     getAddress: async () => sweepPool, merkleRoot: async () => posted ? report.root : ethers.ZeroHash,
     epoch: async () => posted ? 4 : 0, cumulativeSpent: async () => posted ? 67n : 0n,
     totalDeposited: async () => 1000n, maxEpochDelta: async () => 1000n,
     pendingRoot: async () => posted ? {} : { merkleRoot: report.root, newEpoch: 4, newCumulativeSpent: 67n,
-      previousEpoch: 0, previousCumulativeSpent: 0n, nonce: 1n, executeAfter: 100 },
+      previousEpoch: 0, previousCumulativeSpent: 0n, nonce: 1n, executeAfter: 14600 },
     operatorWithdrawn: async () => 10n, totalBurned: async () => 7n,
-    runner: { provider: { getNetwork: async () => ({ chainId: 1n }), getBlock: async () => ({ timestamp: 90, number: 5 + depth }) } },
+    runner: { provider: { getTransactionReceipt: chainEvidence.getTransactionReceipt,
+      getNetwork: async () => ({ chainId: 1n }), getBlock: async tag => ({ timestamp: (tag === 4 || !posted) ? 14500 : 14600,
+      hash: '0x' + 'cd'.repeat(32), number: typeof tag === 'number' ? tag : 5 + depth }) } },
     queryFilter: () => assert.fail(), filters: { RootPosted: true, RootProposed: true },
   };
-  const rootEventReader = async () => ({ transactionHash: '0x' + 'ab'.repeat(32), blockHash: '0x' + 'cd'.repeat(32),
-    blockNumber: 5, args: { nonce: 1n, executeAfter: 100 }, getTransactionReceipt: async () => ({ status: 1 }) });
+  const rootEventReader = async ({ name, root, cumulativeSpentWei, nonce }) => {
+    const blockNumber = name === 'RootProposed' ? 4 : 5;
+    const hash = '0x' + (name === 'RootProposed' ? 'ab' : 'ba').repeat(32);
+    const blockHash = '0x' + 'cd'.repeat(32);
+    return chainEvidence.event(name, { address: sweepPool, transactionHash: hash, blockHash, blockNumber,
+      args: { epoch: 4, merkleRoot: root, cumulativeSpent: cumulativeSpentWei, nonce: nonce ?? 1n, executeAfter: 14600 } });
+  };
   const observe = prior => rollTapSettlement({ ...args, pool, rootEventReader, prior });
   const pending = await observe(early);
   assert.equal(pending.root_pending, true);
@@ -1148,6 +1272,7 @@ test('TAP sweep pays unchanged held storage in a later receiptless epoch and rep
   assert.equal(waiting.awaiting_finality, true);
   depth = 12;
   const final = await observe(waiting);
+  depth += 3; // Later finality evidence must not change an already archived submission.
   const replay = await observe(final);
   for (const result of [waiting, final, replay]) {
     assert.deepEqual(result.tap_liability_sweep, metadata);
@@ -1191,18 +1316,32 @@ test('TAP sweep pays unchanged held storage in a later receiptless epoch and rep
     assert.equal(refused.carried_root, undefined);
   }
 
-  const accrued = { ...paid, total_au: '112' };
-  const nextRoot = distribution([{ account: sweepTarget, amount: 55n }]).root;
+  // The next 2 AU buy 1 wei. Gross moves 67 -> 68 and the exact cap moves
+  // 50 -> 51, one more than floor((68 - 67) * 75 / 100).
+  const accrued = { ...paid, total_au: '103' };
+  const nextRoot = distribution([{ account: sweepTarget, amount: 51n }]).root;
   const nextPool = { ...pool, pendingRoot: async () => ({ merkleRoot: nextRoot, newEpoch: 5,
-    newCumulativeSpent: 74n, previousEpoch: 4, previousCumulativeSpent: 67n, nonce: 2n, executeAfter: 200 }) };
-  const additional = await rollTapSettlement({ ...sweepFixture(5, { rows: [accrued] }).args,
+    newCumulativeSpent: 68n, previousEpoch: 4, previousCumulativeSpent: 67n, nonce: 2n, executeAfter: 18600 }),
+    runner: { provider: { getTransactionReceipt: chainEvidence.getTransactionReceipt, getNetwork: async () => ({ chainId: 1n }),
+      getBlock: async tag => ({ number: typeof tag === 'number' ? tag : 20,
+      timestamp: 18200, hash: '0x' + 'cd'.repeat(32) }) } } };
+  const later = sweepFixture(5, { rows: [accrued] });
+  later.state.set(`settle/targeted/tap/state/1/${sweepPool}`, { type: 'targeted_tap_settlement_state',
+    chain_id: 1, pool_address: sweepPool, token_address: sweepToken, payment_config_ver: 1, last_epoch: 4,
+    last_root: prior.root, cumulative_spent_wei: '67', cumulative_provider_claimed_wei: '50' });
+  const nextProposal = async request => {
+    const event = await rootEventReader(request);
+    return chainEvidence.event(request.name, { ...event, args: { ...event.args, epoch: 5, executeAfter: 18600 } });
+  };
+  const additional = await rollTapSettlement({ ...later.args, rootEventReader: nextProposal,
     pool: nextPool, prior, operatorAddress: '0x' + '87'.repeat(20) });
   assert.equal(additional.root_pending, true, additional.reasons?.join(', '));
-  assert.equal(additional.spent_au, '11');
+  assert.equal(additional.spent_au, '2');
+  assert.equal(additional.cumulative_spent_wei, '68');
   assert.equal(additional.checkpoint_outputs[0].paid_cum_au_before, '101');
   assert.equal(additional.checkpoint_outputs[0].aggregate_paid_cum_au_before, '101');
   assert.equal(additional.checkpoint_outputs[0].previous_cumulative_wei, '50');
-  assert.equal(additional.providers[0].cumulative_wei, '55');
+  assert.equal(additional.providers[0].cumulative_wei, '51');
 });
 
 test('TAP sweep bounds output revisions while verifying every off-page receipt and allocation', async () => {
@@ -1294,6 +1433,7 @@ test('TAP sweep rejects caller projections, malformed pointers and stale policy 
   assert.equal(dust.canonical_deferred_liabilities[0].reason, 'below_tap_wei_precision');
   const legacy = { ...args, bundle: { ...args.bundle } };
   delete legacy.bundle.tap_liability_sweep;
+  legacy.tapRateLock = { ...args.tapRateLock, bundle_sha256: crypto.createHash('sha256').update(stableJson(legacy.bundle)).digest('hex') };
   const old = await rollTapSettlement({ ...legacy, fetchImpl: () => assert.fail('unexpected sweep read') });
   assert.equal(Object.hasOwn(old, 'tap_liability_sweep'), false);
   assert.equal(old.reason, 'no claimable provider earnings');
@@ -1672,7 +1812,7 @@ test('TAP crash after confirmed proposeRoot resumes with one proposal and one ex
 test('TAP settlement roller posts root and provider proof verifies independently', async () => {
   const ganache = Ganache.provider({
     logging: { quiet: true },
-    chain: { chainId: 61_000 },
+    chain: { chainId: 61_000, time: new Date(3600_000) },
     wallet: { totalAccounts: 5 },
   });
   const provider = new ethers.BrowserProvider(ganache);
@@ -1785,7 +1925,7 @@ test('TAP settlement roller posts root and provider proof verifies independently
 test('TAP settlement roller includes buyer refund leaves in the claim root', async () => {
   const ganache = Ganache.provider({
     logging: { quiet: true },
-    chain: { chainId: 61_000 },
+    chain: { chainId: 61_000, time: new Date(3600_000) },
     wallet: { totalAccounts: 4 },
   });
   const provider = new ethers.BrowserProvider(ganache);
@@ -1865,7 +2005,7 @@ test('TAP settlement roller includes buyer refund leaves in the claim root', asy
 test('TAP settlement roller requires targeted bindings and skips repeated roots', async () => {
   const ganache = Ganache.provider({
     logging: { quiet: true },
-    chain: { chainId: 61_000 },
+    chain: { chainId: 61_000, time: new Date(3600_000) },
     wallet: { totalAccounts: 4 },
   });
   const provider = new ethers.BrowserProvider(ganache);
@@ -2098,7 +2238,7 @@ test('TAP settlement nets one logical bill across provider redispatch attempts',
 test('TAP settlement roller resumes fee and burn after an exact root-only partial run', async () => {
   const ganache = Ganache.provider({
     logging: { quiet: true },
-    chain: { chainId: 61_000 },
+    chain: { chainId: 61_000, time: new Date(3600_000) },
     wallet: { totalAccounts: 4 },
   });
   const provider = new ethers.BrowserProvider(ganache);
@@ -2400,7 +2540,7 @@ test('guardian pre-sign screen halts invariant violations', async () => {
     settlement: {
       root,
       cumulative_spent_wei: '1100',
-      entries: [],
+      entries: [{ account: b, cumulative_wei: '825' }],
     },
     previous: {
       epoch: 1,
@@ -2420,7 +2560,7 @@ test('guardian pre-sign screen halts invariant violations', async () => {
 test('TAP settlement CLI dry-runs and broadcasts with env key against a locked JSON-RPC node', async (t) => {
   const server = Ganache.server({
     logging: { quiet: true },
-    chain: { chainId: 61_000 },
+    chain: { chainId: 61_000, time: new Date(3600_000) },
     wallet: {
       lock: true,
       accounts: [
@@ -2489,7 +2629,7 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
       set_by_role: 'admin',
     }],
     ['epoch/apply/state', { updated_epoch: 7 }],
-    ['params/challenge_epochs', { current: { value: 6, effective_at: 0 }, pending: null }],
+    ['params/challenge_epochs', { key: 'challenge_epochs', current: { ver: 1, value: 6, effective_at: 0 }, pending: null }],
     ['params/payout_min_au', { key: 'payout_min_au', current: { value: '0', effective_at: 0, ver: 1 }, pending: null }],
     ['tap/rate/latest', {
       denom: 'tap_usd_au',
@@ -2542,6 +2682,12 @@ test('TAP settlement CLI dry-runs and broadcasts with env key against a locked J
       paid_cum_au: '0',
     }],
   ]);
+  const rate = ledgerState.get('tap/rate/latest');
+  rate.updated_at = oracleRecord({ tap_usd_au: rate.tap_usd_au, source: rate.source, rate_ts: rate.ts,
+    posted_by: admin }).updated_at;
+  ledgerState.set(rate.updated_at, rate);
+  ledgerState.set('epoch/apply-anchor/1', { type: 'epoch_apply_anchor', epoch: 1,
+    apply_hash: bundle.epoch_apply_hash, settlement_unix: 3600, applied_at: 'fixture' });
   const ledgerServer = http.createServer(async (request, response) => {
     const url = new URL(request.url, 'http://127.0.0.1');
     if (request.method === 'POST' && url.pathname.endsWith('/contract/feature')) {

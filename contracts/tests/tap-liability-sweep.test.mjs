@@ -27,9 +27,9 @@ function fixture() {
       tnk: { network: 'mainnet' }, tap: { chain_id: 1, token_address: TOKEN, pool_address: POOL },
     }],
     [APPLY, { updated_epoch: EPOCH, last_apply_hash: HASH, pending_epoch: null,
-      updated_at: 'epoch-tx', last_settlement_unix: AT - 1 }],
+      updated_at: 'epoch-tx', last_settlement_unix: AT }],
     [ANCHOR, { type: 'epoch_apply_anchor', epoch: EPOCH, apply_hash: HASH, applied_at: 'epoch-tx',
-      settlement_unix: AT - 1 }],
+      settlement_unix: AT }],
   ]);
   const reads = [];
   const pages = [];
@@ -205,10 +205,13 @@ test('selects active parameters at the supplied timestamp and rotates past filte
   f.param('payout_min_au', String(2n * DOLLAR), { value: String(DOLLAR), effective_at: AT, ver: 2 });
   f.param('fee_bps', 1500, { value: 1400, effective_at: AT + 1, ver: 2 });
 
+  await assert.rejects(f.run({ at: AT - 1 }), /liability snapshot differs/);
+  f.state.get(APPLY).last_settlement_unix = f.state.get(ANCHOR).settlement_unix = AT - 1;
   const before = await f.run({ at: AT - 1 });
   assert.equal(before.max_outputs, 1);
   assert.deepEqual(before.liabilities, []);
   assert.equal(before.next_after, first.key);
+  f.state.get(APPLY).last_settlement_unix = f.state.get(ANCHOR).settlement_unix = AT;
   const start = await f.run();
   assert.deepEqual(start.liabilities.map(r => r.payout_revision), [first.revision]);
   assert.equal(start.max_outputs, 2);
@@ -218,6 +221,7 @@ test('selects active parameters at the supplied timestamp and rotates past filte
   assert.equal(end.next_after, null);
   assert.deepEqual(end.liabilities.map(r => r.payout_revision), [third.revision]);
   assert.deepEqual(f.pages, [{ limit: 1, after: null }, { limit: 2, after: null }, { limit: 2, after: second.key }]);
+  f.state.get(APPLY).last_settlement_unix = f.state.get(ANCHOR).settlement_unix = AT + 1;
   await assert.rejects(f.run({ at: AT + 1 }), /fee schedule/);
 });
 
@@ -335,7 +339,7 @@ test('rejects inconsistent financial identities, records, schedules and contract
     [f => { f.param('canary_probe_holdback_bps', -1); }, /out of range/],
     [f => { f.param('canary_probe_holdback_bps', 1); f.param('canary_probe_release_min_passes', 1); }, /threshold/],
     [f => { f.param('payout_min_au', '0'); f.state.get('params/payout_min_au').current.effective_at = AT + 1; },
-      /No active value/],
+      /Missing historical TAP parameter/],
     [f => { f.state.get(ANCHOR).epoch--; }, /anchor is invalid/],
     [f => { f.state.get(APPLY).last_apply_hash = id(5); }, /apply hash mismatch/],
   ];
